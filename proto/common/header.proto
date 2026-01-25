@@ -1,0 +1,135 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Vecton Contributors
+
+syntax = "proto3";
+
+package common;
+
+import "common/errors.proto";
+
+// ============================================================================
+// Client Information
+// ============================================================================
+
+/// Client information for correlation and routing.
+message ClientInfoProto {
+  /// Unique identifier for this call (UUID string).
+  /// Aligns with types::CallId.
+  string call_id = 1;
+
+  /// Client identifier (stable per client process / instance).
+  /// Aligns with types::ClientId (u64).
+  uint64 client_id = 2;
+
+  /// Optional client name for diagnostics.
+  string client_name = 3;
+}
+
+// ============================================================================
+// Protocol Headers (RequestHeaderProto / ResponseHeaderProto)
+// ============================================================================
+
+/// Request header carried with every RPC request (metadata-plane and optionally data-plane).
+///
+/// Canonical cross-transport propagation:
+/// - gRPC: embedded in request messages AND (optionally) mirrored into gRPC metadata for early reject.
+/// - QUIC/RDMA/CUSTOM: serialized as the first frame/message before the request body.
+///
+/// NOTE:
+/// - Keep this message small and stable. Do not use it as a "catch-all".
+message RequestHeaderProto {
+  /// Client information (call_id, client_id, client_name).
+  ClientInfoProto client = 1;
+
+  /// Group ID for this request (required for metadata-plane RPCs).
+  /// Client must fill this field for all metadata RPCs (including msync, read, and write requests).
+  /// Server uses this for routing, validation, logging, and must echo it back in response.
+  /// Aligns with types::ShardGroupId (u64).
+  uint64 group_id = 2;
+
+  /// Mount epoch for FS write operations.
+  /// Client should provide the mount_epoch it knows for the mount being accessed.
+  /// Server validates this against current mount.mount_epoch and returns NEED_REFRESH if mismatch.
+  /// Optional: if not provided, server skips mount_epoch validation (for backward compatibility).
+  optional uint64 mount_epoch = 3;
+
+  /// Absolute deadline (Unix epoch milliseconds).
+  /// For gRPC, grpc-timeout should be authoritative; this is the cross-transport canonical form.
+  int64 deadline_ms = 4;
+
+  /// W3C Trace Context: traceparent header value.
+  string traceparent = 5;
+
+  /// Optional caller context for auditing/diagnostics.
+  /// This is NOT a generic extension point for protocol-critical fields.
+  CallerContextProto caller_context = 6;
+
+  /// Optional state ID for consistency checking (read gating) and routing.
+  /// When provided, a node must satisfy last_applied >= state_id to serve certain reads.
+  /// Leaders should return current/applied state in response headers to advance the client watermark.
+  RaftLogIdProto state_id = 7;
+
+  /// Optional retry count from client perspective (0 = first attempt).
+  int32 retry_count = 8;
+}
+
+/// Human-oriented context for auditing and lightweight diagnostics.
+/// Keep bounded in size and stable in meaning.
+message CallerContextProto {
+  /// Example: "type=spark,job=42"
+  string context = 1;
+
+  /// Optional signature for tamper detection or provenance (opaque).
+  bytes signature = 2;
+}
+
+/// Raft log position used as a monotonic "state watermark".
+/// Represents the state machine's applied position (last_applied_log_id).
+/// Aligns with openraft::LogId<u64> where leader_id = (term, node_id) and index is log index.
+message RaftLogIdProto {
+  /// Leader term that created the entry (part of leader_id).
+  uint64 term = 1;
+
+  /// Node ID of the leader that created the entry (part of leader_id).
+  /// This is NOT necessarily the current leader.
+  uint64 leader_node_id = 2;
+
+  /// Log index.
+  uint64 index = 3;
+}
+
+/// Response header carried with every RPC response.
+///
+/// IMPORTANT gRPC note:
+/// If gRPC returns a non-OK status, many clients will not receive the response message body.
+/// Therefore, for recoverable business/protocol errors, prefer:
+/// - gRPC status = OK
+/// - ResponseHeaderProto.error (ErrorDetailProto) with appropriate error_class
+/// Use non-OK gRPC status only for unrecoverable transport/auth/framework errors, and include
+/// minimal correlation info (e.g., x-call-id, x-error-code) in trailers metadata.
+message ResponseHeaderProto {
+  /// Client information (call_id, client_id, client_name).
+  ClientInfoProto client = 1;
+
+  /// Canonical error detail (single source of truth for all error semantics).
+  /// If error_class = ERROR_CLASS_OK, this field should be unset or have error_class = OK.
+  /// For errors, this field contains all error information (class, code, reason, retry_after_ms).
+  optional ErrorDetailProto error = 2;
+
+  /// Client-visible state watermark returned by the server.
+  /// This is the latest state the client has "seen" from the server (typically equals last_applied_log_id),
+  /// and should be used to advance the client's consistency watermark for subsequent requests.
+  RaftLogIdProto state_id = 4;
+
+  /// Group ID that this response applies to (required for metadata-plane RPCs).
+  /// Server must echo back the actual group_id that processed this request.
+  /// Client must use this group_id (not the request group_id) as the key for updating group->state_id cache,
+  /// to avoid updating the wrong group when route epoch changes.
+  /// Aligns with types::ShardGroupId (u64).
+  uint64 group_id = 5;
+
+  /// Mount epoch returned by server (for FS operations).
+  /// Server fills this with the current mount.mount_epoch so client can update its cache.
+  /// Only set for FS operations that access a mount.
+  optional uint64 mount_epoch = 10;
+}

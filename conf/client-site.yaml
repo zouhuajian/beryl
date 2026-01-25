@@ -1,0 +1,178 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Vecton Contributors
+
+# Vecton Client-Site Configuration
+# This file contains client-side configuration for accessing metadata and worker services.
+# Configuration keys use dot notation (e.g., client.metadata.endpoints).
+# Environment variables can override values (e.g., CLIENT_METADATA_ENDPOINTS).
+
+# ============================================================================
+# Client Configuration
+# ============================================================================
+
+# Client ID
+# Type: integer
+# Default: 0
+# Description: Unique identifier for this client instance
+client.id: 0
+
+# Client default timeout (milliseconds)
+# Type: integer
+# Default: 30000
+# Description: Default timeout for client operations (milliseconds)
+client.default_timeout_ms: 30000
+
+# Client metadata endpoints (comma-separated)
+# Type: string (comma-separated list)
+# Default: "127.0.0.1:18080"
+# Description: Comma-separated list of metadata service endpoints
+# Format: "host:port" or "http://host:port" or comma-separated list
+# Example: "127.0.0.1:18080,127.0.0.1:18081"
+client.metadata.endpoints: "127.0.0.1:18080"
+
+# Client consistency: default level
+# Type: string (enum: "normal", "strong", "weak")
+# Default: "normal"
+# Description: Default consistency level for reads
+# - normal: Standard consistency (default)
+# - strong: Strong consistency (may be slower)
+# - weak: Weak consistency (may be faster)
+client.consistency.default: "normal"
+
+# Client read mode: default
+# Type: string (enum: "cached", "direct")
+# Default: "cached"
+# Description: Default read mode
+# - cached: Read from worker cache (faster, may be stale)
+# - direct: Read directly from UFS (slower, always fresh)
+client.read_mode.default: "cached"
+
+# Client read mode: fallback
+# Type: string (enum: "direct", "disable")
+# Default: "direct"
+# Description: Fallback strategy when read mode fails
+# - direct: Fallback to direct read
+# - disable: Disable read mode (use default path)
+client.read_mode.fallback: "direct"
+
+# Client write mode: default
+# Type: string (enum: "back", "through", "direct")
+# Default: "back"
+# Description: Default write mode
+# - back: Write-back (write to worker, async to UFS)
+# - through: Write-through (write to worker and UFS synchronously)
+# - direct: Write directly to UFS (bypass worker)
+client.write_mode.default: "back"
+
+# Client write mode: fallback
+# Type: string (enum: "through", "direct", "disable")
+# Default: "through"
+# Description: Fallback strategy when write mode fails
+# - through: Fallback to write-through
+# - direct: Fallback to direct-to-UFS
+# - disable: Disable write mode (use default path)
+client.write_mode.fallback: "through"
+
+# ============================================================================
+# Client Cache Configuration
+# ============================================================================
+
+# Client cache: file metadata max entries
+# Type: integer
+# Default: 10000
+# Description: Maximum number of file metadata entries in cache
+client.cache.file_meta.max_entries: 10000
+
+# Client cache: file metadata max bytes (optional)
+# Type: integer (optional)
+# Default: null
+# Description: Maximum memory for file metadata cache in bytes (null = unlimited)
+client.cache.file_meta.max_bytes: null
+
+# Client cache: file metadata TTL (seconds)
+# Type: integer
+# Default: 300
+# Description: Time-to-live for file metadata cache entries (seconds)
+client.cache.file_meta.ttl_secs: 300
+
+# Client cache: route table max entries
+# Type: integer
+# Default: 1000
+# Description: Maximum number of route table entries in cache
+client.cache.route.max_entries: 1000
+
+# Client cache: route table TTL (seconds)
+# Type: integer
+# Default: 60
+# Description: Time-to-live for route table cache entries (seconds)
+client.cache.route.ttl_secs: 60
+
+# ============================================================================
+# Client Retry Configuration
+# ============================================================================
+
+# Client retry: max retries
+# Type: integer
+# Default: 3
+# Description: Maximum number of retries for failed operations
+client.retry.max_retries: 3
+
+# Client retry: initial backoff (milliseconds)
+# Type: integer
+# Default: 100
+# Description: Initial backoff delay in milliseconds
+client.retry.initial_backoff_ms: 100
+
+# Client retry: max backoff (milliseconds)
+# Type: integer
+# Default: 5000
+# Description: Maximum backoff delay in milliseconds
+client.retry.max_backoff_ms: 5000
+
+# Client retry: backoff multiplier
+# Type: float or string
+# Default: "2.0"
+# Description: Multiplier for exponential backoff (must be > 0)
+client.retry.backoff_multiplier: "2.0"
+
+# ============================================================================
+# Client Worker Direct Read Configuration
+# ============================================================================
+# Direct read allows clients to read directly from worker nodes, bypassing metadata.
+# This can improve read performance but requires caching and version checking.
+
+# Client worker direct read: enabled
+# Type: boolean
+# Default: true
+# Description: Enable direct read from worker nodes
+client.worker.direct_read.enabled: true
+
+# Client worker direct read: cache max entries
+# Type: integer
+# Default: 1000
+# Description: Maximum number of entries in direct read cache
+client.worker.direct_read.cache.max_entries: 1000
+
+# Client worker direct read: cache TTL (seconds)
+# Type: integer
+# Default: 60
+# Description: Time-to-live for direct read cache entries (seconds)
+client.worker.direct_read.cache.ttl_secs: 60
+
+# Client worker direct read: version check
+# Type: boolean
+# Default: true
+# Description: Enable version checking for direct reads (ensures data freshness)
+client.worker.direct_read.version_check: true
+
+# ============================================================================
+# Client Transport Configuration
+# ============================================================================
+# NOTE: client.transport.xxx configuration has been removed.
+# Client transport kind is now determined from metadata worker information.
+# The client will automatically use the transport protocol (grpc/quic/rdma)
+# that each worker declares in its registration/heartbeat.
+#
+# If you need to configure timeout/backpressure settings, they can be
+# configured via client.rpc.* (TODO: implement if needed).
+

@@ -1,0 +1,533 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Vecton Contributors
+
+# Vecton Core-Site Configuration
+# This file contains server-side configuration for metadata and worker services.
+# Configuration keys use dot notation (e.g., metadata.rpc.port).
+# Environment variables can override values (e.g., METADATA_RPC_PORT).
+
+# ============================================================================
+# Metadata Service Configuration
+# ============================================================================
+
+# Metadata RPC server address
+# Type: string
+# Default: "0.0.0.0"
+# Description: Bind address for metadata RPC server
+metadata.rpc.addr: "0.0.0.0"
+
+# Metadata RPC server port
+# Type: integer
+# Default: 18080
+# Range: 1-65535
+# Description: Port for metadata RPC server
+metadata.rpc.port: 18080
+
+# ============================================================================
+# Metadata Raft Configuration (for metadata clustering)
+# ============================================================================
+
+# Metadata Raft cluster ID
+# Type: string
+# Default: "vecton-metadata"
+# Description: Unique identifier for the Raft cluster
+metadata.raft.cluster_id: "vecton-metadata"
+
+# Metadata Raft node ID
+# Type: integer
+# Default: 1
+# Range: >= 1
+# Description: Unique identifier for this Raft node (must be unique in cluster)
+metadata.raft.node_id: 1
+
+# Metadata Raft peer addresses (comma-separated)
+# Type: string (comma-separated list)
+# Default: "" (empty for single-node)
+# Description: Comma-separated list of peer addresses (e.g., "127.0.0.1:18080,127.0.0.1:18081")
+# Example: "127.0.0.1:18080,127.0.0.1:18081,127.0.0.1:18082"
+metadata.raft.peers: ""
+
+# Metadata Raft storage directory
+# Type: string (path)
+# Default: "./data/metadata/raft"
+# Description: Directory for storing Raft log and state
+metadata.raft.storage.dir: "./data/metadata/raft"
+
+# Metadata Raft snapshot interval (seconds)
+# Type: integer
+# Default: 3600
+# Description: Interval between Raft snapshots
+metadata.raft.snapshot.interval_secs: 3600
+
+# Metadata Raft snapshot retain count
+# Type: integer
+# Default: 3
+# Description: Number of snapshots to retain
+metadata.raft.snapshot.retain_count: 3
+
+# Metadata Raft log compaction interval (seconds)
+# Type: integer
+# Default: 300
+# Description: Interval for Raft log compaction
+metadata.raft.log.compaction_interval_secs: 300
+
+# Metadata Raft log retain count
+# Type: integer
+# Default: 1000
+# Description: Number of log entries to retain before compaction
+metadata.raft.log.retain_count: 1000
+
+# Metadata Raft heartbeat interval (milliseconds)
+# Type: integer
+# Default: 1000
+# Description: Interval between Raft heartbeats
+metadata.raft.heartbeat_interval_ms: 1000
+
+# Metadata Raft election timeout minimum (milliseconds)
+# Type: integer
+# Default: 5000
+# Description: Minimum election timeout
+metadata.raft.election_timeout_min_ms: 5000
+
+# Metadata Raft election timeout maximum (milliseconds)
+# Type: integer
+# Default: 10000
+# Description: Maximum election timeout
+metadata.raft.election_timeout_max_ms: 10000
+
+# ============================================================================
+# Metadata Shard Configuration
+# ============================================================================
+
+# Metadata shard: number of shards
+# Type: integer
+# Default: 1
+# Description: Number of shards for metadata partitioning
+metadata.shard.num_shards: 1
+
+# Metadata shard: group ID
+# Type: integer
+# Default: 0
+# Description: Shard group identifier
+metadata.shard.group_id: 0
+
+# ============================================================================
+# Worker Service Configuration
+# ============================================================================
+
+# Worker RPC bind address
+# Type: string (socket address)
+# Default: "0.0.0.0:9090"
+# Description: Bind address for worker RPC server (format: "host:port")
+worker.rpc.bind: "0.0.0.0:9090"
+
+# Worker RPC max inflight requests
+# Type: integer
+# Default: 100
+# Description: Maximum concurrent RPC requests
+worker.rpc.max_inflight: 100
+
+# Worker storage directories (comma-separated or single path)
+# Type: string (path or comma-separated paths)
+# Default: "./data"
+# Description: Directories for storing block data (can be multiple for load balancing)
+worker.storage.dirs: "./data"
+
+# Worker storage block size
+# Type: string (size with unit: KB, MB, GB) or integer (bytes)
+# Default: "32MB"
+# Description: Default block size in bytes (must be divisible by chunk_size)
+worker.storage.block_size: "32MB"
+
+# Worker storage chunk size
+# Type: string (size with unit: KB, MB, GB) or integer (bytes)
+# Default: "1MB"
+# Description: Default chunk size in bytes (must divide block_size evenly)
+worker.storage.chunk_size: "1MB"
+
+# Worker storage kind
+# Type: string (enum: "fs", "io_uring", "spdk")
+# Default: "fs"
+# Description: Storage backend type (fs=filesystem, io_uring=Linux io_uring, spdk=SPDK)
+worker.storage.kind: "fs"
+
+# Worker concurrency: max read operations
+# Type: integer
+# Default: 100
+# Description: Maximum concurrent read operations
+worker.concurrency.max_read_ops: 100
+
+# Worker concurrency: max write operations
+# Type: integer
+# Default: 50
+# Description: Maximum concurrent write operations
+worker.concurrency.max_write_ops: 50
+
+# Worker concurrency: queue size
+# Type: integer
+# Default: 1000
+# Description: Request queue size
+worker.concurrency.queue_size: 1000
+
+# Worker eviction: high watermark
+# Type: float (0.0-1.0) or string
+# Default: "0.90"
+# Description: High watermark for eviction (0.0-1.0, e.g., 0.90 = 90%)
+worker.eviction.high_watermark: "0.90"
+
+# Worker eviction: low watermark
+# Type: float (0.0-1.0) or string
+# Default: "0.80"
+# Description: Low watermark for eviction (must be < high_watermark)
+worker.eviction.low_watermark: "0.80"
+
+# Worker eviction: rate (bytes per second)
+# Type: string (size with unit) or integer (bytes)
+# Default: "100MB"
+# Description: Eviction rate in bytes per second
+worker.eviction.rate_bytes_per_sec: "100MB"
+
+# Worker eviction: rate (IOPS)
+# Type: integer
+# Default: 100
+# Description: Eviction rate in IOPS
+worker.eviction.rate_iops: 100
+
+# Worker orphan: grace period (seconds)
+# Type: integer
+# Default: 3600
+# Description: Grace period before deleting orphan blocks (seconds)
+worker.orphan.grace_period_secs: 3600
+
+# Worker orphan: scan interval (seconds)
+# Type: integer
+# Default: 300
+# Description: Interval for scanning orphan blocks (seconds)
+worker.orphan.scan_interval_secs: 300
+
+# Worker volume health: error rate threshold
+# Type: float or string
+# Default: 10.0
+# Description: Error rate threshold (errors per second)
+worker.volume_health.error_rate_threshold: 10.0
+
+# Worker volume health: consecutive failures threshold
+# Type: integer
+# Default: 5
+# Description: Number of consecutive failures before marking volume unhealthy
+worker.volume_health.consecutive_failures_threshold: 5
+
+# Worker volume health: recovery probe interval (seconds)
+# Type: integer
+# Default: 60
+# Description: Interval for probing volume recovery (seconds)
+worker.volume_health.recovery_probe_interval_secs: 60
+
+# Worker volume health: recovery probe timeout (seconds)
+# Type: integer
+# Default: 5
+# Description: Timeout for recovery probe (seconds)
+worker.volume_health.recovery_probe_timeout_secs: 5
+
+# Worker UFS: default UFS instance ID
+# Type: string (optional)
+# Default: null
+# Description: Default UFS instance ID to use (if not specified, first available is used)
+worker.ufs.default_id: null
+
+# Worker UFS: max concurrent operations per instance
+# Type: integer
+# Default: 10
+# Description: Maximum concurrent operations per UFS instance
+worker.ufs.max_concurrent_per_instance: 10
+
+# Worker UFS: timeout (milliseconds)
+# Type: integer
+# Default: 30000
+# Description: Timeout for UFS operations (milliseconds)
+worker.ufs.timeout_ms: 30000
+
+# Worker UFS: async fill
+# Type: boolean
+# Default: false
+# Description: Enable async fill-back for UFS reads
+worker.ufs.async_fill: false
+
+# Worker metadata: heartbeat interval (seconds)
+# Type: integer
+# Default: 5
+# Description: Interval between heartbeats to metadata service (seconds)
+worker.metadata.heartbeat_interval_sec: 5
+
+# Worker metadata: block report interval (seconds)
+# Type: integer
+# Default: 60
+# Description: Interval between block reports to metadata service (seconds)
+worker.metadata.block_report_interval_sec: 60
+
+# Worker metadata: backoff duration (seconds)
+# Type: integer
+# Default: 10
+# Description: Backoff duration on metadata connection failure (seconds)
+worker.metadata.backoff_duration_sec: 10
+
+# Worker metadata: group endpoints
+# Type: string (comma-separated "group_id:endpoint" pairs)
+# Default: "" (empty)
+# Description: Metadata group endpoints (e.g., "0:127.0.0.1:18080,1:127.0.0.1:18081")
+worker.metadata.groups: ""
+
+# Worker replication: peer connection pool size
+# Type: integer
+# Default: 4
+# Description: Connection pool size per peer worker
+worker.replication.peer_connection_pool_size: 4
+
+# Worker replication: max concurrent blocks
+# Type: integer
+# Default: 10
+# Description: Maximum concurrent blocks being replicated
+worker.replication.max_concurrent_blocks: 10
+
+# Worker replication: max concurrent chunks per block
+# Type: integer
+# Default: 4
+# Description: Maximum concurrent chunks per block during replication
+worker.replication.max_concurrent_chunks_per_block: 4
+
+# Worker replication: chunk timeout (milliseconds)
+# Type: integer
+# Default: 30000
+# Description: Timeout for chunk replication (milliseconds)
+worker.replication.chunk_timeout_ms: 30000
+
+# Worker replication: peer endpoints
+# Type: string (comma-separated "worker_id:endpoint" pairs)
+# Default: "" (empty)
+# Description: Peer worker endpoints (e.g., "1:127.0.0.1:9091,2:127.0.0.1:9092")
+worker.replication.peer_endpoints: ""
+
+# Worker replication: fencing mode
+# Type: string (enum: "strict", "special", "skip")
+# Default: "special"
+# Description: Fencing token mode for replication
+worker.replication.fencing.mode: "special"
+
+# Worker replication: special token (optional)
+# Type: string (optional)
+# Default: null
+# Description: Special token value for replication (when mode=special)
+worker.replication.fencing.special_token: null
+
+# ============================================================================
+# Worker Transport Configuration
+# ============================================================================
+# All transport parameters for worker are now under worker.transport.xxx
+# Global transport.xxx is kept for backward compatibility and client/metadata use
+
+# Worker transport: kind
+# Type: string (enum: "grpc", "quic", "rdma", "io_uring", "local")
+# Default: "grpc"
+# Description: Transport kind for worker-to-worker communication
+worker.transport.kind: "grpc"
+
+# Worker transport: connection timeout (milliseconds)
+# Type: integer
+# Default: 5000
+# Description: Timeout for establishing connections
+worker.transport.connect_timeout_ms: 5000
+
+# Worker transport: request timeout (milliseconds)
+# Type: integer
+# Default: 30000
+# Description: Default timeout for RPC requests
+worker.transport.request_timeout_ms: 30000
+
+# Worker transport: max inflight requests
+# Type: integer
+# Default: 100
+# Description: Maximum concurrent inflight requests (client-side backpressure)
+worker.transport.max_inflight_requests: 100
+
+# Worker transport: max inflight streams
+# Type: integer
+# Default: 10
+# Description: Maximum concurrent inflight streams (for streaming RPCs)
+worker.transport.max_inflight_streams: 10
+
+# Worker transport: server max inflight
+# Type: integer
+# Default: 100
+# Description: Maximum concurrent inflight requests on server side
+worker.transport.server.max_inflight: 100
+
+# Worker transport: keepalive interval (milliseconds)
+# Type: integer
+# Default: 30000
+# Description: Keep-alive interval for connections
+worker.transport.keepalive_interval_ms: 30000
+
+# Worker transport: keepalive timeout (milliseconds)
+# Type: integer
+# Default: 5000
+# Description: Keep-alive timeout for connections
+worker.transport.keepalive_timeout_ms: 5000
+
+# Worker transport: zero-copy required
+# Type: boolean
+# Default: true
+# Description: Require zero-copy support for transport
+worker.transport.zero_copy.required: true
+
+# Worker transport: combo allow fallback
+# Type: boolean
+# Default: false
+# Description: Allow fallback to another transport if combo is invalid
+worker.transport.combo.allow_fallback: false
+
+# Worker transport: fallback transport (optional)
+# Type: string (optional)
+# Default: null
+# Description: Fallback transport kind (if allow_fallback is true)
+worker.transport.combo.fallback_transport: null
+
+# ============================================================================
+# UFS (Underlying File System) Configuration
+# ============================================================================
+# UFS instances are configured separately (typically via JSON file or metadata).
+# The following are global UFS settings. For per-instance configuration,
+# see ufs crate documentation or use metadata-provided UFS specs.
+
+# UFS instance max inflight (per instance)
+# Format: ufs.{instance_id}.max_inflight
+# Type: integer
+# Default: 10
+# Example: ufs.s3-backend.max_inflight: 20
+# Description: Maximum concurrent operations for a specific UFS instance
+
+# ============================================================================
+# Observability Configuration
+# ============================================================================
+
+# Observe logging: level
+# Type: string (enum: "trace", "debug", "info", "warn", "error")
+# Default: "info"
+# Description: Log level
+observe.logging.level: "info"
+
+# Observe logging: format
+# Type: string (enum: "json", "pretty")
+# Default: "json"
+# Description: Log format (json for production, pretty for development)
+observe.logging.format: "json"
+
+# Observe logging: targets (optional)
+# Type: string (optional)
+# Default: null
+# Description: Target filters (e.g., "metadata=debug,transport=info")
+observe.logging.targets: null
+
+# Observe logging: stdout
+# Type: boolean
+# Default: true
+# Description: Output logs to stdout
+observe.logging.stdout: true
+
+# Observe tracing: enabled
+# Type: boolean
+# Default: true
+# Description: Enable distributed tracing
+observe.tracing.enabled: true
+
+# Observe tracing: sampling ratio
+# Type: float (0.0-1.0) or string
+# Default: "1.0"
+# Description: Sampling ratio for traces (1.0 = 100%)
+observe.tracing.sampling.ratio: "1.0"
+
+# Observe tracing: parent-based sampling
+# Type: boolean
+# Default: true
+# Description: Use parent-based sampling (respect parent trace decision)
+observe.tracing.sampling.parent_based: true
+
+# Observe tracing: OTLP enabled
+# Type: boolean
+# Default: false
+# Description: Enable OTLP trace export
+observe.tracing.otlp.enabled: false
+
+# Observe tracing: OTLP endpoint
+# Type: string (URL)
+# Default: "http://localhost:4317"
+# Description: OTLP endpoint URL
+observe.tracing.otlp.endpoint: "http://localhost:4317"
+
+# Observe tracing: OTLP protocol
+# Type: string (enum: "grpc", "http")
+# Default: "grpc"
+# Description: OTLP protocol
+observe.tracing.otlp.protocol: "grpc"
+
+# Observe tracing: OTLP timeout (milliseconds)
+# Type: integer
+# Default: 10000
+# Description: OTLP export timeout
+observe.tracing.otlp.timeout_ms: 10000
+
+# Observe metrics: enabled
+# Type: boolean
+# Default: true
+# Description: Enable metrics collection
+observe.metrics.enabled: true
+
+# Observe metrics: Prometheus enabled
+# Type: boolean
+# Default: true
+# Description: Enable Prometheus metrics exporter
+observe.metrics.prometheus.enabled: true
+
+# Observe metrics: Prometheus bind address
+# Type: string (socket address)
+# Default: "0.0.0.0:9090"
+# Description: Bind address for Prometheus metrics endpoint
+observe.metrics.prometheus.bind: "0.0.0.0:9090"
+
+# Observe metrics: Prometheus path
+# Type: string
+# Default: "/metrics"
+# Description: HTTP path for Prometheus metrics
+observe.metrics.prometheus.path: "/metrics"
+
+# Observe metrics: OTLP enabled
+# Type: boolean
+# Default: false
+# Description: Enable OTLP metrics export
+observe.metrics.otlp.enabled: false
+
+# Observe metrics: OTLP endpoint
+# Type: string (URL)
+# Default: "http://localhost:4317"
+# Description: OTLP metrics endpoint URL
+observe.metrics.otlp.endpoint: "http://localhost:4317"
+
+# Observe metrics: OTLP protocol
+# Type: string (enum: "grpc", "http")
+# Default: "grpc"
+# Description: OTLP metrics protocol
+observe.metrics.otlp.protocol: "grpc"
+
+# Observe metrics: OTLP interval (milliseconds)
+# Type: integer
+# Default: 60000
+# Description: OTLP metrics export interval
+observe.metrics.otlp.interval_ms: 60000
+
+
+#  metadata.worker.max_commands_per_heartbeat	8	Max commands returned per heartbeat
+#  metadata.repair.max_queue_size	10000	Repair queue maximum capacity
+#  metadata.repair.max_attempts	3	Max retries per repair task
+#  metadata.repair.inflight_timeout_ms	300000	In-flight task timeout (5 minutes)
+#  metadata.repair.initial_backoff_ms	1000	Initial backoff (1 second)
+#  metadata.repair.max_backoff_ms	60000	Max backoff (1 minute)
+#  metadata.repair.worker_inflight_limit	4	Max concurrent tasks per worker

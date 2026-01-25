@@ -1,0 +1,213 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Vecton Contributors
+
+syntax = "proto3";
+
+package metapeer;
+
+import "fs/types.proto";
+import "common/common.proto";
+import "common/header.proto";
+
+message MountEntryProto {
+  common.MountIdProto mount_id = 1;
+  /// UFS URI (e.g., "s3://bucket/path", "file:///path").
+  string ufs_uri = 2;
+  /// Mount prefix in metadata namespace (e.g., "/mnt/s3").
+  string mount_prefix = 3;
+  /// Configuration hash/version for change detection.
+  string config_hash = 4;
+  /// Mount configuration version.
+  uint64 config_version = 5;
+  /// Optional: mount-specific parameters.
+  map<string, string> params = 6;
+  /// Namespace owner group ID: all FS write operations within this mount
+  /// must route to this single Raft group for atomic rename within mount.
+  uint64 namespace_owner_group_id = 7;
+  /// Root inode ID: the root directory inode for this mount.
+  /// Must be a directory inode and must exist when mount is created/loaded.
+  fs.InodeIdProto root_inode_id = 8;
+}
+
+message MountTableProto {
+  /// Mount entries.
+  repeated MountEntryProto entries = 1;
+  /// Table version/epoch for conflict resolution.
+  uint64 version = 2;
+  /// Last applied operation sequence (for ordering).
+  uint64 last_applied_seq = 3;
+}
+
+/// Shard range: defines the key space covered by a shard.
+message ShardRangeProto {
+  /// Start key (inclusive, UTF-8 encoded).
+  string start_key = 1;
+  /// End key (exclusive, UTF-8 encoded).
+  string end_key = 2;
+}
+
+/// Shard ownership and replica information.
+message ShardReplicaProto {
+  /// Replica role: PRIMARY, SECONDARY, etc.
+  string role = 1;
+  /// Node ID hosting this replica.
+  uint64 node_id = 2;
+  /// Replica state: ACTIVE, STANDBY, etc.
+  string state = 3;
+}
+
+message ShardInfoProto {
+  common.ShardIdProto shard_id = 1;
+  common.ShardGroupIdProto shard_group_id = 2;
+  /// Shard range (key space).
+  ShardRangeProto range = 3;
+  /// Replicas for this shard.
+  repeated ShardReplicaProto replicas = 4;
+  /// Shard version/epoch.
+  uint64 version = 5;
+}
+
+message ShardGroupProto {
+  common.ShardGroupIdProto shard_group_id = 1;
+  /// Shards in this group.
+  repeated ShardInfoProto shards = 2;
+  /// Group policy (replication factor, consistency level, etc.).
+  map<string, string> policy = 3;
+  /// Group version/epoch.
+  uint64 version = 4;
+}
+
+message ShardMapProto {
+  /// Shard groups.
+  repeated ShardGroupProto groups = 1;
+  /// Map version/epoch for conflict resolution.
+  uint64 version = 2;
+  /// Last applied operation sequence (for ordering).
+  uint64 last_applied_seq = 3;
+}
+
+// ============================================================================
+// Metadata ↔ Metadata RPC: Peer Discovery & Handshake
+// ============================================================================
+
+message HandshakeRequestProto {
+  common.RequestHeaderProto header = 1;
+  /// Node information of the caller.
+  common.NodeInfoProto node_info = 2;
+  /// Cluster/group identifier.
+  string cluster_id = 3;
+  /// Optional: supported protocol versions.
+  repeated string supported_versions = 4;
+}
+
+message HandshakeResponseProto {
+  common.ResponseHeaderProto header = 1;
+  /// Node information of the responder.
+  common.NodeInfoProto node_info = 2;
+  /// Accepted protocol version.
+  string protocol_version = 3;
+  /// Cluster/group identifier (must match).
+  string cluster_id = 4;
+  /// Optional: capabilities negotiation result.
+  uint64 negotiated_capabilities = 5;
+}
+
+message JoinRequestProto {
+  common.RequestHeaderProto header = 1;
+  /// Node information of the joining node.
+  common.NodeInfoProto node_info = 2;
+  /// Cluster/group identifier.
+  string cluster_id = 3;
+  /// Optional: known peer endpoints for bootstrap.
+  repeated common.EndpointProto known_peers = 4;
+}
+
+message JoinResponseProto {
+  common.ResponseHeaderProto header = 1;
+  /// Assigned node ID (if auto-assigned).
+  uint64 node_id = 2;
+  /// Current cluster membership.
+  repeated common.NodeInfoProto members = 3;
+  /// Current cluster epoch/version.
+  uint64 cluster_epoch = 4;
+}
+
+message ExchangeMountTableRequestProto {
+  common.RequestHeaderProto header = 1;
+  /// Local mount table to exchange.
+  MountTableProto local_table = 2;
+  /// Known remote version (for delta sync).
+  uint64 known_version = 3;
+}
+
+message ExchangeMountTableResponseProto {
+  common.ResponseHeaderProto header = 1;
+  /// Remote mount table.
+  MountTableProto remote_table = 2;
+  /// Whether merge/resolution is needed.
+  bool needs_resolution = 3;
+}
+
+message GetMountTableRequestProto {
+  common.RequestHeaderProto header = 1;
+  /// Optional: specific version to fetch.
+  uint64 version = 2;
+}
+
+message GetMountTableResponseProto {
+  common.ResponseHeaderProto header = 1;
+  MountTableProto table = 2;
+}
+
+message ExchangeShardMapRequestProto {
+  common.RequestHeaderProto header = 1;
+  /// Local shard map to exchange.
+  ShardMapProto local_map = 2;
+  /// Known remote version (for delta sync).
+  uint64 known_version = 3;
+}
+
+message ExchangeShardMapResponseProto {
+  common.ResponseHeaderProto header = 1;
+  /// Remote shard map.
+  ShardMapProto remote_map = 2;
+  /// Whether merge/resolution is needed.
+  bool needs_resolution = 3;
+}
+
+message GetShardMapRequestProto {
+  common.RequestHeaderProto header = 1;
+  /// Optional: specific version to fetch.
+  uint64 version = 2;
+  /// Optional: filter by shard group ID.
+  common.ShardGroupIdProto shard_group_id = 3;
+}
+
+message GetShardMapResponseProto {
+  common.ResponseHeaderProto header = 1;
+  ShardMapProto map = 2;
+}
+
+// ============================================================================
+// Metadata Peer Service
+// ============================================================================
+
+service MetadataPeerServiceProto {
+  /// Handshake: negotiate protocol version and capabilities.
+  rpc Handshake(HandshakeRequestProto) returns (HandshakeResponseProto);
+
+  /// Join: request to join the metadata cluster.
+  rpc Join(JoinRequestProto) returns (JoinResponseProto);
+
+  /// Exchange mount table: bidirectional mount table synchronization.
+  rpc ExchangeMountTable(ExchangeMountTableRequestProto) returns (ExchangeMountTableResponseProto);
+
+  /// Get mount table: fetch mount table from peer.
+  rpc GetMountTable(GetMountTableRequestProto) returns (GetMountTableResponseProto);
+
+  /// Exchange shard map: bidirectional shard map synchronization.
+  rpc ExchangeShardMap(ExchangeShardMapRequestProto) returns (ExchangeShardMapResponseProto);
+
+  /// Get shard map: fetch shard map from peer.
+  rpc GetShardMap(GetShardMapRequestProto) returns (GetShardMapResponseProto);
+}

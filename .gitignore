@@ -1,0 +1,97 @@
+# =========================
+# Rust / Cargo
+# =========================
+# Cargo registry/git caches are global by default, generally not inside repo.
+# But if you ever vendor them locally:
+.cargo/
+**/.cargo/
+/target/
+/**/target/
+/docs/*
+**/*/docs/**
+
+
+# Rustfmt / clippy / coverage artifacts
+*.rlib
+*.rmeta
+*.d
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# Build scripts output (rarely committed)
+**/build/
+
+# =========================
+# IDE / Editor
+# =========================
+# IntelliJ / RustRover
+.idea/
+*.iml
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# CLion / JetBrains
+cmake-build-*/
+out/
+
+# Vim / Emacs / swap
+*~
+*.swp
+*.swo
+*.tmp
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# =========================
+# Language Server / Tooling
+# =========================
+# rust-analyzer
+rust-analyzer.log
+# Flycheck (your tree has target/flycheck0, but ignore generic cases too)
+flycheck*
+**/flycheck*
+
+# =========================
+# Logs / Runtime data
+# =========================
+*.log
+logs/
+log/
+
+# Data directories (add as needed for worker/meta local runs)
+data/
+tmp/
+run/
+pids/
+
+# If you dump local RocksDB or state machine data under repo
+**/rocksdb/
+**/db/
+**/*.sst
+**/WAL/
+**/MANIFEST-*
+
+# =========================
+# Secrets / Local overrides (recommended pattern)
+# =========================
+# Keep a committed template, ignore local override:
+# e.g. conf/core-site.yaml.example (commit), conf/core-site.yaml (ignore)
+# Uncomment if you want this behavior:
+# /conf/core-site.yaml
+# /conf/*-local.yaml
+# /conf/*.local.yaml
+# *.secret*
+# *.key
+# *.pem

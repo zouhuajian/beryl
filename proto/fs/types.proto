@@ -1,0 +1,127 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Vecton Contributors
+
+syntax = "proto3";
+
+package fs;
+
+import "common/common.proto";
+
+// ============================================================================
+// File: proto/fs/types.proto
+// Purpose: FS domain canonical types for use by metadata APIs.
+// ============================================================================
+
+/// Inode identifier (64-bit).
+message InodeIdProto {
+  uint64 value = 1;
+}
+
+/// Inode kind (file, directory, symlink).
+enum InodeKindProto {
+  INODE_KIND_UNSPECIFIED = 0;
+  INODE_KIND_FILE = 1;
+  INODE_KIND_DIR = 2;
+  INODE_KIND_SYMLINK = 3;
+}
+
+/// File attributes (metadata for inodes).
+/// All timestamps are in milliseconds since Unix epoch.
+message FileAttrsProto {
+  /// File mode (permissions + type bits).
+  uint32 mode = 1;
+  /// User ID.
+  uint32 uid = 2;
+  /// Group ID.
+  uint32 gid = 3;
+  /// File size in bytes.
+  uint64 size = 4;
+  /// Access time (milliseconds since Unix epoch).
+  uint64 atime_ms = 5;
+  /// Modification time (milliseconds since Unix epoch).
+  uint64 mtime_ms = 6;
+  /// Change time (milliseconds since Unix epoch).
+  uint64 ctime_ms = 7;
+  /// Number of hard links.
+  uint32 nlink = 8;
+}
+
+/// File extent: maps file offset range to block.
+/// Placement/residency are resolved via block metadata; do not add location hints here.
+message ExtentProto {
+  /// File offset (start of this extent in the file).
+  uint64 file_offset = 1;
+  /// Block ID that contains this extent.
+  common.BlockIdProto block_id = 2;
+  /// Offset within the block (where this extent starts in the block).
+  uint64 block_offset = 3;
+  /// Length of this extent in bytes.
+  uint64 len = 4;
+  /// File version (optional, for future use).
+  optional uint64 file_version = 5;
+  /// Block stamp (optional, for direct read validation).
+  optional uint64 block_stamp = 6;
+}
+
+/// Inode file data (block map + lease persistence).
+message InodeFileProto {
+  /// File extents (block map).
+  /// Supports append-only write path.
+  repeated ExtentProto extents = 1;
+  /// Lease epoch (monotonically increasing, for fencing).
+  /// Persisted for lease management.
+  optional uint64 lease_epoch = 2;
+  /// Current lease ID (optional, for diagnostics/recovery).
+  /// Used for lease management.
+  optional common.LeaseIdProto lease_id = 3;
+}
+
+/// Inode directory data (payload intentionally empty).
+message InodeDirectoryProto {
+  /// Directory payload intentionally empty; entries live in dentry/direntry index.
+}
+
+/// Inode symlink data (placeholder).
+message InodeSymlinkProto {
+  /// Placeholder: future target path.
+  optional string target = 1;
+}
+
+/// Inode (filesystem object).
+message InodeProto {
+  /// Inode ID.
+  InodeIdProto inode_id = 1;
+  /// Inode kind.
+  InodeKindProto kind = 2;
+  /// File attributes.
+  FileAttrsProto attrs = 3;
+  /// Variant-specific data (oneof).
+  oneof data {
+    InodeFileProto file = 4;
+    InodeDirectoryProto dir = 5;
+    InodeSymlinkProto symlink = 6;
+  }
+  /// Mount ID: identifies which mount this inode belongs to.
+  /// Enables O(1) mount resolution during FS write routing.
+  common.MountIdProto mount_id = 7;
+  /// Extended attributes (authoritative).
+  repeated XattrProto xattrs = 8;
+}
+
+/// Xattr entry.
+message XattrProto {
+  string name = 1;
+  bytes value = 2;
+}
+
+/// Directory entry (name + inode reference).
+message DirEntryProto {
+  /// Entry name (UTF-8).
+  string name = 1;
+  /// Referenced inode ID.
+  InodeIdProto inode_id = 2;
+  /// Inode kind (for quick filtering).
+  InodeKindProto kind = 3;
+  /// Optional attributes (for optimization, to avoid extra Lookup calls).
+  optional FileAttrsProto attrs = 4;
+}

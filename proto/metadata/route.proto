@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Vecton Contributors
+
+syntax = "proto3";
+
+package metadata;
+
+import "common/common.proto";
+import "common/header.proto";
+
+// ============================================================================
+// Metadata Route Service (routing/consistency/cache refresh)
+// ============================================================================
+//
+// This service handles routing, consistency, and cache refresh operations.
+// No inode/path semantics are introduced here.
+// Unified state_id/mount_epoch/route_epoch validation and NEED_REFRESH/MOVED error semantics.
+
+message GetFileMetaRequestProto {
+  common.RequestHeaderProto header = 1;
+  // header.group_id is required
+  // header.state_id is used as min_state_id for follower read-gating (if provided)
+
+  oneof target {
+    uint64 inode_id = 2;
+    string path = 3;
+  }
+  common.ConsistencyLevelProto consistency = 4;
+}
+
+message GetFileMetaResponseProto {
+  common.ResponseHeaderProto header = 1;
+  common.FileMetaProto meta = 2;
+  uint64 leader_id = 3;
+  repeated uint64 follower_ids = 4;
+  uint64 route_epoch = 5;
+  map<uint64, common.WorkerEndpointInfoProto> worker_info = 6;
+}
+
+message RefreshRouteRequestProto {
+  common.RequestHeaderProto header = 1;
+  optional uint64 inode_id = 2;
+}
+
+message RefreshRouteResponseProto {
+  common.ResponseHeaderProto header = 1;
+  uint64 route_epoch = 2;
+  map<uint64, uint64> shard_to_group = 3;
+}
+
+message MsyncRequestProto {
+  common.RequestHeaderProto header = 1;
+  // header.group_id is required for msync
+  // header.state_id is used as min_state_id (if provided, wait until last_applied >= state_id)
+  // header.deadline_ms + gRPC deadline controls timeout
+
+  optional bool include_readable_followers = 6;
+}
+
+message MsyncResponseProto {
+  common.ResponseHeaderProto header = 1;
+  // header.group_id must be filled (echo back the requested group_id)
+  // header.state_id must be filled (current last_applied for the group)
+
+  repeated uint64 readable_follower_ids = 2;
+}
+
+message GetRouteTableRequestProto {
+  common.RequestHeaderProto header = 1;
+}
+
+message GetRouteTableResponseProto {
+  common.ResponseHeaderProto header = 1;
+  uint64 route_epoch = 2;
+  map<uint64, uint64> shard_to_group = 3;
+  map<uint64, uint64> group_to_leader = 4;
+  map<uint64, NodeListProto> group_to_followers = 5;
+}
+
+message NodeListProto {
+  repeated uint64 node_ids = 1;
+}
+
+service MetadataRouteServiceProto {
+  // File metadata and routing
+  rpc GetFileMeta(GetFileMetaRequestProto) returns (GetFileMetaResponseProto);
+  rpc RefreshRoute(RefreshRouteRequestProto) returns (RefreshRouteResponseProto);
+  rpc Msync(MsyncRequestProto) returns (MsyncResponseProto);
+  rpc GetRouteTable(GetRouteTableRequestProto) returns (GetRouteTableResponseProto);
+}

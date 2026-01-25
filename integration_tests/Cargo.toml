@@ -1,0 +1,18 @@
+[package]
+name = "integration_tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+client = { path = "../client" }
+proto = { path = "../proto" }
+common = { path = "../common" }
+types = { path = "../types" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tonic = { workspace = true }
+futures = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+tempfile = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }

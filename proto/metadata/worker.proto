@@ -1,0 +1,386 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Vecton Contributors
+
+syntax = "proto3";
+
+package metadata;
+
+import "common/common.proto";
+import "common/header.proto";
+
+// ============================================================================
+// Worker → Metadata RPC: Registration & Heartbeat
+// ============================================================================
+
+message RegisterWorkerRequestProto {
+  common.RequestHeaderProto header = 1;
+  /// Worker address/endpoint.
+  common.EndpointProto endpoint = 2;
+  /// Optional: worker capabilities/features.
+  uint64 capabilities = 3;
+  /// Optional: version string.
+  string version = 4;
+  /// Optional: labels/tags for placement.
+  map<string, string> labels = 5;
+  /// Optional: suggested worker_id (for re-registration).
+  uint64 suggested_worker_id = 6;
+  /// Network transport kind (grpc/quic/rdma).
+  common.NetTransportKindProto net_transport_kind = 7;
+  /// Worker epoch/boot_id (monotonically increasing or UUID-based).
+  uint64 worker_epoch = 8;
+}
+
+message RegisterWorkerResponseProto {
+  common.ResponseHeaderProto header = 1;
+  /// Assigned or confirmed worker_id.
+  uint64 worker_id = 2;
+  /// Optional: initial configuration.
+  WorkerConfigProto config = 3;
+}
+
+message WorkerConfigProto {
+  /// Heartbeat interval in seconds.
+  uint32 heartbeat_interval_sec = 1;
+  /// Block report interval in seconds.
+  uint32 block_report_interval_sec = 2;
+  /// Other configuration parameters.
+  map<string, string> params = 3;
+}
+
+message HeartbeatRequestProto {
+  common.RequestHeaderProto header = 1;
+  uint64 worker_id = 2;
+  
+  /// Capacity information.
+  CapacityInfoProto capacity = 3;
+  /// Load information.
+  LoadInfoProto load = 4;
+  /// Health status.
+  HealthStatusProto health = 5;
+  /// Network transport kind (grpc/quic/rdma).
+  common.NetTransportKindProto net_transport_kind = 6;
+  /// Worker epoch/boot_id (must match registration).
+  uint64 worker_epoch = 7;
+  /// Task acknowledgments (completed tasks).
+  repeated TaskAckProto acks = 8;
+}
+
+message CapacityInfoProto {
+  /// Total capacity in bytes.
+  uint64 total_bytes = 1;
+  /// Used capacity in bytes.
+  uint64 used_bytes = 2;
+  /// Available capacity in bytes.
+  uint64 available_bytes = 3;
+}
+
+message LoadInfoProto {
+  /// Number of active read operations.
+  uint32 active_reads = 1;
+  /// Number of active write operations.
+  uint32 active_writes = 2;
+  /// CPU usage percentage (0-100).
+  uint32 cpu_usage_percent = 3;
+  /// Memory usage in bytes.
+  uint64 memory_used_bytes = 4;
+}
+
+enum HealthStatusProto {
+  HEALTH_STATUS_UNSPECIFIED = 0;
+  HEALTH_STATUS_HEALTHY = 1;
+  HEALTH_STATUS_DEGRADED = 2;
+  HEALTH_STATUS_UNHEALTHY = 3;
+}
+
+message HeartbeatResponseProto {
+  common.ResponseHeaderProto header = 1;
+  /// Commands from metadata to worker (can return multiple).
+  repeated WorkerCommandProto commands = 2;
+  /// Full report lease token (if can_full_report is true).
+  /// Worker must include this token in full block report.
+  uint64 full_report_lease_token = 3;
+  /// Whether worker can send full block report (has slot).
+  bool can_full_report = 4;
+  /// Backoff delay in milliseconds (if can_full_report is false and needs_full_sync).
+  uint32 backoff_ms = 5;
+}
+
+message WorkerCommandProto {
+  /// Task ID for acknowledgment.
+  uint64 task_id = 1;
+  oneof command {
+    EvictCommandProto evict = 2;
+    DeleteBlocksCommandProto delete_blocks = 9;  // Enhanced delete with per-block status
+    ReplicateCommandProto replicate = 3;
+    MoveCopyCommandProto move_copy = 4;
+    ThrottleCommandProto throttle = 5;
+    ConfigRefreshCommandProto config_refresh = 6;
+    RequestFullBlockReportCommandProto request_full_block_report = 7;
+    BlockReportBackoffCommandProto block_report_backoff = 8;
+  }
+}
+
+/// Request worker to send a full block report to this metadata node.
+/// Used when metadata restarts and needs to rebuild presence view.
+message RequestFullBlockReportCommandProto {
+  /// Target metadata epoch (to identify this metadata instance).
+  uint64 target_metadata_epoch = 1;
+  /// Reason for requesting full report (e.g., "METADATA_RESTART").
+  string reason = 2;
+}
+
+/// Request worker to back off and retry full block report later.
+/// Used for storm control when too many workers are syncing simultaneously.
+message BlockReportBackoffCommandProto {
+  /// Retry after this many milliseconds (with jitter).
+  uint32 retry_after_ms = 1;
+}
+
+message EvictCommandProto {
+  /// Block IDs to evict.
+  repeated common.BlockIdProto block_ids = 1;
+  /// Reason for eviction.
+  string reason = 2;
+  /// Delete intent ID (for idempotency and progress tracking).
+  uint64 intent_id = 3;
+  /// Operation kind: DELETE or COMPACT.
+  DeleteOpKindProto op_kind = 4;
+  /// Not before timestamp (milliseconds since epoch, optional grace window).
+  uint64 not_before_ms = 5;
+  /// Expected metadata epoch (for consistency check, optional).
+  uint64 expected_epoch = 6;
+}
+
+/// Delete operation kind.
+enum DeleteOpKindProto {
+  DELETE_OP_KIND_UNSPECIFIED = 0;
+  DELETE_OP_KIND_DELETE = 1;      // Delete block (tombstone or remove)
+  DELETE_OP_KIND_COMPACT = 2;     // Compact/merge block (future use)
+  DELETE_OP_KIND_REPLICA_EVICT = 3; // Evict replica (delete only local copy, keep other replicas)
+}
+
+/// DeleteBlocks command: Enhanced delete with per-block status reporting.
+message DeleteBlocksCommandProto {
+  /// Delete intent ID (for idempotency and progress tracking).
+  uint64 intent_id = 1;
+  /// Operation kind: DELETE or COMPACT.
+  DeleteOpKindProto op_kind = 2;
+  /// Blocks to delete with per-block metadata.
+  repeated DeleteBlockRequestProto blocks = 3;
+  /// Not before timestamp (milliseconds since epoch, optional grace window).
+  uint64 not_before_ms = 4;
+  /// Expected metadata epoch (for consistency check, optional).
+  uint64 expected_epoch = 5;
+}
+
+/// Per-block delete request.
+message DeleteBlockRequestProto {
+  /// Block ID to delete.
+  common.BlockIdProto block_id = 1;
+  /// Optional: expected state (for conflict detection).
+  string expected_state = 2;
+}
+
+/// Per-block delete result (in TaskAck or DeleteBlocksResponse).
+message DeleteBlockResultProto {
+  /// Block ID.
+  common.BlockIdProto block_id = 1;
+  /// Delete status.
+  DeleteBlockStatusProto status = 2;
+  /// Error class (for retry strategy).
+  ErrorClassProto error_class = 3;
+  /// Retry after milliseconds (if retryable).
+  uint32 retry_after_ms = 4;
+  /// Optional error message.
+  string message = 5;
+}
+
+/// Delete block status.
+enum DeleteBlockStatusProto {
+  DELETE_BLOCK_STATUS_UNSPECIFIED = 0;
+  DELETE_BLOCK_STATUS_DELETED = 1;        // Block deleted (tombstoned or removed)
+  DELETE_BLOCK_STATUS_TOMBSTONED = 2;     // Block marked as tombstone (soft delete)
+  DELETE_BLOCK_STATUS_NOT_FOUND = 3;       // Block not found (idempotent success)
+  DELETE_BLOCK_STATUS_IN_PROGRESS = 4;    // Delete in progress (metadata should retry/poll)
+  DELETE_BLOCK_STATUS_BUSY = 5;            // Block busy (write/repair in-flight, RETRYABLE)
+  DELETE_BLOCK_STATUS_CONFLICT = 6;        // State conflict (e.g., expected_state mismatch, RETRYABLE)
+  DELETE_BLOCK_STATUS_FAILED_FATAL = 7;    // Permanent failure (should not retry)
+}
+
+message ReplicateCommandProto {
+  /// Block ID to replicate.
+  common.BlockIdProto block_id = 1;
+  /// Target worker IDs for replication.
+  repeated uint64 target_worker_ids = 2;
+}
+
+message MoveCopyCommandProto {
+  /// Block ID to move.
+  common.BlockIdProto block_id = 1;
+  /// Source worker ID (from where to copy).
+  uint64 from_worker_id = 2;
+  /// Target worker ID (to where to copy).
+  uint64 to_worker_id = 3;
+}
+
+message ThrottleCommandProto {
+  /// Throttle read operations (0 = no limit, >0 = max concurrent).
+  uint32 max_reads = 1;
+  /// Throttle write operations (0 = no limit, >0 = max concurrent).
+  uint32 max_writes = 2;
+}
+
+message ConfigRefreshCommandProto {
+  /// Updated configuration.
+  WorkerConfigProto config = 1;
+}
+
+/// Task acknowledgment.
+message TaskAckProto {
+  /// Task ID being acknowledged.
+  uint64 task_id = 1;
+  /// Acknowledgment status.
+  TaskAckStatusProto status = 2;
+  /// Optional error message (for failures).
+  string error_message = 3;
+  /// Error class/category for adaptive backoff.
+  ErrorClassProto error_class = 4;
+  /// Optional error code (for detailed classification).
+  string error_code = 5;
+  /// For MoveCopy: whether verification passed.
+  bool verify_ok = 6;
+  /// For DeleteBlocks: per-block results.
+  repeated DeleteBlockResultProto block_results = 7;
+  /// Delete intent ID (for DeleteBlocks command).
+  uint64 intent_id = 8;
+}
+
+/// Task acknowledgment status.
+enum TaskAckStatusProto {
+  TASK_ACK_STATUS_UNSPECIFIED = 0;
+  TASK_ACK_STATUS_SUCCESS = 1;
+  TASK_ACK_STATUS_FAILED = 2;
+  TASK_ACK_STATUS_RETRYABLE_FAILED = 3;
+}
+
+/// Error class for adaptive backoff and retry strategy.
+enum ErrorClassProto {
+  ERROR_CLASS_UNSPECIFIED = 0;
+  ERROR_CLASS_OK = 1;
+  ERROR_CLASS_RETRYABLE = 2;  // Transient error, should retry with backoff
+  ERROR_CLASS_FATAL = 3;       // Permanent error, should not retry
+  ERROR_CLASS_NEED_REFRESH = 4; // Need to refresh state (e.g., worker info)
+}
+
+// ============================================================================
+// Worker → Metadata RPC: Block Reporting
+// ============================================================================
+
+/// Block report type: FULL (snapshot) or INCREMENTAL (delta).
+enum BlockReportTypeProto {
+  BLOCK_REPORT_TYPE_UNSPECIFIED = 0;
+  BLOCK_REPORT_TYPE_FULL = 1;
+  BLOCK_REPORT_TYPE_INCREMENTAL = 2;
+}
+
+/// Full block report entry (for FULL reports).
+message BlockReportEntryFullProto {
+  common.BlockIdProto block_id = 1;
+  /// Optional chunk presence bitmap.
+  common.ChunkBitmapProto chunk_bitmap = 2;
+}
+
+/// Incremental block report entry (for INCREMENTAL reports).
+message BlockReportEntryDeltaProto {
+  common.BlockIdProto block_id = 1;
+  /// Operation: ADD or REMOVE.
+  BlockReportDeltaOpProto op = 2;
+  /// Optional chunk presence bitmap (for ADD operations).
+  common.ChunkBitmapProto chunk_bitmap = 3;
+}
+
+/// Delta operation type.
+enum BlockReportDeltaOpProto {
+  BLOCK_REPORT_DELTA_OP_UNSPECIFIED = 0;
+  BLOCK_REPORT_DELTA_OP_ADD = 1;
+  BLOCK_REPORT_DELTA_OP_REMOVE = 2;
+}
+
+message BlockReportRequestProto {
+  common.RequestHeaderProto header = 1;
+  uint64 worker_id = 2;
+  BlockReportTypeProto report_type = 3;
+  
+  /// For FULL reports: complete snapshot of all blocks.
+  repeated BlockReportEntryFullProto full_entries = 4;
+  /// For INCREMENTAL reports: delta operations (ADD/REMOVE).
+  repeated BlockReportEntryDeltaProto delta_entries = 5;
+  /// For INCREMENTAL reports: last report sequence number (optional, for dedup).
+  uint64 last_report_seq = 6;
+  /// Full report lease token (required for FULL reports when needs_full_sync).
+  /// Must match the token received in HeartbeatResponseProto.full_report_lease_token.
+  uint64 full_report_lease_token = 7;
+}
+
+/// Legacy BlockReportEntry (kept for backward compatibility during migration).
+/// DEPRECATED: Use BlockReportEntryFullProto or BlockReportEntryDeltaProto instead.
+message BlockReportEntryProto {
+  common.BlockIdProto block_id = 1;
+  /// Chunk presence bitmap.
+  common.ChunkBitmapProto chunk_bitmap = 2;
+  /// Committed length for this block.
+  uint64 committed_length = 3;
+  /// Optional: checksum/digest (e.g., SHA-256 as bytes).
+  bytes checksum = 4;
+  /// Optional: storage location hint.
+  string storage_hint = 5;
+}
+
+message BlockReportResponseProto {
+  common.ResponseHeaderProto header = 1;
+  /// Acknowledged sequence number for this report (for INCREMENTAL dedup).
+  uint64 report_seq = 2;
+  /// Commands from metadata (can return multiple, e.g., fast-path commands).
+  repeated WorkerCommandProto commands = 3;
+  /// Optional: retry_after_ms for storm control (metadata requests worker to delay FULL report).
+  uint32 retry_after_ms = 4;
+}
+
+// ============================================================================
+// Worker → Metadata RPC: Presence Reporting (compatibility)
+// ============================================================================
+
+/// Legacy presence reporting (weakly-consistent, lightweight).
+/// This is kept for compatibility with existing ReportPresence RPC.
+/// For strongly-consistent reporting, use BlockReport instead.
+/// Note: Renamed to avoid conflict with metadata/client.proto's ReportPresenceRequest.
+message WorkerReportPresenceRequestProto {
+  common.RequestHeaderProto header = 1;
+  uint64 data_handle_id = 2;
+  uint32 block_index = 3;
+  uint64 worker_id = 4;
+  common.ChunkBitmapProto bitmap = 5;
+}
+
+message WorkerReportPresenceResponseProto {
+  common.ResponseHeaderProto header = 1;
+}
+
+// ============================================================================
+// Metadata Worker Service
+// ============================================================================
+
+service MetadataWorkerServiceProto {
+  /// Register a worker with metadata service.
+  rpc RegisterWorker(RegisterWorkerRequestProto) returns (RegisterWorkerResponseProto);
+  
+  /// Periodic heartbeat from worker to metadata.
+  rpc Heartbeat(HeartbeatRequestProto) returns (HeartbeatResponseProto);
+  
+  /// Block report: worker reports blocks/chunks it holds.
+  rpc BlockReport(BlockReportRequestProto) returns (BlockReportResponseProto);
+  
+  /// Legacy presence reporting (weakly-consistent).
+  /// Note: Renamed from ReportPresence to avoid conflict with metadata/client.proto.
+  rpc ReportPresence(WorkerReportPresenceRequestProto) returns (WorkerReportPresenceResponseProto);
+}

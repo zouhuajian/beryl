@@ -1,0 +1,68 @@
+[package]
+name = "transport"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Core
+bytes = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "net"] }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Utilities
+parking_lot = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Observability (use common module)
+common = { path = "../common", features = ["prometheus"] }
+
+# Domain types and proto
+types = { path = "../types" }
+proto = { path = "../proto" }
+
+# gRPC (default implementation)
+tonic = { workspace = true, features = ["transport"] }
+prost = { workspace = true }
+tower = { workspace = true }
+uuid = { workspace = true }
+
+# io_uring (glommio) - Linux only, requires kernel 5.8+
+# Note: glommio is only available on Linux, so we use platform-specific dependencies
+# This ensures glommio is only compiled on Linux, even if io_uring feature is enabled on other platforms
+# Version is managed in workspace root Cargo.toml
+[target.'cfg(target_os = "linux")'.dependencies]
+glommio = { workspace = true, optional = true }
+
+[features]
+default = ["grpc"]
+grpc = []
+# io_uring feature: on Linux, this enables glommio; on other platforms, it's a no-op
+# The code uses #[cfg(all(feature = "io_uring", target_os = "linux"))] to ensure
+# glommio-specific code only compiles on Linux
+io_uring = []
+quic = []
+rdma = []
+spdk = []
+
+# On Linux, io_uring feature enables glommio dependency
+# This is done via a build script or by ensuring code only uses glommio when both
+# feature and platform conditions are met. Since we can't have platform-specific
+# feature dependencies in Cargo.toml, we handle this in code with cfg attributes.
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio-test = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+tracing-subscriber = { workspace = true }
+
+[[example]]
+name = "replication_demo"
+path = "examples/replication_demo.rs"
+required-features = ["grpc"]

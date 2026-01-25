@@ -1,0 +1,118 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Vecton Contributors
+
+syntax = "proto3";
+
+package common;
+
+// ============================================================================
+// Canonical Error Model (Single Source of Truth)
+// ============================================================================
+//
+// This file defines the unified error model for the storage system.
+// All error semantics should be expressed through these types.
+//
+// Key principles:
+// - FS errno and RPC error codes are mutually exclusive (oneof)
+// - retry_after_ms has a single source of truth
+// - ErrorClass and RefreshReason are enums (not strings)
+// - No duplicate fields or conflicting priorities
+
+/// Coarse-grained error class for client behavior.
+enum ErrorClassProto {
+  ERROR_CLASS_OK = 0;
+  ERROR_CLASS_NEED_REFRESH = 1;  // Client must refresh routing/mount/state
+  ERROR_CLASS_RETRYABLE = 2;     // Temporary failure, can retry
+  ERROR_CLASS_FATAL = 3;         // Unrecoverable error
+}
+
+/// Reason for NEED_REFRESH error class.
+enum RefreshReasonProto {
+  REFRESH_REASON_UNKNOWN = 0;
+  REFRESH_REASON_NOT_LEADER = 1;
+  REFRESH_REASON_MOVED = 2;
+  REFRESH_REASON_STALE_STATE = 3;
+  REFRESH_REASON_MOUNT_EPOCH_MISMATCH = 4;
+  REFRESH_REASON_ROUTE_EPOCH_MISMATCH = 5;
+  REFRESH_REASON_WORKER_EPOCH_MISMATCH = 6;
+  REFRESH_REASON_BLOCK_STAMP_MISMATCH = 7;
+  REFRESH_REASON_FENCING = 8;
+  REFRESH_REASON_EPOCH_MISMATCH = 9;
+}
+
+/// Filesystem error codes (POSIX errno).
+/// These are used for FS operation errors and are mutually exclusive with RpcErrorCodeProto.
+enum FsErrnoProto {
+  FS_ERRNO_OK = 0;
+  FS_ERRNO_ENOENT = 2;      // No such file or directory
+  FS_ERRNO_EEXIST = 17;     // File exists
+  FS_ERRNO_ENOTEMPTY = 39;   // Directory not empty
+  FS_ERRNO_ENOTDIR = 20;     // Not a directory
+  FS_ERRNO_EISDIR = 21;      // Is a directory
+  FS_ERRNO_EXDEV = 18;       // Cross-device link (rename across mounts)
+  FS_ERRNO_EPERM = 1;        // Permission denied
+  FS_ERRNO_EACCES = 13;      // Permission denied (access)
+  FS_ERRNO_EINVAL = 22;      // Invalid argument
+  FS_ERRNO_ENOTSUP = 45;     // Operation not supported
+  FS_ERRNO_ENOTIMPL = 38;    // Not implemented
+  FS_ERRNO_EAGAIN = 11;      // Resource temporarily unavailable (e.g., lease conflict)
+  FS_ERRNO_EBUSY = 16;       // Device or resource busy (e.g., file locked by another writer)
+}
+
+/// RPC-level error codes (framework/routing/consistency).
+/// These are used for RPC/protocol errors and are mutually exclusive with FsErrnoProto.
+enum RpcErrorCodeProto {
+  RPC_ERR_CODE_UNSPECIFIED = 0;
+
+  // ---- Framework / protocol ----
+  RPC_ERR_CODE_NO_SUCH_METHOD = 1;
+  RPC_ERR_CODE_INVALID_HEADER = 2;
+  RPC_ERR_CODE_VERSION_MISMATCH = 3;
+  RPC_ERR_CODE_DESERIALIZE_REQUEST = 4;
+  RPC_ERR_CODE_SERIALIZE_RESPONSE = 5;
+
+  // ---- Auth / permission ----
+  RPC_ERR_CODE_UNAUTHENTICATED = 20;
+  RPC_ERR_CODE_PERMISSION_DENIED = 21;
+
+  // ---- Routing / topology / raft ----
+  RPC_ERR_CODE_NOT_LEADER = 40;
+  RPC_ERR_CODE_STALE_STATE = 41;      // follower last_applied < requested state_id
+  RPC_ERR_CODE_FENCING = 42;
+  RPC_ERR_CODE_SHARD_MOVED = 43;
+  RPC_ERR_CODE_NODE_UNAVAILABLE = 44;
+
+  // ---- Epoch mismatches (for refresh reasons) ----
+  RPC_ERR_CODE_MOUNT_EPOCH_MISMATCH = 50;
+  RPC_ERR_CODE_ROUTE_EPOCH_MISMATCH = 51;
+  RPC_ERR_CODE_WORKER_EPOCH_MISMATCH = 52;
+  RPC_ERR_CODE_BLOCK_STAMP_MISMATCH = 53;
+  RPC_ERR_CODE_EPOCH_MISMATCH = 54;
+
+  // ---- Application ----
+  RPC_ERR_CODE_INVALID_ARGUMENT = 100;
+  RPC_ERR_CODE_INTERNAL = 101;
+  RPC_ERR_CODE_APPLICATION = 102;
+}
+
+/// Canonical error detail (single source of truth for all error semantics).
+message ErrorDetailProto {
+  /// Error class (required).
+  ErrorClassProto error_class = 1;
+
+  /// Error code: either FS errno or RPC code (mutually exclusive via oneof).
+  oneof code {
+    FsErrnoProto fs_errno = 2;
+    RpcErrorCodeProto rpc_code = 3;
+  }
+
+  /// Refresh reason (required when error_class = NEED_REFRESH).
+  RefreshReasonProto refresh_reason = 4;
+
+  /// Retry after delay in milliseconds (optional, only for RETRYABLE errors).
+  /// This is the SINGLE source of truth for retry timing.
+  optional uint64 retry_after_ms = 5;
+
+  /// Human-readable error message.
+  string message = 6;
+}

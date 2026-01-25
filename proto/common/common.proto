@@ -1,0 +1,233 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Vecton Contributors
+
+syntax = "proto3";
+
+package common;
+
+// ============================================================================
+// Identity Types (aligned with types::ids)
+// ============================================================================
+
+/// Data handle identity for the data-plane.
+/// A DataHandleId identifies a concrete data instance bound to an inode at a specific point in time
+/// (e.g., after create, after a committed write session, or after a version switch).
+/// It is NOT a namespace identity and MUST NOT be used for directory semantics or rename routing.
+message DataHandleIdProto {
+  uint64 value = 1;
+}
+
+/// Data-plane block identity.
+/// Blocks are addressed under a DataHandleId, not under an inode.
+/// This prevents namespace identity (inode) from being conflated with data instances (handles).
+/// Aligns with types::BlockId { data_handle: DataHandleId, index: BlockIndex }.
+message BlockIdProto {
+  uint64 data_handle_id = 1;
+  uint32 block_index = 2;
+}
+
+/// Chunk identity: (BlockId, ChunkIndex).
+/// Aligns with types::ChunkId { block: BlockId, index: ChunkIndex }.
+message ChunkIdProto {
+  BlockIdProto block = 1;
+  uint32 chunk_index = 2;
+}
+
+/// Worker identity.
+/// Aligns with types::WorkerId (u64).
+message WorkerIdProto {
+  uint64 value = 1;
+}
+
+/// Stream identity.
+/// Aligns with types::StreamId (u128).
+message StreamIdProto {
+  // u128 encoded as two uint64 (high, low)
+  uint64 high = 1;
+  uint64 low = 2;
+}
+
+/// Lease identity (writer lease).
+/// Aligns with types::LeaseId (u128).
+message LeaseIdProto {
+  // u128 encoded as two uint64 (high, low)
+  uint64 high = 1;
+  uint64 low = 2;
+}
+
+/// Shard identity.
+/// Aligns with types::ShardId (u64).
+message ShardIdProto {
+  uint64 value = 1;
+}
+
+/// Shard group identity.
+/// Aligns with types::ShardGroupId (u64).
+message ShardGroupIdProto {
+  uint64 value = 1;
+}
+
+/// Mount identity.
+/// Aligns with types::MountId (u64).
+message MountIdProto {
+  uint64 value = 1;
+}
+
+// ============================================================================
+// Common Data Structures
+// ============================================================================
+
+/// File layout parameters (aligned with types::layout::FileLayout).
+message FileLayoutProto {
+  uint32 block_size = 1;
+  uint32 chunk_size = 2;
+  uint32 replication = 3;  // Note: proto3 doesn't support uint8, use uint32
+}
+
+/// Block placement information (aligned with types::block::BlockPlacement).
+message BlockPlacementProto {
+  uint64 primary_worker_id = 1;
+  repeated uint64 replica_worker_ids = 2;
+}
+
+/// Worker endpoint information for client access.
+message WorkerEndpointInfoProto {
+  uint64 worker_id = 1;
+  string endpoint = 2;  // host:port
+  NetTransportKindProto net_transport_kind = 3;
+  uint64 worker_epoch = 4;
+}
+
+/// Block state (aligned with types::block::BlockState).
+enum BlockStateProto {
+  BLOCK_STATE_UNSPECIFIED = 0;
+  BLOCK_STATE_OPEN = 1;
+  BLOCK_STATE_SEALED = 2;
+  BLOCK_STATE_ABORTED = 3;
+}
+
+/// Block metadata (aligned with types::block::BlockMeta).
+message BlockMetaProto {
+  uint64 inode_id = 1;
+  uint64 data_handle_id = 2;
+  uint32 block_index = 3;
+  uint64 start_offset = 4;
+  BlockStateProto state = 5;
+  BlockPlacementProto placement = 6;
+  uint64 committed_length = 7;
+  uint64 block_stamp = 8;  // block-level layout epoch; change on route/content/commit changes
+}
+
+/// Byte range within a file.
+/// Aligns with types::chunk::ByteRange { offset: u64, len: u32 }.
+message ByteRangeProto {
+  uint64 offset = 1;
+  uint32 len = 2;
+}
+
+/// Chunk bitmap for presence tracking.
+/// Aligns with types::chunk::ChunkBitmap { bits: Vec<u64> }.
+message ChunkBitmapProto {
+  repeated fixed64 bits = 1;
+}
+
+/// Fencing token for write operations.
+/// Aligns with types::lease::FencingToken { block_id: BlockId, owner: ClientId, epoch: u64 }.
+message FencingTokenProto {
+  BlockIdProto block_id = 1;
+  uint64 owner = 2;  // ClientId
+  uint64 epoch = 3;
+}
+
+// ============================================================================
+// Path Encoding
+// ============================================================================
+
+/// Path encoding: UTF-8 string representation.
+/// Aligns with types::Path (if exists) or string-based path representation.
+/// Paths are encoded as UTF-8 strings, consistent with filesystem conventions.
+///
+/// Note: For binary path representations, use bytes field directly.
+/// This message wrapper is optional; paths can be passed as string fields directly.
+message PathProto {
+  /// UTF-8 encoded path string.
+  string value = 1;
+}
+
+// ============================================================================
+// Endpoint / Node Information
+// ============================================================================
+
+/// Worker network endpoint information.
+message EndpointProto {
+  string host = 1;
+  uint32 port = 2;
+  /// Optional: protocol hint (e.g., "grpc", "quic").
+  string protocol = 3;
+}
+
+/// Node information for metadata peer discovery.
+message NodeInfoProto {
+  /// Node identifier (could be metadata node ID).
+  uint64 node_id = 1;
+  EndpointProto endpoint = 2;
+  /// Optional: version string.
+  string version = 3;
+  /// Optional: capabilities/features bitmask.
+  uint64 capabilities = 4;
+}
+
+// ============================================================================
+// Network Transport Kind
+// ============================================================================
+
+/// Network transport kind for worker communication.
+enum NetTransportKindProto {
+  NET_TRANSPORT_KIND_UNSPECIFIED = 0;
+  NET_TRANSPORT_KIND_GRPC = 1;
+  NET_TRANSPORT_KIND_QUIC = 2;
+  NET_TRANSPORT_KIND_RDMA = 3;
+}
+
+// ============================================================================
+// Consistency & Mode Enums
+// ============================================================================
+
+/// Consistency level for read operations.
+enum ConsistencyLevelProto {
+  CONSISTENCY_UNSPECIFIED = 0;
+  CONSISTENCY_STRONG = 1;  // Linearizable (leader or read-index)
+  CONSISTENCY_NORMAL = 2;  // Bounded-stale (follower with TTL/refresh)
+  CONSISTENCY_WEAK = 3;    // Best-effort (follower + cache)
+}
+
+/// Read mode hint for client operations.
+enum ReadModeProto {
+  READ_MODE_UNSPECIFIED = 0;
+  READ_MODE_DIRECT = 1;      // Direct read from worker
+  READ_MODE_CACHED = 2;      // Use cached metadata
+}
+
+/// Write mode for client operations.
+enum WriteModeProto {
+  WRITE_MODE_UNSPECIFIED = 0;
+  WRITE_MODE_THROUGH = 1;    // Write-through to UFS
+  WRITE_MODE_BACK = 2;       // Write-back (cache)
+  WRITE_MODE_DIRECT = 3;     // Direct to UFS
+}
+
+// ============================================================================
+// File Metadata (for client caching)
+// ============================================================================
+
+/// File metadata with version and consistency token.
+message FileMetaProto {
+  uint64 inode_id = 1;
+  uint64 data_handle_id = 2;
+  uint64 file_version = 3;  // Version for cache invalidation
+  repeated BlockMetaProto blocks = 4;
+  uint64 route_epoch = 5;    // Route table epoch
+  uint64 consistency_token = 6;  // For follower read validation
+  FileLayoutProto layout = 7;
+  uint64 committed_length = 8;
+}

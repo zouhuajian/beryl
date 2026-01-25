@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Vecton Contributors
+
+edition = "2021"
+max_width = 120
+
+hard_tabs = false
+tab_spaces = 4
+
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
