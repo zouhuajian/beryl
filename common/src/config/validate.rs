@@ -9,7 +9,7 @@ use crate::config::keys::{
     client_write_mode, metadata_raft, metadata_rpc, observe_metrics, worker_eviction, worker_replication, worker_rpc,
     worker_storage, worker_transport, worker_ufs,
 };
-use crate::error::{CommonError, ErrorCode};
+use crate::error::{CommonError, CommonErrorCode};
 
 /// Validate core-site configuration.
 pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
@@ -17,7 +17,7 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
     if let Some(port) = config.get_i64(metadata_rpc::PORT) {
         if !(1..=65535).contains(&port) {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
+                CommonErrorCode::InvalidArgument,
                 format!("{} must be in range 1-65535, got {}", metadata_rpc::PORT, port),
             ));
         }
@@ -27,7 +27,7 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
     if let Some(node_id) = config.get_i64(metadata_raft::NODE_ID) {
         if node_id < 1 {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
+                CommonErrorCode::InvalidArgument,
                 format!("{} must be >= 1, got {}", metadata_raft::NODE_ID, node_id),
             ));
         }
@@ -37,7 +37,7 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
     if let Some(bind) = config.get_str(worker_rpc::BIND) {
         if bind.parse::<std::net::SocketAddr>().is_err() && !bind.contains(':') {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
+                CommonErrorCode::InvalidArgument,
                 format!("{} must be a valid socket address, got {}", worker_rpc::BIND, bind),
             ));
         }
@@ -48,7 +48,7 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
         if let Some(chunk_size) = config.get_bytes(worker_storage::CHUNK_SIZE) {
             if chunk_size > block_size {
                 return Err(CommonError::new(
-                    ErrorCode::InvalidArgument,
+                    CommonErrorCode::InvalidArgument,
                     format!(
                         "{} ({}) must be <= {} ({})",
                         worker_storage::CHUNK_SIZE,
@@ -60,7 +60,7 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
             }
             if block_size % chunk_size != 0 {
                 return Err(CommonError::new(
-                    ErrorCode::InvalidArgument,
+                    CommonErrorCode::InvalidArgument,
                     format!(
                         "{} ({}) must be divisible by {} ({})",
                         worker_storage::BLOCK_SIZE,
@@ -82,7 +82,7 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
     // io_uring transport requires io_uring storage (or fs with io_uring support)
     if transport_kind == "io_uring" && storage_kind != "io_uring" && storage_kind != "fs" {
         return Err(CommonError::new(
-            ErrorCode::InvalidArgument,
+            CommonErrorCode::InvalidArgument,
             format!(
                 "{}=io_uring requires {}=io_uring or fs, got {}",
                 worker_transport::KIND,
@@ -105,14 +105,14 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
         if let Some(val) = config.get_usize(key) {
             if val == 0 {
                 return Err(CommonError::new(
-                    ErrorCode::InvalidArgument,
+                    CommonErrorCode::InvalidArgument,
                     format!("{} must be > 0", key),
                 ));
             }
         } else if let Some(ms) = config.get_i64(key) {
             if ms <= 0 {
                 return Err(CommonError::new(
-                    ErrorCode::InvalidArgument,
+                    CommonErrorCode::InvalidArgument,
                     format!("{} must be > 0", key),
                 ));
             }
@@ -124,7 +124,7 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
         if let Some(ms) = config.get_i64(key) {
             if ms <= 0 {
                 return Err(CommonError::new(
-                    ErrorCode::InvalidArgument,
+                    CommonErrorCode::InvalidArgument,
                     format!("{} must be > 0", key),
                 ));
             }
@@ -136,7 +136,7 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
         let valid_kinds = ["grpc", "quic", "rdma", "io_uring", "local"];
         if !valid_kinds.contains(&kind.as_str()) {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
+                CommonErrorCode::InvalidArgument,
                 format!(
                     "{} must be one of {:?}, got {}",
                     worker_transport::KIND,
@@ -152,7 +152,7 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
         let valid_kinds = ["fs", "io_uring", "spdk"];
         if !valid_kinds.contains(&kind.as_str()) {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
+                CommonErrorCode::InvalidArgument,
                 format!(
                     "{} must be one of {:?}, got {}",
                     worker_storage::KIND,
@@ -169,7 +169,7 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
             if let Some(max) = config.get_usize(key) {
                 if max == 0 {
                     return Err(CommonError::new(
-                        ErrorCode::InvalidArgument,
+                        CommonErrorCode::InvalidArgument,
                         format!("{} must be > 0", key),
                     ));
                 }
@@ -183,7 +183,7 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
             if let Ok(port) = port_str.parse::<i64>() {
                 if !(1..=65535).contains(&port) {
                     return Err(CommonError::new(
-                        ErrorCode::InvalidArgument,
+                        CommonErrorCode::InvalidArgument,
                         format!(
                             "{} port must be in range 1-65535, got {}",
                             observe_metrics::PROMETHEUS_BIND,
@@ -200,7 +200,7 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
         if let Ok(high) = high_str.parse::<f64>() {
             if !(0.0..=1.0).contains(&high) {
                 return Err(CommonError::new(
-                    ErrorCode::InvalidArgument,
+                    CommonErrorCode::InvalidArgument,
                     format!(
                         "{} must be in range 0.0-1.0, got {}",
                         worker_eviction::HIGH_WATERMARK,
@@ -212,7 +212,7 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
                 if let Ok(low) = low_str.parse::<f64>() {
                     if low >= high {
                         return Err(CommonError::new(
-                            ErrorCode::InvalidArgument,
+                            CommonErrorCode::InvalidArgument,
                             format!(
                                 "{} ({}) must be < {} ({})",
                                 worker_eviction::LOW_WATERMARK,
@@ -236,7 +236,7 @@ pub fn validate_client(config: &FlatConfig) -> Result<(), CommonError> {
     if let Some(ms) = config.get_i64(client::DEFAULT_TIMEOUT_MS) {
         if ms <= 0 {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
+                CommonErrorCode::InvalidArgument,
                 format!("{} must be > 0", client::DEFAULT_TIMEOUT_MS),
             ));
         }
@@ -251,7 +251,7 @@ pub fn validate_client(config: &FlatConfig) -> Result<(), CommonError> {
             .collect();
         if endpoints.is_empty() {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
+                CommonErrorCode::InvalidArgument,
                 format!("{} must contain at least one endpoint", client::METADATA_ENDPOINTS),
             ));
         }
@@ -272,7 +272,7 @@ pub fn validate_client(config: &FlatConfig) -> Result<(), CommonError> {
         let valid_values = ["normal", "strong", "weak"];
         if !valid_values.contains(&consistency.as_str()) {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
+                CommonErrorCode::InvalidArgument,
                 format!(
                     "{} must be one of {:?}, got {}",
                     client_consistency::DEFAULT,
@@ -288,7 +288,7 @@ pub fn validate_client(config: &FlatConfig) -> Result<(), CommonError> {
         let valid_values = ["cached", "direct"];
         if !valid_values.contains(&mode.as_str()) {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
+                CommonErrorCode::InvalidArgument,
                 format!(
                     "{} must be one of {:?}, got {}",
                     client_read_mode::DEFAULT,
@@ -304,7 +304,7 @@ pub fn validate_client(config: &FlatConfig) -> Result<(), CommonError> {
         let valid_values = ["back", "through", "direct"];
         if !valid_values.contains(&mode.as_str()) {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
+                CommonErrorCode::InvalidArgument,
                 format!(
                     "{} must be one of {:?}, got {}",
                     client_write_mode::DEFAULT,
@@ -324,7 +324,7 @@ pub fn validate_client(config: &FlatConfig) -> Result<(), CommonError> {
         if let Some(ttl) = config.get_i64(key) {
             if ttl <= 0 {
                 return Err(CommonError::new(
-                    ErrorCode::InvalidArgument,
+                    CommonErrorCode::InvalidArgument,
                     format!("{} must be > 0", key),
                 ));
             }
@@ -335,7 +335,7 @@ pub fn validate_client(config: &FlatConfig) -> Result<(), CommonError> {
     if let Some(max_retries) = config.get_i64(client_retry::MAX_RETRIES) {
         if max_retries < 0 {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
+                CommonErrorCode::InvalidArgument,
                 format!("{} must be >= 0, got {}", client_retry::MAX_RETRIES, max_retries),
             ));
         }
@@ -344,7 +344,7 @@ pub fn validate_client(config: &FlatConfig) -> Result<(), CommonError> {
         if let Ok(multiplier) = multiplier_str.parse::<f64>() {
             if multiplier <= 0.0 {
                 return Err(CommonError::new(
-                    ErrorCode::InvalidArgument,
+                    CommonErrorCode::InvalidArgument,
                     format!("{} must be > 0, got {}", client_retry::BACKOFF_MULTIPLIER, multiplier),
                 ));
             }

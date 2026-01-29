@@ -10,7 +10,6 @@ use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as Canonica
 use common::header::RpcErrorCode;
 use thiserror::Error;
 use tonic::{Code, Status};
-// Removed unused imports: BlockId, DataHandleId, ClientId
 
 /// Metadata service error.
 #[derive(Debug, Error)]

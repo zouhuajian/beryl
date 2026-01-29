@@ -6,7 +6,7 @@
 //! This module validates that the selected NetTransport and LocalIoStorage
 //! combination is compatible, especially for zero-copy operations.
 
-use common::error::{CommonError, ErrorCode};
+use common::error::{CommonError, CommonErrorCode};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 use transport::local_io::{build_local_io, LocalIoConfig, LocalIoKind};
@@ -172,7 +172,7 @@ pub fn build_and_validate_combo(
         "rdma" => NetTransportKind::Rdma,
         _ => {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
+                CommonErrorCode::InvalidArgument,
                 format!("Unknown transport kind: {}", transport_kind),
             ));
         }
@@ -180,7 +180,7 @@ pub fn build_and_validate_combo(
 
     let transport_config = NetTransportConfig::new(net_kind);
     let transport = build_net_transport(&transport_config)
-        .map_err(|e| CommonError::new(ErrorCode::InvalidArgument, format!("Failed to build transport: {}", e)))?;
+        .map_err(|e| CommonError::new(CommonErrorCode::InvalidArgument, format!("Failed to build transport: {}", e)))?;
 
     // Build storage
     let storage_kind_enum = match storage_kind {
@@ -189,7 +189,7 @@ pub fn build_and_validate_combo(
         "spdk" => LocalIoKind::Spdk,
         _ => {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
+                CommonErrorCode::InvalidArgument,
                 format!("Unknown storage kind: {}", storage_kind),
             ));
         }
@@ -197,7 +197,7 @@ pub fn build_and_validate_combo(
 
     let storage_config = LocalIoConfig::new(storage_kind_enum);
     let storage = build_local_io(&storage_config)
-        .map_err(|e| CommonError::new(ErrorCode::InvalidArgument, format!("Failed to build storage: {}", e)))?;
+        .map_err(|e| CommonError::new(CommonErrorCode::InvalidArgument, format!("Failed to build storage: {}", e)))?;
 
     // Get capabilities
     let transport_caps = get_transport_capabilities(&transport);
@@ -237,7 +237,7 @@ pub fn build_and_validate_combo(
                 "rdma" => NetTransportKind::Rdma,
                 _ => {
                     return Err(CommonError::new(
-                        ErrorCode::InvalidArgument,
+                        CommonErrorCode::InvalidArgument,
                         format!("Unknown fallback transport kind: {}", fallback),
                     ));
                 }
@@ -246,7 +246,7 @@ pub fn build_and_validate_combo(
             let fallback_config = NetTransportConfig::new(fallback_kind);
             let fallback_transport_box = build_net_transport(&fallback_config).map_err(|e| {
                 CommonError::new(
-                    ErrorCode::InvalidArgument,
+                    CommonErrorCode::InvalidArgument,
                     format!("Failed to build fallback transport: {}", e),
                 )
             })?;
@@ -271,7 +271,7 @@ pub fn build_and_validate_combo(
                     Ok((fallback_transport_box, storage, fallback))
                 }
                 _ => Err(CommonError::new(
-                    ErrorCode::InvalidArgument,
+                    CommonErrorCode::InvalidArgument,
                     format!(
                         "Fallback transport {} also invalid with storage {}",
                         fallback, storage_caps.kind
@@ -280,7 +280,7 @@ pub fn build_and_validate_combo(
             }
         }
         ComboValidationResult::Invalid { reason } => Err(CommonError::new(
-            ErrorCode::InvalidArgument,
+            CommonErrorCode::InvalidArgument,
             format!("Invalid transport×storage combo: {}", reason),
         )),
     }

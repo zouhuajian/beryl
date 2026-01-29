@@ -201,12 +201,12 @@ impl UfsFiller {
                     // Record error metrics
                     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
                     let error_kind = match &e.code {
-                        common::ErrorCode::NotFound => "not_found",
-                        common::ErrorCode::PermissionDenied => "permission_denied",
-                        common::ErrorCode::Timeout => "timeout",
-                        common::ErrorCode::Unavailable
-                        | common::ErrorCode::Throttled
-                        | common::ErrorCode::Overloaded => "retryable",
+                        common::CommonErrorCode::NotFound => "not_found",
+                        common::CommonErrorCode::PermissionDenied => "permission_denied",
+                        common::CommonErrorCode::Timeout => "timeout",
+                        common::CommonErrorCode::Unavailable
+                        | common::CommonErrorCode::Throttled
+                        | common::CommonErrorCode::Overloaded => "retryable",
                         _ => "internal",
                     };
 

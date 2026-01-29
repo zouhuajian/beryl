@@ -3,7 +3,7 @@
 
 //! Retry policy and async retry utilities.
 
-use crate::error::{CommonError, ErrorCode};
+use crate::error::{CommonError, CommonErrorCode};
 use crate::header::RequestHeader;
 use std::future::Future;
 use std::time::Duration;
@@ -121,7 +121,7 @@ where
         let remaining = ctx.deadline.remaining();
         if remaining.is_zero() {
             let err =
-                last_error.unwrap_or_else(|| CommonError::new(ErrorCode::Timeout, "deadline exceeded before retry"));
+                last_error.unwrap_or_else(|| CommonError::new(CommonErrorCode::Timeout, "deadline exceeded before retry"));
             warn!(
                 attempt,
                 elapsed_ms = start.elapsed().as_millis(),
@@ -134,7 +134,7 @@ where
         if let Some(max_elapsed) = policy.max_elapsed {
             if start.elapsed() > max_elapsed {
                 let err =
-                    last_error.unwrap_or_else(|| CommonError::new(ErrorCode::Timeout, "max elapsed time exceeded"));
+                    last_error.unwrap_or_else(|| CommonError::new(CommonErrorCode::Timeout, "max elapsed time exceeded"));
                 warn!(
                     attempt,
                     elapsed_ms = start.elapsed().as_millis(),
@@ -206,7 +206,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::ErrorCode;
+    use crate::error::CommonErrorCode;
     use crate::header::RequestHeader;
     use crate::time::Deadline;
     use tokio::time::sleep;
@@ -243,7 +243,7 @@ mod tests {
             attempts += 1;
             async move {
                 if attempts < 3 {
-                    Err(CommonError::new(ErrorCode::Unavailable, "temporary error"))
+                    Err(CommonError::new(CommonErrorCode::Unavailable, "temporary error"))
                 } else {
                     Ok::<i32, CommonError>(42)
                 }
@@ -264,7 +264,7 @@ mod tests {
         let mut attempts = 0;
         let result: Result<i32, CommonError> = retry_async(&policy, &ctx, "test", || {
             attempts += 1;
-            async move { Err(CommonError::new(ErrorCode::InvalidArgument, "not retryable")) }
+            async move { Err(CommonError::new(CommonErrorCode::InvalidArgument, "not retryable")) }
         })
         .await;
 
@@ -287,7 +287,7 @@ mod tests {
             attempts += 1;
             async move {
                 sleep(Duration::from_millis(20)).await;
-                Err(CommonError::new(ErrorCode::Unavailable, "temporary error"))
+                Err(CommonError::new(CommonErrorCode::Unavailable, "temporary error"))
             }
         })
         .await;
@@ -305,7 +305,7 @@ mod tests {
         let mut attempts = 0;
         let result: Result<i32, CommonError> = retry_async(&policy, &ctx, "test", || {
             attempts += 1;
-            async move { Err(CommonError::new(ErrorCode::Unavailable, "error")) }
+            async move { Err(CommonError::new(CommonErrorCode::Unavailable, "error")) }
         })
         .await;
 

@@ -1595,29 +1595,6 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         }))
     }
 
-    async fn stat_fs(&self, _request: Request<StatFsRequestProto>) -> Result<Response<StatFsResponseProto>, Status> {
-        Err(Status::unimplemented("StatFs not yet implemented"))
-    }
-
-    async fn access(&self, _request: Request<AccessRequestProto>) -> Result<Response<AccessResponseProto>, Status> {
-        Err(Status::unimplemented("Access not yet implemented"))
-    }
-
-    async fn symlink(&self, _request: Request<SymlinkRequestProto>) -> Result<Response<SymlinkResponseProto>, Status> {
-        Err(Status::unimplemented("Symlink not yet implemented"))
-    }
-
-    async fn readlink(
-        &self,
-        _request: Request<ReadlinkRequestProto>,
-    ) -> Result<Response<ReadlinkResponseProto>, Status> {
-        Err(Status::unimplemented("Readlink not yet implemented"))
-    }
-
-    async fn link(&self, _request: Request<LinkRequestProto>) -> Result<Response<LinkResponseProto>, Status> {
-        Err(Status::unimplemented("Link not yet implemented"))
-    }
-
     #[instrument(skip(self), fields(call_id, client_id))]
     async fn open_write(
         &self,
@@ -2415,6 +2392,29 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             header: Some(resp_header),
             new_size: req.new_size,
         }))
+    }
+
+    async fn stat_fs(&self, _request: Request<StatFsRequestProto>) -> Result<Response<StatFsResponseProto>, Status> {
+        Err(Status::unimplemented("StatFs not yet implemented"))
+    }
+
+    async fn access(&self, _request: Request<AccessRequestProto>) -> Result<Response<AccessResponseProto>, Status> {
+        Err(Status::unimplemented("Access not yet implemented"))
+    }
+
+    async fn symlink(&self, _request: Request<SymlinkRequestProto>) -> Result<Response<SymlinkResponseProto>, Status> {
+        Err(Status::unimplemented("Symlink not yet implemented"))
+    }
+
+    async fn readlink(
+        &self,
+        _request: Request<ReadlinkRequestProto>,
+    ) -> Result<Response<ReadlinkResponseProto>, Status> {
+        Err(Status::unimplemented("Readlink not yet implemented"))
+    }
+
+    async fn link(&self, _request: Request<LinkRequestProto>) -> Result<Response<LinkResponseProto>, Status> {
+        Err(Status::unimplemented("Link not yet implemented"))
     }
 
     async fn set_xattr(

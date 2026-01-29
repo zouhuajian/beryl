@@ -5,7 +5,7 @@
 
 use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshReason};
 use common::header::RpcErrorCode;
-use common::{CommonError, ErrorCode as CommonErrorCode};
+use common::{CommonError, CommonErrorCode as CommonErrorCode};
 use proto::common::RpcErrorCodeProto as ProtoErrorCode;
 use thiserror::Error;
 

@@ -185,7 +185,7 @@ pub mod canonical {
 
 /// Error codes for common error classification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ErrorCode {
+pub enum CommonErrorCode {
     /// Operation timed out.
     Timeout,
     /// Service is unavailable.
@@ -206,28 +206,28 @@ pub enum ErrorCode {
     Internal,
 }
 
-impl ErrorCode {
+impl CommonErrorCode {
     /// Check if this error code is retryable.
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            ErrorCode::Timeout | ErrorCode::Unavailable | ErrorCode::Throttled | ErrorCode::Overloaded
+            CommonErrorCode::Timeout | CommonErrorCode::Unavailable | CommonErrorCode::Throttled | CommonErrorCode::Overloaded
         )
     }
 }
 
-impl fmt::Display for ErrorCode {
+impl fmt::Display for CommonErrorCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ErrorCode::Timeout => write!(f, "Timeout"),
-            ErrorCode::Unavailable => write!(f, "Unavailable"),
-            ErrorCode::Throttled => write!(f, "Throttled"),
-            ErrorCode::Overloaded => write!(f, "Overloaded"),
-            ErrorCode::NotFound => write!(f, "NotFound"),
-            ErrorCode::PermissionDenied => write!(f, "PermissionDenied"),
-            ErrorCode::InvalidArgument => write!(f, "InvalidArgument"),
-            ErrorCode::Io => write!(f, "Io"),
-            ErrorCode::Internal => write!(f, "Internal"),
+            CommonErrorCode::Timeout => write!(f, "Timeout"),
+            CommonErrorCode::Unavailable => write!(f, "Unavailable"),
+            CommonErrorCode::Throttled => write!(f, "Throttled"),
+            CommonErrorCode::Overloaded => write!(f, "Overloaded"),
+            CommonErrorCode::NotFound => write!(f, "NotFound"),
+            CommonErrorCode::PermissionDenied => write!(f, "PermissionDenied"),
+            CommonErrorCode::InvalidArgument => write!(f, "InvalidArgument"),
+            CommonErrorCode::Io => write!(f, "Io"),
+            CommonErrorCode::Internal => write!(f, "Internal"),
         }
     }
 }
@@ -260,7 +260,7 @@ impl Default for ErrorMeta {
 #[derive(Debug)]
 pub struct CommonError {
     /// Error code.
-    pub code: ErrorCode,
+    pub code: CommonErrorCode,
     /// Human-readable error message.
     pub message: String,
     /// Source error (if any).
@@ -283,7 +283,7 @@ impl Clone for CommonError {
 
 impl CommonError {
     /// Create a new CommonError.
-    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+    pub fn new(code: CommonErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -376,8 +376,8 @@ where
     }
 }
 
-impl From<ErrorCode> for CommonError {
-    fn from(code: ErrorCode) -> Self {
+impl From<CommonErrorCode> for CommonError {
+    fn from(code: CommonErrorCode) -> Self {
         CommonError::new(code, code.to_string())
     }
 }

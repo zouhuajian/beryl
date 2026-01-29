@@ -35,15 +35,9 @@ message DataResponseHeaderProto {
 
   /// Current worker_epoch as observed by the worker.
   /// Filled when returning NEED_REFRESH for WorkerEpochMismatch/Fencing to let clients refresh cache.
-  optional uint64 worker_epoch = 6;
+  optional uint64 worker_epoch = 3;
 
   /// Optional endpoint hint for redirect/refresh (single endpoint for now).
   /// This provides enough data for the client to refresh connection without a separate metadata round trip.
-  optional common.WorkerEndpointInfoProto endpoint_hint = 7;
-
-  // Reserved field numbers for deleted fields:
-  // 2: error_class (ErrorClassProto) - DELETED, use error.error_class instead
-  // 3: refresh_reason (RefreshReasonProto) - DELETED, use error.refresh_reason instead
-  // 4: retry_after_ms (uint32) - DELETED, use error.retry_after_ms instead
-  // 5: message (string) - DELETED, use error.message instead
+  optional common.WorkerEndpointInfoProto endpoint_hint = 4;
 }

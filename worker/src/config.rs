@@ -4,7 +4,7 @@
 //! Worker configuration loading and validation.
 
 use common::config::CoreConfig;
-use common::error::{CommonError, ErrorCode};
+use common::error::{CommonError, CommonErrorCode};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -480,8 +480,8 @@ impl WorkerConfig {
         // Validate block_size % chunk_size == 0
         if self.block_size % self.chunk_size != 0 {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
-                format!(
+				CommonErrorCode::InvalidArgument,
+				format!(
                     "block_size ({}) must be divisible by chunk_size ({})",
                     self.block_size, self.chunk_size
                 ),
@@ -491,24 +491,24 @@ impl WorkerConfig {
         // Validate rpc.bind is a valid socket address
         if self.rpc_bind.parse::<std::net::SocketAddr>().is_err() {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
-                format!("invalid rpc.bind address: {}", self.rpc_bind),
+				CommonErrorCode::InvalidArgument,
+				format!("invalid rpc.bind address: {}", self.rpc_bind),
             ));
         }
 
         // Validate rpc_max_inflight > 0
         if self.rpc_max_inflight == 0 {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
-                "rpc.max_inflight must be > 0",
+				CommonErrorCode::InvalidArgument,
+				"rpc.max_inflight must be > 0",
             ));
         }
 
         // Validate storage_dirs
         if self.storage_dirs.is_empty() {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
-                "at least one storage directory is required",
+				CommonErrorCode::InvalidArgument,
+				"at least one storage directory is required",
             ));
         }
 
@@ -518,8 +518,8 @@ impl WorkerConfig {
                 // Try to create it
                 if let Err(e) = std::fs::create_dir_all(dir) {
                     return Err(CommonError::new(
-                        ErrorCode::Io,
-                        format!("failed to create storage directory {}: {}", dir.display(), e),
+						CommonErrorCode::Io,
+						format!("failed to create storage directory {}: {}", dir.display(), e),
                     ));
                 }
             }
@@ -527,15 +527,15 @@ impl WorkerConfig {
             // Check if writable
             let metadata = std::fs::metadata(dir).map_err(|e| {
                 CommonError::new(
-                    ErrorCode::Io,
-                    format!("failed to access storage directory {}: {}", dir.display(), e),
+					CommonErrorCode::Io,
+					format!("failed to access storage directory {}: {}", dir.display(), e),
                 )
             })?;
 
             if !metadata.is_dir() {
                 return Err(CommonError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("storage path is not a directory: {}", dir.display()),
+					CommonErrorCode::InvalidArgument,
+					format!("storage path is not a directory: {}", dir.display()),
                 ));
             }
 
@@ -543,8 +543,8 @@ impl WorkerConfig {
             let test_file = dir.join(".worker_test_write");
             if let Err(e) = std::fs::write(&test_file, b"test") {
                 return Err(CommonError::new(
-                    ErrorCode::Io,
-                    format!("storage directory is not writable: {}: {}", dir.display(), e),
+					CommonErrorCode::Io,
+					format!("storage directory is not writable: {}: {}", dir.display(), e),
                 ));
             }
             // Clean up test file
@@ -554,20 +554,20 @@ impl WorkerConfig {
         // Validate concurrency settings
         if self.max_read_ops == 0 {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
-                "concurrency.max_read_ops must be > 0",
+				CommonErrorCode::InvalidArgument,
+				"concurrency.max_read_ops must be > 0",
             ));
         }
         if self.max_write_ops == 0 {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
-                "concurrency.max_write_ops must be > 0",
+				CommonErrorCode::InvalidArgument,
+				"concurrency.max_write_ops must be > 0",
             ));
         }
         if self.queue_size == 0 {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
-                "concurrency.queue_size must be > 0",
+				CommonErrorCode::InvalidArgument,
+				"concurrency.queue_size must be > 0",
             ));
         }
 
@@ -577,16 +577,16 @@ impl WorkerConfig {
             // Check group_id uniqueness
             if !group_ids.insert(group.group_id) {
                 return Err(CommonError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("duplicate metadata group_id: {}", group.group_id),
+					CommonErrorCode::InvalidArgument,
+					format!("duplicate metadata group_id: {}", group.group_id),
                 ));
             }
 
             // Validate endpoint format (basic check: should be a valid URL or socket address)
             if group.endpoint.is_empty() {
                 return Err(CommonError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("empty endpoint for metadata group {}", group.group_id),
+					CommonErrorCode::InvalidArgument,
+					format!("empty endpoint for metadata group {}", group.group_id),
                 ));
             }
 
@@ -617,8 +617,8 @@ impl WorkerConfig {
         if let Some(ref ufs_id) = self.ufs.default_ufs_id {
             if ufs_id.is_empty() {
                 return Err(CommonError::new(
-                    ErrorCode::InvalidArgument,
-                    "ufs.default_id cannot be empty if specified",
+					CommonErrorCode::InvalidArgument,
+					"ufs.default_id cannot be empty if specified",
                 ));
             }
         }
@@ -626,16 +626,16 @@ impl WorkerConfig {
         // Validate UFS timeout
         if self.ufs.timeout_ms == 0 {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
-                "ufs.timeout_ms must be > 0",
+				CommonErrorCode::InvalidArgument,
+				"ufs.timeout_ms must be > 0",
             ));
         }
 
         // Validate UFS concurrency
         if self.ufs.max_concurrent_per_ufs == 0 {
             return Err(CommonError::new(
-                ErrorCode::InvalidArgument,
-                "ufs.max_concurrent_per_instance must be > 0",
+				CommonErrorCode::InvalidArgument,
+				"ufs.max_concurrent_per_instance must be > 0",
             ));
         }
 

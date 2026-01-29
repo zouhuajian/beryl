@@ -3,7 +3,7 @@
 
 //! Deadline and timeout utilities.
 
-use crate::error::{CommonError, ErrorCode};
+use crate::error::{CommonError, CommonErrorCode};
 use std::future::Future;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration as TokioDuration, timeout as tokio_timeout};
@@ -71,14 +71,14 @@ where
 {
     let remaining = deadline.remaining();
     if remaining.is_zero() {
-        return Err(CommonError::new(ErrorCode::Timeout, "deadline has already passed"));
+        return Err(CommonError::new(CommonErrorCode::Timeout, "deadline has already passed"));
     }
 
     match tokio_timeout(TokioDuration::from_secs(remaining.as_secs() + 1), future).await {
         Ok(result) => Ok(result),
         Err(_) => Err(CommonError::new(
-            ErrorCode::Timeout,
-            format!("operation timed out after {}ms", remaining.as_millis()),
+			CommonErrorCode::Timeout,
+			format!("operation timed out after {}ms", remaining.as_millis()),
         )),
     }
 }
@@ -122,7 +122,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, ErrorCode::Timeout);
+        assert_eq!(err.code, CommonErrorCode::Timeout);
     }
 
     #[tokio::test]
@@ -132,7 +132,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, ErrorCode::Timeout);
+        assert_eq!(err.code, CommonErrorCode::Timeout);
     }
 
     #[test]

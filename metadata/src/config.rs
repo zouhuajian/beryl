@@ -139,8 +139,8 @@ impl MetadataConfig {
         let port = flat.get_i64("metadata.rpc.port").unwrap_or(18080) as u16;
         let rpc_addr = format!("{}:{}", addr, port).parse().map_err(|e| {
             CommonError::new(
-                common::error::ErrorCode::InvalidArgument,
-                format!("Invalid metadata.rpc.addr/port: {}", e),
+				common::error::CommonErrorCode::InvalidArgument,
+				format!("Invalid metadata.rpc.addr/port: {}", e),
             )
         })?;
 
