@@ -347,10 +347,9 @@ impl OrphanBlockCleaner {
                         vec![worker_id], // Include target worker for orphan
                     ) {
                         Ok(intent) => {
-                            use crate::raft::Command;
-                            use types::CallId;
+                            use crate::raft::{Command, DedupKey};
                             let command = Command::CreateDeleteIntents {
-                                request_id: CallId::new(),
+                                dedup: DedupKey::system(),
                                 intents: vec![intent],
                             };
 

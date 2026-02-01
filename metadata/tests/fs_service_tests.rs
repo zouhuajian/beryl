@@ -267,9 +267,13 @@ async fn test_rename_cross_mount_exdev() {
         name: "a".to_string(),
     };
 
-    let lookup_a_mount2_resp = harness.fs_service.lookup(Request::new(lookup_a_mount2_req)).await;
-
-    assert!(lookup_a_mount2_resp.is_err());
+    let lookup_a_mount2_resp = harness
+        .fs_service
+        .lookup(Request::new(lookup_a_mount2_req))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(lookup_a_mount2_resp.inode.is_none());
 }
 
 /// B3: Test ReadDir pagination with cursor_key.

@@ -8,9 +8,24 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+// Global dedup metrics (low cardinality, process-wide).
+pub static DEDUP_LOOKUP_HIT_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static DEDUP_LOOKUP_MISS_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static DEDUP_LOOKUP_MISMATCH_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static DEDUP_EVICTED_TTL_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static DEDUP_EVICTED_SIZE_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static DEDUP_STORE_ENTRIES_GAUGE: AtomicU64 = AtomicU64::new(0);
+
 /// Metadata service metrics.
 #[derive(Clone)]
 pub struct MetadataMetrics {
+    // Dedup metrics (low cardinality)
+    pub dedup_lookup_hit_total: Arc<AtomicU64>,
+    pub dedup_lookup_miss_total: Arc<AtomicU64>,
+    pub dedup_lookup_mismatch_total: Arc<AtomicU64>,
+    pub dedup_evicted_ttl_total: Arc<AtomicU64>,
+    pub dedup_evicted_size_total: Arc<AtomicU64>,
+    pub dedup_store_entries_gauge: Arc<AtomicU64>,
     // File operations
     pub files_total: Arc<AtomicUsize>,
     pub files_created_total: Arc<AtomicU64>,
@@ -187,6 +202,12 @@ impl MetadataMetrics {
             orphan_gate_state: Arc::new(AtomicUsize::new(0)),
             orphan_cleanup_skipped_total: Arc::new(AtomicU64::new(0)),
             orphan_cleanup_actions_total: Arc::new(AtomicU64::new(0)),
+            dedup_lookup_hit_total: Arc::new(AtomicU64::new(0)),
+            dedup_lookup_miss_total: Arc::new(AtomicU64::new(0)),
+            dedup_lookup_mismatch_total: Arc::new(AtomicU64::new(0)),
+            dedup_evicted_ttl_total: Arc::new(AtomicU64::new(0)),
+            dedup_evicted_size_total: Arc::new(AtomicU64::new(0)),
+            dedup_store_entries_gauge: Arc::new(AtomicU64::new(0)),
             maintenance_blockreport_active_workers: Arc::new(AtomicUsize::new(0)),
             maintenance_blockreport_full_reported_workers: Arc::new(AtomicUsize::new(0)),
             maintenance_blockreport_ratio: Arc::new(AtomicUsize::new(0)),

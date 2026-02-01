@@ -4,15 +4,12 @@
 //! Raft-based StateStore implementation.
 
 use crate::error::{MetadataError, MetadataResult};
-use crate::raft::{AppRaftNode, Command};
+use crate::raft::{AppDataResponse, AppRaftNode, BlockCommandResult, Command, DedupKey, LeaseCommandResult};
 use crate::state::{BlockMetaState, LayoutVersion, LeaseState, StateStore};
 use async_trait::async_trait;
-use bincode::config::standard;
-use bincode::serde::decode_from_slice;
 use std::sync::Arc;
 use types::block::{BlockPlacement, BlockState};
 use types::ids::BlockId;
-use types::CallId;
 
 /// Raft-based StateStore implementation.
 pub struct RaftStateStore {
@@ -41,28 +38,25 @@ impl StateStore for RaftStateStore {
         block_id: BlockId,
         placement: BlockPlacement,
     ) -> MetadataResult<BlockMetaState> {
-        let request_id = CallId::new();
-
         let command = Command::AllocateBlock {
-            request_id,
+            dedup: DedupKey::system(),
             inode_id,
             block_id,
             placement,
         };
 
-        let result = self.raft_node.propose(command).await?;
-
-        let (block_meta, _): (BlockMetaState, _) = decode_from_slice(&result, standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to deserialize result: {}", e)))?;
-
-        Ok(block_meta)
+        match self.raft_node.propose(command).await? {
+            AppDataResponse::Block(BlockCommandResult::Allocated(meta)) => Ok(meta),
+            other => Err(MetadataError::Internal(format!(
+                "Unexpected response for AllocateBlock: {:?}",
+                other
+            ))),
+        }
     }
 
     async fn update_block_state(&self, block_id: BlockId, state: BlockState) -> MetadataResult<()> {
-        let request_id = CallId::new();
-
         let command = Command::UpdateBlockState {
-            request_id,
+            dedup: DedupKey::system(),
             block_id,
             state,
         };
@@ -83,32 +77,37 @@ impl StateStore for RaftStateStore {
         epoch: u64,
         expires_at_ms: u64,
     ) -> MetadataResult<LeaseState> {
-        let request_id = CallId::new();
-
         let command = Command::AcquireLease {
-            request_id,
+            dedup: DedupKey::system(),
             block_id,
             client_id,
             epoch,
             expires_at_ms,
         };
 
-        let result = self.raft_node.propose(command).await?;
-
-        let (lease, _): (LeaseState, _) = decode_from_slice(&result, standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to deserialize result: {}", e)))?;
-
-        Ok(lease)
+        match self.raft_node.propose(command).await? {
+            AppDataResponse::Lease(LeaseCommandResult::Acquired(lease)) => Ok(lease),
+            other => Err(MetadataError::Internal(format!(
+                "Unexpected response for AcquireLease: {:?}",
+                other
+            ))),
+        }
     }
 
     async fn release_lease(&self, block_id: BlockId) -> MetadataResult<()> {
-        let request_id = CallId::new();
-
         // Command::ReleaseLease doesn't need client_id or fencing_token
-        let command = Command::ReleaseLease { request_id, block_id };
+        let command = Command::ReleaseLease {
+            dedup: DedupKey::system(),
+            block_id,
+        };
 
-        self.raft_node.propose(command).await?;
-        Ok(())
+        match self.raft_node.propose(command).await? {
+            AppDataResponse::Lease(LeaseCommandResult::Released) => Ok(()),
+            other => Err(MetadataError::Internal(format!(
+                "Unexpected response for ReleaseLease: {:?}",
+                other
+            ))),
+        }
     }
 
     async fn get_inode(&self, inode_id: types::fs::InodeId) -> MetadataResult<Option<types::fs::Inode>> {

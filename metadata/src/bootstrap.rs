@@ -5,11 +5,10 @@
 
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::{DataIoPolicy, MountKind, MountTable, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
-use crate::raft::{AppRaftNode, Command};
+use crate::raft::{AppRaftNode, Command, DedupKey};
 use std::sync::Arc;
 use tracing::warn;
 use types::ids::ShardGroupId;
-use types::CallId;
 
 /// Ensure the root mount exists and is durable.
 pub async fn ensure_root_mount(
@@ -46,7 +45,7 @@ pub async fn ensure_root_mount(
 
     let mount_id = mount_table.allocate_mount_id();
     let command = Command::CreateMount {
-        request_id: CallId::new(),
+        dedup: DedupKey::system(),
         mount_id,
         mount_prefix: ROOT_MOUNT_PREFIX.to_string(),
         mount_kind: MountKind::Internal,

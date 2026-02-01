@@ -15,7 +15,6 @@ use tokio::sync::Notify;
 use tokio::time::sleep;
 use tracing::{info, warn};
 use types::ids::ShardGroupId;
-use types::CallId;
 
 #[derive(Debug, Clone)]
 pub struct RootReadinessConfig {
@@ -145,7 +144,7 @@ pub async fn wait_for_root_ready_with_metrics(
         if raft_node.is_leader() {
             let mount_id = mount_table.allocate_mount_id();
             let command = Command::CreateMount {
-                request_id: CallId::new(),
+                dedup: crate::raft::DedupKey::system(),
                 mount_id,
                 mount_prefix: ROOT_MOUNT_PREFIX.to_string(),
                 mount_kind: MountKind::Internal,

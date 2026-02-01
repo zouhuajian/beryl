@@ -23,8 +23,12 @@
 //!   - Note: Fixed-width encoding enables efficient iteration and comparison
 
 use crate::error::{MetadataError, MetadataResult};
+use crate::metrics::{
+    DEDUP_EVICTED_SIZE_TOTAL, DEDUP_EVICTED_TTL_TOTAL, DEDUP_LOOKUP_HIT_TOTAL, DEDUP_LOOKUP_MISS_TOTAL,
+    DEDUP_STORE_ENTRIES_GAUGE,
+};
 use crate::mount::MountEntry;
-use crate::raft::types::AppMetadataRaftState;
+use crate::raft::types::{AppDataResponse, AppMetadataRaftState, CommandFingerprint, DedupKey, ShardGroupInfo};
 use crate::state::{BlockMetaState, LayoutVersion, LeaseState};
 use crate::worker::WorkerInfo;
 use bincode::config::standard;
@@ -33,12 +37,12 @@ use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::warn;
 use types::fs::{Inode, InodeId};
 use types::ids::{BlockId, DataHandleId, MountId, ShardGroupId, ShardId, WorkerId};
 use types::layout::FileLayout;
-use types::CallId;
 
 /// Column family names for RocksDB.
 const CF_BLOCKS: &str = "blocks";
@@ -55,6 +59,11 @@ const CF_META: &str = "meta"; // layout_version, mount_version, etc.
 const CF_RAFT_LOG: &str = "raft_log"; // Raft log entries
 const CF_RAFT_STATE: &str = "raft_state"; // Raft state (hard_state, membership)
 const CF_RAFT_SNAPSHOT: &str = "raft_snapshot"; // Raft snapshots
+
+const DEDUP_VERSION_KEY: &[u8] = b"dedup_version";
+const DEDUP_FORMAT_VERSION: u64 = 3;
+const DEDUP_TTL_MS: u64 = 10 * 60 * 1000; // 10 minutes; TODO: make configurable
+const DEDUP_MAX_ENTRIES: usize = if cfg!(debug_assertions) { 128 } else { 10_000 };
 
 // FS column families
 const CF_INODES: &str = "inodes"; // inode/{inode_id_be} -> Inode
@@ -80,16 +89,10 @@ pub const STATE_CFS: &[&str] = &[
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppliedResult {
     pub seq: u64,
-    pub result: Vec<u8>, // Serialized result
-}
-
-/// Shard group information.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ShardGroupInfo {
-    pub group_id: ShardGroupId,
-    pub shard_ids: Vec<u64>,
-    pub initial_members: Vec<u64>,
-    pub version: u64,
+    pub fingerprint: CommandFingerprint,
+    pub result: AppDataResponse,
+    pub created_at_ms: u64,
+    pub size_bytes: u32,
 }
 
 /// RocksDB storage backend.
@@ -134,6 +137,9 @@ impl RocksDBStorage {
 
         let db = DB::open_cf_descriptors(&opts, &path_buf, cfs)
             .map_err(|e| MetadataError::Internal(format!("Failed to open RocksDB: {}", e)))?;
+
+        // Clear legacy dedup entries when format version changes.
+        reset_dedup_if_stale(&db)?;
 
         let snapshot_dir = path_buf.join("snapshots");
         std::fs::create_dir_all(&snapshot_dir)
@@ -232,38 +238,69 @@ impl RocksDBStorage {
     }
 
     /// Get applied result for idempotency.
-    pub fn get_applied_result(&self, request_id: &CallId) -> MetadataResult<Option<AppliedResult>> {
+    pub fn get_applied_result(&self, request: &DedupKey) -> MetadataResult<Option<AppliedResult>> {
+        let now_ms = now_millis();
+        let evicted = self.evict_expired(now_ms)?;
+        if evicted > 0 {
+            DEDUP_EVICTED_TTL_TOTAL.fetch_add(evicted as u64, Ordering::Relaxed);
+        }
+
         let cf = self
             .db
             .cf_handle(CF_DEDUP)
             .ok_or_else(|| MetadataError::Internal("Dedup CF not found".to_string()))?;
-        let key = request_id.to_string();
+        let key = format!("{}:{}", request.client_id.as_raw(), request.call_id);
 
         match self.db.get_cf(cf, key.as_bytes()) {
             Ok(Some(value)) => {
                 let result: AppliedResult = decode_from_slice(&value, standard())
                     .map_err(|e| MetadataError::Internal(format!("Failed to deserialize AppliedResult: {}", e)))?
                     .0;
+                DEDUP_LOOKUP_HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
                 Ok(Some(result))
             }
-            Ok(None) => Ok(None),
+            Ok(None) => {
+                DEDUP_LOOKUP_MISS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                Ok(None)
+            }
             Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
         }
     }
 
     /// Put applied result for idempotency.
-    pub fn put_applied_result(&self, request_id: &CallId, result: AppliedResult) -> MetadataResult<()> {
+    pub fn put_applied_result(&self, request: &DedupKey, result: AppliedResult) -> MetadataResult<()> {
+        // Evict stale entries before inserting
+        let now_ms = now_millis();
+        let evicted_ttl = self.evict_expired(now_ms)?;
+        if evicted_ttl > 0 {
+            DEDUP_EVICTED_TTL_TOTAL.fetch_add(evicted_ttl as u64, Ordering::Relaxed);
+        }
+
         let cf = self
             .db
             .cf_handle(CF_DEDUP)
             .ok_or_else(|| MetadataError::Internal("Dedup CF not found".to_string()))?;
-        let key = request_id.to_string();
+        let key = format!("{}:{}", request.client_id.as_raw(), request.call_id);
+        let mut result = result;
+        let value = encode_to_vec(&result, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize AppliedResult: {}", e)))?;
+        result.size_bytes = value.len() as u32;
         let value = encode_to_vec(&result, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize AppliedResult: {}", e)))?;
 
         self.db
             .put_cf(cf, key.as_bytes(), value)
             .map_err(|e| MetadataError::Internal(format!("RocksDB error: {}", e)))?;
+
+        // Enforce size bound after insertion to account for the new record.
+        let evicted_size = self.enforce_size_bound()?;
+        if evicted_size > 0 {
+            DEDUP_EVICTED_SIZE_TOTAL.fetch_add(evicted_size as u64, Ordering::Relaxed);
+        }
+
+        // Update gauge
+        let entries = self.count_dedup_entries()?;
+        DEDUP_STORE_ENTRIES_GAUGE.store(entries as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1558,15 +1595,142 @@ impl RocksDBStorage {
             .write(batch)
             .map_err(|e| MetadataError::Internal(format!("RocksDB batch write: {}", e)))
     }
+
+    fn evict_expired(&self, now_ms: u64) -> MetadataResult<usize> {
+        let cf = self
+            .db
+            .cf_handle(CF_DEDUP)
+            .ok_or_else(|| MetadataError::Internal("Dedup CF not found".to_string()))?;
+        let mut evicted = 0usize;
+        let mut batch = WriteBatch::default();
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) =
+                item.map_err(|e| MetadataError::Internal(format!("RocksDB iterator error (dedup ttl): {}", e)))?;
+            let applied: AppliedResult = match decode_from_slice(&value, standard()) {
+                Ok((ar, _)) => ar,
+                Err(_) => {
+                    // If corrupt, evict defensively
+                    batch.delete_cf(cf, key);
+                    evicted += 1;
+                    continue;
+                }
+            };
+            if now_ms.saturating_sub(applied.created_at_ms) > DEDUP_TTL_MS {
+                batch.delete_cf(cf, key);
+                evicted += 1;
+            }
+        }
+        if evicted > 0 {
+            self.write_batch(batch)?;
+        }
+        Ok(evicted)
+    }
+
+    fn enforce_size_bound(&self) -> MetadataResult<usize> {
+        let cf = self
+            .db
+            .cf_handle(CF_DEDUP)
+            .ok_or_else(|| MetadataError::Internal("Dedup CF not found".to_string()))?;
+        let mut entries = Vec::new();
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) =
+                item.map_err(|e| MetadataError::Internal(format!("RocksDB iterator error (dedup size): {}", e)))?;
+            let applied: AppliedResult = match decode_from_slice(&value, standard()) {
+                Ok((ar, _)) => ar,
+                Err(_) => {
+                    // Corrupt entry: schedule removal
+                    entries.push((0u64, key));
+                    continue;
+                }
+            };
+            entries.push((applied.created_at_ms, key));
+        }
+        if entries.len() <= DEDUP_MAX_ENTRIES {
+            return Ok(0);
+        }
+        // Evict oldest
+        entries.sort_by_key(|(ts, _)| *ts);
+        let remove_count = entries.len() - DEDUP_MAX_ENTRIES;
+        let mut batch = WriteBatch::default();
+        for (_, key) in entries.into_iter().take(remove_count) {
+            batch.delete_cf(cf, key);
+        }
+        if remove_count > 0 {
+            self.write_batch(batch)?;
+        }
+        Ok(remove_count)
+    }
+
+    fn count_dedup_entries(&self) -> MetadataResult<usize> {
+        let cf = self
+            .db
+            .cf_handle(CF_DEDUP)
+            .ok_or_else(|| MetadataError::Internal("Dedup CF not found".to_string()))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut count = 0usize;
+        for item in iter {
+            item.map_err(|e| MetadataError::Internal(format!("RocksDB iterator error (dedup count): {}", e)))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+}
+
+fn reset_dedup_if_stale(db: &DB) -> MetadataResult<()> {
+    let meta_cf = db
+        .cf_handle(CF_META)
+        .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
+    let dedup_cf = db
+        .cf_handle(CF_DEDUP)
+        .ok_or_else(|| MetadataError::Internal("Dedup CF not found".to_string()))?;
+
+    let stored_version = match db.get_cf(meta_cf, DEDUP_VERSION_KEY) {
+        Ok(Some(bytes)) => {
+            let (v, _): (u64, _) = decode_from_slice(&bytes, standard())
+                .map_err(|e| MetadataError::Internal(format!("Failed to decode dedup_version: {}", e)))?;
+            v
+        }
+        Ok(None) => 0,
+        Err(e) => return Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
+    };
+
+    if stored_version == DEDUP_FORMAT_VERSION {
+        return Ok(());
+    }
+
+    let mut batch = WriteBatch::default();
+    let iter = db.iterator_cf(dedup_cf, rocksdb::IteratorMode::Start);
+    for item in iter {
+        let (key, _) =
+            item.map_err(|e| MetadataError::Internal(format!("RocksDB iterator error clearing dedup: {}", e)))?;
+        batch.delete_cf(dedup_cf, key);
+    }
+
+    let version_bytes = encode_to_vec(&DEDUP_FORMAT_VERSION, standard())
+        .map_err(|e| MetadataError::Internal(format!("Failed to encode dedup_version: {}", e)))?;
+    batch.put_cf(meta_cf, DEDUP_VERSION_KEY, version_bytes);
+    db.write(batch)
+        .map_err(|e| MetadataError::Internal(format!("RocksDB error clearing dedup: {}", e)))?;
+
+    Ok(())
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use tempfile::TempDir;
     use types::fs::{FileAttrs, Inode, InodeId};
     use types::ids::MountId;
+    use types::{CallId, ClientId};
 
     #[test]
     fn test_data_handle_allocator_unique_and_durable() {
@@ -1685,5 +1849,47 @@ mod tests {
             }
             Ok(_) => panic!("Expected error but got Ok"),
         }
+    }
+
+    #[test]
+    fn dedup_ttl_evicts_and_returns_miss() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+        let key = DedupKey::new(ClientId::new(42), CallId::new());
+        let result = AppliedResult {
+            seq: 1,
+            fingerprint: CommandFingerprint(1),
+            result: AppDataResponse::None,
+            created_at_ms: now_millis().saturating_sub(DEDUP_TTL_MS + 1_000),
+            size_bytes: 0,
+        };
+        storage.put_applied_result(&key, result).unwrap();
+
+        let fetched = storage.get_applied_result(&key).unwrap();
+        assert!(fetched.is_none(), "expired dedup entry should be evicted");
+    }
+
+    #[test]
+    fn dedup_size_bound_evicts_oldest() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+
+        for _ in 0..(DEDUP_MAX_ENTRIES + 2) {
+            let key = DedupKey::new(ClientId::new(7), CallId::new());
+            let result = AppliedResult {
+                seq: 1,
+                fingerprint: CommandFingerprint(2),
+                result: AppDataResponse::None,
+                created_at_ms: now_millis(),
+                size_bytes: 0,
+            };
+            storage.put_applied_result(&key, result).unwrap();
+        }
+
+        let count = storage.count_dedup_entries().unwrap();
+        assert!(
+            count <= DEDUP_MAX_ENTRIES,
+            "size bound should cap dedup entries (count={count}, max={DEDUP_MAX_ENTRIES})"
+        );
     }
 }

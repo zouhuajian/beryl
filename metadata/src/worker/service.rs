@@ -441,7 +441,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 
         // Create command and propose to Raft (only descriptor, no runtime)
         let command = Command::UpsertWorkerDescriptor {
-            request_id: _caller_ctx.client.call_id,
+            dedup: crate::raft::DedupKey::new(_caller_ctx.client.client_id, _caller_ctx.client.call_id),
             worker_id,
             address: format!("{}:{}", endpoint.host, endpoint.port),
             net_transport_kind,

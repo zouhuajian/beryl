@@ -63,9 +63,12 @@ async fn create_file_and_lookup(harness: &FsTestHarness, mount_root: u64, name: 
 }
 
 fn make_request_header() -> Option<RequestHeaderProto> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let call_seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     Some(RequestHeaderProto {
         client: Some(ClientInfoProto {
-            call_id: "call-1".to_string(),
+            call_id: format!("call-{}", call_seq),
             client_id: 42,
             client_name: String::new(),
         }),
@@ -198,7 +201,9 @@ async fn fsync_barrier_success_updates_size() {
         .await
         .unwrap()
         .into_inner();
-    assert!(resp.header.as_ref().unwrap().error.is_none());
+    if let Some(err) = resp.header.as_ref().and_then(|h| h.error.clone()) {
+        panic!("fsync returned error: {:?}", err);
+    }
 
     // Worker saw the effective target size (>= last_written)
     let committed = last_req.lock().unwrap().clone().unwrap().committed_length;

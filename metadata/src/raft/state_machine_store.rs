@@ -6,7 +6,7 @@
 use crate::error::{MetadataError, MetadataResult};
 use crate::raft::snapshot::SnapshotFile;
 use crate::raft::storage::{RocksDBStorage, STATE_CFS};
-use crate::raft::types::{AppMetadataRaftState, MetadataNode, MetadataRaftTypeConfig};
+use crate::raft::types::{AppDataResponse, AppMetadataRaftState, MetadataNode, MetadataRaftTypeConfig};
 use crate::state::LayoutVersion;
 use openraft::storage::{RaftStateMachine, SnapshotSignature};
 use openraft::AnyError;
@@ -83,7 +83,7 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
         Ok((last_applied, membership))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<Vec<u8>>, StorageError<u64>>
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<AppDataResponse>, StorageError<u64>>
     where
         I: IntoIterator<Item = Entry<MetadataRaftTypeConfig>> + openraft::OptionalSend,
         I::IntoIter: openraft::OptionalSend,
@@ -122,7 +122,7 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
                         source: StorageIOError::<u64>::apply(log_id, AnyError::new(&e)),
                     })?;
 
-                    results.push(Vec::new());
+                    results.push(AppDataResponse::None);
                 }
                 EntryPayload::Blank => {
                     // Blank entry, just update last_applied_log_id
@@ -132,7 +132,7 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
                         source: StorageIOError::<u64>::apply(log_id, AnyError::new(&e)),
                     })?;
 
-                    results.push(Vec::new());
+                    results.push(AppDataResponse::None);
                 }
             }
         }

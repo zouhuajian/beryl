@@ -24,5 +24,9 @@ pub use node::AppRaftNode;
 pub use snapshot::SnapshotFile;
 pub use state_machine::AppRaftStateMachine;
 pub use state_machine_store::{AppSnapshotBuilder, StateMachineStorage};
-pub use storage::RocksDBStorage;
-pub use types::{AppMetadataRaftState, MetadataNode, MetadataRaftTypeConfig};
+pub use storage::{AppliedResult, RocksDBStorage};
+pub use types::{
+    AppDataResponse, AppMetadataRaftState, BlockCommandResult, CommandFingerprint, DedupKey, DeleteIntentsResult,
+    FsCommandResult, FsErrnoResult, FsOkResult, LeaseCommandResult, MetadataNode, MetadataRaftTypeConfig,
+    MountCommandResult, ShardGroupInfo, WorkerCommandResult,
+};

@@ -383,10 +383,9 @@ impl OverReplicaCleanupService {
             )?;
 
             // Propose intent via Raft
-            use crate::raft::Command;
-            use types::CallId;
+            use crate::raft::{Command, DedupKey};
             let command = Command::CreateDeleteIntents {
-                request_id: CallId::new(),
+                dedup: DedupKey::system(),
                 intents: vec![intent.clone()],
             };
 

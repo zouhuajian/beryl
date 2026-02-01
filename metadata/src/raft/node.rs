@@ -13,7 +13,7 @@ use crate::raft::network::NetworkFactory;
 use crate::raft::state_machine::AppRaftStateMachine as AppStateMachine;
 use crate::raft::state_machine_store::StateMachineStorage;
 use crate::raft::storage::RocksDBStorage;
-use crate::raft::types::{AppMetadataRaftState, MetadataNode, MetadataRaftTypeConfig};
+use crate::raft::types::{AppDataResponse, AppMetadataRaftState, MetadataNode, MetadataRaftTypeConfig};
 use crate::raft_conv;
 use openraft::{Config, Raft, RaftMetrics, RaftTypeConfig, ServerState, SnapshotPolicy};
 use parking_lot::RwLock;
@@ -125,7 +125,7 @@ impl AppRaftNode {
     }
 
     /// Propose a command to Raft.
-    pub async fn propose(&self, command: Command) -> MetadataResult<Vec<u8>> {
+    pub async fn propose(&self, command: Command) -> MetadataResult<AppDataResponse> {
         // Use openraft client_write API
         let result = self.raft.client_write(command).await.map_err(|e| {
             // Map openraft errors to MetadataError
@@ -150,7 +150,6 @@ impl AppRaftNode {
         })?;
 
         // Extract response from ClientWriteResponse
-        // The response is Vec<u8> (MetadataRaftTypeConfig::R)
         Ok(result.data)
     }
 

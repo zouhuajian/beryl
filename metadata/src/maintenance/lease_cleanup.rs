@@ -187,11 +187,10 @@ impl LeaseCleanupService {
 
             let mut released = 0;
             for block_id in &eligible_for_release {
-                use crate::raft::Command;
-                use types::CallId;
+                use crate::raft::{Command, DedupKey};
 
                 let command = Command::ReleaseLease {
-                    request_id: CallId::new(),
+                    dedup: DedupKey::system(),
                     block_id: *block_id,
                 };
 
