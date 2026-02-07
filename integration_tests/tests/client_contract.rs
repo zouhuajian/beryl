@@ -144,6 +144,7 @@ async fn test_msync_with_mock() {
         retry_count: 0,
         group_id: 0,
         mount_epoch: None,
+        route_epoch: None,
     };
     header.group_id = 0;
 

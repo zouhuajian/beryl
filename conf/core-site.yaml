@@ -23,6 +23,18 @@ metadata.rpc.addr: "0.0.0.0"
 # Description: Port for metadata RPC server
 metadata.rpc.port: 18080
 
+# Inode service exposure gate (privileged/FUSE-only entrypoint)
+# Type: boolean
+# Default: false
+# Description: When false, inode service is not registered at all.
+metadata.inode_service.enable: false
+
+# Inode service loopback bind enforcement (single-endpoint mode)
+# Type: boolean
+# Default: true
+# Description: If inode service is enabled, metadata.rpc.addr must be loopback when this is true.
+metadata.inode_service.require_loopback_bind: true
+
 # ============================================================================
 # Metadata Raft Configuration (for metadata clustering)
 # ============================================================================

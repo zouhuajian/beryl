@@ -16,6 +16,8 @@ use std::path::Path;
 pub struct MetadataConfig {
     /// RPC server address.
     pub rpc_addr: SocketAddr,
+    /// Inode service exposure configuration.
+    pub inode_service: InodeServiceConfig,
     /// Raft configuration.
     pub raft: RaftConfig,
     /// Shard configuration.
@@ -30,6 +32,15 @@ pub struct MetadataConfig {
 #[derive(Clone, Debug)]
 pub struct BootstrapConfig {
     pub root_readiness: RootReadinessConfig,
+}
+
+/// Inode service exposure configuration.
+#[derive(Clone, Debug)]
+pub struct InodeServiceConfig {
+    /// Whether privileged inode RPCs are exposed.
+    pub enable: bool,
+    /// When true, inode service may only be served on loopback RPC binds.
+    pub require_loopback_bind: bool,
 }
 
 /// Worker and repair configuration.
@@ -121,6 +132,15 @@ impl Default for WorkerConfig {
     }
 }
 
+impl Default for InodeServiceConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            require_loopback_bind: true,
+        }
+    }
+}
+
 impl MetadataConfig {
     /// Load configuration from core-site.yaml.
     pub fn load<P: AsRef<Path>>(config_path: P) -> Result<Self, CommonError> {
@@ -143,6 +163,14 @@ impl MetadataConfig {
                 format!("Invalid metadata.rpc.addr/port: {}", e),
             )
         })?;
+
+        // Read inode service exposure config (privileged-only entrypoint, disabled by default).
+        let inode_service = InodeServiceConfig {
+            enable: flat.get_bool("metadata.inode_service.enable").unwrap_or(false),
+            require_loopback_bind: flat
+                .get_bool("metadata.inode_service.require_loopback_bind")
+                .unwrap_or(true),
+        };
 
         // Read Raft config
         let peers = if let Some(peers_str) = flat.get_str("metadata.raft.peers") {
@@ -202,6 +230,7 @@ impl MetadataConfig {
 
         Ok(Self {
             rpc_addr,
+            inode_service,
             raft,
             shard,
             worker,
@@ -214,6 +243,7 @@ impl Default for MetadataConfig {
     fn default() -> Self {
         Self {
             rpc_addr: "0.0.0.0:18080".parse().unwrap(),
+            inode_service: InodeServiceConfig::default(),
             raft: RaftConfig::default(),
             shard: ShardConfig::default(),
             worker: WorkerConfig::default(),
@@ -221,5 +251,29 @@ impl Default for MetadataConfig {
                 root_readiness: RootReadinessConfig::default(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::config::CoreConfig;
+
+    #[test]
+    fn inode_service_defaults_to_disabled() {
+        let config = MetadataConfig::default();
+        assert!(!config.inode_service.enable);
+        assert!(config.inode_service.require_loopback_bind);
+    }
+
+    #[test]
+    fn inode_service_config_parses_overrides() {
+        let mut flat = CoreConfig::default().as_flat().clone();
+        flat.set("metadata.inode_service.enable", true);
+        flat.set("metadata.inode_service.require_loopback_bind", false);
+
+        let config = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap();
+        assert!(config.inode_service.enable);
+        assert!(!config.inode_service.require_loopback_bind);
     }
 }

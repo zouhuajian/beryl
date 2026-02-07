@@ -71,6 +71,10 @@ message RequestHeaderProto {
 
   /// Optional retry count from client perspective (0 = first attempt).
   int32 retry_count = 8;
+
+  /// Optional route epoch observed by client.
+  /// Used by FileSystemService layout/write-session APIs for refresh+replay loops.
+  optional uint64 route_epoch = 9;
 }
 
 /// Human-oriented context for auditing and lightweight diagnostics.

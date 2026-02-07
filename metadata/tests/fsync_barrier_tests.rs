@@ -79,6 +79,7 @@ fn make_request_header() -> Option<RequestHeaderProto> {
         caller_context: None,
         state_id: None,
         retry_count: 0,
+        route_epoch: None,
     })
 }
 

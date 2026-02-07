@@ -22,8 +22,13 @@ message WriteTargetProto {
 // ===== Request/Response =====
 
 // ============================================================================
-// Metadata FS Service (Inode-centric FUSE/HCFS core)
+// Metadata FS Service (Inode-centric privileged entrypoint)
 // ============================================================================
+//
+// PRIVILEGED ENTRYPOINT:
+// - This service is inode/handle-centric and reserved for FUSE/trusted clients.
+// - External/general clients should use metadata.FileSystemServiceProto (filesystem.proto).
+// - Do not add new external/public path APIs here.
 
 /// Lookup request: resolve name to inode.
 message LookupRequestProto {
@@ -590,7 +595,7 @@ message FileBlockLocationProto {
 }
 
 // ============================================================================
-// Metadata FS Service
+// Metadata FS Service (privileged)
 // ============================================================================
 
 service MetadataFsServiceProto {

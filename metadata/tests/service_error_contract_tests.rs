@@ -20,7 +20,7 @@ const REQUIRED_SCAN_FILES: &[&str] = &[
 const ALLOWLISTED_STATUS_FILES: &[&str] = &["src/worker/service.rs", "../worker/src/service.rs"];
 const SERVER_IMPL_MARKERS: &[&str] = &[
     "impl MetadataFsServiceProto for",
-    "impl MetadataPathServiceProto for",
+    "impl FileSystemServiceProto for",
     "impl MetadataWorkerServiceProto for",
     "impl WorkerDataService for",
 ];
@@ -28,6 +28,11 @@ const FORBIDDEN_PATTERNS: &[&str] = &["Status::from_error", "return Err(Status",
 const FS_HANDLER_FILES: &[&str] = &["src/service/fs_service.rs", "src/service/path_service.rs"];
 const FS_RPC_APPLICATION_ALLOWLIST: &[&str] = &[];
 const FORBIDDEN_FS_APPLICATION_PATTERN: &str = "RpcErrorCode::Application";
+const PATH_SERVICE_COUPLING_FORBIDDEN: &[&str] = &[
+    "self.fs_service.",
+    "fs_service: Arc<",
+    "MetadataFsServiceProto as FsServiceTrait",
+];
 
 fn collect_rs_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("failed to read {}: {}", dir.display(), e)) {
@@ -108,6 +113,19 @@ fn fs_handler_application_report(findings: &[String]) -> String {
         files,
         FS_RPC_APPLICATION_ALLOWLIST.len(),
         allowlist,
+        findings.join("\n")
+    )
+}
+
+fn path_service_coupling_report(findings: &[String]) -> String {
+    let patterns = PATH_SERVICE_COUPLING_FORBIDDEN
+        .iter()
+        .map(|p| format!("  - {}", p))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "path_service_file: src/service/path_service.rs\nforbidden_patterns:\n{}\nfindings:\n{}",
+        patterns,
         findings.join("\n")
     )
 }
@@ -199,6 +217,32 @@ fn test_fs_handlers_do_not_emit_rpc_application() {
         findings.is_empty(),
         "filesystem handlers must not emit RpcCode::Application; use errno mapping via to_canonical_fs()\n{}",
         fs_handler_application_report(&findings)
+    );
+}
+
+#[test]
+fn test_path_service_has_no_inode_handler_coupling() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = manifest_dir.join("src/service/path_service.rs");
+    let content = fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
+
+    let mut findings = Vec::new();
+    for (line_no, line) in content.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        for pattern in PATH_SERVICE_COUPLING_FORBIDDEN {
+            if line.contains(pattern) {
+                findings.push(format!("src/service/path_service.rs:{} => {}", line_no + 1, pattern));
+            }
+        }
+    }
+
+    assert!(
+        findings.is_empty(),
+        "path service must not couple to inode handler implementation\n{}",
+        path_service_coupling_report(&findings)
     );
 }
 

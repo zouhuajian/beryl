@@ -297,6 +297,7 @@ impl From<&RequestHeader> for proto_common::RequestHeaderProto {
             retry_count: header.retry_count,
             group_id: header.group_id.unwrap_or(0),
             mount_epoch: header.mount_epoch,
+            route_epoch: None,
         }
     }
 }

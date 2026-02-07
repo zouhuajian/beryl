@@ -24,7 +24,7 @@
 //! ## Services
 //!
 //! - **MetadataFsServiceProto**: Authoritative inode-based FS service (see `service/fs_service.rs`)
-//! - **MetadataPathServiceProto**: Path adapter layer (path → walk → FS service)
+//! - **FileSystemServiceProto**: External path-based filesystem entrypoint (path → walk → FS service)
 //! - **MetadataClientService**: Supports data_handle_id-based data plane operations
 //!
 //! See `docs/metadata-services.md` for service architecture.

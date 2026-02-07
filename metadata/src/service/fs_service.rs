@@ -6,31 +6,36 @@
 //! FS write routing convergence - all FS write operations
 //! must route to mount.namespace_owner_group_id.
 
-use super::extract_and_inject_context;
+use super::domain::{
+    CloseWriteInput, CloseWriteIntent, FileRange, Freshness, FsyncBarrierInput, GetFileLayoutInput, OpenWriteInput,
+    ReleaseSessionInput, RenewLeaseInput,
+};
+use super::fs_core::FsCore;
 use super::guard::{AuthzContext, AuthzOp, GuardChain, GuardSpec, LeadershipChecker};
-use super::{fatal_fs_header, header_from_canonical_error, need_refresh_header, ok_header_from_request};
+use super::{
+    extent_from_proto, extent_to_proto, extract_and_inject_context, fatal_fs_header, fencing_to_proto,
+    header_from_canonical_error, header_from_core_failure, lease_id_from_proto, lease_id_to_proto, location_to_proto,
+    need_refresh_header, ok_header_from_core_success, ok_header_from_request, presented_fencing_from_proto,
+    request_context_from_proto, write_target_to_proto,
+};
 use crate::data_io::DataIoOp;
 use crate::error::{to_canonical_fs, MetadataError, MetadataResult};
 use crate::mount::MountTable;
 use crate::raft::{AppDataResponse, AppRaftNode, Command, DedupKey, FsCommandResult, RocksDBStorage};
 use crate::readiness::RootReadinessGate;
 use crate::state::StateStore;
-use common::error::canonical::CanonicalError;
 use common::error::canonical::RefreshReason;
 use common::header::{RequestHeader, RpcErrorCode};
 use proto::metadata::metadata_fs_service_proto_server::MetadataFsServiceProto;
 use proto::metadata::*;
-use proto::worker::worker_data_service_client::WorkerDataServiceClient;
 use proto::worker::CommitWriteRequestProto;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 use tracing::{debug, instrument, warn};
-use types::fs::{Extent, FileAttrs, FsErrorCode, InodeId, InodeKind};
-use types::ids::{BlockId, BlockIndex, DataHandleId, LeaseId, MountId, ShardGroupId};
+use types::fs::{FileAttrs, FsErrorCode, InodeId, InodeKind};
+use types::ids::{LeaseId, MountId, ShardGroupId};
 use types::layout::FileLayout;
-use types::lease::FencingToken;
 use types::RaftLogId;
 
 type CommitHook = Arc<dyn Fn(CommitWriteRequestProto) -> proto::worker::CommitWriteResponseProto + Send + Sync>;
@@ -49,67 +54,6 @@ pub struct RoutedFsWriteCtx {
     pub latest_state_id: Option<RaftLogId>,
 }
 
-fn canonical_from_error_detail(detail: proto::common::ErrorDetailProto) -> CanonicalError {
-    use common::error::canonical::{ErrorClass, ErrorCode};
-    let class = match detail.error_class {
-        1 => ErrorClass::NeedRefresh,
-        2 => ErrorClass::Retryable,
-        3 => ErrorClass::Fatal,
-        _ => ErrorClass::Ok,
-    };
-    let code = match detail.code {
-        Some(proto::common::error_detail_proto::Code::FsErrno(errno)) => {
-            FsErrorCode::from_u32(errno as u32).map(ErrorCode::FsErrno)
-        }
-        Some(proto::common::error_detail_proto::Code::RpcCode(code)) => {
-            let rpc = match code {
-                1 => RpcErrorCode::NoSuchMethod,
-                2 => RpcErrorCode::InvalidHeader,
-                3 => RpcErrorCode::VersionMismatch,
-                4 => RpcErrorCode::DeserializeRequest,
-                5 => RpcErrorCode::SerializeResponse,
-                20 => RpcErrorCode::Unauthenticated,
-                21 => RpcErrorCode::PermissionDenied,
-                40 => RpcErrorCode::NotLeader,
-                41 => RpcErrorCode::StaleState,
-                42 => RpcErrorCode::Fencing,
-                43 => RpcErrorCode::ShardMoved,
-                44 => RpcErrorCode::NodeUnavailable,
-                50 => RpcErrorCode::MountEpochMismatch,
-                51 => RpcErrorCode::RouteEpochMismatch,
-                52 => RpcErrorCode::WorkerEpochMismatch,
-                53 => RpcErrorCode::BlockStampMismatch,
-                54 => RpcErrorCode::EpochMismatch,
-                _ => RpcErrorCode::Unspecified,
-            };
-            Some(ErrorCode::RpcCode(rpc))
-        }
-        None => None,
-    };
-    let reason = if class == ErrorClass::NeedRefresh {
-        Some(match detail.refresh_reason {
-            2 => RefreshReason::Moved,
-            3 => RefreshReason::StaleState,
-            4 => RefreshReason::MountEpochMismatch,
-            5 => RefreshReason::RouteEpochMismatch,
-            6 => RefreshReason::WorkerEpochMismatch,
-            7 => RefreshReason::BlockStampMismatch,
-            8 => RefreshReason::Fencing,
-            9 => RefreshReason::EpochMismatch,
-            _ => RefreshReason::Unknown,
-        })
-    } else {
-        None
-    };
-    CanonicalError {
-        class,
-        code,
-        reason,
-        retry_after_ms: detail.retry_after_ms,
-        message: detail.message,
-    }
-}
-
 /// FS write operation type (for AuthZ hook and logging).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FsWriteOp {
@@ -123,7 +67,7 @@ pub enum FsWriteOp {
 
 /// MetadataFsServiceProto implementation.
 pub struct MetadataFsServiceImpl {
-    state_store: Arc<dyn StateStore>,
+    fs_core: Arc<FsCore>,
     mount_table: Arc<MountTable>,
     storage: Option<Arc<RocksDBStorage>>,
     raft_node: Option<Arc<AppRaftNode>>,
@@ -138,23 +82,36 @@ pub struct MetadataFsServiceImpl {
 
 impl MetadataFsServiceImpl {
     pub fn new(state_store: Arc<dyn StateStore>, mount_table: Arc<MountTable>) -> Self {
+        let write_session_manager = Arc::new(crate::write_session::WriteSessionManager::default());
+        let inode_lease_manager = Arc::new(crate::inode_lease::InodeLeaseManager::default());
+        let worker_commit_hook: Arc<Mutex<Option<CommitHook>>> = Arc::new(Mutex::new(None));
+        let fs_core = Arc::new(FsCore::new(
+            Arc::clone(&state_store),
+            Arc::clone(&mount_table),
+            Arc::clone(&write_session_manager),
+            Arc::clone(&inode_lease_manager),
+            Arc::clone(&worker_commit_hook),
+        ));
         Self {
-            state_store,
+            fs_core,
             guard_chain: GuardChain::new(Arc::clone(&mount_table)),
             mount_table,
             storage: None,
             raft_node: None,
             metrics: None,
-            write_session_manager: Arc::new(crate::write_session::WriteSessionManager::default()),
+            write_session_manager,
             worker_manager: None,
-            inode_lease_manager: Arc::new(crate::inode_lease::InodeLeaseManager::default()),
-            worker_commit_hook: Arc::new(Mutex::new(None)),
+            inode_lease_manager,
+            worker_commit_hook,
         }
     }
 
     /// Set storage for inode/dentry access (required for FS operations).
     pub fn with_storage(mut self, storage: Arc<RocksDBStorage>) -> Self {
         self.storage = Some(storage);
+        Arc::get_mut(&mut self.fs_core)
+            .expect("fs_core should be uniquely owned during builder configuration")
+            .set_storage(self.storage.as_ref().unwrap().clone());
         self
     }
 
@@ -162,6 +119,9 @@ impl MetadataFsServiceImpl {
     pub fn with_raft_node(mut self, raft_node: Arc<AppRaftNode>) -> Self {
         self.guard_chain.set_leadership_checker(Arc::clone(&raft_node));
         self.raft_node = Some(raft_node);
+        Arc::get_mut(&mut self.fs_core)
+            .expect("fs_core should be uniquely owned during builder configuration")
+            .set_raft_node(self.raft_node.as_ref().unwrap().clone());
         self
     }
 
@@ -177,6 +137,9 @@ impl MetadataFsServiceImpl {
     /// Set metrics for FS write routing tracking (optional).
     pub fn with_metrics(mut self, metrics: Arc<crate::metrics::MetadataMetrics>) -> Self {
         self.metrics = Some(metrics);
+        Arc::get_mut(&mut self.fs_core)
+            .expect("fs_core should be uniquely owned during builder configuration")
+            .set_metrics(self.metrics.as_ref().unwrap().clone());
         self
     }
 
@@ -235,7 +198,14 @@ impl MetadataFsServiceImpl {
     /// Set worker manager for block allocation (optional).
     pub fn with_worker_manager(mut self, worker_manager: Arc<crate::worker::WorkerManager>) -> Self {
         self.worker_manager = Some(worker_manager);
+        Arc::get_mut(&mut self.fs_core)
+            .expect("fs_core should be uniquely owned during builder configuration")
+            .set_worker_manager(self.worker_manager.as_ref().unwrap().clone());
         self
+    }
+
+    pub fn fs_core(&self) -> Arc<FsCore> {
+        Arc::clone(&self.fs_core)
     }
 
     /// Route FS write operation to mount.namespace_owner_group_id.
@@ -349,7 +319,7 @@ impl MetadataFsServiceImpl {
         }
     }
 
-    // DEPRECATED: Use error_helpers::fatal_fs_header or need_refresh_header instead.
+    // DEPRECATED: Use core_util::fatal_fs_header or need_refresh_header instead.
     // This method is kept temporarily for compatibility but will be removed.
     #[allow(dead_code)]
     fn create_fs_error_response(
@@ -429,7 +399,7 @@ impl MetadataFsServiceImpl {
         Ok(fs_result)
     }
 
-    // DEPRECATED: Use error_helpers::ok_header_from_request instead.
+    // DEPRECATED: Use core_util::ok_header_from_request instead.
     #[allow(dead_code)]
     fn create_response_header_from_request(
         &self,
@@ -2138,17 +2108,42 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     async fn release(&self, request: Request<ReleaseRequestProto>) -> Result<Response<ReleaseResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_request(&req.header, &caller_ctx, GuardSpec::metadata_read(), None, None)
-        {
-            return Ok(Response::new(ReleaseResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+        if let Some(session) = self.fs_core.write_session_for_handle(req.file_handle) {
+            if let Some(resp_header) = self.guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::data_io(DataIoOp::CloseWrite).with_leader(),
+                Some(session.mount_id),
+                Some(AuthzContext {
+                    op: AuthzOp::DataIo(DataIoOp::CloseWrite),
+                    mount_id: Some(session.mount_id),
+                    inode_id: Some(session.inode_id),
+                }),
+            ) {
+                return Ok(Response::new(ReleaseResponseProto {
+                    header: Some(resp_header),
+                    ..Default::default()
+                }));
+            }
         }
-        let resp_header = ok_header_from_request(&req.header, None, None);
-        Ok(Response::new(ReleaseResponseProto {
-            header: Some(resp_header),
-        }))
+
+        let req_ctx = request_context_from_proto(&req.header);
+        let resp = match self
+            .fs_core
+            .release_session(ReleaseSessionInput {
+                ctx: req_ctx.clone(),
+                file_handle: req.file_handle,
+            })
+            .await
+        {
+            Ok(success) => ReleaseResponseProto {
+                header: Some(ok_header_from_core_success(&req_ctx, &success)),
+            },
+            Err(failure) => ReleaseResponseProto {
+                header: Some(header_from_core_failure(&req_ctx, &failure)),
+            },
+        };
+        Ok(Response::new(resp))
     }
 
     async fn fsync(&self, request: Request<FsyncRequestProto>) -> Result<Response<FsyncResponseProto>, Status> {
@@ -2234,287 +2229,37 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }));
         }
 
-        // Resolve lease and fencing
-        let mut lease_id_proto = req.lease_id;
-        let mut lease_epoch = req.lease_epoch.unwrap_or(0);
-        let mut fencing_token = req.fencing_token;
-
-        if let Some(handle) = req.file_handle {
-            if let Some(session) = self.write_session_manager.get_session(handle) {
-                if session.inode_id != inode_id {
-                    let resp_header = fatal_fs_header(
-                        &req.header,
-                        FsErrorCode::EInval,
-                        "File handle does not match inode".to_string(),
-                        None,
-                        None,
-                    );
-                    return Ok(Response::new(FsyncResponseProto {
-                        header: Some(resp_header),
-                    }));
-                }
-                if lease_id_proto.is_none() {
-                    lease_id_proto = Some(proto::common::LeaseIdProto {
-                        high: (session.lease_id.as_raw() >> 64) as u64,
-                        low: session.lease_id.as_raw() as u64,
-                    });
-                }
-                if lease_epoch == 0 {
-                    lease_epoch = session.lease_epoch;
-                }
-                if fencing_token.is_none() {
-                    fencing_token = Some(proto::common::FencingTokenProto {
-                        block_id: Some(proto::common::BlockIdProto {
-                            data_handle_id: session.fencing_token.block_id.data_handle_id.as_raw(),
-                            block_index: session.fencing_token.block_id.index.as_raw(),
-                        }),
-                        owner: session.fencing_token.owner.as_raw(),
-                        epoch: session.fencing_token.epoch,
-                    });
-                }
-            } else {
-                let resp_header = fatal_fs_header(
-                    &req.header,
-                    FsErrorCode::EInval,
-                    "File handle not found".to_string(),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(FsyncResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
-        }
-
-        let lease_id_proto = match lease_id_proto {
-            Some(lease_id_proto) => lease_id_proto,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing lease_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(FsyncResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
+        let req_ctx = request_context_from_proto(&req.header);
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req
+                .route_epoch
+                .or_else(|| req.header.as_ref().and_then(|h| h.route_epoch)),
+            worker_epoch: req.worker_epoch,
         };
-        let lease_id_raw = (lease_id_proto.high as u128) << 64 | lease_id_proto.low as u128;
-        let lease_id_typed = LeaseId::new(lease_id_raw);
-
-        // Validate lease
-        if let Err(e) = self
-            .inode_lease_manager
-            .validate_lease(inode_id, lease_id_typed, lease_epoch)
+        let resp = match self
+            .fs_core
+            .fsync_barrier(FsyncBarrierInput {
+                ctx: req_ctx.clone(),
+                inode_id,
+                file_handle: req.file_handle,
+                lease_id: lease_id_from_proto(req.lease_id),
+                lease_epoch: req.lease_epoch,
+                fencing_token: presented_fencing_from_proto(req.fencing_token),
+                target_size: req.target_size,
+                flags: req.flags as i32,
+                freshness,
+            })
+            .await
         {
-            let resp_header = fatal_fs_header(
-                &req.header,
-                e,
-                format!(
-                    "Lease validation failed for fsync: inode={}, lease_id={:?}",
-                    inode_id, lease_id_typed
-                ),
-                None,
-                None,
-            );
-            return Ok(Response::new(FsyncResponseProto {
-                header: Some(resp_header),
-            }));
-        }
-
-        // Collect worker endpoints from write session (preferred)
-        let mut commit_workers: Vec<proto::common::WorkerEndpointInfoProto> = Vec::new();
-        let mut target_size = req.target_size.unwrap_or(inode.attrs.size);
-        if let Some(handle) = req.file_handle {
-            if let Some(session) = self.write_session_manager.get_session(handle) {
-                // Only use write_session targets per requirements
-                for wt in &session.write_targets {
-                    commit_workers.extend(wt.worker_endpoints.clone());
-                }
-                // Effective target size: never less than session base_size/last_written
-                target_size = target_size.max(session.base_size).max(session.last_written);
-            } else {
-                let resp_header = fatal_fs_header(
-                    &req.header,
-                    FsErrorCode::EInval,
-                    "File handle not found".to_string(),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(FsyncResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
-        }
-
-        if commit_workers.is_empty() {
-            // Metadata-only fsync fallback (no worker hints)
-            target_size = target_size.max(inode.attrs.size);
-        } else {
-            // Call CommitWrite on all workers
-            let mut tasks = Vec::new();
-            for ep in commit_workers {
-                let endpoint = format!("http://{}", ep.endpoint);
-                let header_client = proto::common::ClientInfoProto {
-                    call_id: caller_ctx.client.call_id.to_string(),
-                    client_id: caller_ctx.client.client_id.as_raw(),
-                    client_name: caller_ctx.client.client_name.clone().unwrap_or_default(),
-                };
-                // Build request
-                let commit_req = CommitWriteRequestProto {
-                    header: Some(proto::worker::DataRequestHeaderProto {
-                        client: Some(header_client.clone()),
-                        traceparent: req.header.as_ref().map(|h| h.traceparent.clone()).unwrap_or_default(),
-                    }),
-                    block_id: fencing_token.as_ref().and_then(|t| t.block_id.clone()).or_else(|| {
-                        // fallback: inode->data_handle
-                        Some(proto::common::BlockIdProto {
-                            data_handle_id: inode.current_data_handle_id.as_raw(),
-                            block_index: 0,
-                        })
-                    }),
-                    token: fencing_token.clone(),
-                    lease_epoch,
-                    route_epoch: req.route_epoch.unwrap_or(0),
-                    worker_epoch: ep.worker_epoch,
-                    file_version: 0,
-                    committed_length: target_size,
-                };
-                if let Some(hook) = self.worker_commit_hook.lock().unwrap().clone() {
-                    let req_clone = commit_req.clone();
-                    tasks.push(tokio::spawn(async move { Ok(Response::new(hook(req_clone))) }));
-                    continue;
-                }
-                let mut client = match WorkerDataServiceClient::connect(endpoint.clone()).await {
-                    Ok(client) => client,
-                    Err(e) => {
-                        let resp_header = Self::header_from_error(
-                            &req.header,
-                            MetadataError::ServiceUnavailable(format!("Failed to connect worker {}: {}", endpoint, e)),
-                            None,
-                            None,
-                        );
-                        return Ok(Response::new(FsyncResponseProto {
-                            header: Some(resp_header),
-                        }));
-                    }
-                };
-                tasks.push(tokio::spawn(async move {
-                    client.commit_write(Request::new(commit_req)).await
-                }));
-            }
-
-            for t in tasks {
-                let resp = match t.await {
-                    Ok(Ok(resp)) => resp,
-                    Ok(Err(status)) => {
-                        let resp_header = Self::header_from_error(
-                            &req.header,
-                            MetadataError::ServiceUnavailable(format!("Worker commit failed: {}", status)),
-                            None,
-                            None,
-                        );
-                        return Ok(Response::new(FsyncResponseProto {
-                            header: Some(resp_header),
-                        }));
-                    }
-                    Err(e) => {
-                        let resp_header = Self::header_from_error(
-                            &req.header,
-                            MetadataError::ServiceUnavailable(format!("Join error: {}", e)),
-                            None,
-                            None,
-                        );
-                        return Ok(Response::new(FsyncResponseProto {
-                            header: Some(resp_header),
-                        }));
-                    }
-                };
-                let inner = resp.into_inner();
-                if let Some(err) = inner.header.and_then(|h| h.error) {
-                    let cerr = canonical_from_error_detail(err);
-                    let resp_header = super::header_from_canonical_error(&req.header, None, None, &cerr);
-                    return Ok(Response::new(FsyncResponseProto {
-                        header: Some(resp_header),
-                    }));
-                }
-            }
-        }
-
-        // Persist mtime/ctime (and optional target_size) through Raft
-        let mut attrs = inode.attrs.clone();
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        attrs.size = attrs.size.max(target_size);
-        attrs.update_mtime_ctime(now_ms);
-
-        let ctx = match self.route_fs_write_ctx(FsWriteOp::SetAttr, &[inode_id], &req.header) {
-            Ok(ctx) => ctx,
-            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
-                let resp_header = need_refresh_header(
-                    &req.header,
-                    RpcErrorCode::MountEpochMismatch,
-                    RefreshReason::MountEpochMismatch,
-                    format!("Mount epoch mismatch: client={}, server={} ", got, expected),
-                    None,
-                    Some(expected),
-                );
-                return Ok(Response::new(FsyncResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(FsyncResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
+            Ok(success) => FsyncResponseProto {
+                header: Some(ok_header_from_core_success(&req_ctx, &success)),
+            },
+            Err(failure) => FsyncResponseProto {
+                header: Some(header_from_core_failure(&req_ctx, &failure)),
+            },
         };
-        let dedup = if caller_ctx.client.client_id.as_raw() == 0 {
-            DedupKey::system()
-        } else {
-            match self.dedup_key(&caller_ctx) {
-                Ok(k) => k,
-                Err(err) => {
-                    let resp_header = Self::header_from_error(
-                        &req.header,
-                        err,
-                        Some(ctx.namespace_owner_group_id.as_raw()),
-                        Some(ctx.mount_epoch),
-                    );
-                    return Ok(Response::new(FsyncResponseProto {
-                        header: Some(resp_header),
-                    }));
-                }
-            }
-        };
-        let command = Command::SetAttr {
-            dedup,
-            inode_id,
-            mask: 1 | 32, // size + mtime
-            attrs,
-        };
-        if let Err(err) = self.propose_fs_write_command(FsWriteOp::SetAttr, command).await {
-            let resp_header = Self::header_from_error(
-                &req.header,
-                err,
-                Some(ctx.namespace_owner_group_id.as_raw()),
-                Some(ctx.mount_epoch),
-            );
-            return Ok(Response::new(FsyncResponseProto {
-                header: Some(resp_header),
-            }));
-        }
-
-        let resp_header = ok_header_from_request(
-            &req.header,
-            Some(ctx.namespace_owner_group_id.as_raw()),
-            Some(ctx.mount_epoch),
-        );
-
-        Ok(Response::new(FsyncResponseProto {
-            header: Some(resp_header),
-        }))
+        Ok(Response::new(resp))
     }
 
     async fn hsync(&self, request: Request<HsyncRequestProto>) -> Result<Response<HsyncResponseProto>, Status> {
@@ -2698,225 +2443,55 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }));
         }
 
-        // Determine write mode (mode is i32 in proto)
+        let req_ctx = request_context_from_proto(&req.header);
         let mode = match req.mode {
-            2 => crate::inode_lease::WriteMode::Append, // WRITE_MODE_APPEND
-            1 => crate::inode_lease::WriteMode::Write,  // WRITE_MODE_WRITE
-            _ => crate::inode_lease::WriteMode::Write,  // Default to WRITE
+            x if x == WriteModeProto::WriteModeAppend as i32 => crate::inode_lease::WriteMode::Append,
+            _ => crate::inode_lease::WriteMode::Write,
         };
-
-        // Get base size: for APPEND, use file_size; for WRITE, use 0 (future: support offset)
-        let base_size = match mode {
-            crate::inode_lease::WriteMode::Append => inode.attrs.size,
-            crate::inode_lease::WriteMode::Write => 0, // TODO: Support offset in future
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: None,
         };
-
-        // Get current lease_epoch from inode (persisted)
-        let current_lease_epoch = match &inode.data {
-            types::fs::InodeData::File { lease_epoch, .. } => *lease_epoch,
-            _ => None,
-        };
-
-        // Try to acquire lease
-        let (lease_id, lease_epoch, expires_at_ms) = match self.inode_lease_manager.try_acquire(
-            inode_id,
-            caller_ctx.client.client_id,
-            Some(caller_ctx.client.call_id.clone()),
-            mode,
-            current_lease_epoch,
-        ) {
-            Ok(result) => result,
-            Err(FsErrorCode::EBusy) => {
-                let resp_header = fatal_fs_header(
-                    &req.header,
-                    FsErrorCode::EBusy,
-                    format!("File already has an active write lease: {}", inode_id),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(OpenWriteResponseProto {
-                    header: Some(resp_header),
-                    file_handle: 0,
-                    lease_id: None,
-                    fencing_token: None,
-                    write_targets: vec![],
-                    base_size: 0,
-                    open_epoch: 0,
-                    lease_epoch: 0,
-                    expires_at_ms: 0,
-                }));
-            }
-            Err(e) => {
-                let resp_header = fatal_fs_header(
-                    &req.header,
-                    e,
-                    format!("Failed to acquire lease: {}", inode_id),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(OpenWriteResponseProto {
-                    header: Some(resp_header),
-                    file_handle: 0,
-                    lease_id: None,
-                    fencing_token: None,
-                    write_targets: vec![],
-                    base_size: 0,
-                    open_epoch: 0,
-                    lease_epoch: 0,
-                    expires_at_ms: 0,
-                }));
-            }
-        };
-
-        // Update inode with new lease_epoch (persist to Raft)
-        // This is done via a SetAttr-like command, but we'll do it atomically with OpenWrite
-        // For now, we'll update it in CloseWrite to avoid extra Raft write
-        // TODO: Consider batching lease_epoch update with block allocation
-
-        let open_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-
-        // Get data_handle_id from inode_id (for block allocation)
-        let data_handle_id = DataHandleId::new(inode_id.as_raw());
-
-        // Allocate block(s) for write
-        let desired_len = req.desired_len.unwrap_or(4 * 1024 * 1024); // Default 4MB
-        let block_size = 4 * 1024 * 1024; // TODO: Get from file layout
-        let num_blocks = (desired_len + block_size - 1) / block_size;
-        let num_blocks = num_blocks.max(1).min(10); // Limit to 10 blocks for now
-
-        let mut write_targets = Vec::new();
-        let worker_manager = match self.worker_manager.as_ref() {
-            Some(worker_manager) => worker_manager,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::Internal("Worker manager not available".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(OpenWriteResponseProto {
-                    header: Some(resp_header),
-                    file_handle: 0,
-                    lease_id: None,
-                    fencing_token: None,
-                    write_targets: vec![],
-                    base_size: 0,
-                    open_epoch: 0,
-                    lease_epoch: 0,
-                    expires_at_ms: 0,
-                }));
-            }
-        };
-
-        for i in 0..num_blocks {
-            let block_index = BlockIndex::new(i as u32);
-            let block_id = BlockId::new(data_handle_id, block_index);
-
-            // Select workers for placement
-            let placement = match worker_manager.select_workers_for_placement(3, None) {
-                Ok(placement) => placement,
-                Err(e) => {
-                    let resp_header = Self::header_from_error(
-                        &req.header,
-                        MetadataError::Internal(format!("Failed to select workers: {}", e)),
-                        None,
-                        None,
-                    );
-                    return Ok(Response::new(OpenWriteResponseProto {
-                        header: Some(resp_header),
-                        file_handle: 0,
-                        lease_id: None,
-                        fencing_token: None,
-                        write_targets: vec![],
-                        base_size: 0,
-                        open_epoch: 0,
-                        lease_epoch: 0,
-                        expires_at_ms: 0,
-                    }));
-                }
-            };
-
-            // Create fencing token (use lease_epoch for fencing)
-            let _fencing_token = FencingToken {
-                block_id,
-                owner: caller_ctx.client.client_id,
-                epoch: lease_epoch,
-            };
-
-            // Convert worker IDs to endpoints (simplified)
-            let mut worker_endpoints = Vec::new();
-            for worker_id in placement.all_workers() {
-                if let Some(worker_info) = worker_manager.get_worker(worker_id) {
-                    worker_endpoints.push(proto::common::WorkerEndpointInfoProto {
-                        worker_id: worker_id.as_raw(),
-                        endpoint: format!("{}:{}", worker_info.address, 0), // TODO: Get port
-                        net_transport_kind: worker_info.net_transport_kind as i32,
-                        worker_epoch: worker_info.worker_epoch,
-                    });
+        let resp = match self
+            .fs_core
+            .open_write(OpenWriteInput {
+                ctx: req_ctx.clone(),
+                inode_id,
+                desired_len: req.desired_len,
+                mode,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_core_success(&req_ctx, &success);
+                let payload = success.payload;
+                OpenWriteResponseProto {
+                    header: Some(header),
+                    file_handle: payload.session_key.file_handle,
+                    lease_id: Some(lease_id_to_proto(payload.session_key.lease_id)),
+                    fencing_token: Some(fencing_to_proto(payload.session_key.fencing_token)),
+                    write_targets: payload.write_targets.iter().map(write_target_to_proto).collect(),
+                    base_size: payload.base_size,
+                    open_epoch: payload.session_key.open_epoch,
+                    lease_epoch: payload.session_key.lease_epoch,
+                    expires_at_ms: payload.expires_at_ms,
                 }
             }
-
-            write_targets.push(proto::metadata::WriteTargetProto {
-                block_id: Some(proto::common::BlockIdProto {
-                    data_handle_id: data_handle_id.as_raw(),
-                    block_index: block_index.as_raw(),
-                }),
-                worker_endpoints,
-                fencing_token: Some(proto::common::FencingTokenProto {
-                    block_id: Some(proto::common::BlockIdProto {
-                        data_handle_id: data_handle_id.as_raw(),
-                        block_index: block_index.as_raw(),
-                    }),
-                    owner: caller_ctx.client.client_id.as_raw(),
-                    epoch: lease_epoch,
-                }),
-            });
-        }
-
-        // Create write session
-        let file_handle = self.write_session_manager.create_session(
-            inode_id,
-            inode.mount_id,
-            lease_id,
-            lease_epoch,
-            FencingToken {
-                block_id: BlockId::new(data_handle_id, BlockIndex::new(0)),
-                owner: caller_ctx.client.client_id,
-                epoch: lease_epoch,
+            Err(failure) => OpenWriteResponseProto {
+                header: Some(header_from_core_failure(&req_ctx, &failure)),
+                file_handle: 0,
+                lease_id: None,
+                fencing_token: None,
+                write_targets: vec![],
+                base_size: 0,
+                open_epoch: 0,
+                lease_epoch: 0,
+                expires_at_ms: 0,
             },
-            open_epoch,
-            base_size,
-            mode,
-            write_targets.clone(),
-            crate::write_session::WriterIdentity {
-                client_id: caller_ctx.client.client_id,
-                call_id: caller_ctx.client.call_id,
-            },
-        );
-
-        let resp_header = ok_header_from_request(&req.header, None, None);
-
-        Ok(Response::new(OpenWriteResponseProto {
-            header: Some(resp_header),
-            file_handle,
-            lease_id: Some(proto::common::LeaseIdProto {
-                high: (lease_id.as_raw() >> 64) as u64,
-                low: lease_id.as_raw() as u64,
-            }),
-            fencing_token: Some(proto::common::FencingTokenProto {
-                block_id: Some(proto::common::BlockIdProto {
-                    data_handle_id: data_handle_id.as_raw(),
-                    block_index: 0,
-                }),
-                owner: caller_ctx.client.client_id.as_raw(),
-                epoch: lease_epoch,
-            }),
-            write_targets,
-            base_size,
-            open_epoch,
-            lease_epoch,
-            expires_at_ms,
-        }))
+        };
+        Ok(Response::new(resp))
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -2927,15 +2502,12 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
 
-        let file_handle = req.file_handle;
-
-        // Get write session
-        let session = match self.write_session_manager.get_session(file_handle) {
+        let session = match self.fs_core.write_session_for_handle(req.file_handle) {
             Some(session) => session,
             None => {
                 let resp_header = Self::header_from_error(
                     &req.header,
-                    MetadataError::NotFound(format!("Write session not found: {}", file_handle)),
+                    MetadataError::NotFound(format!("Write session not found: {}", req.file_handle)),
                     None,
                     None,
                 );
@@ -2965,191 +2537,13 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }));
         }
 
-        // Validate lease_id and lease_epoch (fencing check)
-        let lease_id_proto = match req.lease_id {
-            Some(lease_id_proto) => lease_id_proto,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing lease_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(CloseWriteResponseProto {
-                    header: Some(resp_header),
-                    committed_size: 0,
-                    file_version: None,
-                }));
-            }
-        };
-        let lease_id_raw = (lease_id_proto.high as u128) << 64 | lease_id_proto.low as u128;
-        let lease_id_typed = LeaseId::new(lease_id_raw);
-
-        // Get lease_epoch from request
-        let request_lease_epoch = req.lease_epoch;
-
-        // Validate lease using InodeLeaseManager (fencing)
-        if let Err(e) = self
-            .inode_lease_manager
-            .validate_lease(session.inode_id, lease_id_typed, request_lease_epoch)
+        let extents = match req
+            .extents
+            .into_iter()
+            .map(extent_from_proto)
+            .collect::<Result<Vec<_>, _>>()
         {
-            let resp_header = fatal_fs_header(
-                &req.header,
-                e,
-                format!(
-                    "Lease validation failed (fencing): inode={}, lease_id={:?}",
-                    session.inode_id, lease_id_typed
-                ),
-                None,
-                None,
-            );
-            return Ok(Response::new(CloseWriteResponseProto {
-                header: Some(resp_header),
-                committed_size: 0,
-                file_version: None,
-            }));
-        }
-
-        // Validate open_epoch
-        if req.open_epoch != session.open_epoch {
-            let resp_header = Self::header_from_error(
-                &req.header,
-                MetadataError::PermissionDenied(format!(
-                    "Open epoch mismatch: expected {}, got {}",
-                    session.open_epoch, req.open_epoch
-                )),
-                None,
-                None,
-            );
-            return Ok(Response::new(CloseWriteResponseProto {
-                header: Some(resp_header),
-                committed_size: 0,
-                file_version: None,
-            }));
-        }
-
-        // Convert proto extents to Rust extents
-        let mut extents = Vec::new();
-        for proto_extent in req.extents {
-            let block_id = match proto_extent.block_id {
-                Some(block_id) => block_id,
-                None => {
-                    let resp_header = Self::header_from_error(
-                        &req.header,
-                        MetadataError::InvalidArgument("Missing block_id in extent".to_string()),
-                        None,
-                        None,
-                    );
-                    return Ok(Response::new(CloseWriteResponseProto {
-                        header: Some(resp_header),
-                        committed_size: 0,
-                        file_version: None,
-                    }));
-                }
-            };
-            extents.push(Extent {
-                file_offset: proto_extent.file_offset,
-                block_id: BlockId::new(
-                    DataHandleId::new(block_id.data_handle_id),
-                    BlockIndex::new(block_id.block_index),
-                ),
-                block_offset: proto_extent.block_offset,
-                len: proto_extent.len,
-                file_version: proto_extent.file_version,
-                block_stamp: proto_extent.block_stamp,
-            });
-        }
-
-        // Validate append-only: if mode is APPEND, extents must start from base_size and be contiguous
-        if session.mode == crate::inode_lease::WriteMode::Append {
-            let mut expected_offset = session.base_size;
-            for extent in &extents {
-                if extent.file_offset != expected_offset {
-                    let resp_header = fatal_fs_header(
-                        &req.header,
-                        FsErrorCode::EInval,
-                        format!(
-                            "Extent file_offset mismatch: expected {}, got {} (append mode requires contiguous writes from base_size)",
-                            expected_offset, extent.file_offset
-                        ),
-                        None,
-                        None,
-                    );
-                    return Ok(Response::new(CloseWriteResponseProto {
-                        header: Some(resp_header),
-                        committed_size: 0,
-                        file_version: None,
-                    }));
-                }
-                expected_offset += extent.len;
-            }
-        } else {
-            // WRITE mode: future support for random writes
-            // For now, we still validate basic constraints
-            for extent in &extents {
-                if extent.file_offset + extent.len > req.final_size {
-                    let resp_header = fatal_fs_header(
-                        &req.header,
-                        FsErrorCode::EInval,
-                        format!(
-                            "Extent extends beyond final_size: extent_end={}, final_size={}",
-                            extent.file_offset + extent.len,
-                            req.final_size
-                        ),
-                        None,
-                        None,
-                    );
-                    return Ok(Response::new(CloseWriteResponseProto {
-                        header: Some(resp_header),
-                        committed_size: 0,
-                        file_version: None,
-                    }));
-                }
-            }
-        }
-
-        // Validate final_size (for APPEND mode, must match expected_offset)
-        if session.mode == crate::inode_lease::WriteMode::Append {
-            let expected_offset = session.base_size + extents.iter().map(|e| e.len).sum::<u64>();
-            if req.final_size != expected_offset {
-                let resp_header = fatal_fs_header(
-                    &req.header,
-                    FsErrorCode::EInval,
-                    format!(
-                        "Final size mismatch: expected {}, got {} (append mode)",
-                        expected_offset, req.final_size
-                    ),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(CloseWriteResponseProto {
-                    header: Some(resp_header),
-                    committed_size: 0,
-                    file_version: None,
-                }));
-            }
-        }
-
-        // Note: Idempotency is checked in state machine, not here
-
-        // Route FS write operation
-        let ctx = match self.route_fs_write_ctx(FsWriteOp::SetAttr, &[session.inode_id], &req.header) {
-            Ok(ctx) => ctx,
-            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
-                let resp_header = need_refresh_header(
-                    &req.header,
-                    RpcErrorCode::MountEpochMismatch,
-                    RefreshReason::MountEpochMismatch,
-                    format!("Mount epoch mismatch: client={}, server={} ", got, expected),
-                    None,
-                    Some(expected),
-                );
-                return Ok(Response::new(CloseWriteResponseProto {
-                    header: Some(resp_header),
-                    committed_size: 0,
-                    file_version: None,
-                }));
-            }
+            Ok(extents) => extents,
             Err(err) => {
                 let resp_header = Self::header_from_error(&req.header, err, None, None);
                 return Ok(Response::new(CloseWriteResponseProto {
@@ -3160,66 +2554,45 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }
         };
 
-        let dedup = match self.dedup_key(&caller_ctx) {
-            Ok(k) => k,
-            Err(err) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(CloseWriteResponseProto {
-                    header: Some(resp_header),
-                    committed_size: 0,
-                    file_version: None,
-                }));
+        let req_ctx = request_context_from_proto(&req.header);
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: None,
+        };
+        let resp = match self
+            .fs_core
+            .close_write(CloseWriteInput {
+                ctx: req_ctx.clone(),
+                file_handle: req.file_handle,
+                lease_id: lease_id_from_proto(req.lease_id),
+                lease_epoch: req.lease_epoch,
+                open_epoch: req.open_epoch,
+                fencing_token: presented_fencing_from_proto(req.fencing_token),
+                intent: CloseWriteIntent {
+                    extents,
+                    final_size: req.final_size,
+                },
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_core_success(&req_ctx, &success);
+                let payload = success.payload;
+                CloseWriteResponseProto {
+                    header: Some(header),
+                    committed_size: payload.committed_size,
+                    file_version: payload.file_version,
+                }
             }
-        };
-        // Send Raft command
-        let command = Command::CloseWrite {
-            dedup,
-            inode_id: session.inode_id,
-            extents,
-            final_size: req.final_size,
-            lease_id: session.lease_id,
-            open_epoch: session.open_epoch,
-            lease_epoch: request_lease_epoch,
-        };
-
-        // Propose via unified helper
-        if let Err(err) = self.propose_fs_write_command(FsWriteOp::SetAttr, command).await {
-            let resp_header = Self::header_from_error(
-                &req.header,
-                err,
-                Some(ctx.namespace_owner_group_id.as_raw()),
-                Some(ctx.mount_epoch),
-            );
-            return Ok(Response::new(CloseWriteResponseProto {
-                header: Some(resp_header),
+            Err(failure) => CloseWriteResponseProto {
+                header: Some(header_from_core_failure(&req_ctx, &failure)),
                 committed_size: 0,
                 file_version: None,
-            }));
-        }
-
-        // Release lease
-        self.inode_lease_manager
-            .release(session.inode_id, lease_id_typed, session.lease_epoch);
-
-        // Remove session
-        self.write_session_manager.remove_session(file_handle);
-
-        let resp_header = ok_header_from_request(
-            &req.header,
-            Some(ctx.namespace_owner_group_id.as_raw()),
-            Some(ctx.mount_epoch),
-        );
-
-        Ok(Response::new(CloseWriteResponseProto {
-            header: Some(resp_header),
-            committed_size: req.final_size,
-            file_version: None,
-        }))
+            },
+        };
+        Ok(Response::new(resp))
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -3317,71 +2690,42 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }));
         }
 
-        // Get extents from inode
-        let extents = match &inode.data {
-            types::fs::InodeData::File { extents, .. } => extents.clone(),
-            _ => Vec::new(),
+        let req_ctx = request_context_from_proto(&req.header);
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: None,
         };
-
-        // Filter by range if provided
-        let filtered_extents: Vec<proto::fs::ExtentProto> = if let Some(range) = req.range {
-            extents
-                .into_iter()
-                .filter(|e| {
-                    let extent_end = e.file_offset + e.len;
-                    let range_end = range.offset + range.len as u64;
-                    e.file_offset < range_end && extent_end > range.offset
-                })
-                .map(|e| proto::fs::ExtentProto {
-                    file_offset: e.file_offset,
-                    block_id: Some(proto::common::BlockIdProto {
-                        data_handle_id: e.block_id.data_handle_id.as_raw(),
-                        block_index: e.block_id.index.as_raw(),
-                    }),
-                    block_offset: e.block_offset,
-                    len: e.len,
-                    file_version: e.file_version,
-                    block_stamp: e.block_stamp,
-                })
-                .collect()
-        } else {
-            extents
-                .into_iter()
-                .map(|e| proto::fs::ExtentProto {
-                    file_offset: e.file_offset,
-                    block_id: Some(proto::common::BlockIdProto {
-                        data_handle_id: e.block_id.data_handle_id.as_raw(),
-                        block_index: e.block_id.index.as_raw(),
-                    }),
-                    block_offset: e.block_offset,
-                    len: e.len,
-                    file_version: e.file_version,
-                    block_stamp: e.block_stamp,
-                })
-                .collect()
-        };
-
-        let mut locations = Vec::with_capacity(filtered_extents.len());
-        for extent in &filtered_extents {
-            if let Some(block_id) = &extent.block_id {
-                locations.push(proto::metadata::FileBlockLocationProto {
-                    block_id: Some(block_id.clone()),
-                    file_offset: extent.file_offset,
-                    len: extent.len,
-                    workers: Vec::new(),
-                    worker_epoch: None,
-                });
+        let range = req.range.map(|r| FileRange {
+            offset: r.offset,
+            len: r.len as u64,
+        });
+        let resp = match self
+            .fs_core
+            .get_file_layout(GetFileLayoutInput {
+                ctx: req_ctx.clone(),
+                inode_id,
+                range,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_core_success(&req_ctx, &success);
+                let payload = success.payload;
+                GetFileLayoutResponseProto {
+                    header: Some(header),
+                    extents: payload.extents.iter().map(extent_to_proto).collect(),
+                    file_size: payload.file_size,
+                    locations: payload.locations.iter().map(location_to_proto).collect(),
+                }
             }
-        }
-
-        let resp_header = ok_header_from_request(&req.header, None, None);
-
-        Ok(Response::new(GetFileLayoutResponseProto {
-            header: Some(resp_header),
-            extents: filtered_extents,
-            file_size: inode.attrs.size,
-            locations,
-        }))
+            Err(failure) => GetFileLayoutResponseProto {
+                header: Some(header_from_core_failure(&req_ctx, &failure)),
+                ..Default::default()
+            },
+        };
+        Ok(Response::new(resp))
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -3392,15 +2736,12 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
 
-        let file_handle = req.file_handle;
-
-        // Get write session to find inode_id
-        let session = match self.write_session_manager.get_session(file_handle) {
+        let session = match self.fs_core.write_session_for_handle(req.file_handle) {
             Some(session) => session,
             None => {
                 let resp_header = Self::header_from_error(
                     &req.header,
-                    MetadataError::NotFound(format!("Write session not found: {}", file_handle)),
+                    MetadataError::NotFound(format!("Write session not found: {}", req.file_handle)),
                     None,
                     None,
                 );
@@ -3428,55 +2769,33 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }));
         }
 
-        // Validate lease_id and lease_epoch
-        let lease_id_proto = match req.lease_id {
-            Some(lease_id_proto) => lease_id_proto,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing lease_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(RenewInodeLeaseResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
+        let req_ctx = request_context_from_proto(&req.header);
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: None,
         };
-        let lease_id_raw = (lease_id_proto.high as u128) << 64 | lease_id_proto.low as u128;
-        let lease_id_typed = LeaseId::new(lease_id_raw);
-
-        // Renew lease (runtime-only, does not write to Raft)
-        let expires_at_ms = match self
-            .inode_lease_manager
-            .renew(session.inode_id, lease_id_typed, req.lease_epoch)
+        let resp = match self
+            .fs_core
+            .renew_lease(RenewLeaseInput {
+                ctx: req_ctx.clone(),
+                file_handle: req.file_handle,
+                lease_id: lease_id_from_proto(req.lease_id),
+                lease_epoch: req.lease_epoch,
+                freshness,
+            })
+            .await
         {
-            Ok(expires) => expires,
-            Err(e) => {
-                let resp_header = fatal_fs_header(
-                    &req.header,
-                    e,
-                    format!(
-                        "Lease renewal failed: inode={}, lease_id={:?}",
-                        session.inode_id, lease_id_typed
-                    ),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(RenewInodeLeaseResponseProto {
-                    header: Some(resp_header),
-                    expires_at_ms: 0,
-                }));
-            }
+            Ok(success) => RenewInodeLeaseResponseProto {
+                header: Some(ok_header_from_core_success(&req_ctx, &success)),
+                expires_at_ms: success.payload.expires_at_ms,
+            },
+            Err(failure) => RenewInodeLeaseResponseProto {
+                header: Some(header_from_core_failure(&req_ctx, &failure)),
+                ..Default::default()
+            },
         };
-
-        let resp_header = ok_header_from_request(&req.header, None, None);
-
-        Ok(Response::new(RenewInodeLeaseResponseProto {
-            header: Some(resp_header),
-            expires_at_ms,
-        }))
+        Ok(Response::new(resp))
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]

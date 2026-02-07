@@ -7,9 +7,9 @@ mod common;
 
 use common::FsTestHarness;
 use metadata::service::guard::LeadershipChecker;
-use metadata::service::{MetadataFsServiceImpl, MetadataPathServiceImpl};
+use metadata::service::{MetadataFileSystemServiceImpl, MetadataFsServiceImpl};
+use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::metadata_fs_service_proto_server::MetadataFsServiceProto;
-use proto::metadata::metadata_path_service_proto_server::MetadataPathServiceProto;
 use proto::metadata::*;
 use std::sync::Arc;
 use tonic::Request;
@@ -22,6 +22,15 @@ struct NotLeader;
 impl LeadershipChecker for NotLeader {
     fn is_leader(&self) -> bool {
         false
+    }
+}
+
+#[derive(Clone)]
+struct AlwaysLeader;
+
+impl LeadershipChecker for AlwaysLeader {
+    fn is_leader(&self) -> bool {
+        true
     }
 }
 
@@ -43,12 +52,11 @@ async fn test_path_service_propagates_need_refresh_from_fs() {
     )
     .with_storage(fs_harness.storage.clone())
     .with_leadership_checker(Arc::new(NotLeader));
+    let fs_core = fs_service.fs_core();
 
-    let path_service = MetadataPathServiceImpl::new(
-        fs_harness.mount_table.clone(),
-        fs_harness.storage.clone(),
-        Arc::new(fs_service),
-    );
+    let path_service =
+        MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
+            .with_leadership_checker(Arc::new(NotLeader));
 
     let attrs = FileAttrs::new();
     let req_header = FsTestHarness::create_test_request_header();
@@ -68,7 +76,7 @@ async fn test_path_service_propagates_need_refresh_from_fs() {
         create_parents: false,
     };
 
-    let resp = MetadataPathServiceProto::mkdir_path(&path_service, Request::new(mkdir_req))
+    let resp = FileSystemServiceProto::mkdir(&path_service, Request::new(mkdir_req))
         .await
         .unwrap()
         .into_inner();
@@ -102,20 +110,19 @@ async fn test_path_service_resolver_not_found_is_enoent() {
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone());
+    let fs_core = fs_service.fs_core();
 
-    let path_service = MetadataPathServiceImpl::new(
-        fs_harness.mount_table.clone(),
-        fs_harness.storage.clone(),
-        Arc::new(fs_service),
-    );
+    let path_service =
+        MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
+            .with_leadership_checker(Arc::new(AlwaysLeader));
 
     let req_header = FsTestHarness::create_test_request_header();
-    let lookup_req = LookupPathRequestProto {
+    let lookup_req = GetFileStatusRequestProto {
         header: req_header,
         path: "/mnt/test/missing.txt".to_string(),
     };
 
-    let resp = MetadataPathServiceProto::lookup_path(&path_service, Request::new(lookup_req))
+    let resp = FileSystemServiceProto::get_file_status(&path_service, Request::new(lookup_req))
         .await
         .unwrap()
         .into_inner();
@@ -183,11 +190,10 @@ async fn test_path_service_mount_epoch_mismatch_is_need_refresh_with_reason_and_
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone());
-    let path_service = MetadataPathServiceImpl::new(
-        fs_harness.mount_table.clone(),
-        fs_harness.storage.clone(),
-        Arc::new(fs_service),
-    );
+    let fs_core = fs_service.fs_core();
+    let path_service =
+        MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
+            .with_leadership_checker(Arc::new(AlwaysLeader));
 
     let mut req_header = FsTestHarness::create_test_request_header();
     if let Some(header) = req_header.as_mut() {
@@ -216,7 +222,7 @@ async fn test_path_service_mount_epoch_mismatch_is_need_refresh_with_reason_and_
         create_parents: false,
     };
 
-    let resp = MetadataPathServiceProto::mkdir_path(&path_service, Request::new(mkdir_req))
+    let resp = FileSystemServiceProto::mkdir(&path_service, Request::new(mkdir_req))
         .await
         .expect("business errors must return grpc OK")
         .into_inner();

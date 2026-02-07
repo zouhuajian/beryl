@@ -1,30 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! MetadataPathServiceProto implementation.
+//! FileSystemServiceProto implementation.
 //!
 //! This is a thin adapter layer that converts path-based requests to inode-based operations.
-//! All FS semantics are delegated to MetadataFsServiceProto (fs.proto).
+//! All FS semantics are delegated to FsCore domain APIs.
 
+use super::domain::{
+    CloseWriteInput, CloseWriteIntent, CreateInput, FileRange, Freshness, FsyncBarrierInput, GetAttrInput,
+    GetFileLayoutInput, GetXattrInput, ListXattrInput, MkdirInput, OpenInput, OpenWriteInput, ReadDirInput,
+    ReleaseSessionInput, RemoveXattrInput, RenameInput, RenewLeaseInput, RmdirInput, SetXattrInput, TruncateInput,
+    UnlinkInput,
+};
 use super::extract_and_inject_context;
-use super::{header_from_canonical_error, ok_header_from_request};
+use super::guard::{AuthzContext, AuthzOp, GuardChain, GuardSpec, LeadershipChecker};
+use super::FsCore;
+use super::{
+    extent_from_proto, extent_to_proto, fencing_to_proto, header_from_canonical_error, header_from_core_failure,
+    lease_id_from_proto, lease_id_to_proto, location_to_proto, need_refresh_header, ok_header_from_core_success,
+    ok_header_from_request, presented_fencing_from_proto, request_context_from_proto, write_target_to_proto,
+};
+use crate::data_io::DataIoOp;
 use crate::error::{to_canonical_fs, MetadataError, MetadataResult};
 use crate::mount::MountTable;
 use crate::path_resolver::{MountContext, PathResolver};
 use crate::raft::RocksDBStorage;
-use proto::metadata::metadata_fs_service_proto_server::MetadataFsServiceProto as FsServiceTrait;
-use proto::metadata::metadata_path_service_proto_server::MetadataPathServiceProto;
+use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::*;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
-use tracing::{instrument, warn};
+use tracing::instrument;
 use types::fs::FileAttrs;
 use types::layout::FileLayout;
 
-/// MetadataPathServiceProto implementation.
-pub struct MetadataPathServiceImpl {
+/// FileSystemServiceProto implementation.
+pub struct MetadataFileSystemServiceImpl {
     path_resolver: PathResolver,
-    fs_service: Arc<super::fs_service::MetadataFsServiceImpl>,
+    fs_core: Arc<FsCore>,
+    guard_chain: GuardChain,
     metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
 }
 
@@ -42,16 +55,17 @@ macro_rules! error_response {
     }};
 }
 
-impl MetadataPathServiceImpl {
-    pub fn new(
-        mount_table: Arc<MountTable>,
-        storage: Arc<RocksDBStorage>,
-        fs_service: Arc<super::fs_service::MetadataFsServiceImpl>,
-    ) -> Self {
+impl MetadataFileSystemServiceImpl {
+    pub fn new(mount_table: Arc<MountTable>, storage: Arc<RocksDBStorage>, fs_core: Arc<FsCore>) -> Self {
         let path_resolver = PathResolver::new(mount_table.clone(), storage.clone());
+        let mut guard_chain = GuardChain::new(mount_table);
+        if let Some(raft_node) = fs_core.raft_node() {
+            guard_chain.set_leadership_checker(raft_node);
+        }
         Self {
             path_resolver,
-            fs_service,
+            fs_core,
+            guard_chain,
             metrics: None,
         }
     }
@@ -59,6 +73,19 @@ impl MetadataPathServiceImpl {
     /// Set metrics for tracking (optional).
     pub fn with_metrics(mut self, metrics: Arc<crate::metrics::MetadataMetrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    pub fn with_readiness_gate(mut self, readiness_gate: Arc<crate::readiness::RootReadinessGate>) -> Self {
+        self.guard_chain.set_readiness_gate(readiness_gate);
+        self
+    }
+
+    pub fn with_leadership_checker<T>(mut self, checker: Arc<T>) -> Self
+    where
+        T: LeadershipChecker + 'static,
+    {
+        self.guard_chain.set_leadership_checker(checker);
         self
     }
 
@@ -107,6 +134,30 @@ impl MetadataPathServiceImpl {
         header_from_canonical_error(req_header, group_id, mount_epoch, &canonical)
     }
 
+    fn guard_request(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        caller_ctx: &common::header::RequestHeader,
+        spec: GuardSpec,
+        mount_id: Option<types::ids::MountId>,
+        authz: Option<AuthzContext>,
+        fallback_group_id: Option<u64>,
+        fallback_mount_epoch: Option<u64>,
+    ) -> Option<proto::common::ResponseHeaderProto> {
+        match self
+            .guard_chain
+            .check_request(req_header, caller_ctx, spec, mount_id, authz)
+        {
+            Ok(()) => None,
+            Err(failure) => Some(header_from_canonical_error(
+                req_header,
+                failure.group_id.or(fallback_group_id),
+                failure.mount_epoch.or(fallback_mount_epoch),
+                &failure.err,
+            )),
+        }
+    }
+
     /// Convert types FileAttrs to proto FileAttrsProto.
     fn file_attrs_to_proto(attrs: &FileAttrs) -> proto::fs::FileAttrsProto {
         proto::fs::FileAttrsProto {
@@ -148,112 +199,75 @@ impl MetadataPathServiceImpl {
 }
 
 #[tonic::async_trait]
-impl MetadataPathServiceProto for MetadataPathServiceImpl {
+impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn lookup_path(
+    async fn get_file_status(
         &self,
-        request: Request<LookupPathRequestProto>,
-    ) -> Result<Response<LookupPathResponseProto>, Status> {
+        request: Request<GetFileStatusRequestProto>,
+    ) -> Result<Response<GetFileStatusResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let caller_ctx = extract_and_inject_context(&req.header);
 
-        // Resolve path to parent + name
-        let resolved = match self.path_resolver.resolve_path(&req.path) {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                let resp_header = self.header_from_path_error(&req.header, err, None);
-                return error_response!(LookupPathResponseProto, resp_header);
-            }
-        };
-
-        if resolved.inode_id.is_none() {
-            let resp_header = self.header_from_path_error(
-                &req.header,
-                MetadataError::NotFound(format!("Path not found: {}", req.path)),
-                Some(&resolved.mount_ctx),
-            );
-            return error_response!(LookupPathResponseProto, resp_header);
-        }
-
-        let fs_req = LookupRequestProto {
-            header: req.header.clone(),
-            parent_inode_id: Some(proto::fs::InodeIdProto {
-                value: resolved.parent_inode_id.as_raw(),
-            }),
-            name: resolved.name,
-        };
-
-        let fs_resp = FsServiceTrait::lookup(self.fs_service.as_ref(), Request::new(fs_req)).await?;
-        let LookupResponseProto { header, inode, attrs } = fs_resp.into_inner();
-
-        let resp_header = self.header_or_ok(
-            &req.header,
-            header,
-            Some(resolved.mount_ctx.owner_group_id.as_raw()),
-            Some(resolved.mount_ctx.mount_epoch),
-        );
-
-        response_with_header!(
-            LookupPathResponseProto {
-                inode,
-                attrs,
-                ..Default::default()
-            },
-            resp_header
-        )
-    }
-
-    #[instrument(skip(self), fields(call_id, client_id))]
-    async fn get_attr_path(
-        &self,
-        request: Request<GetAttrPathRequestProto>,
-    ) -> Result<Response<GetAttrPathResponseProto>, Status> {
-        let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
-
-        // Resolve path to inode
+        // Resolve path to inode.
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, None);
-                return error_response!(GetAttrPathResponseProto, resp_header);
+                return error_response!(GetFileStatusResponseProto, resp_header);
             }
         };
 
-        let fs_req = GetAttrRequestProto {
-            header: req.header.clone(),
-            inode_id: Some(proto::fs::InodeIdProto {
-                value: resolved.inode_id.as_raw(),
-            }),
-        };
-
-        let fs_resp = FsServiceTrait::get_attr(self.fs_service.as_ref(), Request::new(fs_req)).await?;
-        let GetAttrResponseProto { header, attrs } = fs_resp.into_inner();
-
-        let resp_header = self.header_or_ok(
+        if let Some(resp_header) = self.guard_request(
             &req.header,
-            header,
+            &caller_ctx,
+            GuardSpec::metadata_read(),
+            Some(resolved.mount_ctx.mount_id),
+            None,
             Some(resolved.mount_ctx.owner_group_id.as_raw()),
             Some(resolved.mount_ctx.mount_epoch),
-        );
+        ) {
+            return error_response!(GetFileStatusResponseProto, resp_header);
+        }
 
-        response_with_header!(
-            GetAttrPathResponseProto {
-                attrs,
-                inode: None,
-                ..Default::default()
-            },
-            resp_header
-        )
+        let req_ctx = request_context_from_proto(&req.header);
+        match self
+            .fs_core
+            .get_attr(GetAttrInput {
+                ctx: req_ctx.clone(),
+                inode_id: resolved.inode_id,
+            })
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_core_success(&req_ctx, &success);
+                response_with_header!(
+                    GetFileStatusResponseProto {
+                        inode_id: Some(proto::fs::InodeIdProto {
+                            value: resolved.inode_id.as_raw(),
+                        }),
+                        attrs: Some(Self::file_attrs_to_proto(&success.payload.attrs)),
+                        inode: None,
+                        ..Default::default()
+                    },
+                    header
+                )
+            }
+            Err(failure) => {
+                let header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                    Some(resolved.mount_ctx.mount_epoch),
+                );
+                error_response!(GetFileStatusResponseProto, header)
+            }
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn mkdir_path(
-        &self,
-        request: Request<MkdirPathRequestProto>,
-    ) -> Result<Response<MkdirPathResponseProto>, Status> {
+    async fn mkdir(&self, request: Request<MkdirPathRequestProto>) -> Result<Response<MkdirPathResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let caller_ctx = extract_and_inject_context(&req.header);
 
         // Resolve path
         let resolved = match self.path_resolver.resolve_path(&req.path) {
@@ -264,14 +278,19 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             }
         };
 
-        // Validate mount_epoch
-        if let Err(err) = self.validate_mount_epoch(&req.header, &resolved.mount_ctx) {
-            warn!(
-                path = %req.path,
-                err = %err,
-                "MkdirPath rejected: mount epoch mismatch (NEED_REFRESH)"
-            );
-            let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
+        if let Some(resp_header) = self.guard_request(
+            &req.header,
+            &caller_ctx,
+            GuardSpec::metadata_write(),
+            Some(resolved.mount_ctx.mount_id),
+            Some(AuthzContext {
+                op: AuthzOp::FsWrite(super::FsWriteOp::Mkdir),
+                mount_id: Some(resolved.mount_ctx.mount_id),
+                inode_id: Some(resolved.parent_inode_id),
+            }),
+            Some(resolved.mount_ctx.owner_group_id.as_raw()),
+            Some(resolved.mount_ctx.mount_epoch),
+        ) {
             return error_response!(MkdirPathResponseProto, resp_header);
         }
 
@@ -284,43 +303,66 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             }
         };
 
-        // Call FS service Mkdir
-        let fs_req = MkdirRequestProto {
-            header: req.header.clone(),
-            parent_inode_id: Some(proto::fs::InodeIdProto {
-                value: resolved.parent_inode_id.as_raw(),
-            }),
-            name: resolved.name,
-            attrs: Some(Self::file_attrs_to_proto(&attrs)),
+        let req_ctx = request_context_from_proto(&req.header);
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: None,
         };
-
-        let fs_resp = FsServiceTrait::mkdir(self.fs_service.as_ref(), Request::new(fs_req)).await?;
-        let MkdirResponseProto { header, inode, attrs } = fs_resp.into_inner();
-
-        let resp_header = self.header_or_ok(
-            &req.header,
-            header,
-            Some(resolved.mount_ctx.owner_group_id.as_raw()),
-            Some(resolved.mount_ctx.mount_epoch),
-        );
-
-        response_with_header!(
-            MkdirPathResponseProto {
-                inode,
+        match self
+            .fs_core
+            .mkdir(MkdirInput {
+                ctx: req_ctx.clone(),
+                parent_inode_id: resolved.parent_inode_id,
+                name: resolved.name,
                 attrs,
-                ..Default::default()
-            },
-            resp_header
-        )
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_core_success(&req_ctx, &success);
+                let payload = success.payload;
+                let attrs_proto = payload.attrs.as_ref().map(Self::file_attrs_to_proto);
+                let inode = payload.inode_id.map(|inode_id| proto::fs::InodeProto {
+                    inode_id: Some(proto::fs::InodeIdProto {
+                        value: inode_id.as_raw(),
+                    }),
+                    kind: proto::fs::InodeKindProto::InodeKindDir as i32,
+                    attrs: attrs_proto.clone(),
+                    mount_id: Some(proto::common::MountIdProto {
+                        value: resolved.mount_ctx.mount_id.as_raw(),
+                    }),
+                    ..Default::default()
+                });
+                response_with_header!(
+                    MkdirPathResponseProto {
+                        inode,
+                        attrs: attrs_proto,
+                        ..Default::default()
+                    },
+                    header
+                )
+            }
+            Err(failure) => {
+                let header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                    Some(resolved.mount_ctx.mount_epoch),
+                );
+                error_response!(MkdirPathResponseProto, header)
+            }
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn create_path(
+    async fn create(
         &self,
         request: Request<CreatePathRequestProto>,
     ) -> Result<Response<CreatePathResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let caller_ctx = extract_and_inject_context(&req.header);
 
         // Resolve path
         let resolved = match self.path_resolver.resolve_path(&req.path) {
@@ -331,14 +373,19 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             }
         };
 
-        // Validate mount_epoch
-        if let Err(err) = self.validate_mount_epoch(&req.header, &resolved.mount_ctx) {
-            warn!(
-                path = %req.path,
-                err = %err,
-                "CreatePath rejected: mount epoch mismatch (NEED_REFRESH)"
-            );
-            let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
+        if let Some(resp_header) = self.guard_request(
+            &req.header,
+            &caller_ctx,
+            GuardSpec::metadata_write(),
+            Some(resolved.mount_ctx.mount_id),
+            Some(AuthzContext {
+                op: AuthzOp::FsWrite(super::FsWriteOp::Create),
+                mount_id: Some(resolved.mount_ctx.mount_id),
+                inode_id: Some(resolved.parent_inode_id),
+            }),
+            Some(resolved.mount_ctx.owner_group_id.as_raw()),
+            Some(resolved.mount_ctx.mount_epoch),
+        ) {
             return error_response!(CreatePathResponseProto, resp_header);
         }
 
@@ -358,55 +405,71 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             }
         };
 
-        // Call FS service Create
-        let fs_req = CreateRequestProto {
-            header: req.header.clone(),
-            parent_inode_id: Some(proto::fs::InodeIdProto {
-                value: resolved.parent_inode_id.as_raw(),
-            }),
-            name: resolved.name,
-            attrs: Some(Self::file_attrs_to_proto(&attrs)),
-            layout: Some(proto::common::FileLayoutProto {
-                block_size: layout.block_size,
-                chunk_size: layout.chunk_size,
-                replication: layout.replication as u32,
-            }),
+        let req_ctx = request_context_from_proto(&req.header);
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: None,
         };
-
-        let fs_resp = FsServiceTrait::create(self.fs_service.as_ref(), Request::new(fs_req)).await?;
-        let CreateResponseProto {
-            header,
-            inode,
-            attrs,
-            data_handle_id: _,
-        } = fs_resp.into_inner();
-        let inode_id = inode.as_ref().and_then(|i| i.inode_id.clone());
-
-        let resp_header = self.header_or_ok(
-            &req.header,
-            header,
-            Some(resolved.mount_ctx.owner_group_id.as_raw()),
-            Some(resolved.mount_ctx.mount_epoch),
-        );
-
-        response_with_header!(
-            CreatePathResponseProto {
-                inode_id,
-                inode,
+        match self
+            .fs_core
+            .create(CreateInput {
+                ctx: req_ctx.clone(),
+                parent_inode_id: resolved.parent_inode_id,
+                name: resolved.name,
                 attrs,
-                ..Default::default()
-            },
-            resp_header
-        )
+                layout,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_core_success(&req_ctx, &success);
+                let payload = success.payload;
+                let attrs_proto = payload.attrs.as_ref().map(Self::file_attrs_to_proto);
+                let inode_id = payload.inode_id.map(|inode_id| proto::fs::InodeIdProto {
+                    value: inode_id.as_raw(),
+                });
+                let inode = payload.inode_id.map(|inode_id| proto::fs::InodeProto {
+                    inode_id: Some(proto::fs::InodeIdProto {
+                        value: inode_id.as_raw(),
+                    }),
+                    kind: proto::fs::InodeKindProto::InodeKindFile as i32,
+                    attrs: attrs_proto.clone(),
+                    mount_id: Some(proto::common::MountIdProto {
+                        value: resolved.mount_ctx.mount_id.as_raw(),
+                    }),
+                    ..Default::default()
+                });
+                response_with_header!(
+                    CreatePathResponseProto {
+                        inode_id,
+                        inode,
+                        attrs: attrs_proto,
+                        ..Default::default()
+                    },
+                    header
+                )
+            }
+            Err(failure) => {
+                let header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                    Some(resolved.mount_ctx.mount_epoch),
+                );
+                error_response!(CreatePathResponseProto, header)
+            }
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn unlink_path(
+    async fn unlink(
         &self,
         request: Request<UnlinkPathRequestProto>,
     ) -> Result<Response<UnlinkPathResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let caller_ctx = extract_and_inject_context(&req.header);
 
         // Resolve path
         let resolved = match self.path_resolver.resolve_path(&req.path) {
@@ -417,46 +480,60 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             }
         };
 
-        // Validate mount_epoch
-        if let Err(err) = self.validate_mount_epoch(&req.header, &resolved.mount_ctx) {
-            warn!(
-                path = %req.path,
-                err = %err,
-                "UnlinkPath rejected: mount epoch mismatch (NEED_REFRESH)"
-            );
-            let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
+        if let Some(resp_header) = self.guard_request(
+            &req.header,
+            &caller_ctx,
+            GuardSpec::metadata_write(),
+            Some(resolved.mount_ctx.mount_id),
+            Some(AuthzContext {
+                op: AuthzOp::FsWrite(super::FsWriteOp::Unlink),
+                mount_id: Some(resolved.mount_ctx.mount_id),
+                inode_id: Some(resolved.parent_inode_id),
+            }),
+            Some(resolved.mount_ctx.owner_group_id.as_raw()),
+            Some(resolved.mount_ctx.mount_epoch),
+        ) {
             return error_response!(UnlinkPathResponseProto, resp_header);
         }
 
-        // Call FS service Unlink
-        let fs_req = UnlinkRequestProto {
-            header: req.header.clone(),
-            parent_inode_id: Some(proto::fs::InodeIdProto {
-                value: resolved.parent_inode_id.as_raw(),
-            }),
-            name: resolved.name,
+        let req_ctx = request_context_from_proto(&req.header);
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: None,
         };
-
-        let fs_resp = FsServiceTrait::unlink(self.fs_service.as_ref(), Request::new(fs_req)).await?;
-        let UnlinkResponseProto { header } = fs_resp.into_inner();
-
-        let resp_header = self.header_or_ok(
-            &req.header,
-            header,
-            Some(resolved.mount_ctx.owner_group_id.as_raw()),
-            Some(resolved.mount_ctx.mount_epoch),
-        );
-
-        response_with_header!(UnlinkPathResponseProto::default(), resp_header)
+        match self
+            .fs_core
+            .unlink(UnlinkInput {
+                ctx: req_ctx.clone(),
+                parent_inode_id: resolved.parent_inode_id,
+                name: resolved.name,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                response_with_header!(
+                    UnlinkPathResponseProto::default(),
+                    ok_header_from_core_success(&req_ctx, &success)
+                )
+            }
+            Err(failure) => {
+                let header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                    Some(resolved.mount_ctx.mount_epoch),
+                );
+                error_response!(UnlinkPathResponseProto, header)
+            }
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn rmdir_path(
-        &self,
-        request: Request<RmdirPathRequestProto>,
-    ) -> Result<Response<RmdirPathResponseProto>, Status> {
+    async fn rmdir(&self, request: Request<RmdirPathRequestProto>) -> Result<Response<RmdirPathResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let caller_ctx = extract_and_inject_context(&req.header);
 
         // Resolve path
         let resolved = match self.path_resolver.resolve_path(&req.path) {
@@ -467,46 +544,63 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             }
         };
 
-        // Validate mount_epoch
-        if let Err(err) = self.validate_mount_epoch(&req.header, &resolved.mount_ctx) {
-            warn!(
-                path = %req.path,
-                err = %err,
-                "RmdirPath rejected: mount epoch mismatch (NEED_REFRESH)"
-            );
-            let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
+        if let Some(resp_header) = self.guard_request(
+            &req.header,
+            &caller_ctx,
+            GuardSpec::metadata_write(),
+            Some(resolved.mount_ctx.mount_id),
+            Some(AuthzContext {
+                op: AuthzOp::FsWrite(super::FsWriteOp::Rmdir),
+                mount_id: Some(resolved.mount_ctx.mount_id),
+                inode_id: Some(resolved.parent_inode_id),
+            }),
+            Some(resolved.mount_ctx.owner_group_id.as_raw()),
+            Some(resolved.mount_ctx.mount_epoch),
+        ) {
             return error_response!(RmdirPathResponseProto, resp_header);
         }
 
-        // Call FS service Rmdir
-        let fs_req = RmdirRequestProto {
-            header: req.header.clone(),
-            parent_inode_id: Some(proto::fs::InodeIdProto {
-                value: resolved.parent_inode_id.as_raw(),
-            }),
-            name: resolved.name,
+        let req_ctx = request_context_from_proto(&req.header);
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: None,
         };
-
-        let fs_resp = FsServiceTrait::rmdir(self.fs_service.as_ref(), Request::new(fs_req)).await?;
-        let RmdirResponseProto { header } = fs_resp.into_inner();
-
-        let resp_header = self.header_or_ok(
-            &req.header,
-            header,
-            Some(resolved.mount_ctx.owner_group_id.as_raw()),
-            Some(resolved.mount_ctx.mount_epoch),
-        );
-
-        response_with_header!(RmdirPathResponseProto::default(), resp_header)
+        match self
+            .fs_core
+            .rmdir(RmdirInput {
+                ctx: req_ctx.clone(),
+                parent_inode_id: resolved.parent_inode_id,
+                name: resolved.name,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                response_with_header!(
+                    RmdirPathResponseProto::default(),
+                    ok_header_from_core_success(&req_ctx, &success)
+                )
+            }
+            Err(failure) => {
+                let header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                    Some(resolved.mount_ctx.mount_epoch),
+                );
+                error_response!(RmdirPathResponseProto, header)
+            }
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn rename_path(
+    async fn rename(
         &self,
         request: Request<RenamePathRequestProto>,
     ) -> Result<Response<RenamePathResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let caller_ctx = extract_and_inject_context(&req.header);
 
         // Resolve both paths
         let (src_resolved, dst_resolved) = match self.path_resolver.resolve_rename(&req.src_path, &req.dst_path) {
@@ -517,52 +611,66 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             }
         };
 
-        // Validate mount_epoch (both should be same mount at this point)
-        if let Err(err) = self.validate_mount_epoch(&req.header, &src_resolved.mount_ctx) {
-            warn!(
-                src_path = %req.src_path,
-                dst_path = %req.dst_path,
-                err = %err,
-                "RenamePath rejected: mount epoch mismatch (NEED_REFRESH)"
-            );
-            let resp_header = self.header_from_path_error(&req.header, err, Some(&src_resolved.mount_ctx));
+        if let Some(resp_header) = self.guard_request(
+            &req.header,
+            &caller_ctx,
+            GuardSpec::metadata_write(),
+            Some(src_resolved.mount_ctx.mount_id),
+            Some(AuthzContext {
+                op: AuthzOp::FsWrite(super::FsWriteOp::Rename),
+                mount_id: Some(src_resolved.mount_ctx.mount_id),
+                inode_id: Some(src_resolved.parent_inode_id),
+            }),
+            Some(src_resolved.mount_ctx.owner_group_id.as_raw()),
+            Some(src_resolved.mount_ctx.mount_epoch),
+        ) {
             return error_response!(RenamePathResponseProto, resp_header);
         }
 
-        // Call FS service Rename
-        let fs_req = FsRenameRequestProto {
-            header: req.header.clone(),
-            src_parent_inode_id: Some(proto::fs::InodeIdProto {
-                value: src_resolved.parent_inode_id.as_raw(),
-            }),
-            src_name: src_resolved.name,
-            dst_parent_inode_id: Some(proto::fs::InodeIdProto {
-                value: dst_resolved.parent_inode_id.as_raw(),
-            }),
-            dst_name: dst_resolved.name,
-            flags: req.flags,
+        let req_ctx = request_context_from_proto(&req.header);
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: None,
         };
-
-        let fs_resp = FsServiceTrait::rename(self.fs_service.as_ref(), Request::new(fs_req)).await?;
-        let FsRenameResponseProto { header } = fs_resp.into_inner();
-
-        let resp_header = self.header_or_ok(
-            &req.header,
-            header,
-            Some(src_resolved.mount_ctx.owner_group_id.as_raw()),
-            Some(src_resolved.mount_ctx.mount_epoch),
-        );
-
-        response_with_header!(RenamePathResponseProto::default(), resp_header)
+        match self
+            .fs_core
+            .rename(RenameInput {
+                ctx: req_ctx.clone(),
+                src_parent_inode_id: src_resolved.parent_inode_id,
+                src_name: src_resolved.name,
+                dst_parent_inode_id: dst_resolved.parent_inode_id,
+                dst_name: dst_resolved.name,
+                flags: req.flags,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                response_with_header!(
+                    RenamePathResponseProto::default(),
+                    ok_header_from_core_success(&req_ctx, &success)
+                )
+            }
+            Err(failure) => {
+                let header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    Some(src_resolved.mount_ctx.owner_group_id.as_raw()),
+                    Some(src_resolved.mount_ctx.mount_epoch),
+                );
+                error_response!(RenamePathResponseProto, header)
+            }
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn list_status_path(
+    async fn list_status(
         &self,
         request: Request<ListStatusPathRequestProto>,
     ) -> Result<Response<ListStatusPathResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let caller_ctx = extract_and_inject_context(&req.header);
 
         // Resolve path to inode
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
@@ -573,52 +681,78 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             }
         };
 
-        // For non-recursive listing, just call FS service ReadDir
         if !req.recursive {
-            // Parse cursor (if provided)
+            if let Some(resp_header) = self.guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::metadata_read(),
+                Some(resolved.mount_ctx.mount_id),
+                None,
+                Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                Some(resolved.mount_ctx.mount_epoch),
+            ) {
+                return error_response!(ListStatusPathResponseProto, resp_header);
+            }
+
+            let req_ctx = request_context_from_proto(&req.header);
             let cursor_key = if req.cursor.is_empty() {
                 None
             } else {
-                Some(req.cursor.as_slice())
+                Some(req.cursor.clone())
             };
-
-            let _max_entries = if req.limit == 0 { None } else { Some(req.limit as usize) };
-
-            // Call FS service ReadDir
-            let fs_req = ReadDirRequestProto {
-                header: req.header.clone(),
-                parent_inode_id: Some(proto::fs::InodeIdProto {
-                    value: resolved.inode_id.as_raw(),
-                }),
-                cursor_key: cursor_key.map(|c| c.to_vec()).unwrap_or_default(),
-                max_entries: req.limit,
-            };
-
-            let fs_resp = FsServiceTrait::read_dir(self.fs_service.as_ref(), Request::new(fs_req)).await?;
-
-            let ReadDirResponseProto {
-                header,
-                entries,
-                next_cursor_key,
-                eof,
-            } = fs_resp.into_inner();
-
-            let resp_header = self.header_or_ok(
-                &req.header,
-                header,
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
-            );
-
-            response_with_header!(
-                ListStatusPathResponseProto {
-                    entries,
-                    next_cursor: next_cursor_key,
-                    eof,
-                    ..Default::default()
-                },
-                resp_header
-            )
+            let max_entries = if req.limit == 0 { None } else { Some(req.limit as usize) };
+            match self
+                .fs_core
+                .read_dir(ReadDirInput {
+                    ctx: req_ctx.clone(),
+                    parent_inode_id: resolved.inode_id,
+                    cursor_key,
+                    max_entries,
+                })
+                .await
+            {
+                Ok(success) => {
+                    let header = ok_header_from_core_success(&req_ctx, &success);
+                    let payload = success.payload;
+                    let entries = payload
+                        .entries
+                        .into_iter()
+                        .map(|entry| proto::fs::DirEntryProto {
+                            name: entry.name,
+                            inode_id: Some(proto::fs::InodeIdProto {
+                                value: entry.inode_id.as_raw(),
+                            }),
+                            kind: match entry.kind {
+                                Some(types::fs::InodeKind::File) => proto::fs::InodeKindProto::InodeKindFile as i32,
+                                Some(types::fs::InodeKind::Dir) => proto::fs::InodeKindProto::InodeKindDir as i32,
+                                Some(types::fs::InodeKind::Symlink) => {
+                                    proto::fs::InodeKindProto::InodeKindSymlink as i32
+                                }
+                                None => proto::fs::InodeKindProto::InodeKindUnspecified as i32,
+                            },
+                            attrs: entry.attrs.as_ref().map(Self::file_attrs_to_proto),
+                        })
+                        .collect();
+                    response_with_header!(
+                        ListStatusPathResponseProto {
+                            entries,
+                            next_cursor: payload.next_cursor_key,
+                            eof: payload.eof,
+                            ..Default::default()
+                        },
+                        header
+                    )
+                }
+                Err(failure) => {
+                    let header = self.header_or_ok(
+                        &req.header,
+                        Some(header_from_core_failure(&req_ctx, &failure)),
+                        Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                        Some(resolved.mount_ctx.mount_epoch),
+                    );
+                    error_response!(ListStatusPathResponseProto, header)
+                }
+            }
         } else {
             // Recursive listing: TODO implement BFS/DFS with hard limits
             let resp_header = self.header_from_path_error(
@@ -631,12 +765,9 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn open_path(
-        &self,
-        request: Request<OpenPathRequestProto>,
-    ) -> Result<Response<OpenPathResponseProto>, Status> {
+    async fn open(&self, request: Request<OpenPathRequestProto>) -> Result<Response<OpenPathResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let caller_ctx = extract_and_inject_context(&req.header);
 
         // Resolve path to inode
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
@@ -647,64 +778,107 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             }
         };
 
-        // Call FS service Open
-        let fs_req = OpenRequestProto {
-            header: req.header.clone(),
-            inode_id: Some(proto::fs::InodeIdProto {
-                value: resolved.inode_id.as_raw(),
-            }),
-            flags: req.flags,
-        };
-
-        let fs_resp = FsServiceTrait::open(self.fs_service.as_ref(), Request::new(fs_req)).await?;
-
-        let OpenResponseProto { header, file_handle } = fs_resp.into_inner();
-
-        let resp_header = self.header_or_ok(
+        if let Some(resp_header) = self.guard_request(
             &req.header,
-            header,
+            &caller_ctx,
+            GuardSpec::metadata_read(),
+            Some(resolved.mount_ctx.mount_id),
+            None,
             Some(resolved.mount_ctx.owner_group_id.as_raw()),
             Some(resolved.mount_ctx.mount_epoch),
-        );
+        ) {
+            return error_response!(OpenPathResponseProto, resp_header);
+        }
 
-        response_with_header!(
-            OpenPathResponseProto {
-                file_handle,
-                ..Default::default()
-            },
-            resp_header
-        )
+        let req_ctx = request_context_from_proto(&req.header);
+        match self
+            .fs_core
+            .open(OpenInput {
+                ctx: req_ctx.clone(),
+                inode_id: resolved.inode_id,
+                flags: req.flags as i32,
+            })
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_core_success(&req_ctx, &success);
+                response_with_header!(
+                    OpenPathResponseProto {
+                        file_handle: success.payload.file_handle,
+                        ..Default::default()
+                    },
+                    header
+                )
+            }
+            Err(failure) => {
+                let header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                    Some(resolved.mount_ctx.mount_epoch),
+                );
+                error_response!(OpenPathResponseProto, header)
+            }
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn release_path(
+    async fn release(
         &self,
         request: Request<ReleasePathRequestProto>,
     ) -> Result<Response<ReleasePathResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(session) = self.fs_core.write_session_for_handle(req.file_handle) {
+            let (group_id, mount_epoch) = self.fs_core.mount_hints_for_mount(session.mount_id);
+            if let Some(resp_header) = self.guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::data_io(DataIoOp::CloseWrite).with_leader(),
+                Some(session.mount_id),
+                Some(AuthzContext {
+                    op: AuthzOp::DataIo(DataIoOp::CloseWrite),
+                    mount_id: Some(session.mount_id),
+                    inode_id: Some(session.inode_id),
+                }),
+                group_id,
+                mount_epoch,
+            ) {
+                return response_with_header!(ReleasePathResponseProto::default(), resp_header);
+            }
+        }
 
-        // Call FS service Release
-        let fs_req = ReleaseRequestProto {
-            header: req.header.clone(),
-            file_handle: req.file_handle,
-        };
-
-        let fs_resp = FsServiceTrait::release(self.fs_service.as_ref(), Request::new(fs_req)).await?;
-        let ReleaseResponseProto { header } = fs_resp.into_inner();
-
-        let resp_header = self.header_or_ok(&req.header, header, None, None);
-
-        response_with_header!(ReleasePathResponseProto::default(), resp_header)
+        let req_ctx = request_context_from_proto(&req.header);
+        match self
+            .fs_core
+            .release_session(ReleaseSessionInput {
+                ctx: req_ctx.clone(),
+                file_handle: req.file_handle,
+            })
+            .await
+        {
+            Ok(success) => {
+                response_with_header!(
+                    ReleasePathResponseProto::default(),
+                    ok_header_from_core_success(&req_ctx, &success)
+                )
+            }
+            Err(failure) => {
+                let header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    None,
+                    None,
+                );
+                response_with_header!(ReleasePathResponseProto::default(), header)
+            }
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn fsync_path(
-        &self,
-        request: Request<FsyncPathRequestProto>,
-    ) -> Result<Response<FsyncPathResponseProto>, Status> {
+    async fn fsync(&self, request: Request<FsyncPathRequestProto>) -> Result<Response<FsyncPathResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let caller_ctx = extract_and_inject_context(&req.header);
 
         // Handle path-based or handle-based fsync
         match req.target {
@@ -718,31 +892,59 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
                     }
                 };
 
-                // Call FS service Fsync
-                let fs_req = FsyncRequestProto {
-                    header: req.header.clone(),
-                    inode_id: Some(proto::fs::InodeIdProto {
-                        value: resolved.inode_id.as_raw(),
-                    }),
-                    flags: req.flags,
-                    file_handle: None,
-                    lease_id: None,
-                    lease_epoch: None,
-                    fencing_token: None,
-                    route_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
-                    worker_epoch: None,
-                    target_size: None,
-                };
-
-                let fs_resp = FsServiceTrait::fsync(self.fs_service.as_ref(), Request::new(fs_req)).await?;
-                let fs_resp_inner = fs_resp.into_inner();
-                let resp_header = self.header_or_ok(
+                if let Some(resp_header) = self.guard_request(
                     &req.header,
-                    fs_resp_inner.header,
+                    &caller_ctx,
+                    GuardSpec::data_io(DataIoOp::Fsync).with_leader(),
+                    Some(resolved.mount_ctx.mount_id),
+                    Some(AuthzContext {
+                        op: AuthzOp::DataIo(DataIoOp::Fsync),
+                        mount_id: Some(resolved.mount_ctx.mount_id),
+                        inode_id: Some(resolved.inode_id),
+                    }),
                     Some(resolved.mount_ctx.owner_group_id.as_raw()),
                     Some(resolved.mount_ctx.mount_epoch),
-                );
-                return response_with_header!(FsyncPathResponseProto::default(), resp_header);
+                ) {
+                    return error_response!(FsyncPathResponseProto, resp_header);
+                }
+
+                let req_ctx = request_context_from_proto(&req.header);
+                let freshness = Freshness {
+                    mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+                    route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+                    worker_epoch: None,
+                };
+                match self
+                    .fs_core
+                    .fsync_barrier(FsyncBarrierInput {
+                        ctx: req_ctx.clone(),
+                        inode_id: resolved.inode_id,
+                        file_handle: None,
+                        lease_id: None,
+                        lease_epoch: None,
+                        fencing_token: None,
+                        target_size: None,
+                        flags: req.flags as i32,
+                        freshness,
+                    })
+                    .await
+                {
+                    Ok(success) => {
+                        return response_with_header!(
+                            FsyncPathResponseProto::default(),
+                            ok_header_from_core_success(&req_ctx, &success)
+                        );
+                    }
+                    Err(failure) => {
+                        let header = self.header_or_ok(
+                            &req.header,
+                            Some(header_from_core_failure(&req_ctx, &failure)),
+                            Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                            Some(resolved.mount_ctx.mount_epoch),
+                        );
+                        return response_with_header!(FsyncPathResponseProto::default(), header);
+                    }
+                }
             }
             Some(proto::metadata::fsync_path_request_proto::Target::FileHandle(_handle)) => {
                 // Handle-based fsync: TODO implement when FS service supports it
@@ -765,10 +967,7 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn hsync_path(
-        &self,
-        request: Request<HsyncPathRequestProto>,
-    ) -> Result<Response<HsyncPathResponseProto>, Status> {
+    async fn hsync(&self, request: Request<HsyncPathRequestProto>) -> Result<Response<HsyncPathResponseProto>, Status> {
         let req = request.into_inner();
         let inner = match req.fsync {
             Some(inner) => inner,
@@ -782,7 +981,7 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             }
         };
         let fallback_header = inner.header.clone();
-        let resp = self.fsync_path(Request::new(inner)).await?;
+        let resp = self.fsync(Request::new(inner)).await?;
         response_with_header!(
             HsyncPathResponseProto::default(),
             resp.into_inner()
@@ -792,7 +991,7 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn hflush_path(
+    async fn hflush(
         &self,
         request: Request<HflushPathRequestProto>,
     ) -> Result<Response<HflushPathResponseProto>, Status> {
@@ -809,7 +1008,7 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             }
         };
         let fallback_header = inner.header.clone();
-        let resp = self.fsync_path(Request::new(inner)).await?;
+        let resp = self.fsync(Request::new(inner)).await?;
         response_with_header!(
             HflushPathResponseProto::default(),
             resp.into_inner()
@@ -819,12 +1018,12 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn truncate_path(
+    async fn truncate(
         &self,
         request: Request<TruncatePathRequestProto>,
     ) -> Result<Response<TruncatePathResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let caller_ctx = extract_and_inject_context(&req.header);
 
         // Resolve path to inode
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
@@ -835,43 +1034,69 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             }
         };
 
-        // Call FS service Truncate
-        let fs_req = TruncateRequestProto {
-            header: req.header.clone(),
-            inode_id: Some(proto::fs::InodeIdProto {
-                value: resolved.inode_id.as_raw(),
-            }),
-            new_size: req.new_size,
-            lease_id: req.lease_id,
-            lease_epoch: req.lease_epoch,
-        };
-
-        let fs_resp = FsServiceTrait::truncate(self.fs_service.as_ref(), Request::new(fs_req)).await?;
-        let TruncateResponseProto { header, new_size } = fs_resp.into_inner();
-
-        let resp_header = self.header_or_ok(
+        if let Some(resp_header) = self.guard_request(
             &req.header,
-            header,
+            &caller_ctx,
+            GuardSpec::data_io(DataIoOp::Truncate).with_leader(),
+            Some(resolved.mount_ctx.mount_id),
+            Some(AuthzContext {
+                op: AuthzOp::DataIo(DataIoOp::Truncate),
+                mount_id: Some(resolved.mount_ctx.mount_id),
+                inode_id: Some(resolved.inode_id),
+            }),
             Some(resolved.mount_ctx.owner_group_id.as_raw()),
             Some(resolved.mount_ctx.mount_epoch),
-        );
+        ) {
+            return error_response!(TruncatePathResponseProto, resp_header);
+        }
 
-        response_with_header!(
-            TruncatePathResponseProto {
-                new_size,
-                ..Default::default()
-            },
-            resp_header
-        )
+        let req_ctx = request_context_from_proto(&req.header);
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: None,
+        };
+        match self
+            .fs_core
+            .truncate(TruncateInput {
+                ctx: req_ctx.clone(),
+                inode_id: resolved.inode_id,
+                new_size: req.new_size,
+                lease_id: lease_id_from_proto(req.lease_id),
+                lease_epoch: req.lease_epoch,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_core_success(&req_ctx, &success);
+                response_with_header!(
+                    TruncatePathResponseProto {
+                        new_size: success.payload.new_size,
+                        ..Default::default()
+                    },
+                    header
+                )
+            }
+            Err(failure) => {
+                let header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                    Some(resolved.mount_ctx.mount_epoch),
+                );
+                error_response!(TruncatePathResponseProto, header)
+            }
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn set_xattr_path(
+    async fn set_xattr(
         &self,
         request: Request<SetXattrPathRequestProto>,
     ) -> Result<Response<SetXattrPathResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let caller_ctx = extract_and_inject_context(&req.header);
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -879,34 +1104,67 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
                 return error_response!(SetXattrPathResponseProto, resp_header);
             }
         };
-        let fs_req = SetXattrRequestProto {
-            header: req.header.clone(),
-            inode_id: Some(proto::fs::InodeIdProto {
-                value: resolved.inode_id.as_raw(),
-            }),
-            name: req.name,
-            value: req.value,
-            create: req.create,
-            replace: req.replace,
-        };
-        let resp = FsServiceTrait::set_xattr(self.fs_service.as_ref(), Request::new(fs_req)).await?;
-        let resp_inner = resp.into_inner();
-        let resp_header = self.header_or_ok(
+
+        if let Some(resp_header) = self.guard_request(
             &req.header,
-            resp_inner.header,
+            &caller_ctx,
+            GuardSpec::metadata_write(),
+            Some(resolved.mount_ctx.mount_id),
+            Some(AuthzContext {
+                op: AuthzOp::FsWrite(super::FsWriteOp::SetAttr),
+                mount_id: Some(resolved.mount_ctx.mount_id),
+                inode_id: Some(resolved.inode_id),
+            }),
             Some(resolved.mount_ctx.owner_group_id.as_raw()),
             Some(resolved.mount_ctx.mount_epoch),
-        );
-        response_with_header!(SetXattrPathResponseProto::default(), resp_header)
+        ) {
+            return error_response!(SetXattrPathResponseProto, resp_header);
+        }
+
+        let req_ctx = request_context_from_proto(&req.header);
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: None,
+        };
+        match self
+            .fs_core
+            .set_xattr(SetXattrInput {
+                ctx: req_ctx.clone(),
+                inode_id: resolved.inode_id,
+                name: req.name,
+                value: req.value,
+                create: req.create,
+                replace: req.replace,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                response_with_header!(
+                    SetXattrPathResponseProto::default(),
+                    ok_header_from_core_success(&req_ctx, &success)
+                )
+            }
+            Err(failure) => {
+                let header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                    Some(resolved.mount_ctx.mount_epoch),
+                );
+                error_response!(SetXattrPathResponseProto, header)
+            }
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn get_xattr_path(
+    async fn get_xattr(
         &self,
         request: Request<GetXattrPathRequestProto>,
     ) -> Result<Response<GetXattrPathResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let caller_ctx = extract_and_inject_context(&req.header);
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -914,37 +1172,58 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
                 return error_response!(GetXattrPathResponseProto, resp_header);
             }
         };
-        let fs_req = GetXattrRequestProto {
-            header: req.header.clone(),
-            inode_id: Some(proto::fs::InodeIdProto {
-                value: resolved.inode_id.as_raw(),
-            }),
-            name: req.name,
-        };
-        let resp = FsServiceTrait::get_xattr(self.fs_service.as_ref(), Request::new(fs_req)).await?;
-        let GetXattrResponseProto { header, value } = resp.into_inner();
-        let resp_header = self.header_or_ok(
+
+        if let Some(resp_header) = self.guard_request(
             &req.header,
-            header,
+            &caller_ctx,
+            GuardSpec::metadata_read(),
+            Some(resolved.mount_ctx.mount_id),
+            None,
             Some(resolved.mount_ctx.owner_group_id.as_raw()),
             Some(resolved.mount_ctx.mount_epoch),
-        );
-        response_with_header!(
-            GetXattrPathResponseProto {
-                value,
-                ..Default::default()
-            },
-            resp_header
-        )
+        ) {
+            return error_response!(GetXattrPathResponseProto, resp_header);
+        }
+
+        let req_ctx = request_context_from_proto(&req.header);
+        match self
+            .fs_core
+            .get_xattr(GetXattrInput {
+                ctx: req_ctx.clone(),
+                inode_id: resolved.inode_id,
+                name: req.name,
+            })
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_core_success(&req_ctx, &success);
+                response_with_header!(
+                    GetXattrPathResponseProto {
+                        value: success.payload.value,
+                        ..Default::default()
+                    },
+                    header
+                )
+            }
+            Err(failure) => {
+                let header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                    Some(resolved.mount_ctx.mount_epoch),
+                );
+                error_response!(GetXattrPathResponseProto, header)
+            }
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn list_xattr_path(
+    async fn list_xattr(
         &self,
         request: Request<ListXattrPathRequestProto>,
     ) -> Result<Response<ListXattrPathResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let caller_ctx = extract_and_inject_context(&req.header);
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -952,36 +1231,57 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
                 return error_response!(ListXattrPathResponseProto, resp_header);
             }
         };
-        let fs_req = ListXattrRequestProto {
-            header: req.header.clone(),
-            inode_id: Some(proto::fs::InodeIdProto {
-                value: resolved.inode_id.as_raw(),
-            }),
-        };
-        let resp = FsServiceTrait::list_xattr(self.fs_service.as_ref(), Request::new(fs_req)).await?;
-        let ListXattrResponseProto { header, names } = resp.into_inner();
-        let resp_header = self.header_or_ok(
+
+        if let Some(resp_header) = self.guard_request(
             &req.header,
-            header,
+            &caller_ctx,
+            GuardSpec::metadata_read(),
+            Some(resolved.mount_ctx.mount_id),
+            None,
             Some(resolved.mount_ctx.owner_group_id.as_raw()),
             Some(resolved.mount_ctx.mount_epoch),
-        );
-        response_with_header!(
-            ListXattrPathResponseProto {
-                names,
-                ..Default::default()
-            },
-            resp_header
-        )
+        ) {
+            return error_response!(ListXattrPathResponseProto, resp_header);
+        }
+
+        let req_ctx = request_context_from_proto(&req.header);
+        match self
+            .fs_core
+            .list_xattr(ListXattrInput {
+                ctx: req_ctx.clone(),
+                inode_id: resolved.inode_id,
+            })
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_core_success(&req_ctx, &success);
+                response_with_header!(
+                    ListXattrPathResponseProto {
+                        names: success.payload.names,
+                        ..Default::default()
+                    },
+                    header
+                )
+            }
+            Err(failure) => {
+                let header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                    Some(resolved.mount_ctx.mount_epoch),
+                );
+                error_response!(ListXattrPathResponseProto, header)
+            }
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn remove_xattr_path(
+    async fn remove_xattr(
         &self,
         request: Request<RemoveXattrPathRequestProto>,
     ) -> Result<Response<RemoveXattrPathResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let caller_ctx = extract_and_inject_context(&req.header);
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -989,66 +1289,541 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
                 return error_response!(RemoveXattrPathResponseProto, resp_header);
             }
         };
-        let fs_req = RemoveXattrRequestProto {
-            header: req.header.clone(),
-            inode_id: Some(proto::fs::InodeIdProto {
-                value: resolved.inode_id.as_raw(),
-            }),
-            name: req.name,
-        };
-        let resp = FsServiceTrait::remove_xattr(self.fs_service.as_ref(), Request::new(fs_req)).await?;
-        let resp_inner = resp.into_inner();
-        let resp_header = self.header_or_ok(
+
+        if let Some(resp_header) = self.guard_request(
             &req.header,
-            resp_inner.header,
+            &caller_ctx,
+            GuardSpec::metadata_write(),
+            Some(resolved.mount_ctx.mount_id),
+            Some(AuthzContext {
+                op: AuthzOp::FsWrite(super::FsWriteOp::SetAttr),
+                mount_id: Some(resolved.mount_ctx.mount_id),
+                inode_id: Some(resolved.inode_id),
+            }),
             Some(resolved.mount_ctx.owner_group_id.as_raw()),
             Some(resolved.mount_ctx.mount_epoch),
-        );
-        response_with_header!(RemoveXattrPathResponseProto::default(), resp_header)
+        ) {
+            return error_response!(RemoveXattrPathResponseProto, resp_header);
+        }
+
+        let req_ctx = request_context_from_proto(&req.header);
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: None,
+        };
+        match self
+            .fs_core
+            .remove_xattr(RemoveXattrInput {
+                ctx: req_ctx.clone(),
+                inode_id: resolved.inode_id,
+                name: req.name,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                response_with_header!(
+                    RemoveXattrPathResponseProto::default(),
+                    ok_header_from_core_success(&req_ctx, &success)
+                )
+            }
+            Err(failure) => {
+                let header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                    Some(resolved.mount_ctx.mount_epoch),
+                );
+                error_response!(RemoveXattrPathResponseProto, header)
+            }
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn get_file_block_locations_path(
+    async fn get_file_layout_by_path(
         &self,
-        request: Request<GetFileBlockLocationsPathRequestProto>,
-    ) -> Result<Response<GetFileBlockLocationsPathResponseProto>, Status> {
+        request: Request<GetFileLayoutByPathRequestProto>,
+    ) -> Result<Response<GetFileLayoutByPathResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let caller_ctx = extract_and_inject_context(&req.header);
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, None);
-                return error_response!(GetFileBlockLocationsPathResponseProto, resp_header);
+                return error_response!(GetFileLayoutByPathResponseProto, resp_header);
             }
         };
-        let fs_req = GetFileLayoutRequestProto {
-            header: req.header.clone(),
-            inode_id: Some(proto::fs::InodeIdProto {
-                value: resolved.inode_id.as_raw(),
-            }),
-            range: req.range,
-        };
-        let resp = FsServiceTrait::get_file_layout(self.fs_service.as_ref(), Request::new(fs_req)).await?;
-        let GetFileLayoutResponseProto {
-            header,
-            extents,
-            file_size,
-            locations,
-        } = resp.into_inner();
-        let resp_header = self.header_or_ok(
+        if let Some(resp_header) = self.guard_request(
             &req.header,
-            header,
+            &caller_ctx,
+            GuardSpec::data_io(DataIoOp::Read),
+            Some(resolved.mount_ctx.mount_id),
+            Some(AuthzContext {
+                op: AuthzOp::DataIo(DataIoOp::Read),
+                mount_id: Some(resolved.mount_ctx.mount_id),
+                inode_id: Some(resolved.inode_id),
+            }),
             Some(resolved.mount_ctx.owner_group_id.as_raw()),
             Some(resolved.mount_ctx.mount_epoch),
-        );
-        response_with_header!(
-            GetFileBlockLocationsPathResponseProto {
-                extents,
-                file_size,
-                locations,
-                ..Default::default()
-            },
-            resp_header
-        )
+        ) {
+            return error_response!(GetFileLayoutByPathResponseProto, resp_header);
+        }
+        let req_ctx = request_context_from_proto(&req.header);
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: None,
+        };
+        let range = req.range.map(|r| FileRange {
+            offset: r.offset,
+            len: r.len as u64,
+        });
+        match self
+            .fs_core
+            .get_file_layout(GetFileLayoutInput {
+                ctx: req_ctx.clone(),
+                inode_id: resolved.inode_id,
+                range,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_core_success(&req_ctx, &success);
+                let payload = success.payload;
+                response_with_header!(
+                    GetFileLayoutByPathResponseProto {
+                        extents: payload.extents.iter().map(extent_to_proto).collect(),
+                        file_size: payload.file_size,
+                        locations: payload.locations.iter().map(location_to_proto).collect(),
+                        ..Default::default()
+                    },
+                    header
+                )
+            }
+            Err(failure) => {
+                let header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                    Some(resolved.mount_ctx.mount_epoch),
+                );
+                error_response!(GetFileLayoutByPathResponseProto, header)
+            }
+        }
+    }
+
+    #[instrument(skip(self), fields(call_id, client_id))]
+    async fn open_write_by_path(
+        &self,
+        request: Request<OpenWriteByPathRequestProto>,
+    ) -> Result<Response<OpenWriteByPathResponseProto>, Status> {
+        let req = request.into_inner();
+        let caller_ctx = extract_and_inject_context(&req.header);
+
+        let resolved = match self.path_resolver.resolve_inode(&req.path) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, None);
+                return error_response!(OpenWriteByPathResponseProto, resp_header);
+            }
+        };
+
+        if let Err(err) = self.validate_mount_epoch(&req.header, &resolved.mount_ctx) {
+            let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
+            return error_response!(OpenWriteByPathResponseProto, resp_header);
+        }
+        if let Some(resp_header) = self.guard_request(
+            &req.header,
+            &caller_ctx,
+            GuardSpec::data_io(DataIoOp::OpenWrite).with_leader(),
+            Some(resolved.mount_ctx.mount_id),
+            Some(AuthzContext {
+                op: AuthzOp::DataIo(DataIoOp::OpenWrite),
+                mount_id: Some(resolved.mount_ctx.mount_id),
+                inode_id: Some(resolved.inode_id),
+            }),
+            Some(resolved.mount_ctx.owner_group_id.as_raw()),
+            Some(resolved.mount_ctx.mount_epoch),
+        ) {
+            return error_response!(OpenWriteByPathResponseProto, resp_header);
+        }
+
+        let req_ctx = request_context_from_proto(&req.header);
+        let mode = match req.mode {
+            x if x == WriteModeProto::WriteModeAppend as i32 => crate::inode_lease::WriteMode::Append,
+            _ => crate::inode_lease::WriteMode::Write,
+        };
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: None,
+        };
+        match self
+            .fs_core
+            .open_write(OpenWriteInput {
+                ctx: req_ctx.clone(),
+                inode_id: resolved.inode_id,
+                desired_len: req.desired_len,
+                mode,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_core_success(&req_ctx, &success);
+                let payload = success.payload;
+                response_with_header!(
+                    OpenWriteByPathResponseProto {
+                        file_handle: payload.session_key.file_handle,
+                        lease_id: Some(lease_id_to_proto(payload.session_key.lease_id)),
+                        fencing_token: Some(fencing_to_proto(payload.session_key.fencing_token)),
+                        write_targets: payload.write_targets.iter().map(write_target_to_proto).collect(),
+                        base_size: payload.base_size,
+                        open_epoch: payload.session_key.open_epoch,
+                        lease_epoch: payload.session_key.lease_epoch,
+                        expires_at_ms: payload.expires_at_ms,
+                        ..Default::default()
+                    },
+                    header
+                )
+            }
+            Err(failure) => {
+                let resp_header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                    Some(resolved.mount_ctx.mount_epoch),
+                );
+                error_response!(OpenWriteByPathResponseProto, resp_header)
+            }
+        }
+    }
+
+    #[instrument(skip(self), fields(call_id, client_id))]
+    async fn close_write_session(
+        &self,
+        request: Request<CloseWriteSessionRequestProto>,
+    ) -> Result<Response<CloseWriteSessionResponseProto>, Status> {
+        let req = request.into_inner();
+        let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(session) = self.fs_core.write_session_for_handle(req.file_handle) {
+            let (group_id, mount_epoch) = self.fs_core.mount_hints_for_mount(session.mount_id);
+            if let Some(resp_header) = self.guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::data_io(DataIoOp::CloseWrite).with_leader(),
+                Some(session.mount_id),
+                Some(AuthzContext {
+                    op: AuthzOp::DataIo(DataIoOp::CloseWrite),
+                    mount_id: Some(session.mount_id),
+                    inode_id: Some(session.inode_id),
+                }),
+                group_id,
+                mount_epoch,
+            ) {
+                return error_response!(CloseWriteSessionResponseProto, resp_header);
+            }
+        }
+
+        let extents = match req
+            .extents
+            .into_iter()
+            .map(extent_from_proto)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(extents) => extents,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, None);
+                return error_response!(CloseWriteSessionResponseProto, resp_header);
+            }
+        };
+
+        let req_ctx = request_context_from_proto(&req.header);
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: None,
+        };
+        match self
+            .fs_core
+            .close_write(CloseWriteInput {
+                ctx: req_ctx.clone(),
+                file_handle: req.file_handle,
+                lease_id: lease_id_from_proto(req.lease_id),
+                lease_epoch: req.lease_epoch,
+                open_epoch: req.open_epoch,
+                fencing_token: presented_fencing_from_proto(req.fencing_token),
+                intent: CloseWriteIntent {
+                    extents,
+                    final_size: req.final_size,
+                },
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_core_success(&req_ctx, &success);
+                let payload = success.payload;
+                response_with_header!(
+                    CloseWriteSessionResponseProto {
+                        committed_size: payload.committed_size,
+                        file_version: payload.file_version,
+                        ..Default::default()
+                    },
+                    header
+                )
+            }
+            Err(failure) => {
+                let resp_header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    None,
+                    None,
+                );
+                error_response!(CloseWriteSessionResponseProto, resp_header)
+            }
+        }
+    }
+
+    #[instrument(skip(self), fields(call_id, client_id))]
+    async fn renew_write_session_lease(
+        &self,
+        request: Request<RenewWriteSessionLeaseRequestProto>,
+    ) -> Result<Response<RenewWriteSessionLeaseResponseProto>, Status> {
+        let req = request.into_inner();
+        let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(session) = self.fs_core.write_session_for_handle(req.file_handle) {
+            let (group_id, mount_epoch) = self.fs_core.mount_hints_for_mount(session.mount_id);
+            if let Some(resp_header) = self.guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::data_io(DataIoOp::RenewLease).with_leader(),
+                Some(session.mount_id),
+                Some(AuthzContext {
+                    op: AuthzOp::DataIo(DataIoOp::RenewLease),
+                    mount_id: Some(session.mount_id),
+                    inode_id: Some(session.inode_id),
+                }),
+                group_id,
+                mount_epoch,
+            ) {
+                return error_response!(RenewWriteSessionLeaseResponseProto, resp_header);
+            }
+        }
+
+        let req_ctx = request_context_from_proto(&req.header);
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: None,
+        };
+        match self
+            .fs_core
+            .renew_lease(RenewLeaseInput {
+                ctx: req_ctx.clone(),
+                file_handle: req.file_handle,
+                lease_id: lease_id_from_proto(req.lease_id),
+                lease_epoch: req.lease_epoch,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => response_with_header!(
+                RenewWriteSessionLeaseResponseProto {
+                    expires_at_ms: success.payload.expires_at_ms,
+                    ..Default::default()
+                },
+                ok_header_from_core_success(&req_ctx, &success)
+            ),
+            Err(failure) => {
+                let resp_header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    None,
+                    None,
+                );
+                error_response!(RenewWriteSessionLeaseResponseProto, resp_header)
+            }
+        }
+    }
+
+    #[instrument(skip(self), fields(call_id, client_id))]
+    async fn fsync_session(
+        &self,
+        request: Request<FsyncSessionRequestProto>,
+    ) -> Result<Response<FsyncSessionResponseProto>, Status> {
+        let req = request.into_inner();
+        let caller_ctx = extract_and_inject_context(&req.header);
+        let session = match self.fs_core.write_session_for_handle(req.file_handle) {
+            Some(session) => session,
+            None => {
+                let resp_header = need_refresh_header(
+                    &req.header,
+                    common::header::RpcErrorCode::Fencing,
+                    common::error::canonical::RefreshReason::Fencing,
+                    "write session not found; refresh and re-open session before replaying fsync",
+                    None,
+                    None,
+                );
+                return response_with_header!(FsyncSessionResponseProto::default(), resp_header);
+            }
+        };
+        let (group_id, mount_epoch) = self.fs_core.mount_hints_for_mount(session.mount_id);
+        if let Some(resp_header) = self.guard_request(
+            &req.header,
+            &caller_ctx,
+            GuardSpec::data_io(DataIoOp::Fsync).with_leader(),
+            Some(session.mount_id),
+            Some(AuthzContext {
+                op: AuthzOp::DataIo(DataIoOp::Fsync),
+                mount_id: Some(session.mount_id),
+                inode_id: Some(session.inode_id),
+            }),
+            group_id,
+            mount_epoch,
+        ) {
+            return response_with_header!(FsyncSessionResponseProto::default(), resp_header);
+        }
+
+        let req_ctx = request_context_from_proto(&req.header);
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: req.worker_epoch,
+        };
+        match self
+            .fs_core
+            .fsync_barrier(FsyncBarrierInput {
+                ctx: req_ctx.clone(),
+                inode_id: session.inode_id,
+                file_handle: Some(req.file_handle),
+                lease_id: lease_id_from_proto(req.lease_id),
+                lease_epoch: req.lease_epoch,
+                fencing_token: presented_fencing_from_proto(req.fencing_token),
+                target_size: req.target_size,
+                flags: req.flags as i32,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => response_with_header!(
+                FsyncSessionResponseProto::default(),
+                ok_header_from_core_success(&req_ctx, &success)
+            ),
+            Err(failure) => {
+                let resp_header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    None,
+                    None,
+                );
+                response_with_header!(FsyncSessionResponseProto::default(), resp_header)
+            }
+        }
+    }
+
+    #[instrument(skip(self), fields(call_id, client_id))]
+    async fn hsync_session(
+        &self,
+        request: Request<HsyncSessionRequestProto>,
+    ) -> Result<Response<HsyncSessionResponseProto>, Status> {
+        let req = request.into_inner();
+        let inner = match req.fsync {
+            Some(inner) => inner,
+            None => {
+                let resp_header = self.header_from_path_error(
+                    &None,
+                    MetadataError::InvalidArgument("missing fsync payload".to_string()),
+                    None,
+                );
+                return response_with_header!(HsyncSessionResponseProto::default(), resp_header);
+            }
+        };
+        let fallback_header = inner.header.clone();
+        let resp = self.fsync_session(Request::new(inner)).await?;
+        let resp_header = resp
+            .into_inner()
+            .header
+            .unwrap_or_else(|| ok_header_from_request(&fallback_header, None, None));
+        response_with_header!(HsyncSessionResponseProto::default(), resp_header)
+    }
+
+    #[instrument(skip(self), fields(call_id, client_id))]
+    async fn hflush_session(
+        &self,
+        request: Request<HflushSessionRequestProto>,
+    ) -> Result<Response<HflushSessionResponseProto>, Status> {
+        let req = request.into_inner();
+        let inner = match req.fsync {
+            Some(inner) => inner,
+            None => {
+                let resp_header = self.header_from_path_error(
+                    &None,
+                    MetadataError::InvalidArgument("missing fsync payload".to_string()),
+                    None,
+                );
+                return response_with_header!(HflushSessionResponseProto::default(), resp_header);
+            }
+        };
+        let fallback_header = inner.header.clone();
+        let resp = self.fsync_session(Request::new(inner)).await?;
+        let resp_header = resp
+            .into_inner()
+            .header
+            .unwrap_or_else(|| ok_header_from_request(&fallback_header, None, None));
+        response_with_header!(HflushSessionResponseProto::default(), resp_header)
+    }
+
+    #[instrument(skip(self), fields(call_id, client_id))]
+    async fn release_session(
+        &self,
+        request: Request<ReleaseSessionRequestProto>,
+    ) -> Result<Response<ReleaseSessionResponseProto>, Status> {
+        let req = request.into_inner();
+        let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(session) = self.fs_core.write_session_for_handle(req.file_handle) {
+            let (group_id, mount_epoch) = self.fs_core.mount_hints_for_mount(session.mount_id);
+            if let Some(resp_header) = self.guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::data_io(DataIoOp::CloseWrite).with_leader(),
+                Some(session.mount_id),
+                Some(AuthzContext {
+                    op: AuthzOp::DataIo(DataIoOp::CloseWrite),
+                    mount_id: Some(session.mount_id),
+                    inode_id: Some(session.inode_id),
+                }),
+                group_id,
+                mount_epoch,
+            ) {
+                return response_with_header!(ReleaseSessionResponseProto::default(), resp_header);
+            }
+        }
+
+        let req_ctx = request_context_from_proto(&req.header);
+        match self
+            .fs_core
+            .release_session(ReleaseSessionInput {
+                ctx: req_ctx.clone(),
+                file_handle: req.file_handle,
+            })
+            .await
+        {
+            Ok(success) => response_with_header!(
+                ReleaseSessionResponseProto::default(),
+                ok_header_from_core_success(&req_ctx, &success)
+            ),
+            Err(failure) => {
+                let resp_header = self.header_or_ok(
+                    &req.header,
+                    Some(header_from_core_failure(&req_ctx, &failure)),
+                    None,
+                    None,
+                );
+                response_with_header!(ReleaseSessionResponseProto::default(), resp_header)
+            }
+        }
     }
 }

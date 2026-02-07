@@ -5,6 +5,7 @@
 //!
 //! This crate provides gRPC service definitions and message types for:
 //! - client → metadata: MetadataClientService
+//! - client → metadata (filesystem): FileSystemServiceProto
 //! - client → worker: WorkerDataService
 //! - worker → metadata: MetadataWorkerService
 //! - metadata ↔ metadata: MetadataPeerService

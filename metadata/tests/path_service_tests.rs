@@ -6,8 +6,8 @@
 mod common;
 use common::FsTestHarness;
 use metadata::error::MetadataError;
-use metadata::service::{MetadataFsServiceImpl, MetadataPathServiceImpl};
-use proto::metadata::metadata_path_service_proto_server::MetadataPathServiceProto;
+use metadata::service::{MetadataFileSystemServiceImpl, MetadataFsServiceImpl};
+use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::*;
 use std::sync::Arc;
 use tonic::Request;
@@ -18,7 +18,7 @@ use types::layout::FileLayout;
 /// Test harness for path service tests.
 pub struct PathTestHarness {
     pub fs_harness: FsTestHarness,
-    pub path_service: MetadataPathServiceImpl,
+    pub path_service: MetadataFileSystemServiceImpl,
 }
 
 impl PathTestHarness {
@@ -45,13 +45,11 @@ impl PathTestHarness {
         .with_storage(fs_harness.storage.clone())
         .with_raft_node(fs_harness.raft_node.clone())
         .with_metrics(metrics.clone());
+        let fs_core = fs_service.fs_core();
 
-        let path_service = MetadataPathServiceImpl::new(
-            fs_harness.mount_table.clone(),
-            fs_harness.storage.clone(),
-            Arc::new(fs_service),
-        )
-        .with_metrics(metrics);
+        let path_service =
+            MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
+                .with_metrics(metrics);
 
         Ok(Self {
             fs_harness,
@@ -91,7 +89,7 @@ async fn test_create_getattr_liststatus() {
         }),
     };
 
-    let create_resp = MetadataPathServiceProto::create_path(&harness.path_service, Request::new(create_req))
+    let create_resp = FileSystemServiceProto::create(&harness.path_service, Request::new(create_req))
         .await
         .unwrap()
         .into_inner();
@@ -101,22 +99,19 @@ async fn test_create_getattr_liststatus() {
     let inode_id = create_resp.inode_id.unwrap().value;
 
     // GetAttr
-    let getattr_req = GetAttrPathRequestProto {
+    let getattr_req = GetFileStatusRequestProto {
         header: req_header.clone(),
         path: "/mnt/test/file.txt".to_string(),
     };
 
-    let getattr_resp = MetadataPathServiceProto::get_attr_path(&harness.path_service, Request::new(getattr_req))
+    let getattr_resp = FileSystemServiceProto::get_file_status(&harness.path_service, Request::new(getattr_req))
         .await
         .unwrap()
         .into_inner();
 
     assert!(getattr_resp.header.is_some());
     assert!(getattr_resp.attrs.is_some());
-    assert_eq!(
-        getattr_resp.inode.as_ref().unwrap().inode_id.as_ref().unwrap().value,
-        inode_id
-    );
+    assert_eq!(getattr_resp.inode_id.as_ref().unwrap().value, inode_id);
 
     // ListStatus
     let list_req = ListStatusPathRequestProto {
@@ -127,7 +122,7 @@ async fn test_create_getattr_liststatus() {
         limit: 100,
     };
 
-    let list_resp = MetadataPathServiceProto::list_status_path(&harness.path_service, Request::new(list_req))
+    let list_resp = FileSystemServiceProto::list_status(&harness.path_service, Request::new(list_req))
         .await
         .unwrap()
         .into_inner();
@@ -163,7 +158,7 @@ async fn test_mkdir_nested_create_liststatus() {
         create_parents: false,
     };
 
-    let mkdir_resp = MetadataPathServiceProto::mkdir_path(&harness.path_service, Request::new(mkdir_req))
+    let mkdir_resp = FileSystemServiceProto::mkdir(&harness.path_service, Request::new(mkdir_req))
         .await
         .unwrap()
         .into_inner();
@@ -193,7 +188,7 @@ async fn test_mkdir_nested_create_liststatus() {
         }),
     };
 
-    let create_resp = MetadataPathServiceProto::create_path(&harness.path_service, Request::new(create_req))
+    let create_resp = FileSystemServiceProto::create(&harness.path_service, Request::new(create_req))
         .await
         .unwrap()
         .into_inner();
@@ -209,7 +204,7 @@ async fn test_mkdir_nested_create_liststatus() {
         limit: 10,
     };
 
-    let list_resp = MetadataPathServiceProto::list_status_path(&harness.path_service, Request::new(list_req))
+    let list_resp = FileSystemServiceProto::list_status(&harness.path_service, Request::new(list_req))
         .await
         .unwrap()
         .into_inner();
@@ -250,7 +245,7 @@ async fn test_rename_same_mount() {
         }),
     };
 
-    let create_resp = MetadataPathServiceProto::create_path(&harness.path_service, Request::new(create_req))
+    let create_resp = FileSystemServiceProto::create(&harness.path_service, Request::new(create_req))
         .await
         .unwrap()
         .into_inner();
@@ -265,7 +260,7 @@ async fn test_rename_same_mount() {
         flags: 0,
     };
 
-    let rename_resp = MetadataPathServiceProto::rename_path(&harness.path_service, Request::new(rename_req))
+    let rename_resp = FileSystemServiceProto::rename(&harness.path_service, Request::new(rename_req))
         .await
         .unwrap()
         .into_inner();
@@ -273,30 +268,29 @@ async fn test_rename_same_mount() {
     assert!(rename_resp.header.is_some());
 
     // Verify "a" no longer exists
-    let lookup_a_req = LookupPathRequestProto {
+    let lookup_a_req = GetFileStatusRequestProto {
         header: req_header.clone(),
         path: "/mnt/test/a".to_string(),
     };
 
-    let lookup_a_resp = MetadataPathServiceProto::lookup_path(&harness.path_service, Request::new(lookup_a_req)).await;
-
-    assert!(lookup_a_resp.is_err()); // Should fail with ENOENT
+    let lookup_a_resp = FileSystemServiceProto::get_file_status(&harness.path_service, Request::new(lookup_a_req))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(lookup_a_resp.header.as_ref().and_then(|h| h.error.as_ref()).is_some());
 
     // Verify "b" exists with same inode_id
-    let lookup_b_req = LookupPathRequestProto {
+    let lookup_b_req = GetFileStatusRequestProto {
         header: req_header.clone(),
         path: "/mnt/test/b".to_string(),
     };
 
-    let lookup_b_resp = MetadataPathServiceProto::lookup_path(&harness.path_service, Request::new(lookup_b_req))
+    let lookup_b_resp = FileSystemServiceProto::get_file_status(&harness.path_service, Request::new(lookup_b_req))
         .await
         .unwrap()
         .into_inner();
 
-    assert_eq!(
-        lookup_b_resp.inode.as_ref().unwrap().inode_id.as_ref().unwrap().value,
-        inode_id_a
-    );
+    assert_eq!(lookup_b_resp.inode_id.as_ref().unwrap().value, inode_id_a);
 }
 
 /// Test rename cross mount -> EXDEV.
@@ -340,7 +334,7 @@ async fn test_rename_cross_mount_exdev() {
         }),
     };
 
-    MetadataPathServiceProto::create_path(&harness.path_service, Request::new(create_req))
+    FileSystemServiceProto::create(&harness.path_service, Request::new(create_req))
         .await
         .unwrap();
 
@@ -352,7 +346,7 @@ async fn test_rename_cross_mount_exdev() {
         flags: 0,
     };
 
-    let rename_resp = MetadataPathServiceProto::rename_path(&harness.path_service, Request::new(rename_req))
+    let rename_resp = FileSystemServiceProto::rename(&harness.path_service, Request::new(rename_req))
         .await
         .unwrap()
         .into_inner();
@@ -396,7 +390,7 @@ async fn test_delete_unlink_rmdir_notempty() {
         create_parents: false,
     };
 
-    MetadataPathServiceProto::mkdir_path(&harness.path_service, Request::new(mkdir_req))
+    FileSystemServiceProto::mkdir(&harness.path_service, Request::new(mkdir_req))
         .await
         .unwrap();
 
@@ -421,7 +415,7 @@ async fn test_delete_unlink_rmdir_notempty() {
         }),
     };
 
-    MetadataPathServiceProto::create_path(&harness.path_service, Request::new(create_req))
+    FileSystemServiceProto::create(&harness.path_service, Request::new(create_req))
         .await
         .unwrap();
 
@@ -431,7 +425,7 @@ async fn test_delete_unlink_rmdir_notempty() {
         path: "/mnt/test/dir".to_string(),
     };
 
-    let rmdir_resp = MetadataPathServiceProto::rmdir_path(&harness.path_service, Request::new(rmdir_req))
+    let rmdir_resp = FileSystemServiceProto::rmdir(&harness.path_service, Request::new(rmdir_req))
         .await
         .unwrap()
         .into_inner();
@@ -453,7 +447,7 @@ async fn test_delete_unlink_rmdir_notempty() {
         path: "/mnt/test/dir/file.txt".to_string(),
     };
 
-    let unlink_resp = MetadataPathServiceProto::unlink_path(&harness.path_service, Request::new(unlink_req))
+    let unlink_resp = FileSystemServiceProto::unlink(&harness.path_service, Request::new(unlink_req))
         .await
         .unwrap()
         .into_inner();
@@ -466,7 +460,7 @@ async fn test_delete_unlink_rmdir_notempty() {
         path: "/mnt/test/dir".to_string(),
     };
 
-    let rmdir_resp2 = MetadataPathServiceProto::rmdir_path(&harness.path_service, Request::new(rmdir_req2))
+    let rmdir_resp2 = FileSystemServiceProto::rmdir(&harness.path_service, Request::new(rmdir_req2))
         .await
         .unwrap()
         .into_inner();
