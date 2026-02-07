@@ -431,13 +431,15 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         };
 
         // Register worker in manager (in-memory for now)
-        self.worker_manager.register_worker(
-            worker_id,
-            address.clone(),
-            net_transport_kind,
-            worker_epoch,
-            None, // TODO: Extract fault_domain from labels
-        )?;
+        self.worker_manager
+            .register_worker(
+                worker_id,
+                address.clone(),
+                net_transport_kind,
+                worker_epoch,
+                None, // TODO: Extract fault_domain from labels
+            )
+            .map_err(|e| Status::internal(format!("Failed to register worker: {}", e)))?;
 
         // Create command and propose to Raft (only descriptor, no runtime)
         let command = Command::UpsertWorkerDescriptor {
@@ -502,17 +504,20 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         use super::manager::HealthStatus;
         let health_status = HealthStatus::from(health_proto as i32);
 
-        let descriptor_changed = self.worker_manager.update_runtime(
-            worker_id,
-            net_transport_kind,
-            worker_epoch,
-            capacity.total_bytes,
-            capacity.used_bytes,
-            capacity.available_bytes,
-            load.active_reads,
-            load.active_writes,
-            health_status,
-        )?;
+        let descriptor_changed = self
+            .worker_manager
+            .update_runtime(
+                worker_id,
+                net_transport_kind,
+                worker_epoch,
+                capacity.total_bytes,
+                capacity.used_bytes,
+                capacity.available_bytes,
+                load.active_reads,
+                load.active_writes,
+                health_status,
+            )
+            .map_err(|e| Status::internal(format!("Failed to update worker runtime: {}", e)))?;
 
         // If descriptor changed, require worker to re-register (leader-only check)
         let is_leader = self.raft_node.is_leader();
@@ -712,7 +717,8 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                         .block_id
                         .as_ref()
                         .ok_or_else(|| Status::invalid_argument("Missing block_id in full entry"))?;
-                    let block_id = Self::proto_to_block_id(block_id)?;
+                    let block_id =
+                        Self::proto_to_block_id(block_id).map_err(|e| Status::invalid_argument(e.to_string()))?;
                     reported_blocks.push(block_id);
                 }
 
@@ -769,7 +775,8 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                         .block_id
                         .as_ref()
                         .ok_or_else(|| Status::invalid_argument("Missing block_id in delta entry"))?;
-                    let block_id = Self::proto_to_block_id(block_id)?;
+                    let block_id =
+                        Self::proto_to_block_id(block_id).map_err(|e| Status::invalid_argument(e.to_string()))?;
 
                     match entry.op() {
                         proto::metadata::BlockReportDeltaOpProto::BlockReportDeltaOpAdd => {

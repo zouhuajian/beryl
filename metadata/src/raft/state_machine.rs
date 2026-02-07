@@ -5,7 +5,7 @@
 //!
 //! Applies commands to the state machine and maintains consistency.
 
-use crate::error::{MetadataError, MetadataResult};
+use crate::error::{to_canonical_fs, MetadataError, MetadataResult};
 use crate::mount::MountTable;
 use crate::raft::command::Command;
 use crate::raft::storage::{AppliedResult, RocksDBStorage};
@@ -27,22 +27,9 @@ use types::layout::FileLayout;
 use types::lease::{FencingToken, Lease};
 
 fn meta_err_to_fs_errno(err: &MetadataError) -> Option<FsErrorCode> {
-    match err {
-        MetadataError::NotFound(_) => Some(FsErrorCode::ENoEnt),
-        MetadataError::AlreadyExists(_) => Some(FsErrorCode::EExist),
-        MetadataError::InvalidArgument(msg) => {
-            if msg.contains("Directory not empty") {
-                Some(FsErrorCode::ENotEmpty)
-            } else {
-                Some(FsErrorCode::EInval)
-            }
-        }
-        MetadataError::LeaseFenced { .. } => Some(FsErrorCode::EAgain),
-        MetadataError::EpochMismatch { .. }
-        | MetadataError::LeaderChanged(_)
-        | MetadataError::RoutingStale(_)
-        | MetadataError::StaleState(_) => Some(FsErrorCode::EAgain),
-        MetadataError::Internal(_) | MetadataError::ServiceUnavailable(_) => Some(FsErrorCode::EInval),
+    match to_canonical_fs(err.clone()).code {
+        Some(common::error::canonical::ErrorCode::FsErrno(errno)) => Some(errno),
+        _ => None,
     }
 }
 
@@ -711,7 +698,7 @@ impl AppRaftStateMachine {
                 .get_inode(parent_inode_id)?
                 .ok_or_else(|| MetadataError::NotFound(format!("Parent inode not found: {}", parent_inode_id)))?;
             if !parent_inode.kind.is_dir() {
-                return Err(MetadataError::InvalidArgument(format!(
+                return Err(MetadataError::NotDir(format!(
                     "Parent is not a directory: {}",
                     parent_inode_id
                 )));
@@ -771,7 +758,7 @@ impl AppRaftStateMachine {
                 .get_inode(parent_inode_id)?
                 .ok_or_else(|| MetadataError::NotFound(format!("Parent inode not found: {}", parent_inode_id)))?;
             if !parent_inode.kind.is_dir() {
-                return Err(MetadataError::InvalidArgument(format!(
+                return Err(MetadataError::NotDir(format!(
                     "Parent is not a directory: {}",
                     parent_inode_id
                 )));
@@ -835,10 +822,7 @@ impl AppRaftStateMachine {
 
             // Check it's not a directory
             if child_inode.kind.is_dir() {
-                return Err(MetadataError::InvalidArgument(format!(
-                    "Cannot unlink directory: {}",
-                    name
-                )));
+                return Err(MetadataError::IsDir(format!("Cannot unlink directory: {}", name)));
             }
 
             let now_ms = self.now_ms();
@@ -932,12 +916,15 @@ impl AppRaftStateMachine {
 
             // Check it's a directory
             if !child_inode.kind.is_dir() {
-                return Err(MetadataError::InvalidArgument(format!("Not a directory: {}", name)));
+                return Err(MetadataError::NotDir(format!("Not a directory: {}", name)));
             }
 
             // Check directory is empty
             if !self.storage.is_directory_empty(child_inode_id)? {
-                return Err(MetadataError::InvalidArgument(format!("Directory not empty: {}", name)));
+                return Err(MetadataError::DirectoryNotEmpty(format!(
+                    "Directory not empty: {}",
+                    name
+                )));
             }
 
             let now_ms = self.now_ms();
@@ -1004,12 +991,12 @@ impl AppRaftStateMachine {
 
                 if src_inode.kind.is_dir() {
                     if !dst_inode.kind.is_dir() {
-                        return Err(MetadataError::InvalidArgument(
+                        return Err(MetadataError::NotDir(
                             "Cannot overwrite non-directory with directory".to_string(),
                         ));
                     }
                     if !self.storage.is_directory_empty(dst_inode_id)? {
-                        return Err(MetadataError::InvalidArgument(
+                        return Err(MetadataError::DirectoryNotEmpty(
                             "Cannot overwrite non-empty directory".to_string(),
                         ));
                     }
@@ -1017,9 +1004,7 @@ impl AppRaftStateMachine {
                     self.storage.delete_inode(dst_inode_id)?;
                 } else {
                     if dst_inode.kind.is_dir() {
-                        return Err(MetadataError::InvalidArgument(
-                            "Cannot overwrite directory with file".to_string(),
-                        ));
+                        return Err(MetadataError::IsDir("Cannot overwrite directory with file".to_string()));
                     }
                     // Delete destination file
                     self.storage.delete_inode(dst_inode_id)?;

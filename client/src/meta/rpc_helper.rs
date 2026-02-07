@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-
 //! Helper for metadata RPC calls with group_id and state_id management.
 //!
 //! This module provides unified handling for:
@@ -12,9 +11,7 @@
 //! - Error handling and retry (STALE_STATE -> Msync, NOT_LEADER -> refresh route)
 
 use crate::cache::StateIdCache;
-use crate::canonical::{
-    handle_response_header as canonical_handle_response_header, retry_metadata_once, ClientAction, RetryOutcome,
-};
+use crate::canonical::{retry_metadata_once, validate_header_or_action, RefreshDispatchContext, RetryOutcome};
 use crate::error::{ClientError, ClientResult};
 use crate::meta::MetadataClient;
 use crate::routing::{GroupRoleCache, RouteTable};
@@ -25,6 +22,15 @@ use types::fs::InodeId;
 use types::ids::ShardGroupId;
 use types::GroupWatermark;
 use types::RaftLogId;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefreshDispatchAction {
+    RefreshMountAndRoute,
+    RefreshRoute,
+    RefreshWorker,
+    RefreshFencing,
+    RefreshState,
+}
 
 /// RPC helper for metadata operations with group-aware state management.
 pub struct MetadataRpcHelper {
@@ -105,49 +111,101 @@ impl MetadataRpcHelper {
         header
     }
 
-    /// Handle response header: update state_id cache and check for errors.
-    ///
-    /// This function now delegates to `client::canonical::handle_response_header` for
-    /// unified error decision-making. The canonical handler converts ResponseHeader to
-    /// ClientAction, which we then convert to ClientError for backward compatibility.
-    ///
-    /// TODO: Once all callers are updated to use ClientAction directly, this function
-    /// can be simplified or removed.
+    /// Handle response header: validate canonical error semantics and update state cache.
     pub fn handle_response_header(&self, response_header: &ResponseHeader) -> ClientResult<()> {
-        // Update state_id cache using response.group_id
-        self.update_state_id_from_response(response_header);
-
-        // Use canonical error handler for unified decision-making
-        match canonical_handle_response_header(response_header) {
-            Ok(()) => Ok(()),
-            Err(action) => match action {
-                ClientAction::Refresh(reason) => {
-                    let msg = match reason {
-                        RefreshReason::StaleState => "STALE_STATE",
-                        RefreshReason::NotLeader => "NOT_LEADER",
-                        RefreshReason::Moved | RefreshReason::RouteEpochMismatch => "SHARD_MOVED",
-                        RefreshReason::MountEpochMismatch => "MOUNT_EPOCH_MISMATCH",
-                        _ => "NEED_REFRESH",
-                    };
-                    Err(ClientError::Metadata(format!("{}: need refresh", msg)))
-                }
-                ClientAction::Retry { after_ms } => Err(ClientError::Metadata(format!(
-                    "RETRYABLE: retry after {}ms",
-                    after_ms.unwrap_or(0)
-                ))),
-                ClientAction::Fail(err) => Err(ClientError::Metadata(format!("FATAL: {}", err.message))),
-            },
+        match validate_header_or_action(response_header) {
+            Ok(()) => {
+                self.update_state_id_from_response(response_header);
+                Ok(())
+            }
+            Err(action) => Err(ClientError::from(action)),
         }
     }
 
-    /// Execute a metadata RPC with a single automatic refresh/ retry based on canonical_error.
+    fn refresh_action_for_reason(reason: RefreshReason) -> RefreshDispatchAction {
+        match reason {
+            RefreshReason::MountEpochMismatch => RefreshDispatchAction::RefreshMountAndRoute,
+            RefreshReason::RouteEpochMismatch | RefreshReason::Moved | RefreshReason::NotLeader => {
+                RefreshDispatchAction::RefreshRoute
+            }
+            RefreshReason::WorkerEpochMismatch => RefreshDispatchAction::RefreshWorker,
+            RefreshReason::Fencing => RefreshDispatchAction::RefreshFencing,
+            RefreshReason::StaleState | RefreshReason::BlockStampMismatch | RefreshReason::EpochMismatch => {
+                RefreshDispatchAction::RefreshState
+            }
+            RefreshReason::Unknown => RefreshDispatchAction::RefreshRoute,
+        }
+    }
+
+    async fn dispatch_refresh(
+        &self,
+        base_header: &RequestHeader,
+        current_header: RequestHeader,
+        dispatch_ctx: RefreshDispatchContext,
+    ) -> ClientResult<RequestHeader> {
+        let RefreshDispatchContext {
+            reason,
+            hint,
+            canonical: _canonical,
+            response_header,
+        } = dispatch_ctx;
+
+        let action = Self::refresh_action_for_reason(reason);
+        metrics::counter!(
+            "client_metadata_refresh_dispatch_total",
+            "reason" => format!("{:?}", reason),
+            "action" => format!("{:?}", action)
+        )
+        .increment(1);
+
+        let mut next_header = current_header.child_with_same_call_id();
+        if let Some(gid) = hint.group_id.or(response_header.group_id) {
+            next_header.group_id = Some(gid);
+        }
+        if let Some(state_id) = response_header.state_id {
+            next_header.state_id = Some(state_id);
+        }
+        if let Some(mount_epoch) = hint.mount_epoch.or(response_header.mount_epoch) {
+            next_header.mount_epoch = Some(mount_epoch);
+        }
+
+        match action {
+            RefreshDispatchAction::RefreshMountAndRoute => {
+                // TODO(ERR-4): replace route refresh fallback with dedicated mount-table refresh
+                // once a mount refresh API is available on the metadata service.
+                self.refresh_route_table(base_header).await?;
+            }
+            RefreshDispatchAction::RefreshRoute => {
+                self.refresh_route_table(base_header).await?;
+            }
+            RefreshDispatchAction::RefreshWorker => {
+                // Best available worker metadata refresh in metadata-plane helper.
+                self.refresh_route_table(base_header).await?;
+            }
+            RefreshDispatchAction::RefreshFencing => {
+                if let Some(gid) = next_header.group_id {
+                    self.msync_group(base_header, ShardGroupId::new(gid), next_header.state_id)
+                        .await?;
+                }
+                self.refresh_route_table(base_header).await?;
+            }
+            RefreshDispatchAction::RefreshState => {
+                if let Some(gid) = next_header.group_id {
+                    self.msync_group(base_header, ShardGroupId::new(gid), next_header.state_id)
+                        .await?;
+                } else {
+                    self.refresh_route_table(base_header).await?;
+                }
+            }
+        }
+
+        Ok(next_header)
+    }
+
+    /// Execute a metadata RPC with bounded refresh/retry based on canonical_error.
     ///
     /// The `call` closure must return the parsed `ResponseHeader` plus payload for the RPC.
-    /// Refresh behaviour:
-    /// - MountEpochMismatch: adopt mount_epoch hint from response and retry once.
-    /// - RouteEpochMismatch/Moved/NotLeader: refresh route table then retry once.
-    /// - StaleState: msync group if group_id/state_id is available, then retry once.
-    /// - Retryable: single bounded retry with optional backoff.
+    /// Refresh behaviour is dispatched by `dispatch_refresh()` using refresh reason + hints.
     pub async fn call_with_refresh<T, CallFut>(
         &self,
         base_header: &RequestHeader,
@@ -158,7 +216,8 @@ impl MetadataRpcHelper {
     where
         CallFut: std::future::Future<Output = ClientResult<(ResponseHeader, T)>>,
     {
-        let initial_header = self.create_request_header(base_header, group_id, is_read);
+        let base_header = base_header.clone();
+        let initial_header = self.create_request_header(&base_header, group_id, is_read);
         let mut call = call;
         let outcome = retry_metadata_once(
             initial_header,
@@ -166,48 +225,9 @@ impl MetadataRpcHelper {
                 let fut = call(hdr.clone());
                 async move { fut.await }
             },
-            |reason, resp_header| {
-                let mount_epoch = resp_header.mount_epoch;
-                let group_id = resp_header.group_id;
-                let state_id = resp_header.state_id;
-                async move {
-                    metrics::counter!(
-                        "client_metadata_refresh_total",
-                        "reason" => format!("{:?}", reason),
-                        "group_id" => group_id.unwrap_or(0).to_string()
-                    )
-                    .increment(1);
-
-                    let mut next_header = base_header.child_with_same_call_id();
-                    next_header.group_id = group_id.or(next_header.group_id);
-                    if let Some(state_id) = state_id {
-                        next_header.state_id = Some(state_id);
-                    }
-
-                    match reason {
-                        RefreshReason::MountEpochMismatch => {
-                            if let Some(epoch) = mount_epoch {
-                                next_header.mount_epoch = Some(epoch);
-                            }
-                        }
-                        RefreshReason::RouteEpochMismatch | RefreshReason::Moved | RefreshReason::NotLeader => {
-                            let refresh_header = base_header.child();
-                            // Ignore refresh failures here; let the retry surface the error.
-                            let _ = self.refresh_route_table(&refresh_header).await;
-                        }
-                        RefreshReason::StaleState => {
-                            if let Some(gid) = next_header.group_id {
-                                let refresh_header = base_header.child().with_group_id(gid);
-                                let _ = self
-                                    .msync_group(&refresh_header, ShardGroupId::new(gid), state_id)
-                                    .await;
-                            }
-                        }
-                        _ => {}
-                    }
-
-                    Ok(next_header)
-                }
+            |dispatch_ctx, current_header| {
+                let base_header = base_header.clone();
+                async move { self.dispatch_refresh(&base_header, current_header, dispatch_ctx).await }
             },
         )
         .await?;
@@ -234,14 +254,13 @@ impl MetadataRpcHelper {
         // Use MetadataClient's msync method directly
         let response = self.metadata_client.msync(&header, false).await?;
 
-        // Update state_id from response
-        if let Some(ref resp_header) = response.header {
-            let resp_header: ResponseHeader = resp_header
-                .clone()
-                .try_into()
-                .map_err(|e| ClientError::Metadata(format!("Failed to parse response header: {}", e)))?;
-            self.update_state_id_from_response(&resp_header);
-        }
+        let resp_header = response
+            .header
+            .ok_or_else(|| ClientError::Metadata("Missing response header".to_string()))?;
+        let resp_header: ResponseHeader = resp_header
+            .try_into()
+            .map_err(|e| ClientError::Metadata(format!("Failed to parse response header: {}", e)))?;
+        self.handle_response_header(&resp_header)?;
 
         Ok(())
     }
@@ -251,14 +270,13 @@ impl MetadataRpcHelper {
         let header = base_header.child();
         let response = self.metadata_client.get_route_table(&header).await?;
 
-        // Update route table
-        if let Some(ref resp_header) = response.header {
-            let resp_header: ResponseHeader = resp_header
-                .clone()
-                .try_into()
-                .map_err(|e| ClientError::Metadata(format!("Failed to parse response header: {}", e)))?;
-            self.update_state_id_from_response(&resp_header);
-        }
+        let resp_header = response
+            .header
+            .ok_or_else(|| ClientError::Metadata("Missing response header".to_string()))?;
+        let resp_header: ResponseHeader = resp_header
+            .try_into()
+            .map_err(|e| ClientError::Metadata(format!("Failed to parse response header: {}", e)))?;
+        self.handle_response_header(&resp_header)?;
 
         let route_epoch = response.route_epoch;
         self.route_table
@@ -276,5 +294,338 @@ impl MetadataRpcHelper {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::StateIdCache;
+    use crate::meta::MetadataClient;
+    use crate::routing::{GroupRoleCache, RouteTable};
+    use common::error::canonical::CanonicalError;
+    use common::header::RequestHeader;
+    use common::header::{ClientInfo, ResponseHeader, RpcErrorCode};
+    use proto::metadata::metadata_route_service_proto_server::{
+        MetadataRouteServiceProto, MetadataRouteServiceProtoServer,
+    };
+    use proto::metadata::*;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{transport::Server, Request, Response, Status};
+    use types::ids::ShardGroupId;
+    use types::ClientId;
+
+    #[derive(Clone, Default)]
+    struct MockRouteService;
+
+    fn error_header(group_id: Option<u64>) -> proto::common::ResponseHeaderProto {
+        let canonical = CanonicalError::need_refresh(
+            RpcErrorCode::NotLeader,
+            common::error::canonical::RefreshReason::NotLeader,
+            "not leader",
+        );
+        let client = ClientInfo::new(ClientId::new(1));
+        let header = ResponseHeader::error(client, canonical);
+        let header = if let Some(gid) = group_id {
+            header.with_group_id(gid)
+        } else {
+            header
+        };
+        (&header).into()
+    }
+
+    #[tonic::async_trait]
+    impl MetadataRouteServiceProto for MockRouteService {
+        async fn get_file_meta(
+            &self,
+            _request: Request<GetFileMetaRequestProto>,
+        ) -> Result<Response<GetFileMetaResponseProto>, Status> {
+            Err(Status::unimplemented("not implemented"))
+        }
+
+        async fn refresh_route(
+            &self,
+            _request: Request<RefreshRouteRequestProto>,
+        ) -> Result<Response<RefreshRouteResponseProto>, Status> {
+            Err(Status::unimplemented("not implemented"))
+        }
+
+        async fn msync(&self, request: Request<MsyncRequestProto>) -> Result<Response<MsyncResponseProto>, Status> {
+            let req = request.into_inner();
+            let group_id = req
+                .header
+                .as_ref()
+                .and_then(|h| if h.group_id != 0 { Some(h.group_id) } else { None });
+            Ok(Response::new(MsyncResponseProto {
+                header: Some(error_header(group_id)),
+                readable_follower_ids: vec![],
+            }))
+        }
+
+        async fn get_route_table(
+            &self,
+            _request: Request<GetRouteTableRequestProto>,
+        ) -> Result<Response<GetRouteTableResponseProto>, Status> {
+            Ok(Response::new(GetRouteTableResponseProto {
+                header: Some(error_header(None)),
+                route_epoch: 42,
+                shard_to_group: Default::default(),
+                group_to_leader: Default::default(),
+                group_to_followers: Default::default(),
+            }))
+        }
+    }
+
+    async fn start_mock_server() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(MetadataRouteServiceProtoServer::new(MockRouteService::default()))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        addr
+    }
+
+    #[derive(Clone)]
+    struct DispatchRouteService {
+        route_calls: Arc<AtomicUsize>,
+        msync_calls: Arc<AtomicUsize>,
+    }
+
+    impl DispatchRouteService {
+        fn ok_header(group_id: Option<u64>) -> proto::common::ResponseHeaderProto {
+            let header = if let Some(gid) = group_id {
+                ResponseHeader::ok(ClientInfo::new(ClientId::new(1))).with_group_id(gid)
+            } else {
+                ResponseHeader::ok(ClientInfo::new(ClientId::new(1)))
+            };
+            (&header).into()
+        }
+    }
+
+    #[tonic::async_trait]
+    impl MetadataRouteServiceProto for DispatchRouteService {
+        async fn get_file_meta(
+            &self,
+            _request: Request<GetFileMetaRequestProto>,
+        ) -> Result<Response<GetFileMetaResponseProto>, Status> {
+            Err(Status::unimplemented("not implemented"))
+        }
+
+        async fn refresh_route(
+            &self,
+            _request: Request<RefreshRouteRequestProto>,
+        ) -> Result<Response<RefreshRouteResponseProto>, Status> {
+            Err(Status::unimplemented("not implemented"))
+        }
+
+        async fn msync(&self, request: Request<MsyncRequestProto>) -> Result<Response<MsyncResponseProto>, Status> {
+            self.msync_calls.fetch_add(1, Ordering::SeqCst);
+            let req = request.into_inner();
+            let group_id = req
+                .header
+                .as_ref()
+                .and_then(|h| if h.group_id != 0 { Some(h.group_id) } else { None });
+            Ok(Response::new(MsyncResponseProto {
+                header: Some(Self::ok_header(group_id)),
+                readable_follower_ids: vec![],
+            }))
+        }
+
+        async fn get_route_table(
+            &self,
+            _request: Request<GetRouteTableRequestProto>,
+        ) -> Result<Response<GetRouteTableResponseProto>, Status> {
+            self.route_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Response::new(GetRouteTableResponseProto {
+                header: Some(Self::ok_header(None)),
+                route_epoch: 99,
+                shard_to_group: Default::default(),
+                group_to_leader: Default::default(),
+                group_to_followers: Default::default(),
+            }))
+        }
+    }
+
+    async fn start_dispatch_server(service: DispatchRouteService) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(MetadataRouteServiceProtoServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        addr
+    }
+
+    async fn build_helper(endpoint: &str) -> MetadataRpcHelper {
+        let state_cache = Arc::new(StateIdCache::new(60));
+        let route_table = Arc::new(RouteTable::new(crate::cache::RouteCache::new(64, 60)));
+        let group_role = Arc::new(GroupRoleCache::new(60));
+        let metadata_client = Arc::new(MetadataClient::new(endpoint).await.unwrap());
+        MetadataRpcHelper::new(state_cache, route_table, group_role, metadata_client)
+    }
+
+    #[tokio::test]
+    async fn test_msync_group_fails_on_header_error() {
+        let addr = start_mock_server().await;
+        let endpoint = format!("http://{}", addr);
+        let helper = build_helper(&endpoint).await;
+
+        let base_header = RequestHeader::new(ClientId::new(1));
+        let result = helper.msync_group(&base_header, ShardGroupId::new(7), None).await;
+        assert!(result.is_err());
+        assert!(helper.get_state_id(&ShardGroupId::new(7)).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_refresh_route_table_fails_on_header_error() {
+        let addr = start_mock_server().await;
+        let endpoint = format!("http://{}", addr);
+        let helper = build_helper(&endpoint).await;
+
+        let base_header = RequestHeader::new(ClientId::new(1));
+        let result = helper.refresh_route_table(&base_header).await;
+        assert!(result.is_err());
+        assert_eq!(helper.route_table.route_epoch(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_refresh_mount_epoch_uses_route_refresh() {
+        let route_calls = Arc::new(AtomicUsize::new(0));
+        let msync_calls = Arc::new(AtomicUsize::new(0));
+        let service = DispatchRouteService {
+            route_calls: route_calls.clone(),
+            msync_calls: msync_calls.clone(),
+        };
+
+        let addr = start_dispatch_server(service).await;
+        let endpoint = format!("http://{}", addr);
+        let helper = build_helper(&endpoint).await;
+
+        let base_header = RequestHeader::new(ClientId::new(1)).with_group_id(9);
+        let current_header = base_header.child_with_same_call_id();
+        let canonical = CanonicalError::need_refresh(
+            RpcErrorCode::MountEpochMismatch,
+            RefreshReason::MountEpochMismatch,
+            "mount mismatch",
+        );
+        let mut response_header =
+            ResponseHeader::from_canonical(base_header.client.clone(), canonical.clone()).with_group_id(9);
+        response_header.mount_epoch = Some(42);
+
+        let next_header = helper
+            .dispatch_refresh(
+                &base_header,
+                current_header,
+                RefreshDispatchContext {
+                    reason: RefreshReason::MountEpochMismatch,
+                    hint: crate::canonical::RefreshHint {
+                        group_id: Some(9),
+                        mount_epoch: Some(42),
+                        ..Default::default()
+                    },
+                    canonical,
+                    response_header,
+                },
+            )
+            .await
+            .expect("mount refresh dispatch");
+
+        assert_eq!(next_header.mount_epoch, Some(42));
+        assert_eq!(route_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(msync_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_refresh_not_leader_uses_route_refresh() {
+        let route_calls = Arc::new(AtomicUsize::new(0));
+        let msync_calls = Arc::new(AtomicUsize::new(0));
+        let service = DispatchRouteService {
+            route_calls: route_calls.clone(),
+            msync_calls: msync_calls.clone(),
+        };
+
+        let addr = start_dispatch_server(service).await;
+        let endpoint = format!("http://{}", addr);
+        let helper = build_helper(&endpoint).await;
+
+        let base_header = RequestHeader::new(ClientId::new(1)).with_group_id(7);
+        let current_header = base_header.child_with_same_call_id();
+        let canonical = CanonicalError::need_refresh(RpcErrorCode::NotLeader, RefreshReason::NotLeader, "not leader");
+        let response_header =
+            ResponseHeader::from_canonical(base_header.client.clone(), canonical.clone()).with_group_id(7);
+
+        let _ = helper
+            .dispatch_refresh(
+                &base_header,
+                current_header,
+                RefreshDispatchContext {
+                    reason: RefreshReason::NotLeader,
+                    hint: crate::canonical::RefreshHint {
+                        group_id: Some(7),
+                        ..Default::default()
+                    },
+                    canonical,
+                    response_header,
+                },
+            )
+            .await
+            .expect("route refresh dispatch");
+
+        assert_eq!(route_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(msync_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_refresh_stale_state_uses_msync() {
+        let route_calls = Arc::new(AtomicUsize::new(0));
+        let msync_calls = Arc::new(AtomicUsize::new(0));
+        let service = DispatchRouteService {
+            route_calls: route_calls.clone(),
+            msync_calls: msync_calls.clone(),
+        };
+
+        let addr = start_dispatch_server(service).await;
+        let endpoint = format!("http://{}", addr);
+        let helper = build_helper(&endpoint).await;
+
+        let base_header = RequestHeader::new(ClientId::new(1)).with_group_id(5);
+        let mut current_header = base_header.child_with_same_call_id();
+        current_header.state_id = Some(RaftLogId::new(1, 1, 7));
+        let canonical =
+            CanonicalError::need_refresh(RpcErrorCode::StaleState, RefreshReason::StaleState, "stale state");
+        let mut response_header =
+            ResponseHeader::from_canonical(base_header.client.clone(), canonical.clone()).with_group_id(5);
+        response_header.state_id = Some(RaftLogId::new(1, 1, 7));
+
+        let _ = helper
+            .dispatch_refresh(
+                &base_header,
+                current_header,
+                RefreshDispatchContext {
+                    reason: RefreshReason::StaleState,
+                    hint: crate::canonical::RefreshHint {
+                        group_id: Some(5),
+                        ..Default::default()
+                    },
+                    canonical,
+                    response_header,
+                },
+            )
+            .await
+            .expect("stale state dispatch");
+
+        assert_eq!(route_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(msync_calls.load(Ordering::SeqCst), 1);
     }
 }

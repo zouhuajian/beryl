@@ -48,3 +48,4 @@ tokio-test = { workspace = true }
 assert_fs = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tonic = { workspace = true, features = ["transport"] }
+tokio-stream = { version = "0.1", features = ["net"] }

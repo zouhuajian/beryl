@@ -24,15 +24,15 @@ pub fn load_from_yaml_file<P: AsRef<Path>>(path: P) -> Result<FlatConfig, Common
 
     let content = fs::read_to_string(path).map_err(|e| {
         CommonError::new(
-			CommonErrorCode::Io,
-			format!("failed to read config file {}: {}", path.display(), e),
+            CommonErrorCode::Io,
+            format!("failed to read config file {}: {}", path.display(), e),
         )
     })?;
 
     let value: Value = serde_yaml::from_str(&content).map_err(|e| {
         CommonError::new(
-			CommonErrorCode::InvalidArgument,
-			format!("failed to parse YAML file {}: {}", path.display(), e),
+            CommonErrorCode::InvalidArgument,
+            format!("failed to parse YAML file {}: {}", path.display(), e),
         )
     })?;
 

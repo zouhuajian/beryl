@@ -4,6 +4,7 @@
 //! HCFS-style API implementation.
 
 use crate::cache::{FileMetaCache, RouteCache};
+use crate::canonical::validate_header_or_action;
 use crate::config::ClientConfig;
 use crate::consistency::ConsistencyLevel;
 use crate::error::{ClientError, ClientResult};
@@ -143,6 +144,14 @@ impl Client {
         let response = meta_client
             .get_file_meta(&ctx, Some(handle.inode_id), None, consistency, None)
             .await?;
+
+        let response_header = response
+            .header
+            .clone()
+            .ok_or_else(|| ClientError::Metadata("Missing response header".to_string()))?;
+        let response_header = common::header::ResponseHeader::try_from(response_header)
+            .map_err(|e| ClientError::Metadata(format!("Failed to parse response header: {}", e)))?;
+        validate_header_or_action(&response_header).map_err(ClientError::from)?;
 
         // Update caches
         if let Some(meta) = response.meta {

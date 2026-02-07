@@ -3,14 +3,13 @@
 
 //! Worker RPC client.
 
-use crate::canonical::{handle_canonical_error, ClientAction, RetryOutcome};
+use crate::canonical::{validate_data_header_or_action, ClientAction, RetryOutcome};
 use crate::error::{ClientError, ClientResult};
 use crate::modes::ReadMode;
 use bytes::Bytes;
 use common::error::canonical::RefreshReason;
 use common::header::RequestHeader;
 use futures::StreamExt;
-use proto::convert::error_detail_to_canonical;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -462,34 +461,34 @@ impl WorkerClient {
                 })
                 .await?;
 
-            let (canonical, hint_epoch, endpoint_hint) = Self::canonical_from_data_header(response.header.as_ref());
-            if let Some(ref err) = canonical {
-                last_canonical_error = Some(err.clone());
-            }
-
-            match canonical
-                .as_ref()
-                .map(|err| handle_canonical_error(err))
-                .unwrap_or(Ok(()))
-            {
+            match validate_data_header_or_action(response.header.as_ref()) {
                 Ok(()) => {
                     return Ok(RetryOutcome {
                         result: response,
                         refreshes,
                         retries,
+                        transport_retries: 0,
                         last_canonical_error,
                     });
                 }
-                Err(ClientAction::Refresh(reason)) => {
+                Err(ClientAction::Refresh {
+                    reason,
+                    hint,
+                    canonical,
+                }) => {
+                    last_canonical_error = Some(canonical.clone());
                     if refreshes > 0 {
-                        return Err(ClientError::NeedRefresh(format!("repeat refresh: {:?}", reason)));
+                        return Err(ClientError::from(ClientAction::Refresh {
+                            reason,
+                            hint,
+                            canonical,
+                        }));
                     }
                     refreshes = 1;
 
                     // Always fetch authoritative endpoint/epoch from metadata.
                     let meta_info = metadata_refresh(self.endpoint_info.worker_id).await?;
-                    let hint = hint_epoch;
-                    if let Some(epoch) = hint {
+                    if let Some(epoch) = hint.worker_epoch {
                         if epoch != meta_info.worker_epoch {
                             warn!(
                                 worker_id = self.endpoint_info.worker_id.as_u64(),
@@ -513,14 +512,29 @@ impl WorkerClient {
                                 let token = refresh_fn().await?;
                                 attempt_request.token = Some(token);
                             } else {
-                                return Err(ClientError::NeedRefresh("fencing refresh unavailable".to_string()));
+                                return Err(ClientError::from(ClientAction::Refresh {
+                                    reason,
+                                    hint,
+                                    canonical,
+                                }));
                             }
                         }
-                        _ => return Err(ClientError::NeedRefresh(format!("unexpected refresh: {:?}", reason))),
+                        _ => {
+                            return Err(ClientError::from(ClientAction::Refresh {
+                                reason,
+                                hint,
+                                canonical,
+                            }))
+                        }
                     }
 
-                    if let Some(endpoint_proto) = endpoint_hint {
-                        let hint_info = WorkerEndpointInfo::from_proto(endpoint_proto);
+                    if let Some(endpoint_hint) = hint.endpoint_hint {
+                        let hint_info = WorkerEndpointInfo {
+                            worker_id: WorkerId::new(endpoint_hint.worker_id),
+                            endpoint: endpoint_hint.endpoint,
+                            net_transport_kind: endpoint_hint.net_transport_kind,
+                            worker_epoch: endpoint_hint.worker_epoch,
+                        };
                         if hint_info.worker_epoch != meta_info.worker_epoch {
                             warn!(
                                 worker_id = self.endpoint_info.worker_id.as_u64(),
@@ -540,9 +554,10 @@ impl WorkerClient {
 
                     continue;
                 }
-                Err(ClientAction::Retry { after_ms }) => {
+                Err(ClientAction::Retry { after_ms, canonical }) => {
+                    last_canonical_error = Some(canonical.clone());
                     if retries > 0 {
-                        return Err(ClientError::Worker("retry limit exceeded".to_string()));
+                        return Err(ClientError::from(ClientAction::Retry { after_ms, canonical }));
                     }
                     retries = 1;
                     if let Some(delay) = after_ms {
@@ -550,10 +565,13 @@ impl WorkerClient {
                     }
                     continue;
                 }
-                Err(ClientAction::Fail(err)) => return Err(ClientError::Worker(err.message)),
+                Err(action) => return Err(ClientError::from(action)),
             }
         }
 
+        if let Some(canonical) = last_canonical_error {
+            return Err(ClientError::from(ClientAction::Fail { canonical }));
+        }
         Err(ClientError::Worker("write_chunk retry loop exhausted".to_string()))
     }
 
@@ -663,23 +681,6 @@ impl WorkerClient {
     /// Get worker endpoint info.
     pub fn endpoint_info(&self) -> &WorkerEndpointInfo {
         &self.endpoint_info
-    }
-
-    fn canonical_from_data_header(
-        header: Option<&proto::worker::DataResponseHeaderProto>,
-    ) -> (
-        Option<common::error::canonical::CanonicalError>,
-        Option<u64>,
-        Option<proto::common::WorkerEndpointInfoProto>,
-    ) {
-        if let Some(header) = header {
-            let canonical = header.error.as_ref().map(|err| error_detail_to_canonical(err));
-            let worker_epoch_hint = header.worker_epoch;
-            let endpoint_hint = header.endpoint_hint.clone();
-            (canonical, worker_epoch_hint, endpoint_hint)
-        } else {
-            (None, None, None)
-        }
     }
 }
 

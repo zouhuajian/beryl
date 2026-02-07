@@ -60,7 +60,7 @@ const CF_RAFT_LOG: &str = "raft_log"; // Raft log entries
 const CF_RAFT_STATE: &str = "raft_state"; // Raft state (hard_state, membership)
 const CF_RAFT_SNAPSHOT: &str = "raft_snapshot"; // Raft snapshots
 
-const DEDUP_VERSION_KEY: &[u8] = b"dedup_version";
+const DEDUP_VERSION_KEY: &str = "dedup_version";
 const DEDUP_FORMAT_VERSION: u64 = 3;
 const DEDUP_TTL_MS: u64 = 10 * 60 * 1000; // 10 minutes; TODO: make configurable
 const DEDUP_MAX_ENTRIES: usize = if cfg!(debug_assertions) { 128 } else { 10_000 };

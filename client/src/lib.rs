@@ -35,6 +35,6 @@ pub use config::ClientConfig;
 pub use error::{ClientError, ClientResult};
 // RequestHeader is available from common::header::RequestHeader
 pub use api::hcfs::{Client, Handle, OpenFlags};
-pub use canonical::{handle_response_header, ClientAction};
+pub use canonical::{validate_header_or_action, ClientAction};
 pub use consistency::ConsistencyLevel;
 pub use modes::{ReadMode, WriteMode};

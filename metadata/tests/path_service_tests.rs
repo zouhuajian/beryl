@@ -51,7 +51,6 @@ impl PathTestHarness {
             fs_harness.storage.clone(),
             Arc::new(fs_service),
         )
-        .with_raft_node(fs_harness.raft_node.clone())
         .with_metrics(metrics);
 
         Ok(Self {

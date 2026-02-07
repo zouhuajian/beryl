@@ -3,9 +3,10 @@
 
 //! Client error types and error code mapping.
 
+use crate::canonical::ClientAction;
 use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshReason};
 use common::header::RpcErrorCode;
-use common::{CommonError, CommonErrorCode as CommonErrorCode};
+use common::{CommonError, CommonErrorCode};
 use proto::common::RpcErrorCodeProto as ProtoErrorCode;
 use thiserror::Error;
 
@@ -66,9 +67,9 @@ pub enum ClientError {
     #[error("Unimplemented: {0}")]
     Unimplemented(String),
 
-    /// Need refresh (for follower read).
-    #[error("Need refresh: {0}")]
-    NeedRefresh(String),
+    /// Structured action error derived from canonical/header validation.
+    #[error("Client action: {0:?}")]
+    Action(ClientAction),
 }
 
 /// Result type alias for client operations.
@@ -85,7 +86,16 @@ impl ClientError {
             ClientError::NotLeader(_) => true,
             ClientError::RouteEpochMismatch { .. } => true,
             ClientError::StaleMeta(_) => true,
-            ClientError::NeedRefresh(_) => true,
+            ClientError::Action(action) => match action {
+                ClientAction::Retry { .. } | ClientAction::Refresh { .. } => true,
+                ClientAction::TransportFail { status } => {
+                    matches!(
+                        status.code(),
+                        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::ResourceExhausted
+                    )
+                }
+                ClientAction::Fail { .. } | ClientAction::Ok => false,
+            },
             ClientError::VersionMismatch { .. } => false, // Cache invalidation, not retry
             ClientError::Cache(_) => false,
             ClientError::Moved(_) => false,
@@ -101,13 +111,21 @@ impl ClientError {
                 | ClientError::RouteEpochMismatch { .. }
                 | ClientError::StaleMeta(_)
                 | ClientError::Moved(_)
-        )
+        ) || matches!(self, ClientError::Action(ClientAction::Refresh { .. }))
     }
 
     /// Get the leader ID if this is a NotLeader error.
     pub fn leader_id(&self) -> Option<u64> {
         match self {
             ClientError::NotLeader(id) => *id,
+            _ => None,
+        }
+    }
+
+    /// Extract action if this error is action-based.
+    pub fn action(&self) -> Option<&ClientAction> {
+        match self {
+            ClientError::Action(action) => Some(action),
             _ => None,
         }
     }
@@ -127,7 +145,15 @@ impl From<ProtoErrorCode> for ClientError {
             14 => ClientError::VersionMismatch { expected: 0, actual: 0 },
             15 => ClientError::Moved("Resource moved".to_string()),
             16 => ClientError::Unimplemented("Feature not implemented".to_string()),
-            17 => ClientError::NeedRefresh("Need refresh".to_string()),
+            17 => ClientError::Action(ClientAction::Refresh {
+                reason: RefreshReason::StaleState,
+                hint: Default::default(),
+                canonical: CanonicalError::need_refresh(
+                    RpcErrorCode::StaleState,
+                    RefreshReason::StaleState,
+                    "Need refresh",
+                ),
+            }),
             1 => ClientError::Common(CommonError::new(CommonErrorCode::Timeout, "Timeout")),
             2 => ClientError::Common(CommonError::new(CommonErrorCode::Unavailable, "Unavailable")),
             3 => ClientError::Common(CommonError::new(CommonErrorCode::Throttled, "Throttled")),
@@ -147,27 +173,7 @@ impl From<ProtoErrorCode> for ClientError {
 /// Convert tonic::Status to ClientError.
 impl From<tonic::Status> for ClientError {
     fn from(status: tonic::Status) -> Self {
-        // Try to extract error code from status details
-        // TODO: Parse error details from status if needed
-
-        // Map gRPC status codes
-        match status.code() {
-            tonic::Code::NotFound => ClientError::Common(CommonError::new(CommonErrorCode::NotFound, status.message())),
-            tonic::Code::PermissionDenied => {
-                ClientError::Common(CommonError::new(CommonErrorCode::PermissionDenied, status.message()))
-            }
-            tonic::Code::InvalidArgument => {
-                ClientError::Common(CommonError::new(CommonErrorCode::InvalidArgument, status.message()))
-            }
-            tonic::Code::Unavailable => {
-                ClientError::Common(CommonError::new(CommonErrorCode::Unavailable, status.message()))
-            }
-            tonic::Code::DeadlineExceeded => {
-                ClientError::Common(CommonError::new(CommonErrorCode::Timeout, status.message()))
-            }
-            tonic::Code::Unimplemented => ClientError::Unimplemented(status.message().to_string()),
-            _ => ClientError::Common(CommonError::new(CommonErrorCode::Internal, status.message())),
-        }
+        ClientError::Action(ClientAction::TransportFail { status })
     }
 }
 
@@ -186,9 +192,6 @@ impl From<ClientError> for CanonicalError {
             ClientError::StaleMeta(msg) => {
                 CanonicalError::need_refresh(RpcErrorCode::StaleState, RefreshReason::StaleState, msg)
             }
-            ClientError::NeedRefresh(msg) => {
-                CanonicalError::need_refresh(RpcErrorCode::StaleState, RefreshReason::Unknown, msg)
-            }
             ClientError::Moved(msg) => {
                 CanonicalError::need_refresh(RpcErrorCode::ShardMoved, RefreshReason::Moved, msg)
             }
@@ -198,6 +201,19 @@ impl From<ClientError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("version mismatch: expected {}, got {}", expected, actual),
+            },
+            ClientError::Action(action) => match action {
+                ClientAction::Ok => CanonicalError::ok("ok"),
+                ClientAction::Refresh { canonical, .. }
+                | ClientAction::Retry { canonical, .. }
+                | ClientAction::Fail { canonical } => canonical,
+                ClientAction::TransportFail { status } => CanonicalError {
+                    class: ErrorClass::Fatal,
+                    code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
+                    reason: None,
+                    retry_after_ms: None,
+                    message: format!("transport status {:?}: {}", status.code(), status.message()),
+                },
             },
             ClientError::Common(common_err) => {
                 let is_retryable = common_err.is_retryable();

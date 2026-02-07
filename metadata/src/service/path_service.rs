@@ -7,31 +7,39 @@
 //! All FS semantics are delegated to MetadataFsServiceProto (fs.proto).
 
 use super::extract_and_inject_context;
-use super::{fatal_fs_header, need_refresh_header, ok_header_from_request};
-use crate::error::{MetadataError, MetadataResult};
+use super::{header_from_canonical_error, ok_header_from_request};
+use crate::error::{to_canonical_fs, MetadataError, MetadataResult};
 use crate::mount::MountTable;
-use crate::path_resolver::PathResolver;
-use crate::raft::{AppRaftNode, RocksDBStorage};
-use common::error::canonical::RefreshReason;
-use common::header::RpcErrorCode;
+use crate::path_resolver::{MountContext, PathResolver};
+use crate::raft::RocksDBStorage;
 use proto::metadata::metadata_fs_service_proto_server::MetadataFsServiceProto as FsServiceTrait;
 use proto::metadata::metadata_path_service_proto_server::MetadataPathServiceProto;
 use proto::metadata::*;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::{instrument, warn};
-use types::fs::{FileAttrs, FsErrorCode, Inode, InodeKind};
+use types::fs::FileAttrs;
 use types::layout::FileLayout;
-use types::RaftLogId;
 
 /// MetadataPathServiceProto implementation.
 pub struct MetadataPathServiceImpl {
     path_resolver: PathResolver,
     fs_service: Arc<super::fs_service::MetadataFsServiceImpl>,
-    mount_table: Arc<MountTable>,
-    storage: Arc<RocksDBStorage>,
-    raft_node: Option<Arc<AppRaftNode>>,
     metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
+}
+
+macro_rules! response_with_header {
+    ($resp:expr, $header:expr) => {{
+        let mut resp = $resp;
+        resp.header = Some($header);
+        Ok(Response::new(resp))
+    }};
+}
+
+macro_rules! error_response {
+    ($resp_ty:ty, $header:expr) => {{
+        response_with_header!(<$resp_ty>::default(), $header)
+    }};
 }
 
 impl MetadataPathServiceImpl {
@@ -44,17 +52,8 @@ impl MetadataPathServiceImpl {
         Self {
             path_resolver,
             fs_service,
-            mount_table,
-            storage,
-            raft_node: None,
             metrics: None,
         }
-    }
-
-    /// Set Raft node for leader/follower information (optional).
-    pub fn with_raft_node(mut self, raft_node: Arc<AppRaftNode>) -> Self {
-        self.raft_node = Some(raft_node);
-        self
     }
 
     /// Set metrics for tracking (optional).
@@ -73,21 +72,39 @@ impl MetadataPathServiceImpl {
         if let Some(header) = req_header {
             if let Some(client_mount_epoch) = header.mount_epoch {
                 if client_mount_epoch != mount_ctx.mount_epoch {
-                    return Err(MetadataError::StaleState(format!(
-                        "Mount epoch mismatch: client={}, server={} (mount_id={:?}). Client must refresh mount table.",
-                        client_mount_epoch, mount_ctx.mount_epoch, mount_ctx.mount_id
-                    )));
+                    return Err(MetadataError::MountEpochMismatch {
+                        expected: mount_ctx.mount_epoch,
+                        got: client_mount_epoch,
+                        mount_id: Some(mount_ctx.mount_id),
+                    });
                 }
             }
         }
         Ok(())
     }
 
-    /// Get latest state_id if available.
-    fn get_latest_state_id(&self) -> Option<RaftLogId> {
-        self.raft_node
-            .as_ref()
-            .and_then(|node| node.get_last_applied_state_id())
+    fn header_or_ok(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        fs_header: Option<proto::common::ResponseHeaderProto>,
+        group_id: Option<u64>,
+        mount_epoch: Option<u64>,
+    ) -> proto::common::ResponseHeaderProto {
+        fs_header.unwrap_or_else(|| ok_header_from_request(req_header, group_id, mount_epoch))
+    }
+
+    fn header_from_path_error(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        err: MetadataError,
+        mount_ctx: Option<&MountContext>,
+    ) -> proto::common::ResponseHeaderProto {
+        let (group_id, mount_epoch) = mount_ctx
+            .map(|ctx| (Some(ctx.owner_group_id.as_raw()), Some(ctx.mount_epoch)))
+            .unwrap_or((None, None));
+
+        let canonical = to_canonical_fs(err);
+        header_from_canonical_error(req_header, group_id, mount_epoch, &canonical)
     }
 
     /// Convert types FileAttrs to proto FileAttrsProto.
@@ -128,77 +145,6 @@ impl MetadataPathServiceImpl {
             layout.replication as u8,
         ))
     }
-
-    /// Convert types Inode to proto InodeProto.
-    fn inode_to_proto(inode: &Inode) -> proto::fs::InodeProto {
-        let (file_data, dir_data, symlink_data) = match &inode.data {
-            types::fs::InodeData::File { extents, lease_epoch } => (
-                Some(proto::fs::InodeFileProto {
-                    extents: extents
-                        .iter()
-                        .map(|e| proto::fs::ExtentProto {
-                            file_offset: e.file_offset,
-                            block_id: Some(proto::common::BlockIdProto {
-                                data_handle_id: e.block_id.data_handle_id.as_raw(),
-                                block_index: e.block_id.index.as_raw(),
-                            }),
-                            block_offset: e.block_offset,
-                            len: e.len,
-                            file_version: e.file_version,
-                            block_stamp: e.block_stamp,
-                        })
-                        .collect(),
-                    lease_epoch: *lease_epoch,
-                    lease_id: None, // Optional, not stored in inode currently
-                }),
-                None,
-                None,
-            ),
-            types::fs::InodeData::Dir => (None, Some(proto::fs::InodeDirectoryProto {}), None),
-            types::fs::InodeData::Symlink { target } => (
-                None,
-                None,
-                target.as_ref().map(|t| proto::fs::InodeSymlinkProto {
-                    target: Some(t.clone()),
-                }),
-            ),
-        };
-
-        use proto::fs::inode_proto::Data;
-        let data = if let Some(file) = file_data {
-            Some(Data::File(file))
-        } else if let Some(dir) = dir_data {
-            Some(Data::Dir(dir))
-        } else if let Some(symlink) = symlink_data {
-            Some(Data::Symlink(symlink))
-        } else {
-            None
-        };
-
-        proto::fs::InodeProto {
-            inode_id: Some(proto::fs::InodeIdProto {
-                value: inode.inode_id.as_raw(),
-            }),
-            kind: match inode.kind {
-                InodeKind::File => proto::fs::InodeKindProto::InodeKindFile as i32,
-                InodeKind::Dir => proto::fs::InodeKindProto::InodeKindDir as i32,
-                InodeKind::Symlink => proto::fs::InodeKindProto::InodeKindSymlink as i32,
-            },
-            attrs: Some(Self::file_attrs_to_proto(&inode.attrs)),
-            data,
-            mount_id: Some(proto::common::MountIdProto {
-                value: inode.mount_id.as_raw(),
-            }),
-            xattrs: inode
-                .xattrs
-                .iter()
-                .map(|(k, v)| proto::fs::XattrProto {
-                    name: k.clone(),
-                    value: v.clone(),
-                })
-                .collect(),
-        }
-    }
 }
 
 #[tonic::async_trait]
@@ -211,31 +157,50 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
         let req = request.into_inner();
         let _caller_ctx = extract_and_inject_context(&req.header);
 
-        // Resolve path to inode
-        let resolved = self
-            .path_resolver
-            .resolve_path(&req.path)
-            .map_err(|e| Status::from_error(Box::new(e)))?;
+        // Resolve path to parent + name
+        let resolved = match self.path_resolver.resolve_path(&req.path) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, None);
+                return error_response!(LookupPathResponseProto, resp_header);
+            }
+        };
 
-        // If entry doesn't exist, return ENOENT
-        let inode_id = resolved.inode_id.ok_or_else(|| {
-            let err = MetadataError::NotFound(format!("Entry not found: {}", req.path));
-            Status::from_error(Box::new(err))
-        })?;
+        if resolved.inode_id.is_none() {
+            let resp_header = self.header_from_path_error(
+                &req.header,
+                MetadataError::NotFound(format!("Path not found: {}", req.path)),
+                Some(&resolved.mount_ctx),
+            );
+            return error_response!(LookupPathResponseProto, resp_header);
+        }
 
-        // Get inode and attrs
-        let inode = self
-            .storage
-            .get_inode(inode_id)?
-            .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {}", inode_id)))?;
+        let fs_req = LookupRequestProto {
+            header: req.header.clone(),
+            parent_inode_id: Some(proto::fs::InodeIdProto {
+                value: resolved.parent_inode_id.as_raw(),
+            }),
+            name: resolved.name,
+        };
 
-        let resp_header = ok_header_from_request(&req.header, None, None);
+        let fs_resp = FsServiceTrait::lookup(self.fs_service.as_ref(), Request::new(fs_req)).await?;
+        let LookupResponseProto { header, inode, attrs } = fs_resp.into_inner();
 
-        Ok(Response::new(LookupPathResponseProto {
-            header: Some(resp_header),
-            inode: Some(Self::inode_to_proto(&inode)),
-            attrs: Some(Self::file_attrs_to_proto(&inode.attrs)),
-        }))
+        let resp_header = self.header_or_ok(
+            &req.header,
+            header,
+            Some(resolved.mount_ctx.owner_group_id.as_raw()),
+            Some(resolved.mount_ctx.mount_epoch),
+        );
+
+        response_with_header!(
+            LookupPathResponseProto {
+                inode,
+                attrs,
+                ..Default::default()
+            },
+            resp_header
+        )
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -247,24 +212,39 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
         let _caller_ctx = extract_and_inject_context(&req.header);
 
         // Resolve path to inode
-        let resolved = self
-            .path_resolver
-            .resolve_inode(&req.path)
-            .map_err(|e| Status::from_error(Box::new(e)))?;
+        let resolved = match self.path_resolver.resolve_inode(&req.path) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, None);
+                return error_response!(GetAttrPathResponseProto, resp_header);
+            }
+        };
 
-        // Get inode and attrs
-        let inode = self
-            .storage
-            .get_inode(resolved.inode_id)?
-            .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {}", resolved.inode_id)))?;
+        let fs_req = GetAttrRequestProto {
+            header: req.header.clone(),
+            inode_id: Some(proto::fs::InodeIdProto {
+                value: resolved.inode_id.as_raw(),
+            }),
+        };
 
-        let resp_header = ok_header_from_request(&req.header, None, None);
+        let fs_resp = FsServiceTrait::get_attr(self.fs_service.as_ref(), Request::new(fs_req)).await?;
+        let GetAttrResponseProto { header, attrs } = fs_resp.into_inner();
 
-        Ok(Response::new(GetAttrPathResponseProto {
-            header: Some(resp_header),
-            attrs: Some(Self::file_attrs_to_proto(&inode.attrs)),
-            inode: Some(Self::inode_to_proto(&inode)),
-        }))
+        let resp_header = self.header_or_ok(
+            &req.header,
+            header,
+            Some(resolved.mount_ctx.owner_group_id.as_raw()),
+            Some(resolved.mount_ctx.mount_epoch),
+        );
+
+        response_with_header!(
+            GetAttrPathResponseProto {
+                attrs,
+                inode: None,
+                ..Default::default()
+            },
+            resp_header
+        )
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -276,35 +256,33 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
         let _caller_ctx = extract_and_inject_context(&req.header);
 
         // Resolve path
-        let resolved = self
-            .path_resolver
-            .resolve_path(&req.path)
-            .map_err(|e| Status::from_error(Box::new(e)))?;
+        let resolved = match self.path_resolver.resolve_path(&req.path) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, None);
+                return error_response!(MkdirPathResponseProto, resp_header);
+            }
+        };
 
         // Validate mount_epoch
-        if let Err(MetadataError::StaleState(msg)) = self.validate_mount_epoch(&req.header, &resolved.mount_ctx) {
+        if let Err(err) = self.validate_mount_epoch(&req.header, &resolved.mount_ctx) {
             warn!(
                 path = %req.path,
-                msg = %msg,
+                err = %err,
                 "MkdirPath rejected: mount epoch mismatch (NEED_REFRESH)"
             );
-            let resp_header = need_refresh_header(
-                &req.header,
-                RpcErrorCode::MountEpochMismatch,
-                RefreshReason::MountEpochMismatch,
-                msg,
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
-            );
-            return Ok(Response::new(MkdirPathResponseProto {
-                header: Some(resp_header),
-                inode: None,
-                attrs: None,
-            }));
+            let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
+            return error_response!(MkdirPathResponseProto, resp_header);
         }
 
         // Convert attrs
-        let attrs = Self::proto_to_file_attrs(req.attrs)?;
+        let attrs = match Self::proto_to_file_attrs(req.attrs) {
+            Ok(attrs) => attrs,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
+                return error_response!(MkdirPathResponseProto, resp_header);
+            }
+        };
 
         // Call FS service Mkdir
         let fs_req = MkdirRequestProto {
@@ -316,34 +294,24 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             attrs: Some(Self::file_attrs_to_proto(&attrs)),
         };
 
-        let fs_resp = FsServiceTrait::mkdir(self.fs_service.as_ref(), Request::new(fs_req))
-            .await
-            .map_err(|e| {
-                // Convert gRPC Status to MetadataError
-                MetadataError::Internal(format!("FS service error: {}", e))
-            })?;
+        let fs_resp = FsServiceTrait::mkdir(self.fs_service.as_ref(), Request::new(fs_req)).await?;
+        let MkdirResponseProto { header, inode, attrs } = fs_resp.into_inner();
 
-        let fs_resp_inner = fs_resp.into_inner();
-
-        // Build response with mount_epoch and state_id
-        let mut resp_header = ok_header_from_request(
+        let resp_header = self.header_or_ok(
             &req.header,
+            header,
             Some(resolved.mount_ctx.owner_group_id.as_raw()),
             Some(resolved.mount_ctx.mount_epoch),
         );
-        if let Some(state_id) = self.get_latest_state_id() {
-            resp_header.state_id = Some(proto::common::RaftLogIdProto {
-                term: state_id.term,
-                leader_node_id: state_id.leader_node_id,
-                index: state_id.index,
-            });
-        }
 
-        Ok(Response::new(MkdirPathResponseProto {
-            header: Some(resp_header),
-            inode: fs_resp_inner.inode,
-            attrs: fs_resp_inner.attrs,
-        }))
+        response_with_header!(
+            MkdirPathResponseProto {
+                inode,
+                attrs,
+                ..Default::default()
+            },
+            resp_header
+        )
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -355,37 +323,40 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
         let _caller_ctx = extract_and_inject_context(&req.header);
 
         // Resolve path
-        let resolved = self
-            .path_resolver
-            .resolve_path(&req.path)
-            .map_err(|e| Status::from_error(Box::new(e)))?;
+        let resolved = match self.path_resolver.resolve_path(&req.path) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, None);
+                return error_response!(CreatePathResponseProto, resp_header);
+            }
+        };
 
         // Validate mount_epoch
-        if let Err(MetadataError::StaleState(msg)) = self.validate_mount_epoch(&req.header, &resolved.mount_ctx) {
+        if let Err(err) = self.validate_mount_epoch(&req.header, &resolved.mount_ctx) {
             warn!(
                 path = %req.path,
-                msg = %msg,
+                err = %err,
                 "CreatePath rejected: mount epoch mismatch (NEED_REFRESH)"
             );
-            let resp_header = need_refresh_header(
-                &req.header,
-                RpcErrorCode::MountEpochMismatch,
-                RefreshReason::MountEpochMismatch,
-                msg,
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
-            );
-            return Ok(Response::new(CreatePathResponseProto {
-                header: Some(resp_header),
-                inode_id: None,
-                inode: None,
-                attrs: None,
-            }));
+            let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
+            return error_response!(CreatePathResponseProto, resp_header);
         }
 
         // Convert attrs and layout
-        let attrs = Self::proto_to_file_attrs(req.attrs)?;
-        let layout = Self::proto_to_file_layout(req.layout)?;
+        let attrs = match Self::proto_to_file_attrs(req.attrs) {
+            Ok(attrs) => attrs,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
+                return error_response!(CreatePathResponseProto, resp_header);
+            }
+        };
+        let layout = match Self::proto_to_file_layout(req.layout) {
+            Ok(layout) => layout,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
+                return error_response!(CreatePathResponseProto, resp_header);
+            }
+        };
 
         // Call FS service Create
         let fs_req = CreateRequestProto {
@@ -402,32 +373,31 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             }),
         };
 
-        let fs_resp = FsServiceTrait::create(self.fs_service.as_ref(), Request::new(fs_req))
-            .await
-            .map_err(|e| MetadataError::Internal(format!("FS service error: {}", e)))?;
+        let fs_resp = FsServiceTrait::create(self.fs_service.as_ref(), Request::new(fs_req)).await?;
+        let CreateResponseProto {
+            header,
+            inode,
+            attrs,
+            data_handle_id: _,
+        } = fs_resp.into_inner();
+        let inode_id = inode.as_ref().and_then(|i| i.inode_id.clone());
 
-        let fs_resp_inner = fs_resp.into_inner();
-
-        // Build response
-        let mut resp_header = ok_header_from_request(
+        let resp_header = self.header_or_ok(
             &req.header,
+            header,
             Some(resolved.mount_ctx.owner_group_id.as_raw()),
             Some(resolved.mount_ctx.mount_epoch),
         );
-        if let Some(state_id) = self.get_latest_state_id() {
-            resp_header.state_id = Some(proto::common::RaftLogIdProto {
-                term: state_id.term,
-                leader_node_id: state_id.leader_node_id,
-                index: state_id.index,
-            });
-        }
 
-        Ok(Response::new(CreatePathResponseProto {
-            header: Some(resp_header),
-            inode_id: fs_resp_inner.inode.as_ref().and_then(|i| i.inode_id.clone()),
-            inode: fs_resp_inner.inode,
-            attrs: fs_resp_inner.attrs,
-        }))
+        response_with_header!(
+            CreatePathResponseProto {
+                inode_id,
+                inode,
+                attrs,
+                ..Default::default()
+            },
+            resp_header
+        )
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -439,29 +409,23 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
         let _caller_ctx = extract_and_inject_context(&req.header);
 
         // Resolve path
-        let resolved = self
-            .path_resolver
-            .resolve_path(&req.path)
-            .map_err(|e| Status::from_error(Box::new(e)))?;
+        let resolved = match self.path_resolver.resolve_path(&req.path) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, None);
+                return error_response!(UnlinkPathResponseProto, resp_header);
+            }
+        };
 
         // Validate mount_epoch
-        if let Err(MetadataError::StaleState(msg)) = self.validate_mount_epoch(&req.header, &resolved.mount_ctx) {
+        if let Err(err) = self.validate_mount_epoch(&req.header, &resolved.mount_ctx) {
             warn!(
                 path = %req.path,
-                msg = %msg,
+                err = %err,
                 "UnlinkPath rejected: mount epoch mismatch (NEED_REFRESH)"
             );
-            let resp_header = need_refresh_header(
-                &req.header,
-                RpcErrorCode::MountEpochMismatch,
-                RefreshReason::MountEpochMismatch,
-                msg,
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
-            );
-            return Ok(Response::new(UnlinkPathResponseProto {
-                header: Some(resp_header),
-            }));
+            let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
+            return error_response!(UnlinkPathResponseProto, resp_header);
         }
 
         // Call FS service Unlink
@@ -473,27 +437,17 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             name: resolved.name,
         };
 
-        FsServiceTrait::unlink(self.fs_service.as_ref(), Request::new(fs_req))
-            .await
-            .map_err(|e| MetadataError::Internal(format!("FS service error: {}", e)))?;
+        let fs_resp = FsServiceTrait::unlink(self.fs_service.as_ref(), Request::new(fs_req)).await?;
+        let UnlinkResponseProto { header } = fs_resp.into_inner();
 
-        // Build response
-        let mut resp_header = ok_header_from_request(
+        let resp_header = self.header_or_ok(
             &req.header,
+            header,
             Some(resolved.mount_ctx.owner_group_id.as_raw()),
             Some(resolved.mount_ctx.mount_epoch),
         );
-        if let Some(state_id) = self.get_latest_state_id() {
-            resp_header.state_id = Some(proto::common::RaftLogIdProto {
-                term: state_id.term,
-                leader_node_id: state_id.leader_node_id,
-                index: state_id.index,
-            });
-        }
 
-        Ok(Response::new(UnlinkPathResponseProto {
-            header: Some(resp_header),
-        }))
+        response_with_header!(UnlinkPathResponseProto::default(), resp_header)
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -505,29 +459,23 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
         let _caller_ctx = extract_and_inject_context(&req.header);
 
         // Resolve path
-        let resolved = self
-            .path_resolver
-            .resolve_path(&req.path)
-            .map_err(|e| Status::from_error(Box::new(e)))?;
+        let resolved = match self.path_resolver.resolve_path(&req.path) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, None);
+                return error_response!(RmdirPathResponseProto, resp_header);
+            }
+        };
 
         // Validate mount_epoch
-        if let Err(MetadataError::StaleState(msg)) = self.validate_mount_epoch(&req.header, &resolved.mount_ctx) {
+        if let Err(err) = self.validate_mount_epoch(&req.header, &resolved.mount_ctx) {
             warn!(
                 path = %req.path,
-                msg = %msg,
+                err = %err,
                 "RmdirPath rejected: mount epoch mismatch (NEED_REFRESH)"
             );
-            let resp_header = need_refresh_header(
-                &req.header,
-                RpcErrorCode::MountEpochMismatch,
-                RefreshReason::MountEpochMismatch,
-                msg,
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
-            );
-            return Ok(Response::new(RmdirPathResponseProto {
-                header: Some(resp_header),
-            }));
+            let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
+            return error_response!(RmdirPathResponseProto, resp_header);
         }
 
         // Call FS service Rmdir
@@ -539,27 +487,17 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             name: resolved.name,
         };
 
-        FsServiceTrait::rmdir(self.fs_service.as_ref(), Request::new(fs_req))
-            .await
-            .map_err(|e| MetadataError::Internal(format!("FS service error: {}", e)))?;
+        let fs_resp = FsServiceTrait::rmdir(self.fs_service.as_ref(), Request::new(fs_req)).await?;
+        let RmdirResponseProto { header } = fs_resp.into_inner();
 
-        // Build response
-        let mut resp_header = ok_header_from_request(
+        let resp_header = self.header_or_ok(
             &req.header,
+            header,
             Some(resolved.mount_ctx.owner_group_id.as_raw()),
             Some(resolved.mount_ctx.mount_epoch),
         );
-        if let Some(state_id) = self.get_latest_state_id() {
-            resp_header.state_id = Some(proto::common::RaftLogIdProto {
-                term: state_id.term,
-                leader_node_id: state_id.leader_node_id,
-                index: state_id.index,
-            });
-        }
 
-        Ok(Response::new(RmdirPathResponseProto {
-            header: Some(resp_header),
-        }))
+        response_with_header!(RmdirPathResponseProto::default(), resp_header)
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -573,40 +511,22 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
         // Resolve both paths
         let (src_resolved, dst_resolved) = match self.path_resolver.resolve_rename(&req.src_path, &req.dst_path) {
             Ok(resolved) => resolved,
-            Err(e) => {
-                // Check if it's a cross-mount error
-                if let MetadataError::InvalidArgument(msg) = &e {
-                    if msg.contains("Cross-mount") {
-                        // Return EXDEV error
-                        let resp_header = fatal_fs_header(&req.header, FsErrorCode::EXDev, msg.clone(), None, None);
-                        return Ok(Response::new(RenamePathResponseProto {
-                            header: Some(resp_header),
-                        }));
-                    }
-                }
-                return Err(Status::from_error(Box::new(e)));
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, None);
+                return error_response!(RenamePathResponseProto, resp_header);
             }
         };
 
         // Validate mount_epoch (both should be same mount at this point)
-        if let Err(MetadataError::StaleState(msg)) = self.validate_mount_epoch(&req.header, &src_resolved.mount_ctx) {
+        if let Err(err) = self.validate_mount_epoch(&req.header, &src_resolved.mount_ctx) {
             warn!(
                 src_path = %req.src_path,
                 dst_path = %req.dst_path,
-                msg = %msg,
+                err = %err,
                 "RenamePath rejected: mount epoch mismatch (NEED_REFRESH)"
             );
-            let resp_header = need_refresh_header(
-                &req.header,
-                RpcErrorCode::MountEpochMismatch,
-                RefreshReason::MountEpochMismatch,
-                msg,
-                Some(src_resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(src_resolved.mount_ctx.mount_epoch),
-            );
-            return Ok(Response::new(RenamePathResponseProto {
-                header: Some(resp_header),
-            }));
+            let resp_header = self.header_from_path_error(&req.header, err, Some(&src_resolved.mount_ctx));
+            return error_response!(RenamePathResponseProto, resp_header);
         }
 
         // Call FS service Rename
@@ -623,27 +543,17 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             flags: req.flags,
         };
 
-        FsServiceTrait::rename(self.fs_service.as_ref(), Request::new(fs_req))
-            .await
-            .map_err(|e| MetadataError::Internal(format!("FS service error: {}", e)))?;
+        let fs_resp = FsServiceTrait::rename(self.fs_service.as_ref(), Request::new(fs_req)).await?;
+        let FsRenameResponseProto { header } = fs_resp.into_inner();
 
-        // Build response
-        let mut resp_header = ok_header_from_request(
+        let resp_header = self.header_or_ok(
             &req.header,
+            header,
             Some(src_resolved.mount_ctx.owner_group_id.as_raw()),
             Some(src_resolved.mount_ctx.mount_epoch),
         );
-        if let Some(state_id) = self.get_latest_state_id() {
-            resp_header.state_id = Some(proto::common::RaftLogIdProto {
-                term: state_id.term,
-                leader_node_id: state_id.leader_node_id,
-                index: state_id.index,
-            });
-        }
 
-        Ok(Response::new(RenamePathResponseProto {
-            header: Some(resp_header),
-        }))
+        response_with_header!(RenamePathResponseProto::default(), resp_header)
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -655,32 +565,13 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
         let _caller_ctx = extract_and_inject_context(&req.header);
 
         // Resolve path to inode
-        let resolved = self
-            .path_resolver
-            .resolve_inode(&req.path)
-            .map_err(|e| Status::from_error(Box::new(e)))?;
-
-        // Verify it's a directory
-        let inode = self
-            .storage
-            .get_inode(resolved.inode_id)?
-            .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {}", resolved.inode_id)))?;
-
-        if !inode.kind.is_dir() {
-            let resp_header = fatal_fs_header(
-                &req.header,
-                FsErrorCode::ENotDir,
-                format!("Not a directory: {}", req.path),
-                None,
-                None,
-            );
-            return Ok(Response::new(ListStatusPathResponseProto {
-                header: Some(resp_header),
-                entries: vec![],
-                next_cursor: vec![],
-                eof: true,
-            }));
-        }
+        let resolved = match self.path_resolver.resolve_inode(&req.path) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, None);
+                return error_response!(ListStatusPathResponseProto, resp_header);
+            }
+        };
 
         // For non-recursive listing, just call FS service ReadDir
         if !req.recursive {
@@ -703,36 +594,39 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
                 max_entries: req.limit,
             };
 
-            let fs_resp = FsServiceTrait::read_dir(self.fs_service.as_ref(), Request::new(fs_req))
-                .await
-                .map_err(|e| MetadataError::Internal(format!("FS service error: {}", e)))?;
+            let fs_resp = FsServiceTrait::read_dir(self.fs_service.as_ref(), Request::new(fs_req)).await?;
 
-            let fs_resp_inner = fs_resp.into_inner();
+            let ReadDirResponseProto {
+                header,
+                entries,
+                next_cursor_key,
+                eof,
+            } = fs_resp.into_inner();
 
-            let resp_header = ok_header_from_request(&req.header, None, None);
+            let resp_header = self.header_or_ok(
+                &req.header,
+                header,
+                Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                Some(resolved.mount_ctx.mount_epoch),
+            );
 
-            Ok(Response::new(ListStatusPathResponseProto {
-                header: Some(resp_header),
-                entries: fs_resp_inner.entries,
-                next_cursor: fs_resp_inner.next_cursor_key,
-                eof: fs_resp_inner.eof,
-            }))
+            response_with_header!(
+                ListStatusPathResponseProto {
+                    entries,
+                    next_cursor: next_cursor_key,
+                    eof,
+                    ..Default::default()
+                },
+                resp_header
+            )
         } else {
             // Recursive listing: TODO implement BFS/DFS with hard limits
-            // For now, return unimplemented
-            let resp_header = fatal_fs_header(
+            let resp_header = self.header_from_path_error(
                 &req.header,
-                FsErrorCode::ENotImpl,
-                "Recursive listing not yet implemented".to_string(),
-                None,
+                MetadataError::NotSupported("Recursive listing not yet implemented".to_string()),
                 None,
             );
-            Ok(Response::new(ListStatusPathResponseProto {
-                header: Some(resp_header),
-                entries: vec![],
-                next_cursor: vec![],
-                eof: true,
-            }))
+            error_response!(ListStatusPathResponseProto, resp_header)
         }
     }
 
@@ -745,10 +639,13 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
         let _caller_ctx = extract_and_inject_context(&req.header);
 
         // Resolve path to inode
-        let resolved = self
-            .path_resolver
-            .resolve_inode(&req.path)
-            .map_err(|e| Status::from_error(Box::new(e)))?;
+        let resolved = match self.path_resolver.resolve_inode(&req.path) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, None);
+                return error_response!(OpenPathResponseProto, resp_header);
+            }
+        };
 
         // Call FS service Open
         let fs_req = OpenRequestProto {
@@ -759,18 +656,24 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             flags: req.flags,
         };
 
-        let fs_resp = FsServiceTrait::open(self.fs_service.as_ref(), Request::new(fs_req))
-            .await
-            .map_err(|e| MetadataError::Internal(format!("FS service error: {}", e)))?;
+        let fs_resp = FsServiceTrait::open(self.fs_service.as_ref(), Request::new(fs_req)).await?;
 
-        let fs_resp_inner = fs_resp.into_inner();
+        let OpenResponseProto { header, file_handle } = fs_resp.into_inner();
 
-        let resp_header = ok_header_from_request(&req.header, None, None);
+        let resp_header = self.header_or_ok(
+            &req.header,
+            header,
+            Some(resolved.mount_ctx.owner_group_id.as_raw()),
+            Some(resolved.mount_ctx.mount_epoch),
+        );
 
-        Ok(Response::new(OpenPathResponseProto {
-            header: Some(resp_header),
-            file_handle: fs_resp_inner.file_handle,
-        }))
+        response_with_header!(
+            OpenPathResponseProto {
+                file_handle,
+                ..Default::default()
+            },
+            resp_header
+        )
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -787,15 +690,12 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             file_handle: req.file_handle,
         };
 
-        FsServiceTrait::release(self.fs_service.as_ref(), Request::new(fs_req))
-            .await
-            .map_err(|e| MetadataError::Internal(format!("FS service error: {}", e)))?;
+        let fs_resp = FsServiceTrait::release(self.fs_service.as_ref(), Request::new(fs_req)).await?;
+        let ReleaseResponseProto { header } = fs_resp.into_inner();
 
-        let resp_header = ok_header_from_request(&req.header, None, None);
+        let resp_header = self.header_or_ok(&req.header, header, None, None);
 
-        Ok(Response::new(ReleasePathResponseProto {
-            header: Some(resp_header),
-        }))
+        response_with_header!(ReleasePathResponseProto::default(), resp_header)
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -810,10 +710,13 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
         match req.target {
             Some(proto::metadata::fsync_path_request_proto::Target::Path(path)) => {
                 // Resolve path to inode
-                let resolved = self
-                    .path_resolver
-                    .resolve_inode(&path)
-                    .map_err(|e| Status::from_error(Box::new(e)))?;
+                let resolved = match self.path_resolver.resolve_inode(&path) {
+                    Ok(resolved) => resolved,
+                    Err(err) => {
+                        let resp_header = self.header_from_path_error(&req.header, err, None);
+                        return error_response!(FsyncPathResponseProto, resp_header);
+                    }
+                };
 
                 // Call FS service Fsync
                 let fs_req = FsyncRequestProto {
@@ -831,24 +734,34 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
                     target_size: None,
                 };
 
-                FsServiceTrait::fsync(self.fs_service.as_ref(), Request::new(fs_req))
-                    .await
-                    .map_err(|e| MetadataError::Internal(format!("FS service error: {}", e)))?;
+                let fs_resp = FsServiceTrait::fsync(self.fs_service.as_ref(), Request::new(fs_req)).await?;
+                let fs_resp_inner = fs_resp.into_inner();
+                let resp_header = self.header_or_ok(
+                    &req.header,
+                    fs_resp_inner.header,
+                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                    Some(resolved.mount_ctx.mount_epoch),
+                );
+                return response_with_header!(FsyncPathResponseProto::default(), resp_header);
             }
             Some(proto::metadata::fsync_path_request_proto::Target::FileHandle(_handle)) => {
                 // Handle-based fsync: TODO implement when FS service supports it
-                return Err(Status::unimplemented("Handle-based fsync not yet implemented"));
+                let resp_header = self.header_from_path_error(
+                    &req.header,
+                    MetadataError::NotSupported("Handle-based fsync not yet implemented".to_string()),
+                    None,
+                );
+                return error_response!(FsyncPathResponseProto, resp_header);
             }
             None => {
-                return Err(Status::invalid_argument("Either path or file_handle must be provided"));
+                let resp_header = self.header_from_path_error(
+                    &req.header,
+                    MetadataError::InvalidArgument("Either path or file_handle must be provided".to_string()),
+                    None,
+                );
+                return error_response!(FsyncPathResponseProto, resp_header);
             }
         }
-
-        let resp_header = ok_header_from_request(&req.header, None, None);
-
-        Ok(Response::new(FsyncPathResponseProto {
-            header: Some(resp_header),
-        }))
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -857,11 +770,25 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
         request: Request<HsyncPathRequestProto>,
     ) -> Result<Response<HsyncPathResponseProto>, Status> {
         let req = request.into_inner();
-        let inner = req.fsync.ok_or_else(|| Status::invalid_argument("missing fsync"))?;
+        let inner = match req.fsync {
+            Some(inner) => inner,
+            None => {
+                let resp_header = self.header_from_path_error(
+                    &None,
+                    MetadataError::InvalidArgument("missing fsync".to_string()),
+                    None,
+                );
+                return error_response!(HsyncPathResponseProto, resp_header);
+            }
+        };
+        let fallback_header = inner.header.clone();
         let resp = self.fsync_path(Request::new(inner)).await?;
-        Ok(Response::new(HsyncPathResponseProto {
-            header: resp.into_inner().header,
-        }))
+        response_with_header!(
+            HsyncPathResponseProto::default(),
+            resp.into_inner()
+                .header
+                .unwrap_or_else(|| ok_header_from_request(&fallback_header, None, None))
+        )
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -870,11 +797,25 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
         request: Request<HflushPathRequestProto>,
     ) -> Result<Response<HflushPathResponseProto>, Status> {
         let req = request.into_inner();
-        let inner = req.fsync.ok_or_else(|| Status::invalid_argument("missing fsync"))?;
+        let inner = match req.fsync {
+            Some(inner) => inner,
+            None => {
+                let resp_header = self.header_from_path_error(
+                    &None,
+                    MetadataError::InvalidArgument("missing fsync".to_string()),
+                    None,
+                );
+                return error_response!(HflushPathResponseProto, resp_header);
+            }
+        };
+        let fallback_header = inner.header.clone();
         let resp = self.fsync_path(Request::new(inner)).await?;
-        Ok(Response::new(HflushPathResponseProto {
-            header: resp.into_inner().header,
-        }))
+        response_with_header!(
+            HflushPathResponseProto::default(),
+            resp.into_inner()
+                .header
+                .unwrap_or_else(|| ok_header_from_request(&fallback_header, None, None))
+        )
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -886,10 +827,13 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
         let _caller_ctx = extract_and_inject_context(&req.header);
 
         // Resolve path to inode
-        let resolved = self
-            .path_resolver
-            .resolve_inode(&req.path)
-            .map_err(|e| Status::from_error(Box::new(e)))?;
+        let resolved = match self.path_resolver.resolve_inode(&req.path) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, None);
+                return error_response!(TruncatePathResponseProto, resp_header);
+            }
+        };
 
         // Call FS service Truncate
         let fs_req = TruncateRequestProto {
@@ -902,16 +846,23 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             lease_epoch: req.lease_epoch,
         };
 
-        let fs_resp = FsServiceTrait::truncate(self.fs_service.as_ref(), Request::new(fs_req))
-            .await
-            .map_err(|e| MetadataError::Internal(format!("FS service error: {}", e)))?;
+        let fs_resp = FsServiceTrait::truncate(self.fs_service.as_ref(), Request::new(fs_req)).await?;
+        let TruncateResponseProto { header, new_size } = fs_resp.into_inner();
 
-        let fs_resp_inner = fs_resp.into_inner();
+        let resp_header = self.header_or_ok(
+            &req.header,
+            header,
+            Some(resolved.mount_ctx.owner_group_id.as_raw()),
+            Some(resolved.mount_ctx.mount_epoch),
+        );
 
-        Ok(Response::new(TruncatePathResponseProto {
-            header: fs_resp_inner.header,
-            new_size: fs_resp_inner.new_size,
-        }))
+        response_with_header!(
+            TruncatePathResponseProto {
+                new_size,
+                ..Default::default()
+            },
+            resp_header
+        )
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -921,10 +872,13 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
     ) -> Result<Response<SetXattrPathResponseProto>, Status> {
         let req = request.into_inner();
         let _caller_ctx = extract_and_inject_context(&req.header);
-        let resolved = self
-            .path_resolver
-            .resolve_inode(&req.path)
-            .map_err(|e| Status::from_error(Box::new(e)))?;
+        let resolved = match self.path_resolver.resolve_inode(&req.path) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, None);
+                return error_response!(SetXattrPathResponseProto, resp_header);
+            }
+        };
         let fs_req = SetXattrRequestProto {
             header: req.header.clone(),
             inode_id: Some(proto::fs::InodeIdProto {
@@ -935,12 +889,15 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             create: req.create,
             replace: req.replace,
         };
-        let resp = FsServiceTrait::set_xattr(self.fs_service.as_ref(), Request::new(fs_req))
-            .await
-            .map_err(|e| MetadataError::Internal(format!("FS service error: {}", e)))?;
-        Ok(Response::new(SetXattrPathResponseProto {
-            header: resp.into_inner().header,
-        }))
+        let resp = FsServiceTrait::set_xattr(self.fs_service.as_ref(), Request::new(fs_req)).await?;
+        let resp_inner = resp.into_inner();
+        let resp_header = self.header_or_ok(
+            &req.header,
+            resp_inner.header,
+            Some(resolved.mount_ctx.owner_group_id.as_raw()),
+            Some(resolved.mount_ctx.mount_epoch),
+        );
+        response_with_header!(SetXattrPathResponseProto::default(), resp_header)
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -950,10 +907,13 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
     ) -> Result<Response<GetXattrPathResponseProto>, Status> {
         let req = request.into_inner();
         let _caller_ctx = extract_and_inject_context(&req.header);
-        let resolved = self
-            .path_resolver
-            .resolve_inode(&req.path)
-            .map_err(|e| Status::from_error(Box::new(e)))?;
+        let resolved = match self.path_resolver.resolve_inode(&req.path) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, None);
+                return error_response!(GetXattrPathResponseProto, resp_header);
+            }
+        };
         let fs_req = GetXattrRequestProto {
             header: req.header.clone(),
             inode_id: Some(proto::fs::InodeIdProto {
@@ -961,14 +921,21 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             }),
             name: req.name,
         };
-        let resp = FsServiceTrait::get_xattr(self.fs_service.as_ref(), Request::new(fs_req))
-            .await
-            .map_err(|e| MetadataError::Internal(format!("FS service error: {}", e)))?;
-        let inner = resp.into_inner();
-        Ok(Response::new(GetXattrPathResponseProto {
-            header: inner.header,
-            value: inner.value,
-        }))
+        let resp = FsServiceTrait::get_xattr(self.fs_service.as_ref(), Request::new(fs_req)).await?;
+        let GetXattrResponseProto { header, value } = resp.into_inner();
+        let resp_header = self.header_or_ok(
+            &req.header,
+            header,
+            Some(resolved.mount_ctx.owner_group_id.as_raw()),
+            Some(resolved.mount_ctx.mount_epoch),
+        );
+        response_with_header!(
+            GetXattrPathResponseProto {
+                value,
+                ..Default::default()
+            },
+            resp_header
+        )
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -978,24 +945,34 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
     ) -> Result<Response<ListXattrPathResponseProto>, Status> {
         let req = request.into_inner();
         let _caller_ctx = extract_and_inject_context(&req.header);
-        let resolved = self
-            .path_resolver
-            .resolve_inode(&req.path)
-            .map_err(|e| Status::from_error(Box::new(e)))?;
+        let resolved = match self.path_resolver.resolve_inode(&req.path) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, None);
+                return error_response!(ListXattrPathResponseProto, resp_header);
+            }
+        };
         let fs_req = ListXattrRequestProto {
             header: req.header.clone(),
             inode_id: Some(proto::fs::InodeIdProto {
                 value: resolved.inode_id.as_raw(),
             }),
         };
-        let resp = FsServiceTrait::list_xattr(self.fs_service.as_ref(), Request::new(fs_req))
-            .await
-            .map_err(|e| MetadataError::Internal(format!("FS service error: {}", e)))?;
-        let inner = resp.into_inner();
-        Ok(Response::new(ListXattrPathResponseProto {
-            header: inner.header,
-            names: inner.names,
-        }))
+        let resp = FsServiceTrait::list_xattr(self.fs_service.as_ref(), Request::new(fs_req)).await?;
+        let ListXattrResponseProto { header, names } = resp.into_inner();
+        let resp_header = self.header_or_ok(
+            &req.header,
+            header,
+            Some(resolved.mount_ctx.owner_group_id.as_raw()),
+            Some(resolved.mount_ctx.mount_epoch),
+        );
+        response_with_header!(
+            ListXattrPathResponseProto {
+                names,
+                ..Default::default()
+            },
+            resp_header
+        )
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -1005,10 +982,13 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
     ) -> Result<Response<RemoveXattrPathResponseProto>, Status> {
         let req = request.into_inner();
         let _caller_ctx = extract_and_inject_context(&req.header);
-        let resolved = self
-            .path_resolver
-            .resolve_inode(&req.path)
-            .map_err(|e| Status::from_error(Box::new(e)))?;
+        let resolved = match self.path_resolver.resolve_inode(&req.path) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, None);
+                return error_response!(RemoveXattrPathResponseProto, resp_header);
+            }
+        };
         let fs_req = RemoveXattrRequestProto {
             header: req.header.clone(),
             inode_id: Some(proto::fs::InodeIdProto {
@@ -1016,12 +996,15 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             }),
             name: req.name,
         };
-        let resp = FsServiceTrait::remove_xattr(self.fs_service.as_ref(), Request::new(fs_req))
-            .await
-            .map_err(|e| MetadataError::Internal(format!("FS service error: {}", e)))?;
-        Ok(Response::new(RemoveXattrPathResponseProto {
-            header: resp.into_inner().header,
-        }))
+        let resp = FsServiceTrait::remove_xattr(self.fs_service.as_ref(), Request::new(fs_req)).await?;
+        let resp_inner = resp.into_inner();
+        let resp_header = self.header_or_ok(
+            &req.header,
+            resp_inner.header,
+            Some(resolved.mount_ctx.owner_group_id.as_raw()),
+            Some(resolved.mount_ctx.mount_epoch),
+        );
+        response_with_header!(RemoveXattrPathResponseProto::default(), resp_header)
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -1031,10 +1014,13 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
     ) -> Result<Response<GetFileBlockLocationsPathResponseProto>, Status> {
         let req = request.into_inner();
         let _caller_ctx = extract_and_inject_context(&req.header);
-        let resolved = self
-            .path_resolver
-            .resolve_inode(&req.path)
-            .map_err(|e| Status::from_error(Box::new(e)))?;
+        let resolved = match self.path_resolver.resolve_inode(&req.path) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, None);
+                return error_response!(GetFileBlockLocationsPathResponseProto, resp_header);
+            }
+        };
         let fs_req = GetFileLayoutRequestProto {
             header: req.header.clone(),
             inode_id: Some(proto::fs::InodeIdProto {
@@ -1042,15 +1028,27 @@ impl MetadataPathServiceProto for MetadataPathServiceImpl {
             }),
             range: req.range,
         };
-        let resp = FsServiceTrait::get_file_layout(self.fs_service.as_ref(), Request::new(fs_req))
-            .await
-            .map_err(|e| MetadataError::Internal(format!("FS service error: {}", e)))?;
-        let inner = resp.into_inner();
-        Ok(Response::new(GetFileBlockLocationsPathResponseProto {
-            header: inner.header,
-            extents: inner.extents,
-            file_size: inner.file_size,
-            locations: inner.locations,
-        }))
+        let resp = FsServiceTrait::get_file_layout(self.fs_service.as_ref(), Request::new(fs_req)).await?;
+        let GetFileLayoutResponseProto {
+            header,
+            extents,
+            file_size,
+            locations,
+        } = resp.into_inner();
+        let resp_header = self.header_or_ok(
+            &req.header,
+            header,
+            Some(resolved.mount_ctx.owner_group_id.as_raw()),
+            Some(resolved.mount_ctx.mount_epoch),
+        );
+        response_with_header!(
+            GetFileBlockLocationsPathResponseProto {
+                extents,
+                file_size,
+                locations,
+                ..Default::default()
+            },
+            resp_header
+        )
     }
 }

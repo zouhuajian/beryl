@@ -7,10 +7,10 @@
 //! must route to mount.namespace_owner_group_id.
 
 use super::extract_and_inject_context;
-use super::guard::{AuthzContext, AuthzOp, GuardChain, GuardSpec};
+use super::guard::{AuthzContext, AuthzOp, GuardChain, GuardSpec, LeadershipChecker};
 use super::{fatal_fs_header, header_from_canonical_error, need_refresh_header, ok_header_from_request};
 use crate::data_io::DataIoOp;
-use crate::error::{MetadataError, MetadataResult};
+use crate::error::{to_canonical_fs, MetadataError, MetadataResult};
 use crate::mount::MountTable;
 use crate::raft::{AppDataResponse, AppRaftNode, Command, DedupKey, FsCommandResult, RocksDBStorage};
 use crate::readiness::RootReadinessGate;
@@ -34,10 +34,6 @@ use types::lease::FencingToken;
 use types::RaftLogId;
 
 type CommitHook = Arc<dyn Fn(CommitWriteRequestProto) -> proto::worker::CommitWriteResponseProto + Send + Sync>;
-
-fn to_canonical_fs(err: MetadataError) -> CanonicalError {
-    err.into()
-}
 
 /// Routed FS write context.
 /// Contains mount information needed for FS write operations.
@@ -79,7 +75,7 @@ fn canonical_from_error_detail(detail: proto::common::ErrorDetailProto) -> Canon
                 42 => RpcErrorCode::Fencing,
                 43 => RpcErrorCode::ShardMoved,
                 44 => RpcErrorCode::NodeUnavailable,
-                50 => RpcErrorCode::EpochMismatch,
+                50 => RpcErrorCode::MountEpochMismatch,
                 51 => RpcErrorCode::RouteEpochMismatch,
                 52 => RpcErrorCode::WorkerEpochMismatch,
                 53 => RpcErrorCode::BlockStampMismatch,
@@ -94,7 +90,7 @@ fn canonical_from_error_detail(detail: proto::common::ErrorDetailProto) -> Canon
         Some(match detail.refresh_reason {
             2 => RefreshReason::Moved,
             3 => RefreshReason::StaleState,
-            4 => RefreshReason::RouteEpochMismatch,
+            4 => RefreshReason::MountEpochMismatch,
             5 => RefreshReason::RouteEpochMismatch,
             6 => RefreshReason::WorkerEpochMismatch,
             7 => RefreshReason::BlockStampMismatch,
@@ -166,6 +162,15 @@ impl MetadataFsServiceImpl {
     pub fn with_raft_node(mut self, raft_node: Arc<AppRaftNode>) -> Self {
         self.guard_chain.set_leadership_checker(Arc::clone(&raft_node));
         self.raft_node = Some(raft_node);
+        self
+    }
+
+    /// Set a custom leadership checker (primarily for tests).
+    pub fn with_leadership_checker<T>(mut self, checker: Arc<T>) -> Self
+    where
+        T: LeadershipChecker + 'static,
+    {
+        self.guard_chain.set_leadership_checker(checker);
         self
     }
 
@@ -265,7 +270,7 @@ impl MetadataFsServiceImpl {
                 .get_inode(*other_parent)?
                 .ok_or_else(|| MetadataError::NotFound(format!("Parent inode not found: {}", other_parent)))?;
             if inode.mount_id != mount_id {
-                return Err(MetadataError::InvalidArgument(
+                return Err(MetadataError::CrossMountRename(
                     "cross-mount operation is not allowed".to_string(),
                 ));
             }
@@ -283,9 +288,10 @@ impl MetadataFsServiceImpl {
             if let Some(client_mount_epoch) = header.mount_epoch {
                 let current_mount_epoch = mount_entry.config_version;
                 if client_mount_epoch != current_mount_epoch {
-                    return Err(MetadataError::EpochMismatch {
+                    return Err(MetadataError::MountEpochMismatch {
                         expected: current_mount_epoch,
                         got: client_mount_epoch,
+                        mount_id: Some(mount_id),
                     });
                 }
             }
@@ -787,7 +793,7 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         // Route and validate mount_epoch
         let ctx = match self.route_fs_write_ctx(FsWriteOp::SetAttr, &[inode_id], &req.header) {
             Ok(ctx) => ctx,
-            Err(MetadataError::EpochMismatch { expected, got }) => {
+            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
                 // Mount epoch mismatch - return NEED_REFRESH
                 // Update metrics
                 if let Some(ref metrics) = self.metrics {
@@ -805,8 +811,8 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 let mount_epoch = mount_entry.map(|e| e.config_version).or(Some(expected));
                 let resp_header = need_refresh_header(
                     &req.header,
-                    RpcErrorCode::EpochMismatch,
-                    RefreshReason::RouteEpochMismatch,
+                    RpcErrorCode::MountEpochMismatch,
+                    RefreshReason::MountEpochMismatch,
                     format!("Mount epoch mismatch: client={}, server={}", got, expected),
                     None,
                     mount_epoch,
@@ -968,7 +974,7 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
 
         let ctx = match self.route_fs_write_ctx(FsWriteOp::Mkdir, &[parent_inode_id], &req.header) {
             Ok(ctx) => ctx,
-            Err(MetadataError::EpochMismatch { expected, got }) => {
+            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
                 // Mount epoch mismatch - return NEED_REFRESH
                 // Update metrics
                 if let Some(ref metrics) = self.metrics {
@@ -992,8 +998,8 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 };
                 let resp_header = need_refresh_header(
                     &req.header,
-                    RpcErrorCode::EpochMismatch,
-                    RefreshReason::RouteEpochMismatch,
+                    RpcErrorCode::MountEpochMismatch,
+                    RefreshReason::MountEpochMismatch,
                     format!("Mount epoch mismatch: client={}, server={} ", got, expected),
                     None,
                     mount_epoch,
@@ -1179,7 +1185,7 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
 
         let ctx = match self.route_fs_write_ctx(FsWriteOp::Create, &[parent_inode_id], &req.header) {
             Ok(ctx) => ctx,
-            Err(MetadataError::EpochMismatch { expected, got }) => {
+            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
                 if let Some(ref metrics) = self.metrics {
                     metrics
                         .fs_write_mount_epoch_mismatch_total
@@ -1194,8 +1200,8 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 let mount_epoch = Some(expected);
                 let resp_header = need_refresh_header(
                     &req.header,
-                    RpcErrorCode::EpochMismatch,
-                    RefreshReason::RouteEpochMismatch,
+                    RpcErrorCode::MountEpochMismatch,
+                    RefreshReason::MountEpochMismatch,
                     format!("Mount epoch mismatch: client={}, server={} ", got, expected),
                     None,
                     mount_epoch,
@@ -1511,7 +1517,7 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
 
         let ctx = match self.route_fs_write_ctx(FsWriteOp::Unlink, &[parent_inode_id], &req.header) {
             Ok(ctx) => ctx,
-            Err(MetadataError::EpochMismatch { expected, got }) => {
+            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
                 if let Some(ref metrics) = self.metrics {
                     metrics
                         .fs_write_mount_epoch_mismatch_total
@@ -1525,8 +1531,8 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 );
                 let resp_header = need_refresh_header(
                     &req.header,
-                    RpcErrorCode::EpochMismatch,
-                    RefreshReason::RouteEpochMismatch,
+                    RpcErrorCode::MountEpochMismatch,
+                    RefreshReason::MountEpochMismatch,
                     format!("Mount epoch mismatch: client={}, server={} ", got, expected),
                     None,
                     Some(expected),
@@ -1651,7 +1657,7 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
 
         let ctx = match self.route_fs_write_ctx(FsWriteOp::Rmdir, &[parent_inode_id], &req.header) {
             Ok(ctx) => ctx,
-            Err(MetadataError::EpochMismatch { expected, got }) => {
+            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
                 if let Some(ref metrics) = self.metrics {
                     metrics
                         .fs_write_mount_epoch_mismatch_total
@@ -1665,8 +1671,8 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 );
                 let resp_header = need_refresh_header(
                     &req.header,
-                    RpcErrorCode::EpochMismatch,
-                    RefreshReason::RouteEpochMismatch,
+                    RpcErrorCode::MountEpochMismatch,
+                    RefreshReason::MountEpochMismatch,
                     format!("Mount epoch mismatch: client={}, server={} ", got, expected),
                     None,
                     Some(expected),
@@ -1775,10 +1781,9 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         // Reject unsupported flags (only RENAME_NOREPLACE supported).
         let supported_mask: u32 = 0x1;
         if req.flags & !supported_mask != 0 {
-            let resp_header = fatal_fs_header(
+            let resp_header = Self::header_from_error(
                 &req.header,
-                FsErrorCode::ENotsup,
-                format!("Unsupported rename flags: {}", req.flags),
+                MetadataError::NotSupported(format!("Unsupported rename flags: {}", req.flags)),
                 None,
                 None,
             );
@@ -1905,13 +1910,12 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                     }));
                 }
             };
-            let resp_header = fatal_fs_header(
+            let resp_header = Self::header_from_error(
                 &req.header,
-                FsErrorCode::EXDev,
-                format!(
+                MetadataError::CrossMountRename(format!(
                     "Cross-mount rename not allowed: src_mount={:?}, dst_mount={:?}",
                     src_parent_inode.mount_id, dst_parent_inode.mount_id
-                ),
+                )),
                 None,
                 Some(mount_entry.config_version),
             );
@@ -1927,7 +1931,7 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             &req.header,
         ) {
             Ok(ctx) => ctx,
-            Err(MetadataError::EpochMismatch { expected, got }) => {
+            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
                 // Mount epoch mismatch - return NEED_REFRESH
                 // Update metrics
                 if let Some(ref metrics) = self.metrics {
@@ -1946,8 +1950,8 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 let mount_epoch = mount_entry.map(|e| e.config_version).or(Some(expected));
                 let resp_header = need_refresh_header(
                     &req.header,
-                    RpcErrorCode::EpochMismatch,
-                    RefreshReason::RouteEpochMismatch,
+                    RpcErrorCode::MountEpochMismatch,
+                    RefreshReason::MountEpochMismatch,
                     format!("Mount epoch mismatch: client={}, server={} ", got, expected),
                     None,
                     mount_epoch,
@@ -2016,10 +2020,12 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                     if can_precheck {
                         match storage.get_dentry(dst_parent_inode_id, &req.dst_name) {
                             Ok(Some(_)) => {
-                                let resp_header = fatal_fs_header(
+                                let resp_header = Self::header_from_error(
                                     &req.header,
-                                    FsErrorCode::EExist,
-                                    format!("Destination exists and RENAME_NOREPLACE set: {}", req.dst_name),
+                                    MetadataError::AlreadyExists(format!(
+                                        "Destination exists and RENAME_NOREPLACE set: {}",
+                                        req.dst_name
+                                    )),
                                     Some(ctx.namespace_owner_group_id.as_raw()),
                                     Some(ctx.mount_epoch),
                                 );
@@ -2082,21 +2088,12 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         };
 
         if let Err(err) = self.propose_fs_write_command(FsWriteOp::Rename, command).await {
-            let resp_header = match err {
-                MetadataError::AlreadyExists(msg) => fatal_fs_header(
-                    &req.header,
-                    FsErrorCode::EExist,
-                    msg,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                ),
-                err => Self::header_from_error(
-                    &req.header,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                ),
-            };
+            let resp_header = Self::header_from_error(
+                &req.header,
+                err,
+                Some(ctx.namespace_owner_group_id.as_raw()),
+                Some(ctx.mount_epoch),
+            );
             return Ok(Response::new(FsRenameResponseProto {
                 header: Some(resp_header),
             }));
@@ -2210,10 +2207,9 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         };
 
         if !inode.kind.is_file() {
-            let resp_header = fatal_fs_header(
+            let resp_header = Self::header_from_error(
                 &req.header,
-                FsErrorCode::EIsDir,
-                format!("Inode is not a file: {}", inode_id),
+                MetadataError::IsDir(format!("Inode is not a file: {}", inode_id)),
                 None,
                 None,
             );
@@ -2454,11 +2450,11 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
 
         let ctx = match self.route_fs_write_ctx(FsWriteOp::SetAttr, &[inode_id], &req.header) {
             Ok(ctx) => ctx,
-            Err(MetadataError::EpochMismatch { expected, got }) => {
+            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
                 let resp_header = need_refresh_header(
                     &req.header,
-                    RpcErrorCode::EpochMismatch,
-                    RefreshReason::RouteEpochMismatch,
+                    RpcErrorCode::MountEpochMismatch,
+                    RefreshReason::MountEpochMismatch,
                     format!("Mount epoch mismatch: client={}, server={} ", got, expected),
                     None,
                     Some(expected),
@@ -2659,10 +2655,9 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         };
 
         if !inode.kind.is_file() {
-            let resp_header = fatal_fs_header(
+            let resp_header = Self::header_from_error(
                 &req.header,
-                FsErrorCode::EIsDir,
-                format!("Inode is not a file: {}", inode_id),
+                MetadataError::IsDir(format!("Inode is not a file: {}", inode_id)),
                 None,
                 None,
             );
@@ -3017,13 +3012,12 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
 
         // Validate open_epoch
         if req.open_epoch != session.open_epoch {
-            let resp_header = fatal_fs_header(
+            let resp_header = Self::header_from_error(
                 &req.header,
-                FsErrorCode::EPerm,
-                format!(
+                MetadataError::PermissionDenied(format!(
                     "Open epoch mismatch: expected {}, got {}",
                     session.open_epoch, req.open_epoch
-                ),
+                )),
                 None,
                 None,
             );
@@ -3141,11 +3135,11 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         // Route FS write operation
         let ctx = match self.route_fs_write_ctx(FsWriteOp::SetAttr, &[session.inode_id], &req.header) {
             Ok(ctx) => ctx,
-            Err(MetadataError::EpochMismatch { expected, got }) => {
+            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
                 let resp_header = need_refresh_header(
                     &req.header,
-                    RpcErrorCode::EpochMismatch,
-                    RefreshReason::RouteEpochMismatch,
+                    RpcErrorCode::MountEpochMismatch,
+                    RefreshReason::MountEpochMismatch,
                     format!("Mount epoch mismatch: client={}, server={} ", got, expected),
                     None,
                     Some(expected),
@@ -3292,10 +3286,9 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         };
 
         if !inode.kind.is_file() {
-            let resp_header = fatal_fs_header(
+            let resp_header = Self::header_from_error(
                 &req.header,
-                FsErrorCode::EIsDir,
-                format!("Inode is not a file: {}", inode_id),
+                MetadataError::IsDir(format!("Inode is not a file: {}", inode_id)),
                 None,
                 None,
             );
@@ -3551,10 +3544,9 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         };
 
         if !inode.kind.is_file() {
-            let resp_header = fatal_fs_header(
+            let resp_header = Self::header_from_error(
                 &req.header,
-                FsErrorCode::EIsDir,
-                format!("Inode is not a file: {}", inode_id),
+                MetadataError::IsDir(format!("Inode is not a file: {}", inode_id)),
                 None,
                 None,
             );
@@ -3624,13 +3616,12 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         let current_size = inode.attrs.size;
         if req.new_size > current_size {
             // Truncate grow not supported
-            let resp_header = fatal_fs_header(
+            let resp_header = Self::header_from_error(
                 &req.header,
-                FsErrorCode::ENotsup,
-                format!(
+                MetadataError::NotSupported(format!(
                     "Truncate grow not supported: current_size={}, new_size={}",
                     current_size, req.new_size
-                ),
+                )),
                 None,
                 None,
             );
@@ -3652,11 +3643,11 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         // Route FS write operation
         let ctx = match self.route_fs_write_ctx(FsWriteOp::SetAttr, &[inode_id], &req.header) {
             Ok(ctx) => ctx,
-            Err(MetadataError::EpochMismatch { expected, got }) => {
+            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
                 let resp_header = need_refresh_header(
                     &req.header,
-                    RpcErrorCode::EpochMismatch,
-                    RefreshReason::RouteEpochMismatch,
+                    RpcErrorCode::MountEpochMismatch,
+                    RefreshReason::MountEpochMismatch,
                     format!("Mount epoch mismatch: client={}, server={} ", got, expected),
                     None,
                     Some(expected),
@@ -3727,10 +3718,9 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
 
     async fn stat_fs(&self, request: Request<StatFsRequestProto>) -> Result<Response<StatFsResponseProto>, Status> {
         let req = request.into_inner();
-        let resp_header = fatal_fs_header(
+        let resp_header = Self::header_from_error(
             &req.header,
-            FsErrorCode::ENotImpl,
-            "StatFs not yet implemented".to_string(),
+            MetadataError::NotSupported("StatFs not yet implemented".to_string()),
             None,
             None,
         );
@@ -3742,10 +3732,9 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
 
     async fn access(&self, request: Request<AccessRequestProto>) -> Result<Response<AccessResponseProto>, Status> {
         let req = request.into_inner();
-        let resp_header = fatal_fs_header(
+        let resp_header = Self::header_from_error(
             &req.header,
-            FsErrorCode::ENotImpl,
-            "Access not yet implemented".to_string(),
+            MetadataError::NotSupported("Access not yet implemented".to_string()),
             None,
             None,
         );
@@ -3757,10 +3746,9 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
 
     async fn symlink(&self, request: Request<SymlinkRequestProto>) -> Result<Response<SymlinkResponseProto>, Status> {
         let req = request.into_inner();
-        let resp_header = fatal_fs_header(
+        let resp_header = Self::header_from_error(
             &req.header,
-            FsErrorCode::ENotImpl,
-            "Symlink not yet implemented".to_string(),
+            MetadataError::NotSupported("Symlink not yet implemented".to_string()),
             None,
             None,
         );
@@ -3775,10 +3763,9 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         request: Request<ReadlinkRequestProto>,
     ) -> Result<Response<ReadlinkResponseProto>, Status> {
         let req = request.into_inner();
-        let resp_header = fatal_fs_header(
+        let resp_header = Self::header_from_error(
             &req.header,
-            FsErrorCode::ENotImpl,
-            "Readlink not yet implemented".to_string(),
+            MetadataError::NotSupported("Readlink not yet implemented".to_string()),
             None,
             None,
         );
@@ -3790,10 +3777,9 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
 
     async fn link(&self, request: Request<LinkRequestProto>) -> Result<Response<LinkResponseProto>, Status> {
         let req = request.into_inner();
-        let resp_header = fatal_fs_header(
+        let resp_header = Self::header_from_error(
             &req.header,
-            FsErrorCode::ENotImpl,
-            "Link not yet implemented".to_string(),
+            MetadataError::NotSupported("Link not yet implemented".to_string()),
             None,
             None,
         );
@@ -3827,11 +3813,11 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         // Route
         let ctx = match self.route_fs_write_ctx(FsWriteOp::SetAttr, &[inode_id], &req.header) {
             Ok(ctx) => ctx,
-            Err(MetadataError::EpochMismatch { expected, got }) => {
+            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
                 let resp_header = need_refresh_header(
                     &req.header,
-                    RpcErrorCode::EpochMismatch,
-                    RefreshReason::RouteEpochMismatch,
+                    RpcErrorCode::MountEpochMismatch,
+                    RefreshReason::MountEpochMismatch,
                     format!("Mount epoch mismatch: client={}, server={} ", got, expected),
                     None,
                     Some(expected),
@@ -4093,11 +4079,11 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         };
         let ctx = match self.route_fs_write_ctx(FsWriteOp::SetAttr, &[inode_id], &req.header) {
             Ok(ctx) => ctx,
-            Err(MetadataError::EpochMismatch { expected, got }) => {
+            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
                 let resp_header = need_refresh_header(
                     &req.header,
-                    RpcErrorCode::EpochMismatch,
-                    RefreshReason::RouteEpochMismatch,
+                    RpcErrorCode::MountEpochMismatch,
+                    RefreshReason::MountEpochMismatch,
                     format!("Mount epoch mismatch: client={}, server={} ", got, expected),
                     None,
                     Some(expected),

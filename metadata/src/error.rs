@@ -9,10 +9,11 @@
 use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshReason};
 use common::header::RpcErrorCode;
 use thiserror::Error;
-use tonic::{Code, Status};
+use types::fs::FsErrorCode;
+use types::ids::MountId;
 
 /// Metadata service error.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum MetadataError {
     /// Resource not found.
     #[error("not found: {0}")]
@@ -26,6 +27,38 @@ pub enum MetadataError {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    /// Not a directory.
+    #[error("not a directory: {0}")]
+    NotDir(String),
+
+    /// Is a directory.
+    #[error("is a directory: {0}")]
+    IsDir(String),
+
+    /// Directory not empty.
+    #[error("directory not empty: {0}")]
+    DirectoryNotEmpty(String),
+
+    /// Cross-mount rename.
+    #[error("cross-mount rename not allowed: {0}")]
+    CrossMountRename(String),
+
+    /// Permission denied.
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+
+    /// Operation not supported.
+    #[error("operation not supported: {0}")]
+    NotSupported(String),
+
+    /// Resource busy.
+    #[error("resource busy: {0}")]
+    Busy(String),
+
+    /// Resource temporarily unavailable.
+    #[error("resource temporarily unavailable: {0}")]
+    Again(String),
+
     /// Lease fenced: expected epoch >= {expected}, got {got}.
     #[error("lease fenced: expected epoch >= {expected}, got {got}")]
     LeaseFenced { expected: u64, got: u64 },
@@ -37,6 +70,14 @@ pub enum MetadataError {
     /// Epoch mismatch (retryable).
     #[error("epoch mismatch: expected {expected}, got {got}")]
     EpochMismatch { expected: u64, got: u64 },
+
+    /// Mount epoch mismatch (retryable).
+    #[error("mount epoch mismatch: expected {expected}, got {got} (mount_id={mount_id:?})")]
+    MountEpochMismatch {
+        expected: u64,
+        got: u64,
+        mount_id: Option<MountId>,
+    },
 
     /// Routing stale (retryable).
     #[error("routing stale: {0}")]
@@ -60,30 +101,12 @@ impl MetadataError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::LeaderChanged(_) | Self::EpochMismatch { .. } | Self::RoutingStale(_) | Self::StaleState(_)
+            Self::LeaderChanged(_)
+                | Self::EpochMismatch { .. }
+                | Self::MountEpochMismatch { .. }
+                | Self::RoutingStale(_)
+                | Self::StaleState(_)
         )
-    }
-
-    /// Convert to tonic Status.
-    pub fn to_status(&self) -> Status {
-        match self {
-            Self::NotFound(_) => Status::new(Code::NotFound, self.to_string()),
-            Self::AlreadyExists(_) => Status::new(Code::AlreadyExists, self.to_string()),
-            Self::InvalidArgument(_) => Status::new(Code::InvalidArgument, self.to_string()),
-            Self::LeaseFenced { .. } => Status::new(Code::FailedPrecondition, self.to_string()),
-            Self::LeaderChanged(_) => Status::new(Code::Unavailable, self.to_string()),
-            Self::EpochMismatch { .. } => Status::new(Code::Aborted, self.to_string()),
-            Self::RoutingStale(_) => Status::new(Code::Unavailable, self.to_string()),
-            Self::StaleState(_) => Status::new(Code::FailedPrecondition, self.to_string()),
-            Self::Internal(_) => Status::new(Code::Internal, self.to_string()),
-            Self::ServiceUnavailable(_) => Status::new(Code::Unavailable, self.to_string()),
-        }
-    }
-}
-
-impl From<MetadataError> for Status {
-    fn from(err: MetadataError) -> Self {
-        err.to_status()
     }
 }
 
@@ -98,19 +121,29 @@ impl From<MetadataError> for CanonicalError {
                 RefreshReason::EpochMismatch,
                 format!("epoch mismatch: expected {}, got {}", expected, got),
             ),
+            MetadataError::MountEpochMismatch {
+                expected,
+                got,
+                mount_id,
+            } => CanonicalError::need_refresh(
+                RpcErrorCode::MountEpochMismatch,
+                RefreshReason::MountEpochMismatch,
+                format!(
+                    "mount epoch mismatch: expected {}, got {} (mount_id={:?})",
+                    expected, got, mount_id
+                ),
+            ),
             MetadataError::RoutingStale(msg) => {
                 CanonicalError::need_refresh(RpcErrorCode::ShardMoved, RefreshReason::RouteEpochMismatch, msg)
             }
             MetadataError::StaleState(msg) => {
                 CanonicalError::need_refresh(RpcErrorCode::StaleState, RefreshReason::StaleState, msg)
             }
-            MetadataError::LeaseFenced { expected, got } => CanonicalError {
-                class: ErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing)),
-                reason: Some(RefreshReason::Fencing),
-                retry_after_ms: None,
-                message: format!("lease fenced: expected >= {}, got {}", expected, got),
-            },
+            MetadataError::LeaseFenced { expected, got } => CanonicalError::need_refresh(
+                RpcErrorCode::Fencing,
+                RefreshReason::Fencing,
+                format!("lease fenced: expected >= {}, got {}", expected, got),
+            ),
             MetadataError::NotFound(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
                 code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
@@ -132,6 +165,62 @@ impl From<MetadataError> for CanonicalError {
                 retry_after_ms: None,
                 message: format!("invalid argument: {}", msg),
             },
+            MetadataError::NotDir(msg) => CanonicalError {
+                class: ErrorClass::Fatal,
+                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
+                reason: None,
+                retry_after_ms: None,
+                message: format!("not a directory: {}", msg),
+            },
+            MetadataError::IsDir(msg) => CanonicalError {
+                class: ErrorClass::Fatal,
+                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
+                reason: None,
+                retry_after_ms: None,
+                message: format!("is a directory: {}", msg),
+            },
+            MetadataError::DirectoryNotEmpty(msg) => CanonicalError {
+                class: ErrorClass::Fatal,
+                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
+                reason: None,
+                retry_after_ms: None,
+                message: format!("directory not empty: {}", msg),
+            },
+            MetadataError::CrossMountRename(msg) => CanonicalError {
+                class: ErrorClass::Fatal,
+                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
+                reason: None,
+                retry_after_ms: None,
+                message: format!("cross-mount rename not allowed: {}", msg),
+            },
+            MetadataError::PermissionDenied(msg) => CanonicalError {
+                class: ErrorClass::Fatal,
+                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
+                reason: None,
+                retry_after_ms: None,
+                message: format!("permission denied: {}", msg),
+            },
+            MetadataError::NotSupported(msg) => CanonicalError {
+                class: ErrorClass::Fatal,
+                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
+                reason: None,
+                retry_after_ms: None,
+                message: format!("operation not supported: {}", msg),
+            },
+            MetadataError::Busy(msg) => CanonicalError {
+                class: ErrorClass::Fatal,
+                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
+                reason: None,
+                retry_after_ms: None,
+                message: format!("resource busy: {}", msg),
+            },
+            MetadataError::Again(msg) => CanonicalError {
+                class: ErrorClass::Fatal,
+                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
+                reason: None,
+                retry_after_ms: None,
+                message: format!("resource temporarily unavailable: {}", msg),
+            },
             MetadataError::Internal(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
                 code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
@@ -151,31 +240,110 @@ impl From<MetadataError> for CanonicalError {
 /// Result type for metadata operations.
 pub type MetadataResult<T> = Result<T, MetadataError>;
 
+/// Authoritative FS canonicalization entrypoint.
+///
+/// This is the single place that maps `MetadataError` into FS errno-backed
+/// canonical errors for filesystem-facing handlers.
+pub fn to_canonical_fs(err: MetadataError) -> CanonicalError {
+    match err {
+        MetadataError::LeaderChanged(msg) => {
+            CanonicalError::need_refresh(RpcErrorCode::NotLeader, RefreshReason::NotLeader, msg)
+        }
+        MetadataError::EpochMismatch { expected, got } => CanonicalError::need_refresh(
+            RpcErrorCode::EpochMismatch,
+            RefreshReason::EpochMismatch,
+            format!("epoch mismatch: expected {}, got {}", expected, got),
+        ),
+        MetadataError::MountEpochMismatch {
+            expected,
+            got,
+            mount_id,
+        } => CanonicalError::need_refresh(
+            RpcErrorCode::MountEpochMismatch,
+            RefreshReason::MountEpochMismatch,
+            format!(
+                "mount epoch mismatch: expected {}, got {} (mount_id={:?})",
+                expected, got, mount_id
+            ),
+        ),
+        MetadataError::RoutingStale(msg) => {
+            CanonicalError::need_refresh(RpcErrorCode::ShardMoved, RefreshReason::RouteEpochMismatch, msg)
+        }
+        MetadataError::StaleState(msg) => {
+            CanonicalError::need_refresh(RpcErrorCode::StaleState, RefreshReason::StaleState, msg)
+        }
+        MetadataError::LeaseFenced { expected, got } => CanonicalError::need_refresh(
+            RpcErrorCode::Fencing,
+            RefreshReason::Fencing,
+            format!("lease fenced: expected >= {}, got {}", expected, got),
+        ),
+        MetadataError::ServiceUnavailable(msg) => CanonicalError::retryable(
+            RpcErrorCode::NodeUnavailable,
+            Some(1000),
+            format!("service unavailable: {}", msg),
+        ),
+        MetadataError::NotFound(msg) => CanonicalError::fatal_fs(FsErrorCode::ENoEnt, msg),
+        MetadataError::AlreadyExists(msg) => CanonicalError::fatal_fs(FsErrorCode::EExist, msg),
+        MetadataError::InvalidArgument(msg) => CanonicalError::fatal_fs(FsErrorCode::EInval, msg),
+        MetadataError::NotDir(msg) => CanonicalError::fatal_fs(FsErrorCode::ENotDir, msg),
+        MetadataError::IsDir(msg) => CanonicalError::fatal_fs(FsErrorCode::EIsDir, msg),
+        MetadataError::DirectoryNotEmpty(msg) => CanonicalError::fatal_fs(FsErrorCode::ENotEmpty, msg),
+        MetadataError::CrossMountRename(msg) => CanonicalError::fatal_fs(FsErrorCode::EXDev, msg),
+        MetadataError::PermissionDenied(msg) => CanonicalError::fatal_fs(FsErrorCode::EAcces, msg),
+        MetadataError::NotSupported(msg) => CanonicalError::fatal_fs(FsErrorCode::ENotsup, msg),
+        MetadataError::Busy(msg) => CanonicalError::fatal_fs(FsErrorCode::EBusy, msg),
+        MetadataError::Again(msg) => CanonicalError::fatal_fs(FsErrorCode::EAgain, msg),
+        MetadataError::Internal(msg) => CanonicalError::fatal_fs(FsErrorCode::EInval, msg),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::error::canonical::ErrorCode as CanonicalCode;
+    use types::fs::FsErrorCode;
 
     #[test]
     fn test_error_retryable() {
         assert!(MetadataError::LeaderChanged("test".to_string()).is_retryable());
         assert!(MetadataError::EpochMismatch { expected: 1, got: 0 }.is_retryable());
+        assert!(MetadataError::MountEpochMismatch {
+            expected: 2,
+            got: 1,
+            mount_id: None
+        }
+        .is_retryable());
         assert!(MetadataError::RoutingStale("test".to_string()).is_retryable());
         assert!(!MetadataError::NotFound("test".to_string()).is_retryable());
         assert!(!MetadataError::LeaseFenced { expected: 1, got: 0 }.is_retryable());
     }
 
     #[test]
-    fn test_error_to_status() {
-        let err = MetadataError::NotFound("file".to_string());
-        let status = err.to_status();
-        assert_eq!(status.code(), Code::NotFound);
+    fn test_to_canonical_fs_errno_coverage() {
+        let cases = vec![
+            (MetadataError::NotFound("x".to_string()), FsErrorCode::ENoEnt),
+            (MetadataError::AlreadyExists("x".to_string()), FsErrorCode::EExist),
+            (MetadataError::InvalidArgument("x".to_string()), FsErrorCode::EInval),
+            (MetadataError::NotDir("x".to_string()), FsErrorCode::ENotDir),
+            (MetadataError::IsDir("x".to_string()), FsErrorCode::EIsDir),
+            (
+                MetadataError::DirectoryNotEmpty("x".to_string()),
+                FsErrorCode::ENotEmpty,
+            ),
+            (MetadataError::CrossMountRename("x".to_string()), FsErrorCode::EXDev),
+            (MetadataError::PermissionDenied("x".to_string()), FsErrorCode::EAcces),
+            (MetadataError::NotSupported("x".to_string()), FsErrorCode::ENotsup),
+            (MetadataError::Busy("x".to_string()), FsErrorCode::EBusy),
+            (MetadataError::Again("x".to_string()), FsErrorCode::EAgain),
+        ];
 
-        let err = MetadataError::LeaseFenced { expected: 2, got: 1 };
-        let status = err.to_status();
-        assert_eq!(status.code(), Code::FailedPrecondition);
-
-        let err = MetadataError::LeaderChanged("test".to_string());
-        let status = err.to_status();
-        assert_eq!(status.code(), Code::Unavailable);
+        for (input, expected_errno) in cases {
+            let canonical = to_canonical_fs(input);
+            assert_eq!(canonical.class, ErrorClass::Fatal);
+            assert!(matches!(
+                canonical.code,
+                Some(CanonicalCode::FsErrno(errno)) if errno == expected_errno
+            ));
+        }
     }
 }

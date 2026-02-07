@@ -7,8 +7,11 @@ use ::common::error::canonical::{CanonicalError, ErrorCode as CanonicalErrorCode
 use ::common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
 use bytes::Bytes;
 use client::api::hcfs::Client;
-use client::canonical::{handle_canonical_error, retry_metadata_once, ClientAction, RetryOutcome};
+use client::canonical::{
+    handle_canonical_error, retry_metadata_once, retry_metadata_with_policy, ClientAction, RetryOutcome, RetryPolicy,
+};
 use client::config::ClientConfig;
+use client::error::ClientError;
 use common::{create_test_file_meta, init_logging, MockMetadataServer, MockWorkerServer};
 use proto::metadata::{MsyncRequestProto, RefreshRouteRequestProto};
 use proto::worker::worker_data_service_server::WorkerDataService;
@@ -164,6 +167,8 @@ async fn test_mount_epoch_mismatch_refresh_and_retry() {
     let base_header = RequestHeader::new(types::ids::ClientId::new(7)).with_group_id(0);
     let server_epoch = Arc::new(AtomicU64::new(2));
     let attempts = Arc::new(AtomicUsize::new(0));
+    let mount_refreshes = Arc::new(AtomicUsize::new(0));
+    let route_refreshes = Arc::new(AtomicUsize::new(0));
 
     let outcome: RetryOutcome<(ResponseHeader, ())> = retry_metadata_once(
         base_header.clone(),
@@ -194,15 +199,28 @@ async fn test_mount_epoch_mismatch_refresh_and_retry() {
                 }
             }
         },
-        |reason, resp_header| {
-            let mut refreshed = base_header.child_with_same_call_id();
-            let mount_epoch = resp_header.mount_epoch;
-            let group_id = resp_header.group_id;
-            async move {
-                assert_eq!(reason, RefreshReason::MountEpochMismatch);
-                refreshed.mount_epoch = mount_epoch;
-                refreshed.group_id = group_id;
-                Ok(refreshed)
+        {
+            let mount_refreshes = mount_refreshes.clone();
+            let route_refreshes = route_refreshes.clone();
+            move |dispatch_ctx, current_header| {
+                let mount_refreshes = mount_refreshes.clone();
+                let route_refreshes = route_refreshes.clone();
+                let mut refreshed = current_header.child_with_same_call_id();
+                let reason = dispatch_ctx.reason;
+                let mount_epoch = dispatch_ctx
+                    .hint
+                    .mount_epoch
+                    .or(dispatch_ctx.response_header.mount_epoch);
+                let group_id = dispatch_ctx.hint.group_id.or(dispatch_ctx.response_header.group_id);
+                async move {
+                    assert_eq!(reason, RefreshReason::MountEpochMismatch);
+                    // Best available mount refresh hook in this test: route/mapping refresh.
+                    mount_refreshes.fetch_add(1, Ordering::SeqCst);
+                    route_refreshes.fetch_add(1, Ordering::SeqCst);
+                    refreshed.mount_epoch = mount_epoch;
+                    refreshed.group_id = group_id;
+                    Ok(refreshed)
+                }
             }
         },
     )
@@ -212,6 +230,8 @@ async fn test_mount_epoch_mismatch_refresh_and_retry() {
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     assert_eq!(outcome.refreshes, 1);
     assert_eq!(outcome.retries, 0);
+    assert_eq!(mount_refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(route_refreshes.load(Ordering::SeqCst), 1);
     let last_err = outcome.last_canonical_error.expect("should capture NEED_REFRESH");
     assert_eq!(
         last_err.code,
@@ -281,7 +301,10 @@ async fn test_worker_epoch_mismatch_refresh_and_retry() {
             refreshes += 1;
             assert!(matches!(
                 action,
-                Err(ClientAction::Refresh(RefreshReason::WorkerEpochMismatch))
+                Err(ClientAction::Refresh {
+                    reason: RefreshReason::WorkerEpochMismatch,
+                    ..
+                })
             ));
             let hinted_epoch = header.worker_epoch.expect("worker_epoch hint");
             // Metadata refresh must be invoked and override hinted epoch.
@@ -363,7 +386,13 @@ async fn test_fencing_refresh_and_retry_with_metadata() {
             let canonical = proto::convert::error_detail_to_canonical(err_detail);
             let action = handle_canonical_error(&canonical);
             refreshes += 1;
-            assert!(matches!(action, Err(ClientAction::Refresh(RefreshReason::Fencing))));
+            assert!(matches!(
+                action,
+                Err(ClientAction::Refresh {
+                    reason: RefreshReason::Fencing,
+                    ..
+                })
+            ));
 
             meta_refreshes.fetch_add(1, Ordering::SeqCst);
             attempt_request.worker_epoch = 3;
@@ -396,16 +425,14 @@ async fn test_moved_refresh_and_retry() {
     init_logging();
 
     let base_header = RequestHeader::new(types::ids::ClientId::new(11)).with_group_id(1);
-    let refreshes = Arc::new(AtomicUsize::new(0));
     let attempts = Arc::new(AtomicUsize::new(0));
+    let route_refreshes = Arc::new(AtomicUsize::new(0));
 
     let outcome: RetryOutcome<(ResponseHeader, ())> = retry_metadata_once(
         base_header.clone(),
         {
-            let refreshes = refreshes.clone();
             let attempts = attempts.clone();
             move |hdr: RequestHeader| {
-                let refreshes = refreshes.clone();
                 let attempts = attempts.clone();
                 async move {
                     let attempt = attempts.fetch_add(1, Ordering::SeqCst);
@@ -424,13 +451,19 @@ async fn test_moved_refresh_and_retry() {
                 }
             }
         },
-        |reason, resp_header| {
-            let mut next_header = base_header.child_with_same_call_id();
-            let group_id_hint = resp_header.group_id;
-            async move {
-                assert_eq!(reason, RefreshReason::Moved);
-                next_header.group_id = group_id_hint.or(next_header.group_id);
-                Ok(next_header)
+        {
+            let route_refreshes = route_refreshes.clone();
+            move |dispatch_ctx, current_header| {
+                let route_refreshes = route_refreshes.clone();
+                let mut next_header = current_header.child_with_same_call_id();
+                let reason = dispatch_ctx.reason;
+                let group_id_hint = dispatch_ctx.hint.group_id.or(dispatch_ctx.response_header.group_id);
+                async move {
+                    assert_eq!(reason, RefreshReason::Moved);
+                    route_refreshes.fetch_add(1, Ordering::SeqCst);
+                    next_header.group_id = group_id_hint.or(next_header.group_id);
+                    Ok(next_header)
+                }
             }
         },
     )
@@ -438,6 +471,7 @@ async fn test_moved_refresh_and_retry() {
     .expect("moved refresh");
 
     assert_eq!(outcome.refreshes, 1);
+    assert_eq!(route_refreshes.load(Ordering::SeqCst), 1);
     assert_eq!(outcome.result.0.group_id, Some(2));
     let last_err = outcome.last_canonical_error.expect("captured moved err");
     assert_eq!(
@@ -445,6 +479,62 @@ async fn test_moved_refresh_and_retry() {
         Some(CanonicalErrorCode::RpcCode(RpcErrorCode::ShardMoved))
     );
     assert_eq!(last_err.reason, Some(RefreshReason::Moved));
+}
+
+/// NotLeader should trigger route refresh action and succeed on retry.
+#[tokio::test]
+async fn test_not_leader_refresh_and_retry() {
+    init_logging();
+
+    let base_header = RequestHeader::new(types::ids::ClientId::new(21)).with_group_id(2);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let route_refreshes = Arc::new(AtomicUsize::new(0));
+
+    let outcome: RetryOutcome<(ResponseHeader, ())> = retry_metadata_once(
+        base_header.clone(),
+        {
+            let attempts = attempts.clone();
+            move |hdr: RequestHeader| {
+                let attempts = attempts.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        let canonical = CanonicalError::need_refresh(
+                            RpcErrorCode::NotLeader,
+                            RefreshReason::NotLeader,
+                            "not leader".to_string(),
+                        );
+                        let resp = ResponseHeader::from_canonical(hdr.client.clone(), canonical).with_group_id(4);
+                        Ok((resp, ()))
+                    } else {
+                        let resp = ResponseHeader::ok(hdr.client.clone()).with_group_id(hdr.group_id.unwrap_or(0));
+                        Ok((resp, ()))
+                    }
+                }
+            }
+        },
+        {
+            let route_refreshes = route_refreshes.clone();
+            move |dispatch_ctx, current_header| {
+                let route_refreshes = route_refreshes.clone();
+                let mut next_header = current_header.child_with_same_call_id();
+                let reason = dispatch_ctx.reason;
+                let group_id_hint = dispatch_ctx.hint.group_id.or(dispatch_ctx.response_header.group_id);
+                async move {
+                    assert_eq!(reason, RefreshReason::NotLeader);
+                    route_refreshes.fetch_add(1, Ordering::SeqCst);
+                    next_header.group_id = group_id_hint.or(next_header.group_id);
+                    Ok(next_header)
+                }
+            }
+        },
+    )
+    .await
+    .expect("not leader refresh");
+
+    assert_eq!(outcome.refreshes, 1);
+    assert_eq!(route_refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome.result.0.group_id, Some(4));
 }
 
 /// Block stamp mismatch should trigger refresh and retry success.
@@ -482,9 +572,10 @@ async fn test_block_stamp_mismatch_refresh_and_retry() {
                 }
             }
         },
-        |reason, resp_header| {
-            let mut next_header = base_header.child_with_same_call_id();
-            let group_id_hint = resp_header.group_id;
+        |dispatch_ctx, current_header| {
+            let mut next_header = current_header.child_with_same_call_id();
+            let reason = dispatch_ctx.reason;
+            let group_id_hint = dispatch_ctx.hint.group_id.or(dispatch_ctx.response_header.group_id);
             async move {
                 assert_eq!(reason, RefreshReason::BlockStampMismatch);
                 next_header.group_id = group_id_hint.or(next_header.group_id);
@@ -502,6 +593,63 @@ async fn test_block_stamp_mismatch_refresh_and_retry() {
         Some(CanonicalErrorCode::RpcCode(RpcErrorCode::BlockStampMismatch))
     );
     assert_eq!(last_err.reason, Some(RefreshReason::BlockStampMismatch));
+}
+
+/// Transport failures are retried by transport policy and must not trigger refresh dispatch.
+#[tokio::test]
+async fn test_transport_layering_retries_without_refresh_dispatch() {
+    init_logging();
+
+    let base_header = RequestHeader::new(types::ids::ClientId::new(33)).with_group_id(9);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let refresh_dispatches = Arc::new(AtomicUsize::new(0));
+
+    let mut call = {
+        let attempts = attempts.clone();
+        move |hdr: RequestHeader| {
+            let attempts = attempts.clone();
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    Err(ClientError::from(tonic::Status::unavailable("temporary outage")))
+                } else {
+                    Ok((
+                        ResponseHeader::ok(hdr.client.clone()).with_group_id(hdr.group_id.unwrap_or(9)),
+                        (),
+                    ))
+                }
+            }
+        }
+    };
+
+    let mut dispatch = {
+        let refresh_dispatches = refresh_dispatches.clone();
+        move |_dispatch_ctx, current_header: RequestHeader| {
+            let refresh_dispatches = refresh_dispatches.clone();
+            async move {
+                refresh_dispatches.fetch_add(1, Ordering::SeqCst);
+                Ok(current_header)
+            }
+        }
+    };
+
+    let outcome = retry_metadata_with_policy(
+        base_header,
+        &mut call,
+        &mut dispatch,
+        RetryPolicy {
+            max_refresh_attempts: 1,
+            max_retryable_attempts: 1,
+            max_transport_retries: 1,
+            transport_retry_base_ms: 0,
+        },
+    )
+    .await
+    .expect("transport retry should recover");
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(refresh_dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(outcome.transport_retries, 1);
 }
 
 /// Placeholder for follower read refresh scenario (needs mock metadata wiring).

@@ -71,14 +71,17 @@ where
 {
     let remaining = deadline.remaining();
     if remaining.is_zero() {
-        return Err(CommonError::new(CommonErrorCode::Timeout, "deadline has already passed"));
+        return Err(CommonError::new(
+            CommonErrorCode::Timeout,
+            "deadline has already passed",
+        ));
     }
 
     match tokio_timeout(TokioDuration::from_secs(remaining.as_secs() + 1), future).await {
         Ok(result) => Ok(result),
         Err(_) => Err(CommonError::new(
-			CommonErrorCode::Timeout,
-			format!("operation timed out after {}ms", remaining.as_millis()),
+            CommonErrorCode::Timeout,
+            format!("operation timed out after {}ms", remaining.as_millis()),
         )),
     }
 }

@@ -179,8 +179,12 @@ pub fn build_and_validate_combo(
     };
 
     let transport_config = NetTransportConfig::new(net_kind);
-    let transport = build_net_transport(&transport_config)
-        .map_err(|e| CommonError::new(CommonErrorCode::InvalidArgument, format!("Failed to build transport: {}", e)))?;
+    let transport = build_net_transport(&transport_config).map_err(|e| {
+        CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            format!("Failed to build transport: {}", e),
+        )
+    })?;
 
     // Build storage
     let storage_kind_enum = match storage_kind {
@@ -196,8 +200,12 @@ pub fn build_and_validate_combo(
     };
 
     let storage_config = LocalIoConfig::new(storage_kind_enum);
-    let storage = build_local_io(&storage_config)
-        .map_err(|e| CommonError::new(CommonErrorCode::InvalidArgument, format!("Failed to build storage: {}", e)))?;
+    let storage = build_local_io(&storage_config).map_err(|e| {
+        CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            format!("Failed to build storage: {}", e),
+        )
+    })?;
 
     // Get capabilities
     let transport_caps = get_transport_capabilities(&transport);

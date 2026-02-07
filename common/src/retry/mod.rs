@@ -120,8 +120,8 @@ where
         // Check deadline before attempting
         let remaining = ctx.deadline.remaining();
         if remaining.is_zero() {
-            let err =
-                last_error.unwrap_or_else(|| CommonError::new(CommonErrorCode::Timeout, "deadline exceeded before retry"));
+            let err = last_error
+                .unwrap_or_else(|| CommonError::new(CommonErrorCode::Timeout, "deadline exceeded before retry"));
             warn!(
                 attempt,
                 elapsed_ms = start.elapsed().as_millis(),
@@ -133,8 +133,8 @@ where
         // Check max elapsed time
         if let Some(max_elapsed) = policy.max_elapsed {
             if start.elapsed() > max_elapsed {
-                let err =
-                    last_error.unwrap_or_else(|| CommonError::new(CommonErrorCode::Timeout, "max elapsed time exceeded"));
+                let err = last_error
+                    .unwrap_or_else(|| CommonError::new(CommonErrorCode::Timeout, "max elapsed time exceeded"));
                 warn!(
                     attempt,
                     elapsed_ms = start.elapsed().as_millis(),

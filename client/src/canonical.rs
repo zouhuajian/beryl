@@ -2,80 +2,202 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-
 //! Canonical error handling for client operations.
 //!
 //! This module provides a unified entry point for client error decision-making,
-//! converting ResponseHeader to a canonical ClientAction that the client can
-//! use to determine refresh/retry/fail behavior.
-//!
-//! CURRENT IMPLEMENTATION:
-//! - Reads from `ResponseHeader` which is converted from `ResponseHeaderProto.error` (ErrorDetailProto)
-//! - All error semantics come from the single canonical error field
+//! converting response headers to a structured `ClientAction` that preserves
+//! canonical error details and refresh hints.
 
-use crate::error::ClientError;
-use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshReason};
-use common::header::{RequestHeader, ResponseHeader, RpcErrorCode, RpcStatus};
+use crate::error::{ClientError, ClientResult};
+use common::error::canonical::{CanonicalError, ErrorClass, RefreshReason};
+use common::header::{RequestHeader, ResponseHeader};
+use proto::convert::error_detail_to_canonical;
+use std::time::Duration;
 
-/// Client action determined from response header.
-#[derive(Clone, Debug)]
-pub enum ClientAction {
-    /// Client must refresh routing/mount/state before retrying.
-    Refresh(RefreshReason),
-    /// Client can retry after the specified delay (milliseconds).
-    Retry {
-        /// Retry after delay in milliseconds (None = immediate retry).
-        after_ms: Option<u64>,
-    },
-    /// Unrecoverable error; client should fail.
-    Fail(CanonicalError),
+/// Endpoint hint preserved on refresh actions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EndpointHint {
+    /// Worker ID for the hint.
+    pub worker_id: u64,
+    /// Endpoint address.
+    pub endpoint: String,
+    /// Transport kind as proto enum raw value.
+    pub net_transport_kind: i32,
+    /// Worker epoch for the hinted endpoint.
+    pub worker_epoch: u64,
 }
 
-/// Handle response header and return client action.
-///
-/// This is the **canonical entry point** for client error decision-making.
-/// All client code should use this function to determine behavior from
-/// ResponseHeader, ensuring consistent semantics across the codebase.
-///
-/// This function reads ONLY from `ResponseHeaderProto.error` (ErrorDetailProto),
-/// which is the single source of truth for all error semantics.
-///
-/// For gRPC non-OK status codes, these are treated as transport/auth/framework
-/// errors and mapped to appropriate CanonicalError.
-pub fn handle_response_header(header: &common::header::ResponseHeader) -> Result<(), ClientAction> {
-    match header.status {
-        RpcStatus::Ok => {
-            debug_assert!(
-                header.canonical_error.is_none(),
-                "RpcStatus::Ok must not carry canonical_error"
-            );
-            Ok(())
-        }
-        RpcStatus::Error | RpcStatus::Fatal => {
-            let canonical = match header.canonical_error.clone() {
-                Some(canonical) => canonical,
-                None => {
-                    debug_assert!(
-                        false,
-                        "non-OK response header missing canonical_error; treating as fatal"
-                    );
-                    CanonicalError {
-                        class: ErrorClass::Fatal,
-                        code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                        reason: None,
-                        retry_after_ms: None,
-                        message: format!("response status {:?} missing canonical_error", header.status),
-                    }
-                }
-            };
-            handle_canonical(&canonical)
+impl From<proto::common::WorkerEndpointInfoProto> for EndpointHint {
+    fn from(value: proto::common::WorkerEndpointInfoProto) -> Self {
+        Self {
+            worker_id: value.worker_id,
+            endpoint: value.endpoint,
+            net_transport_kind: value.net_transport_kind,
+            worker_epoch: value.worker_epoch,
         }
     }
 }
 
-/// Handle canonical error directly (data-plane helpers convert to CanonicalError).
+/// Structured refresh hints preserved from response headers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RefreshHint {
+    /// Group ID hint from metadata header.
+    pub group_id: Option<u64>,
+    /// Route epoch hint (if present in future headers).
+    pub route_epoch: Option<u64>,
+    /// Mount epoch hint from metadata header.
+    pub mount_epoch: Option<u64>,
+    /// Worker epoch hint from data header.
+    pub worker_epoch: Option<u64>,
+    /// Endpoint hint from data header.
+    pub endpoint_hint: Option<EndpointHint>,
+}
+
+/// Client action determined from canonical/header validation.
+#[derive(Clone, Debug)]
+pub enum ClientAction {
+    /// Header is valid and body is safe to consume.
+    Ok,
+    /// Client must refresh state before retrying.
+    Refresh {
+        /// Refresh reason from canonical error.
+        reason: RefreshReason,
+        /// Structured refresh hints from response header.
+        hint: RefreshHint,
+        /// Original canonical error.
+        canonical: CanonicalError,
+    },
+    /// Client may retry after delay.
+    Retry {
+        /// Retry delay in milliseconds.
+        after_ms: Option<u64>,
+        /// Original canonical error.
+        canonical: CanonicalError,
+    },
+    /// Unrecoverable business failure.
+    Fail {
+        /// Original canonical error.
+        canonical: CanonicalError,
+    },
+    /// gRPC transport/auth/framework failure (non-OK status).
+    TransportFail {
+        /// Original tonic status.
+        status: tonic::Status,
+    },
+}
+
+/// Refresh dispatch context passed to the refresh action machine.
+#[derive(Clone, Debug)]
+pub struct RefreshDispatchContext {
+    /// Refresh reason from canonical error.
+    pub reason: RefreshReason,
+    /// Parsed refresh hints for this response.
+    pub hint: RefreshHint,
+    /// Original canonical error.
+    pub canonical: CanonicalError,
+    /// Full response header that triggered refresh.
+    pub response_header: ResponseHeader,
+}
+
+/// Bounded retry policy for the client action machine.
+#[derive(Clone, Debug)]
+pub struct RetryPolicy {
+    /// Max refresh actions per operation.
+    pub max_refresh_attempts: u32,
+    /// Max retryable-class retries per operation.
+    pub max_retryable_attempts: u32,
+    /// Max transport retries for transient gRPC failures.
+    pub max_transport_retries: u32,
+    /// Base backoff for transport retries.
+    pub transport_retry_base_ms: u64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_refresh_attempts: 2,
+            max_retryable_attempts: 1,
+            max_transport_retries: 2,
+            transport_retry_base_ms: 50,
+        }
+    }
+}
+
+/// Validate metadata response header and return structured action on error.
+///
+/// This is the single entrypoint for header validation before response body use.
+pub fn validate_header_or_action(header: &ResponseHeader) -> Result<(), ClientAction> {
+    debug_assert!(
+        (header.status == common::header::RpcStatus::Ok) == header.canonical_error.is_none(),
+        "response header status/canonical mismatch: status={:?} canonical_present={}",
+        header.status,
+        header.canonical_error.is_some()
+    );
+
+    let Some(canonical) = header.canonical_error.clone() else {
+        return Ok(());
+    };
+
+    let hint = RefreshHint {
+        group_id: header.group_id,
+        route_epoch: None,
+        mount_epoch: header.mount_epoch,
+        worker_epoch: None,
+        endpoint_hint: None,
+    };
+    validate_canonical_with_hint(canonical, hint)
+}
+
+/// Validate worker data-plane header and return structured action on error.
+pub fn validate_data_header_or_action(
+    header: Option<&proto::worker::DataResponseHeaderProto>,
+) -> Result<(), ClientAction> {
+    let Some(header) = header else {
+        return Ok(());
+    };
+
+    let Some(err_detail) = header.error.as_ref() else {
+        return Ok(());
+    };
+
+    let canonical = error_detail_to_canonical(err_detail);
+    let hint = RefreshHint {
+        group_id: None,
+        route_epoch: None,
+        mount_epoch: None,
+        worker_epoch: header.worker_epoch,
+        endpoint_hint: header.endpoint_hint.clone().map(EndpointHint::from),
+    };
+
+    validate_canonical_with_hint(canonical, hint)
+}
+
+/// Validate canonical error directly.
 pub fn handle_canonical_error(err: &CanonicalError) -> Result<(), ClientAction> {
-    handle_canonical(err)
+    validate_canonical_with_hint(err.clone(), RefreshHint::default())
+}
+
+fn validate_canonical_with_hint(canonical: CanonicalError, hint: RefreshHint) -> Result<(), ClientAction> {
+    match canonical.class {
+        ErrorClass::Ok => Ok(()),
+        ErrorClass::NeedRefresh => {
+            let reason = canonical.reason.unwrap_or(RefreshReason::Unknown);
+            debug_assert!(
+                reason != RefreshReason::Unknown,
+                "NeedRefresh canonical error should include a specific refresh reason"
+            );
+            Err(ClientAction::Refresh {
+                reason,
+                hint,
+                canonical,
+            })
+        }
+        ErrorClass::Retryable => Err(ClientAction::Retry {
+            after_ms: canonical.retry_after_ms,
+            canonical,
+        }),
+        ErrorClass::Fatal => Err(ClientAction::Fail { canonical }),
+    }
 }
 
 /// Outcome of a refresh-aware call.
@@ -87,6 +209,8 @@ pub struct RetryOutcome<T> {
     pub refreshes: u32,
     /// Count of retry-after responses handled.
     pub retries: u32,
+    /// Count of transport retries performed.
+    pub transport_retries: u32,
     /// Last canonical error observed before success (if any).
     pub last_canonical_error: Option<CanonicalError>,
 }
@@ -98,6 +222,7 @@ impl<T> RetryOutcome<T> {
             result,
             refreshes: 0,
             retries: 0,
+            transport_retries: 0,
             last_canonical_error: None,
         }
     }
@@ -108,155 +233,275 @@ impl<T> RetryOutcome<T> {
             result: f(self.result),
             refreshes: self.refreshes,
             retries: self.retries,
+            transport_retries: self.transport_retries,
             last_canonical_error: self.last_canonical_error,
         }
     }
 }
 
-/// Retry once on NEED_REFRESH using canonical_error as the only control source.
+/// Retry with bounded refresh/retry/transport handling.
 ///
-/// - Executes `call` with the provided `RequestHeader`
-/// - On NEED_REFRESH, invokes `refresh` to update the header using hints from the response,
-///   then retries once.
-/// - On RETRYABLE, performs a single bounded retry with optional backoff from retry_after_ms.
+/// The refresh callback is the authoritative dispatch point that translates
+/// refresh reasons into real refresh actions and produces a refreshed request
+/// context for the next retry.
 pub async fn retry_metadata_once<T, CallFut, RefreshFut>(
     header: RequestHeader,
     mut call: impl FnMut(RequestHeader) -> CallFut,
-    mut refresh: impl FnMut(RefreshReason, &ResponseHeader) -> RefreshFut,
-) -> crate::error::ClientResult<RetryOutcome<(ResponseHeader, T)>>
+    mut dispatch_refresh: impl FnMut(RefreshDispatchContext, RequestHeader) -> RefreshFut,
+) -> ClientResult<RetryOutcome<(ResponseHeader, T)>>
 where
-    CallFut: std::future::Future<Output = crate::error::ClientResult<(ResponseHeader, T)>>,
-    RefreshFut: std::future::Future<Output = crate::error::ClientResult<RequestHeader>>,
+    CallFut: std::future::Future<Output = ClientResult<(ResponseHeader, T)>>,
+    RefreshFut: std::future::Future<Output = ClientResult<RequestHeader>>,
 {
+    retry_metadata_with_policy(header, &mut call, &mut dispatch_refresh, RetryPolicy::default()).await
+}
+
+/// Same as [`retry_metadata_once`] with explicit retry policy.
+pub async fn retry_metadata_with_policy<T, CallFut, RefreshFut>(
+    header: RequestHeader,
+    call: &mut impl FnMut(RequestHeader) -> CallFut,
+    dispatch_refresh: &mut impl FnMut(RefreshDispatchContext, RequestHeader) -> RefreshFut,
+    policy: RetryPolicy,
+) -> ClientResult<RetryOutcome<(ResponseHeader, T)>>
+where
+    CallFut: std::future::Future<Output = ClientResult<(ResponseHeader, T)>>,
+    RefreshFut: std::future::Future<Output = ClientResult<RequestHeader>>,
+{
+    let mut current_header = header;
     let mut refreshes = 0;
     let mut retries = 0;
+    let mut transport_retries = 0;
     let mut last_canonical_error = None;
 
-    // First attempt
-    let (resp_header, payload) = call(header.clone()).await?;
-    match handle_response_header(&resp_header) {
-        Ok(()) => {
-            return Ok(RetryOutcome {
-                result: (resp_header, payload),
-                refreshes,
-                retries,
-                last_canonical_error,
-            });
-        }
-        Err(ClientAction::Refresh(reason)) => {
-            last_canonical_error = resp_header.canonical_error.clone();
-            refreshes = 1;
-            let refreshed_header = refresh(reason, &resp_header).await?;
-            let (resp_header, payload) = call(refreshed_header).await?;
-            match handle_response_header(&resp_header) {
-                Ok(()) => {
-                    return Ok(RetryOutcome {
-                        result: (resp_header, payload),
-                        refreshes,
-                        retries,
-                        last_canonical_error,
-                    });
+    loop {
+        let rpc_result = call(current_header.clone()).await;
+        let (resp_header, payload) = match rpc_result {
+            Ok(ok) => ok,
+            Err(err) => match err {
+                ClientError::Action(ClientAction::TransportFail { status }) => {
+                    if transport_retries < policy.max_transport_retries && is_transient_transport_status(&status) {
+                        let backoff_ms = transport_backoff_ms(policy.transport_retry_base_ms, transport_retries + 1);
+                        transport_retries += 1;
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        current_header = current_header.child_with_same_call_id();
+                        continue;
+                    }
+                    return Err(ClientError::Action(ClientAction::TransportFail { status }));
                 }
-                Err(action) => return Err(action_to_client_error(action)),
+                other => return Err(other),
+            },
+        };
+
+        match validate_header_or_action(&resp_header) {
+            Ok(()) => {
+                return Ok(RetryOutcome {
+                    result: (resp_header, payload),
+                    refreshes,
+                    retries,
+                    transport_retries,
+                    last_canonical_error,
+                });
             }
-        }
-        Err(ClientAction::Retry { after_ms }) => {
-            last_canonical_error = resp_header.canonical_error.clone();
-            retries = 1;
-            if let Some(delay) = after_ms {
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-            }
-            let (resp_header, payload) = call(header.child_with_same_call_id()).await?;
-            match handle_response_header(&resp_header) {
-                Ok(()) => {
-                    return Ok(RetryOutcome {
-                        result: (resp_header, payload),
-                        refreshes,
-                        retries,
-                        last_canonical_error,
-                    });
+            Err(ClientAction::Refresh {
+                reason,
+                hint,
+                canonical,
+            }) => {
+                if refreshes >= policy.max_refresh_attempts {
+                    return Err(ClientError::from(ClientAction::Refresh {
+                        reason,
+                        hint,
+                        canonical,
+                    }));
                 }
-                Err(action) => return Err(action_to_client_error(action)),
+                refreshes += 1;
+                last_canonical_error = Some(canonical.clone());
+                current_header = dispatch_refresh(
+                    RefreshDispatchContext {
+                        reason,
+                        hint,
+                        canonical,
+                        response_header: resp_header,
+                    },
+                    current_header,
+                )
+                .await?;
+            }
+            Err(ClientAction::Retry { after_ms, canonical }) => {
+                if retries >= policy.max_retryable_attempts {
+                    return Err(ClientError::from(ClientAction::Retry { after_ms, canonical }));
+                }
+                retries += 1;
+                last_canonical_error = Some(canonical.clone());
+                if let Some(delay) = after_ms {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+                current_header = current_header.child_with_same_call_id();
+            }
+            Err(ClientAction::Fail { canonical }) => {
+                return Err(ClientError::from(ClientAction::Fail { canonical }));
+            }
+            Err(ClientAction::TransportFail { status }) => {
+                if transport_retries < policy.max_transport_retries && is_transient_transport_status(&status) {
+                    let backoff_ms = transport_backoff_ms(policy.transport_retry_base_ms, transport_retries + 1);
+                    transport_retries += 1;
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    current_header = current_header.child_with_same_call_id();
+                    continue;
+                }
+                return Err(ClientError::from(ClientAction::TransportFail { status }));
+            }
+            Err(ClientAction::Ok) => {
+                debug_assert!(false, "ClientAction::Ok should never be returned as error");
+                return Err(ClientError::Metadata("invalid client action state".to_string()));
             }
         }
-        Err(ClientAction::Fail(err)) => Err(crate::error::ClientError::Metadata(err.message)),
     }
 }
 
-fn handle_canonical(err: &CanonicalError) -> Result<(), ClientAction> {
-    match err.class {
-        ErrorClass::Ok => Ok(()),
-        ErrorClass::NeedRefresh => Err(ClientAction::Refresh(err.reason.unwrap_or(RefreshReason::Unknown))),
-        ErrorClass::Retryable => Err(ClientAction::Retry {
-            after_ms: err.retry_after_ms,
-        }),
-        ErrorClass::Fatal => Err(ClientAction::Fail(err.clone())),
+fn is_transient_transport_status(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::ResourceExhausted
+    )
+}
+
+fn transport_backoff_ms(base_ms: u64, attempt: u32) -> u64 {
+    let shift = attempt.saturating_sub(1).min(4);
+    base_ms.saturating_mul(1u64 << shift)
+}
+
+impl ClientAction {
+    /// Return canonical error if this action carries one.
+    pub fn canonical(&self) -> Option<&CanonicalError> {
+        match self {
+            ClientAction::Refresh { canonical, .. }
+            | ClientAction::Retry { canonical, .. }
+            | ClientAction::Fail { canonical } => Some(canonical),
+            ClientAction::Ok | ClientAction::TransportFail { .. } => None,
+        }
     }
 }
 
-fn action_to_client_error(action: ClientAction) -> ClientError {
-    match action {
-        ClientAction::Refresh(reason) => ClientError::NeedRefresh(format!("refresh required: {:?}", reason)),
-        ClientAction::Retry { after_ms } => {
-            ClientError::Metadata(format!("retry requested after {}ms", after_ms.unwrap_or(0)))
-        }
-        ClientAction::Fail(err) => ClientError::Metadata(err.message),
+impl From<ClientAction> for ClientError {
+    fn from(action: ClientAction) -> Self {
+        ClientError::Action(action)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::error::canonical::ErrorCode as CanonicalErrorCode;
+    use common::header::RpcErrorCode;
     use common::header::{ClientInfo, ResponseHeader};
 
     #[test]
-    fn test_handle_ok_header() {
+    fn validate_ok_header_returns_ok() {
         let header = ResponseHeader::ok(ClientInfo::new(types::ClientId::new(1)));
-        let result = handle_response_header(&header);
-        assert!(result.is_ok());
+        assert!(validate_header_or_action(&header).is_ok());
     }
 
     #[test]
-    fn test_handle_not_leader() {
+    fn validate_need_refresh_preserves_reason_and_hint() {
         let canonical = CanonicalError::need_refresh(RpcErrorCode::NotLeader, RefreshReason::NotLeader, "not leader");
-        let header = ResponseHeader::error(ClientInfo::new(types::ClientId::new(1)), canonical);
-        let result = handle_response_header(&header);
-        match result {
-            Err(ClientAction::Refresh(RefreshReason::NotLeader)) => {}
-            _ => panic!("expected Refresh(NotLeader)"),
-        }
-    }
+        let mut header = ResponseHeader::error(ClientInfo::new(types::ClientId::new(1)), canonical.clone());
+        header.group_id = Some(7);
+        header.mount_epoch = Some(12);
 
-    #[test]
-    fn test_handle_retryable() {
-        let canonical = CanonicalError::retryable(RpcErrorCode::NodeUnavailable, Some(1000), "unavailable");
-        let header = ResponseHeader::error(ClientInfo::new(types::ClientId::new(1)), canonical);
-        let result = handle_response_header(&header);
+        let result = validate_header_or_action(&header);
         match result {
-            Err(ClientAction::Retry { after_ms: Some(1000) }) => {}
-            // Note: use plain string here to avoid format-string `{}` parsing.
-            _ => panic!("expected Retry with after_ms = Some(1000)"),
-        }
-    }
-
-    #[test]
-    fn test_handle_fatal() {
-        let header = ResponseHeader::error(
-            ClientInfo::new(types::ClientId::new(1)),
-            CanonicalError {
-                class: ErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                reason: None,
-                retry_after_ms: None,
-                message: "fatal error".to_string(),
-            },
-        );
-        let result = handle_response_header(&header);
-        match result {
-            Err(ClientAction::Fail(err)) => {
-                assert_eq!(err.class, ErrorClass::Fatal);
+            Err(ClientAction::Refresh {
+                reason,
+                hint,
+                canonical: returned,
+            }) => {
+                assert_eq!(reason, RefreshReason::NotLeader);
+                assert_eq!(hint.group_id, Some(7));
+                assert_eq!(hint.mount_epoch, Some(12));
+                assert_eq!(returned.reason, canonical.reason);
+                assert_eq!(returned.code, canonical.code);
             }
-            _ => panic!("expected Fail"),
+            _ => panic!("expected Refresh action"),
         }
+    }
+
+    #[test]
+    fn validate_retryable_preserves_retry_after() {
+        let canonical = CanonicalError::retryable(RpcErrorCode::NodeUnavailable, Some(1000), "unavailable");
+        let header = ResponseHeader::error(ClientInfo::new(types::ClientId::new(1)), canonical.clone());
+        let result = validate_header_or_action(&header);
+        match result {
+            Err(ClientAction::Retry {
+                after_ms,
+                canonical: returned,
+            }) => {
+                assert_eq!(after_ms, Some(1000));
+                assert_eq!(returned.retry_after_ms, canonical.retry_after_ms);
+                assert_eq!(returned.code, canonical.code);
+            }
+            _ => panic!("expected Retry action"),
+        }
+    }
+
+    #[test]
+    fn validate_fatal_returns_fail() {
+        let canonical = CanonicalError {
+            class: ErrorClass::Fatal,
+            code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
+            reason: None,
+            retry_after_ms: None,
+            message: "fatal error".to_string(),
+        };
+        let header = ResponseHeader::error(ClientInfo::new(types::ClientId::new(1)), canonical.clone());
+        let result = validate_header_or_action(&header);
+        match result {
+            Err(ClientAction::Fail { canonical: returned }) => {
+                assert_eq!(returned.class, ErrorClass::Fatal);
+                assert_eq!(returned.code, canonical.code);
+            }
+            _ => panic!("expected Fail action"),
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_loop_retries_transient_transport_without_refresh_dispatch() {
+        let mut calls = 0usize;
+        let mut refresh_dispatch_calls = 0usize;
+        let header = RequestHeader::new(types::ClientId::new(1));
+
+        let mut call = |hdr: RequestHeader| {
+            let _ = hdr;
+            calls += 1;
+            async move {
+                if calls == 1 {
+                    Err(ClientError::from(tonic::Status::unavailable("temporary outage")))
+                } else {
+                    Ok((ResponseHeader::ok(ClientInfo::new(types::ClientId::new(1))), ()))
+                }
+            }
+        };
+
+        let mut dispatch_refresh = |ctx: RefreshDispatchContext, req: RequestHeader| {
+            let _ = (ctx, req);
+            refresh_dispatch_calls += 1;
+            async move { Ok(RequestHeader::new(types::ClientId::new(1))) }
+        };
+
+        let policy = RetryPolicy {
+            max_refresh_attempts: 1,
+            max_retryable_attempts: 1,
+            max_transport_retries: 1,
+            transport_retry_base_ms: 0,
+        };
+
+        let outcome = retry_metadata_with_policy(header, &mut call, &mut dispatch_refresh, policy)
+            .await
+            .expect("retry succeeds");
+        assert_eq!(calls, 2);
+        assert_eq!(refresh_dispatch_calls, 0);
+        assert_eq!(outcome.transport_retries, 1);
+        assert_eq!(outcome.refreshes, 0);
+        assert_eq!(outcome.retries, 0);
     }
 }

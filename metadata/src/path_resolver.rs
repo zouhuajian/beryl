@@ -174,7 +174,7 @@ impl PathResolver {
             .ok_or_else(|| MetadataError::NotFound(format!("Parent inode not found: {}", parent_inode_id)))?;
 
         if !parent_inode.kind.is_dir() {
-            return Err(MetadataError::InvalidArgument(format!(
+            return Err(MetadataError::NotDir(format!(
                 "Parent is not a directory: {}",
                 parent_inode_id
             )));
@@ -229,7 +229,7 @@ impl PathResolver {
 
         // Check if same mount
         if src_resolved.mount_ctx.mount_id != dst_resolved.mount_ctx.mount_id {
-            return Err(MetadataError::InvalidArgument(format!(
+            return Err(MetadataError::CrossMountRename(format!(
                 "Cross-mount rename not allowed: src_mount={:?}, dst_mount={:?}",
                 src_resolved.mount_ctx.mount_id, dst_resolved.mount_ctx.mount_id
             )));

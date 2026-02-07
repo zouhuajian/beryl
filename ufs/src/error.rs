@@ -88,7 +88,9 @@ impl From<UfsError> for common::CommonError {
         use common::CommonErrorCode;
         match &err {
             UfsError::NotFound(_) => common::CommonError::new(CommonErrorCode::NotFound, err.to_string()),
-            UfsError::PermissionDenied(_) => common::CommonError::new(CommonErrorCode::PermissionDenied, err.to_string()),
+            UfsError::PermissionDenied(_) => {
+                common::CommonError::new(CommonErrorCode::PermissionDenied, err.to_string())
+            }
             UfsError::Overloaded(_) => common::CommonError::new(CommonErrorCode::Overloaded, err.to_string()),
             UfsError::InvalidPath(_) | UfsError::InvalidSpec(_) => {
                 common::CommonError::new(CommonErrorCode::InvalidArgument, err.to_string())

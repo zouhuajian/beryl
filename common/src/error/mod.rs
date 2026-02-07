@@ -211,7 +211,10 @@ impl CommonErrorCode {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            CommonErrorCode::Timeout | CommonErrorCode::Unavailable | CommonErrorCode::Throttled | CommonErrorCode::Overloaded
+            CommonErrorCode::Timeout
+                | CommonErrorCode::Unavailable
+                | CommonErrorCode::Throttled
+                | CommonErrorCode::Overloaded
         )
     }
 }
