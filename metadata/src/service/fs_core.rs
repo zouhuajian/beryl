@@ -17,8 +17,9 @@ use crate::error::{to_canonical_fs, MetadataError, MetadataResult};
 use crate::mount::MountTable;
 use crate::raft::{AppDataResponse, AppRaftNode, Command, DedupKey, FsCommandResult, RocksDBStorage};
 use crate::state::StateStore;
-use common::error::canonical::CanonicalError;
-use common::error::canonical::RefreshReason;
+use common::error::canonical::{
+    CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshHint, RefreshReason, WorkerEndpointHint,
+};
 use common::header::{RequestHeader, RpcErrorCode};
 use proto::worker::worker_data_service_client::WorkerDataServiceClient;
 use proto::worker::CommitWriteRequestProto;
@@ -52,64 +53,7 @@ enum CoreWriteOp {
 }
 
 fn canonical_from_error_detail(detail: proto::common::ErrorDetailProto) -> CanonicalError {
-    use common::error::canonical::{ErrorClass, ErrorCode};
-    let class = match detail.error_class {
-        1 => ErrorClass::NeedRefresh,
-        2 => ErrorClass::Retryable,
-        3 => ErrorClass::Fatal,
-        _ => ErrorClass::Ok,
-    };
-    let code = match detail.code {
-        Some(proto::common::error_detail_proto::Code::FsErrno(errno)) => {
-            FsErrorCode::from_u32(errno as u32).map(ErrorCode::FsErrno)
-        }
-        Some(proto::common::error_detail_proto::Code::RpcCode(code)) => {
-            let rpc = match code {
-                1 => RpcErrorCode::NoSuchMethod,
-                2 => RpcErrorCode::InvalidHeader,
-                3 => RpcErrorCode::VersionMismatch,
-                4 => RpcErrorCode::DeserializeRequest,
-                5 => RpcErrorCode::SerializeResponse,
-                20 => RpcErrorCode::Unauthenticated,
-                21 => RpcErrorCode::PermissionDenied,
-                40 => RpcErrorCode::NotLeader,
-                41 => RpcErrorCode::StaleState,
-                42 => RpcErrorCode::Fencing,
-                43 => RpcErrorCode::ShardMoved,
-                44 => RpcErrorCode::NodeUnavailable,
-                50 => RpcErrorCode::MountEpochMismatch,
-                51 => RpcErrorCode::RouteEpochMismatch,
-                52 => RpcErrorCode::WorkerEpochMismatch,
-                53 => RpcErrorCode::BlockStampMismatch,
-                54 => RpcErrorCode::EpochMismatch,
-                _ => RpcErrorCode::Unspecified,
-            };
-            Some(ErrorCode::RpcCode(rpc))
-        }
-        None => None,
-    };
-    let reason = if class == ErrorClass::NeedRefresh {
-        Some(match detail.refresh_reason {
-            2 => RefreshReason::Moved,
-            3 => RefreshReason::StaleState,
-            4 => RefreshReason::MountEpochMismatch,
-            5 => RefreshReason::RouteEpochMismatch,
-            6 => RefreshReason::WorkerEpochMismatch,
-            7 => RefreshReason::BlockStampMismatch,
-            8 => RefreshReason::Fencing,
-            9 => RefreshReason::EpochMismatch,
-            _ => RefreshReason::Unknown,
-        })
-    } else {
-        None
-    };
-    CanonicalError {
-        class,
-        code,
-        reason,
-        retry_after_ms: detail.retry_after_ms,
-        message: detail.message,
-    }
+    proto::convert::error_detail_to_canonical(&detail)
 }
 
 pub struct FsCore {
@@ -178,6 +122,10 @@ impl FsCore {
         ctx.caller.state_id
     }
 
+    async fn authoritative_route_epoch(&self) -> Option<u64> {
+        self.state_store.get_layout_version().await.ok().map(|v| v.as_u64())
+    }
+
     fn success<T>(
         &self,
         ctx: &RequestContext,
@@ -185,10 +133,22 @@ impl FsCore {
         group_id: Option<u64>,
         mount_epoch: Option<u64>,
     ) -> CoreResult<T> {
+        self.success_with_route_epoch(ctx, payload, group_id, mount_epoch, None)
+    }
+
+    fn success_with_route_epoch<T>(
+        &self,
+        ctx: &RequestContext,
+        payload: T,
+        group_id: Option<u64>,
+        mount_epoch: Option<u64>,
+        route_epoch: Option<u64>,
+    ) -> CoreResult<T> {
         Ok(CoreSuccess {
             payload,
             group_id,
             mount_epoch,
+            route_epoch,
             state_id: Self::state_id_from_ctx(ctx),
         })
     }
@@ -200,11 +160,23 @@ impl FsCore {
         group_id: Option<u64>,
         mount_epoch: Option<u64>,
     ) -> CoreResult<T> {
+        self.failure_from_error_with_route_epoch(ctx, err, group_id, mount_epoch, None)
+    }
+
+    fn failure_from_error_with_route_epoch<T>(
+        &self,
+        ctx: &RequestContext,
+        err: MetadataError,
+        group_id: Option<u64>,
+        mount_epoch: Option<u64>,
+        route_epoch: Option<u64>,
+    ) -> CoreResult<T> {
         let err = to_canonical_fs(err);
         Err(CoreFailure::new(
             err,
             group_id,
             mount_epoch,
+            route_epoch,
             Self::state_id_from_ctx(ctx),
         ))
     }
@@ -216,10 +188,22 @@ impl FsCore {
         group_id: Option<u64>,
         mount_epoch: Option<u64>,
     ) -> CoreResult<T> {
+        self.failure_from_canonical_with_route_epoch(ctx, err, group_id, mount_epoch, None)
+    }
+
+    fn failure_from_canonical_with_route_epoch<T>(
+        &self,
+        ctx: &RequestContext,
+        err: CanonicalError,
+        group_id: Option<u64>,
+        mount_epoch: Option<u64>,
+        route_epoch: Option<u64>,
+    ) -> CoreResult<T> {
         Err(CoreFailure::new(
             err,
             group_id,
             mount_epoch,
+            route_epoch,
             Self::state_id_from_ctx(ctx),
         ))
     }
@@ -233,12 +217,35 @@ impl FsCore {
         group_id: Option<u64>,
         mount_epoch: Option<u64>,
     ) -> CoreResult<T> {
-        self.failure_from_canonical(
-            ctx,
-            CanonicalError::need_refresh(rpc_code, reason, message),
-            group_id,
-            mount_epoch,
-        )
+        self.need_refresh_failure_with_hint(ctx, rpc_code, reason, message, group_id, mount_epoch, None, None)
+    }
+
+    fn need_refresh_failure_with_hint<T>(
+        &self,
+        ctx: &RequestContext,
+        rpc_code: RpcErrorCode,
+        reason: RefreshReason,
+        message: impl Into<String>,
+        group_id: Option<u64>,
+        mount_epoch: Option<u64>,
+        route_epoch: Option<u64>,
+        mut hint: Option<RefreshHint>,
+    ) -> CoreResult<T> {
+        if let Some(group_id_value) = group_id {
+            hint.get_or_insert_with(RefreshHint::default).group_id = Some(group_id_value);
+        }
+        if let Some(mount_epoch_value) = mount_epoch {
+            hint.get_or_insert_with(RefreshHint::default).mount_epoch = Some(mount_epoch_value);
+        }
+        if let Some(route_epoch_value) = route_epoch {
+            hint.get_or_insert_with(RefreshHint::default).route_epoch = Some(route_epoch_value);
+        }
+
+        let canonical = match hint {
+            Some(hint) => CanonicalError::need_refresh_with_hint(rpc_code, reason, hint, message),
+            None => CanonicalError::need_refresh(rpc_code, reason, message),
+        };
+        self.failure_from_canonical_with_route_epoch(ctx, canonical, group_id, mount_epoch, route_epoch)
     }
 
     fn fatal_fs_failure<T>(
@@ -252,8 +259,53 @@ impl FsCore {
         self.failure_from_canonical(ctx, CanonicalError::fatal_fs(errno, message), group_id, mount_epoch)
     }
 
+    fn session_terminal_failure<T>(
+        &self,
+        ctx: &RequestContext,
+        reason: RefreshReason,
+        rpc_code: RpcErrorCode,
+        message: impl Into<String>,
+        group_id: Option<u64>,
+        mount_epoch: Option<u64>,
+    ) -> CoreResult<T> {
+        let canonical = CanonicalError {
+            class: ErrorClass::Fatal,
+            code: Some(CanonicalErrorCode::RpcCode(rpc_code)),
+            reason: Some(reason),
+            retry_after_ms: None,
+            message: message.into(),
+            refresh_hint: None,
+        };
+        self.failure_from_canonical(ctx, canonical, group_id, mount_epoch)
+    }
+
     fn replay_hint(intent: &str) -> String {
         format!("refresh metadata and re-open write session, then replay {}", intent)
+    }
+
+    fn worker_refresh_hint_from_session(
+        session: &crate::write_session::WriteSession,
+        worker_epoch: Option<u64>,
+        resolve_required: bool,
+    ) -> RefreshHint {
+        let mut worker_endpoints = Vec::new();
+        for target in &session.write_targets {
+            for endpoint in &target.worker_endpoints {
+                worker_endpoints.push(WorkerEndpointHint {
+                    worker_id: endpoint.worker_id,
+                    endpoint: endpoint.endpoint.clone(),
+                    net_transport_kind: endpoint.net_transport_kind,
+                    worker_epoch: endpoint.worker_epoch,
+                });
+            }
+        }
+
+        RefreshHint {
+            worker_epoch,
+            worker_endpoints,
+            worker_resolve_required: resolve_required,
+            ..Default::default()
+        }
     }
 
     pub(crate) fn mount_hints_for_mount(&self, mount_id: MountId) -> (Option<u64>, Option<u64>) {
@@ -278,9 +330,14 @@ impl FsCore {
         {
             if client_mount_epoch != server_mount_epoch {
                 return Err(CoreFailure::new(
-                    CanonicalError::need_refresh(
+                    CanonicalError::need_refresh_with_hint(
                         RpcErrorCode::MountEpochMismatch,
                         RefreshReason::MountEpochMismatch,
+                        RefreshHint {
+                            group_id,
+                            mount_epoch: Some(server_mount_epoch),
+                            ..Default::default()
+                        },
                         format!(
                             "mount_epoch mismatch: client={}, server={}; {}",
                             client_mount_epoch,
@@ -290,6 +347,7 @@ impl FsCore {
                     ),
                     group_id,
                     Some(server_mount_epoch),
+                    None,
                     Self::state_id_from_ctx(ctx),
                 ));
             }
@@ -306,9 +364,6 @@ impl FsCore {
         intent: &str,
     ) -> Result<Option<u64>, CoreFailure> {
         let client_route_epoch = freshness.route_epoch.or(ctx.route_epoch);
-        let Some(client_route_epoch) = client_route_epoch else {
-            return Ok(None);
-        };
 
         let server_route_epoch = match self.state_store.get_layout_version().await {
             Ok(v) => v.as_u64(),
@@ -317,25 +372,35 @@ impl FsCore {
                     to_canonical_fs(err),
                     group_id,
                     mount_epoch,
+                    None,
                     Self::state_id_from_ctx(ctx),
                 ));
             }
         };
 
-        if client_route_epoch != server_route_epoch {
-            return Err(CoreFailure::new(
-                CanonicalError::need_refresh(
-                    RpcErrorCode::RouteEpochMismatch,
-                    RefreshReason::RouteEpochMismatch,
-                    format!(
-                        "route_epoch mismatch: client={}, server={}; refresh route and replay {}",
-                        client_route_epoch, server_route_epoch, intent
+        if let Some(client_route_epoch) = client_route_epoch {
+            if client_route_epoch != server_route_epoch {
+                return Err(CoreFailure::new(
+                    CanonicalError::need_refresh_with_hint(
+                        RpcErrorCode::RouteEpochMismatch,
+                        RefreshReason::RouteEpochMismatch,
+                        RefreshHint {
+                            group_id,
+                            route_epoch: Some(server_route_epoch),
+                            mount_epoch,
+                            ..Default::default()
+                        },
+                        format!(
+                            "route_epoch mismatch: client={}, server={}; refresh route and replay {}",
+                            client_route_epoch, server_route_epoch, intent
+                        ),
                     ),
-                ),
-                group_id,
-                mount_epoch,
-                Self::state_id_from_ctx(ctx),
-            ));
+                    group_id,
+                    mount_epoch,
+                    Some(server_route_epoch),
+                    Self::state_id_from_ctx(ctx),
+                ));
+            }
         }
 
         Ok(Some(server_route_epoch))
@@ -365,23 +430,44 @@ impl FsCore {
         match self.route_fs_write_ctx(op, parent_inode_ids, client_mount_epoch) {
             Ok(ctx) => Ok(ctx),
             Err(err) => {
-                let (group_id, mount_epoch) = match &err {
-                    MetadataError::MountEpochMismatch { mount_id, .. } => {
+                let (group_id, mount_epoch, canonical) = match err {
+                    MetadataError::MountEpochMismatch {
+                        expected,
+                        got,
+                        mount_id,
+                    } => {
                         if let Some(metrics) = &self.metrics {
                             metrics
                                 .fs_write_mount_epoch_mismatch_total
                                 .fetch_add(1, Ordering::Relaxed);
                         }
-                        mount_id
+                        let (group_id, mount_epoch) = mount_id
                             .map(|id| self.mount_hints_for_mount(id))
-                            .unwrap_or((None, None))
+                            .unwrap_or((None, None));
+                        let canonical = CanonicalError::need_refresh_with_hint(
+                            RpcErrorCode::MountEpochMismatch,
+                            RefreshReason::MountEpochMismatch,
+                            RefreshHint {
+                                group_id,
+                                mount_epoch,
+                                ..Default::default()
+                            },
+                            format!(
+                                "mount_epoch mismatch: client={}, server={}; {}",
+                                got,
+                                expected,
+                                Self::replay_hint("request")
+                            ),
+                        );
+                        (group_id, mount_epoch, canonical)
                     }
-                    _ => (None, None),
+                    other => (None, None, to_canonical_fs(other)),
                 };
                 Err(CoreFailure::new(
-                    to_canonical_fs(err),
+                    canonical,
                     group_id,
                     mount_epoch,
+                    None,
                     Self::state_id_from_ctx(req_ctx),
                 ))
             }
@@ -415,13 +501,15 @@ impl FsCore {
         };
 
         let (group_id, mount_epoch) = self.mount_hints_for_mount(inode.mount_id);
-        self.success(
+        let route_epoch = self.authoritative_route_epoch().await;
+        self.success_with_route_epoch(
             &req.ctx,
             GetAttrOutput {
                 attrs: inode.attrs.clone(),
             },
             group_id,
             mount_epoch,
+            route_epoch,
         )
     }
 
@@ -923,7 +1011,8 @@ impl FsCore {
         }
 
         let (group_id, mount_epoch) = self.mount_hints_for_mount(parent_inode.mount_id);
-        self.success(
+        let route_epoch = self.authoritative_route_epoch().await;
+        self.success_with_route_epoch(
             &req.ctx,
             ReadDirOutput {
                 entries: dir_entries,
@@ -932,6 +1021,7 @@ impl FsCore {
             },
             group_id,
             mount_epoch,
+            route_epoch,
         )
     }
 
@@ -963,7 +1053,14 @@ impl FsCore {
 
         let _flags = req.flags;
         let (group_id, mount_epoch) = self.mount_hints_for_mount(inode.mount_id);
-        self.success(&req.ctx, OpenOutput { file_handle: 0 }, group_id, mount_epoch)
+        let route_epoch = self.authoritative_route_epoch().await;
+        self.success_with_route_epoch(
+            &req.ctx,
+            OpenOutput { file_handle: 0 },
+            group_id,
+            mount_epoch,
+            route_epoch,
+        )
     }
 
     pub(crate) async fn truncate(&self, req: TruncateInput) -> CoreResult<TruncateOutput> {
@@ -1308,12 +1405,8 @@ impl FsCore {
             Some(session) => session,
             None => {
                 // Release is best-effort cleanup and intentionally idempotent for replay safety.
-                return self.success(
-                    &req.ctx,
-                    ReleaseSessionOutput,
-                    req.ctx.caller.group_id,
-                    req.ctx.caller.mount_epoch,
-                );
+                let route_epoch = self.authoritative_route_epoch().await;
+                return self.success_with_route_epoch(&req.ctx, ReleaseSessionOutput, None, None, route_epoch);
             }
         };
 
@@ -1322,7 +1415,8 @@ impl FsCore {
         self.write_session_manager.remove_session(req.file_handle);
 
         let (group_id, mount_epoch) = self.mount_hints_for_mount(session.mount_id);
-        self.success(&req.ctx, ReleaseSessionOutput, group_id, mount_epoch)
+        let route_epoch = self.authoritative_route_epoch().await;
+        self.success_with_route_epoch(&req.ctx, ReleaseSessionOutput, group_id, mount_epoch, route_epoch)
     }
 
     pub(crate) async fn get_file_layout(&self, req: GetFileLayoutInput) -> CoreResult<GetFileLayoutOutput> {
@@ -1368,12 +1462,13 @@ impl FsCore {
             Err(err) => return Err(err),
         };
 
-        if let Err(err) = self
+        let route_epoch = match self
             .validate_route_epoch(&req.ctx, req.freshness, group_id, mount_epoch, "GetFileLayout")
             .await
         {
-            return Err(err);
-        }
+            Ok(route_epoch) => route_epoch,
+            Err(err) => return Err(err),
+        };
 
         let extents = match &inode.data {
             types::fs::InodeData::File { extents, .. } => extents.clone(),
@@ -1404,7 +1499,7 @@ impl FsCore {
             })
             .collect();
 
-        self.success(
+        self.success_with_route_epoch(
             &req.ctx,
             GetFileLayoutOutput {
                 extents: filtered_extents,
@@ -1413,6 +1508,7 @@ impl FsCore {
             },
             group_id,
             mount_epoch,
+            route_epoch,
         )
     }
 
@@ -1422,14 +1518,13 @@ impl FsCore {
         let session = match self.write_session_manager.get_session(file_handle) {
             Some(session) => session,
             None => {
-                return self.need_refresh_failure(
+                return self.session_terminal_failure(
                     &req.ctx,
+                    RefreshReason::SessionInvalid,
                     RpcErrorCode::Fencing,
-                    RefreshReason::Fencing,
                     format!(
-                        "write session not found for handle={}; {}",
+                        "write session not found for handle={}; reopen and replay RenewWriteSessionLease",
                         file_handle,
-                        Self::replay_hint("RenewWriteSessionLease")
                     ),
                     None,
                     None,
@@ -1456,17 +1551,16 @@ impl FsCore {
         };
 
         if lease_id_typed != session.lease_id || req.lease_epoch != session.lease_epoch {
-            return self.need_refresh_failure(
+            return self.session_terminal_failure(
                 &req.ctx,
+                RefreshReason::SessionInvalid,
                 RpcErrorCode::Fencing,
-                RefreshReason::Fencing,
                 format!(
-                    "lease/session mismatch: expected lease_id={:?} lease_epoch={}, got lease_id={:?} lease_epoch={}; {}",
+                    "lease/session mismatch: expected lease_id={:?} lease_epoch={}, got lease_id={:?} lease_epoch={}; reopen and replay RenewWriteSessionLease",
                     session.lease_id,
                     session.lease_epoch,
                     lease_id_typed,
                     req.lease_epoch,
-                    Self::replay_hint("RenewWriteSessionLease")
                 ),
                 group_id,
                 mount_epoch,
@@ -1479,14 +1573,13 @@ impl FsCore {
         {
             Ok(expires) => expires,
             Err(_) => {
-                return self.need_refresh_failure(
+                return self.session_terminal_failure(
                     &req.ctx,
+                    RefreshReason::SessionExpired,
                     RpcErrorCode::Fencing,
-                    RefreshReason::Fencing,
                     format!(
-                        "lease renewal rejected for handle={}; {}",
+                        "lease renewal rejected for handle={}; session expired, reopen and replay RenewWriteSessionLease",
                         file_handle,
-                        Self::replay_hint("RenewWriteSessionLease")
                     ),
                     group_id,
                     mount_epoch,
@@ -1494,7 +1587,14 @@ impl FsCore {
             }
         };
 
-        self.success(&req.ctx, RenewLeaseOutput { expires_at_ms }, group_id, mount_epoch)
+        let route_epoch = self.authoritative_route_epoch().await;
+        self.success_with_route_epoch(
+            &req.ctx,
+            RenewLeaseOutput { expires_at_ms },
+            group_id,
+            mount_epoch,
+            route_epoch,
+        )
     }
 
     pub(crate) async fn open_write(&self, req: OpenWriteInput) -> CoreResult<OpenWriteOutput> {
@@ -1543,12 +1643,13 @@ impl FsCore {
             Err(err) => return Err(err),
         };
 
-        if let Err(err) = self
+        let route_epoch = match self
             .validate_route_epoch(&req.ctx, req.freshness, group_id, mount_epoch, "OpenWriteByPath")
             .await
         {
-            return Err(err);
-        }
+            Ok(route_epoch) => route_epoch,
+            Err(err) => return Err(err),
+        };
 
         let mode = req.mode;
         let base_size = match mode {
@@ -1692,7 +1793,7 @@ impl FsCore {
             },
         );
 
-        self.success(
+        self.success_with_route_epoch(
             &req.ctx,
             OpenWriteOutput {
                 session_key: SessionKey {
@@ -1708,6 +1809,7 @@ impl FsCore {
             },
             group_id,
             mount_epoch,
+            route_epoch,
         )
     }
 
@@ -1718,14 +1820,13 @@ impl FsCore {
         let session = match self.write_session_manager.get_session(file_handle) {
             Some(session) => session,
             None => {
-                return self.need_refresh_failure(
+                return self.session_terminal_failure(
                     &req.ctx,
+                    RefreshReason::SessionInvalid,
                     RpcErrorCode::Fencing,
-                    RefreshReason::Fencing,
                     format!(
-                        "write session not found for handle={}; {}",
+                        "write session not found for handle={}; reopen and replay CloseWriteSession",
                         file_handle,
-                        Self::replay_hint("CloseWriteSession")
                     ),
                     None,
                     None,
@@ -1739,12 +1840,13 @@ impl FsCore {
                 Err(err) => return Err(err),
             };
 
-        if let Err(err) = self
+        let route_epoch = match self
             .validate_route_epoch(&req.ctx, req.freshness, group_id, mount_epoch, "CloseWriteSession")
             .await
         {
-            return Err(err);
-        }
+            Ok(route_epoch) => route_epoch,
+            Err(err) => return Err(err),
+        };
 
         if let Some(worker_manager) = self.worker_manager.as_ref() {
             for target in &session.write_targets {
@@ -1752,7 +1854,8 @@ impl FsCore {
                     let worker_id = WorkerId::new(endpoint.worker_id);
                     let current_epoch = worker_manager.get_descriptor(worker_id).map(|d| d.worker_epoch);
                     if current_epoch != Some(endpoint.worker_epoch) {
-                        return self.need_refresh_failure(
+                        let hint = Self::worker_refresh_hint_from_session(&session, current_epoch, true);
+                        return self.need_refresh_failure_with_hint(
                             &req.ctx,
                             RpcErrorCode::WorkerEpochMismatch,
                             RefreshReason::WorkerEpochMismatch,
@@ -1765,6 +1868,8 @@ impl FsCore {
                             ),
                             group_id,
                             mount_epoch,
+                            route_epoch,
+                            Some(hint),
                         );
                     }
                 }
@@ -1785,17 +1890,16 @@ impl FsCore {
         let request_lease_epoch = req.lease_epoch;
 
         if lease_id_typed != session.lease_id || request_lease_epoch != session.lease_epoch {
-            return self.need_refresh_failure(
+            return self.session_terminal_failure(
                 &req.ctx,
+                RefreshReason::SessionInvalid,
                 RpcErrorCode::Fencing,
-                RefreshReason::Fencing,
                 format!(
-                    "lease/session mismatch: expected lease_id={:?} lease_epoch={}, got lease_id={:?} lease_epoch={}; {}",
+                    "lease/session mismatch: expected lease_id={:?} lease_epoch={}, got lease_id={:?} lease_epoch={}; reopen and replay CloseWriteSession",
                     session.lease_id,
                     session.lease_epoch,
                     lease_id_typed,
                     request_lease_epoch,
-                    Self::replay_hint("CloseWriteSession")
                 ),
                 group_id,
                 mount_epoch,
@@ -1805,14 +1909,13 @@ impl FsCore {
         let req_token = match req.fencing_token.as_ref() {
             Some(token) => token,
             None => {
-                return self.need_refresh_failure(
+                return self.session_terminal_failure(
                     &req.ctx,
+                    RefreshReason::SessionInvalid,
                     RpcErrorCode::Fencing,
-                    RefreshReason::Fencing,
                     format!(
-                        "missing fencing_token for handle={}; {}",
+                        "missing fencing_token for handle={}; reopen and replay CloseWriteSession",
                         file_handle,
-                        Self::replay_hint("CloseWriteSession")
                     ),
                     group_id,
                     mount_epoch,
@@ -1820,14 +1923,13 @@ impl FsCore {
             }
         };
         if !Self::fencing_token_matches_session(&session, req_token) {
-            return self.need_refresh_failure(
+            return self.session_terminal_failure(
                 &req.ctx,
+                RefreshReason::SessionInvalid,
                 RpcErrorCode::Fencing,
-                RefreshReason::Fencing,
                 format!(
-                    "fencing_token mismatch for handle={}; {}",
+                    "fencing_token mismatch for handle={}; reopen and replay CloseWriteSession",
                     file_handle,
-                    Self::replay_hint("CloseWriteSession")
                 ),
                 group_id,
                 mount_epoch,
@@ -1835,15 +1937,13 @@ impl FsCore {
         }
 
         if req.open_epoch != session.open_epoch {
-            return self.need_refresh_failure(
+            return self.session_terminal_failure(
                 &req.ctx,
+                RefreshReason::SessionInvalid,
                 RpcErrorCode::EpochMismatch,
-                RefreshReason::EpochMismatch,
                 format!(
-                    "open_epoch mismatch: expected {}, got {}; {}",
-                    session.open_epoch,
-                    req.open_epoch,
-                    Self::replay_hint("CloseWriteSession")
+                    "open_epoch mismatch: expected {}, got {}; reopen and replay CloseWriteSession",
+                    session.open_epoch, req.open_epoch,
                 ),
                 group_id,
                 mount_epoch,
@@ -1855,14 +1955,13 @@ impl FsCore {
             .validate_lease(session.inode_id, lease_id_typed, request_lease_epoch)
             .is_err()
         {
-            return self.need_refresh_failure(
+            return self.session_terminal_failure(
                 &req.ctx,
+                RefreshReason::SessionExpired,
                 RpcErrorCode::Fencing,
-                RefreshReason::Fencing,
                 format!(
-                    "lease validation rejected for handle={}; {}",
+                    "lease validation rejected for handle={}; session expired, reopen and replay CloseWriteSession",
                     file_handle,
-                    Self::replay_hint("CloseWriteSession")
                 ),
                 group_id,
                 mount_epoch,
@@ -1963,7 +2062,7 @@ impl FsCore {
             .release(session.inode_id, lease_id_typed, session.lease_epoch);
         self.write_session_manager.remove_session(file_handle);
 
-        self.success(
+        self.success_with_route_epoch(
             &req.ctx,
             CloseWriteOutput {
                 committed_size: req.intent.final_size,
@@ -1971,6 +2070,7 @@ impl FsCore {
             },
             Some(ctx.namespace_owner_group_id.as_raw()),
             Some(ctx.mount_epoch),
+            route_epoch,
         )
     }
 
@@ -2018,12 +2118,13 @@ impl FsCore {
             Err(err) => return Err(err),
         };
 
-        if let Err(err) = self
+        let route_epoch = match self
             .validate_route_epoch(&req.ctx, req.freshness, group_id, mount_epoch, "FsyncSession")
             .await
         {
-            return Err(err);
-        }
+            Ok(route_epoch) => route_epoch,
+            Err(err) => return Err(err),
+        };
 
         let mut lease_id = req.lease_id;
         let mut lease_epoch = req.lease_epoch.unwrap_or(0);
@@ -2042,14 +2143,13 @@ impl FsCore {
             let session = match self.write_session_manager.get_session(handle) {
                 Some(session) => session,
                 None => {
-                    return self.need_refresh_failure(
+                    return self.session_terminal_failure(
                         &req.ctx,
+                        RefreshReason::SessionInvalid,
                         RpcErrorCode::Fencing,
-                        RefreshReason::Fencing,
                         format!(
-                            "write session not found for handle={}; {}",
+                            "write session not found for handle={}; reopen and replay FsyncSession",
                             handle,
-                            Self::replay_hint("FsyncSession")
                         ),
                         group_id,
                         mount_epoch,
@@ -2058,15 +2158,13 @@ impl FsCore {
             };
 
             if session.inode_id != inode_id {
-                return self.need_refresh_failure(
+                return self.session_terminal_failure(
                     &req.ctx,
+                    RefreshReason::SessionInvalid,
                     RpcErrorCode::EpochMismatch,
-                    RefreshReason::EpochMismatch,
                     format!(
-                        "file_handle={} does not match inode={}; {}",
-                        handle,
-                        inode_id,
-                        Self::replay_hint("FsyncSession")
+                        "file_handle={} does not match inode={}; reopen and replay FsyncSession",
+                        handle, inode_id,
                     ),
                     group_id,
                     mount_epoch,
@@ -2083,14 +2181,13 @@ impl FsCore {
                 fencing_token = Some(session.fencing_token);
             } else if let Some(token) = presented_token.as_ref() {
                 if !Self::fencing_token_matches_session(&session, token) {
-                    return self.need_refresh_failure(
+                    return self.session_terminal_failure(
                         &req.ctx,
+                        RefreshReason::SessionInvalid,
                         RpcErrorCode::Fencing,
-                        RefreshReason::Fencing,
                         format!(
-                            "fencing_token mismatch for handle={}; {}",
+                            "fencing_token mismatch for handle={}; reopen and replay FsyncSession",
                             handle,
-                            Self::replay_hint("FsyncSession")
                         ),
                         group_id,
                         mount_epoch,
@@ -2110,7 +2207,14 @@ impl FsCore {
                     .flat_map(|t| t.worker_endpoints.iter())
                     .any(|ep| ep.worker_epoch != client_worker_epoch);
                 if mismatch {
-                    return self.need_refresh_failure(
+                    let server_worker_epoch = session
+                        .write_targets
+                        .iter()
+                        .flat_map(|t| t.worker_endpoints.iter())
+                        .map(|ep| ep.worker_epoch)
+                        .max();
+                    let hint = Self::worker_refresh_hint_from_session(&session, server_worker_epoch, false);
+                    return self.need_refresh_failure_with_hint(
                         &req.ctx,
                         RpcErrorCode::WorkerEpochMismatch,
                         RefreshReason::WorkerEpochMismatch,
@@ -2121,6 +2225,8 @@ impl FsCore {
                         ),
                         group_id,
                         mount_epoch,
+                        route_epoch,
+                        Some(hint),
                     );
                 }
             }
@@ -2143,14 +2249,13 @@ impl FsCore {
             .validate_lease(inode_id, lease_id_typed, lease_epoch)
             .is_err()
         {
-            return self.need_refresh_failure(
+            return self.session_terminal_failure(
                 &req.ctx,
+                RefreshReason::SessionExpired,
                 RpcErrorCode::Fencing,
-                RefreshReason::Fencing,
                 format!(
-                    "lease validation rejected for inode={}; {}",
+                    "lease validation rejected for inode={}; session expired, reopen and replay FsyncSession",
                     inode_id,
-                    Self::replay_hint("FsyncSession")
                 ),
                 group_id,
                 mount_epoch,
@@ -2246,7 +2351,13 @@ impl FsCore {
                 };
                 if let Some(err) = inner.header.and_then(|h| h.error) {
                     let cerr = canonical_from_error_detail(err);
-                    return self.failure_from_canonical(&req.ctx, cerr, group_id, mount_epoch);
+                    return self.failure_from_canonical_with_route_epoch(
+                        &req.ctx,
+                        cerr,
+                        group_id,
+                        mount_epoch,
+                        route_epoch,
+                    );
                 }
             }
         }
@@ -2295,11 +2406,12 @@ impl FsCore {
             );
         }
 
-        self.success(
+        self.success_with_route_epoch(
             &req.ctx,
             FsyncBarrierOutput,
             Some(ctx.namespace_owner_group_id.as_raw()),
             Some(ctx.mount_epoch),
+            route_epoch,
         )
     }
 

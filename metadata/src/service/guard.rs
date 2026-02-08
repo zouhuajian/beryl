@@ -10,7 +10,7 @@ use crate::error::MetadataError;
 use crate::mount::{DataIoPolicy, MountTable, ROOT_MOUNT_PREFIX};
 use crate::raft::AppRaftNode;
 use crate::readiness::RootReadinessGate;
-use common::error::canonical::{CanonicalError, RefreshReason};
+use common::error::canonical::{CanonicalError, RefreshHint, RefreshReason};
 use common::header::{RequestHeader, RpcErrorCode};
 use std::sync::Arc;
 use types::fs::FsErrorCode;
@@ -24,11 +24,21 @@ pub struct AuthzContext {
 
 pub trait LeadershipChecker: Send + Sync {
     fn is_leader(&self) -> bool;
+    fn leader_endpoint(&self) -> Option<String> {
+        None
+    }
 }
 
 impl LeadershipChecker for AppRaftNode {
     fn is_leader(&self) -> bool {
         self.is_leader()
+    }
+
+    fn leader_endpoint(&self) -> Option<String> {
+        let leader_id = self.get_leader_id()?;
+        let membership = self.get_membership()?;
+        let leader_node = membership.nodes().find(|(node_id, _)| **node_id == leader_id)?.1;
+        Some(leader_node.address.clone())
     }
 }
 
@@ -252,7 +262,7 @@ struct LeadershipGuard {
 }
 
 impl LeadershipGuard {
-    fn check(&self, _ctx: &GuardContext) -> Result<(), GuardFailure> {
+    fn check(&self, ctx: &GuardContext) -> Result<(), GuardFailure> {
         let Some(checker) = self.checker.as_ref() else {
             return Err(GuardFailure::new(
                 MetadataError::ServiceUnavailable("raft node not available".to_string()).into(),
@@ -261,9 +271,20 @@ impl LeadershipGuard {
         if checker.is_leader() {
             Ok(())
         } else {
-            Err(GuardFailure::new(CanonicalError::need_refresh(
+            let group_id = ctx
+                .req_header_proto
+                .as_ref()
+                .and_then(|header| (header.group_id != 0).then_some(header.group_id))
+                .or(ctx.caller.group_id);
+            let hint = RefreshHint {
+                leader_endpoint: checker.leader_endpoint(),
+                group_id,
+                ..Default::default()
+            };
+            Err(GuardFailure::new(CanonicalError::need_refresh_with_hint(
                 RpcErrorCode::NotLeader,
                 RefreshReason::NotLeader,
+                hint,
                 "not leader",
             )))
         }

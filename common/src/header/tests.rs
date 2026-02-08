@@ -56,6 +56,7 @@ mod tests {
             reason: None,
             retry_after_ms: Some(1000),
             message: "Test error".to_string(),
+            refresh_hint: None,
         };
         let resp_error = ResponseHeader::error(client, canonical);
         assert_eq!(resp_error.status, RpcStatus::Error);

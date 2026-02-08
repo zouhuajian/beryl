@@ -17,6 +17,7 @@ prost = { workspace = true }
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
 futures = { workspace = true }
+async-trait = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }

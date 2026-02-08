@@ -13,6 +13,7 @@ use metadata::service::guard::LeadershipChecker;
 use metadata::service::{
     AuthzOp, AuthzProvider, AuthzTarget, DenyAllAuthz, MetadataFileSystemServiceImpl, MetadataFsServiceImpl,
 };
+use metadata::state::StateStore;
 use proto::common::{error_detail_proto::Code as ErrorCodeProto, ErrorClassProto, FsErrnoProto};
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::metadata_fs_service_proto_server::MetadataFsServiceProto;
@@ -29,6 +30,10 @@ struct NotLeader;
 impl LeadershipChecker for NotLeader {
     fn is_leader(&self) -> bool {
         false
+    }
+
+    fn leader_endpoint(&self) -> Option<String> {
+        Some("127.0.0.1:17000".to_string())
     }
 }
 
@@ -123,6 +128,13 @@ async fn test_path_service_propagates_need_refresh_from_fs() {
         error.refresh_reason,
         proto::common::RefreshReasonProto::RefreshReasonNotLeader as i32
     );
+    assert_eq!(
+        error
+            .refresh_hint
+            .as_ref()
+            .and_then(|hint| hint.leader_endpoint.as_deref()),
+        Some("127.0.0.1:17000")
+    );
 }
 
 #[tokio::test]
@@ -167,6 +179,139 @@ async fn test_path_service_resolver_not_found_is_enoent() {
             proto::common::FsErrnoProto::FsErrnoEnoent as i32
         ))
     );
+}
+
+#[tokio::test]
+async fn get_file_status_success_header_includes_route_and_mount_epoch() {
+    let fs_harness = FsTestHarness::new().await.unwrap();
+    let (mount_id, _root_inode_id) = fs_harness
+        .create_mount_with_root(
+            "/mnt/test".to_string(),
+            "file:///tmp/test".to_string(),
+            ShardGroupId::new(1),
+        )
+        .await
+        .unwrap();
+    let mount = fs_harness.mount_table.get_mount(mount_id).unwrap().unwrap();
+    let route_epoch = fs_harness.state_store.get_layout_version().await.unwrap().as_u64();
+
+    let fs_service = MetadataFsServiceImpl::new(
+        fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
+        fs_harness.mount_table.clone(),
+    )
+    .with_storage(fs_harness.storage.clone())
+    .with_raft_node(fs_harness.raft_node.clone())
+    .with_leadership_checker(Arc::new(AlwaysLeader));
+    let fs_core = fs_service.fs_core();
+    let path_service =
+        MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
+            .with_leadership_checker(Arc::new(AlwaysLeader));
+
+    let resp = FileSystemServiceProto::get_file_status(
+        &path_service,
+        Request::new(GetFileStatusRequestProto {
+            header: FsTestHarness::create_test_request_header(),
+            path: "/mnt/test".to_string(),
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    let header = resp.header.expect("missing response header");
+    assert!(header.error.is_none());
+    assert_eq!(header.mount_epoch, Some(mount.config_version));
+    assert_eq!(header.route_epoch, Some(route_epoch));
+}
+
+#[tokio::test]
+async fn list_status_success_header_includes_route_and_mount_epoch() {
+    let fs_harness = FsTestHarness::new().await.unwrap();
+    let (mount_id, _root_inode_id) = fs_harness
+        .create_mount_with_root(
+            "/mnt/test".to_string(),
+            "file:///tmp/test".to_string(),
+            ShardGroupId::new(1),
+        )
+        .await
+        .unwrap();
+    let mount = fs_harness.mount_table.get_mount(mount_id).unwrap().unwrap();
+    let route_epoch = fs_harness.state_store.get_layout_version().await.unwrap().as_u64();
+
+    let fs_service = MetadataFsServiceImpl::new(
+        fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
+        fs_harness.mount_table.clone(),
+    )
+    .with_storage(fs_harness.storage.clone())
+    .with_raft_node(fs_harness.raft_node.clone())
+    .with_leadership_checker(Arc::new(AlwaysLeader));
+    let fs_core = fs_service.fs_core();
+    let path_service =
+        MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
+            .with_leadership_checker(Arc::new(AlwaysLeader));
+
+    let resp = FileSystemServiceProto::list_status(
+        &path_service,
+        Request::new(ListStatusPathRequestProto {
+            header: FsTestHarness::create_test_request_header(),
+            path: "/mnt/test".to_string(),
+            recursive: false,
+            cursor: vec![],
+            limit: 16,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    let header = resp.header.expect("missing response header");
+    assert!(header.error.is_none());
+    assert_eq!(header.mount_epoch, Some(mount.config_version));
+    assert_eq!(header.route_epoch, Some(route_epoch));
+}
+
+#[tokio::test]
+async fn open_success_header_includes_route_and_mount_epoch() {
+    let fs_harness = FsTestHarness::new().await.unwrap();
+    let (mount_id, _root_inode_id) = fs_harness
+        .create_mount_with_root(
+            "/mnt/test".to_string(),
+            "file:///tmp/test".to_string(),
+            ShardGroupId::new(1),
+        )
+        .await
+        .unwrap();
+    let mount = fs_harness.mount_table.get_mount(mount_id).unwrap().unwrap();
+    let route_epoch = fs_harness.state_store.get_layout_version().await.unwrap().as_u64();
+
+    let fs_service = MetadataFsServiceImpl::new(
+        fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
+        fs_harness.mount_table.clone(),
+    )
+    .with_storage(fs_harness.storage.clone())
+    .with_raft_node(fs_harness.raft_node.clone())
+    .with_leadership_checker(Arc::new(AlwaysLeader));
+    let fs_core = fs_service.fs_core();
+    let path_service =
+        MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
+            .with_leadership_checker(Arc::new(AlwaysLeader));
+
+    let resp = FileSystemServiceProto::open(
+        &path_service,
+        Request::new(OpenPathRequestProto {
+            header: FsTestHarness::create_test_request_header(),
+            path: "/mnt/test".to_string(),
+            flags: 0,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    let header = resp.header.expect("missing response header");
+    assert!(header.error.is_none());
+    assert_eq!(header.mount_epoch, Some(mount.config_version));
+    assert_eq!(header.route_epoch, Some(route_epoch));
 }
 
 #[tokio::test]
@@ -221,26 +366,27 @@ async fn test_path_service_mount_epoch_mismatch_is_need_refresh_with_reason_and_
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
-    .with_storage(fs_harness.storage.clone());
+    .with_storage(fs_harness.storage.clone())
+    .with_raft_node(fs_harness.raft_node.clone());
     let fs_core = fs_service.fs_core();
     let path_service =
         MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
             .with_leadership_checker(Arc::new(AlwaysLeader));
 
-    let mut req_header = FsTestHarness::create_test_request_header();
-    if let Some(header) = req_header.as_mut() {
-        let mount = fs_harness
-            .mount_table
-            .get_mount(mount_id)
-            .unwrap()
-            .expect("mount must exist");
-        header.mount_epoch = Some(mount.config_version.saturating_sub(1));
-    }
+    let mount = fs_harness
+        .mount_table
+        .get_mount(mount_id)
+        .unwrap()
+        .expect("mount must exist");
 
     let attrs = FileAttrs::new();
-    let mkdir_req = MkdirPathRequestProto {
-        header: req_header,
-        path: "/mnt/test/dir".to_string(),
+    let mut create_header = FsTestHarness::create_test_request_header();
+    if let Some(header) = create_header.as_mut() {
+        header.mount_epoch = Some(mount.config_version);
+    }
+    let create_req = CreatePathRequestProto {
+        header: create_header,
+        path: "/mnt/test/open_write_mount_epoch.bin".to_string(),
         attrs: Some(proto::fs::FileAttrsProto {
             mode: attrs.mode,
             uid: attrs.uid,
@@ -251,10 +397,35 @@ async fn test_path_service_mount_epoch_mismatch_is_need_refresh_with_reason_and_
             ctime_ms: attrs.ctime_ms,
             nlink: attrs.nlink,
         }),
-        create_parents: false,
+        layout: Some(proto::common::FileLayoutProto {
+            block_size: 1024,
+            chunk_size: 512,
+            replication: 1,
+        }),
+    };
+    let create_resp = FileSystemServiceProto::create(&path_service, Request::new(create_req))
+        .await
+        .expect("create path should succeed")
+        .into_inner();
+    let create_header = create_resp.header.expect("missing create response header");
+    assert!(
+        create_header.error.is_none(),
+        "create precondition failed: {:?}",
+        create_header.error
+    );
+
+    let mut req_header = FsTestHarness::create_test_request_header();
+    if let Some(header) = req_header.as_mut() {
+        header.mount_epoch = Some(mount.config_version.saturating_sub(1));
+    }
+    let open_req = OpenWriteByPathRequestProto {
+        header: req_header,
+        path: "/mnt/test/open_write_mount_epoch.bin".to_string(),
+        desired_len: Some(1024),
+        mode: WriteModeProto::WriteModeWrite as i32,
     };
 
-    let resp = FileSystemServiceProto::mkdir(&path_service, Request::new(mkdir_req))
+    let resp = FileSystemServiceProto::open_write_by_path(&path_service, Request::new(open_req))
         .await
         .expect("business errors must return grpc OK")
         .into_inner();
@@ -270,6 +441,10 @@ async fn test_path_service_mount_epoch_mismatch_is_need_refresh_with_reason_and_
         proto::common::RefreshReasonProto::RefreshReasonMountEpochMismatch as i32
     );
     assert!(header.mount_epoch.is_some(), "mount_epoch hint must be present");
+    assert_eq!(
+        error.refresh_hint.as_ref().and_then(|hint| hint.mount_epoch),
+        Some(mount.config_version)
+    );
 }
 
 #[tokio::test]

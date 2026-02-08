@@ -201,6 +201,7 @@ impl From<ClientError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("version mismatch: expected {}, got {}", expected, actual),
+                refresh_hint: None,
             },
             ClientError::Action(action) => match action {
                 ClientAction::Ok => CanonicalError::ok("ok"),
@@ -213,6 +214,7 @@ impl From<ClientError> for CanonicalError {
                     reason: None,
                     retry_after_ms: None,
                     message: format!("transport status {:?}: {}", status.code(), status.message()),
+                    refresh_hint: None,
                 },
             },
             ClientError::Common(common_err) => {
@@ -227,6 +229,7 @@ impl From<ClientError> for CanonicalError {
                     reason: None,
                     retry_after_ms: if is_retryable { Some(1000) } else { None },
                     message: common_err.to_string(),
+                    refresh_hint: None,
                 }
             }
             ClientError::Metadata(msg) | ClientError::Worker(msg) | ClientError::Routing(msg) => {
@@ -238,6 +241,7 @@ impl From<ClientError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: msg,
+                refresh_hint: None,
             },
         }
     }

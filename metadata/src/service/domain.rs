@@ -82,6 +82,7 @@ pub struct CoreSuccess<T> {
     pub payload: T,
     pub group_id: Option<u64>,
     pub mount_epoch: Option<u64>,
+    pub route_epoch: Option<u64>,
     pub state_id: Option<RaftLogId>,
 }
 
@@ -90,6 +91,7 @@ pub struct CoreFailure {
     pub error: CanonicalError,
     pub group_id: Option<u64>,
     pub mount_epoch: Option<u64>,
+    pub route_epoch: Option<u64>,
     pub state_id: Option<RaftLogId>,
 }
 
@@ -98,12 +100,14 @@ impl CoreFailure {
         error: CanonicalError,
         group_id: Option<u64>,
         mount_epoch: Option<u64>,
+        route_epoch: Option<u64>,
         state_id: Option<RaftLogId>,
     ) -> Self {
         Self {
             error,
             group_id,
             mount_epoch,
+            route_epoch,
             state_id,
         }
     }

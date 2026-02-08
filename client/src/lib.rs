@@ -37,4 +37,8 @@ pub use error::{ClientError, ClientResult};
 pub use api::hcfs::{Client, Handle, OpenFlags};
 pub use canonical::{validate_header_or_action, ClientAction};
 pub use consistency::ConsistencyLevel;
+pub use meta::{
+    replay_policy_for_method, ActionMachine, ActionMachinePolicy, FileSystemRpc, FileSystemRpcMethod, ReplayPolicy,
+    RpcOp, TonicFileSystemRpc,
+};
 pub use modes::{ReadMode, WriteMode};

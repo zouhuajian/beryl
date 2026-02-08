@@ -261,6 +261,7 @@ async fn fsync_barrier_retryable_does_not_persist_size() {
                     refresh_reason: RefreshReasonProto::RefreshReasonUnknown as i32,
                     retry_after_ms: Some(50),
                     message: "timeout".to_string(),
+                    refresh_hint: None,
                 };
                 CommitWriteResponseProto {
                     header: Some(proto::worker::DataResponseHeaderProto {

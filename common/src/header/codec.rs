@@ -163,6 +163,7 @@ impl RequestHeaderCodec {
             retry_count: 0,
             group_id: None,
             mount_epoch,
+            route_epoch: None,
         }
     }
 }
@@ -219,6 +220,7 @@ mod tests {
             retry_count: 0,
             group_id: None,
             mount_epoch: None,
+            route_epoch: None,
         };
 
         // Encode

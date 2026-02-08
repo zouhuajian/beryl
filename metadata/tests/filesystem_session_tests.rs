@@ -36,6 +36,7 @@ impl LeadershipChecker for AlwaysLeader {
 
 struct SessionHarness {
     pub _fs_harness: FsTestHarness,
+    pub fs_service: Arc<MetadataFsServiceImpl>,
     pub path_service: MetadataFileSystemServiceImpl,
     pub mount_epoch: u64,
     pub route_epoch: u64,
@@ -79,15 +80,17 @@ impl SessionHarness {
             .unwrap();
 
         let metrics = Arc::new(metadata::metrics::MetadataMetrics::new());
-        let fs_service = MetadataFsServiceImpl::new(
-            fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
-            fs_harness.mount_table.clone(),
-        )
-        .with_storage(fs_harness.storage.clone())
-        .with_raft_node(fs_harness.raft_node.clone())
-        .with_leadership_checker(Arc::new(AlwaysLeader))
-        .with_worker_manager(worker_manager)
-        .with_metrics(metrics.clone());
+        let fs_service = Arc::new(
+            MetadataFsServiceImpl::new(
+                fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
+                fs_harness.mount_table.clone(),
+            )
+            .with_storage(fs_harness.storage.clone())
+            .with_raft_node(fs_harness.raft_node.clone())
+            .with_leadership_checker(Arc::new(AlwaysLeader))
+            .with_worker_manager(worker_manager)
+            .with_metrics(metrics.clone()),
+        );
         fs_service.set_worker_commit_hook_for_test(Arc::new(|_req| CommitWriteResponseProto::default()));
         let fs_core = fs_service.fs_core();
 
@@ -101,6 +104,7 @@ impl SessionHarness {
 
         Self {
             _fs_harness: fs_harness,
+            fs_service,
             path_service,
             mount_epoch: mount_entry.config_version,
             route_epoch,
@@ -165,6 +169,61 @@ fn rpc_code(resp: &Option<proto::common::ResponseHeaderProto>) -> Option<i32> {
     }
 }
 
+fn assert_success_freshness(header: &proto::common::ResponseHeaderProto, harness: &SessionHarness, rpc_name: &str) {
+    assert!(
+        header.error.is_none(),
+        "{} returned unexpected error envelope: {:?}",
+        rpc_name,
+        header.error
+    );
+    assert_eq!(
+        header.mount_epoch,
+        Some(harness.mount_epoch),
+        "{} success header must carry authoritative mount_epoch",
+        rpc_name
+    );
+    assert_eq!(
+        header.route_epoch,
+        Some(harness.route_epoch),
+        "{} success header must carry authoritative route_epoch",
+        rpc_name
+    );
+}
+
+async fn open_write_session(harness: &SessionHarness, path: &str) -> OpenWriteByPathResponseProto {
+    let open_resp = FileSystemServiceProto::open_write_by_path(
+        &harness.path_service,
+        Request::new(OpenWriteByPathRequestProto {
+            header: harness.header(Some(harness.route_epoch)),
+            path: path.to_string(),
+            desired_len: Some(1024),
+            mode: WriteModeProto::WriteModeWrite as i32,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    let open_header = open_resp.header.as_ref().expect("missing open_write header");
+    assert_success_freshness(open_header, harness, "OpenWriteByPath");
+    open_resp
+}
+
+fn fsync_request_for_open(
+    harness: &SessionHarness,
+    open_resp: &OpenWriteByPathResponseProto,
+) -> FsyncSessionRequestProto {
+    FsyncSessionRequestProto {
+        header: harness.header(Some(harness.route_epoch)),
+        file_handle: open_resp.file_handle,
+        flags: 0,
+        lease_id: open_resp.lease_id,
+        lease_epoch: Some(open_resp.lease_epoch),
+        fencing_token: open_resp.fencing_token,
+        worker_epoch: None,
+        target_size: Some(0),
+    }
+}
+
 #[tokio::test]
 async fn write_session_happy_path() {
     let harness = SessionHarness::new().await;
@@ -181,7 +240,10 @@ async fn write_session_happy_path() {
         .await
         .unwrap()
         .into_inner();
-    assert!(open_resp.header.as_ref().and_then(|h| h.error.as_ref()).is_none());
+    let open_header = open_resp.header.as_ref().expect("missing open_write header");
+    assert!(open_header.error.is_none());
+    assert_eq!(open_header.mount_epoch, Some(harness.mount_epoch));
+    assert_eq!(open_header.route_epoch, Some(harness.route_epoch));
 
     let renew_req = RenewWriteSessionLeaseRequestProto {
         header: harness.header(Some(harness.route_epoch)),
@@ -193,7 +255,10 @@ async fn write_session_happy_path() {
         .await
         .unwrap()
         .into_inner();
-    assert!(renew_resp.header.as_ref().and_then(|h| h.error.as_ref()).is_none());
+    let renew_header = renew_resp.header.as_ref().expect("missing renew header");
+    assert!(renew_header.error.is_none());
+    assert_eq!(renew_header.mount_epoch, Some(harness.mount_epoch));
+    assert_eq!(renew_header.route_epoch, Some(harness.route_epoch));
 
     let close_req = CloseWriteSessionRequestProto {
         header: harness.header(Some(harness.route_epoch)),
@@ -210,6 +275,128 @@ async fn write_session_happy_path() {
         .unwrap()
         .into_inner();
     assert!(close_resp.header.as_ref().and_then(|h| h.error.as_ref()).is_none());
+}
+
+#[tokio::test]
+async fn get_file_layout_by_path_success_header_includes_route_and_mount_epoch() {
+    let harness = SessionHarness::new().await;
+    let path = "/mnt/test/layout_freshness.bin";
+    harness.create_file(path).await;
+
+    let layout_resp = FileSystemServiceProto::get_file_layout_by_path(
+        &harness.path_service,
+        Request::new(GetFileLayoutByPathRequestProto {
+            header: harness.header(Some(harness.route_epoch)),
+            path: path.to_string(),
+            range: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    let header = layout_resp
+        .header
+        .as_ref()
+        .expect("missing get_file_layout_by_path header");
+    assert_success_freshness(header, &harness, "GetFileLayoutByPath");
+}
+
+#[tokio::test]
+async fn open_write_by_path_success_header_includes_route_and_mount_epoch() {
+    let harness = SessionHarness::new().await;
+    let path = "/mnt/test/open_write_freshness.bin";
+    harness.create_file(path).await;
+    let _ = open_write_session(&harness, path).await;
+}
+
+#[tokio::test]
+async fn close_write_session_success_header_includes_route_and_mount_epoch() {
+    let harness = SessionHarness::new().await;
+    let path = "/mnt/test/close_write_freshness.bin";
+    harness.create_file(path).await;
+
+    let open_resp = open_write_session(&harness, path).await;
+    let close_resp = FileSystemServiceProto::close_write_session(
+        &harness.path_service,
+        Request::new(CloseWriteSessionRequestProto {
+            header: harness.header(Some(harness.route_epoch)),
+            file_handle: open_resp.file_handle,
+            lease_id: open_resp.lease_id,
+            fencing_token: open_resp.fencing_token,
+            extents: vec![],
+            final_size: 0,
+            open_epoch: open_resp.open_epoch,
+            lease_epoch: open_resp.lease_epoch,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    let header = close_resp.header.as_ref().expect("missing close_write_session header");
+    assert_success_freshness(header, &harness, "CloseWriteSession");
+}
+
+#[tokio::test]
+async fn fsync_session_success_header_includes_route_and_mount_epoch() {
+    let harness = SessionHarness::new().await;
+    let path = "/mnt/test/fsync_freshness.bin";
+    harness.create_file(path).await;
+
+    let open_resp = open_write_session(&harness, path).await;
+    let fsync_resp = FileSystemServiceProto::fsync_session(
+        &harness.path_service,
+        Request::new(fsync_request_for_open(&harness, &open_resp)),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    let header = fsync_resp.header.as_ref().expect("missing fsync_session header");
+    assert_success_freshness(header, &harness, "FsyncSession");
+}
+
+#[tokio::test]
+async fn hsync_session_success_header_includes_route_and_mount_epoch() {
+    let harness = SessionHarness::new().await;
+    let path = "/mnt/test/hsync_freshness.bin";
+    harness.create_file(path).await;
+
+    let open_resp = open_write_session(&harness, path).await;
+    let hsync_resp = FileSystemServiceProto::hsync_session(
+        &harness.path_service,
+        Request::new(HsyncSessionRequestProto {
+            fsync: Some(fsync_request_for_open(&harness, &open_resp)),
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    let header = hsync_resp.header.as_ref().expect("missing hsync_session header");
+    assert_success_freshness(header, &harness, "HsyncSession");
+}
+
+#[tokio::test]
+async fn hflush_session_success_header_includes_route_and_mount_epoch() {
+    let harness = SessionHarness::new().await;
+    let path = "/mnt/test/hflush_freshness.bin";
+    harness.create_file(path).await;
+
+    let open_resp = open_write_session(&harness, path).await;
+    let hflush_resp = FileSystemServiceProto::hflush_session(
+        &harness.path_service,
+        Request::new(HflushSessionRequestProto {
+            fsync: Some(fsync_request_for_open(&harness, &open_resp)),
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    let header = hflush_resp.header.as_ref().expect("missing hflush_session header");
+    assert_success_freshness(header, &harness, "HflushSession");
 }
 
 #[tokio::test]
@@ -288,6 +475,41 @@ async fn write_session_full_lifecycle_includes_sync_and_release() {
 }
 
 #[tokio::test]
+async fn release_session_success_header_includes_route_and_mount_epoch() {
+    let harness = SessionHarness::new().await;
+    let path = "/mnt/test/release_freshness.bin";
+    harness.create_file(path).await;
+
+    let open_req = OpenWriteByPathRequestProto {
+        header: harness.header(Some(harness.route_epoch)),
+        path: path.to_string(),
+        desired_len: Some(1024),
+        mode: WriteModeProto::WriteModeWrite as i32,
+    };
+    let open_resp = FileSystemServiceProto::open_write_by_path(&harness.path_service, Request::new(open_req))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(open_resp.header.as_ref().and_then(|h| h.error.as_ref()).is_none());
+
+    let release_resp = FileSystemServiceProto::release_session(
+        &harness.path_service,
+        Request::new(ReleaseSessionRequestProto {
+            header: harness.header(Some(harness.route_epoch)),
+            file_handle: open_resp.file_handle,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    let release_header = release_resp.header.expect("missing release header");
+    assert!(release_header.error.is_none());
+    assert_eq!(release_header.mount_epoch, Some(harness.mount_epoch));
+    assert_eq!(release_header.route_epoch, Some(harness.route_epoch));
+}
+
+#[tokio::test]
 async fn route_epoch_mismatch_closed_loop() {
     let harness = SessionHarness::new().await;
     let path = "/mnt/test/layout.bin";
@@ -303,6 +525,7 @@ async fn route_epoch_mismatch_closed_loop() {
         FileSystemServiceProto::get_file_layout_by_path(&harness.path_service, Request::new(layout_req_stale)).await;
     assert!(stale_call.is_ok());
     let stale_resp = stale_call.unwrap().into_inner();
+    let stale_header = stale_resp.header.as_ref().expect("missing stale layout header");
     let err = stale_resp.header.as_ref().and_then(|h| h.error.as_ref()).unwrap();
     assert_eq!(err.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
     assert_eq!(
@@ -313,6 +536,14 @@ async fn route_epoch_mismatch_closed_loop() {
         err.refresh_reason,
         RefreshReasonProto::RefreshReasonRouteEpochMismatch as i32
     );
+    let refresh_hint = err
+        .refresh_hint
+        .as_ref()
+        .expect("route mismatch must include refresh_hint");
+    assert_eq!(refresh_hint.route_epoch, Some(harness.route_epoch));
+    assert_eq!(refresh_hint.mount_epoch, Some(harness.mount_epoch));
+    assert_eq!(stale_header.route_epoch, Some(harness.route_epoch));
+    assert_eq!(stale_header.mount_epoch, Some(harness.mount_epoch));
     assert!(err.message.contains("refresh route and replay"));
     assert!(
         err.message.contains("server="),
@@ -335,11 +566,14 @@ async fn route_epoch_mismatch_closed_loop() {
             .await
             .unwrap()
             .into_inner();
-    assert!(fresh_resp.header.as_ref().and_then(|h| h.error.as_ref()).is_none());
+    let fresh_header = fresh_resp.header.as_ref().expect("missing fresh layout header");
+    assert!(fresh_header.error.is_none());
+    assert_eq!(fresh_header.mount_epoch, Some(harness.mount_epoch));
+    assert_eq!(fresh_header.route_epoch, Some(harness.route_epoch));
 }
 
 #[tokio::test]
-async fn fencing_is_refreshable() {
+async fn fencing_reports_structured_session_invalid() {
     let harness = SessionHarness::new().await;
     let path = "/mnt/test/fencing.bin";
     harness.create_file(path).await;
@@ -375,15 +609,18 @@ async fn fencing_is_refreshable() {
         .unwrap()
         .into_inner();
     let err = close_resp.header.as_ref().and_then(|h| h.error.as_ref()).unwrap();
-    assert_eq!(err.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+    assert_eq!(err.error_class, ErrorClassProto::ErrorClassFatal as i32);
     assert_eq!(
         rpc_code(&close_resp.header),
         Some(RpcErrorCodeProto::RpcErrCodeFencing as i32)
     );
-    assert_eq!(err.refresh_reason, RefreshReasonProto::RefreshReasonFencing as i32);
+    assert_eq!(
+        err.refresh_reason,
+        RefreshReasonProto::RefreshReasonSessionInvalid as i32
+    );
     assert!(
-        err.message.contains("re-open write session"),
-        "expected actionable replay hint in fencing response: {}",
+        err.message.contains("reopen and replay"),
+        "expected actionable reopen hint in fencing response: {}",
         err.message
     );
 }
@@ -437,6 +674,89 @@ async fn worker_epoch_mismatch_is_refreshable() {
 }
 
 #[tokio::test]
+async fn fsync_missing_session_reports_session_invalid_reason() {
+    let harness = SessionHarness::new().await;
+
+    let fsync_req = FsyncSessionRequestProto {
+        header: harness.header(Some(harness.route_epoch)),
+        file_handle: u64::MAX,
+        flags: 0,
+        lease_id: None,
+        lease_epoch: None,
+        fencing_token: None,
+        worker_epoch: None,
+        target_size: None,
+    };
+    let fsync_call = FileSystemServiceProto::fsync_session(&harness.path_service, Request::new(fsync_req)).await;
+    assert!(fsync_call.is_ok(), "business mismatch must not use non-OK gRPC status");
+    let fsync_resp = fsync_call.unwrap().into_inner();
+    let err = fsync_resp.header.as_ref().and_then(|h| h.error.as_ref()).unwrap();
+    assert_eq!(err.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+    assert_eq!(
+        rpc_code(&fsync_resp.header),
+        Some(RpcErrorCodeProto::RpcErrCodeFencing as i32)
+    );
+    assert_eq!(
+        err.refresh_reason,
+        RefreshReasonProto::RefreshReasonSessionInvalid as i32
+    );
+}
+
+#[tokio::test]
+async fn renew_lease_reports_structured_session_expired_reason() {
+    let harness = SessionHarness::new().await;
+    let path = "/mnt/test/session_expired.bin";
+    harness.create_file(path).await;
+
+    let open_resp = FileSystemServiceProto::open_write_by_path(
+        &harness.path_service,
+        Request::new(OpenWriteByPathRequestProto {
+            header: harness.header(Some(harness.route_epoch)),
+            path: path.to_string(),
+            desired_len: Some(1024),
+            mode: WriteModeProto::WriteModeWrite as i32,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert!(open_resp.header.as_ref().and_then(|h| h.error.as_ref()).is_none());
+
+    let session = harness
+        .fs_service
+        .write_session_manager_for_test()
+        .get_session(open_resp.file_handle)
+        .expect("session must exist after open");
+    harness
+        .fs_service
+        .inode_lease_manager_for_test()
+        .release(session.inode_id, session.lease_id, session.lease_epoch);
+
+    let renew_call = FileSystemServiceProto::renew_write_session_lease(
+        &harness.path_service,
+        Request::new(RenewWriteSessionLeaseRequestProto {
+            header: harness.header(Some(harness.route_epoch)),
+            file_handle: open_resp.file_handle,
+            lease_id: open_resp.lease_id,
+            lease_epoch: open_resp.lease_epoch,
+        }),
+    )
+    .await;
+    assert!(renew_call.is_ok(), "session expiry is a business error envelope");
+    let renew_resp = renew_call.unwrap().into_inner();
+    let err = renew_resp.header.as_ref().and_then(|h| h.error.as_ref()).unwrap();
+    assert_eq!(err.error_class, ErrorClassProto::ErrorClassFatal as i32);
+    assert_eq!(
+        rpc_code(&renew_resp.header),
+        Some(RpcErrorCodeProto::RpcErrCodeFencing as i32)
+    );
+    assert_eq!(
+        err.refresh_reason,
+        RefreshReasonProto::RefreshReasonSessionExpired as i32
+    );
+}
+
+#[tokio::test]
 async fn no_business_status_regression() {
     let harness = SessionHarness::new().await;
     let path = "/mnt/test/status.bin";
@@ -469,13 +789,13 @@ async fn no_business_status_regression() {
     assert!(close_call.is_ok(), "business mismatch must not use non-OK gRPC status");
     let close_resp = close_call.unwrap().into_inner();
     let err = close_resp.header.as_ref().and_then(|h| h.error.as_ref()).unwrap();
-    assert_eq!(err.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+    assert_eq!(err.error_class, ErrorClassProto::ErrorClassFatal as i32);
     assert_eq!(
         rpc_code(&close_resp.header),
         Some(RpcErrorCodeProto::RpcErrCodeEpochMismatch as i32)
     );
     assert_eq!(
         err.refresh_reason,
-        RefreshReasonProto::RefreshReasonEpochMismatch as i32
+        RefreshReasonProto::RefreshReasonSessionInvalid as i32
     );
 }

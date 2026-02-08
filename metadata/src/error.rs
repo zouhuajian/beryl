@@ -150,6 +150,7 @@ impl From<MetadataError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("not found: {}", msg),
+                refresh_hint: None,
             },
             MetadataError::AlreadyExists(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
@@ -157,6 +158,7 @@ impl From<MetadataError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("already exists: {}", msg),
+                refresh_hint: None,
             },
             MetadataError::InvalidArgument(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
@@ -164,6 +166,7 @@ impl From<MetadataError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("invalid argument: {}", msg),
+                refresh_hint: None,
             },
             MetadataError::NotDir(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
@@ -171,6 +174,7 @@ impl From<MetadataError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("not a directory: {}", msg),
+                refresh_hint: None,
             },
             MetadataError::IsDir(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
@@ -178,6 +182,7 @@ impl From<MetadataError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("is a directory: {}", msg),
+                refresh_hint: None,
             },
             MetadataError::DirectoryNotEmpty(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
@@ -185,6 +190,7 @@ impl From<MetadataError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("directory not empty: {}", msg),
+                refresh_hint: None,
             },
             MetadataError::CrossMountRename(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
@@ -192,6 +198,7 @@ impl From<MetadataError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("cross-mount rename not allowed: {}", msg),
+                refresh_hint: None,
             },
             MetadataError::PermissionDenied(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
@@ -199,6 +206,7 @@ impl From<MetadataError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("permission denied: {}", msg),
+                refresh_hint: None,
             },
             MetadataError::NotSupported(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
@@ -206,6 +214,7 @@ impl From<MetadataError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("operation not supported: {}", msg),
+                refresh_hint: None,
             },
             MetadataError::Busy(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
@@ -213,6 +222,7 @@ impl From<MetadataError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("resource busy: {}", msg),
+                refresh_hint: None,
             },
             MetadataError::Again(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
@@ -220,6 +230,7 @@ impl From<MetadataError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("resource temporarily unavailable: {}", msg),
+                refresh_hint: None,
             },
             MetadataError::Internal(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
@@ -227,6 +238,7 @@ impl From<MetadataError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("internal error: {}", msg),
+                refresh_hint: None,
             },
             MetadataError::ServiceUnavailable(msg) => CanonicalError::retryable(
                 RpcErrorCode::NodeUnavailable,

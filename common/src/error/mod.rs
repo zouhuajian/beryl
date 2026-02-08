@@ -74,6 +74,32 @@ pub mod canonical {
         Fencing,
         /// Generic epoch mismatch not further classified.
         EpochMismatch,
+        /// Write session is invalid and must be reopened.
+        SessionInvalid,
+        /// Write session lease/session has expired and must be reopened.
+        SessionExpired,
+    }
+
+    /// Worker endpoint hint used in canonical refresh hints.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct WorkerEndpointHint {
+        pub worker_id: u64,
+        pub endpoint: String,
+        pub net_transport_kind: i32,
+        pub worker_epoch: u64,
+    }
+
+    /// Structured refresh hints attached to canonical errors.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RefreshHint {
+        pub leader_endpoint: Option<String>,
+        pub group_id: Option<u64>,
+        pub mount_epoch: Option<u64>,
+        pub mount_prefix: Option<String>,
+        pub route_epoch: Option<u64>,
+        pub worker_epoch: Option<u64>,
+        pub worker_endpoints: Vec<WorkerEndpointHint>,
+        pub worker_resolve_required: bool,
     }
 
     /// Error code namespace – either a filesystem errno or an RPC‑level code.
@@ -100,6 +126,7 @@ pub mod canonical {
         pub reason: Option<RefreshReason>,
         pub retry_after_ms: Option<u64>,
         pub message: String,
+        pub refresh_hint: Option<RefreshHint>,
     }
 
     impl CanonicalError {
@@ -111,6 +138,7 @@ pub mod canonical {
                 reason: None,
                 retry_after_ms: None,
                 message: message.into(),
+                refresh_hint: None,
             };
             err.debug_validate();
             err
@@ -124,6 +152,7 @@ pub mod canonical {
                 reason: None,
                 retry_after_ms: None,
                 message: message.into(),
+                refresh_hint: None,
             };
             err.debug_validate();
             err
@@ -137,6 +166,26 @@ pub mod canonical {
                 reason: Some(reason),
                 retry_after_ms: None,
                 message: message.into(),
+                refresh_hint: None,
+            };
+            err.debug_validate();
+            err
+        }
+
+        /// Construct a NEED_REFRESH error from an RPC code + refresh reason + structured hint.
+        pub fn need_refresh_with_hint(
+            code: RpcErrorCode,
+            reason: RefreshReason,
+            hint: RefreshHint,
+            message: impl Into<String>,
+        ) -> Self {
+            let err = Self {
+                class: ErrorClass::NeedRefresh,
+                code: Some(ErrorCode::RpcCode(code)),
+                reason: Some(reason),
+                retry_after_ms: None,
+                message: message.into(),
+                refresh_hint: Some(hint),
             };
             err.debug_validate();
             err
@@ -150,9 +199,16 @@ pub mod canonical {
                 reason: None,
                 retry_after_ms,
                 message: message.into(),
+                refresh_hint: None,
             };
             err.debug_validate();
             err
+        }
+
+        /// Attach structured refresh hint to an existing canonical error.
+        pub fn with_refresh_hint(mut self, hint: RefreshHint) -> Self {
+            self.refresh_hint = Some(hint);
+            self
         }
 
         /// Best-effort invariant checks; only compiled in debug/profile builds.

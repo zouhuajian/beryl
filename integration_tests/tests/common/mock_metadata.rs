@@ -84,6 +84,7 @@ impl MetadataRouteServiceProto for MockMetadataServer {
             state_id: Some(state_id),
             group_id,
             mount_epoch: None,
+            route_epoch: Some(route_epoch),
         };
 
         Ok(Response::new(GetFileMetaResponseProto {
@@ -122,6 +123,7 @@ impl MetadataRouteServiceProto for MockMetadataServer {
             state_id: Some(state_id),
             group_id,
             mount_epoch: None,
+            route_epoch: Some(route_epoch),
         };
 
         Ok(Response::new(RefreshRouteResponseProto {
@@ -160,6 +162,7 @@ impl MetadataRouteServiceProto for MockMetadataServer {
             state_id: Some(state_id),
             group_id,
             mount_epoch: None,
+            route_epoch: Some(route_epoch),
         };
 
         let readable_follower_ids = if req.include_readable_followers.unwrap_or(false) {
@@ -208,6 +211,7 @@ impl MetadataRouteServiceProto for MockMetadataServer {
             state_id: Some(state_id),
             group_id,
             mount_epoch: None,
+            route_epoch: Some(route_epoch),
         };
 
         Ok(Response::new(GetRouteTableResponseProto {

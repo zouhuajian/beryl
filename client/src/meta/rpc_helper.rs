@@ -125,15 +125,15 @@ impl MetadataRpcHelper {
     fn refresh_action_for_reason(reason: RefreshReason) -> RefreshDispatchAction {
         match reason {
             RefreshReason::MountEpochMismatch => RefreshDispatchAction::RefreshMountAndRoute,
-            RefreshReason::RouteEpochMismatch | RefreshReason::Moved | RefreshReason::NotLeader => {
-                RefreshDispatchAction::RefreshRoute
-            }
+            RefreshReason::RouteEpochMismatch | RefreshReason::NotLeader => RefreshDispatchAction::RefreshRoute,
             RefreshReason::WorkerEpochMismatch => RefreshDispatchAction::RefreshWorker,
-            RefreshReason::Fencing => RefreshDispatchAction::RefreshFencing,
+            RefreshReason::Fencing | RefreshReason::SessionInvalid | RefreshReason::SessionExpired => {
+                RefreshDispatchAction::RefreshFencing
+            }
             RefreshReason::StaleState | RefreshReason::BlockStampMismatch | RefreshReason::EpochMismatch => {
                 RefreshDispatchAction::RefreshState
             }
-            RefreshReason::Unknown => RefreshDispatchAction::RefreshRoute,
+            _ => RefreshDispatchAction::RefreshRoute,
         }
     }
 

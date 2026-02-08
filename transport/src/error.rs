@@ -146,6 +146,7 @@ impl From<TransportError> for CanonicalError {
                         reason: None,
                         retry_after_ms: None,
                         message,
+                        refresh_hint: None,
                     }
                 }
             }
@@ -159,6 +160,7 @@ impl From<TransportError> for CanonicalError {
                 reason: None,
                 retry_after_ms: if is_retryable { Some(1000) } else { None },
                 message: msg,
+                refresh_hint: None,
             },
         }
     }

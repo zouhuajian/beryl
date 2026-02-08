@@ -136,4 +136,8 @@ message ResponseHeaderProto {
   /// Server fills this with the current mount.mount_epoch so client can update its cache.
   /// Only set for FS operations that access a mount.
   optional uint64 mount_epoch = 10;
+
+  /// Route epoch returned by server (for FS route/layout operations).
+  /// Server should fill this with authoritative layout version when available.
+  optional uint64 route_epoch = 11;
 }

@@ -12,9 +12,10 @@ use proto::metadata::{
 };
 use std::sync::Arc;
 use tonic::Request;
-use types::acl::{encode_posix_acl, AclEntry, AclPerm, AclSubject, PosixAcl, POSIX_ACL_ACCESS_XATTR};
 use types::fs::FileAttrs;
 use types::ids::ShardGroupId;
+
+const POSIX_ACL_ACCESS_XATTR: &str = "system.posix_acl_access";
 
 #[derive(Clone)]
 struct AlwaysLeader;
@@ -74,21 +75,9 @@ async fn acl_xattr_roundtrip_works_under_default_none_authz() {
     .into_inner();
     assert!(mkdir_resp.header.as_ref().and_then(|h| h.error.as_ref()).is_none());
 
-    let acl = PosixAcl::new(vec![
-        AclEntry {
-            subject: AclSubject::User(1000),
-            perms: AclPerm::READ | AclPerm::WRITE,
-        },
-        AclEntry {
-            subject: AclSubject::Group(2000),
-            perms: AclPerm::READ,
-        },
-        AclEntry {
-            subject: AclSubject::Other,
-            perms: AclPerm::READ,
-        },
-    ]);
-    let acl_blob = encode_posix_acl(&acl);
+    // Keep this test independent from optional ACL codec symbols in `types`.
+    // For stub/no-authz semantics we only need xattr roundtrip behavior.
+    let acl_blob = vec![0x01, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD];
 
     let set_resp = FileSystemServiceProto::set_xattr(
         &path_service,

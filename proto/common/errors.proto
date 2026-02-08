@@ -5,6 +5,8 @@ syntax = "proto3";
 
 package common;
 
+import "common/common.proto";
+
 // ============================================================================
 // Canonical Error Model (Single Source of Truth)
 // ============================================================================
@@ -26,7 +28,7 @@ enum ErrorClassProto {
   ERROR_CLASS_FATAL = 3;         // Unrecoverable error
 }
 
-/// Reason for NEED_REFRESH error class.
+/// Structured reason for refresh and session lifecycle handling.
 enum RefreshReasonProto {
   REFRESH_REASON_UNKNOWN = 0;
   REFRESH_REASON_NOT_LEADER = 1;
@@ -38,6 +40,35 @@ enum RefreshReasonProto {
   REFRESH_REASON_BLOCK_STAMP_MISMATCH = 7;
   REFRESH_REASON_FENCING = 8;
   REFRESH_REASON_EPOCH_MISMATCH = 9;
+  REFRESH_REASON_SESSION_INVALID = 10;
+  REFRESH_REASON_SESSION_EXPIRED = 11;
+}
+
+/// Structured hints for NEED_REFRESH/MOVED handling.
+message RefreshHintProto {
+  /// Metadata leader endpoint (`host:port` or URL).
+  optional string leader_endpoint = 1;
+
+  /// Optional raft/shard group identifier.
+  optional uint64 group_id = 2;
+
+  /// Authoritative mount epoch for the target mount.
+  optional uint64 mount_epoch = 3;
+
+  /// Optional mount prefix associated with mount_epoch.
+  optional string mount_prefix = 4;
+
+  /// Authoritative route/layout epoch.
+  optional uint64 route_epoch = 5;
+
+  /// Authoritative worker epoch.
+  optional uint64 worker_epoch = 6;
+
+  /// Worker endpoint hints when route/placement is already known.
+  repeated WorkerEndpointInfoProto worker_endpoints = 7;
+
+  /// Server requests client to re-resolve worker placement.
+  bool worker_resolve_required = 8;
 }
 
 /// Filesystem error codes (POSIX errno).
@@ -115,4 +146,7 @@ message ErrorDetailProto {
 
   /// Human-readable error message.
   string message = 6;
+
+  /// Structured refresh hints for deterministic client refresh+replay.
+  optional RefreshHintProto refresh_hint = 7;
 }

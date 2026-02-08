@@ -10,7 +10,7 @@
 
 use crate::error::{ClientError, ClientResult};
 use common::error::canonical::{CanonicalError, ErrorClass, RefreshReason};
-use common::header::{RequestHeader, ResponseHeader};
+use common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
 use proto::convert::error_detail_to_canonical;
 use std::time::Duration;
 
@@ -86,6 +86,22 @@ pub enum ClientAction {
     },
 }
 
+/// Unified RPC envelope parse outcome.
+///
+/// This models the contract:
+/// - non-OK gRPC status => transport/framework failure
+/// - gRPC OK + header.error => canonical business/protocol error
+/// - gRPC OK + no header.error => success
+#[derive(Clone, Debug)]
+pub enum RpcEnvelope {
+    /// gRPC OK and no canonical error in response header.
+    Ok,
+    /// gRPC non-OK transport/auth/framework error.
+    TransportError(tonic::Status),
+    /// gRPC OK with canonical business/protocol error.
+    CanonicalError(CanonicalError),
+}
+
 /// Refresh dispatch context passed to the refresh action machine.
 #[derive(Clone, Debug)]
 pub struct RefreshDispatchContext {
@@ -138,12 +154,20 @@ pub fn validate_header_or_action(header: &ResponseHeader) -> Result<(), ClientAc
         return Ok(());
     };
 
+    let canonical_hint = canonical.refresh_hint.as_ref();
     let hint = RefreshHint {
-        group_id: header.group_id,
-        route_epoch: None,
-        mount_epoch: header.mount_epoch,
-        worker_epoch: None,
-        endpoint_hint: None,
+        group_id: canonical_hint.and_then(|hint| hint.group_id).or(header.group_id),
+        route_epoch: canonical_hint.and_then(|hint| hint.route_epoch).or(header.route_epoch),
+        mount_epoch: canonical_hint.and_then(|hint| hint.mount_epoch).or(header.mount_epoch),
+        worker_epoch: canonical_hint.and_then(|hint| hint.worker_epoch),
+        endpoint_hint: canonical_hint
+            .and_then(|hint| hint.worker_endpoints.first())
+            .map(|endpoint| EndpointHint {
+                worker_id: endpoint.worker_id,
+                endpoint: endpoint.endpoint.clone(),
+                net_transport_kind: endpoint.net_transport_kind,
+                worker_epoch: endpoint.worker_epoch,
+            }),
     };
     validate_canonical_with_hint(canonical, hint)
 }
@@ -170,6 +194,45 @@ pub fn validate_data_header_or_action(
     };
 
     validate_canonical_with_hint(canonical, hint)
+}
+
+/// Parse gRPC status + response header into a unified envelope outcome.
+///
+/// `grpc_status` should be:
+/// - `Ok(())` when the RPC transport returned gRPC OK and a response body.
+/// - `Err(status)` when tonic returned a non-OK gRPC status.
+pub fn parse_rpc_envelope(
+    grpc_status: Result<(), tonic::Status>,
+    response_header: Option<&proto::common::ResponseHeaderProto>,
+) -> RpcEnvelope {
+    match grpc_status {
+        Err(status) => RpcEnvelope::TransportError(status),
+        Ok(()) => {
+            let Some(header) = response_header else {
+                return RpcEnvelope::CanonicalError(CanonicalError {
+                    class: ErrorClass::Fatal,
+                    code: Some(common::error::canonical::ErrorCode::RpcCode(
+                        RpcErrorCode::InvalidHeader,
+                    )),
+                    reason: None,
+                    retry_after_ms: None,
+                    message: "missing response header".to_string(),
+                    refresh_hint: None,
+                });
+            };
+            match header.error.as_ref() {
+                None => RpcEnvelope::Ok,
+                Some(err_detail) => {
+                    let canonical = error_detail_to_canonical(err_detail);
+                    if matches!(canonical.class, ErrorClass::Ok) {
+                        RpcEnvelope::Ok
+                    } else {
+                        RpcEnvelope::CanonicalError(canonical)
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Validate canonical error directly.
@@ -395,6 +458,7 @@ mod tests {
     use common::error::canonical::ErrorCode as CanonicalErrorCode;
     use common::header::RpcErrorCode;
     use common::header::{ClientInfo, ResponseHeader};
+    use proto::convert::canonical_to_error_detail;
 
     #[test]
     fn validate_ok_header_returns_ok() {
@@ -452,6 +516,7 @@ mod tests {
             reason: None,
             retry_after_ms: None,
             message: "fatal error".to_string(),
+            refresh_hint: None,
         };
         let header = ResponseHeader::error(ClientInfo::new(types::ClientId::new(1)), canonical.clone());
         let result = validate_header_or_action(&header);
@@ -461,6 +526,52 @@ mod tests {
                 assert_eq!(returned.code, canonical.code);
             }
             _ => panic!("expected Fail action"),
+        }
+    }
+
+    #[test]
+    fn parse_rpc_envelope_reports_transport_error() {
+        match parse_rpc_envelope(Err(tonic::Status::unavailable("down")), None) {
+            RpcEnvelope::TransportError(status) => assert_eq!(status.code(), tonic::Code::Unavailable),
+            _ => panic!("expected transport envelope"),
+        }
+    }
+
+    #[test]
+    fn parse_rpc_envelope_reports_canonical_error() {
+        let canonical = CanonicalError::need_refresh(RpcErrorCode::NotLeader, RefreshReason::NotLeader, "not leader");
+        let header = proto::common::ResponseHeaderProto {
+            client: Some(proto::common::ClientInfoProto {
+                call_id: types::CallId::new().to_string(),
+                client_id: 7,
+                client_name: "test".to_string(),
+            }),
+            error: Some(canonical_to_error_detail(&canonical)),
+            state_id: None,
+            group_id: 0,
+            mount_epoch: None,
+            route_epoch: None,
+        };
+        match parse_rpc_envelope(Ok(()), Some(&header)) {
+            RpcEnvelope::CanonicalError(err) => {
+                assert_eq!(err.class, ErrorClass::NeedRefresh);
+                assert_eq!(err.reason, Some(RefreshReason::NotLeader));
+            }
+            _ => panic!("expected canonical envelope"),
+        }
+    }
+
+    #[test]
+    fn parse_rpc_envelope_missing_header_is_fatal_canonical() {
+        match parse_rpc_envelope(Ok(()), None) {
+            RpcEnvelope::CanonicalError(err) => {
+                assert_eq!(err.class, ErrorClass::Fatal);
+                assert!(matches!(
+                    err.code,
+                    Some(CanonicalErrorCode::RpcCode(RpcErrorCode::InvalidHeader))
+                ));
+            }
+            _ => panic!("expected fatal canonical envelope"),
         }
     }
 

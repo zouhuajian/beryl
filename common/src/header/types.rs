@@ -42,6 +42,8 @@ pub struct RequestHeader {
     pub state_id: Option<RaftLogId>,
     /// Optional retry count from client perspective (0 = first attempt).
     pub retry_count: i32,
+    /// Optional route epoch observed by client.
+    pub route_epoch: Option<u64>,
 }
 
 /// Human-oriented context for auditing and lightweight diagnostics.
@@ -72,6 +74,8 @@ pub struct ResponseHeader {
     /// Mount epoch returned by server (for FS operations).
     /// Server fills this with the current mount.mount_epoch so client can update its cache.
     pub mount_epoch: Option<u64>,
+    /// Route epoch returned by server (for FS route/layout operations).
+    pub route_epoch: Option<u64>,
 }
 
 /// High-level status for the RPC outcome.
@@ -162,6 +166,7 @@ impl RequestHeader {
             retry_count: 0,
             group_id: None,
             mount_epoch: None,
+            route_epoch: None,
         }
     }
 
@@ -213,6 +218,7 @@ impl RequestHeader {
             retry_count: 0,
             group_id: self.group_id,
             mount_epoch: self.mount_epoch,
+            route_epoch: self.route_epoch,
         }
     }
 
@@ -231,6 +237,7 @@ impl RequestHeader {
             retry_count: self.retry_count + 1,
             group_id: self.group_id,
             mount_epoch: self.mount_epoch,
+            route_epoch: self.route_epoch,
         }
     }
 
@@ -278,6 +285,7 @@ impl ResponseHeader {
             state_id: None,
             group_id: None,
             mount_epoch: None,
+            route_epoch: None,
         }
     }
 
@@ -308,6 +316,7 @@ impl ResponseHeader {
             state_id: None,
             group_id: None,
             mount_epoch: None,
+            route_epoch: None,
         }
     }
 

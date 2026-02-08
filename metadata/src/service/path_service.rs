@@ -1815,7 +1815,17 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
 
         if let Err(err) = self.validate_mount_epoch(&req.header, &resolved.mount_ctx) {
-            let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
+            let resp_header = match err {
+                MetadataError::MountEpochMismatch { expected, got, .. } => need_refresh_header(
+                    &req.header,
+                    common::header::RpcErrorCode::MountEpochMismatch,
+                    common::error::canonical::RefreshReason::MountEpochMismatch,
+                    format!("mount_epoch mismatch: client={}, server={}", got, expected),
+                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                    Some(resolved.mount_ctx.mount_epoch),
+                ),
+                other => self.header_from_path_error(&req.header, other, Some(&resolved.mount_ctx)),
+            };
             return error_response!(OpenWriteByPathResponseProto, resp_header);
         }
         if let Some(resp_header) = self
@@ -2052,7 +2062,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 let resp_header = need_refresh_header(
                     &req.header,
                     common::header::RpcErrorCode::Fencing,
-                    common::error::canonical::RefreshReason::Fencing,
+                    common::error::canonical::RefreshReason::SessionInvalid,
                     "write session not found; refresh and re-open session before replaying fsync",
                     None,
                     None,

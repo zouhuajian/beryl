@@ -10,7 +10,8 @@ use crate::common as proto_common;
 use ::common::{
     Deadline,
     error::canonical::{
-        CanonicalError, ErrorClass as CanonicalErrorClass, ErrorCode as CanonicalErrorCode, RefreshReason,
+        CanonicalError, ErrorClass as CanonicalErrorClass, ErrorCode as CanonicalErrorCode,
+        RefreshHint as CanonicalRefreshHint, RefreshReason, WorkerEndpointHint,
     },
     header::{CallerContext, ClientInfo, RequestHeader, ResponseHeader, RpcErrorCode, RpcStatus},
 };
@@ -272,6 +273,7 @@ impl TryFrom<proto_common::RequestHeaderProto> for RequestHeader {
             caller_context,
             state_id,
             retry_count: proto.retry_count,
+            route_epoch: proto.route_epoch,
         })
     }
 }
@@ -297,7 +299,7 @@ impl From<&RequestHeader> for proto_common::RequestHeaderProto {
             retry_count: header.retry_count,
             group_id: header.group_id.unwrap_or(0),
             mount_epoch: header.mount_epoch,
-            route_epoch: None,
+            route_epoch: header.route_epoch,
         }
     }
 }
@@ -347,6 +349,7 @@ impl TryFrom<proto_common::ResponseHeaderProto> for ResponseHeader {
                 Some(proto.group_id)
             },
             mount_epoch: proto.mount_epoch,
+            route_epoch: proto.route_epoch,
         })
     }
 }
@@ -372,6 +375,7 @@ impl From<&ResponseHeader> for proto_common::ResponseHeaderProto {
                     reason: None,
                     retry_after_ms: None,
                     message: format!("missing canonical_error for status {:?}", header.status),
+                    refresh_hint: None,
                 })
             }),
         };
@@ -388,6 +392,7 @@ impl From<&ResponseHeader> for proto_common::ResponseHeaderProto {
             }),
             group_id: header.group_id.unwrap_or(0),
             mount_epoch: header.mount_epoch,
+            route_epoch: header.route_epoch,
         }
     }
 }
@@ -542,6 +547,8 @@ fn refresh_reason_proto_to_enum(reason: proto_common::RefreshReasonProto) -> Ref
         proto_common::RefreshReasonProto::RefreshReasonBlockStampMismatch => RefreshReason::BlockStampMismatch,
         proto_common::RefreshReasonProto::RefreshReasonFencing => RefreshReason::Fencing,
         proto_common::RefreshReasonProto::RefreshReasonEpochMismatch => RefreshReason::EpochMismatch,
+        proto_common::RefreshReasonProto::RefreshReasonSessionInvalid => RefreshReason::SessionInvalid,
+        proto_common::RefreshReasonProto::RefreshReasonSessionExpired => RefreshReason::SessionExpired,
     }
 }
 
@@ -557,7 +564,53 @@ fn refresh_reason_to_proto(reason: &Option<RefreshReason>) -> i32 {
         RefreshReason::BlockStampMismatch => proto_common::RefreshReasonProto::RefreshReasonBlockStampMismatch as i32,
         RefreshReason::Fencing => proto_common::RefreshReasonProto::RefreshReasonFencing as i32,
         RefreshReason::EpochMismatch => proto_common::RefreshReasonProto::RefreshReasonEpochMismatch as i32,
+        RefreshReason::SessionInvalid => proto_common::RefreshReasonProto::RefreshReasonSessionInvalid as i32,
+        RefreshReason::SessionExpired => proto_common::RefreshReasonProto::RefreshReasonSessionExpired as i32,
     }
+}
+
+fn refresh_hint_proto_to_hint(hint: Option<&proto_common::RefreshHintProto>) -> Option<CanonicalRefreshHint> {
+    hint.map(|hint| CanonicalRefreshHint {
+        leader_endpoint: hint.leader_endpoint.clone(),
+        group_id: hint.group_id,
+        mount_epoch: hint.mount_epoch,
+        mount_prefix: hint.mount_prefix.clone(),
+        route_epoch: hint.route_epoch,
+        worker_epoch: hint.worker_epoch,
+        worker_endpoints: hint
+            .worker_endpoints
+            .iter()
+            .map(|endpoint| WorkerEndpointHint {
+                worker_id: endpoint.worker_id,
+                endpoint: endpoint.endpoint.clone(),
+                net_transport_kind: endpoint.net_transport_kind,
+                worker_epoch: endpoint.worker_epoch,
+            })
+            .collect(),
+        worker_resolve_required: hint.worker_resolve_required,
+    })
+}
+
+fn refresh_hint_to_proto(hint: Option<&CanonicalRefreshHint>) -> Option<proto_common::RefreshHintProto> {
+    hint.map(|hint| proto_common::RefreshHintProto {
+        leader_endpoint: hint.leader_endpoint.clone(),
+        group_id: hint.group_id,
+        mount_epoch: hint.mount_epoch,
+        mount_prefix: hint.mount_prefix.clone(),
+        route_epoch: hint.route_epoch,
+        worker_epoch: hint.worker_epoch,
+        worker_endpoints: hint
+            .worker_endpoints
+            .iter()
+            .map(|endpoint| proto_common::WorkerEndpointInfoProto {
+                worker_id: endpoint.worker_id,
+                endpoint: endpoint.endpoint.clone(),
+                net_transport_kind: endpoint.net_transport_kind,
+                worker_epoch: endpoint.worker_epoch,
+            })
+            .collect(),
+        worker_resolve_required: hint.worker_resolve_required,
+    })
 }
 
 /// Convert proto ErrorDetailProto into canonical error.
@@ -590,6 +643,7 @@ pub fn error_detail_to_canonical(err_detail: &proto_common::ErrorDetailProto) ->
         reason,
         retry_after_ms: err_detail.retry_after_ms,
         message: err_detail.message.clone(),
+        refresh_hint: refresh_hint_proto_to_hint(err_detail.refresh_hint.as_ref()),
     }
 }
 
@@ -618,6 +672,7 @@ pub fn canonical_to_error_detail(err: &CanonicalError) -> proto_common::ErrorDet
         refresh_reason: refresh_reason_to_proto(&err.reason),
         retry_after_ms: err.retry_after_ms,
         message: err.message.clone(),
+        refresh_hint: refresh_hint_to_proto(err.refresh_hint.as_ref()),
     }
 }
 
@@ -660,15 +715,18 @@ mod tests {
                 refresh_reason: proto_common::RefreshReasonProto::RefreshReasonRouteEpochMismatch as i32,
                 retry_after_ms: None,
                 message: "route epoch mismatch".to_string(),
+                refresh_hint: None,
             }),
             state_id: None,
             group_id: 10,
             mount_epoch: Some(7),
+            route_epoch: Some(9),
         };
 
         let header: ResponseHeader = proto_header.try_into().unwrap();
         assert_eq!(header.status, RpcStatus::Error);
         assert_eq!(header.mount_epoch, Some(7));
+        assert_eq!(header.route_epoch, Some(9));
         let canonical = header
             .canonical_error
             .as_ref()

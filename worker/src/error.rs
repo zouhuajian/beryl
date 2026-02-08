@@ -224,6 +224,7 @@ impl From<WorkerError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("chunk conflict: {}", msg),
+                refresh_hint: None,
             },
             WorkerError::DiskError(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
@@ -231,6 +232,7 @@ impl From<WorkerError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("disk I/O error: {}", msg),
+                refresh_hint: None,
             },
             WorkerError::Cancelled(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
@@ -238,6 +240,7 @@ impl From<WorkerError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("operation cancelled: {}", msg),
+                refresh_hint: None,
             },
             WorkerError::InvalidArgument(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
@@ -245,6 +248,7 @@ impl From<WorkerError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("invalid argument: {}", msg),
+                refresh_hint: None,
             },
             WorkerError::NotFound(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
@@ -252,6 +256,7 @@ impl From<WorkerError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("not found: {}", msg),
+                refresh_hint: None,
             },
             WorkerError::PermissionDenied(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
@@ -259,6 +264,7 @@ impl From<WorkerError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("permission denied: {}", msg),
+                refresh_hint: None,
             },
             WorkerError::Internal(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
@@ -266,6 +272,7 @@ impl From<WorkerError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("internal error: {}", msg),
+                refresh_hint: None,
             },
         }
     }
