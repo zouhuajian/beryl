@@ -12,6 +12,7 @@
 
 extern crate core;
 
+pub mod acl;
 pub mod block;
 pub mod chunk;
 pub mod fs;
@@ -23,6 +24,10 @@ pub mod raft_log_id;
 pub mod reqresp;
 pub mod stream;
 
+pub use acl::{
+    AclCodecError, AclEntry, AclPerm, AclSubject, POSIX_ACL_ACCESS_XATTR, POSIX_ACL_DEFAULT_XATTR, PosixAcl,
+    PosixDefaultAcl, decode_posix_acl, encode_posix_acl, is_acl_xattr_key,
+};
 pub use fs::{DirEntry, Extent, FileAttrs, FsErrorCode, Inode, InodeData, InodeId, InodeKind};
 pub use group_watermark::{GroupWatermark, MountEpoch};
 pub use ids::{

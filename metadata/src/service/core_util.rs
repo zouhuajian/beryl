@@ -259,6 +259,16 @@ pub fn retryable_header(
     header_from_canonical_error(req_header, group_id, mount_epoch, &err)
 }
 
+pub fn permission_denied_canonical_error(op: Option<&str>, detail: Option<&str>) -> CanonicalError {
+    let message = match (op, detail) {
+        (Some(op), Some(detail)) => format!("permission denied: op={} target={}", op, detail),
+        (Some(op), None) => format!("permission denied: op={}", op),
+        (None, Some(detail)) => format!("permission denied: target={}", detail),
+        (None, None) => "permission denied".to_string(),
+    };
+    CanonicalError::fatal_fs(FsErrorCode::EAcces, message)
+}
+
 pub fn lease_id_from_proto(lease_id: Option<proto::common::LeaseIdProto>) -> Option<LeaseId> {
     lease_id.map(|lease_id_proto| {
         let lease_id_raw = (lease_id_proto.high as u128) << 64 | lease_id_proto.low as u128;

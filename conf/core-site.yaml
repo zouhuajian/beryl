@@ -35,6 +35,18 @@ metadata.inode_service.enable: false
 # Description: If inode service is enabled, metadata.rpc.addr must be loopback when this is true.
 metadata.inode_service.require_loopback_bind: true
 
+# Filesystem service authz mode (non-compositional: choose exactly one provider)
+# Type: string (enum: "NONE", "RANGER", "ACL")
+# Default: "NONE"
+# Description: Path-entrypoint authz provider selection.
+metadata.authz.filesystem.mode: "NONE"
+
+# Inode service authz mode (non-compositional: choose exactly one provider)
+# Type: string (enum: "NONE", "ACL")
+# Default: "NONE"
+# Description: Inode/handle service authz provider selection. "RANGER" is invalid here.
+metadata.authz.inode.mode: "NONE"
+
 # ============================================================================
 # Metadata Raft Configuration (for metadata clustering)
 # ============================================================================

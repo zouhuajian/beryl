@@ -11,13 +11,14 @@ use super::domain::{
     ReleaseSessionInput, RenewLeaseInput,
 };
 use super::fs_core::FsCore;
-use super::guard::{AuthzContext, AuthzOp, GuardChain, GuardSpec, LeadershipChecker};
+use super::guard::{AuthzContext, GuardChain, GuardSpec, LeadershipChecker};
 use super::{
     extent_from_proto, extent_to_proto, extract_and_inject_context, fatal_fs_header, fencing_to_proto,
     header_from_canonical_error, header_from_core_failure, lease_id_from_proto, lease_id_to_proto, location_to_proto,
     need_refresh_header, ok_header_from_core_success, ok_header_from_request, presented_fencing_from_proto,
     request_context_from_proto, write_target_to_proto,
 };
+use super::{AuthzOp, AuthzProvider, AuthzTarget};
 use crate::data_io::DataIoOp;
 use crate::error::{to_canonical_fs, MetadataError, MetadataResult};
 use crate::mount::MountTable;
@@ -63,6 +64,31 @@ pub enum FsWriteOp {
     Rmdir,
     Rename,
     SetAttr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FsRpcAuthz {
+    Lookup,
+    GetAttr,
+    SetAttr,
+    Mkdir,
+    Create,
+    ReadDir,
+    Unlink,
+    Rmdir,
+    Rename,
+    Open,
+    Release,
+    Fsync,
+    OpenWrite,
+    CloseWrite,
+    GetFileLayout,
+    RenewInodeLease,
+    Truncate,
+    SetXattr,
+    GetXattr,
+    ListXattr,
+    RemoveXattr,
 }
 
 /// MetadataFsServiceProto implementation.
@@ -148,6 +174,11 @@ impl MetadataFsServiceImpl {
         self
     }
 
+    pub fn with_authz_provider(mut self, provider: Arc<dyn AuthzProvider>) -> Self {
+        self.guard_chain.set_authz_provider(provider);
+        self
+    }
+
     /// Test helper: override the worker commit hook for injected responses.
     pub fn set_worker_commit_hook_for_test(
         &self,
@@ -206,6 +237,30 @@ impl MetadataFsServiceImpl {
 
     pub fn fs_core(&self) -> Arc<FsCore> {
         Arc::clone(&self.fs_core)
+    }
+
+    // RPC -> authz mapping table for inode/handle service handlers:
+    // READ_META: lookup/get_attr/read_dir/open/get_xattr/list_xattr
+    // WRITE_META: mkdir/create/unlink/rmdir/rename/set_attr/set_xattr/remove_xattr
+    // DATA_IO: release/open_write/close_write/fsync/hsync/hflush/truncate/get_file_layout/renew_inode_lease
+    fn authz_for_rpc(rpc: FsRpcAuthz, target: AuthzTarget) -> AuthzContext {
+        let op = match rpc {
+            FsRpcAuthz::Lookup | FsRpcAuthz::GetAttr | FsRpcAuthz::ReadDir | FsRpcAuthz::Open => AuthzOp::Read,
+            FsRpcAuthz::SetAttr | FsRpcAuthz::Mkdir | FsRpcAuthz::Create => AuthzOp::Write,
+            FsRpcAuthz::Unlink | FsRpcAuthz::Rmdir => AuthzOp::Delete,
+            FsRpcAuthz::Rename => AuthzOp::Rename,
+            FsRpcAuthz::GetXattr | FsRpcAuthz::ListXattr | FsRpcAuthz::SetXattr | FsRpcAuthz::RemoveXattr => {
+                AuthzOp::Xattr
+            }
+            FsRpcAuthz::Release
+            | FsRpcAuthz::Fsync
+            | FsRpcAuthz::OpenWrite
+            | FsRpcAuthz::CloseWrite
+            | FsRpcAuthz::GetFileLayout
+            | FsRpcAuthz::RenewInodeLease
+            | FsRpcAuthz::Truncate => AuthzOp::Write,
+        };
+        AuthzContext { op, target }
     }
 
     /// Route FS write operation to mount.namespace_owner_group_id.
@@ -297,17 +352,21 @@ impl MetadataFsServiceImpl {
         })
     }
 
-    fn guard_request(
+    async fn guard_request(
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
         caller_ctx: &RequestHeader,
-        spec: GuardSpec,
+        mut spec: GuardSpec,
         mount_id: Option<MountId>,
         authz: Option<AuthzContext>,
     ) -> Option<proto::common::ResponseHeaderProto> {
+        if authz.is_some() {
+            spec = spec.with_authz();
+        }
         match self
             .guard_chain
             .check_request(req_header, caller_ctx, spec, mount_id, authz)
+            .await
         {
             Ok(()) => None,
             Err(failure) => Some(header_from_canonical_error(
@@ -455,13 +514,6 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     async fn lookup(&self, request: Request<LookupRequestProto>) -> Result<Response<LookupResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_request(&req.header, &caller_ctx, GuardSpec::metadata_read(), None, None)
-        {
-            return Ok(Response::new(LookupResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
-        }
 
         let parent_inode_id = match req.parent_inode_id {
             Some(parent_inode_id) => InodeId::new(parent_inode_id.value),
@@ -478,6 +530,24 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 }));
             }
         };
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::metadata_read().with_authz(),
+                None,
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::Lookup,
+                    AuthzTarget::for_inode(parent_inode_id),
+                )),
+            )
+            .await
+        {
+            return Ok(Response::new(LookupResponseProto {
+                header: Some(resp_header),
+                ..Default::default()
+            }));
+        }
 
         let storage = match self.storage.as_ref() {
             Some(storage) => storage,
@@ -629,13 +699,6 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     async fn get_attr(&self, request: Request<GetAttrRequestProto>) -> Result<Response<GetAttrResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_request(&req.header, &caller_ctx, GuardSpec::metadata_read(), None, None)
-        {
-            return Ok(Response::new(GetAttrResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
-        }
 
         let inode_id = match req.inode_id {
             Some(inode_id) => InodeId::new(inode_id.value),
@@ -652,6 +715,24 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 }));
             }
         };
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::metadata_read().with_authz(),
+                None,
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::GetAttr,
+                    AuthzTarget::for_inode(inode_id),
+                )),
+            )
+            .await
+        {
+            return Ok(Response::new(GetAttrResponseProto {
+                header: Some(resp_header),
+                ..Default::default()
+            }));
+        }
 
         let storage = match self.storage.as_ref() {
             Some(storage) => storage,
@@ -802,17 +883,19 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }
         };
 
-        if let Some(resp_header) = self.guard_request(
-            &req.header,
-            &caller_ctx,
-            GuardSpec::metadata_write(),
-            Some(inode.mount_id),
-            Some(AuthzContext {
-                op: AuthzOp::FsWrite(FsWriteOp::SetAttr),
-                mount_id: Some(inode.mount_id),
-                inode_id: Some(inode_id),
-            }),
-        ) {
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::metadata_write(),
+                Some(inode.mount_id),
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::SetAttr,
+                    AuthzTarget::for_inode(inode_id),
+                )),
+            )
+            .await
+        {
             return Ok(Response::new(SetAttrResponseProto {
                 header: Some(resp_header),
                 attrs: None,
@@ -1036,17 +1119,19 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 }));
             }
         };
-        if let Some(resp_header) = self.guard_request(
-            &req.header,
-            &caller_ctx,
-            GuardSpec::metadata_write(),
-            Some(parent_inode.mount_id),
-            Some(AuthzContext {
-                op: AuthzOp::FsWrite(FsWriteOp::Mkdir),
-                mount_id: Some(parent_inode.mount_id),
-                inode_id: Some(parent_inode_id),
-            }),
-        ) {
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::metadata_write(),
+                Some(parent_inode.mount_id),
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::Mkdir,
+                    AuthzTarget::for_inode(parent_inode_id),
+                )),
+            )
+            .await
+        {
             return Ok(Response::new(MkdirResponseProto {
                 header: Some(resp_header),
                 inode: None,
@@ -1190,17 +1275,19 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }
         };
 
-        if let Some(resp_header) = self.guard_request(
-            &req.header,
-            &caller_ctx,
-            GuardSpec::metadata_write(),
-            Some(ctx.mount_id),
-            Some(AuthzContext {
-                op: AuthzOp::FsWrite(FsWriteOp::Create),
-                mount_id: Some(ctx.mount_id),
-                inode_id: Some(parent_inode_id),
-            }),
-        ) {
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::metadata_write(),
+                Some(ctx.mount_id),
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::Create,
+                    AuthzTarget::for_inode(parent_inode_id),
+                )),
+            )
+            .await
+        {
             return Ok(Response::new(CreateResponseProto {
                 header: Some(resp_header),
                 ..Default::default()
@@ -1324,13 +1411,6 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     async fn read_dir(&self, request: Request<ReadDirRequestProto>) -> Result<Response<ReadDirResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_request(&req.header, &caller_ctx, GuardSpec::metadata_read(), None, None)
-        {
-            return Ok(Response::new(ReadDirResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
-        }
 
         let parent_inode_id = match req.parent_inode_id {
             Some(parent_inode_id) => InodeId::new(parent_inode_id.value),
@@ -1347,6 +1427,24 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 }));
             }
         };
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::metadata_read().with_authz(),
+                None,
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::ReadDir,
+                    AuthzTarget::for_inode(parent_inode_id),
+                )),
+            )
+            .await
+        {
+            return Ok(Response::new(ReadDirResponseProto {
+                header: Some(resp_header),
+                ..Default::default()
+            }));
+        }
 
         let storage = match self.storage.as_ref() {
             Some(storage) => storage,
@@ -1521,17 +1619,19 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }
         };
 
-        if let Some(resp_header) = self.guard_request(
-            &req.header,
-            &caller_ctx,
-            GuardSpec::metadata_write(),
-            Some(ctx.mount_id),
-            Some(AuthzContext {
-                op: AuthzOp::FsWrite(FsWriteOp::Unlink),
-                mount_id: Some(ctx.mount_id),
-                inode_id: Some(parent_inode_id),
-            }),
-        ) {
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::metadata_write(),
+                Some(ctx.mount_id),
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::Unlink,
+                    AuthzTarget::for_inode(parent_inode_id),
+                )),
+            )
+            .await
+        {
             return Ok(Response::new(UnlinkResponseProto {
                 header: Some(resp_header),
                 ..Default::default()
@@ -1661,17 +1761,19 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }
         };
 
-        if let Some(resp_header) = self.guard_request(
-            &req.header,
-            &caller_ctx,
-            GuardSpec::metadata_write(),
-            Some(ctx.mount_id),
-            Some(AuthzContext {
-                op: AuthzOp::FsWrite(FsWriteOp::Rmdir),
-                mount_id: Some(ctx.mount_id),
-                inode_id: Some(parent_inode_id),
-            }),
-        ) {
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::metadata_write(),
+                Some(ctx.mount_id),
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::Rmdir,
+                    AuthzTarget::for_inode(parent_inode_id),
+                )),
+            )
+            .await
+        {
             return Ok(Response::new(RmdirResponseProto {
                 header: Some(resp_header),
                 ..Default::default()
@@ -1939,17 +2041,19 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }
         };
 
-        if let Some(resp_header) = self.guard_request(
-            &req.header,
-            &caller_ctx,
-            GuardSpec::metadata_write(),
-            Some(src_parent_inode.mount_id),
-            Some(AuthzContext {
-                op: AuthzOp::FsWrite(FsWriteOp::Rename),
-                mount_id: Some(src_parent_inode.mount_id),
-                inode_id: Some(src_parent_inode_id),
-            }),
-        ) {
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::metadata_write(),
+                Some(src_parent_inode.mount_id),
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::Rename,
+                    AuthzTarget::for_inode(src_parent_inode_id).with_parent(dst_parent_inode_id),
+                )),
+            )
+            .await
+        {
             return Ok(Response::new(FsRenameResponseProto {
                 header: Some(resp_header),
             }));
@@ -2091,7 +2195,18 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     async fn open(&self, request: Request<OpenRequestProto>) -> Result<Response<OpenResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_request(&req.header, &caller_ctx, GuardSpec::metadata_read(), None, None)
+        let authz = req.inode_id.as_ref().map(|inode_id| {
+            Self::authz_for_rpc(FsRpcAuthz::Open, AuthzTarget::for_inode(InodeId::new(inode_id.value)))
+        });
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::metadata_read().with_authz(),
+                None,
+                authz,
+            )
+            .await
         {
             return Ok(Response::new(OpenResponseProto {
                 header: Some(resp_header),
@@ -2109,22 +2224,41 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
         if let Some(session) = self.fs_core.write_session_for_handle(req.file_handle) {
-            if let Some(resp_header) = self.guard_request(
-                &req.header,
-                &caller_ctx,
-                GuardSpec::data_io(DataIoOp::CloseWrite).with_leader(),
-                Some(session.mount_id),
-                Some(AuthzContext {
-                    op: AuthzOp::DataIo(DataIoOp::CloseWrite),
-                    mount_id: Some(session.mount_id),
-                    inode_id: Some(session.inode_id),
-                }),
-            ) {
+            if let Some(resp_header) = self
+                .guard_request(
+                    &req.header,
+                    &caller_ctx,
+                    GuardSpec::data_io(DataIoOp::CloseWrite).with_leader().with_authz(),
+                    Some(session.mount_id),
+                    Some(Self::authz_for_rpc(
+                        FsRpcAuthz::Release,
+                        AuthzTarget::for_session(req.file_handle, Some(session.inode_id)),
+                    )),
+                )
+                .await
+            {
                 return Ok(Response::new(ReleaseResponseProto {
                     header: Some(resp_header),
                     ..Default::default()
                 }));
             }
+        } else if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::metadata_read().with_authz(),
+                None,
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::Release,
+                    AuthzTarget::for_file_handle(req.file_handle),
+                )),
+            )
+            .await
+        {
+            return Ok(Response::new(ReleaseResponseProto {
+                header: Some(resp_header),
+                ..Default::default()
+            }));
         }
 
         let req_ctx = request_context_from_proto(&req.header);
@@ -2213,17 +2347,16 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }));
         }
 
-        if let Some(resp_header) = self.guard_request(
-            &req.header,
-            &caller_ctx,
-            GuardSpec::data_io(DataIoOp::Fsync).with_leader(),
-            Some(inode.mount_id),
-            Some(AuthzContext {
-                op: AuthzOp::DataIo(DataIoOp::Fsync),
-                mount_id: Some(inode.mount_id),
-                inode_id: Some(inode_id),
-            }),
-        ) {
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::data_io(DataIoOp::Fsync).with_leader().with_authz(),
+                Some(inode.mount_id),
+                Some(Self::authz_for_rpc(FsRpcAuthz::Fsync, AuthzTarget::for_inode(inode_id))),
+            )
+            .await
+        {
             return Ok(Response::new(FsyncResponseProto {
                 header: Some(resp_header),
             }));
@@ -2419,17 +2552,19 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }));
         }
 
-        if let Some(resp_header) = self.guard_request(
-            &req.header,
-            &caller_ctx,
-            GuardSpec::data_io(DataIoOp::OpenWrite).with_leader(),
-            Some(inode.mount_id),
-            Some(AuthzContext {
-                op: AuthzOp::DataIo(DataIoOp::OpenWrite),
-                mount_id: Some(inode.mount_id),
-                inode_id: Some(inode_id),
-            }),
-        ) {
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::data_io(DataIoOp::OpenWrite).with_leader().with_authz(),
+                Some(inode.mount_id),
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::OpenWrite,
+                    AuthzTarget::for_inode(inode_id),
+                )),
+            )
+            .await
+        {
             return Ok(Response::new(OpenWriteResponseProto {
                 header: Some(resp_header),
                 file_handle: 0,
@@ -2519,17 +2654,19 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }
         };
 
-        if let Some(resp_header) = self.guard_request(
-            &req.header,
-            &caller_ctx,
-            GuardSpec::data_io(DataIoOp::CloseWrite).with_leader(),
-            Some(session.mount_id),
-            Some(AuthzContext {
-                op: AuthzOp::DataIo(DataIoOp::CloseWrite),
-                mount_id: Some(session.mount_id),
-                inode_id: Some(session.inode_id),
-            }),
-        ) {
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::data_io(DataIoOp::CloseWrite).with_leader().with_authz(),
+                Some(session.mount_id),
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::CloseWrite,
+                    AuthzTarget::for_session(req.file_handle, Some(session.inode_id)),
+                )),
+            )
+            .await
+        {
             return Ok(Response::new(CloseWriteResponseProto {
                 header: Some(resp_header),
                 committed_size: 0,
@@ -2673,17 +2810,19 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }));
         }
 
-        if let Some(resp_header) = self.guard_request(
-            &req.header,
-            &caller_ctx,
-            GuardSpec::data_io(DataIoOp::Read),
-            Some(inode.mount_id),
-            Some(AuthzContext {
-                op: AuthzOp::DataIo(DataIoOp::Read),
-                mount_id: Some(inode.mount_id),
-                inode_id: Some(inode_id),
-            }),
-        ) {
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::data_io(DataIoOp::Read).with_authz(),
+                Some(inode.mount_id),
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::GetFileLayout,
+                    AuthzTarget::for_inode(inode_id),
+                )),
+            )
+            .await
+        {
             return Ok(Response::new(GetFileLayoutResponseProto {
                 header: Some(resp_header),
                 ..Default::default()
@@ -2752,17 +2891,19 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }
         };
 
-        if let Some(resp_header) = self.guard_request(
-            &req.header,
-            &caller_ctx,
-            GuardSpec::data_io(DataIoOp::RenewLease).with_leader(),
-            Some(session.mount_id),
-            Some(AuthzContext {
-                op: AuthzOp::DataIo(DataIoOp::RenewLease),
-                mount_id: Some(session.mount_id),
-                inode_id: Some(session.inode_id),
-            }),
-        ) {
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::data_io(DataIoOp::RenewLease).with_leader().with_authz(),
+                Some(session.mount_id),
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::RenewInodeLease,
+                    AuthzTarget::for_session(req.file_handle, Some(session.inode_id)),
+                )),
+            )
+            .await
+        {
             return Ok(Response::new(RenewInodeLeaseResponseProto {
                 header: Some(resp_header),
                 ..Default::default()
@@ -2875,17 +3016,19 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }));
         }
 
-        if let Some(resp_header) = self.guard_request(
-            &req.header,
-            &caller_ctx,
-            GuardSpec::data_io(DataIoOp::Truncate).with_leader(),
-            Some(inode.mount_id),
-            Some(AuthzContext {
-                op: AuthzOp::DataIo(DataIoOp::Truncate),
-                mount_id: Some(inode.mount_id),
-                inode_id: Some(inode_id),
-            }),
-        ) {
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::data_io(DataIoOp::Truncate).with_leader().with_authz(),
+                Some(inode.mount_id),
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::Truncate,
+                    AuthzTarget::for_inode(inode_id),
+                )),
+            )
+            .await
+        {
             return Ok(Response::new(TruncateResponseProto {
                 header: Some(resp_header),
                 new_size: 0,
@@ -3154,17 +3297,19 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 }));
             }
         };
-        if let Some(resp_header) = self.guard_request(
-            &req.header,
-            &caller_ctx,
-            GuardSpec::metadata_write(),
-            Some(ctx.mount_id),
-            Some(AuthzContext {
-                op: AuthzOp::FsWrite(FsWriteOp::SetAttr),
-                mount_id: Some(ctx.mount_id),
-                inode_id: Some(inode_id),
-            }),
-        ) {
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::metadata_write(),
+                Some(ctx.mount_id),
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::SetXattr,
+                    AuthzTarget::for_inode(inode_id),
+                )),
+            )
+            .await
+        {
             return Ok(Response::new(SetXattrResponseProto {
                 header: Some(resp_header),
                 ..Default::default()
@@ -3221,13 +3366,6 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     ) -> Result<Response<GetXattrResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_request(&req.header, &caller_ctx, GuardSpec::metadata_read(), None, None)
-        {
-            return Ok(Response::new(GetXattrResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
-        }
         let inode_id = match req.inode_id {
             Some(inode_id) => InodeId::new(inode_id.value),
             None => {
@@ -3243,6 +3381,24 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 }));
             }
         };
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::metadata_read().with_authz(),
+                None,
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::GetXattr,
+                    AuthzTarget::for_inode(inode_id),
+                )),
+            )
+            .await
+        {
+            return Ok(Response::new(GetXattrResponseProto {
+                header: Some(resp_header),
+                ..Default::default()
+            }));
+        }
         let storage = match self.storage.as_ref() {
             Some(storage) => storage,
             None => {
@@ -3308,13 +3464,6 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     ) -> Result<Response<ListXattrResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_request(&req.header, &caller_ctx, GuardSpec::metadata_read(), None, None)
-        {
-            return Ok(Response::new(ListXattrResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
-        }
         let inode_id = match req.inode_id {
             Some(inode_id) => InodeId::new(inode_id.value),
             None => {
@@ -3330,6 +3479,24 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 }));
             }
         };
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::metadata_read().with_authz(),
+                None,
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::ListXattr,
+                    AuthzTarget::for_inode(inode_id),
+                )),
+            )
+            .await
+        {
+            return Ok(Response::new(ListXattrResponseProto {
+                header: Some(resp_header),
+                ..Default::default()
+            }));
+        }
         let storage = match self.storage.as_ref() {
             Some(storage) => storage,
             None => {
@@ -3420,17 +3587,19 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 }));
             }
         };
-        if let Some(resp_header) = self.guard_request(
-            &req.header,
-            &caller_ctx,
-            GuardSpec::metadata_write(),
-            Some(ctx.mount_id),
-            Some(AuthzContext {
-                op: AuthzOp::FsWrite(FsWriteOp::SetAttr),
-                mount_id: Some(ctx.mount_id),
-                inode_id: Some(inode_id),
-            }),
-        ) {
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &caller_ctx,
+                GuardSpec::metadata_write(),
+                Some(ctx.mount_id),
+                Some(Self::authz_for_rpc(
+                    FsRpcAuthz::RemoveXattr,
+                    AuthzTarget::for_inode(inode_id),
+                )),
+            )
+            .await
+        {
             return Ok(Response::new(RemoveXattrResponseProto {
                 header: Some(resp_header),
                 ..Default::default()

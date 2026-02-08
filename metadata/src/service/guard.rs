@@ -3,7 +3,8 @@
 
 //! Request guard pipeline for metadata services.
 
-use super::FsWriteOp;
+use super::authz::{AllowAllAuthz, AuthzOp, AuthzProvider, AuthzTarget};
+use super::domain::RequestContext;
 use crate::data_io::DataIoOp;
 use crate::error::MetadataError;
 use crate::mount::{DataIoPolicy, MountTable, ROOT_MOUNT_PREFIX};
@@ -13,33 +14,12 @@ use common::error::canonical::{CanonicalError, RefreshReason};
 use common::header::{RequestHeader, RpcErrorCode};
 use std::sync::Arc;
 use types::fs::FsErrorCode;
-use types::fs::InodeId;
 use types::ids::MountId;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AuthzOp {
-    FsWrite(FsWriteOp),
-    DataIo(DataIoOp),
-}
 
 #[derive(Clone, Debug)]
 pub struct AuthzContext {
     pub op: AuthzOp,
-    pub mount_id: Option<MountId>,
-    pub inode_id: Option<InodeId>,
-}
-
-pub trait AuthzProvider: Send + Sync {
-    fn authorize(&self, caller: &RequestHeader, ctx: &AuthzContext) -> Result<(), CanonicalError>;
-}
-
-#[derive(Clone, Debug)]
-pub struct AllowAllAuthz;
-
-impl AuthzProvider for AllowAllAuthz {
-    fn authorize(&self, _caller: &RequestHeader, _ctx: &AuthzContext) -> Result<(), CanonicalError> {
-        Ok(())
-    }
+    pub target: AuthzTarget,
 }
 
 pub trait LeadershipChecker: Send + Sync {
@@ -195,7 +175,7 @@ impl GuardChain {
         self.authz.provider = provider;
     }
 
-    pub fn check(&self, ctx: &GuardContext) -> Result<(), GuardFailure> {
+    pub async fn check(&self, ctx: &GuardContext<'_>) -> Result<(), GuardFailure> {
         if ctx.spec.requires_root_ready {
             self.readiness.check(ctx)?;
         }
@@ -211,12 +191,12 @@ impl GuardChain {
                     MetadataError::InvalidArgument("missing authz context".to_string()).into(),
                 ));
             }
-            self.authz.check(ctx)?;
+            self.authz.check(ctx).await?;
         }
         Ok(())
     }
 
-    pub fn check_request(
+    pub async fn check_request(
         &self,
         req_header_proto: &Option<proto::common::RequestHeaderProto>,
         caller: &RequestHeader,
@@ -231,10 +211,10 @@ impl GuardChain {
             mount_id,
             authz,
         };
-        self.check(&ctx)
+        self.check(&ctx).await
     }
 
-    pub fn check_system(&self, spec: GuardSpec) -> Result<(), GuardFailure> {
+    pub async fn check_system(&self, spec: GuardSpec) -> Result<(), GuardFailure> {
         let caller = RequestHeader::new(types::ClientId::new(0));
         let ctx = GuardContext {
             req_header_proto: &None,
@@ -243,7 +223,7 @@ impl GuardChain {
             mount_id: None,
             authz: None,
         };
-        self.check(&ctx)
+        self.check(&ctx).await
     }
 }
 
@@ -338,12 +318,18 @@ struct AuthGuard {
 }
 
 impl AuthGuard {
-    fn check(&self, ctx: &GuardContext) -> Result<(), GuardFailure> {
+    async fn check(&self, ctx: &GuardContext<'_>) -> Result<(), GuardFailure> {
         let Some(authz_ctx) = ctx.authz.as_ref() else {
             return Ok(());
         };
+        let req_ctx = RequestContext {
+            caller: ctx.caller.clone(),
+            traceparent: ctx.caller.traceparent.clone(),
+            route_epoch: ctx.req_header_proto.as_ref().and_then(|h| h.route_epoch),
+        };
         self.provider
-            .authorize(ctx.caller, authz_ctx)
+            .authorize(&req_ctx, authz_ctx.target.clone(), authz_ctx.op)
+            .await
             .map_err(GuardFailure::new)
     }
 }
@@ -381,8 +367,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn readiness_guard_blocks_when_not_ready() {
+    #[tokio::test]
+    async fn readiness_guard_blocks_when_not_ready() {
         let mount_table = Arc::new(MountTable::new());
         let mut chain = GuardChain::new(mount_table);
         let gate = Arc::new(RootReadinessGate::new(None));
@@ -392,14 +378,14 @@ mod tests {
         let req_header = None;
         let ctx = base_context(GuardSpec::metadata_read(), None, None, &caller, &req_header);
 
-        let err = chain.check(&ctx).unwrap_err();
+        let err = chain.check(&ctx).await.unwrap_err();
         assert_eq!(err.err.class, ErrorClass::Retryable);
         assert_eq!(err.err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NodeUnavailable)));
         assert_eq!(gate.is_ready(), false);
     }
 
-    #[test]
-    fn leadership_guard_returns_not_leader() {
+    #[tokio::test]
+    async fn leadership_guard_returns_not_leader() {
         let mount_table = Arc::new(MountTable::new());
         let mut chain = GuardChain::new(mount_table);
         chain.set_leadership_checker(Arc::new(StaticLeader(false)));
@@ -410,21 +396,20 @@ mod tests {
             GuardSpec::metadata_write(),
             None,
             Some(AuthzContext {
-                op: AuthzOp::FsWrite(FsWriteOp::Mkdir),
-                mount_id: None,
-                inode_id: None,
+                op: AuthzOp::Write,
+                target: AuthzTarget::for_path("/test".to_string()),
             }),
             &caller,
             &req_header,
         );
 
-        let err = chain.check(&ctx).unwrap_err();
+        let err = chain.check(&ctx).await.unwrap_err();
         assert_eq!(err.err.class, ErrorClass::NeedRefresh);
         assert_eq!(err.err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NotLeader)));
     }
 
-    #[test]
-    fn data_io_guard_forbids_root() {
+    #[tokio::test]
+    async fn data_io_guard_forbids_root() {
         let mount_table = Arc::new(MountTable::new());
         let root_entry = mount_table
             .create_mount(
@@ -448,7 +433,7 @@ mod tests {
             &req_header,
         );
 
-        let err = chain.check(&ctx).unwrap_err();
+        let err = chain.check(&ctx).await.unwrap_err();
         assert_eq!(err.err.class, ErrorClass::Fatal);
         assert_eq!(err.err.code, Some(ErrorCode::FsErrno(FsErrorCode::ENotsup)));
         assert!(err.err.message.contains("RootDataIoForbidden"));

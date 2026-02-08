@@ -18,6 +18,8 @@ pub struct MetadataConfig {
     pub rpc_addr: SocketAddr,
     /// Inode service exposure configuration.
     pub inode_service: InodeServiceConfig,
+    /// Authz mode configuration.
+    pub authz: MetadataAuthzConfig,
     /// Raft configuration.
     pub raft: RaftConfig,
     /// Shard configuration.
@@ -41,6 +43,81 @@ pub struct InodeServiceConfig {
     pub enable: bool,
     /// When true, inode service may only be served on loopback RPC binds.
     pub require_loopback_bind: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileSystemAuthzMode {
+    None,
+    Ranger,
+    Acl,
+}
+
+impl FileSystemAuthzMode {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_uppercase().as_str() {
+            "NONE" => Some(Self::None),
+            "RANGER" => Some(Self::Ranger),
+            "ACL" => Some(Self::Acl),
+            _ => None,
+        }
+    }
+}
+
+impl Default for FileSystemAuthzMode {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InodeAuthzMode {
+    None,
+    Acl,
+}
+
+impl InodeAuthzMode {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_uppercase().as_str() {
+            "NONE" => Some(Self::None),
+            "ACL" => Some(Self::Acl),
+            _ => None,
+        }
+    }
+}
+
+impl Default for InodeAuthzMode {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FileSystemAuthzConfig {
+    pub mode: FileSystemAuthzMode,
+}
+
+#[derive(Clone, Debug)]
+pub struct InodeAuthzConfig {
+    pub mode: InodeAuthzMode,
+}
+
+#[derive(Clone, Debug)]
+pub struct MetadataAuthzConfig {
+    pub filesystem: FileSystemAuthzConfig,
+    pub inode: InodeAuthzConfig,
+}
+
+impl Default for MetadataAuthzConfig {
+    fn default() -> Self {
+        Self {
+            filesystem: FileSystemAuthzConfig {
+                mode: FileSystemAuthzMode::None,
+            },
+            inode: InodeAuthzConfig {
+                mode: InodeAuthzMode::None,
+            },
+        }
+    }
 }
 
 /// Worker and repair configuration.
@@ -172,6 +249,43 @@ impl MetadataConfig {
                 .unwrap_or(true),
         };
 
+        let filesystem_mode_raw = flat
+            .get_str("metadata.authz.filesystem.mode")
+            .unwrap_or_else(|| "NONE".to_string());
+        let filesystem_mode = FileSystemAuthzMode::parse(&filesystem_mode_raw).ok_or_else(|| {
+            CommonError::new(
+                common::error::CommonErrorCode::InvalidArgument,
+                format!(
+                    "Invalid metadata.authz.filesystem.mode={}, expected one of NONE|RANGER|ACL",
+                    filesystem_mode_raw
+                ),
+            )
+        })?;
+
+        let inode_mode_raw = flat
+            .get_str("metadata.authz.inode.mode")
+            .unwrap_or_else(|| "NONE".to_string());
+        if inode_mode_raw.trim().eq_ignore_ascii_case("RANGER") {
+            return Err(CommonError::new(
+                common::error::CommonErrorCode::InvalidArgument,
+                "Invalid metadata.authz.inode.mode=RANGER: expected NONE|ACL".to_string(),
+            ));
+        }
+        let inode_mode = InodeAuthzMode::parse(&inode_mode_raw).ok_or_else(|| {
+            CommonError::new(
+                common::error::CommonErrorCode::InvalidArgument,
+                format!(
+                    "Invalid metadata.authz.inode.mode={}, expected one of NONE|ACL",
+                    inode_mode_raw
+                ),
+            )
+        })?;
+
+        let authz = MetadataAuthzConfig {
+            filesystem: FileSystemAuthzConfig { mode: filesystem_mode },
+            inode: InodeAuthzConfig { mode: inode_mode },
+        };
+
         // Read Raft config
         let peers = if let Some(peers_str) = flat.get_str("metadata.raft.peers") {
             // Parse comma-separated list of peers
@@ -231,6 +345,7 @@ impl MetadataConfig {
         Ok(Self {
             rpc_addr,
             inode_service,
+            authz,
             raft,
             shard,
             worker,
@@ -244,6 +359,7 @@ impl Default for MetadataConfig {
         Self {
             rpc_addr: "0.0.0.0:18080".parse().unwrap(),
             inode_service: InodeServiceConfig::default(),
+            authz: MetadataAuthzConfig::default(),
             raft: RaftConfig::default(),
             shard: ShardConfig::default(),
             worker: WorkerConfig::default(),
@@ -275,5 +391,41 @@ mod tests {
         let config = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap();
         assert!(config.inode_service.enable);
         assert!(!config.inode_service.require_loopback_bind);
+    }
+
+    #[test]
+    fn authz_mode_defaults_to_none() {
+        let config = MetadataConfig::default();
+        assert_eq!(config.authz.filesystem.mode, FileSystemAuthzMode::None);
+        assert_eq!(config.authz.inode.mode, InodeAuthzMode::None);
+    }
+
+    #[test]
+    fn authz_mode_parses_valid_values() {
+        let mut flat = CoreConfig::default().as_flat().clone();
+        flat.set("metadata.authz.filesystem.mode", "acl");
+        flat.set("metadata.authz.inode.mode", "acl");
+
+        let config = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap();
+        assert_eq!(config.authz.filesystem.mode, FileSystemAuthzMode::Acl);
+        assert_eq!(config.authz.inode.mode, InodeAuthzMode::Acl);
+    }
+
+    #[test]
+    fn authz_in_inode_rejects_ranger() {
+        let mut flat = CoreConfig::default().as_flat().clone();
+        flat.set("metadata.authz.inode.mode", "RANGER");
+        let err = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap_err();
+        assert!(err.message.contains("metadata.authz.inode.mode"));
+        assert!(err.message.contains("NONE|ACL"));
+    }
+
+    #[test]
+    fn authz_filesystem_rejects_unknown_mode() {
+        let mut flat = CoreConfig::default().as_flat().clone();
+        flat.set("metadata.authz.filesystem.mode", "UNKNOWN");
+        let err = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap_err();
+        assert!(err.message.contains("metadata.authz.filesystem.mode"));
+        assert!(err.message.contains("NONE|RANGER|ACL"));
     }
 }
