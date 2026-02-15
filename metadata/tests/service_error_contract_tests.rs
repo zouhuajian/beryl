@@ -12,26 +12,26 @@ use std::path::{Path, PathBuf};
 
 const SCAN_ROOTS: &[&str] = &["src/service", "src/worker", "../worker/src"];
 const REQUIRED_SCAN_FILES: &[&str] = &[
-    "src/service/fs_service.rs",
+    "src/service/inode_service.rs",
     "src/service/path_service.rs",
     "src/worker/service.rs",
     "../worker/src/service.rs",
 ];
 const ALLOWLISTED_STATUS_FILES: &[&str] = &["src/worker/service.rs", "../worker/src/service.rs"];
 const SERVER_IMPL_MARKERS: &[&str] = &[
-    "impl MetadataFsServiceProto for",
+    "impl MetadataInodeServiceProto for",
     "impl FileSystemServiceProto for",
     "impl MetadataWorkerServiceProto for",
     "impl WorkerDataService for",
 ];
 const FORBIDDEN_PATTERNS: &[&str] = &["Status::from_error", "return Err(Status", "Err(Status"];
-const FS_HANDLER_FILES: &[&str] = &["src/service/fs_service.rs", "src/service/path_service.rs"];
+const FS_HANDLER_FILES: &[&str] = &["src/service/inode_service.rs", "src/service/path_service.rs"];
 const FS_RPC_APPLICATION_ALLOWLIST: &[&str] = &[];
 const FORBIDDEN_FS_APPLICATION_PATTERN: &str = "RpcErrorCode::Application";
 const PATH_SERVICE_COUPLING_FORBIDDEN: &[&str] = &[
-    "self.fs_service.",
-    "fs_service: Arc<",
-    "MetadataFsServiceProto as FsServiceTrait",
+    "self.inode_service.",
+    "inode_service: Arc<",
+    "MetadataInodeServiceProto as InodeServiceTrait",
 ];
 
 fn collect_rs_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {

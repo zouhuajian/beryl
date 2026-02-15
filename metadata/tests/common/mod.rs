@@ -9,7 +9,7 @@
 use metadata::error::MetadataResult;
 use metadata::mount::{DataIoPolicy, MountKind, MountTable};
 use metadata::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
-use metadata::service::MetadataFsServiceImpl;
+use metadata::service::MetadataInodeServiceImpl;
 use metadata::state::RaftStateStore;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -24,7 +24,7 @@ pub struct FsTestHarness {
     pub state_machine: Arc<AppRaftStateMachine>,
     pub raft_node: Arc<AppRaftNode>,
     pub state_store: Arc<RaftStateStore>,
-    pub fs_service: MetadataFsServiceImpl,
+    pub inode_service: MetadataInodeServiceImpl,
 }
 
 impl FsTestHarness {
@@ -60,7 +60,7 @@ impl FsTestHarness {
         // Create FS service
         use metadata::metrics::MetadataMetrics;
         let metrics = Arc::new(MetadataMetrics::new());
-        let fs_service = MetadataFsServiceImpl::new(
+        let inode_service = MetadataInodeServiceImpl::new(
             state_store.clone() as Arc<dyn metadata::state::StateStore>,
             mount_table.clone(),
         )
@@ -75,7 +75,7 @@ impl FsTestHarness {
             state_machine,
             raft_node,
             state_store,
-            fs_service,
+            inode_service,
         })
     }
 

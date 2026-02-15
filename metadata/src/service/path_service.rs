@@ -2304,7 +2304,7 @@ mod tests {
 
     use crate::mount::{DataIoPolicy, MountKind, ROOT_INODE_ID};
     use crate::readiness::RootReadinessGate;
-    use crate::service::MetadataFsServiceImpl;
+    use crate::service::MetadataInodeServiceImpl;
     use crate::state::MemoryStateStore;
 
     #[derive(Clone)]
@@ -2342,10 +2342,10 @@ mod tests {
         let storage = Arc::new(RocksDBStorage::open(dir.path()).expect("open rocksdb"));
         let mount_table = Arc::new(MountTable::new());
         let state_store: Arc<dyn crate::state::StateStore> = Arc::new(MemoryStateStore::new());
-        let fs_service = MetadataFsServiceImpl::new(Arc::clone(&state_store), Arc::clone(&mount_table))
+        let inode_service = MetadataInodeServiceImpl::new(Arc::clone(&state_store), Arc::clone(&mount_table))
             .with_storage(storage.clone());
         let path_service =
-            MetadataFileSystemServiceImpl::new(Arc::clone(&mount_table), storage.clone(), fs_service.fs_core());
+            MetadataFileSystemServiceImpl::new(Arc::clone(&mount_table), storage.clone(), inode_service.fs_core());
         (path_service, mount_table, storage)
     }
 

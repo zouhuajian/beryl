@@ -13,13 +13,13 @@ use metadata::service::domain::RequestContext;
 use metadata::service::guard::LeadershipChecker;
 use metadata::service::{
     AclInodeAuthz, AuthzOp, AuthzProvider, AuthzScheme, AuthzTarget, DenyAllAuthz, MetadataFileSystemServiceImpl,
-    MetadataFsServiceImpl, RocksDbInodePermReader, StaticGroupResolver,
+    MetadataInodeServiceImpl, RocksDbInodePermReader, StaticGroupResolver,
 };
 use metadata::state::StateStore;
 use metadata::RootReadinessGate;
 use proto::common::{error_detail_proto::Code as ErrorCodeProto, ErrorClassProto, FsErrnoProto, RpcErrorCodeProto};
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
-use proto::metadata::metadata_fs_service_proto_server::MetadataFsServiceProto;
+use proto::metadata::metadata_inode_service_proto_server::MetadataInodeServiceProto;
 use proto::metadata::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -98,13 +98,13 @@ async fn test_path_service_propagates_need_refresh_from_fs() {
         .await
         .unwrap();
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone())
     .with_leadership_checker(Arc::new(NotLeader));
-    let fs_core = fs_service.fs_core();
+    let fs_core = inode_service.fs_core();
 
     let path_service =
         MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
@@ -165,13 +165,13 @@ async fn test_path_service_readiness_precedes_path_resolution() {
         .unwrap();
     let readiness_gate = Arc::new(RootReadinessGate::new(None));
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone())
     .with_readiness_gate(Arc::clone(&readiness_gate));
-    let fs_core = fs_service.fs_core();
+    let fs_core = inode_service.fs_core();
 
     let path_service =
         MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
@@ -210,13 +210,13 @@ async fn test_path_service_write_leadership_precedes_path_resolution() {
         .await
         .unwrap();
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone())
     .with_leadership_checker(Arc::new(NotLeader));
-    let fs_core = fs_service.fs_core();
+    let fs_core = inode_service.fs_core();
 
     let path_service =
         MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
@@ -283,13 +283,13 @@ async fn test_open_write_by_path_leadership_precedes_mount_epoch_validation() {
         .put_dentry(root_inode_id, "leader-first.bin", inode_id)
         .unwrap();
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone())
     .with_leadership_checker(Arc::new(NotLeader));
-    let fs_core = fs_service.fs_core();
+    let fs_core = inode_service.fs_core();
 
     let path_service =
         MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
@@ -337,12 +337,12 @@ async fn test_path_service_resolver_not_found_is_enoent() {
         .await
         .unwrap();
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone());
-    let fs_core = fs_service.fs_core();
+    let fs_core = inode_service.fs_core();
 
     let path_service =
         MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
@@ -383,14 +383,14 @@ async fn get_file_status_success_header_includes_route_and_mount_epoch() {
     let mount = fs_harness.mount_table.get_mount(mount_id).unwrap().unwrap();
     let route_epoch = fs_harness.state_store.get_layout_version().await.unwrap().as_u64();
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone())
     .with_raft_node(fs_harness.raft_node.clone())
     .with_leadership_checker(Arc::new(AlwaysLeader));
-    let fs_core = fs_service.fs_core();
+    let fs_core = inode_service.fs_core();
     let path_service =
         MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
             .with_leadership_checker(Arc::new(AlwaysLeader));
@@ -426,14 +426,14 @@ async fn list_status_success_header_includes_route_and_mount_epoch() {
     let mount = fs_harness.mount_table.get_mount(mount_id).unwrap().unwrap();
     let route_epoch = fs_harness.state_store.get_layout_version().await.unwrap().as_u64();
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone())
     .with_raft_node(fs_harness.raft_node.clone())
     .with_leadership_checker(Arc::new(AlwaysLeader));
-    let fs_core = fs_service.fs_core();
+    let fs_core = inode_service.fs_core();
     let path_service =
         MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
             .with_leadership_checker(Arc::new(AlwaysLeader));
@@ -472,14 +472,14 @@ async fn open_success_header_includes_route_and_mount_epoch() {
     let mount = fs_harness.mount_table.get_mount(mount_id).unwrap().unwrap();
     let route_epoch = fs_harness.state_store.get_layout_version().await.unwrap().as_u64();
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone())
     .with_raft_node(fs_harness.raft_node.clone())
     .with_leadership_checker(Arc::new(AlwaysLeader));
-    let fs_core = fs_service.fs_core();
+    let fs_core = inode_service.fs_core();
     let path_service =
         MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
             .with_leadership_checker(Arc::new(AlwaysLeader));
@@ -503,7 +503,7 @@ async fn open_success_header_includes_route_and_mount_epoch() {
 }
 
 #[tokio::test]
-async fn test_fs_service_lookup_not_found_is_grpc_ok_with_header_error() {
+async fn test_inode_service_lookup_not_found_is_grpc_ok_with_header_error() {
     let fs_harness = FsTestHarness::new().await.unwrap();
     let (_mount_id, root_inode_id) = fs_harness
         .create_mount_with_root(
@@ -523,7 +523,7 @@ async fn test_fs_service_lookup_not_found_is_grpc_ok_with_header_error() {
         name: "missing.txt".to_string(),
     };
 
-    let resp = MetadataFsServiceProto::lookup(&fs_harness.fs_service, Request::new(lookup_req))
+    let resp = MetadataInodeServiceProto::lookup(&fs_harness.inode_service, Request::new(lookup_req))
         .await
         .expect("business errors must return grpc OK")
         .into_inner();
@@ -550,13 +550,13 @@ async fn test_path_service_mount_epoch_mismatch_is_need_refresh_with_reason_and_
         .await
         .unwrap();
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone())
     .with_raft_node(fs_harness.raft_node.clone());
-    let fs_core = fs_service.fs_core();
+    let fs_core = inode_service.fs_core();
     let path_service =
         MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
             .with_leadership_checker(Arc::new(AlwaysLeader));
@@ -647,14 +647,14 @@ async fn test_path_service_deny_all_blocks_metadata_read_with_header_error() {
         .await
         .unwrap();
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone())
     .with_authz_provider(Arc::new(DenyAllAuthz))
     .with_leadership_checker(Arc::new(AlwaysLeader));
-    let fs_core = fs_service.fs_core();
+    let fs_core = inode_service.fs_core();
 
     let path_service =
         MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
@@ -699,14 +699,14 @@ async fn test_path_service_acl_mode_denies_when_principal_missing() {
         .await
         .unwrap();
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone())
     .with_raft_node(fs_harness.raft_node.clone())
     .with_leadership_checker(Arc::new(AlwaysLeader));
-    let fs_core = fs_service.fs_core();
+    let fs_core = inode_service.fs_core();
 
     let acl_provider = Arc::new(AclInodeAuthz::new(
         Arc::new(StaticGroupResolver::new(BTreeMap::new())),
@@ -738,7 +738,7 @@ async fn test_path_service_acl_mode_denies_when_principal_missing() {
 }
 
 #[tokio::test]
-async fn test_fs_service_acl_mode_denies_when_principal_missing_with_grpc_ok() {
+async fn test_inode_service_acl_mode_denies_when_principal_missing_with_grpc_ok() {
     let fs_harness = FsTestHarness::new().await.unwrap();
     let (_mount_id, root_inode_id) = fs_harness
         .create_mount_with_root(
@@ -755,7 +755,7 @@ async fn test_fs_service_acl_mode_denies_when_principal_missing_with_grpc_ok() {
         Arc::new(StaticGroupResolver::new(BTreeMap::new())),
         Arc::clone(&perm_reader),
     ));
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
@@ -765,8 +765,8 @@ async fn test_fs_service_acl_mode_denies_when_principal_missing_with_grpc_ok() {
     .with_inode_perm_reader(perm_reader)
     .with_leadership_checker(Arc::new(AlwaysLeader));
 
-    let resp = MetadataFsServiceProto::get_attr(
-        &fs_service,
+    let resp = MetadataInodeServiceProto::get_attr(
+        &inode_service,
         Request::new(GetAttrRequestProto {
             header: FsTestHarness::create_test_request_header(),
             inode_id: Some(proto::fs::InodeIdProto {
@@ -812,7 +812,7 @@ async fn test_acl_cache_invalidation_after_set_attr_is_immediate() {
         Arc::new(StaticGroupResolver::new(BTreeMap::new())),
         Arc::clone(&perm_reader),
     ));
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
@@ -822,8 +822,8 @@ async fn test_acl_cache_invalidation_after_set_attr_is_immediate() {
     .with_inode_perm_reader(perm_reader)
     .with_leadership_checker(Arc::new(AlwaysLeader));
 
-    let first_read = MetadataFsServiceProto::get_attr(
-        &fs_service,
+    let first_read = MetadataInodeServiceProto::get_attr(
+        &inode_service,
         Request::new(GetAttrRequestProto {
             header: header_with_principal("2000"),
             inode_id: Some(proto::fs::InodeIdProto {
@@ -841,8 +841,8 @@ async fn test_acl_cache_invalidation_after_set_attr_is_immediate() {
 
     let mut chmod_attrs = attrs;
     chmod_attrs.mode = 0o600; // remove others read
-    let chmod = MetadataFsServiceProto::set_attr(
-        &fs_service,
+    let chmod = MetadataInodeServiceProto::set_attr(
+        &inode_service,
         Request::new(SetAttrRequestProto {
             header: header_with_principal("1000"),
             inode_id: Some(proto::fs::InodeIdProto {
@@ -869,8 +869,8 @@ async fn test_acl_cache_invalidation_after_set_attr_is_immediate() {
         "set_attr should succeed for owner"
     );
 
-    let second_read = MetadataFsServiceProto::get_attr(
-        &fs_service,
+    let second_read = MetadataInodeServiceProto::get_attr(
+        &inode_service,
         Request::new(GetAttrRequestProto {
             header: header_with_principal("2000"),
             inode_id: Some(proto::fs::InodeIdProto {
@@ -905,14 +905,14 @@ async fn test_path_service_deny_all_blocks_open_write_by_path_with_header_error(
         .await
         .unwrap();
 
-    let allow_fs_service = MetadataFsServiceImpl::new(
+    let allow_inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone())
     .with_raft_node(fs_harness.raft_node.clone())
     .with_leadership_checker(Arc::new(AlwaysLeader));
-    let allow_fs_core = allow_fs_service.fs_core();
+    let allow_fs_core = allow_inode_service.fs_core();
     let allow_path_service = MetadataFileSystemServiceImpl::new(
         fs_harness.mount_table.clone(),
         fs_harness.storage.clone(),
@@ -950,7 +950,7 @@ async fn test_path_service_deny_all_blocks_open_write_by_path_with_header_error(
         create_resp.header
     );
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
@@ -958,7 +958,7 @@ async fn test_path_service_deny_all_blocks_open_write_by_path_with_header_error(
     .with_raft_node(fs_harness.raft_node.clone())
     .with_authz_provider(Arc::new(DenyAllAuthz))
     .with_leadership_checker(Arc::new(AlwaysLeader));
-    let fs_core = fs_service.fs_core();
+    let fs_core = inode_service.fs_core();
     let path_service =
         MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
             .with_authz_provider(Arc::new(DenyAllAuthz))
@@ -998,14 +998,14 @@ async fn test_path_service_path_authz_plumbing_calls_read_write_and_rename_targe
         .await
         .unwrap();
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone())
     .with_raft_node(fs_harness.raft_node.clone())
     .with_leadership_checker(Arc::new(AlwaysLeader));
-    let fs_core = fs_service.fs_core();
+    let fs_core = inode_service.fs_core();
 
     let audit = Arc::new(AuditAuthz::default());
     let path_service =
@@ -1093,14 +1093,14 @@ async fn test_path_service_rename_path_authz_checks_src_then_dst_parent() {
         .await
         .unwrap();
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone())
     .with_raft_node(fs_harness.raft_node.clone())
     .with_leadership_checker(Arc::new(AlwaysLeader));
-    let fs_core = fs_service.fs_core();
+    let fs_core = inode_service.fs_core();
 
     let audit = Arc::new(AuditAuthz::default());
     let path_service =
@@ -1226,14 +1226,14 @@ async fn test_path_service_acl_traverse_denies_without_intermediate_execute() {
         .unwrap();
     fs_harness.storage.put_dentry(dir_b, "file", file_inode).unwrap();
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn StateStore>,
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone())
     .with_raft_node(fs_harness.raft_node.clone())
     .with_leadership_checker(Arc::new(AlwaysLeader));
-    let fs_core = fs_service.fs_core();
+    let fs_core = inode_service.fs_core();
 
     let acl_provider = Arc::new(AclInodeAuthz::new(
         Arc::new(StaticGroupResolver::new(BTreeMap::new())),
@@ -1314,14 +1314,14 @@ async fn test_path_service_acl_sticky_bit_denies_unlink_for_non_owner() {
         .put_dentry(sticky_dir, "victim", victim_inode)
         .unwrap();
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn StateStore>,
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone())
     .with_raft_node(fs_harness.raft_node.clone())
     .with_leadership_checker(Arc::new(AlwaysLeader));
-    let fs_core = fs_service.fs_core();
+    let fs_core = inode_service.fs_core();
 
     let acl_provider = Arc::new(AclInodeAuthz::new(
         Arc::new(StaticGroupResolver::new(BTreeMap::new())),
@@ -1353,7 +1353,7 @@ async fn test_path_service_acl_sticky_bit_denies_unlink_for_non_owner() {
 }
 
 #[tokio::test]
-async fn test_fs_service_acl_sticky_bit_denies_rename_for_non_owner() {
+async fn test_inode_service_acl_sticky_bit_denies_rename_for_non_owner() {
     let fs_harness = FsTestHarness::new().await.unwrap();
     let (mount_id, root_inode_id) = fs_harness
         .create_mount_with_root(
@@ -1400,7 +1400,7 @@ async fn test_fs_service_acl_sticky_bit_denies_rename_for_non_owner() {
         Arc::new(StaticGroupResolver::new(BTreeMap::new())),
         Arc::clone(&perm_reader),
     ));
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn StateStore>,
         fs_harness.mount_table.clone(),
     )
@@ -1410,8 +1410,8 @@ async fn test_fs_service_acl_sticky_bit_denies_rename_for_non_owner() {
     .with_inode_perm_reader(perm_reader)
     .with_leadership_checker(Arc::new(AlwaysLeader));
 
-    let resp = MetadataFsServiceProto::rename(
-        &fs_service,
+    let resp = MetadataInodeServiceProto::rename(
+        &inode_service,
         Request::new(FsRenameRequestProto {
             header: header_with_principal("2000"),
             src_parent_inode_id: Some(proto::fs::InodeIdProto {

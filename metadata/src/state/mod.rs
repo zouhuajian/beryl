@@ -140,7 +140,7 @@ pub trait StateStore: Send + Sync {
     // NOTE: FileMeta and file-based operations have been removed.
     // All file metadata is now stored in inodes. Use the FS service (inode/dentry-based) instead.
     // Path is not authoritative storage. All path operations must go through the FS service (inode/dentry-based).
-    // The old MetadataClientService is deprecated. Use MetadataFsServiceProto instead.
+    // The old MetadataClientService is deprecated. Use MetadataInodeServiceProto instead.
 
     // NOTE: list_files has been removed. Path-based listing is not authoritative.
     // Use the FS service ReadDir operation (inode/dentry-based) instead.

@@ -598,7 +598,7 @@ message FileBlockLocationProto {
 // Metadata FS Service (privileged)
 // ============================================================================
 
-service MetadataFsServiceProto {
+service MetadataInodeServiceProto {
   // Core operations
   rpc Lookup(LookupRequestProto) returns (LookupResponseProto);
   rpc GetAttr(GetAttrRequestProto) returns (GetAttrResponseProto);

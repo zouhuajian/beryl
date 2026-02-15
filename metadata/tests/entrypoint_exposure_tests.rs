@@ -9,11 +9,11 @@
 mod common;
 
 use common::FsTestHarness;
-use metadata::service::{MetadataFileSystemServiceImpl, MetadataFsServiceImpl};
+use metadata::service::{MetadataFileSystemServiceImpl, MetadataInodeServiceImpl};
 use proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProtoServer;
-use proto::metadata::metadata_fs_service_proto_client::MetadataFsServiceProtoClient;
-use proto::metadata::metadata_fs_service_proto_server::MetadataFsServiceProtoServer;
+use proto::metadata::metadata_inode_service_proto_client::MetadataInodeServiceProtoClient;
+use proto::metadata::metadata_inode_service_proto_server::MetadataInodeServiceProtoServer;
 use proto::metadata::{GetFileStatusRequestProto, LookupRequestProto};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -26,7 +26,7 @@ use types::ids::ShardGroupId;
 struct ServiceHarness {
     _fs_harness: FsTestHarness,
     filesystem_service: MetadataFileSystemServiceImpl,
-    inode_service: MetadataFsServiceImpl,
+    inode_service: MetadataInodeServiceImpl,
     root_inode_id: u64,
 }
 
@@ -43,7 +43,7 @@ async fn build_service_harness() -> ServiceHarness {
 
     let metrics = Arc::new(metadata::metrics::MetadataMetrics::new());
 
-    let inode_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
@@ -51,14 +51,14 @@ async fn build_service_harness() -> ServiceHarness {
     .with_raft_node(fs_harness.raft_node.clone())
     .with_metrics(metrics.clone());
 
-    let fs_service_for_filesystem = MetadataFsServiceImpl::new(
+    let inode_service_for_filesystem = MetadataInodeServiceImpl::new(
         fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
         fs_harness.mount_table.clone(),
     )
     .with_storage(fs_harness.storage.clone())
     .with_raft_node(fs_harness.raft_node.clone())
     .with_metrics(metrics.clone());
-    let fs_core = fs_service_for_filesystem.fs_core();
+    let fs_core = inode_service_for_filesystem.fs_core();
 
     let filesystem_service =
         MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
@@ -92,7 +92,7 @@ async fn spawn_server(
         if enable_inode_service {
             Server::builder()
                 .add_service(FileSystemServiceProtoServer::new(filesystem_service))
-                .add_service(MetadataFsServiceProtoServer::new(inode_service))
+                .add_service(MetadataInodeServiceProtoServer::new(inode_service))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                     let _ = shutdown_rx.await;
                 })
@@ -140,7 +140,7 @@ async fn inode_service_disabled_by_default_not_registered() {
         .connect()
         .await
         .unwrap();
-    let mut inode_client = MetadataFsServiceProtoClient::new(channel);
+    let mut inode_client = MetadataInodeServiceProtoClient::new(channel);
     let inode_result = inode_client
         .lookup(Request::new(LookupRequestProto {
             header: FsTestHarness::create_test_request_header(),
@@ -170,7 +170,7 @@ async fn inode_service_enabled_is_registered() {
         .connect()
         .await
         .unwrap();
-    let mut inode_client = MetadataFsServiceProtoClient::new(channel);
+    let mut inode_client = MetadataInodeServiceProtoClient::new(channel);
     let resp = inode_client
         .lookup(Request::new(LookupRequestProto {
             header: FsTestHarness::create_test_request_header(),

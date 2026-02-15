@@ -6,7 +6,7 @@
 mod common;
 use common::FsTestHarness;
 use metadata::error::MetadataError;
-use metadata::service::{MetadataFileSystemServiceImpl, MetadataFsServiceImpl};
+use metadata::service::{MetadataFileSystemServiceImpl, MetadataInodeServiceImpl};
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::*;
 use std::sync::Arc;
@@ -38,14 +38,14 @@ impl PathTestHarness {
         // Create path service
         use metadata::metrics::MetadataMetrics;
         let metrics = Arc::new(MetadataMetrics::new());
-        let fs_service = MetadataFsServiceImpl::new(
+        let inode_service = MetadataInodeServiceImpl::new(
             fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
             fs_harness.mount_table.clone(),
         )
         .with_storage(fs_harness.storage.clone())
         .with_raft_node(fs_harness.raft_node.clone())
         .with_metrics(metrics.clone());
-        let fs_core = fs_service.fs_core();
+        let fs_core = inode_service.fs_core();
 
         let path_service =
             MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)

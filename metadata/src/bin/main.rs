@@ -11,7 +11,7 @@ use metadata::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use metadata::readiness::{wait_for_root_ready_with_metrics, RootReadinessGate};
 use metadata::service::{
     cached_static_group_resolver, filesystem_authz_provider, inode_authz_provider, AuthzProviderDeps,
-    MetadataFileSystemServiceImpl, MetadataFsServiceImpl, RocksDbInodePermReader,
+    MetadataFileSystemServiceImpl, MetadataInodeServiceImpl, RocksDbInodePermReader,
 };
 use metadata::state::RaftStateStore;
 use metadata::ufs_proxy::UfsMetadataProxy;
@@ -20,7 +20,7 @@ use metadata::worker::{
 };
 use metadata::{MetadataConfig, MountTable};
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProtoServer;
-use proto::metadata::metadata_fs_service_proto_server::MetadataFsServiceProtoServer;
+use proto::metadata::metadata_inode_service_proto_server::MetadataInodeServiceProtoServer;
 use proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProtoServer;
 use std::sync::Arc;
 use tokio::signal;
@@ -134,7 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     if serve_inode_service {
         health_reporter
-            .set_not_serving::<MetadataFsServiceProtoServer<MetadataFsServiceImpl>>()
+            .set_not_serving::<MetadataInodeServiceProtoServer<MetadataInodeServiceImpl>>()
             .await;
     }
 
@@ -227,7 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Note: state_store is Arc<RaftStateStore>, which implements StateStore trait
     let mount_table_for_readiness = Arc::clone(&mount_table);
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         state_store.clone() as Arc<dyn metadata::state::StateStore>,
         Arc::clone(&mount_table),
     )
@@ -238,7 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_inode_perm_reader(Arc::clone(&authz_deps.inode_perm_reader))
     .with_readiness_gate(Arc::clone(&readiness_gate));
 
-    let fs_service_for_filesystem = MetadataFsServiceImpl::new(
+    let inode_service_for_filesystem = MetadataInodeServiceImpl::new(
         state_store.clone() as Arc<dyn metadata::state::StateStore>,
         Arc::clone(&mount_table),
     )
@@ -248,7 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_authz_provider(inode_authz_provider(config.authz.inode.mode, &authz_deps))
     .with_inode_perm_reader(Arc::clone(&authz_deps.inode_perm_reader))
     .with_readiness_gate(Arc::clone(&readiness_gate));
-    let fs_core_for_filesystem = fs_service_for_filesystem.fs_core();
+    let fs_core_for_filesystem = inode_service_for_filesystem.fs_core();
 
     let filesystem_service =
         MetadataFileSystemServiceImpl::new(Arc::clone(&mount_table), Arc::clone(&storage), fs_core_for_filesystem)
@@ -281,7 +281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await;
                 if serve_inode_service_for_health {
                     health_reporter
-                        .set_serving::<MetadataFsServiceProtoServer<MetadataFsServiceImpl>>()
+                        .set_serving::<MetadataInodeServiceProtoServer<MetadataInodeServiceImpl>>()
                         .await;
                 }
             }
@@ -304,7 +304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // .add_service(MetadataClientServiceServer::new(client_service))
             .add_service(FileSystemServiceProtoServer::new(filesystem_service))
             .add_service(MetadataWorkerServiceProtoServer::new(worker_service))
-            .add_service(MetadataFsServiceProtoServer::new(fs_service))
+            .add_service(MetadataInodeServiceProtoServer::new(inode_service))
             .add_service(health_service)
             .serve_with_shutdown(addr, shutdown_signal())
             .await?;

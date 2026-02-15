@@ -3,11 +3,11 @@
 
 use common::header::RequestHeader;
 use metadata::readiness::RootReadinessGate;
-use metadata::service::MetadataFsServiceImpl;
+use metadata::service::MetadataInodeServiceImpl;
 use metadata::state::MemoryStateStore;
 use metadata::MountTable;
-use proto::metadata::metadata_fs_service_proto_client::MetadataFsServiceProtoClient;
-use proto::metadata::metadata_fs_service_proto_server::MetadataFsServiceProtoServer;
+use proto::metadata::metadata_inode_service_proto_client::MetadataInodeServiceProtoClient;
+use proto::metadata::metadata_inode_service_proto_server::MetadataInodeServiceProtoServer;
 use proto::metadata::GetAttrRequestProto;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -29,7 +29,7 @@ async fn readiness_gate_blocks_rpc_until_ready() {
     let mount_table = std::sync::Arc::new(MountTable::load_from_storage(&storage).unwrap());
     let readiness_gate = std::sync::Arc::new(RootReadinessGate::new(None));
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         std::sync::Arc::new(MemoryStateStore::new()),
         std::sync::Arc::clone(&mount_table),
     )
@@ -38,7 +38,7 @@ async fn readiness_gate_blocks_rpc_until_ready() {
 
     let (health_reporter, health_service) = health_reporter();
     health_reporter
-        .set_not_serving::<MetadataFsServiceProtoServer<MetadataFsServiceImpl>>()
+        .set_not_serving::<MetadataInodeServiceProtoServer<MetadataInodeServiceImpl>>()
         .await;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -48,7 +48,7 @@ async fn readiness_gate_blocks_rpc_until_ready() {
     tokio::spawn(async move {
         Server::builder()
             .add_service(health_service)
-            .add_service(MetadataFsServiceProtoServer::new(fs_service))
+            .add_service(MetadataInodeServiceProtoServer::new(inode_service))
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                 let _ = shutdown_rx.await;
             })
@@ -64,7 +64,7 @@ async fn readiness_gate_blocks_rpc_until_ready() {
     let mut health_client = HealthClient::new(channel);
     let health_resp = health_client
         .check(Request::new(HealthCheckRequest {
-            service: MetadataFsServiceProtoServer::<MetadataFsServiceImpl>::NAME.to_string(),
+            service: MetadataInodeServiceProtoServer::<MetadataInodeServiceImpl>::NAME.to_string(),
         }))
         .await
         .unwrap()
@@ -76,7 +76,7 @@ async fn readiness_gate_blocks_rpc_until_ready() {
         .connect()
         .await
         .unwrap();
-    let mut fs_client = MetadataFsServiceProtoClient::new(fs_channel);
+    let mut fs_client = MetadataInodeServiceProtoClient::new(fs_channel);
     let req = GetAttrRequestProto {
         header: Some((&RequestHeader::new(ClientId::new(1))).into()),
         inode_id: Some(proto::fs::InodeIdProto { value: 1 }),
@@ -96,12 +96,12 @@ async fn readiness_gate_blocks_rpc_until_ready() {
 
     readiness_gate.set_ready();
     health_reporter
-        .set_serving::<MetadataFsServiceProtoServer<MetadataFsServiceImpl>>()
+        .set_serving::<MetadataInodeServiceProtoServer<MetadataInodeServiceImpl>>()
         .await;
 
     let health_resp = health_client
         .check(Request::new(HealthCheckRequest {
-            service: MetadataFsServiceProtoServer::<MetadataFsServiceImpl>::NAME.to_string(),
+            service: MetadataInodeServiceProtoServer::<MetadataInodeServiceImpl>::NAME.to_string(),
         }))
         .await
         .unwrap()

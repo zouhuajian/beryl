@@ -5,7 +5,7 @@
 
 mod common;
 use common::FsTestHarness;
-use proto::metadata::metadata_fs_service_proto_server::MetadataFsServiceProto;
+use proto::metadata::metadata_inode_service_proto_server::MetadataInodeServiceProto;
 use proto::metadata::{FsRenameRequestProto, LookupRequestProto};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::Request;
@@ -59,7 +59,7 @@ async fn rename_noreplace_preserves_destination() {
         flags: 0x1, // RENAME_NOREPLACE
     };
 
-    let result = MetadataFsServiceProto::rename(&harness.fs_service, Request::new(rename_req)).await;
+    let result = MetadataInodeServiceProto::rename(&harness.inode_service, Request::new(rename_req)).await;
     match result {
         Ok(resp) => {
             let errno = FsTestHarness::extract_error_code(&resp.into_inner().header);
@@ -79,8 +79,8 @@ async fn rename_noreplace_preserves_destination() {
     if let Some(h) = lookup_header.as_mut() {
         h.group_id = group_id;
     }
-    let lookup_a = MetadataFsServiceProto::lookup(
-        &harness.fs_service,
+    let lookup_a = MetadataInodeServiceProto::lookup(
+        &harness.inode_service,
         Request::new(LookupRequestProto {
             header: lookup_header.clone(),
             parent_inode_id: Some(proto::fs::InodeIdProto {
@@ -97,8 +97,8 @@ async fn rename_noreplace_preserves_destination() {
         inode_a.as_raw()
     );
 
-    let lookup_b = MetadataFsServiceProto::lookup(
-        &harness.fs_service,
+    let lookup_b = MetadataInodeServiceProto::lookup(
+        &harness.inode_service,
         Request::new(LookupRequestProto {
             header: lookup_header,
             parent_inode_id: Some(proto::fs::InodeIdProto {

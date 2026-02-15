@@ -6,7 +6,7 @@
 mod common;
 use common::FsTestHarness;
 use metadata::error::MetadataError;
-use proto::metadata::metadata_fs_service_proto_server::MetadataFsServiceProto;
+use proto::metadata::metadata_inode_service_proto_server::MetadataInodeServiceProto;
 use proto::metadata::*;
 use std::collections::HashSet;
 use tonic::Request;
@@ -59,7 +59,7 @@ async fn test_rename_same_mount_atomic() {
         }),
     };
 
-    let create_resp = MetadataFsServiceProto::create(&harness.fs_service, Request::new(create_req))
+    let create_resp = MetadataInodeServiceProto::create(&harness.inode_service, Request::new(create_req))
         .await
         .unwrap()
         .into_inner();
@@ -74,7 +74,7 @@ async fn test_rename_same_mount_atomic() {
         name: "a".to_string(),
     };
 
-    let lookup_resp = MetadataFsServiceProto::lookup(&harness.fs_service, Request::new(lookup_req.clone()))
+    let lookup_resp = MetadataInodeServiceProto::lookup(&harness.inode_service, Request::new(lookup_req.clone()))
         .await
         .unwrap()
         .into_inner();
@@ -95,7 +95,7 @@ async fn test_rename_same_mount_atomic() {
         flags: 0,
     };
 
-    let rename_resp = MetadataFsServiceProto::rename(&harness.fs_service, Request::new(rename_req))
+    let rename_resp = MetadataInodeServiceProto::rename(&harness.inode_service, Request::new(rename_req))
         .await
         .unwrap()
         .into_inner();
@@ -112,7 +112,7 @@ async fn test_rename_same_mount_atomic() {
         name: "a".to_string(),
     };
 
-    let lookup_a_resp = MetadataFsServiceProto::lookup(&harness.fs_service, Request::new(lookup_a_req)).await;
+    let lookup_a_resp = MetadataInodeServiceProto::lookup(&harness.inode_service, Request::new(lookup_a_req)).await;
 
     assert!(lookup_a_resp.is_err());
     let status = lookup_a_resp.unwrap_err();
@@ -127,7 +127,7 @@ async fn test_rename_same_mount_atomic() {
         name: "b".to_string(),
     };
 
-    let lookup_b_resp = MetadataFsServiceProto::lookup(&harness.fs_service, Request::new(lookup_b_req))
+    let lookup_b_resp = MetadataInodeServiceProto::lookup(&harness.inode_service, Request::new(lookup_b_req))
         .await
         .unwrap()
         .into_inner();
@@ -145,7 +145,7 @@ async fn test_rename_same_mount_atomic() {
         max_entries: 100,
     };
 
-    let readdir_resp = MetadataFsServiceProto::read_dir(&harness.fs_service, Request::new(readdir_req))
+    let readdir_resp = MetadataInodeServiceProto::read_dir(&harness.inode_service, Request::new(readdir_req))
         .await
         .unwrap()
         .into_inner();
@@ -213,7 +213,7 @@ async fn test_rename_cross_mount_exdev() {
         }),
     };
 
-    MetadataFsServiceProto::create(&harness.fs_service, Request::new(create_req))
+    MetadataInodeServiceProto::create(&harness.inode_service, Request::new(create_req))
         .await
         .unwrap();
 
@@ -231,7 +231,7 @@ async fn test_rename_cross_mount_exdev() {
         flags: 0,
     };
 
-    let rename_resp = MetadataFsServiceProto::rename(&harness.fs_service, Request::new(rename_req))
+    let rename_resp = MetadataInodeServiceProto::rename(&harness.inode_service, Request::new(rename_req))
         .await
         .unwrap()
         .into_inner();
@@ -250,7 +250,7 @@ async fn test_rename_cross_mount_exdev() {
     };
 
     let lookup_a_resp = harness
-        .fs_service
+        .inode_service
         .lookup(Request::new(lookup_a_req))
         .await
         .unwrap()
@@ -268,7 +268,7 @@ async fn test_rename_cross_mount_exdev() {
     };
 
     let lookup_a_mount2_resp = harness
-        .fs_service
+        .inode_service
         .lookup(Request::new(lookup_a_mount2_req))
         .await
         .unwrap()
@@ -327,7 +327,7 @@ async fn test_mkdir_create_readdir_pagination() {
             }),
         };
 
-        harness.fs_service.create(Request::new(create_req)).await.unwrap();
+        harness.inode_service.create(Request::new(create_req)).await.unwrap();
     }
 
     // Act: ReadDir with pagination (max_entries=10)
@@ -347,7 +347,7 @@ async fn test_mkdir_create_readdir_pagination() {
         };
 
         let readdir_resp = harness
-            .fs_service
+            .inode_service
             .read_dir(Request::new(readdir_req))
             .await
             .unwrap()
@@ -407,7 +407,7 @@ async fn test_rmdir_nonempty_fails() {
         }),
     };
 
-    let mkdir_resp = MetadataFsServiceProto::mkdir(&harness.fs_service, Request::new(mkdir_req))
+    let mkdir_resp = MetadataInodeServiceProto::mkdir(&harness.inode_service, Request::new(mkdir_req))
         .await
         .unwrap()
         .into_inner();
@@ -423,7 +423,7 @@ async fn test_rmdir_nonempty_fails() {
     };
 
     let lookup_dir_resp = harness
-        .fs_service
+        .inode_service
         .lookup(Request::new(lookup_dir_req))
         .await
         .unwrap()
@@ -459,7 +459,7 @@ async fn test_rmdir_nonempty_fails() {
         }),
     };
 
-    MetadataFsServiceProto::create(&harness.fs_service, Request::new(create_req))
+    MetadataInodeServiceProto::create(&harness.inode_service, Request::new(create_req))
         .await
         .unwrap();
 
@@ -472,7 +472,7 @@ async fn test_rmdir_nonempty_fails() {
         name: "dir".to_string(),
     };
 
-    let rmdir_resp = MetadataFsServiceProto::rmdir(&harness.fs_service, Request::new(rmdir_req))
+    let rmdir_resp = MetadataInodeServiceProto::rmdir(&harness.inode_service, Request::new(rmdir_req))
         .await
         .unwrap()
         .into_inner();
@@ -491,7 +491,7 @@ async fn test_rmdir_nonempty_fails() {
     };
 
     let lookup_dir_again_resp = harness
-        .fs_service
+        .inode_service
         .lookup(Request::new(lookup_dir_again_req))
         .await
         .unwrap()
@@ -509,7 +509,7 @@ async fn test_rmdir_nonempty_fails() {
     };
 
     let lookup_x_resp = harness
-        .fs_service
+        .inode_service
         .lookup(Request::new(lookup_x_req))
         .await
         .unwrap()

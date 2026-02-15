@@ -8,7 +8,7 @@ mod common;
 use ::common::header::RequestHeader as CommonRequestHeader;
 use common::FsTestHarness;
 use metadata::service::guard::LeadershipChecker;
-use metadata::service::{MetadataFileSystemServiceImpl, MetadataFsServiceImpl};
+use metadata::service::{MetadataFileSystemServiceImpl, MetadataInodeServiceImpl};
 use metadata::state::StateStore;
 use metadata::worker::{HealthStatus, WorkerManager};
 use proto::common::{
@@ -36,7 +36,7 @@ impl LeadershipChecker for AlwaysLeader {
 
 struct SessionHarness {
     pub _fs_harness: FsTestHarness,
-    pub fs_service: Arc<MetadataFsServiceImpl>,
+    pub inode_service: Arc<MetadataInodeServiceImpl>,
     pub path_service: MetadataFileSystemServiceImpl,
     pub mount_epoch: u64,
     pub route_epoch: u64,
@@ -80,8 +80,8 @@ impl SessionHarness {
             .unwrap();
 
         let metrics = Arc::new(metadata::metrics::MetadataMetrics::new());
-        let fs_service = Arc::new(
-            MetadataFsServiceImpl::new(
+        let inode_service = Arc::new(
+            MetadataInodeServiceImpl::new(
                 fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
                 fs_harness.mount_table.clone(),
             )
@@ -91,8 +91,8 @@ impl SessionHarness {
             .with_worker_manager(worker_manager)
             .with_metrics(metrics.clone()),
         );
-        fs_service.set_worker_commit_hook_for_test(Arc::new(|_req| CommitWriteResponseProto::default()));
-        let fs_core = fs_service.fs_core();
+        inode_service.set_worker_commit_hook_for_test(Arc::new(|_req| CommitWriteResponseProto::default()));
+        let fs_core = inode_service.fs_core();
 
         let path_service =
             MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
@@ -104,7 +104,7 @@ impl SessionHarness {
 
         Self {
             _fs_harness: fs_harness,
-            fs_service,
+            inode_service,
             path_service,
             mount_epoch: mount_entry.config_version,
             route_epoch,
@@ -723,14 +723,15 @@ async fn renew_lease_reports_structured_session_expired_reason() {
     assert!(open_resp.header.as_ref().and_then(|h| h.error.as_ref()).is_none());
 
     let session = harness
-        .fs_service
+        .inode_service
         .write_session_manager_for_test()
         .get_session(open_resp.file_handle)
         .expect("session must exist after open");
-    harness
-        .fs_service
-        .inode_lease_manager_for_test()
-        .release(session.inode_id, session.lease_id, session.lease_epoch);
+    harness.inode_service.inode_lease_manager_for_test().release(
+        session.inode_id,
+        session.lease_id,
+        session.lease_epoch,
+    );
 
     let renew_call = FileSystemServiceProto::renew_write_session_lease(
         &harness.path_service,

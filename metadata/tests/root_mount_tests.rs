@@ -8,10 +8,10 @@ use metadata::mount::{DataIoPolicy, MountKind, ROOT_INODE_ID, ROOT_MOUNT_PREFIX}
 use metadata::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use metadata::readiness::{wait_for_root_ready, RootReadinessConfig, RootReadinessGate};
 use metadata::service::guard::LeadershipChecker;
-use metadata::service::MetadataFsServiceImpl;
+use metadata::service::MetadataInodeServiceImpl;
 use metadata::state::MemoryStateStore;
 use proto::common::LeaseIdProto;
-use proto::metadata::metadata_fs_service_proto_server::MetadataFsServiceProto;
+use proto::metadata::metadata_inode_service_proto_server::MetadataInodeServiceProto;
 use proto::metadata::{GetFileLayoutRequestProto, OpenWriteRequestProto, TruncateRequestProto};
 use tempfile::TempDir;
 use types::fs::{FileAttrs, Inode};
@@ -95,7 +95,7 @@ async fn root_forbids_truncate() {
     let inode = Inode::new_file(inode_id, attrs, root.mount_id, DataHandleId::new(2));
     storage.put_inode(&inode).unwrap();
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         std::sync::Arc::new(MemoryStateStore::new()),
         std::sync::Arc::clone(&mount_table),
     )
@@ -113,7 +113,7 @@ async fn root_forbids_truncate() {
         lease_epoch: 1,
     };
 
-    let resp = fs_service
+    let resp = inode_service
         .truncate(tonic::Request::new(req))
         .await
         .unwrap()
@@ -233,7 +233,7 @@ async fn root_forbids_data_io_by_default() {
     let inode = Inode::new_file(inode_id, attrs, root.mount_id, DataHandleId::new(1));
     storage.put_inode(&inode).unwrap();
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         std::sync::Arc::new(MemoryStateStore::new()),
         std::sync::Arc::clone(&mount_table),
     )
@@ -250,7 +250,7 @@ async fn root_forbids_data_io_by_default() {
         mode: proto::metadata::WriteModeProto::WriteModeWrite as i32,
     };
 
-    let resp = fs_service
+    let resp = inode_service
         .open_write(tonic::Request::new(req))
         .await
         .unwrap()
@@ -310,7 +310,7 @@ async fn root_data_io_not_leader_precedes_root_policy_check() {
     let inode = Inode::new_file(inode_id, attrs, root.mount_id, DataHandleId::new(4));
     storage.put_inode(&inode).unwrap();
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         std::sync::Arc::new(MemoryStateStore::new()),
         std::sync::Arc::clone(&mount_table),
     )
@@ -327,7 +327,7 @@ async fn root_data_io_not_leader_precedes_root_policy_check() {
         mode: proto::metadata::WriteModeProto::WriteModeWrite as i32,
     };
 
-    let resp = fs_service
+    let resp = inode_service
         .open_write(tonic::Request::new(req))
         .await
         .expect("gRPC transport status must remain OK")
@@ -393,7 +393,7 @@ async fn root_forbids_read_data_io() {
     let inode = Inode::new_file(inode_id, attrs, root.mount_id, DataHandleId::new(3));
     storage.put_inode(&inode).unwrap();
 
-    let fs_service = MetadataFsServiceImpl::new(
+    let inode_service = MetadataInodeServiceImpl::new(
         std::sync::Arc::new(MemoryStateStore::new()),
         std::sync::Arc::clone(&mount_table),
     )
@@ -408,7 +408,7 @@ async fn root_forbids_read_data_io() {
         range: None,
     };
 
-    let resp = fs_service
+    let resp = inode_service
         .get_file_layout(tonic::Request::new(req))
         .await
         .unwrap()

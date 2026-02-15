@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! MetadataFsServiceProto implementation.
+//! MetadataInodeServiceProto implementation.
 //!
 //! FS write routing convergence - all FS write operations
 //! must route to mount.namespace_owner_group_id.
@@ -27,7 +27,7 @@ use crate::readiness::RootReadinessGate;
 use crate::state::StateStore;
 use common::error::canonical::RefreshReason;
 use common::header::{RequestHeader, RpcErrorCode};
-use proto::metadata::metadata_fs_service_proto_server::MetadataFsServiceProto;
+use proto::metadata::metadata_inode_service_proto_server::MetadataInodeServiceProto;
 use proto::metadata::*;
 use proto::worker::CommitWriteRequestProto;
 use std::sync::atomic::Ordering;
@@ -91,8 +91,8 @@ enum FsRpcAuthz {
     RemoveXattr,
 }
 
-/// MetadataFsServiceProto implementation.
-pub struct MetadataFsServiceImpl {
+/// MetadataInodeServiceProto implementation.
+pub struct MetadataInodeServiceImpl {
     fs_core: Arc<FsCore>,
     mount_table: Arc<MountTable>,
     storage: Option<Arc<RocksDBStorage>>,
@@ -107,7 +107,7 @@ pub struct MetadataFsServiceImpl {
     inode_perm_reader: Option<Arc<dyn InodePermReader>>,
 }
 
-impl MetadataFsServiceImpl {
+impl MetadataInodeServiceImpl {
     pub fn new(state_store: Arc<dyn StateStore>, mount_table: Arc<MountTable>) -> Self {
         let write_session_manager = Arc::new(crate::write_session::WriteSessionManager::default());
         let inode_lease_manager = Arc::new(crate::inode_lease::InodeLeaseManager::default());
@@ -572,7 +572,7 @@ impl MetadataFsServiceImpl {
 }
 
 #[tonic::async_trait]
-impl MetadataFsServiceProto for MetadataFsServiceImpl {
+impl MetadataInodeServiceProto for MetadataInodeServiceImpl {
     #[instrument(skip(self), fields(call_id, client_id))]
     async fn lookup(&self, request: Request<LookupRequestProto>) -> Result<Response<LookupResponseProto>, Status> {
         let req = request.into_inner();
@@ -2372,7 +2372,7 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         }))
     }
 
-    // TODO(fs_service): implement extended operations (open/release/fsync)
+    // TODO(inode_service): implement extended operations (open/release/fsync)
     async fn open(&self, request: Request<OpenRequestProto>) -> Result<Response<OpenResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
@@ -3945,13 +3945,13 @@ mod tests {
     fn build_acl_service(
         storage: Arc<RocksDBStorage>,
         group_resolver: Arc<dyn GroupResolver>,
-    ) -> MetadataFsServiceImpl {
+    ) -> MetadataInodeServiceImpl {
         let state_store: Arc<dyn crate::state::StateStore> = Arc::new(MemoryStateStore::new());
         let mount_table = Arc::new(MountTable::new());
         let inode_perm_reader: Arc<dyn InodePermReader> = Arc::new(RocksDbInodePermReader::new(storage.clone(), 600));
         let authz_provider: Arc<dyn AuthzProvider> =
             Arc::new(AclInodeAuthz::new(group_resolver, inode_perm_reader.clone()));
-        MetadataFsServiceImpl::new(state_store, mount_table)
+        MetadataInodeServiceImpl::new(state_store, mount_table)
             .with_storage(storage)
             .with_authz_provider(authz_provider)
             .with_inode_perm_reader(inode_perm_reader)

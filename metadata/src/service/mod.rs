@@ -10,8 +10,8 @@ pub mod authz;
 mod core_util;
 pub mod domain;
 mod fs_core;
-mod fs_service;
 pub mod guard;
+mod inode_service;
 mod path_service;
 
 // pub use client_service::MetadataClientServiceImpl;
@@ -28,6 +28,6 @@ pub use core_util::{
     write_target_to_proto,
 };
 pub(crate) use fs_core::FsCore;
-pub use fs_service::{FsWriteOp, MetadataFsServiceImpl, RoutedFsWriteCtx};
 pub use guard::{AuthzContext, GuardChain, GuardSpec, LeadershipChecker};
+pub use inode_service::{FsWriteOp, MetadataInodeServiceImpl, RoutedFsWriteCtx};
 pub use path_service::MetadataFileSystemServiceImpl;

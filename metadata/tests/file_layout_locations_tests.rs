@@ -5,7 +5,7 @@
 
 mod common;
 use common::FsTestHarness;
-use proto::metadata::metadata_fs_service_proto_server::MetadataFsServiceProto;
+use proto::metadata::metadata_inode_service_proto_server::MetadataInodeServiceProto;
 use proto::metadata::GetFileLayoutRequestProto;
 use std::collections::BTreeMap;
 use tonic::Request;
@@ -62,8 +62,8 @@ async fn get_file_layout_returns_slice_keyed_locations() {
     harness.storage.put_inode(&inode).unwrap();
 
     // Call GetFileLayout.
-    let resp = MetadataFsServiceProto::get_file_layout(
-        &harness.fs_service,
+    let resp = MetadataInodeServiceProto::get_file_layout(
+        &harness.inode_service,
         Request::new(GetFileLayoutRequestProto {
             header: FsTestHarness::create_test_request_header(),
             inode_id: Some(proto::fs::InodeIdProto {
