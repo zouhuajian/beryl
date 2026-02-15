@@ -739,10 +739,6 @@ mod tests {
             canonical.reason,
             Some(common::error::canonical::RefreshReason::RouteEpochMismatch)
         );
-        let legacy = header
-            .legacy_error()
-            .expect("legacy_error should be derived for logging");
-        assert_eq!(legacy.code, RpcErrorCode::RouteEpochMismatch);
     }
 
     #[test]
@@ -771,7 +767,6 @@ mod tests {
             decoded_canonical.reason,
             Some(common::error::canonical::RefreshReason::RouteEpochMismatch)
         );
-        assert!(decoded.legacy_error().is_some());
 
         assert_eq!(proto.error, reencoded.error, "wire form must roundtrip");
     }

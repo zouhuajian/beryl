@@ -19,7 +19,7 @@ use types::ids::MountId;
 #[derive(Clone, Debug)]
 pub struct AuthzContext {
     pub op: AuthzOp,
-    pub target: AuthzTarget,
+    pub targets: Vec<AuthzTarget>,
 }
 
 pub trait LeadershipChecker: Send + Sync {
@@ -58,7 +58,7 @@ impl GuardSpec {
             requires_raft: false,
             requires_leader: false,
             data_io_op: None,
-            enforce_authz: false,
+            enforce_authz: true,
         }
     }
 
@@ -348,20 +348,27 @@ impl AuthGuard {
             traceparent: ctx.caller.traceparent.clone(),
             route_epoch: ctx.req_header_proto.as_ref().and_then(|h| h.route_epoch),
         };
-        self.provider
-            .authorize(&req_ctx, authz_ctx.target.clone(), authz_ctx.op)
-            .await
-            .map_err(GuardFailure::new)
+        for target in &authz_ctx.targets {
+            self.provider
+                .authorize(&req_ctx, target.clone(), authz_ctx.op)
+                .await
+                .map_err(GuardFailure::new)?;
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::authz::AuthzScheme;
+    use async_trait::async_trait;
+    use common::error::canonical::CanonicalError;
     use crate::mount::{DataIoPolicy, MountKind, ROOT_INODE_ID};
     use crate::readiness::RootReadinessGate;
     use common::error::canonical::{ErrorClass, ErrorCode};
     use common::header::RpcErrorCode;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use types::ids::ShardGroupId;
 
     struct StaticLeader(bool);
@@ -369,6 +376,27 @@ mod tests {
     impl LeadershipChecker for StaticLeader {
         fn is_leader(&self) -> bool {
             self.0
+        }
+    }
+
+    struct CountingAuthz {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AuthzProvider for CountingAuthz {
+        fn scheme(&self) -> AuthzScheme {
+            AuthzScheme::None
+        }
+
+        async fn authorize(
+            &self,
+            _req_ctx: &RequestContext,
+            _target: AuthzTarget,
+            _op: AuthzOp,
+        ) -> Result<(), CanonicalError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
     }
 
@@ -418,7 +446,7 @@ mod tests {
             None,
             Some(AuthzContext {
                 op: AuthzOp::Write,
-                target: AuthzTarget::for_path("/test".to_string()),
+                targets: vec![AuthzTarget::for_path("/test".to_string())],
             }),
             &caller,
             &req_header,
@@ -460,5 +488,45 @@ mod tests {
         assert!(err.err.message.contains("RootDataIoForbidden"));
         assert_eq!(err.group_id, Some(root_entry.namespace_owner_group_id.as_raw()));
         assert_eq!(err.mount_epoch, Some(root_entry.config_version));
+    }
+
+    #[tokio::test]
+    async fn metadata_read_requires_authz_context() {
+        let chain = GuardChain::new(Arc::new(MountTable::new()));
+        let caller = RequestHeader::new(types::ClientId::new(4));
+        let req_header = None;
+        let ctx = base_context(GuardSpec::metadata_read(), None, None, &caller, &req_header);
+
+        let err = chain.check(&ctx).await.unwrap_err();
+        assert_eq!(err.err.class, ErrorClass::Fatal);
+        assert!(err.err.message.contains("missing authz context"));
+    }
+
+    #[tokio::test]
+    async fn auth_guard_authorizes_all_targets() {
+        let call_counter = Arc::new(AtomicUsize::new(0));
+        let mut chain = GuardChain::new(Arc::new(MountTable::new()));
+        chain.set_authz_provider(Arc::new(CountingAuthz {
+            calls: Arc::clone(&call_counter),
+        }));
+
+        let caller = RequestHeader::new(types::ClientId::new(5));
+        let req_header = None;
+        let ctx = base_context(
+            GuardSpec::metadata_read(),
+            None,
+            Some(AuthzContext {
+                op: AuthzOp::Rename,
+                targets: vec![
+                    AuthzTarget::for_path("/src".to_string()),
+                    AuthzTarget::for_path_parent("/dst-parent", "name"),
+                ],
+            }),
+            &caller,
+            &req_header,
+        );
+
+        chain.check(&ctx).await.unwrap();
+        assert_eq!(call_counter.load(Ordering::Relaxed), 2);
     }
 }

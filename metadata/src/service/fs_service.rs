@@ -260,7 +260,10 @@ impl MetadataFsServiceImpl {
             | FsRpcAuthz::RenewInodeLease
             | FsRpcAuthz::Truncate => AuthzOp::Write,
         };
-        AuthzContext { op, target }
+        AuthzContext {
+            op,
+            targets: vec![target],
+        }
     }
 
     /// Route FS write operation to mount.namespace_owner_group_id.

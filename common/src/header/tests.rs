@@ -48,7 +48,6 @@ mod tests {
         assert_eq!(resp.client.client_id.as_raw(), 789);
         assert_eq!(resp.status, RpcStatus::Ok);
         assert!(resp.canonical_error.is_none());
-        assert!(resp.legacy_error().is_none());
 
         let canonical = CanonicalError {
             class: ErrorClass::Retryable,
@@ -64,7 +63,6 @@ mod tests {
             resp_error.canonical_error.as_ref().and_then(|c| c.retry_after_ms),
             Some(1000)
         );
-        assert!(resp_error.legacy_error().is_some());
         assert!(matches!(
             resp_error.canonical_error.as_ref().and_then(|c| c.reason.clone()),
             None | Some(RefreshReason::Unknown)

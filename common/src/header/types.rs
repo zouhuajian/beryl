@@ -332,17 +332,6 @@ impl ResponseHeader {
         self
     }
 
-    /// Derived legacy error view for compatibility/logging only.
-    ///
-    /// NOTE: This is derived from `canonical_error` and must NOT be used for control flow.
-    /// Control flow must read `canonical_error` directly as the single source of truth.
-    #[deprecated(note = "legacy_error is for logging only; control flow must read canonical_error")]
-    pub fn legacy_error(&self) -> Option<RpcError> {
-        self.canonical_error
-            .as_ref()
-            .and_then(|canonical| Self::rpc_error_from_canonical(canonical))
-    }
-
     fn rpc_error_from_canonical(canonical_error: &CanonicalError) -> Option<RpcError> {
         if matches!(canonical_error.class, CanonicalErrorClass::Ok) {
             return None;

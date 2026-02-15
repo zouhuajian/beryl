@@ -16,8 +16,8 @@ mod path_service;
 
 // pub use client_service::MetadataClientServiceImpl;
 pub use self::authz::{
-    filesystem_authz_provider, inode_authz_provider, AllowAllAuthz, AuthzOp, AuthzProvider, AuthzTarget, DenyAllAuthz,
-    StubAclAuthz, StubRangerAuthz,
+    filesystem_authz_provider, inode_authz_provider, AllowAllAuthz, AuthzOp, AuthzProvider, AuthzScheme, AuthzTarget,
+    DenyAllAuthz, StubAclAuthz, StubRangerAuthz,
 };
 pub use core_util::{
     extent_from_proto, extent_to_proto, extract_and_inject_context, fatal_fs_header, fencing_to_proto,

@@ -11,7 +11,8 @@ use common::FsTestHarness;
 use metadata::service::domain::RequestContext;
 use metadata::service::guard::LeadershipChecker;
 use metadata::service::{
-    AuthzOp, AuthzProvider, AuthzTarget, DenyAllAuthz, MetadataFileSystemServiceImpl, MetadataFsServiceImpl,
+    AuthzOp, AuthzProvider, AuthzScheme, AuthzTarget, DenyAllAuthz, MetadataFileSystemServiceImpl,
+    MetadataFsServiceImpl,
 };
 use metadata::state::StateStore;
 use proto::common::{error_detail_proto::Code as ErrorCodeProto, ErrorClassProto, FsErrnoProto};
@@ -60,6 +61,10 @@ impl AuditAuthz {
 
 #[async_trait]
 impl AuthzProvider for AuditAuthz {
+    fn scheme(&self) -> AuthzScheme {
+        AuthzScheme::RangerPath
+    }
+
     async fn authorize(
         &self,
         _req_ctx: &RequestContext,

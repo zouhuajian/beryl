@@ -34,6 +34,13 @@ pub enum AuthzOp {
     Xattr,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthzScheme {
+    RangerPath,
+    AclInode,
+    None,
+}
+
 impl AuthzOp {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -136,6 +143,8 @@ impl AuthzTarget {
 
 #[async_trait]
 pub trait AuthzProvider: Send + Sync {
+    fn scheme(&self) -> AuthzScheme;
+
     async fn authorize(&self, req_ctx: &RequestContext, target: AuthzTarget, op: AuthzOp)
         -> Result<(), CanonicalError>;
 }
@@ -145,6 +154,10 @@ pub struct AllowAllAuthz;
 
 #[async_trait]
 impl AuthzProvider for AllowAllAuthz {
+    fn scheme(&self) -> AuthzScheme {
+        AuthzScheme::None
+    }
+
     async fn authorize(
         &self,
         _req_ctx: &RequestContext,
@@ -160,6 +173,10 @@ pub struct DenyAllAuthz;
 
 #[async_trait]
 impl AuthzProvider for DenyAllAuthz {
+    fn scheme(&self) -> AuthzScheme {
+        AuthzScheme::None
+    }
+
     async fn authorize(
         &self,
         _req_ctx: &RequestContext,
@@ -179,6 +196,10 @@ pub struct StubAclAuthz;
 
 #[async_trait]
 impl AuthzProvider for StubAclAuthz {
+    fn scheme(&self) -> AuthzScheme {
+        AuthzScheme::AclInode
+    }
+
     async fn authorize(
         &self,
         req_ctx: &RequestContext,
@@ -205,6 +226,10 @@ pub struct StubRangerAuthz;
 
 #[async_trait]
 impl AuthzProvider for StubRangerAuthz {
+    fn scheme(&self) -> AuthzScheme {
+        AuthzScheme::RangerPath
+    }
+
     async fn authorize(
         &self,
         req_ctx: &RequestContext,
