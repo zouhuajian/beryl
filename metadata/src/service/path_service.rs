@@ -377,8 +377,6 @@ impl MetadataFileSystemServiceImpl {
         mut spec: GuardSpec,
         mount_id: Option<types::ids::MountId>,
         authz: Option<AuthzContext>,
-        fallback_group_id: Option<u64>,
-        fallback_mount_epoch: Option<u64>,
     ) -> Option<proto::common::ResponseHeaderProto> {
         if authz.is_some() {
             spec = spec.with_authz();
@@ -391,11 +389,35 @@ impl MetadataFileSystemServiceImpl {
             Ok(()) => None,
             Err(failure) => Some(header_from_canonical_error(
                 req_header,
-                failure.group_id.or(fallback_group_id),
-                failure.mount_epoch.or(fallback_mount_epoch),
+                failure.group_id,
+                failure.mount_epoch,
                 &failure.err,
             )),
         }
+    }
+
+    async fn guard_pre_read(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        caller_ctx: &common::header::RequestHeader,
+    ) -> Option<proto::common::ResponseHeaderProto> {
+        self.guard_request(req_header, caller_ctx, GuardSpec::readiness_only(), None, None)
+            .await
+    }
+
+    async fn guard_pre_write(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        caller_ctx: &common::header::RequestHeader,
+    ) -> Option<proto::common::ResponseHeaderProto> {
+        self.guard_request(
+            req_header,
+            caller_ctx,
+            GuardSpec::readiness_only().with_leader(),
+            None,
+            None,
+        )
+        .await
     }
 
     /// Convert types FileAttrs to proto FileAttrsProto.
@@ -447,6 +469,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<GetFileStatusResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
+            return error_response!(GetFileStatusResponseProto, resp_header);
+        }
 
         // Resolve path to inode.
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
@@ -469,10 +494,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_read(),
-                Some(resolved.mount_ctx.mount_id),
+                None,
                 Some(authz_ctx),
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
             )
             .await
         {
@@ -518,6 +541,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     async fn mkdir(&self, request: Request<MkdirPathRequestProto>) -> Result<Response<MkdirPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return error_response!(MkdirPathResponseProto, resp_header);
+        }
 
         // Resolve path
         let resolved = match self.path_resolver.resolve_path(&req.path) {
@@ -540,10 +566,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_write(),
-                Some(resolved.mount_ctx.mount_id),
+                None,
                 Some(authz_ctx),
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
             )
             .await
         {
@@ -619,6 +643,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<CreatePathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return error_response!(CreatePathResponseProto, resp_header);
+        }
 
         // Resolve path
         let resolved = match self.path_resolver.resolve_path(&req.path) {
@@ -641,10 +668,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_write(),
-                Some(resolved.mount_ctx.mount_id),
+                None,
                 Some(authz_ctx),
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
             )
             .await
         {
@@ -732,6 +757,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<UnlinkPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return error_response!(UnlinkPathResponseProto, resp_header);
+        }
 
         // Resolve path
         let resolved = match self.path_resolver.resolve_path(&req.path) {
@@ -754,10 +782,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_write(),
-                Some(resolved.mount_ctx.mount_id),
+                None,
                 Some(authz_ctx),
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
             )
             .await
         {
@@ -802,6 +828,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     async fn rmdir(&self, request: Request<RmdirPathRequestProto>) -> Result<Response<RmdirPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return error_response!(RmdirPathResponseProto, resp_header);
+        }
 
         // Resolve path
         let resolved = match self.path_resolver.resolve_path(&req.path) {
@@ -824,10 +853,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_write(),
-                Some(resolved.mount_ctx.mount_id),
+                None,
                 Some(authz_ctx),
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
             )
             .await
         {
@@ -875,6 +902,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<RenamePathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return error_response!(RenamePathResponseProto, resp_header);
+        }
 
         // Resolve both paths
         let (src_resolved, dst_resolved) = match self.path_resolver.resolve_rename(&req.src_path, &req.dst_path) {
@@ -897,10 +927,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_write(),
-                Some(src_resolved.mount_ctx.mount_id),
+                None,
                 Some(authz_ctx),
-                Some(src_resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(src_resolved.mount_ctx.mount_epoch),
             )
             .await
         {
@@ -951,6 +979,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<ListStatusPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
+            return error_response!(ListStatusPathResponseProto, resp_header);
+        }
 
         // Resolve path to inode
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
@@ -974,10 +1005,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     &req.header,
                     &caller_ctx,
                     GuardSpec::metadata_read(),
-                    Some(resolved.mount_ctx.mount_id),
+                    None,
                     Some(authz_ctx),
-                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                    Some(resolved.mount_ctx.mount_epoch),
                 )
                 .await
             {
@@ -1058,6 +1087,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     async fn open(&self, request: Request<OpenPathRequestProto>) -> Result<Response<OpenPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
+            return error_response!(OpenPathResponseProto, resp_header);
+        }
 
         // Resolve path to inode
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
@@ -1080,10 +1112,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_read(),
-                Some(resolved.mount_ctx.mount_id),
+                None,
                 Some(authz_ctx),
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
             )
             .await
         {
@@ -1129,8 +1159,16 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<ReleasePathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(session) = self.fs_core.write_session_for_handle(req.file_handle) {
-            let (group_id, mount_epoch) = self.fs_core.mount_hints_for_mount(session.mount_id);
+        let session = self.fs_core.write_session_for_handle(req.file_handle);
+        if session.is_some() {
+            if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+                return response_with_header!(ReleasePathResponseProto::default(), resp_header);
+            }
+        } else if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
+            return response_with_header!(ReleasePathResponseProto::default(), resp_header);
+        }
+
+        if let Some(session) = session {
             if let Some(resp_header) = self
                 .guard_request(
                     &req.header,
@@ -1141,8 +1179,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         PathRpcAuthz::Release,
                         vec![AuthzTarget::for_session(req.file_handle, Some(session.inode_id))],
                     )),
-                    group_id,
-                    mount_epoch,
                 )
                 .await
             {
@@ -1158,8 +1194,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     PathRpcAuthz::Release,
                     vec![AuthzTarget::for_file_handle(req.file_handle)],
                 )),
-                None,
-                None,
             )
             .await
         {
@@ -1197,6 +1231,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     async fn fsync(&self, request: Request<FsyncPathRequestProto>) -> Result<Response<FsyncPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return error_response!(FsyncPathResponseProto, resp_header);
+        }
 
         // Handle path-based or handle-based fsync
         match req.target {
@@ -1224,8 +1261,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         GuardSpec::data_io(DataIoOp::Fsync).with_leader(),
                         Some(resolved.mount_ctx.mount_id),
                         Some(authz_ctx),
-                        Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                        Some(resolved.mount_ctx.mount_epoch),
                     )
                     .await
                 {
@@ -1348,6 +1383,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<TruncatePathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return error_response!(TruncatePathResponseProto, resp_header);
+        }
 
         // Resolve path to inode
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
@@ -1372,8 +1410,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 GuardSpec::data_io(DataIoOp::Truncate).with_leader(),
                 Some(resolved.mount_ctx.mount_id),
                 Some(authz_ctx),
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
             )
             .await
         {
@@ -1427,6 +1463,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<SetXattrPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return error_response!(SetXattrPathResponseProto, resp_header);
+        }
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -1447,10 +1486,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_write(),
-                Some(resolved.mount_ctx.mount_id),
+                None,
                 Some(authz_ctx),
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
             )
             .await
         {
@@ -1504,6 +1541,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<GetXattrPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
+            return error_response!(GetXattrPathResponseProto, resp_header);
+        }
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -1524,10 +1564,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_read(),
-                Some(resolved.mount_ctx.mount_id),
+                None,
                 Some(authz_ctx),
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
             )
             .await
         {
@@ -1573,6 +1611,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<ListXattrPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
+            return error_response!(ListXattrPathResponseProto, resp_header);
+        }
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -1593,10 +1634,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_read(),
-                Some(resolved.mount_ctx.mount_id),
+                None,
                 Some(authz_ctx),
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
             )
             .await
         {
@@ -1641,6 +1680,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<RemoveXattrPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return error_response!(RemoveXattrPathResponseProto, resp_header);
+        }
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -1661,10 +1703,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_write(),
-                Some(resolved.mount_ctx.mount_id),
+                None,
                 Some(authz_ctx),
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
             )
             .await
         {
@@ -1715,6 +1755,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<GetFileLayoutByPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
+            return error_response!(GetFileLayoutByPathResponseProto, resp_header);
+        }
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -1736,8 +1779,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 GuardSpec::data_io(DataIoOp::Read),
                 Some(resolved.mount_ctx.mount_id),
                 Some(authz_ctx),
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
             )
             .await
         {
@@ -1795,6 +1836,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<OpenWriteByPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return error_response!(OpenWriteByPathResponseProto, resp_header);
+        }
 
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
@@ -1832,8 +1876,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 GuardSpec::data_io(DataIoOp::OpenWrite).with_leader(),
                 Some(resolved.mount_ctx.mount_id),
                 Some(authz_ctx),
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
             )
             .await
         {
@@ -1898,8 +1940,11 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<CloseWriteSessionResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return error_response!(CloseWriteSessionResponseProto, resp_header);
+        }
+
         if let Some(session) = self.fs_core.write_session_for_handle(req.file_handle) {
-            let (group_id, mount_epoch) = self.fs_core.mount_hints_for_mount(session.mount_id);
             if let Some(resp_header) = self
                 .guard_request(
                     &req.header,
@@ -1910,8 +1955,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         PathRpcAuthz::CloseWriteSession,
                         vec![AuthzTarget::for_session(req.file_handle, Some(session.inode_id))],
                     )),
-                    group_id,
-                    mount_epoch,
                 )
                 .await
             {
@@ -1986,8 +2029,11 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<RenewWriteSessionLeaseResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return error_response!(RenewWriteSessionLeaseResponseProto, resp_header);
+        }
+
         if let Some(session) = self.fs_core.write_session_for_handle(req.file_handle) {
-            let (group_id, mount_epoch) = self.fs_core.mount_hints_for_mount(session.mount_id);
             if let Some(resp_header) = self
                 .guard_request(
                     &req.header,
@@ -1998,8 +2044,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         PathRpcAuthz::RenewWriteSessionLease,
                         vec![AuthzTarget::for_session(req.file_handle, Some(session.inode_id))],
                     )),
-                    group_id,
-                    mount_epoch,
                 )
                 .await
             {
@@ -2050,6 +2094,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<FsyncSessionResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return response_with_header!(FsyncSessionResponseProto::default(), resp_header);
+        }
+
         let session = match self.fs_core.write_session_for_handle(req.file_handle) {
             Some(session) => session,
             None => {
@@ -2064,7 +2112,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return response_with_header!(FsyncSessionResponseProto::default(), resp_header);
             }
         };
-        let (group_id, mount_epoch) = self.fs_core.mount_hints_for_mount(session.mount_id);
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
@@ -2075,8 +2122,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     PathRpcAuthz::FsyncSession,
                     vec![AuthzTarget::for_session(req.file_handle, Some(session.inode_id))],
                 )),
-                group_id,
-                mount_epoch,
             )
             .await
         {
@@ -2179,8 +2224,16 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<ReleaseSessionResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(session) = self.fs_core.write_session_for_handle(req.file_handle) {
-            let (group_id, mount_epoch) = self.fs_core.mount_hints_for_mount(session.mount_id);
+        let session = self.fs_core.write_session_for_handle(req.file_handle);
+        if session.is_some() {
+            if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+                return response_with_header!(ReleaseSessionResponseProto::default(), resp_header);
+            }
+        } else if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
+            return response_with_header!(ReleaseSessionResponseProto::default(), resp_header);
+        }
+
+        if let Some(session) = session {
             if let Some(resp_header) = self
                 .guard_request(
                     &req.header,
@@ -2191,8 +2244,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         PathRpcAuthz::ReleaseSession,
                         vec![AuthzTarget::for_session(req.file_handle, Some(session.inode_id))],
                     )),
-                    group_id,
-                    mount_epoch,
                 )
                 .await
             {
@@ -2208,8 +2259,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     PathRpcAuthz::ReleaseSession,
                     vec![AuthzTarget::for_file_handle(req.file_handle)],
                 )),
-                None,
-                None,
             )
             .await
         {
@@ -2246,9 +2295,17 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use common::error::canonical::CanonicalError;
-    use common::header::RequestHeader;
+    use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode, RefreshReason};
+    use common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::TempDir;
+    use types::fs::Inode;
+    use types::ids::{ClientId, DataHandleId, ShardGroupId};
+
+    use crate::mount::{DataIoPolicy, MountKind, ROOT_INODE_ID};
+    use crate::readiness::RootReadinessGate;
+    use crate::service::MetadataFsServiceImpl;
+    use crate::state::MemoryStateStore;
 
     #[derive(Clone)]
     struct CountingAuthz {
@@ -2271,6 +2328,38 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
+    }
+
+    struct StaticLeader(bool);
+
+    impl LeadershipChecker for StaticLeader {
+        fn is_leader(&self) -> bool {
+            self.0
+        }
+    }
+
+    fn build_path_service(dir: &TempDir) -> (MetadataFileSystemServiceImpl, Arc<MountTable>, Arc<RocksDBStorage>) {
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).expect("open rocksdb"));
+        let mount_table = Arc::new(MountTable::new());
+        let state_store: Arc<dyn crate::state::StateStore> = Arc::new(MemoryStateStore::new());
+        let fs_service = MetadataFsServiceImpl::new(Arc::clone(&state_store), Arc::clone(&mount_table))
+            .with_storage(storage.clone());
+        let path_service =
+            MetadataFileSystemServiceImpl::new(Arc::clone(&mount_table), storage.clone(), fs_service.fs_core());
+        (path_service, mount_table, storage)
+    }
+
+    fn req_header(client_id: u64) -> Option<proto::common::RequestHeaderProto> {
+        let header = RequestHeader::new(ClientId::new(client_id));
+        Some((&header).into())
+    }
+
+    fn canonical_error(header: Option<proto::common::ResponseHeaderProto>) -> CanonicalError {
+        let header = ResponseHeader::try_from(header.expect("response header must be present"))
+            .expect("response header must decode");
+        header
+            .canonical_error
+            .expect("response header must include canonical error")
     }
 
     #[tokio::test]
@@ -2328,5 +2417,92 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn get_file_status_not_ready_beats_not_found() {
+        let dir = TempDir::new().expect("create temp dir");
+        let (service, _mount_table, _storage) = build_path_service(&dir);
+        let readiness_gate = Arc::new(RootReadinessGate::new(None));
+        let service = service.with_readiness_gate(readiness_gate);
+
+        let response = service
+            .get_file_status(Request::new(GetFileStatusRequestProto {
+                header: req_header(101),
+                path: "/missing".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .expect("gRPC transport status must stay OK");
+        let err = canonical_error(response.get_ref().header.clone());
+        assert_eq!(err.class, ErrorClass::Retryable);
+        assert_eq!(err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NodeUnavailable)));
+        assert!(err.message.contains("root mount not ready"));
+    }
+
+    #[tokio::test]
+    async fn mkdir_not_leader_beats_not_found() {
+        let dir = TempDir::new().expect("create temp dir");
+        let (service, _mount_table, _storage) = build_path_service(&dir);
+        let service = service.with_leadership_checker(Arc::new(StaticLeader(false)));
+
+        let response = service
+            .mkdir(Request::new(MkdirPathRequestProto {
+                header: req_header(102),
+                path: "/missing/child".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .expect("gRPC transport status must stay OK");
+        let err = canonical_error(response.get_ref().header.clone());
+        assert_eq!(err.class, ErrorClass::NeedRefresh);
+        assert_eq!(err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NotLeader)));
+        assert_eq!(err.reason, Some(RefreshReason::NotLeader));
+    }
+
+    #[tokio::test]
+    async fn open_write_not_leader_beats_root_data_io_policy_denial() {
+        let dir = TempDir::new().expect("create temp dir");
+        let (service, mount_table, storage) = build_path_service(&dir);
+        let service = service.with_leadership_checker(Arc::new(StaticLeader(false)));
+
+        let root_entry = mount_table
+            .create_mount(
+                "/".to_string(),
+                MountKind::Internal,
+                None,
+                DataIoPolicy::Forbid,
+                ShardGroupId::new(1),
+                ROOT_INODE_ID,
+            )
+            .expect("create root mount");
+        storage
+            .put_inode(&Inode::new_dir(ROOT_INODE_ID, FileAttrs::new(), root_entry.mount_id))
+            .expect("put root inode");
+        let file_inode_id = InodeId::new(2);
+        storage
+            .put_inode(&Inode::new_file(
+                file_inode_id,
+                FileAttrs::new(),
+                root_entry.mount_id,
+                DataHandleId::new(1),
+            ))
+            .expect("put file inode");
+        storage
+            .put_dentry(ROOT_INODE_ID, "file", file_inode_id)
+            .expect("put file dentry");
+
+        let response = service
+            .open_write_by_path(Request::new(OpenWriteByPathRequestProto {
+                header: req_header(103),
+                path: "/file".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .expect("gRPC transport status must stay OK");
+        let err = canonical_error(response.get_ref().header.clone());
+        assert_eq!(err.class, ErrorClass::NeedRefresh);
+        assert_eq!(err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NotLeader)));
+        assert_eq!(err.reason, Some(RefreshReason::NotLeader));
     }
 }

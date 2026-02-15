@@ -7,6 +7,7 @@ use metadata::ensure_root_mount;
 use metadata::mount::{DataIoPolicy, MountKind, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
 use metadata::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use metadata::readiness::{wait_for_root_ready, RootReadinessConfig, RootReadinessGate};
+use metadata::service::guard::LeadershipChecker;
 use metadata::service::MetadataFsServiceImpl;
 use metadata::state::MemoryStateStore;
 use proto::common::LeaseIdProto;
@@ -16,6 +17,24 @@ use tempfile::TempDir;
 use types::fs::{FileAttrs, Inode};
 use types::ids::{DataHandleId, ShardGroupId};
 use types::ClientId;
+
+#[derive(Clone)]
+struct AlwaysLeader;
+
+impl LeadershipChecker for AlwaysLeader {
+    fn is_leader(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone)]
+struct NeverLeader;
+
+impl LeadershipChecker for NeverLeader {
+    fn is_leader(&self) -> bool {
+        false
+    }
+}
 
 async fn bootstrap_raft(
     storage: std::sync::Arc<RocksDBStorage>,
@@ -80,7 +99,8 @@ async fn root_forbids_truncate() {
         std::sync::Arc::new(MemoryStateStore::new()),
         std::sync::Arc::clone(&mount_table),
     )
-    .with_storage(std::sync::Arc::clone(&storage));
+    .with_storage(std::sync::Arc::clone(&storage))
+    .with_leadership_checker(std::sync::Arc::new(AlwaysLeader));
 
     let header = RequestHeader::new(ClientId::new(1));
     let req = TruncateRequestProto {
@@ -217,7 +237,8 @@ async fn root_forbids_data_io_by_default() {
         std::sync::Arc::new(MemoryStateStore::new()),
         std::sync::Arc::clone(&mount_table),
     )
-    .with_storage(std::sync::Arc::clone(&storage));
+    .with_storage(std::sync::Arc::clone(&storage))
+    .with_leadership_checker(std::sync::Arc::new(AlwaysLeader));
 
     let header = RequestHeader::new(ClientId::new(1));
     let req = OpenWriteRequestProto {
@@ -244,6 +265,89 @@ async fn root_forbids_data_io_by_default() {
         _ => panic!("expected FsErrno"),
     }
     assert!(err.message.contains("RootDataIoForbidden"));
+}
+
+#[tokio::test]
+async fn root_data_io_not_leader_precedes_root_policy_check() {
+    let dir = TempDir::new().unwrap();
+    let storage = std::sync::Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_table = std::sync::Arc::new(metadata::mount::MountTable::load_from_storage(&storage).unwrap());
+    let raft_node = bootstrap_raft(std::sync::Arc::clone(&storage), std::sync::Arc::clone(&mount_table)).await;
+
+    ensure_root_mount(
+        std::sync::Arc::clone(&raft_node),
+        std::sync::Arc::clone(&mount_table),
+        ShardGroupId::new(1),
+    )
+    .await
+    .unwrap();
+
+    let readiness_gate = std::sync::Arc::new(RootReadinessGate::new(None));
+    let readiness_config = RootReadinessConfig {
+        initial_backoff_ms: 10,
+        max_backoff_ms: 50,
+        warn_after_ms: 200,
+    };
+    wait_for_root_ready(
+        std::sync::Arc::clone(&raft_node),
+        std::sync::Arc::clone(&mount_table),
+        ShardGroupId::new(1),
+        std::sync::Arc::clone(&readiness_gate),
+        readiness_config,
+    )
+    .await
+    .unwrap();
+
+    let root = mount_table
+        .list_mounts()
+        .into_iter()
+        .find(|entry| entry.mount_prefix == ROOT_MOUNT_PREFIX)
+        .expect("root mount should exist");
+
+    let inode_id = types::fs::InodeId::new(13);
+    let mut attrs = FileAttrs::new();
+    attrs.update_timestamps(1);
+    let inode = Inode::new_file(inode_id, attrs, root.mount_id, DataHandleId::new(4));
+    storage.put_inode(&inode).unwrap();
+
+    let fs_service = MetadataFsServiceImpl::new(
+        std::sync::Arc::new(MemoryStateStore::new()),
+        std::sync::Arc::clone(&mount_table),
+    )
+    .with_storage(std::sync::Arc::clone(&storage))
+    .with_leadership_checker(std::sync::Arc::new(NeverLeader));
+
+    let header = RequestHeader::new(ClientId::new(1));
+    let req = OpenWriteRequestProto {
+        header: Some((&header).into()),
+        inode_id: Some(proto::fs::InodeIdProto {
+            value: inode_id.as_raw(),
+        }),
+        desired_len: None,
+        mode: proto::metadata::WriteModeProto::WriteModeWrite as i32,
+    };
+
+    let resp = fs_service
+        .open_write(tonic::Request::new(req))
+        .await
+        .expect("gRPC transport status must remain OK")
+        .into_inner();
+    let err = resp.header.and_then(|h| h.error).expect("expected error");
+
+    assert_eq!(
+        err.error_class,
+        proto::common::ErrorClassProto::ErrorClassNeedRefresh as i32
+    );
+    assert_eq!(
+        err.refresh_reason,
+        proto::common::RefreshReasonProto::RefreshReasonNotLeader as i32
+    );
+    match err.code {
+        Some(proto::common::error_detail_proto::Code::RpcCode(code)) => {
+            assert_eq!(code, proto::common::RpcErrorCodeProto::RpcErrCodeNotLeader as i32);
+        }
+        _ => panic!("expected RpcCode NotLeader"),
+    }
 }
 
 #[tokio::test]

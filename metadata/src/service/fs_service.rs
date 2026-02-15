@@ -417,6 +417,30 @@ impl MetadataFsServiceImpl {
         }
     }
 
+    async fn guard_pre_read(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        caller_ctx: &RequestHeader,
+    ) -> Option<proto::common::ResponseHeaderProto> {
+        self.guard_request(req_header, caller_ctx, GuardSpec::readiness_only(), None, None)
+            .await
+    }
+
+    async fn guard_pre_write(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        caller_ctx: &RequestHeader,
+    ) -> Option<proto::common::ResponseHeaderProto> {
+        self.guard_request(
+            req_header,
+            caller_ctx,
+            GuardSpec::readiness_only().with_leader(),
+            None,
+            None,
+        )
+        .await
+    }
+
     // DEPRECATED: Use core_util::fatal_fs_header or need_refresh_header instead.
     // This method is kept temporarily for compatibility but will be removed.
     #[allow(dead_code)]
@@ -824,6 +848,12 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     async fn set_attr(&self, request: Request<SetAttrRequestProto>) -> Result<Response<SetAttrResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return Ok(Response::new(SetAttrResponseProto {
+                header: Some(resp_header),
+                attrs: None,
+            }));
+        }
 
         let inode_id = match req.inode_id {
             Some(inode_id) => InodeId::new(inode_id.value),
@@ -927,7 +957,7 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_write(),
-                Some(inode.mount_id),
+                None,
                 Some(Self::authz_for_rpc(
                     FsRpcAuthz::SetAttr,
                     AuthzTarget::for_inode(inode_id),
@@ -1051,6 +1081,13 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     async fn mkdir(&self, request: Request<MkdirRequestProto>) -> Result<Response<MkdirResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return Ok(Response::new(MkdirResponseProto {
+                header: Some(resp_header),
+                inode: None,
+                attrs: None,
+            }));
+        }
 
         let parent_inode_id = match req.parent_inode_id {
             Some(parent_inode_id) => InodeId::new(parent_inode_id.value),
@@ -1133,7 +1170,7 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 }));
             }
         };
-        let parent_inode = match storage.get_inode(parent_inode_id) {
+        let _parent_inode = match storage.get_inode(parent_inode_id) {
             Ok(Some(parent_inode)) => parent_inode,
             Ok(None) => {
                 let resp_header = Self::header_from_error(
@@ -1167,7 +1204,7 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_write(),
-                Some(parent_inode.mount_id),
+                None,
                 Some(Self::authz_for_rpc(
                     FsRpcAuthz::Mkdir,
                     AuthzTarget::for_inode(parent_inode_id),
@@ -1264,6 +1301,12 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     async fn create(&self, request: Request<CreateRequestProto>) -> Result<Response<CreateResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return Ok(Response::new(CreateResponseProto {
+                header: Some(resp_header),
+                ..Default::default()
+            }));
+        }
 
         let parent_inode_id = match req.parent_inode_id {
             Some(parent_inode_id) => InodeId::new(parent_inode_id.value),
@@ -1323,7 +1366,7 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_write(),
-                Some(ctx.mount_id),
+                None,
                 Some(Self::authz_for_rpc(
                     FsRpcAuthz::Create,
                     AuthzTarget::for_inode(parent_inode_id),
@@ -1609,6 +1652,12 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     async fn unlink(&self, request: Request<UnlinkRequestProto>) -> Result<Response<UnlinkResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return Ok(Response::new(UnlinkResponseProto {
+                header: Some(resp_header),
+                ..Default::default()
+            }));
+        }
 
         let parent_inode_id = match req.parent_inode_id {
             Some(parent_inode_id) => InodeId::new(parent_inode_id.value),
@@ -1696,7 +1745,7 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_write(),
-                Some(ctx.mount_id),
+                None,
                 Some(authz_ctx),
             )
             .await
@@ -1777,6 +1826,12 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     async fn rmdir(&self, request: Request<RmdirRequestProto>) -> Result<Response<RmdirResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return Ok(Response::new(RmdirResponseProto {
+                header: Some(resp_header),
+                ..Default::default()
+            }));
+        }
 
         let parent_inode_id = match req.parent_inode_id {
             Some(parent_inode_id) => InodeId::new(parent_inode_id.value),
@@ -1864,7 +1919,7 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_write(),
-                Some(ctx.mount_id),
+                None,
                 Some(authz_ctx),
             )
             .await
@@ -1945,6 +2000,11 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     async fn rename(&self, request: Request<FsRenameRequestProto>) -> Result<Response<FsRenameResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return Ok(Response::new(FsRenameResponseProto {
+                header: Some(resp_header),
+            }));
+        }
         // Reject unsupported flags (only RENAME_NOREPLACE supported).
         let supported_mask: u32 = 0x1;
         if req.flags & !supported_mask != 0 {
@@ -2170,7 +2230,7 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_write(),
-                Some(src_parent_inode.mount_id),
+                None,
                 Some(authz_ctx),
             )
             .await
@@ -2344,7 +2404,22 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     async fn release(&self, request: Request<ReleaseRequestProto>) -> Result<Response<ReleaseResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(session) = self.fs_core.write_session_for_handle(req.file_handle) {
+        let session = self.fs_core.write_session_for_handle(req.file_handle);
+        if session.is_some() {
+            if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+                return Ok(Response::new(ReleaseResponseProto {
+                    header: Some(resp_header),
+                    ..Default::default()
+                }));
+            }
+        } else if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
+            return Ok(Response::new(ReleaseResponseProto {
+                header: Some(resp_header),
+                ..Default::default()
+            }));
+        }
+
+        if let Some(session) = session {
             if let Some(resp_header) = self
                 .guard_request(
                     &req.header,
@@ -2404,6 +2479,11 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     async fn fsync(&self, request: Request<FsyncRequestProto>) -> Result<Response<FsyncResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return Ok(Response::new(FsyncResponseProto {
+                header: Some(resp_header),
+            }));
+        }
 
         let inode_id = match req.inode_id {
             Some(inode_id) => InodeId::new(inode_id.value),
@@ -2568,6 +2648,19 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     ) -> Result<Response<OpenWriteResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return Ok(Response::new(OpenWriteResponseProto {
+                header: Some(resp_header),
+                file_handle: 0,
+                lease_id: None,
+                fencing_token: None,
+                write_targets: vec![],
+                base_size: 0,
+                open_epoch: 0,
+                lease_epoch: 0,
+                expires_at_ms: 0,
+            }));
+        }
 
         let inode_id = match req.inode_id {
             Some(inode_id) => InodeId::new(inode_id.value),
@@ -2757,6 +2850,13 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     ) -> Result<Response<CloseWriteResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return Ok(Response::new(CloseWriteResponseProto {
+                header: Some(resp_header),
+                committed_size: 0,
+                file_version: None,
+            }));
+        }
 
         let session = match self.fs_core.write_session_for_handle(req.file_handle) {
             Some(session) => session,
@@ -2860,6 +2960,12 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     ) -> Result<Response<GetFileLayoutResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
+            return Ok(Response::new(GetFileLayoutResponseProto {
+                header: Some(resp_header),
+                ..Default::default()
+            }));
+        }
 
         let inode_id = match req.inode_id {
             Some(inode_id) => InodeId::new(inode_id.value),
@@ -2995,6 +3101,12 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     ) -> Result<Response<RenewInodeLeaseResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return Ok(Response::new(RenewInodeLeaseResponseProto {
+                header: Some(resp_header),
+                ..Default::default()
+            }));
+        }
 
         let session = match self.fs_core.write_session_for_handle(req.file_handle) {
             Some(session) => session,
@@ -3067,6 +3179,12 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     ) -> Result<Response<TruncateResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return Ok(Response::new(TruncateResponseProto {
+                header: Some(resp_header),
+                new_size: 0,
+            }));
+        }
 
         let inode_id = match req.inode_id {
             Some(inode_id) => InodeId::new(inode_id.value),
@@ -3378,6 +3496,12 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     ) -> Result<Response<SetXattrResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return Ok(Response::new(SetXattrResponseProto {
+                header: Some(resp_header),
+                ..Default::default()
+            }));
+        }
         let inode_id = match req.inode_id {
             Some(inode_id) => InodeId::new(inode_id.value),
             None => {
@@ -3423,7 +3547,7 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_write(),
-                Some(ctx.mount_id),
+                None,
                 Some(Self::authz_for_rpc(
                     FsRpcAuthz::SetXattr,
                     AuthzTarget::for_inode(inode_id),
@@ -3672,6 +3796,12 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
     ) -> Result<Response<RemoveXattrResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            return Ok(Response::new(RemoveXattrResponseProto {
+                header: Some(resp_header),
+                ..Default::default()
+            }));
+        }
         let inode_id = match req.inode_id {
             Some(inode_id) => InodeId::new(inode_id.value),
             None => {
@@ -3716,7 +3846,7 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_write(),
-                Some(ctx.mount_id),
+                None,
                 Some(Self::authz_for_rpc(
                     FsRpcAuthz::RemoveXattr,
                     AuthzTarget::for_inode(inode_id),

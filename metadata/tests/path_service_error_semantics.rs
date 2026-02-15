@@ -16,6 +16,7 @@ use metadata::service::{
     MetadataFsServiceImpl, RocksDbInodePermReader, StaticGroupResolver,
 };
 use metadata::state::StateStore;
+use metadata::RootReadinessGate;
 use proto::common::{error_detail_proto::Code as ErrorCodeProto, ErrorClassProto, FsErrnoProto, RpcErrorCodeProto};
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::metadata_fs_service_proto_server::MetadataFsServiceProto;
@@ -149,6 +150,179 @@ async fn test_path_service_propagates_need_refresh_from_fs() {
             .and_then(|hint| hint.leader_endpoint.as_deref()),
         Some("127.0.0.1:17000")
     );
+}
+
+#[tokio::test]
+async fn test_path_service_readiness_precedes_path_resolution() {
+    let fs_harness = FsTestHarness::new().await.unwrap();
+    let (_mount_id, _root_inode_id) = fs_harness
+        .create_mount_with_root(
+            "/mnt/test".to_string(),
+            "file:///tmp/test".to_string(),
+            ShardGroupId::new(1),
+        )
+        .await
+        .unwrap();
+    let readiness_gate = Arc::new(RootReadinessGate::new(None));
+
+    let fs_service = MetadataFsServiceImpl::new(
+        fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
+        fs_harness.mount_table.clone(),
+    )
+    .with_storage(fs_harness.storage.clone())
+    .with_readiness_gate(Arc::clone(&readiness_gate));
+    let fs_core = fs_service.fs_core();
+
+    let path_service =
+        MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
+            .with_readiness_gate(Arc::clone(&readiness_gate))
+            .with_leadership_checker(Arc::new(AlwaysLeader));
+
+    let resp = FileSystemServiceProto::get_file_status(
+        &path_service,
+        Request::new(GetFileStatusRequestProto {
+            header: FsTestHarness::create_test_request_header(),
+            path: "/mnt/test/does-not-exist".to_string(),
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    let header = resp.header.expect("missing response header");
+    let error = header.error.expect("expected readiness error");
+    assert_eq!(error.error_class, ErrorClassProto::ErrorClassRetryable as i32);
+    match error.code {
+        Some(ErrorCodeProto::RpcCode(code)) if code == RpcErrorCodeProto::RpcErrCodeNodeUnavailable as i32 => {}
+        other => panic!("expected NodeUnavailable, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_path_service_write_leadership_precedes_path_resolution() {
+    let fs_harness = FsTestHarness::new().await.unwrap();
+    let (_mount_id, _root_inode_id) = fs_harness
+        .create_mount_with_root(
+            "/mnt/test".to_string(),
+            "file:///tmp/test".to_string(),
+            ShardGroupId::new(1),
+        )
+        .await
+        .unwrap();
+
+    let fs_service = MetadataFsServiceImpl::new(
+        fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
+        fs_harness.mount_table.clone(),
+    )
+    .with_storage(fs_harness.storage.clone())
+    .with_leadership_checker(Arc::new(NotLeader));
+    let fs_core = fs_service.fs_core();
+
+    let path_service =
+        MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
+            .with_leadership_checker(Arc::new(NotLeader));
+
+    let attrs = FileAttrs::new();
+    let resp = FileSystemServiceProto::mkdir(
+        &path_service,
+        Request::new(MkdirPathRequestProto {
+            header: FsTestHarness::create_test_request_header(),
+            path: "/mnt/test/missing/dir".to_string(),
+            attrs: Some(proto::fs::FileAttrsProto {
+                mode: attrs.mode,
+                uid: attrs.uid,
+                gid: attrs.gid,
+                size: attrs.size,
+                atime_ms: attrs.atime_ms,
+                mtime_ms: attrs.mtime_ms,
+                ctime_ms: attrs.ctime_ms,
+                nlink: attrs.nlink,
+            }),
+            create_parents: false,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    let header = resp.header.expect("missing response header");
+    let error = header.error.expect("expected not-leader error");
+    assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+    assert_eq!(
+        error.refresh_reason,
+        proto::common::RefreshReasonProto::RefreshReasonNotLeader as i32
+    );
+    match error.code {
+        Some(ErrorCodeProto::RpcCode(code)) if code == RpcErrorCodeProto::RpcErrCodeNotLeader as i32 => {}
+        other => panic!("expected NotLeader, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_open_write_by_path_leadership_precedes_mount_epoch_validation() {
+    let fs_harness = FsTestHarness::new().await.unwrap();
+    let (mount_id, root_inode_id) = fs_harness
+        .create_mount_with_root(
+            "/mnt/test".to_string(),
+            "file:///tmp/test".to_string(),
+            ShardGroupId::new(1),
+        )
+        .await
+        .unwrap();
+    let mount = fs_harness
+        .mount_table
+        .get_mount(mount_id)
+        .unwrap()
+        .expect("mount must exist");
+
+    let inode_id = InodeId::new(9301);
+    let inode = Inode::new_file(inode_id, FileAttrs::new(), mount_id, DataHandleId::new(9301));
+    fs_harness.storage.put_inode(&inode).unwrap();
+    fs_harness
+        .storage
+        .put_dentry(root_inode_id, "leader-first.bin", inode_id)
+        .unwrap();
+
+    let fs_service = MetadataFsServiceImpl::new(
+        fs_harness.state_store.clone() as Arc<dyn metadata::state::StateStore>,
+        fs_harness.mount_table.clone(),
+    )
+    .with_storage(fs_harness.storage.clone())
+    .with_leadership_checker(Arc::new(NotLeader));
+    let fs_core = fs_service.fs_core();
+
+    let path_service =
+        MetadataFileSystemServiceImpl::new(fs_harness.mount_table.clone(), fs_harness.storage.clone(), fs_core)
+            .with_leadership_checker(Arc::new(NotLeader));
+
+    let mut header = FsTestHarness::create_test_request_header();
+    if let Some(header) = header.as_mut() {
+        header.mount_epoch = Some(mount.config_version.saturating_sub(1));
+    }
+    let resp = FileSystemServiceProto::open_write_by_path(
+        &path_service,
+        Request::new(OpenWriteByPathRequestProto {
+            header,
+            path: "/mnt/test/leader-first.bin".to_string(),
+            desired_len: Some(1),
+            mode: WriteModeProto::WriteModeWrite as i32,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    let header = resp.header.expect("missing response header");
+    let error = header.error.expect("expected not-leader error");
+    assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+    assert_eq!(
+        error.refresh_reason,
+        proto::common::RefreshReasonProto::RefreshReasonNotLeader as i32
+    );
+    match error.code {
+        Some(ErrorCodeProto::RpcCode(code)) if code == RpcErrorCodeProto::RpcErrCodeNotLeader as i32 => {}
+        other => panic!("expected NotLeader, got {:?}", other),
+    }
 }
 
 #[tokio::test]
