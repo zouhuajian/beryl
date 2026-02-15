@@ -13,17 +13,17 @@ use super::domain::{
     UnlinkInput,
 };
 use super::extract_and_inject_context;
-use super::guard::{AuthzContext, GuardChain, GuardSpec, LeadershipChecker};
+use super::guard::{AuthzCheck, AuthzContext, GuardChain, GuardSpec, LeadershipChecker};
 use super::{
     extent_from_proto, extent_to_proto, fencing_to_proto, header_from_canonical_error, header_from_core_failure,
     lease_id_from_proto, lease_id_to_proto, location_to_proto, need_refresh_header, ok_header_from_core_success,
     ok_header_from_request, presented_fencing_from_proto, request_context_from_proto, write_target_to_proto,
 };
-use super::{AllowAllAuthz, AuthzOp, AuthzProvider, AuthzScheme, AuthzTarget, FsCore};
+use super::{AllowAllAuthz, AuthzOp, AuthzProvider, AuthzScheme, AuthzTarget, FsCore, InodePermReader};
 use crate::data_io::DataIoOp;
 use crate::error::{to_canonical_fs, MetadataError, MetadataResult};
 use crate::mount::MountTable;
-use crate::path_resolver::{MountContext, PathResolver};
+use crate::path_resolver::{MountContext, PathResolver, ResolvedInode, ResolvedPath};
 use crate::raft::RocksDBStorage;
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::*;
@@ -40,6 +40,7 @@ pub struct MetadataFileSystemServiceImpl {
     guard_chain: GuardChain,
     authz_provider: Arc<dyn AuthzProvider>,
     metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
+    inode_perm_reader: Option<Arc<dyn InodePermReader>>,
 }
 
 macro_rules! response_with_header {
@@ -96,6 +97,7 @@ impl MetadataFileSystemServiceImpl {
             guard_chain,
             authz_provider,
             metrics: None,
+            inode_perm_reader: None,
         }
     }
 
@@ -124,6 +126,11 @@ impl MetadataFileSystemServiceImpl {
         self
     }
 
+    pub fn with_inode_perm_reader(mut self, inode_perm_reader: Arc<dyn InodePermReader>) -> Self {
+        self.inode_perm_reader = Some(inode_perm_reader);
+        self
+    }
+
     fn path_parent_target(path: &str) -> MetadataResult<AuthzTarget> {
         let normalized = PathResolver::normalize(path)?;
         if normalized == "/" {
@@ -142,11 +149,7 @@ impl MetadataFileSystemServiceImpl {
         Ok(AuthzTarget::for_path(PathResolver::normalize(path)?))
     }
 
-    fn authz_targets_for_path(
-        scheme: AuthzScheme,
-        path: &str,
-        inode_id: InodeId,
-    ) -> MetadataResult<Vec<AuthzTarget>> {
+    fn authz_targets_for_path(scheme: AuthzScheme, path: &str, inode_id: InodeId) -> MetadataResult<Vec<AuthzTarget>> {
         match scheme {
             AuthzScheme::RangerPath => Ok(vec![Self::path_target(path)?]),
             AuthzScheme::AclInode | AuthzScheme::None => Ok(vec![AuthzTarget::for_inode(inode_id)]),
@@ -199,7 +202,127 @@ impl MetadataFileSystemServiceImpl {
             | PathRpcAuthz::FsyncSession
             | PathRpcAuthz::ReleaseSession => AuthzOp::Write,
         };
-        AuthzContext { op, targets }
+        AuthzContext::new(op, targets)
+    }
+
+    fn traverse_pre_checks(scheme: AuthzScheme, traverse_dirs: &[InodeId]) -> Vec<AuthzCheck> {
+        if !matches!(scheme, AuthzScheme::AclInode) {
+            return Vec::new();
+        }
+        traverse_dirs
+            .iter()
+            .copied()
+            .map(|inode_id| AuthzCheck {
+                op: AuthzOp::Execute,
+                target: AuthzTarget::for_inode(inode_id),
+            })
+            .collect()
+    }
+
+    fn sticky_pre_checks_for_delete(
+        scheme: AuthzScheme,
+        parent_inode_id: InodeId,
+        target_inode_id: Option<InodeId>,
+    ) -> Vec<AuthzCheck> {
+        if !matches!(scheme, AuthzScheme::AclInode) {
+            return Vec::new();
+        }
+        target_inode_id
+            .into_iter()
+            .map(|target_inode_id| AuthzCheck {
+                op: AuthzOp::Sticky,
+                target: AuthzTarget::for_inode(target_inode_id).with_parent(parent_inode_id),
+            })
+            .collect()
+    }
+
+    fn sticky_pre_checks_for_rename(
+        scheme: AuthzScheme,
+        src_parent_inode_id: InodeId,
+        src_inode_id: Option<InodeId>,
+        dst_parent_inode_id: InodeId,
+        dst_inode_id: Option<InodeId>,
+    ) -> Vec<AuthzCheck> {
+        if !matches!(scheme, AuthzScheme::AclInode) {
+            return Vec::new();
+        }
+        let mut checks = Vec::new();
+        if let Some(src_inode_id) = src_inode_id {
+            checks.push(AuthzCheck {
+                op: AuthzOp::Sticky,
+                target: AuthzTarget::for_inode(src_inode_id).with_parent(src_parent_inode_id),
+            });
+        }
+        if let Some(dst_inode_id) = dst_inode_id {
+            checks.push(AuthzCheck {
+                op: AuthzOp::Sticky,
+                target: AuthzTarget::for_inode(dst_inode_id).with_parent(dst_parent_inode_id),
+            });
+        }
+        checks
+    }
+
+    fn authz_ctx_for_path(
+        &self,
+        rpc: PathRpcAuthz,
+        path: &str,
+        resolved: &ResolvedInode,
+    ) -> MetadataResult<AuthzContext> {
+        let scheme = self.authz_provider.scheme();
+        let targets = Self::authz_targets_for_path(scheme, path, resolved.inode_id)?;
+        let pre_checks = Self::traverse_pre_checks(scheme, &resolved.traverse_dir_inode_ids);
+        Ok(Self::authz_for_rpc(rpc, targets).with_pre_checks(pre_checks))
+    }
+
+    fn authz_ctx_for_parent(
+        &self,
+        rpc: PathRpcAuthz,
+        path: &str,
+        resolved: &ResolvedPath,
+    ) -> MetadataResult<AuthzContext> {
+        let scheme = self.authz_provider.scheme();
+        let targets = Self::authz_targets_for_parent(scheme, path, resolved.parent_inode_id)?;
+        let pre_checks = Self::traverse_pre_checks(scheme, &resolved.traverse_dir_inode_ids);
+        Ok(Self::authz_for_rpc(rpc, targets).with_pre_checks(pre_checks))
+    }
+
+    fn authz_ctx_for_delete(
+        &self,
+        rpc: PathRpcAuthz,
+        path: &str,
+        resolved: &ResolvedPath,
+    ) -> MetadataResult<AuthzContext> {
+        let scheme = self.authz_provider.scheme();
+        let mut pre_checks = Self::traverse_pre_checks(scheme, &resolved.traverse_dir_inode_ids);
+        pre_checks.extend(Self::sticky_pre_checks_for_delete(
+            scheme,
+            resolved.parent_inode_id,
+            resolved.inode_id,
+        ));
+        let targets = Self::authz_targets_for_parent(scheme, path, resolved.parent_inode_id)?;
+        Ok(Self::authz_for_rpc(rpc, targets).with_pre_checks(pre_checks))
+    }
+
+    fn authz_ctx_for_rename(
+        &self,
+        src_path: &str,
+        dst_path: &str,
+        src: &ResolvedPath,
+        dst: &ResolvedPath,
+    ) -> MetadataResult<AuthzContext> {
+        let scheme = self.authz_provider.scheme();
+        let targets =
+            Self::authz_targets_for_rename(scheme, src_path, dst_path, src.parent_inode_id, dst.parent_inode_id)?;
+        let mut pre_checks = Self::traverse_pre_checks(scheme, &src.traverse_dir_inode_ids);
+        pre_checks.extend(Self::traverse_pre_checks(scheme, &dst.traverse_dir_inode_ids));
+        pre_checks.extend(Self::sticky_pre_checks_for_rename(
+            scheme,
+            src.parent_inode_id,
+            src.inode_id,
+            dst.parent_inode_id,
+            dst.inode_id,
+        ));
+        Ok(Self::authz_for_rpc(PathRpcAuthz::Rename, targets).with_pre_checks(pre_checks))
     }
 
     /// Validate mount_epoch for write operations.
@@ -333,12 +456,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(GetFileStatusResponseProto, resp_header);
             }
         };
-        let authz_ctx = match Self::authz_targets_for_path(
-            self.authz_provider.scheme(),
-            &req.path,
-            resolved.inode_id,
-        ) {
-            Ok(targets) => Self::authz_for_rpc(PathRpcAuthz::GetFileStatus, targets),
+        let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::GetFileStatus, &req.path, &resolved) {
+            Ok(authz_ctx) => authz_ctx,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(GetFileStatusResponseProto, resp_header);
@@ -408,12 +527,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(MkdirPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match Self::authz_targets_for_parent(
-            self.authz_provider.scheme(),
-            &req.path,
-            resolved.parent_inode_id,
-        ) {
-            Ok(targets) => Self::authz_for_rpc(PathRpcAuthz::Mkdir, targets),
+        let authz_ctx = match self.authz_ctx_for_parent(PathRpcAuthz::Mkdir, &req.path, &resolved) {
+            Ok(authz_ctx) => authz_ctx,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(MkdirPathResponseProto, resp_header);
@@ -513,12 +628,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(CreatePathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match Self::authz_targets_for_parent(
-            self.authz_provider.scheme(),
-            &req.path,
-            resolved.parent_inode_id,
-        ) {
-            Ok(targets) => Self::authz_for_rpc(PathRpcAuthz::Create, targets),
+        let authz_ctx = match self.authz_ctx_for_parent(PathRpcAuthz::Create, &req.path, &resolved) {
+            Ok(authz_ctx) => authz_ctx,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(CreatePathResponseProto, resp_header);
@@ -630,12 +741,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(UnlinkPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match Self::authz_targets_for_parent(
-            self.authz_provider.scheme(),
-            &req.path,
-            resolved.parent_inode_id,
-        ) {
-            Ok(targets) => Self::authz_for_rpc(PathRpcAuthz::Unlink, targets),
+        let authz_ctx = match self.authz_ctx_for_delete(PathRpcAuthz::Unlink, &req.path, &resolved) {
+            Ok(authz_ctx) => authz_ctx,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(UnlinkPathResponseProto, resp_header);
@@ -704,12 +811,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(RmdirPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match Self::authz_targets_for_parent(
-            self.authz_provider.scheme(),
-            &req.path,
-            resolved.parent_inode_id,
-        ) {
-            Ok(targets) => Self::authz_for_rpc(PathRpcAuthz::Rmdir, targets),
+        let authz_ctx = match self.authz_ctx_for_delete(PathRpcAuthz::Rmdir, &req.path, &resolved) {
+            Ok(authz_ctx) => authz_ctx,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(RmdirPathResponseProto, resp_header);
@@ -781,14 +884,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(RenamePathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match Self::authz_targets_for_rename(
-            self.authz_provider.scheme(),
-            &req.src_path,
-            &req.dst_path,
-            src_resolved.parent_inode_id,
-            dst_resolved.parent_inode_id,
-        ) {
-            Ok(targets) => Self::authz_for_rpc(PathRpcAuthz::Rename, targets),
+        let authz_ctx = match self.authz_ctx_for_rename(&req.src_path, &req.dst_path, &src_resolved, &dst_resolved) {
+            Ok(authz_ctx) => authz_ctx,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&src_resolved.mount_ctx));
                 return error_response!(RenamePathResponseProto, resp_header);
@@ -865,12 +962,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
 
         if !req.recursive {
-            let authz_ctx = match Self::authz_targets_for_path(
-                self.authz_provider.scheme(),
-                &req.path,
-                resolved.inode_id,
-            ) {
-                Ok(targets) => Self::authz_for_rpc(PathRpcAuthz::ListStatus, targets),
+            let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::ListStatus, &req.path, &resolved) {
+                Ok(authz_ctx) => authz_ctx,
                 Err(err) => {
                     let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                     return error_response!(ListStatusPathResponseProto, resp_header);
@@ -974,12 +1067,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(OpenPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match Self::authz_targets_for_path(
-            self.authz_provider.scheme(),
-            &req.path,
-            resolved.inode_id,
-        ) {
-            Ok(targets) => Self::authz_for_rpc(PathRpcAuthz::Open, targets),
+        let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::Open, &req.path, &resolved) {
+            Ok(authz_ctx) => authz_ctx,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(OpenPathResponseProto, resp_header);
@@ -1120,12 +1209,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         return error_response!(FsyncPathResponseProto, resp_header);
                     }
                 };
-                let authz_ctx = match Self::authz_targets_for_path(
-                    self.authz_provider.scheme(),
-                    &path,
-                    resolved.inode_id,
-                ) {
-                    Ok(targets) => Self::authz_for_rpc(PathRpcAuthz::Fsync, targets),
+                let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::Fsync, &path, &resolved) {
+                    Ok(authz_ctx) => authz_ctx,
                     Err(err) => {
                         let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                         return error_response!(FsyncPathResponseProto, resp_header);
@@ -1272,12 +1357,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(TruncatePathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match Self::authz_targets_for_path(
-            self.authz_provider.scheme(),
-            &req.path,
-            resolved.inode_id,
-        ) {
-            Ok(targets) => Self::authz_for_rpc(PathRpcAuthz::Truncate, targets),
+        let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::Truncate, &req.path, &resolved) {
+            Ok(authz_ctx) => authz_ctx,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(TruncatePathResponseProto, resp_header);
@@ -1353,12 +1434,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(SetXattrPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match Self::authz_targets_for_path(
-            self.authz_provider.scheme(),
-            &req.path,
-            resolved.inode_id,
-        ) {
-            Ok(targets) => Self::authz_for_rpc(PathRpcAuthz::SetXattr, targets),
+        let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::SetXattr, &req.path, &resolved) {
+            Ok(authz_ctx) => authz_ctx,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(SetXattrPathResponseProto, resp_header);
@@ -1400,6 +1477,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             .await
         {
             Ok(success) => {
+                if let Some(reader) = self.inode_perm_reader.as_ref() {
+                    reader.invalidate(resolved.inode_id);
+                }
                 response_with_header!(
                     SetXattrPathResponseProto::default(),
                     ok_header_from_core_success(&req_ctx, &success)
@@ -1431,12 +1511,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(GetXattrPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match Self::authz_targets_for_path(
-            self.authz_provider.scheme(),
-            &req.path,
-            resolved.inode_id,
-        ) {
-            Ok(targets) => Self::authz_for_rpc(PathRpcAuthz::GetXattr, targets),
+        let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::GetXattr, &req.path, &resolved) {
+            Ok(authz_ctx) => authz_ctx,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(GetXattrPathResponseProto, resp_header);
@@ -1504,12 +1580,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(ListXattrPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match Self::authz_targets_for_path(
-            self.authz_provider.scheme(),
-            &req.path,
-            resolved.inode_id,
-        ) {
-            Ok(targets) => Self::authz_for_rpc(PathRpcAuthz::ListXattr, targets),
+        let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::ListXattr, &req.path, &resolved) {
+            Ok(authz_ctx) => authz_ctx,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(ListXattrPathResponseProto, resp_header);
@@ -1576,12 +1648,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(RemoveXattrPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match Self::authz_targets_for_path(
-            self.authz_provider.scheme(),
-            &req.path,
-            resolved.inode_id,
-        ) {
-            Ok(targets) => Self::authz_for_rpc(PathRpcAuthz::RemoveXattr, targets),
+        let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::RemoveXattr, &req.path, &resolved) {
+            Ok(authz_ctx) => authz_ctx,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(RemoveXattrPathResponseProto, resp_header);
@@ -1620,6 +1688,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             .await
         {
             Ok(success) => {
+                if let Some(reader) = self.inode_perm_reader.as_ref() {
+                    reader.invalidate(resolved.inode_id);
+                }
                 response_with_header!(
                     RemoveXattrPathResponseProto::default(),
                     ok_header_from_core_success(&req_ctx, &success)
@@ -1651,12 +1722,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(GetFileLayoutByPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match Self::authz_targets_for_path(
-            self.authz_provider.scheme(),
-            &req.path,
-            resolved.inode_id,
-        ) {
-            Ok(targets) => Self::authz_for_rpc(PathRpcAuthz::GetFileLayoutByPath, targets),
+        let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::GetFileLayoutByPath, &req.path, &resolved) {
+            Ok(authz_ctx) => authz_ctx,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(GetFileLayoutByPathResponseProto, resp_header);
@@ -1736,12 +1803,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(OpenWriteByPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match Self::authz_targets_for_path(
-            self.authz_provider.scheme(),
-            &req.path,
-            resolved.inode_id,
-        ) {
-            Ok(targets) => Self::authz_for_rpc(PathRpcAuthz::OpenWriteByPath, targets),
+        let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::OpenWriteByPath, &req.path, &resolved) {
+            Ok(authz_ctx) => authz_ctx,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(OpenWriteByPathResponseProto, resp_header);

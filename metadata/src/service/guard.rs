@@ -17,9 +17,31 @@ use types::fs::FsErrorCode;
 use types::ids::MountId;
 
 #[derive(Clone, Debug)]
+pub struct AuthzCheck {
+    pub op: AuthzOp,
+    pub target: AuthzTarget,
+}
+
+#[derive(Clone, Debug)]
 pub struct AuthzContext {
     pub op: AuthzOp,
     pub targets: Vec<AuthzTarget>,
+    pub pre_checks: Vec<AuthzCheck>,
+}
+
+impl AuthzContext {
+    pub fn new(op: AuthzOp, targets: Vec<AuthzTarget>) -> Self {
+        Self {
+            op,
+            targets,
+            pre_checks: Vec::new(),
+        }
+    }
+
+    pub fn with_pre_checks(mut self, pre_checks: Vec<AuthzCheck>) -> Self {
+        self.pre_checks = pre_checks;
+        self
+    }
 }
 
 pub trait LeadershipChecker: Send + Sync {
@@ -347,7 +369,17 @@ impl AuthGuard {
             caller: ctx.caller.clone(),
             traceparent: ctx.caller.traceparent.clone(),
             route_epoch: ctx.req_header_proto.as_ref().and_then(|h| h.route_epoch),
+            principal: ctx.caller.principal.clone(),
+            real_user: ctx.caller.real_user.clone(),
+            doas: ctx.caller.doas.clone(),
+            authn_type: ctx.caller.authn_type,
         };
+        for check in &authz_ctx.pre_checks {
+            self.provider
+                .authorize(&req_ctx, check.target.clone(), check.op)
+                .await
+                .map_err(GuardFailure::new)?;
+        }
         for target in &authz_ctx.targets {
             self.provider
                 .authorize(&req_ctx, target.clone(), authz_ctx.op)
@@ -360,12 +392,12 @@ impl AuthGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::authz::AuthzScheme;
-    use async_trait::async_trait;
-    use common::error::canonical::CanonicalError;
+    use super::*;
     use crate::mount::{DataIoPolicy, MountKind, ROOT_INODE_ID};
     use crate::readiness::RootReadinessGate;
+    use async_trait::async_trait;
+    use common::error::canonical::CanonicalError;
     use common::error::canonical::{ErrorClass, ErrorCode};
     use common::header::RpcErrorCode;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -447,6 +479,7 @@ mod tests {
             Some(AuthzContext {
                 op: AuthzOp::Write,
                 targets: vec![AuthzTarget::for_path("/test".to_string())],
+                pre_checks: Vec::new(),
             }),
             &caller,
             &req_header,
@@ -521,6 +554,7 @@ mod tests {
                     AuthzTarget::for_path("/src".to_string()),
                     AuthzTarget::for_path_parent("/dst-parent", "name"),
                 ],
+                pre_checks: Vec::new(),
             }),
             &caller,
             &req_header,

@@ -8,6 +8,7 @@
 use crate::readiness::RootReadinessConfig;
 use common::config::CoreConfig;
 use common::error::CommonError;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::Path;
 
@@ -105,6 +106,14 @@ pub struct InodeAuthzConfig {
 pub struct MetadataAuthzConfig {
     pub filesystem: FileSystemAuthzConfig,
     pub inode: InodeAuthzConfig,
+    pub groups: GroupResolverConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct GroupResolverConfig {
+    pub cache_ttl_secs: u64,
+    pub stale_while_error: bool,
+    pub static_mappings: BTreeMap<String, Vec<String>>,
 }
 
 impl Default for MetadataAuthzConfig {
@@ -116,6 +125,17 @@ impl Default for MetadataAuthzConfig {
             inode: InodeAuthzConfig {
                 mode: InodeAuthzMode::None,
             },
+            groups: GroupResolverConfig::default(),
+        }
+    }
+}
+
+impl Default for GroupResolverConfig {
+    fn default() -> Self {
+        Self {
+            cache_ttl_secs: 300,
+            stale_while_error: false,
+            static_mappings: BTreeMap::new(),
         }
     }
 }
@@ -218,6 +238,27 @@ impl Default for InodeServiceConfig {
     }
 }
 
+fn parse_group_mappings(flat: &common::config::FlatConfig) -> BTreeMap<String, Vec<String>> {
+    let mut mappings = BTreeMap::new();
+    for key in flat.keys_with_prefix("metadata.authz.groups.mapping") {
+        let Some(principal) = key.strip_prefix("metadata.authz.groups.mapping.") else {
+            continue;
+        };
+        if principal.trim().is_empty() {
+            continue;
+        }
+        let raw_groups = flat.get_str(&key).unwrap_or_default();
+        let groups = raw_groups
+            .split(',')
+            .map(|part| part.trim())
+            .filter(|part| !part.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        mappings.insert(principal.to_string(), groups);
+    }
+    mappings
+}
+
 impl MetadataConfig {
     /// Load configuration from core-site.yaml.
     pub fn load<P: AsRef<Path>>(config_path: P) -> Result<Self, CommonError> {
@@ -284,6 +325,16 @@ impl MetadataConfig {
         let authz = MetadataAuthzConfig {
             filesystem: FileSystemAuthzConfig { mode: filesystem_mode },
             inode: InodeAuthzConfig { mode: inode_mode },
+            groups: GroupResolverConfig {
+                cache_ttl_secs: flat
+                    .get_i64("metadata.authz.groups.cache_ttl_secs")
+                    .unwrap_or(300)
+                    .max(0) as u64,
+                stale_while_error: flat
+                    .get_bool("metadata.authz.groups.stale_while_error")
+                    .unwrap_or(false),
+                static_mappings: parse_group_mappings(&flat),
+            },
         };
 
         // Read Raft config
@@ -398,6 +449,9 @@ mod tests {
         let config = MetadataConfig::default();
         assert_eq!(config.authz.filesystem.mode, FileSystemAuthzMode::None);
         assert_eq!(config.authz.inode.mode, InodeAuthzMode::None);
+        assert_eq!(config.authz.groups.cache_ttl_secs, 300);
+        assert!(!config.authz.groups.stale_while_error);
+        assert!(config.authz.groups.static_mappings.is_empty());
     }
 
     #[test]
@@ -409,6 +463,27 @@ mod tests {
         let config = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap();
         assert_eq!(config.authz.filesystem.mode, FileSystemAuthzMode::Acl);
         assert_eq!(config.authz.inode.mode, InodeAuthzMode::Acl);
+    }
+
+    #[test]
+    fn authz_group_mapping_parses_and_cache_ttl_applies() {
+        let mut flat = CoreConfig::default().as_flat().clone();
+        flat.set("metadata.authz.groups.cache_ttl_secs", 42i64);
+        flat.set("metadata.authz.groups.stale_while_error", true);
+        flat.set("metadata.authz.groups.mapping.alice", "10,20");
+        flat.set("metadata.authz.groups.mapping.bob", "30");
+
+        let config = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap();
+        assert_eq!(config.authz.groups.cache_ttl_secs, 42);
+        assert!(config.authz.groups.stale_while_error);
+        assert_eq!(
+            config.authz.groups.static_mappings.get("alice"),
+            Some(&vec!["10".to_string(), "20".to_string()])
+        );
+        assert_eq!(
+            config.authz.groups.static_mappings.get("bob"),
+            Some(&vec!["30".to_string()])
+        );
     }
 
     #[test]

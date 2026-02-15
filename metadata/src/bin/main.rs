@@ -10,7 +10,8 @@ use metadata::maintenance::MaintenanceService;
 use metadata::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use metadata::readiness::{wait_for_root_ready_with_metrics, RootReadinessGate};
 use metadata::service::{
-    filesystem_authz_provider, inode_authz_provider, MetadataFileSystemServiceImpl, MetadataFsServiceImpl,
+    cached_static_group_resolver, filesystem_authz_provider, inode_authz_provider, AuthzProviderDeps,
+    MetadataFileSystemServiceImpl, MetadataFsServiceImpl, RocksDbInodePermReader,
 };
 use metadata::state::RaftStateStore;
 use metadata::ufs_proxy::UfsMetadataProxy;
@@ -215,6 +216,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     worker_service.set_slot_metrics(Arc::clone(&metadata_metrics));
     worker_service.start_background_tasks();
 
+    let authz_deps = AuthzProviderDeps::new(
+        cached_static_group_resolver(
+            config.authz.groups.static_mappings.clone(),
+            config.authz.groups.cache_ttl_secs,
+            config.authz.groups.stale_while_error,
+        ),
+        Arc::new(RocksDbInodePermReader::new(Arc::clone(&storage), 2)),
+    );
+
     // Note: state_store is Arc<RaftStateStore>, which implements StateStore trait
     let mount_table_for_readiness = Arc::clone(&mount_table);
     let fs_service = MetadataFsServiceImpl::new(
@@ -224,7 +234,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_storage(Arc::clone(&storage))
     .with_raft_node(Arc::clone(&raft_node))
     .with_metrics(Arc::clone(&metadata_metrics))
-    .with_authz_provider(inode_authz_provider(config.authz.inode.mode))
+    .with_authz_provider(inode_authz_provider(config.authz.inode.mode, &authz_deps))
+    .with_inode_perm_reader(Arc::clone(&authz_deps.inode_perm_reader))
     .with_readiness_gate(Arc::clone(&readiness_gate));
 
     let fs_service_for_filesystem = MetadataFsServiceImpl::new(
@@ -234,14 +245,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_storage(Arc::clone(&storage))
     .with_raft_node(Arc::clone(&raft_node))
     .with_metrics(Arc::clone(&metadata_metrics))
-    .with_authz_provider(inode_authz_provider(config.authz.inode.mode))
+    .with_authz_provider(inode_authz_provider(config.authz.inode.mode, &authz_deps))
+    .with_inode_perm_reader(Arc::clone(&authz_deps.inode_perm_reader))
     .with_readiness_gate(Arc::clone(&readiness_gate));
     let fs_core_for_filesystem = fs_service_for_filesystem.fs_core();
 
     let filesystem_service =
         MetadataFileSystemServiceImpl::new(Arc::clone(&mount_table), Arc::clone(&storage), fs_core_for_filesystem)
             .with_metrics(Arc::clone(&metadata_metrics))
-            .with_authz_provider(filesystem_authz_provider(config.authz.filesystem.mode))
+            .with_authz_provider(filesystem_authz_provider(config.authz.filesystem.mode, &authz_deps))
+            .with_inode_perm_reader(Arc::clone(&authz_deps.inode_perm_reader))
             .with_readiness_gate(Arc::clone(&readiness_gate));
 
     let readiness_config = config.bootstrap.root_readiness.clone();

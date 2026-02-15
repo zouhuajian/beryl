@@ -44,6 +44,16 @@ pub struct RequestHeader {
     pub retry_count: i32,
     /// Optional route epoch observed by client.
     pub route_epoch: Option<u64>,
+    /// Authenticated principal/user identity.
+    ///
+    /// Required when ACL authorization mode is enabled.
+    pub principal: Option<String>,
+    /// Real user identity (proxy-user scenarios; reserved for future use).
+    pub real_user: Option<String>,
+    /// Proxy/doAs target user (reserved for future use).
+    pub doas: Option<String>,
+    /// Authentication type marker for the request.
+    pub authn_type: AuthnType,
 }
 
 /// Human-oriented context for auditing and lightweight diagnostics.
@@ -53,6 +63,21 @@ pub struct CallerContext {
     pub context: String,
     /// Optional signature for tamper detection or provenance (opaque).
     pub signature: Option<Vec<u8>>,
+}
+
+/// Authentication type marker for request identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthnType {
+    Unspecified,
+    Simple,
+    Kerberos,
+    Token,
+}
+
+impl Default for AuthnType {
+    fn default() -> Self {
+        Self::Unspecified
+    }
 }
 
 /// Response header carried with every RPC response.
@@ -167,6 +192,10 @@ impl RequestHeader {
             group_id: None,
             mount_epoch: None,
             route_epoch: None,
+            principal: None,
+            real_user: None,
+            doas: None,
+            authn_type: AuthnType::Unspecified,
         }
     }
 
@@ -200,6 +229,30 @@ impl RequestHeader {
         self
     }
 
+    /// Set the authenticated principal.
+    pub fn with_principal(mut self, principal: impl Into<String>) -> Self {
+        self.principal = Some(principal.into());
+        self
+    }
+
+    /// Set the real user identity.
+    pub fn with_real_user(mut self, real_user: impl Into<String>) -> Self {
+        self.real_user = Some(real_user.into());
+        self
+    }
+
+    /// Set the doAs/proxy user identity.
+    pub fn with_doas(mut self, doas: impl Into<String>) -> Self {
+        self.doas = Some(doas.into());
+        self
+    }
+
+    /// Set the request authentication type marker.
+    pub fn with_authn_type(mut self, authn_type: AuthnType) -> Self {
+        self.authn_type = authn_type;
+        self
+    }
+
     /// Create a child header (for nested calls).
     ///
     /// Inherits client_id, deadline, traceparent, state_id, and group_id.
@@ -219,6 +272,10 @@ impl RequestHeader {
             group_id: self.group_id,
             mount_epoch: self.mount_epoch,
             route_epoch: self.route_epoch,
+            principal: self.principal.clone(),
+            real_user: self.real_user.clone(),
+            doas: self.doas.clone(),
+            authn_type: self.authn_type,
         }
     }
 
@@ -238,6 +295,10 @@ impl RequestHeader {
             group_id: self.group_id,
             mount_epoch: self.mount_epoch,
             route_epoch: self.route_epoch,
+            principal: self.principal.clone(),
+            real_user: self.real_user.clone(),
+            doas: self.doas.clone(),
+            authn_type: self.authn_type,
         }
     }
 

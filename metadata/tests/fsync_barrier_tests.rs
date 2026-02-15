@@ -80,6 +80,10 @@ fn make_request_header() -> Option<RequestHeaderProto> {
         state_id: None,
         retry_count: 0,
         route_epoch: None,
+        principal: String::new(),
+        real_user: String::new(),
+        doas: String::new(),
+        authn_type: proto::common::AuthnTypeProto::Unspecified as i32,
     })
 }
 

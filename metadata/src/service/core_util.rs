@@ -38,10 +38,17 @@ pub fn request_context_from_proto(req_header: &Option<proto::common::RequestHead
     if let Some(ref state_id) = caller.state_id {
         Span::current().record("state_id", &format!("{:?}", state_id));
     }
+    if let Some(principal) = &caller.principal {
+        Span::current().record("principal", principal);
+    }
 
     RequestContext {
         traceparent: caller.traceparent.clone(),
         route_epoch: req_header.as_ref().and_then(|h| h.route_epoch),
+        principal: caller.principal.clone(),
+        real_user: caller.real_user.clone(),
+        doas: caller.doas.clone(),
+        authn_type: caller.authn_type,
         caller,
     }
 }

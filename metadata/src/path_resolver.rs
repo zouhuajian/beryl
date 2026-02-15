@@ -29,6 +29,9 @@ pub struct ResolvedPath {
     pub mount_ctx: MountContext,
     pub parent_inode_id: InodeId,
     pub name: String,
+    /// Directory inodes requiring traverse/search (`EXECUTE`) checks in order.
+    /// Includes mount root and the resolved parent directory.
+    pub traverse_dir_inode_ids: Vec<InodeId>,
     /// Optional: inode_id if the entry already exists (for lookup operations).
     pub inode_id: Option<InodeId>,
 }
@@ -38,6 +41,9 @@ pub struct ResolvedPath {
 pub struct ResolvedInode {
     pub mount_ctx: MountContext,
     pub inode_id: InodeId,
+    /// Directory inodes requiring traverse/search (`EXECUTE`) checks in order.
+    /// Includes mount root and each ancestor directory (excludes target inode).
+    pub traverse_dir_inode_ids: Vec<InodeId>,
 }
 
 /// Path resolver: converts paths to inode IDs.
@@ -123,12 +129,20 @@ impl PathResolver {
         best_match.ok_or_else(|| MetadataError::NotFound(format!("No mount found for path: {}", normalized)))
     }
 
-    /// Walk dentry tree: starting from root_inode_id, follow the path components.
-    /// Returns the final inode_id if the path exists, or None if any component is missing.
-    fn walk_dentry(&self, root_inode_id: InodeId, components: &[String]) -> MetadataResult<Option<InodeId>> {
+    /// Walk dentry tree and return:
+    /// - final inode id after following all components
+    /// - ordered directory inode list that must pass traverse/search checks
+    ///   (one entry per path component lookup, i.e. root + ancestor directories).
+    fn walk_dentry_with_traverse(
+        &self,
+        root_inode_id: InodeId,
+        components: &[String],
+    ) -> MetadataResult<(InodeId, Vec<InodeId>)> {
         let mut current_inode_id = root_inode_id;
+        let mut traverse_dir_inode_ids = Vec::with_capacity(components.len());
 
         for component in components {
+            traverse_dir_inode_ids.push(current_inode_id);
             // Get dentry
             let child_inode_id = self.storage.get_dentry(current_inode_id, component)?.ok_or_else(|| {
                 MetadataError::NotFound(format!(
@@ -140,7 +154,7 @@ impl PathResolver {
             current_inode_id = child_inode_id;
         }
 
-        Ok(Some(current_inode_id))
+        Ok((current_inode_id, traverse_dir_inode_ids))
     }
 
     /// Resolve path to ResolvedPath (for create/unlink/rename operations).
@@ -159,13 +173,14 @@ impl PathResolver {
         let (parent_components, name) = components.split_at(components.len() - 1);
         let name = name[0].clone();
 
-        // Walk to parent directory
-        let parent_inode_id = if parent_components.is_empty() {
-            mount_entry.root_inode_id
+        // Walk to parent directory and collect traverse directories.
+        let (parent_inode_id, mut traverse_dir_inode_ids) = if parent_components.is_empty() {
+            (mount_entry.root_inode_id, Vec::new())
         } else {
-            self.walk_dentry(mount_entry.root_inode_id, parent_components)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Parent directory not found: {}", path)))?
+            self.walk_dentry_with_traverse(mount_entry.root_inode_id, parent_components)?
         };
+        // Accessing the final path component always traverses the resolved parent directory.
+        traverse_dir_inode_ids.push(parent_inode_id);
 
         // Verify parent is a directory
         let parent_inode = self
@@ -192,6 +207,7 @@ impl PathResolver {
             },
             parent_inode_id,
             name,
+            traverse_dir_inode_ids,
             inode_id,
         })
     }
@@ -201,12 +217,11 @@ impl PathResolver {
     pub fn resolve_inode(&self, path: &str) -> MetadataResult<ResolvedInode> {
         let (mount_entry, components) = self.resolve_mount(path)?;
 
-        let inode_id = if components.is_empty() {
-            // Path is mount root
-            mount_entry.root_inode_id
+        let (inode_id, traverse_dir_inode_ids) = if components.is_empty() {
+            // Path is mount root (no parent components to traverse).
+            (mount_entry.root_inode_id, Vec::new())
         } else {
-            self.walk_dentry(mount_entry.root_inode_id, &components)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Path not found: {}", path)))?
+            self.walk_dentry_with_traverse(mount_entry.root_inode_id, &components)?
         };
 
         Ok(ResolvedInode {
@@ -217,6 +232,7 @@ impl PathResolver {
                 root_inode_id: mount_entry.root_inode_id,
             },
             inode_id,
+            traverse_dir_inode_ids,
         })
     }
 
@@ -242,10 +258,10 @@ impl PathResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mount::MountTable;
+    use crate::mount::{DataIoPolicy, MountKind, MountTable};
     use tempfile::TempDir;
-    use types::fs::InodeId;
-    use types::ids::ShardGroupId;
+    use types::fs::{FileAttrs, Inode, InodeId};
+    use types::ids::{DataHandleId, ShardGroupId};
 
     #[test]
     fn test_normalize() {
@@ -300,5 +316,112 @@ mod tests {
 
         let (mount, _) = resolver.resolve_mount("/mnt/s3/file.txt").unwrap();
         assert_eq!(mount.mount_prefix, "/mnt/s3"); // Should match longer prefix
+    }
+
+    #[test]
+    fn resolve_inode_collects_traverse_directories_for_nested_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(temp_dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+
+        let root_inode_id = InodeId::new(100);
+        let mount = mount_table
+            .create_mount(
+                "/mnt/test".to_string(),
+                MountKind::External,
+                Some("file:///tmp/test".to_string()),
+                DataIoPolicy::Allow,
+                ShardGroupId::new(1),
+                root_inode_id,
+            )
+            .unwrap();
+
+        let mut root_attrs = FileAttrs::new();
+        root_attrs.mode = 0o755;
+        storage
+            .put_inode(&Inode::new_dir(root_inode_id, root_attrs, mount.mount_id))
+            .unwrap();
+
+        let dir_a = InodeId::new(101);
+        let mut dir_a_attrs = FileAttrs::new();
+        dir_a_attrs.mode = 0o755;
+        storage
+            .put_inode(&Inode::new_dir(dir_a, dir_a_attrs, mount.mount_id))
+            .unwrap();
+        storage.put_dentry(root_inode_id, "a", dir_a).unwrap();
+
+        let dir_b = InodeId::new(102);
+        let mut dir_b_attrs = FileAttrs::new();
+        dir_b_attrs.mode = 0o755;
+        storage
+            .put_inode(&Inode::new_dir(dir_b, dir_b_attrs, mount.mount_id))
+            .unwrap();
+        storage.put_dentry(dir_a, "b", dir_b).unwrap();
+
+        let file_c = InodeId::new(103);
+        let mut file_attrs = FileAttrs::new();
+        file_attrs.mode = 0o644;
+        storage
+            .put_inode(&Inode::new_file(
+                file_c,
+                file_attrs,
+                mount.mount_id,
+                DataHandleId::new(1),
+            ))
+            .unwrap();
+        storage.put_dentry(dir_b, "c", file_c).unwrap();
+
+        let resolver = PathResolver::new(mount_table, storage);
+        let resolved = resolver.resolve_inode("/mnt/test/a/b/c").unwrap();
+        assert_eq!(resolved.inode_id, file_c);
+        assert_eq!(resolved.traverse_dir_inode_ids, vec![root_inode_id, dir_a, dir_b]);
+    }
+
+    #[test]
+    fn resolve_path_collects_traverse_directories_including_parent() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(temp_dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+
+        let root_inode_id = InodeId::new(200);
+        let mount = mount_table
+            .create_mount(
+                "/mnt/test2".to_string(),
+                MountKind::External,
+                Some("file:///tmp/test2".to_string()),
+                DataIoPolicy::Allow,
+                ShardGroupId::new(2),
+                root_inode_id,
+            )
+            .unwrap();
+
+        let mut root_attrs = FileAttrs::new();
+        root_attrs.mode = 0o755;
+        storage
+            .put_inode(&Inode::new_dir(root_inode_id, root_attrs, mount.mount_id))
+            .unwrap();
+
+        let dir_a = InodeId::new(201);
+        let mut dir_a_attrs = FileAttrs::new();
+        dir_a_attrs.mode = 0o755;
+        storage
+            .put_inode(&Inode::new_dir(dir_a, dir_a_attrs, mount.mount_id))
+            .unwrap();
+        storage.put_dentry(root_inode_id, "a", dir_a).unwrap();
+
+        let dir_b = InodeId::new(202);
+        let mut dir_b_attrs = FileAttrs::new();
+        dir_b_attrs.mode = 0o755;
+        storage
+            .put_inode(&Inode::new_dir(dir_b, dir_b_attrs, mount.mount_id))
+            .unwrap();
+        storage.put_dentry(dir_a, "b", dir_b).unwrap();
+
+        let resolver = PathResolver::new(mount_table, storage);
+        let resolved = resolver.resolve_path("/mnt/test2/a/b/new-file").unwrap();
+        assert_eq!(resolved.parent_inode_id, dir_b);
+        assert_eq!(resolved.traverse_dir_inode_ids, vec![root_inode_id, dir_a, dir_b]);
+        assert_eq!(resolved.name, "new-file");
+        assert!(resolved.inode_id.is_none());
     }
 }

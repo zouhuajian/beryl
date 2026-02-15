@@ -6,7 +6,7 @@
 //! This module provides utilities for propagating RequestHeader across service boundaries
 //! via HTTP headers, gRPC metadata, or other transport mechanisms.
 
-use crate::header::RequestHeader;
+use crate::header::{AuthnType, RequestHeader};
 use crate::time::Deadline;
 use std::str::FromStr;
 use types::{CallId, ClientId, RaftLogId};
@@ -19,6 +19,10 @@ pub const HEADER_MOUNT_EPOCH: &str = "x-mount-epoch";
 pub const HEADER_TRACEPARENT: &str = "traceparent";
 pub const HEADER_DEADLINE_MS: &str = "x-deadline-ms";
 pub const HEADER_GRPC_TIMEOUT: &str = "grpc-timeout";
+pub const HEADER_PRINCIPAL: &str = "x-principal";
+pub const HEADER_REAL_USER: &str = "x-real-user";
+pub const HEADER_DOAS: &str = "x-doas";
+pub const HEADER_AUTHN_TYPE: &str = "x-authn-type";
 
 /// Codec for RequestHeader header encoding/decoding.
 pub struct RequestHeaderCodec;
@@ -54,6 +58,26 @@ impl RequestHeaderCodec {
         if let Some(ref tp) = header.traceparent {
             headers.push((HEADER_TRACEPARENT.to_string(), tp.clone()));
         }
+
+        if let Some(ref principal) = header.principal {
+            headers.push((HEADER_PRINCIPAL.to_string(), principal.clone()));
+        }
+        if let Some(ref real_user) = header.real_user {
+            headers.push((HEADER_REAL_USER.to_string(), real_user.clone()));
+        }
+        if let Some(ref doas) = header.doas {
+            headers.push((HEADER_DOAS.to_string(), doas.clone()));
+        }
+        headers.push((
+            HEADER_AUTHN_TYPE.to_string(),
+            match header.authn_type {
+                AuthnType::Unspecified => "unspecified",
+                AuthnType::Simple => "simple",
+                AuthnType::Kerberos => "kerberos",
+                AuthnType::Token => "token",
+            }
+            .to_string(),
+        ));
 
         // x-deadline-ms: absolute deadline in unix ms for lossless roundtrip
         headers.push((HEADER_DEADLINE_MS.to_string(), header.deadline.as_unix_ms().to_string()));
@@ -91,6 +115,10 @@ impl RequestHeaderCodec {
         let mut traceparent = None;
         let mut deadline_ms = None;
         let mut mount_epoch = None;
+        let mut principal = None;
+        let mut real_user = None;
+        let mut doas = None;
+        let mut authn_type = AuthnType::Unspecified;
 
         for (key, value) in iter {
             match key.as_str() {
@@ -118,6 +146,29 @@ impl RequestHeaderCodec {
                 }
                 k if k.eq_ignore_ascii_case(HEADER_TRACEPARENT) => {
                     traceparent = Some(value);
+                }
+                k if k.eq_ignore_ascii_case(HEADER_PRINCIPAL) => {
+                    if !value.is_empty() {
+                        principal = Some(value);
+                    }
+                }
+                k if k.eq_ignore_ascii_case(HEADER_REAL_USER) => {
+                    if !value.is_empty() {
+                        real_user = Some(value);
+                    }
+                }
+                k if k.eq_ignore_ascii_case(HEADER_DOAS) => {
+                    if !value.is_empty() {
+                        doas = Some(value);
+                    }
+                }
+                k if k.eq_ignore_ascii_case(HEADER_AUTHN_TYPE) => {
+                    authn_type = match value.to_ascii_lowercase().as_str() {
+                        "simple" => AuthnType::Simple,
+                        "kerberos" => AuthnType::Kerberos,
+                        "token" => AuthnType::Token,
+                        _ => AuthnType::Unspecified,
+                    };
                 }
                 k if k.eq_ignore_ascii_case(HEADER_GRPC_TIMEOUT) => {
                     // Parse gRPC timeout format (e.g., "30S", "500M")
@@ -164,6 +215,10 @@ impl RequestHeaderCodec {
             group_id: None,
             mount_epoch,
             route_epoch: None,
+            principal,
+            real_user,
+            doas,
+            authn_type,
         }
     }
 }
@@ -221,6 +276,10 @@ mod tests {
             group_id: None,
             mount_epoch: None,
             route_epoch: None,
+            principal: None,
+            real_user: None,
+            doas: None,
+            authn_type: AuthnType::Unspecified,
         };
 
         // Encode
@@ -275,6 +334,22 @@ mod tests {
             vec![(HEADER_DEADLINE_MS.to_string(), deadline_ms.to_string())].into_iter(),
         );
         assert_eq!(decoded.deadline.as_unix_ms(), deadline_ms);
+    }
+
+    #[test]
+    fn test_identity_fields_roundtrip() {
+        let mut header = RequestHeader::new(ClientId::new(7));
+        header.principal = Some("1000".to_string());
+        header.real_user = Some("alice".to_string());
+        header.doas = Some("bob".to_string());
+        header.authn_type = AuthnType::Simple;
+
+        let encoded = RequestHeaderCodec::encode_to_headers(&header);
+        let decoded = RequestHeaderCodec::decode_from_headers(encoded.into_iter());
+        assert_eq!(decoded.principal, Some("1000".to_string()));
+        assert_eq!(decoded.real_user, Some("alice".to_string()));
+        assert_eq!(decoded.doas, Some("bob".to_string()));
+        assert_eq!(decoded.authn_type, AuthnType::Simple);
     }
 
     #[test]

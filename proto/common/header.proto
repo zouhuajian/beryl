@@ -75,6 +75,27 @@ message RequestHeaderProto {
   /// Optional route epoch observed by client.
   /// Used by FileSystemService layout/write-session APIs for refresh+replay loops.
   optional uint64 route_epoch = 9;
+
+  /// Authenticated principal/user identity.
+  /// In ACL mode this must be non-empty; in NONE/RANGER it may be empty.
+  string principal = 10;
+
+  /// Real user identity (proxy-user scenarios, reserved for future use).
+  string real_user = 11;
+
+  /// Proxy user / doAs target user (reserved for future use).
+  string doas = 12;
+
+  /// Authentication type marker (stub enum for future authn integrations).
+  AuthnTypeProto authn_type = 13;
+}
+
+/// Authentication type of the request principal.
+enum AuthnTypeProto {
+  AUTHN_TYPE_PROTO_UNSPECIFIED = 0;
+  AUTHN_TYPE_PROTO_SIMPLE = 1;
+  AUTHN_TYPE_PROTO_KERBEROS = 2;
+  AUTHN_TYPE_PROTO_TOKEN = 3;
 }
 
 /// Human-oriented context for auditing and lightweight diagnostics.

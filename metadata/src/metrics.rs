@@ -16,6 +16,22 @@ pub static DEDUP_EVICTED_TTL_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static DEDUP_EVICTED_SIZE_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static DEDUP_STORE_ENTRIES_GAUGE: AtomicU64 = AtomicU64::new(0);
 
+// Authz/cache metrics (low cardinality, process-wide).
+pub static AUTHZ_GROUPS_CACHE_HIT_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static AUTHZ_GROUPS_CACHE_MISS_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static AUTHZ_GROUPS_CACHE_EXPIRY_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static AUTHZ_GROUPS_STALE_FALLBACK_USED_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static AUTHZ_GROUPS_RESOLVER_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static AUTHZ_PERM_CACHE_HIT_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static AUTHZ_PERM_CACHE_MISS_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static AUTHZ_PERM_CACHE_INVALIDATE_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static AUTHZ_ALLOW_RANGER_PATH_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static AUTHZ_DENY_RANGER_PATH_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static AUTHZ_ALLOW_ACL_INODE_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static AUTHZ_DENY_ACL_INODE_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static AUTHZ_ALLOW_NONE_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static AUTHZ_DENY_NONE_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// Metadata service metrics.
 #[derive(Clone)]
 pub struct MetadataMetrics {
@@ -847,6 +863,106 @@ impl MetadataMetrics {
         metrics.push(format!(
             "metadata_fs_raft_appends_setattr {}",
             self.fs_raft_appends_setattr.load(Ordering::Relaxed)
+        ));
+
+        // Authz/cache metrics
+        metrics.push(format!(
+            "# HELP metadata_authz_groups_cache_hit_total Total group cache hits in ACL authz"
+        ));
+        metrics.push(format!(
+            "metadata_authz_groups_cache_hit_total {}",
+            AUTHZ_GROUPS_CACHE_HIT_TOTAL.load(Ordering::Relaxed)
+        ));
+        metrics.push(format!(
+            "# HELP metadata_authz_groups_cache_miss_total Total group cache misses in ACL authz"
+        ));
+        metrics.push(format!(
+            "metadata_authz_groups_cache_miss_total {}",
+            AUTHZ_GROUPS_CACHE_MISS_TOTAL.load(Ordering::Relaxed)
+        ));
+        metrics.push(format!(
+            "# HELP metadata_authz_groups_cache_expiry_total Total group cache expiry events in ACL authz"
+        ));
+        metrics.push(format!(
+            "metadata_authz_groups_cache_expiry_total {}",
+            AUTHZ_GROUPS_CACHE_EXPIRY_TOTAL.load(Ordering::Relaxed)
+        ));
+        metrics.push(format!(
+            "# HELP metadata_authz_groups_stale_fallback_used_total Total stale group cache fallbacks used on resolver errors"
+        ));
+        metrics.push(format!(
+            "metadata_authz_groups_stale_fallback_used_total {}",
+            AUTHZ_GROUPS_STALE_FALLBACK_USED_TOTAL.load(Ordering::Relaxed)
+        ));
+        metrics.push(format!(
+            "# HELP metadata_authz_groups_resolver_error_total Total group resolver errors observed by ACL authz"
+        ));
+        metrics.push(format!(
+            "metadata_authz_groups_resolver_error_total {}",
+            AUTHZ_GROUPS_RESOLVER_ERROR_TOTAL.load(Ordering::Relaxed)
+        ));
+        metrics.push(format!(
+            "# HELP metadata_authz_perm_cache_hit_total Total inode permission cache hits"
+        ));
+        metrics.push(format!(
+            "metadata_authz_perm_cache_hit_total {}",
+            AUTHZ_PERM_CACHE_HIT_TOTAL.load(Ordering::Relaxed)
+        ));
+        metrics.push(format!(
+            "# HELP metadata_authz_perm_cache_miss_total Total inode permission cache misses"
+        ));
+        metrics.push(format!(
+            "metadata_authz_perm_cache_miss_total {}",
+            AUTHZ_PERM_CACHE_MISS_TOTAL.load(Ordering::Relaxed)
+        ));
+        metrics.push(format!(
+            "# HELP metadata_authz_perm_cache_invalidate_total Total inode permission cache invalidations"
+        ));
+        metrics.push(format!(
+            "metadata_authz_perm_cache_invalidate_total {}",
+            AUTHZ_PERM_CACHE_INVALIDATE_TOTAL.load(Ordering::Relaxed)
+        ));
+        metrics.push(format!(
+            "# HELP metadata_authz_allow_ranger_path_total Total authz allows for RangerPath scheme"
+        ));
+        metrics.push(format!(
+            "metadata_authz_allow_ranger_path_total {}",
+            AUTHZ_ALLOW_RANGER_PATH_TOTAL.load(Ordering::Relaxed)
+        ));
+        metrics.push(format!(
+            "# HELP metadata_authz_deny_ranger_path_total Total authz denials for RangerPath scheme"
+        ));
+        metrics.push(format!(
+            "metadata_authz_deny_ranger_path_total {}",
+            AUTHZ_DENY_RANGER_PATH_TOTAL.load(Ordering::Relaxed)
+        ));
+        metrics.push(format!(
+            "# HELP metadata_authz_allow_acl_inode_total Total authz allows for AclInode scheme"
+        ));
+        metrics.push(format!(
+            "metadata_authz_allow_acl_inode_total {}",
+            AUTHZ_ALLOW_ACL_INODE_TOTAL.load(Ordering::Relaxed)
+        ));
+        metrics.push(format!(
+            "# HELP metadata_authz_deny_acl_inode_total Total authz denials for AclInode scheme"
+        ));
+        metrics.push(format!(
+            "metadata_authz_deny_acl_inode_total {}",
+            AUTHZ_DENY_ACL_INODE_TOTAL.load(Ordering::Relaxed)
+        ));
+        metrics.push(format!(
+            "# HELP metadata_authz_allow_none_total Total authz allows for None scheme"
+        ));
+        metrics.push(format!(
+            "metadata_authz_allow_none_total {}",
+            AUTHZ_ALLOW_NONE_TOTAL.load(Ordering::Relaxed)
+        ));
+        metrics.push(format!(
+            "# HELP metadata_authz_deny_none_total Total authz denials for None scheme"
+        ));
+        metrics.push(format!(
+            "metadata_authz_deny_none_total {}",
+            AUTHZ_DENY_NONE_TOTAL.load(Ordering::Relaxed)
         ));
 
         metrics.join("\n")

@@ -47,6 +47,25 @@ metadata.authz.filesystem.mode: "NONE"
 # Description: Inode/handle service authz provider selection. "RANGER" is invalid here.
 metadata.authz.inode.mode: "NONE"
 
+# ACL group resolver cache TTL (seconds)
+# Type: integer
+# Default: 300
+# Description: Group mapping cache TTL for ACL authorization.
+metadata.authz.groups.cache_ttl_secs: 300
+
+# ACL group resolver stale-while-error policy
+# Type: boolean
+# Default: false
+# Description: When true, expired cached group mappings may be used if backend resolve fails.
+# Security: false is fail-closed (deny on resolver error).
+metadata.authz.groups.stale_while_error: false
+
+# Optional static principal -> groups mappings used by the ACL group resolver backend.
+# Key pattern: metadata.authz.groups.mapping.<principal>
+# Value: comma-separated groups (typically numeric gids for MVP mode-bit matching).
+# Example:
+# metadata.authz.groups.mapping.1000: "100,200"
+
 # ============================================================================
 # Metadata Raft Configuration (for metadata clustering)
 # ============================================================================

@@ -145,6 +145,10 @@ async fn test_msync_with_mock() {
         group_id: 0,
         mount_epoch: None,
         route_epoch: None,
+        principal: String::new(),
+        real_user: String::new(),
+        doas: String::new(),
+        authn_type: proto::common::AuthnTypeProto::Unspecified as i32,
     };
     header.group_id = 0;
 

@@ -1367,6 +1367,10 @@ fn default_request_header_proto() -> RequestHeaderProto {
         state_id: None,
         retry_count: 0,
         route_epoch: None,
+        principal: String::new(),
+        real_user: String::new(),
+        doas: String::new(),
+        authn_type: proto::common::AuthnTypeProto::Unspecified as i32,
     }
 }
 
@@ -1601,6 +1605,10 @@ mod tests {
             state_id: None,
             retry_count: 0,
             route_epoch: None,
+            principal: String::new(),
+            real_user: String::new(),
+            doas: String::new(),
+            authn_type: proto::common::AuthnTypeProto::Unspecified as i32,
         }
     }
 

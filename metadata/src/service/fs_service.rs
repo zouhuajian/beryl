@@ -11,14 +11,14 @@ use super::domain::{
     ReleaseSessionInput, RenewLeaseInput,
 };
 use super::fs_core::FsCore;
-use super::guard::{AuthzContext, GuardChain, GuardSpec, LeadershipChecker};
+use super::guard::{AuthzCheck, AuthzContext, GuardChain, GuardSpec, LeadershipChecker};
 use super::{
     extent_from_proto, extent_to_proto, extract_and_inject_context, fatal_fs_header, fencing_to_proto,
     header_from_canonical_error, header_from_core_failure, lease_id_from_proto, lease_id_to_proto, location_to_proto,
     need_refresh_header, ok_header_from_core_success, ok_header_from_request, presented_fencing_from_proto,
     request_context_from_proto, write_target_to_proto,
 };
-use super::{AuthzOp, AuthzProvider, AuthzTarget};
+use super::{AuthzOp, AuthzProvider, AuthzTarget, InodePermReader};
 use crate::data_io::DataIoOp;
 use crate::error::{to_canonical_fs, MetadataError, MetadataResult};
 use crate::mount::MountTable;
@@ -104,6 +104,7 @@ pub struct MetadataFsServiceImpl {
     inode_lease_manager: Arc<crate::inode_lease::InodeLeaseManager>,
     worker_commit_hook: Arc<Mutex<Option<CommitHook>>>,
     guard_chain: GuardChain,
+    inode_perm_reader: Option<Arc<dyn InodePermReader>>,
 }
 
 impl MetadataFsServiceImpl {
@@ -129,6 +130,7 @@ impl MetadataFsServiceImpl {
             worker_manager: None,
             inode_lease_manager,
             worker_commit_hook,
+            inode_perm_reader: None,
         }
     }
 
@@ -176,6 +178,11 @@ impl MetadataFsServiceImpl {
 
     pub fn with_authz_provider(mut self, provider: Arc<dyn AuthzProvider>) -> Self {
         self.guard_chain.set_authz_provider(provider);
+        self
+    }
+
+    pub fn with_inode_perm_reader(mut self, inode_perm_reader: Arc<dyn InodePermReader>) -> Self {
+        self.inode_perm_reader = Some(inode_perm_reader);
         self
     }
 
@@ -260,10 +267,39 @@ impl MetadataFsServiceImpl {
             | FsRpcAuthz::RenewInodeLease
             | FsRpcAuthz::Truncate => AuthzOp::Write,
         };
-        AuthzContext {
-            op,
-            targets: vec![target],
+        AuthzContext::new(op, vec![target])
+    }
+
+    fn sticky_pre_checks_for_delete(parent_inode_id: InodeId, target_inode_id: Option<InodeId>) -> Vec<AuthzCheck> {
+        target_inode_id
+            .into_iter()
+            .map(|target_inode_id| AuthzCheck {
+                op: AuthzOp::Sticky,
+                target: AuthzTarget::for_inode(target_inode_id).with_parent(parent_inode_id),
+            })
+            .collect()
+    }
+
+    fn sticky_pre_checks_for_rename(
+        src_parent_inode_id: InodeId,
+        src_inode_id: Option<InodeId>,
+        dst_parent_inode_id: InodeId,
+        dst_inode_id: Option<InodeId>,
+    ) -> Vec<AuthzCheck> {
+        let mut checks = Vec::new();
+        if let Some(src_inode_id) = src_inode_id {
+            checks.push(AuthzCheck {
+                op: AuthzOp::Sticky,
+                target: AuthzTarget::for_inode(src_inode_id).with_parent(src_parent_inode_id),
+            });
         }
+        if let Some(dst_inode_id) = dst_inode_id {
+            checks.push(AuthzCheck {
+                op: AuthzOp::Sticky,
+                target: AuthzTarget::for_inode(dst_inode_id).with_parent(dst_parent_inode_id),
+            });
+        }
+        checks
     }
 
     /// Route FS write operation to mount.namespace_owner_group_id.
@@ -959,6 +995,10 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }));
         }
 
+        if let Some(reader) = self.inode_perm_reader.as_ref() {
+            reader.invalidate(inode_id);
+        }
+
         // Read updated inode
         let updated_inode = match storage.get_inode(inode_id) {
             Ok(Some(inode)) => inode,
@@ -1621,17 +1661,43 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 }));
             }
         };
+        let storage = match self.storage.as_ref() {
+            Some(storage) => storage,
+            None => {
+                let resp_header = Self::header_from_error(
+                    &req.header,
+                    MetadataError::Internal("Storage not available".to_string()),
+                    None,
+                    None,
+                );
+                return Ok(Response::new(UnlinkResponseProto {
+                    header: Some(resp_header),
+                    ..Default::default()
+                }));
+            }
+        };
+        let target_inode_id = match storage.get_dentry(parent_inode_id, &req.name) {
+            Ok(inode_id) => inode_id,
+            Err(err) => {
+                let resp_header = Self::header_from_error(&req.header, err, None, None);
+                return Ok(Response::new(UnlinkResponseProto {
+                    header: Some(resp_header),
+                    ..Default::default()
+                }));
+            }
+        };
 
+        let mut authz_ctx = Self::authz_for_rpc(FsRpcAuthz::Unlink, AuthzTarget::for_inode(parent_inode_id));
+        authz_ctx
+            .pre_checks
+            .extend(Self::sticky_pre_checks_for_delete(parent_inode_id, target_inode_id));
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_write(),
                 Some(ctx.mount_id),
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::Unlink,
-                    AuthzTarget::for_inode(parent_inode_id),
-                )),
+                Some(authz_ctx),
             )
             .await
         {
@@ -1763,17 +1829,43 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 }));
             }
         };
+        let storage = match self.storage.as_ref() {
+            Some(storage) => storage,
+            None => {
+                let resp_header = Self::header_from_error(
+                    &req.header,
+                    MetadataError::Internal("Storage not available".to_string()),
+                    None,
+                    None,
+                );
+                return Ok(Response::new(RmdirResponseProto {
+                    header: Some(resp_header),
+                    ..Default::default()
+                }));
+            }
+        };
+        let target_inode_id = match storage.get_dentry(parent_inode_id, &req.name) {
+            Ok(inode_id) => inode_id,
+            Err(err) => {
+                let resp_header = Self::header_from_error(&req.header, err, None, None);
+                return Ok(Response::new(RmdirResponseProto {
+                    header: Some(resp_header),
+                    ..Default::default()
+                }));
+            }
+        };
 
+        let mut authz_ctx = Self::authz_for_rpc(FsRpcAuthz::Rmdir, AuthzTarget::for_inode(parent_inode_id));
+        authz_ctx
+            .pre_checks
+            .extend(Self::sticky_pre_checks_for_delete(parent_inode_id, target_inode_id));
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_write(),
                 Some(ctx.mount_id),
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::Rmdir,
-                    AuthzTarget::for_inode(parent_inode_id),
-                )),
+                Some(authz_ctx),
             )
             .await
         {
@@ -2044,16 +2136,42 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
             }
         };
 
+        let src_inode_id = match storage.get_dentry(src_parent_inode_id, &req.src_name) {
+            Ok(inode_id) => inode_id,
+            Err(err) => {
+                let resp_header = Self::header_from_error(&req.header, err, None, None);
+                return Ok(Response::new(FsRenameResponseProto {
+                    header: Some(resp_header),
+                }));
+            }
+        };
+        let dst_inode_id = match storage.get_dentry(dst_parent_inode_id, &req.dst_name) {
+            Ok(inode_id) => inode_id,
+            Err(err) => {
+                let resp_header = Self::header_from_error(&req.header, err, None, None);
+                return Ok(Response::new(FsRenameResponseProto {
+                    header: Some(resp_header),
+                }));
+            }
+        };
+
+        let mut authz_ctx = Self::authz_for_rpc(
+            FsRpcAuthz::Rename,
+            AuthzTarget::for_inode(src_parent_inode_id).with_parent(dst_parent_inode_id),
+        );
+        authz_ctx.pre_checks.extend(Self::sticky_pre_checks_for_rename(
+            src_parent_inode_id,
+            src_inode_id,
+            dst_parent_inode_id,
+            dst_inode_id,
+        ));
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
                 &caller_ctx,
                 GuardSpec::metadata_write(),
                 Some(src_parent_inode.mount_id),
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::Rename,
-                    AuthzTarget::for_inode(src_parent_inode_id).with_parent(dst_parent_inode_id),
-                )),
+                Some(authz_ctx),
             )
             .await
         {
@@ -3353,6 +3471,9 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 ..Default::default()
             }));
         }
+        if let Some(reader) = self.inode_perm_reader.as_ref() {
+            reader.invalidate(inode_id);
+        }
         let resp_header = ok_header_from_request(
             &req.header,
             Some(ctx.namespace_owner_group_id.as_raw()),
@@ -3640,6 +3761,9 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
                 ..Default::default()
             }));
         }
+        if let Some(reader) = self.inode_perm_reader.as_ref() {
+            reader.invalidate(inode_id);
+        }
         let resp_header = ok_header_from_request(
             &req.header,
             Some(ctx.namespace_owner_group_id.as_raw()),
@@ -3648,5 +3772,171 @@ impl MetadataFsServiceProto for MetadataFsServiceImpl {
         Ok(Response::new(RemoveXattrResponseProto {
             header: Some(resp_header),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::{AclInodeAuthz, CachedGroupResolver, GroupResolver, InodePermReader, RocksDbInodePermReader};
+    use crate::state::MemoryStateStore;
+    use common::error::canonical::{CanonicalError, ErrorCode as CanonicalErrorCode};
+    use common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
+    use tempfile::TempDir;
+    use types::acl::{encode_posix_acl, AclEntry, AclPerm, AclSubject, PosixAcl};
+    use types::fs::{FileAttrs, Inode, InodeId};
+    use types::ids::{ClientId, DataHandleId, MountId};
+
+    #[derive(Clone)]
+    struct AlwaysFailGroupResolver;
+
+    impl GroupResolver for AlwaysFailGroupResolver {
+        fn groups_for(&self, _principal: &str) -> Result<Vec<String>, CanonicalError> {
+            Err(CanonicalError::retryable(
+                RpcErrorCode::NodeUnavailable,
+                None,
+                "group backend unavailable",
+            ))
+        }
+    }
+
+    fn put_test_inode(storage: &Arc<RocksDBStorage>, inode_id: InodeId, access_acl: Option<Vec<u8>>) {
+        let mut attrs = FileAttrs::new();
+        attrs.uid = 1000;
+        attrs.gid = 2000;
+        attrs.mode = 0o644;
+        let mut inode = Inode::new_file(inode_id, attrs, MountId::new(1), DataHandleId::new(1));
+        if let Some(acl) = access_acl {
+            inode.xattrs.insert(types::acl::POSIX_ACL_ACCESS_XATTR.to_string(), acl);
+        }
+        storage.put_inode(&inode).expect("put test inode");
+    }
+
+    fn build_acl_service(
+        storage: Arc<RocksDBStorage>,
+        group_resolver: Arc<dyn GroupResolver>,
+    ) -> MetadataFsServiceImpl {
+        let state_store: Arc<dyn crate::state::StateStore> = Arc::new(MemoryStateStore::new());
+        let mount_table = Arc::new(MountTable::new());
+        let inode_perm_reader: Arc<dyn InodePermReader> = Arc::new(RocksDbInodePermReader::new(storage.clone(), 600));
+        let authz_provider: Arc<dyn AuthzProvider> =
+            Arc::new(AclInodeAuthz::new(group_resolver, inode_perm_reader.clone()));
+        MetadataFsServiceImpl::new(state_store, mount_table)
+            .with_storage(storage)
+            .with_authz_provider(authz_provider)
+            .with_inode_perm_reader(inode_perm_reader)
+    }
+
+    fn get_attr_request(inode_id: InodeId, principal: Option<&str>) -> Request<GetAttrRequestProto> {
+        let mut header = RequestHeader::new(ClientId::new(88));
+        header.principal = principal.map(ToString::to_string);
+        let proto_header: proto::common::RequestHeaderProto = (&header).into();
+        Request::new(GetAttrRequestProto {
+            header: Some(proto_header),
+            inode_id: Some(proto::fs::InodeIdProto {
+                value: inode_id.as_raw(),
+            }),
+            ..Default::default()
+        })
+    }
+
+    fn extract_canonical_error(resp: &GetAttrResponseProto) -> CanonicalError {
+        let proto_header = resp.header.clone().expect("response header must be present");
+        let header = ResponseHeader::try_from(proto_header).expect("response header must decode");
+        header
+            .canonical_error
+            .expect("denial response must carry canonical error")
+    }
+
+    #[tokio::test]
+    async fn get_attr_missing_principal_returns_grpc_ok_with_header_error() {
+        let dir = TempDir::new().expect("create temp dir");
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).expect("open rocksdb"));
+        let inode_id = InodeId::new(5001);
+        put_test_inode(&storage, inode_id, None);
+        let service = build_acl_service(storage, Arc::new(crate::service::StaticGroupResolver::default()));
+
+        let response = service
+            .get_attr(get_attr_request(inode_id, None))
+            .await
+            .expect("gRPC transport status must stay OK");
+        let err = extract_canonical_error(response.get_ref());
+        assert_eq!(
+            err.code,
+            Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Unauthenticated))
+        );
+        assert!(err.message.contains("MISSING_PRINCIPAL"));
+    }
+
+    #[tokio::test]
+    async fn get_attr_group_resolver_failure_returns_grpc_ok_with_header_error() {
+        let dir = TempDir::new().expect("create temp dir");
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).expect("open rocksdb"));
+        let inode_id = InodeId::new(5002);
+        put_test_inode(&storage, inode_id, None);
+        let resolver: Arc<dyn GroupResolver> =
+            Arc::new(CachedGroupResolver::new(Arc::new(AlwaysFailGroupResolver), 300, false));
+        let service = build_acl_service(storage, resolver);
+
+        let response = service
+            .get_attr(get_attr_request(inode_id, Some("2001")))
+            .await
+            .expect("gRPC transport status must stay OK");
+        let err = extract_canonical_error(response.get_ref());
+        assert_eq!(
+            err.code,
+            Some(CanonicalErrorCode::RpcCode(RpcErrorCode::PermissionDenied))
+        );
+        assert!(err.message.contains("GROUP_RESOLVE_FAILED"));
+    }
+
+    #[tokio::test]
+    async fn get_attr_unsupported_acl_returns_grpc_ok_with_header_error() {
+        let dir = TempDir::new().expect("create temp dir");
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).expect("open rocksdb"));
+        let inode_id = InodeId::new(5003);
+        let unsupported_acl = PosixAcl::new(vec![
+            AclEntry {
+                subject: AclSubject::Other,
+                perms: AclPerm::READ,
+            },
+            AclEntry {
+                subject: AclSubject::Other,
+                perms: AclPerm::WRITE,
+            },
+        ]);
+        put_test_inode(&storage, inode_id, Some(encode_posix_acl(&unsupported_acl)));
+        let service = build_acl_service(storage, Arc::new(crate::service::StaticGroupResolver::default()));
+
+        let response = service
+            .get_attr(get_attr_request(inode_id, Some("2001")))
+            .await
+            .expect("gRPC transport status must stay OK");
+        let err = extract_canonical_error(response.get_ref());
+        assert_eq!(
+            err.code,
+            Some(CanonicalErrorCode::RpcCode(RpcErrorCode::PermissionDenied))
+        );
+        assert!(err.message.contains("UNSUPPORTED_ACL"));
+    }
+
+    #[tokio::test]
+    async fn get_attr_malformed_acl_returns_grpc_ok_with_header_error() {
+        let dir = TempDir::new().expect("create temp dir");
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).expect("open rocksdb"));
+        let inode_id = InodeId::new(5004);
+        put_test_inode(&storage, inode_id, Some(vec![1, 2, 3]));
+        let service = build_acl_service(storage, Arc::new(crate::service::StaticGroupResolver::default()));
+
+        let response = service
+            .get_attr(get_attr_request(inode_id, Some("2001")))
+            .await
+            .expect("gRPC transport status must stay OK");
+        let err = extract_canonical_error(response.get_ref());
+        assert_eq!(
+            err.code,
+            Some(CanonicalErrorCode::RpcCode(RpcErrorCode::PermissionDenied))
+        );
+        assert!(err.message.contains("ACL_MALFORMED"));
     }
 }
