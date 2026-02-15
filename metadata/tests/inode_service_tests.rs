@@ -1,27 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! FS service tests.
+//! Inode service tests.
 
 mod common;
 use common::FsTestHarness;
-use metadata::error::MetadataError;
 use proto::metadata::metadata_inode_service_proto_server::MetadataInodeServiceProto;
 use proto::metadata::*;
 use std::collections::HashSet;
 use tonic::Request;
-use types::fs::{FileAttrs, InodeId, InodeKind};
+use types::fs::FileAttrs;
 use types::ids::ShardGroupId;
 use types::layout::FileLayout;
 
 /// B1: Test rename within same mount is atomic.
 #[tokio::test]
-#[ignore = "pending inode/data_handle alignment in fs service tests"]
+#[ignore = "pending inode/data_handle alignment in inode service tests"]
 async fn test_rename_same_mount_atomic() {
     let harness = FsTestHarness::new().await.unwrap();
 
     // Arrange: Create mount and root inode
-    let (mount_id, root_inode_id) = harness
+    let (_mount_id, root_inode_id) = harness
         .create_mount_with_root(
             "/mnt/test".to_string(),
             "file:///tmp/test".to_string(),
@@ -59,7 +58,7 @@ async fn test_rename_same_mount_atomic() {
         }),
     };
 
-    let create_resp = MetadataInodeServiceProto::create(&harness.inode_service, Request::new(create_req))
+    let _create_resp = MetadataInodeServiceProto::create(&harness.inode_service, Request::new(create_req))
         .await
         .unwrap()
         .into_inner();
@@ -166,7 +165,7 @@ async fn test_rename_cross_mount_exdev() {
     let harness = FsTestHarness::new().await.unwrap();
 
     // Arrange: Create two mounts
-    let (mount1_id, mount1_root) = harness
+    let (_mount1_id, mount1_root) = harness
         .create_mount_with_root(
             "/mnt/mount1".to_string(),
             "file:///tmp/mount1".to_string(),
@@ -175,7 +174,7 @@ async fn test_rename_cross_mount_exdev() {
         .await
         .unwrap();
 
-    let (mount2_id, mount2_root) = harness
+    let (_mount2_id, mount2_root) = harness
         .create_mount_with_root(
             "/mnt/mount2".to_string(),
             "file:///tmp/mount2".to_string(),
@@ -278,7 +277,7 @@ async fn test_rename_cross_mount_exdev() {
 
 /// B3: Test ReadDir pagination with cursor_key.
 #[tokio::test]
-#[ignore = "pending inode/data_handle alignment in fs service tests"]
+#[ignore = "pending inode/data_handle alignment in inode service tests"]
 async fn test_mkdir_create_readdir_pagination() {
     let harness = FsTestHarness::new().await.unwrap();
 
@@ -369,7 +368,7 @@ async fn test_mkdir_create_readdir_pagination() {
 
 /// B4: Test rmdir fails on non-empty directory.
 #[tokio::test]
-#[ignore = "pending inode/data_handle alignment in fs service tests"]
+#[ignore = "pending inode/data_handle alignment in inode service tests"]
 async fn test_rmdir_nonempty_fails() {
     let harness = FsTestHarness::new().await.unwrap();
 
@@ -407,7 +406,7 @@ async fn test_rmdir_nonempty_fails() {
         }),
     };
 
-    let mkdir_resp = MetadataInodeServiceProto::mkdir(&harness.inode_service, Request::new(mkdir_req))
+    let _mkdir_resp = MetadataInodeServiceProto::mkdir(&harness.inode_service, Request::new(mkdir_req))
         .await
         .unwrap()
         .into_inner();

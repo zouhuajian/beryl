@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Test harness for FS service tests.
+//! Test harness for inode service tests.
 //!
 //! This module provides test-only utilities for creating in-memory Raft nodes,
 //! temporary RocksDB instances, and mount initialization for testing.
@@ -16,7 +16,7 @@ use tempfile::TempDir;
 use types::fs::{FileAttrs, Inode, InodeId};
 use types::ids::{MountId, ShardGroupId};
 
-/// Test harness for FS service tests.
+/// Test harness for inode service tests.
 pub struct FsTestHarness {
     pub temp_dir: TempDir,
     pub storage: Arc<RocksDBStorage>,
@@ -57,7 +57,7 @@ impl FsTestHarness {
         // Create state store
         let state_store = Arc::new(RaftStateStore::new(Arc::clone(&raft_node)));
 
-        // Create FS service
+        // Create inode service
         use metadata::metrics::MetadataMetrics;
         let metrics = Arc::new(MetadataMetrics::new());
         let inode_service = MetadataInodeServiceImpl::new(
