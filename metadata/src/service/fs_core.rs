@@ -4,14 +4,16 @@
 //! Shared filesystem core semantics used by FileSystemService and InodeService.
 
 use super::domain::{
-    CloseWriteInput, CloseWriteOutput, CoreFailure, CoreResult, CoreSuccess, CreateInput, CreateOutput,
-    FileBlockLocation, Freshness, FsyncBarrierInput, FsyncBarrierOutput, GetAttrInput, GetAttrOutput,
-    GetFileLayoutInput, GetFileLayoutOutput, GetXattrInput, GetXattrOutput, ListXattrInput, ListXattrOutput,
-    MkdirInput, MkdirOutput, OpenInput, OpenOutput, OpenWriteInput, OpenWriteOutput, PresentedFencingToken,
-    ReadDirEntry, ReadDirInput, ReadDirOutput, ReleaseSessionInput, ReleaseSessionOutput, RemoveXattrInput,
-    RemoveXattrOutput, RenameInput, RenameOutput, RenewLeaseInput, RenewLeaseOutput, RequestContext, RmdirInput,
-    RmdirOutput, SessionKey, SetXattrInput, SetXattrOutput, TruncateInput, TruncateOutput, UnlinkInput, UnlinkOutput,
-    WorkerHint, WriteTarget,
+    AccessInput, AccessOutput, CloseWriteInput, CloseWriteOutput, CoreFailure, CoreResult, CoreSuccess, CreateInput,
+    CreateOutput, DeleteOpPlan, FileBlockLocation, Freshness, FsyncBarrierInput, FsyncBarrierOutput, GetAttrInput,
+    GetAttrOutput, GetFileLayoutInput, GetFileLayoutOutput, GetXattrInput, GetXattrOutput, InodeMountGuardInputs,
+    InodeOwner, LinkInput, LinkOutput, ListXattrInput, ListXattrOutput, LookupInput, LookupOutput, MkdirInput,
+    MkdirOutput, OpenInput, OpenOutput, OpenWriteInput, OpenWriteOutput, PresentedFencingToken, ReadDirEntry,
+    ReadDirInput, ReadDirOutput, ReadlinkInput, ReadlinkOutput, ReleaseSessionInput, ReleaseSessionOutput,
+    RemoveXattrInput, RemoveXattrOutput, RenameInput, RenameOpPlan, RenameOutput, RenewLeaseInput, RenewLeaseOutput,
+    RequestContext, RmdirInput, RmdirOutput, SessionGuardInputs, SessionKey, SetAttrInput, SetAttrOutput,
+    SetXattrInput, SetXattrOutput, StatFsInput, StatFsOutput, SymlinkInput, SymlinkOutput, TruncateInput,
+    TruncateOutput, UnlinkInput, UnlinkOutput, WorkerHint, WriteTarget,
 };
 use crate::error::{to_canonical_fs, MetadataError, MetadataResult};
 use crate::mount::MountTable;
@@ -107,6 +109,62 @@ impl FsCore {
 
     pub fn raft_node(&self) -> Option<Arc<AppRaftNode>> {
         self.raft_node.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_worker_commit_hook_for_test(&self, hook: CommitHook) {
+        let mut guard = self
+            .worker_commit_hook
+            .lock()
+            .expect("worker commit hook lock poisoned");
+        *guard = Some(hook);
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn set_worker_commit_hook_debug(&self, hook: CommitHook) {
+        let mut guard = self
+            .worker_commit_hook
+            .lock()
+            .expect("worker commit hook lock poisoned");
+        *guard = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_worker_commit_hook_for_test(&self) {
+        let mut guard = self
+            .worker_commit_hook
+            .lock()
+            .expect("worker commit hook lock poisoned");
+        guard.take();
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn clear_worker_commit_hook_debug(&self) {
+        let mut guard = self
+            .worker_commit_hook
+            .lock()
+            .expect("worker commit hook lock poisoned");
+        guard.take();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_session_manager_for_test(&self) -> Arc<crate::write_session::WriteSessionManager> {
+        Arc::clone(&self.write_session_manager)
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_write_session_manager(&self) -> Arc<crate::write_session::WriteSessionManager> {
+        Arc::clone(&self.write_session_manager)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inode_lease_manager_for_test(&self) -> Arc<crate::inode_lease::InodeLeaseManager> {
+        Arc::clone(&self.inode_lease_manager)
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_inode_lease_manager(&self) -> Arc<crate::inode_lease::InodeLeaseManager> {
+        Arc::clone(&self.inode_lease_manager)
     }
     fn dedup_key(&self, caller_ctx: &RequestHeader) -> MetadataResult<DedupKey> {
         let client_id = caller_ctx.client.client_id;
@@ -474,7 +532,332 @@ impl FsCore {
         }
     }
 
-    pub(crate) async fn get_attr(&self, req: GetAttrInput) -> CoreResult<GetAttrOutput> {
+    fn storage_for_ctx<'a>(&'a self, req_ctx: &RequestContext) -> Result<&'a Arc<RocksDBStorage>, CoreFailure> {
+        self.storage.as_ref().ok_or_else(|| {
+            CoreFailure::new(
+                to_canonical_fs(MetadataError::Internal("Storage not available".to_string())),
+                None,
+                None,
+                None,
+                Self::state_id_from_ctx(req_ctx),
+            )
+        })
+    }
+
+    fn owner_from_inode(inode: &types::fs::Inode) -> InodeOwner {
+        InodeOwner {
+            uid: inode.attrs.uid,
+            gid: inode.attrs.gid,
+        }
+    }
+
+    fn owner_for_inode_id(
+        &self,
+        req_ctx: &RequestContext,
+        storage: &RocksDBStorage,
+        inode_id: InodeId,
+    ) -> Result<Option<InodeOwner>, CoreFailure> {
+        let inode = match storage.get_inode(inode_id) {
+            Ok(inode) => inode,
+            Err(err) => {
+                return Err(CoreFailure::new(
+                    to_canonical_fs(err),
+                    None,
+                    None,
+                    None,
+                    Self::state_id_from_ctx(req_ctx),
+                ));
+            }
+        };
+        Ok(inode.as_ref().map(Self::owner_from_inode))
+    }
+
+    pub(crate) async fn plan_unlink(
+        &self,
+        req_ctx: &RequestContext,
+        parent_inode_id: InodeId,
+        name: &str,
+    ) -> CoreResult<DeleteOpPlan> {
+        let storage = match self.storage_for_ctx(req_ctx) {
+            Ok(storage) => storage,
+            Err(failure) => return Err(failure),
+        };
+
+        let target_inode_id = match storage.get_dentry(parent_inode_id, name) {
+            Ok(inode_id) => inode_id,
+            Err(err) => return self.failure_from_error(req_ctx, err, None, None),
+        };
+        let parent_owner = match self.owner_for_inode_id(req_ctx, storage, parent_inode_id) {
+            Ok(owner) => owner,
+            Err(failure) => return Err(failure),
+        };
+        let target_owner = match target_inode_id {
+            Some(inode_id) => match self.owner_for_inode_id(req_ctx, storage, inode_id) {
+                Ok(owner) => owner,
+                Err(failure) => return Err(failure),
+            },
+            None => None,
+        };
+
+        self.success(
+            req_ctx,
+            DeleteOpPlan {
+                parent_inode_id,
+                target_inode_id,
+                parent_owner,
+                target_owner,
+            },
+            None,
+            None,
+        )
+    }
+
+    pub(crate) async fn plan_rmdir(
+        &self,
+        req_ctx: &RequestContext,
+        parent_inode_id: InodeId,
+        name: &str,
+    ) -> CoreResult<DeleteOpPlan> {
+        self.plan_unlink(req_ctx, parent_inode_id, name).await
+    }
+
+    pub(crate) async fn plan_rename(
+        &self,
+        req_ctx: &RequestContext,
+        src_parent_inode_id: InodeId,
+        src_name: &str,
+        dst_parent_inode_id: InodeId,
+        dst_name: &str,
+    ) -> CoreResult<RenameOpPlan> {
+        let storage = match self.storage_for_ctx(req_ctx) {
+            Ok(storage) => storage,
+            Err(failure) => return Err(failure),
+        };
+
+        let src_inode_id = match storage.get_dentry(src_parent_inode_id, src_name) {
+            Ok(inode_id) => inode_id,
+            Err(err) => return self.failure_from_error(req_ctx, err, None, None),
+        };
+        let dst_inode_id = match storage.get_dentry(dst_parent_inode_id, dst_name) {
+            Ok(inode_id) => inode_id,
+            Err(err) => return self.failure_from_error(req_ctx, err, None, None),
+        };
+
+        let src_parent_owner = match self.owner_for_inode_id(req_ctx, storage, src_parent_inode_id) {
+            Ok(owner) => owner,
+            Err(failure) => return Err(failure),
+        };
+        let dst_parent_owner = match self.owner_for_inode_id(req_ctx, storage, dst_parent_inode_id) {
+            Ok(owner) => owner,
+            Err(failure) => return Err(failure),
+        };
+        let src_owner = match src_inode_id {
+            Some(inode_id) => match self.owner_for_inode_id(req_ctx, storage, inode_id) {
+                Ok(owner) => owner,
+                Err(failure) => return Err(failure),
+            },
+            None => None,
+        };
+        let dst_owner = match dst_inode_id {
+            Some(inode_id) => match self.owner_for_inode_id(req_ctx, storage, inode_id) {
+                Ok(owner) => owner,
+                Err(failure) => return Err(failure),
+            },
+            None => None,
+        };
+
+        self.success(
+            req_ctx,
+            RenameOpPlan {
+                src_parent_inode_id,
+                dst_parent_inode_id,
+                src_inode_id,
+                dst_inode_id,
+                src_parent_owner,
+                src_owner,
+                dst_parent_owner,
+                dst_owner,
+            },
+            None,
+            None,
+        )
+    }
+
+    pub(crate) async fn plan_session(
+        &self,
+        req_ctx: &RequestContext,
+        file_handle: u64,
+    ) -> CoreResult<SessionGuardInputs> {
+        let session = self.write_session_manager.get_session(file_handle);
+        self.success(
+            req_ctx,
+            SessionGuardInputs {
+                file_handle,
+                inode_id: session.as_ref().map(|s| s.inode_id),
+                mount_id: session.as_ref().map(|s| s.mount_id),
+            },
+            None,
+            None,
+        )
+    }
+
+    pub(crate) async fn plan_inode_mount(
+        &self,
+        req_ctx: &RequestContext,
+        inode_id: InodeId,
+    ) -> CoreResult<InodeMountGuardInputs> {
+        let storage = match self.storage_for_ctx(req_ctx) {
+            Ok(storage) => storage,
+            Err(failure) => return Err(failure),
+        };
+        let inode = match storage.get_inode(inode_id) {
+            Ok(Some(inode)) => inode,
+            Ok(None) => {
+                return self.failure_from_error(
+                    req_ctx,
+                    MetadataError::NotFound(format!("Inode not found: {}", inode_id)),
+                    None,
+                    None,
+                );
+            }
+            Err(err) => return self.failure_from_error(req_ctx, err, None, None),
+        };
+        self.success(
+            req_ctx,
+            InodeMountGuardInputs {
+                inode_id,
+                mount_id: inode.mount_id,
+            },
+            None,
+            None,
+        )
+    }
+
+    pub(crate) async fn execute_lookup(&self, req: LookupInput) -> CoreResult<LookupOutput> {
+        let storage = match self.storage_for_ctx(&req.ctx) {
+            Ok(storage) => storage,
+            Err(failure) => return Err(failure),
+        };
+
+        let child_inode_id = match storage.get_dentry(req.parent_inode_id, &req.name) {
+            Ok(Some(child_inode_id)) => child_inode_id,
+            Ok(None) => {
+                return self.failure_from_error(
+                    &req.ctx,
+                    MetadataError::NotFound(format!(
+                        "Entry not found: parent={}, name={}",
+                        req.parent_inode_id, req.name
+                    )),
+                    None,
+                    None,
+                );
+            }
+            Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
+        };
+
+        let child_inode = match storage.get_inode(child_inode_id) {
+            Ok(Some(child_inode)) => child_inode,
+            Ok(None) => {
+                return self.failure_from_error(
+                    &req.ctx,
+                    MetadataError::NotFound(format!("Inode not found: {}", child_inode_id)),
+                    None,
+                    None,
+                );
+            }
+            Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
+        };
+
+        let (group_id, mount_epoch) = self.mount_hints_for_mount(child_inode.mount_id);
+        let route_epoch = self.authoritative_route_epoch().await;
+        self.success_with_route_epoch(
+            &req.ctx,
+            LookupOutput { inode: child_inode },
+            group_id,
+            mount_epoch,
+            route_epoch,
+        )
+    }
+
+    pub(crate) async fn execute_set_attr(&self, req: SetAttrInput) -> CoreResult<SetAttrOutput> {
+        let ctx = match self.route_ctx_for_write(&req.ctx, CoreWriteOp::SetAttr, &[req.inode_id], req.freshness) {
+            Ok(ctx) => ctx,
+            Err(err) => return Err(err),
+        };
+
+        let dedup = match self.dedup_key(&req.ctx.caller) {
+            Ok(k) => k,
+            Err(err) => {
+                return self.failure_from_error(
+                    &req.ctx,
+                    err,
+                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.mount_epoch),
+                );
+            }
+        };
+
+        let command = Command::SetAttr {
+            dedup,
+            inode_id: req.inode_id,
+            mask: req.mask,
+            attrs: req.attrs,
+        };
+        let result = match self.propose_fs_write_command(CoreWriteOp::SetAttr, command).await {
+            Ok(result) => result,
+            Err(err) => {
+                return self.failure_from_error(
+                    &req.ctx,
+                    err,
+                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.mount_epoch),
+                );
+            }
+        };
+
+        match result {
+            FsCommandResult::Ok(_) => {
+                let storage = match self.storage_for_ctx(&req.ctx) {
+                    Ok(storage) => storage,
+                    Err(failure) => return Err(failure),
+                };
+                let inode = match storage.get_inode(req.inode_id) {
+                    Ok(Some(inode)) => inode,
+                    Ok(None) => {
+                        return self.failure_from_error(
+                            &req.ctx,
+                            MetadataError::Internal("Inode disappeared after update".to_string()),
+                            Some(ctx.namespace_owner_group_id.as_raw()),
+                            Some(ctx.mount_epoch),
+                        );
+                    }
+                    Err(err) => {
+                        return self.failure_from_error(
+                            &req.ctx,
+                            err,
+                            Some(ctx.namespace_owner_group_id.as_raw()),
+                            Some(ctx.mount_epoch),
+                        );
+                    }
+                };
+                self.success(
+                    &req.ctx,
+                    SetAttrOutput { attrs: inode.attrs },
+                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.mount_epoch),
+                )
+            }
+            FsCommandResult::Err(err) => self.fatal_fs_failure(
+                &req.ctx,
+                err.errno,
+                err.message,
+                Some(ctx.namespace_owner_group_id.as_raw()),
+                Some(ctx.mount_epoch),
+            ),
+        }
+    }
+
+    pub(crate) async fn execute_get_attr(&self, req: GetAttrInput) -> CoreResult<GetAttrOutput> {
         let storage = match self.storage.as_ref() {
             Some(storage) => storage,
             None => {
@@ -513,7 +896,7 @@ impl FsCore {
         )
     }
 
-    pub(crate) async fn mkdir(&self, req: MkdirInput) -> CoreResult<MkdirOutput> {
+    pub(crate) async fn execute_mkdir(&self, req: MkdirInput) -> CoreResult<MkdirOutput> {
         let ctx = match self.route_ctx_for_write(&req.ctx, CoreWriteOp::Mkdir, &[req.parent_inode_id], req.freshness) {
             Ok(ctx) => ctx,
             Err(err) => return Err(err),
@@ -585,7 +968,7 @@ impl FsCore {
         }
     }
 
-    pub(crate) async fn create(&self, req: CreateInput) -> CoreResult<CreateOutput> {
+    pub(crate) async fn execute_create(&self, req: CreateInput) -> CoreResult<CreateOutput> {
         let ctx = match self.route_ctx_for_write(&req.ctx, CoreWriteOp::Create, &[req.parent_inode_id], req.freshness) {
             Ok(ctx) => ctx,
             Err(err) => return Err(err),
@@ -659,7 +1042,7 @@ impl FsCore {
         }
     }
 
-    pub(crate) async fn unlink(&self, req: UnlinkInput) -> CoreResult<UnlinkOutput> {
+    pub(crate) async fn execute_unlink(&self, req: UnlinkInput) -> CoreResult<UnlinkOutput> {
         let ctx = match self.route_ctx_for_write(&req.ctx, CoreWriteOp::Unlink, &[req.parent_inode_id], req.freshness) {
             Ok(ctx) => ctx,
             Err(err) => return Err(err),
@@ -716,7 +1099,7 @@ impl FsCore {
         }
     }
 
-    pub(crate) async fn rmdir(&self, req: RmdirInput) -> CoreResult<RmdirOutput> {
+    pub(crate) async fn execute_rmdir(&self, req: RmdirInput) -> CoreResult<RmdirOutput> {
         let ctx = match self.route_ctx_for_write(&req.ctx, CoreWriteOp::Rmdir, &[req.parent_inode_id], req.freshness) {
             Ok(ctx) => ctx,
             Err(err) => return Err(err),
@@ -773,7 +1156,7 @@ impl FsCore {
         }
     }
 
-    pub(crate) async fn rename(&self, req: RenameInput) -> CoreResult<RenameOutput> {
+    pub(crate) async fn execute_rename(&self, req: RenameInput) -> CoreResult<RenameOutput> {
         let supported_mask: u32 = 0x1;
         if req.flags & !supported_mask != 0 {
             return self.failure_from_error(
@@ -958,7 +1341,7 @@ impl FsCore {
         }
     }
 
-    pub(crate) async fn read_dir(&self, req: ReadDirInput) -> CoreResult<ReadDirOutput> {
+    pub(crate) async fn execute_read_dir(&self, req: ReadDirInput) -> CoreResult<ReadDirOutput> {
         let storage = match self.storage.as_ref() {
             Some(storage) => storage,
             None => {
@@ -1025,7 +1408,7 @@ impl FsCore {
         )
     }
 
-    pub(crate) async fn open(&self, req: OpenInput) -> CoreResult<OpenOutput> {
+    pub(crate) async fn execute_open(&self, req: OpenInput) -> CoreResult<OpenOutput> {
         let storage = match self.storage.as_ref() {
             Some(storage) => storage,
             None => {
@@ -1063,7 +1446,7 @@ impl FsCore {
         )
     }
 
-    pub(crate) async fn truncate(&self, req: TruncateInput) -> CoreResult<TruncateOutput> {
+    pub(crate) async fn execute_truncate(&self, req: TruncateInput) -> CoreResult<TruncateOutput> {
         let storage = match self.storage.as_ref() {
             Some(storage) => storage,
             None => {
@@ -1206,7 +1589,7 @@ impl FsCore {
         }
     }
 
-    pub(crate) async fn set_xattr(&self, req: SetXattrInput) -> CoreResult<SetXattrOutput> {
+    pub(crate) async fn execute_set_xattr(&self, req: SetXattrInput) -> CoreResult<SetXattrOutput> {
         let route_ctx = match self.route_ctx_for_write(&req.ctx, CoreWriteOp::SetAttr, &[req.inode_id], req.freshness) {
             Ok(ctx) => ctx,
             Err(err) => return Err(err),
@@ -1266,7 +1649,7 @@ impl FsCore {
         }
     }
 
-    pub(crate) async fn get_xattr(&self, req: GetXattrInput) -> CoreResult<GetXattrOutput> {
+    pub(crate) async fn execute_get_xattr(&self, req: GetXattrInput) -> CoreResult<GetXattrOutput> {
         let storage = match self.storage.as_ref() {
             Some(storage) => storage,
             None => {
@@ -1308,7 +1691,7 @@ impl FsCore {
         self.success(&req.ctx, GetXattrOutput { value }, group_id, mount_epoch)
     }
 
-    pub(crate) async fn list_xattr(&self, req: ListXattrInput) -> CoreResult<ListXattrOutput> {
+    pub(crate) async fn execute_list_xattr(&self, req: ListXattrInput) -> CoreResult<ListXattrOutput> {
         let storage = match self.storage.as_ref() {
             Some(storage) => storage,
             None => {
@@ -1339,7 +1722,7 @@ impl FsCore {
         self.success(&req.ctx, ListXattrOutput { names }, group_id, mount_epoch)
     }
 
-    pub(crate) async fn remove_xattr(&self, req: RemoveXattrInput) -> CoreResult<RemoveXattrOutput> {
+    pub(crate) async fn execute_remove_xattr(&self, req: RemoveXattrInput) -> CoreResult<RemoveXattrOutput> {
         let route_ctx = match self.route_ctx_for_write(&req.ctx, CoreWriteOp::SetAttr, &[req.inode_id], req.freshness) {
             Ok(ctx) => ctx,
             Err(err) => return Err(err),
@@ -1400,7 +1783,7 @@ impl FsCore {
         self.write_session_manager.get_session(file_handle)
     }
 
-    pub(crate) async fn release_session(&self, req: ReleaseSessionInput) -> CoreResult<ReleaseSessionOutput> {
+    pub(crate) async fn execute_release(&self, req: ReleaseSessionInput) -> CoreResult<ReleaseSessionOutput> {
         let session = match self.write_session_manager.get_session(req.file_handle) {
             Some(session) => session,
             None => {
@@ -1419,7 +1802,7 @@ impl FsCore {
         self.success_with_route_epoch(&req.ctx, ReleaseSessionOutput, group_id, mount_epoch, route_epoch)
     }
 
-    pub(crate) async fn get_file_layout(&self, req: GetFileLayoutInput) -> CoreResult<GetFileLayoutOutput> {
+    pub(crate) async fn execute_get_file_layout(&self, req: GetFileLayoutInput) -> CoreResult<GetFileLayoutOutput> {
         let storage = match self.storage.as_ref() {
             Some(storage) => storage,
             None => {
@@ -1512,7 +1895,7 @@ impl FsCore {
         )
     }
 
-    pub(crate) async fn renew_lease(&self, req: RenewLeaseInput) -> CoreResult<RenewLeaseOutput> {
+    pub(crate) async fn execute_renew_inode_lease(&self, req: RenewLeaseInput) -> CoreResult<RenewLeaseOutput> {
         let file_handle = req.file_handle;
 
         let session = match self.write_session_manager.get_session(file_handle) {
@@ -1597,7 +1980,7 @@ impl FsCore {
         )
     }
 
-    pub(crate) async fn open_write(&self, req: OpenWriteInput) -> CoreResult<OpenWriteOutput> {
+    pub(crate) async fn execute_open_write(&self, req: OpenWriteInput) -> CoreResult<OpenWriteOutput> {
         let caller_ctx = &req.ctx.caller;
         let inode_id = req.inode_id;
 
@@ -1813,7 +2196,7 @@ impl FsCore {
         )
     }
 
-    pub(crate) async fn close_write(&self, req: CloseWriteInput) -> CoreResult<CloseWriteOutput> {
+    pub(crate) async fn execute_close_write(&self, req: CloseWriteInput) -> CoreResult<CloseWriteOutput> {
         let caller_ctx = &req.ctx.caller;
         let file_handle = req.file_handle;
 
@@ -2074,7 +2457,7 @@ impl FsCore {
         )
     }
 
-    pub(crate) async fn fsync_barrier(&self, req: FsyncBarrierInput) -> CoreResult<FsyncBarrierOutput> {
+    pub(crate) async fn execute_fsync(&self, req: FsyncBarrierInput) -> CoreResult<FsyncBarrierOutput> {
         let caller_ctx = &req.ctx.caller;
         let inode_id = req.inode_id;
 
@@ -2412,6 +2795,60 @@ impl FsCore {
             Some(ctx.namespace_owner_group_id.as_raw()),
             Some(ctx.mount_epoch),
             route_epoch,
+        )
+    }
+
+    pub(crate) async fn execute_hsync(&self, req: FsyncBarrierInput) -> CoreResult<FsyncBarrierOutput> {
+        self.execute_fsync(req).await
+    }
+
+    pub(crate) async fn execute_hflush(&self, req: FsyncBarrierInput) -> CoreResult<FsyncBarrierOutput> {
+        self.execute_fsync(req).await
+    }
+
+    pub(crate) async fn execute_stat_fs(&self, req: StatFsInput) -> CoreResult<StatFsOutput> {
+        self.failure_from_error(
+            &req.ctx,
+            MetadataError::NotSupported("StatFs not yet implemented".to_string()),
+            None,
+            None,
+        )
+    }
+
+    pub(crate) async fn execute_access(&self, req: AccessInput) -> CoreResult<AccessOutput> {
+        let _ = req.mode;
+        self.failure_from_error(
+            &req.ctx,
+            MetadataError::NotSupported("Access not yet implemented".to_string()),
+            None,
+            None,
+        )
+    }
+
+    pub(crate) async fn execute_symlink(&self, req: SymlinkInput) -> CoreResult<SymlinkOutput> {
+        self.failure_from_error(
+            &req.ctx,
+            MetadataError::NotSupported("Symlink not yet implemented".to_string()),
+            None,
+            None,
+        )
+    }
+
+    pub(crate) async fn execute_readlink(&self, req: ReadlinkInput) -> CoreResult<ReadlinkOutput> {
+        self.failure_from_error(
+            &req.ctx,
+            MetadataError::NotSupported("Readlink not yet implemented".to_string()),
+            None,
+            None,
+        )
+    }
+
+    pub(crate) async fn execute_link(&self, req: LinkInput) -> CoreResult<LinkOutput> {
+        self.failure_from_error(
+            &req.ctx,
+            MetadataError::NotSupported("Link not yet implemented".to_string()),
+            None,
+            None,
         )
     }
 

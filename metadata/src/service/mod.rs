@@ -29,5 +29,5 @@ pub use core_util::{
 };
 pub(crate) use fs_core::FsCore;
 pub use guard::{AuthzContext, GuardChain, GuardSpec, LeadershipChecker};
-pub use inode_service::{FsWriteOp, MetadataInodeServiceImpl, RoutedFsWriteCtx};
+pub use inode_service::MetadataInodeServiceImpl;
 pub use path_service::MetadataFileSystemServiceImpl;

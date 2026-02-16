@@ -110,7 +110,7 @@ async fn fsync_barrier_success_updates_size() {
     let inode_id = types::fs::InodeId::new(inode_id_raw);
 
     // Lease + write session setup
-    let lease_mgr = harness.inode_service.inode_lease_manager_for_test();
+    let lease_mgr = harness.inode_service.debug_inode_lease_manager();
     let client_id = ClientId::new(42);
     let call_id = types::CallId::new();
     let (lease_id, lease_epoch, _) = lease_mgr
@@ -129,7 +129,7 @@ async fn fsync_barrier_success_updates_size() {
         let last_req = last_req.clone();
         harness
             .inode_service
-            .set_worker_commit_hook_for_test(Arc::new(move |req: CommitWriteRequestProto| {
+            .set_worker_commit_hook_debug(Arc::new(move |req: CommitWriteRequestProto| {
                 last_req.lock().unwrap().replace(req.clone());
                 CommitWriteResponseProto {
                     header: Some(proto::worker::DataResponseHeaderProto {
@@ -165,7 +165,7 @@ async fn fsync_barrier_success_updates_size() {
         }),
     };
 
-    let session_mgr = harness.inode_service.write_session_manager_for_test();
+    let session_mgr = harness.inode_service.debug_write_session_manager();
     let file_handle = session_mgr.create_session(
         inode_id,
         mount_id,
@@ -218,7 +218,7 @@ async fn fsync_barrier_success_updates_size() {
     let inode = harness.storage.get_inode(inode_id).unwrap().unwrap();
     assert!(inode.attrs.size >= 8);
 
-    harness.inode_service.clear_worker_commit_hook_for_test();
+    harness.inode_service.clear_worker_commit_hook_debug();
 }
 
 #[tokio::test]
@@ -236,7 +236,7 @@ async fn fsync_barrier_retryable_does_not_persist_size() {
     let inode_id_raw = create_file_and_lookup(&harness, root_inode_id.as_raw(), "b").await;
     let inode_id = types::fs::InodeId::new(inode_id_raw);
 
-    let lease_mgr = harness.inode_service.inode_lease_manager_for_test();
+    let lease_mgr = harness.inode_service.debug_inode_lease_manager();
     let client_id = ClientId::new(99);
     let call_id = types::CallId::new();
     let (lease_id, lease_epoch, _) = lease_mgr
@@ -255,7 +255,7 @@ async fn fsync_barrier_retryable_does_not_persist_size() {
         let last_req = last_req.clone();
         harness
             .inode_service
-            .set_worker_commit_hook_for_test(Arc::new(move |req: CommitWriteRequestProto| {
+            .set_worker_commit_hook_debug(Arc::new(move |req: CommitWriteRequestProto| {
                 last_req.lock().unwrap().replace(req.clone());
                 let err = proto::common::ErrorDetailProto {
                     error_class: ErrorClassProto::ErrorClassRetryable as i32,
@@ -301,7 +301,7 @@ async fn fsync_barrier_retryable_does_not_persist_size() {
         }),
     };
 
-    let session_mgr = harness.inode_service.write_session_manager_for_test();
+    let session_mgr = harness.inode_service.debug_write_session_manager();
     let file_handle = session_mgr.create_session(
         inode_id,
         mount_id,
@@ -355,5 +355,5 @@ async fn fsync_barrier_retryable_does_not_persist_size() {
     let inode = harness.storage.get_inode(inode_id).unwrap().unwrap();
     assert_eq!(inode.attrs.size, 0);
 
-    harness.inode_service.clear_worker_commit_hook_for_test();
+    harness.inode_service.clear_worker_commit_hook_debug();
 }

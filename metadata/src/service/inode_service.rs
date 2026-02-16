@@ -1,73 +1,102 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! MetadataInodeServiceProto implementation.
-//!
-//! FS write routing convergence - all FS write operations
-//! must route to mount.namespace_owner_group_id.
+//! MetadataInodeServiceProto implementation as a thin RPC adapter.
 
 use super::domain::{
-    CloseWriteInput, CloseWriteIntent, FileRange, Freshness, FsyncBarrierInput, GetFileLayoutInput, OpenWriteInput,
-    ReleaseSessionInput, RenewLeaseInput,
+    AccessInput, CloseWriteInput, CloseWriteIntent, CreateInput, FileRange, Freshness, FsyncBarrierInput, GetAttrInput,
+    GetFileLayoutInput, GetXattrInput, LinkInput, ListXattrInput, LookupInput, MkdirInput, OpenInput, OpenWriteInput,
+    ReadDirInput, ReadlinkInput, ReleaseSessionInput, RemoveXattrInput, RenameInput, RenewLeaseInput, RmdirInput,
+    SetAttrInput, SetXattrInput, StatFsInput, SymlinkInput, TruncateInput, UnlinkInput,
 };
 use super::fs_core::FsCore;
 use super::guard::{AuthzCheck, AuthzContext, GuardChain, GuardSpec, LeadershipChecker};
 use super::{
-    extent_from_proto, extent_to_proto, extract_and_inject_context, fatal_fs_header, fencing_to_proto,
-    header_from_canonical_error, header_from_core_failure, lease_id_from_proto, lease_id_to_proto, location_to_proto,
-    need_refresh_header, ok_header_from_core_success, ok_header_from_request, presented_fencing_from_proto,
-    request_context_from_proto, write_target_to_proto,
+    extent_from_proto, extent_to_proto, fencing_to_proto, header_from_canonical_error, header_from_core_failure,
+    lease_id_from_proto, lease_id_to_proto, location_to_proto, ok_header_from_core_success,
+    presented_fencing_from_proto, request_context_from_proto, write_target_to_proto,
 };
-use super::{AuthzOp, AuthzProvider, AuthzTarget, InodePermReader};
+use super::{AllowAllAuthz, AuthzOp, AuthzProvider, AuthzScheme, AuthzTarget, InodePermReader};
 use crate::data_io::DataIoOp;
 use crate::error::{to_canonical_fs, MetadataError, MetadataResult};
 use crate::mount::MountTable;
-use crate::raft::{AppDataResponse, AppRaftNode, Command, DedupKey, FsCommandResult, RocksDBStorage};
+use crate::raft::{AppRaftNode, RocksDBStorage};
 use crate::readiness::RootReadinessGate;
 use crate::state::StateStore;
-use common::error::canonical::RefreshReason;
-use common::header::{RequestHeader, RpcErrorCode};
+use common::header::RequestHeader;
 use proto::metadata::metadata_inode_service_proto_server::MetadataInodeServiceProto;
 use proto::metadata::*;
 use proto::worker::CommitWriteRequestProto;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status};
-use tracing::{debug, instrument, warn};
-use types::fs::{FileAttrs, FsErrorCode, InodeId, InodeKind};
-use types::ids::{LeaseId, MountId, ShardGroupId};
-use types::layout::FileLayout;
-use types::RaftLogId;
+use tracing::instrument;
+use types::fs::{FileAttrs, InodeData, InodeId, InodeKind};
+
+macro_rules! response_with_header {
+    ($resp:expr, $header:expr) => {{
+        let mut resp = $resp;
+        resp.header = Some($header);
+        Ok(Response::new(resp))
+    }};
+}
+
+macro_rules! error_response {
+    ($resp_ty:ty, $header:expr) => {{
+        response_with_header!(<$resp_ty>::default(), $header)
+    }};
+}
+
+trait HeaderCarrier: Default {
+    fn set_header(&mut self, header: proto::common::ResponseHeaderProto);
+}
+
+macro_rules! impl_header_carrier {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl HeaderCarrier for $ty {
+                fn set_header(&mut self, header: proto::common::ResponseHeaderProto) {
+                    self.header = Some(header);
+                }
+            }
+        )+
+    };
+}
+
+impl_header_carrier!(
+    LookupResponseProto,
+    GetAttrResponseProto,
+    SetAttrResponseProto,
+    MkdirResponseProto,
+    CreateResponseProto,
+    ReadDirResponseProto,
+    UnlinkResponseProto,
+    RmdirResponseProto,
+    FsRenameResponseProto,
+    OpenResponseProto,
+    ReleaseResponseProto,
+    FsyncResponseProto,
+    HsyncResponseProto,
+    HflushResponseProto,
+    OpenWriteResponseProto,
+    CloseWriteResponseProto,
+    GetFileLayoutResponseProto,
+    RenewInodeLeaseResponseProto,
+    TruncateResponseProto,
+    StatFsResponseProto,
+    AccessResponseProto,
+    SymlinkResponseProto,
+    ReadlinkResponseProto,
+    LinkResponseProto,
+    SetXattrResponseProto,
+    GetXattrResponseProto,
+    ListXattrResponseProto,
+    RemoveXattrResponseProto
+);
 
 type CommitHook = Arc<dyn Fn(CommitWriteRequestProto) -> proto::worker::CommitWriteResponseProto + Send + Sync>;
 
-/// Routed FS write context.
-/// Contains mount information needed for FS write operations.
-#[derive(Clone, Debug)]
-pub struct RoutedFsWriteCtx {
-    /// Mount ID.
-    pub mount_id: MountId,
-    /// Namespace owner group ID (target Raft group for this write).
-    pub namespace_owner_group_id: ShardGroupId,
-    /// Mount epoch (for validation).
-    pub mount_epoch: u64,
-    /// Latest state ID (if available).
-    pub latest_state_id: Option<RaftLogId>,
-}
-
-/// FS write operation type (for AuthZ hook and logging).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FsWriteOp {
-    Create,
-    Mkdir,
-    Unlink,
-    Rmdir,
-    Rename,
-    SetAttr,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FsRpcAuthz {
+enum InodeRpcAuthz {
     Lookup,
     GetAttr,
     SetAttr,
@@ -80,29 +109,34 @@ enum FsRpcAuthz {
     Open,
     Release,
     Fsync,
+    Hsync,
+    Hflush,
     OpenWrite,
     CloseWrite,
     GetFileLayout,
     RenewInodeLease,
     Truncate,
+    StatFs,
+    Access,
+    Symlink,
+    Readlink,
+    Link,
     SetXattr,
     GetXattr,
     ListXattr,
     RemoveXattr,
 }
 
+#[derive(Clone, Copy)]
+enum FsyncFlavor {
+    Fsync,
+    Hsync,
+    Hflush,
+}
+
 /// MetadataInodeServiceProto implementation.
 pub struct MetadataInodeServiceImpl {
     fs_core: Arc<FsCore>,
-    mount_table: Arc<MountTable>,
-    storage: Option<Arc<RocksDBStorage>>,
-    raft_node: Option<Arc<AppRaftNode>>,
-    metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
-    write_session_manager: Arc<crate::write_session::WriteSessionManager>,
-    /// Worker manager (for block allocation).
-    worker_manager: Option<Arc<crate::worker::WorkerManager>>,
-    inode_lease_manager: Arc<crate::inode_lease::InodeLeaseManager>,
-    worker_commit_hook: Arc<Mutex<Option<CommitHook>>>,
     guard_chain: GuardChain,
     inode_perm_reader: Option<Arc<dyn InodePermReader>>,
 }
@@ -119,41 +153,32 @@ impl MetadataInodeServiceImpl {
             Arc::clone(&inode_lease_manager),
             Arc::clone(&worker_commit_hook),
         ));
+
+        let mut guard_chain = GuardChain::new(mount_table);
+        guard_chain.set_authz_provider(Arc::new(AllowAllAuthz));
+
         Self {
             fs_core,
-            guard_chain: GuardChain::new(Arc::clone(&mount_table)),
-            mount_table,
-            storage: None,
-            raft_node: None,
-            metrics: None,
-            write_session_manager,
-            worker_manager: None,
-            inode_lease_manager,
-            worker_commit_hook,
+            guard_chain,
             inode_perm_reader: None,
         }
     }
 
-    /// Set storage for inode/dentry access (required for FS operations).
-    pub fn with_storage(mut self, storage: Arc<RocksDBStorage>) -> Self {
-        self.storage = Some(storage);
+    pub fn with_storage(mut self, db: Arc<RocksDBStorage>) -> Self {
         Arc::get_mut(&mut self.fs_core)
             .expect("fs_core should be uniquely owned during builder configuration")
-            .set_storage(self.storage.as_ref().unwrap().clone());
+            .set_storage(db);
         self
     }
 
-    /// Set Raft node for leader/follower information (optional).
-    pub fn with_raft_node(mut self, raft_node: Arc<AppRaftNode>) -> Self {
-        self.guard_chain.set_leadership_checker(Arc::clone(&raft_node));
-        self.raft_node = Some(raft_node);
+    pub fn with_raft_node(mut self, node: Arc<AppRaftNode>) -> Self {
+        self.guard_chain.set_leadership_checker(Arc::clone(&node));
         Arc::get_mut(&mut self.fs_core)
             .expect("fs_core should be uniquely owned during builder configuration")
-            .set_raft_node(self.raft_node.as_ref().unwrap().clone());
+            .set_raft_node(node);
         self
     }
 
-    /// Set a custom leadership checker (primarily for tests).
     pub fn with_leadership_checker<T>(mut self, checker: Arc<T>) -> Self
     where
         T: LeadershipChecker + 'static,
@@ -162,12 +187,10 @@ impl MetadataInodeServiceImpl {
         self
     }
 
-    /// Set metrics for FS write routing tracking (optional).
     pub fn with_metrics(mut self, metrics: Arc<crate::metrics::MetadataMetrics>) -> Self {
-        self.metrics = Some(metrics);
         Arc::get_mut(&mut self.fs_core)
             .expect("fs_core should be uniquely owned during builder configuration")
-            .set_metrics(self.metrics.as_ref().unwrap().clone());
+            .set_metrics(metrics);
         self
     }
 
@@ -177,6 +200,10 @@ impl MetadataInodeServiceImpl {
     }
 
     pub fn with_authz_provider(mut self, provider: Arc<dyn AuthzProvider>) -> Self {
+        assert!(
+            !matches!(provider.scheme(), AuthzScheme::RangerPath),
+            "InodeService does not support RangerPath; use FileSystemService"
+        );
         self.guard_chain.set_authz_provider(provider);
         self
     }
@@ -186,59 +213,50 @@ impl MetadataInodeServiceImpl {
         self
     }
 
-    /// Test helper: override the worker commit hook for injected responses.
-    pub fn set_worker_commit_hook_for_test(
-        &self,
-        hook: Arc<
-            dyn Fn(proto::worker::CommitWriteRequestProto) -> proto::worker::CommitWriteResponseProto + Send + Sync,
-        >,
-    ) {
-        let mut guard = self.worker_commit_hook.lock().unwrap();
-        *guard = Some(hook);
+    #[cfg(test)]
+    pub fn set_worker_commit_hook_for_test(&self, hook: CommitHook) {
+        self.fs_core.set_worker_commit_hook_for_test(hook);
     }
 
-    /// Test helper: clear any overridden commit hook.
+    #[cfg(debug_assertions)]
+    pub fn set_worker_commit_hook_debug(&self, hook: CommitHook) {
+        self.fs_core.set_worker_commit_hook_debug(hook);
+    }
+
+    #[cfg(test)]
     pub fn clear_worker_commit_hook_for_test(&self) {
-        let mut guard = self.worker_commit_hook.lock().unwrap();
-        guard.take();
+        self.fs_core.clear_worker_commit_hook_for_test();
     }
 
-    /// Test helper: expose the write session manager.
+    #[cfg(debug_assertions)]
+    pub fn clear_worker_commit_hook_debug(&self) {
+        self.fs_core.clear_worker_commit_hook_debug();
+    }
+
+    #[cfg(test)]
     pub fn write_session_manager_for_test(&self) -> Arc<crate::write_session::WriteSessionManager> {
-        Arc::clone(&self.write_session_manager)
+        self.fs_core.write_session_manager_for_test()
     }
 
-    /// Test helper: expose the inode lease manager.
+    #[cfg(debug_assertions)]
+    pub fn debug_write_session_manager(&self) -> Arc<crate::write_session::WriteSessionManager> {
+        self.fs_core.debug_write_session_manager()
+    }
+
+    #[cfg(test)]
     pub fn inode_lease_manager_for_test(&self) -> Arc<crate::inode_lease::InodeLeaseManager> {
-        Arc::clone(&self.inode_lease_manager)
+        self.fs_core.inode_lease_manager_for_test()
     }
 
-    fn dedup_key(&self, caller_ctx: &RequestHeader) -> MetadataResult<DedupKey> {
-        let client_id = caller_ctx.client.client_id;
-        if client_id.as_raw() == 0 {
-            return Err(MetadataError::InvalidArgument(
-                "client_id must be provided for dedup".to_string(),
-            ));
-        }
-        Ok(DedupKey::new(client_id, caller_ctx.client.call_id))
+    #[cfg(debug_assertions)]
+    pub fn debug_inode_lease_manager(&self) -> Arc<crate::inode_lease::InodeLeaseManager> {
+        self.fs_core.debug_inode_lease_manager()
     }
 
-    fn header_from_error(
-        req_header: &Option<proto::common::RequestHeaderProto>,
-        err: MetadataError,
-        group_id: Option<u64>,
-        mount_epoch: Option<u64>,
-    ) -> proto::common::ResponseHeaderProto {
-        let err = to_canonical_fs(err);
-        header_from_canonical_error(req_header, group_id, mount_epoch, &err)
-    }
-
-    /// Set worker manager for block allocation (optional).
     pub fn with_worker_manager(mut self, worker_manager: Arc<crate::worker::WorkerManager>) -> Self {
-        self.worker_manager = Some(worker_manager);
         Arc::get_mut(&mut self.fs_core)
             .expect("fs_core should be uniquely owned during builder configuration")
-            .set_worker_manager(self.worker_manager.as_ref().unwrap().clone());
+            .set_worker_manager(worker_manager);
         self
     }
 
@@ -246,157 +264,12 @@ impl MetadataInodeServiceImpl {
         Arc::clone(&self.fs_core)
     }
 
-    // RPC -> authz mapping table for inode/handle service handlers:
-    // READ_META: lookup/get_attr/read_dir/open/get_xattr/list_xattr
-    // WRITE_META: mkdir/create/unlink/rmdir/rename/set_attr/set_xattr/remove_xattr
-    // DATA_IO: release/open_write/close_write/fsync/hsync/hflush/truncate/get_file_layout/renew_inode_lease
-    fn authz_for_rpc(rpc: FsRpcAuthz, target: AuthzTarget) -> AuthzContext {
-        let op = match rpc {
-            FsRpcAuthz::Lookup | FsRpcAuthz::GetAttr | FsRpcAuthz::ReadDir | FsRpcAuthz::Open => AuthzOp::Read,
-            FsRpcAuthz::SetAttr | FsRpcAuthz::Mkdir | FsRpcAuthz::Create => AuthzOp::Write,
-            FsRpcAuthz::Unlink | FsRpcAuthz::Rmdir => AuthzOp::Delete,
-            FsRpcAuthz::Rename => AuthzOp::Rename,
-            FsRpcAuthz::GetXattr | FsRpcAuthz::ListXattr | FsRpcAuthz::SetXattr | FsRpcAuthz::RemoveXattr => {
-                AuthzOp::Xattr
-            }
-            FsRpcAuthz::Release
-            | FsRpcAuthz::Fsync
-            | FsRpcAuthz::OpenWrite
-            | FsRpcAuthz::CloseWrite
-            | FsRpcAuthz::GetFileLayout
-            | FsRpcAuthz::RenewInodeLease
-            | FsRpcAuthz::Truncate => AuthzOp::Write,
-        };
-        AuthzContext::new(op, vec![target])
-    }
-
-    fn sticky_pre_checks_for_delete(parent_inode_id: InodeId, target_inode_id: Option<InodeId>) -> Vec<AuthzCheck> {
-        target_inode_id
-            .into_iter()
-            .map(|target_inode_id| AuthzCheck {
-                op: AuthzOp::Sticky,
-                target: AuthzTarget::for_inode(target_inode_id).with_parent(parent_inode_id),
-            })
-            .collect()
-    }
-
-    fn sticky_pre_checks_for_rename(
-        src_parent_inode_id: InodeId,
-        src_inode_id: Option<InodeId>,
-        dst_parent_inode_id: InodeId,
-        dst_inode_id: Option<InodeId>,
-    ) -> Vec<AuthzCheck> {
-        let mut checks = Vec::new();
-        if let Some(src_inode_id) = src_inode_id {
-            checks.push(AuthzCheck {
-                op: AuthzOp::Sticky,
-                target: AuthzTarget::for_inode(src_inode_id).with_parent(src_parent_inode_id),
-            });
-        }
-        if let Some(dst_inode_id) = dst_inode_id {
-            checks.push(AuthzCheck {
-                op: AuthzOp::Sticky,
-                target: AuthzTarget::for_inode(dst_inode_id).with_parent(dst_parent_inode_id),
-            });
-        }
-        checks
-    }
-
-    /// Route FS write operation to mount.namespace_owner_group_id.
-    ///
-    /// This function:
-    /// 1. Reads parent inode(s) to get mount_id
-    /// 2. Queries mount table to get namespace_owner_group_id
-    /// 3. Validates mount_epoch/state_id if provided
-    /// 4. Returns RoutedFsWriteCtx for use in Raft command
-    fn route_fs_write_ctx(
-        &self,
-        op: FsWriteOp,
-        parent_inode_ids: &[InodeId],
-        req_header: &Option<proto::common::RequestHeaderProto>,
-    ) -> MetadataResult<RoutedFsWriteCtx> {
-        let storage = self
-            .storage
-            .as_ref()
-            .ok_or_else(|| MetadataError::Internal("Storage not available".to_string()))?;
-
-        // Read first parent inode to get mount_id
-        let parent_inode_id = parent_inode_ids
-            .first()
-            .ok_or_else(|| MetadataError::InvalidArgument("No parent inode provided".to_string()))?;
-        let parent_inode = storage
-            .get_inode(*parent_inode_id)?
-            .ok_or_else(|| MetadataError::NotFound(format!("Parent inode not found: {}", parent_inode_id)))?;
-
-        let mount_id = parent_inode.mount_id;
-        for other_parent in parent_inode_ids.iter().skip(1) {
-            let inode = storage
-                .get_inode(*other_parent)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Parent inode not found: {}", other_parent)))?;
-            if inode.mount_id != mount_id {
-                return Err(MetadataError::CrossMountRename(
-                    "cross-mount operation is not allowed".to_string(),
-                ));
-            }
-        }
-
-        // Get mount entry
-        let mount_entry = self
-            .mount_table
-            .get_mount(mount_id)?
-            .ok_or_else(|| MetadataError::NotFound(format!("Mount not found: {:?}", mount_id)))?;
-
-        // Validate mount_epoch if provided
-        // If mismatch, return error that will be converted to NEED_REFRESH/MOVED
-        if let Some(header) = req_header {
-            if let Some(client_mount_epoch) = header.mount_epoch {
-                let current_mount_epoch = mount_entry.config_version;
-                if client_mount_epoch != current_mount_epoch {
-                    return Err(MetadataError::MountEpochMismatch {
-                        expected: current_mount_epoch,
-                        got: client_mount_epoch,
-                        mount_id: Some(mount_id),
-                    });
-                }
-            }
-        }
-
-        // Get latest state_id if available
-        let latest_state_id = if let Some(ref raft_node) = self.raft_node {
-            raft_node.get_last_applied_state_id()
-        } else {
-            None
-        };
-
-        // Log routing decision
-        debug!(
-            op = ?op,
-            mount_id = %mount_id.as_raw(),
-            owner_group_id = %mount_entry.namespace_owner_group_id.as_raw(),
-            mount_epoch = mount_entry.config_version,
-            "FS write routed to mount namespace owner group"
-        );
-
-        if let Some(ref metrics) = self.metrics {
-            metrics
-                .fs_write_routed_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        Ok(RoutedFsWriteCtx {
-            mount_id,
-            namespace_owner_group_id: mount_entry.namespace_owner_group_id,
-            mount_epoch: mount_entry.config_version,
-            latest_state_id,
-        })
-    }
-
     async fn guard_request(
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
         caller_ctx: &RequestHeader,
         mut spec: GuardSpec,
-        mount_id: Option<MountId>,
+        mount_id: Option<types::ids::MountId>,
         authz: Option<AuthzContext>,
     ) -> Option<proto::common::ResponseHeaderProto> {
         if authz.is_some() {
@@ -441,97 +314,71 @@ impl MetadataInodeServiceImpl {
         .await
     }
 
-    // DEPRECATED: Use core_util::fatal_fs_header or need_refresh_header instead.
-    // This method is kept temporarily for compatibility but will be removed.
-    #[allow(dead_code)]
-    fn create_fs_error_response(
-        &self,
-        req_header: &Option<proto::common::RequestHeaderProto>,
-        error_code: FsErrorCode,
-        message: String,
-        group_id: Option<u64>,
-        mount_epoch: Option<u64>,
-    ) -> proto::common::ResponseHeaderProto {
-        fatal_fs_header(req_header, error_code, message, group_id, mount_epoch)
-    }
-
-    /// Propose FS write command to Raft and update metrics.
-    /// This is the unified entry point for all FS write operations that write to Raft.
-    /// It ensures we can track and guard against write amplification.
-    async fn propose_fs_write_command(&self, op: FsWriteOp, command: Command) -> MetadataResult<FsCommandResult> {
-        let raft_node = self
-            .raft_node
-            .as_ref()
-            .ok_or_else(|| MetadataError::Internal("Raft node not available".to_string()))?;
-
-        let dedup_key = command.dedup_key().clone();
-        let fingerprint = command.fingerprint();
-
-        if let Some(storage) = &self.storage {
-            if let Some(existing) = storage.get_applied_result(&dedup_key)? {
-                if existing.fingerprint != fingerprint {
-                    return Err(MetadataError::InvalidArgument(format!(
-                        "call_id {} reused with different command payload",
-                        dedup_key.call_id
-                    )));
-                }
-                return Ok(match existing.result {
-                    AppDataResponse::Fs(res) => res,
-                    _ => FsCommandResult::ok(),
-                });
-            }
-        }
-
-        // Update metrics before proposing
-        if let Some(metrics) = &self.metrics {
-            metrics.fs_raft_appends_total.fetch_add(1, Ordering::Relaxed);
-            match op {
-                FsWriteOp::Create => {
-                    metrics.fs_raft_appends_create.fetch_add(1, Ordering::Relaxed);
-                }
-                FsWriteOp::Mkdir => {
-                    metrics.fs_raft_appends_mkdir.fetch_add(1, Ordering::Relaxed);
-                }
-                FsWriteOp::Unlink => {
-                    metrics.fs_raft_appends_unlink.fetch_add(1, Ordering::Relaxed);
-                }
-                FsWriteOp::Rmdir => {
-                    metrics.fs_raft_appends_rmdir.fetch_add(1, Ordering::Relaxed);
-                }
-                FsWriteOp::Rename => {
-                    metrics.fs_raft_appends_rename.fetch_add(1, Ordering::Relaxed);
-                }
-                FsWriteOp::SetAttr => {
-                    metrics.fs_raft_appends_setattr.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-
-        // Propose to Raft
-        let response = raft_node
-            .propose(command)
-            .await
-            .map_err(|e| MetadataError::Internal(format!("Failed to propose command: {}", e)))?;
-
-        let fs_result = match response {
-            AppDataResponse::Fs(res) => res,
-            _ => FsCommandResult::ok(),
+    fn authz_for_rpc(rpc: InodeRpcAuthz, targets: Vec<AuthzTarget>) -> AuthzContext {
+        let op = match rpc {
+            InodeRpcAuthz::Lookup
+            | InodeRpcAuthz::GetAttr
+            | InodeRpcAuthz::ReadDir
+            | InodeRpcAuthz::Open
+            | InodeRpcAuthz::GetFileLayout
+            | InodeRpcAuthz::StatFs
+            | InodeRpcAuthz::Access
+            | InodeRpcAuthz::Readlink => AuthzOp::Read,
+            InodeRpcAuthz::SetAttr
+            | InodeRpcAuthz::Mkdir
+            | InodeRpcAuthz::Create
+            | InodeRpcAuthz::Release
+            | InodeRpcAuthz::Fsync
+            | InodeRpcAuthz::Hsync
+            | InodeRpcAuthz::Hflush
+            | InodeRpcAuthz::OpenWrite
+            | InodeRpcAuthz::CloseWrite
+            | InodeRpcAuthz::RenewInodeLease
+            | InodeRpcAuthz::Truncate
+            | InodeRpcAuthz::Symlink
+            | InodeRpcAuthz::Link => AuthzOp::Write,
+            InodeRpcAuthz::Unlink | InodeRpcAuthz::Rmdir => AuthzOp::Delete,
+            InodeRpcAuthz::Rename => AuthzOp::Rename,
+            InodeRpcAuthz::SetXattr
+            | InodeRpcAuthz::GetXattr
+            | InodeRpcAuthz::ListXattr
+            | InodeRpcAuthz::RemoveXattr => AuthzOp::Xattr,
         };
-
-        Ok(fs_result)
+        AuthzContext::new(op, targets)
     }
 
-    // DEPRECATED: Use core_util::ok_header_from_request instead.
-    #[allow(dead_code)]
-    fn create_response_header_from_request(
-        &self,
-        req_header: &Option<proto::common::RequestHeaderProto>,
-        group_id: Option<u64>,
-    ) -> proto::common::ResponseHeaderProto {
-        ok_header_from_request(req_header, group_id, None)
+    fn sticky_pre_checks_for_delete(parent_inode_id: InodeId, target_inode_id: Option<InodeId>) -> Vec<AuthzCheck> {
+        target_inode_id
+            .into_iter()
+            .map(|target_inode_id| AuthzCheck {
+                op: AuthzOp::Sticky,
+                target: AuthzTarget::for_inode(target_inode_id).with_parent(parent_inode_id),
+            })
+            .collect()
     }
 
-    /// Convert proto FileAttrsProto to types FileAttrs.
+    fn sticky_pre_checks_for_rename(
+        src_parent_inode_id: InodeId,
+        src_inode_id: Option<InodeId>,
+        dst_parent_inode_id: InodeId,
+        dst_inode_id: Option<InodeId>,
+    ) -> Vec<AuthzCheck> {
+        let mut checks = Vec::new();
+        if let Some(src_inode_id) = src_inode_id {
+            checks.push(AuthzCheck {
+                op: AuthzOp::Sticky,
+                target: AuthzTarget::for_inode(src_inode_id).with_parent(src_parent_inode_id),
+            });
+        }
+        if let Some(dst_inode_id) = dst_inode_id {
+            checks.push(AuthzCheck {
+                op: AuthzOp::Sticky,
+                target: AuthzTarget::for_inode(dst_inode_id).with_parent(dst_parent_inode_id),
+            });
+        }
+        checks
+    }
+
     fn proto_to_file_attrs(attrs: Option<proto::fs::FileAttrsProto>) -> MetadataResult<FileAttrs> {
         let attrs = attrs.ok_or_else(|| MetadataError::InvalidArgument("Missing FileAttrs".to_string()))?;
         Ok(FileAttrs {
@@ -546,7 +393,6 @@ impl MetadataInodeServiceImpl {
         })
     }
 
-    /// Convert types FileAttrs to proto FileAttrsProto.
     fn file_attrs_to_proto(attrs: &FileAttrs) -> proto::fs::FileAttrsProto {
         proto::fs::FileAttrsProto {
             mode: attrs.mode,
@@ -560,14 +406,198 @@ impl MetadataInodeServiceImpl {
         }
     }
 
-    /// Convert proto FileLayoutProto to types FileLayout.
-    fn proto_to_file_layout(layout: Option<proto::common::FileLayoutProto>) -> MetadataResult<FileLayout> {
+    fn proto_to_file_layout(
+        layout: Option<proto::common::FileLayoutProto>,
+    ) -> MetadataResult<types::layout::FileLayout> {
         let layout = layout.ok_or_else(|| MetadataError::InvalidArgument("Missing FileLayout".to_string()))?;
-        Ok(FileLayout::new(
+        Ok(types::layout::FileLayout::new(
             layout.block_size,
             layout.chunk_size,
             layout.replication as u8,
         ))
+    }
+
+    fn inode_id_from_proto(field: Option<proto::fs::InodeIdProto>, field_name: &str) -> MetadataResult<InodeId> {
+        let inode_id = field.ok_or_else(|| MetadataError::InvalidArgument(format!("Missing {}", field_name)))?;
+        Ok(InodeId::new(inode_id.value))
+    }
+
+    fn freshness_from_header(req_header: &Option<proto::common::RequestHeaderProto>) -> Freshness {
+        Freshness {
+            mount_epoch: req_header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req_header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: None,
+        }
+    }
+
+    fn response_with_metadata_error<T: HeaderCarrier>(
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        err: MetadataError,
+    ) -> Result<Response<T>, Status> {
+        let canonical = to_canonical_fs(err);
+        let mut response = T::default();
+        response.set_header(header_from_canonical_error(req_header, None, None, &canonical));
+        Ok(Response::new(response))
+    }
+
+    fn inode_to_proto(inode: &types::fs::Inode) -> proto::fs::InodeProto {
+        let data = match &inode.data {
+            InodeData::File { extents, lease_epoch } => {
+                Some(proto::fs::inode_proto::Data::File(proto::fs::InodeFileProto {
+                    extents: extents.iter().map(extent_to_proto).collect(),
+                    lease_epoch: *lease_epoch,
+                    lease_id: None,
+                }))
+            }
+            InodeData::Dir => Some(proto::fs::inode_proto::Data::Dir(proto::fs::InodeDirectoryProto {})),
+            InodeData::Symlink { target } => {
+                Some(proto::fs::inode_proto::Data::Symlink(proto::fs::InodeSymlinkProto {
+                    target: target.clone(),
+                }))
+            }
+        };
+
+        proto::fs::InodeProto {
+            inode_id: Some(proto::fs::InodeIdProto {
+                value: inode.inode_id.as_raw(),
+            }),
+            kind: match inode.kind {
+                InodeKind::File => proto::fs::InodeKindProto::InodeKindFile as i32,
+                InodeKind::Dir => proto::fs::InodeKindProto::InodeKindDir as i32,
+                InodeKind::Symlink => proto::fs::InodeKindProto::InodeKindSymlink as i32,
+            },
+            attrs: Some(Self::file_attrs_to_proto(&inode.attrs)),
+            data,
+            mount_id: Some(proto::common::MountIdProto {
+                value: inode.mount_id.as_raw(),
+            }),
+            xattrs: inode
+                .xattrs
+                .iter()
+                .map(|(name, value)| proto::fs::XattrProto {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    async fn fsync_like(
+        &self,
+        req: FsyncRequestProto,
+        flavor: FsyncFlavor,
+    ) -> Result<proto::common::ResponseHeaderProto, Status> {
+        let req_ctx = request_context_from_proto(&req.header);
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &req_ctx.caller).await {
+            return Ok(resp_header);
+        }
+
+        let inode_id = match Self::inode_id_from_proto(req.inode_id.clone(), "inode_id") {
+            Ok(inode_id) => inode_id,
+            Err(err) => {
+                return Ok(header_from_canonical_error(
+                    &req.header,
+                    None,
+                    None,
+                    &to_canonical_fs(err),
+                ));
+            }
+        };
+
+        let session_plan = match req.file_handle {
+            Some(file_handle) => match self.fs_core.plan_session(&req_ctx, file_handle).await {
+                Ok(plan) => Some(plan),
+                Err(failure) => return Ok(header_from_core_failure(&req_ctx, &failure)),
+            },
+            None => None,
+        };
+        let mount_plan = match self.fs_core.plan_inode_mount(&req_ctx, inode_id).await {
+            Ok(plan) => plan,
+            Err(failure) => return Ok(header_from_core_failure(&req_ctx, &failure)),
+        };
+
+        let rpc = match flavor {
+            FsyncFlavor::Fsync => InodeRpcAuthz::Fsync,
+            FsyncFlavor::Hsync => InodeRpcAuthz::Hsync,
+            FsyncFlavor::Hflush => InodeRpcAuthz::Hflush,
+        };
+        let authz_inode_id = session_plan
+            .as_ref()
+            .and_then(|plan| plan.payload.inode_id)
+            .unwrap_or(inode_id);
+        let authz = Self::authz_for_rpc(rpc, vec![AuthzTarget::for_inode(authz_inode_id)]);
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &req_ctx.caller,
+                GuardSpec::data_io(DataIoOp::Fsync).with_leader(),
+                Some(mount_plan.payload.mount_id),
+                Some(authz),
+            )
+            .await
+        {
+            return Ok(resp_header);
+        }
+
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req
+                .route_epoch
+                .or_else(|| req.header.as_ref().and_then(|h| h.route_epoch)),
+            worker_epoch: req.worker_epoch,
+        };
+        let result = match flavor {
+            FsyncFlavor::Fsync => {
+                self.fs_core
+                    .execute_fsync(FsyncBarrierInput {
+                        ctx: req_ctx.clone(),
+                        inode_id,
+                        file_handle: req.file_handle,
+                        lease_id: lease_id_from_proto(req.lease_id),
+                        lease_epoch: req.lease_epoch,
+                        fencing_token: presented_fencing_from_proto(req.fencing_token),
+                        target_size: req.target_size,
+                        flags: req.flags as i32,
+                        freshness,
+                    })
+                    .await
+            }
+            FsyncFlavor::Hsync => {
+                self.fs_core
+                    .execute_hsync(FsyncBarrierInput {
+                        ctx: req_ctx.clone(),
+                        inode_id,
+                        file_handle: req.file_handle,
+                        lease_id: lease_id_from_proto(req.lease_id),
+                        lease_epoch: req.lease_epoch,
+                        fencing_token: presented_fencing_from_proto(req.fencing_token),
+                        target_size: req.target_size,
+                        flags: req.flags as i32,
+                        freshness,
+                    })
+                    .await
+            }
+            FsyncFlavor::Hflush => {
+                self.fs_core
+                    .execute_hflush(FsyncBarrierInput {
+                        ctx: req_ctx.clone(),
+                        inode_id,
+                        file_handle: req.file_handle,
+                        lease_id: lease_id_from_proto(req.lease_id),
+                        lease_epoch: req.lease_epoch,
+                        fencing_token: presented_fencing_from_proto(req.fencing_token),
+                        target_size: req.target_size,
+                        flags: req.flags as i32,
+                        freshness,
+                    })
+                    .await
+            }
+        };
+
+        Ok(match result {
+            Ok(success) => ok_header_from_core_success(&req_ctx, &success),
+            Err(failure) => header_from_core_failure(&req_ctx, &failure),
+        })
     }
 }
 
@@ -576,2069 +606,724 @@ impl MetadataInodeServiceProto for MetadataInodeServiceImpl {
     #[instrument(skip(self), fields(call_id, client_id))]
     async fn lookup(&self, request: Request<LookupRequestProto>) -> Result<Response<LookupResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
+        let req_ctx = request_context_from_proto(&req.header);
 
-        let parent_inode_id = match req.parent_inode_id {
-            Some(parent_inode_id) => InodeId::new(parent_inode_id.value),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing parent_inode_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(LookupResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
+        let parent_inode_id = match Self::inode_id_from_proto(req.parent_inode_id.clone(), "parent_inode_id") {
+            Ok(parent_inode_id) => parent_inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
         };
+        if let Some(resp_header) = self.guard_pre_read(&req.header, &req_ctx.caller).await {
+            return error_response!(LookupResponseProto, resp_header);
+        }
+
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::Lookup, vec![AuthzTarget::for_inode(parent_inode_id)]);
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
-                &caller_ctx,
-                GuardSpec::metadata_read().with_authz(),
+                &req_ctx.caller,
+                GuardSpec::metadata_read(),
                 None,
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::Lookup,
-                    AuthzTarget::for_inode(parent_inode_id),
-                )),
+                Some(authz),
             )
             .await
         {
-            return Ok(Response::new(LookupResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+            return error_response!(LookupResponseProto, resp_header);
         }
 
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(LookupResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
+        match self
+            .fs_core
+            .execute_lookup(LookupInput {
+                ctx: req_ctx.clone(),
+                parent_inode_id,
+                name: req.name,
+            })
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_core_success(&req_ctx, &success);
+                let inode = success.payload.inode;
+                response_with_header!(
+                    LookupResponseProto {
+                        inode: Some(Self::inode_to_proto(&inode)),
+                        attrs: Some(Self::file_attrs_to_proto(&inode.attrs)),
+                        ..Default::default()
+                    },
+                    header
+                )
             }
-        };
-
-        // Get dentry
-        let child_inode_id = match storage.get_dentry(parent_inode_id, &req.name) {
-            Ok(Some(child_inode_id)) => child_inode_id,
-            Ok(None) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::NotFound(format!(
-                        "Entry not found: parent={}, name={}",
-                        parent_inode_id, req.name
-                    )),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(LookupResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(LookupResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-
-        // Get child inode
-        let child_inode = match storage.get_inode(child_inode_id) {
-            Ok(Some(child_inode)) => child_inode,
-            Ok(None) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::NotFound(format!("Inode not found: {}", child_inode_id)),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(LookupResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(LookupResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-
-        // Convert to proto
-        let (file_data, dir_data, symlink_data) = match &child_inode.data {
-            types::fs::InodeData::File { extents, lease_epoch } => (
-                Some(proto::fs::InodeFileProto {
-                    extents: extents
-                        .iter()
-                        .map(|e| proto::fs::ExtentProto {
-                            file_offset: e.file_offset,
-                            block_id: Some(proto::common::BlockIdProto {
-                                data_handle_id: e.block_id.data_handle_id.as_raw(),
-                                block_index: e.block_id.index.as_raw(),
-                            }),
-                            block_offset: e.block_offset,
-                            len: e.len,
-                            file_version: e.file_version,
-                            block_stamp: e.block_stamp,
-                        })
-                        .collect(),
-                    lease_epoch: *lease_epoch,
-                    lease_id: None, // Optional, not stored in inode currently
-                }),
-                None,
-                None,
-            ),
-            types::fs::InodeData::Dir => (None, Some(proto::fs::InodeDirectoryProto {}), None),
-            types::fs::InodeData::Symlink { target } => (
-                None,
-                None,
-                target.as_ref().map(|t| proto::fs::InodeSymlinkProto {
-                    target: Some(t.clone()),
-                }),
-            ),
-        };
-
-        // Build oneof data field
-        use proto::fs::inode_proto::Data;
-        let data = if let Some(file) = file_data {
-            Some(Data::File(file))
-        } else if let Some(dir) = dir_data {
-            Some(Data::Dir(dir))
-        } else if let Some(symlink) = symlink_data {
-            Some(Data::Symlink(symlink))
-        } else {
-            None
-        };
-
-        let inode_proto = proto::fs::InodeProto {
-            inode_id: Some(proto::fs::InodeIdProto {
-                value: child_inode.inode_id.as_raw(),
-            }),
-            kind: match child_inode.kind {
-                InodeKind::File => proto::fs::InodeKindProto::InodeKindFile as i32,
-                InodeKind::Dir => proto::fs::InodeKindProto::InodeKindDir as i32,
-                InodeKind::Symlink => proto::fs::InodeKindProto::InodeKindSymlink as i32,
-            },
-            attrs: Some(Self::file_attrs_to_proto(&child_inode.attrs)),
-            data,
-            mount_id: Some(proto::common::MountIdProto {
-                value: child_inode.mount_id.as_raw(),
-            }),
-            xattrs: child_inode
-                .xattrs
-                .iter()
-                .map(|(k, v)| proto::fs::XattrProto {
-                    name: k.clone(),
-                    value: v.clone(),
-                })
-                .collect(),
-        };
-
-        let resp_header = ok_header_from_request(&req.header, None, None);
-
-        Ok(Response::new(LookupResponseProto {
-            header: Some(resp_header),
-            inode: Some(inode_proto),
-            attrs: Some(Self::file_attrs_to_proto(&child_inode.attrs)),
-        }))
+            Err(failure) => error_response!(LookupResponseProto, header_from_core_failure(&req_ctx, &failure)),
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
     async fn get_attr(&self, request: Request<GetAttrRequestProto>) -> Result<Response<GetAttrResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
+        let req_ctx = request_context_from_proto(&req.header);
 
-        let inode_id = match req.inode_id {
-            Some(inode_id) => InodeId::new(inode_id.value),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing inode_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(GetAttrResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
+        let inode_id = match Self::inode_id_from_proto(req.inode_id.clone(), "inode_id") {
+            Ok(inode_id) => inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
         };
+        if let Some(resp_header) = self.guard_pre_read(&req.header, &req_ctx.caller).await {
+            return error_response!(GetAttrResponseProto, resp_header);
+        }
+
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::GetAttr, vec![AuthzTarget::for_inode(inode_id)]);
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
-                &caller_ctx,
-                GuardSpec::metadata_read().with_authz(),
+                &req_ctx.caller,
+                GuardSpec::metadata_read(),
                 None,
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::GetAttr,
-                    AuthzTarget::for_inode(inode_id),
-                )),
+                Some(authz),
             )
             .await
         {
-            return Ok(Response::new(GetAttrResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+            return error_response!(GetAttrResponseProto, resp_header);
         }
 
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(GetAttrResponseProto {
-                    header: Some(resp_header),
+        match self
+            .fs_core
+            .execute_get_attr(GetAttrInput {
+                ctx: req_ctx.clone(),
+                inode_id,
+            })
+            .await
+        {
+            Ok(success) => response_with_header!(
+                GetAttrResponseProto {
+                    attrs: Some(Self::file_attrs_to_proto(&success.payload.attrs)),
                     ..Default::default()
-                }));
-            }
-        };
-
-        let inode = match storage.get_inode(inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::NotFound(format!("Inode not found: {}", inode_id)),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(GetAttrResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(GetAttrResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-
-        let resp_header = ok_header_from_request(&req.header, None, None);
-
-        Ok(Response::new(GetAttrResponseProto {
-            header: Some(resp_header),
-            attrs: Some(Self::file_attrs_to_proto(&inode.attrs)),
-        }))
+                },
+                ok_header_from_core_success(&req_ctx, &success)
+            ),
+            Err(failure) => error_response!(GetAttrResponseProto, header_from_core_failure(&req_ctx, &failure)),
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
     async fn set_attr(&self, request: Request<SetAttrRequestProto>) -> Result<Response<SetAttrResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
-            return Ok(Response::new(SetAttrResponseProto {
-                header: Some(resp_header),
-                attrs: None,
-            }));
+        let req_ctx = request_context_from_proto(&req.header);
+
+        let inode_id = match Self::inode_id_from_proto(req.inode_id.clone(), "inode_id") {
+            Ok(inode_id) => inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
+        };
+        let attrs = match Self::proto_to_file_attrs(req.attrs) {
+            Ok(attrs) => attrs,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
+        };
+
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &req_ctx.caller).await {
+            return error_response!(SetAttrResponseProto, resp_header);
         }
 
-        let inode_id = match req.inode_id {
-            Some(inode_id) => InodeId::new(inode_id.value),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing inode_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(SetAttrResponseProto {
-                    header: Some(resp_header),
-                    attrs: None,
-                }));
-            }
-        };
-
-        // Route FS write operation
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(SetAttrResponseProto {
-                    header: Some(resp_header),
-                    attrs: None,
-                }));
-            }
-        };
-        let inode = match storage.get_inode(inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::NotFound(format!("Inode not found: {}", inode_id)),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(SetAttrResponseProto {
-                    header: Some(resp_header),
-                    attrs: None,
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(SetAttrResponseProto {
-                    header: Some(resp_header),
-                    attrs: None,
-                }));
-            }
-        };
-
-        // Route and validate mount_epoch
-        let ctx = match self.route_fs_write_ctx(FsWriteOp::SetAttr, &[inode_id], &req.header) {
-            Ok(ctx) => ctx,
-            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
-                // Mount epoch mismatch - return NEED_REFRESH
-                // Update metrics
-                if let Some(ref metrics) = self.metrics {
-                    metrics
-                        .fs_write_mount_epoch_mismatch_total
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                warn!(
-                    inode_id = %inode_id,
-                    expected = expected,
-                    got = got,
-                    "FS write rejected: mount epoch mismatch (NEED_REFRESH)"
-                );
-                let mount_entry = self.mount_table.get_mount(inode.mount_id).ok().flatten();
-                let mount_epoch = mount_entry.map(|e| e.config_version).or(Some(expected));
-                let resp_header = need_refresh_header(
-                    &req.header,
-                    RpcErrorCode::MountEpochMismatch,
-                    RefreshReason::MountEpochMismatch,
-                    format!("Mount epoch mismatch: client={}, server={}", got, expected),
-                    None,
-                    mount_epoch,
-                );
-                return Ok(Response::new(SetAttrResponseProto {
-                    header: Some(resp_header),
-                    attrs: None,
-                }));
-            }
-            Err(e) => {
-                let err = to_canonical_fs(e);
-                let resp_header = super::header_from_canonical_error(&req.header, None, None, &err);
-                return Ok(Response::new(SetAttrResponseProto {
-                    header: Some(resp_header),
-                    attrs: None,
-                }));
-            }
-        };
-
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::SetAttr, vec![AuthzTarget::for_inode(inode_id)]);
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
-                &caller_ctx,
+                &req_ctx.caller,
                 GuardSpec::metadata_write(),
                 None,
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::SetAttr,
-                    AuthzTarget::for_inode(inode_id),
-                )),
+                Some(authz),
             )
             .await
         {
-            return Ok(Response::new(SetAttrResponseProto {
-                header: Some(resp_header),
-                attrs: None,
-            }));
+            return error_response!(SetAttrResponseProto, resp_header);
         }
 
-        // Convert attrs
-        let attrs = match Self::proto_to_file_attrs(req.attrs) {
-            Ok(attrs) => attrs,
-            Err(err) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(SetAttrResponseProto {
-                    header: Some(resp_header),
-                    attrs: None,
-                }));
+        let freshness = Self::freshness_from_header(&req.header);
+        match self
+            .fs_core
+            .execute_set_attr(SetAttrInput {
+                ctx: req_ctx.clone(),
+                inode_id,
+                mask: req.mask,
+                attrs,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                if let Some(reader) = self.inode_perm_reader.as_ref() {
+                    reader.invalidate(inode_id);
+                }
+                response_with_header!(
+                    SetAttrResponseProto {
+                        attrs: Some(Self::file_attrs_to_proto(&success.payload.attrs)),
+                        ..Default::default()
+                    },
+                    ok_header_from_core_success(&req_ctx, &success)
+                )
             }
-        };
-
-        let dedup = match self.dedup_key(&caller_ctx) {
-            Ok(k) => k,
-            Err(err) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(SetAttrResponseProto {
-                    header: Some(resp_header),
-                    attrs: None,
-                }));
-            }
-        };
-        // Send Raft command
-        let command = Command::SetAttr {
-            dedup,
-            inode_id,
-            mask: req.mask,
-            attrs,
-        };
-
-        // Propose via unified helper (tracks metrics)
-        if let Err(err) = self.propose_fs_write_command(FsWriteOp::SetAttr, command).await {
-            let resp_header = Self::header_from_error(
-                &req.header,
-                err,
-                Some(ctx.namespace_owner_group_id.as_raw()),
-                Some(ctx.mount_epoch),
-            );
-            return Ok(Response::new(SetAttrResponseProto {
-                header: Some(resp_header),
-                attrs: None,
-            }));
+            Err(failure) => error_response!(SetAttrResponseProto, header_from_core_failure(&req_ctx, &failure)),
         }
-
-        if let Some(reader) = self.inode_perm_reader.as_ref() {
-            reader.invalidate(inode_id);
-        }
-
-        // Read updated inode
-        let updated_inode = match storage.get_inode(inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::Internal("Inode disappeared after update".to_string()),
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(SetAttrResponseProto {
-                    header: Some(resp_header),
-                    attrs: None,
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(SetAttrResponseProto {
-                    header: Some(resp_header),
-                    attrs: None,
-                }));
-            }
-        };
-
-        let mut resp_header = ok_header_from_request(
-            &req.header,
-            Some(ctx.namespace_owner_group_id.as_raw()),
-            Some(ctx.mount_epoch),
-        );
-        if let Some(state_id) = ctx.latest_state_id {
-            resp_header.state_id = Some(proto::common::RaftLogIdProto {
-                term: state_id.term,
-                leader_node_id: state_id.leader_node_id,
-                index: state_id.index,
-            });
-        }
-
-        Ok(Response::new(SetAttrResponseProto {
-            header: Some(resp_header),
-            attrs: Some(Self::file_attrs_to_proto(&updated_inode.attrs)),
-        }))
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
     async fn mkdir(&self, request: Request<MkdirRequestProto>) -> Result<Response<MkdirResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
-            return Ok(Response::new(MkdirResponseProto {
-                header: Some(resp_header),
-                inode: None,
-                attrs: None,
-            }));
+        let req_ctx = request_context_from_proto(&req.header);
+
+        let parent_inode_id = match Self::inode_id_from_proto(req.parent_inode_id.clone(), "parent_inode_id") {
+            Ok(parent_inode_id) => parent_inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
+        };
+        let attrs = match Self::proto_to_file_attrs(req.attrs) {
+            Ok(attrs) => attrs,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
+        };
+
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &req_ctx.caller).await {
+            return error_response!(MkdirResponseProto, resp_header);
         }
 
-        let parent_inode_id = match req.parent_inode_id {
-            Some(parent_inode_id) => InodeId::new(parent_inode_id.value),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing parent_inode_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(MkdirResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-
-        let ctx = match self.route_fs_write_ctx(FsWriteOp::Mkdir, &[parent_inode_id], &req.header) {
-            Ok(ctx) => ctx,
-            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
-                // Mount epoch mismatch - return NEED_REFRESH
-                // Update metrics
-                if let Some(ref metrics) = self.metrics {
-                    metrics
-                        .fs_write_mount_epoch_mismatch_total
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                warn!(
-                    parent_inode_id = %parent_inode_id,
-                    expected = expected,
-                    got = got,
-                    "FS write rejected: mount epoch mismatch (NEED_REFRESH)"
-                );
-                let mount_epoch = if let Some(storage) = self.storage.as_ref() {
-                    let parent_inode = storage.get_inode(parent_inode_id).ok().flatten();
-                    let parent_mount_id = parent_inode.map(|i| i.mount_id);
-                    let mount_entry = parent_mount_id.and_then(|id| self.mount_table.get_mount(id).ok().flatten());
-                    mount_entry.map(|e| e.config_version).or(Some(expected))
-                } else {
-                    Some(expected)
-                };
-                let resp_header = need_refresh_header(
-                    &req.header,
-                    RpcErrorCode::MountEpochMismatch,
-                    RefreshReason::MountEpochMismatch,
-                    format!("Mount epoch mismatch: client={}, server={} ", got, expected),
-                    None,
-                    mount_epoch,
-                );
-                return Ok(Response::new(MkdirResponseProto {
-                    header: Some(resp_header),
-                    inode: None,
-                    attrs: None,
-                }));
-            }
-            Err(e) => {
-                let err = to_canonical_fs(e);
-                let resp_header = super::header_from_canonical_error(&req.header, None, None, &err);
-                return Ok(Response::new(MkdirResponseProto {
-                    header: Some(resp_header),
-                    inode: None,
-                    attrs: None,
-                }));
-            }
-        };
-
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(MkdirResponseProto {
-                    header: Some(resp_header),
-                    inode: None,
-                    attrs: None,
-                }));
-            }
-        };
-        let _parent_inode = match storage.get_inode(parent_inode_id) {
-            Ok(Some(parent_inode)) => parent_inode,
-            Ok(None) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::NotFound(format!("Parent inode not found: {}", parent_inode_id)),
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(MkdirResponseProto {
-                    header: Some(resp_header),
-                    inode: None,
-                    attrs: None,
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(MkdirResponseProto {
-                    header: Some(resp_header),
-                    inode: None,
-                    attrs: None,
-                }));
-            }
-        };
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::Mkdir, vec![AuthzTarget::for_inode(parent_inode_id)]);
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
-                &caller_ctx,
+                &req_ctx.caller,
                 GuardSpec::metadata_write(),
                 None,
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::Mkdir,
-                    AuthzTarget::for_inode(parent_inode_id),
-                )),
+                Some(authz),
             )
             .await
         {
-            return Ok(Response::new(MkdirResponseProto {
-                header: Some(resp_header),
-                inode: None,
-                attrs: None,
-            }));
+            return error_response!(MkdirResponseProto, resp_header);
         }
 
-        // Convert attrs
-        let attrs = match Self::proto_to_file_attrs(req.attrs) {
-            Ok(attrs) => attrs,
-            Err(err) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(MkdirResponseProto {
-                    header: Some(resp_header),
-                    inode: None,
-                    attrs: None,
-                }));
+        let freshness = Self::freshness_from_header(&req.header);
+        match self
+            .fs_core
+            .execute_mkdir(MkdirInput {
+                ctx: req_ctx.clone(),
+                parent_inode_id,
+                name: req.name,
+                attrs,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                let attrs_proto = success.payload.attrs.as_ref().map(Self::file_attrs_to_proto);
+                let inode_proto = success.payload.inode_id.map(|inode_id| proto::fs::InodeProto {
+                    inode_id: Some(proto::fs::InodeIdProto {
+                        value: inode_id.as_raw(),
+                    }),
+                    kind: proto::fs::InodeKindProto::InodeKindDir as i32,
+                    attrs: attrs_proto.clone(),
+                    data: Some(proto::fs::inode_proto::Data::Dir(proto::fs::InodeDirectoryProto {})),
+                    mount_id: None,
+                    xattrs: vec![],
+                });
+                response_with_header!(
+                    MkdirResponseProto {
+                        inode: inode_proto,
+                        attrs: attrs_proto,
+                        ..Default::default()
+                    },
+                    ok_header_from_core_success(&req_ctx, &success)
+                )
             }
-        };
-
-        let dedup = match self.dedup_key(&caller_ctx) {
-            Ok(k) => k,
-            Err(err) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(MkdirResponseProto {
-                    header: Some(resp_header),
-                    inode: None,
-                    attrs: None,
-                }));
-            }
-        };
-        // Send Raft command
-        let command = Command::Mkdir {
-            dedup,
-            parent_inode_id,
-            name: req.name,
-            attrs,
-        };
-
-        if let Err(err) = self.propose_fs_write_command(FsWriteOp::Mkdir, command).await {
-            let resp_header = Self::header_from_error(
-                &req.header,
-                err,
-                Some(ctx.namespace_owner_group_id.as_raw()),
-                Some(ctx.mount_epoch),
-            );
-            return Ok(Response::new(MkdirResponseProto {
-                header: Some(resp_header),
-                inode: None,
-                attrs: None,
-            }));
+            Err(failure) => error_response!(MkdirResponseProto, header_from_core_failure(&req_ctx, &failure)),
         }
-
-        // TODO: Parse result to get created inode_id
-        // For now, return placeholder
-        let mut resp_header = ok_header_from_request(
-            &req.header,
-            Some(ctx.namespace_owner_group_id.as_raw()),
-            Some(ctx.mount_epoch),
-        );
-        if let Some(state_id) = ctx.latest_state_id {
-            resp_header.state_id = Some(proto::common::RaftLogIdProto {
-                term: state_id.term,
-                leader_node_id: state_id.leader_node_id,
-                index: state_id.index,
-            });
-        }
-
-        Ok(Response::new(MkdirResponseProto {
-            header: Some(resp_header),
-            inode: None, // TODO: Return created inode
-            attrs: None, // TODO: Return created attrs
-        }))
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
     async fn create(&self, request: Request<CreateRequestProto>) -> Result<Response<CreateResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
-            return Ok(Response::new(CreateResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
-        }
+        let req_ctx = request_context_from_proto(&req.header);
 
-        let parent_inode_id = match req.parent_inode_id {
-            Some(parent_inode_id) => InodeId::new(parent_inode_id.value),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing parent_inode_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(CreateResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
+        let parent_inode_id = match Self::inode_id_from_proto(req.parent_inode_id.clone(), "parent_inode_id") {
+            Ok(parent_inode_id) => parent_inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
         };
-
-        let ctx = match self.route_fs_write_ctx(FsWriteOp::Create, &[parent_inode_id], &req.header) {
-            Ok(ctx) => ctx,
-            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
-                if let Some(ref metrics) = self.metrics {
-                    metrics
-                        .fs_write_mount_epoch_mismatch_total
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                warn!(
-                    parent_inode_id = %parent_inode_id,
-                    expected = expected,
-                    got = got,
-                    "FS write rejected: mount epoch mismatch (NEED_REFRESH)"
-                );
-                let mount_epoch = Some(expected);
-                let resp_header = need_refresh_header(
-                    &req.header,
-                    RpcErrorCode::MountEpochMismatch,
-                    RefreshReason::MountEpochMismatch,
-                    format!("Mount epoch mismatch: client={}, server={} ", got, expected),
-                    None,
-                    mount_epoch,
-                );
-                return Ok(Response::new(CreateResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(CreateResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-
-        if let Some(resp_header) = self
-            .guard_request(
-                &req.header,
-                &caller_ctx,
-                GuardSpec::metadata_write(),
-                None,
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::Create,
-                    AuthzTarget::for_inode(parent_inode_id),
-                )),
-            )
-            .await
-        {
-            return Ok(Response::new(CreateResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
-        }
-
-        // Convert attrs and layout
         let attrs = match Self::proto_to_file_attrs(req.attrs) {
             Ok(attrs) => attrs,
-            Err(err) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(CreateResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
         };
         let layout = match Self::proto_to_file_layout(req.layout) {
             Ok(layout) => layout,
-            Err(err) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(CreateResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
         };
 
-        let dedup = match self.dedup_key(&caller_ctx) {
-            Ok(k) => k,
-            Err(err) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(CreateResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-        // Send Raft command
-        let command = Command::Create {
-            dedup,
-            parent_inode_id,
-            name: req.name,
-            attrs,
-            layout,
-        };
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &req_ctx.caller).await {
+            return error_response!(CreateResponseProto, resp_header);
+        }
 
-        let result = match self.propose_fs_write_command(FsWriteOp::Create, command).await {
-            Ok(result) => result,
-            Err(err) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(CreateResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::Create, vec![AuthzTarget::for_inode(parent_inode_id)]);
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &req_ctx.caller,
+                GuardSpec::metadata_write(),
+                None,
+                Some(authz),
+            )
+            .await
+        {
+            return error_response!(CreateResponseProto, resp_header);
+        }
 
-        match result {
-            FsCommandResult::Ok(ok) => {
-                let mut resp_header = ok_header_from_request(
-                    &req.header,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                if let Some(state_id) = ctx.latest_state_id {
-                    resp_header.state_id = Some(proto::common::RaftLogIdProto {
-                        term: state_id.term,
-                        leader_node_id: state_id.leader_node_id,
-                        index: state_id.index,
-                    });
-                }
-
-                Ok(Response::new(CreateResponseProto {
-                    header: Some(resp_header),
-                    inode: None, // TODO: Return created inode
-                    attrs: None, // TODO: Return created attrs
-                    data_handle_id: ok
-                        .data_handle_id
-                        .map(types::ids::DataHandleId::as_raw)
-                        .unwrap_or_default(),
-                }))
+        let freshness = Self::freshness_from_header(&req.header);
+        match self
+            .fs_core
+            .execute_create(CreateInput {
+                ctx: req_ctx.clone(),
+                parent_inode_id,
+                name: req.name,
+                attrs,
+                layout,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                let attrs_proto = success.payload.attrs.as_ref().map(Self::file_attrs_to_proto);
+                let inode_proto = success.payload.inode_id.map(|inode_id| proto::fs::InodeProto {
+                    inode_id: Some(proto::fs::InodeIdProto {
+                        value: inode_id.as_raw(),
+                    }),
+                    kind: proto::fs::InodeKindProto::InodeKindFile as i32,
+                    attrs: attrs_proto.clone(),
+                    data: None,
+                    mount_id: None,
+                    xattrs: vec![],
+                });
+                response_with_header!(
+                    CreateResponseProto {
+                        inode: inode_proto,
+                        attrs: attrs_proto,
+                        data_handle_id: success
+                            .payload
+                            .data_handle_id
+                            .map(types::ids::DataHandleId::as_raw)
+                            .unwrap_or_default(),
+                        ..Default::default()
+                    },
+                    ok_header_from_core_success(&req_ctx, &success)
+                )
             }
-            FsCommandResult::Err(err) => {
-                let resp_header = fatal_fs_header(
-                    &req.header,
-                    err.errno,
-                    err.message,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                Ok(Response::new(CreateResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }))
-            }
+            Err(failure) => error_response!(CreateResponseProto, header_from_core_failure(&req_ctx, &failure)),
         }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
     async fn read_dir(&self, request: Request<ReadDirRequestProto>) -> Result<Response<ReadDirResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
+        let req_ctx = request_context_from_proto(&req.header);
 
-        let parent_inode_id = match req.parent_inode_id {
-            Some(parent_inode_id) => InodeId::new(parent_inode_id.value),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing parent_inode_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(ReadDirResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
+        let parent_inode_id = match Self::inode_id_from_proto(req.parent_inode_id.clone(), "parent_inode_id") {
+            Ok(parent_inode_id) => parent_inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
         };
+
+        if let Some(resp_header) = self.guard_pre_read(&req.header, &req_ctx.caller).await {
+            return error_response!(ReadDirResponseProto, resp_header);
+        }
+
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::ReadDir, vec![AuthzTarget::for_inode(parent_inode_id)]);
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
-                &caller_ctx,
-                GuardSpec::metadata_read().with_authz(),
+                &req_ctx.caller,
+                GuardSpec::metadata_read(),
                 None,
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::ReadDir,
-                    AuthzTarget::for_inode(parent_inode_id),
-                )),
+                Some(authz),
             )
             .await
         {
-            return Ok(Response::new(ReadDirResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+            return error_response!(ReadDirResponseProto, resp_header);
         }
 
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(ReadDirResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-
-        // Verify parent is a directory
-        let parent_inode = match storage.get_inode(parent_inode_id) {
-            Ok(Some(parent_inode)) => parent_inode,
-            Ok(None) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::NotFound(format!("Parent inode not found: {}", parent_inode_id)),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(ReadDirResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(ReadDirResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-        if !parent_inode.kind.is_dir() {
-            let err = to_canonical_fs(MetadataError::InvalidArgument(format!(
-                "Parent is not a directory: {}",
-                parent_inode_id
-            )));
-            let resp_header = super::header_from_canonical_error(&req.header, None, None, &err);
-            return Ok(Response::new(ReadDirResponseProto {
-                header: Some(resp_header),
-                entries: vec![],
-                next_cursor_key: vec![],
-                eof: true,
-            }));
-        }
-
-        // Parse cursor_key (opaque bytes)
         let cursor_key = if req.cursor_key.is_empty() {
             None
         } else {
-            Some(req.cursor_key.as_slice())
+            Some(req.cursor_key)
         };
-
-        // Parse max_entries (0 means no limit)
         let max_entries = if req.max_entries == 0 {
             None
         } else {
             Some(req.max_entries as usize)
         };
 
-        // List dentries with pagination
-        let (entries, next_cursor_key, eof) =
-            match storage.list_dentries_with_cursor(parent_inode_id, cursor_key, max_entries) {
-                Ok(result) => result,
-                Err(err) => {
-                    let resp_header = Self::header_from_error(&req.header, err, None, None);
-                    return Ok(Response::new(ReadDirResponseProto {
-                        header: Some(resp_header),
-                        entries: vec![],
-                        next_cursor_key: vec![],
-                        eof: true,
-                    }));
-                }
-            };
+        match self
+            .fs_core
+            .execute_read_dir(ReadDirInput {
+                ctx: req_ctx.clone(),
+                parent_inode_id,
+                cursor_key,
+                max_entries,
+            })
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_core_success(&req_ctx, &success);
+                let payload = success.payload;
+                let entries = payload
+                    .entries
+                    .iter()
+                    .map(|entry| proto::fs::DirEntryProto {
+                        name: entry.name.clone(),
+                        inode_id: Some(proto::fs::InodeIdProto {
+                            value: entry.inode_id.as_raw(),
+                        }),
+                        kind: entry
+                            .kind
+                            .map(|kind| match kind {
+                                InodeKind::File => proto::fs::InodeKindProto::InodeKindFile as i32,
+                                InodeKind::Dir => proto::fs::InodeKindProto::InodeKindDir as i32,
+                                InodeKind::Symlink => proto::fs::InodeKindProto::InodeKindSymlink as i32,
+                            })
+                            .unwrap_or(proto::fs::InodeKindProto::InodeKindUnspecified as i32),
+                        attrs: entry.attrs.as_ref().map(Self::file_attrs_to_proto),
+                    })
+                    .collect();
 
-        // Convert to DirEntryProto
-        let mut dir_entries = Vec::new();
-        for (name, child_inode_id) in entries {
-            // Optionally load child inode for attrs (for optimization)
-            let child_inode = storage.get_inode(child_inode_id).ok().flatten();
-            let attrs = child_inode.as_ref().map(|i| Self::file_attrs_to_proto(&i.attrs));
-            let kind = child_inode
-                .map(|i| match i.kind {
-                    InodeKind::File => proto::fs::InodeKindProto::InodeKindFile as i32,
-                    InodeKind::Dir => proto::fs::InodeKindProto::InodeKindDir as i32,
-                    InodeKind::Symlink => proto::fs::InodeKindProto::InodeKindSymlink as i32,
-                })
-                .unwrap_or(proto::fs::InodeKindProto::InodeKindUnspecified as i32);
-
-            dir_entries.push(proto::fs::DirEntryProto {
-                name,
-                inode_id: Some(proto::fs::InodeIdProto {
-                    value: child_inode_id.as_raw(),
-                }),
-                kind,
-                attrs,
-            });
+                response_with_header!(
+                    ReadDirResponseProto {
+                        entries,
+                        next_cursor_key: payload.next_cursor_key,
+                        eof: payload.eof,
+                        ..Default::default()
+                    },
+                    header
+                )
+            }
+            Err(failure) => error_response!(ReadDirResponseProto, header_from_core_failure(&req_ctx, &failure)),
         }
-
-        let resp_header = ok_header_from_request(&req.header, None, None);
-
-        Ok(Response::new(ReadDirResponseProto {
-            header: Some(resp_header),
-            entries: dir_entries,
-            next_cursor_key: next_cursor_key.unwrap_or_default(),
-            eof,
-        }))
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
     async fn unlink(&self, request: Request<UnlinkRequestProto>) -> Result<Response<UnlinkResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
-            return Ok(Response::new(UnlinkResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+        let req_ctx = request_context_from_proto(&req.header);
+
+        let parent_inode_id = match Self::inode_id_from_proto(req.parent_inode_id.clone(), "parent_inode_id") {
+            Ok(parent_inode_id) => parent_inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
+        };
+
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &req_ctx.caller).await {
+            return error_response!(UnlinkResponseProto, resp_header);
         }
 
-        let parent_inode_id = match req.parent_inode_id {
-            Some(parent_inode_id) => InodeId::new(parent_inode_id.value),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing parent_inode_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(UnlinkResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
+        let plan = match self.fs_core.plan_unlink(&req_ctx, parent_inode_id, &req.name).await {
+            Ok(plan) => plan,
+            Err(failure) => return error_response!(UnlinkResponseProto, header_from_core_failure(&req_ctx, &failure)),
         };
 
-        let ctx = match self.route_fs_write_ctx(FsWriteOp::Unlink, &[parent_inode_id], &req.header) {
-            Ok(ctx) => ctx,
-            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
-                if let Some(ref metrics) = self.metrics {
-                    metrics
-                        .fs_write_mount_epoch_mismatch_total
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                warn!(
-                    parent_inode_id = %parent_inode_id,
-                    expected = expected,
-                    got = got,
-                    "FS write rejected: mount epoch mismatch (NEED_REFRESH)"
-                );
-                let resp_header = need_refresh_header(
-                    &req.header,
-                    RpcErrorCode::MountEpochMismatch,
-                    RefreshReason::MountEpochMismatch,
-                    format!("Mount epoch mismatch: client={}, server={} ", got, expected),
-                    None,
-                    Some(expected),
-                );
-                return Ok(Response::new(UnlinkResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(UnlinkResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(UnlinkResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-        let target_inode_id = match storage.get_dentry(parent_inode_id, &req.name) {
-            Ok(inode_id) => inode_id,
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(UnlinkResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-
-        let mut authz_ctx = Self::authz_for_rpc(FsRpcAuthz::Unlink, AuthzTarget::for_inode(parent_inode_id));
-        authz_ctx
-            .pre_checks
-            .extend(Self::sticky_pre_checks_for_delete(parent_inode_id, target_inode_id));
+        let mut authz = Self::authz_for_rpc(
+            InodeRpcAuthz::Unlink,
+            vec![AuthzTarget::for_inode(plan.payload.parent_inode_id)],
+        );
+        authz.pre_checks =
+            Self::sticky_pre_checks_for_delete(plan.payload.parent_inode_id, plan.payload.target_inode_id);
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
-                &caller_ctx,
+                &req_ctx.caller,
                 GuardSpec::metadata_write(),
                 None,
-                Some(authz_ctx),
+                Some(authz),
             )
             .await
         {
-            return Ok(Response::new(UnlinkResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+            return error_response!(UnlinkResponseProto, resp_header);
         }
 
-        let dedup = match self.dedup_key(&caller_ctx) {
-            Ok(k) => k,
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(UnlinkResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-        let command = Command::Unlink {
-            dedup,
-            parent_inode_id,
-            name: req.name,
-        };
-
-        let result = match self.propose_fs_write_command(FsWriteOp::Unlink, command).await {
-            Ok(result) => result,
-            Err(err) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(UnlinkResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-
-        match result {
-            FsCommandResult::Ok(_) => {
-                let mut resp_header = ok_header_from_request(
-                    &req.header,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                if let Some(state_id) = ctx.latest_state_id {
-                    resp_header.state_id = Some(proto::common::RaftLogIdProto {
-                        term: state_id.term,
-                        leader_node_id: state_id.leader_node_id,
-                        index: state_id.index,
-                    });
-                }
-
-                Ok(Response::new(UnlinkResponseProto {
-                    header: Some(resp_header),
-                }))
-            }
-            FsCommandResult::Err(err) => {
-                let resp_header = fatal_fs_header(
-                    &req.header,
-                    err.errno,
-                    err.message,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                Ok(Response::new(UnlinkResponseProto {
-                    header: Some(resp_header),
-                }))
-            }
+        let freshness = Self::freshness_from_header(&req.header);
+        match self
+            .fs_core
+            .execute_unlink(UnlinkInput {
+                ctx: req_ctx.clone(),
+                parent_inode_id,
+                name: req.name,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => response_with_header!(
+                UnlinkResponseProto::default(),
+                ok_header_from_core_success(&req_ctx, &success)
+            ),
+            Err(failure) => error_response!(UnlinkResponseProto, header_from_core_failure(&req_ctx, &failure)),
         }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
     async fn rmdir(&self, request: Request<RmdirRequestProto>) -> Result<Response<RmdirResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
-            return Ok(Response::new(RmdirResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+        let req_ctx = request_context_from_proto(&req.header);
+
+        let parent_inode_id = match Self::inode_id_from_proto(req.parent_inode_id.clone(), "parent_inode_id") {
+            Ok(parent_inode_id) => parent_inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
+        };
+
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &req_ctx.caller).await {
+            return error_response!(RmdirResponseProto, resp_header);
         }
 
-        let parent_inode_id = match req.parent_inode_id {
-            Some(parent_inode_id) => InodeId::new(parent_inode_id.value),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing parent_inode_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(RmdirResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
+        let plan = match self.fs_core.plan_rmdir(&req_ctx, parent_inode_id, &req.name).await {
+            Ok(plan) => plan,
+            Err(failure) => return error_response!(RmdirResponseProto, header_from_core_failure(&req_ctx, &failure)),
         };
 
-        let ctx = match self.route_fs_write_ctx(FsWriteOp::Rmdir, &[parent_inode_id], &req.header) {
-            Ok(ctx) => ctx,
-            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
-                if let Some(ref metrics) = self.metrics {
-                    metrics
-                        .fs_write_mount_epoch_mismatch_total
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                warn!(
-                    parent_inode_id = %parent_inode_id,
-                    expected = expected,
-                    got = got,
-                    "FS write rejected: mount epoch mismatch (NEED_REFRESH)"
-                );
-                let resp_header = need_refresh_header(
-                    &req.header,
-                    RpcErrorCode::MountEpochMismatch,
-                    RefreshReason::MountEpochMismatch,
-                    format!("Mount epoch mismatch: client={}, server={} ", got, expected),
-                    None,
-                    Some(expected),
-                );
-                return Ok(Response::new(RmdirResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(RmdirResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(RmdirResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-        let target_inode_id = match storage.get_dentry(parent_inode_id, &req.name) {
-            Ok(inode_id) => inode_id,
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(RmdirResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-
-        let mut authz_ctx = Self::authz_for_rpc(FsRpcAuthz::Rmdir, AuthzTarget::for_inode(parent_inode_id));
-        authz_ctx
-            .pre_checks
-            .extend(Self::sticky_pre_checks_for_delete(parent_inode_id, target_inode_id));
+        let mut authz = Self::authz_for_rpc(
+            InodeRpcAuthz::Rmdir,
+            vec![AuthzTarget::for_inode(plan.payload.parent_inode_id)],
+        );
+        authz.pre_checks =
+            Self::sticky_pre_checks_for_delete(plan.payload.parent_inode_id, plan.payload.target_inode_id);
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
-                &caller_ctx,
+                &req_ctx.caller,
                 GuardSpec::metadata_write(),
                 None,
-                Some(authz_ctx),
+                Some(authz),
             )
             .await
         {
-            return Ok(Response::new(RmdirResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+            return error_response!(RmdirResponseProto, resp_header);
         }
 
-        let dedup = match self.dedup_key(&caller_ctx) {
-            Ok(k) => k,
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(RmdirResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-        let command = Command::Rmdir {
-            dedup,
-            parent_inode_id,
-            name: req.name,
-        };
-
-        let result = match self.propose_fs_write_command(FsWriteOp::Rmdir, command).await {
-            Ok(result) => result,
-            Err(err) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(RmdirResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-
-        match result {
-            FsCommandResult::Ok(_) => {
-                let mut resp_header = ok_header_from_request(
-                    &req.header,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                if let Some(state_id) = ctx.latest_state_id {
-                    resp_header.state_id = Some(proto::common::RaftLogIdProto {
-                        term: state_id.term,
-                        leader_node_id: state_id.leader_node_id,
-                        index: state_id.index,
-                    });
-                }
-
-                Ok(Response::new(RmdirResponseProto {
-                    header: Some(resp_header),
-                }))
-            }
-            FsCommandResult::Err(err) => {
-                let resp_header = fatal_fs_header(
-                    &req.header,
-                    err.errno,
-                    err.message,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                Ok(Response::new(RmdirResponseProto {
-                    header: Some(resp_header),
-                }))
-            }
+        let freshness = Self::freshness_from_header(&req.header);
+        match self
+            .fs_core
+            .execute_rmdir(RmdirInput {
+                ctx: req_ctx.clone(),
+                parent_inode_id,
+                name: req.name,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => response_with_header!(
+                RmdirResponseProto::default(),
+                ok_header_from_core_success(&req_ctx, &success)
+            ),
+            Err(failure) => error_response!(RmdirResponseProto, header_from_core_failure(&req_ctx, &failure)),
         }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
     async fn rename(&self, request: Request<FsRenameRequestProto>) -> Result<Response<FsRenameResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
-            return Ok(Response::new(FsRenameResponseProto {
-                header: Some(resp_header),
-            }));
-        }
-        // Reject unsupported flags (only RENAME_NOREPLACE supported).
-        let supported_mask: u32 = 0x1;
-        if req.flags & !supported_mask != 0 {
-            let resp_header = Self::header_from_error(
-                &req.header,
-                MetadataError::NotSupported(format!("Unsupported rename flags: {}", req.flags)),
-                None,
-                None,
-            );
-            return Ok(Response::new(FsRenameResponseProto {
-                header: Some(resp_header),
-            }));
-        }
+        let req_ctx = request_context_from_proto(&req.header);
 
-        let src_parent_inode_id = match req.src_parent_inode_id {
-            Some(src_parent_inode_id) => InodeId::new(src_parent_inode_id.value),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing src_parent_inode_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(FsRenameResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
-        };
-        let dst_parent_inode_id = match req.dst_parent_inode_id {
-            Some(dst_parent_inode_id) => InodeId::new(dst_parent_inode_id.value),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing dst_parent_inode_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(FsRenameResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
-        };
-
-        // Check cross-mount rename
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(FsRenameResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
-        };
-        let src_parent_inode = match storage.get_inode(src_parent_inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::NotFound(format!("Source parent inode not found: {}", src_parent_inode_id)),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(FsRenameResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(FsRenameResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
-        };
-        let dst_parent_inode = match storage.get_inode(dst_parent_inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::NotFound(format!("Destination parent inode not found: {}", dst_parent_inode_id)),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(FsRenameResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(FsRenameResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
-        };
-
-        if src_parent_inode.mount_id != dst_parent_inode.mount_id {
-            // Cross-mount rename - return EXDEV immediately
-            // Update metrics
-            if let Some(ref metrics) = self.metrics {
-                metrics
-                    .fs_write_cross_mount_rename_exdev_total
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            debug!(
-                src_mount_id = %src_parent_inode.mount_id.as_raw(),
-                dst_mount_id = %dst_parent_inode.mount_id.as_raw(),
-                "Cross-mount rename rejected with EXDEV"
-            );
-            let mount_entry = match self.mount_table.get_mount(src_parent_inode.mount_id) {
-                Ok(Some(entry)) => entry,
-                Ok(None) => {
-                    let resp_header = Self::header_from_error(
-                        &req.header,
-                        MetadataError::Internal("Mount disappeared".to_string()),
-                        None,
-                        None,
-                    );
-                    return Ok(Response::new(FsRenameResponseProto {
-                        header: Some(resp_header),
-                    }));
-                }
-                Err(err) => {
-                    let resp_header = Self::header_from_error(&req.header, err, None, None);
-                    return Ok(Response::new(FsRenameResponseProto {
-                        header: Some(resp_header),
-                    }));
-                }
+        let src_parent_inode_id =
+            match Self::inode_id_from_proto(req.src_parent_inode_id.clone(), "src_parent_inode_id") {
+                Ok(inode_id) => inode_id,
+                Err(err) => return Self::response_with_metadata_error(&req.header, err),
             };
-            let resp_header = Self::header_from_error(
-                &req.header,
-                MetadataError::CrossMountRename(format!(
-                    "Cross-mount rename not allowed: src_mount={:?}, dst_mount={:?}",
-                    src_parent_inode.mount_id, dst_parent_inode.mount_id
-                )),
-                None,
-                Some(mount_entry.config_version),
-            );
-            return Ok(Response::new(FsRenameResponseProto {
-                header: Some(resp_header),
-            }));
+        let dst_parent_inode_id =
+            match Self::inode_id_from_proto(req.dst_parent_inode_id.clone(), "dst_parent_inode_id") {
+                Ok(inode_id) => inode_id,
+                Err(err) => return Self::response_with_metadata_error(&req.header, err),
+            };
+
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &req_ctx.caller).await {
+            return error_response!(FsRenameResponseProto, resp_header);
         }
 
-        // Route FS write operation (both parents in same mount)
-        let ctx = match self.route_fs_write_ctx(
-            FsWriteOp::Rename,
-            &[src_parent_inode_id, dst_parent_inode_id],
-            &req.header,
-        ) {
-            Ok(ctx) => ctx,
-            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
-                // Mount epoch mismatch - return NEED_REFRESH
-                // Update metrics
-                if let Some(ref metrics) = self.metrics {
-                    metrics
-                        .fs_write_mount_epoch_mismatch_total
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                warn!(
-                    src_parent_inode_id = %src_parent_inode_id,
-                    dst_parent_inode_id = %dst_parent_inode_id,
-                    expected = expected,
-                    got = got,
-                    "FS write rejected: mount epoch mismatch (NEED_REFRESH)"
-                );
-                let mount_entry = self.mount_table.get_mount(src_parent_inode.mount_id).ok().flatten();
-                let mount_epoch = mount_entry.map(|e| e.config_version).or(Some(expected));
-                let resp_header = need_refresh_header(
-                    &req.header,
-                    RpcErrorCode::MountEpochMismatch,
-                    RefreshReason::MountEpochMismatch,
-                    format!("Mount epoch mismatch: client={}, server={} ", got, expected),
-                    None,
-                    mount_epoch,
-                );
-                return Ok(Response::new(FsRenameResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
-            Err(e) => {
-                let err = to_canonical_fs(e);
-                let resp_header = super::header_from_canonical_error(&req.header, None, None, &err);
-                return Ok(Response::new(FsRenameResponseProto {
-                    header: Some(resp_header),
-                }));
+        let plan = match self
+            .fs_core
+            .plan_rename(
+                &req_ctx,
+                src_parent_inode_id,
+                &req.src_name,
+                dst_parent_inode_id,
+                &req.dst_name,
+            )
+            .await
+        {
+            Ok(plan) => plan,
+            Err(failure) => {
+                return error_response!(FsRenameResponseProto, header_from_core_failure(&req_ctx, &failure));
             }
         };
 
-        let src_inode_id = match storage.get_dentry(src_parent_inode_id, &req.src_name) {
-            Ok(inode_id) => inode_id,
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(FsRenameResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
-        };
-        let dst_inode_id = match storage.get_dentry(dst_parent_inode_id, &req.dst_name) {
-            Ok(inode_id) => inode_id,
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(FsRenameResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
-        };
-
-        let mut authz_ctx = Self::authz_for_rpc(
-            FsRpcAuthz::Rename,
-            AuthzTarget::for_inode(src_parent_inode_id).with_parent(dst_parent_inode_id),
+        let mut authz = Self::authz_for_rpc(
+            InodeRpcAuthz::Rename,
+            vec![
+                AuthzTarget::for_inode(plan.payload.src_parent_inode_id),
+                AuthzTarget::for_inode(plan.payload.dst_parent_inode_id),
+            ],
         );
-        authz_ctx.pre_checks.extend(Self::sticky_pre_checks_for_rename(
-            src_parent_inode_id,
-            src_inode_id,
-            dst_parent_inode_id,
-            dst_inode_id,
-        ));
+        authz.pre_checks = Self::sticky_pre_checks_for_rename(
+            plan.payload.src_parent_inode_id,
+            plan.payload.src_inode_id,
+            plan.payload.dst_parent_inode_id,
+            plan.payload.dst_inode_id,
+        );
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
-                &caller_ctx,
+                &req_ctx.caller,
                 GuardSpec::metadata_write(),
                 None,
-                Some(authz_ctx),
+                Some(authz),
             )
             .await
         {
-            return Ok(Response::new(FsRenameResponseProto {
-                header: Some(resp_header),
-            }));
+            return error_response!(FsRenameResponseProto, resp_header);
         }
 
-        if req.flags & 0x1 != 0 {
-            if let Some(ref raft_node) = self.raft_node {
-                if raft_node.is_leader() {
-                    let mut can_precheck = true;
-                    if let Some(required_state_id) = req
-                        .header
-                        .as_ref()
-                        .and_then(|h| h.state_id.as_ref())
-                        .map(|sid| types::RaftLogId::new(sid.term, sid.leader_node_id, sid.index))
-                    {
-                        if let Some(last_applied) = raft_node.get_last_applied_state_id() {
-                            if last_applied < required_state_id {
-                                let resp_header = need_refresh_header(
-                                    &req.header,
-                                    RpcErrorCode::StaleState,
-                                    RefreshReason::StaleState,
-                                    format!(
-                                        "Stale state: last_applied={:?} < required={:?}",
-                                        last_applied, required_state_id
-                                    ),
-                                    Some(ctx.namespace_owner_group_id.as_raw()),
-                                    Some(ctx.mount_epoch),
-                                );
-                                return Ok(Response::new(FsRenameResponseProto {
-                                    header: Some(resp_header),
-                                }));
-                            }
-                        } else {
-                            can_precheck = false;
-                        }
-                    }
-
-                    if can_precheck {
-                        match storage.get_dentry(dst_parent_inode_id, &req.dst_name) {
-                            Ok(Some(_)) => {
-                                let resp_header = Self::header_from_error(
-                                    &req.header,
-                                    MetadataError::AlreadyExists(format!(
-                                        "Destination exists and RENAME_NOREPLACE set: {}",
-                                        req.dst_name
-                                    )),
-                                    Some(ctx.namespace_owner_group_id.as_raw()),
-                                    Some(ctx.mount_epoch),
-                                );
-                                return Ok(Response::new(FsRenameResponseProto {
-                                    header: Some(resp_header),
-                                }));
-                            }
-                            Ok(None) => {}
-                            Err(err) => {
-                                let resp_header = Self::header_from_error(
-                                    &req.header,
-                                    err,
-                                    Some(ctx.namespace_owner_group_id.as_raw()),
-                                    Some(ctx.mount_epoch),
-                                );
-                                return Ok(Response::new(FsRenameResponseProto {
-                                    header: Some(resp_header),
-                                }));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Send Raft command
-        if self.raft_node.as_ref().is_none() {
-            let resp_header = Self::header_from_error(
-                &req.header,
-                MetadataError::Internal("Raft node not available".to_string()),
-                Some(ctx.namespace_owner_group_id.as_raw()),
-                Some(ctx.mount_epoch),
-            );
-            return Ok(Response::new(FsRenameResponseProto {
-                header: Some(resp_header),
-            }));
-        }
-
-        let dedup = match self.dedup_key(&caller_ctx) {
-            Ok(k) => k,
-            Err(err) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(FsRenameResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
-        };
-        let command = Command::Rename {
-            dedup,
-            src_parent_inode_id,
-            src_name: req.src_name,
-            dst_parent_inode_id,
-            dst_name: req.dst_name,
-            flags: req.flags,
-        };
-
-        if let Err(err) = self.propose_fs_write_command(FsWriteOp::Rename, command).await {
-            let resp_header = Self::header_from_error(
-                &req.header,
-                err,
-                Some(ctx.namespace_owner_group_id.as_raw()),
-                Some(ctx.mount_epoch),
-            );
-            return Ok(Response::new(FsRenameResponseProto {
-                header: Some(resp_header),
-            }));
-        }
-
-        let mut resp_header = ok_header_from_request(
-            &req.header,
-            Some(ctx.namespace_owner_group_id.as_raw()),
-            Some(ctx.mount_epoch),
-        );
-        if let Some(state_id) = ctx.latest_state_id {
-            resp_header.state_id = Some(proto::common::RaftLogIdProto {
-                term: state_id.term,
-                leader_node_id: state_id.leader_node_id,
-                index: state_id.index,
-            });
-        }
-
-        Ok(Response::new(FsRenameResponseProto {
-            header: Some(resp_header),
-        }))
-    }
-
-    // TODO(inode_service): implement extended operations (open/release/fsync)
-    async fn open(&self, request: Request<OpenRequestProto>) -> Result<Response<OpenResponseProto>, Status> {
-        let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        let authz = req.inode_id.as_ref().map(|inode_id| {
-            Self::authz_for_rpc(FsRpcAuthz::Open, AuthzTarget::for_inode(InodeId::new(inode_id.value)))
-        });
-        if let Some(resp_header) = self
-            .guard_request(
-                &req.header,
-                &caller_ctx,
-                GuardSpec::metadata_read().with_authz(),
-                None,
-                authz,
-            )
-            .await
-        {
-            return Ok(Response::new(OpenResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
-        }
-        let resp_header = ok_header_from_request(&req.header, None, None);
-        Ok(Response::new(OpenResponseProto {
-            header: Some(resp_header),
-            file_handle: 0,
-        }))
-    }
-
-    async fn release(&self, request: Request<ReleaseRequestProto>) -> Result<Response<ReleaseResponseProto>, Status> {
-        let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        let session = self.fs_core.write_session_for_handle(req.file_handle);
-        if session.is_some() {
-            if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
-                return Ok(Response::new(ReleaseResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        } else if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
-            return Ok(Response::new(ReleaseResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
-        }
-
-        if let Some(session) = session {
-            if let Some(resp_header) = self
-                .guard_request(
-                    &req.header,
-                    &caller_ctx,
-                    GuardSpec::data_io(DataIoOp::CloseWrite).with_leader().with_authz(),
-                    Some(session.mount_id),
-                    Some(Self::authz_for_rpc(
-                        FsRpcAuthz::Release,
-                        AuthzTarget::for_session(req.file_handle, Some(session.inode_id)),
-                    )),
-                )
-                .await
-            {
-                return Ok(Response::new(ReleaseResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        } else if let Some(resp_header) = self
-            .guard_request(
-                &req.header,
-                &caller_ctx,
-                GuardSpec::metadata_read().with_authz(),
-                None,
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::Release,
-                    AuthzTarget::for_file_handle(req.file_handle),
-                )),
-            )
-            .await
-        {
-            return Ok(Response::new(ReleaseResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
-        }
-
-        let req_ctx = request_context_from_proto(&req.header);
-        let resp = match self
+        let freshness = Self::freshness_from_header(&req.header);
+        match self
             .fs_core
-            .release_session(ReleaseSessionInput {
+            .execute_rename(RenameInput {
                 ctx: req_ctx.clone(),
-                file_handle: req.file_handle,
-            })
-            .await
-        {
-            Ok(success) => ReleaseResponseProto {
-                header: Some(ok_header_from_core_success(&req_ctx, &success)),
-            },
-            Err(failure) => ReleaseResponseProto {
-                header: Some(header_from_core_failure(&req_ctx, &failure)),
-            },
-        };
-        Ok(Response::new(resp))
-    }
-
-    async fn fsync(&self, request: Request<FsyncRequestProto>) -> Result<Response<FsyncResponseProto>, Status> {
-        let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
-            return Ok(Response::new(FsyncResponseProto {
-                header: Some(resp_header),
-            }));
-        }
-
-        let inode_id = match req.inode_id {
-            Some(inode_id) => InodeId::new(inode_id.value),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing inode_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(FsyncResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
-        };
-
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(FsyncResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
-        };
-
-        let inode = match storage.get_inode(inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::NotFound(format!("Inode not found: {}", inode_id)),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(FsyncResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(FsyncResponseProto {
-                    header: Some(resp_header),
-                }));
-            }
-        };
-
-        if !inode.kind.is_file() {
-            let resp_header = Self::header_from_error(
-                &req.header,
-                MetadataError::IsDir(format!("Inode is not a file: {}", inode_id)),
-                None,
-                None,
-            );
-            return Ok(Response::new(FsyncResponseProto {
-                header: Some(resp_header),
-            }));
-        }
-
-        if let Some(resp_header) = self
-            .guard_request(
-                &req.header,
-                &caller_ctx,
-                GuardSpec::data_io(DataIoOp::Fsync).with_leader().with_authz(),
-                Some(inode.mount_id),
-                Some(Self::authz_for_rpc(FsRpcAuthz::Fsync, AuthzTarget::for_inode(inode_id))),
-            )
-            .await
-        {
-            return Ok(Response::new(FsyncResponseProto {
-                header: Some(resp_header),
-            }));
-        }
-
-        let req_ctx = request_context_from_proto(&req.header);
-        let freshness = Freshness {
-            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
-            route_epoch: req
-                .route_epoch
-                .or_else(|| req.header.as_ref().and_then(|h| h.route_epoch)),
-            worker_epoch: req.worker_epoch,
-        };
-        let resp = match self
-            .fs_core
-            .fsync_barrier(FsyncBarrierInput {
-                ctx: req_ctx.clone(),
-                inode_id,
-                file_handle: req.file_handle,
-                lease_id: lease_id_from_proto(req.lease_id),
-                lease_epoch: req.lease_epoch,
-                fencing_token: presented_fencing_from_proto(req.fencing_token),
-                target_size: req.target_size,
-                flags: req.flags as i32,
+                src_parent_inode_id,
+                src_name: req.src_name,
+                dst_parent_inode_id,
+                dst_name: req.dst_name,
+                flags: req.flags,
                 freshness,
             })
             .await
         {
-            Ok(success) => FsyncResponseProto {
-                header: Some(ok_header_from_core_success(&req_ctx, &success)),
-            },
-            Err(failure) => FsyncResponseProto {
-                header: Some(header_from_core_failure(&req_ctx, &failure)),
-            },
+            Ok(success) => {
+                response_with_header!(
+                    FsRenameResponseProto::default(),
+                    ok_header_from_core_success(&req_ctx, &success)
+                )
+            }
+            Err(failure) => error_response!(FsRenameResponseProto, header_from_core_failure(&req_ctx, &failure)),
+        }
+    }
+
+    async fn open(&self, request: Request<OpenRequestProto>) -> Result<Response<OpenResponseProto>, Status> {
+        let req = request.into_inner();
+        let req_ctx = request_context_from_proto(&req.header);
+
+        let inode_id = match Self::inode_id_from_proto(req.inode_id.clone(), "inode_id") {
+            Ok(inode_id) => inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
         };
-        Ok(Response::new(resp))
+
+        if let Some(resp_header) = self.guard_pre_read(&req.header, &req_ctx.caller).await {
+            return error_response!(OpenResponseProto, resp_header);
+        }
+
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::Open, vec![AuthzTarget::for_inode(inode_id)]);
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &req_ctx.caller,
+                GuardSpec::metadata_read(),
+                None,
+                Some(authz),
+            )
+            .await
+        {
+            return error_response!(OpenResponseProto, resp_header);
+        }
+
+        match self
+            .fs_core
+            .execute_open(OpenInput {
+                ctx: req_ctx.clone(),
+                inode_id,
+                flags: req.flags as i32,
+            })
+            .await
+        {
+            Ok(success) => response_with_header!(
+                OpenResponseProto {
+                    file_handle: success.payload.file_handle,
+                    ..Default::default()
+                },
+                ok_header_from_core_success(&req_ctx, &success)
+            ),
+            Err(failure) => error_response!(OpenResponseProto, header_from_core_failure(&req_ctx, &failure)),
+        }
+    }
+
+    async fn release(&self, request: Request<ReleaseRequestProto>) -> Result<Response<ReleaseResponseProto>, Status> {
+        let req = request.into_inner();
+        let req_ctx = request_context_from_proto(&req.header);
+
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &req_ctx.caller).await {
+            return error_response!(ReleaseResponseProto, resp_header);
+        }
+
+        let plan = match self.fs_core.plan_session(&req_ctx, req.file_handle).await {
+            Ok(plan) => plan,
+            Err(failure) => return error_response!(ReleaseResponseProto, header_from_core_failure(&req_ctx, &failure)),
+        };
+
+        let authz_targets = plan
+            .payload
+            .inode_id
+            .into_iter()
+            .map(AuthzTarget::for_inode)
+            .collect::<Vec<_>>();
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::Release, authz_targets);
+        let spec = if plan.payload.mount_id.is_some() {
+            GuardSpec::data_io(DataIoOp::CloseWrite).with_leader()
+        } else {
+            GuardSpec::metadata_write()
+        };
+        if let Some(resp_header) = self
+            .guard_request(&req.header, &req_ctx.caller, spec, plan.payload.mount_id, Some(authz))
+            .await
+        {
+            return error_response!(ReleaseResponseProto, resp_header);
+        }
+
+        match self
+            .fs_core
+            .execute_release(ReleaseSessionInput {
+                ctx: req_ctx.clone(),
+                file_handle: req.file_handle,
+            })
+            .await
+        {
+            Ok(success) => {
+                response_with_header!(
+                    ReleaseResponseProto::default(),
+                    ok_header_from_core_success(&req_ctx, &success)
+                )
+            }
+            Err(failure) => error_response!(ReleaseResponseProto, header_from_core_failure(&req_ctx, &failure)),
+        }
+    }
+
+    async fn fsync(&self, request: Request<FsyncRequestProto>) -> Result<Response<FsyncResponseProto>, Status> {
+        let resp_header = self.fsync_like(request.into_inner(), FsyncFlavor::Fsync).await?;
+        response_with_header!(FsyncResponseProto::default(), resp_header)
     }
 
     async fn hsync(&self, request: Request<HsyncRequestProto>) -> Result<Response<HsyncResponseProto>, Status> {
-        // Reuse fsync semantics
-        let inner = request.into_inner();
-        let fsync_req = match inner.fsync {
-            Some(req) => req,
+        let req = request.into_inner();
+        let fsync_req = match req.fsync {
+            Some(fsync_req) => fsync_req,
             None => {
-                let resp_header = Self::header_from_error(
-                    &None,
-                    MetadataError::InvalidArgument("missing fsync body".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(HsyncResponseProto {
-                    header: Some(resp_header),
-                }));
+                let canonical = to_canonical_fs(MetadataError::InvalidArgument("missing fsync body".to_string()));
+                let resp_header = header_from_canonical_error(&None, None, None, &canonical);
+                return error_response!(HsyncResponseProto, resp_header);
             }
         };
-        let resp = self.fsync(Request::new(fsync_req)).await?;
-        Ok(Response::new(HsyncResponseProto {
-            header: resp.into_inner().header,
-        }))
+        let resp_header = self.fsync_like(fsync_req, FsyncFlavor::Hsync).await?;
+        response_with_header!(HsyncResponseProto::default(), resp_header)
     }
 
     async fn hflush(&self, request: Request<HflushRequestProto>) -> Result<Response<HflushResponseProto>, Status> {
-        let inner = request.into_inner();
-        let fsync_req = match inner.fsync {
-            Some(req) => req,
+        let req = request.into_inner();
+        let fsync_req = match req.fsync {
+            Some(fsync_req) => fsync_req,
             None => {
-                let resp_header = Self::header_from_error(
-                    &None,
-                    MetadataError::InvalidArgument("missing fsync body".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(HflushResponseProto {
-                    header: Some(resp_header),
-                }));
+                let canonical = to_canonical_fs(MetadataError::InvalidArgument("missing fsync body".to_string()));
+                let resp_header = header_from_canonical_error(&None, None, None, &canonical);
+                return error_response!(HflushResponseProto, resp_header);
             }
         };
-        let resp = self.fsync(Request::new(fsync_req)).await?;
-        Ok(Response::new(HflushResponseProto {
-            header: resp.into_inner().header,
-        }))
+        let resp_header = self.fsync_like(fsync_req, FsyncFlavor::Hflush).await?;
+        response_with_header!(HflushResponseProto::default(), resp_header)
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -2647,164 +1332,45 @@ impl MetadataInodeServiceProto for MetadataInodeServiceImpl {
         request: Request<OpenWriteRequestProto>,
     ) -> Result<Response<OpenWriteResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
-            return Ok(Response::new(OpenWriteResponseProto {
-                header: Some(resp_header),
-                file_handle: 0,
-                lease_id: None,
-                fencing_token: None,
-                write_targets: vec![],
-                base_size: 0,
-                open_epoch: 0,
-                lease_epoch: 0,
-                expires_at_ms: 0,
-            }));
+        let req_ctx = request_context_from_proto(&req.header);
+
+        let inode_id = match Self::inode_id_from_proto(req.inode_id.clone(), "inode_id") {
+            Ok(inode_id) => inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
+        };
+
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &req_ctx.caller).await {
+            return error_response!(OpenWriteResponseProto, resp_header);
         }
 
-        let inode_id = match req.inode_id {
-            Some(inode_id) => InodeId::new(inode_id.value),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing inode_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(OpenWriteResponseProto {
-                    header: Some(resp_header),
-                    file_handle: 0,
-                    lease_id: None,
-                    fencing_token: None,
-                    write_targets: vec![],
-                    base_size: 0,
-                    open_epoch: 0,
-                    lease_epoch: 0,
-                    expires_at_ms: 0,
-                }));
+        let plan = match self.fs_core.plan_inode_mount(&req_ctx, inode_id).await {
+            Ok(plan) => plan,
+            Err(failure) => {
+                return error_response!(OpenWriteResponseProto, header_from_core_failure(&req_ctx, &failure));
             }
         };
-
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(OpenWriteResponseProto {
-                    header: Some(resp_header),
-                    file_handle: 0,
-                    lease_id: None,
-                    fencing_token: None,
-                    write_targets: vec![],
-                    base_size: 0,
-                    open_epoch: 0,
-                    lease_epoch: 0,
-                    expires_at_ms: 0,
-                }));
-            }
-        };
-
-        // Get inode and verify it's a file
-        let inode = match storage.get_inode(inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::NotFound(format!("Inode not found: {}", inode_id)),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(OpenWriteResponseProto {
-                    header: Some(resp_header),
-                    file_handle: 0,
-                    lease_id: None,
-                    fencing_token: None,
-                    write_targets: vec![],
-                    base_size: 0,
-                    open_epoch: 0,
-                    lease_epoch: 0,
-                    expires_at_ms: 0,
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(OpenWriteResponseProto {
-                    header: Some(resp_header),
-                    file_handle: 0,
-                    lease_id: None,
-                    fencing_token: None,
-                    write_targets: vec![],
-                    base_size: 0,
-                    open_epoch: 0,
-                    lease_epoch: 0,
-                    expires_at_ms: 0,
-                }));
-            }
-        };
-
-        if !inode.kind.is_file() {
-            let resp_header = Self::header_from_error(
-                &req.header,
-                MetadataError::IsDir(format!("Inode is not a file: {}", inode_id)),
-                None,
-                None,
-            );
-            return Ok(Response::new(OpenWriteResponseProto {
-                header: Some(resp_header),
-                file_handle: 0,
-                lease_id: None,
-                fencing_token: None,
-                write_targets: vec![],
-                base_size: 0,
-                open_epoch: 0,
-                lease_epoch: 0,
-                expires_at_ms: 0,
-            }));
-        }
-
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::OpenWrite, vec![AuthzTarget::for_inode(inode_id)]);
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
-                &caller_ctx,
-                GuardSpec::data_io(DataIoOp::OpenWrite).with_leader().with_authz(),
-                Some(inode.mount_id),
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::OpenWrite,
-                    AuthzTarget::for_inode(inode_id),
-                )),
+                &req_ctx.caller,
+                GuardSpec::data_io(DataIoOp::OpenWrite).with_leader(),
+                Some(plan.payload.mount_id),
+                Some(authz),
             )
             .await
         {
-            return Ok(Response::new(OpenWriteResponseProto {
-                header: Some(resp_header),
-                file_handle: 0,
-                lease_id: None,
-                fencing_token: None,
-                write_targets: vec![],
-                base_size: 0,
-                open_epoch: 0,
-                lease_epoch: 0,
-                expires_at_ms: 0,
-            }));
+            return error_response!(OpenWriteResponseProto, resp_header);
         }
 
-        let req_ctx = request_context_from_proto(&req.header);
         let mode = match req.mode {
             x if x == WriteModeProto::WriteModeAppend as i32 => crate::inode_lease::WriteMode::Append,
             _ => crate::inode_lease::WriteMode::Write,
         };
-        let freshness = Freshness {
-            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
-            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
-            worker_epoch: None,
-        };
-        let resp = match self
+        let freshness = Self::freshness_from_header(&req.header);
+        match self
             .fs_core
-            .open_write(OpenWriteInput {
+            .execute_open_write(OpenWriteInput {
                 ctx: req_ctx.clone(),
                 inode_id,
                 desired_len: req.desired_len,
@@ -2813,34 +1379,27 @@ impl MetadataInodeServiceProto for MetadataInodeServiceImpl {
             })
             .await
         {
-            Ok(success) => {
-                let header = ok_header_from_core_success(&req_ctx, &success);
-                let payload = success.payload;
+            Ok(success) => response_with_header!(
                 OpenWriteResponseProto {
-                    header: Some(header),
-                    file_handle: payload.session_key.file_handle,
-                    lease_id: Some(lease_id_to_proto(payload.session_key.lease_id)),
-                    fencing_token: Some(fencing_to_proto(payload.session_key.fencing_token)),
-                    write_targets: payload.write_targets.iter().map(write_target_to_proto).collect(),
-                    base_size: payload.base_size,
-                    open_epoch: payload.session_key.open_epoch,
-                    lease_epoch: payload.session_key.lease_epoch,
-                    expires_at_ms: payload.expires_at_ms,
-                }
-            }
-            Err(failure) => OpenWriteResponseProto {
-                header: Some(header_from_core_failure(&req_ctx, &failure)),
-                file_handle: 0,
-                lease_id: None,
-                fencing_token: None,
-                write_targets: vec![],
-                base_size: 0,
-                open_epoch: 0,
-                lease_epoch: 0,
-                expires_at_ms: 0,
-            },
-        };
-        Ok(Response::new(resp))
+                    file_handle: success.payload.session_key.file_handle,
+                    lease_id: Some(lease_id_to_proto(success.payload.session_key.lease_id)),
+                    fencing_token: Some(fencing_to_proto(success.payload.session_key.fencing_token)),
+                    write_targets: success
+                        .payload
+                        .write_targets
+                        .iter()
+                        .map(write_target_to_proto)
+                        .collect(),
+                    base_size: success.payload.base_size,
+                    open_epoch: success.payload.session_key.open_epoch,
+                    lease_epoch: success.payload.session_key.lease_epoch,
+                    expires_at_ms: success.payload.expires_at_ms,
+                    ..Default::default()
+                },
+                ok_header_from_core_success(&req_ctx, &success)
+            ),
+            Err(failure) => error_response!(OpenWriteResponseProto, header_from_core_failure(&req_ctx, &failure)),
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -2849,78 +1408,53 @@ impl MetadataInodeServiceProto for MetadataInodeServiceImpl {
         request: Request<CloseWriteRequestProto>,
     ) -> Result<Response<CloseWriteResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
-            return Ok(Response::new(CloseWriteResponseProto {
-                header: Some(resp_header),
-                committed_size: 0,
-                file_version: None,
-            }));
-        }
-
-        let session = match self.fs_core.write_session_for_handle(req.file_handle) {
-            Some(session) => session,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::NotFound(format!("Write session not found: {}", req.file_handle)),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(CloseWriteResponseProto {
-                    header: Some(resp_header),
-                    committed_size: 0,
-                    file_version: None,
-                }));
-            }
-        };
-
-        if let Some(resp_header) = self
-            .guard_request(
-                &req.header,
-                &caller_ctx,
-                GuardSpec::data_io(DataIoOp::CloseWrite).with_leader().with_authz(),
-                Some(session.mount_id),
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::CloseWrite,
-                    AuthzTarget::for_session(req.file_handle, Some(session.inode_id)),
-                )),
-            )
-            .await
-        {
-            return Ok(Response::new(CloseWriteResponseProto {
-                header: Some(resp_header),
-                committed_size: 0,
-                file_version: None,
-            }));
-        }
+        let req_ctx = request_context_from_proto(&req.header);
 
         let extents = match req
             .extents
+            .clone()
             .into_iter()
             .map(extent_from_proto)
             .collect::<Result<Vec<_>, _>>()
         {
             Ok(extents) => extents,
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(CloseWriteResponseProto {
-                    header: Some(resp_header),
-                    committed_size: 0,
-                    file_version: None,
-                }));
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
+        };
+
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &req_ctx.caller).await {
+            return error_response!(CloseWriteResponseProto, resp_header);
+        }
+
+        let plan = match self.fs_core.plan_session(&req_ctx, req.file_handle).await {
+            Ok(plan) => plan,
+            Err(failure) => {
+                return error_response!(CloseWriteResponseProto, header_from_core_failure(&req_ctx, &failure));
             }
         };
 
-        let req_ctx = request_context_from_proto(&req.header);
-        let freshness = Freshness {
-            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
-            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
-            worker_epoch: None,
+        let authz_targets = plan
+            .payload
+            .inode_id
+            .into_iter()
+            .map(AuthzTarget::for_inode)
+            .collect::<Vec<_>>();
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::CloseWrite, authz_targets);
+        let spec = if plan.payload.mount_id.is_some() {
+            GuardSpec::data_io(DataIoOp::CloseWrite).with_leader()
+        } else {
+            GuardSpec::metadata_write()
         };
-        let resp = match self
+        if let Some(resp_header) = self
+            .guard_request(&req.header, &req_ctx.caller, spec, plan.payload.mount_id, Some(authz))
+            .await
+        {
+            return error_response!(CloseWriteResponseProto, resp_header);
+        }
+
+        let freshness = Self::freshness_from_header(&req.header);
+        match self
             .fs_core
-            .close_write(CloseWriteInput {
+            .execute_close_write(CloseWriteInput {
                 ctx: req_ctx.clone(),
                 file_handle: req.file_handle,
                 lease_id: lease_id_from_proto(req.lease_id),
@@ -2935,22 +1469,16 @@ impl MetadataInodeServiceProto for MetadataInodeServiceImpl {
             })
             .await
         {
-            Ok(success) => {
-                let header = ok_header_from_core_success(&req_ctx, &success);
-                let payload = success.payload;
+            Ok(success) => response_with_header!(
                 CloseWriteResponseProto {
-                    header: Some(header),
-                    committed_size: payload.committed_size,
-                    file_version: payload.file_version,
-                }
-            }
-            Err(failure) => CloseWriteResponseProto {
-                header: Some(header_from_core_failure(&req_ctx, &failure)),
-                committed_size: 0,
-                file_version: None,
-            },
-        };
-        Ok(Response::new(resp))
+                    committed_size: success.payload.committed_size,
+                    file_version: success.payload.file_version,
+                    ..Default::default()
+                },
+                ok_header_from_core_success(&req_ctx, &success)
+            ),
+            Err(failure) => error_response!(CloseWriteResponseProto, header_from_core_failure(&req_ctx, &failure)),
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -2959,116 +1487,45 @@ impl MetadataInodeServiceProto for MetadataInodeServiceImpl {
         request: Request<GetFileLayoutRequestProto>,
     ) -> Result<Response<GetFileLayoutResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
-            return Ok(Response::new(GetFileLayoutResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+        let req_ctx = request_context_from_proto(&req.header);
+
+        let inode_id = match Self::inode_id_from_proto(req.inode_id.clone(), "inode_id") {
+            Ok(inode_id) => inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
+        };
+
+        if let Some(resp_header) = self.guard_pre_read(&req.header, &req_ctx.caller).await {
+            return error_response!(GetFileLayoutResponseProto, resp_header);
         }
 
-        let inode_id = match req.inode_id {
-            Some(inode_id) => InodeId::new(inode_id.value),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing inode_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(GetFileLayoutResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
+        let plan = match self.fs_core.plan_inode_mount(&req_ctx, inode_id).await {
+            Ok(plan) => plan,
+            Err(failure) => {
+                return error_response!(GetFileLayoutResponseProto, header_from_core_failure(&req_ctx, &failure));
             }
         };
-
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(GetFileLayoutResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-
-        let inode = match storage.get_inode(inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::NotFound(format!("Inode not found: {}", inode_id)),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(GetFileLayoutResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(GetFileLayoutResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-
-        if !inode.kind.is_file() {
-            let resp_header = Self::header_from_error(
-                &req.header,
-                MetadataError::IsDir(format!("Inode is not a file: {}", inode_id)),
-                None,
-                None,
-            );
-            return Ok(Response::new(GetFileLayoutResponseProto {
-                header: Some(resp_header),
-                extents: vec![],
-                file_size: 0,
-                locations: Vec::new(),
-            }));
-        }
-
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::GetFileLayout, vec![AuthzTarget::for_inode(inode_id)]);
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
-                &caller_ctx,
-                GuardSpec::data_io(DataIoOp::Read).with_authz(),
-                Some(inode.mount_id),
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::GetFileLayout,
-                    AuthzTarget::for_inode(inode_id),
-                )),
+                &req_ctx.caller,
+                GuardSpec::data_io(DataIoOp::Read),
+                Some(plan.payload.mount_id),
+                Some(authz),
             )
             .await
         {
-            return Ok(Response::new(GetFileLayoutResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+            return error_response!(GetFileLayoutResponseProto, resp_header);
         }
 
-        let req_ctx = request_context_from_proto(&req.header);
-        let freshness = Freshness {
-            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
-            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
-            worker_epoch: None,
-        };
-        let range = req.range.map(|r| FileRange {
-            offset: r.offset,
-            len: r.len as u64,
+        let range = req.range.map(|range| FileRange {
+            offset: range.offset,
+            len: range.len as u64,
         });
-        let resp = match self
+        let freshness = Self::freshness_from_header(&req.header);
+        match self
             .fs_core
-            .get_file_layout(GetFileLayoutInput {
+            .execute_get_file_layout(GetFileLayoutInput {
                 ctx: req_ctx.clone(),
                 inode_id,
                 range,
@@ -3076,22 +1533,17 @@ impl MetadataInodeServiceProto for MetadataInodeServiceImpl {
             })
             .await
         {
-            Ok(success) => {
-                let header = ok_header_from_core_success(&req_ctx, &success);
-                let payload = success.payload;
+            Ok(success) => response_with_header!(
                 GetFileLayoutResponseProto {
-                    header: Some(header),
-                    extents: payload.extents.iter().map(extent_to_proto).collect(),
-                    file_size: payload.file_size,
-                    locations: payload.locations.iter().map(location_to_proto).collect(),
-                }
-            }
-            Err(failure) => GetFileLayoutResponseProto {
-                header: Some(header_from_core_failure(&req_ctx, &failure)),
-                ..Default::default()
-            },
-        };
-        Ok(Response::new(resp))
+                    extents: success.payload.extents.iter().map(extent_to_proto).collect(),
+                    file_size: success.payload.file_size,
+                    locations: success.payload.locations.iter().map(location_to_proto).collect(),
+                    ..Default::default()
+                },
+                ok_header_from_core_success(&req_ctx, &success)
+            ),
+            Err(failure) => error_response!(GetFileLayoutResponseProto, header_from_core_failure(&req_ctx, &failure)),
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -3100,58 +1552,44 @@ impl MetadataInodeServiceProto for MetadataInodeServiceImpl {
         request: Request<RenewInodeLeaseRequestProto>,
     ) -> Result<Response<RenewInodeLeaseResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
-            return Ok(Response::new(RenewInodeLeaseResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+        let req_ctx = request_context_from_proto(&req.header);
+
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &req_ctx.caller).await {
+            return error_response!(RenewInodeLeaseResponseProto, resp_header);
         }
 
-        let session = match self.fs_core.write_session_for_handle(req.file_handle) {
-            Some(session) => session,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::NotFound(format!("Write session not found: {}", req.file_handle)),
-                    None,
-                    None,
+        let plan = match self.fs_core.plan_session(&req_ctx, req.file_handle).await {
+            Ok(plan) => plan,
+            Err(failure) => {
+                return error_response!(
+                    RenewInodeLeaseResponseProto,
+                    header_from_core_failure(&req_ctx, &failure)
                 );
-                return Ok(Response::new(RenewInodeLeaseResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
             }
         };
-
+        let authz_targets = plan
+            .payload
+            .inode_id
+            .into_iter()
+            .map(AuthzTarget::for_inode)
+            .collect::<Vec<_>>();
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::RenewInodeLease, authz_targets);
+        let spec = if plan.payload.mount_id.is_some() {
+            GuardSpec::data_io(DataIoOp::RenewLease).with_leader()
+        } else {
+            GuardSpec::metadata_write()
+        };
         if let Some(resp_header) = self
-            .guard_request(
-                &req.header,
-                &caller_ctx,
-                GuardSpec::data_io(DataIoOp::RenewLease).with_leader().with_authz(),
-                Some(session.mount_id),
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::RenewInodeLease,
-                    AuthzTarget::for_session(req.file_handle, Some(session.inode_id)),
-                )),
-            )
+            .guard_request(&req.header, &req_ctx.caller, spec, plan.payload.mount_id, Some(authz))
             .await
         {
-            return Ok(Response::new(RenewInodeLeaseResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+            return error_response!(RenewInodeLeaseResponseProto, resp_header);
         }
 
-        let req_ctx = request_context_from_proto(&req.header);
-        let freshness = Freshness {
-            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
-            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
-            worker_epoch: None,
-        };
-        let resp = match self
+        let freshness = Self::freshness_from_header(&req.header);
+        match self
             .fs_core
-            .renew_lease(RenewLeaseInput {
+            .execute_renew_inode_lease(RenewLeaseInput {
                 ctx: req_ctx.clone(),
                 file_handle: req.file_handle,
                 lease_id: lease_id_from_proto(req.lease_id),
@@ -3160,16 +1598,20 @@ impl MetadataInodeServiceProto for MetadataInodeServiceImpl {
             })
             .await
         {
-            Ok(success) => RenewInodeLeaseResponseProto {
-                header: Some(ok_header_from_core_success(&req_ctx, &success)),
-                expires_at_ms: success.payload.expires_at_ms,
-            },
-            Err(failure) => RenewInodeLeaseResponseProto {
-                header: Some(header_from_core_failure(&req_ctx, &failure)),
-                ..Default::default()
-            },
-        };
-        Ok(Response::new(resp))
+            Ok(success) => response_with_header!(
+                RenewInodeLeaseResponseProto {
+                    expires_at_ms: success.payload.expires_at_ms,
+                    ..Default::default()
+                },
+                ok_header_from_core_success(&req_ctx, &success)
+            ),
+            Err(failure) => {
+                error_response!(
+                    RenewInodeLeaseResponseProto,
+                    header_from_core_failure(&req_ctx, &failure)
+                )
+            }
+        }
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -3178,285 +1620,212 @@ impl MetadataInodeServiceProto for MetadataInodeServiceImpl {
         request: Request<TruncateRequestProto>,
     ) -> Result<Response<TruncateResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
-            return Ok(Response::new(TruncateResponseProto {
-                header: Some(resp_header),
-                new_size: 0,
-            }));
+        let req_ctx = request_context_from_proto(&req.header);
+
+        let inode_id = match Self::inode_id_from_proto(req.inode_id.clone(), "inode_id") {
+            Ok(inode_id) => inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
+        };
+
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &req_ctx.caller).await {
+            return error_response!(TruncateResponseProto, resp_header);
         }
 
-        let inode_id = match req.inode_id {
-            Some(inode_id) => InodeId::new(inode_id.value),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing inode_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(TruncateResponseProto {
-                    header: Some(resp_header),
-                    new_size: 0,
-                }));
+        let plan = match self.fs_core.plan_inode_mount(&req_ctx, inode_id).await {
+            Ok(plan) => plan,
+            Err(failure) => {
+                return error_response!(TruncateResponseProto, header_from_core_failure(&req_ctx, &failure))
             }
         };
 
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(TruncateResponseProto {
-                    header: Some(resp_header),
-                    new_size: 0,
-                }));
-            }
-        };
-
-        // Get inode
-        let inode = match storage.get_inode(inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::NotFound(format!("Inode not found: {}", inode_id)),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(TruncateResponseProto {
-                    header: Some(resp_header),
-                    new_size: 0,
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(TruncateResponseProto {
-                    header: Some(resp_header),
-                    new_size: 0,
-                }));
-            }
-        };
-
-        if !inode.kind.is_file() {
-            let resp_header = Self::header_from_error(
-                &req.header,
-                MetadataError::IsDir(format!("Inode is not a file: {}", inode_id)),
-                None,
-                None,
-            );
-            return Ok(Response::new(TruncateResponseProto {
-                header: Some(resp_header),
-                new_size: 0,
-            }));
-        }
-
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::Truncate, vec![AuthzTarget::for_inode(inode_id)]);
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
-                &caller_ctx,
-                GuardSpec::data_io(DataIoOp::Truncate).with_leader().with_authz(),
-                Some(inode.mount_id),
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::Truncate,
-                    AuthzTarget::for_inode(inode_id),
-                )),
+                &req_ctx.caller,
+                GuardSpec::data_io(DataIoOp::Truncate).with_leader(),
+                Some(plan.payload.mount_id),
+                Some(authz),
             )
             .await
         {
-            return Ok(Response::new(TruncateResponseProto {
-                header: Some(resp_header),
-                new_size: 0,
-            }));
+            return error_response!(TruncateResponseProto, resp_header);
         }
 
-        // Validate lease (required for truncate)
-        let lease_id_proto = match req.lease_id {
-            Some(lease_id_proto) => lease_id_proto,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing lease_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(TruncateResponseProto {
-                    header: Some(resp_header),
-                    new_size: 0,
-                }));
-            }
-        };
-        let lease_id_raw = (lease_id_proto.high as u128) << 64 | lease_id_proto.low as u128;
-        let lease_id_typed = LeaseId::new(lease_id_raw);
-
-        if let Err(e) = self
-            .inode_lease_manager
-            .validate_lease(inode_id, lease_id_typed, req.lease_epoch)
-        {
-            let resp_header = fatal_fs_header(
-                &req.header,
-                e,
-                format!(
-                    "Lease validation failed for truncate: inode={}, lease_id={:?}",
-                    inode_id, lease_id_typed
-                ),
-                None,
-                None,
-            );
-            return Ok(Response::new(TruncateResponseProto {
-                header: Some(resp_header),
-                new_size: 0,
-            }));
-        }
-
-        // Validate new_size
-        let current_size = inode.attrs.size;
-        if req.new_size > current_size {
-            // Truncate grow not supported
-            let resp_header = Self::header_from_error(
-                &req.header,
-                MetadataError::NotSupported(format!(
-                    "Truncate grow not supported: current_size={}, new_size={}",
-                    current_size, req.new_size
-                )),
-                None,
-                None,
-            );
-            return Ok(Response::new(TruncateResponseProto {
-                header: Some(resp_header),
-                new_size: 0,
-            }));
-        }
-
-        if req.new_size == current_size {
-            // No-op truncate
-            let resp_header = ok_header_from_request(&req.header, None, None);
-            return Ok(Response::new(TruncateResponseProto {
-                header: Some(resp_header),
+        let freshness = Self::freshness_from_header(&req.header);
+        match self
+            .fs_core
+            .execute_truncate(TruncateInput {
+                ctx: req_ctx.clone(),
+                inode_id,
                 new_size: req.new_size,
-            }));
+                lease_id: lease_id_from_proto(req.lease_id),
+                lease_epoch: req.lease_epoch,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => response_with_header!(
+                TruncateResponseProto {
+                    new_size: success.payload.new_size,
+                    ..Default::default()
+                },
+                ok_header_from_core_success(&req_ctx, &success)
+            ),
+            Err(failure) => error_response!(TruncateResponseProto, header_from_core_failure(&req_ctx, &failure)),
         }
-
-        // Route FS write operation
-        let ctx = match self.route_fs_write_ctx(FsWriteOp::SetAttr, &[inode_id], &req.header) {
-            Ok(ctx) => ctx,
-            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
-                let resp_header = need_refresh_header(
-                    &req.header,
-                    RpcErrorCode::MountEpochMismatch,
-                    RefreshReason::MountEpochMismatch,
-                    format!("Mount epoch mismatch: client={}, server={} ", got, expected),
-                    None,
-                    Some(expected),
-                );
-                return Ok(Response::new(TruncateResponseProto {
-                    header: Some(resp_header),
-                    new_size: 0,
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(TruncateResponseProto {
-                    header: Some(resp_header),
-                    new_size: 0,
-                }));
-            }
-        };
-
-        let dedup = match self.dedup_key(&caller_ctx) {
-            Ok(k) => k,
-            Err(err) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(TruncateResponseProto {
-                    header: Some(resp_header),
-                    new_size: 0,
-                }));
-            }
-        };
-        // Send Raft command
-        let command = Command::Truncate {
-            dedup,
-            inode_id,
-            new_size: req.new_size,
-            lease_id: lease_id_typed,
-            lease_epoch: req.lease_epoch,
-        };
-
-        // Propose via unified helper
-        if let Err(err) = self.propose_fs_write_command(FsWriteOp::SetAttr, command).await {
-            let resp_header = Self::header_from_error(
-                &req.header,
-                err,
-                Some(ctx.namespace_owner_group_id.as_raw()),
-                Some(ctx.mount_epoch),
-            );
-            return Ok(Response::new(TruncateResponseProto {
-                header: Some(resp_header),
-                new_size: 0,
-            }));
-        }
-
-        let resp_header = ok_header_from_request(
-            &req.header,
-            Some(ctx.namespace_owner_group_id.as_raw()),
-            Some(ctx.mount_epoch),
-        );
-
-        Ok(Response::new(TruncateResponseProto {
-            header: Some(resp_header),
-            new_size: req.new_size,
-        }))
     }
 
     async fn stat_fs(&self, request: Request<StatFsRequestProto>) -> Result<Response<StatFsResponseProto>, Status> {
         let req = request.into_inner();
-        let resp_header = Self::header_from_error(
-            &req.header,
-            MetadataError::NotSupported("StatFs not yet implemented".to_string()),
-            None,
-            None,
-        );
-        Ok(Response::new(StatFsResponseProto {
-            header: Some(resp_header),
-            ..Default::default()
-        }))
+        let req_ctx = request_context_from_proto(&req.header);
+
+        let inode_id = match Self::inode_id_from_proto(req.inode_id.clone(), "inode_id") {
+            Ok(inode_id) => inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
+        };
+
+        if let Some(resp_header) = self.guard_pre_read(&req.header, &req_ctx.caller).await {
+            return error_response!(StatFsResponseProto, resp_header);
+        }
+
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::StatFs, vec![AuthzTarget::for_inode(inode_id)]);
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &req_ctx.caller,
+                GuardSpec::metadata_read(),
+                None,
+                Some(authz),
+            )
+            .await
+        {
+            return error_response!(StatFsResponseProto, resp_header);
+        }
+
+        match self
+            .fs_core
+            .execute_stat_fs(StatFsInput {
+                ctx: req_ctx.clone(),
+                inode_id,
+            })
+            .await
+        {
+            Ok(success) => response_with_header!(
+                StatFsResponseProto {
+                    total_blocks: success.payload.total_blocks,
+                    free_blocks: success.payload.free_blocks,
+                    available_blocks: success.payload.available_blocks,
+                    block_size: success.payload.block_size,
+                    ..Default::default()
+                },
+                ok_header_from_core_success(&req_ctx, &success)
+            ),
+            Err(failure) => error_response!(StatFsResponseProto, header_from_core_failure(&req_ctx, &failure)),
+        }
     }
 
     async fn access(&self, request: Request<AccessRequestProto>) -> Result<Response<AccessResponseProto>, Status> {
         let req = request.into_inner();
-        let resp_header = Self::header_from_error(
-            &req.header,
-            MetadataError::NotSupported("Access not yet implemented".to_string()),
-            None,
-            None,
-        );
-        Ok(Response::new(AccessResponseProto {
-            header: Some(resp_header),
-            ..Default::default()
-        }))
+        let req_ctx = request_context_from_proto(&req.header);
+
+        let inode_id = match Self::inode_id_from_proto(req.inode_id.clone(), "inode_id") {
+            Ok(inode_id) => inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
+        };
+
+        if let Some(resp_header) = self.guard_pre_read(&req.header, &req_ctx.caller).await {
+            return error_response!(AccessResponseProto, resp_header);
+        }
+
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::Access, vec![AuthzTarget::for_inode(inode_id)]);
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &req_ctx.caller,
+                GuardSpec::metadata_read(),
+                None,
+                Some(authz),
+            )
+            .await
+        {
+            return error_response!(AccessResponseProto, resp_header);
+        }
+
+        match self
+            .fs_core
+            .execute_access(AccessInput {
+                ctx: req_ctx.clone(),
+                inode_id,
+                mode: req.mode,
+            })
+            .await
+        {
+            Ok(success) => response_with_header!(
+                AccessResponseProto {
+                    granted: success.payload.granted,
+                    ..Default::default()
+                },
+                ok_header_from_core_success(&req_ctx, &success)
+            ),
+            Err(failure) => error_response!(AccessResponseProto, header_from_core_failure(&req_ctx, &failure)),
+        }
     }
 
     async fn symlink(&self, request: Request<SymlinkRequestProto>) -> Result<Response<SymlinkResponseProto>, Status> {
         let req = request.into_inner();
-        let resp_header = Self::header_from_error(
-            &req.header,
-            MetadataError::NotSupported("Symlink not yet implemented".to_string()),
-            None,
-            None,
-        );
-        Ok(Response::new(SymlinkResponseProto {
-            header: Some(resp_header),
-            ..Default::default()
-        }))
+        let req_ctx = request_context_from_proto(&req.header);
+
+        let parent_inode_id = match Self::inode_id_from_proto(req.parent_inode_id.clone(), "parent_inode_id") {
+            Ok(inode_id) => inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
+        };
+        let attrs = match Self::proto_to_file_attrs(req.attrs) {
+            Ok(attrs) => attrs,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
+        };
+
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &req_ctx.caller).await {
+            return error_response!(SymlinkResponseProto, resp_header);
+        }
+
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::Symlink, vec![AuthzTarget::for_inode(parent_inode_id)]);
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &req_ctx.caller,
+                GuardSpec::metadata_write(),
+                None,
+                Some(authz),
+            )
+            .await
+        {
+            return error_response!(SymlinkResponseProto, resp_header);
+        }
+
+        let freshness = Self::freshness_from_header(&req.header);
+        match self
+            .fs_core
+            .execute_symlink(SymlinkInput {
+                ctx: req_ctx.clone(),
+                parent_inode_id,
+                name: req.name,
+                target: req.target,
+                attrs,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => response_with_header!(
+                SymlinkResponseProto {
+                    inode: success.payload.inode.as_ref().map(Self::inode_to_proto),
+                    attrs: success.payload.attrs.as_ref().map(Self::file_attrs_to_proto),
+                    ..Default::default()
+                },
+                ok_header_from_core_success(&req_ctx, &success)
+            ),
+            Err(failure) => error_response!(SymlinkResponseProto, header_from_core_failure(&req_ctx, &failure)),
+        }
     }
 
     async fn readlink(
@@ -3464,30 +1833,114 @@ impl MetadataInodeServiceProto for MetadataInodeServiceImpl {
         request: Request<ReadlinkRequestProto>,
     ) -> Result<Response<ReadlinkResponseProto>, Status> {
         let req = request.into_inner();
-        let resp_header = Self::header_from_error(
-            &req.header,
-            MetadataError::NotSupported("Readlink not yet implemented".to_string()),
-            None,
-            None,
-        );
-        Ok(Response::new(ReadlinkResponseProto {
-            header: Some(resp_header),
-            ..Default::default()
-        }))
+        let req_ctx = request_context_from_proto(&req.header);
+
+        let inode_id = match Self::inode_id_from_proto(req.inode_id.clone(), "inode_id") {
+            Ok(inode_id) => inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
+        };
+
+        if let Some(resp_header) = self.guard_pre_read(&req.header, &req_ctx.caller).await {
+            return error_response!(ReadlinkResponseProto, resp_header);
+        }
+
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::Readlink, vec![AuthzTarget::for_inode(inode_id)]);
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &req_ctx.caller,
+                GuardSpec::metadata_read(),
+                None,
+                Some(authz),
+            )
+            .await
+        {
+            return error_response!(ReadlinkResponseProto, resp_header);
+        }
+
+        match self
+            .fs_core
+            .execute_readlink(ReadlinkInput {
+                ctx: req_ctx.clone(),
+                inode_id,
+            })
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_core_success(&req_ctx, &success);
+                let payload = success.payload;
+                response_with_header!(
+                    ReadlinkResponseProto {
+                        target: payload.target,
+                        ..Default::default()
+                    },
+                    header
+                )
+            }
+            Err(failure) => error_response!(ReadlinkResponseProto, header_from_core_failure(&req_ctx, &failure)),
+        }
     }
 
     async fn link(&self, request: Request<LinkRequestProto>) -> Result<Response<LinkResponseProto>, Status> {
         let req = request.into_inner();
-        let resp_header = Self::header_from_error(
-            &req.header,
-            MetadataError::NotSupported("Link not yet implemented".to_string()),
-            None,
-            None,
+        let req_ctx = request_context_from_proto(&req.header);
+
+        let src_inode_id = match Self::inode_id_from_proto(req.src_inode_id.clone(), "src_inode_id") {
+            Ok(inode_id) => inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
+        };
+        let dst_parent_inode_id =
+            match Self::inode_id_from_proto(req.dst_parent_inode_id.clone(), "dst_parent_inode_id") {
+                Ok(inode_id) => inode_id,
+                Err(err) => return Self::response_with_metadata_error(&req.header, err),
+            };
+
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &req_ctx.caller).await {
+            return error_response!(LinkResponseProto, resp_header);
+        }
+
+        let authz = Self::authz_for_rpc(
+            InodeRpcAuthz::Link,
+            vec![
+                AuthzTarget::for_inode(src_inode_id),
+                AuthzTarget::for_inode(dst_parent_inode_id),
+            ],
         );
-        Ok(Response::new(LinkResponseProto {
-            header: Some(resp_header),
-            ..Default::default()
-        }))
+        if let Some(resp_header) = self
+            .guard_request(
+                &req.header,
+                &req_ctx.caller,
+                GuardSpec::metadata_write(),
+                None,
+                Some(authz),
+            )
+            .await
+        {
+            return error_response!(LinkResponseProto, resp_header);
+        }
+
+        let freshness = Self::freshness_from_header(&req.header);
+        match self
+            .fs_core
+            .execute_link(LinkInput {
+                ctx: req_ctx.clone(),
+                src_inode_id,
+                dst_parent_inode_id,
+                dst_name: req.dst_name,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => response_with_header!(
+                LinkResponseProto {
+                    inode: success.payload.inode.as_ref().map(Self::inode_to_proto),
+                    attrs: success.payload.attrs.as_ref().map(Self::file_attrs_to_proto),
+                    ..Default::default()
+                },
+                ok_header_from_core_success(&req_ctx, &success)
+            ),
+            Err(failure) => error_response!(LinkResponseProto, header_from_core_failure(&req_ctx, &failure)),
+        }
     }
 
     async fn set_xattr(
@@ -3495,117 +1948,56 @@ impl MetadataInodeServiceProto for MetadataInodeServiceImpl {
         request: Request<SetXattrRequestProto>,
     ) -> Result<Response<SetXattrResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
-            return Ok(Response::new(SetXattrResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+        let req_ctx = request_context_from_proto(&req.header);
+
+        let inode_id = match Self::inode_id_from_proto(req.inode_id.clone(), "inode_id") {
+            Ok(inode_id) => inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
+        };
+
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &req_ctx.caller).await {
+            return error_response!(SetXattrResponseProto, resp_header);
         }
-        let inode_id = match req.inode_id {
-            Some(inode_id) => InodeId::new(inode_id.value),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing inode_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(SetXattrResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-        // Route
-        let ctx = match self.route_fs_write_ctx(FsWriteOp::SetAttr, &[inode_id], &req.header) {
-            Ok(ctx) => ctx,
-            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
-                let resp_header = need_refresh_header(
-                    &req.header,
-                    RpcErrorCode::MountEpochMismatch,
-                    RefreshReason::MountEpochMismatch,
-                    format!("Mount epoch mismatch: client={}, server={} ", got, expected),
-                    None,
-                    Some(expected),
-                );
-                return Ok(Response::new(SetXattrResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(SetXattrResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
+
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::SetXattr, vec![AuthzTarget::for_inode(inode_id)]);
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
-                &caller_ctx,
+                &req_ctx.caller,
                 GuardSpec::metadata_write(),
                 None,
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::SetXattr,
-                    AuthzTarget::for_inode(inode_id),
-                )),
+                Some(authz),
             )
             .await
         {
-            return Ok(Response::new(SetXattrResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+            return error_response!(SetXattrResponseProto, resp_header);
         }
-        let dedup = match self.dedup_key(&caller_ctx) {
-            Ok(k) => k,
-            Err(err) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(SetXattrResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
+
+        let freshness = Self::freshness_from_header(&req.header);
+        match self
+            .fs_core
+            .execute_set_xattr(SetXattrInput {
+                ctx: req_ctx.clone(),
+                inode_id,
+                name: req.name,
+                value: req.value,
+                create: req.create,
+                replace: req.replace,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                if let Some(reader) = self.inode_perm_reader.as_ref() {
+                    reader.invalidate(inode_id);
+                }
+                response_with_header!(
+                    SetXattrResponseProto::default(),
+                    ok_header_from_core_success(&req_ctx, &success)
+                )
             }
-        };
-        let command = Command::SetXattr {
-            dedup,
-            inode_id,
-            name: req.name,
-            value: req.value,
-            create: req.create,
-            replace: req.replace,
-        };
-        if let Err(err) = self.propose_fs_write_command(FsWriteOp::SetAttr, command).await {
-            let resp_header = Self::header_from_error(
-                &req.header,
-                err,
-                Some(ctx.namespace_owner_group_id.as_raw()),
-                Some(ctx.mount_epoch),
-            );
-            return Ok(Response::new(SetXattrResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+            Err(failure) => error_response!(SetXattrResponseProto, header_from_core_failure(&req_ctx, &failure)),
         }
-        if let Some(reader) = self.inode_perm_reader.as_ref() {
-            reader.invalidate(inode_id);
-        }
-        let resp_header = ok_header_from_request(
-            &req.header,
-            Some(ctx.namespace_owner_group_id.as_raw()),
-            Some(ctx.mount_epoch),
-        );
-        Ok(Response::new(SetXattrResponseProto {
-            header: Some(resp_header),
-        }))
     }
 
     async fn get_xattr(
@@ -3613,97 +2005,53 @@ impl MetadataInodeServiceProto for MetadataInodeServiceImpl {
         request: Request<GetXattrRequestProto>,
     ) -> Result<Response<GetXattrResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        let inode_id = match req.inode_id {
-            Some(inode_id) => InodeId::new(inode_id.value),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing inode_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(GetXattrResponseProto {
-                    header: Some(resp_header),
-                    value: vec![],
-                }));
-            }
+        let req_ctx = request_context_from_proto(&req.header);
+
+        let inode_id = match Self::inode_id_from_proto(req.inode_id.clone(), "inode_id") {
+            Ok(inode_id) => inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
         };
+
+        if let Some(resp_header) = self.guard_pre_read(&req.header, &req_ctx.caller).await {
+            return error_response!(GetXattrResponseProto, resp_header);
+        }
+
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::GetXattr, vec![AuthzTarget::for_inode(inode_id)]);
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
-                &caller_ctx,
-                GuardSpec::metadata_read().with_authz(),
+                &req_ctx.caller,
+                GuardSpec::metadata_read(),
                 None,
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::GetXattr,
-                    AuthzTarget::for_inode(inode_id),
-                )),
+                Some(authz),
             )
             .await
         {
-            return Ok(Response::new(GetXattrResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+            return error_response!(GetXattrResponseProto, resp_header);
         }
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(GetXattrResponseProto {
-                    header: Some(resp_header),
-                    value: vec![],
-                }));
+
+        match self
+            .fs_core
+            .execute_get_xattr(GetXattrInput {
+                ctx: req_ctx.clone(),
+                inode_id,
+                name: req.name,
+            })
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_core_success(&req_ctx, &success);
+                let payload = success.payload;
+                response_with_header!(
+                    GetXattrResponseProto {
+                        value: payload.value,
+                        ..Default::default()
+                    },
+                    header
+                )
             }
-        };
-        let inode = match storage.get_inode(inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::NotFound(format!("Inode not found: {}", inode_id)),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(GetXattrResponseProto {
-                    header: Some(resp_header),
-                    value: vec![],
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(GetXattrResponseProto {
-                    header: Some(resp_header),
-                    value: vec![],
-                }));
-            }
-        };
-        let value = match inode.xattrs.get(&req.name) {
-            Some(value) => value.clone(),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::NotFound(format!("xattr not found: {}", req.name)),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(GetXattrResponseProto {
-                    header: Some(resp_header),
-                    value: vec![],
-                }));
-            }
-        };
-        let resp_header = ok_header_from_request(&req.header, None, None);
-        Ok(Response::new(GetXattrResponseProto {
-            header: Some(resp_header),
-            value,
-        }))
+            Err(failure) => error_response!(GetXattrResponseProto, header_from_core_failure(&req_ctx, &failure)),
+        }
     }
 
     async fn list_xattr(
@@ -3711,83 +2059,52 @@ impl MetadataInodeServiceProto for MetadataInodeServiceImpl {
         request: Request<ListXattrRequestProto>,
     ) -> Result<Response<ListXattrResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        let inode_id = match req.inode_id {
-            Some(inode_id) => InodeId::new(inode_id.value),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing inode_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(ListXattrResponseProto {
-                    header: Some(resp_header),
-                    names: vec![],
-                }));
-            }
+        let req_ctx = request_context_from_proto(&req.header);
+
+        let inode_id = match Self::inode_id_from_proto(req.inode_id.clone(), "inode_id") {
+            Ok(inode_id) => inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
         };
+
+        if let Some(resp_header) = self.guard_pre_read(&req.header, &req_ctx.caller).await {
+            return error_response!(ListXattrResponseProto, resp_header);
+        }
+
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::ListXattr, vec![AuthzTarget::for_inode(inode_id)]);
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
-                &caller_ctx,
-                GuardSpec::metadata_read().with_authz(),
+                &req_ctx.caller,
+                GuardSpec::metadata_read(),
                 None,
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::ListXattr,
-                    AuthzTarget::for_inode(inode_id),
-                )),
+                Some(authz),
             )
             .await
         {
-            return Ok(Response::new(ListXattrResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+            return error_response!(ListXattrResponseProto, resp_header);
         }
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(ListXattrResponseProto {
-                    header: Some(resp_header),
-                    names: vec![],
-                }));
+
+        match self
+            .fs_core
+            .execute_list_xattr(ListXattrInput {
+                ctx: req_ctx.clone(),
+                inode_id,
+            })
+            .await
+        {
+            Ok(success) => {
+                let header = ok_header_from_core_success(&req_ctx, &success);
+                let payload = success.payload;
+                response_with_header!(
+                    ListXattrResponseProto {
+                        names: payload.names,
+                        ..Default::default()
+                    },
+                    header
+                )
             }
-        };
-        let inode = match storage.get_inode(inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::NotFound(format!("Inode not found: {}", inode_id)),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(ListXattrResponseProto {
-                    header: Some(resp_header),
-                    names: vec![],
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(ListXattrResponseProto {
-                    header: Some(resp_header),
-                    names: vec![],
-                }));
-            }
-        };
-        let names = inode.xattrs.keys().cloned().collect::<Vec<_>>();
-        let resp_header = ok_header_from_request(&req.header, None, None);
-        Ok(Response::new(ListXattrResponseProto {
-            header: Some(resp_header),
-            names,
-        }))
+            Err(failure) => error_response!(ListXattrResponseProto, header_from_core_failure(&req_ctx, &failure)),
+        }
     }
 
     async fn remove_xattr(
@@ -3795,278 +2112,52 @@ impl MetadataInodeServiceProto for MetadataInodeServiceImpl {
         request: Request<RemoveXattrRequestProto>,
     ) -> Result<Response<RemoveXattrResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
-            return Ok(Response::new(RemoveXattrResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+        let req_ctx = request_context_from_proto(&req.header);
+
+        let inode_id = match Self::inode_id_from_proto(req.inode_id.clone(), "inode_id") {
+            Ok(inode_id) => inode_id,
+            Err(err) => return Self::response_with_metadata_error(&req.header, err),
+        };
+
+        if let Some(resp_header) = self.guard_pre_write(&req.header, &req_ctx.caller).await {
+            return error_response!(RemoveXattrResponseProto, resp_header);
         }
-        let inode_id = match req.inode_id {
-            Some(inode_id) => InodeId::new(inode_id.value),
-            None => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    MetadataError::InvalidArgument("Missing inode_id".to_string()),
-                    None,
-                    None,
-                );
-                return Ok(Response::new(RemoveXattrResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
-        let ctx = match self.route_fs_write_ctx(FsWriteOp::SetAttr, &[inode_id], &req.header) {
-            Ok(ctx) => ctx,
-            Err(MetadataError::MountEpochMismatch { expected, got, .. }) => {
-                let resp_header = need_refresh_header(
-                    &req.header,
-                    RpcErrorCode::MountEpochMismatch,
-                    RefreshReason::MountEpochMismatch,
-                    format!("Mount epoch mismatch: client={}, server={} ", got, expected),
-                    None,
-                    Some(expected),
-                );
-                return Ok(Response::new(RemoveXattrResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-            Err(err) => {
-                let resp_header = Self::header_from_error(&req.header, err, None, None);
-                return Ok(Response::new(RemoveXattrResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
-            }
-        };
+
+        let authz = Self::authz_for_rpc(InodeRpcAuthz::RemoveXattr, vec![AuthzTarget::for_inode(inode_id)]);
         if let Some(resp_header) = self
             .guard_request(
                 &req.header,
-                &caller_ctx,
+                &req_ctx.caller,
                 GuardSpec::metadata_write(),
                 None,
-                Some(Self::authz_for_rpc(
-                    FsRpcAuthz::RemoveXattr,
-                    AuthzTarget::for_inode(inode_id),
-                )),
+                Some(authz),
             )
             .await
         {
-            return Ok(Response::new(RemoveXattrResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+            return error_response!(RemoveXattrResponseProto, resp_header);
         }
-        let dedup = match self.dedup_key(&caller_ctx) {
-            Ok(k) => k,
-            Err(err) => {
-                let resp_header = Self::header_from_error(
-                    &req.header,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-                return Ok(Response::new(RemoveXattrResponseProto {
-                    header: Some(resp_header),
-                    ..Default::default()
-                }));
+
+        let freshness = Self::freshness_from_header(&req.header);
+        match self
+            .fs_core
+            .execute_remove_xattr(RemoveXattrInput {
+                ctx: req_ctx.clone(),
+                inode_id,
+                name: req.name,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => {
+                if let Some(reader) = self.inode_perm_reader.as_ref() {
+                    reader.invalidate(inode_id);
+                }
+                response_with_header!(
+                    RemoveXattrResponseProto::default(),
+                    ok_header_from_core_success(&req_ctx, &success)
+                )
             }
-        };
-        let command = Command::RemoveXattr {
-            dedup,
-            inode_id,
-            name: req.name,
-        };
-        if let Err(err) = self.propose_fs_write_command(FsWriteOp::SetAttr, command).await {
-            let resp_header = Self::header_from_error(
-                &req.header,
-                err,
-                Some(ctx.namespace_owner_group_id.as_raw()),
-                Some(ctx.mount_epoch),
-            );
-            return Ok(Response::new(RemoveXattrResponseProto {
-                header: Some(resp_header),
-                ..Default::default()
-            }));
+            Err(failure) => error_response!(RemoveXattrResponseProto, header_from_core_failure(&req_ctx, &failure)),
         }
-        if let Some(reader) = self.inode_perm_reader.as_ref() {
-            reader.invalidate(inode_id);
-        }
-        let resp_header = ok_header_from_request(
-            &req.header,
-            Some(ctx.namespace_owner_group_id.as_raw()),
-            Some(ctx.mount_epoch),
-        );
-        Ok(Response::new(RemoveXattrResponseProto {
-            header: Some(resp_header),
-        }))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::service::{AclInodeAuthz, CachedGroupResolver, GroupResolver, InodePermReader, RocksDbInodePermReader};
-    use crate::state::MemoryStateStore;
-    use common::error::canonical::{CanonicalError, ErrorCode as CanonicalErrorCode};
-    use common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
-    use tempfile::TempDir;
-    use types::acl::{encode_posix_acl, AclEntry, AclPerm, AclSubject, PosixAcl};
-    use types::fs::{FileAttrs, Inode, InodeId};
-    use types::ids::{ClientId, DataHandleId, MountId};
-
-    #[derive(Clone)]
-    struct AlwaysFailGroupResolver;
-
-    impl GroupResolver for AlwaysFailGroupResolver {
-        fn groups_for(&self, _principal: &str) -> Result<Vec<String>, CanonicalError> {
-            Err(CanonicalError::retryable(
-                RpcErrorCode::NodeUnavailable,
-                None,
-                "group backend unavailable",
-            ))
-        }
-    }
-
-    fn put_test_inode(storage: &Arc<RocksDBStorage>, inode_id: InodeId, access_acl: Option<Vec<u8>>) {
-        let mut attrs = FileAttrs::new();
-        attrs.uid = 1000;
-        attrs.gid = 2000;
-        attrs.mode = 0o644;
-        let mut inode = Inode::new_file(inode_id, attrs, MountId::new(1), DataHandleId::new(1));
-        if let Some(acl) = access_acl {
-            inode.xattrs.insert(types::acl::POSIX_ACL_ACCESS_XATTR.to_string(), acl);
-        }
-        storage.put_inode(&inode).expect("put test inode");
-    }
-
-    fn build_acl_service(
-        storage: Arc<RocksDBStorage>,
-        group_resolver: Arc<dyn GroupResolver>,
-    ) -> MetadataInodeServiceImpl {
-        let state_store: Arc<dyn crate::state::StateStore> = Arc::new(MemoryStateStore::new());
-        let mount_table = Arc::new(MountTable::new());
-        let inode_perm_reader: Arc<dyn InodePermReader> = Arc::new(RocksDbInodePermReader::new(storage.clone(), 600));
-        let authz_provider: Arc<dyn AuthzProvider> =
-            Arc::new(AclInodeAuthz::new(group_resolver, inode_perm_reader.clone()));
-        MetadataInodeServiceImpl::new(state_store, mount_table)
-            .with_storage(storage)
-            .with_authz_provider(authz_provider)
-            .with_inode_perm_reader(inode_perm_reader)
-    }
-
-    fn get_attr_request(inode_id: InodeId, principal: Option<&str>) -> Request<GetAttrRequestProto> {
-        let mut header = RequestHeader::new(ClientId::new(88));
-        header.principal = principal.map(ToString::to_string);
-        let proto_header: proto::common::RequestHeaderProto = (&header).into();
-        Request::new(GetAttrRequestProto {
-            header: Some(proto_header),
-            inode_id: Some(proto::fs::InodeIdProto {
-                value: inode_id.as_raw(),
-            }),
-            ..Default::default()
-        })
-    }
-
-    fn extract_canonical_error(resp: &GetAttrResponseProto) -> CanonicalError {
-        let proto_header = resp.header.clone().expect("response header must be present");
-        let header = ResponseHeader::try_from(proto_header).expect("response header must decode");
-        header
-            .canonical_error
-            .expect("denial response must carry canonical error")
-    }
-
-    #[tokio::test]
-    async fn get_attr_missing_principal_returns_grpc_ok_with_header_error() {
-        let dir = TempDir::new().expect("create temp dir");
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).expect("open rocksdb"));
-        let inode_id = InodeId::new(5001);
-        put_test_inode(&storage, inode_id, None);
-        let service = build_acl_service(storage, Arc::new(crate::service::StaticGroupResolver::default()));
-
-        let response = service
-            .get_attr(get_attr_request(inode_id, None))
-            .await
-            .expect("gRPC transport status must stay OK");
-        let err = extract_canonical_error(response.get_ref());
-        assert_eq!(
-            err.code,
-            Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Unauthenticated))
-        );
-        assert!(err.message.contains("MISSING_PRINCIPAL"));
-    }
-
-    #[tokio::test]
-    async fn get_attr_group_resolver_failure_returns_grpc_ok_with_header_error() {
-        let dir = TempDir::new().expect("create temp dir");
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).expect("open rocksdb"));
-        let inode_id = InodeId::new(5002);
-        put_test_inode(&storage, inode_id, None);
-        let resolver: Arc<dyn GroupResolver> =
-            Arc::new(CachedGroupResolver::new(Arc::new(AlwaysFailGroupResolver), 300, false));
-        let service = build_acl_service(storage, resolver);
-
-        let response = service
-            .get_attr(get_attr_request(inode_id, Some("2001")))
-            .await
-            .expect("gRPC transport status must stay OK");
-        let err = extract_canonical_error(response.get_ref());
-        assert_eq!(
-            err.code,
-            Some(CanonicalErrorCode::RpcCode(RpcErrorCode::PermissionDenied))
-        );
-        assert!(err.message.contains("GROUP_RESOLVE_FAILED"));
-    }
-
-    #[tokio::test]
-    async fn get_attr_unsupported_acl_returns_grpc_ok_with_header_error() {
-        let dir = TempDir::new().expect("create temp dir");
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).expect("open rocksdb"));
-        let inode_id = InodeId::new(5003);
-        let unsupported_acl = PosixAcl::new(vec![
-            AclEntry {
-                subject: AclSubject::Other,
-                perms: AclPerm::READ,
-            },
-            AclEntry {
-                subject: AclSubject::Other,
-                perms: AclPerm::WRITE,
-            },
-        ]);
-        put_test_inode(&storage, inode_id, Some(encode_posix_acl(&unsupported_acl)));
-        let service = build_acl_service(storage, Arc::new(crate::service::StaticGroupResolver::default()));
-
-        let response = service
-            .get_attr(get_attr_request(inode_id, Some("2001")))
-            .await
-            .expect("gRPC transport status must stay OK");
-        let err = extract_canonical_error(response.get_ref());
-        assert_eq!(
-            err.code,
-            Some(CanonicalErrorCode::RpcCode(RpcErrorCode::PermissionDenied))
-        );
-        assert!(err.message.contains("UNSUPPORTED_ACL"));
-    }
-
-    #[tokio::test]
-    async fn get_attr_malformed_acl_returns_grpc_ok_with_header_error() {
-        let dir = TempDir::new().expect("create temp dir");
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).expect("open rocksdb"));
-        let inode_id = InodeId::new(5004);
-        put_test_inode(&storage, inode_id, Some(vec![1, 2, 3]));
-        let service = build_acl_service(storage, Arc::new(crate::service::StaticGroupResolver::default()));
-
-        let response = service
-            .get_attr(get_attr_request(inode_id, Some("2001")))
-            .await
-            .expect("gRPC transport status must stay OK");
-        let err = extract_canonical_error(response.get_ref());
-        assert_eq!(
-            err.code,
-            Some(CanonicalErrorCode::RpcCode(RpcErrorCode::PermissionDenied))
-        );
-        assert!(err.message.contains("ACL_MALFORMED"));
     }
 }

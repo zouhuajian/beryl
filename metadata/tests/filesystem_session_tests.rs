@@ -91,7 +91,7 @@ impl SessionHarness {
             .with_worker_manager(worker_manager)
             .with_metrics(metrics.clone()),
         );
-        inode_service.set_worker_commit_hook_for_test(Arc::new(|_req| CommitWriteResponseProto::default()));
+        inode_service.set_worker_commit_hook_debug(Arc::new(|_req| CommitWriteResponseProto::default()));
         let fs_core = inode_service.fs_core();
 
         let path_service =
@@ -724,14 +724,13 @@ async fn renew_lease_reports_structured_session_expired_reason() {
 
     let session = harness
         .inode_service
-        .write_session_manager_for_test()
+        .debug_write_session_manager()
         .get_session(open_resp.file_handle)
         .expect("session must exist after open");
-    harness.inode_service.inode_lease_manager_for_test().release(
-        session.inode_id,
-        session.lease_id,
-        session.lease_epoch,
-    );
+    harness
+        .inode_service
+        .debug_inode_lease_manager()
+        .release(session.inode_id, session.lease_id, session.lease_epoch);
 
     let renew_call = FileSystemServiceProto::renew_write_session_lease(
         &harness.path_service,

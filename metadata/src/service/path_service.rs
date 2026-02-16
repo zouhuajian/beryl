@@ -505,7 +505,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         let req_ctx = request_context_from_proto(&req.header);
         match self
             .fs_core
-            .get_attr(GetAttrInput {
+            .execute_get_attr(GetAttrInput {
                 ctx: req_ctx.clone(),
                 inode_id: resolved.inode_id,
             })
@@ -591,7 +591,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
         match self
             .fs_core
-            .mkdir(MkdirInput {
+            .execute_mkdir(MkdirInput {
                 ctx: req_ctx.clone(),
                 parent_inode_id: resolved.parent_inode_id,
                 name: resolved.name,
@@ -700,7 +700,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
         match self
             .fs_core
-            .create(CreateInput {
+            .execute_create(CreateInput {
                 ctx: req_ctx.clone(),
                 parent_inode_id: resolved.parent_inode_id,
                 name: resolved.name,
@@ -798,7 +798,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
         match self
             .fs_core
-            .unlink(UnlinkInput {
+            .execute_unlink(UnlinkInput {
                 ctx: req_ctx.clone(),
                 parent_inode_id: resolved.parent_inode_id,
                 name: resolved.name,
@@ -869,7 +869,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
         match self
             .fs_core
-            .rmdir(RmdirInput {
+            .execute_rmdir(RmdirInput {
                 ctx: req_ctx.clone(),
                 parent_inode_id: resolved.parent_inode_id,
                 name: resolved.name,
@@ -943,7 +943,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
         match self
             .fs_core
-            .rename(RenameInput {
+            .execute_rename(RenameInput {
                 ctx: req_ctx.clone(),
                 src_parent_inode_id: src_resolved.parent_inode_id,
                 src_name: src_resolved.name,
@@ -1022,7 +1022,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             let max_entries = if req.limit == 0 { None } else { Some(req.limit as usize) };
             match self
                 .fs_core
-                .read_dir(ReadDirInput {
+                .execute_read_dir(ReadDirInput {
                     ctx: req_ctx.clone(),
                     parent_inode_id: resolved.inode_id,
                     cursor_key,
@@ -1123,7 +1123,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         let req_ctx = request_context_from_proto(&req.header);
         match self
             .fs_core
-            .open(OpenInput {
+            .execute_open(OpenInput {
                 ctx: req_ctx.clone(),
                 inode_id: resolved.inode_id,
                 flags: req.flags as i32,
@@ -1203,7 +1203,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         let req_ctx = request_context_from_proto(&req.header);
         match self
             .fs_core
-            .release_session(ReleaseSessionInput {
+            .execute_release(ReleaseSessionInput {
                 ctx: req_ctx.clone(),
                 file_handle: req.file_handle,
             })
@@ -1275,7 +1275,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 };
                 match self
                     .fs_core
-                    .fsync_barrier(FsyncBarrierInput {
+                    .execute_fsync(FsyncBarrierInput {
                         ctx: req_ctx.clone(),
                         inode_id: resolved.inode_id,
                         file_handle: None,
@@ -1424,7 +1424,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
         match self
             .fs_core
-            .truncate(TruncateInput {
+            .execute_truncate(TruncateInput {
                 ctx: req_ctx.clone(),
                 inode_id: resolved.inode_id,
                 new_size: req.new_size,
@@ -1502,7 +1502,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
         match self
             .fs_core
-            .set_xattr(SetXattrInput {
+            .execute_set_xattr(SetXattrInput {
                 ctx: req_ctx.clone(),
                 inode_id: resolved.inode_id,
                 name: req.name,
@@ -1575,7 +1575,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         let req_ctx = request_context_from_proto(&req.header);
         match self
             .fs_core
-            .get_xattr(GetXattrInput {
+            .execute_get_xattr(GetXattrInput {
                 ctx: req_ctx.clone(),
                 inode_id: resolved.inode_id,
                 name: req.name,
@@ -1645,7 +1645,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         let req_ctx = request_context_from_proto(&req.header);
         match self
             .fs_core
-            .list_xattr(ListXattrInput {
+            .execute_list_xattr(ListXattrInput {
                 ctx: req_ctx.clone(),
                 inode_id: resolved.inode_id,
             })
@@ -1719,7 +1719,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
         match self
             .fs_core
-            .remove_xattr(RemoveXattrInput {
+            .execute_remove_xattr(RemoveXattrInput {
                 ctx: req_ctx.clone(),
                 inode_id: resolved.inode_id,
                 name: req.name,
@@ -1796,7 +1796,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         });
         match self
             .fs_core
-            .get_file_layout(GetFileLayoutInput {
+            .execute_get_file_layout(GetFileLayoutInput {
                 ctx: req_ctx.clone(),
                 inode_id: resolved.inode_id,
                 range,
@@ -1894,7 +1894,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
         match self
             .fs_core
-            .open_write(OpenWriteInput {
+            .execute_open_write(OpenWriteInput {
                 ctx: req_ctx.clone(),
                 inode_id: resolved.inode_id,
                 desired_len: req.desired_len,
@@ -1983,7 +1983,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
         match self
             .fs_core
-            .close_write(CloseWriteInput {
+            .execute_close_write(CloseWriteInput {
                 ctx: req_ctx.clone(),
                 file_handle: req.file_handle,
                 lease_id: lease_id_from_proto(req.lease_id),
@@ -2059,7 +2059,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
         match self
             .fs_core
-            .renew_lease(RenewLeaseInput {
+            .execute_renew_inode_lease(RenewLeaseInput {
                 ctx: req_ctx.clone(),
                 file_handle: req.file_handle,
                 lease_id: lease_id_from_proto(req.lease_id),
@@ -2136,7 +2136,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
         match self
             .fs_core
-            .fsync_barrier(FsyncBarrierInput {
+            .execute_fsync(FsyncBarrierInput {
                 ctx: req_ctx.clone(),
                 inode_id: session.inode_id,
                 file_handle: Some(req.file_handle),
@@ -2268,7 +2268,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         let req_ctx = request_context_from_proto(&req.header);
         match self
             .fs_core
-            .release_session(ReleaseSessionInput {
+            .execute_release(ReleaseSessionInput {
                 ctx: req_ctx.clone(),
                 file_handle: req.file_handle,
             })
