@@ -23,29 +23,11 @@ metadata.rpc.addr: "0.0.0.0"
 # Description: Port for metadata RPC server
 metadata.rpc.port: 18080
 
-# Inode service exposure gate (privileged/FUSE-only entrypoint)
-# Type: boolean
-# Default: false
-# Description: When false, inode service is not registered at all.
-metadata.inode_service.enable: false
-
-# Inode service loopback bind enforcement (single-endpoint mode)
-# Type: boolean
-# Default: true
-# Description: If inode service is enabled, metadata.rpc.addr must be loopback when this is true.
-metadata.inode_service.require_loopback_bind: true
-
 # Filesystem service authz mode (non-compositional: choose exactly one provider)
 # Type: string (enum: "NONE", "RANGER", "ACL")
 # Default: "NONE"
 # Description: Path-entrypoint authz provider selection.
 metadata.authz.filesystem.mode: "NONE"
-
-# Inode service authz mode (non-compositional: choose exactly one provider)
-# Type: string (enum: "NONE", "ACL")
-# Default: "NONE"
-# Description: Inode/handle service authz provider selection. "RANGER" is invalid here.
-metadata.authz.inode.mode: "NONE"
 
 # ACL group resolver cache TTL (seconds)
 # Type: integer

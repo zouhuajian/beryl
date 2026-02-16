@@ -192,10 +192,27 @@ impl GuardChain {
         }
     }
 
-    pub fn set_readiness_gate(&mut self, gate: Arc<RootReadinessGate>) {
+    pub(crate) fn with_readiness_gate(mut self, gate: Option<Arc<RootReadinessGate>>) -> Self {
+        self.readiness.readiness_gate = gate;
+        self
+    }
+
+    pub(crate) fn with_leadership_checker(mut self, checker: Option<Arc<dyn LeadershipChecker>>) -> Self {
+        self.leadership.checker = checker;
+        self
+    }
+
+    pub(crate) fn with_authz_provider(mut self, provider: Arc<dyn AuthzProvider>) -> Self {
+        self.authz.provider = provider;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_readiness_gate(&mut self, gate: Arc<RootReadinessGate>) {
         self.readiness.readiness_gate = Some(gate);
     }
 
+    #[cfg(test)]
     pub fn set_leadership_checker<T>(&mut self, checker: Arc<T>)
     where
         T: LeadershipChecker + 'static,
@@ -203,7 +220,8 @@ impl GuardChain {
         self.leadership.checker = Some(checker);
     }
 
-    pub fn set_authz_provider(&mut self, provider: Arc<dyn AuthzProvider>) {
+    #[cfg(test)]
+    pub(crate) fn set_authz_provider(&mut self, provider: Arc<dyn AuthzProvider>) {
         self.authz.provider = provider;
     }
 

@@ -10,15 +10,14 @@ pub mod authz;
 mod core_util;
 pub mod domain;
 mod fs_core;
-pub mod guard;
-mod inode_service;
+mod guard;
 mod path_service;
 
 // pub use client_service::MetadataClientServiceImpl;
 pub use self::authz::{
-    cached_static_group_resolver, filesystem_authz_provider, inode_authz_provider, AclInodeAuthz, AllowAllAuthz,
-    AuthzOp, AuthzProvider, AuthzProviderDeps, AuthzScheme, AuthzTarget, CachedGroupResolver, DenyAllAuthz,
-    GroupResolver, InodePermInputs, InodePermReader, RocksDbInodePermReader, StaticGroupResolver, StubRangerAuthz,
+    cached_static_group_resolver, filesystem_authz_provider, AclInodeAuthz, AllowAllAuthz, AuthzOp, AuthzProvider,
+    AuthzProviderDeps, AuthzScheme, AuthzTarget, CachedGroupResolver, DenyAllAuthz, GroupResolver, InodePermInputs,
+    InodePermReader, RocksDbInodePermReader, StaticGroupResolver, StubRangerAuthz,
 };
 pub use core_util::{
     extent_from_proto, extent_to_proto, extract_and_inject_context, fatal_fs_header, fencing_to_proto,
@@ -28,6 +27,6 @@ pub use core_util::{
     write_target_to_proto,
 };
 pub(crate) use fs_core::FsCore;
-pub use guard::{AuthzContext, GuardChain, GuardSpec, LeadershipChecker};
-pub use inode_service::MetadataInodeServiceImpl;
-pub use path_service::MetadataFileSystemServiceImpl;
+pub use fs_core::SharedWorkerCommitHook;
+pub use guard::{AuthzContext, LeadershipChecker};
+pub use path_service::{MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl};

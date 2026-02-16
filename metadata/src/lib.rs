@@ -23,7 +23,6 @@
 //!
 //! ## Services
 //!
-//! - **MetadataInodeServiceProto**: Authoritative inode-based FS service (see `service/inode_service.rs`)
 //! - **FileSystemServiceProto**: External path-based filesystem entrypoint (path → walk → FS service)
 //! - **MetadataClientService**: Supports data_handle_id-based data plane operations
 //!

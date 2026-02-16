@@ -11,6 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=metadata/filesystem.proto");
     println!("cargo:rerun-if-changed=metadata/data_control.proto");
     println!("cargo:rerun-if-changed=metadata/route.proto");
+    // fs.proto remains because filesystem.proto imports shared metadata message types from it.
     println!("cargo:rerun-if-changed=metadata/fs.proto");
     println!("cargo:rerun-if-changed=metadata/worker.proto");
     println!("cargo:rerun-if-changed=metadata/peer.proto");
@@ -32,6 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "metadata/filesystem.proto",
                 "metadata/data_control.proto",
                 "metadata/route.proto",
+                // fs.proto now contributes shared messages only (no inode service block).
                 "metadata/fs.proto",
                 "metadata/worker.proto",
                 "metadata/peer.proto",

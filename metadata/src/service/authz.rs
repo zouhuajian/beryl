@@ -17,7 +17,7 @@
 
 use super::core_util::permission_denied_canonical_error;
 use super::domain::RequestContext;
-use crate::config::{FileSystemAuthzMode, InodeAuthzMode};
+use crate::config::FileSystemAuthzMode;
 use crate::metrics::{
     AUTHZ_ALLOW_ACL_INODE_TOTAL, AUTHZ_ALLOW_NONE_TOTAL, AUTHZ_ALLOW_RANGER_PATH_TOTAL, AUTHZ_DENY_ACL_INODE_TOTAL,
     AUTHZ_DENY_NONE_TOTAL, AUTHZ_DENY_RANGER_PATH_TOTAL, AUTHZ_GROUPS_CACHE_EXPIRY_TOTAL, AUTHZ_GROUPS_CACHE_HIT_TOTAL,
@@ -731,13 +731,6 @@ fn filesystem_authz_provider_kind(mode: FileSystemAuthzMode) -> AuthzProviderKin
     }
 }
 
-fn inode_authz_provider_kind(mode: InodeAuthzMode) -> AuthzProviderKind {
-    match mode {
-        InodeAuthzMode::None => AuthzProviderKind::AllowAll,
-        InodeAuthzMode::Acl => AuthzProviderKind::AclInode,
-    }
-}
-
 fn build_authz_provider(kind: AuthzProviderKind, deps: &AuthzProviderDeps) -> Arc<dyn AuthzProvider> {
     match kind {
         AuthzProviderKind::AllowAll => Arc::new(AllowAllAuthz),
@@ -751,10 +744,6 @@ fn build_authz_provider(kind: AuthzProviderKind, deps: &AuthzProviderDeps) -> Ar
 
 pub fn filesystem_authz_provider(mode: FileSystemAuthzMode, deps: &AuthzProviderDeps) -> Arc<dyn AuthzProvider> {
     build_authz_provider(filesystem_authz_provider_kind(mode), deps)
-}
-
-pub fn inode_authz_provider(mode: InodeAuthzMode, deps: &AuthzProviderDeps) -> Arc<dyn AuthzProvider> {
-    build_authz_provider(inode_authz_provider_kind(mode), deps)
 }
 
 pub fn cached_static_group_resolver(
@@ -1685,14 +1674,6 @@ mod tests {
         assert_eq!(
             filesystem_authz_provider_kind(FileSystemAuthzMode::Ranger),
             AuthzProviderKind::StubRanger
-        );
-        assert_eq!(
-            inode_authz_provider_kind(InodeAuthzMode::Acl),
-            AuthzProviderKind::AclInode
-        );
-        assert_eq!(
-            inode_authz_provider_kind(InodeAuthzMode::None),
-            AuthzProviderKind::AllowAll
         );
     }
 

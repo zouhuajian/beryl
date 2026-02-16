@@ -17,8 +17,6 @@ use std::path::Path;
 pub struct MetadataConfig {
     /// RPC server address.
     pub rpc_addr: SocketAddr,
-    /// Inode service exposure configuration.
-    pub inode_service: InodeServiceConfig,
     /// Authz mode configuration.
     pub authz: MetadataAuthzConfig,
     /// Raft configuration.
@@ -35,15 +33,6 @@ pub struct MetadataConfig {
 #[derive(Clone, Debug)]
 pub struct BootstrapConfig {
     pub root_readiness: RootReadinessConfig,
-}
-
-/// Inode service exposure configuration.
-#[derive(Clone, Debug)]
-pub struct InodeServiceConfig {
-    /// Whether privileged inode RPCs are exposed.
-    pub enable: bool,
-    /// When true, inode service may only be served on loopback RPC binds.
-    pub require_loopback_bind: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,42 +59,14 @@ impl Default for FileSystemAuthzMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InodeAuthzMode {
-    None,
-    Acl,
-}
-
-impl InodeAuthzMode {
-    fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_uppercase().as_str() {
-            "NONE" => Some(Self::None),
-            "ACL" => Some(Self::Acl),
-            _ => None,
-        }
-    }
-}
-
-impl Default for InodeAuthzMode {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct FileSystemAuthzConfig {
     pub mode: FileSystemAuthzMode,
 }
 
 #[derive(Clone, Debug)]
-pub struct InodeAuthzConfig {
-    pub mode: InodeAuthzMode,
-}
-
-#[derive(Clone, Debug)]
 pub struct MetadataAuthzConfig {
     pub filesystem: FileSystemAuthzConfig,
-    pub inode: InodeAuthzConfig,
     pub groups: GroupResolverConfig,
 }
 
@@ -121,9 +82,6 @@ impl Default for MetadataAuthzConfig {
         Self {
             filesystem: FileSystemAuthzConfig {
                 mode: FileSystemAuthzMode::None,
-            },
-            inode: InodeAuthzConfig {
-                mode: InodeAuthzMode::None,
             },
             groups: GroupResolverConfig::default(),
         }
@@ -229,15 +187,6 @@ impl Default for WorkerConfig {
     }
 }
 
-impl Default for InodeServiceConfig {
-    fn default() -> Self {
-        Self {
-            enable: false,
-            require_loopback_bind: true,
-        }
-    }
-}
-
 fn parse_group_mappings(flat: &common::config::FlatConfig) -> BTreeMap<String, Vec<String>> {
     let mut mappings = BTreeMap::new();
     for key in flat.keys_with_prefix("metadata.authz.groups.mapping") {
@@ -282,14 +231,6 @@ impl MetadataConfig {
             )
         })?;
 
-        // Read inode service exposure config (privileged-only entrypoint, disabled by default).
-        let inode_service = InodeServiceConfig {
-            enable: flat.get_bool("metadata.inode_service.enable").unwrap_or(false),
-            require_loopback_bind: flat
-                .get_bool("metadata.inode_service.require_loopback_bind")
-                .unwrap_or(true),
-        };
-
         let filesystem_mode_raw = flat
             .get_str("metadata.authz.filesystem.mode")
             .unwrap_or_else(|| "NONE".to_string());
@@ -303,28 +244,8 @@ impl MetadataConfig {
             )
         })?;
 
-        let inode_mode_raw = flat
-            .get_str("metadata.authz.inode.mode")
-            .unwrap_or_else(|| "NONE".to_string());
-        if inode_mode_raw.trim().eq_ignore_ascii_case("RANGER") {
-            return Err(CommonError::new(
-                common::error::CommonErrorCode::InvalidArgument,
-                "Invalid metadata.authz.inode.mode=RANGER: expected NONE|ACL".to_string(),
-            ));
-        }
-        let inode_mode = InodeAuthzMode::parse(&inode_mode_raw).ok_or_else(|| {
-            CommonError::new(
-                common::error::CommonErrorCode::InvalidArgument,
-                format!(
-                    "Invalid metadata.authz.inode.mode={}, expected one of NONE|ACL",
-                    inode_mode_raw
-                ),
-            )
-        })?;
-
         let authz = MetadataAuthzConfig {
             filesystem: FileSystemAuthzConfig { mode: filesystem_mode },
-            inode: InodeAuthzConfig { mode: inode_mode },
             groups: GroupResolverConfig {
                 cache_ttl_secs: flat
                     .get_i64("metadata.authz.groups.cache_ttl_secs")
@@ -395,7 +316,6 @@ impl MetadataConfig {
 
         Ok(Self {
             rpc_addr,
-            inode_service,
             authz,
             raft,
             shard,
@@ -409,7 +329,6 @@ impl Default for MetadataConfig {
     fn default() -> Self {
         Self {
             rpc_addr: "0.0.0.0:18080".parse().unwrap(),
-            inode_service: InodeServiceConfig::default(),
             authz: MetadataAuthzConfig::default(),
             raft: RaftConfig::default(),
             shard: ShardConfig::default(),
@@ -427,28 +346,9 @@ mod tests {
     use common::config::CoreConfig;
 
     #[test]
-    fn inode_service_defaults_to_disabled() {
-        let config = MetadataConfig::default();
-        assert!(!config.inode_service.enable);
-        assert!(config.inode_service.require_loopback_bind);
-    }
-
-    #[test]
-    fn inode_service_config_parses_overrides() {
-        let mut flat = CoreConfig::default().as_flat().clone();
-        flat.set("metadata.inode_service.enable", true);
-        flat.set("metadata.inode_service.require_loopback_bind", false);
-
-        let config = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap();
-        assert!(config.inode_service.enable);
-        assert!(!config.inode_service.require_loopback_bind);
-    }
-
-    #[test]
     fn authz_mode_defaults_to_none() {
         let config = MetadataConfig::default();
         assert_eq!(config.authz.filesystem.mode, FileSystemAuthzMode::None);
-        assert_eq!(config.authz.inode.mode, InodeAuthzMode::None);
         assert_eq!(config.authz.groups.cache_ttl_secs, 300);
         assert!(!config.authz.groups.stale_while_error);
         assert!(config.authz.groups.static_mappings.is_empty());
@@ -458,11 +358,9 @@ mod tests {
     fn authz_mode_parses_valid_values() {
         let mut flat = CoreConfig::default().as_flat().clone();
         flat.set("metadata.authz.filesystem.mode", "acl");
-        flat.set("metadata.authz.inode.mode", "acl");
 
         let config = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap();
         assert_eq!(config.authz.filesystem.mode, FileSystemAuthzMode::Acl);
-        assert_eq!(config.authz.inode.mode, InodeAuthzMode::Acl);
     }
 
     #[test]
@@ -484,15 +382,6 @@ mod tests {
             config.authz.groups.static_mappings.get("bob"),
             Some(&vec!["30".to_string()])
         );
-    }
-
-    #[test]
-    fn authz_in_inode_rejects_ranger() {
-        let mut flat = CoreConfig::default().as_flat().clone();
-        flat.set("metadata.authz.inode.mode", "RANGER");
-        let err = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap_err();
-        assert!(err.message.contains("metadata.authz.inode.mode"));
-        assert!(err.message.contains("NONE|ACL"));
     }
 
     #[test]

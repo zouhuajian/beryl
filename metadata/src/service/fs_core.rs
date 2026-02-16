@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Shared filesystem core semantics used by FileSystemService and InodeService.
+//! Shared filesystem core semantics used by path service RPC handlers.
 
 use super::domain::{
     AccessInput, AccessOutput, CloseWriteInput, CloseWriteOutput, CoreFailure, CoreResult, CoreSuccess, CreateInput,
@@ -34,7 +34,9 @@ use types::ids::{BlockId, BlockIndex, DataHandleId, MountId, ShardGroupId, Worke
 use types::lease::FencingToken;
 use types::RaftLogId;
 
-type CommitHook = Arc<dyn Fn(CommitWriteRequestProto) -> proto::worker::CommitWriteResponseProto + Send + Sync>;
+pub(crate) type WorkerCommitHook =
+    Arc<dyn Fn(CommitWriteRequestProto) -> proto::worker::CommitWriteResponseProto + Send + Sync>;
+pub type SharedWorkerCommitHook = Arc<Mutex<Option<WorkerCommitHook>>>;
 
 #[derive(Clone, Debug)]
 struct RoutedFsWriteCtx {
@@ -67,16 +69,30 @@ pub struct FsCore {
     write_session_manager: Arc<crate::write_session::WriteSessionManager>,
     worker_manager: Option<Arc<crate::worker::WorkerManager>>,
     inode_lease_manager: Arc<crate::inode_lease::InodeLeaseManager>,
-    worker_commit_hook: Arc<Mutex<Option<CommitHook>>>,
+    worker_commit_hook: SharedWorkerCommitHook,
 }
 
 impl FsCore {
+    #[cfg(test)]
+    pub fn new_default(state_store: Arc<dyn StateStore>, mount_table: Arc<MountTable>) -> Self {
+        let write_session_manager = Arc::new(crate::write_session::WriteSessionManager::default());
+        let inode_lease_manager = Arc::new(crate::inode_lease::InodeLeaseManager::default());
+        let worker_commit_hook: SharedWorkerCommitHook = Arc::new(Mutex::new(None));
+        Self::new(
+            state_store,
+            mount_table,
+            write_session_manager,
+            inode_lease_manager,
+            worker_commit_hook,
+        )
+    }
+
     pub fn new(
         state_store: Arc<dyn StateStore>,
         mount_table: Arc<MountTable>,
         write_session_manager: Arc<crate::write_session::WriteSessionManager>,
         inode_lease_manager: Arc<crate::inode_lease::InodeLeaseManager>,
-        worker_commit_hook: Arc<Mutex<Option<CommitHook>>>,
+        worker_commit_hook: SharedWorkerCommitHook,
     ) -> Self {
         Self {
             state_store,
@@ -112,7 +128,7 @@ impl FsCore {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_worker_commit_hook_for_test(&self, hook: CommitHook) {
+    pub(crate) fn set_worker_commit_hook_for_test(&self, hook: WorkerCommitHook) {
         let mut guard = self
             .worker_commit_hook
             .lock()
@@ -121,7 +137,7 @@ impl FsCore {
     }
 
     #[cfg(debug_assertions)]
-    pub(crate) fn set_worker_commit_hook_debug(&self, hook: CommitHook) {
+    pub(crate) fn set_worker_commit_hook_debug(&self, hook: WorkerCommitHook) {
         let mut guard = self
             .worker_commit_hook
             .lock()

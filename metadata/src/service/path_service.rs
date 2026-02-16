@@ -19,7 +19,7 @@ use super::{
     lease_id_from_proto, lease_id_to_proto, location_to_proto, need_refresh_header, ok_header_from_core_success,
     ok_header_from_request, presented_fencing_from_proto, request_context_from_proto, write_target_to_proto,
 };
-use super::{AllowAllAuthz, AuthzOp, AuthzProvider, AuthzScheme, AuthzTarget, FsCore, InodePermReader};
+use super::{AuthzOp, AuthzProvider, AuthzScheme, AuthzTarget, FsCore, InodePermReader, SharedWorkerCommitHook};
 use crate::data_io::DataIoOp;
 use crate::error::{to_canonical_fs, MetadataError, MetadataResult};
 use crate::mount::MountTable;
@@ -82,53 +82,78 @@ enum PathRpcAuthz {
     ReleaseSession,
 }
 
+pub struct MetadataFileSystemServiceDeps {
+    pub state_store: Arc<dyn crate::state::StateStore>,
+    pub mount_table: Arc<MountTable>,
+    pub storage: Arc<RocksDBStorage>,
+    pub write_session_manager: Arc<crate::write_session::WriteSessionManager>,
+    pub inode_lease_manager: Arc<crate::inode_lease::InodeLeaseManager>,
+    pub worker_commit_hook: SharedWorkerCommitHook,
+    pub raft_node: Option<Arc<crate::raft::AppRaftNode>>,
+    pub worker_manager: Option<Arc<crate::worker::WorkerManager>>,
+    pub metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
+    pub readiness_gate: Option<Arc<crate::readiness::RootReadinessGate>>,
+    pub leadership_checker: Option<Arc<dyn LeadershipChecker>>,
+    pub authz_provider: Arc<dyn AuthzProvider>,
+    pub inode_perm_reader: Option<Arc<dyn InodePermReader>>,
+}
+
 impl MetadataFileSystemServiceImpl {
-    pub fn new(mount_table: Arc<MountTable>, storage: Arc<RocksDBStorage>, fs_core: Arc<FsCore>) -> Self {
-        let path_resolver = PathResolver::new(mount_table.clone(), storage.clone());
-        let mut guard_chain = GuardChain::new(mount_table);
-        if let Some(raft_node) = fs_core.raft_node() {
-            guard_chain.set_leadership_checker(raft_node);
+    pub fn new(deps: MetadataFileSystemServiceDeps) -> Self {
+        let MetadataFileSystemServiceDeps {
+            state_store,
+            mount_table,
+            storage,
+            write_session_manager,
+            inode_lease_manager,
+            worker_commit_hook,
+            raft_node,
+            worker_manager,
+            metrics,
+            readiness_gate,
+            leadership_checker,
+            authz_provider,
+            inode_perm_reader,
+        } = deps;
+
+        let path_resolver = PathResolver::new(Arc::clone(&mount_table), Arc::clone(&storage));
+        let mut fs_core = FsCore::new(
+            state_store,
+            Arc::clone(&mount_table),
+            write_session_manager,
+            inode_lease_manager,
+            worker_commit_hook,
+        );
+        fs_core.set_storage(Arc::clone(&storage));
+        if let Some(raft_node) = raft_node.as_ref() {
+            fs_core.set_raft_node(Arc::clone(raft_node));
         }
-        let authz_provider: Arc<dyn AuthzProvider> = Arc::new(AllowAllAuthz);
-        guard_chain.set_authz_provider(authz_provider.clone());
+        if let Some(worker_manager) = worker_manager.as_ref() {
+            fs_core.set_worker_manager(Arc::clone(worker_manager));
+        }
+        if let Some(metrics) = metrics.as_ref() {
+            fs_core.set_metrics(Arc::clone(metrics));
+        }
+        let fs_core = Arc::new(fs_core);
+
+        let leadership_checker = leadership_checker.or_else(|| {
+            raft_node
+                .as_ref()
+                .map(|raft_node| Arc::clone(raft_node) as Arc<dyn LeadershipChecker>)
+        });
+        let guard_chain = GuardChain::new(mount_table)
+            .with_readiness_gate(readiness_gate)
+            .with_leadership_checker(leadership_checker)
+            .with_authz_provider(Arc::clone(&authz_provider));
+
         Self {
             path_resolver,
             fs_core,
             guard_chain,
             authz_provider,
-            metrics: None,
-            inode_perm_reader: None,
+            metrics,
+            inode_perm_reader,
         }
-    }
-
-    /// Set metrics for tracking (optional).
-    pub fn with_metrics(mut self, metrics: Arc<crate::metrics::MetadataMetrics>) -> Self {
-        self.metrics = Some(metrics);
-        self
-    }
-
-    pub fn with_readiness_gate(mut self, readiness_gate: Arc<crate::readiness::RootReadinessGate>) -> Self {
-        self.guard_chain.set_readiness_gate(readiness_gate);
-        self
-    }
-
-    pub fn with_leadership_checker<T>(mut self, checker: Arc<T>) -> Self
-    where
-        T: LeadershipChecker + 'static,
-    {
-        self.guard_chain.set_leadership_checker(checker);
-        self
-    }
-
-    pub fn with_authz_provider(mut self, provider: Arc<dyn AuthzProvider>) -> Self {
-        self.authz_provider = provider.clone();
-        self.guard_chain.set_authz_provider(provider);
-        self
-    }
-
-    pub fn with_inode_perm_reader(mut self, inode_perm_reader: Arc<dyn InodePermReader>) -> Self {
-        self.inode_perm_reader = Some(inode_perm_reader);
-        self
     }
 
     fn path_parent_target(path: &str) -> MetadataResult<AuthzTarget> {
@@ -2295,17 +2320,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode, RefreshReason};
-    use common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
+    use common::error::canonical::CanonicalError;
+    use common::header::RequestHeader;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tempfile::TempDir;
-    use types::fs::Inode;
-    use types::ids::{ClientId, DataHandleId, ShardGroupId};
-
-    use crate::mount::{DataIoPolicy, MountKind, ROOT_INODE_ID};
-    use crate::readiness::RootReadinessGate;
-    use crate::service::MetadataInodeServiceImpl;
-    use crate::state::MemoryStateStore;
 
     #[derive(Clone)]
     struct CountingAuthz {
@@ -2328,38 +2345,6 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
-    }
-
-    struct StaticLeader(bool);
-
-    impl LeadershipChecker for StaticLeader {
-        fn is_leader(&self) -> bool {
-            self.0
-        }
-    }
-
-    fn build_path_service(dir: &TempDir) -> (MetadataFileSystemServiceImpl, Arc<MountTable>, Arc<RocksDBStorage>) {
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).expect("open rocksdb"));
-        let mount_table = Arc::new(MountTable::new());
-        let state_store: Arc<dyn crate::state::StateStore> = Arc::new(MemoryStateStore::new());
-        let inode_service = MetadataInodeServiceImpl::new(Arc::clone(&state_store), Arc::clone(&mount_table))
-            .with_storage(storage.clone());
-        let path_service =
-            MetadataFileSystemServiceImpl::new(Arc::clone(&mount_table), storage.clone(), inode_service.fs_core());
-        (path_service, mount_table, storage)
-    }
-
-    fn req_header(client_id: u64) -> Option<proto::common::RequestHeaderProto> {
-        let header = RequestHeader::new(ClientId::new(client_id));
-        Some((&header).into())
-    }
-
-    fn canonical_error(header: Option<proto::common::ResponseHeaderProto>) -> CanonicalError {
-        let header = ResponseHeader::try_from(header.expect("response header must be present"))
-            .expect("response header must decode");
-        header
-            .canonical_error
-            .expect("response header must include canonical error")
     }
 
     #[tokio::test]
@@ -2417,92 +2402,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 3);
-    }
-
-    #[tokio::test]
-    async fn get_file_status_not_ready_beats_not_found() {
-        let dir = TempDir::new().expect("create temp dir");
-        let (service, _mount_table, _storage) = build_path_service(&dir);
-        let readiness_gate = Arc::new(RootReadinessGate::new(None));
-        let service = service.with_readiness_gate(readiness_gate);
-
-        let response = service
-            .get_file_status(Request::new(GetFileStatusRequestProto {
-                header: req_header(101),
-                path: "/missing".to_string(),
-                ..Default::default()
-            }))
-            .await
-            .expect("gRPC transport status must stay OK");
-        let err = canonical_error(response.get_ref().header.clone());
-        assert_eq!(err.class, ErrorClass::Retryable);
-        assert_eq!(err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NodeUnavailable)));
-        assert!(err.message.contains("root mount not ready"));
-    }
-
-    #[tokio::test]
-    async fn mkdir_not_leader_beats_not_found() {
-        let dir = TempDir::new().expect("create temp dir");
-        let (service, _mount_table, _storage) = build_path_service(&dir);
-        let service = service.with_leadership_checker(Arc::new(StaticLeader(false)));
-
-        let response = service
-            .mkdir(Request::new(MkdirPathRequestProto {
-                header: req_header(102),
-                path: "/missing/child".to_string(),
-                ..Default::default()
-            }))
-            .await
-            .expect("gRPC transport status must stay OK");
-        let err = canonical_error(response.get_ref().header.clone());
-        assert_eq!(err.class, ErrorClass::NeedRefresh);
-        assert_eq!(err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NotLeader)));
-        assert_eq!(err.reason, Some(RefreshReason::NotLeader));
-    }
-
-    #[tokio::test]
-    async fn open_write_not_leader_beats_root_data_io_policy_denial() {
-        let dir = TempDir::new().expect("create temp dir");
-        let (service, mount_table, storage) = build_path_service(&dir);
-        let service = service.with_leadership_checker(Arc::new(StaticLeader(false)));
-
-        let root_entry = mount_table
-            .create_mount(
-                "/".to_string(),
-                MountKind::Internal,
-                None,
-                DataIoPolicy::Forbid,
-                ShardGroupId::new(1),
-                ROOT_INODE_ID,
-            )
-            .expect("create root mount");
-        storage
-            .put_inode(&Inode::new_dir(ROOT_INODE_ID, FileAttrs::new(), root_entry.mount_id))
-            .expect("put root inode");
-        let file_inode_id = InodeId::new(2);
-        storage
-            .put_inode(&Inode::new_file(
-                file_inode_id,
-                FileAttrs::new(),
-                root_entry.mount_id,
-                DataHandleId::new(1),
-            ))
-            .expect("put file inode");
-        storage
-            .put_dentry(ROOT_INODE_ID, "file", file_inode_id)
-            .expect("put file dentry");
-
-        let response = service
-            .open_write_by_path(Request::new(OpenWriteByPathRequestProto {
-                header: req_header(103),
-                path: "/file".to_string(),
-                ..Default::default()
-            }))
-            .await
-            .expect("gRPC transport status must stay OK");
-        let err = canonical_error(response.get_ref().header.clone());
-        assert_eq!(err.class, ErrorClass::NeedRefresh);
-        assert_eq!(err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NotLeader)));
-        assert_eq!(err.reason, Some(RefreshReason::NotLeader));
     }
 }

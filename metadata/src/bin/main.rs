@@ -10,8 +10,8 @@ use metadata::maintenance::MaintenanceService;
 use metadata::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use metadata::readiness::{wait_for_root_ready_with_metrics, RootReadinessGate};
 use metadata::service::{
-    cached_static_group_resolver, filesystem_authz_provider, inode_authz_provider, AuthzProviderDeps,
-    MetadataFileSystemServiceImpl, MetadataInodeServiceImpl, RocksDbInodePermReader,
+    cached_static_group_resolver, filesystem_authz_provider, AuthzProviderDeps, MetadataFileSystemServiceDeps,
+    MetadataFileSystemServiceImpl, RocksDbInodePermReader, SharedWorkerCommitHook,
 };
 use metadata::state::RaftStateStore;
 use metadata::ufs_proxy::UfsMetadataProxy;
@@ -20,13 +20,13 @@ use metadata::worker::{
 };
 use metadata::{MetadataConfig, MountTable};
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProtoServer;
-use proto::metadata::metadata_inode_service_proto_server::MetadataInodeServiceProtoServer;
 use proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProtoServer;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::signal;
 use tonic::transport::Server;
 use tonic_health::server::health_reporter;
-use tracing::{info, warn};
+use tracing::info;
 use types::ids::ShardGroupId;
 use ufs::UfsRegistry;
 
@@ -48,23 +48,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(config_path = %config_path, "Loading configuration");
 
     let config = MetadataConfig::load(&config_path)?;
-    let serve_inode_service = config.inode_service.enable;
-    if serve_inode_service && config.inode_service.require_loopback_bind && !config.rpc_addr.ip().is_loopback() {
-        return Err(format!(
-            "metadata.inode_service.enable=true requires loopback metadata.rpc.addr when \
-             metadata.inode_service.require_loopback_bind=true; got {}",
-            config.rpc_addr
-        )
-        .into());
-    }
 
     // Print configuration summary (redacted for sensitive values)
     info!(
         rpc_addr = %config.rpc_addr,
-        inode_service_enabled = serve_inode_service,
-        inode_service_require_loopback_bind = config.inode_service.require_loopback_bind,
         authz_filesystem_mode = ?config.authz.filesystem.mode,
-        authz_inode_mode = ?config.authz.inode.mode,
         node_id = config.raft.node_id,
         cluster_id = %config.raft.cluster_id,
         peers_count = config.raft.peers.len(),
@@ -132,11 +120,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     health_reporter
         .set_not_serving::<FileSystemServiceProtoServer<MetadataFileSystemServiceImpl>>()
         .await;
-    if serve_inode_service {
-        health_reporter
-            .set_not_serving::<MetadataInodeServiceProtoServer<MetadataInodeServiceImpl>>()
-            .await;
-    }
 
     // Create repair metrics
     use metadata::worker::RepairMetrics;
@@ -225,37 +208,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(RocksDbInodePermReader::new(Arc::clone(&storage), 2)),
     );
 
-    // Note: state_store is Arc<RaftStateStore>, which implements StateStore trait
     let mount_table_for_readiness = Arc::clone(&mount_table);
-    let inode_service = MetadataInodeServiceImpl::new(
-        state_store.clone() as Arc<dyn metadata::state::StateStore>,
-        Arc::clone(&mount_table),
-    )
-    .with_storage(Arc::clone(&storage))
-    .with_raft_node(Arc::clone(&raft_node))
-    .with_metrics(Arc::clone(&metadata_metrics))
-    .with_authz_provider(inode_authz_provider(config.authz.inode.mode, &authz_deps))
-    .with_inode_perm_reader(Arc::clone(&authz_deps.inode_perm_reader))
-    .with_readiness_gate(Arc::clone(&readiness_gate));
-
-    let inode_service_for_filesystem = MetadataInodeServiceImpl::new(
-        state_store.clone() as Arc<dyn metadata::state::StateStore>,
-        Arc::clone(&mount_table),
-    )
-    .with_storage(Arc::clone(&storage))
-    .with_raft_node(Arc::clone(&raft_node))
-    .with_metrics(Arc::clone(&metadata_metrics))
-    .with_authz_provider(inode_authz_provider(config.authz.inode.mode, &authz_deps))
-    .with_inode_perm_reader(Arc::clone(&authz_deps.inode_perm_reader))
-    .with_readiness_gate(Arc::clone(&readiness_gate));
-    let fs_core_for_filesystem = inode_service_for_filesystem.fs_core();
-
-    let filesystem_service =
-        MetadataFileSystemServiceImpl::new(Arc::clone(&mount_table), Arc::clone(&storage), fs_core_for_filesystem)
-            .with_metrics(Arc::clone(&metadata_metrics))
-            .with_authz_provider(filesystem_authz_provider(config.authz.filesystem.mode, &authz_deps))
-            .with_inode_perm_reader(Arc::clone(&authz_deps.inode_perm_reader))
-            .with_readiness_gate(Arc::clone(&readiness_gate));
+    let write_session_manager = Arc::new(metadata::write_session::WriteSessionManager::default());
+    let inode_lease_manager = Arc::new(metadata::inode_lease::InodeLeaseManager::default());
+    let worker_commit_hook: SharedWorkerCommitHook = Arc::new(Mutex::new(None));
+    let filesystem_service = MetadataFileSystemServiceImpl::new(MetadataFileSystemServiceDeps {
+        state_store: state_store.clone() as Arc<dyn metadata::state::StateStore>,
+        mount_table: Arc::clone(&mount_table),
+        storage: Arc::clone(&storage),
+        write_session_manager,
+        inode_lease_manager,
+        worker_commit_hook,
+        raft_node: Some(Arc::clone(&raft_node)),
+        worker_manager: Some(Arc::clone(&worker_manager)),
+        metrics: Some(Arc::clone(&metadata_metrics)),
+        readiness_gate: Some(Arc::clone(&readiness_gate)),
+        leadership_checker: None,
+        authz_provider: filesystem_authz_provider(config.authz.filesystem.mode, &authz_deps),
+        inode_perm_reader: Some(Arc::clone(&authz_deps.inode_perm_reader)),
+    });
 
     let readiness_config = config.bootstrap.root_readiness.clone();
     let readiness_gate_clone = Arc::clone(&readiness_gate);
@@ -263,7 +234,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raft_node_clone = Arc::clone(&raft_node);
     let shard_group_id_clone = shard_group_id;
     let metrics_clone = Arc::clone(&metadata_metrics);
-    let serve_inode_service_for_health = serve_inode_service;
     tokio::spawn(async move {
         let result = wait_for_root_ready_with_metrics(
             raft_node_clone,
@@ -279,11 +249,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 health_reporter
                     .set_serving::<FileSystemServiceProtoServer<MetadataFileSystemServiceImpl>>()
                     .await;
-                if serve_inode_service_for_health {
-                    health_reporter
-                        .set_serving::<MetadataInodeServiceProtoServer<MetadataInodeServiceImpl>>()
-                        .await;
-                }
             }
             Err(err) => {
                 tracing::error!(error = %err, "Root readiness watcher failed");
@@ -293,35 +258,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start gRPC server
     let addr = config.rpc_addr;
-    if serve_inode_service {
-        warn!(
-            addr = %addr,
-            "Inode service is enabled on the shared metadata RPC endpoint; keep this endpoint privileged-only"
-        );
-        info!(addr = %addr, "Listening on");
-        Server::builder()
-            // DEPRECATED: MetadataClientService removed
-            // .add_service(MetadataClientServiceServer::new(client_service))
-            .add_service(FileSystemServiceProtoServer::new(filesystem_service))
-            .add_service(MetadataWorkerServiceProtoServer::new(worker_service))
-            .add_service(MetadataInodeServiceProtoServer::new(inode_service))
-            .add_service(health_service)
-            .serve_with_shutdown(addr, shutdown_signal())
-            .await?;
-    } else {
-        info!(
-            addr = %addr,
-            "Listening on (inode service disabled by default; external FS entrypoint is FileSystemService only)"
-        );
-        Server::builder()
-            // DEPRECATED: MetadataClientService removed
-            // .add_service(MetadataClientServiceServer::new(client_service))
-            .add_service(FileSystemServiceProtoServer::new(filesystem_service))
-            .add_service(MetadataWorkerServiceProtoServer::new(worker_service))
-            .add_service(health_service)
-            .serve_with_shutdown(addr, shutdown_signal())
-            .await?;
-    }
+    info!(addr = %addr, "Listening on (path/filesystem + worker services)");
+    Server::builder()
+        // DEPRECATED: MetadataClientService removed
+        // .add_service(MetadataClientServiceServer::new(client_service))
+        .add_service(FileSystemServiceProtoServer::new(filesystem_service))
+        .add_service(MetadataWorkerServiceProtoServer::new(worker_service))
+        .add_service(health_service)
+        .serve_with_shutdown(addr, shutdown_signal())
+        .await?;
 
     Ok(())
 }
