@@ -7,7 +7,7 @@
 **/.cargo/
 /target/
 /**/target/
-
+docs/
 docs_backup/*
 
 
@@ -95,3 +95,4 @@ pids/
 # *.secret*
 # *.key
 # *.pem
+.agents/
