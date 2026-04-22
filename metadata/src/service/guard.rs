@@ -6,7 +6,7 @@
 use super::authz::{AllowAllAuthz, AuthzOp, AuthzProvider, AuthzTarget};
 use super::domain::RequestContext;
 use crate::data_io::DataIoOp;
-use crate::error::MetadataError;
+use crate::error::{to_canonical_rpc, MetadataError};
 use crate::mount::{DataIoPolicy, MountTable, ROOT_MOUNT_PREFIX};
 use crate::raft::AppRaftNode;
 use crate::readiness::RootReadinessGate;
@@ -157,6 +157,12 @@ impl GuardFailure {
         }
     }
 
+    /// Keep the production RPC-side metadata->canonical mapping visible in the
+    /// guard path instead of hiding it behind implicit conversions.
+    fn from_rpc_metadata_error(err: MetadataError) -> Self {
+        Self::new(to_canonical_rpc(err))
+    }
+
     fn with_mount(mut self, group_id: Option<u64>, mount_epoch: Option<u64>) -> Self {
         self.group_id = group_id;
         self.mount_epoch = mount_epoch;
@@ -229,9 +235,9 @@ impl GuardChain {
         }
         if ctx.policy.enforce_authz {
             if ctx.authz.is_none() {
-                return Err(GuardFailure::new(
-                    MetadataError::InvalidArgument("missing authz context".to_string()).into(),
-                ));
+                return Err(GuardFailure::from_rpc_metadata_error(MetadataError::InvalidArgument(
+                    "missing authz context".to_string(),
+                )));
             }
             self.authz.check(ctx).await?;
         }
@@ -282,8 +288,8 @@ impl ReadinessGuard {
         if gate.is_ready() {
             return Ok(());
         }
-        Err(GuardFailure::new(
-            MetadataError::ServiceUnavailable("root mount not ready".to_string()).into(),
+        Err(GuardFailure::from_rpc_metadata_error(
+            MetadataError::ServiceUnavailable("root mount not ready".to_string()),
         ))
     }
 }
@@ -296,8 +302,8 @@ struct LeadershipGuard {
 impl LeadershipGuard {
     fn check(&self, ctx: &GuardContext) -> Result<(), GuardFailure> {
         let Some(checker) = self.checker.as_ref() else {
-            return Err(GuardFailure::new(
-                MetadataError::ServiceUnavailable("raft node not available".to_string()).into(),
+            return Err(GuardFailure::from_rpc_metadata_error(
+                MetadataError::ServiceUnavailable("raft node not available".to_string()),
             ));
         };
         if checker.is_leader() {
@@ -334,15 +340,20 @@ impl DataIoPolicyGuard {
             return Ok(());
         };
         let mount_id = ctx.mount_id.ok_or_else(|| {
-            GuardFailure::new(MetadataError::InvalidArgument("missing mount_id for data-io guard".to_string()).into())
+            GuardFailure::from_rpc_metadata_error(MetadataError::InvalidArgument(
+                "missing mount_id for data-io guard".to_string(),
+            ))
         })?;
 
         let mount_entry = self
             .mount_table
             .get_mount(mount_id)
-            .map_err(|err| GuardFailure::new(err.into()))?
+            .map_err(GuardFailure::from_rpc_metadata_error)?
             .ok_or_else(|| {
-                GuardFailure::new(MetadataError::NotFound(format!("Mount not found: {:?}", mount_id)).into())
+                GuardFailure::from_rpc_metadata_error(MetadataError::NotFound(format!(
+                    "Mount not found: {:?}",
+                    mount_id
+                )))
             })?;
 
         if mount_entry.data_io_policy != DataIoPolicy::Forbid {

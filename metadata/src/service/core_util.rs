@@ -57,7 +57,7 @@ pub fn extract_and_inject_context(req_header: &Option<proto::common::RequestHead
     request_context_from_proto(req_header).caller
 }
 
-fn map_canonical_to_error_detail(err: &CanonicalError) -> Option<proto::common::ErrorDetailProto> {
+fn error_detail_from_canonical(err: &CanonicalError) -> Option<proto::common::ErrorDetailProto> {
     debug_assert!(
         err.class != ErrorClass::Ok || (err.code.is_none() && err.reason.is_none() && err.retry_after_ms.is_none()),
         "CanonicalError invariant violated: Ok must not carry code/reason/retry_after_ms"
@@ -233,7 +233,7 @@ pub fn header_from_canonical_error_with_context(
     err: &CanonicalError,
 ) -> proto::common::ResponseHeaderProto {
     let mut header = build_base_response_header(ctx, group_id, mount_epoch, route_epoch, state_id);
-    header.error = map_canonical_to_error_detail(err);
+    header.error = error_detail_from_canonical(err);
     header
 }
 
