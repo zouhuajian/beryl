@@ -13,7 +13,7 @@ use super::domain::{
     UnlinkInput,
 };
 use super::extract_and_inject_context;
-use super::guard::{AuthzCheck, AuthzContext, GuardChain, GuardSpec, LeadershipChecker};
+use super::guard::{AuthzCheck, AuthzContext, GuardChain, GuardPolicy, LeadershipChecker};
 use super::{
     extent_from_proto, extent_to_proto, fencing_to_proto, header_from_canonical_error, header_from_core_failure,
     lease_id_from_proto, lease_id_to_proto, location_to_proto, need_refresh_header, ok_header_from_core_success,
@@ -374,20 +374,20 @@ impl MetadataFileSystemServiceImpl {
         header_from_canonical_error(req_header, group_id, mount_epoch, &canonical)
     }
 
-    async fn guard_request(
+    async fn guard_policy(
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
         caller_ctx: &common::header::RequestHeader,
-        mut spec: GuardSpec,
+        mut policy: GuardPolicy,
         mount_id: Option<types::ids::MountId>,
         authz: Option<AuthzContext>,
     ) -> Option<proto::common::ResponseHeaderProto> {
         if authz.is_some() {
-            spec = spec.with_authz();
+            policy = policy.with_authz();
         }
         match self
             .guard_chain
-            .check_request(req_header, caller_ctx, spec, mount_id, authz)
+            .check_request(req_header, caller_ctx, policy, mount_id, authz)
             .await
         {
             Ok(()) => None,
@@ -398,30 +398,6 @@ impl MetadataFileSystemServiceImpl {
                 &failure.err,
             )),
         }
-    }
-
-    async fn guard_pre_read(
-        &self,
-        req_header: &Option<proto::common::RequestHeaderProto>,
-        caller_ctx: &common::header::RequestHeader,
-    ) -> Option<proto::common::ResponseHeaderProto> {
-        self.guard_request(req_header, caller_ctx, GuardSpec::readiness_only(), None, None)
-            .await
-    }
-
-    async fn guard_pre_write(
-        &self,
-        req_header: &Option<proto::common::RequestHeaderProto>,
-        caller_ctx: &common::header::RequestHeader,
-    ) -> Option<proto::common::ResponseHeaderProto> {
-        self.guard_request(
-            req_header,
-            caller_ctx,
-            GuardSpec::readiness_only().with_leader(),
-            None,
-            None,
-        )
-        .await
     }
 
     /// Convert types FileAttrs to proto FileAttrsProto.
@@ -473,7 +449,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<GetFileStatusResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_READ_PRE, None, None)
+            .await
+        {
             return error_response!(GetFileStatusResponseProto, resp_header);
         }
 
@@ -494,10 +473,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
 
         if let Some(resp_header) = self
-            .guard_request(
+            .guard_policy(
                 &req.header,
                 &caller_ctx,
-                GuardSpec::metadata_read(),
+                GuardPolicy::METADATA_READ,
                 None,
                 Some(authz_ctx),
             )
@@ -545,7 +524,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     async fn mkdir(&self, request: Request<MkdirPathRequestProto>) -> Result<Response<MkdirPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
+            .await
+        {
             return error_response!(MkdirPathResponseProto, resp_header);
         }
 
@@ -566,10 +548,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
 
         if let Some(resp_header) = self
-            .guard_request(
+            .guard_policy(
                 &req.header,
                 &caller_ctx,
-                GuardSpec::metadata_write(),
+                GuardPolicy::METADATA_WRITE,
                 None,
                 Some(authz_ctx),
             )
@@ -647,7 +629,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<CreatePathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
+            .await
+        {
             return error_response!(CreatePathResponseProto, resp_header);
         }
 
@@ -668,10 +653,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
 
         if let Some(resp_header) = self
-            .guard_request(
+            .guard_policy(
                 &req.header,
                 &caller_ctx,
-                GuardSpec::metadata_write(),
+                GuardPolicy::METADATA_WRITE,
                 None,
                 Some(authz_ctx),
             )
@@ -761,7 +746,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<UnlinkPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
+            .await
+        {
             return error_response!(UnlinkPathResponseProto, resp_header);
         }
 
@@ -782,10 +770,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
 
         if let Some(resp_header) = self
-            .guard_request(
+            .guard_policy(
                 &req.header,
                 &caller_ctx,
-                GuardSpec::metadata_write(),
+                GuardPolicy::METADATA_WRITE,
                 None,
                 Some(authz_ctx),
             )
@@ -832,7 +820,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     async fn rmdir(&self, request: Request<RmdirPathRequestProto>) -> Result<Response<RmdirPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
+            .await
+        {
             return error_response!(RmdirPathResponseProto, resp_header);
         }
 
@@ -853,10 +844,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
 
         if let Some(resp_header) = self
-            .guard_request(
+            .guard_policy(
                 &req.header,
                 &caller_ctx,
-                GuardSpec::metadata_write(),
+                GuardPolicy::METADATA_WRITE,
                 None,
                 Some(authz_ctx),
             )
@@ -906,7 +897,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<RenamePathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
+            .await
+        {
             return error_response!(RenamePathResponseProto, resp_header);
         }
 
@@ -927,10 +921,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
 
         if let Some(resp_header) = self
-            .guard_request(
+            .guard_policy(
                 &req.header,
                 &caller_ctx,
-                GuardSpec::metadata_write(),
+                GuardPolicy::METADATA_WRITE,
                 None,
                 Some(authz_ctx),
             )
@@ -983,7 +977,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<ListStatusPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_READ_PRE, None, None)
+            .await
+        {
             return error_response!(ListStatusPathResponseProto, resp_header);
         }
 
@@ -1005,10 +1002,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 }
             };
             if let Some(resp_header) = self
-                .guard_request(
+                .guard_policy(
                     &req.header,
                     &caller_ctx,
-                    GuardSpec::metadata_read(),
+                    GuardPolicy::METADATA_READ,
                     None,
                     Some(authz_ctx),
                 )
@@ -1091,7 +1088,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     async fn open(&self, request: Request<OpenPathRequestProto>) -> Result<Response<OpenPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_READ_PRE, None, None)
+            .await
+        {
             return error_response!(OpenPathResponseProto, resp_header);
         }
 
@@ -1112,10 +1112,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
 
         if let Some(resp_header) = self
-            .guard_request(
+            .guard_policy(
                 &req.header,
                 &caller_ctx,
-                GuardSpec::metadata_read(),
+                GuardPolicy::METADATA_READ,
                 None,
                 Some(authz_ctx),
             )
@@ -1165,19 +1165,25 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         let caller_ctx = extract_and_inject_context(&req.header);
         let session = self.fs_core.write_session_for_handle(req.file_handle);
         if session.is_some() {
-            if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            if let Some(resp_header) = self
+                .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
+                .await
+            {
                 return response_with_header!(ReleasePathResponseProto::default(), resp_header);
             }
-        } else if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
+        } else if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_READ_PRE, None, None)
+            .await
+        {
             return response_with_header!(ReleasePathResponseProto::default(), resp_header);
         }
 
         if let Some(session) = session {
             if let Some(resp_header) = self
-                .guard_request(
+                .guard_policy(
                     &req.header,
                     &caller_ctx,
-                    GuardSpec::data_io(DataIoOp::CloseWrite).with_leader(),
+                    GuardPolicy::data_io(DataIoOp::CloseWrite).with_leader(),
                     Some(session.mount_id),
                     Some(Self::authz_for_rpc(
                         PathRpcAuthz::Release,
@@ -1189,10 +1195,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return response_with_header!(ReleasePathResponseProto::default(), resp_header);
             }
         } else if let Some(resp_header) = self
-            .guard_request(
+            .guard_policy(
                 &req.header,
                 &caller_ctx,
-                GuardSpec::metadata_read(),
+                GuardPolicy::METADATA_READ,
                 None,
                 Some(Self::authz_for_rpc(
                     PathRpcAuthz::Release,
@@ -1235,7 +1241,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     async fn fsync(&self, request: Request<FsyncPathRequestProto>) -> Result<Response<FsyncPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
+            .await
+        {
             return error_response!(FsyncPathResponseProto, resp_header);
         }
 
@@ -1259,10 +1268,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 };
 
                 if let Some(resp_header) = self
-                    .guard_request(
+                    .guard_policy(
                         &req.header,
                         &caller_ctx,
-                        GuardSpec::data_io(DataIoOp::Fsync).with_leader(),
+                        GuardPolicy::data_io(DataIoOp::Fsync).with_leader(),
                         Some(resolved.mount_ctx.mount_id),
                         Some(authz_ctx),
                     )
@@ -1387,7 +1396,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<TruncatePathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
+            .await
+        {
             return error_response!(TruncatePathResponseProto, resp_header);
         }
 
@@ -1408,10 +1420,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
 
         if let Some(resp_header) = self
-            .guard_request(
+            .guard_policy(
                 &req.header,
                 &caller_ctx,
-                GuardSpec::data_io(DataIoOp::Truncate).with_leader(),
+                GuardPolicy::data_io(DataIoOp::Truncate).with_leader(),
                 Some(resolved.mount_ctx.mount_id),
                 Some(authz_ctx),
             )
@@ -1467,7 +1479,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<SetXattrPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
+            .await
+        {
             return error_response!(SetXattrPathResponseProto, resp_header);
         }
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
@@ -1486,10 +1501,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
 
         if let Some(resp_header) = self
-            .guard_request(
+            .guard_policy(
                 &req.header,
                 &caller_ctx,
-                GuardSpec::metadata_write(),
+                GuardPolicy::METADATA_WRITE,
                 None,
                 Some(authz_ctx),
             )
@@ -1545,7 +1560,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<GetXattrPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_READ_PRE, None, None)
+            .await
+        {
             return error_response!(GetXattrPathResponseProto, resp_header);
         }
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
@@ -1564,10 +1582,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
 
         if let Some(resp_header) = self
-            .guard_request(
+            .guard_policy(
                 &req.header,
                 &caller_ctx,
-                GuardSpec::metadata_read(),
+                GuardPolicy::METADATA_READ,
                 None,
                 Some(authz_ctx),
             )
@@ -1615,7 +1633,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<ListXattrPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_READ_PRE, None, None)
+            .await
+        {
             return error_response!(ListXattrPathResponseProto, resp_header);
         }
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
@@ -1634,10 +1655,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
 
         if let Some(resp_header) = self
-            .guard_request(
+            .guard_policy(
                 &req.header,
                 &caller_ctx,
-                GuardSpec::metadata_read(),
+                GuardPolicy::METADATA_READ,
                 None,
                 Some(authz_ctx),
             )
@@ -1684,7 +1705,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<RemoveXattrPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
+            .await
+        {
             return error_response!(RemoveXattrPathResponseProto, resp_header);
         }
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
@@ -1703,10 +1727,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
 
         if let Some(resp_header) = self
-            .guard_request(
+            .guard_policy(
                 &req.header,
                 &caller_ctx,
-                GuardSpec::metadata_write(),
+                GuardPolicy::METADATA_WRITE,
                 None,
                 Some(authz_ctx),
             )
@@ -1759,7 +1783,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<GetFileLayoutByPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_READ_PRE, None, None)
+            .await
+        {
             return error_response!(GetFileLayoutByPathResponseProto, resp_header);
         }
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
@@ -1777,10 +1804,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             }
         };
         if let Some(resp_header) = self
-            .guard_request(
+            .guard_policy(
                 &req.header,
                 &caller_ctx,
-                GuardSpec::data_io(DataIoOp::Read),
+                GuardPolicy::data_io(DataIoOp::Read),
                 Some(resolved.mount_ctx.mount_id),
                 Some(authz_ctx),
             )
@@ -1840,7 +1867,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<OpenWriteByPathResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
+            .await
+        {
             return error_response!(OpenWriteByPathResponseProto, resp_header);
         }
 
@@ -1878,10 +1908,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             return error_response!(OpenWriteByPathResponseProto, header);
         }
         if let Some(resp_header) = self
-            .guard_request(
+            .guard_policy(
                 &req.header,
                 &caller_ctx,
-                GuardSpec::data_io(DataIoOp::OpenWrite).with_leader(),
+                GuardPolicy::data_io(DataIoOp::OpenWrite).with_leader(),
                 Some(resolved.mount_ctx.mount_id),
                 Some(authz_ctx),
             )
@@ -1942,16 +1972,19 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<CloseWriteSessionResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
+            .await
+        {
             return error_response!(CloseWriteSessionResponseProto, resp_header);
         }
 
         if let Some(session) = self.fs_core.write_session_for_handle(req.file_handle) {
             if let Some(resp_header) = self
-                .guard_request(
+                .guard_policy(
                     &req.header,
                     &caller_ctx,
-                    GuardSpec::data_io(DataIoOp::CloseWrite).with_leader(),
+                    GuardPolicy::data_io(DataIoOp::CloseWrite).with_leader(),
                     Some(session.mount_id),
                     Some(Self::authz_for_rpc(
                         PathRpcAuthz::CloseWriteSession,
@@ -2031,16 +2064,19 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<RenewWriteSessionLeaseResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
+            .await
+        {
             return error_response!(RenewWriteSessionLeaseResponseProto, resp_header);
         }
 
         if let Some(session) = self.fs_core.write_session_for_handle(req.file_handle) {
             if let Some(resp_header) = self
-                .guard_request(
+                .guard_policy(
                     &req.header,
                     &caller_ctx,
-                    GuardSpec::data_io(DataIoOp::RenewLease).with_leader(),
+                    GuardPolicy::data_io(DataIoOp::RenewLease).with_leader(),
                     Some(session.mount_id),
                     Some(Self::authz_for_rpc(
                         PathRpcAuthz::RenewWriteSessionLease,
@@ -2096,7 +2132,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<FsyncSessionResponseProto>, Status> {
         let req = request.into_inner();
         let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+        if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
+            .await
+        {
             return response_with_header!(FsyncSessionResponseProto::default(), resp_header);
         }
 
@@ -2115,10 +2154,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             }
         };
         if let Some(resp_header) = self
-            .guard_request(
+            .guard_policy(
                 &req.header,
                 &caller_ctx,
-                GuardSpec::data_io(DataIoOp::Fsync).with_leader(),
+                GuardPolicy::data_io(DataIoOp::Fsync).with_leader(),
                 Some(session.mount_id),
                 Some(Self::authz_for_rpc(
                     PathRpcAuthz::FsyncSession,
@@ -2228,19 +2267,25 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         let caller_ctx = extract_and_inject_context(&req.header);
         let session = self.fs_core.write_session_for_handle(req.file_handle);
         if session.is_some() {
-            if let Some(resp_header) = self.guard_pre_write(&req.header, &caller_ctx).await {
+            if let Some(resp_header) = self
+                .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
+                .await
+            {
                 return response_with_header!(ReleaseSessionResponseProto::default(), resp_header);
             }
-        } else if let Some(resp_header) = self.guard_pre_read(&req.header, &caller_ctx).await {
+        } else if let Some(resp_header) = self
+            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_READ_PRE, None, None)
+            .await
+        {
             return response_with_header!(ReleaseSessionResponseProto::default(), resp_header);
         }
 
         if let Some(session) = session {
             if let Some(resp_header) = self
-                .guard_request(
+                .guard_policy(
                     &req.header,
                     &caller_ctx,
-                    GuardSpec::data_io(DataIoOp::CloseWrite).with_leader(),
+                    GuardPolicy::data_io(DataIoOp::CloseWrite).with_leader(),
                     Some(session.mount_id),
                     Some(Self::authz_for_rpc(
                         PathRpcAuthz::ReleaseSession,
@@ -2252,10 +2297,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return response_with_header!(ReleaseSessionResponseProto::default(), resp_header);
             }
         } else if let Some(resp_header) = self
-            .guard_request(
+            .guard_policy(
                 &req.header,
                 &caller_ctx,
-                GuardSpec::metadata_read(),
+                GuardPolicy::METADATA_READ,
                 None,
                 Some(Self::authz_for_rpc(
                     PathRpcAuthz::ReleaseSession,
@@ -2346,7 +2391,7 @@ mod tests {
             .check_request(
                 &req_header,
                 &caller,
-                GuardSpec::metadata_read(),
+                GuardPolicy::METADATA_READ,
                 None,
                 Some(MetadataFileSystemServiceImpl::authz_for_rpc(
                     PathRpcAuthz::Create,
@@ -2369,7 +2414,7 @@ mod tests {
             .check_request(
                 &req_header,
                 &caller,
-                GuardSpec::metadata_read(),
+                GuardPolicy::METADATA_READ,
                 None,
                 Some(MetadataFileSystemServiceImpl::authz_for_rpc(
                     PathRpcAuthz::Rename,

@@ -65,7 +65,7 @@ impl LeadershipChecker for AppRaftNode {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct GuardSpec {
+pub struct GuardPolicy {
     pub requires_root_ready: bool,
     pub requires_raft: bool,
     pub requires_leader: bool,
@@ -73,48 +73,40 @@ pub struct GuardSpec {
     pub enforce_authz: bool,
 }
 
-impl GuardSpec {
-    pub fn metadata_read() -> Self {
-        Self {
-            requires_root_ready: true,
-            requires_raft: false,
-            requires_leader: false,
-            data_io_op: None,
-            enforce_authz: true,
-        }
-    }
+impl GuardPolicy {
+    pub const PATH_READ_PRE: Self = Self {
+        requires_root_ready: true,
+        requires_raft: false,
+        requires_leader: false,
+        data_io_op: None,
+        enforce_authz: false,
+    };
 
-    pub fn metadata_write() -> Self {
-        Self {
-            requires_root_ready: true,
-            requires_raft: false,
-            requires_leader: true,
-            data_io_op: None,
-            enforce_authz: true,
-        }
-    }
+    pub const PATH_WRITE_PRE: Self = Self {
+        requires_root_ready: true,
+        requires_raft: false,
+        requires_leader: true,
+        data_io_op: None,
+        enforce_authz: false,
+    };
 
-    pub fn leader_only() -> Self {
-        Self {
-            requires_root_ready: false,
-            requires_raft: false,
-            requires_leader: true,
-            data_io_op: None,
-            enforce_authz: false,
-        }
-    }
+    pub const METADATA_READ: Self = Self {
+        requires_root_ready: true,
+        requires_raft: false,
+        requires_leader: false,
+        data_io_op: None,
+        enforce_authz: true,
+    };
 
-    pub fn readiness_only() -> Self {
-        Self {
-            requires_root_ready: true,
-            requires_raft: false,
-            requires_leader: false,
-            data_io_op: None,
-            enforce_authz: false,
-        }
-    }
+    pub const METADATA_WRITE: Self = Self {
+        requires_root_ready: true,
+        requires_raft: false,
+        requires_leader: true,
+        data_io_op: None,
+        enforce_authz: true,
+    };
 
-    pub fn data_io(op: DataIoOp) -> Self {
+    pub const fn data_io(op: DataIoOp) -> Self {
         Self {
             requires_root_ready: true,
             requires_raft: false,
@@ -124,17 +116,17 @@ impl GuardSpec {
         }
     }
 
-    pub fn with_leader(mut self) -> Self {
+    pub const fn with_leader(mut self) -> Self {
         self.requires_leader = true;
         self
     }
 
-    pub fn with_raft(mut self) -> Self {
+    pub const fn with_raft(mut self) -> Self {
         self.requires_raft = true;
         self
     }
 
-    pub fn with_authz(mut self) -> Self {
+    pub const fn with_authz(mut self) -> Self {
         self.enforce_authz = true;
         self
     }
@@ -144,7 +136,7 @@ impl GuardSpec {
 pub struct GuardContext<'a> {
     pub req_header_proto: &'a Option<proto::common::RequestHeaderProto>,
     pub caller: &'a RequestHeader,
-    pub spec: GuardSpec,
+    pub policy: GuardPolicy,
     pub mount_id: Option<MountId>,
     pub authz: Option<AuthzContext>,
 }
@@ -226,16 +218,16 @@ impl GuardChain {
     }
 
     pub async fn check(&self, ctx: &GuardContext<'_>) -> Result<(), GuardFailure> {
-        if ctx.spec.requires_root_ready {
+        if ctx.policy.requires_root_ready {
             self.readiness.check(ctx)?;
         }
-        if ctx.spec.data_io_op.is_some() {
+        if ctx.policy.data_io_op.is_some() {
             self.data_io.check(ctx)?;
         }
-        if ctx.spec.requires_raft || ctx.spec.requires_leader {
+        if ctx.policy.requires_raft || ctx.policy.requires_leader {
             self.leadership.check(ctx)?;
         }
-        if ctx.spec.enforce_authz {
+        if ctx.policy.enforce_authz {
             if ctx.authz.is_none() {
                 return Err(GuardFailure::new(
                     MetadataError::InvalidArgument("missing authz context".to_string()).into(),
@@ -250,26 +242,26 @@ impl GuardChain {
         &self,
         req_header_proto: &Option<proto::common::RequestHeaderProto>,
         caller: &RequestHeader,
-        spec: GuardSpec,
+        policy: GuardPolicy,
         mount_id: Option<MountId>,
         authz: Option<AuthzContext>,
     ) -> Result<(), GuardFailure> {
         let ctx = GuardContext {
             req_header_proto,
             caller,
-            spec,
+            policy,
             mount_id,
             authz,
         };
         self.check(&ctx).await
     }
 
-    pub async fn check_system(&self, spec: GuardSpec) -> Result<(), GuardFailure> {
+    pub async fn check_system(&self, policy: GuardPolicy) -> Result<(), GuardFailure> {
         let caller = RequestHeader::new(types::ClientId::new(0));
         let ctx = GuardContext {
             req_header_proto: &None,
             caller: &caller,
-            spec,
+            policy,
             mount_id: None,
             authz: None,
         };
@@ -338,7 +330,7 @@ struct DataIoPolicyGuard {
 
 impl DataIoPolicyGuard {
     fn check(&self, ctx: &GuardContext) -> Result<(), GuardFailure> {
-        let Some(op) = ctx.spec.data_io_op else {
+        let Some(op) = ctx.policy.data_io_op else {
             return Ok(());
         };
         let mount_id = ctx.mount_id.ok_or_else(|| {
@@ -451,7 +443,7 @@ mod tests {
     }
 
     fn base_context<'a>(
-        spec: GuardSpec,
+        policy: GuardPolicy,
         mount_id: Option<MountId>,
         authz: Option<AuthzContext>,
         caller: &'a RequestHeader,
@@ -460,7 +452,7 @@ mod tests {
         GuardContext {
             req_header_proto: req_header,
             caller,
-            spec,
+            policy,
             mount_id,
             authz,
         }
@@ -475,7 +467,7 @@ mod tests {
 
         let caller = RequestHeader::new(types::ClientId::new(1));
         let req_header = None;
-        let ctx = base_context(GuardSpec::metadata_read(), None, None, &caller, &req_header);
+        let ctx = base_context(GuardPolicy::METADATA_READ, None, None, &caller, &req_header);
 
         let err = chain.check(&ctx).await.unwrap_err();
         assert_eq!(err.err.class, ErrorClass::Retryable);
@@ -492,7 +484,7 @@ mod tests {
         let caller = RequestHeader::new(types::ClientId::new(2));
         let req_header = None;
         let ctx = base_context(
-            GuardSpec::metadata_write(),
+            GuardPolicy::METADATA_WRITE,
             None,
             Some(AuthzContext {
                 op: AuthzOp::Write,
@@ -526,7 +518,7 @@ mod tests {
         let caller = RequestHeader::new(types::ClientId::new(3));
         let req_header = None;
         let ctx = base_context(
-            GuardSpec::data_io(DataIoOp::Read),
+            GuardPolicy::data_io(DataIoOp::Read),
             Some(root_entry.mount_id),
             None,
             &caller,
@@ -546,7 +538,7 @@ mod tests {
         let chain = GuardChain::new(Arc::new(MountTable::new()));
         let caller = RequestHeader::new(types::ClientId::new(4));
         let req_header = None;
-        let ctx = base_context(GuardSpec::metadata_read(), None, None, &caller, &req_header);
+        let ctx = base_context(GuardPolicy::METADATA_READ, None, None, &caller, &req_header);
 
         let err = chain.check(&ctx).await.unwrap_err();
         assert_eq!(err.err.class, ErrorClass::Fatal);
@@ -564,7 +556,7 @@ mod tests {
         let caller = RequestHeader::new(types::ClientId::new(5));
         let req_header = None;
         let ctx = base_context(
-            GuardSpec::metadata_read(),
+            GuardPolicy::METADATA_READ,
             None,
             Some(AuthzContext {
                 op: AuthzOp::Rename,
