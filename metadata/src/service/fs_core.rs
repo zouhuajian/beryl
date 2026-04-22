@@ -398,11 +398,42 @@ impl FsCore {
         freshness: Freshness,
         mount_id: MountId,
     ) -> Result<(Option<u64>, Option<u64>), CoreFailure> {
+        self.validate_mount_epoch_for_mount_with_replay(ctx, freshness, mount_id, Some("request"))
+    }
+
+    pub(crate) fn validate_mount_freshness(
+        &self,
+        ctx: &RequestContext,
+        freshness: Freshness,
+        mount_id: MountId,
+    ) -> Result<(Option<u64>, Option<u64>), CoreFailure> {
+        self.validate_mount_epoch_for_mount_with_replay(ctx, freshness, mount_id, None)
+    }
+
+    fn validate_mount_epoch_for_mount_with_replay(
+        &self,
+        ctx: &RequestContext,
+        freshness: Freshness,
+        mount_id: MountId,
+        replay_intent: Option<&str>,
+    ) -> Result<(Option<u64>, Option<u64>), CoreFailure> {
         let (group_id, mount_epoch) = self.mount_hints_for_mount(mount_id);
         if let (Some(client_mount_epoch), Some(server_mount_epoch)) =
             (freshness.mount_epoch.or(ctx.caller.mount_epoch), mount_epoch)
         {
             if client_mount_epoch != server_mount_epoch {
+                let message = match replay_intent {
+                    Some(intent) => format!(
+                        "mount_epoch mismatch: client={}, server={}; {}",
+                        client_mount_epoch,
+                        server_mount_epoch,
+                        Self::replay_hint(intent)
+                    ),
+                    None => format!(
+                        "mount_epoch mismatch: client={}, server={}",
+                        client_mount_epoch, server_mount_epoch
+                    ),
+                };
                 return Err(CoreFailure::new(
                     CanonicalError::need_refresh_with_hint(
                         RpcErrorCode::MountEpochMismatch,
@@ -412,12 +443,7 @@ impl FsCore {
                             mount_epoch: Some(server_mount_epoch),
                             ..Default::default()
                         },
-                        format!(
-                            "mount_epoch mismatch: client={}, server={}; {}",
-                            client_mount_epoch,
-                            server_mount_epoch,
-                            Self::replay_hint("request")
-                        ),
+                        message,
                     ),
                     group_id,
                     Some(server_mount_epoch),
@@ -3019,5 +3045,78 @@ impl FsCore {
         };
 
         Ok(fs_result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
+    use crate::state::MemoryStateStore;
+    use common::error::canonical::{ErrorCode as CanonicalErrorCode, RefreshReason};
+    use common::header::{AuthnType, RequestHeader, RpcErrorCode};
+    use std::sync::Arc;
+    use types::ids::{ClientId, MountId, ShardGroupId};
+
+    fn request_context() -> RequestContext {
+        RequestContext {
+            caller: RequestHeader::new(ClientId::new(7)),
+            traceparent: None,
+            route_epoch: None,
+            principal: None,
+            real_user: None,
+            doas: None,
+            authn_type: AuthnType::Unspecified,
+        }
+    }
+
+    fn fs_core_with_mount(mount_id: MountId, mount_epoch: u64, group_id: ShardGroupId) -> FsCore {
+        let mount_table = Arc::new(MountTable::new());
+        mount_table
+            .upsert(MountEntry {
+                mount_id,
+                mount_prefix: "/".to_string(),
+                mount_kind: MountKind::Internal,
+                ufs_uri: None,
+                data_io_policy: DataIoPolicy::Allow,
+                config_version: mount_epoch,
+                namespace_owner_group_id: group_id,
+                root_inode_id: ROOT_INODE_ID,
+            })
+            .unwrap();
+        FsCore::new_default(Arc::new(MemoryStateStore::new()), mount_table)
+    }
+
+    #[test]
+    fn validate_mount_freshness_returns_mount_epoch_need_refresh_without_replay_suffix() {
+        let mount_id = MountId::new(11);
+        let group_id = ShardGroupId::new(3);
+        let fs_core = fs_core_with_mount(mount_id, 9, group_id);
+        let ctx = request_context();
+
+        let failure = fs_core
+            .validate_mount_freshness(
+                &ctx,
+                Freshness {
+                    mount_epoch: Some(4),
+                    route_epoch: None,
+                    worker_epoch: None,
+                },
+                mount_id,
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            failure.error.code,
+            Some(CanonicalErrorCode::RpcCode(RpcErrorCode::MountEpochMismatch))
+        );
+        assert_eq!(failure.error.reason, Some(RefreshReason::MountEpochMismatch));
+        assert_eq!(failure.error.message, "mount_epoch mismatch: client=4, server=9");
+        let hint = failure.error.refresh_hint.expect("refresh hint");
+        assert_eq!(hint.group_id, Some(group_id.as_raw()));
+        assert_eq!(hint.mount_epoch, Some(9));
+        assert_eq!(failure.group_id, Some(group_id.as_raw()));
+        assert_eq!(failure.mount_epoch, Some(9));
+        assert_eq!(failure.route_epoch, None);
     }
 }

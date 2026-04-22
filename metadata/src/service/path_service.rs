@@ -350,27 +350,6 @@ impl MetadataFileSystemServiceImpl {
         Ok(Self::authz_for_rpc(PathRpcAuthz::Rename, targets).with_pre_checks(pre_checks))
     }
 
-    /// Validate mount_epoch for write operations.
-    /// Returns error if mount_epoch mismatch (should be converted to NEED_REFRESH).
-    fn validate_mount_epoch(
-        &self,
-        req_header: &Option<proto::common::RequestHeaderProto>,
-        mount_ctx: &crate::path_resolver::MountContext,
-    ) -> MetadataResult<()> {
-        if let Some(header) = req_header {
-            if let Some(client_mount_epoch) = header.mount_epoch {
-                if client_mount_epoch != mount_ctx.mount_epoch {
-                    return Err(MetadataError::MountEpochMismatch {
-                        expected: mount_ctx.mount_epoch,
-                        got: client_mount_epoch,
-                        mount_id: Some(mount_ctx.mount_id),
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn header_or_ok(
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
@@ -1880,19 +1859,23 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             }
         };
 
-        if let Err(err) = self.validate_mount_epoch(&req.header, &resolved.mount_ctx) {
-            let resp_header = match err {
-                MetadataError::MountEpochMismatch { expected, got, .. } => need_refresh_header(
-                    &req.header,
-                    common::header::RpcErrorCode::MountEpochMismatch,
-                    common::error::canonical::RefreshReason::MountEpochMismatch,
-                    format!("mount_epoch mismatch: client={}, server={}", got, expected),
-                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                    Some(resolved.mount_ctx.mount_epoch),
-                ),
-                other => self.header_from_path_error(&req.header, other, Some(&resolved.mount_ctx)),
-            };
-            return error_response!(OpenWriteByPathResponseProto, resp_header);
+        let req_ctx = request_context_from_proto(&req.header);
+        let freshness = Freshness {
+            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
+            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
+            worker_epoch: None,
+        };
+        if let Err(failure) = self
+            .fs_core
+            .validate_mount_freshness(&req_ctx, freshness, resolved.mount_ctx.mount_id)
+        {
+            let header = self.header_or_ok(
+                &req.header,
+                Some(header_from_core_failure(&req_ctx, &failure)),
+                Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                Some(resolved.mount_ctx.mount_epoch),
+            );
+            return error_response!(OpenWriteByPathResponseProto, header);
         }
         if let Some(resp_header) = self
             .guard_request(
@@ -1907,15 +1890,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             return error_response!(OpenWriteByPathResponseProto, resp_header);
         }
 
-        let req_ctx = request_context_from_proto(&req.header);
         let mode = match req.mode {
             x if x == WriteModeProto::WriteModeAppend as i32 => crate::inode_lease::WriteMode::Append,
             _ => crate::inode_lease::WriteMode::Write,
-        };
-        let freshness = Freshness {
-            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
-            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
-            worker_epoch: None,
         };
         match self
             .fs_core
