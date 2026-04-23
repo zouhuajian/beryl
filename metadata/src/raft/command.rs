@@ -76,9 +76,6 @@ pub enum Command {
     /// Delete mount entry.
     DeleteMount { dedup: DedupKey, mount_id: MountId },
 
-    /// Increment layout version (for epoch updates).
-    IncrementLayoutVersion { dedup: DedupKey },
-
     /// Add a new shard group.
     AddShardGroup {
         dedup: DedupKey,
@@ -203,7 +200,6 @@ impl Command {
             | Command::ReleaseLease { dedup, .. }
             | Command::CreateMount { dedup, .. }
             | Command::DeleteMount { dedup, .. }
-            | Command::IncrementLayoutVersion { dedup, .. }
             | Command::AddShardGroup { dedup, .. }
             | Command::UpsertWorkerDescriptor { dedup, .. }
             | Command::CreateDeleteIntents { dedup, .. }
@@ -278,7 +274,6 @@ enum FingerprintView {
     DeleteMount {
         mount_id: MountId,
     },
-    IncrementLayoutVersion,
     AddShardGroup {
         shard_group_id: ShardGroupId,
         shard_ids: Vec<ShardId>,
@@ -413,7 +408,6 @@ impl From<&Command> for FingerprintView {
                 root_inode_id: *root_inode_id,
             },
             Command::DeleteMount { mount_id, .. } => FingerprintView::DeleteMount { mount_id: *mount_id },
-            Command::IncrementLayoutVersion { .. } => FingerprintView::IncrementLayoutVersion,
             Command::AddShardGroup {
                 shard_group_id,
                 shard_ids,

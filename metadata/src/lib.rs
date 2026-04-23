@@ -69,4 +69,4 @@ pub use config::MetadataConfig;
 pub use error::{MetadataError, MetadataResult};
 pub use mount::MountTable;
 pub use readiness::{wait_for_root_ready, RootReadinessConfig, RootReadinessGate};
-pub use state::{LayoutVersion, MemoryStateStore, StateStore};
+pub use state::{MemoryStateStore, RouteEpoch, StateStore};

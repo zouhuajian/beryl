@@ -10,7 +10,7 @@
 //! - dedup/{request_id} -> AppliedResult (serialized)
 //! - shard_groups/{group_id} -> ShardGroupInfo (serialized)
 //! - shard_routing/{shard_id} -> group_id (u64 as string)
-//! - layout_version -> u64
+//! - route_epoch -> u64
 //! - mount_version -> u64
 //!
 //! FS schema:
@@ -29,7 +29,7 @@ use crate::metrics::{
 };
 use crate::mount::MountEntry;
 use crate::raft::types::{AppDataResponse, AppMetadataRaftState, CommandFingerprint, DedupKey, ShardGroupInfo};
-use crate::state::{BlockMetaState, LayoutVersion, LeaseState};
+use crate::state::{BlockMetaState, LeaseState, RouteEpoch};
 use crate::worker::WorkerInfo;
 use bincode::config::standard;
 use bincode::serde::{decode_from_slice, encode_to_vec};
@@ -55,7 +55,7 @@ const CF_WORKERS: &str = "workers";
 const CF_BLOCK_REF_COUNTS: &str = "block_ref_counts"; // block_id -> u64 (global refcount)
 const CF_DELETE_INTENTS: &str = "delete_intents"; // intent_id -> DeleteIntent
 /// Raft column families
-const CF_META: &str = "meta"; // layout_version, mount_version, etc.
+const CF_META: &str = "meta"; // route_epoch, mount_version, file layouts, etc.
 const CF_RAFT_LOG: &str = "raft_log"; // Raft log entries
 const CF_RAFT_STATE: &str = "raft_state"; // Raft state (hard_state, membership)
 const CF_RAFT_SNAPSHOT: &str = "raft_snapshot"; // Raft snapshots
@@ -304,36 +304,36 @@ impl RocksDBStorage {
         Ok(())
     }
 
-    /// Get layout version.
-    pub fn get_layout_version(&self) -> MetadataResult<LayoutVersion> {
+    /// Get the authoritative route epoch used for stale-route validation.
+    pub fn get_route_epoch(&self) -> MetadataResult<RouteEpoch> {
         let cf = self
             .db
             .cf_handle(CF_META)
             .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
 
-        match self.db.get_cf(cf, b"layout_version") {
+        match self.db.get_cf(cf, b"route_epoch") {
             Ok(Some(value)) => {
                 let version: u64 = decode_from_slice(&value, standard())
-                    .map_err(|e| MetadataError::Internal(format!("Failed to deserialize layout_version: {}", e)))?
+                    .map_err(|e| MetadataError::Internal(format!("Failed to deserialize route_epoch: {}", e)))?
                     .0;
-                Ok(LayoutVersion::new(version))
+                Ok(RouteEpoch::new(version))
             }
-            Ok(None) => Ok(LayoutVersion::new(1)), // Default version
+            Ok(None) => Ok(RouteEpoch::new(1)), // Default epoch
             Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
         }
     }
 
-    /// Put layout version.
-    pub fn put_layout_version(&self, version: LayoutVersion) -> MetadataResult<()> {
+    /// Persist the authoritative route epoch used for stale-route validation.
+    pub fn put_route_epoch(&self, epoch: RouteEpoch) -> MetadataResult<()> {
         let cf = self
             .db
             .cf_handle(CF_META)
             .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
-        let value = encode_to_vec(&version.as_u64(), standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to serialize layout_version: {}", e)))?;
+        let value = encode_to_vec(&epoch.as_u64(), standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize route_epoch: {}", e)))?;
 
         self.db
-            .put_cf(cf, b"layout_version", value)
+            .put_cf(cf, b"route_epoch", value)
             .map_err(|e| MetadataError::Internal(format!("RocksDB error: {}", e)))?;
         Ok(())
     }

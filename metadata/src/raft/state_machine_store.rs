@@ -7,7 +7,7 @@ use crate::error::{MetadataError, MetadataResult};
 use crate::raft::snapshot::SnapshotFile;
 use crate::raft::storage::{RocksDBStorage, STATE_CFS};
 use crate::raft::types::{AppDataResponse, AppMetadataRaftState, MetadataNode, MetadataRaftTypeConfig};
-use crate::state::LayoutVersion;
+use crate::state::RouteEpoch;
 use openraft::storage::{RaftStateMachine, SnapshotSignature};
 use openraft::AnyError;
 use openraft::Entry;
@@ -37,7 +37,7 @@ const SNAPSHOT_MAGIC: &[u8] = b"VECT";
 const SNAPSHOT_VERSION_V1: u8 = 1;
 const META_CF_NAME: &str = "meta";
 const APPLIED_SEQ_KEY: &[u8] = b"applied_seq";
-const LAYOUT_VERSION_KEY: &[u8] = b"layout_version";
+const ROUTE_EPOCH_KEY: &[u8] = b"route_epoch";
 const SNAPSHOT_BATCH_BYTES: usize = 2 * 1024 * 1024;
 const TAG_END: u8 = 0;
 const TAG_CF_START: u8 = 1;
@@ -281,7 +281,7 @@ impl openraft::storage::RaftSnapshotBuilder<MetadataRaftTypeConfig> for AppSnaps
         let snap = self.storage.snapshot();
 
         let raft_state = load_raft_state_from_snapshot(&self.storage, &snap)?;
-        let layout_version = load_layout_version_from_snapshot(&self.storage, &snap)?;
+        let route_epoch = load_route_epoch_from_snapshot(&self.storage, &snap)?;
         let applied_seq = load_applied_seq_from_snapshot(&self.storage, &snap)?;
 
         let snapshot_id = format_snapshot_id(raft_state.last_applied_log_id);
@@ -291,7 +291,7 @@ impl openraft::storage::RaftSnapshotBuilder<MetadataRaftTypeConfig> for AppSnaps
             source: StorageIOError::<u64>::write_snapshot(None, AnyError::new(&e)),
         })?;
 
-        write_snapshot_payload(&self.storage, &snap, &mut file, applied_seq, layout_version)?;
+        write_snapshot_payload(&self.storage, &snap, &mut file, applied_seq, route_epoch)?;
 
         let final_path = snapshot_file_path(&self.storage, &snapshot_id);
         if final_path.exists() {
@@ -357,7 +357,7 @@ impl openraft::storage::RaftSnapshotBuilder<MetadataRaftTypeConfig> for AppSnaps
 
 #[derive(Serialize, Deserialize)]
 struct SnapshotHeaderV1 {
-    layout_version: u64,
+    route_epoch: u64,
     applied_seq: u64,
 }
 
@@ -401,7 +401,7 @@ fn write_header<W: Write + Seek>(writer: &mut W, header: &SnapshotHeaderV1) -> s
     writer.seek(SeekFrom::Start(0))?;
     writer.write_all(SNAPSHOT_MAGIC)?;
     writer.write_all(&[SNAPSHOT_VERSION_V1])?;
-    writer.write_all(&header.layout_version.to_le_bytes())?;
+    writer.write_all(&header.route_epoch.to_le_bytes())?;
     writer.write_all(&header.applied_seq.to_le_bytes())?;
     Ok(())
 }
@@ -427,13 +427,13 @@ fn read_header<R: Read + Seek>(reader: &mut R) -> std::io::Result<SnapshotHeader
 
     let mut buf_u64 = [0u8; 8];
     reader.read_exact(&mut buf_u64)?;
-    let layout_version = u64::from_le_bytes(buf_u64);
+    let route_epoch = u64::from_le_bytes(buf_u64);
 
     reader.read_exact(&mut buf_u64)?;
     let applied_seq = u64::from_le_bytes(buf_u64);
 
     Ok(SnapshotHeaderV1 {
-        layout_version,
+        route_epoch,
         applied_seq,
     })
 }
@@ -565,12 +565,12 @@ fn load_raft_state_from_snapshot(
     }
 }
 
-fn load_layout_version_from_snapshot(
+fn load_route_epoch_from_snapshot(
     storage: &RocksDBStorage,
     snap: &DbSnapshot<'_>,
-) -> Result<LayoutVersion, StorageError<u64>> {
-    let version = read_u64_from_snapshot_cf(storage, snap, META_CF_NAME, LAYOUT_VERSION_KEY, 1)?;
-    Ok(LayoutVersion::new(version))
+) -> Result<RouteEpoch, StorageError<u64>> {
+    let epoch = read_u64_from_snapshot_cf(storage, snap, META_CF_NAME, ROUTE_EPOCH_KEY, 1)?;
+    Ok(RouteEpoch::new(epoch))
 }
 
 fn load_applied_seq_from_snapshot(storage: &RocksDBStorage, snap: &DbSnapshot<'_>) -> Result<u64, StorageError<u64>> {
@@ -582,10 +582,10 @@ fn write_snapshot_payload(
     snap: &DbSnapshot<'_>,
     file: &mut std::fs::File,
     applied_seq: u64,
-    layout_version: LayoutVersion,
+    route_epoch: RouteEpoch,
 ) -> Result<(), StorageError<u64>> {
     let header = SnapshotHeaderV1 {
-        layout_version: layout_version.as_u64(),
+        route_epoch: route_epoch.as_u64(),
         applied_seq,
     };
     write_header(file, &header).map_err(|e| StorageError::IO {
@@ -738,7 +738,7 @@ mod tests {
     use super::*;
     use crate::mount::MountTable;
     use crate::raft::state_machine::AppRaftStateMachine;
-    use crate::state::LayoutVersion;
+    use crate::state::RouteEpoch;
     use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine as _};
     use openraft::LeaderId;
     use tempfile::TempDir;
@@ -768,7 +768,7 @@ mod tests {
         ));
         sm_a.set_applied_seq(9);
 
-        storage_a.put_layout_version(LayoutVersion::new(7)).unwrap();
+        storage_a.put_route_epoch(RouteEpoch::new(7)).unwrap();
         storage_a.put_applied_seq(9).unwrap();
 
         // Write a simple entry into another CF to ensure multi-CF round-trip.

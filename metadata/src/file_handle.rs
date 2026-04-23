@@ -32,7 +32,6 @@ pub struct OpenFileEntry {
     pub data_handle_id: DataHandleId,
     pub client_id: ClientId,
     pub opened_at: u64, // Unix timestamp in milliseconds
-    pub layout_version: u64,
 }
 
 /// File handle manager.
@@ -55,7 +54,7 @@ impl FileHandleManager {
     }
 
     /// Open a file and return a handle.
-    pub fn open_file(&self, data_handle_id: DataHandleId, client_id: ClientId, layout_version: u64) -> FileHandle {
+    pub fn open_file(&self, data_handle_id: DataHandleId, client_id: ClientId) -> FileHandle {
         let mut next_id = self.next_handle_id.write();
         let handle = FileHandle::new(*next_id);
         *next_id += 1;
@@ -67,7 +66,6 @@ impl FileHandleManager {
             data_handle_id,
             client_id,
             opened_at: now,
-            layout_version,
         };
 
         // Add to handles map
@@ -102,11 +100,6 @@ impl FileHandleManager {
     /// Get file ID from handle.
     pub fn get_data_handle_id(&self, handle: FileHandle) -> Option<DataHandleId> {
         self.handles.read().get(&handle).map(|e| e.data_handle_id)
-    }
-
-    /// Get layout version from handle.
-    pub fn get_layout_version(&self, handle: FileHandle) -> Option<u64> {
-        self.handles.read().get(&handle).map(|e| e.layout_version)
     }
 
     /// Check if a handle is valid.

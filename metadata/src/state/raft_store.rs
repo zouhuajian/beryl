@@ -5,7 +5,7 @@
 
 use crate::error::{MetadataError, MetadataResult};
 use crate::raft::{AppDataResponse, AppRaftNode, BlockCommandResult, Command, DedupKey, LeaseCommandResult};
-use crate::state::{BlockMetaState, LayoutVersion, LeaseState, StateStore};
+use crate::state::{BlockMetaState, LeaseState, RouteEpoch, StateStore};
 use async_trait::async_trait;
 use std::sync::Arc;
 use types::block::{BlockPlacement, BlockState};
@@ -118,14 +118,8 @@ impl StateStore for RaftStateStore {
         self.raft_node.read(false, |sm| sm.storage().get_layout(inode_id)).await
     }
 
-    async fn get_layout_version(&self) -> MetadataResult<LayoutVersion> {
+    async fn get_route_epoch(&self) -> MetadataResult<RouteEpoch> {
         // Read from state machine storage (leader-read)
-        self.raft_node.read(false, |sm| sm.storage().get_layout_version()).await
-    }
-
-    async fn increment_layout_version(&self) -> MetadataResult<LayoutVersion> {
-        // This is typically not called directly, but if needed, we can implement it
-        // For now, just return current version
-        self.get_layout_version().await
+        self.raft_node.read(false, |sm| sm.storage().get_route_epoch()).await
     }
 }

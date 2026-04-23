@@ -197,7 +197,7 @@ impl FsCore {
     }
 
     async fn authoritative_route_epoch(&self) -> Option<u64> {
-        self.state_store.get_layout_version().await.ok().map(|v| v.as_u64())
+        self.state_store.get_route_epoch().await.ok().map(|v| v.as_u64())
     }
 
     fn success<T>(
@@ -465,7 +465,7 @@ impl FsCore {
     ) -> Result<Option<u64>, CoreFailure> {
         let client_route_epoch = freshness.route_epoch.or(ctx.route_epoch);
 
-        let server_route_epoch = match self.state_store.get_layout_version().await {
+        let server_route_epoch = match self.state_store.get_route_epoch().await {
             Ok(v) => v.as_u64(),
             Err(err) => {
                 return Err(CoreFailure::new(
@@ -3052,11 +3052,77 @@ impl FsCore {
 mod tests {
     use super::*;
     use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
-    use crate::state::MemoryStateStore;
+    use crate::raft::AppRaftStateMachine;
+    use crate::state::{BlockMetaState, LeaseState, MemoryStateStore, RouteEpoch};
+    use async_trait::async_trait;
     use common::error::canonical::{ErrorCode as CanonicalErrorCode, RefreshReason};
     use common::header::{AuthnType, RequestHeader, RpcErrorCode};
     use std::sync::Arc;
+    use tempfile::TempDir;
+    use types::block::{BlockPlacement, BlockState};
+    use types::fs::{FileAttrs, Inode};
     use types::ids::{ClientId, MountId, ShardGroupId};
+    use types::layout::FileLayout;
+
+    struct StorageBackedRouteEpochStore {
+        storage: Arc<RocksDBStorage>,
+    }
+
+    fn unsupported_test_store_op<T>() -> MetadataResult<T> {
+        Err(MetadataError::Internal(
+            "storage-backed route_epoch test store only supports route_epoch".to_string(),
+        ))
+    }
+
+    #[async_trait]
+    impl StateStore for StorageBackedRouteEpochStore {
+        async fn get_block(&self, _block_id: BlockId) -> MetadataResult<Option<BlockMetaState>> {
+            unsupported_test_store_op()
+        }
+
+        async fn create_block(
+            &self,
+            _inode_id: InodeId,
+            _block_id: BlockId,
+            _placement: BlockPlacement,
+        ) -> MetadataResult<BlockMetaState> {
+            unsupported_test_store_op()
+        }
+
+        async fn update_block_state(&self, _block_id: BlockId, _state: BlockState) -> MetadataResult<()> {
+            unsupported_test_store_op()
+        }
+
+        async fn get_lease(&self, _block_id: BlockId) -> MetadataResult<Option<LeaseState>> {
+            unsupported_test_store_op()
+        }
+
+        async fn acquire_lease(
+            &self,
+            _block_id: BlockId,
+            _client_id: ClientId,
+            _epoch: u64,
+            _expires_at_ms: u64,
+        ) -> MetadataResult<LeaseState> {
+            unsupported_test_store_op()
+        }
+
+        async fn release_lease(&self, _block_id: BlockId) -> MetadataResult<()> {
+            unsupported_test_store_op()
+        }
+
+        async fn get_inode(&self, _inode_id: InodeId) -> MetadataResult<Option<Inode>> {
+            unsupported_test_store_op()
+        }
+
+        async fn get_layout(&self, _inode_id: InodeId) -> MetadataResult<FileLayout> {
+            unsupported_test_store_op()
+        }
+
+        async fn get_route_epoch(&self) -> MetadataResult<RouteEpoch> {
+            self.storage.get_route_epoch()
+        }
+    }
 
     fn request_context() -> RequestContext {
         RequestContext {
@@ -3118,5 +3184,144 @@ mod tests {
         assert_eq!(failure.group_id, Some(group_id.as_raw()));
         assert_eq!(failure.mount_epoch, Some(9));
         assert_eq!(failure.route_epoch, None);
+    }
+
+    #[tokio::test]
+    async fn create_mount_route_epoch_progression_rejects_stale_client_route_epoch() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let state_machine = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let mount_id = MountId::new(21);
+        let root_inode_id = InodeId::new(210);
+        storage
+            .put_inode(&Inode::new_dir(root_inode_id, FileAttrs::new(), mount_id))
+            .unwrap();
+
+        let stale_route_epoch = storage.get_route_epoch().unwrap().as_u64();
+        state_machine
+            .apply(
+                Command::CreateMount {
+                    dedup: DedupKey::system(),
+                    mount_id,
+                    mount_prefix: "/mnt/route".to_string(),
+                    mount_kind: MountKind::External,
+                    ufs_uri: Some("ufs://route".to_string()),
+                    data_io_policy: DataIoPolicy::Allow,
+                    namespace_owner_group_id: ShardGroupId::new(6),
+                    root_inode_id,
+                },
+                1,
+            )
+            .unwrap();
+
+        let advanced_route_epoch = storage.get_route_epoch().unwrap().as_u64();
+        assert_eq!(advanced_route_epoch, stale_route_epoch + 1);
+
+        let fs_core = FsCore::new_default(
+            Arc::new(StorageBackedRouteEpochStore {
+                storage: Arc::clone(&storage),
+            }),
+            mount_table,
+        );
+        let failure = fs_core
+            .validate_route_epoch(
+                &request_context(),
+                Freshness {
+                    mount_epoch: Some(1),
+                    route_epoch: Some(stale_route_epoch),
+                    worker_epoch: None,
+                },
+                Some(6),
+                Some(1),
+                "OpenWriteByPath",
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            failure.error.code,
+            Some(CanonicalErrorCode::RpcCode(RpcErrorCode::RouteEpochMismatch))
+        );
+        assert_eq!(failure.error.reason, Some(RefreshReason::RouteEpochMismatch));
+        let hint = failure.error.refresh_hint.expect("refresh hint");
+        assert_eq!(hint.route_epoch, Some(advanced_route_epoch));
+        assert_eq!(hint.mount_epoch, Some(1));
+        assert_eq!(failure.route_epoch, Some(advanced_route_epoch));
+    }
+
+    #[tokio::test]
+    async fn delete_mount_route_epoch_progression_rejects_stale_client_route_epoch() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let state_machine = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let mount_id = MountId::new(31);
+        let root_inode_id = InodeId::new(310);
+        storage
+            .put_inode(&Inode::new_dir(root_inode_id, FileAttrs::new(), mount_id))
+            .unwrap();
+
+        state_machine
+            .apply(
+                Command::CreateMount {
+                    dedup: DedupKey::system(),
+                    mount_id,
+                    mount_prefix: "/mnt/delete-route".to_string(),
+                    mount_kind: MountKind::External,
+                    ufs_uri: Some("ufs://delete-route".to_string()),
+                    data_io_policy: DataIoPolicy::Allow,
+                    namespace_owner_group_id: ShardGroupId::new(8),
+                    root_inode_id,
+                },
+                1,
+            )
+            .unwrap();
+
+        let stale_route_epoch = storage.get_route_epoch().unwrap().as_u64();
+        state_machine
+            .apply(
+                Command::DeleteMount {
+                    dedup: DedupKey::system(),
+                    mount_id,
+                },
+                2,
+            )
+            .unwrap();
+
+        let advanced_route_epoch = storage.get_route_epoch().unwrap().as_u64();
+        assert_eq!(advanced_route_epoch, stale_route_epoch + 1);
+
+        let fs_core = FsCore::new_default(
+            Arc::new(StorageBackedRouteEpochStore {
+                storage: Arc::clone(&storage),
+            }),
+            mount_table,
+        );
+        let failure = fs_core
+            .validate_route_epoch(
+                &request_context(),
+                Freshness {
+                    mount_epoch: None,
+                    route_epoch: Some(stale_route_epoch),
+                    worker_epoch: None,
+                },
+                None,
+                None,
+                "GetFileLayout",
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            failure.error.code,
+            Some(CanonicalErrorCode::RpcCode(RpcErrorCode::RouteEpochMismatch))
+        );
+        assert_eq!(failure.error.reason, Some(RefreshReason::RouteEpochMismatch));
+        let hint = failure.error.refresh_hint.expect("refresh hint");
+        assert_eq!(hint.route_epoch, Some(advanced_route_epoch));
+        assert_eq!(failure.route_epoch, Some(advanced_route_epoch));
     }
 }

@@ -18,13 +18,15 @@ use types::block::{BlockPlacement, BlockState};
 use types::ids::{BlockId, ClientId, DataHandleId};
 use types::lease::Lease;
 
-/// Layout version / epoch for consistency.
+/// Authoritative route epoch used by metadata stale-route validation.
+///
+/// This carrier is distinct from per-inode `FileLayout` state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct LayoutVersion(u64);
+pub struct RouteEpoch(u64);
 
-impl LayoutVersion {
-    pub fn new(version: u64) -> Self {
-        Self(version)
+impl RouteEpoch {
+    pub fn new(epoch: u64) -> Self {
+        Self(epoch)
     }
 
     pub fn as_u64(&self) -> u64 {
@@ -179,11 +181,8 @@ pub trait StateStore: Send + Sync {
     /// Get layout for an inode (authoritative).
     async fn get_layout(&self, inode_id: types::fs::InodeId) -> MetadataResult<types::layout::FileLayout>;
 
-    /// Get current layout version.
-    async fn get_layout_version(&self) -> MetadataResult<LayoutVersion>;
-
-    /// Increment layout version (for epoch updates).
-    async fn increment_layout_version(&self) -> MetadataResult<LayoutVersion>;
+    /// Get the current authoritative route epoch.
+    async fn get_route_epoch(&self) -> MetadataResult<RouteEpoch>;
 }
 
 #[cfg(test)]
@@ -203,9 +202,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_layout_version() {
-        let v1 = LayoutVersion::new(1);
-        let v2 = LayoutVersion::new(2);
+    async fn test_route_epoch() {
+        let v1 = RouteEpoch::new(1);
+        let v2 = RouteEpoch::new(2);
 
         assert_eq!(v1.as_u64(), 1);
         assert_eq!(v2.as_u64(), 2);

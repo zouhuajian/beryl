@@ -73,8 +73,6 @@ pub enum AppDataResponse {
     Lease(LeaseCommandResult),
     /// Mount-related command result.
     Mount(MountCommandResult),
-    /// Layout version update.
-    LayoutVersion(LayoutVersion),
     /// Shard group creation/update.
     ShardGroup(ShardGroupInfo),
     /// Worker-related command result.
@@ -182,6 +180,3 @@ pub struct ShardGroupInfo {
     pub initial_members: Vec<u64>,
     pub version: u64,
 }
-
-/// Layout version wrapper (forward declared to avoid import cycles).
-pub type LayoutVersion = crate::state::LayoutVersion;

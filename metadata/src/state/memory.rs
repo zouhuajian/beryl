@@ -6,7 +6,7 @@
 //! This is a placeholder implementation using HashMap.
 //! TODO(state): replace with Raft-backed state machine.
 
-use super::{BlockMetaState, LayoutVersion, LeaseState, StateStore};
+use super::{BlockMetaState, LeaseState, RouteEpoch, StateStore};
 use crate::error::{MetadataError, MetadataResult};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -21,7 +21,7 @@ pub struct MemoryStateStore {
     leases: Arc<RwLock<HashMap<BlockId, LeaseState>>>,
     inodes: Arc<RwLock<HashMap<types::fs::InodeId, types::fs::Inode>>>,
     layouts: Arc<RwLock<HashMap<types::fs::InodeId, types::layout::FileLayout>>>,
-    layout_version: Arc<RwLock<LayoutVersion>>,
+    route_epoch: Arc<RwLock<RouteEpoch>>,
 }
 
 impl MemoryStateStore {
@@ -38,7 +38,7 @@ impl MemoryStateStore {
             leases: Arc::new(RwLock::new(HashMap::new())),
             inodes: Arc::new(RwLock::new(HashMap::new())),
             layouts: Arc::new(RwLock::new(HashMap::new())),
-            layout_version: Arc::new(RwLock::new(LayoutVersion::new(1))),
+            route_epoch: Arc::new(RwLock::new(RouteEpoch::new(1))),
         }
     }
 }
@@ -144,13 +144,7 @@ impl StateStore for MemoryStateStore {
         )))
     }
 
-    async fn get_layout_version(&self) -> MetadataResult<LayoutVersion> {
-        Ok(*self.layout_version.read())
-    }
-
-    async fn increment_layout_version(&self) -> MetadataResult<LayoutVersion> {
-        let mut version = self.layout_version.write();
-        *version = LayoutVersion::new(version.as_u64() + 1);
-        Ok(*version)
+    async fn get_route_epoch(&self) -> MetadataResult<RouteEpoch> {
+        Ok(*self.route_epoch.read())
     }
 }

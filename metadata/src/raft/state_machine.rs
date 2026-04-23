@@ -13,7 +13,7 @@ use crate::raft::types::{
     AppDataResponse, BlockCommandResult, DeleteIntentsResult, FsCommandResult, FsErrnoResult, FsOkResult,
     LeaseCommandResult, MountCommandResult, ShardGroupInfo, WorkerCommandResult,
 };
-use crate::state::{BlockMetaState, LayoutVersion, LeaseState};
+use crate::state::{BlockMetaState, LeaseState, RouteEpoch};
 use crate::worker::{HealthStatus, WorkerDescriptor, WorkerInfo};
 use parking_lot::RwLock;
 use std::sync::atomic::Ordering;
@@ -125,9 +125,6 @@ impl AppRaftStateMachine {
                 root_inode_id,
             )?),
             Command::DeleteMount { mount_id, .. } => AppDataResponse::Mount(self.apply_delete_mount(mount_id)?),
-            Command::IncrementLayoutVersion { .. } => {
-                AppDataResponse::LayoutVersion(self.apply_increment_layout_version()?)
-            }
             Command::AddShardGroup {
                 shard_group_id,
                 shard_ids,
@@ -502,6 +499,8 @@ impl AppRaftStateMachine {
         // Increment mount version
         self.storage.put_mount_version(new_version)?;
 
+        self.advance_authoritative_route_epoch()?;
+
         // Synchronize in-memory MountTable (must succeed after RocksDB write)
         self.mount_table
             .upsert(entry.clone())
@@ -529,6 +528,8 @@ impl AppRaftStateMachine {
         let mount_version = self.storage.get_mount_version()?;
         self.storage.put_mount_version(mount_version + 1)?;
 
+        self.advance_authoritative_route_epoch()?;
+
         // Synchronize in-memory MountTable (must succeed after RocksDB delete)
         self.mount_table
             .remove(mount_id)
@@ -537,12 +538,12 @@ impl AppRaftStateMachine {
         Ok(MountCommandResult::Deleted)
     }
 
-    fn apply_increment_layout_version(&self) -> MetadataResult<LayoutVersion> {
-        let current = self.storage.get_layout_version()?;
-        let new_version = LayoutVersion::new(current.as_u64() + 1);
-        self.storage.put_layout_version(new_version)?;
+    fn advance_authoritative_route_epoch(&self) -> MetadataResult<RouteEpoch> {
+        let current = self.storage.get_route_epoch()?;
+        let new_epoch = RouteEpoch::new(current.as_u64() + 1);
+        self.storage.put_route_epoch(new_epoch)?;
 
-        Ok(new_version)
+        Ok(new_epoch)
     }
 
     fn apply_add_shard_group(
@@ -569,6 +570,8 @@ impl AppRaftStateMachine {
 
         self.storage.put_shard_group(&info)?;
 
+        // Shard-group registration is not part of the filesystem-facing route_epoch contract.
+        // FsCore stale-route validation is keyed to mount routing ownership changes instead.
         // Persist shard to group routing mappings
         for shard_id in &shard_ids {
             self.storage.put_shard_routing(*shard_id, shard_group_id)?;
