@@ -1,8 +1,56 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-use crate::service::domain::{CoreResult, ReleaseSessionInput, ReleaseSessionOutput};
-use super::*;
+use super::{CoreWriteOp, FsCore};
+use crate::error::MetadataError;
+use crate::raft::{Command, DedupKey};
+use crate::service::domain::{
+    CloseWriteInput, CloseWriteOutput, CoreResult, FsyncBarrierInput, FsyncBarrierOutput, OpenWriteInput,
+    OpenWriteOutput, ReleaseSessionInput, ReleaseSessionOutput, RenewLeaseInput, RenewLeaseOutput, SessionKey,
+    WorkerHint, WriteTarget,
+};
+use common::error::canonical::{RefreshHint, RefreshReason, WorkerEndpointHint};
+use common::header::RpcErrorCode;
+use proto::worker::worker_data_service_client::WorkerDataServiceClient;
+use proto::worker::CommitWriteRequestProto;
+use std::time::{SystemTime, UNIX_EPOCH};
+use types::fs::FsErrorCode;
+use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+use types::lease::FencingToken;
+
+fn canonical_from_error_detail(detail: proto::common::ErrorDetailProto) -> common::error::canonical::CanonicalError {
+    proto::convert::error_detail_to_canonical(&detail)
+}
+
+fn worker_refresh_hint_from_session(
+    session: &crate::write_session::WriteSession,
+    worker_epoch: Option<u64>,
+    resolve_required: bool,
+) -> RefreshHint {
+    let capacity = session
+        .write_targets
+        .iter()
+        .map(|target| target.worker_endpoints.len())
+        .sum();
+    let mut worker_endpoints = Vec::with_capacity(capacity);
+    for target in &session.write_targets {
+        for endpoint in &target.worker_endpoints {
+            worker_endpoints.push(WorkerEndpointHint {
+                worker_id: endpoint.worker_id,
+                endpoint: endpoint.endpoint.clone(),
+                net_transport_kind: endpoint.net_transport_kind,
+                worker_epoch: endpoint.worker_epoch,
+            });
+        }
+    }
+
+    RefreshHint {
+        worker_epoch,
+        worker_endpoints,
+        worker_resolve_required: resolve_required,
+        ..Default::default()
+    }
+}
 
 pub(super) struct WriteSessionCoordinator<'a> {
     core: &'a FsCore,
@@ -239,8 +287,8 @@ impl<'a> WriteSessionCoordinator<'a> {
             }
         };
 
-        let mut write_targets = Vec::new();
-        let mut write_targets_proto = Vec::new();
+        let mut write_targets = Vec::with_capacity(num_blocks as usize);
+        let mut write_targets_proto = Vec::with_capacity(num_blocks as usize);
         for i in 0..num_blocks {
             let block_index = BlockIndex::new(i as u32);
             let block_id = BlockId::new(data_handle_id, block_index);
@@ -256,8 +304,8 @@ impl<'a> WriteSessionCoordinator<'a> {
                 }
             };
 
-            let mut worker_endpoints = Vec::new();
-            let mut worker_endpoints_proto = Vec::new();
+            let mut worker_endpoints = Vec::with_capacity(3);
+            let mut worker_endpoints_proto = Vec::with_capacity(3);
             for worker_id in placement.all_workers() {
                 if let Some(worker_info) = worker_manager.get_worker(worker_id) {
                     let endpoint = format!("{}:{}", worker_info.address, 0);
@@ -389,7 +437,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     let worker_id = WorkerId::new(endpoint.worker_id);
                     let current_epoch = worker_manager.get_descriptor(worker_id).map(|d| d.worker_epoch);
                     if current_epoch != Some(endpoint.worker_epoch) {
-                        let hint = FsCore::worker_refresh_hint_from_session(&session, current_epoch, true);
+                        let hint = worker_refresh_hint_from_session(&session, current_epoch, true);
                         return self.core.need_refresh_failure_with_hint(
                             &req.ctx,
                             RpcErrorCode::WorkerEpochMismatch,
@@ -754,7 +802,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                         .flat_map(|t| t.worker_endpoints.iter())
                         .map(|ep| ep.worker_epoch)
                         .max();
-                    let hint = FsCore::worker_refresh_hint_from_session(&session, server_worker_epoch, false);
+                    let hint = worker_refresh_hint_from_session(&session, server_worker_epoch, false);
                     return self.core.need_refresh_failure_with_hint(
                         &req.ctx,
                         RpcErrorCode::WorkerEpochMismatch,
@@ -807,7 +855,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         if commit_workers.is_empty() {
             target_size = target_size.max(inode.attrs.size);
         } else {
-            let mut tasks = Vec::new();
+            let mut tasks = Vec::with_capacity(commit_workers.len());
             let effective_route_epoch = req.freshness.route_epoch.or(req.ctx.route_epoch).unwrap_or(0);
             for ep in commit_workers {
                 let endpoint = format!("http://{}", ep.endpoint);

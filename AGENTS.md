@@ -6,6 +6,34 @@ This is the repository-wide execution contract.
 
 If a subdirectory contains a more specific `AGENTS.md`, that file overrides this one for files in that subtree.
 
+## Code Style
+
+When changing Rust code in this repository, follow these defaults unless a closer `AGENTS.md` says otherwise:
+
+- use `Vec::with_capacity()` when the size is known or can be estimated well
+- wrap large or expensive-to-clone shared fields in `Arc<T>` instead of repeatedly deep-cloning
+- use `Box::pin(...)` or `.boxed()`, but never both for the same value
+- remove dead code instead of adding `#[allow(dead_code)]`
+- implement `Default` on config / options structs instead of standalone `default_*()` helpers
+- keep `use` imports at the top of the file unless a local-scope import is clearly necessary
+- extract substantial new logic into submodules instead of growing already large files
+- delete obsolete internal (`pub(crate)` / private) methods in the same change that introduces their replacements
+- choose log levels by audience: `debug!` for routine high-frequency operations, `info!` for operator-visible state changes, `warn!` for unexpected but recoverable conditions
+
+### Tests and module structure
+
+- keep `#[cfg(test)] mod tests` as one block at the bottom of the file; never place production code after it
+- do not use `#[path = "..."] mod tests;` in production code
+- do not use `#[path = "..."]` to work around normal module organization, except as a clearly temporary refactor step
+- if a file must be split, prefer normal directory modules (`mod.rs` plus submodules)
+- production module boundaries must be driven by production responsibilities, not test organization
+
+### Visibility and comments
+
+- prefer the narrowest visibility that works: private > `pub(super)` > `pub(crate)` > `pub`
+- if a submodule needs deep access to parent internals, treat that as transitional and narrow the dependency surface over time
+- all newly added or modified code comments must be in English
+- comments should explain invariants, ownership boundaries, lifecycle assumptions, or non-obvious tradeoffs
 ## 1. Repository-wide invariants
 
 These rules apply everywhere in the repo:
