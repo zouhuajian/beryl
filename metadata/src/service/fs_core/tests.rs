@@ -9,6 +9,7 @@ use crate::state::{BlockMetaState, LeaseState, MemoryStateStore, RouteEpoch};
 use async_trait::async_trait;
 use common::error::canonical::{ErrorCode as CanonicalErrorCode, RefreshReason};
 use common::header::{AuthnType, RequestHeader, RpcErrorCode};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use types::block::{BlockPlacement, BlockState};
@@ -16,6 +17,8 @@ use types::fs::{FileAttrs, Inode};
 use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, MountId, ShardGroupId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
+
+use super::freshness::{FreshnessValidator, StaleStateStatus};
 
 struct StorageBackedRouteEpochStore {
     storage: Arc<RocksDBStorage>,
@@ -193,6 +196,133 @@ fn validate_mount_freshness_returns_mount_epoch_need_refresh_without_replay_suff
     assert_eq!(failure.group_id, Some(group_id.as_raw()));
     assert_eq!(failure.mount_epoch, Some(9));
     assert_eq!(failure.route_epoch, None);
+}
+
+#[test]
+fn freshness_validator_rejects_routed_write_mount_epoch_with_replay_hint() {
+    let mount_id = MountId::new(12);
+    let group_id = ShardGroupId::new(4);
+    let mount_table = Arc::new(MountTable::new());
+    mount_table
+        .upsert(MountEntry {
+            mount_id,
+            mount_prefix: "/data".to_string(),
+            mount_kind: MountKind::Internal,
+            ufs_uri: None,
+            data_io_policy: DataIoPolicy::Allow,
+            config_version: 9,
+            namespace_owner_group_id: group_id,
+            root_inode_id: ROOT_INODE_ID,
+        })
+        .unwrap();
+    let validator = FreshnessValidator::new(Arc::new(MemoryStateStore::new()), mount_table);
+    let ctx = request_context();
+
+    let failure = validator
+        .validate_routed_write_mount_epoch(
+            &ctx,
+            Freshness {
+                mount_epoch: Some(4),
+                route_epoch: None,
+                worker_epoch: None,
+            },
+            mount_id,
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::MountEpochMismatch))
+    );
+    assert_eq!(failure.error.reason, Some(RefreshReason::MountEpochMismatch));
+    assert_eq!(
+        failure.error.message,
+        "mount_epoch mismatch: client=4, server=9; refresh metadata and re-open write session, then replay request"
+    );
+    let hint = failure.error.refresh_hint.expect("refresh hint");
+    assert_eq!(hint.group_id, Some(group_id.as_raw()));
+    assert_eq!(hint.mount_epoch, Some(9));
+    assert_eq!(failure.group_id, Some(group_id.as_raw()));
+    assert_eq!(failure.mount_epoch, Some(9));
+}
+
+#[test]
+fn routed_write_mount_epoch_mismatch_preserves_metrics_and_wire_shape() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(13);
+    let parent_inode_id = InodeId::new(130);
+    storage
+        .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
+        .unwrap();
+    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(5));
+    fs_core.set_storage(storage);
+    let metrics = Arc::new(crate::metrics::MetadataMetrics::new());
+    fs_core.set_metrics(Arc::clone(&metrics));
+
+    let failure = fs_core
+        .route_ctx_for_write(
+            &request_context(),
+            CoreWriteOp::Create,
+            &[parent_inode_id],
+            Freshness {
+                mount_epoch: Some(4),
+                route_epoch: None,
+                worker_epoch: None,
+            },
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::MountEpochMismatch))
+    );
+    assert_eq!(failure.error.reason, Some(RefreshReason::MountEpochMismatch));
+    assert_eq!(
+        failure.error.message,
+        "mount_epoch mismatch: client=4, server=9; refresh metadata and re-open write session, then replay request"
+    );
+    let hint = failure.error.refresh_hint.expect("refresh hint");
+    assert_eq!(hint.group_id, Some(5));
+    assert_eq!(hint.mount_epoch, Some(9));
+    assert_eq!(failure.group_id, Some(5));
+    assert_eq!(failure.mount_epoch, Some(9));
+    assert_eq!(metrics.fs_write_mount_epoch_mismatch_total.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn freshness_validator_rejects_stale_state_watermark() {
+    let group_id = ShardGroupId::new(4);
+    let validator = FreshnessValidator::new(Arc::new(MemoryStateStore::new()), Arc::new(MountTable::new()));
+    let mut ctx = request_context();
+    ctx.caller.state_id = Some(types::RaftLogId::new(1, 7, 12));
+
+    let failure = validator
+        .validate_stale_state(
+            &ctx,
+            Some(types::RaftLogId::new(1, 7, 10)),
+            Some(group_id.as_raw()),
+            Some(9),
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::StaleState))
+    );
+    assert_eq!(failure.error.reason, Some(RefreshReason::StaleState));
+    assert_eq!(
+        failure.error.message,
+        "Stale state: last_applied=RaftLogId { term: 1, leader_node_id: 7, index: 10 } < required=RaftLogId { term: 1, leader_node_id: 7, index: 12 }"
+    );
+    assert_eq!(failure.group_id, Some(group_id.as_raw()));
+    assert_eq!(failure.mount_epoch, Some(9));
+    assert_eq!(failure.state_id, Some(types::RaftLogId::new(1, 7, 12)));
+
+    let unknown = validator
+        .validate_stale_state(&ctx, None, Some(group_id.as_raw()), Some(9))
+        .expect("missing last_applied should preserve existing precheck fallback");
+    assert_eq!(unknown, StaleStateStatus::UnknownLastApplied);
 }
 
 #[tokio::test]

@@ -3,6 +3,7 @@
 
 //! Shared filesystem core semantics used by path service RPC handlers.
 
+mod freshness;
 mod mutation;
 mod read;
 mod write_session;
@@ -27,12 +28,15 @@ use types::fs::{FsErrorCode, InodeId};
 use types::ids::{MountId, ShardGroupId};
 use types::RaftLogId;
 
+use freshness::{FreshnessValidator, StaleStateStatus};
+
 pub(crate) type WorkerCommitHook =
     Arc<dyn Fn(CommitWriteRequestProto) -> proto::worker::CommitWriteResponseProto + Send + Sync>;
 pub type SharedWorkerCommitHook = Arc<Mutex<Option<WorkerCommitHook>>>;
 
 #[derive(Clone, Debug)]
 struct RoutedFsWriteCtx {
+    mount_id: MountId,
     namespace_owner_group_id: ShardGroupId,
     mount_epoch: u64,
 }
@@ -48,8 +52,8 @@ enum CoreWriteOp {
 }
 
 pub(crate) struct FsCore {
-    state_store: Arc<dyn StateStore>,
     mount_table: Arc<MountTable>,
+    freshness_validator: FreshnessValidator,
     storage: Option<Arc<RocksDBStorage>>,
     raft_node: Option<Arc<AppRaftNode>>,
     metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
@@ -68,7 +72,7 @@ impl FsCore {
         worker_commit_hook: SharedWorkerCommitHook,
     ) -> Self {
         Self {
-            state_store,
+            freshness_validator: FreshnessValidator::new(Arc::clone(&state_store), Arc::clone(&mount_table)),
             mount_table,
             storage: None,
             raft_node: None,
@@ -107,11 +111,11 @@ impl FsCore {
     }
 
     fn state_id_from_ctx(ctx: &RequestContext) -> Option<RaftLogId> {
-        ctx.caller.state_id
+        FreshnessValidator::state_id_from_ctx(ctx)
     }
 
     async fn authoritative_route_epoch(&self) -> Option<u64> {
-        self.state_store.get_route_epoch().await.ok().map(|v| v.as_u64())
+        self.freshness_validator.authoritative_route_epoch().await
     }
 
     fn success<T>(
@@ -196,18 +200,6 @@ impl FsCore {
         ))
     }
 
-    fn need_refresh_failure<T>(
-        &self,
-        ctx: &RequestContext,
-        rpc_code: RpcErrorCode,
-        reason: RefreshReason,
-        message: impl Into<String>,
-        group_id: Option<u64>,
-        mount_epoch: Option<u64>,
-    ) -> CoreResult<T> {
-        self.need_refresh_failure_with_hint(ctx, rpc_code, reason, message, group_id, mount_epoch, None, None)
-    }
-
     fn need_refresh_failure_with_hint<T>(
         &self,
         ctx: &RequestContext,
@@ -272,13 +264,7 @@ impl FsCore {
     }
 
     pub(crate) fn mount_hints_for_mount(&self, mount_id: MountId) -> (Option<u64>, Option<u64>) {
-        match self.mount_table.get_mount(mount_id) {
-            Ok(Some(mount_entry)) => (
-                Some(mount_entry.namespace_owner_group_id.as_raw()),
-                Some(mount_entry.config_version),
-            ),
-            _ => (None, None),
-        }
+        self.freshness_validator.mount_hints_for_mount(mount_id)
     }
 
     fn validate_mount_epoch_for_mount(
@@ -287,7 +273,8 @@ impl FsCore {
         freshness: Freshness,
         mount_id: MountId,
     ) -> Result<(Option<u64>, Option<u64>), CoreFailure> {
-        self.validate_mount_epoch_for_mount_with_replay(ctx, freshness, mount_id, Some("request"))
+        self.freshness_validator
+            .validate_mount_epoch_for_mount(ctx, freshness, mount_id)
     }
 
     pub(crate) fn validate_mount_freshness(
@@ -296,52 +283,8 @@ impl FsCore {
         freshness: Freshness,
         mount_id: MountId,
     ) -> Result<(Option<u64>, Option<u64>), CoreFailure> {
-        self.validate_mount_epoch_for_mount_with_replay(ctx, freshness, mount_id, None)
-    }
-
-    fn validate_mount_epoch_for_mount_with_replay(
-        &self,
-        ctx: &RequestContext,
-        freshness: Freshness,
-        mount_id: MountId,
-        replay_intent: Option<&str>,
-    ) -> Result<(Option<u64>, Option<u64>), CoreFailure> {
-        let (group_id, mount_epoch) = self.mount_hints_for_mount(mount_id);
-        if let (Some(client_mount_epoch), Some(server_mount_epoch)) =
-            (freshness.mount_epoch.or(ctx.caller.mount_epoch), mount_epoch)
-        {
-            if client_mount_epoch != server_mount_epoch {
-                let message = match replay_intent {
-                    Some(intent) => format!(
-                        "mount_epoch mismatch: client={}, server={}; {}",
-                        client_mount_epoch,
-                        server_mount_epoch,
-                        Self::replay_hint(intent)
-                    ),
-                    None => format!(
-                        "mount_epoch mismatch: client={}, server={}",
-                        client_mount_epoch, server_mount_epoch
-                    ),
-                };
-                return Err(CoreFailure::new(
-                    CanonicalError::need_refresh_with_hint(
-                        RpcErrorCode::MountEpochMismatch,
-                        RefreshReason::MountEpochMismatch,
-                        RefreshHint {
-                            group_id,
-                            mount_epoch: Some(server_mount_epoch),
-                            ..Default::default()
-                        },
-                        message,
-                    ),
-                    group_id,
-                    Some(server_mount_epoch),
-                    None,
-                    Self::state_id_from_ctx(ctx),
-                ));
-            }
-        }
-        Ok((group_id, mount_epoch))
+        self.freshness_validator
+            .validate_mount_freshness(ctx, freshness, mount_id)
     }
 
     async fn validate_route_epoch(
@@ -352,47 +295,20 @@ impl FsCore {
         mount_epoch: Option<u64>,
         intent: &str,
     ) -> Result<Option<u64>, CoreFailure> {
-        let client_route_epoch = freshness.route_epoch.or(ctx.route_epoch);
+        self.freshness_validator
+            .validate_route_epoch(ctx, freshness, group_id, mount_epoch, intent)
+            .await
+    }
 
-        let server_route_epoch = match self.state_store.get_route_epoch().await {
-            Ok(v) => v.as_u64(),
-            Err(err) => {
-                return Err(CoreFailure::new(
-                    to_canonical_fs(err),
-                    group_id,
-                    mount_epoch,
-                    None,
-                    Self::state_id_from_ctx(ctx),
-                ));
-            }
-        };
-
-        if let Some(client_route_epoch) = client_route_epoch {
-            if client_route_epoch != server_route_epoch {
-                return Err(CoreFailure::new(
-                    CanonicalError::need_refresh_with_hint(
-                        RpcErrorCode::RouteEpochMismatch,
-                        RefreshReason::RouteEpochMismatch,
-                        RefreshHint {
-                            group_id,
-                            route_epoch: Some(server_route_epoch),
-                            mount_epoch,
-                            ..Default::default()
-                        },
-                        format!(
-                            "route_epoch mismatch: client={}, server={}; refresh route and replay {}",
-                            client_route_epoch, server_route_epoch, intent
-                        ),
-                    ),
-                    group_id,
-                    mount_epoch,
-                    Some(server_route_epoch),
-                    Self::state_id_from_ctx(ctx),
-                ));
-            }
-        }
-
-        Ok(Some(server_route_epoch))
+    fn validate_stale_state(
+        &self,
+        ctx: &RequestContext,
+        last_applied: Option<RaftLogId>,
+        group_id: Option<u64>,
+        mount_epoch: Option<u64>,
+    ) -> Result<StaleStateStatus, CoreFailure> {
+        self.freshness_validator
+            .validate_stale_state(ctx, last_applied, group_id, mount_epoch)
     }
 
     fn fencing_token_matches_session(
@@ -415,52 +331,43 @@ impl FsCore {
         parent_inode_ids: &[InodeId],
         freshness: Freshness,
     ) -> Result<RoutedFsWriteCtx, CoreFailure> {
-        let client_mount_epoch = freshness.mount_epoch.or(req_ctx.caller.mount_epoch);
-        match self.route_fs_write_ctx(op, parent_inode_ids, client_mount_epoch) {
-            Ok(ctx) => Ok(ctx),
+        self.route_ctx_for_write_with_error_hints(req_ctx, op, parent_inode_ids, freshness, None, None)
+    }
+
+    fn route_ctx_for_write_with_error_hints(
+        &self,
+        req_ctx: &RequestContext,
+        op: CoreWriteOp,
+        parent_inode_ids: &[InodeId],
+        freshness: Freshness,
+        error_group_id: Option<u64>,
+        error_mount_epoch: Option<u64>,
+    ) -> Result<RoutedFsWriteCtx, CoreFailure> {
+        let ctx = match self.route_fs_write_ctx(op, parent_inode_ids) {
+            Ok(ctx) => ctx,
             Err(err) => {
-                let (group_id, mount_epoch, canonical) = match err {
-                    MetadataError::MountEpochMismatch {
-                        expected,
-                        got,
-                        mount_id,
-                    } => {
-                        if let Some(metrics) = &self.metrics {
-                            metrics
-                                .fs_write_mount_epoch_mismatch_total
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        let (group_id, mount_epoch) = mount_id
-                            .map(|id| self.mount_hints_for_mount(id))
-                            .unwrap_or((None, None));
-                        let canonical = CanonicalError::need_refresh_with_hint(
-                            RpcErrorCode::MountEpochMismatch,
-                            RefreshReason::MountEpochMismatch,
-                            RefreshHint {
-                                group_id,
-                                mount_epoch,
-                                ..Default::default()
-                            },
-                            format!(
-                                "mount_epoch mismatch: client={}, server={}; {}",
-                                got,
-                                expected,
-                                Self::replay_hint("request")
-                            ),
-                        );
-                        (group_id, mount_epoch, canonical)
-                    }
-                    other => (None, None, to_canonical_fs(other)),
-                };
-                Err(CoreFailure::new(
-                    canonical,
-                    group_id,
-                    mount_epoch,
+                return Err(CoreFailure::new(
+                    to_canonical_fs(err),
+                    error_group_id,
+                    error_mount_epoch,
                     None,
                     Self::state_id_from_ctx(req_ctx),
-                ))
+                ));
             }
+        };
+
+        if let Err(failure) =
+            self.freshness_validator
+                .validate_routed_write_mount_epoch(req_ctx, freshness, ctx.mount_id)
+        {
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .fs_write_mount_epoch_mismatch_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return Err(failure);
         }
+        Ok(ctx)
     }
 
     fn storage_for_ctx<'a>(&'a self, req_ctx: &RequestContext) -> Result<&'a Arc<RocksDBStorage>, CoreFailure> {
@@ -503,12 +410,7 @@ impl FsCore {
         Ok(inode.as_ref().map(Self::owner_from_inode))
     }
 
-    fn route_fs_write_ctx(
-        &self,
-        op: CoreWriteOp,
-        parent_inode_ids: &[InodeId],
-        client_mount_epoch: Option<u64>,
-    ) -> MetadataResult<RoutedFsWriteCtx> {
+    fn route_fs_write_ctx(&self, op: CoreWriteOp, parent_inode_ids: &[InodeId]) -> MetadataResult<RoutedFsWriteCtx> {
         let storage = self
             .storage
             .as_ref()
@@ -538,17 +440,6 @@ impl FsCore {
             .get_mount(mount_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("Mount not found: {:?}", mount_id)))?;
 
-        if let Some(client_mount_epoch) = client_mount_epoch {
-            let current_mount_epoch = mount_entry.config_version;
-            if client_mount_epoch != current_mount_epoch {
-                return Err(MetadataError::MountEpochMismatch {
-                    expected: current_mount_epoch,
-                    got: client_mount_epoch,
-                    mount_id: Some(mount_id),
-                });
-            }
-        }
-
         debug!(
             op = ?op,
             mount_id = %mount_id.as_raw(),
@@ -564,6 +455,7 @@ impl FsCore {
         }
 
         Ok(RoutedFsWriteCtx {
+            mount_id,
             namespace_owner_group_id: mount_entry.namespace_owner_group_id,
             mount_epoch: mount_entry.config_version,
         })

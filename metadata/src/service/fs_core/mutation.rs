@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-use super::{CoreWriteOp, FsCore};
+use super::{CoreWriteOp, FsCore, StaleStateStatus};
 use crate::error::MetadataError;
 use crate::raft::{Command, FsCommandResult};
 use crate::service::domain::{
@@ -9,8 +9,6 @@ use crate::service::domain::{
     RenameInput, RenameOpPlan, RenameOutput, RequestContext, RmdirInput, RmdirOutput, SetAttrInput, SetAttrOutput,
     SetXattrInput, SetXattrOutput, TruncateInput, TruncateOutput, UnlinkInput, UnlinkOutput,
 };
-use common::error::canonical::RefreshReason;
-use common::header::RpcErrorCode;
 use std::sync::atomic::Ordering;
 use types::fs::InodeId;
 
@@ -547,24 +545,17 @@ impl FsCore {
             if let Some(raft_node) = self.raft_node.as_ref() {
                 if raft_node.is_leader() {
                     let mut can_precheck = true;
-                    if let Some(required_state_id) = req.ctx.caller.state_id {
-                        if let Some(last_applied) = raft_node.get_last_applied_state_id() {
-                            if last_applied < required_state_id {
-                                return self.need_refresh_failure(
-                                    &req.ctx,
-                                    RpcErrorCode::StaleState,
-                                    RefreshReason::StaleState,
-                                    format!(
-                                        "Stale state: last_applied={:?} < required={:?}",
-                                        last_applied, required_state_id
-                                    ),
-                                    Some(ctx.namespace_owner_group_id.as_raw()),
-                                    Some(ctx.mount_epoch),
-                                );
-                            }
-                        } else {
+                    match self.validate_stale_state(
+                        &req.ctx,
+                        raft_node.get_last_applied_state_id(),
+                        Some(ctx.namespace_owner_group_id.as_raw()),
+                        Some(ctx.mount_epoch),
+                    ) {
+                        Ok(StaleStateStatus::Ready) => {}
+                        Ok(StaleStateStatus::UnknownLastApplied) => {
                             can_precheck = false;
                         }
+                        Err(failure) => return Err(failure),
                     }
 
                     if can_precheck {

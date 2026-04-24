@@ -601,15 +601,16 @@ impl<'a> WriteSessionCoordinator<'a> {
             }
         }
 
-        let ctx = match self.core.route_fs_write_ctx(
+        let ctx = match self.core.route_ctx_for_write_with_error_hints(
+            &req.ctx,
             CoreWriteOp::SetAttr,
             &[session.inode_id],
-            req.freshness.mount_epoch.or(req.ctx.caller.mount_epoch),
+            req.freshness,
+            group_id,
+            mount_epoch,
         ) {
             Ok(ctx) => ctx,
-            Err(err) => {
-                return self.core.failure_from_error(&req.ctx, err, group_id, mount_epoch);
-            }
+            Err(failure) => return Err(failure),
         };
 
         let dedup = match self.core.dedup_key(caller_ctx) {
@@ -957,13 +958,16 @@ impl<'a> WriteSessionCoordinator<'a> {
         attrs.size = attrs.size.max(target_size);
         attrs.update_mtime_ctime(now_ms);
 
-        let ctx = match self.core.route_fs_write_ctx(
+        let ctx = match self.core.route_ctx_for_write_with_error_hints(
+            &req.ctx,
             CoreWriteOp::SetAttr,
             &[inode_id],
-            req.freshness.mount_epoch.or(req.ctx.caller.mount_epoch),
+            req.freshness,
+            group_id,
+            mount_epoch,
         ) {
             Ok(ctx) => ctx,
-            Err(err) => return self.core.failure_from_error(&req.ctx, err, group_id, mount_epoch),
+            Err(failure) => return Err(failure),
         };
 
         let dedup = if caller_ctx.client.client_id.as_raw() == 0 {
