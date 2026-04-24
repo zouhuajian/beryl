@@ -14,6 +14,7 @@ use common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
 use tracing::Span;
 use types::fs::{Extent, FsErrorCode};
 use types::ids::{BlockId, BlockIndex, DataHandleId, LeaseId};
+use types::layout::FileLayout;
 use types::lease::FencingToken;
 use types::RaftLogId;
 
@@ -278,6 +279,42 @@ pub fn header_from_canonical_error(
 ) -> proto::common::ResponseHeaderProto {
     let ctx = request_context_from_proto(req_header);
     header_from_canonical_error_with_context(&ctx, group_id, mount_epoch, None, None, err)
+}
+
+pub fn file_attrs_to_proto(attrs: &types::fs::FileAttrs) -> proto::fs::FileAttrsProto {
+    proto::fs::FileAttrsProto {
+        mode: attrs.mode,
+        uid: attrs.uid,
+        gid: attrs.gid,
+        size: attrs.size,
+        atime_ms: attrs.atime_ms,
+        mtime_ms: attrs.mtime_ms,
+        ctime_ms: attrs.ctime_ms,
+        nlink: attrs.nlink,
+    }
+}
+
+pub fn file_attrs_from_proto(attrs: Option<proto::fs::FileAttrsProto>) -> Result<types::fs::FileAttrs, MetadataError> {
+    let attrs = attrs.ok_or_else(|| MetadataError::InvalidArgument("Missing FileAttrs".to_string()))?;
+    Ok(types::fs::FileAttrs {
+        mode: attrs.mode,
+        uid: attrs.uid,
+        gid: attrs.gid,
+        size: attrs.size,
+        atime_ms: attrs.atime_ms,
+        mtime_ms: attrs.mtime_ms,
+        ctime_ms: attrs.ctime_ms,
+        nlink: attrs.nlink,
+    })
+}
+
+pub fn file_layout_from_proto(layout: Option<proto::common::FileLayoutProto>) -> Result<FileLayout, MetadataError> {
+    let layout = layout.ok_or_else(|| MetadataError::InvalidArgument("Missing FileLayout".to_string()))?;
+    Ok(FileLayout::new(
+        layout.block_size,
+        layout.chunk_size,
+        layout.replication as u8,
+    ))
 }
 
 pub fn fatal_fs_header(

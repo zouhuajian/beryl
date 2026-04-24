@@ -15,9 +15,10 @@ use super::domain::{
 use super::extract_and_inject_context;
 use super::guard::{AuthzCheck, AuthzContext, GuardChain, GuardPolicy, LeadershipChecker};
 use super::{
-    extent_from_proto, extent_to_proto, fencing_to_proto, header_from_canonical_error, header_from_core_failure,
-    lease_id_from_proto, lease_id_to_proto, location_to_proto, need_refresh_header, ok_header_from_core_success,
-    ok_header_from_request, presented_fencing_from_proto, request_context_from_proto, write_target_to_proto,
+    extent_from_proto, extent_to_proto, fencing_to_proto, file_attrs_from_proto, file_attrs_to_proto,
+    file_layout_from_proto, header_from_canonical_error, header_from_core_failure, lease_id_from_proto,
+    lease_id_to_proto, location_to_proto, need_refresh_header, ok_header_from_core_success, ok_header_from_request,
+    presented_fencing_from_proto, request_context_from_proto, write_target_to_proto,
 };
 use super::{AuthzOp, AuthzProvider, AuthzScheme, AuthzTarget, FsCore, InodePermReader, SharedWorkerCommitHook};
 use crate::data_io::DataIoOp;
@@ -30,8 +31,7 @@ use proto::metadata::*;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::instrument;
-use types::fs::{FileAttrs, InodeId};
-use types::layout::FileLayout;
+use types::fs::InodeId;
 
 /// FileSystemServiceProto implementation.
 pub struct MetadataFileSystemServiceImpl {
@@ -350,16 +350,6 @@ impl MetadataFileSystemServiceImpl {
         Ok(Self::authz_for_rpc(PathRpcAuthz::Rename, targets).with_pre_checks(pre_checks))
     }
 
-    fn header_or_ok(
-        &self,
-        req_header: &Option<proto::common::RequestHeaderProto>,
-        fs_header: Option<proto::common::ResponseHeaderProto>,
-        group_id: Option<u64>,
-        mount_epoch: Option<u64>,
-    ) -> proto::common::ResponseHeaderProto {
-        fs_header.unwrap_or_else(|| ok_header_from_request(req_header, group_id, mount_epoch))
-    }
-
     fn header_from_path_error(
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
@@ -398,45 +388,6 @@ impl MetadataFileSystemServiceImpl {
                 &failure.err,
             )),
         }
-    }
-
-    /// Convert types FileAttrs to proto FileAttrsProto.
-    fn file_attrs_to_proto(attrs: &FileAttrs) -> proto::fs::FileAttrsProto {
-        proto::fs::FileAttrsProto {
-            mode: attrs.mode,
-            uid: attrs.uid,
-            gid: attrs.gid,
-            size: attrs.size,
-            atime_ms: attrs.atime_ms,
-            mtime_ms: attrs.mtime_ms,
-            ctime_ms: attrs.ctime_ms,
-            nlink: attrs.nlink,
-        }
-    }
-
-    /// Convert proto FileAttrsProto to types FileAttrs.
-    fn proto_to_file_attrs(attrs: Option<proto::fs::FileAttrsProto>) -> MetadataResult<FileAttrs> {
-        let attrs = attrs.ok_or_else(|| MetadataError::InvalidArgument("Missing FileAttrs".to_string()))?;
-        Ok(FileAttrs {
-            mode: attrs.mode,
-            uid: attrs.uid,
-            gid: attrs.gid,
-            size: attrs.size,
-            atime_ms: attrs.atime_ms,
-            mtime_ms: attrs.mtime_ms,
-            ctime_ms: attrs.ctime_ms,
-            nlink: attrs.nlink,
-        })
-    }
-
-    /// Convert proto FileLayoutProto to types FileLayout.
-    fn proto_to_file_layout(layout: Option<proto::common::FileLayoutProto>) -> MetadataResult<FileLayout> {
-        let layout = layout.ok_or_else(|| MetadataError::InvalidArgument("Missing FileLayout".to_string()))?;
-        Ok(FileLayout::new(
-            layout.block_size,
-            layout.chunk_size,
-            layout.replication as u8,
-        ))
     }
 }
 
@@ -501,7 +452,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         inode_id: Some(proto::fs::InodeIdProto {
                             value: resolved.inode_id.as_raw(),
                         }),
-                        attrs: Some(Self::file_attrs_to_proto(&success.payload.attrs)),
+                        attrs: Some(file_attrs_to_proto(&success.payload.attrs)),
                         inode: None,
                         ..Default::default()
                     },
@@ -509,12 +460,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
             Err(failure) => {
-                let header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                    Some(resolved.mount_ctx.mount_epoch),
-                );
+                let header = header_from_core_failure(&req_ctx, &failure);
                 error_response!(GetFileStatusResponseProto, header)
             }
         }
@@ -561,7 +507,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         }
 
         // Convert attrs
-        let attrs = match Self::proto_to_file_attrs(req.attrs) {
+        let attrs = match file_attrs_from_proto(req.attrs) {
             Ok(attrs) => attrs,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
@@ -589,7 +535,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             Ok(success) => {
                 let header = ok_header_from_core_success(&req_ctx, &success);
                 let payload = success.payload;
-                let attrs_proto = payload.attrs.as_ref().map(Self::file_attrs_to_proto);
+                let attrs_proto = payload.attrs.as_ref().map(file_attrs_to_proto);
                 let inode = payload.inode_id.map(|inode_id| proto::fs::InodeProto {
                     inode_id: Some(proto::fs::InodeIdProto {
                         value: inode_id.as_raw(),
@@ -611,12 +557,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
             Err(failure) => {
-                let header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                    Some(resolved.mount_ctx.mount_epoch),
-                );
+                let header = header_from_core_failure(&req_ctx, &failure);
                 error_response!(MkdirPathResponseProto, header)
             }
         }
@@ -666,14 +607,14 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         }
 
         // Convert attrs and layout
-        let attrs = match Self::proto_to_file_attrs(req.attrs) {
+        let attrs = match file_attrs_from_proto(req.attrs) {
             Ok(attrs) => attrs,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(CreatePathResponseProto, resp_header);
             }
         };
-        let layout = match Self::proto_to_file_layout(req.layout) {
+        let layout = match file_layout_from_proto(req.layout) {
             Ok(layout) => layout,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
@@ -702,7 +643,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             Ok(success) => {
                 let header = ok_header_from_core_success(&req_ctx, &success);
                 let payload = success.payload;
-                let attrs_proto = payload.attrs.as_ref().map(Self::file_attrs_to_proto);
+                let attrs_proto = payload.attrs.as_ref().map(file_attrs_to_proto);
                 let inode_id = payload.inode_id.map(|inode_id| proto::fs::InodeIdProto {
                     value: inode_id.as_raw(),
                 });
@@ -728,12 +669,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
             Err(failure) => {
-                let header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                    Some(resolved.mount_ctx.mount_epoch),
-                );
+                let header = header_from_core_failure(&req_ctx, &failure);
                 error_response!(CreatePathResponseProto, header)
             }
         }
@@ -805,12 +741,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
             Err(failure) => {
-                let header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                    Some(resolved.mount_ctx.mount_epoch),
-                );
+                let header = header_from_core_failure(&req_ctx, &failure);
                 error_response!(UnlinkPathResponseProto, header)
             }
         }
@@ -879,12 +810,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
             Err(failure) => {
-                let header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                    Some(resolved.mount_ctx.mount_epoch),
-                );
+                let header = header_from_core_failure(&req_ctx, &failure);
                 error_response!(RmdirPathResponseProto, header)
             }
         }
@@ -959,12 +885,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
             Err(failure) => {
-                let header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    Some(src_resolved.mount_ctx.owner_group_id.as_raw()),
-                    Some(src_resolved.mount_ctx.mount_epoch),
-                );
+                let header = header_from_core_failure(&req_ctx, &failure);
                 error_response!(RenamePathResponseProto, header)
             }
         }
@@ -1050,7 +971,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                                 }
                                 None => proto::fs::InodeKindProto::InodeKindUnspecified as i32,
                             },
-                            attrs: entry.attrs.as_ref().map(Self::file_attrs_to_proto),
+                            attrs: entry.attrs.as_ref().map(file_attrs_to_proto),
                         })
                         .collect();
                     response_with_header!(
@@ -1064,12 +985,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     )
                 }
                 Err(failure) => {
-                    let header = self.header_or_ok(
-                        &req.header,
-                        Some(header_from_core_failure(&req_ctx, &failure)),
-                        Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                        Some(resolved.mount_ctx.mount_epoch),
-                    );
+                    let header = header_from_core_failure(&req_ctx, &failure);
                     error_response!(ListStatusPathResponseProto, header)
                 }
             }
@@ -1145,12 +1061,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
             Err(failure) => {
-                let header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                    Some(resolved.mount_ctx.mount_epoch),
-                );
+                let header = header_from_core_failure(&req_ctx, &failure);
                 error_response!(OpenPathResponseProto, header)
             }
         }
@@ -1226,12 +1137,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
             Err(failure) => {
-                let header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    None,
-                    None,
-                );
+                let header = header_from_core_failure(&req_ctx, &failure);
                 response_with_header!(ReleasePathResponseProto::default(), header)
             }
         }
@@ -1308,12 +1214,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         );
                     }
                     Err(failure) => {
-                        let header = self.header_or_ok(
-                            &req.header,
-                            Some(header_from_core_failure(&req_ctx, &failure)),
-                            Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                            Some(resolved.mount_ctx.mount_epoch),
-                        );
+                        let header = header_from_core_failure(&req_ctx, &failure);
                         return response_with_header!(FsyncPathResponseProto::default(), header);
                     }
                 }
@@ -1461,12 +1362,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
             Err(failure) => {
-                let header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                    Some(resolved.mount_ctx.mount_epoch),
-                );
+                let header = header_from_core_failure(&req_ctx, &failure);
                 error_response!(TruncatePathResponseProto, header)
             }
         }
@@ -1542,12 +1438,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
             Err(failure) => {
-                let header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                    Some(resolved.mount_ctx.mount_epoch),
-                );
+                let header = header_from_core_failure(&req_ctx, &failure);
                 error_response!(SetXattrPathResponseProto, header)
             }
         }
@@ -1615,12 +1506,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
             Err(failure) => {
-                let header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                    Some(resolved.mount_ctx.mount_epoch),
-                );
+                let header = header_from_core_failure(&req_ctx, &failure);
                 error_response!(GetXattrPathResponseProto, header)
             }
         }
@@ -1687,12 +1573,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
             Err(failure) => {
-                let header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                    Some(resolved.mount_ctx.mount_epoch),
-                );
+                let header = header_from_core_failure(&req_ctx, &failure);
                 error_response!(ListXattrPathResponseProto, header)
             }
         }
@@ -1765,12 +1646,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
             Err(failure) => {
-                let header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                    Some(resolved.mount_ctx.mount_epoch),
-                );
+                let header = header_from_core_failure(&req_ctx, &failure);
                 error_response!(RemoveXattrPathResponseProto, header)
             }
         }
@@ -1849,12 +1725,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
             Err(failure) => {
-                let header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                    Some(resolved.mount_ctx.mount_epoch),
-                );
+                let header = header_from_core_failure(&req_ctx, &failure);
                 error_response!(GetFileLayoutByPathResponseProto, header)
             }
         }
@@ -1899,12 +1770,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             .fs_core
             .validate_mount_freshness(&req_ctx, freshness, resolved.mount_ctx.mount_id)
         {
-            let header = self.header_or_ok(
-                &req.header,
-                Some(header_from_core_failure(&req_ctx, &failure)),
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                Some(resolved.mount_ctx.mount_epoch),
-            );
+            let header = header_from_core_failure(&req_ctx, &failure);
             return error_response!(OpenWriteByPathResponseProto, header);
         }
         if let Some(resp_header) = self
@@ -1954,12 +1820,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
             Err(failure) => {
-                let resp_header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    Some(resolved.mount_ctx.owner_group_id.as_raw()),
-                    Some(resolved.mount_ctx.mount_epoch),
-                );
+                let resp_header = header_from_core_failure(&req_ctx, &failure);
                 error_response!(OpenWriteByPathResponseProto, resp_header)
             }
         }
@@ -2046,12 +1907,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
             Err(failure) => {
-                let resp_header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    None,
-                    None,
-                );
+                let resp_header = header_from_core_failure(&req_ctx, &failure);
                 error_response!(CloseWriteSessionResponseProto, resp_header)
             }
         }
@@ -2114,12 +1970,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 ok_header_from_core_success(&req_ctx, &success)
             ),
             Err(failure) => {
-                let resp_header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    None,
-                    None,
-                );
+                let resp_header = header_from_core_failure(&req_ctx, &failure);
                 error_response!(RenewWriteSessionLeaseResponseProto, resp_header)
             }
         }
@@ -2195,12 +2046,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 ok_header_from_core_success(&req_ctx, &success)
             ),
             Err(failure) => {
-                let resp_header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    None,
-                    None,
-                );
+                let resp_header = header_from_core_failure(&req_ctx, &failure);
                 response_with_header!(FsyncSessionResponseProto::default(), resp_header)
             }
         }
@@ -2326,12 +2172,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 ok_header_from_core_success(&req_ctx, &success)
             ),
             Err(failure) => {
-                let resp_header = self.header_or_ok(
-                    &req.header,
-                    Some(header_from_core_failure(&req_ctx, &failure)),
-                    None,
-                    None,
-                );
+                let resp_header = header_from_core_failure(&req_ctx, &failure);
                 response_with_header!(ReleaseSessionResponseProto::default(), resp_header)
             }
         }
