@@ -7,7 +7,6 @@ mod freshness;
 mod mutation;
 mod read;
 mod write_session;
-mod write_session_coordinator;
 
 use super::domain::{
     CoreFailure, CoreResult, CoreSuccess, Freshness, InodeOwner, PresentedFencingToken, RequestContext,
