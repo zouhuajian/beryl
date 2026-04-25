@@ -6,9 +6,9 @@
 use super::domain::{
     CoreFailure, CoreSuccess, FileBlockLocation, PresentedFencingToken, RequestContext, WorkerHint, WriteTarget,
 };
-use crate::error::MetadataError;
+use crate::error::{to_canonical_fs, MetadataError};
 use common::error::canonical::{
-    CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshHint, WorkerEndpointHint,
+    CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshHint, RefreshReason, WorkerEndpointHint,
 };
 use common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
 use tracing::Span;
@@ -259,6 +259,99 @@ pub fn header_from_core_failure(ctx: &RequestContext, failure: &CoreFailure) -> 
         failure.route_epoch,
         failure.state_id,
         &failure.error,
+    )
+}
+
+pub(crate) fn core_failure_from_metadata_error(
+    ctx: &RequestContext,
+    err: MetadataError,
+    group_id: Option<u64>,
+    mount_epoch: Option<u64>,
+    route_epoch: Option<u64>,
+) -> CoreFailure {
+    core_failure_from_canonical_error(ctx, to_canonical_fs(err), group_id, mount_epoch, route_epoch)
+}
+
+fn core_failure_from_canonical_error(
+    ctx: &RequestContext,
+    err: CanonicalError,
+    group_id: Option<u64>,
+    mount_epoch: Option<u64>,
+    route_epoch: Option<u64>,
+) -> CoreFailure {
+    CoreFailure::new(err, group_id, mount_epoch, route_epoch, ctx.caller.state_id)
+}
+
+pub(crate) fn core_failure_from_error_detail(
+    ctx: &RequestContext,
+    detail: proto::common::ErrorDetailProto,
+    group_id: Option<u64>,
+    mount_epoch: Option<u64>,
+    route_epoch: Option<u64>,
+) -> CoreFailure {
+    core_failure_from_canonical_error(
+        ctx,
+        proto::convert::error_detail_to_canonical(&detail),
+        group_id,
+        mount_epoch,
+        route_epoch,
+    )
+}
+
+pub(crate) fn need_refresh_core_failure(
+    ctx: &RequestContext,
+    rpc_code: RpcErrorCode,
+    reason: RefreshReason,
+    message: impl Into<String>,
+    group_id: Option<u64>,
+    mount_epoch: Option<u64>,
+    route_epoch: Option<u64>,
+    hint: Option<RefreshHint>,
+) -> CoreFailure {
+    let err = match hint {
+        Some(hint) => CanonicalError::need_refresh_with_hint(rpc_code, reason, hint, message),
+        None => CanonicalError::need_refresh(rpc_code, reason, message),
+    };
+    core_failure_from_canonical_error(ctx, err, group_id, mount_epoch, route_epoch)
+}
+
+pub(crate) fn fatal_fs_core_failure(
+    ctx: &RequestContext,
+    errno: FsErrorCode,
+    message: impl Into<String>,
+    group_id: Option<u64>,
+    mount_epoch: Option<u64>,
+) -> CoreFailure {
+    core_failure_from_canonical_error(
+        ctx,
+        CanonicalError::fatal_fs(errno, message),
+        group_id,
+        mount_epoch,
+        None,
+    )
+}
+
+pub(crate) fn terminal_rpc_core_failure(
+    ctx: &RequestContext,
+    reason: RefreshReason,
+    rpc_code: RpcErrorCode,
+    message: impl Into<String>,
+    group_id: Option<u64>,
+    mount_epoch: Option<u64>,
+) -> CoreFailure {
+    core_failure_from_canonical_error(
+        ctx,
+        CanonicalError {
+            class: ErrorClass::Fatal,
+            code: Some(CanonicalErrorCode::RpcCode(rpc_code)),
+            reason: Some(reason),
+            retry_after_ms: None,
+            message: message.into(),
+            refresh_hint: None,
+        },
+        group_id,
+        mount_epoch,
+        None,
     )
 }
 

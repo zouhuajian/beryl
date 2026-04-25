@@ -8,16 +8,18 @@ mod mutation;
 mod read;
 mod write_session;
 
+use super::core_util::{
+    core_failure_from_error_detail, core_failure_from_metadata_error, fatal_fs_core_failure, need_refresh_core_failure,
+    terminal_rpc_core_failure,
+};
 use super::domain::{
     CoreFailure, CoreResult, CoreSuccess, Freshness, InodeOwner, PresentedFencingToken, RequestContext,
 };
-use crate::error::{to_canonical_fs, MetadataError, MetadataResult};
+use crate::error::{MetadataError, MetadataResult};
 use crate::mount::MountTable;
 use crate::raft::{AppDataResponse, AppRaftNode, Command, DedupKey, FsCommandResult, RocksDBStorage};
 use crate::state::StateStore;
-use common::error::canonical::{
-    CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshHint, RefreshReason,
-};
+use common::error::canonical::{RefreshHint, RefreshReason};
 use common::header::{RequestHeader, RpcErrorCode};
 use proto::worker::CommitWriteRequestProto;
 use std::sync::atomic::Ordering;
@@ -162,40 +164,29 @@ impl FsCore {
         mount_epoch: Option<u64>,
         route_epoch: Option<u64>,
     ) -> CoreResult<T> {
-        let err = to_canonical_fs(err);
-        Err(CoreFailure::new(
+        Err(core_failure_from_metadata_error(
+            ctx,
             err,
             group_id,
             mount_epoch,
             route_epoch,
-            Self::state_id_from_ctx(ctx),
         ))
     }
 
-    fn failure_from_canonical<T>(
+    fn failure_from_error_detail_with_route_epoch<T>(
         &self,
         ctx: &RequestContext,
-        err: CanonicalError,
-        group_id: Option<u64>,
-        mount_epoch: Option<u64>,
-    ) -> CoreResult<T> {
-        self.failure_from_canonical_with_route_epoch(ctx, err, group_id, mount_epoch, None)
-    }
-
-    fn failure_from_canonical_with_route_epoch<T>(
-        &self,
-        ctx: &RequestContext,
-        err: CanonicalError,
+        detail: proto::common::ErrorDetailProto,
         group_id: Option<u64>,
         mount_epoch: Option<u64>,
         route_epoch: Option<u64>,
     ) -> CoreResult<T> {
-        Err(CoreFailure::new(
-            err,
+        Err(core_failure_from_error_detail(
+            ctx,
+            detail,
             group_id,
             mount_epoch,
             route_epoch,
-            Self::state_id_from_ctx(ctx),
         ))
     }
 
@@ -220,11 +211,16 @@ impl FsCore {
             hint.get_or_insert_with(RefreshHint::default).route_epoch = Some(route_epoch_value);
         }
 
-        let canonical = match hint {
-            Some(hint) => CanonicalError::need_refresh_with_hint(rpc_code, reason, hint, message),
-            None => CanonicalError::need_refresh(rpc_code, reason, message),
-        };
-        self.failure_from_canonical_with_route_epoch(ctx, canonical, group_id, mount_epoch, route_epoch)
+        Err(need_refresh_core_failure(
+            ctx,
+            rpc_code,
+            reason,
+            message,
+            group_id,
+            mount_epoch,
+            route_epoch,
+            hint,
+        ))
     }
 
     fn fatal_fs_failure<T>(
@@ -235,7 +231,7 @@ impl FsCore {
         group_id: Option<u64>,
         mount_epoch: Option<u64>,
     ) -> CoreResult<T> {
-        self.failure_from_canonical(ctx, CanonicalError::fatal_fs(errno, message), group_id, mount_epoch)
+        Err(fatal_fs_core_failure(ctx, errno, message, group_id, mount_epoch))
     }
 
     fn session_terminal_failure<T>(
@@ -247,15 +243,14 @@ impl FsCore {
         group_id: Option<u64>,
         mount_epoch: Option<u64>,
     ) -> CoreResult<T> {
-        let canonical = CanonicalError {
-            class: ErrorClass::Fatal,
-            code: Some(CanonicalErrorCode::RpcCode(rpc_code)),
-            reason: Some(reason),
-            retry_after_ms: None,
-            message: message.into(),
-            refresh_hint: None,
-        };
-        self.failure_from_canonical(ctx, canonical, group_id, mount_epoch)
+        Err(terminal_rpc_core_failure(
+            ctx,
+            reason,
+            rpc_code,
+            message,
+            group_id,
+            mount_epoch,
+        ))
     }
 
     fn replay_hint(intent: &str) -> String {
@@ -345,12 +340,12 @@ impl FsCore {
         let ctx = match self.route_fs_write_ctx(op, parent_inode_ids) {
             Ok(ctx) => ctx,
             Err(err) => {
-                return Err(CoreFailure::new(
-                    to_canonical_fs(err),
+                return Err(core_failure_from_metadata_error(
+                    req_ctx,
+                    err,
                     error_group_id,
                     error_mount_epoch,
                     None,
-                    Self::state_id_from_ctx(req_ctx),
                 ));
             }
         };
@@ -371,12 +366,12 @@ impl FsCore {
 
     fn storage_for_ctx<'a>(&'a self, req_ctx: &RequestContext) -> Result<&'a Arc<RocksDBStorage>, CoreFailure> {
         self.storage.as_ref().ok_or_else(|| {
-            CoreFailure::new(
-                to_canonical_fs(MetadataError::Internal("Storage not available".to_string())),
+            core_failure_from_metadata_error(
+                req_ctx,
+                MetadataError::Internal("Storage not available".to_string()),
                 None,
                 None,
                 None,
-                Self::state_id_from_ctx(req_ctx),
             )
         })
     }
@@ -397,13 +392,7 @@ impl FsCore {
         let inode = match storage.get_inode(inode_id) {
             Ok(inode) => inode,
             Err(err) => {
-                return Err(CoreFailure::new(
-                    to_canonical_fs(err),
-                    None,
-                    None,
-                    None,
-                    Self::state_id_from_ctx(req_ctx),
-                ));
+                return Err(core_failure_from_metadata_error(req_ctx, err, None, None, None));
             }
         };
         Ok(inode.as_ref().map(Self::owner_from_inode))

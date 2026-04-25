@@ -70,10 +70,6 @@ impl FsCore {
     }
 }
 
-fn canonical_from_error_detail(detail: proto::common::ErrorDetailProto) -> common::error::canonical::CanonicalError {
-    proto::convert::error_detail_to_canonical(&detail)
-}
-
 fn worker_refresh_hint_from_session(
     session: &crate::write_session::WriteSession,
     worker_epoch: Option<u64>,
@@ -993,10 +989,9 @@ impl<'a> WriteSessionCoordinator<'a> {
                     }
                 };
                 if let Some(err) = inner.header.and_then(|h| h.error) {
-                    let cerr = canonical_from_error_detail(err);
-                    return self.core.failure_from_canonical_with_route_epoch(
+                    return self.core.failure_from_error_detail_with_route_epoch(
                         &req.ctx,
-                        cerr,
+                        err,
                         group_id,
                         mount_epoch,
                         route_epoch,

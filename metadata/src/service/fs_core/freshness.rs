@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-use crate::error::to_canonical_fs;
 use crate::mount::MountTable;
+use crate::service::core_util::{core_failure_from_metadata_error, need_refresh_core_failure};
 use crate::service::domain::{CoreFailure, Freshness, RequestContext};
 use crate::state::StateStore;
-use common::error::canonical::{CanonicalError, RefreshHint, RefreshReason};
+use common::error::canonical::{RefreshHint, RefreshReason};
 use common::header::RpcErrorCode;
 use std::sync::Arc;
 use types::ids::MountId;
@@ -100,21 +100,19 @@ impl FreshnessValidator {
                         client_mount_epoch, server_mount_epoch
                     ),
                 };
-                return Err(CoreFailure::new(
-                    CanonicalError::need_refresh_with_hint(
-                        RpcErrorCode::MountEpochMismatch,
-                        RefreshReason::MountEpochMismatch,
-                        RefreshHint {
-                            group_id,
-                            mount_epoch: Some(server_mount_epoch),
-                            ..Default::default()
-                        },
-                        message,
-                    ),
+                return Err(need_refresh_core_failure(
+                    ctx,
+                    RpcErrorCode::MountEpochMismatch,
+                    RefreshReason::MountEpochMismatch,
+                    message,
                     group_id,
                     Some(server_mount_epoch),
                     None,
-                    Self::state_id_from_ctx(ctx),
+                    Some(RefreshHint {
+                        group_id,
+                        mount_epoch: Some(server_mount_epoch),
+                        ..Default::default()
+                    }),
                 ));
             }
         }
@@ -134,37 +132,29 @@ impl FreshnessValidator {
         let server_route_epoch = match self.state_store.get_route_epoch().await {
             Ok(v) => v.as_u64(),
             Err(err) => {
-                return Err(CoreFailure::new(
-                    to_canonical_fs(err),
-                    group_id,
-                    mount_epoch,
-                    None,
-                    Self::state_id_from_ctx(ctx),
-                ));
+                return Err(core_failure_from_metadata_error(ctx, err, group_id, mount_epoch, None));
             }
         };
 
         if let Some(client_route_epoch) = client_route_epoch {
             if client_route_epoch != server_route_epoch {
-                return Err(CoreFailure::new(
-                    CanonicalError::need_refresh_with_hint(
-                        RpcErrorCode::RouteEpochMismatch,
-                        RefreshReason::RouteEpochMismatch,
-                        RefreshHint {
-                            group_id,
-                            route_epoch: Some(server_route_epoch),
-                            mount_epoch,
-                            ..Default::default()
-                        },
-                        format!(
-                            "route_epoch mismatch: client={}, server={}; refresh route and replay {}",
-                            client_route_epoch, server_route_epoch, intent
-                        ),
+                return Err(need_refresh_core_failure(
+                    ctx,
+                    RpcErrorCode::RouteEpochMismatch,
+                    RefreshReason::RouteEpochMismatch,
+                    format!(
+                        "route_epoch mismatch: client={}, server={}; refresh route and replay {}",
+                        client_route_epoch, server_route_epoch, intent
                     ),
                     group_id,
                     mount_epoch,
                     Some(server_route_epoch),
-                    Self::state_id_from_ctx(ctx),
+                    Some(RefreshHint {
+                        group_id,
+                        route_epoch: Some(server_route_epoch),
+                        mount_epoch,
+                        ..Default::default()
+                    }),
                 ));
             }
         }
@@ -186,19 +176,18 @@ impl FreshnessValidator {
             return Ok(StaleStateStatus::UnknownLastApplied);
         };
         if last_applied < required_state_id {
-            return Err(CoreFailure::new(
-                CanonicalError::need_refresh(
-                    RpcErrorCode::StaleState,
-                    RefreshReason::StaleState,
-                    format!(
-                        "Stale state: last_applied={:?} < required={:?}",
-                        last_applied, required_state_id
-                    ),
+            return Err(need_refresh_core_failure(
+                ctx,
+                RpcErrorCode::StaleState,
+                RefreshReason::StaleState,
+                format!(
+                    "Stale state: last_applied={:?} < required={:?}",
+                    last_applied, required_state_id
                 ),
                 group_id,
                 mount_epoch,
                 None,
-                Self::state_id_from_ctx(ctx),
+                None,
             ));
         }
         Ok(StaleStateStatus::Ready)
