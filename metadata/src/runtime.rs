@@ -187,6 +187,7 @@ pub fn bootstrap_core() -> Result<CoreStage, DynError> {
 
 /// Builds authoritative storage, mount, raft, and state-store dependencies in startup order.
 pub async fn bootstrap_authority(config: &MetadataConfig) -> Result<AuthorityStage, DynError> {
+    // TODO: use path from config
     let db_path = std::env::var("VECTON_METADATA_DB_PATH").unwrap_or_else(|_| "data/metadata".to_string());
     let storage = Arc::new(RocksDBStorage::open(&db_path).map_err(|e| format!("Failed to initialize RocksDB: {e}"))?);
 
