@@ -25,6 +25,7 @@ use proto::metadata::file_system_service_proto_server::FileSystemServiceProtoSer
 use proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProtoServer;
 use std::sync::{Arc, Mutex};
 use tokio::signal;
+use tokio::task::JoinHandle;
 use tonic::transport::Server;
 use tonic_health::pb::health_server::HealthServer;
 use tonic_health::server::{HealthReporter, HealthService};
@@ -36,11 +37,13 @@ pub type DynError = Box<dyn std::error::Error>;
 
 type MetadataHealthServer = HealthServer<HealthService>;
 
+/// Process-wide bootstrap state that must stay alive for the metadata binary lifetime.
 pub struct CoreStage {
     pub config: Arc<MetadataConfig>,
     _observability_guard: ObservabilityGuard,
 }
 
+/// Authoritative metadata dependencies built before any public service is exposed.
 pub struct AuthorityStage {
     pub storage: Arc<RocksDBStorage>,
     pub mount_table: Arc<MountTable>,
@@ -53,20 +56,34 @@ pub struct AuthorityStage {
     _ufs_metadata_proxy: Arc<UfsMetadataProxy>,
 }
 
+/// Worker-facing RPC surface plus the worker-owned handles shared with background startup.
 pub struct WorkerRuntime {
     pub service: MetadataWorkerServiceImpl,
+    owned: WorkerOwnedRuntime,
+}
+
+/// Runtime objects owned by the worker side, even when background services need cloned handles.
+struct WorkerOwnedRuntime {
     repair_queue: Arc<RepairQueue>,
     orphan_queue: Arc<OrphanQueue>,
     repair_planner: Arc<RepairPlanner>,
     shared_inflight_registry: Arc<InflightRegistry>,
 }
 
+/// Filesystem-facing RPC surface and readiness state exposed through tonic health.
 pub struct FileSystemRuntime {
     pub service: MetadataFileSystemServiceImpl,
     pub health_service: MetadataHealthServer,
-    _readiness_gate: Arc<RootReadinessGate>,
+    _readiness: ReadinessRuntime,
 }
 
+/// Keeps the readiness gate and watcher task alive for as long as the filesystem runtime lives.
+struct ReadinessRuntime {
+    _gate: Arc<RootReadinessGate>,
+    _watcher: JoinHandle<()>,
+}
+
+/// Started background side effects that must stay alive for the server lifetime.
 pub struct BackgroundRuntime {
     _shared_inflight_registry: Arc<InflightRegistry>,
     _lease_runtime: Arc<LeaseRuntimeTable>,
@@ -74,6 +91,67 @@ pub struct BackgroundRuntime {
     _delete_executor: Arc<DeleteExecutor>,
 }
 
+/// Cloned worker-owned handles consumed by background services without transferring ownership.
+struct WorkerBackgroundInputs {
+    repair_queue: Arc<RepairQueue>,
+    orphan_queue: Arc<OrphanQueue>,
+    repair_planner: Arc<RepairPlanner>,
+    shared_inflight_registry: Arc<InflightRegistry>,
+}
+
+impl WorkerOwnedRuntime {
+    /// Builds worker-owned queues and shared registries before worker service construction.
+    fn new(config: &MetadataConfig) -> Self {
+        let repair_metrics = Arc::new(metadata::worker::RepairMetrics::new());
+        let repair_config = &config.worker.repair;
+        let mut repair_queue = RepairQueue::with_config_and_metrics(
+            repair_config.max_queue_size,
+            repair_config.max_attempts,
+            repair_config.inflight_timeout_ms,
+            repair_config.initial_backoff_ms,
+            repair_config.max_backoff_ms,
+            repair_config.worker_inflight_limit,
+            Some(Arc::clone(&repair_metrics)),
+        );
+        let shared_inflight_registry = Arc::new(InflightRegistry::new(5 * 60 * 1000));
+        repair_queue.set_inflight_registry(Arc::clone(&shared_inflight_registry));
+        let repair_queue = Arc::new(repair_queue);
+        let orphan_queue = Arc::new(OrphanQueue::new(10_000));
+        let repair_planner = Arc::new(RepairPlanner::new(Arc::clone(&repair_queue), Arc::clone(&orphan_queue)));
+
+        Self {
+            repair_queue,
+            orphan_queue,
+            repair_planner,
+            shared_inflight_registry,
+        }
+    }
+
+    /// Produces the background wiring inputs while keeping ownership anchored in `WorkerRuntime`.
+    fn background_inputs(&self) -> WorkerBackgroundInputs {
+        WorkerBackgroundInputs {
+            repair_queue: Arc::clone(&self.repair_queue),
+            orphan_queue: Arc::clone(&self.orphan_queue),
+            repair_planner: Arc::clone(&self.repair_planner),
+            shared_inflight_registry: Arc::clone(&self.shared_inflight_registry),
+        }
+    }
+}
+
+impl WorkerRuntime {
+    /// Exposes only the worker-owned handles background services need to be started.
+    fn background_inputs(&self) -> WorkerBackgroundInputs {
+        self.owned.background_inputs()
+    }
+
+    /// Performs the single handoff from started background runtime back into the worker service.
+    fn connect_background_runtime(&mut self, delete_executor: Arc<DeleteExecutor>) {
+        self.service.set_delete_executor(delete_executor);
+        self.service.start_background_tasks();
+    }
+}
+
+/// Loads process configuration and initializes observability before metadata authority is built.
 pub fn bootstrap_core() -> Result<CoreStage, DynError> {
     let obs_config = ObservabilityConfig::default();
     let service_info = ServiceInfo {
@@ -107,6 +185,7 @@ pub fn bootstrap_core() -> Result<CoreStage, DynError> {
     })
 }
 
+/// Builds authoritative storage, mount, raft, and state-store dependencies in startup order.
 pub async fn bootstrap_authority(config: &MetadataConfig) -> Result<AuthorityStage, DynError> {
     let db_path = std::env::var("VECTON_METADATA_DB_PATH").unwrap_or_else(|_| "data/metadata".to_string());
     let storage = Arc::new(RocksDBStorage::open(&db_path).map_err(|e| format!("Failed to initialize RocksDB: {e}"))?);
@@ -157,59 +236,39 @@ pub async fn bootstrap_authority(config: &MetadataConfig) -> Result<AuthoritySta
     })
 }
 
+/// Constructs the worker RPC service without starting background side effects.
 pub fn build_worker_runtime(config: &MetadataConfig, authority: &AuthorityStage) -> WorkerRuntime {
-    let repair_metrics = Arc::new(metadata::worker::RepairMetrics::new());
-    let repair_config = &config.worker.repair;
-    let mut repair_queue = RepairQueue::with_config_and_metrics(
-        repair_config.max_queue_size,
-        repair_config.max_attempts,
-        repair_config.inflight_timeout_ms,
-        repair_config.initial_backoff_ms,
-        repair_config.max_backoff_ms,
-        repair_config.worker_inflight_limit,
-        Some(Arc::clone(&repair_metrics)),
-    );
-    let shared_inflight_registry = Arc::new(InflightRegistry::new(5 * 60 * 1000));
-    repair_queue.set_inflight_registry(Arc::clone(&shared_inflight_registry));
-    let repair_queue = Arc::new(repair_queue);
-    let orphan_queue = Arc::new(OrphanQueue::new(10_000));
-    let repair_planner = Arc::new(RepairPlanner::new(Arc::clone(&repair_queue), Arc::clone(&orphan_queue)));
+    let owned = WorkerOwnedRuntime::new(config);
 
     let mut worker_service = MetadataWorkerServiceImpl::new(
         Arc::clone(&authority.raft_node),
         Arc::clone(&authority.worker_manager),
-        Arc::clone(&repair_queue),
-        Arc::clone(&orphan_queue),
+        Arc::clone(&owned.repair_queue),
+        Arc::clone(&owned.orphan_queue),
         Arc::clone(&authority.mount_table),
     );
     worker_service.set_slot_metrics(Arc::clone(&authority.metadata_metrics));
 
     WorkerRuntime {
         service: worker_service,
-        repair_queue,
-        orphan_queue,
-        repair_planner,
-        shared_inflight_registry,
+        owned,
     }
 }
 
+/// Starts background maintenance side effects after authority and worker runtime exist.
 pub async fn build_background_runtime(authority: &AuthorityStage, worker: &mut WorkerRuntime) -> BackgroundRuntime {
-    let lease_runtime = Arc::new(LeaseRuntimeTable::new(30_000, 10_000, 30_000));
-    if authority.raft_node.is_leader() {
-        lease_runtime.start_warmup();
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        lease_runtime.complete_warmup();
-    }
+    let worker_inputs = worker.background_inputs();
+    let lease_runtime = start_lease_runtime(authority).await;
 
     let maintenance_service = Arc::new(MaintenanceService::new_with_inflight_registry(
         Arc::clone(&authority.raft_node),
         Arc::clone(&authority.storage),
         Arc::clone(&authority.worker_manager),
-        Arc::clone(&worker.repair_queue),
-        Arc::clone(&worker.orphan_queue),
-        Arc::clone(&worker.repair_planner),
+        Arc::clone(&worker_inputs.repair_queue),
+        Arc::clone(&worker_inputs.orphan_queue),
+        Arc::clone(&worker_inputs.repair_planner),
         Arc::clone(&authority.metadata_metrics),
-        Some(Arc::clone(&worker.shared_inflight_registry)),
+        Some(Arc::clone(&worker_inputs.shared_inflight_registry)),
         Arc::clone(&authority.mount_table),
     ));
     maintenance_service.start();
@@ -223,17 +282,28 @@ pub async fn build_background_runtime(authority: &AuthorityStage, worker: &mut W
     ));
     delete_executor.start();
 
-    worker.service.set_delete_executor(Arc::clone(&delete_executor));
-    worker.service.start_background_tasks();
+    worker.connect_background_runtime(Arc::clone(&delete_executor));
 
     BackgroundRuntime {
-        _shared_inflight_registry: Arc::clone(&worker.shared_inflight_registry),
+        _shared_inflight_registry: worker_inputs.shared_inflight_registry,
         _lease_runtime: lease_runtime,
         _maintenance_service: maintenance_service,
         _delete_executor: delete_executor,
     }
 }
 
+/// Preserves lease warmup behavior behind a named startup step.
+async fn start_lease_runtime(authority: &AuthorityStage) -> Arc<LeaseRuntimeTable> {
+    let lease_runtime = Arc::new(LeaseRuntimeTable::new(30_000, 10_000, 30_000));
+    if authority.raft_node.is_leader() {
+        lease_runtime.start_warmup();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        lease_runtime.complete_warmup();
+    }
+    lease_runtime
+}
+
+/// Constructs the filesystem RPC service and its readiness/health reporting runtime.
 pub async fn build_filesystem_runtime(
     config: &MetadataConfig,
     authority: &AuthorityStage,
@@ -279,7 +349,7 @@ pub async fn build_filesystem_runtime(
     let raft_node_clone = Arc::clone(&authority.raft_node);
     let shard_group_id = authority.shard_group_id;
     let metrics = Arc::clone(&authority.metadata_metrics);
-    tokio::spawn(async move {
+    let readiness_watcher = tokio::spawn(async move {
         let result = wait_for_root_ready_with_metrics(
             raft_node_clone,
             mount_table_clone,
@@ -304,22 +374,31 @@ pub async fn build_filesystem_runtime(
     Ok(FileSystemRuntime {
         service: filesystem_service,
         health_service,
-        _readiness_gate: readiness_gate,
+        _readiness: ReadinessRuntime {
+            _gate: readiness_gate,
+            _watcher: readiness_watcher,
+        },
     })
 }
 
+/// Exposes the filesystem, worker, and health services using the staged runtime objects.
 pub async fn serve(
     config: &MetadataConfig,
     filesystem: FileSystemRuntime,
     worker: WorkerRuntime,
     _background: BackgroundRuntime,
 ) -> Result<(), DynError> {
+    let FileSystemRuntime {
+        service: filesystem_service,
+        health_service,
+        _readiness,
+    } = filesystem;
     let addr = config.rpc_addr;
     info!(addr = %addr, "Listening on (path/filesystem + worker services)");
     Server::builder()
-        .add_service(FileSystemServiceProtoServer::new(filesystem.service))
+        .add_service(FileSystemServiceProtoServer::new(filesystem_service))
         .add_service(MetadataWorkerServiceProtoServer::new(worker.service))
-        .add_service(filesystem.health_service)
+        .add_service(health_service)
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
 
@@ -423,7 +502,29 @@ mod tests {
         let config = test_config();
         let authority = test_authority_stage(&dir).await;
         let mut worker = build_worker_runtime(&config, &authority);
-        let _background = build_background_runtime(&authority, &mut worker).await;
+        let background = build_background_runtime(&authority, &mut worker).await;
+        assert!(Arc::ptr_eq(
+            &background._shared_inflight_registry,
+            &worker.owned.shared_inflight_registry
+        ));
+        assert!(Arc::strong_count(&background._delete_executor) >= 3);
         let _filesystem = build_filesystem_runtime(&config, &authority).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_owned_runtime_supplies_background_inputs_without_moving_ownership() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let authority = test_authority_stage(&dir).await;
+        let worker = build_worker_runtime(&config, &authority);
+        let inputs = worker.background_inputs();
+
+        assert!(Arc::ptr_eq(&worker.owned.repair_queue, &inputs.repair_queue));
+        assert!(Arc::ptr_eq(&worker.owned.orphan_queue, &inputs.orphan_queue));
+        assert!(Arc::ptr_eq(&worker.owned.repair_planner, &inputs.repair_planner));
+        assert!(Arc::ptr_eq(
+            &worker.owned.shared_inflight_registry,
+            &inputs.shared_inflight_registry
+        ));
     }
 }
