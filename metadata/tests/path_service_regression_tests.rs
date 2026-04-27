@@ -9,9 +9,9 @@ use metadata::mount::{DataIoPolicy, MountKind, MountTable, ROOT_INODE_ID};
 use metadata::raft::RocksDBStorage;
 use metadata::readiness::RootReadinessGate;
 use metadata::service::{
-    AclInodeAuthz, AllowAllAuthz, AuthzProvider, CachedGroupResolver, GroupResolver, InodePermReader,
-    LeadershipChecker, MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl, RocksDbInodePermReader,
-    SharedWorkerCommitHook, StaticGroupResolver,
+    AclInodeAuthz, AllowAllAuthz, AuthzProvider, CachedGroupResolver, FileSystemAuthorityDeps, FileSystemPolicyDeps,
+    FileSystemRuntimeDeps, GroupResolver, InodePermReader, LeadershipChecker, MetadataFileSystemServiceDeps,
+    MetadataFileSystemServiceImpl, RocksDbInodePermReader, SharedWorkerCommitHook, StaticGroupResolver,
 };
 use metadata::state::MemoryStateStore;
 use proto::common::{
@@ -168,19 +168,25 @@ fn build_env(
     let worker_commit_hook: SharedWorkerCommitHook = Arc::new(Mutex::new(None));
 
     let service = MetadataFileSystemServiceImpl::new(MetadataFileSystemServiceDeps {
-        state_store,
-        mount_table,
-        storage: Arc::clone(&storage),
-        write_session_manager,
-        inode_lease_manager,
-        worker_commit_hook,
-        raft_node: None,
-        worker_manager: None,
-        metrics: None,
-        readiness_gate,
-        leadership_checker,
-        authz_provider,
-        inode_perm_reader,
+        authority: FileSystemAuthorityDeps {
+            state_store,
+            mount_table,
+            storage: Arc::clone(&storage),
+            raft_node: None,
+        },
+        runtime: FileSystemRuntimeDeps {
+            write_session_manager,
+            inode_lease_manager,
+            worker_commit_hook,
+            worker_manager: None,
+            metrics: None,
+            readiness_gate,
+        },
+        policy: FileSystemPolicyDeps {
+            leadership_checker,
+            authz_provider,
+            inode_perm_reader,
+        },
     });
 
     PathTestEnv {

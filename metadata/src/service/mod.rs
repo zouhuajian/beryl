@@ -30,4 +30,7 @@ pub use core_util::{
 pub(crate) use fs_core::FsCore;
 pub use fs_core::SharedWorkerCommitHook;
 pub use guard::{AuthzContext, LeadershipChecker};
-pub use path_service::{MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl};
+pub use path_service::{
+    FileSystemAuthorityDeps, FileSystemPolicyDeps, FileSystemRuntimeDeps, MetadataFileSystemServiceDeps,
+    MetadataFileSystemServiceImpl,
+};

@@ -76,8 +76,8 @@ flowchart TB
 
 | 模块/文件 | 核心职责 | 关键类型/函数 | 说明 |
 | --- | --- | --- | --- |
-| `metadata/src/bin/main.rs` | 真实进程入口 | `main()` | 只负责串联 runtime composition 函数并把最终服务交给 `serve()`，保持薄入口。 |
-| `metadata/src/runtime.rs` | metadata runtime composition root | `load_config()`、`init_observability()`、`build_authority()`、`build_worker_manager()`、`build_worker_service()`、`build_maintenance()`、`build_worker_background()`、`build_readiness()`、`build_filesystem_service()`、`compose_services()`、`serve()` | 当前启动边界的主入口；把 authority、worker manager、worker service、worker background、maintenance、readiness、RPC service registration 分开表达。 |
+| `metadata/src/bin/main.rs` | 真实进程入口 | `main()` | 只负责 `load_config()`、`init_observability()`、`MetadataServer::build()`、`server.serve()`，保持薄入口。 |
+| `metadata/src/runtime.rs` | metadata runtime composition root | `MetadataServer`、`MetadataAuthority`、`WorkerRuntime`、`Maintenance`、`Readiness`、`RpcServices`、`RuntimeHandles` | `MetadataServer::build()` 是最终 server composition 入口；它只组合长期对象，不作为万能容器或业务逻辑入口。 |
 | `metadata/src/bootstrap.rs` | root mount 启动引导 | `ensure_root_mount()` | 保证 root mount 的 invariant；非 leader 场景遇到 leader changed 会记录并返回，等待后续 readiness。 |
 | `metadata/src/config.rs` | metadata 配置模型 | `MetadataConfig`、`AuthzConfig`、`WorkerConfig` | 仍有部分 TODO，例如 raft/shard 配置扩展和 DB path 配置化。 |
 | `metadata/src/error.rs` | metadata domain error 到 canonical error 的显式映射 | `MetadataError`、`to_canonical_rpc()`、`to_canonical_fs()` | 当前生产路径使用显式 mapper，不依赖隐式 `From<MetadataError>`。 |
@@ -106,13 +106,15 @@ flowchart TB
 
 ## 4. 启动链路
 
-当前启动链路以 `metadata/src/bin/main.rs` 为真实入口，组合逻辑集中在 `metadata/src/runtime.rs`。`main()` 不再包含 `#[path = "..."]` 的生产模块绕行，也不直接构造底层对象；它只按顺序调用短函数，把最终 `RpcServices` 和 `RuntimeHandles` 交给 `serve()`。
+当前启动链路以 `metadata/src/bin/main.rs` 为真实入口，组合逻辑集中在 `metadata/src/runtime.rs`。`main()` 不再包含 `#[path = "..."]` 的生产模块绕行，也不直接构造底层对象；它只按顺序调用 `load_config()`、`init_observability()`、`MetadataServer::build(config)`、`server.serve()`。
 
-当前代码保留的 runtime 对象都对应长期职责：`MetadataAuthority` 表示 authority bundle，`WorkerService` 表示 worker RPC 入口及其 worker-owned repair state，`WorkerBackground` 表示 worker heavy background task handle 与 repair state，`Maintenance` 表示 metadata maintenance resources 及 task handles，`Readiness` 表示 root readiness watcher 与 health state，`RpcServices` 表示最终注册的 RPC services，`RuntimeHandles` 表示 `serve()` 需要持有到 server 生命周期结束的后台 task handles。
+`MetadataServer` 是最终 server composition object，但不是万能容器。它持有配置、`MetadataAuthority`、required `WorkerRuntime`、最终 `RpcServices` 和 `RuntimeHandles`；authority、worker、maintenance、readiness、FileSystemService deps 分组等具体构造仍由命名清晰的 runtime helper 表达。
+
+当前代码保留的 runtime 对象都对应长期职责：`MetadataAuthority` 表示 authority bundle，`WorkerRuntime` 表示 required worker soft state 和 worker-owned repair state，`WorkerBackground` 表示 worker heavy background task handle 与 repair state，`Maintenance` 表示 metadata maintenance resources 及 task handles，`Readiness` 表示 root readiness watcher 与 health state，`RpcServices` 表示最终注册的 RPC services，`RuntimeHandles` 表示 `serve()` 需要持有到 server 生命周期结束的后台 task handles。
 
 `RuntimeHandles` 当前持有 `WorkerBackgroundHandle`、`MaintenanceHandle`、`DeleteExecutorHandle`、`ReadinessHandle`，语义是保留这些 `JoinHandle` 不再在 start 方法内部丢弃。当前代码还没有 cancellation token 或逐 task join 流程，因此这里不声明完整 graceful shutdown；server 退出后由进程 / Tokio runtime 结束这些后台循环。
 
-`runtime::tests::runtime_composition_separates_worker_maintenance_and_readiness`、`runtime::tests::runtime_handles_hold_started_background_tasks` 和 `runtime::tests::worker_service_supplies_background_inputs_without_optional_worker_mode` 覆盖当前组合关系与 lifecycle handle 持有关系。
+`runtime::tests::metadata_server_build_composes_required_runtime`、`runtime::tests::binary_entrypoint_delegates_to_metadata_server`、`runtime::tests::runtime_composition_separates_worker_maintenance_and_readiness`、`runtime::tests::runtime_handles_hold_started_background_tasks` 和 `runtime::tests::worker_service_supplies_background_inputs_without_optional_worker_mode` 覆盖当前组合关系、薄入口、required worker 与 lifecycle handle 持有关系。
 
 ```mermaid
 sequenceDiagram
@@ -123,7 +125,7 @@ sequenceDiagram
     participant SM as AppRaftStateMachine
     participant Raft as AppRaftNode
     participant WorkerMgr as WorkerManager
-    participant WorkerSvc as WorkerService
+    participant WorkerRuntime as WorkerRuntime
     participant WorkerBg as WorkerBackground
     participant Maint as Maintenance
     participant Ready as Readiness
@@ -132,28 +134,28 @@ sequenceDiagram
 
     Main->>Runtime: load_config()
     Main->>Runtime: init_observability(config)
-    Main->>Runtime: build_authority(config)
+    Main->>Runtime: MetadataServer::build(config)
+    Runtime->>Runtime: build_authority(config)
     Runtime->>Storage: open(db_path)
     Runtime->>Mount: load_from_storage(storage)
     Runtime->>SM: new(storage, mount_table)
     Runtime->>Raft: new(config, state_machine)
     Runtime->>Runtime: ensure_root_mount()
     Runtime->>Runtime: RaftStateStore / UfsRegistry / metrics
-    Main->>Runtime: build_worker_manager()
+    Runtime->>Runtime: build_worker_runtime()
     Runtime->>WorkerMgr: heartbeat / block locations / worker epoch
-    Main->>Runtime: build_readiness()
+    Runtime->>WorkerRuntime: repair queues / worker RPC
+    Runtime->>Runtime: build_readiness()
     Runtime->>Ready: root watcher / HealthService
-    Main->>Runtime: build_filesystem_service()
+    Runtime->>Runtime: build_filesystem_service()
     Runtime->>FS: guard / authz / FsCore
-    Main->>Runtime: build_worker_service()
-    Runtime->>WorkerSvc: repair queues / worker RPC
-    Main->>Runtime: build_maintenance()
+    Runtime->>Runtime: build_maintenance()
     Runtime->>Maint: lease runtime / maintenance / delete executor
-    Main->>Runtime: build_worker_background()
+    Runtime->>Runtime: build_worker_background()
     Runtime->>WorkerBg: worker cleanup / repair metrics tasks
-    Main->>Runtime: compose_services()
-    Main->>Runtime: serve(services, handles)
-    Runtime->>Server: FileSystemService + WorkerService + Health
+    Runtime->>Runtime: compose_services()
+    Main->>Runtime: server.serve()
+    Runtime->>Server: FileSystemService + MetadataWorkerService + Health
 ```
 
 启动阶段职责：
@@ -162,15 +164,15 @@ sequenceDiagram
 | --- | --- | --- | --- | --- |
 | `load_config()` | 环境变量 `VECTON_CONFIG`，默认 `conf/core-site.yaml` | `Arc<MetadataConfig>` | 读取配置文件 | 只表达配置加载，不承担 observability 或 authority 初始化。 |
 | `init_observability()` | `MetadataConfig` | `Observability` | 初始化 tracing / metrics provider，并记录已加载配置的非敏感摘要 | 只负责进程级 observability guard 的生命周期。 |
+| `MetadataServer::build()` | `Arc<MetadataConfig>` | `MetadataServer` | 按顺序构造 authority、required worker runtime、readiness、FileSystemService、maintenance、worker background、`RpcServices` 和 `RuntimeHandles` | 最终 server composition object；只组合长期对象，不新增临时 Build/Refs 容器。 |
 | `build_authority()` | `MetadataConfig` | `MetadataAuthority` | 打开 RocksDB，加载 mount，构造 Raft state machine / Raft node，确保 root mount，构造 `RaftStateStore` 和 UFS registry/proxy | 保持 authority bootstrap 顺序：`RocksDBStorage -> MountTable -> AppRaftStateMachine -> AppRaftNode -> ensure_root_mount -> RaftStateStore`。 |
-| `build_worker_manager()` | 无 | `Arc<WorkerManager>` | 初始化 metadata epoch | worker 是 metadata required runtime component；这里创建 heartbeat、block locations、full report sync、worker epoch 等软状态管理器。 |
+| `build_worker_runtime()` | config、authority | `WorkerRuntime`、`MetadataWorkerServiceImpl` | 初始化 metadata epoch，构造 worker manager、repair/orphan queue、planner 和标准注册用 worker RPC service | worker 是 metadata required runtime component；不存在 optional/disabled worker subsystem。 |
 | `build_readiness()` | config、authority | `Readiness` | 创建 root readiness gate、HealthService，并启动 root watcher，保留 `ReadinessHandle` | readiness/health 生命周期独立于 worker background 和 maintenance；当前 handle 持有 watcher `JoinHandle`。 |
-| `build_filesystem_service()` | config、authority、worker manager、readiness | `MetadataFileSystemServiceImpl` | 构造 authz、write session manager、inode lease manager、FileSystemService deps | 只构造 filesystem RPC service，不启动 readiness watcher，也不注册 tonic server。 |
-| `build_worker_service()` | config、authority、worker manager | `WorkerService` | 构造 repair/orphan queue、planner、worker RPC service | worker service 是标准 RPC service，不存在 disabled/optional mode。 |
-| `build_maintenance()` | authority、worker manager、worker service | `Maintenance` | 启动 lease runtime、`MaintenanceService`、`DeleteExecutor`，保留 `MaintenanceHandle` 与 `DeleteExecutorHandle` | metadata maintenance 独立于 worker RPC serving；GC、lease cleanup、orphan/overrep cleanup、delete executor 归这里。 |
-| `build_worker_background()` | worker service、maintenance | `WorkerBackground` | 把 `DeleteExecutor` 接入 worker service，并启动 worker cleanup、repair/lease metrics 等 heavy background tasks，保留 `WorkerBackgroundHandle` | worker 能力本身 required；heavy background 在 authority 和 maintenance ready 后 lazy start。 |
-| `compose_services()` | filesystem service、worker service、readiness、worker background、maintenance | `RpcServices`、`RuntimeHandles` | 无额外启动副作用 | 把可注册 RPC services 与必须持有的 lifecycle handles 分开；不在这里启动新后台任务。 |
-| `serve()` | config、`RpcServices`、`RuntimeHandles` | 运行中的 gRPC server | 绑定 socket，注册 FileSystemService、MetadataWorkerService、HealthService，等待 shutdown signal | `serve()` 只做 service registration 和 lifecycle holding，不构建 authority、worker、maintenance 或 readiness；当前不执行逐 task graceful shutdown。 |
+| `build_filesystem_service()` | config、authority、worker manager、readiness | `MetadataFileSystemServiceImpl` | 构造 authz、write session manager、inode lease manager，并按 authority/runtime/policy 分组组装 FileSystemService deps | 只构造 filesystem RPC service，不启动 readiness watcher，也不注册 tonic server。 |
+| `build_maintenance()` | authority、worker runtime | `Maintenance` | 启动 lease runtime、`MaintenanceService`、`DeleteExecutor`，保留 `MaintenanceHandle` 与 `DeleteExecutorHandle` | metadata maintenance 独立于 worker RPC serving；GC、lease cleanup、orphan/overrep cleanup、delete executor 归这里。 |
+| `build_worker_background()` | worker runtime、maintenance | `WorkerBackground` | 把 `DeleteExecutor` 接入 worker service，并启动 worker cleanup、repair/lease metrics 等 heavy background tasks，保留 `WorkerBackgroundHandle` | worker 能力本身 required；heavy background 在 authority ready 后 lazy start。 |
+| `compose_services()` | filesystem service、worker runtime、readiness、worker background、maintenance | `RpcServices`、`RuntimeHandles` | 无额外启动副作用 | 把可注册 RPC services 与必须持有的 lifecycle handles 分开；不在这里启动新后台任务。 |
+| `MetadataServer::serve()` | `MetadataServer` | 运行中的 gRPC server | 绑定 socket，注册 FileSystemService、MetadataWorkerService、HealthService，等待 shutdown signal | 只做 service registration 和 lifecycle holding，不构建 authority、worker、maintenance 或 readiness；当前不执行逐 task graceful shutdown。 |
 
 `ensure_root_mount()` 的重要 invariant：已有 root mount 必须是 `/`、`ROOT_INODE_ID`、`MountKind::Internal`、无 UFS URI、`DataIoPolicy::Forbid`。如果 root mount 不存在，leader 会通过 `Command::CreateMount` 创建；非 leader 遇到 leader changed 时不直接失败启动，而是让 readiness 后续收敛。
 
@@ -223,6 +225,8 @@ flowchart LR
 ## 6. 请求入口与服务分层
 
 `FileSystemService` 是当前对外统一 path-first 入口。`FsCore` 是 service 内共享的 domain core；service 层负责 RPC 和策略适配，不应该承载复杂业务规则。当前代码里 `path_service.rs` 仍然偏大，但它的主流路径已经是：guard/authz/path resolve 后调用 `FsCore`。
+
+`MetadataFileSystemServiceDeps` 只表达显式依赖注入，不负责构造 runtime state。当前它按职责分成 `FileSystemAuthorityDeps`、`FileSystemRuntimeDeps`、`FileSystemPolicyDeps`：authority 组包含 `StateStore`、`MountTable`、`RocksDBStorage`、Raft node；runtime 组包含 write session、inode lease、worker commit hook、worker manager、metrics、readiness gate；policy 组包含 leadership checker、authz provider、inode permission reader。`build_filesystem_service()` 仍显式创建并注入 `WriteSessionManager`、`InodeLeaseManager`、`SharedWorkerCommitHook`。
 
 ```mermaid
 flowchart TD
@@ -591,9 +595,10 @@ flowchart LR
 
 | 整理项 | 当前代码证据 | 说明 |
 | --- | --- | --- |
-| `main.rs` 变薄 | `metadata/src/bin/main.rs` | 入口只串联 runtime 阶段。 |
-| runtime composition 函数拆分 | `metadata/src/runtime.rs` | config、observability、authority、worker manager、worker service、worker background、maintenance、readiness、RPC composition、serve 分离。 |
-| worker manager / service / background 分离 | `WorkerManager`、`WorkerService`、`WorkerBackground` | worker 是 required runtime component；worker service 始终注册，heavy background 在 authority ready 后启动。 |
+| `main.rs` 变薄 | `metadata/src/bin/main.rs` | 入口只执行 config、observability、`MetadataServer::build()`、`server.serve()`。 |
+| `MetadataServer` 收敛启动组合 | `metadata/src/runtime.rs` | 最终 server composition object 持有 config、authority、required worker runtime、RPC services 和 runtime handles；不引入临时 Build/Refs 容器。 |
+| worker runtime / background 分离 | `WorkerRuntime`、`WorkerManager`、`WorkerBackground` | worker 是 required runtime component；worker service 始终注册，heavy background 在 authority ready 后启动。 |
+| FileSystemService deps 分组 | `MetadataFileSystemServiceDeps`、`FileSystemAuthorityDeps`、`FileSystemRuntimeDeps`、`FileSystemPolicyDeps` | service 构造入参按 authority/runtime/policy 分组，同时保留 write session、inode lease、worker commit hook 的显式注入。 |
 | maintenance / readiness 与 worker background 分离 | `Maintenance`、`Readiness`、`RuntimeHandles` | maintenance/delete/lease cleanup 不再藏在泛化 background runtime；readiness/health watcher 独立持有；后台循环已有 JoinHandle 持有，但 graceful shutdown 仍待补齐。 |
 | `FsCore` 抽出 | `metadata/src/service/fs_core/` | read、mutation、freshness、write session 已成子模块。 |
 | error contract 集中 | `metadata/src/error.rs`、`metadata/src/service/core_util.rs` | 显式 `to_canonical_rpc/fs` 与 header helpers。 |

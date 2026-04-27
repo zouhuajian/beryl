@@ -83,16 +83,28 @@ enum PathRpcAuthz {
 }
 
 pub struct MetadataFileSystemServiceDeps {
+    pub authority: FileSystemAuthorityDeps,
+    pub runtime: FileSystemRuntimeDeps,
+    pub policy: FileSystemPolicyDeps,
+}
+
+pub struct FileSystemAuthorityDeps {
     pub state_store: Arc<dyn crate::state::StateStore>,
     pub mount_table: Arc<MountTable>,
     pub storage: Arc<RocksDBStorage>,
+    pub raft_node: Option<Arc<crate::raft::AppRaftNode>>,
+}
+
+pub struct FileSystemRuntimeDeps {
     pub write_session_manager: Arc<crate::write_session::WriteSessionManager>,
     pub inode_lease_manager: Arc<crate::inode_lease::InodeLeaseManager>,
     pub worker_commit_hook: SharedWorkerCommitHook,
-    pub raft_node: Option<Arc<crate::raft::AppRaftNode>>,
     pub worker_manager: Option<Arc<crate::worker::WorkerManager>>,
     pub metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
     pub readiness_gate: Option<Arc<crate::readiness::RootReadinessGate>>,
+}
+
+pub struct FileSystemPolicyDeps {
     pub leadership_checker: Option<Arc<dyn LeadershipChecker>>,
     pub authz_provider: Arc<dyn AuthzProvider>,
     pub inode_perm_reader: Option<Arc<dyn InodePermReader>>,
@@ -101,20 +113,29 @@ pub struct MetadataFileSystemServiceDeps {
 impl MetadataFileSystemServiceImpl {
     pub fn new(deps: MetadataFileSystemServiceDeps) -> Self {
         let MetadataFileSystemServiceDeps {
+            authority,
+            runtime,
+            policy,
+        } = deps;
+        let FileSystemAuthorityDeps {
             state_store,
             mount_table,
             storage,
+            raft_node,
+        } = authority;
+        let FileSystemRuntimeDeps {
             write_session_manager,
             inode_lease_manager,
             worker_commit_hook,
-            raft_node,
             worker_manager,
             metrics,
             readiness_gate,
+        } = runtime;
+        let FileSystemPolicyDeps {
             leadership_checker,
             authz_provider,
             inode_perm_reader,
-        } = deps;
+        } = policy;
 
         let path_resolver = PathResolver::new(Arc::clone(&mount_table), Arc::clone(&storage));
         let mut fs_core = FsCore::new(
