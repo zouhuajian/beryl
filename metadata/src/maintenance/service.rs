@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use types::ids::{BlockId, DataHandleId};
 
@@ -35,6 +36,17 @@ pub const ACTIVE_TTL_MS: u64 = 180_000;
 
 /// Reference count for blocks (data_handle_id -> block_id -> count).
 type BlockRefCounts = HashMap<DataHandleId, HashMap<BlockId, u32>>;
+
+/// Maintenance background task handles.
+pub struct MaintenanceHandle {
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl MaintenanceHandle {
+    pub fn task_count(&self) -> usize {
+        self.tasks.len()
+    }
+}
 
 /// Maintenance service for background tasks.
 pub struct MaintenanceService {
@@ -186,12 +198,9 @@ impl MaintenanceService {
     }
 
     /// Start all background maintenance tasks.
-    pub fn start(&self) {
-        // Set inflight_registry in repair_queue (shared instance for cross-operation mutual exclusion)
-        // Note: This requires mutable access to RepairQueue, which is Arc.
-        // We'll need to refactor RepairQueue to use Arc<RwLock<Option<...>>> or similar.
-        // For now, repair_queue should have inflight_registry set before calling start().
-        // This is done in main.rs.
+    pub fn start(&self) -> MaintenanceHandle {
+        let mut tasks = Vec::with_capacity(7);
+
         // Start GC task with self-healing
         {
             let gc_service = Arc::new(GcService::new(
@@ -213,7 +222,7 @@ impl MaintenanceService {
             let gc = Arc::clone(&gc_service);
             let raft_node = Arc::clone(&self.raft_node);
             let interval_sec = self.gc_interval_sec;
-            tokio::spawn(async move {
+            tasks.push(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(interval_sec));
                 loop {
                     interval.tick().await;
@@ -223,7 +232,7 @@ impl MaintenanceService {
                         }
                     }
                 }
-            });
+            }));
 
             // GC self-healing: reload refcounts
             let gc_reload = Arc::clone(&gc_service);
@@ -232,7 +241,7 @@ impl MaintenanceService {
             let gc_gate = Arc::clone(&self.gc_gate);
             let metrics = Arc::clone(&self.metrics);
             let reload_interval = self.refcount_reload_interval_sec;
-            tokio::spawn(async move {
+            tasks.push(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(reload_interval));
                 loop {
                     interval.tick().await;
@@ -243,7 +252,7 @@ impl MaintenanceService {
                         debug!(error = %e, "GC refcount reload attempt failed");
                     }
                 }
-            });
+            }));
         }
 
         // Start lease cleanup task with self-healing
@@ -263,7 +272,7 @@ impl MaintenanceService {
             let lease = Arc::clone(&lease_service);
             let raft_node = Arc::clone(&self.raft_node);
             let interval_sec = self.lease_cleanup_interval_sec;
-            tokio::spawn(async move {
+            tasks.push(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(interval_sec));
                 loop {
                     interval.tick().await;
@@ -273,7 +282,7 @@ impl MaintenanceService {
                         }
                     }
                 }
-            });
+            }));
         }
 
         // Start orphan cleanup task
@@ -295,7 +304,7 @@ impl MaintenanceService {
             let orphan = Arc::clone(&orphan_service);
             let raft_node = Arc::clone(&self.raft_node);
             let interval_sec = self.orphan_cleanup_interval_sec;
-            tokio::spawn(async move {
+            tasks.push(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(interval_sec));
                 loop {
                     interval.tick().await;
@@ -305,7 +314,7 @@ impl MaintenanceService {
                         }
                     }
                 }
-            });
+            }));
         }
 
         // Start rebalance task
@@ -315,7 +324,7 @@ impl MaintenanceService {
             let worker_manager = Arc::clone(&self.worker_manager);
             let raft_node = Arc::clone(&self.raft_node);
             let interval_sec = self.rebalance_interval_sec;
-            tokio::spawn(async move {
+            tasks.push(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(interval_sec));
                 loop {
                     interval.tick().await;
@@ -330,14 +339,14 @@ impl MaintenanceService {
                         }
                     }
                 }
-            });
+            }));
         }
 
         // Start timeout requeue task
         {
             let repair_queue = Arc::clone(&self.repair_queue);
             let interval_sec = self.timeout_check_interval_sec;
-            tokio::spawn(async move {
+            tasks.push(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(interval_sec));
                 loop {
                     interval.tick().await;
@@ -347,7 +356,7 @@ impl MaintenanceService {
                         info!(timeout_count, "Requeued timed-out repair tasks");
                     }
                 }
-            });
+            }));
         }
 
         // Start over-replication cleanup task
@@ -368,7 +377,7 @@ impl MaintenanceService {
             let overrep = Arc::clone(&overrep_service);
             let raft_node = Arc::clone(&self.raft_node);
             let interval_sec = 300; // 5 minutes (same as GC)
-            tokio::spawn(async move {
+            tasks.push(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(interval_sec));
                 loop {
                     interval.tick().await;
@@ -378,10 +387,12 @@ impl MaintenanceService {
                         }
                     }
                 }
-            });
+            }));
         }
 
         info!("Maintenance service started with fail-closed gates");
+
+        MaintenanceHandle { tasks }
     }
 
     /// Increment reference count for a block.

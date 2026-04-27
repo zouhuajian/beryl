@@ -26,7 +26,7 @@ pub use intents::DeleteIntentBuilder;
 pub use lease_cleanup::LeaseCleanupService;
 pub use orphan::{OrphanBlockCleaner, PendingOrphan};
 pub use overrep::{OverRepCandidate, OverReplicaCleanupService};
-pub use service::MaintenanceService;
+pub use service::{MaintenanceHandle, MaintenanceService};
 
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::MountTable;

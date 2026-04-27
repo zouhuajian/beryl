@@ -19,9 +19,22 @@ use proto::metadata::metadata_worker_service_proto_server::MetadataWorkerService
 use proto::metadata::*;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
 use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+
+/// Worker service background task handles.
+pub struct WorkerBackgroundHandle {
+    _lease_metrics_task: Option<JoinHandle<()>>,
+    _dead_worker_cleanup_task: JoinHandle<()>,
+}
+
+impl WorkerBackgroundHandle {
+    pub fn task_count(&self) -> usize {
+        usize::from(self._lease_metrics_task.is_some()) + 1
+    }
+}
 
 /// MetadataWorkerService implementation.
 pub struct MetadataWorkerServiceImpl {
@@ -103,14 +116,14 @@ impl MetadataWorkerServiceImpl {
     }
 
     /// Start background task for worker dead cleanup, replication check, and lease metrics update.
-    pub fn start_background_tasks(&self) {
+    pub fn start_background_tasks(&self) -> WorkerBackgroundHandle {
         // Start lease metrics update task
-        if let Some(ref slot_metrics) = self.slot_metrics {
+        let lease_metrics_task = if let Some(ref slot_metrics) = self.slot_metrics {
             let lease_manager = self.worker_manager.lease_manager();
             let worker_manager = Arc::clone(&self.worker_manager);
             let slot_metrics = Arc::clone(slot_metrics);
             let raft_node = Arc::clone(&self.raft_node);
-            tokio::spawn(async move {
+            Some(tokio::spawn(async move {
                 use tokio::time::{interval, Duration};
                 let mut interval = interval(Duration::from_secs(10)); // Update every 10 seconds
                 loop {
@@ -150,14 +163,17 @@ impl MetadataWorkerServiceImpl {
                         .full_report_leases_waiting
                         .store(waiting_count, std::sync::atomic::Ordering::Relaxed);
                 }
-            });
-        }
+            }))
+        } else {
+            None
+        };
+
         let worker_manager = Arc::clone(&self.worker_manager);
         let repair_planner = Arc::clone(&self.repair_planner);
         let repair_queue = Arc::clone(&self.repair_queue);
         let raft_node = Arc::clone(&self.raft_node);
 
-        tokio::spawn(async move {
+        let dead_worker_cleanup_task = tokio::spawn(async move {
             use tokio::time::{interval, Duration};
             // TODO: Check interval secs needs from core-site.yaml
             let mut interval = interval(Duration::from_secs(30)); // Check every 30 seconds
@@ -208,6 +224,11 @@ impl MetadataWorkerServiceImpl {
                 }
             }
         });
+
+        WorkerBackgroundHandle {
+            _lease_metrics_task: lease_metrics_task,
+            _dead_worker_cleanup_task: dead_worker_cleanup_task,
+        }
     }
 
     /// Get pending commands for a worker from repair queue.

@@ -28,7 +28,7 @@ mod tests;
 mod integration_tests;
 
 pub use command_sender::CommandSender;
-pub use delete_executor::DeleteExecutor;
+pub use delete_executor::{DeleteExecutor, DeleteExecutorHandle};
 pub use full_report_lease::{FullReportLease, FullReportLeaseManager};
 pub use manager::{HealthStatus, WorkerDescriptor, WorkerInfo, WorkerManager};
 pub use metrics::{RepairMetrics, WorkerMetrics};
@@ -36,4 +36,4 @@ pub use repair::{
     ErrorClass, OrphanMetrics, OrphanQueue, RepairPlanner, RepairQueue, RepairTask, RepairTaskId, RepairTaskRecord,
     TaskAckStatus,
 };
-pub use service::MetadataWorkerServiceImpl;
+pub use service::{MetadataWorkerServiceImpl, WorkerBackgroundHandle};

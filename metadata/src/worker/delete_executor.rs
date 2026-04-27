@@ -25,10 +25,22 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::task::JoinHandle;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 use types::block::BlockState;
 use types::ids::{BlockId, WorkerId};
+
+/// Delete executor background task handle.
+pub struct DeleteExecutorHandle {
+    _task: JoinHandle<()>,
+}
+
+impl DeleteExecutorHandle {
+    pub fn is_finished(&self) -> bool {
+        self._task.is_finished()
+    }
+}
 
 /// Delete intent execution status.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,10 +139,10 @@ impl DeleteExecutor {
     }
 
     /// Start the executor main loop.
-    pub fn start(self: &Arc<Self>) {
+    pub fn start(self: &Arc<Self>) -> DeleteExecutorHandle {
         let executor = Arc::clone(self);
         let poll_interval = self.poll_interval_sec;
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(poll_interval));
             loop {
                 interval.tick().await;
@@ -142,6 +154,7 @@ impl DeleteExecutor {
             }
         });
         info!("DeleteExecutor started");
+        DeleteExecutorHandle { _task: task }
     }
 
     /// Run one execution cycle.
