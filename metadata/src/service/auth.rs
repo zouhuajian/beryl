@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Permission checker contract and mode-backed checker construction.
-
-pub mod acl;
-pub mod ranger;
-
-pub use acl::{
-    cached_static_group_resolver, AclPermissionChecker, CachedGroupResolver, GroupResolver, InodePermInputs,
-    InodePermReader, RocksDbInodePermReader, StaticGroupResolver, StaticPermReader,
-};
-pub use ranger::RangerPermissionChecker;
+//! Permission checker contract and current allow-all implementation.
+//!
+//! This module currently provides the permission-checking extension point and
+//! the default allow-all implementation. Current active behavior is the NONE
+//! allow-all mode. Vecton currently supports only the NONE permission mode in
+//! this metadata service. ACL and Ranger providers are
+//! expected future implementations and must be added as explicit
+//! `PermissionChecker` implementations with tests before they can be enabled.
 
 use crate::config::FileSystemAuthzMode;
 use crate::metrics::AUTHZ_ALLOW_NONE_TOTAL;
@@ -19,6 +17,7 @@ use crate::service::domain::RequestContext;
 use async_trait::async_trait;
 use bitflags::bitflags;
 use common::error::canonical::CanonicalError;
+use common::error::{CommonError, CommonErrorCode};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -128,47 +127,17 @@ impl PermissionChecker for NonePermissionChecker {
     }
 }
 
-#[derive(Clone)]
-pub struct PermissionCheckerDeps {
-    pub group_resolver: Arc<dyn GroupResolver>,
-    pub inode_perm_reader: Arc<dyn InodePermReader>,
-}
-
-impl PermissionCheckerDeps {
-    pub fn new(group_resolver: Arc<dyn GroupResolver>, inode_perm_reader: Arc<dyn InodePermReader>) -> Self {
-        Self {
-            group_resolver,
-            inode_perm_reader,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PermissionCheckerKind {
-    None,
-    Acl,
-    Ranger,
-}
-
-fn filesystem_permission_checker_kind(mode: FileSystemAuthzMode) -> PermissionCheckerKind {
+pub fn filesystem_permission_checker(mode: FileSystemAuthzMode) -> Result<Arc<dyn PermissionChecker>, CommonError> {
     match mode {
-        FileSystemAuthzMode::None => PermissionCheckerKind::None,
-        FileSystemAuthzMode::Acl => PermissionCheckerKind::Acl,
-        FileSystemAuthzMode::Ranger => PermissionCheckerKind::Ranger,
-    }
-}
-
-pub fn filesystem_permission_checker(
-    mode: FileSystemAuthzMode,
-    deps: &PermissionCheckerDeps,
-) -> Arc<dyn PermissionChecker> {
-    match filesystem_permission_checker_kind(mode) {
-        PermissionCheckerKind::None => Arc::new(NonePermissionChecker),
-        PermissionCheckerKind::Acl => Arc::new(AclPermissionChecker::new(
-            Arc::clone(&deps.group_resolver),
-            Arc::clone(&deps.inode_perm_reader),
+        FileSystemAuthzMode::None => Ok(Arc::new(NonePermissionChecker)),
+        FileSystemAuthzMode::Acl => Err(CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            "ACL permission mode is not implemented yet",
         )),
-        PermissionCheckerKind::Ranger => Arc::new(RangerPermissionChecker::new()),
+        FileSystemAuthzMode::Ranger => Err(CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            "Ranger permission mode is not implemented yet",
+        )),
     }
 }
 
@@ -176,18 +145,15 @@ pub fn filesystem_permission_checker(
 mod tests {
     use super::*;
     use common::header::RequestHeader;
-    use std::collections::BTreeMap;
     use types::fs::InodeId;
     use types::ids::{ClientId, MountId, ShardGroupId};
 
-    fn test_request_context(principal: Option<&str>) -> RequestContext {
-        let mut caller = RequestHeader::new(ClientId::new(101));
-        caller.principal = principal.map(ToString::to_string);
+    fn test_request_context() -> RequestContext {
         RequestContext {
-            caller,
+            caller: RequestHeader::new(ClientId::new(101)),
             traceparent: None,
             route_epoch: None,
-            principal: principal.map(ToString::to_string),
+            principal: None,
             real_user: None,
             doas: None,
             authn_type: common::header::AuthnType::Unspecified,
@@ -210,40 +176,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn none_permission_checker_allows_resolved_operation_facts() {
-        let req_ctx = test_request_context(None);
+    async fn none_permission_checker_allows_all_operations() {
+        let req_ctx = test_request_context();
         let checker = NonePermissionChecker;
-        let traverse = [InodeId::new(1), InodeId::new(2)];
-        let resolved = resolved_parent(InodeId::new(3), traverse.to_vec());
+        let resolved = resolved_parent(InodeId::new(3), vec![InodeId::new(1), InodeId::new(2)]);
 
+        checker
+            .check_perm(&req_ctx, PermissionBits::READ, "/mnt/target", &resolved)
+            .await
+            .expect("NONE permission mode allows direct permission checks");
         checker
             .check_parent_perm(&req_ctx, PermissionBits::WRITE, "/mnt/parent/new-file", &resolved)
             .await
-            .expect("NONE permission mode must allow without reading facts");
+            .expect("NONE permission mode allows parent permission checks");
+        checker
+            .check_set_attr_perm(&req_ctx, "/mnt/target", &resolved, SetAttrPerm::default())
+            .await
+            .expect("NONE permission mode allows setattr permission checks");
+        checker
+            .check_super(&req_ctx)
+            .await
+            .expect("NONE permission mode allows superuser checks");
+
+        assert_eq!(
+            checker
+                .get_perm(&req_ctx, "/mnt/target", &resolved)
+                .await
+                .expect("NONE permission mode reports allow-all bits"),
+            PermissionBits::all()
+        );
     }
 
     #[test]
-    fn auth_mode_selection_matches_permission_checker_contract() {
-        assert_eq!(
-            filesystem_permission_checker_kind(FileSystemAuthzMode::None),
-            PermissionCheckerKind::None
-        );
-        assert_eq!(
-            filesystem_permission_checker_kind(FileSystemAuthzMode::Acl),
-            PermissionCheckerKind::Acl
-        );
-        assert_eq!(
-            filesystem_permission_checker_kind(FileSystemAuthzMode::Ranger),
-            PermissionCheckerKind::Ranger
-        );
-    }
+    fn factory_constructs_none_and_rejects_future_modes() {
+        assert!(filesystem_permission_checker(FileSystemAuthzMode::None).is_ok());
 
-    #[test]
-    fn public_reexports_compile() {
-        let resolver: Arc<dyn GroupResolver> = Arc::new(StaticGroupResolver::new(BTreeMap::new()));
-        let reader: Arc<dyn InodePermReader> = Arc::new(StaticPermReader::new(Vec::new()));
-        let _acl = AclPermissionChecker::new(Arc::clone(&resolver), Arc::clone(&reader));
-        let _ranger = RangerPermissionChecker::new();
-        let _deps = PermissionCheckerDeps::new(resolver, reader);
+        match filesystem_permission_checker(FileSystemAuthzMode::Acl) {
+            Ok(_) => panic!("ACL mode must fail fast instead of mapping to NONE"),
+            Err(err) => assert_eq!(err.message, "ACL permission mode is not implemented yet"),
+        }
+
+        match filesystem_permission_checker(FileSystemAuthzMode::Ranger) {
+            Ok(_) => panic!("Ranger mode must fail fast instead of mapping to NONE"),
+            Err(err) => assert_eq!(err.message, "Ranger permission mode is not implemented yet"),
+        }
     }
 }

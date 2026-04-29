@@ -11,9 +11,8 @@ use crate::metrics::MetadataMetrics;
 use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use crate::readiness::{wait_for_root_ready_with_metrics, RootReadinessGate};
 use crate::service::{
-    cached_static_group_resolver, filesystem_permission_checker, FileSystemAuthorityDeps, FileSystemPolicyDeps,
-    FileSystemRuntimeDeps, MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl, PermissionCheckerDeps,
-    RocksDbInodePermReader, SharedWorkerCommitHook,
+    filesystem_permission_checker, FileSystemAuthorityDeps, FileSystemPolicyDeps, FileSystemRuntimeDeps,
+    MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl, SharedWorkerCommitHook,
 };
 use crate::state::RaftStateStore;
 use crate::ufs_proxy::UfsMetadataProxy;
@@ -444,15 +443,6 @@ pub async fn build_filesystem_service(
     worker_manager: Arc<WorkerManager>,
     readiness: &Readiness,
 ) -> Result<MetadataFileSystemServiceImpl, DynError> {
-    let permission_deps = PermissionCheckerDeps::new(
-        cached_static_group_resolver(
-            config.authz.groups.static_mappings.clone(),
-            config.authz.groups.cache_ttl_secs,
-            config.authz.groups.stale_while_error,
-        ),
-        Arc::new(RocksDbInodePermReader::new(Arc::clone(&authority.storage), 2)),
-    );
-
     let write_session_manager = Arc::new(crate::write_session::WriteSessionManager::default());
     let inode_lease_manager = Arc::new(crate::inode_lease::InodeLeaseManager::default());
     let worker_commit_hook: SharedWorkerCommitHook = Arc::new(Mutex::new(None));
@@ -473,8 +463,7 @@ pub async fn build_filesystem_service(
         },
         policy: FileSystemPolicyDeps {
             leadership_checker: None,
-            permission_checker: filesystem_permission_checker(config.authz.filesystem.mode, &permission_deps),
-            inode_perm_reader: Some(Arc::clone(&permission_deps.inode_perm_reader)),
+            permission_checker: filesystem_permission_checker(config.authz.filesystem.mode)?,
         },
     });
 

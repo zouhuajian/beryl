@@ -15,10 +15,7 @@ mod path_service;
 
 // pub use client_service::MetadataClientServiceImpl;
 pub use self::auth::{
-    cached_static_group_resolver, filesystem_permission_checker, AclPermissionChecker, CachedGroupResolver,
-    GroupResolver, InodePermInputs, InodePermReader, NonePermissionChecker, PermissionBits, PermissionChecker,
-    PermissionCheckerDeps, RangerPermissionChecker, RocksDbInodePermReader, SetAttrPerm, StaticGroupResolver,
-    StaticPermReader,
+    filesystem_permission_checker, NonePermissionChecker, PermissionBits, PermissionChecker, SetAttrPerm,
 };
 pub use core_util::{
     extent_from_proto, extent_to_proto, extract_and_inject_context, fatal_fs_header, fencing_to_proto,

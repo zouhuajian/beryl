@@ -3,8 +3,12 @@
 
 //! FileSystemServiceProto implementation.
 //!
-//! This is a thin adapter layer that converts path-based requests to inode-based operations.
-//! All FS semantics are delegated to FsCore domain APIs.
+//! This module keeps the complete path-first RPC API view. It orchestrates
+//! request context extraction, guard checks, path resolution, permission
+//! checks, FsCore calls, and response/header construction.
+//!
+//! Provider-specific permission rules live behind GuardChain/PermissionChecker.
+//! Domain freshness, session, lease, and fencing semantics remain in FsCore.
 
 use super::domain::{
     CloseWriteInput, CloseWriteIntent, CreateInput, FileRange, Freshness, FsyncBarrierInput, GetAttrInput,
@@ -19,7 +23,7 @@ use super::{
     lease_id_to_proto, location_to_proto, need_refresh_header, ok_header_from_core_success, ok_header_from_request,
     presented_fencing_from_proto, request_context_from_proto, write_target_to_proto,
 };
-use super::{FsCore, InodePermReader, PermissionBits, PermissionChecker, SharedWorkerCommitHook};
+use super::{FsCore, PermissionBits, PermissionChecker, SharedWorkerCommitHook};
 use crate::error::{to_canonical_fs, MetadataError};
 use crate::mount::MountTable;
 use crate::path_resolver::{MountContext, PathResolver};
@@ -36,7 +40,6 @@ pub struct MetadataFileSystemServiceImpl {
     fs_core: Arc<FsCore>,
     guard_chain: GuardChain,
     metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
-    inode_perm_reader: Option<Arc<dyn InodePermReader>>,
 }
 
 macro_rules! response_with_header {
@@ -87,7 +90,6 @@ pub struct FileSystemRuntimeDeps {
 pub struct FileSystemPolicyDeps {
     pub leadership_checker: Option<Arc<dyn LeadershipChecker>>,
     pub permission_checker: Arc<dyn PermissionChecker>,
-    pub inode_perm_reader: Option<Arc<dyn InodePermReader>>,
 }
 
 impl MetadataFileSystemServiceImpl {
@@ -114,7 +116,6 @@ impl MetadataFileSystemServiceImpl {
         let FileSystemPolicyDeps {
             leadership_checker,
             permission_checker,
-            inode_perm_reader,
         } = policy;
 
         let path_resolver = PathResolver::new(Arc::clone(&mount_table), Arc::clone(&storage));
@@ -152,7 +153,6 @@ impl MetadataFileSystemServiceImpl {
             fs_core,
             guard_chain,
             metrics,
-            inode_perm_reader,
         }
     }
 
@@ -1174,9 +1174,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             .await
         {
             Ok(success) => {
-                if let Some(reader) = self.inode_perm_reader.as_ref() {
-                    reader.invalidate(inode_id);
-                }
                 response_with_header!(
                     SetXattrPathResponseProto::default(),
                     ok_header_from_core_success(&req_ctx, &success)
@@ -1361,9 +1358,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             .await
         {
             Ok(success) => {
-                if let Some(reader) = self.inode_perm_reader.as_ref() {
-                    reader.invalidate(inode_id);
-                }
                 response_with_header!(
                     RemoveXattrPathResponseProto::default(),
                     ok_header_from_core_success(&req_ctx, &success)
