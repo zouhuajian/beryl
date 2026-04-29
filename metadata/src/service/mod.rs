@@ -6,7 +6,7 @@
 //! Implements MetadataClientService RPC handlers with proper context propagation
 //! and error handling.
 
-pub mod authz;
+pub mod auth;
 mod core_util;
 pub mod domain;
 mod fs_core;
@@ -14,10 +14,11 @@ mod guard;
 mod path_service;
 
 // pub use client_service::MetadataClientServiceImpl;
-pub use self::authz::{
-    cached_static_group_resolver, filesystem_authz_provider, AclInodeAuthz, AllowAllAuthz, AuthzOp, AuthzProvider,
-    AuthzProviderDeps, AuthzScheme, AuthzTarget, CachedGroupResolver, DenyAllAuthz, GroupResolver, InodePermInputs,
-    InodePermReader, RocksDbInodePermReader, StaticGroupResolver, StubRangerAuthz,
+pub use self::auth::{
+    cached_static_group_resolver, filesystem_permission_checker, AclPermissionChecker, CachedGroupResolver,
+    GroupResolver, InodePermInputs, InodePermReader, NonePermissionChecker, PermissionBits, PermissionChecker,
+    PermissionCheckerDeps, RangerPermissionChecker, RocksDbInodePermReader, SetAttrPerm, StaticGroupResolver,
+    StaticPermReader,
 };
 pub use core_util::{
     extent_from_proto, extent_to_proto, extract_and_inject_context, fatal_fs_header, fencing_to_proto,
@@ -29,7 +30,7 @@ pub use core_util::{
 };
 pub(crate) use fs_core::FsCore;
 pub use fs_core::SharedWorkerCommitHook;
-pub use guard::{AuthzContext, LeadershipChecker};
+pub use guard::{GuardChain, GuardFailure, LeadershipChecker};
 pub use path_service::{
     FileSystemAuthorityDeps, FileSystemPolicyDeps, FileSystemRuntimeDeps, MetadataFileSystemServiceDeps,
     MetadataFileSystemServiceImpl,

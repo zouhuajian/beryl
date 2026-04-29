@@ -3,46 +3,19 @@
 
 //! Request guard pipeline for metadata services.
 
-use super::authz::{AllowAllAuthz, AuthzOp, AuthzProvider, AuthzTarget};
+use super::auth::{NonePermissionChecker, PermissionBits, PermissionChecker, SetAttrPerm};
 use super::domain::RequestContext;
 use crate::data_io::DataIoOp;
 use crate::error::{to_canonical_rpc, MetadataError};
 use crate::mount::{DataIoPolicy, MountTable, ROOT_MOUNT_PREFIX};
+use crate::path_resolver::ResolvedPath;
 use crate::raft::AppRaftNode;
 use crate::readiness::RootReadinessGate;
 use common::error::canonical::{CanonicalError, RefreshHint, RefreshReason};
-use common::header::{RequestHeader, RpcErrorCode};
+use common::header::RpcErrorCode;
 use std::sync::Arc;
 use types::fs::FsErrorCode;
 use types::ids::MountId;
-
-#[derive(Clone, Debug)]
-pub struct AuthzCheck {
-    pub op: AuthzOp,
-    pub target: AuthzTarget,
-}
-
-#[derive(Clone, Debug)]
-pub struct AuthzContext {
-    pub op: AuthzOp,
-    pub targets: Vec<AuthzTarget>,
-    pub pre_checks: Vec<AuthzCheck>,
-}
-
-impl AuthzContext {
-    pub fn new(op: AuthzOp, targets: Vec<AuthzTarget>) -> Self {
-        Self {
-            op,
-            targets,
-            pre_checks: Vec::new(),
-        }
-    }
-
-    pub fn with_pre_checks(mut self, pre_checks: Vec<AuthzCheck>) -> Self {
-        self.pre_checks = pre_checks;
-        self
-    }
-}
 
 pub trait LeadershipChecker: Send + Sync {
     fn is_leader(&self) -> bool;
@@ -64,83 +37,6 @@ impl LeadershipChecker for AppRaftNode {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct GuardPolicy {
-    pub requires_root_ready: bool,
-    pub requires_raft: bool,
-    pub requires_leader: bool,
-    pub data_io_op: Option<DataIoOp>,
-    pub enforce_authz: bool,
-}
-
-impl GuardPolicy {
-    pub const PATH_READ_PRE: Self = Self {
-        requires_root_ready: true,
-        requires_raft: false,
-        requires_leader: false,
-        data_io_op: None,
-        enforce_authz: false,
-    };
-
-    pub const PATH_WRITE_PRE: Self = Self {
-        requires_root_ready: true,
-        requires_raft: false,
-        requires_leader: true,
-        data_io_op: None,
-        enforce_authz: false,
-    };
-
-    pub const METADATA_READ: Self = Self {
-        requires_root_ready: true,
-        requires_raft: false,
-        requires_leader: false,
-        data_io_op: None,
-        enforce_authz: true,
-    };
-
-    pub const METADATA_WRITE: Self = Self {
-        requires_root_ready: true,
-        requires_raft: false,
-        requires_leader: true,
-        data_io_op: None,
-        enforce_authz: true,
-    };
-
-    pub const fn data_io(op: DataIoOp) -> Self {
-        Self {
-            requires_root_ready: true,
-            requires_raft: false,
-            requires_leader: false,
-            data_io_op: Some(op),
-            enforce_authz: false,
-        }
-    }
-
-    pub const fn with_leader(mut self) -> Self {
-        self.requires_leader = true;
-        self
-    }
-
-    pub const fn with_raft(mut self) -> Self {
-        self.requires_raft = true;
-        self
-    }
-
-    pub const fn with_authz(mut self) -> Self {
-        self.enforce_authz = true;
-        self
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct GuardContext<'a> {
-    pub req_header_proto: &'a Option<proto::common::RequestHeaderProto>,
-    pub caller: &'a RequestHeader,
-    pub policy: GuardPolicy,
-    pub mount_id: Option<MountId>,
-    pub authz: Option<AuthzContext>,
-}
-
 #[derive(Clone, Debug)]
 pub struct GuardFailure {
     pub err: CanonicalError,
@@ -157,8 +53,6 @@ impl GuardFailure {
         }
     }
 
-    /// Keep the production RPC-side metadata->canonical mapping visible in the
-    /// guard path instead of hiding it behind implicit conversions.
     fn from_rpc_metadata_error(err: MetadataError) -> Self {
         Self::new(to_canonical_rpc(err))
     }
@@ -175,7 +69,7 @@ pub struct GuardChain {
     readiness: ReadinessGuard,
     leadership: LeadershipGuard,
     data_io: DataIoPolicyGuard,
-    authz: AuthGuard,
+    permission: Arc<dyn PermissionChecker>,
 }
 
 impl GuardChain {
@@ -184,9 +78,7 @@ impl GuardChain {
             readiness: ReadinessGuard { readiness_gate: None },
             leadership: LeadershipGuard { checker: None },
             data_io: DataIoPolicyGuard { mount_table },
-            authz: AuthGuard {
-                provider: Arc::new(AllowAllAuthz),
-            },
+            permission: Arc::new(NonePermissionChecker),
         }
     }
 
@@ -200,8 +92,8 @@ impl GuardChain {
         self
     }
 
-    pub(crate) fn with_authz_provider(mut self, provider: Arc<dyn AuthzProvider>) -> Self {
-        self.authz.provider = provider;
+    pub(crate) fn with_permission_checker(mut self, checker: Arc<dyn PermissionChecker>) -> Self {
+        self.permission = checker;
         self
     }
 
@@ -219,59 +111,71 @@ impl GuardChain {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_authz_provider(&mut self, provider: Arc<dyn AuthzProvider>) {
-        self.authz.provider = provider;
+    pub(crate) fn set_permission_checker(&mut self, checker: Arc<dyn PermissionChecker>) {
+        self.permission = checker;
     }
 
-    pub async fn check(&self, ctx: &GuardContext<'_>) -> Result<(), GuardFailure> {
-        if ctx.policy.requires_root_ready {
-            self.readiness.check(ctx)?;
-        }
-        if ctx.policy.data_io_op.is_some() {
-            self.data_io.check(ctx)?;
-        }
-        if ctx.policy.requires_raft || ctx.policy.requires_leader {
-            self.leadership.check(ctx)?;
-        }
-        if ctx.policy.enforce_authz {
-            if ctx.authz.is_none() {
-                return Err(GuardFailure::from_rpc_metadata_error(MetadataError::InvalidArgument(
-                    "missing authz context".to_string(),
-                )));
-            }
-            self.authz.check(ctx).await?;
-        }
-        Ok(())
+    pub async fn check_meta_read(&self, _ctx: &RequestContext) -> Result<(), GuardFailure> {
+        self.readiness.check()
     }
 
-    pub async fn check_request(
+    pub async fn check_meta_write(&self, ctx: &RequestContext) -> Result<(), GuardFailure> {
+        self.readiness.check()?;
+        self.leadership.check(ctx)
+    }
+
+    pub async fn check_data_read(&self, _ctx: &RequestContext, mount_id: MountId) -> Result<(), GuardFailure> {
+        self.readiness.check()?;
+        self.data_io.check(mount_id, DataIoOp::Read)
+    }
+
+    pub async fn check_data_write(&self, ctx: &RequestContext, mount_id: MountId) -> Result<(), GuardFailure> {
+        self.readiness.check()?;
+        self.leadership.check(ctx)?;
+        self.data_io.check(mount_id, DataIoOp::Write)
+    }
+
+    pub async fn check_perm(
         &self,
-        req_header_proto: &Option<proto::common::RequestHeaderProto>,
-        caller: &RequestHeader,
-        policy: GuardPolicy,
-        mount_id: Option<MountId>,
-        authz: Option<AuthzContext>,
+        ctx: &RequestContext,
+        bits: PermissionBits,
+        path: &str,
+        resolved: &ResolvedPath,
     ) -> Result<(), GuardFailure> {
-        let ctx = GuardContext {
-            req_header_proto,
-            caller,
-            policy,
-            mount_id,
-            authz,
-        };
-        self.check(&ctx).await
+        self.permission
+            .check_perm(ctx, bits, path, resolved)
+            .await
+            .map_err(GuardFailure::new)
     }
 
-    pub async fn check_system(&self, policy: GuardPolicy) -> Result<(), GuardFailure> {
-        let caller = RequestHeader::new(types::ClientId::new(0));
-        let ctx = GuardContext {
-            req_header_proto: &None,
-            caller: &caller,
-            policy,
-            mount_id: None,
-            authz: None,
-        };
-        self.check(&ctx).await
+    pub async fn check_parent_perm(
+        &self,
+        ctx: &RequestContext,
+        bits: PermissionBits,
+        path: &str,
+        resolved: &ResolvedPath,
+    ) -> Result<(), GuardFailure> {
+        self.permission
+            .check_parent_perm(ctx, bits, path, resolved)
+            .await
+            .map_err(GuardFailure::new)
+    }
+
+    pub async fn check_set_attr_perm(
+        &self,
+        ctx: &RequestContext,
+        path: &str,
+        resolved: &ResolvedPath,
+        req: SetAttrPerm,
+    ) -> Result<(), GuardFailure> {
+        self.permission
+            .check_set_attr_perm(ctx, path, resolved, req)
+            .await
+            .map_err(GuardFailure::new)
+    }
+
+    pub async fn check_super(&self, ctx: &RequestContext) -> Result<(), GuardFailure> {
+        self.permission.check_super(ctx).await.map_err(GuardFailure::new)
     }
 }
 
@@ -281,7 +185,7 @@ struct ReadinessGuard {
 }
 
 impl ReadinessGuard {
-    fn check(&self, _ctx: &GuardContext) -> Result<(), GuardFailure> {
+    fn check(&self) -> Result<(), GuardFailure> {
         let Some(gate) = self.readiness_gate.as_ref() else {
             return Ok(());
         };
@@ -300,7 +204,7 @@ struct LeadershipGuard {
 }
 
 impl LeadershipGuard {
-    fn check(&self, ctx: &GuardContext) -> Result<(), GuardFailure> {
+    fn check(&self, ctx: &RequestContext) -> Result<(), GuardFailure> {
         let Some(checker) = self.checker.as_ref() else {
             return Err(GuardFailure::from_rpc_metadata_error(
                 MetadataError::ServiceUnavailable("raft node not available".to_string()),
@@ -309,14 +213,9 @@ impl LeadershipGuard {
         if checker.is_leader() {
             Ok(())
         } else {
-            let group_id = ctx
-                .req_header_proto
-                .as_ref()
-                .and_then(|header| (header.group_id != 0).then_some(header.group_id))
-                .or(ctx.caller.group_id);
             let hint = RefreshHint {
                 leader_endpoint: checker.leader_endpoint(),
-                group_id,
+                group_id: ctx.caller.group_id,
                 ..Default::default()
             };
             Err(GuardFailure::new(CanonicalError::need_refresh_with_hint(
@@ -335,16 +234,7 @@ struct DataIoPolicyGuard {
 }
 
 impl DataIoPolicyGuard {
-    fn check(&self, ctx: &GuardContext) -> Result<(), GuardFailure> {
-        let Some(op) = ctx.policy.data_io_op else {
-            return Ok(());
-        };
-        let mount_id = ctx.mount_id.ok_or_else(|| {
-            GuardFailure::from_rpc_metadata_error(MetadataError::InvalidArgument(
-                "missing mount_id for data-io guard".to_string(),
-            ))
-        })?;
-
+    fn check(&self, mount_id: MountId, op: DataIoOp) -> Result<(), GuardFailure> {
         let mount_entry = self
             .mount_table
             .get_mount(mount_id)
@@ -376,51 +266,14 @@ impl DataIoPolicyGuard {
     }
 }
 
-#[derive(Clone)]
-struct AuthGuard {
-    provider: Arc<dyn AuthzProvider>,
-}
-
-impl AuthGuard {
-    async fn check(&self, ctx: &GuardContext<'_>) -> Result<(), GuardFailure> {
-        let Some(authz_ctx) = ctx.authz.as_ref() else {
-            return Ok(());
-        };
-        let req_ctx = RequestContext {
-            caller: ctx.caller.clone(),
-            traceparent: ctx.caller.traceparent.clone(),
-            route_epoch: ctx.req_header_proto.as_ref().and_then(|h| h.route_epoch),
-            principal: ctx.caller.principal.clone(),
-            real_user: ctx.caller.real_user.clone(),
-            doas: ctx.caller.doas.clone(),
-            authn_type: ctx.caller.authn_type,
-        };
-        for check in &authz_ctx.pre_checks {
-            self.provider
-                .authorize(&req_ctx, check.target.clone(), check.op)
-                .await
-                .map_err(GuardFailure::new)?;
-        }
-        for target in &authz_ctx.targets {
-            self.provider
-                .authorize(&req_ctx, target.clone(), authz_ctx.op)
-                .await
-                .map_err(GuardFailure::new)?;
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::authz::AuthzScheme;
     use super::*;
     use crate::mount::{DataIoPolicy, MountKind, ROOT_INODE_ID};
     use crate::readiness::RootReadinessGate;
     use async_trait::async_trait;
-    use common::error::canonical::CanonicalError;
     use common::error::canonical::{ErrorClass, ErrorCode};
-    use common::header::RpcErrorCode;
+    use common::header::{RequestHeader, RpcErrorCode};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use types::ids::ShardGroupId;
 
@@ -432,40 +285,84 @@ mod tests {
         }
     }
 
-    struct CountingAuthz {
-        calls: Arc<AtomicUsize>,
+    struct CountingPermissionChecker {
+        perm_calls: Arc<AtomicUsize>,
+        parent_calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
-    impl AuthzProvider for CountingAuthz {
-        fn scheme(&self) -> AuthzScheme {
-            AuthzScheme::None
+    impl PermissionChecker for CountingPermissionChecker {
+        async fn check_perm(
+            &self,
+            _ctx: &RequestContext,
+            _bits: PermissionBits,
+            _path: &str,
+            _resolved: &ResolvedPath,
+        ) -> Result<(), CanonicalError> {
+            self.perm_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
 
-        async fn authorize(
+        async fn check_parent_perm(
             &self,
-            _req_ctx: &RequestContext,
-            _target: AuthzTarget,
-            _op: AuthzOp,
+            _ctx: &RequestContext,
+            _bits: PermissionBits,
+            _path: &str,
+            _resolved: &ResolvedPath,
         ) -> Result<(), CanonicalError> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.parent_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn check_super(&self, _ctx: &RequestContext) -> Result<(), CanonicalError> {
+            Ok(())
+        }
+
+        async fn get_perm(
+            &self,
+            _ctx: &RequestContext,
+            _path: &str,
+            _resolved: &ResolvedPath,
+        ) -> Result<PermissionBits, CanonicalError> {
+            Ok(PermissionBits::all())
+        }
+
+        async fn check_set_attr_perm(
+            &self,
+            _ctx: &RequestContext,
+            _path: &str,
+            _resolved: &ResolvedPath,
+            _req: SetAttrPerm,
+        ) -> Result<(), CanonicalError> {
             Ok(())
         }
     }
 
-    fn base_context<'a>(
-        policy: GuardPolicy,
-        mount_id: Option<MountId>,
-        authz: Option<AuthzContext>,
-        caller: &'a RequestHeader,
-        req_header: &'a Option<proto::common::RequestHeaderProto>,
-    ) -> GuardContext<'a> {
-        GuardContext {
-            req_header_proto: req_header,
-            caller,
-            policy,
-            mount_id,
-            authz,
+    fn request_context(client_id: u64) -> RequestContext {
+        let caller = RequestHeader::new(types::ClientId::new(client_id));
+        RequestContext {
+            caller: caller.clone(),
+            traceparent: caller.traceparent.clone(),
+            route_epoch: None,
+            principal: caller.principal.clone(),
+            real_user: caller.real_user.clone(),
+            doas: caller.doas.clone(),
+            authn_type: caller.authn_type,
+        }
+    }
+
+    fn resolved_path() -> ResolvedPath {
+        ResolvedPath {
+            mount_ctx: crate::path_resolver::MountContext {
+                mount_id: MountId::new(1),
+                mount_epoch: 1,
+                owner_group_id: ShardGroupId::new(1),
+                root_inode_id: ROOT_INODE_ID,
+            },
+            parent_inode_id: Some(ROOT_INODE_ID),
+            name: Some("file".to_string()),
+            inode_id: Some(types::fs::InodeId::new(2)),
+            traverse_dir_inode_ids: vec![ROOT_INODE_ID],
         }
     }
 
@@ -476,37 +373,54 @@ mod tests {
         let gate = Arc::new(RootReadinessGate::new(None));
         chain.set_readiness_gate(Arc::clone(&gate));
 
-        let caller = RequestHeader::new(types::ClientId::new(1));
-        let req_header = None;
-        let ctx = base_context(GuardPolicy::METADATA_READ, None, None, &caller, &req_header);
-
-        let err = chain.check(&ctx).await.unwrap_err();
+        let err = chain.check_meta_read(&request_context(1)).await.unwrap_err();
         assert_eq!(err.err.class, ErrorClass::Retryable);
         assert_eq!(err.err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NodeUnavailable)));
-        assert_eq!(gate.is_ready(), false);
+        assert!(!gate.is_ready());
+    }
+
+    #[tokio::test]
+    async fn check_meta_write_checks_readiness_then_leadership() {
+        let mut chain = GuardChain::new(Arc::new(MountTable::new()));
+        let gate = Arc::new(RootReadinessGate::new(None));
+        chain.set_readiness_gate(Arc::clone(&gate));
+        chain.set_leadership_checker(Arc::new(StaticLeader(false)));
+
+        let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
+        assert_eq!(err.err.class, ErrorClass::Retryable);
+        assert_eq!(err.err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NodeUnavailable)));
     }
 
     #[tokio::test]
     async fn leadership_guard_returns_not_leader() {
-        let mount_table = Arc::new(MountTable::new());
-        let mut chain = GuardChain::new(mount_table);
+        let mut chain = GuardChain::new(Arc::new(MountTable::new()));
         chain.set_leadership_checker(Arc::new(StaticLeader(false)));
 
-        let caller = RequestHeader::new(types::ClientId::new(2));
-        let req_header = None;
-        let ctx = base_context(
-            GuardPolicy::METADATA_WRITE,
-            None,
-            Some(AuthzContext {
-                op: AuthzOp::Write,
-                targets: vec![AuthzTarget::for_path("/test".to_string())],
-                pre_checks: Vec::new(),
-            }),
-            &caller,
-            &req_header,
-        );
+        let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
+        assert_eq!(err.err.class, ErrorClass::NeedRefresh);
+        assert_eq!(err.err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NotLeader)));
+    }
 
-        let err = chain.check(&ctx).await.unwrap_err();
+    #[tokio::test]
+    async fn check_data_write_checks_leadership_before_data_io_policy() {
+        let mount_table = Arc::new(MountTable::new());
+        let root_entry = mount_table
+            .create_mount(
+                ROOT_MOUNT_PREFIX.to_string(),
+                MountKind::Internal,
+                None,
+                DataIoPolicy::Forbid,
+                ShardGroupId::new(1),
+                ROOT_INODE_ID,
+            )
+            .unwrap();
+        let mut chain = GuardChain::new(Arc::clone(&mount_table));
+        chain.set_leadership_checker(Arc::new(StaticLeader(false)));
+
+        let err = chain
+            .check_data_write(&request_context(3), root_entry.mount_id)
+            .await
+            .unwrap_err();
         assert_eq!(err.err.class, ErrorClass::NeedRefresh);
         assert_eq!(err.err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NotLeader)));
     }
@@ -526,17 +440,10 @@ mod tests {
             .unwrap();
         let chain = GuardChain::new(Arc::clone(&mount_table));
 
-        let caller = RequestHeader::new(types::ClientId::new(3));
-        let req_header = None;
-        let ctx = base_context(
-            GuardPolicy::data_io(DataIoOp::Read),
-            Some(root_entry.mount_id),
-            None,
-            &caller,
-            &req_header,
-        );
-
-        let err = chain.check(&ctx).await.unwrap_err();
+        let err = chain
+            .check_data_read(&request_context(3), root_entry.mount_id)
+            .await
+            .unwrap_err();
         assert_eq!(err.err.class, ErrorClass::Fatal);
         assert_eq!(err.err.code, Some(ErrorCode::FsErrno(FsErrorCode::ENotsup)));
         assert!(err.err.message.contains("RootDataIoForbidden"));
@@ -545,43 +452,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_read_requires_authz_context() {
-        let chain = GuardChain::new(Arc::new(MountTable::new()));
-        let caller = RequestHeader::new(types::ClientId::new(4));
-        let req_header = None;
-        let ctx = base_context(GuardPolicy::METADATA_READ, None, None, &caller, &req_header);
-
-        let err = chain.check(&ctx).await.unwrap_err();
-        assert_eq!(err.err.class, ErrorClass::Fatal);
-        assert!(err.err.message.contains("missing authz context"));
-    }
-
-    #[tokio::test]
-    async fn auth_guard_authorizes_all_targets() {
-        let call_counter = Arc::new(AtomicUsize::new(0));
+    async fn permission_methods_delegate_to_configured_checker() {
+        let perm_calls = Arc::new(AtomicUsize::new(0));
+        let parent_calls = Arc::new(AtomicUsize::new(0));
         let mut chain = GuardChain::new(Arc::new(MountTable::new()));
-        chain.set_authz_provider(Arc::new(CountingAuthz {
-            calls: Arc::clone(&call_counter),
+        chain.set_permission_checker(Arc::new(CountingPermissionChecker {
+            perm_calls: Arc::clone(&perm_calls),
+            parent_calls: Arc::clone(&parent_calls),
         }));
+        let ctx = request_context(5);
+        let resolved = resolved_path();
 
-        let caller = RequestHeader::new(types::ClientId::new(5));
-        let req_header = None;
-        let ctx = base_context(
-            GuardPolicy::METADATA_READ,
-            None,
-            Some(AuthzContext {
-                op: AuthzOp::Rename,
-                targets: vec![
-                    AuthzTarget::for_path("/src".to_string()),
-                    AuthzTarget::for_path_parent("/dst-parent", "name"),
-                ],
-                pre_checks: Vec::new(),
-            }),
-            &caller,
-            &req_header,
-        );
+        chain
+            .check_perm(&ctx, PermissionBits::READ, "/file", &resolved)
+            .await
+            .unwrap();
+        chain
+            .check_parent_perm(&ctx, PermissionBits::WRITE, "/file", &resolved)
+            .await
+            .unwrap();
+        chain.check_super(&ctx).await.unwrap();
+        chain
+            .check_set_attr_perm(&ctx, "/file", &resolved, SetAttrPerm::default())
+            .await
+            .unwrap();
 
-        chain.check(&ctx).await.unwrap();
-        assert_eq!(call_counter.load(Ordering::Relaxed), 2);
+        assert_eq!(perm_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(parent_calls.load(Ordering::Relaxed), 1);
     }
 }

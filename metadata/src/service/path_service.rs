@@ -12,33 +12,29 @@ use super::domain::{
     ReleaseSessionInput, RemoveXattrInput, RenameInput, RenewLeaseInput, RmdirInput, SetXattrInput, TruncateInput,
     UnlinkInput,
 };
-use super::extract_and_inject_context;
-use super::guard::{AuthzCheck, AuthzContext, GuardChain, GuardPolicy, LeadershipChecker};
+use super::guard::{GuardChain, GuardFailure, LeadershipChecker};
 use super::{
     extent_from_proto, extent_to_proto, fencing_to_proto, file_attrs_from_proto, file_attrs_to_proto,
     file_layout_from_proto, header_from_canonical_error, header_from_core_failure, lease_id_from_proto,
     lease_id_to_proto, location_to_proto, need_refresh_header, ok_header_from_core_success, ok_header_from_request,
     presented_fencing_from_proto, request_context_from_proto, write_target_to_proto,
 };
-use super::{AuthzOp, AuthzProvider, AuthzScheme, AuthzTarget, FsCore, InodePermReader, SharedWorkerCommitHook};
-use crate::data_io::DataIoOp;
-use crate::error::{to_canonical_fs, MetadataError, MetadataResult};
+use super::{FsCore, InodePermReader, PermissionBits, PermissionChecker, SharedWorkerCommitHook};
+use crate::error::{to_canonical_fs, MetadataError};
 use crate::mount::MountTable;
-use crate::path_resolver::{MountContext, PathResolver, ResolvedInode, ResolvedPath};
+use crate::path_resolver::{MountContext, PathResolver};
 use crate::raft::RocksDBStorage;
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::*;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::instrument;
-use types::fs::InodeId;
 
 /// FileSystemServiceProto implementation.
 pub struct MetadataFileSystemServiceImpl {
     path_resolver: PathResolver,
     fs_core: Arc<FsCore>,
     guard_chain: GuardChain,
-    authz_provider: Arc<dyn AuthzProvider>,
     metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
     inode_perm_reader: Option<Arc<dyn InodePermReader>>,
 }
@@ -57,29 +53,13 @@ macro_rules! error_response {
     }};
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PathRpcAuthz {
-    GetFileStatus,
-    Mkdir,
-    Create,
-    Unlink,
-    Rmdir,
-    Rename,
-    ListStatus,
-    Open,
-    Release,
-    Fsync,
-    Truncate,
-    SetXattr,
-    GetXattr,
-    ListXattr,
-    RemoveXattr,
-    GetFileLayoutByPath,
-    OpenWriteByPath,
-    CloseWriteSession,
-    RenewWriteSessionLease,
-    FsyncSession,
-    ReleaseSession,
+macro_rules! guard_or_error {
+    ($svc:expr, $req:expr, $resp_ty:ty, $check:expr) => {{
+        if let Err(failure) = $check.await {
+            let resp_header = $svc.header_from_guard_failure(&$req.header, failure);
+            return error_response!($resp_ty, resp_header);
+        }
+    }};
 }
 
 pub struct MetadataFileSystemServiceDeps {
@@ -106,7 +86,7 @@ pub struct FileSystemRuntimeDeps {
 
 pub struct FileSystemPolicyDeps {
     pub leadership_checker: Option<Arc<dyn LeadershipChecker>>,
-    pub authz_provider: Arc<dyn AuthzProvider>,
+    pub permission_checker: Arc<dyn PermissionChecker>,
     pub inode_perm_reader: Option<Arc<dyn InodePermReader>>,
 }
 
@@ -133,7 +113,7 @@ impl MetadataFileSystemServiceImpl {
         } = runtime;
         let FileSystemPolicyDeps {
             leadership_checker,
-            authz_provider,
+            permission_checker,
             inode_perm_reader,
         } = policy;
 
@@ -165,210 +145,15 @@ impl MetadataFileSystemServiceImpl {
         let guard_chain = GuardChain::new(mount_table)
             .with_readiness_gate(readiness_gate)
             .with_leadership_checker(leadership_checker)
-            .with_authz_provider(Arc::clone(&authz_provider));
+            .with_permission_checker(permission_checker);
 
         Self {
             path_resolver,
             fs_core,
             guard_chain,
-            authz_provider,
             metrics,
             inode_perm_reader,
         }
-    }
-
-    fn path_parent_target(path: &str) -> MetadataResult<AuthzTarget> {
-        let normalized = PathResolver::normalize(path)?;
-        if normalized == "/" {
-            return Err(MetadataError::InvalidArgument(
-                "Cannot derive parent target from root path".to_string(),
-            ));
-        }
-        let (parent_path, name) = normalized
-            .rsplit_once('/')
-            .ok_or_else(|| MetadataError::InvalidArgument(format!("Invalid path: {}", normalized)))?;
-        let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
-        Ok(AuthzTarget::for_path_parent(parent_path.to_string(), name.to_string()))
-    }
-
-    fn path_target(path: &str) -> MetadataResult<AuthzTarget> {
-        Ok(AuthzTarget::for_path(PathResolver::normalize(path)?))
-    }
-
-    fn authz_targets_for_path(scheme: AuthzScheme, path: &str, inode_id: InodeId) -> MetadataResult<Vec<AuthzTarget>> {
-        match scheme {
-            AuthzScheme::RangerPath => Ok(vec![Self::path_target(path)?]),
-            AuthzScheme::AclInode | AuthzScheme::None => Ok(vec![AuthzTarget::for_inode(inode_id)]),
-        }
-    }
-
-    fn authz_targets_for_parent(
-        scheme: AuthzScheme,
-        path: &str,
-        parent_inode_id: InodeId,
-    ) -> MetadataResult<Vec<AuthzTarget>> {
-        match scheme {
-            AuthzScheme::RangerPath => Ok(vec![Self::path_parent_target(path)?]),
-            AuthzScheme::AclInode | AuthzScheme::None => Ok(vec![AuthzTarget::for_inode(parent_inode_id)]),
-        }
-    }
-
-    fn authz_targets_for_rename(
-        scheme: AuthzScheme,
-        src_path: &str,
-        dst_path: &str,
-        src_parent_inode_id: InodeId,
-        dst_parent_inode_id: InodeId,
-    ) -> MetadataResult<Vec<AuthzTarget>> {
-        match scheme {
-            AuthzScheme::RangerPath => Ok(vec![Self::path_target(src_path)?, Self::path_parent_target(dst_path)?]),
-            AuthzScheme::AclInode | AuthzScheme::None => Ok(vec![
-                AuthzTarget::for_inode(src_parent_inode_id),
-                AuthzTarget::for_inode(dst_parent_inode_id),
-            ]),
-        }
-    }
-
-    fn authz_for_rpc(rpc: PathRpcAuthz, targets: Vec<AuthzTarget>) -> AuthzContext {
-        let op = match rpc {
-            PathRpcAuthz::GetFileStatus | PathRpcAuthz::ListStatus | PathRpcAuthz::Open => AuthzOp::Read,
-            PathRpcAuthz::Mkdir | PathRpcAuthz::Create => AuthzOp::Write,
-            PathRpcAuthz::Unlink | PathRpcAuthz::Rmdir => AuthzOp::Delete,
-            PathRpcAuthz::Rename => AuthzOp::Rename,
-            PathRpcAuthz::GetXattr | PathRpcAuthz::ListXattr | PathRpcAuthz::SetXattr | PathRpcAuthz::RemoveXattr => {
-                AuthzOp::Xattr
-            }
-            PathRpcAuthz::Release
-            | PathRpcAuthz::Fsync
-            | PathRpcAuthz::Truncate
-            | PathRpcAuthz::GetFileLayoutByPath
-            | PathRpcAuthz::OpenWriteByPath
-            | PathRpcAuthz::CloseWriteSession
-            | PathRpcAuthz::RenewWriteSessionLease
-            | PathRpcAuthz::FsyncSession
-            | PathRpcAuthz::ReleaseSession => AuthzOp::Write,
-        };
-        AuthzContext::new(op, targets)
-    }
-
-    fn traverse_pre_checks(scheme: AuthzScheme, traverse_dirs: &[InodeId]) -> Vec<AuthzCheck> {
-        if !matches!(scheme, AuthzScheme::AclInode) {
-            return Vec::new();
-        }
-        traverse_dirs
-            .iter()
-            .copied()
-            .map(|inode_id| AuthzCheck {
-                op: AuthzOp::Execute,
-                target: AuthzTarget::for_inode(inode_id),
-            })
-            .collect()
-    }
-
-    fn sticky_pre_checks_for_delete(
-        scheme: AuthzScheme,
-        parent_inode_id: InodeId,
-        target_inode_id: Option<InodeId>,
-    ) -> Vec<AuthzCheck> {
-        if !matches!(scheme, AuthzScheme::AclInode) {
-            return Vec::new();
-        }
-        target_inode_id
-            .into_iter()
-            .map(|target_inode_id| AuthzCheck {
-                op: AuthzOp::Sticky,
-                target: AuthzTarget::for_inode(target_inode_id).with_parent(parent_inode_id),
-            })
-            .collect()
-    }
-
-    fn sticky_pre_checks_for_rename(
-        scheme: AuthzScheme,
-        src_parent_inode_id: InodeId,
-        src_inode_id: Option<InodeId>,
-        dst_parent_inode_id: InodeId,
-        dst_inode_id: Option<InodeId>,
-    ) -> Vec<AuthzCheck> {
-        if !matches!(scheme, AuthzScheme::AclInode) {
-            return Vec::new();
-        }
-        let mut checks = Vec::new();
-        if let Some(src_inode_id) = src_inode_id {
-            checks.push(AuthzCheck {
-                op: AuthzOp::Sticky,
-                target: AuthzTarget::for_inode(src_inode_id).with_parent(src_parent_inode_id),
-            });
-        }
-        if let Some(dst_inode_id) = dst_inode_id {
-            checks.push(AuthzCheck {
-                op: AuthzOp::Sticky,
-                target: AuthzTarget::for_inode(dst_inode_id).with_parent(dst_parent_inode_id),
-            });
-        }
-        checks
-    }
-
-    fn authz_ctx_for_path(
-        &self,
-        rpc: PathRpcAuthz,
-        path: &str,
-        resolved: &ResolvedInode,
-    ) -> MetadataResult<AuthzContext> {
-        let scheme = self.authz_provider.scheme();
-        let targets = Self::authz_targets_for_path(scheme, path, resolved.inode_id)?;
-        let pre_checks = Self::traverse_pre_checks(scheme, &resolved.traverse_dir_inode_ids);
-        Ok(Self::authz_for_rpc(rpc, targets).with_pre_checks(pre_checks))
-    }
-
-    fn authz_ctx_for_parent(
-        &self,
-        rpc: PathRpcAuthz,
-        path: &str,
-        resolved: &ResolvedPath,
-    ) -> MetadataResult<AuthzContext> {
-        let scheme = self.authz_provider.scheme();
-        let targets = Self::authz_targets_for_parent(scheme, path, resolved.parent_inode_id)?;
-        let pre_checks = Self::traverse_pre_checks(scheme, &resolved.traverse_dir_inode_ids);
-        Ok(Self::authz_for_rpc(rpc, targets).with_pre_checks(pre_checks))
-    }
-
-    fn authz_ctx_for_delete(
-        &self,
-        rpc: PathRpcAuthz,
-        path: &str,
-        resolved: &ResolvedPath,
-    ) -> MetadataResult<AuthzContext> {
-        let scheme = self.authz_provider.scheme();
-        let mut pre_checks = Self::traverse_pre_checks(scheme, &resolved.traverse_dir_inode_ids);
-        pre_checks.extend(Self::sticky_pre_checks_for_delete(
-            scheme,
-            resolved.parent_inode_id,
-            resolved.inode_id,
-        ));
-        let targets = Self::authz_targets_for_parent(scheme, path, resolved.parent_inode_id)?;
-        Ok(Self::authz_for_rpc(rpc, targets).with_pre_checks(pre_checks))
-    }
-
-    fn authz_ctx_for_rename(
-        &self,
-        src_path: &str,
-        dst_path: &str,
-        src: &ResolvedPath,
-        dst: &ResolvedPath,
-    ) -> MetadataResult<AuthzContext> {
-        let scheme = self.authz_provider.scheme();
-        let targets =
-            Self::authz_targets_for_rename(scheme, src_path, dst_path, src.parent_inode_id, dst.parent_inode_id)?;
-        let mut pre_checks = Self::traverse_pre_checks(scheme, &src.traverse_dir_inode_ids);
-        pre_checks.extend(Self::traverse_pre_checks(scheme, &dst.traverse_dir_inode_ids));
-        pre_checks.extend(Self::sticky_pre_checks_for_rename(
-            scheme,
-            src.parent_inode_id,
-            src.inode_id,
-            dst.parent_inode_id,
-            dst.inode_id,
-        ));
-        Ok(Self::authz_for_rpc(PathRpcAuthz::Rename, targets).with_pre_checks(pre_checks))
     }
 
     fn header_from_path_error(
@@ -385,30 +170,12 @@ impl MetadataFileSystemServiceImpl {
         header_from_canonical_error(req_header, group_id, mount_epoch, &canonical)
     }
 
-    async fn guard_policy(
+    fn header_from_guard_failure(
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
-        caller_ctx: &common::header::RequestHeader,
-        mut policy: GuardPolicy,
-        mount_id: Option<types::ids::MountId>,
-        authz: Option<AuthzContext>,
-    ) -> Option<proto::common::ResponseHeaderProto> {
-        if authz.is_some() {
-            policy = policy.with_authz();
-        }
-        match self
-            .guard_chain
-            .check_request(req_header, caller_ctx, policy, mount_id, authz)
-            .await
-        {
-            Ok(()) => None,
-            Err(failure) => Some(header_from_canonical_error(
-                req_header,
-                failure.group_id,
-                failure.mount_epoch,
-                &failure.err,
-            )),
-        }
+        failure: GuardFailure,
+    ) -> proto::common::ResponseHeaderProto {
+        header_from_canonical_error(req_header, failure.group_id, failure.mount_epoch, &failure.err)
     }
 }
 
@@ -420,13 +187,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<GetFileStatusRequestProto>,
     ) -> Result<Response<GetFileStatusResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_READ_PRE, None, None)
-            .await
-        {
-            return error_response!(GetFileStatusResponseProto, resp_header);
-        }
+        let req_ctx = request_context_from_proto(&req.header);
+        guard_or_error!(
+            self,
+            req,
+            GetFileStatusResponseProto,
+            self.guard_chain.check_meta_read(&req_ctx)
+        );
 
         // Resolve path to inode.
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
@@ -436,33 +203,26 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(GetFileStatusResponseProto, resp_header);
             }
         };
-        let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::GetFileStatus, &req.path, &resolved) {
-            Ok(authz_ctx) => authz_ctx,
+        guard_or_error!(
+            self,
+            req,
+            GetFileStatusResponseProto,
+            self.guard_chain
+                .check_perm(&req_ctx, PermissionBits::READ, &req.path, &resolved)
+        );
+        let inode_id = match resolved.expect_inode() {
+            Ok(inode_id) => inode_id,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(GetFileStatusResponseProto, resp_header);
             }
         };
 
-        if let Some(resp_header) = self
-            .guard_policy(
-                &req.header,
-                &caller_ctx,
-                GuardPolicy::METADATA_READ,
-                None,
-                Some(authz_ctx),
-            )
-            .await
-        {
-            return error_response!(GetFileStatusResponseProto, resp_header);
-        }
-
-        let req_ctx = request_context_from_proto(&req.header);
         match self
             .fs_core
             .execute_get_attr(GetAttrInput {
                 ctx: req_ctx.clone(),
-                inode_id: resolved.inode_id,
+                inode_id,
             })
             .await
         {
@@ -471,7 +231,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 response_with_header!(
                     GetFileStatusResponseProto {
                         inode_id: Some(proto::fs::InodeIdProto {
-                            value: resolved.inode_id.as_raw(),
+                            value: inode_id.as_raw(),
                         }),
                         attrs: Some(file_attrs_to_proto(&success.payload.attrs)),
                         inode: None,
@@ -490,13 +250,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     #[instrument(skip(self), fields(call_id, client_id))]
     async fn mkdir(&self, request: Request<MkdirPathRequestProto>) -> Result<Response<MkdirPathResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
-            .await
-        {
-            return error_response!(MkdirPathResponseProto, resp_header);
-        }
+        let req_ctx = request_context_from_proto(&req.header);
+        guard_or_error!(
+            self,
+            req,
+            MkdirPathResponseProto,
+            self.guard_chain.check_meta_write(&req_ctx)
+        );
 
         // Resolve path
         let resolved = match self.path_resolver.resolve_path(&req.path) {
@@ -506,26 +266,27 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(MkdirPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match self.authz_ctx_for_parent(PathRpcAuthz::Mkdir, &req.path, &resolved) {
-            Ok(authz_ctx) => authz_ctx,
+        guard_or_error!(
+            self,
+            req,
+            MkdirPathResponseProto,
+            self.guard_chain
+                .check_parent_perm(&req_ctx, PermissionBits::WRITE, &req.path, &resolved)
+        );
+        let parent_inode_id = match resolved.expect_parent() {
+            Ok(parent_inode_id) => parent_inode_id,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(MkdirPathResponseProto, resp_header);
             }
         };
-
-        if let Some(resp_header) = self
-            .guard_policy(
-                &req.header,
-                &caller_ctx,
-                GuardPolicy::METADATA_WRITE,
-                None,
-                Some(authz_ctx),
-            )
-            .await
-        {
-            return error_response!(MkdirPathResponseProto, resp_header);
-        }
+        let name = match resolved.expect_name() {
+            Ok(name) => name.to_string(),
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
+                return error_response!(MkdirPathResponseProto, resp_header);
+            }
+        };
 
         // Convert attrs
         let attrs = match file_attrs_from_proto(req.attrs) {
@@ -536,7 +297,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             }
         };
 
-        let req_ctx = request_context_from_proto(&req.header);
         let freshness = Freshness {
             mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
             route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
@@ -546,8 +306,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             .fs_core
             .execute_mkdir(MkdirInput {
                 ctx: req_ctx.clone(),
-                parent_inode_id: resolved.parent_inode_id,
-                name: resolved.name,
+                parent_inode_id,
+                name,
                 attrs,
                 freshness,
             })
@@ -590,13 +350,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<CreatePathRequestProto>,
     ) -> Result<Response<CreatePathResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
-            .await
-        {
-            return error_response!(CreatePathResponseProto, resp_header);
-        }
+        let req_ctx = request_context_from_proto(&req.header);
+        guard_or_error!(
+            self,
+            req,
+            CreatePathResponseProto,
+            self.guard_chain.check_meta_write(&req_ctx)
+        );
 
         // Resolve path
         let resolved = match self.path_resolver.resolve_path(&req.path) {
@@ -606,26 +366,27 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(CreatePathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match self.authz_ctx_for_parent(PathRpcAuthz::Create, &req.path, &resolved) {
-            Ok(authz_ctx) => authz_ctx,
+        guard_or_error!(
+            self,
+            req,
+            CreatePathResponseProto,
+            self.guard_chain
+                .check_parent_perm(&req_ctx, PermissionBits::WRITE, &req.path, &resolved)
+        );
+        let parent_inode_id = match resolved.expect_parent() {
+            Ok(parent_inode_id) => parent_inode_id,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(CreatePathResponseProto, resp_header);
             }
         };
-
-        if let Some(resp_header) = self
-            .guard_policy(
-                &req.header,
-                &caller_ctx,
-                GuardPolicy::METADATA_WRITE,
-                None,
-                Some(authz_ctx),
-            )
-            .await
-        {
-            return error_response!(CreatePathResponseProto, resp_header);
-        }
+        let name = match resolved.expect_name() {
+            Ok(name) => name.to_string(),
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
+                return error_response!(CreatePathResponseProto, resp_header);
+            }
+        };
 
         // Convert attrs and layout
         let attrs = match file_attrs_from_proto(req.attrs) {
@@ -643,7 +404,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             }
         };
 
-        let req_ctx = request_context_from_proto(&req.header);
         let freshness = Freshness {
             mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
             route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
@@ -653,8 +413,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             .fs_core
             .execute_create(CreateInput {
                 ctx: req_ctx.clone(),
-                parent_inode_id: resolved.parent_inode_id,
-                name: resolved.name,
+                parent_inode_id,
+                name,
                 attrs,
                 layout,
                 freshness,
@@ -702,13 +462,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<UnlinkPathRequestProto>,
     ) -> Result<Response<UnlinkPathResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
-            .await
-        {
-            return error_response!(UnlinkPathResponseProto, resp_header);
-        }
+        let req_ctx = request_context_from_proto(&req.header);
+        guard_or_error!(
+            self,
+            req,
+            UnlinkPathResponseProto,
+            self.guard_chain.check_meta_write(&req_ctx)
+        );
 
         // Resolve path
         let resolved = match self.path_resolver.resolve_path(&req.path) {
@@ -718,28 +478,28 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(UnlinkPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match self.authz_ctx_for_delete(PathRpcAuthz::Unlink, &req.path, &resolved) {
-            Ok(authz_ctx) => authz_ctx,
+        guard_or_error!(
+            self,
+            req,
+            UnlinkPathResponseProto,
+            self.guard_chain
+                .check_parent_perm(&req_ctx, PermissionBits::WRITE, &req.path, &resolved)
+        );
+        let parent_inode_id = match resolved.expect_parent() {
+            Ok(parent_inode_id) => parent_inode_id,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
+                return error_response!(UnlinkPathResponseProto, resp_header);
+            }
+        };
+        let name = match resolved.expect_name() {
+            Ok(name) => name.to_string(),
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(UnlinkPathResponseProto, resp_header);
             }
         };
 
-        if let Some(resp_header) = self
-            .guard_policy(
-                &req.header,
-                &caller_ctx,
-                GuardPolicy::METADATA_WRITE,
-                None,
-                Some(authz_ctx),
-            )
-            .await
-        {
-            return error_response!(UnlinkPathResponseProto, resp_header);
-        }
-
-        let req_ctx = request_context_from_proto(&req.header);
         let freshness = Freshness {
             mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
             route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
@@ -749,8 +509,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             .fs_core
             .execute_unlink(UnlinkInput {
                 ctx: req_ctx.clone(),
-                parent_inode_id: resolved.parent_inode_id,
-                name: resolved.name,
+                parent_inode_id,
+                name,
                 freshness,
             })
             .await
@@ -771,13 +531,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     #[instrument(skip(self), fields(call_id, client_id))]
     async fn rmdir(&self, request: Request<RmdirPathRequestProto>) -> Result<Response<RmdirPathResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
-            .await
-        {
-            return error_response!(RmdirPathResponseProto, resp_header);
-        }
+        let req_ctx = request_context_from_proto(&req.header);
+        guard_or_error!(
+            self,
+            req,
+            RmdirPathResponseProto,
+            self.guard_chain.check_meta_write(&req_ctx)
+        );
 
         // Resolve path
         let resolved = match self.path_resolver.resolve_path(&req.path) {
@@ -787,28 +547,28 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(RmdirPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match self.authz_ctx_for_delete(PathRpcAuthz::Rmdir, &req.path, &resolved) {
-            Ok(authz_ctx) => authz_ctx,
+        guard_or_error!(
+            self,
+            req,
+            RmdirPathResponseProto,
+            self.guard_chain
+                .check_parent_perm(&req_ctx, PermissionBits::WRITE, &req.path, &resolved)
+        );
+        let parent_inode_id = match resolved.expect_parent() {
+            Ok(parent_inode_id) => parent_inode_id,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
+                return error_response!(RmdirPathResponseProto, resp_header);
+            }
+        };
+        let name = match resolved.expect_name() {
+            Ok(name) => name.to_string(),
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(RmdirPathResponseProto, resp_header);
             }
         };
 
-        if let Some(resp_header) = self
-            .guard_policy(
-                &req.header,
-                &caller_ctx,
-                GuardPolicy::METADATA_WRITE,
-                None,
-                Some(authz_ctx),
-            )
-            .await
-        {
-            return error_response!(RmdirPathResponseProto, resp_header);
-        }
-
-        let req_ctx = request_context_from_proto(&req.header);
         let freshness = Freshness {
             mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
             route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
@@ -818,8 +578,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             .fs_core
             .execute_rmdir(RmdirInput {
                 ctx: req_ctx.clone(),
-                parent_inode_id: resolved.parent_inode_id,
-                name: resolved.name,
+                parent_inode_id,
+                name,
                 freshness,
             })
             .await
@@ -843,13 +603,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<RenamePathRequestProto>,
     ) -> Result<Response<RenamePathResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
-            .await
-        {
-            return error_response!(RenamePathResponseProto, resp_header);
-        }
+        let req_ctx = request_context_from_proto(&req.header);
+        guard_or_error!(
+            self,
+            req,
+            RenamePathResponseProto,
+            self.guard_chain.check_meta_write(&req_ctx)
+        );
 
         // Resolve both paths
         let (src_resolved, dst_resolved) = match self.path_resolver.resolve_rename(&req.src_path, &req.dst_path) {
@@ -859,28 +619,49 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(RenamePathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match self.authz_ctx_for_rename(&req.src_path, &req.dst_path, &src_resolved, &dst_resolved) {
-            Ok(authz_ctx) => authz_ctx,
+        guard_or_error!(
+            self,
+            req,
+            RenamePathResponseProto,
+            self.guard_chain
+                .check_parent_perm(&req_ctx, PermissionBits::WRITE, &req.src_path, &src_resolved)
+        );
+        guard_or_error!(
+            self,
+            req,
+            RenamePathResponseProto,
+            self.guard_chain
+                .check_parent_perm(&req_ctx, PermissionBits::WRITE, &req.dst_path, &dst_resolved)
+        );
+        let src_parent_inode_id = match src_resolved.expect_parent() {
+            Ok(parent_inode_id) => parent_inode_id,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&src_resolved.mount_ctx));
                 return error_response!(RenamePathResponseProto, resp_header);
             }
         };
+        let src_name = match src_resolved.expect_name() {
+            Ok(name) => name.to_string(),
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, Some(&src_resolved.mount_ctx));
+                return error_response!(RenamePathResponseProto, resp_header);
+            }
+        };
+        let dst_parent_inode_id = match dst_resolved.expect_parent() {
+            Ok(parent_inode_id) => parent_inode_id,
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, Some(&dst_resolved.mount_ctx));
+                return error_response!(RenamePathResponseProto, resp_header);
+            }
+        };
+        let dst_name = match dst_resolved.expect_name() {
+            Ok(name) => name.to_string(),
+            Err(err) => {
+                let resp_header = self.header_from_path_error(&req.header, err, Some(&dst_resolved.mount_ctx));
+                return error_response!(RenamePathResponseProto, resp_header);
+            }
+        };
 
-        if let Some(resp_header) = self
-            .guard_policy(
-                &req.header,
-                &caller_ctx,
-                GuardPolicy::METADATA_WRITE,
-                None,
-                Some(authz_ctx),
-            )
-            .await
-        {
-            return error_response!(RenamePathResponseProto, resp_header);
-        }
-
-        let req_ctx = request_context_from_proto(&req.header);
         let freshness = Freshness {
             mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
             route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
@@ -890,10 +671,10 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             .fs_core
             .execute_rename(RenameInput {
                 ctx: req_ctx.clone(),
-                src_parent_inode_id: src_resolved.parent_inode_id,
-                src_name: src_resolved.name,
-                dst_parent_inode_id: dst_resolved.parent_inode_id,
-                dst_name: dst_resolved.name,
+                src_parent_inode_id,
+                src_name,
+                dst_parent_inode_id,
+                dst_name,
                 flags: req.flags,
                 freshness,
             })
@@ -918,13 +699,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<ListStatusPathRequestProto>,
     ) -> Result<Response<ListStatusPathResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_READ_PRE, None, None)
-            .await
-        {
-            return error_response!(ListStatusPathResponseProto, resp_header);
-        }
+        let req_ctx = request_context_from_proto(&req.header);
+        guard_or_error!(
+            self,
+            req,
+            ListStatusPathResponseProto,
+            self.guard_chain.check_meta_read(&req_ctx)
+        );
 
         // Resolve path to inode
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
@@ -936,27 +717,21 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         };
 
         if !req.recursive {
-            let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::ListStatus, &req.path, &resolved) {
-                Ok(authz_ctx) => authz_ctx,
+            guard_or_error!(
+                self,
+                req,
+                ListStatusPathResponseProto,
+                self.guard_chain
+                    .check_perm(&req_ctx, PermissionBits::READ, &req.path, &resolved)
+            );
+            let inode_id = match resolved.expect_inode() {
+                Ok(inode_id) => inode_id,
                 Err(err) => {
                     let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                     return error_response!(ListStatusPathResponseProto, resp_header);
                 }
             };
-            if let Some(resp_header) = self
-                .guard_policy(
-                    &req.header,
-                    &caller_ctx,
-                    GuardPolicy::METADATA_READ,
-                    None,
-                    Some(authz_ctx),
-                )
-                .await
-            {
-                return error_response!(ListStatusPathResponseProto, resp_header);
-            }
 
-            let req_ctx = request_context_from_proto(&req.header);
             let cursor_key = if req.cursor.is_empty() {
                 None
             } else {
@@ -967,7 +742,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 .fs_core
                 .execute_read_dir(ReadDirInput {
                     ctx: req_ctx.clone(),
-                    parent_inode_id: resolved.inode_id,
+                    parent_inode_id: inode_id,
                     cursor_key,
                     max_entries,
                 })
@@ -1024,13 +799,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     #[instrument(skip(self), fields(call_id, client_id))]
     async fn open(&self, request: Request<OpenPathRequestProto>) -> Result<Response<OpenPathResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_READ_PRE, None, None)
-            .await
-        {
-            return error_response!(OpenPathResponseProto, resp_header);
-        }
+        let req_ctx = request_context_from_proto(&req.header);
+        guard_or_error!(
+            self,
+            req,
+            OpenPathResponseProto,
+            self.guard_chain.check_meta_read(&req_ctx)
+        );
 
         // Resolve path to inode
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
@@ -1040,33 +815,26 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(OpenPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::Open, &req.path, &resolved) {
-            Ok(authz_ctx) => authz_ctx,
+        guard_or_error!(
+            self,
+            req,
+            OpenPathResponseProto,
+            self.guard_chain
+                .check_perm(&req_ctx, PermissionBits::READ, &req.path, &resolved)
+        );
+        let inode_id = match resolved.expect_inode() {
+            Ok(inode_id) => inode_id,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(OpenPathResponseProto, resp_header);
             }
         };
 
-        if let Some(resp_header) = self
-            .guard_policy(
-                &req.header,
-                &caller_ctx,
-                GuardPolicy::METADATA_READ,
-                None,
-                Some(authz_ctx),
-            )
-            .await
-        {
-            return error_response!(OpenPathResponseProto, resp_header);
-        }
-
-        let req_ctx = request_context_from_proto(&req.header);
         match self
             .fs_core
             .execute_open(OpenInput {
                 ctx: req_ctx.clone(),
-                inode_id: resolved.inode_id,
+                inode_id,
                 flags: req.flags as i32,
             })
             .await
@@ -1094,55 +862,20 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<ReleasePathRequestProto>,
     ) -> Result<Response<ReleasePathResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        let session = self.fs_core.write_session_for_handle(req.file_handle);
-        if session.is_some() {
-            if let Some(resp_header) = self
-                .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
-                .await
-            {
-                return response_with_header!(ReleasePathResponseProto::default(), resp_header);
-            }
-        } else if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_READ_PRE, None, None)
-            .await
-        {
-            return response_with_header!(ReleasePathResponseProto::default(), resp_header);
-        }
-
-        if let Some(session) = session {
-            if let Some(resp_header) = self
-                .guard_policy(
-                    &req.header,
-                    &caller_ctx,
-                    GuardPolicy::data_io(DataIoOp::CloseWrite).with_leader(),
-                    Some(session.mount_id),
-                    Some(Self::authz_for_rpc(
-                        PathRpcAuthz::Release,
-                        vec![AuthzTarget::for_session(req.file_handle, Some(session.inode_id))],
-                    )),
-                )
-                .await
-            {
-                return response_with_header!(ReleasePathResponseProto::default(), resp_header);
-            }
-        } else if let Some(resp_header) = self
-            .guard_policy(
-                &req.header,
-                &caller_ctx,
-                GuardPolicy::METADATA_READ,
-                None,
-                Some(Self::authz_for_rpc(
-                    PathRpcAuthz::Release,
-                    vec![AuthzTarget::for_file_handle(req.file_handle)],
-                )),
-            )
-            .await
-        {
-            return response_with_header!(ReleasePathResponseProto::default(), resp_header);
-        }
-
         let req_ctx = request_context_from_proto(&req.header);
+        let session = self.fs_core.write_session_for_handle(req.file_handle);
+        if let Some(session) = session.as_ref() {
+            guard_or_error!(
+                self,
+                req,
+                ReleasePathResponseProto,
+                self.guard_chain.check_data_write(&req_ctx, session.mount_id)
+            );
+        } else if let Err(failure) = self.guard_chain.check_meta_read(&req_ctx).await {
+            let resp_header = self.header_from_guard_failure(&req.header, failure);
+            return response_with_header!(ReleasePathResponseProto::default(), resp_header);
+        }
+
         match self
             .fs_core
             .execute_release(ReleaseSessionInput {
@@ -1167,13 +900,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     #[instrument(skip(self), fields(call_id, client_id))]
     async fn fsync(&self, request: Request<FsyncPathRequestProto>) -> Result<Response<FsyncPathResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
-            .await
-        {
-            return error_response!(FsyncPathResponseProto, resp_header);
-        }
+        let req_ctx = request_context_from_proto(&req.header);
+        guard_or_error!(
+            self,
+            req,
+            FsyncPathResponseProto,
+            self.guard_chain.check_meta_write(&req_ctx)
+        );
 
         // Handle path-based or handle-based fsync
         match req.target {
@@ -1186,28 +919,27 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         return error_response!(FsyncPathResponseProto, resp_header);
                     }
                 };
-                let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::Fsync, &path, &resolved) {
-                    Ok(authz_ctx) => authz_ctx,
+                guard_or_error!(
+                    self,
+                    req,
+                    FsyncPathResponseProto,
+                    self.guard_chain
+                        .check_perm(&req_ctx, PermissionBits::WRITE, &path, &resolved)
+                );
+                guard_or_error!(
+                    self,
+                    req,
+                    FsyncPathResponseProto,
+                    self.guard_chain.check_data_write(&req_ctx, resolved.mount_ctx.mount_id)
+                );
+                let inode_id = match resolved.expect_inode() {
+                    Ok(inode_id) => inode_id,
                     Err(err) => {
                         let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                         return error_response!(FsyncPathResponseProto, resp_header);
                     }
                 };
 
-                if let Some(resp_header) = self
-                    .guard_policy(
-                        &req.header,
-                        &caller_ctx,
-                        GuardPolicy::data_io(DataIoOp::Fsync).with_leader(),
-                        Some(resolved.mount_ctx.mount_id),
-                        Some(authz_ctx),
-                    )
-                    .await
-                {
-                    return error_response!(FsyncPathResponseProto, resp_header);
-                }
-
-                let req_ctx = request_context_from_proto(&req.header);
                 let freshness = Freshness {
                     mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
                     route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
@@ -1217,7 +949,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     .fs_core
                     .execute_fsync(FsyncBarrierInput {
                         ctx: req_ctx.clone(),
-                        inode_id: resolved.inode_id,
+                        inode_id,
                         file_handle: None,
                         lease_id: None,
                         lease_epoch: None,
@@ -1317,13 +1049,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<TruncatePathRequestProto>,
     ) -> Result<Response<TruncatePathResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
-            .await
-        {
-            return error_response!(TruncatePathResponseProto, resp_header);
-        }
+        let req_ctx = request_context_from_proto(&req.header);
+        guard_or_error!(
+            self,
+            req,
+            TruncatePathResponseProto,
+            self.guard_chain.check_meta_write(&req_ctx)
+        );
 
         // Resolve path to inode
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
@@ -1333,28 +1065,27 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(TruncatePathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::Truncate, &req.path, &resolved) {
-            Ok(authz_ctx) => authz_ctx,
+        guard_or_error!(
+            self,
+            req,
+            TruncatePathResponseProto,
+            self.guard_chain
+                .check_perm(&req_ctx, PermissionBits::WRITE, &req.path, &resolved)
+        );
+        guard_or_error!(
+            self,
+            req,
+            TruncatePathResponseProto,
+            self.guard_chain.check_data_write(&req_ctx, resolved.mount_ctx.mount_id)
+        );
+        let inode_id = match resolved.expect_inode() {
+            Ok(inode_id) => inode_id,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(TruncatePathResponseProto, resp_header);
             }
         };
 
-        if let Some(resp_header) = self
-            .guard_policy(
-                &req.header,
-                &caller_ctx,
-                GuardPolicy::data_io(DataIoOp::Truncate).with_leader(),
-                Some(resolved.mount_ctx.mount_id),
-                Some(authz_ctx),
-            )
-            .await
-        {
-            return error_response!(TruncatePathResponseProto, resp_header);
-        }
-
-        let req_ctx = request_context_from_proto(&req.header);
         let freshness = Freshness {
             mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
             route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
@@ -1364,7 +1095,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             .fs_core
             .execute_truncate(TruncateInput {
                 ctx: req_ctx.clone(),
-                inode_id: resolved.inode_id,
+                inode_id,
                 new_size: req.new_size,
                 lease_id: lease_id_from_proto(req.lease_id),
                 lease_epoch: req.lease_epoch,
@@ -1395,13 +1126,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<SetXattrPathRequestProto>,
     ) -> Result<Response<SetXattrPathResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
-            .await
-        {
-            return error_response!(SetXattrPathResponseProto, resp_header);
-        }
+        let req_ctx = request_context_from_proto(&req.header);
+        guard_or_error!(
+            self,
+            req,
+            SetXattrPathResponseProto,
+            self.guard_chain.check_meta_write(&req_ctx)
+        );
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -1409,28 +1140,21 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(SetXattrPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::SetXattr, &req.path, &resolved) {
-            Ok(authz_ctx) => authz_ctx,
+        guard_or_error!(
+            self,
+            req,
+            SetXattrPathResponseProto,
+            self.guard_chain
+                .check_perm(&req_ctx, PermissionBits::WRITE, &req.path, &resolved)
+        );
+        let inode_id = match resolved.expect_inode() {
+            Ok(inode_id) => inode_id,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(SetXattrPathResponseProto, resp_header);
             }
         };
 
-        if let Some(resp_header) = self
-            .guard_policy(
-                &req.header,
-                &caller_ctx,
-                GuardPolicy::METADATA_WRITE,
-                None,
-                Some(authz_ctx),
-            )
-            .await
-        {
-            return error_response!(SetXattrPathResponseProto, resp_header);
-        }
-
-        let req_ctx = request_context_from_proto(&req.header);
         let freshness = Freshness {
             mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
             route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
@@ -1440,7 +1164,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             .fs_core
             .execute_set_xattr(SetXattrInput {
                 ctx: req_ctx.clone(),
-                inode_id: resolved.inode_id,
+                inode_id,
                 name: req.name,
                 value: req.value,
                 create: req.create,
@@ -1451,7 +1175,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         {
             Ok(success) => {
                 if let Some(reader) = self.inode_perm_reader.as_ref() {
-                    reader.invalidate(resolved.inode_id);
+                    reader.invalidate(inode_id);
                 }
                 response_with_header!(
                     SetXattrPathResponseProto::default(),
@@ -1471,13 +1195,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<GetXattrPathRequestProto>,
     ) -> Result<Response<GetXattrPathResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_READ_PRE, None, None)
-            .await
-        {
-            return error_response!(GetXattrPathResponseProto, resp_header);
-        }
+        let req_ctx = request_context_from_proto(&req.header);
+        guard_or_error!(
+            self,
+            req,
+            GetXattrPathResponseProto,
+            self.guard_chain.check_meta_read(&req_ctx)
+        );
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -1485,33 +1209,26 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(GetXattrPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::GetXattr, &req.path, &resolved) {
-            Ok(authz_ctx) => authz_ctx,
+        guard_or_error!(
+            self,
+            req,
+            GetXattrPathResponseProto,
+            self.guard_chain
+                .check_perm(&req_ctx, PermissionBits::READ, &req.path, &resolved)
+        );
+        let inode_id = match resolved.expect_inode() {
+            Ok(inode_id) => inode_id,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(GetXattrPathResponseProto, resp_header);
             }
         };
 
-        if let Some(resp_header) = self
-            .guard_policy(
-                &req.header,
-                &caller_ctx,
-                GuardPolicy::METADATA_READ,
-                None,
-                Some(authz_ctx),
-            )
-            .await
-        {
-            return error_response!(GetXattrPathResponseProto, resp_header);
-        }
-
-        let req_ctx = request_context_from_proto(&req.header);
         match self
             .fs_core
             .execute_get_xattr(GetXattrInput {
                 ctx: req_ctx.clone(),
-                inode_id: resolved.inode_id,
+                inode_id,
                 name: req.name,
             })
             .await
@@ -1539,13 +1256,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<ListXattrPathRequestProto>,
     ) -> Result<Response<ListXattrPathResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_READ_PRE, None, None)
-            .await
-        {
-            return error_response!(ListXattrPathResponseProto, resp_header);
-        }
+        let req_ctx = request_context_from_proto(&req.header);
+        guard_or_error!(
+            self,
+            req,
+            ListXattrPathResponseProto,
+            self.guard_chain.check_meta_read(&req_ctx)
+        );
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -1553,33 +1270,26 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(ListXattrPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::ListXattr, &req.path, &resolved) {
-            Ok(authz_ctx) => authz_ctx,
+        guard_or_error!(
+            self,
+            req,
+            ListXattrPathResponseProto,
+            self.guard_chain
+                .check_perm(&req_ctx, PermissionBits::READ, &req.path, &resolved)
+        );
+        let inode_id = match resolved.expect_inode() {
+            Ok(inode_id) => inode_id,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(ListXattrPathResponseProto, resp_header);
             }
         };
 
-        if let Some(resp_header) = self
-            .guard_policy(
-                &req.header,
-                &caller_ctx,
-                GuardPolicy::METADATA_READ,
-                None,
-                Some(authz_ctx),
-            )
-            .await
-        {
-            return error_response!(ListXattrPathResponseProto, resp_header);
-        }
-
-        let req_ctx = request_context_from_proto(&req.header);
         match self
             .fs_core
             .execute_list_xattr(ListXattrInput {
                 ctx: req_ctx.clone(),
-                inode_id: resolved.inode_id,
+                inode_id,
             })
             .await
         {
@@ -1606,13 +1316,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<RemoveXattrPathRequestProto>,
     ) -> Result<Response<RemoveXattrPathResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
-            .await
-        {
-            return error_response!(RemoveXattrPathResponseProto, resp_header);
-        }
+        let req_ctx = request_context_from_proto(&req.header);
+        guard_or_error!(
+            self,
+            req,
+            RemoveXattrPathResponseProto,
+            self.guard_chain.check_meta_write(&req_ctx)
+        );
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -1620,28 +1330,21 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(RemoveXattrPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::RemoveXattr, &req.path, &resolved) {
-            Ok(authz_ctx) => authz_ctx,
+        guard_or_error!(
+            self,
+            req,
+            RemoveXattrPathResponseProto,
+            self.guard_chain
+                .check_perm(&req_ctx, PermissionBits::WRITE, &req.path, &resolved)
+        );
+        let inode_id = match resolved.expect_inode() {
+            Ok(inode_id) => inode_id,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(RemoveXattrPathResponseProto, resp_header);
             }
         };
 
-        if let Some(resp_header) = self
-            .guard_policy(
-                &req.header,
-                &caller_ctx,
-                GuardPolicy::METADATA_WRITE,
-                None,
-                Some(authz_ctx),
-            )
-            .await
-        {
-            return error_response!(RemoveXattrPathResponseProto, resp_header);
-        }
-
-        let req_ctx = request_context_from_proto(&req.header);
         let freshness = Freshness {
             mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
             route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
@@ -1651,7 +1354,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             .fs_core
             .execute_remove_xattr(RemoveXattrInput {
                 ctx: req_ctx.clone(),
-                inode_id: resolved.inode_id,
+                inode_id,
                 name: req.name,
                 freshness,
             })
@@ -1659,7 +1362,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         {
             Ok(success) => {
                 if let Some(reader) = self.inode_perm_reader.as_ref() {
-                    reader.invalidate(resolved.inode_id);
+                    reader.invalidate(inode_id);
                 }
                 response_with_header!(
                     RemoveXattrPathResponseProto::default(),
@@ -1679,13 +1382,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<GetFileLayoutByPathRequestProto>,
     ) -> Result<Response<GetFileLayoutByPathResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_READ_PRE, None, None)
-            .await
-        {
-            return error_response!(GetFileLayoutByPathResponseProto, resp_header);
-        }
+        let req_ctx = request_context_from_proto(&req.header);
+        guard_or_error!(
+            self,
+            req,
+            GetFileLayoutByPathResponseProto,
+            self.guard_chain.check_meta_read(&req_ctx)
+        );
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -1693,26 +1396,26 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(GetFileLayoutByPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::GetFileLayoutByPath, &req.path, &resolved) {
-            Ok(authz_ctx) => authz_ctx,
+        guard_or_error!(
+            self,
+            req,
+            GetFileLayoutByPathResponseProto,
+            self.guard_chain
+                .check_perm(&req_ctx, PermissionBits::READ, &req.path, &resolved)
+        );
+        guard_or_error!(
+            self,
+            req,
+            GetFileLayoutByPathResponseProto,
+            self.guard_chain.check_data_read(&req_ctx, resolved.mount_ctx.mount_id)
+        );
+        let inode_id = match resolved.expect_inode() {
+            Ok(inode_id) => inode_id,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(GetFileLayoutByPathResponseProto, resp_header);
             }
         };
-        if let Some(resp_header) = self
-            .guard_policy(
-                &req.header,
-                &caller_ctx,
-                GuardPolicy::data_io(DataIoOp::Read),
-                Some(resolved.mount_ctx.mount_id),
-                Some(authz_ctx),
-            )
-            .await
-        {
-            return error_response!(GetFileLayoutByPathResponseProto, resp_header);
-        }
-        let req_ctx = request_context_from_proto(&req.header);
         let freshness = Freshness {
             mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
             route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
@@ -1726,7 +1429,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             .fs_core
             .execute_get_file_layout(GetFileLayoutInput {
                 ctx: req_ctx.clone(),
-                inode_id: resolved.inode_id,
+                inode_id,
                 range,
                 freshness,
             })
@@ -1758,13 +1461,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<OpenWriteByPathRequestProto>,
     ) -> Result<Response<OpenWriteByPathResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
-            .await
-        {
-            return error_response!(OpenWriteByPathResponseProto, resp_header);
-        }
+        let req_ctx = request_context_from_proto(&req.header);
+        guard_or_error!(
+            self,
+            req,
+            OpenWriteByPathResponseProto,
+            self.guard_chain.check_meta_write(&req_ctx)
+        );
 
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
@@ -1773,15 +1476,20 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(OpenWriteByPathResponseProto, resp_header);
             }
         };
-        let authz_ctx = match self.authz_ctx_for_path(PathRpcAuthz::OpenWriteByPath, &req.path, &resolved) {
-            Ok(authz_ctx) => authz_ctx,
+        guard_or_error!(
+            self,
+            req,
+            OpenWriteByPathResponseProto,
+            self.guard_chain
+                .check_perm(&req_ctx, PermissionBits::WRITE, &req.path, &resolved)
+        );
+        let inode_id = match resolved.expect_inode() {
+            Ok(inode_id) => inode_id,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
                 return error_response!(OpenWriteByPathResponseProto, resp_header);
             }
         };
-
-        let req_ctx = request_context_from_proto(&req.header);
         let freshness = Freshness {
             mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
             route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
@@ -1794,18 +1502,12 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             let header = header_from_core_failure(&req_ctx, &failure);
             return error_response!(OpenWriteByPathResponseProto, header);
         }
-        if let Some(resp_header) = self
-            .guard_policy(
-                &req.header,
-                &caller_ctx,
-                GuardPolicy::data_io(DataIoOp::OpenWrite).with_leader(),
-                Some(resolved.mount_ctx.mount_id),
-                Some(authz_ctx),
-            )
-            .await
-        {
-            return error_response!(OpenWriteByPathResponseProto, resp_header);
-        }
+        guard_or_error!(
+            self,
+            req,
+            OpenWriteByPathResponseProto,
+            self.guard_chain.check_data_write(&req_ctx, resolved.mount_ctx.mount_id)
+        );
 
         let mode = match req.mode {
             x if x == WriteModeProto::WriteModeAppend as i32 => crate::inode_lease::WriteMode::Append,
@@ -1815,7 +1517,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             .fs_core
             .execute_open_write(OpenWriteInput {
                 ctx: req_ctx.clone(),
-                inode_id: resolved.inode_id,
+                inode_id,
                 desired_len: req.desired_len,
                 mode,
                 freshness,
@@ -1853,30 +1555,21 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<CloseWriteSessionRequestProto>,
     ) -> Result<Response<CloseWriteSessionResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
-            .await
-        {
-            return error_response!(CloseWriteSessionResponseProto, resp_header);
-        }
-
+        let req_ctx = request_context_from_proto(&req.header);
         if let Some(session) = self.fs_core.write_session_for_handle(req.file_handle) {
-            if let Some(resp_header) = self
-                .guard_policy(
-                    &req.header,
-                    &caller_ctx,
-                    GuardPolicy::data_io(DataIoOp::CloseWrite).with_leader(),
-                    Some(session.mount_id),
-                    Some(Self::authz_for_rpc(
-                        PathRpcAuthz::CloseWriteSession,
-                        vec![AuthzTarget::for_session(req.file_handle, Some(session.inode_id))],
-                    )),
-                )
-                .await
-            {
-                return error_response!(CloseWriteSessionResponseProto, resp_header);
-            }
+            guard_or_error!(
+                self,
+                req,
+                CloseWriteSessionResponseProto,
+                self.guard_chain.check_data_write(&req_ctx, session.mount_id)
+            );
+        } else {
+            guard_or_error!(
+                self,
+                req,
+                CloseWriteSessionResponseProto,
+                self.guard_chain.check_meta_write(&req_ctx)
+            );
         }
 
         let extents = match req
@@ -1892,7 +1585,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             }
         };
 
-        let req_ctx = request_context_from_proto(&req.header);
         let freshness = Freshness {
             mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
             route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
@@ -1940,33 +1632,23 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<RenewWriteSessionLeaseRequestProto>,
     ) -> Result<Response<RenewWriteSessionLeaseResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
-            .await
-        {
-            return error_response!(RenewWriteSessionLeaseResponseProto, resp_header);
-        }
-
-        if let Some(session) = self.fs_core.write_session_for_handle(req.file_handle) {
-            if let Some(resp_header) = self
-                .guard_policy(
-                    &req.header,
-                    &caller_ctx,
-                    GuardPolicy::data_io(DataIoOp::RenewLease).with_leader(),
-                    Some(session.mount_id),
-                    Some(Self::authz_for_rpc(
-                        PathRpcAuthz::RenewWriteSessionLease,
-                        vec![AuthzTarget::for_session(req.file_handle, Some(session.inode_id))],
-                    )),
-                )
-                .await
-            {
-                return error_response!(RenewWriteSessionLeaseResponseProto, resp_header);
-            }
-        }
-
         let req_ctx = request_context_from_proto(&req.header);
+        if let Some(session) = self.fs_core.write_session_for_handle(req.file_handle) {
+            guard_or_error!(
+                self,
+                req,
+                RenewWriteSessionLeaseResponseProto,
+                self.guard_chain.check_data_write(&req_ctx, session.mount_id)
+            );
+        } else {
+            guard_or_error!(
+                self,
+                req,
+                RenewWriteSessionLeaseResponseProto,
+                self.guard_chain.check_meta_write(&req_ctx)
+            );
+        }
+
         let freshness = Freshness {
             mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
             route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
@@ -2003,14 +1685,11 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<FsyncSessionRequestProto>,
     ) -> Result<Response<FsyncSessionResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
-            .await
-        {
+        let req_ctx = request_context_from_proto(&req.header);
+        if let Err(failure) = self.guard_chain.check_meta_write(&req_ctx).await {
+            let resp_header = self.header_from_guard_failure(&req.header, failure);
             return response_with_header!(FsyncSessionResponseProto::default(), resp_header);
         }
-
         let session = match self.fs_core.write_session_for_handle(req.file_handle) {
             Some(session) => session,
             None => {
@@ -2025,23 +1704,11 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return response_with_header!(FsyncSessionResponseProto::default(), resp_header);
             }
         };
-        if let Some(resp_header) = self
-            .guard_policy(
-                &req.header,
-                &caller_ctx,
-                GuardPolicy::data_io(DataIoOp::Fsync).with_leader(),
-                Some(session.mount_id),
-                Some(Self::authz_for_rpc(
-                    PathRpcAuthz::FsyncSession,
-                    vec![AuthzTarget::for_session(req.file_handle, Some(session.inode_id))],
-                )),
-            )
-            .await
-        {
+        if let Err(failure) = self.guard_chain.check_data_write(&req_ctx, session.mount_id).await {
+            let resp_header = self.header_from_guard_failure(&req.header, failure);
             return response_with_header!(FsyncSessionResponseProto::default(), resp_header);
         }
 
-        let req_ctx = request_context_from_proto(&req.header);
         let freshness = Freshness {
             mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
             route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
@@ -2131,55 +1798,18 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<ReleaseSessionRequestProto>,
     ) -> Result<Response<ReleaseSessionResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
-        let session = self.fs_core.write_session_for_handle(req.file_handle);
-        if session.is_some() {
-            if let Some(resp_header) = self
-                .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_WRITE_PRE, None, None)
-                .await
-            {
-                return response_with_header!(ReleaseSessionResponseProto::default(), resp_header);
-            }
-        } else if let Some(resp_header) = self
-            .guard_policy(&req.header, &caller_ctx, GuardPolicy::PATH_READ_PRE, None, None)
-            .await
-        {
-            return response_with_header!(ReleaseSessionResponseProto::default(), resp_header);
-        }
-
-        if let Some(session) = session {
-            if let Some(resp_header) = self
-                .guard_policy(
-                    &req.header,
-                    &caller_ctx,
-                    GuardPolicy::data_io(DataIoOp::CloseWrite).with_leader(),
-                    Some(session.mount_id),
-                    Some(Self::authz_for_rpc(
-                        PathRpcAuthz::ReleaseSession,
-                        vec![AuthzTarget::for_session(req.file_handle, Some(session.inode_id))],
-                    )),
-                )
-                .await
-            {
-                return response_with_header!(ReleaseSessionResponseProto::default(), resp_header);
-            }
-        } else if let Some(resp_header) = self
-            .guard_policy(
-                &req.header,
-                &caller_ctx,
-                GuardPolicy::METADATA_READ,
-                None,
-                Some(Self::authz_for_rpc(
-                    PathRpcAuthz::ReleaseSession,
-                    vec![AuthzTarget::for_file_handle(req.file_handle)],
-                )),
-            )
-            .await
-        {
-            return response_with_header!(ReleaseSessionResponseProto::default(), resp_header);
-        }
-
         let req_ctx = request_context_from_proto(&req.header);
+        let session = self.fs_core.write_session_for_handle(req.file_handle);
+        if let Some(session) = session.as_ref() {
+            if let Err(failure) = self.guard_chain.check_data_write(&req_ctx, session.mount_id).await {
+                let resp_header = self.header_from_guard_failure(&req.header, failure);
+                return response_with_header!(ReleaseSessionResponseProto::default(), resp_header);
+            }
+        } else if let Err(failure) = self.guard_chain.check_meta_read(&req_ctx).await {
+            let resp_header = self.header_from_guard_failure(&req.header, failure);
+            return response_with_header!(ReleaseSessionResponseProto::default(), resp_header);
+        }
+
         match self
             .fs_core
             .execute_release(ReleaseSessionInput {
@@ -2202,89 +1832,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use async_trait::async_trait;
-    use common::error::canonical::CanonicalError;
-    use common::header::RequestHeader;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[test]
+    fn path_service_does_not_branch_on_authz_scheme() {
+        let source = include_str!("path_service.rs");
 
-    #[derive(Clone)]
-    struct CountingAuthz {
-        scheme: AuthzScheme,
-        calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl AuthzProvider for CountingAuthz {
-        fn scheme(&self) -> AuthzScheme {
-            self.scheme
-        }
-
-        async fn authorize(
-            &self,
-            _req_ctx: &crate::service::domain::RequestContext,
-            _target: AuthzTarget,
-            _op: AuthzOp,
-        ) -> Result<(), CanonicalError> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn create_and_rename_authz_calls_match_target_count_in_guard_chain() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut chain = GuardChain::new(Arc::new(MountTable::new()));
-        chain.set_authz_provider(Arc::new(CountingAuthz {
-            scheme: AuthzScheme::RangerPath,
-            calls: Arc::clone(&calls),
-        }));
-
-        let caller = RequestHeader::new(types::ids::ClientId::new(1));
-        let req_header = None;
-
-        let create_targets = MetadataFileSystemServiceImpl::authz_targets_for_parent(
-            AuthzScheme::RangerPath,
-            "/dir/new-file",
-            InodeId::new(11),
-        )
-        .unwrap();
-        chain
-            .check_request(
-                &req_header,
-                &caller,
-                GuardPolicy::METADATA_READ,
-                None,
-                Some(MetadataFileSystemServiceImpl::authz_for_rpc(
-                    PathRpcAuthz::Create,
-                    create_targets,
-                )),
-            )
-            .await
-            .unwrap();
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-
-        let rename_targets = MetadataFileSystemServiceImpl::authz_targets_for_rename(
-            AuthzScheme::RangerPath,
-            "/src/name",
-            "/dst/new-name",
-            InodeId::new(11),
-            InodeId::new(22),
-        )
-        .unwrap();
-        chain
-            .check_request(
-                &req_header,
-                &caller,
-                GuardPolicy::METADATA_READ,
-                None,
-                Some(MetadataFileSystemServiceImpl::authz_for_rpc(
-                    PathRpcAuthz::Rename,
-                    rename_targets,
-                )),
-            )
-            .await
-            .unwrap();
-        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert!(!source.contains(concat!("Authz", "Scheme")));
+        assert!(!source.contains(concat!("authz", "_targets_for_")));
+        assert!(!source.contains(concat!("traverse", "_pre_checks")));
+        assert!(!source.contains(concat!("sticky", "_pre_checks")));
     }
 }

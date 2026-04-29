@@ -22,28 +22,50 @@ pub struct MountContext {
     pub root_inode_id: InodeId,
 }
 
-/// Resolved path for create/unlink/rename operations.
-/// Contains parent inode and name for the target entry.
+/// Provider-neutral facts produced by path resolution.
+///
+/// Existing-target flows require `inode_id`; parent/create flows require
+/// `parent_inode_id` and `name`. Mount-root resolution has no parent/name.
 #[derive(Clone, Debug)]
 pub struct ResolvedPath {
     pub mount_ctx: MountContext,
-    pub parent_inode_id: InodeId,
-    pub name: String,
-    /// Directory inodes requiring traverse/search (`EXECUTE`) checks in order.
-    /// Includes mount root and the resolved parent directory.
-    pub traverse_dir_inode_ids: Vec<InodeId>,
-    /// Optional: inode_id if the entry already exists (for lookup operations).
+    pub parent_inode_id: Option<InodeId>,
+    pub name: Option<String>,
     pub inode_id: Option<InodeId>,
+    /// Directory inodes requiring traverse/search (`EXECUTE`) checks in order.
+    /// Existing-target resolution excludes the target inode; parent resolution
+    /// includes the resolved parent directory because the final lookup uses it.
+    pub traverse_dir_inode_ids: Vec<InodeId>,
 }
 
-/// Resolved inode for getattr/open operations.
-#[derive(Clone, Debug)]
-pub struct ResolvedInode {
-    pub mount_ctx: MountContext,
-    pub inode_id: InodeId,
-    /// Directory inodes requiring traverse/search (`EXECUTE`) checks in order.
-    /// Includes mount root and each ancestor directory (excludes target inode).
-    pub traverse_dir_inode_ids: Vec<InodeId>,
+impl ResolvedPath {
+    pub fn expect_inode(&self) -> MetadataResult<InodeId> {
+        self.inode_id
+            .ok_or_else(|| MetadataError::NotFound("resolved path has no target inode".to_string()))
+    }
+
+    pub fn expect_parent(&self) -> MetadataResult<InodeId> {
+        self.parent_inode_id
+            .ok_or_else(|| MetadataError::InvalidArgument("resolved path has no parent inode".to_string()))
+    }
+
+    pub fn expect_name(&self) -> MetadataResult<&str> {
+        self.name
+            .as_deref()
+            .ok_or_else(|| MetadataError::InvalidArgument("resolved path has no terminal name".to_string()))
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub fn mount_id(&self) -> MountId {
+        self.mount_ctx.mount_id
+    }
+
+    pub fn mount_epoch(&self) -> u64 {
+        self.mount_ctx.mount_epoch
+    }
 }
 
 /// Path resolver: converts paths to inode IDs.
@@ -205,16 +227,16 @@ impl PathResolver {
                 owner_group_id: mount_entry.namespace_owner_group_id,
                 root_inode_id: mount_entry.root_inode_id,
             },
-            parent_inode_id,
-            name,
+            parent_inode_id: Some(parent_inode_id),
+            name: Some(name),
             traverse_dir_inode_ids,
             inode_id,
         })
     }
 
-    /// Resolve path to ResolvedInode (for getattr/open operations).
+    /// Resolve path to a unified ResolvedPath with `inode_id` populated.
     /// Returns the inode_id for the target path.
-    pub fn resolve_inode(&self, path: &str) -> MetadataResult<ResolvedInode> {
+    pub fn resolve_inode(&self, path: &str) -> MetadataResult<ResolvedPath> {
         let (mount_entry, components) = self.resolve_mount(path)?;
 
         let (inode_id, traverse_dir_inode_ids) = if components.is_empty() {
@@ -223,15 +245,22 @@ impl PathResolver {
         } else {
             self.walk_dentry_with_traverse(mount_entry.root_inode_id, &components)?
         };
+        let (parent_inode_id, name) = if components.is_empty() {
+            (None, None)
+        } else {
+            (traverse_dir_inode_ids.last().copied(), components.last().cloned())
+        };
 
-        Ok(ResolvedInode {
+        Ok(ResolvedPath {
             mount_ctx: MountContext {
                 mount_id: mount_entry.mount_id,
                 mount_epoch: mount_entry.config_version,
                 owner_group_id: mount_entry.namespace_owner_group_id,
                 root_inode_id: mount_entry.root_inode_id,
             },
-            inode_id,
+            parent_inode_id,
+            name,
+            inode_id: Some(inode_id),
             traverse_dir_inode_ids,
         })
     }
@@ -373,8 +402,10 @@ mod tests {
 
         let resolver = PathResolver::new(mount_table, storage);
         let resolved = resolver.resolve_inode("/mnt/test/a/b/c").unwrap();
-        assert_eq!(resolved.inode_id, file_c);
+        assert_eq!(resolved.expect_inode().unwrap(), file_c);
         assert_eq!(resolved.traverse_dir_inode_ids, vec![root_inode_id, dir_a, dir_b]);
+        assert_eq!(resolved.expect_parent().unwrap(), dir_b);
+        assert_eq!(resolved.name(), Some("c"));
     }
 
     #[test]
@@ -419,9 +450,9 @@ mod tests {
 
         let resolver = PathResolver::new(mount_table, storage);
         let resolved = resolver.resolve_path("/mnt/test2/a/b/new-file").unwrap();
-        assert_eq!(resolved.parent_inode_id, dir_b);
+        assert_eq!(resolved.expect_parent().unwrap(), dir_b);
         assert_eq!(resolved.traverse_dir_inode_ids, vec![root_inode_id, dir_a, dir_b]);
-        assert_eq!(resolved.name, "new-file");
+        assert_eq!(resolved.name(), Some("new-file"));
         assert!(resolved.inode_id.is_none());
     }
 }

@@ -11,8 +11,8 @@ use crate::metrics::MetadataMetrics;
 use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use crate::readiness::{wait_for_root_ready_with_metrics, RootReadinessGate};
 use crate::service::{
-    cached_static_group_resolver, filesystem_authz_provider, AuthzProviderDeps, FileSystemAuthorityDeps,
-    FileSystemPolicyDeps, FileSystemRuntimeDeps, MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl,
+    cached_static_group_resolver, filesystem_permission_checker, FileSystemAuthorityDeps, FileSystemPolicyDeps,
+    FileSystemRuntimeDeps, MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl, PermissionCheckerDeps,
     RocksDbInodePermReader, SharedWorkerCommitHook,
 };
 use crate::state::RaftStateStore;
@@ -444,7 +444,7 @@ pub async fn build_filesystem_service(
     worker_manager: Arc<WorkerManager>,
     readiness: &Readiness,
 ) -> Result<MetadataFileSystemServiceImpl, DynError> {
-    let authz_deps = AuthzProviderDeps::new(
+    let permission_deps = PermissionCheckerDeps::new(
         cached_static_group_resolver(
             config.authz.groups.static_mappings.clone(),
             config.authz.groups.cache_ttl_secs,
@@ -473,8 +473,8 @@ pub async fn build_filesystem_service(
         },
         policy: FileSystemPolicyDeps {
             leadership_checker: None,
-            authz_provider: filesystem_authz_provider(config.authz.filesystem.mode, &authz_deps),
-            inode_perm_reader: Some(Arc::clone(&authz_deps.inode_perm_reader)),
+            permission_checker: filesystem_permission_checker(config.authz.filesystem.mode, &permission_deps),
+            inode_perm_reader: Some(Arc::clone(&permission_deps.inode_perm_reader)),
         },
     });
 

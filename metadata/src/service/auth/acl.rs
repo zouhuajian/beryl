@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Authorization provider contracts and mode-backed providers.
+//! ACL-backed inode permission checker.
 //!
 //! ACL MVP subset contract (enforced fail-closed):
 //! - ACL source: `system.posix_acl_access` xattr only (no default-acl evaluation).
@@ -15,16 +15,17 @@
 //!   `GROUP_RESOLVE_FAILED`, `MISSING_PRINCIPAL`.
 //! - Non-goals in this phase: no default ACL inheritance and no name-based uid/gid expansion.
 
-use super::core_util::permission_denied_canonical_error;
-use super::domain::RequestContext;
-use crate::config::FileSystemAuthzMode;
+use super::{PermissionBits, PermissionChecker, SetAttrPerm};
 use crate::metrics::{
-    AUTHZ_ALLOW_ACL_INODE_TOTAL, AUTHZ_ALLOW_NONE_TOTAL, AUTHZ_ALLOW_RANGER_PATH_TOTAL, AUTHZ_DENY_ACL_INODE_TOTAL,
-    AUTHZ_DENY_NONE_TOTAL, AUTHZ_DENY_RANGER_PATH_TOTAL, AUTHZ_GROUPS_CACHE_EXPIRY_TOTAL, AUTHZ_GROUPS_CACHE_HIT_TOTAL,
-    AUTHZ_GROUPS_CACHE_MISS_TOTAL, AUTHZ_GROUPS_RESOLVER_ERROR_TOTAL, AUTHZ_GROUPS_STALE_FALLBACK_USED_TOTAL,
-    AUTHZ_PERM_CACHE_HIT_TOTAL, AUTHZ_PERM_CACHE_INVALIDATE_TOTAL, AUTHZ_PERM_CACHE_MISS_TOTAL,
+    AUTHZ_ALLOW_ACL_INODE_TOTAL, AUTHZ_DENY_ACL_INODE_TOTAL, AUTHZ_GROUPS_CACHE_EXPIRY_TOTAL,
+    AUTHZ_GROUPS_CACHE_HIT_TOTAL, AUTHZ_GROUPS_CACHE_MISS_TOTAL, AUTHZ_GROUPS_RESOLVER_ERROR_TOTAL,
+    AUTHZ_GROUPS_STALE_FALLBACK_USED_TOTAL, AUTHZ_PERM_CACHE_HIT_TOTAL, AUTHZ_PERM_CACHE_INVALIDATE_TOTAL,
+    AUTHZ_PERM_CACHE_MISS_TOTAL,
 };
+use crate::path_resolver::ResolvedPath;
 use crate::raft::RocksDBStorage;
+use crate::service::core_util::permission_denied_canonical_error;
+use crate::service::domain::RequestContext;
 use async_trait::async_trait;
 use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode};
 use common::header::RpcErrorCode;
@@ -44,175 +45,272 @@ const MISSING_PRINCIPAL_REASON: &str = "MISSING_PRINCIPAL";
 const STICKY_BIT_DENIED_REASON: &str = "STICKY_BIT_DENIED";
 const STICKY_BIT_MASK: u32 = 0o1000;
 
-fn record_authz_allow(scheme: AuthzScheme) {
-    match scheme {
-        AuthzScheme::RangerPath => {
-            AUTHZ_ALLOW_RANGER_PATH_TOTAL.fetch_add(1, Ordering::Relaxed);
-        }
-        AuthzScheme::AclInode => {
-            AUTHZ_ALLOW_ACL_INODE_TOTAL.fetch_add(1, Ordering::Relaxed);
-        }
-        AuthzScheme::None => {
-            AUTHZ_ALLOW_NONE_TOTAL.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+fn record_acl_allow() {
+    AUTHZ_ALLOW_ACL_INODE_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
-fn record_authz_deny(scheme: AuthzScheme) {
-    match scheme {
-        AuthzScheme::RangerPath => {
-            AUTHZ_DENY_RANGER_PATH_TOTAL.fetch_add(1, Ordering::Relaxed);
-        }
-        AuthzScheme::AclInode => {
-            AUTHZ_DENY_ACL_INODE_TOTAL.fetch_add(1, Ordering::Relaxed);
-        }
-        AuthzScheme::None => {
-            AUTHZ_DENY_NONE_TOTAL.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+fn record_acl_deny() {
+    AUTHZ_DENY_ACL_INODE_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-/// Authorization operation primitive shared across providers and service surfaces.
-///
-/// Semantics:
-/// - `Read`: client-visible metadata/data read
-/// - `Write`: state-mutating write (content and metadata that persists state)
-/// - `Execute`: directory traverse/search semantics
-/// - `Rename`: structural move/rename (path flows require src + dst-parent checks)
-/// - `Delete`: unlink/rmdir removal semantics
-/// - `Xattr`: get/set/remove extended attributes
-/// - `Sticky`: sticky-bit ownership policy check for delete/rename entry removal
-///
-/// This enum is SSOT for both ACL and Ranger providers.
-/// Do not introduce parallel provider-specific permission enums.
-pub enum AuthzOp {
+enum AclOperation {
     Read,
     Write,
     Execute,
-    Rename,
-    Delete,
-    Xattr,
     Sticky,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AuthzScheme {
-    RangerPath,
-    AclInode,
-    None,
-}
-
-impl AuthzOp {
-    pub fn as_str(self) -> &'static str {
+impl AclOperation {
+    fn as_str(self) -> &'static str {
         match self {
-            AuthzOp::Read => "READ",
-            AuthzOp::Write => "WRITE",
-            AuthzOp::Execute => "EXECUTE",
-            AuthzOp::Rename => "RENAME",
-            AuthzOp::Delete => "DELETE",
-            AuthzOp::Xattr => "XATTR",
-            AuthzOp::Sticky => "STICKY",
+            AclOperation::Read => "READ",
+            AclOperation::Write => "WRITE",
+            AclOperation::Execute => "EXECUTE",
+            AclOperation::Sticky => "STICKY",
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-/// Authorization target descriptor used by provider checks.
-///
-/// - `Inode`: inode-centric target for privileged/inode flows (optionally with parent inode context)
-/// - `Session`: file-handle/session target for write-session operations
-/// - `Path`: full path target for path-adapter checks before resolve/mutation
-/// - `PathParent`: parent-path + child-name target for create/mkdir/unlink-style checks
-pub enum AuthzTarget {
+enum AclTarget {
     Inode {
         inode_id: InodeId,
         parent_inode_id: Option<InodeId>,
     },
-    Session {
-        file_handle: u64,
-        inode_id: Option<InodeId>,
-    },
-    Path {
-        path: String,
-    },
-    PathParent {
-        parent_path: String,
-        name: String,
-    },
 }
 
-impl AuthzTarget {
-    pub fn for_inode(inode_id: InodeId) -> Self {
+impl AclTarget {
+    fn for_inode(inode_id: InodeId) -> Self {
         Self::Inode {
             inode_id,
             parent_inode_id: None,
         }
     }
 
-    pub fn with_parent(mut self, parent_inode_id: InodeId) -> Self {
-        if let Self::Inode { parent_inode_id: p, .. } = &mut self {
-            *p = Some(parent_inode_id);
-        }
+    fn with_parent(mut self, parent_inode_id: InodeId) -> Self {
+        let Self::Inode { parent_inode_id: p, .. } = &mut self;
+        *p = Some(parent_inode_id);
         self
     }
 
-    pub fn for_session(file_handle: u64, inode_id: Option<InodeId>) -> Self {
-        Self::Session { file_handle, inode_id }
-    }
-
-    pub fn for_file_handle(file_handle: u64) -> Self {
-        Self::Session {
-            file_handle,
-            inode_id: None,
-        }
-    }
-
-    pub fn for_path(path: impl Into<String>) -> Self {
-        Self::Path { path: path.into() }
-    }
-
-    pub fn for_path_parent(parent_path: impl Into<String>, name: impl Into<String>) -> Self {
-        Self::PathParent {
-            parent_path: parent_path.into(),
-            name: name.into(),
-        }
-    }
-
-    pub fn describe(&self) -> Option<String> {
+    fn describe(&self) -> String {
         match self {
-            AuthzTarget::Inode {
+            AclTarget::Inode {
                 inode_id,
                 parent_inode_id,
-            } => Some(match parent_inode_id {
+            } => match parent_inode_id {
                 Some(parent) => format!(
                     "Inode(inode_id={},parent_inode_id={})",
                     inode_id.as_raw(),
                     parent.as_raw()
                 ),
                 None => format!("Inode(inode_id={})", inode_id.as_raw()),
-            }),
-            AuthzTarget::Session { file_handle, inode_id } => Some(match inode_id {
-                Some(id) => format!("Session(file_handle={},inode_id={})", file_handle, id.as_raw()),
-                None => format!("Session(file_handle={})", file_handle),
-            }),
-            AuthzTarget::Path { path } => Some(format!("Path({path})")),
-            AuthzTarget::PathParent { parent_path, name } => {
-                Some(format!("PathParent(parent={parent_path},name={name})"))
-            }
+            },
         }
     }
 }
 
-#[async_trait]
-pub trait AuthzProvider: Send + Sync {
-    fn scheme(&self) -> AuthzScheme;
-
-    async fn authorize(&self, req_ctx: &RequestContext, target: AuthzTarget, op: AuthzOp)
-        -> Result<(), CanonicalError>;
+#[derive(Clone)]
+pub struct AclPermissionChecker {
+    provider: AclAuthorizer,
 }
 
-/// Server-side group resolver used by ACL provider.
+impl AclPermissionChecker {
+    pub fn new(group_resolver: Arc<dyn GroupResolver>, inode_perm_reader: Arc<dyn InodePermReader>) -> Self {
+        Self {
+            provider: AclAuthorizer::new(group_resolver, inode_perm_reader),
+        }
+    }
+
+    async fn authorize(
+        &self,
+        caller: &RequestContext,
+        inode_id: InodeId,
+        op: AclOperation,
+    ) -> Result<(), CanonicalError> {
+        self.provider
+            .authorize(caller, AclTarget::for_inode(inode_id), op)
+            .await
+    }
+
+    async fn authorize_sticky(
+        &self,
+        caller: &RequestContext,
+        parent_inode_id: InodeId,
+        target_inode_id: InodeId,
+    ) -> Result<(), CanonicalError> {
+        self.provider
+            .authorize(
+                caller,
+                AclTarget::for_inode(target_inode_id).with_parent(parent_inode_id),
+                AclOperation::Sticky,
+            )
+            .await
+    }
+
+    async fn check_traverse(&self, caller: &RequestContext, traverse_inodes: &[InodeId]) -> Result<(), CanonicalError> {
+        for inode_id in traverse_inodes {
+            self.authorize(caller, *inode_id, AclOperation::Execute).await?;
+        }
+        Ok(())
+    }
+
+    async fn authorize_bits(
+        &self,
+        caller: &RequestContext,
+        inode_id: InodeId,
+        bits: PermissionBits,
+    ) -> Result<(), CanonicalError> {
+        for (bit, op) in [
+            (PermissionBits::READ, AclOperation::Read),
+            (PermissionBits::WRITE, AclOperation::Write),
+            (PermissionBits::EXECUTE, AclOperation::Execute),
+        ] {
+            if bits.contains(bit) {
+                self.authorize(caller, inode_id, op).await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn principal<'a>(&self, ctx: &'a RequestContext) -> Result<&'a str, CanonicalError> {
+        ctx.principal
+            .as_deref()
+            .or(ctx.caller.principal.as_deref())
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| {
+                rpc_fatal_with_reason(
+                    RpcErrorCode::Unauthenticated,
+                    MISSING_PRINCIPAL_REASON,
+                    "acl authorization requires non-empty principal",
+                )
+            })
+    }
+
+    fn is_superuser(&self, ctx: &RequestContext) -> Result<bool, CanonicalError> {
+        let principal = self.principal(ctx)?;
+        if parse_principal_uid(principal) == Some(0) {
+            return Ok(true);
+        }
+        let groups = self.provider.group_resolver.groups_for(principal)?;
+        Ok(groups.iter().any(|group| group == "supergroup"))
+    }
+
+    fn is_owner(&self, ctx: &RequestContext, inode_id: InodeId) -> Result<bool, CanonicalError> {
+        let principal = self.principal(ctx)?;
+        let Some(uid) = parse_principal_uid(principal) else {
+            return Ok(false);
+        };
+        let Some(inputs) = self.provider.inode_perm_reader.get_perm_inputs(inode_id)? else {
+            return Err(CanonicalError::fatal_fs(
+                FsErrorCode::ENoEnt,
+                format!("inode not found for owner authz: {}", inode_id.as_raw()),
+            ));
+        };
+        Ok(inputs.uid == uid)
+    }
+}
+
+#[async_trait]
+impl PermissionChecker for AclPermissionChecker {
+    async fn check_perm(
+        &self,
+        ctx: &RequestContext,
+        bits: PermissionBits,
+        _path: &str,
+        resolved: &ResolvedPath,
+    ) -> Result<(), CanonicalError> {
+        self.check_traverse(ctx, &resolved.traverse_dir_inode_ids).await?;
+        let inode_id = resolved.expect_inode().map_err(|err| {
+            CanonicalError::fatal_fs(FsErrorCode::ENoEnt, format!("permission target not found: {err}"))
+        })?;
+        self.authorize_bits(ctx, inode_id, bits).await
+    }
+
+    async fn check_parent_perm(
+        &self,
+        ctx: &RequestContext,
+        bits: PermissionBits,
+        _path: &str,
+        resolved: &ResolvedPath,
+    ) -> Result<(), CanonicalError> {
+        let Some(parent_inode_id) = resolved.parent_inode_id else {
+            return Ok(());
+        };
+        self.check_traverse(ctx, &resolved.traverse_dir_inode_ids).await?;
+        self.authorize_bits(ctx, parent_inode_id, bits).await?;
+        if bits.contains(PermissionBits::WRITE) {
+            if let Some(target_inode_id) = resolved.inode_id {
+                self.authorize_sticky(ctx, parent_inode_id, target_inode_id).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn check_super(&self, ctx: &RequestContext) -> Result<(), CanonicalError> {
+        if self.is_superuser(ctx)? {
+            Ok(())
+        } else {
+            Err(rpc_permission_denied_with_reason(
+                "SUPERUSER_REQUIRED",
+                "operation requires superuser",
+            ))
+        }
+    }
+
+    async fn get_perm(
+        &self,
+        ctx: &RequestContext,
+        _path: &str,
+        resolved: &ResolvedPath,
+    ) -> Result<PermissionBits, CanonicalError> {
+        self.check_traverse(ctx, &resolved.traverse_dir_inode_ids).await?;
+        let inode_id = resolved.expect_inode().map_err(|err| {
+            CanonicalError::fatal_fs(FsErrorCode::ENoEnt, format!("permission target not found: {err}"))
+        })?;
+        let mut bits = PermissionBits::empty();
+        for (bit, op) in [
+            (PermissionBits::READ, AclOperation::Read),
+            (PermissionBits::WRITE, AclOperation::Write),
+            (PermissionBits::EXECUTE, AclOperation::Execute),
+        ] {
+            if self.authorize(ctx, inode_id, op).await.is_ok() {
+                bits |= bit;
+            }
+        }
+        Ok(bits)
+    }
+
+    async fn check_set_attr_perm(
+        &self,
+        ctx: &RequestContext,
+        path: &str,
+        resolved: &ResolvedPath,
+        req: SetAttrPerm,
+    ) -> Result<(), CanonicalError> {
+        if req.super_required {
+            self.check_super(ctx).await?;
+        }
+        if req.owner_required {
+            let inode_id = resolved.expect_inode().map_err(|err| {
+                CanonicalError::fatal_fs(FsErrorCode::ENoEnt, format!("permission target not found: {err}"))
+            })?;
+            if !self.is_superuser(ctx)? && !self.is_owner(ctx, inode_id)? {
+                return Err(rpc_permission_denied_with_reason(
+                    "OWNER_REQUIRED",
+                    format!("path={path} inode_id={}", inode_id.as_raw()),
+                ));
+            }
+        }
+        if req.write_required {
+            self.check_perm(ctx, PermissionBits::WRITE, path, resolved).await?;
+        }
+        Ok(())
+    }
+}
+
 pub trait GroupResolver: Send + Sync {
     fn groups_for(&self, principal: &str) -> Result<Vec<String>, CanonicalError>;
 }
@@ -249,6 +347,15 @@ impl GroupResolver for StaticGroupResolver {
     fn groups_for(&self, principal: &str) -> Result<Vec<String>, CanonicalError> {
         Ok(self.principal_to_groups.get(principal).cloned().unwrap_or_default())
     }
+}
+
+pub fn cached_static_group_resolver(
+    principal_to_groups: BTreeMap<String, Vec<String>>,
+    cache_ttl_secs: u64,
+    stale_while_error: bool,
+) -> Arc<dyn GroupResolver> {
+    let backend: Arc<dyn GroupResolver> = Arc::new(StaticGroupResolver::new(principal_to_groups));
+    Arc::new(CachedGroupResolver::new(backend, cache_ttl_secs, stale_while_error))
 }
 
 trait TimeSource: Send + Sync {
@@ -451,56 +558,33 @@ impl InodePermReader for RocksDbInodePermReader {
 }
 
 #[derive(Clone, Debug)]
-pub struct AllowAllAuthz;
+pub struct StaticPermReader {
+    data: Arc<HashMap<InodeId, InodePermInputs>>,
+}
 
-#[async_trait]
-impl AuthzProvider for AllowAllAuthz {
-    fn scheme(&self) -> AuthzScheme {
-        AuthzScheme::None
-    }
-
-    async fn authorize(
-        &self,
-        _req_ctx: &RequestContext,
-        _target: AuthzTarget,
-        _op: AuthzOp,
-    ) -> Result<(), CanonicalError> {
-        record_authz_allow(AuthzScheme::None);
-        Ok(())
+impl StaticPermReader {
+    pub fn new(entries: Vec<InodePermInputs>) -> Self {
+        let data = entries.into_iter().map(|entry| (entry.inode_id, entry)).collect();
+        Self { data: Arc::new(data) }
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct DenyAllAuthz;
-
-#[async_trait]
-impl AuthzProvider for DenyAllAuthz {
-    fn scheme(&self) -> AuthzScheme {
-        AuthzScheme::None
+impl InodePermReader for StaticPermReader {
+    fn get_perm_inputs(&self, inode_id: InodeId) -> Result<Option<InodePermInputs>, CanonicalError> {
+        Ok(self.data.get(&inode_id).cloned())
     }
 
-    async fn authorize(
-        &self,
-        _req_ctx: &RequestContext,
-        target: AuthzTarget,
-        op: AuthzOp,
-    ) -> Result<(), CanonicalError> {
-        record_authz_deny(AuthzScheme::None);
-        Err(permission_denied_canonical_error(
-            Some(op.as_str()),
-            target.describe().as_deref(),
-        ))
-    }
+    fn invalidate(&self, _inode_id: InodeId) {}
 }
 
 #[derive(Clone)]
-pub struct AclInodeAuthz {
+struct AclAuthorizer {
     group_resolver: Arc<dyn GroupResolver>,
     inode_perm_reader: Arc<dyn InodePermReader>,
 }
 
-impl AclInodeAuthz {
-    pub fn new(group_resolver: Arc<dyn GroupResolver>, inode_perm_reader: Arc<dyn InodePermReader>) -> Self {
+impl AclAuthorizer {
+    fn new(group_resolver: Arc<dyn GroupResolver>, inode_perm_reader: Arc<dyn InodePermReader>) -> Self {
         Self {
             group_resolver,
             inode_perm_reader,
@@ -516,7 +600,7 @@ impl AclInodeAuthz {
     ) -> Result<(), CanonicalError> {
         let parent_inode_id = parent_inode_id.ok_or_else(|| {
             permission_denied_canonical_error(
-                Some(AuthzOp::Sticky.as_str()),
+                Some(AclOperation::Sticky.as_str()),
                 Some("sticky checks require parent inode context"),
             )
         })?;
@@ -576,8 +660,8 @@ impl AclInodeAuthz {
     fn authorize_inner(
         &self,
         req_ctx: &RequestContext,
-        target: AuthzTarget,
-        op: AuthzOp,
+        target: AclTarget,
+        op: AclOperation,
     ) -> Result<(), CanonicalError> {
         let principal = req_ctx
             .principal
@@ -596,23 +680,13 @@ impl AclInodeAuthz {
         let principal_uid = parse_principal_uid(principal);
         let target_detail = target.describe();
         let (inode_id, parent_inode_id) = match target {
-            AuthzTarget::Inode {
+            AclTarget::Inode {
                 inode_id,
                 parent_inode_id,
             } => (inode_id, parent_inode_id),
-            AuthzTarget::Session {
-                inode_id: Some(inode_id),
-                ..
-            } => (inode_id, None),
-            other => {
-                return Err(permission_denied_canonical_error(
-                    Some(op.as_str()),
-                    other.describe().as_deref(),
-                ));
-            }
         };
 
-        if matches!(op, AuthzOp::Sticky) {
+        if matches!(op, AclOperation::Sticky) {
             return self.authorize_sticky(principal, principal_uid, inode_id, parent_inode_id);
         }
 
@@ -642,117 +716,28 @@ impl AclInodeAuthz {
                 op,
                 principal,
                 inode_id,
-                target_detail.as_deref(),
+                Some(target_detail.as_str()),
                 source,
             ))
         }
     }
 }
 
-#[async_trait]
-impl AuthzProvider for AclInodeAuthz {
-    fn scheme(&self) -> AuthzScheme {
-        AuthzScheme::AclInode
-    }
-
+impl AclAuthorizer {
     async fn authorize(
         &self,
         req_ctx: &RequestContext,
-        target: AuthzTarget,
-        op: AuthzOp,
+        target: AclTarget,
+        op: AclOperation,
     ) -> Result<(), CanonicalError> {
         let result = self.authorize_inner(req_ctx, target, op);
         if result.is_ok() {
-            record_authz_allow(AuthzScheme::AclInode);
+            record_acl_allow();
         } else {
-            record_authz_deny(AuthzScheme::AclInode);
+            record_acl_deny();
         }
         result
     }
-}
-
-#[derive(Clone, Debug)]
-/// STUB: allow-all placeholder; real Ranger enforcement is not implemented yet.
-pub struct StubRangerAuthz;
-
-#[async_trait]
-impl AuthzProvider for StubRangerAuthz {
-    fn scheme(&self) -> AuthzScheme {
-        AuthzScheme::RangerPath
-    }
-
-    async fn authorize(
-        &self,
-        req_ctx: &RequestContext,
-        target: AuthzTarget,
-        op: AuthzOp,
-    ) -> Result<(), CanonicalError> {
-        debug!(
-            authz_stub = true,
-            provider = "ranger",
-            op = op.as_str(),
-            target = %stub_target_for_log(&target),
-            client_id = req_ctx.caller.client.client_id.as_raw(),
-            group_id = req_ctx.caller.group_id,
-            "authz stub allow-all (RANGER): policy evaluation not implemented yet"
-        );
-        record_authz_allow(AuthzScheme::RangerPath);
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
-pub struct AuthzProviderDeps {
-    pub group_resolver: Arc<dyn GroupResolver>,
-    pub inode_perm_reader: Arc<dyn InodePermReader>,
-}
-
-impl AuthzProviderDeps {
-    pub fn new(group_resolver: Arc<dyn GroupResolver>, inode_perm_reader: Arc<dyn InodePermReader>) -> Self {
-        Self {
-            group_resolver,
-            inode_perm_reader,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AuthzProviderKind {
-    AllowAll,
-    AclInode,
-    StubRanger,
-}
-
-fn filesystem_authz_provider_kind(mode: FileSystemAuthzMode) -> AuthzProviderKind {
-    match mode {
-        FileSystemAuthzMode::None => AuthzProviderKind::AllowAll,
-        FileSystemAuthzMode::Acl => AuthzProviderKind::AclInode,
-        FileSystemAuthzMode::Ranger => AuthzProviderKind::StubRanger,
-    }
-}
-
-fn build_authz_provider(kind: AuthzProviderKind, deps: &AuthzProviderDeps) -> Arc<dyn AuthzProvider> {
-    match kind {
-        AuthzProviderKind::AllowAll => Arc::new(AllowAllAuthz),
-        AuthzProviderKind::AclInode => Arc::new(AclInodeAuthz::new(
-            Arc::clone(&deps.group_resolver),
-            Arc::clone(&deps.inode_perm_reader),
-        )),
-        AuthzProviderKind::StubRanger => Arc::new(StubRangerAuthz),
-    }
-}
-
-pub fn filesystem_authz_provider(mode: FileSystemAuthzMode, deps: &AuthzProviderDeps) -> Arc<dyn AuthzProvider> {
-    build_authz_provider(filesystem_authz_provider_kind(mode), deps)
-}
-
-pub fn cached_static_group_resolver(
-    principal_to_groups: BTreeMap<String, Vec<String>>,
-    cache_ttl_secs: u64,
-    stale_while_error: bool,
-) -> Arc<dyn GroupResolver> {
-    let backend: Arc<dyn GroupResolver> = Arc::new(StaticGroupResolver::new(principal_to_groups));
-    Arc::new(CachedGroupResolver::new(backend, cache_ttl_secs, stale_while_error))
 }
 
 fn parse_principal_uid(principal: &str) -> Option<u32> {
@@ -768,12 +753,11 @@ fn parse_group_ids(groups: &[String]) -> Vec<u32> {
     groups.iter().filter_map(|group| group.parse::<u32>().ok()).collect()
 }
 
-fn required_perm_for_op(op: AuthzOp) -> AclPerm {
+fn required_perm_for_op(op: AclOperation) -> AclPerm {
     match op {
-        AuthzOp::Read => AclPerm::READ,
-        AuthzOp::Execute => AclPerm::EXECUTE,
-        // TODO(authz-acl): split richer semantics for rename/delete/xattr/traverse.
-        AuthzOp::Write | AuthzOp::Rename | AuthzOp::Delete | AuthzOp::Xattr | AuthzOp::Sticky => AclPerm::WRITE,
+        AclOperation::Read => AclPerm::READ,
+        AclOperation::Execute => AclPerm::EXECUTE,
+        AclOperation::Write | AclOperation::Sticky => AclPerm::WRITE,
     }
 }
 
@@ -946,27 +930,6 @@ fn evaluate_acl_mvp(
     ))
 }
 
-fn stub_target_for_log(target: &AuthzTarget) -> &'static str {
-    match target {
-        AuthzTarget::Inode { parent_inode_id, .. } => {
-            if parent_inode_id.is_some() {
-                "inode_with_parent"
-            } else {
-                "inode"
-            }
-        }
-        AuthzTarget::Session { inode_id, .. } => {
-            if inode_id.is_some() {
-                "session_with_inode"
-            } else {
-                "session"
-            }
-        }
-        AuthzTarget::Path { .. } => "path",
-        AuthzTarget::PathParent { .. } => "path_parent",
-    }
-}
-
 fn rpc_fatal_canonical_error(code: RpcErrorCode, message: impl Into<String>) -> CanonicalError {
     CanonicalError {
         class: ErrorClass::Fatal,
@@ -983,7 +946,7 @@ fn rpc_permission_denied_canonical_error(message: impl Into<String>) -> Canonica
 }
 
 fn acl_denied_canonical_error(
-    op: AuthzOp,
+    op: AclOperation,
     principal: &str,
     inode_id: InodeId,
     target: Option<&str>,
@@ -1038,7 +1001,7 @@ mod tests {
     use tempfile::TempDir;
     use types::acl::{encode_posix_acl, AclEntry, PosixAcl};
     use types::fs::{FileAttrs, Inode};
-    use types::ids::{ClientId, DataHandleId, MountId};
+    use types::ids::{ClientId, DataHandleId, MountId, ShardGroupId};
 
     #[derive(Clone)]
     struct TestClock {
@@ -1065,16 +1028,19 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct GroupResponses(Arc<Mutex<Vec<Result<Vec<String>, CanonicalError>>>>);
+
+    #[derive(Clone)]
     struct ScriptedGroupResolver {
         calls: Arc<AtomicUsize>,
-        responses: Arc<Mutex<Vec<Result<Vec<String>, CanonicalError>>>>,
+        responses: GroupResponses,
     }
 
     impl ScriptedGroupResolver {
         fn new(responses: Vec<Result<Vec<String>, CanonicalError>>) -> Self {
             Self {
                 calls: Arc::new(AtomicUsize::new(0)),
-                responses: Arc::new(Mutex::new(responses)),
+                responses: GroupResponses(Arc::new(Mutex::new(responses))),
             }
         }
 
@@ -1086,7 +1052,7 @@ mod tests {
     impl GroupResolver for ScriptedGroupResolver {
         fn groups_for(&self, _principal: &str) -> Result<Vec<String>, CanonicalError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            let mut responses = self.responses.lock().expect("scripted resolver lock poisoned");
+            let mut responses = self.responses.0.lock().expect("scripted resolver lock poisoned");
             responses
                 .remove(0)
                 .map_err(|err| rpc_fatal_canonical_error(RpcErrorCode::NodeUnavailable, err.message))
@@ -1119,26 +1085,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
-    struct StaticPermReader {
-        data: Arc<HashMap<InodeId, InodePermInputs>>,
-    }
-
-    impl StaticPermReader {
-        fn new(entries: Vec<InodePermInputs>) -> Self {
-            let data = entries.into_iter().map(|entry| (entry.inode_id, entry)).collect();
-            Self { data: Arc::new(data) }
-        }
-    }
-
-    impl InodePermReader for StaticPermReader {
-        fn get_perm_inputs(&self, inode_id: InodeId) -> Result<Option<InodePermInputs>, CanonicalError> {
-            Ok(self.data.get(&inode_id).cloned())
-        }
-
-        fn invalidate(&self, _inode_id: InodeId) {}
-    }
-
     fn test_request_context(principal: Option<&str>) -> RequestContext {
         let mut caller = RequestHeader::new(ClientId::new(101));
         caller.principal = principal.map(ToString::to_string);
@@ -1150,6 +1096,36 @@ mod tests {
             real_user: None,
             doas: None,
             authn_type: common::header::AuthnType::Unspecified,
+        }
+    }
+
+    fn resolved_existing(inode_id: InodeId, parent_inode_id: Option<InodeId>, traverse: Vec<InodeId>) -> ResolvedPath {
+        ResolvedPath {
+            mount_ctx: crate::path_resolver::MountContext {
+                mount_id: MountId::new(1),
+                mount_epoch: 1,
+                owner_group_id: ShardGroupId::new(1),
+                root_inode_id: traverse.first().copied().unwrap_or(inode_id),
+            },
+            parent_inode_id,
+            name: Some("target".to_string()),
+            inode_id: Some(inode_id),
+            traverse_dir_inode_ids: traverse,
+        }
+    }
+
+    fn resolved_parent(parent_inode_id: InodeId, traverse: Vec<InodeId>) -> ResolvedPath {
+        ResolvedPath {
+            mount_ctx: crate::path_resolver::MountContext {
+                mount_id: MountId::new(1),
+                mount_epoch: 1,
+                owner_group_id: ShardGroupId::new(1),
+                root_inode_id: traverse.first().copied().unwrap_or(parent_inode_id),
+            },
+            parent_inode_id: Some(parent_inode_id),
+            name: Some("target".to_string()),
+            inode_id: None,
+            traverse_dir_inode_ids: traverse,
         }
     }
 
@@ -1256,7 +1232,7 @@ mod tests {
     #[tokio::test]
     async fn acl_mode_denies_when_principal_missing() {
         let inode_id = InodeId::new(42);
-        let provider = AclInodeAuthz::new(
+        let provider = AclAuthorizer::new(
             Arc::new(StaticGroupResolver::default()),
             Arc::new(StaticPermReader::new(vec![InodePermInputs {
                 inode_id,
@@ -1270,8 +1246,8 @@ mod tests {
         let err = provider
             .authorize(
                 &test_request_context(None),
-                AuthzTarget::for_inode(inode_id),
-                AuthzOp::Read,
+                AclTarget::for_inode(inode_id),
+                AclOperation::Read,
             )
             .await
             .expect_err("missing principal must deny");
@@ -1288,7 +1264,7 @@ mod tests {
         let inode_id = InodeId::new(88);
         let backend = Arc::new(CountingFixedGroupResolver::new(vec!["300".to_string()]));
         let group_resolver: Arc<dyn GroupResolver> = Arc::new(CachedGroupResolver::new(backend.clone(), 300, false));
-        let provider = AclInodeAuthz::new(
+        let provider = AclAuthorizer::new(
             group_resolver,
             Arc::new(StaticPermReader::new(vec![InodePermInputs {
                 inode_id,
@@ -1301,12 +1277,12 @@ mod tests {
         let req_ctx = test_request_context(Some("2000"));
 
         provider
-            .authorize(&req_ctx, AuthzTarget::for_inode(inode_id), AuthzOp::Read)
+            .authorize(&req_ctx, AclTarget::for_inode(inode_id), AclOperation::Read)
             .await
             .expect("group read bit should allow");
 
         let err = provider
-            .authorize(&req_ctx, AuthzTarget::for_inode(inode_id), AuthzOp::Write)
+            .authorize(&req_ctx, AclTarget::for_inode(inode_id), AclOperation::Write)
             .await
             .expect_err("group write bit is not set");
         assert_eq!(err.code, Some(CanonicalErrorCode::FsErrno(FsErrorCode::EAcces)));
@@ -1320,7 +1296,7 @@ mod tests {
         let root = InodeId::new(7001);
         let dir_a = InodeId::new(7002);
         let dir_b = InodeId::new(7003);
-        let provider = AclInodeAuthz::new(
+        let provider = AclAuthorizer::new(
             Arc::new(StaticGroupResolver::default()),
             Arc::new(StaticPermReader::new(vec![
                 InodePermInputs {
@@ -1349,16 +1325,16 @@ mod tests {
         let req_ctx = test_request_context(Some("2000"));
 
         provider
-            .authorize(&req_ctx, AuthzTarget::for_inode(root), AuthzOp::Execute)
+            .authorize(&req_ctx, AclTarget::for_inode(root), AclOperation::Execute)
             .await
             .expect("root traverse should allow");
         provider
-            .authorize(&req_ctx, AuthzTarget::for_inode(dir_a), AuthzOp::Execute)
+            .authorize(&req_ctx, AclTarget::for_inode(dir_a), AclOperation::Execute)
             .await
             .expect("first intermediate traverse should allow");
 
         let err = provider
-            .authorize(&req_ctx, AuthzTarget::for_inode(dir_b), AuthzOp::Execute)
+            .authorize(&req_ctx, AclTarget::for_inode(dir_b), AclOperation::Execute)
             .await
             .expect_err("missing execute on intermediate directory must deny");
         assert_eq!(err.code, Some(CanonicalErrorCode::FsErrno(FsErrorCode::EAcces)));
@@ -1367,10 +1343,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acl_permission_checker_checks_traverse_from_permission_check_facts() {
+        let root = InodeId::new(7201);
+        let parent = InodeId::new(7202);
+        let checker = AclPermissionChecker::new(
+            Arc::new(StaticGroupResolver::default()),
+            Arc::new(StaticPermReader::new(vec![
+                InodePermInputs {
+                    inode_id: root,
+                    uid: 1000,
+                    gid: 1000,
+                    mode: 0o755,
+                    access_acl: None,
+                },
+                InodePermInputs {
+                    inode_id: parent,
+                    uid: 1000,
+                    gid: 1000,
+                    mode: 0o744,
+                    access_acl: None,
+                },
+            ])),
+        );
+        let req_ctx = test_request_context(Some("2000"));
+        let traverse = [root, parent];
+        let resolved = resolved_parent(parent, traverse.to_vec());
+
+        let err = checker
+            .check_parent_perm(&req_ctx, PermissionBits::WRITE, "/mnt/parent/new-file", &resolved)
+            .await
+            .expect_err("missing execute on resolved parent traverse facts must deny");
+
+        assert_eq!(err.code, Some(CanonicalErrorCode::FsErrno(FsErrorCode::EAcces)));
+        assert!(err.message.contains(ACL_DENIED_REASON));
+        assert!(err.message.contains("op=EXECUTE"));
+    }
+
+    #[tokio::test]
+    async fn acl_permission_checker_checks_parent_permission_for_create() {
+        let parent = InodeId::new(7301);
+        let checker = AclPermissionChecker::new(
+            Arc::new(StaticGroupResolver::default()),
+            Arc::new(StaticPermReader::new(vec![InodePermInputs {
+                inode_id: parent,
+                uid: 1000,
+                gid: 1000,
+                mode: 0o555,
+                access_acl: None,
+            }])),
+        );
+        let req_ctx = test_request_context(Some("2000"));
+        let traverse = [parent];
+        let resolved = resolved_parent(parent, traverse.to_vec());
+
+        let err = checker
+            .check_parent_perm(&req_ctx, PermissionBits::WRITE, "/mnt/parent/new-file", &resolved)
+            .await
+            .expect_err("parent without write permission must deny create");
+
+        assert_eq!(err.code, Some(CanonicalErrorCode::FsErrno(FsErrorCode::EAcces)));
+        assert!(err.message.contains(ACL_DENIED_REASON));
+        assert!(err.message.contains("op=WRITE"));
+    }
+
+    #[tokio::test]
     async fn acl_sticky_bit_denies_non_owner_and_allows_owner_or_superuser() {
         let parent = InodeId::new(7101);
         let target = InodeId::new(7102);
-        let provider = AclInodeAuthz::new(
+        let provider = AclAuthorizer::new(
             Arc::new(StaticGroupResolver::default()),
             Arc::new(StaticPermReader::new(vec![
                 InodePermInputs {
@@ -1390,17 +1430,21 @@ mod tests {
             ])),
         );
 
-        let sticky_target = AuthzTarget::for_inode(target).with_parent(parent);
+        let sticky_target = AclTarget::for_inode(target).with_parent(parent);
 
         provider
-            .authorize(&test_request_context(Some("0")), sticky_target.clone(), AuthzOp::Sticky)
+            .authorize(
+                &test_request_context(Some("0")),
+                sticky_target.clone(),
+                AclOperation::Sticky,
+            )
             .await
             .expect("superuser should bypass sticky checks");
         provider
             .authorize(
                 &test_request_context(Some("1001")),
                 sticky_target.clone(),
-                AuthzOp::Sticky,
+                AclOperation::Sticky,
             )
             .await
             .expect("sticky directory owner should be allowed");
@@ -1408,13 +1452,13 @@ mod tests {
             .authorize(
                 &test_request_context(Some("1002")),
                 sticky_target.clone(),
-                AuthzOp::Sticky,
+                AclOperation::Sticky,
             )
             .await
             .expect("target owner should be allowed");
 
         let err = provider
-            .authorize(&test_request_context(Some("2000")), sticky_target, AuthzOp::Sticky)
+            .authorize(&test_request_context(Some("2000")), sticky_target, AclOperation::Sticky)
             .await
             .expect_err("non-owner should be denied by sticky bit");
         assert_eq!(
@@ -1422,6 +1466,85 @@ mod tests {
             Some(CanonicalErrorCode::RpcCode(RpcErrorCode::PermissionDenied))
         );
         assert!(err.message.contains(STICKY_BIT_DENIED_REASON));
+    }
+
+    #[tokio::test]
+    async fn acl_permission_checker_checks_sticky_unlink_from_existing_facts() {
+        let parent = InodeId::new(7401);
+        let target = InodeId::new(7402);
+        let checker = AclPermissionChecker::new(
+            Arc::new(StaticGroupResolver::default()),
+            Arc::new(StaticPermReader::new(vec![
+                InodePermInputs {
+                    inode_id: parent,
+                    uid: 1001,
+                    gid: 1001,
+                    mode: 0o1777,
+                    access_acl: None,
+                },
+                InodePermInputs {
+                    inode_id: target,
+                    uid: 1002,
+                    gid: 1002,
+                    mode: 0o644,
+                    access_acl: None,
+                },
+            ])),
+        );
+        let req_ctx = test_request_context(Some("2000"));
+        let traverse = [parent];
+        let resolved = resolved_existing(target, Some(parent), traverse.to_vec());
+
+        let err = checker
+            .check_parent_perm(&req_ctx, PermissionBits::WRITE, "/mnt/sticky/victim", &resolved)
+            .await
+            .expect_err("sticky parent must deny unlink for non-owner");
+
+        assert_eq!(
+            err.code,
+            Some(CanonicalErrorCode::RpcCode(RpcErrorCode::PermissionDenied))
+        );
+        assert!(err.message.contains(STICKY_BIT_DENIED_REASON));
+    }
+
+    #[tokio::test]
+    async fn acl_permission_checker_checks_rename_parent_permissions_individually() {
+        let src_parent = InodeId::new(7501);
+        let dst_parent = InodeId::new(7502);
+        let checker = AclPermissionChecker::new(
+            Arc::new(StaticGroupResolver::default()),
+            Arc::new(StaticPermReader::new(vec![
+                InodePermInputs {
+                    inode_id: src_parent,
+                    uid: 1001,
+                    gid: 1001,
+                    mode: 0o777,
+                    access_acl: None,
+                },
+                InodePermInputs {
+                    inode_id: dst_parent,
+                    uid: 1001,
+                    gid: 1001,
+                    mode: 0o555,
+                    access_acl: None,
+                },
+            ])),
+        );
+        let req_ctx = test_request_context(Some("2000"));
+        let src_resolved = resolved_parent(src_parent, vec![src_parent]);
+        let dst_resolved = resolved_parent(dst_parent, vec![dst_parent]);
+
+        checker
+            .check_parent_perm(&req_ctx, PermissionBits::WRITE, "/mnt/sticky/src", &src_resolved)
+            .await
+            .expect("source parent with write should allow");
+        let err = checker
+            .check_parent_perm(&req_ctx, PermissionBits::WRITE, "/mnt/sticky/dst", &dst_resolved)
+            .await
+            .expect_err("destination parent without write must deny");
+
+        assert_eq!(err.code, Some(CanonicalErrorCode::FsErrno(FsErrorCode::EAcces)));
+        assert!(err.message.contains(ACL_DENIED_REASON));
     }
 
     #[test]
@@ -1467,7 +1590,7 @@ mod tests {
     #[tokio::test]
     async fn acl_mode_denies_malformed_acl_encoding_fail_closed() {
         let inode_id = InodeId::new(3001);
-        let provider = AclInodeAuthz::new(
+        let provider = AclAuthorizer::new(
             Arc::new(StaticGroupResolver::default()),
             Arc::new(StaticPermReader::new(vec![InodePermInputs {
                 inode_id,
@@ -1481,8 +1604,8 @@ mod tests {
         let err = provider
             .authorize(
                 &test_request_context(Some("2001")),
-                AuthzTarget::for_inode(inode_id),
-                AuthzOp::Read,
+                AclTarget::for_inode(inode_id),
+                AclOperation::Read,
             )
             .await
             .expect_err("malformed acl must fail closed");
@@ -1501,7 +1624,7 @@ mod tests {
             perms: AclPerm::READ,
         }]));
         acl_bytes[..4].copy_from_slice(&2u32.to_le_bytes());
-        let provider = AclInodeAuthz::new(
+        let provider = AclAuthorizer::new(
             Arc::new(StaticGroupResolver::default()),
             Arc::new(StaticPermReader::new(vec![InodePermInputs {
                 inode_id,
@@ -1515,8 +1638,8 @@ mod tests {
         let err = provider
             .authorize(
                 &test_request_context(Some("2001")),
-                AuthzTarget::for_inode(inode_id),
-                AuthzOp::Read,
+                AclTarget::for_inode(inode_id),
+                AclOperation::Read,
             )
             .await
             .expect_err("unknown encoding version must fail closed");
@@ -1540,7 +1663,7 @@ mod tests {
                 perms: AclPerm::WRITE,
             },
         ]);
-        let provider = AclInodeAuthz::new(
+        let provider = AclAuthorizer::new(
             Arc::new(StaticGroupResolver::default()),
             Arc::new(StaticPermReader::new(vec![InodePermInputs {
                 inode_id,
@@ -1554,8 +1677,8 @@ mod tests {
         let err = provider
             .authorize(
                 &test_request_context(Some("2001")),
-                AuthzTarget::for_inode(inode_id),
-                AuthzOp::Read,
+                AclTarget::for_inode(inode_id),
+                AclOperation::Read,
             )
             .await
             .expect_err("unsupported acl entries must fail closed");
@@ -1586,7 +1709,7 @@ mod tests {
 
         let mut mappings = BTreeMap::new();
         mappings.insert("2001".to_string(), vec!["300".to_string()]);
-        let provider = AclInodeAuthz::new(
+        let provider = AclAuthorizer::new(
             Arc::new(StaticGroupResolver::new(mappings)),
             Arc::new(StaticPermReader::new(vec![InodePermInputs {
                 inode_id,
@@ -1600,8 +1723,8 @@ mod tests {
         provider
             .authorize(
                 &test_request_context(Some("2001")),
-                AuthzTarget::for_inode(inode_id),
-                AuthzOp::Read,
+                AclTarget::for_inode(inode_id),
+                AclOperation::Read,
             )
             .await
             .expect("supported subset must allow read");
@@ -1609,8 +1732,8 @@ mod tests {
         let err = provider
             .authorize(
                 &test_request_context(Some("2001")),
-                AuthzTarget::for_inode(inode_id),
-                AuthzOp::Write,
+                AclTarget::for_inode(inode_id),
+                AclOperation::Write,
             )
             .await
             .expect_err("supported subset must deny write");
@@ -1632,11 +1755,11 @@ mod tests {
         storage.put_inode(&inode).expect("put inode");
 
         let reader = Arc::new(RocksDbInodePermReader::new(storage.clone(), 600));
-        let provider = AclInodeAuthz::new(Arc::new(StaticGroupResolver::default()), reader.clone());
+        let provider = AclAuthorizer::new(Arc::new(StaticGroupResolver::default()), reader.clone());
         let req_ctx = test_request_context(Some("2001"));
 
         provider
-            .authorize(&req_ctx, AuthzTarget::for_inode(inode_id), AuthzOp::Read)
+            .authorize(&req_ctx, AclTarget::for_inode(inode_id), AclOperation::Read)
             .await
             .expect("no ACL + mode bits should allow read");
 
@@ -1651,56 +1774,17 @@ mod tests {
         storage.put_inode(&updated).expect("put updated inode");
 
         provider
-            .authorize(&req_ctx, AuthzTarget::for_inode(inode_id), AuthzOp::Read)
+            .authorize(&req_ctx, AclTarget::for_inode(inode_id), AclOperation::Read)
             .await
             .expect("without invalidation cached permission input is still used");
 
         reader.invalidate(inode_id);
         let err = provider
-            .authorize(&req_ctx, AuthzTarget::for_inode(inode_id), AuthzOp::Read)
+            .authorize(&req_ctx, AclTarget::for_inode(inode_id), AclOperation::Read)
             .await
             .expect_err("after invalidation ACL deny must apply immediately");
         assert_eq!(err.code, Some(CanonicalErrorCode::FsErrno(FsErrorCode::EAcces)));
         assert!(err.message.contains(ACL_DENIED_REASON));
         assert!(err.message.contains("source=ACL"));
-    }
-
-    #[test]
-    fn authz_mode_selection_matches_scheme_contract() {
-        assert_eq!(
-            filesystem_authz_provider_kind(FileSystemAuthzMode::Acl),
-            AuthzProviderKind::AclInode
-        );
-        assert_eq!(
-            filesystem_authz_provider_kind(FileSystemAuthzMode::Ranger),
-            AuthzProviderKind::StubRanger
-        );
-    }
-
-    #[tokio::test]
-    async fn stub_ranger_authorize_is_allow_all_for_representative_checks() {
-        let req_ctx = test_request_context(None);
-        let provider = StubRangerAuthz;
-        let targets = [
-            AuthzTarget::for_path("/mnt/stub-check".to_string()),
-            AuthzTarget::for_path_parent("/mnt", "child"),
-            AuthzTarget::for_inode(InodeId::new(42)),
-            AuthzTarget::for_session(7, Some(InodeId::new(42))),
-        ];
-        let ops = [
-            AuthzOp::Read,
-            AuthzOp::Write,
-            AuthzOp::Rename,
-            AuthzOp::Delete,
-            AuthzOp::Xattr,
-        ];
-        for target in targets {
-            for op in ops {
-                provider
-                    .authorize(&req_ctx, target.clone(), op)
-                    .await
-                    .expect("stub ranger must allow");
-            }
-        }
     }
 }

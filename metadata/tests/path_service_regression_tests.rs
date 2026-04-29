@@ -9,9 +9,9 @@ use metadata::mount::{DataIoPolicy, MountKind, MountTable, ROOT_INODE_ID};
 use metadata::raft::RocksDBStorage;
 use metadata::readiness::RootReadinessGate;
 use metadata::service::{
-    AclInodeAuthz, AllowAllAuthz, AuthzProvider, CachedGroupResolver, FileSystemAuthorityDeps, FileSystemPolicyDeps,
-    FileSystemRuntimeDeps, GroupResolver, InodePermReader, LeadershipChecker, MetadataFileSystemServiceDeps,
-    MetadataFileSystemServiceImpl, RocksDbInodePermReader, SharedWorkerCommitHook, StaticGroupResolver,
+    AclPermissionChecker, CachedGroupResolver, FileSystemAuthorityDeps, FileSystemPolicyDeps, FileSystemRuntimeDeps,
+    GroupResolver, InodePermReader, LeadershipChecker, MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl,
+    NonePermissionChecker, PermissionChecker, RocksDbInodePermReader, SharedWorkerCommitHook, StaticGroupResolver,
 };
 use metadata::state::MemoryStateStore;
 use proto::common::{
@@ -20,8 +20,8 @@ use proto::common::{
 };
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::{
-    GetFileStatusRequestProto, MkdirPathRequestProto, OpenWriteByPathRequestProto, RenamePathRequestProto,
-    RmdirPathRequestProto, UnlinkPathRequestProto, WriteModeProto,
+    FsyncSessionRequestProto, GetFileStatusRequestProto, MkdirPathRequestProto, OpenWriteByPathRequestProto,
+    RenamePathRequestProto, RmdirPathRequestProto, UnlinkPathRequestProto, WriteModeProto,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -122,12 +122,25 @@ fn assert_permission_denied_with_reason(err: &proto::common::ErrorDetailProto, r
     );
 }
 
+fn assert_session_invalid_fencing_refresh(err: &proto::common::ErrorDetailProto) {
+    assert_eq!(err.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+    match err.code {
+        Some(ErrorCodeProto::RpcCode(code)) if code == RpcErrorCodeProto::RpcErrCodeFencing as i32 => {}
+        other => panic!("expected Fencing rpc code, got {:?}", other),
+    }
+    assert!(
+        err.message.contains("write session not found"),
+        "expected missing-session detail in message: {}",
+        err.message
+    );
+}
+
 fn build_env(
     mount_prefix: &str,
     data_io_policy: DataIoPolicy,
     readiness_gate: Option<Arc<RootReadinessGate>>,
     leadership_checker: Option<Arc<dyn LeadershipChecker>>,
-    authz_builder: impl FnOnce(&Arc<RocksDBStorage>) -> (Arc<dyn AuthzProvider>, Option<Arc<dyn InodePermReader>>),
+    permission_builder: impl FnOnce(&Arc<RocksDBStorage>) -> (Arc<dyn PermissionChecker>, Option<Arc<dyn InodePermReader>>),
 ) -> PathTestEnv {
     let temp_dir = TempDir::new().expect("create temp dir");
     let storage = Arc::new(RocksDBStorage::open(temp_dir.path()).expect("open rocksdb"));
@@ -161,7 +174,7 @@ fn build_env(
         .put_inode(&Inode::new_dir(root_inode_id, root_attrs, mount_entry.mount_id))
         .expect("put root inode");
 
-    let (authz_provider, inode_perm_reader) = authz_builder(&storage);
+    let (permission_checker, inode_perm_reader) = permission_builder(&storage);
     let state_store: Arc<dyn metadata::state::StateStore> = Arc::new(MemoryStateStore::new());
     let write_session_manager = Arc::new(metadata::write_session::WriteSessionManager::default());
     let inode_lease_manager = Arc::new(metadata::inode_lease::InodeLeaseManager::default());
@@ -184,7 +197,7 @@ fn build_env(
         },
         policy: FileSystemPolicyDeps {
             leadership_checker,
-            authz_provider,
+            permission_checker,
             inode_perm_reader,
         },
     });
@@ -202,7 +215,7 @@ fn build_env(
 async fn readiness_precedence_blocks_before_path_resolution() {
     let readiness_gate = Arc::new(RootReadinessGate::new(None));
     let env = build_env("/mnt/test", DataIoPolicy::Allow, Some(readiness_gate), None, |_| {
-        (Arc::new(AllowAllAuthz), None)
+        (Arc::new(NonePermissionChecker), None)
     });
 
     let response = FileSystemServiceProto::get_file_status(
@@ -231,7 +244,7 @@ async fn leadership_precedence_write_returns_not_leader_before_not_found() {
         DataIoPolicy::Allow,
         None,
         Some(Arc::new(NotLeader)),
-        |_| (Arc::new(AllowAllAuthz), None),
+        |_| (Arc::new(NonePermissionChecker), None),
     );
 
     let response = FileSystemServiceProto::mkdir(
@@ -254,7 +267,7 @@ async fn leadership_precedence_write_returns_not_leader_before_not_found() {
 #[tokio::test]
 async fn leadership_precedence_data_io_returns_not_leader_before_root_policy_error() {
     let env = build_env("/", DataIoPolicy::Forbid, None, Some(Arc::new(NotLeader)), |_| {
-        (Arc::new(AllowAllAuthz), None)
+        (Arc::new(NonePermissionChecker), None)
     });
     let file_inode_id = InodeId::new(2001);
     env.storage
@@ -290,11 +303,11 @@ async fn leadership_precedence_data_io_returns_not_leader_before_root_policy_err
 async fn acl_malformed_xattr_fails_closed_with_permission_denied_header_error() {
     let env = build_env("/mnt/test", DataIoPolicy::Allow, None, None, |storage| {
         let perm_reader: Arc<dyn InodePermReader> = Arc::new(RocksDbInodePermReader::new(Arc::clone(storage), 60));
-        let acl_provider: Arc<dyn AuthzProvider> = Arc::new(AclInodeAuthz::new(
+        let permission_checker: Arc<dyn PermissionChecker> = Arc::new(AclPermissionChecker::new(
             Arc::new(StaticGroupResolver::new(BTreeMap::new())),
             Arc::clone(&perm_reader),
         ));
-        (acl_provider, Some(perm_reader))
+        (permission_checker, Some(perm_reader))
     });
 
     let mut root_inode = env
@@ -326,11 +339,11 @@ async fn acl_malformed_xattr_fails_closed_with_permission_denied_header_error() 
 async fn acl_unsupported_subset_fails_closed_with_permission_denied_header_error() {
     let env = build_env("/mnt/test", DataIoPolicy::Allow, None, None, |storage| {
         let perm_reader: Arc<dyn InodePermReader> = Arc::new(RocksDbInodePermReader::new(Arc::clone(storage), 60));
-        let acl_provider: Arc<dyn AuthzProvider> = Arc::new(AclInodeAuthz::new(
+        let permission_checker: Arc<dyn PermissionChecker> = Arc::new(AclPermissionChecker::new(
             Arc::new(StaticGroupResolver::new(BTreeMap::new())),
             Arc::clone(&perm_reader),
         ));
-        (acl_provider, Some(perm_reader))
+        (permission_checker, Some(perm_reader))
     });
 
     let mut root_inode = env
@@ -375,9 +388,9 @@ async fn groups_resolver_stale_disabled_denies_on_backend_failure() {
         let perm_reader: Arc<dyn InodePermReader> = Arc::new(RocksDbInodePermReader::new(Arc::clone(storage), 60));
         let backend_resolver: Arc<dyn GroupResolver> = backend.clone();
         let group_resolver: Arc<dyn GroupResolver> = Arc::new(CachedGroupResolver::new(backend_resolver, 0, false));
-        let acl_provider: Arc<dyn AuthzProvider> =
-            Arc::new(AclInodeAuthz::new(group_resolver, Arc::clone(&perm_reader)));
-        (acl_provider, Some(perm_reader))
+        let permission_checker: Arc<dyn PermissionChecker> =
+            Arc::new(AclPermissionChecker::new(group_resolver, Arc::clone(&perm_reader)));
+        (permission_checker, Some(perm_reader))
     });
 
     let mut root_inode = env
@@ -424,7 +437,7 @@ async fn groups_resolver_stale_disabled_denies_on_backend_failure() {
 #[tokio::test]
 async fn root_mount_data_io_gate_is_enforced() {
     let env = build_env("/", DataIoPolicy::Forbid, None, Some(Arc::new(AlwaysLeader)), |_| {
-        (Arc::new(AllowAllAuthz), None)
+        (Arc::new(NonePermissionChecker), None)
     });
     let file_inode_id = InodeId::new(3001);
     env.storage
@@ -461,6 +474,31 @@ async fn root_mount_data_io_gate_is_enforced() {
     assert!(err.message.contains("RootDataIoForbidden"));
 }
 
+#[tokio::test]
+async fn fsync_session_missing_session_preserves_refresh_header_contract() {
+    let env = build_env(
+        "/mnt/test",
+        DataIoPolicy::Allow,
+        None,
+        Some(Arc::new(AlwaysLeader)),
+        |_| (Arc::new(NonePermissionChecker), None),
+    );
+
+    let response = FileSystemServiceProto::fsync_session(
+        &env.service,
+        Request::new(FsyncSessionRequestProto {
+            header: header(12),
+            file_handle: 99,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+    let err = header_error(response.header);
+    assert_session_invalid_fencing_refresh(&err);
+}
+
 fn sticky_acl_env() -> PathTestEnv {
     build_env(
         "/mnt/test",
@@ -469,11 +507,11 @@ fn sticky_acl_env() -> PathTestEnv {
         Some(Arc::new(AlwaysLeader)),
         |storage| {
             let perm_reader: Arc<dyn InodePermReader> = Arc::new(RocksDbInodePermReader::new(Arc::clone(storage), 60));
-            let acl_provider: Arc<dyn AuthzProvider> = Arc::new(AclInodeAuthz::new(
+            let permission_checker: Arc<dyn PermissionChecker> = Arc::new(AclPermissionChecker::new(
                 Arc::new(StaticGroupResolver::new(BTreeMap::new())),
                 Arc::clone(&perm_reader),
             ));
-            (acl_provider, Some(perm_reader))
+            (permission_checker, Some(perm_reader))
         },
     )
 }
