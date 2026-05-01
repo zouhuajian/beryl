@@ -10,8 +10,8 @@ use crate::mount::MountTable;
 use crate::raft::command::Command;
 use crate::raft::storage::{AppliedResult, RenameAtomicUpdate, RocksDBStorage};
 use crate::raft::types::{
-    AppDataResponse, BlockCommandResult, DeleteIntentsResult, FsCommandResult, FsErrnoResult, FsOkResult,
-    LeaseCommandResult, MountCommandResult, ShardGroupInfo, WorkerCommandResult,
+    AppDataResponse, BlockCommandResult, CommandFingerprint, DedupKey, DeleteIntentsResult, FsCommandResult,
+    FsErrnoResult, FsOkResult, LeaseCommandResult, MountCommandResult, ShardGroupInfo, WorkerCommandResult,
 };
 use crate::state::{BlockMetaState, LeaseState, RouteEpoch};
 use crate::worker::{HealthStatus, WorkerDescriptor, WorkerInfo};
@@ -74,6 +74,8 @@ impl AppRaftStateMachine {
                     dedup_key.call_id
                 )));
             }
+            self.storage.put_applied_seq(seq)?;
+            *self.applied_seq.write() = seq;
             return Ok(applied.result);
         }
 
@@ -153,14 +155,23 @@ impl AppRaftStateMachine {
                 name,
                 attrs,
                 ..
-            } => AppDataResponse::Fs(self.apply_mkdir(parent_inode_id, name, attrs)),
+            } => {
+                // Create/mkdir/rename persist namespace mutation, dedup result, and applied_seq together.
+                let result = self.apply_mkdir(parent_inode_id, name, attrs, &dedup_key, fingerprint, seq)?;
+                *self.applied_seq.write() = seq;
+                return Ok(AppDataResponse::Fs(result));
+            }
             Command::Create {
                 parent_inode_id,
                 name,
                 attrs,
                 layout,
                 ..
-            } => AppDataResponse::Fs(self.apply_create(parent_inode_id, name, attrs, layout)),
+            } => {
+                let result = self.apply_create(parent_inode_id, name, attrs, layout, &dedup_key, fingerprint, seq)?;
+                *self.applied_seq.write() = seq;
+                return Ok(AppDataResponse::Fs(result));
+            }
             Command::Unlink {
                 parent_inode_id, name, ..
             } => AppDataResponse::Fs(self.apply_unlink(parent_inode_id, name)),
@@ -174,13 +185,20 @@ impl AppRaftStateMachine {
                 dst_name,
                 flags,
                 ..
-            } => AppDataResponse::Fs(self.apply_rename(
-                src_parent_inode_id,
-                src_name,
-                dst_parent_inode_id,
-                dst_name,
-                flags,
-            )),
+            } => {
+                let result = self.apply_rename(
+                    src_parent_inode_id,
+                    src_name,
+                    dst_parent_inode_id,
+                    dst_name,
+                    flags,
+                    &dedup_key,
+                    fingerprint,
+                    seq,
+                )?;
+                *self.applied_seq.write() = seq;
+                return Ok(AppDataResponse::Fs(result));
+            }
             Command::SetAttr {
                 inode_id, mask, attrs, ..
             } => AppDataResponse::Fs(self.apply_set_attr(inode_id, mask, attrs)),
@@ -219,23 +237,28 @@ impl AppRaftStateMachine {
         };
 
         // Store applied result for idempotency
-        let applied_result = AppliedResult {
+        let applied_result = Self::make_applied_result(seq, fingerprint, result.clone());
+        self.storage.put_applied_result(&dedup_key, applied_result)?;
+
+        // Update applied sequence (persist + in-memory)
+        // TODO: Non-namespace commands still need apply-level atomicity follow-up.
+        self.storage.put_applied_seq(seq)?;
+        *self.applied_seq.write() = seq;
+
+        Ok(result)
+    }
+
+    fn make_applied_result(seq: u64, fingerprint: CommandFingerprint, result: AppDataResponse) -> AppliedResult {
+        AppliedResult {
             seq,
             fingerprint,
-            result: result.clone(),
+            result,
             created_at_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64,
             size_bytes: 0,
-        };
-        self.storage.put_applied_result(&dedup_key, applied_result)?;
-
-        // Update applied sequence (persist + in-memory)
-        self.storage.put_applied_seq(seq)?;
-        *self.applied_seq.write() = seq;
-
-        Ok(result)
+        }
     }
 
     fn apply_allocate_block(
@@ -689,9 +712,30 @@ impl AppRaftStateMachine {
         self.storage.get_and_increment_data_handle_id()
     }
 
+    fn persist_fs_apply_result(
+        &self,
+        result: FsCommandResult,
+        dedup_key: &DedupKey,
+        fingerprint: CommandFingerprint,
+        seq: u64,
+    ) -> MetadataResult<FsCommandResult> {
+        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Fs(result.clone()));
+        self.storage
+            .put_apply_result_and_seq_atomic(dedup_key, applied_result, seq)?;
+        Ok(result)
+    }
+
     /// Apply Mkdir command.
-    fn apply_mkdir(&self, parent_inode_id: InodeId, name: String, mut attrs: FileAttrs) -> FsCommandResult {
-        let result: MetadataResult<FsOkResult> = (|| {
+    fn apply_mkdir(
+        &self,
+        parent_inode_id: InodeId,
+        name: String,
+        mut attrs: FileAttrs,
+        dedup_key: &DedupKey,
+        fingerprint: CommandFingerprint,
+        seq: u64,
+    ) -> MetadataResult<FsCommandResult> {
+        let prepared: MetadataResult<(Inode, Inode, FsOkResult)> = (|| {
             // Check parent exists and is a directory
             let parent_inode = self
                 .storage
@@ -729,16 +773,31 @@ impl AppRaftStateMachine {
             let mut updated_parent = parent_inode.clone();
             updated_parent.attrs = parent_attrs;
 
-            self.storage
-                .create_dir_atomic(parent_inode_id, &name, &inode, &updated_parent)?;
-
             Ok(FsOkResult {
                 inode_id: Some(inode_id),
                 data_handle_id: None,
             })
+            .map(|ok| (inode, updated_parent, ok))
         })();
 
-        Self::fs_command_result(result)
+        let (inode, updated_parent, ok) = match prepared {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint, seq)
+            }
+        };
+        let result = FsCommandResult::Ok(ok);
+        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Fs(result.clone()));
+        self.storage.create_dir_with_apply_result_atomic(
+            parent_inode_id,
+            &name,
+            &inode,
+            &updated_parent,
+            dedup_key,
+            applied_result,
+            seq,
+        )?;
+        Ok(result)
     }
 
     /// Apply Create command.
@@ -748,8 +807,11 @@ impl AppRaftStateMachine {
         name: String,
         mut attrs: FileAttrs,
         layout: FileLayout,
-    ) -> FsCommandResult {
-        let result: MetadataResult<FsOkResult> = (|| {
+        dedup_key: &DedupKey,
+        fingerprint: CommandFingerprint,
+        seq: u64,
+    ) -> MetadataResult<FsCommandResult> {
+        let prepared: MetadataResult<(Inode, Inode, FsOkResult)> = (|| {
             // Check parent exists and is a directory
             let parent_inode = self
                 .storage
@@ -785,16 +847,32 @@ impl AppRaftStateMachine {
             let mut updated_parent = parent_inode.clone();
             updated_parent.attrs = parent_attrs;
 
-            self.storage
-                .create_file_atomic(parent_inode_id, &name, &inode, &updated_parent, layout)?;
-
             Ok(FsOkResult {
                 inode_id: Some(inode_id),
                 data_handle_id: Some(data_handle_id),
             })
+            .map(|ok| (inode, updated_parent, ok))
         })();
 
-        Self::fs_command_result(result)
+        let (inode, updated_parent, ok) = match prepared {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint, seq)
+            }
+        };
+        let result = FsCommandResult::Ok(ok);
+        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Fs(result.clone()));
+        self.storage.create_file_with_apply_result_atomic(
+            parent_inode_id,
+            &name,
+            &inode,
+            &updated_parent,
+            layout,
+            dedup_key,
+            applied_result,
+            seq,
+        )?;
+        Ok(result)
     }
 
     /// Apply Unlink command.
@@ -952,8 +1030,18 @@ impl AppRaftStateMachine {
         dst_parent_inode_id: InodeId,
         dst_name: String,
         flags: u32,
-    ) -> FsCommandResult {
-        let result: MetadataResult<FsOkResult> = (|| {
+        dedup_key: &DedupKey,
+        fingerprint: CommandFingerprint,
+        seq: u64,
+    ) -> MetadataResult<FsCommandResult> {
+        let prepared: MetadataResult<(
+            InodeId,
+            Option<InodeId>,
+            Option<Inode>,
+            Option<Inode>,
+            Inode,
+            FsOkResult,
+        )> = (|| {
             // Get source dentry
             let src_inode_id = self
                 .storage
@@ -1043,7 +1131,27 @@ impl AppRaftStateMachine {
             let mut updated_src_inode = src_inode.clone();
             updated_src_inode.attrs = src_attrs;
 
-            self.storage.rename_atomic(RenameAtomicUpdate {
+            Ok((
+                src_inode_id,
+                overwritten_inode_id,
+                updated_src_parent,
+                updated_dst_parent,
+                updated_src_inode,
+                FsOkResult::default(),
+            ))
+        })();
+
+        let (src_inode_id, overwritten_inode_id, updated_src_parent, updated_dst_parent, updated_src_inode, ok) =
+            match prepared {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint, seq)
+                }
+            };
+        let result = FsCommandResult::Ok(ok);
+        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Fs(result.clone()));
+        self.storage.rename_with_apply_result_atomic(
+            RenameAtomicUpdate {
                 src_parent_inode_id,
                 src_name: &src_name,
                 dst_parent_inode_id,
@@ -1053,12 +1161,13 @@ impl AppRaftStateMachine {
                 updated_src_parent: updated_src_parent.as_ref(),
                 updated_dst_parent: updated_dst_parent.as_ref(),
                 updated_src_inode: &updated_src_inode,
-            })?;
+            },
+            dedup_key,
+            applied_result,
+            seq,
+        )?;
 
-            Ok(FsOkResult::default())
-        })();
-
-        Self::fs_command_result(result)
+        Ok(result)
     }
 
     fn validate_rename_overwrite_target_is_safe(&self, dst_inode: &Inode) -> MetadataResult<()> {
@@ -1424,6 +1533,13 @@ mod tests {
         crate::raft::types::DedupKey::new(ClientId::new(client), CallId::new())
     }
 
+    fn expect_fs_ok(raw: AppDataResponse) -> FsOkResult {
+        match raw {
+            AppDataResponse::Fs(FsCommandResult::Ok(ok)) => ok,
+            other => panic!("unexpected apply response: {:?}", other),
+        }
+    }
+
     #[test]
     fn create_mount_requires_owner_group() {
         let dir = TempDir::new().unwrap();
@@ -1554,6 +1670,41 @@ mod tests {
     }
 
     #[test]
+    fn create_reapply_returns_original_success_result_and_applied_seq() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let parent_inode_id = InodeId::new(10);
+        storage
+            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1)))
+            .unwrap();
+
+        let dedup = dedup_for_test(41);
+        let cmd = Command::Create {
+            dedup: dedup.clone(),
+            parent_inode_id,
+            name: "file".to_string(),
+            attrs: FileAttrs::new(),
+            layout: FileLayout::new(4096, 4096, 1),
+        };
+
+        let first = expect_fs_ok(sm.apply(cmd.clone(), 7).unwrap());
+        assert_eq!(storage.get_applied_seq().unwrap(), Some(7));
+        assert_eq!(sm.applied_seq(), 7);
+
+        let second = expect_fs_ok(sm.apply(cmd, 8).unwrap());
+        assert_eq!(second, first);
+        assert_eq!(storage.get_applied_seq().unwrap(), Some(8));
+        assert_eq!(sm.applied_seq(), 8);
+
+        let inode_id = first.inode_id.expect("inode id should be returned");
+        assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), Some(inode_id));
+        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
+    }
+
+    #[test]
     fn mkdir_persists_inode_and_dentry() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
@@ -1583,6 +1734,40 @@ mod tests {
 
         assert!(storage.get_inode(inode_id).unwrap().unwrap().kind.is_dir());
         assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), Some(inode_id));
+    }
+
+    #[test]
+    fn mkdir_reapply_returns_original_success_result_and_applied_seq() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let parent_inode_id = InodeId::new(10);
+        storage
+            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1)))
+            .unwrap();
+
+        let dedup = dedup_for_test(42);
+        let cmd = Command::Mkdir {
+            dedup: dedup.clone(),
+            parent_inode_id,
+            name: "dir".to_string(),
+            attrs: FileAttrs::new(),
+        };
+
+        let first = expect_fs_ok(sm.apply(cmd.clone(), 9).unwrap());
+        assert_eq!(storage.get_applied_seq().unwrap(), Some(9));
+        assert_eq!(sm.applied_seq(), 9);
+
+        let second = expect_fs_ok(sm.apply(cmd, 10).unwrap());
+        assert_eq!(second, first);
+        assert_eq!(storage.get_applied_seq().unwrap(), Some(10));
+        assert_eq!(sm.applied_seq(), 10);
+
+        let inode_id = first.inode_id.expect("inode id should be returned");
+        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), Some(inode_id));
+        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
     }
 
     #[test]
@@ -1630,6 +1815,57 @@ mod tests {
         assert_eq!(storage.get_dentry(parent_inode_id, "old").unwrap(), None);
         assert_eq!(storage.get_dentry(parent_inode_id, "new").unwrap(), Some(inode_id));
         assert!(storage.get_inode(inode_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn rename_reapply_returns_original_success_result_and_applied_seq() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let parent_inode_id = InodeId::new(10);
+        storage
+            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1)))
+            .unwrap();
+
+        let created = expect_fs_ok(
+            sm.apply(
+                Command::Create {
+                    dedup: dedup_for_test(43),
+                    parent_inode_id,
+                    name: "old".to_string(),
+                    attrs: FileAttrs::new(),
+                    layout: FileLayout::new(4096, 4096, 1),
+                },
+                1,
+            )
+            .unwrap(),
+        );
+        let inode_id = created.inode_id.unwrap();
+
+        let dedup = dedup_for_test(44);
+        let cmd = Command::Rename {
+            dedup: dedup.clone(),
+            src_parent_inode_id: parent_inode_id,
+            src_name: "old".to_string(),
+            dst_parent_inode_id: parent_inode_id,
+            dst_name: "new".to_string(),
+            flags: 0,
+        };
+
+        let first = expect_fs_ok(sm.apply(cmd.clone(), 2).unwrap());
+        assert_eq!(first, FsOkResult::default());
+        assert_eq!(storage.get_applied_seq().unwrap(), Some(2));
+        assert_eq!(sm.applied_seq(), 2);
+
+        let second = expect_fs_ok(sm.apply(cmd, 3).unwrap());
+        assert_eq!(second, first);
+        assert_eq!(storage.get_applied_seq().unwrap(), Some(3));
+        assert_eq!(sm.applied_seq(), 3);
+        assert_eq!(storage.get_dentry(parent_inode_id, "old").unwrap(), None);
+        assert_eq!(storage.get_dentry(parent_inode_id, "new").unwrap(), Some(inode_id));
+        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
     }
 
     #[test]

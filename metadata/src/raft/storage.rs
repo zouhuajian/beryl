@@ -318,6 +318,153 @@ impl RocksDBStorage {
         Ok(())
     }
 
+    fn dedup_key_bytes(request: &DedupKey) -> Vec<u8> {
+        format!("{}:{}", request.client_id.as_raw(), request.call_id).into_bytes()
+    }
+
+    fn batch_put_applied_result(
+        batch: &mut WriteBatch,
+        cf: &ColumnFamily,
+        request: &DedupKey,
+        result: AppliedResult,
+    ) -> MetadataResult<()> {
+        let mut result = result;
+        let value = encode_to_vec(&result, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize AppliedResult: {}", e)))?;
+        result.size_bytes = value.len() as u32;
+        let value = encode_to_vec(&result, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize AppliedResult: {}", e)))?;
+        batch.put_cf(cf, Self::dedup_key_bytes(request), value);
+        Ok(())
+    }
+
+    fn batch_put_applied_seq(batch: &mut WriteBatch, cf: &ColumnFamily, seq: u64) -> MetadataResult<()> {
+        let value = encode_to_vec(&seq, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize applied_seq: {}", e)))?;
+        batch.put_cf(cf, b"applied_seq", value);
+        Ok(())
+    }
+
+    fn batch_delete_expired_dedup(
+        &self,
+        batch: &mut WriteBatch,
+        cf: &ColumnFamily,
+        now_ms: u64,
+    ) -> MetadataResult<usize> {
+        let mut evicted = 0usize;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) =
+                item.map_err(|e| MetadataError::Internal(format!("RocksDB iterator error (dedup ttl): {}", e)))?;
+            let applied: AppliedResult = match decode_from_slice(&value, standard()) {
+                Ok((ar, _)) => ar,
+                Err(_) => {
+                    batch.delete_cf(cf, key);
+                    evicted += 1;
+                    continue;
+                }
+            };
+            if now_ms.saturating_sub(applied.created_at_ms) > DEDUP_TTL_MS {
+                batch.delete_cf(cf, key);
+                evicted += 1;
+            }
+        }
+        Ok(evicted)
+    }
+
+    fn batch_enforce_dedup_size_after_insert(
+        &self,
+        batch: &mut WriteBatch,
+        cf: &ColumnFamily,
+        inserted_key: &[u8],
+        inserted_created_at_ms: u64,
+    ) -> MetadataResult<usize> {
+        let mut entries = Vec::new();
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) =
+                item.map_err(|e| MetadataError::Internal(format!("RocksDB iterator error (dedup size): {}", e)))?;
+            if key.as_ref() == inserted_key {
+                continue;
+            }
+            let applied: AppliedResult = match decode_from_slice(&value, standard()) {
+                Ok((ar, _)) => ar,
+                Err(_) => {
+                    entries.push((0u64, key));
+                    continue;
+                }
+            };
+            entries.push((applied.created_at_ms, key));
+        }
+
+        entries.push((inserted_created_at_ms, inserted_key.to_vec().into_boxed_slice()));
+        if entries.len() <= DEDUP_MAX_ENTRIES {
+            return Ok(0);
+        }
+
+        entries.sort_by_key(|(ts, _)| *ts);
+        let remove_count = entries.len() - DEDUP_MAX_ENTRIES;
+        let mut evicted = 0usize;
+        for (_, key) in entries.into_iter().take(remove_count) {
+            if key.as_ref() == inserted_key {
+                continue;
+            }
+            batch.delete_cf(cf, key);
+            evicted += 1;
+        }
+        Ok(evicted)
+    }
+
+    fn refresh_dedup_gauge(&self) {
+        match self.count_dedup_entries() {
+            Ok(entries) => DEDUP_STORE_ENTRIES_GAUGE.store(entries as u64, Ordering::Relaxed),
+            Err(err) => warn!(error = %err, "failed to refresh dedup entry gauge"),
+        }
+    }
+
+    /// Atomically append dedup tracking and applied_seq to an existing RocksDB batch.
+    pub fn commit_apply_batch(
+        &self,
+        mut batch: WriteBatch,
+        request: &DedupKey,
+        result: AppliedResult,
+        seq: u64,
+    ) -> MetadataResult<()> {
+        let cf_dedup = self.cf(CF_DEDUP)?;
+        let cf_meta = self.cf(CF_META)?;
+        let dedup_key = Self::dedup_key_bytes(request);
+        let inserted_created_at_ms = result.created_at_ms;
+
+        let evicted_ttl = self.batch_delete_expired_dedup(&mut batch, cf_dedup, now_millis())?;
+        Self::batch_put_applied_result(&mut batch, cf_dedup, request, result)?;
+        let evicted_size =
+            self.batch_enforce_dedup_size_after_insert(&mut batch, cf_dedup, &dedup_key, inserted_created_at_ms)?;
+        Self::batch_put_applied_seq(&mut batch, cf_meta, seq)?;
+
+        // Namespace apply paths use this boundary so mutation, dedup result, and applied_seq
+        // either all survive replay or all remain absent.
+        self.write_batch(batch)?;
+
+        if evicted_ttl > 0 {
+            DEDUP_EVICTED_TTL_TOTAL.fetch_add(evicted_ttl as u64, Ordering::Relaxed);
+        }
+        if evicted_size > 0 {
+            DEDUP_EVICTED_SIZE_TOTAL.fetch_add(evicted_size as u64, Ordering::Relaxed);
+        }
+        self.refresh_dedup_gauge();
+        Ok(())
+    }
+
+    /// Atomically persist only dedup tracking and applied_seq.
+    pub fn put_apply_result_and_seq_atomic(
+        &self,
+        request: &DedupKey,
+        result: AppliedResult,
+        seq: u64,
+    ) -> MetadataResult<()> {
+        self.commit_apply_batch(WriteBatch::default(), request, result, seq)
+    }
+
     /// Get the authoritative route epoch used for stale-route validation.
     pub fn get_route_epoch(&self) -> MetadataResult<RouteEpoch> {
         let cf = self
@@ -1454,6 +1601,17 @@ impl RocksDBStorage {
         updated_parent: &Inode,
         layout: FileLayout,
     ) -> MetadataResult<()> {
+        self.write_batch(self.create_file_batch(parent_inode_id, name, inode, updated_parent, layout)?)
+    }
+
+    fn create_file_batch(
+        &self,
+        parent_inode_id: InodeId,
+        name: &str,
+        inode: &Inode,
+        updated_parent: &Inode,
+        layout: FileLayout,
+    ) -> MetadataResult<WriteBatch> {
         let cf_inodes = self.cf(CF_INODES)?;
         let cf_dentries = self.cf(CF_DENTRIES)?;
         let cf_meta = self.cf(CF_META)?;
@@ -1478,7 +1636,23 @@ impl RocksDBStorage {
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize inode_id: {}", e)))?;
         batch.put_cf(cf_meta, owner_key.as_bytes(), owner_value);
 
-        self.write_batch(batch)
+        Ok(batch)
+    }
+
+    /// Atomically persist create-file mutation with apply tracking.
+    pub fn create_file_with_apply_result_atomic(
+        &self,
+        parent_inode_id: InodeId,
+        name: &str,
+        inode: &Inode,
+        updated_parent: &Inode,
+        layout: FileLayout,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let batch = self.create_file_batch(parent_inode_id, name, inode, updated_parent, layout)?;
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
     }
 
     /// Atomically persist a mkdir namespace mutation.
@@ -1489,6 +1663,16 @@ impl RocksDBStorage {
         inode: &Inode,
         updated_parent: &Inode,
     ) -> MetadataResult<()> {
+        self.write_batch(self.create_dir_batch(parent_inode_id, name, inode, updated_parent)?)
+    }
+
+    fn create_dir_batch(
+        &self,
+        parent_inode_id: InodeId,
+        name: &str,
+        inode: &Inode,
+        updated_parent: &Inode,
+    ) -> MetadataResult<WriteBatch> {
         let cf_inodes = self.cf(CF_INODES)?;
         let cf_dentries = self.cf(CF_DENTRIES)?;
 
@@ -1501,16 +1685,35 @@ impl RocksDBStorage {
             inode.inode_id.to_be_bytes(),
         );
 
-        self.write_batch(batch)
+        Ok(batch)
+    }
+
+    /// Atomically persist mkdir mutation with apply tracking.
+    pub fn create_dir_with_apply_result_atomic(
+        &self,
+        parent_inode_id: InodeId,
+        name: &str,
+        inode: &Inode,
+        updated_parent: &Inode,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let batch = self.create_dir_batch(parent_inode_id, name, inode, updated_parent)?;
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
     }
 
     /// Atomically persist a rename namespace mutation.
     ///
     /// Overwritten targets must be prevalidated by the state machine as safe namespace-only removals.
-    /// 
+    ///
     /// TODO: Full overwrite cleanup should batch target inode/dentry removal with
     /// target layout, data_handle_owner, block refcount, and delete-intent updates.
     pub fn rename_atomic(&self, update: RenameAtomicUpdate<'_>) -> MetadataResult<()> {
+        self.write_batch(self.rename_batch(update)?)
+    }
+
+    fn rename_batch(&self, update: RenameAtomicUpdate<'_>) -> MetadataResult<WriteBatch> {
         let cf_inodes = self.cf(CF_INODES)?;
         let cf_dentries = self.cf(CF_DENTRIES)?;
 
@@ -1542,7 +1745,19 @@ impl RocksDBStorage {
         }
         Self::batch_put_inode(&mut batch, cf_inodes, update.updated_src_inode)?;
 
-        self.write_batch(batch)
+        Ok(batch)
+    }
+
+    /// Atomically persist rename mutation with apply tracking.
+    pub fn rename_with_apply_result_atomic(
+        &self,
+        update: RenameAtomicUpdate<'_>,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let batch = self.rename_batch(update)?;
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
     }
 
     /// Return the largest inode ID currently present in storage.
@@ -2015,6 +2230,53 @@ mod tests {
             Some(inode_id)
         );
         assert_eq!(storage.get_inode(parent_inode_id).unwrap().unwrap().attrs.mtime_ms, 100);
+    }
+
+    #[test]
+    fn create_file_with_apply_result_atomic_persists_namespace_dedup_and_seq() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+
+        let parent_inode_id = InodeId::new(10);
+        let mut parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        storage.put_inode(&parent).unwrap();
+
+        let inode_id = InodeId::new(11);
+        let data_handle_id = DataHandleId::new(12);
+        let inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id, data_handle_id);
+        parent.attrs.update_mtime_ctime(100);
+        let layout = FileLayout::new(4096, 4096, 1);
+        let dedup = DedupKey::new(ClientId::new(101), types::CallId::new());
+        let applied = AppliedResult {
+            seq: 7,
+            fingerprint: CommandFingerprint(77),
+            result: AppDataResponse::Fs(crate::raft::types::FsCommandResult::Ok(
+                crate::raft::types::FsOkResult {
+                    inode_id: Some(inode_id),
+                    data_handle_id: Some(data_handle_id),
+                },
+            )),
+            created_at_ms: now_millis(),
+            size_bytes: 0,
+        };
+
+        storage
+            .create_file_with_apply_result_atomic(
+                parent_inode_id,
+                "file",
+                &inode,
+                &parent,
+                layout.clone(),
+                &dedup,
+                applied,
+                7,
+            )
+            .unwrap();
+
+        assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), Some(inode_id));
+        assert_eq!(storage.get_layout(inode_id).unwrap(), layout);
+        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
+        assert_eq!(storage.get_applied_seq().unwrap(), Some(7));
     }
 
     #[test]
