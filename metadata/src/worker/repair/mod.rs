@@ -155,7 +155,7 @@ mod tests {
             reason: None,
         };
 
-        let task_id = queue.enqueue(task).unwrap();
+        let _task_id = queue.enqueue(task).unwrap();
         assert_eq!(queue.len_pending(), 1);
 
         // Poll task
@@ -191,7 +191,7 @@ mod tests {
             reason: None,
         };
 
-        let task_id = queue.enqueue(task).unwrap();
+        let _task_id = queue.enqueue(task).unwrap();
         let records = queue.poll_for_worker(worker1, 10);
         assert_eq!(records.len(), 1);
         let polled_id = records[0].id;
@@ -231,7 +231,7 @@ mod tests {
         let _task_id = queue.enqueue(task).unwrap();
         let records = queue.poll_for_worker(worker1, 10);
         assert_eq!(records.len(), 1);
-        let polled_id = records[0].id;
+        let _polled_id = records[0].id;
 
         // Simulate timeout by calling requeue_timeouts with future time
         let future_ms = std::time::SystemTime::now()

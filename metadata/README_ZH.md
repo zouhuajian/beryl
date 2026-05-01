@@ -1,674 +1,392 @@
-# Vecton Metadata 架构说明
+# Vecton Metadata 当前实现说明
 
-本文基于当前代码编写，目标是帮助第一次接触 `metadata` 模块的开发者在 15 到 30 分钟内建立可维护的整体认知。文档中的“当前实现”指当前仓库代码事实；“设计目标”或“历史痕迹”只在代码尚未完全落地时显式标出。
+本文只描述当前仓库代码已经落地的 `metadata` 实现。未闭环能力会明确标为“未实现”“部分实现”“历史残留”或“设计目标”，不要把本文当作未来设计承诺。
 
-## 1. Metadata 在 Vecton 中的定位
+## 1. Metadata 当前定位
 
-`metadata` 是 Vecton 的元数据权威服务。它维护命名空间、inode、dentry、attrs、mount、shard ownership、route epoch、block metadata、delete intent、worker descriptor 等控制面状态，并通过 `proto/metadata/filesystem.proto` 暴露 path-first 的文件系统 RPC。
+`metadata` 是 Vecton 的文件系统元数据权威面，负责 inode、dentry、attrs、mount、Raft mutation、worker descriptor、block metadata、delete intent 和请求一致性错误语义。
 
-它不直接执行数据面 IO。客户端从 metadata 获取文件、写会话、block 或 worker 路由信息后，数据读写应走 client 到 worker 的直接路径；worker 再通过 heartbeat、block report、task ack 等接口把运行时状态反馈给 metadata。这个边界对应根目录 `AGENTS.md` 和 `metadata/AGENTS.md` 中的约束：metadata 负责 authority、commit boundary 和一致性闭环，worker 负责 block/chunk/stream 的本地 IO 和执行。
+`metadata` 不做数据面 IO。读写数据应由 client 直接访问 worker；metadata 只返回或维护数据路径所需的控制面信息，例如 layout、write session、fencing token、block metadata、worker soft state 和 refresh hint。
 
-metadata 的权威范围：
+当前主链路是：
 
-| 权威对象 | 当前承载位置 | 说明 |
-| --- | --- | --- |
-| inode / dentry / attrs | `metadata/src/raft/storage.rs`、`types/src/fs.rs` | 文件系统命名空间的持久事实。path 只是解析入口，不是持久 authority。 |
-| mount table | `metadata/src/mount/mod.rs`、`metadata/src/bootstrap.rs` | longest-prefix resolve、root mount invariant、mount epoch 和 owner group。 |
-| namespace ownership / shard routing | `metadata/src/raft/command.rs`、`metadata/src/raft/storage.rs` | `CreateMount` 持久化 owner group；`AddShardGroup` 维护 shard routing，但当前不推进 filesystem-facing `route_epoch`。 |
-| block metadata / layout / refcount | `metadata/src/raft/storage.rs`、`metadata/src/raft/state_machine.rs` | block 是管理、reporting、repair 单元；chunk 是 worker 本地 IO/checksum/repair 单元。 |
-| worker descriptor | `metadata/src/worker/service.rs`、`metadata/src/worker/manager.rs` | worker 的低频身份和 descriptor 通过 Raft 持久化；heartbeat 和 block presence 是内存软状态。 |
-| request consistency | `common/src/header/types.rs`、`common/src/error/mod.rs`、`metadata/src/service/fs_core/freshness.rs` | `mount_epoch`、`route_epoch`、`state_id`、`worker_epoch`、fencing token 构成刷新闭环。 |
+- 进程启动：`metadata/src/bin/main.rs` -> `metadata/src/runtime.rs::MetadataServer::build()` -> `serve()`。
+- 文件系统 RPC：`MetadataFileSystemServiceImpl` -> `GuardChain` / `PathResolver` -> `FsCore` -> `AppRaftNode` / `RocksDBStorage`。
+- worker metadata RPC：`MetadataWorkerServiceImpl` 处理 register、heartbeat、block report、task ack。
+- 后台任务：`MaintenanceService`、`DeleteExecutor`、worker background tasks 在同一进程内启动并由 `RuntimeHandles` 持有。
 
-metadata 与其他模块的基本关系：
+当前非主链路或未闭环能力包括：UFS metadata proxy、ACL/Ranger authz、完整 direct-read worker route、完整 repair/move/evict/rebalance 自治闭环、多 shard migration、follower read 全路径语义。
 
-- `common/` 提供 canonical error、request/response header、config、observability 基础能力。
-- `types/` 提供 inode、block、lease、worker、mount、routing 等强类型模型。
-- `proto/` 定义 wire contract；metadata 不拥有 proto 生成代码。
-- `client/` 消费 `ResponseHeader.error` 并执行 refresh/replay action machine。
-- `worker/` 执行数据面 IO；metadata 只通过 worker metadata RPC 接收状态、下发 repair/delete/move/evict 任务。
-- `ufs/` 提供外部后端抽象；当前 metadata 启动时构造 UFS registry/proxy，但 FileSystemService 尚未把 UFS metadata proxy 接入主链路。
-
-## 2. 总体架构图
-
-当前 Rust 服务实现中，外部文件系统入口是 `MetadataFileSystemServiceImpl`。`proto/metadata/filesystem.proto` 中仍有“external clients should not call InodeService directly”的注释，但当前 `metadata/src/service` 下没有独立的 Rust `InodeService` 服务实现；更底层的共享业务入口是 `FsCore`。
+## 2. 当前实现总览
 
 ```mermaid
 flowchart TB
-    Client[Client / SDK] --> FS[FileSystemService<br/>MetadataFileSystemServiceImpl]
-    Client -. proto comment only .-> IS[InodeService<br/>no active Rust service impl]
-    FS --> Guard[GuardChain<br/>readiness / leadership / authz / data IO]
-    FS --> Resolver[PathResolver]
-    Resolver --> Mount[MountTable]
-    Resolver --> StoreRead[RocksDBStorage reads]
-    FS --> Core[FsCore]
-
-    Core --> Mount
-    Core --> StateStore[RaftStateStore]
-    Core --> StoreRead
-    StateStore --> RaftNode[AppRaftNode]
-    RaftNode --> SM[AppRaftStateMachine]
-    SM --> Rocks[RocksDBStorage]
+    Main["bin/main.rs"] --> Runtime["MetadataServer::build()"]
+    Runtime --> Authority["MetadataAuthority"]
+    Authority --> Storage["RocksDBStorage"]
+    Authority --> Mount["MountTable"]
+    Authority --> Raft["AppRaftNode"]
+    Raft --> SM["AppRaftStateMachine"]
+    SM --> Storage
     SM --> Mount
 
-    Worker[Worker] --> WorkerSvc[MetadataWorkerServiceImpl<br/>Heartbeat / BlockReport]
-    WorkerSvc --> WorkerMgr[WorkerManager<br/>runtime soft state]
-    WorkerSvc --> RaftNode
-    WorkerSvc --> Repair[RepairQueue / OrphanQueue]
+    Runtime --> WorkerRt["WorkerRuntime"]
+    WorkerRt --> WorkerSvc["MetadataWorkerServiceImpl"]
+    WorkerRt --> WorkerMgr["WorkerManager"]
+    WorkerRt --> Repair["RepairQueue / OrphanQueue / RepairPlanner"]
 
-    WorkerBg[WorkerBackground<br/>worker lazy tasks] --> WorkerSvc
-    WorkerBg --> Repair
-    Maintenance[Maintenance<br/>GC / lease / delete] --> MaintenanceSvc[MaintenanceService]
-    Maintenance --> DeleteExec[DeleteExecutor]
-    Readiness[Readiness<br/>root watcher / health] --> FS
-    Maintenance --> WorkerMgr
+    Runtime --> Ready["RootReadinessGate + HealthService"]
+    Runtime --> FS["MetadataFileSystemServiceImpl"]
+    FS --> Guard["GuardChain"]
+    FS --> Resolver["PathResolver"]
+    FS --> Core["FsCore"]
+    Guard --> Mount
+    Resolver --> Mount
+    Resolver --> Storage
+    Core --> Raft
+    Core --> Storage
+    Core --> WorkerMgr
+
+    Runtime --> Maint["MaintenanceService"]
+    Runtime --> DeleteExec["DeleteExecutor"]
+    Maint --> Repair
+    Maint --> WorkerMgr
     DeleteExec --> WorkerMgr
-    DeleteExec --> Rocks
+    DeleteExec --> Storage
 
-    Common[common<br/>header / error / config / observe] --> FS
-    Types[types<br/>inode / block / lease / worker] --> Core
-    Proto[proto<br/>wire contracts] --> FS
-    Ufs[ufs<br/>registry / proxy] -. constructed, limited integration .-> Mount
+    Runtime -. "构造存在，主链路未使用" .-> UFS["UfsRegistry / UfsMetadataProxy"]
 ```
 
-## 3. 目录结构与模块职责
+图中实线是当前已接入主链路或启动链路的对象；虚线表示 runtime 已构造但 FileSystemService namespace read/write 主路径未使用。
 
-`metadata/src` 的模块边界不是简单按文件名分层。核心原则是：service 层做 RPC 适配、guard、authz、proto/domain 转换；`FsCore` 承载共享业务规则；Raft state machine 承载 authoritative mutation；RocksDB 承载持久状态；worker/background 维护运行时软状态和异步任务。
+## 3. 启动链路
 
-| 模块/文件 | 核心职责 | 关键类型/函数 | 说明 |
-| --- | --- | --- | --- |
-| `metadata/src/bin/main.rs` | 真实进程入口 | `main()` | 只负责 `load_config()`、`init_observability()`、`MetadataServer::build()`、`server.serve()`，保持薄入口。 |
-| `metadata/src/runtime.rs` | metadata runtime composition root | `MetadataServer`、`MetadataAuthority`、`WorkerRuntime`、`Maintenance`、`Readiness`、`RpcServices`、`RuntimeHandles` | `MetadataServer::build()` 是最终 server composition 入口；它只组合长期对象，不作为万能容器或业务逻辑入口。 |
-| `metadata/src/bootstrap.rs` | root mount 启动引导 | `ensure_root_mount()` | 保证 root mount 的 invariant；非 leader 场景遇到 leader changed 会记录并返回，等待后续 readiness。 |
-| `metadata/src/config.rs` | metadata 配置模型 | `MetadataConfig`、`AuthzConfig`、`WorkerConfig` | 仍有部分 TODO，例如 raft/shard 配置扩展和 DB path 配置化。 |
-| `metadata/src/error.rs` | metadata domain error 到 canonical error 的显式映射 | `MetadataError`、`to_canonical_rpc()`、`to_canonical_fs()` | 当前生产路径使用显式 mapper，不依赖隐式 `From<MetadataError>`。 |
-| `metadata/src/service/path_service.rs` | FileSystemService RPC 适配层 | `MetadataFileSystemServiceImpl` | 外部 path-first 入口；负责 header、guard、path resolve、authz、proto/domain 转换，核心业务下沉到 `FsCore`。文件仍较大，是后续可拆分点。 |
-| `metadata/src/service/fs_core/` | 共享 filesystem domain core | `FsCore`、`FreshnessValidator`、`WriteSessionCoordinator` | 承载 mount/route freshness、write session、mutation/read orchestration；不直接处理 tonic request。 |
-| `metadata/src/service/domain.rs` | service 与 core 之间的 domain DTO | `RequestContext`、`Freshness`、`CoreSuccess`、`CoreFailure` | 避免把 proto 类型扩散到 core 业务逻辑。 |
-| `metadata/src/service/guard.rs` | 请求保护链路 | `GuardPolicy`、`GuardChain`、`ReadinessGuard`、`LeadershipGuard`、`DataIoPolicyGuard` | 只做服务门禁：readiness、leadership、authz、data IO policy；不承载 mount/route/session/fencing domain freshness。 |
-| `metadata/src/service/authz.rs` | 授权抽象和 ACL/Ranger provider | `AuthzProvider`、`AclInodeAuthz`、`StubRangerAuthz` | ACL 是 inode xattr MVP；Ranger 当前是 allow-all stub，会记录 `authz_stub = true`。 |
-| `metadata/src/service/core_util.rs` | header/error/proto 转换辅助 | `header_from_core_failure()`、`ok_header_from_core_success()`、`need_refresh_header()` | `MOVED` refresh reason 在 FileSystemService 中被显式 de-scope。 |
-| `metadata/src/path_resolver.rs` | path 到 inode 的适配解析 | `PathResolver`、`ResolvedPath`、`ResolvedInode` | 基于 `MountTable` longest-prefix 和 dentry walk；path 不持久化为 authority。 |
-| `metadata/src/mount/mod.rs` | 内存 mount table 和 mount resolve | `MountTable`、`MountEntry`、`DataIoPolicy` | 启动时从 RocksDB 加载；Raft apply 后同步 upsert/remove；子 mount 通过更长 prefix 覆盖父 mount。 |
-| `metadata/src/raft/command.rs` | authoritative write vocabulary | `Command`、`FsCommand`、`DedupKey` | 所有持久 mutation 应通过命令表达；dedup fingerprint 排除 call_id。 |
-| `metadata/src/raft/state_machine.rs` | Raft apply 后的权威状态变更 | `AppRaftStateMachine::apply()` | 负责 inode/dentry/layout/refcount/mount/shard/worker descriptor/delete intent 的持久 mutation。 |
-| `metadata/src/raft/node.rs` | OpenRaft node 封装 | `AppRaftNode` | 负责 propose、read、membership、snapshot policy 和 network factory。 |
-| `metadata/src/raft/state_machine_store.rs` | OpenRaft state machine storage | `StateMachineStorage` | 负责 applied state、snapshot build/install、调用 `AppRaftStateMachine`。 |
-| `metadata/src/raft/storage.rs` | RocksDB schema 与读写 API | `RocksDBStorage` | 维护 replicated state CF、raft CF、FS CF；同时还有部分直接状态写入路径，需要持续收敛。 |
-| `metadata/src/state/raft_store.rs` | service/core 面向的 StateStore 实现 | `RaftStateStore` | read 当前通过 `AppRaftNode::read(false, ...)` 做 leader-read 检查；write 走 propose。 |
-| `metadata/src/worker/service.rs` | worker metadata RPC | `MetadataWorkerServiceImpl` | 处理 register、heartbeat、block_report、task ack；`report_presence` 当前 deprecated no-op。 |
-| `metadata/src/worker/manager.rs` | worker runtime soft state | `WorkerManager` | 持有 heartbeat、block location、full report lease、metadata epoch 等内存态。 |
-| `metadata/src/worker/repair/` | repair planning 和队列 | `RepairPlanner`、`RepairQueue`、`OrphanQueue` | planner 是纯决策；任务通过 heartbeat 下发和 ack 推进。 |
-| `metadata/src/maintenance/` | 后台维护任务 | `MaintenanceService`、`LeaseCleanup`、`Gc`、`OverReplicationCleanup` | leader-only 后台任务、gate、backoff、inflight 控制；模块仍在整理中。 |
-| `metadata/src/worker/delete_executor.rs` | block delete intent 执行器 | `DeleteExecutor` | 执行持久 delete intent，带 destructive gate、block report convergence、lease/inflight 检查。 |
-| `metadata/src/readiness.rs` | root readiness gate | `RootReadinessGate` | gRPC health 与 request guard 共享 readiness 状态。 |
-| `metadata/src/ufs_proxy.rs` | UFS metadata proxy | `UfsMetadataProxy` | 当前 runtime 构造了该对象，但主 FileSystemService 尚未把它作为 namespace mutation/read 的执行路径。 |
-| `metadata/src/*tests*` | 单元/集成测试 | `runtime::tests`、`fs_core::tests`、`worker::*tests` | 覆盖启动阶段、guard、authz、worker report、delete executor、repair 等局部合同。 |
+`metadata/src/bin/main.rs` 仍是薄入口。它只调用：
 
-## 4. 启动链路
+1. `load_config()`
+2. `init_observability(config.as_ref())`
+3. `MetadataServer::build(config).await`
+4. `server.serve().await`
 
-当前启动链路以 `metadata/src/bin/main.rs` 为真实入口，组合逻辑集中在 `metadata/src/runtime.rs`。`main()` 不再包含 `#[path = "..."]` 的生产模块绕行，也不直接构造底层对象；它只按顺序调用 `load_config()`、`init_observability()`、`MetadataServer::build(config)`、`server.serve()`。
+`MetadataServer::build()` 当前实际构造的长期对象：
 
-`MetadataServer` 是最终 server composition object，但不是万能容器。它持有配置、`MetadataAuthority`、required `WorkerRuntime`、最终 `RpcServices` 和 `RuntimeHandles`；authority、worker、maintenance、readiness、FileSystemService deps 分组等具体构造仍由命名清晰的 runtime helper 表达。
-
-当前代码保留的 runtime 对象都对应长期职责：`MetadataAuthority` 表示 authority bundle，`WorkerRuntime` 表示 required worker soft state 和 worker-owned repair state，`WorkerBackground` 表示 worker heavy background task handle 与 repair state，`Maintenance` 表示 metadata maintenance resources 及 task handles，`Readiness` 表示 root readiness watcher 与 health state，`RpcServices` 表示最终注册的 RPC services，`RuntimeHandles` 表示 `serve()` 需要持有到 server 生命周期结束的后台 task handles。
-
-`RuntimeHandles` 当前持有 `WorkerBackgroundHandle`、`MaintenanceHandle`、`DeleteExecutorHandle`、`ReadinessHandle`，语义是保留这些 `JoinHandle` 不再在 start 方法内部丢弃。当前代码还没有 cancellation token 或逐 task join 流程，因此这里不声明完整 graceful shutdown；server 退出后由进程 / Tokio runtime 结束这些后台循环。
-
-`runtime::tests::metadata_server_build_composes_required_runtime`、`runtime::tests::binary_entrypoint_delegates_to_metadata_server`、`runtime::tests::runtime_composition_separates_worker_maintenance_and_readiness`、`runtime::tests::runtime_handles_hold_started_background_tasks` 和 `runtime::tests::worker_service_supplies_background_inputs_without_optional_worker_mode` 覆盖当前组合关系、薄入口、required worker 与 lifecycle handle 持有关系。
-
-```mermaid
-sequenceDiagram
-    participant Main as bin/main.rs
-    participant Runtime as runtime.rs
-    participant Storage as RocksDBStorage
-    participant Mount as MountTable
-    participant SM as AppRaftStateMachine
-    participant Raft as AppRaftNode
-    participant WorkerMgr as WorkerManager
-    participant WorkerRuntime as WorkerRuntime
-    participant WorkerBg as WorkerBackground
-    participant Maint as Maintenance
-    participant Ready as Readiness
-    participant FS as FileSystemService
-    participant Server as tonic Server
-
-    Main->>Runtime: load_config()
-    Main->>Runtime: init_observability(config)
-    Main->>Runtime: MetadataServer::build(config)
-    Runtime->>Runtime: build_authority(config)
-    Runtime->>Storage: open(db_path)
-    Runtime->>Mount: load_from_storage(storage)
-    Runtime->>SM: new(storage, mount_table)
-    Runtime->>Raft: new(config, state_machine)
-    Runtime->>Runtime: ensure_root_mount()
-    Runtime->>Runtime: RaftStateStore / UfsRegistry / metrics
-    Runtime->>Runtime: build_worker_runtime()
-    Runtime->>WorkerMgr: heartbeat / block locations / worker epoch
-    Runtime->>WorkerRuntime: repair queues / worker RPC
-    Runtime->>Runtime: build_readiness()
-    Runtime->>Ready: root watcher / HealthService
-    Runtime->>Runtime: build_filesystem_service()
-    Runtime->>FS: guard / authz / FsCore
-    Runtime->>Runtime: build_maintenance()
-    Runtime->>Maint: lease runtime / maintenance / delete executor
-    Runtime->>Runtime: build_worker_background()
-    Runtime->>WorkerBg: worker cleanup / repair metrics tasks
-    Runtime->>Runtime: compose_services()
-    Main->>Runtime: server.serve()
-    Runtime->>Server: FileSystemService + MetadataWorkerService + Health
-```
-
-启动阶段职责：
-
-| 阶段 | 输入 | 输出 | 副作用 | 边界意义 |
+| 阶段 | 输入 | 输出 | 副作用 | 边界 |
 | --- | --- | --- | --- | --- |
-| `load_config()` | 环境变量 `VECTON_CONFIG`，默认 `conf/core-site.yaml` | `Arc<MetadataConfig>` | 读取配置文件 | 只表达配置加载，不承担 observability 或 authority 初始化。 |
-| `init_observability()` | `MetadataConfig` | `Observability` | 初始化 tracing / metrics provider，并记录已加载配置的非敏感摘要 | 只负责进程级 observability guard 的生命周期。 |
-| `MetadataServer::build()` | `Arc<MetadataConfig>` | `MetadataServer` | 按顺序构造 authority、required worker runtime、readiness、FileSystemService、maintenance、worker background、`RpcServices` 和 `RuntimeHandles` | 最终 server composition object；只组合长期对象，不新增临时 Build/Refs 容器。 |
-| `build_authority()` | `MetadataConfig` | `MetadataAuthority` | 打开 RocksDB，加载 mount，构造 Raft state machine / Raft node，确保 root mount，构造 `RaftStateStore` 和 UFS registry/proxy | 保持 authority bootstrap 顺序：`RocksDBStorage -> MountTable -> AppRaftStateMachine -> AppRaftNode -> ensure_root_mount -> RaftStateStore`。 |
-| `build_worker_runtime()` | config、authority | `WorkerRuntime`、`MetadataWorkerServiceImpl` | 初始化 metadata epoch，构造 worker manager、repair/orphan queue、planner 和标准注册用 worker RPC service | worker 是 metadata required runtime component；不存在 optional/disabled worker subsystem。 |
-| `build_readiness()` | config、authority | `Readiness` | 创建 root readiness gate、HealthService，并启动 root watcher，保留 `ReadinessHandle` | readiness/health 生命周期独立于 worker background 和 maintenance；当前 handle 持有 watcher `JoinHandle`。 |
-| `build_filesystem_service()` | config、authority、worker manager、readiness | `MetadataFileSystemServiceImpl` | 构造 authz、write session manager、inode lease manager，并按 authority/runtime/policy 分组组装 FileSystemService deps | 只构造 filesystem RPC service，不启动 readiness watcher，也不注册 tonic server。 |
-| `build_maintenance()` | authority、worker runtime | `Maintenance` | 启动 lease runtime、`MaintenanceService`、`DeleteExecutor`，保留 `MaintenanceHandle` 与 `DeleteExecutorHandle` | metadata maintenance 独立于 worker RPC serving；GC、lease cleanup、orphan/overrep cleanup、delete executor 归这里。 |
-| `build_worker_background()` | worker runtime、maintenance | `WorkerBackground` | 把 `DeleteExecutor` 接入 worker service，并启动 worker cleanup、repair/lease metrics 等 heavy background tasks，保留 `WorkerBackgroundHandle` | worker 能力本身 required；heavy background 在 authority ready 后 lazy start。 |
-| `compose_services()` | filesystem service、worker runtime、readiness、worker background、maintenance | `RpcServices`、`RuntimeHandles` | 无额外启动副作用 | 把可注册 RPC services 与必须持有的 lifecycle handles 分开；不在这里启动新后台任务。 |
-| `MetadataServer::serve()` | `MetadataServer` | 运行中的 gRPC server | 绑定 socket，注册 FileSystemService、MetadataWorkerService、HealthService，等待 shutdown signal | 只做 service registration 和 lifecycle holding，不构建 authority、worker、maintenance 或 readiness；当前不执行逐 task graceful shutdown。 |
+| `load_config()` | `VECTON_CONFIG` 或 `conf/core-site.yaml` | `Arc<MetadataConfig>` | 读取配置 | 不构造 runtime。 |
+| `init_observability()` | `MetadataConfig` | `Observability` | 初始化 tracing/metrics guard | 只保活观测资源。 |
+| `build_authority()` | config | `MetadataAuthority` | 打开 RocksDB，加载 `MountTable`，构造 `AppRaftStateMachine` / `AppRaftNode`，执行 root mount bootstrap，构造 `RaftStateStore`、UFS registry/proxy | authority bootstrap 顺序仍是 `RocksDBStorage -> MountTable -> AppRaftStateMachine -> AppRaftNode -> ensure_root_mount -> RaftStateStore`。 |
+| `build_worker_runtime()` | config、authority | `WorkerRuntime`、`MetadataWorkerServiceImpl` | 创建 `WorkerManager`、repair/orphan queue、planner，初始化 metadata epoch | worker 是 required component，不存在 optional/disabled worker runtime。 |
+| `build_readiness()` | config、authority | `Readiness` | 启动 root readiness watcher，创建 HealthService | readiness gate 被 FileSystemService guard 使用。 |
+| `build_filesystem_service()` | config、authority、worker manager、readiness | `MetadataFileSystemServiceImpl` | 创建 write session manager、inode lease manager、worker commit hook、permission checker、FsCore、GuardChain | 只构造 filesystem RPC service，不启动 server。 |
+| `build_maintenance()` | authority、worker runtime | `Maintenance` | 启动 lease runtime、MaintenanceService、DeleteExecutor | 后台维护能力同进程运行。 |
+| `build_worker_background()` | worker runtime、worker service、maintenance | `WorkerBackground` | 给 worker service 注入 DeleteExecutor，启动 worker background tasks | 启动 worker 相关后台循环。 |
+| `compose_services()` | filesystem、worker、readiness、background、maintenance | `RpcServices`、`RuntimeHandles` | 无新增启动副作用 | 分离可注册 RPC service 和需保活 handle。 |
+| `serve()` | config、services、handles | gRPC server | 注册 FileSystemService、MetadataWorkerService、HealthService，等待 Ctrl-C/SIGTERM | 只负责注册和持有 handles，不构造 runtime。 |
 
-`ensure_root_mount()` 的重要 invariant：已有 root mount 必须是 `/`、`ROOT_INODE_ID`、`MountKind::Internal`、无 UFS URI、`DataIoPolicy::Forbid`。如果 root mount 不存在，leader 会通过 `Command::CreateMount` 创建；非 leader 遇到 leader changed 时不直接失败启动，而是让 readiness 后续收敛。
+`RuntimeHandles` 当前持有 `WorkerBackgroundHandle`、`MaintenanceHandle`、`DeleteExecutorHandle`、`ReadinessHandle`，语义是保留后台 `JoinHandle`。代码没有 cancellation token、逐 task stop 或 join 流程，因此不能写成完整 graceful shutdown；目前只是 server shutdown 后进程/Tokio runtime 结束后台循环。
 
-## 5. 权威数据模型
+root mount bootstrap 当前行为：
 
-metadata 的 authority model 是 inode-centric，而不是 path-centric。
+- 若已有 `/` mount，必须满足 `ROOT_INODE_ID`、`MountKind::Internal`、无 `ufs_uri`、`DataIoPolicy::Forbid`。
+- 若缺失且当前节点是 leader，通过 `Command::CreateMount` 创建。
+- 若当前节点不是 leader，`ensure_root_mount()` 直接返回，后续由 readiness watcher 持续等待/尝试。
+- root mount 不能删除。
+
+## 4. 请求主链路
+
+当前对外 filesystem RPC 入口是 `MetadataFileSystemServiceImpl`，实现 `proto::metadata::FileSystemServiceProto`。`proto/metadata/filesystem.proto` 中关于 “external clients should not call InodeService directly” 的注释是历史痕迹；当前 `metadata/src/service` 没有独立 Rust `InodeService` 服务实现。
 
 ```mermaid
 flowchart LR
-    Path[Path string] -->|PathResolver resolve| Mount[MountTable longest prefix]
-    Mount --> Root[Mount root inode]
-    Root --> Dentry[Dentry parent + name]
-    Dentry --> Inode[Inode]
-    Inode --> Attrs[FileAttrs]
-    Inode --> InodeData[InodeData<br/>Dir / File / Symlink]
-    Inode --> DH[Current DataHandleId]
-    DH --> BlockId[BlockId<br/>DataHandleId + BlockIndex]
-    BlockId --> BlockMeta[BlockMeta / refcount / delete intent]
-    BlockId --> Location[WorkerManager block locations<br/>runtime soft state]
-    Mount --> Owner[Namespace owner group]
-    Owner --> RaftGroup[Raft group / shard group]
-    Mount --> ME[Mount epoch]
-    RaftGroup --> RE[Route epoch]
+    RPC["FileSystemService RPC"] --> Header["RequestContext / header"]
+    Header --> Guard["GuardChain"]
+    Guard --> Resolver["PathResolver"]
+    Resolver --> Core["FsCore"]
+    Core --> Read["RocksDB reads"]
+    Core --> Write["Raft propose Command"]
+    Write --> Apply["AppRaftStateMachine::apply"]
+    Apply --> Rocks["RocksDBStorage"]
+    Core --> Resp["CoreSuccess / CoreFailure"]
+    Resp --> Wire["ResponseHeader.error / payload"]
 ```
 
-核心概念：
-
-| 概念 | 代码位置 | 当前语义 |
-| --- | --- | --- |
-| `InodeId` | `types/src/ids.rs` | 命名空间对象的稳定 ID。 |
-| `Inode` | `types/src/fs.rs` | 持久对象，包含 kind、attrs、data、mount_id、`current_data_handle_id`、xattrs。 |
-| `Dentry` | `metadata/src/raft/storage.rs` API | parent inode + name 到 child inode 的映射，是 path resolve 的持久事实。 |
-| `FileAttrs` | `types/src/fs.rs` | size、mode、uid/gid、mtime 等属性。 |
-| `DataHandleId` | `types/src/ids.rs` | 数据实例 ID，不等于 file handle。`BlockId` 由 `DataHandleId + BlockIndex` 组成。 |
-| `FileLayout` | `types/src/layout.rs` | 文件 block/chunk/replication 划分模型，不等于 `route_epoch`。 |
-| `MountEntry` | `metadata/src/mount/mod.rs` | mount prefix、root inode、owner group、data IO policy、config version。 |
-| `namespace_owner_group_id` | `MountEntry::namespace_owner_group_id` | namespace mutation 的 owner group。 |
-| `shard_group_id` | `metadata/src/config.rs`、`types/src/ids.rs` | 当前 metadata 节点所属 raft/shard group。mount owner 可以指向 group。 |
-| `mount_epoch` | `MountEntry::config_version` | mount 配置新鲜度。客户端携带旧值会触发 `MountEpochMismatch`。 |
-| `route_epoch` | `RocksDBStorage::get_route_epoch()` | filesystem-facing 路由新鲜度。mount 创建/删除会推进；`AddShardGroup` 当前不推进。 |
-| `state_id` | `common/src/header/types.rs`、`AppRaftNode::get_last_applied_state_id()` | 已应用 Raft state watermark。部分路径用它做 stale-state 检查。 |
-| `file_handle` / write session | `metadata/src/service/fs_core/write_session.rs` | 运行时写会话身份，包含 lease、fencing、open_epoch、targets；不是持久 data handle。 |
-| `fencing_token` | `types/src/lease.rs` | worker direct data path 与 metadata close/fsync 的一致性保护。 |
-
-需要注意两个当前实现细节：
-
-- `AppRaftStateMachine::apply_create()` 会为新文件分配持久 `current_data_handle_id` 并写入 data handle owner 映射。
-- `WriteSessionCoordinator::execute_open_write()` 当前用 `DataHandleId::new(inode_id.as_raw())` 构造写目标 block id，而不是直接读取 inode 的 `current_data_handle_id`。这属于需要继续审计的历史包袱，维护时不能把它误读为已经完成的 data handle 生命周期模型。
-
-## 6. 请求入口与服务分层
-
-`FileSystemService` 是当前对外统一 path-first 入口。`FsCore` 是 service 内共享的 domain core；service 层负责 RPC 和策略适配，不应该承载复杂业务规则。当前代码里 `path_service.rs` 仍然偏大，但它的主流路径已经是：guard/authz/path resolve 后调用 `FsCore`。
-
-`MetadataFileSystemServiceDeps` 只表达显式依赖注入，不负责构造 runtime state。当前它按职责分成 `FileSystemAuthorityDeps`、`FileSystemRuntimeDeps`、`FileSystemPolicyDeps`：authority 组包含 `StateStore`、`MountTable`、`RocksDBStorage`、Raft node；runtime 组包含 write session、inode lease、worker commit hook、worker manager、metrics、readiness gate；policy 组包含 leadership checker、authz provider、inode permission reader。`build_filesystem_service()` 仍显式创建并注入 `WriteSessionManager`、`InodeLeaseManager`、`SharedWorkerCommitHook`。
-
-```mermaid
-flowchart TD
-    RPC[RPC Request] --> Header[RequestHeaderProto]
-    Header --> PreGuard[GuardPolicy pre-read / pre-write]
-    PreGuard --> Resolve[PathResolver]
-    Resolve --> Authz[Authz target construction]
-    Authz --> Guard[GuardChain<br/>readiness / leadership / authz / data IO]
-    Guard --> Service[FileSystemService adapter]
-    Service --> Core[FsCore domain methods]
-    Core --> ReadStore[RocksDB read]
-    Core --> Raft[Raft propose for mutation]
-    Raft --> SM[AppRaftStateMachine apply]
-    SM --> Store[RocksDB persisted state]
-    Core --> Resp[CoreSuccess / CoreFailure]
-    Resp --> HeaderOut[ResponseHeaderProto + payload]
-```
-
-分层边界：
-
-- proto 层：只定义 wire contract，例如 `RequestHeaderProto`、`ResponseHeaderProto`、`FileSystemServiceProto`、`MetadataWorkerServiceProto`。
-- service 层：抽取 request context，执行 guard/authz/path resolve，构造 domain input，映射 header。
-- domain core：执行 mount/route/session/fencing freshness、业务规则、dedup、Raft command orchestration。
-- storage/Raft 层：持久化 authoritative state；Raft apply 是 mutation 的 commit boundary。
-- worker manager：保存 heartbeat、block locations、full report sync 等运行时软状态，不应成为持久 namespace authority。
-
-`GuardPolicy` 的职责是服务门禁，不是业务新鲜度：
-
-| 检查 | 当前位置 | 说明 |
-| --- | --- | --- |
-| root readiness | `ReadinessGuard` | root 未 ready 返回 retryable canonical error。 |
-| leadership | `LeadershipGuard` | 写路径或要求 leader 的数据 IO 路径返回 `NotLeader` refresh hint。 |
-| authz | `AuthGuard` | 通过 `AuthzProvider` 检查 inode/session/path target。 |
-| data IO policy | `DataIoPolicyGuard` | mount 标记 `DataIoPolicy::Forbid` 时拒绝数据 IO。 |
-| mount/route freshness | `FsCore::FreshnessValidator` | 属于 domain consistency，不放在 guard。 |
-| session/fencing/worker epoch | `WriteSessionCoordinator` | 属于写会话和直接数据路径一致性，不放在 guard。 |
-
-## 7. 关键链路
-
-### 7.1 Path Resolve / Lookup 链路
-
-Path resolve 从字符串 path 开始，但 path 不落库为 authority。`PathResolver` 先调用 `MountTable` 做 longest-prefix match，确定 mount root 和 relative path；之后按 dentry 逐级读取 child inode。
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant FS as FileSystemService
-    participant Guard as GuardChain
-    participant Resolver as PathResolver
-    participant Mount as MountTable
-    participant Store as RocksDBStorage
-    participant Core as FsCore
-
-    Client->>FS: get_file_status(path, header)
-    FS->>Guard: PATH_READ_PRE
-    FS->>Resolver: resolve_inode(path)
-    Resolver->>Mount: resolve_mount(path)
-    Resolver->>Store: read dentry chain
-    Resolver->>Store: read inode / attrs
-    FS->>Guard: METADATA_READ with authz target
-    FS->>Core: execute_get_attr(inode_id, freshness)
-    Core->>Store: read inode
-    Core-->>FS: attrs + group_id + mount_epoch + route_epoch
-    FS-->>Client: gRPC OK + ResponseHeader + payload
-```
-
-主要不变量：
-
-- mount table 采用 longest-prefix；子 mount 覆盖父 mount。
-- `PathResolver::resolve_rename()` 会拒绝跨 mount rename，返回 `CrossMountRename`，最终映射为 EXDEV。
-- lookup/read 返回 header 中的 group、mount epoch、route epoch，用于客户端缓存和后续 refresh。
-- `mount_epoch` 和 `route_epoch` 的实际校验在 `FsCore` freshness validator 中完成，service 不直接复写该逻辑。
-
-### 7.2 Create / Mkdir / Delete / Rename 链路
-
-namespace mutation 必须路由到 mount 的 owner group，并通过 Raft command 提交。`FsCore` 负责构造 dedup key、路由上下文和 command；`AppRaftStateMachine` 负责实际修改 RocksDB 中的 inode/dentry/layout/refcount。
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant FS as FileSystemService
-    participant Resolver as PathResolver
-    participant Core as FsCore
-    participant Raft as AppRaftNode
-    participant SM as AppRaftStateMachine
-    participant Store as RocksDBStorage
-
-    Client->>FS: create / mkdir / unlink / rename
-    FS->>Resolver: resolve parent and existing target
-    Resolver-->>FS: mount_id + parent inode + name
-    FS->>Core: execute_* mutation(input)
-    Core->>Store: load mount / route context
-    Core->>Core: build DedupKey + FsCommand
-    Core->>Raft: propose(Command)
-    Raft->>SM: apply committed command
-    SM->>Store: mutate inode / dentry / layout / refs
-    Store-->>SM: persisted result
-    SM-->>Raft: AppDataResponse::Fs
-    Raft-->>Core: FsCommandResult
-    Core-->>FS: CoreSuccess or CoreFailure
-    FS-->>Client: ResponseHeader + payload/error
-```
-
-关键点：
-
-- `route_fs_write_ctx()` 会确认多父目录操作位于同一 mount，并读取 `namespace_owner_group_id`。
-- rename 的 cross-mount 情况在 resolver/core 之前被拒绝为 EXDEV，不走 UFS proxy 的 copy-delete fallback。
-- rename 的逻辑原子性边界是一个 Raft command；当前 RocksDB apply 中仍有多次 CF 写操作，跨 CF/多 key 原子性需要继续审计。
-- `DedupKey` 来自 `client_id + call_id`；fingerprint 排除 call_id，用于识别重复请求与冲突请求。
-
-### 7.3 Open / Write Session / Fsync 链路
-
-写路径分为 metadata 控制面和 worker 数据面。metadata 打开写会话、授予 lease/fencing、选择 worker targets；客户端后续直连 worker 写数据；`fsync` 或 `close_write_session` 再回到 metadata 完成提交或会话关闭。
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant FS as FileSystemService
-    participant Core as FsCore
-    participant Lease as InodeLeaseManager
-    participant WM as WorkerManager
-    participant Worker
-    participant Raft as AppRaftNode
-    participant SM as AppRaftStateMachine
-
-    Client->>FS: open_write_by_path(path, header)
-    FS->>Core: validate mount / route freshness
-    Core->>Lease: acquire inode lease
-    Core->>WM: select workers for placement
-    Core-->>Client: file_handle + lease + fencing + write targets
-    Client->>Worker: direct write(block, fencing_token)
-    Client->>FS: fsync_session(file_handle, worker_epoch)
-    FS->>Core: validate session / worker epoch / fencing
-    Core->>Worker: CommitWriteRequest via worker client or hook
-    Worker-->>Core: commit header
-    Core->>Raft: propose SetAttr or CloseWrite
-    Raft->>SM: apply metadata commit
-    SM-->>Core: committed attrs/extents
-    Core-->>Client: ResponseHeader
-```
-
-当前实现程度：
-
-- `WriteSessionCoordinator` 维护内存会话；session 失效、过期或 fencing mismatch 会返回 `NEED_REFRESH`，reason 包括 `SessionInvalid`、`SessionExpired`、`Fencing`。
-- `execute_fsync()` 会先调用 worker commit，再通过 `Command::SetAttr` 更新文件 size/mtime。
-- `execute_close_write()` 校验 session、mount、route、worker epoch、lease、fencing、pending extents 后，通过 `Command::CloseWrite` 写入最终 extents 并释放 lease/session。
-- 当前 `open_write` 的 data handle 选择仍需审计：写目标 block id 用 inode id 派生，而 create 时已有持久 `current_data_handle_id`。
-
-### 7.4 GetBlockLocations / Read Route 链路
-
-当前对外读路由接口主要是 `get_file_layout_by_path`。它返回文件 extents、file size 和 `FileBlockLocationProto` 列表，但当前 `FsCore::execute_get_file_layout()` 构造的 locations 中 worker 列表为空；真实 worker location 的内存权威在 `WorkerManager` 中，尚未完整接入该 read route 响应。
-
-```mermaid
-flowchart TD
-    Client[Client get_file_layout_by_path] --> FS[FileSystemService]
-    FS --> Resolver[PathResolver]
-    Resolver --> Core[FsCore::execute_get_file_layout]
-    Core --> Fresh[validate mount_epoch / route_epoch]
-    Core --> Inode[read inode and file extents]
-    Core --> Locations[build FileBlockLocation<br/>current workers empty]
-    Locations --> ClientResp[ResponseHeader + extents + locations]
-    ClientResp -. future / partial .-> DirectRead[Client direct worker read]
-    WorkerResp[Worker NEED_REFRESH] -. client action machine .-> Refresh[Refresh route / worker / state via metadata]
-```
-
-维护时必须区分：
-
-- `types/src/layout.rs::FileLayout` 描述文件如何切分成 block/chunk，不是路由 epoch。
-- `route_epoch` 是 metadata 返回给客户端的路由新鲜度，用于缓存刷新。
-- worker 数据路径的 `worker_epoch`、`block_stamp`、fencing 校验在 worker direct data proto 和 worker 侧逻辑中完成，metadata 的 header 只负责触发 refresh/replay。
-
-### 7.5 Mount 管理链路
-
-mount 是 namespace ownership 和 UFS/IO policy 的边界。启动时 `MountTable::load_from_storage()` 从 RocksDB 恢复；Raft apply `CreateMount/DeleteMount` 后同步更新内存 `MountTable`。
-
-```mermaid
-sequenceDiagram
-    participant Bootstrap
-    participant Store as RocksDBStorage
-    participant Mount as MountTable
-    participant Raft as AppRaftNode
-    participant SM as AppRaftStateMachine
-
-    Bootstrap->>Store: load_mounts()
-    Bootstrap->>Mount: load_from_storage()
-    Bootstrap->>Raft: ensure_root_mount via CreateMount if missing
-    Raft->>SM: apply CreateMount / DeleteMount
-    SM->>Store: put/delete mount + mount_version
-    SM->>Store: advance_authoritative_route_epoch()
-    SM->>Mount: upsert/remove in-memory entry
-    Mount-->>Bootstrap: root ready when invariant holds
-```
-
-规则：
-
-- root mount 是 internal、无 UFS URI、`DataIoPolicy::Forbid`。
-- external mount 必须有 UFS URI；internal mount 不能有 UFS URI。
-- child mount 通过更长 prefix 覆盖 parent mount。
-- mount 创建/删除会推进 filesystem-facing route epoch；`AddShardGroup` 当前不会推进 route epoch。
-- `MountTable::resolve_path()` 当前基于 normalized string prefix 匹配，prefix 边界需要继续审计，避免 `/mnt` 误匹配 `/mnt2` 这类路径。
-
-### 7.6 Worker Heartbeat / Block Report 链路
-
-worker 与 metadata 的关系分为持久 descriptor 和运行时软状态。注册时 descriptor 会通过 Raft 持久化；heartbeat、block report、full report sync、block locations 存在 `WorkerManager` 内存态，重启后需要 worker 重新上报。
-
-```mermaid
-sequenceDiagram
-    participant Worker
-    participant WSvc as MetadataWorkerServiceImpl
-    participant WM as WorkerManager
-    participant Raft as AppRaftNode
-    participant Repair as RepairQueue / OrphanQueue
-    participant Delete as DeleteExecutor
-
-    Worker->>WSvc: register_worker(descriptor)
-    WSvc->>WM: register runtime worker
-    WSvc->>Raft: propose UpsertWorkerDescriptor
-    Worker->>WSvc: heartbeat(runtime, task acks)
-    WSvc->>WM: update runtime soft state
-    WSvc->>Repair: process repair/move/evict acks
-    WSvc->>Delete: process delete acks
-    WSvc-->>Worker: commands
-    Worker->>WSvc: block_report(full/delta)
-    WSvc->>WM: update block locations
-    WSvc->>Repair: orphan / under-replication planning
-    WSvc-->>Worker: report response + commands
-```
-
-当前边界：
-
-- `report_presence` 已 deprecated，当前只是 acknowledge/no-op；强一致 presence 应使用 block report。
-- full report 有 lease/token 和 storm control；incremental report 需要 full sync 基线。
-- block presence/location 是 runtime soft state，不是 Raft authoritative namespace state。
-- worker descriptor 先写入 `WorkerManager` 内存再 propose Raft；如果 propose 失败，可能出现短暂内存/持久状态偏差，需要运维和测试关注。
-
-### 7.7 Repair / Move / Evict 链路
-
-repair 相关代码已经具备 planner、queue、heartbeat 下发、ack 推进、delete executor 和 maintenance gate，但整体仍是分阶段实现，不应写成完整自治 repair 系统已经完成。
-
-```mermaid
-flowchart TD
-    Report[BlockReport] --> Detect[detect orphan / under / over replication]
-    Detect --> Planner[RepairPlanner<br/>pure planning]
-    Planner --> Queue[RepairQueue / OrphanQueue]
-    Queue --> Heartbeat[Worker heartbeat response commands]
-    Heartbeat --> Worker[Worker executes copy / verify / evict]
-    Worker --> Ack[Task ack in heartbeat]
-    Ack --> Queue
-    Ack --> Followup[MoveCopy ack may enqueue Evict]
-    DeleteIntent[DeleteIntent] --> DeleteExec[DeleteExecutor]
-    DeleteExec --> Gates[leader / destructive / convergence / lease / inflight gates]
-    Gates --> DeleteCmd[worker delete commands]
-```
-
-当前支持：
-
-- `RepairPlanner` 根据 block location 和 candidate worker 做纯 planning，不直接访问 storage、raft 或 worker。
-- `RepairQueue` 和 `OrphanQueue` 持有任务状态、lease/backoff/ack 推进。
-- `MaintenanceService` 周期性运行 leader-only GC、lease cleanup、orphan cleanup、rebalance、timeout requeue、over-replication cleanup。
-- `DeleteExecutor` 执行持久 delete intent，包含 leader、block report convergence、destructive gate、lease、inflight、per-worker concurrency 等安全门。
-
-当前限制：
-
-- replication factor 和 placement 策略仍偏 MVP，例如 write placement 中使用固定 `3`。
-- delete intent 的执行状态部分直接写 RocksDB，不通过 Raft command。
-- repair/move/evict 与真实 worker 数据复制、校验、失败恢复的端到端覆盖仍需继续补测试和收敛。
-
-## 8. 错误模型与刷新闭环
-
-Vecton 的错误模型以 `ResponseHeader.error` 为核心。recoverable business/protocol/consistency failure 使用 gRPC OK + `ResponseHeader.error`；transport/auth/framework failure 才使用 non-OK gRPC status。FileSystemService 的主流路径遵守这个模型；worker metadata service 中仍有少量 non-OK status，例如 heartbeat descriptor changed 使用 `failed_precondition`，注册失败路径也会返回 tonic `Status`。
-
-```mermaid
-flowchart TD
-    DomainErr[MetadataError / CanonicalError] --> Mapper{mapping path}
-    Mapper --> RpcMap[to_canonical_rpc]
-    Mapper --> FsMap[to_canonical_fs]
-    RpcMap --> Header[ResponseHeaderProto.error]
-    FsMap --> Header
-    Header --> Class[ErrorClass<br/>NEED_REFRESH / RETRYABLE / FATAL]
-    Class --> Reason[RefreshReason]
-    Reason --> Hint[RefreshHint<br/>leader / group / mount_epoch / route_epoch / worker_epoch]
-    Hint --> Client[client refresh / replay action machine]
-```
-
-关键类型：
-
-- `common/src/error/mod.rs::CanonicalError`
-- `common/src/error/mod.rs::ErrorClass`
-- `common/src/error/mod.rs::RefreshReason`
-- `common/src/error/mod.rs::RefreshHint`
-- `common/src/header/types.rs::ResponseHeader`
-- `metadata/src/error.rs::to_canonical_rpc`
-- `metadata/src/error.rs::to_canonical_fs`
-- `metadata/src/service/core_util.rs::header_from_core_failure`
-
-主要 refresh reason 边界：
-
-| RefreshReason | 当前使用边界 |
-| --- | --- |
-| `NotLeader` | leadership guard 或 Raft propose/read 遇到 leader changed。 |
-| `StaleState` | caller `state_id` 落后于当前 last_applied，部分写路径使用。 |
-| `MountEpochMismatch` | request 或 route context 中的 mount epoch 与当前 mount config version 不一致。 |
-| `RouteEpochMismatch` | request `route_epoch` 与 `StateStore::get_route_epoch()` 不一致。 |
-| `WorkerEpochMismatch` | write session close/fsync 时 caller worker epoch 与 `WorkerManager` 当前 epoch 不一致。 |
-| `BlockStampMismatch` | direct worker data path 使用；metadata header contract 保留该 reason。 |
-| `Fencing` | write session fencing token、lease、open_epoch 不匹配。 |
-| `SessionInvalid` / `SessionExpired` | file handle 或 write session 不存在、过期或已经终止。 |
-| `Moved` | `core_util.rs` 中对 FileSystemService 显式 de-scope，当前不会作为主流路径返回。 |
-
-client 侧 `client/src/canonical.rs` 会先区分 non-OK gRPC 和 OK response header error；`client/src/meta/rpc_helper.rs` 再把 reason 映射为 refresh 动作，例如 mount+route refresh、route refresh、worker refresh、fencing/session refresh、state refresh。维护 metadata 返回 header 时必须保证 `ErrorClass`、`RefreshReason`、`RefreshHint` 三者一致，否则 client 无法正确 replay。
-
-## 9. Raft、RocksDB 与一致性
-
-Raft 是 authoritative mutation 的提交边界；RocksDB 是 committed state 的持久化承载。`AppRaftStateMachine` 只在 command commit 后 apply mutation，并把结果写入 RocksDB。
-
-```mermaid
-flowchart LR
-    Command[Command] --> Raft[AppRaftNode propose]
-    Raft --> Log[OpenRaft log]
-    Log --> Store[StateMachineStorage apply]
-    Store --> SM[AppRaftStateMachine]
-    SM --> Rocks[RocksDBStorage]
-    Rocks --> CFs[STATE_CFS<br/>inodes / dentries / mounts / blocks / workers / delete intents]
-    Rocks --> RaftCF[RAFT_CFS<br/>log / state / snapshot]
-    Store --> Snapshot[Snapshot build / install]
-```
-
-持久状态：
-
-- inode、dentry、attrs、file extents、file layout、data handle owner。
-- mount entries、mount version、route epoch。
-- block metadata、block refcount、leases、delete intents。
-- shard groups、shard routing。
-- worker descriptor 和部分 legacy worker info。
-- dedup applied result、applied seq、raft log/state/snapshot。
-
-运行时 ephemeral 状态：
-
-- `WorkerManager` 中的 heartbeat runtime、block locations、sync state、metadata epoch。
-- write sessions、inode lease manager 的活跃 lease。
-- repair/orphan queues、inflight registry、full report lease manager。
-- readiness watcher、health serving 状态。
-
-当前实现程度：
-
-- `metadata/src/raft/state_machine_store.rs` 已有 snapshot build/install，snapshot payload 来自 replicated state CF，并携带 route epoch/applied seq。
-- `RaftStateStore` 的 read 当前调用 `AppRaftNode::read(false, ...)`，也就是 leader-read 检查；代码中存在 `read(true)` 能力，但主流 StateStore 读不是 follower read。
-- `state_id` 和 stale-state validation 已存在，但不是所有 read/write 都强制使用。
-- 部分维护状态例如 delete intent execution status 会直接写 RocksDB，不通过 Raft command；这是当前实现事实和后续收敛点。
-
-## 10. 与其他模块的关系
-
-| 模块 | metadata 依赖方式 | 边界 |
-| --- | --- | --- |
-| `common` | 使用 config、header、canonical error、metrics/tracing 基础设施 | metadata 可以映射错误和填充 header，但不能改变 common 的跨模块语义。 |
-| `types` | 使用 inode、block、layout、lease、worker、mount/routing ID 等强类型 | domain model 的 authority 在 types；metadata 不应引入松散字符串替代强类型。 |
-| `proto` | 实现 `FileSystemServiceProto` 和 `MetadataWorkerServiceProto`，消费 proto DTO | proto 是 wire contract；业务逻辑应尽快转换到 domain 类型。 |
-| `client` | metadata 返回 header、refresh hint、layout/write session 信息供 client action machine 使用 | metadata 不直接执行 client refresh，只提供可解释的 reason/hint。 |
-| `worker` | worker 通过 register/heartbeat/block_report 与 metadata 通信；client direct data path 使用 worker data proto | metadata 不做 chunk IO，不持有 worker 本地存储布局 authority。 |
-| `transport` | 当前主要由 tonic/proto server/client 承载 RPC；transport 抽象不应渗透到 domain core | framework/transport failure 才使用 non-OK gRPC status。 |
-| `ufs` | runtime 构造 registry/proxy，mount entry 可携带 UFS URI | 当前 FileSystemService 主路径尚未真正把 UFS metadata proxy 作为 namespace 执行后端。 |
-
-## 11. 已完成的架构整理
-
-基于当前代码，可以确认已经完成的整理：
-
-| 整理项 | 当前代码证据 | 说明 |
-| --- | --- | --- |
-| `main.rs` 变薄 | `metadata/src/bin/main.rs` | 入口只执行 config、observability、`MetadataServer::build()`、`server.serve()`。 |
-| `MetadataServer` 收敛启动组合 | `metadata/src/runtime.rs` | 最终 server composition object 持有 config、authority、required worker runtime、RPC services 和 runtime handles；不引入临时 Build/Refs 容器。 |
-| worker runtime / background 分离 | `WorkerRuntime`、`WorkerManager`、`WorkerBackground` | worker 是 required runtime component；worker service 始终注册，heavy background 在 authority ready 后启动。 |
-| FileSystemService deps 分组 | `MetadataFileSystemServiceDeps`、`FileSystemAuthorityDeps`、`FileSystemRuntimeDeps`、`FileSystemPolicyDeps` | service 构造入参按 authority/runtime/policy 分组，同时保留 write session、inode lease、worker commit hook 的显式注入。 |
-| maintenance / readiness 与 worker background 分离 | `Maintenance`、`Readiness`、`RuntimeHandles` | maintenance/delete/lease cleanup 不再藏在泛化 background runtime；readiness/health watcher 独立持有；后台循环已有 JoinHandle 持有，但 graceful shutdown 仍待补齐。 |
-| `FsCore` 抽出 | `metadata/src/service/fs_core/` | read、mutation、freshness、write session 已成子模块。 |
-| error contract 集中 | `metadata/src/error.rs`、`metadata/src/service/core_util.rs` | 显式 `to_canonical_rpc/fs` 与 header helpers。 |
-| guard policy 统一 | `metadata/src/service/guard.rs` | `GuardPolicy` constants 加 `guard_policy()` 调用路径。 |
-| MountTable 启动加载和 Raft apply 同步 | `MountTable::load_from_storage()`、`apply_create_mount()` | mount 内存表不是孤立 runtime 配置。 |
-| MOVED de-scope | `metadata/src/service/core_util.rs` | FileSystemService 遇到 MOVED reason 会降级为 unknown/unsupported path。 |
-| ACL MVP | `metadata/src/service/authz.rs` | `AclInodeAuthz` 基于 inode xattr；default ACL inheritance 等尚未完成。 |
-
-不能写成已完成的能力：
-
-- 没有独立 Rust `InodeService` 服务实现；只有 proto 注释/历史接口痕迹。
-- `GetFileLayoutByPath` 当前没有完整返回 worker locations。
-- Ranger provider 当前是 allow-all stub。
-- UFS proxy 当前未接入 FileSystemService 主读写路径。
-- repair/move/evict 具备框架和部分执行链路，但还不是完整自治 repair 系统。
-- follower read/state watermark 不是全路径强制语义。
-
-## 12. 当前风险、历史包袱与 TODO
-
-| 风险/包袱 | 当前表现 | 影响 | 建议 |
-| --- | --- | --- | --- |
-| write session data handle 语义不一致 | `execute_open_write()` 用 inode id 派生 `DataHandleId`，而 create 时已有持久 `current_data_handle_id` | block id、data handle owner、file layout 生命周期可能不一致 | 审计 open/close/write target 与 `current_data_handle_id`，统一数据实例来源。 |
-| inode id allocator 持久化风险 | `AppRaftStateMachine::next_inode_id` 当前内存从 1 开始 | 重启或 snapshot restore 后可能出现 ID 重用风险，除非外部路径已保证恢复 | 增加持久 allocator 或启动时从 RocksDB 恢复 max inode id，并补 crash/restart 测试。 |
-| read route locations 未完整接入 | `execute_get_file_layout()` 返回的 `FileBlockLocation.workers` 为空 | client 无法仅凭 metadata response 完成完整 read route | 接入 `WorkerManager` location 或明确改造 read route API。 |
-| mount prefix 边界需审计 | `MountTable::resolve_path()` 基于 normalized string prefix | `/mnt` 与 `/mnt2` 这类边界可能误匹配 | 使用 path component 边界匹配并补测试。 |
-| RocksDB 多 key/多 CF apply 原子性 | state machine 多处按步骤调用 storage put/delete | apply 过程中 crash 可能留下部分状态，需确认 RocksDB batch 边界 | 对 namespace mutation 使用 write batch 或补 recovery invariant 校验。 |
-| Ranger authz 是 stub | `StubRangerAuthz` allow-all 并记录 debug | 配置 Ranger 模式不会真正执行策略 | 明确生产禁用或实现真实 Ranger provider。 |
-| UFS proxy 未接入主路径 | runtime 构造 `_ufs_registry` 和 `_ufs_metadata_proxy`，FileSystemService 不使用 | external mount 的 metadata 行为不完整 | 明确 external mount MVP 范围，接入或移除未使用路径。 |
-| worker register 内存先行 | `register_worker` 先更新 `WorkerManager`，再 propose descriptor | Raft propose 失败时可能产生短暂内存/持久偏差 | 调整顺序或在失败时回滚内存态。 |
-| delete intent 状态直接写 RocksDB | `DeleteExecutor` 执行状态不通过 Raft command | 多副本一致性和 failover 语义需要额外证明 | 将状态推进纳入 Raft 或记录为明确的 leader-local runtime 状态。 |
-| repair 策略仍是 MVP | placement/replication factor 局部硬编码，端到端覆盖不足 | 过度相信 repair 可能导致副本不足或误删 | 明确最小支持集，补端到端 repair/move/evict 测试。 |
-| `path_service.rs` 仍然偏大 | RPC、guard、authz target、转换和少量流程控制集中 | 新增 RPC 容易把业务重新写回 service 层 | 继续按 operation family 拆 adapter，但保持 `FsCore` 为业务归属。 |
-| client path 到 group 解析未完成 | `client/src/meta/rpc_helper.rs::resolve_path_to_group()` 返回 `None` | route cache 和 replay 还没有完整 path/group 闭环 | 完成 path route cache 或让 metadata response 提供足够 hint。 |
-| `report_presence` 历史接口残留 | worker service 中 deprecated no-op | 调用方可能误以为 presence 已被 authoritative 记录 | 删除内部调用，文档和 proto 标注迁移到 block report。 |
-
-## 13. 开发不变量与贡献指南
-
-后续修改 metadata 时必须遵守：
-
-- path 是 adapter，不是 authority；不要新增以 path 为持久真相的状态。
-- inode、dentry、attrs 是文件系统 metadata authority。
-- Block 是管理、reporting、replication、delete intent 单元；Chunk 是 worker 本地 IO/checksum/repair 单元。
-- `data_handle_id`、`file_handle`、write session、lease 语义不可混淆。
-- recoverable business/protocol/consistency error 不直接返回 non-OK gRPC；应返回 gRPC OK + `ResponseHeader.error`。
-- `mount_epoch`、`route_epoch`、`state_id`、`worker_epoch`、fencing token 必须保持一致性闭环。
-- guard 只做 service gate；mount/route/session/fencing freshness 属于 domain core。
-- worker runtime 和 background runtime 不能反向偷取 namespace authority；worker soft state 丢失后必须能通过 report/heartbeat 收敛。
-- service 层保持薄；新增业务规则优先放入 `FsCore` 或 state machine。
-- 内部 legacy code 优先删除，不做兼容桥；如果 proto 兼容必须保留，应在注释和 README 中标明边界。
-- 修改 proto/types 时同步更新 mapping、tests、client refresh/replay、README。
-- 新增请求必须明确经过 readiness、authz、leadership、data IO policy 和 domain freshness 策略。
-- 修改 Raft apply 时必须说明 commit boundary、dedup、snapshot/recovery 和 RocksDB 原子性。
-
-## 14. 快速阅读路径
-
-建议新开发者按以下顺序阅读：
-
-1. `metadata/src/bin/main.rs`：确认真实入口和 runtime 阶段顺序。
-2. `metadata/src/runtime.rs`：理解 core、authority、worker、background、filesystem、serve 的组装边界。
-3. `metadata/src/bootstrap.rs` 和 `metadata/src/mount/mod.rs`：理解 root mount、mount table、mount epoch、owner group。
-4. `metadata/src/service/path_service.rs`：看一个完整 RPC 如何从 header、guard、path resolve 进入 `FsCore`。
-5. `metadata/src/service/guard.rs`、`metadata/src/service/authz.rs`、`metadata/src/service/core_util.rs`：理解门禁、授权和 header/error 映射。
-6. `metadata/src/service/fs_core/mod.rs`、`freshness.rs`、`mutation.rs`、`read.rs`、`write_session.rs`：理解 domain core 的职责边界。
-7. `metadata/src/path_resolver.rs`：理解 path 只是 inode/dentry/mount 的解析适配。
-8. `metadata/src/raft/command.rs`、`metadata/src/raft/state_machine.rs`：理解所有 authoritative mutation 的命令和 apply 语义。
-9. `metadata/src/raft/storage.rs`、`metadata/src/raft/state_machine_store.rs`、`metadata/src/state/raft_store.rs`：理解 RocksDB schema、Raft state、snapshot、StateStore。
-10. `metadata/src/worker/service.rs`、`metadata/src/worker/manager.rs`、`metadata/src/worker/repair/`：理解 worker descriptor、heartbeat、block report、repair 任务。
-11. `metadata/src/maintenance/` 和 `metadata/src/worker/delete_executor.rs`：理解后台 GC、lease cleanup、orphan/overrep、delete intent 执行安全门。
-12. `proto/metadata/filesystem.proto`、`proto/metadata/worker.proto`、`proto/common/header.proto`、`proto/common/errors.proto`：对照 wire contract。
-13. `types/src/fs.rs`、`types/src/ids.rs`、`types/src/block.rs`、`types/src/layout.rs`、`types/src/lease.rs`：理解强类型模型。
-14. `client/src/canonical.rs`、`client/src/meta/rpc_helper.rs`、`client/src/meta/filesystem.rs`：理解 metadata header 如何驱动 client refresh/replay。
-
-阅读时优先从真实入口和当前代码流出发。`docs/` 目录如果存在相关设计文档，只能作为背景材料；最终判断以 `AGENTS.md` 和当前代码为准。
+`path_service.rs` 仍然偏大。它当前承担的 adapter 职责包括：tonic request/response、header/context 提取、guard 调用、path resolve、permission target 选择、proto/domain 转换、FsCore 调用、ResponseHeader 构造。核心 freshness、session、lease、fencing、mutation orchestration 已在 `FsCore` 内，但 adapter 还不是很薄。
+
+`FsCore` 当前子模块：
+
+- `mod.rs`：共享 core state、route/write context、dedup、error/header helper、Raft propose 辅助。
+- `read.rs`：getattr、readdir、xattr、layout、statfs/access/symlink 等读类或未实现方法。
+- `mutation.rs`：create、mkdir、unlink、rmdir、rename、setattr、xattr、mount mutation 等。
+- `write_session.rs`：open/renew/release/close/fsync/hsync/hflush/truncate write session 链路。
+- `freshness.rs`：mount_epoch、route_epoch、state_id 校验。
+- `tests.rs`：FsCore 局部合同测试。
+
+Guard 链路当前实际生效内容：
+
+- `check_meta_read()`：readiness。
+- `check_meta_write()`：readiness + leadership。
+- `check_data_read()`：readiness + data IO policy。
+- `check_data_write()`：readiness + leadership + data IO policy。
+- `check_perm()` / `check_parent_perm()` / `check_super()` / `check_set_attr_perm()`：委托 `PermissionChecker`。
+
+mount/route/session/fencing freshness 仍在 `FsCore` / `WriteSessionCoordinator`，不在 guard 中。`GuardChain` 不检查 `mount_epoch`、`route_epoch`、`state_id`、write session、lease、fencing token 或 `worker_epoch`。
+
+Authz 当前状态：
+
+- 配置枚举包含 `NONE`、`ACL`、`RANGER`。
+- 当前可启用实现只有 `NONE`，行为是 allow-all，并记录 `AUTHZ_ALLOW_NONE_TOTAL`。
+- `ACL` 和 `RANGER` 在 `filesystem_permission_checker()` 中直接返回 `InvalidArgument`，不是 ACL MVP，也不是 Ranger allow-all stub。
+
+`MOVED` 当前仍被 FileSystemService de-scope。`core_util.rs` 明确把 `RefreshReason::Moved` 映射成 `RefreshReasonUnknown`，client 侧也把 `ShardMoved` code 映射为 `RouteEpochMismatch` 行为。
+
+## 5. Authority model
+
+metadata 当前 authority 是 inode-centric：
+
+- inode 是文件系统对象身份。
+- dentry 是 parent inode + name 到 child inode 的持久映射。
+- attrs 是 inode 属性事实。
+- path 只是 `PathResolver` 的输入适配，不是持久 authority。
+
+mount / owner group / route epoch：
+
+- `MountTable` 启动时从 RocksDB `mounts` CF 加载，Raft apply `CreateMount` / `DeleteMount` 后同步更新内存表。
+- `MountEntry::namespace_owner_group_id` 是 mount 内 namespace mutation owner group。
+- `mount_epoch` 使用 `MountEntry::config_version`。
+- `route_epoch` 存在 RocksDB `meta` CF 中，`CreateMount` / `DeleteMount` 会推进；`AddShardGroup` 当前不推进 filesystem-facing `route_epoch`。
+- `state_id` 来自 Raft applied state watermark，部分 header 和 stale-state 路径会使用。
+
+data identity / session identity：
+
+- `data_handle_id` 是数据面身份，`BlockId = data_handle_id + block_index`。
+- `file_handle` 是 write session 身份，不是持久文件身份。
+- `fencing_token` 保护 direct client->worker 与 close/fsync 的一致性。
+- `Create` 当前会通过持久 `next_data_handle_id` 分配 `current_data_handle_id` 并写入 `data_handle_owner` 映射。
+- 当前风险：`WriteSessionCoordinator::execute_open_write()` 仍用 `DataHandleId::new(inode_id.as_raw())` 生成 block id，而不是使用 inode 上的 `current_data_handle_id`。这说明 data handle 生命周期尚未统一。
+
+block metadata 与 worker soft state 边界：
+
+- block metadata、lease、block refcount、delete intent 是 RocksDB/Raft 管理状态。
+- worker descriptor 通过 `Command::UpsertWorkerDescriptor` 持久化。
+- heartbeat、capacity/load、block locations、full-report sync state 是 `WorkerManager` 内存软状态。
+
+Raft / RocksDB 现状：
+
+- 主 filesystem mutation、mount mutation、worker descriptor、delete intent 创建都通过 `Command` propose 到 Raft apply。
+- 仍存在直接 RocksDB 写路径：worker identity/worker id allocator 在 register 前经 leader read 取得 storage 后直接写；delete intent 状态更新由 `DeleteExecutor` 直接写 RocksDB；block refcount helper 和一些 maintenance 兼容方法直接写 RocksDB。
+- `RaftStateStore` 读调用 `AppRaftNode::read(false, ...)`，当前是 leader-read 检查，不是 follower read；`AppRaftNode::read(true, ...)` 有 linearizable read 分支，但主 `RaftStateStore` 路径没有使用。
+- snapshot build/install 基于 `STATE_CFS` 的 RocksDB snapshot/payload，包含 replicated state CF；install 时先 clear 对应 CF，再批量恢复。
+- 多 key/多 CF mutation 没有统一 batch 原子性。部分 allocator/snapshot 使用 `WriteBatch`，但 create/mkdir/rename/close_write 等 state machine apply 中仍有多个连续 `put_*` / `delete_*`。
+- inode id allocator 仍是 `AppRaftStateMachine::next_inode_id` 内存计数器，未持久化，属于高优先级 correctness 风险。
+
+## 6. Worker metadata 链路
+
+worker RPC 入口是 `MetadataWorkerServiceImpl`。
+
+register 当前行为：
+
+- 根据 endpoint + labels 计算 identity。
+- 如果没有 suggested worker id，先通过 state machine storage 的 `get_worker_id_by_identity()` / `get_and_increment_worker_id()` / `put_worker_identity()` 直接生成和写入 worker id 映射。
+- 先调用 `WorkerManager::register_worker()` 写入内存 descriptor。
+- 再 propose `Command::UpsertWorkerDescriptor` 持久化 descriptor。
+
+这仍是“先内存后 Raft”的顺序。如果 Raft propose 失败，内存 descriptor 可能短暂领先持久状态。
+
+heartbeat 当前行为：
+
+- 所有节点都更新 `WorkerManager` runtime soft state，不走 Raft。
+- leader 检测 descriptor 变化会返回 non-OK gRPC `failed_precondition` 要求 re-register。
+- leader 分配 full block report lease，处理 task ack，并从 DeleteExecutor/RepairQueue 拉取 worker command。
+- follower 不分配 full report lease，不下发 repair/delete command。
+
+block report 当前行为：
+
+- full report 需要在 worker 需要 full sync 时携带 lease token。
+- full report 替换该 worker 的 block set；incremental report 在已有 full sync 基础上应用 delta。
+- block locations 是 `WorkerManager` 内存 soft state，不通过 Raft 持久化。
+- leader 对新增 block 做 orphan 检测和 replication planning。
+- `report_presence` RPC 仍存在，是 deprecated/no-op；强一致 presence 来源是 `block_report`。
+
+task ack 当前行为：
+
+- heartbeat 中携带 `TaskAckProto`。
+- DeleteExecutor 先尝试按 task id 处理 delete ack。
+- RepairQueue 再处理 replicate/move_copy/evict ack；MoveCopy 成功会 enqueue follow-up Evict task。
+
+## 7. Maintenance / Repair / Delete 当前状态
+
+`MaintenanceService::start()` 当前启动 7 个后台任务：
+
+- GC task。
+- GC refcount reload self-healing。
+- lease cleanup。
+- orphan cleanup。
+- rebalance task。
+- repair timeout requeue。
+- over-replication cleanup。
+
+这些任务都是 leader-only 执行核心动作，但模块成熟度不同：
+
+- 已接入：MaintenanceService 在 runtime 启动，DeleteExecutor 在 runtime 启动并接入 worker heartbeat command/ack。
+- 部分闭环：GC/orphan/overrep 可以创建 delete intent，DeleteExecutor 可读取 pending intents、执行 destructive gate、生成 `DeleteBlocksCommandProto`，并根据 ack + 后续 block report reconcile 更新状态。
+- 框架/部分闭环：RepairPlanner/RepairQueue 支持 Replicate、MoveCopy、Evict 的 planning、queue、dispatch、ack/backoff；实际 copy/verify/evict 是否端到端成功取决于 worker 实现和数据面配合，metadata 侧不能单独证明完整自治 repair。
+- MVP/硬编码：replication factor 多处仍硬编码为 `3u8`；rebalance 是简单 load heuristic；placement/fault-domain 策略未闭环。
+- 直接 RocksDB：DeleteExecutor 的 Completed/Failed 状态通过 `storage.update_delete_intent_status()` 直接写 RocksDB，不是新的 Raft command。
+
+建议文档和瘦身时把 maintenance 作为“可保留框架、默认保守运行或可降级”的后台能力，不要描述成完整自治 repair 系统。
+
+## 8. UFS 与 External Mount 当前状态
+
+runtime 当前构造了 `UfsRegistry` 和 `UfsMetadataProxy`，并把它们保存在 `MetadataAuthority` 私有字段里。
+
+`MountKind::External` 和 `ufs_uri` 可以通过 mount entry 表达，`MountTable::resolve_path()` 可以把统一路径映射到 UFS URI + relative path。`UfsMetadataProxy` 也实现了 stat/list/rename/delete/exists 等代理方法。
+
+但 FileSystemService 主路径没有注入或调用 `UfsMetadataProxy`。当前 namespace read/write 仍走 inode/dentry/attrs/Raft/RocksDB 链路；external mount 只在 mount metadata 和 data IO policy 层部分存在，不能写成已经支持完整 UFS-backed namespace。
+
+当前必须明确的边界：UFS proxy 构造存在，但 namespace read/write 主链路未使用。
+
+## 9. Error model 与 refresh 闭环
+
+当前 wire contract 仍是：
+
+- recoverable business/protocol/consistency failure 使用 gRPC OK + `ResponseHeader.error`。
+- transport/auth/framework failure 使用 non-OK gRPC status。
+
+metadata 侧：
+
+- `metadata/src/error.rs` 把 `MetadataError` 显式映射为 canonical error。
+- `LeaderChanged`、`MountEpochMismatch`、`RoutingStale`、`StaleState`、`LeaseFenced`、`ServiceUnavailable` 等会变成可机器处理的 header error。
+- FileSystemService handler 多数错误走 response header；部分 worker RPC 输入错误和 descriptor changed 使用 non-OK gRPC status。
+
+client 侧：
+
+- `client/src/canonical.rs` 明确解析 non-OK gRPC、gRPC OK + header error、gRPC OK + no error 三种 envelope。
+- `client/src/meta/filesystem.rs` 的 action machine 根据 `RefreshReason` 做 route/mount/worker/session refresh/replay。
+- `client/src/meta/rpc_helper.rs::resolve_path_to_group()` 仍返回 `None`，group route 尚未完成。
+- mount refresh 没有专用 API，当前 fallback 到 route/status refresh。
+- `GetFileLayoutByPath` 可返回 `route_epoch`/`mount_epoch` hint，但 worker locations 当前为空，因此 direct-read worker route hint 不完整。
+- MOVED 仍 de-scope，`ShardMoved` 只走 route refresh 行为。
+
+## 10. 当前已完成整理
+
+以下只列当前代码事实已经完成的整理：
+
+- `main.rs` 已保持薄入口，runtime composition 集中在 `metadata/src/runtime.rs`。
+- `MetadataServer::build()` 统一构造 authority、required worker runtime、readiness、filesystem service、maintenance、worker background、services 和 runtime handles。
+- worker runtime 不是 optional subsystem。
+- `RuntimeHandles` 持有后台 task handles，但未实现完整 graceful shutdown。
+- FileSystemService 对外入口统一为 `MetadataFileSystemServiceImpl`。
+- `FsCore` 已拆成 read/mutation/write_session/freshness 子模块。
+- `GuardChain` 与 domain freshness 分离：guard 做 readiness/leadership/data IO/authz，mount/route/session/fencing 在 FsCore。
+- `MOVED` 在 FileSystemService 中显式 de-scope。
+- worker descriptor 与 heartbeat/block location 的持久态/软状态边界已在代码中分离。
+- block report 是当前 block presence 主来源；`report_presence` 只是 deprecated/no-op。
+
+## 11. 当前风险、历史包袱、TODO
+
+高优先级 correctness 风险：
+
+- `data_handle_id / open_write`：create 使用持久 data_handle allocator，但 open_write 仍用 `inode_id` 派生 `DataHandleId`，data handle 生命周期未统一。
+- inode id allocator：`next_inode_id` 是 state machine 内存计数器，未从 RocksDB/Raft snapshot 恢复，重启后有重复分配风险。
+- RocksDB multi-key/multi-CF 原子性：create/mkdir/rename/close_write 等 mutation 仍由多个 `put_*` 组成，没有统一 batch 原子提交。
+- worker register 顺序：先写 `WorkerManager` 内存 descriptor，再 propose Raft；失败时内存与持久状态可能短暂不一致。
+- delete intent 执行状态：Completed/Failed 由 DeleteExecutor 直接写 RocksDB，不走 Raft command。
+
+当前实现限制：
+
+- `get_file_layout_by_path` 返回 extents 和 `FileBlockLocation`，但 `workers` 为空、`worker_epoch` 为 None，不能支撑完整 direct client-read route。
+- mount prefix 边界：`PathResolver` 和 `MountTable::resolve_path()` 都使用 `starts_with` 做 prefix 匹配，`/mnt/s3x` 误匹配 `/mnt/s3` 的边界风险仍需修复。
+- ACL/Ranger：配置枚举存在，但两者均未实现且 fail fast；不要写成 ACL MVP 或 Ranger stub。
+- UFS proxy：runtime 构造存在，FileSystemService 主链路未使用。
+- repair/move/evict：metadata 侧有 planner/queue/command/ack 框架，但不能证明完整端到端 repair 系统已经闭环。
+- over-rep cleanup/rebalance：任务已启动，但策略仍简单，默认 replication factor 仍多处硬编码。
+- report_presence：RPC 仍残留，但 deprecated/no-op。
+- client path/group route：`resolve_path_to_group()` 仍返回 None；route refresh/replay 能力仍不完整。
+- route owner group / namespace owner group：namespace owner group 参与 write route context 和 header hint；多 group 实际转发/迁移不是完整闭环。
+- external mount：mount metadata 支持 external 表达，但 namespace 操作仍不代理到 UFS。
+- follower read：代码有 linearizable read 分支，但主 `RaftStateStore` 使用 leader-read；follower read 全路径语义未落地。
+
+## 12. Metadata 瘦身建议
+
+P0：必须保留并优先修正的主链路 correctness。
+
+- 保留 `FsCore`、`PathResolver`、`MountTable`、`AppRaftStateMachine`、`RocksDBStorage`、`RaftStateStore`、`ResponseHeader.error` contract、write session/fencing 主链路。
+- 优先修正 inode id allocator 持久化。
+- 统一 data_handle_id 生命周期，特别是 open_write 不能继续用 inode_id 派生 data handle。
+- 修复 mount prefix 边界。
+- 收敛 create/mkdir/rename/close_write/delete-intent 状态等多 key RocksDB mutation 的原子性。
+- 明确 worker register 内存/持久顺序，避免 register 失败后内存状态误导 heartbeat。
+
+P1：最小读写闭环。
+
+- 保留 FileSystemService path-first RPC、guard、readiness、leadership、NONE authz、mount/route/session freshness。
+- 保留 create/mkdir/unlink/rmdir/rename/setattr/xattr/open_write/fsync/close 的最小链路。
+- `get_file_layout_by_path` 先如实返回 extents/epoch；worker locations 未闭环前不要作为完整 direct-read route。
+- client action machine 保留 refresh/replay，但承认 path->group route 和 mount refresh API 未完成。
+
+P2：可保留框架但默认关闭或降级的后台维护能力。
+
+- MaintenanceService、RepairQueue、OrphanQueue、RepairPlanner、DeleteExecutor 可以保留为框架，但生产默认策略应保守。
+- GC、orphan cleanup、over-rep cleanup、rebalance、repair timeout requeue 可按风险分级启用。
+- DeleteExecutor 已能下发 delete command，但状态绕过 Raft，应在高风险环境中谨慎开启 destructive path。
+- replication factor、placement、fault-domain、rebalance 策略可以先保持 MVP，不要扩展成复杂策略。
+
+P3：暂缓实现的高级能力。
+
+- Ranger。
+- 完整 ACL。
+- UFS metadata proxy 接入 FileSystemService 主路径。
+- 完整 repair/move/evict 端到端自治系统。
+- over-rep cleanup 的完整策略化。
+- rebalance 的生产级调度。
+- 多 shard migration。
+- follower read 全路径语义。
+- dedicated mount refresh API 和完整 path/group route cache。
+
+不能为了瘦身删除的模块或合同：
+
+- `FsCore`，因为它承载 domain freshness、mutation、write session/fencing。
+- `MountTable`，因为 mount resolve、mount_epoch、namespace owner group 依赖它。
+- `AppRaftStateMachine` / `AppRaftNode` / `RaftStateStore`，因为 authoritative mutation 依赖 Raft apply。
+- `RocksDBStorage`，因为持久 state 和 snapshot/install 依赖它。
+- `common` header/error contract，尤其 gRPC OK + `ResponseHeader.error`。
+- `MetadataFileSystemServiceImpl` 外部入口。
+- write session manager、inode lease manager、fencing token 链路。
+
+## 13. 快速阅读路径
+
+推荐按以下顺序阅读当前真实代码：
+
+1. `metadata/src/bin/main.rs`
+2. `metadata/src/runtime.rs`
+3. `metadata/src/bootstrap.rs`
+4. `metadata/src/readiness.rs`
+5. `metadata/src/service/path_service.rs`
+6. `metadata/src/service/guard.rs`
+7. `metadata/src/service/auth.rs`
+8. `metadata/src/path_resolver.rs`
+9. `metadata/src/service/fs_core/mod.rs`
+10. `metadata/src/service/fs_core/freshness.rs`
+11. `metadata/src/service/fs_core/read.rs`
+12. `metadata/src/service/fs_core/mutation.rs`
+13. `metadata/src/service/fs_core/write_session.rs`
+14. `metadata/src/raft/command.rs`
+15. `metadata/src/raft/state_machine.rs`
+16. `metadata/src/raft/storage.rs`
+17. `metadata/src/raft/state_machine_store.rs`
+18. `metadata/src/state/raft_store.rs`
+19. `metadata/src/mount/mod.rs`
+20. `metadata/src/worker/service.rs`
+21. `metadata/src/worker/manager.rs`
+22. `metadata/src/worker/repair/`
+23. `metadata/src/worker/delete_executor.rs`
+24. `metadata/src/maintenance/service.rs`
+25. `metadata/src/maintenance/gc.rs`
+26. `metadata/src/maintenance/orphan.rs`
+27. `metadata/src/maintenance/overrep.rs`
+28. `metadata/src/ufs_proxy.rs`
+29. `client/src/canonical.rs`
+30. `client/src/meta/filesystem.rs`
+31. `client/src/meta/rpc_helper.rs`
+
+阅读时不要从旧设计文档反推能力；以这些代码路径的当前行为为准。

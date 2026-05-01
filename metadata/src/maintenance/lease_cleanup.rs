@@ -25,13 +25,13 @@ use super::gate::TaskGate;
 pub struct LeaseCleanupService {
     raft_node: Arc<AppRaftNode>,
     storage: Arc<RocksDBStorage>,
-    worker_manager: Arc<WorkerManager>,
+    _worker_manager: Arc<WorkerManager>,
     lease_gate: Arc<RwLock<TaskGate>>,
     metrics: Arc<MetadataMetrics>,
     last_log_ms: Arc<RwLock<u64>>,
-    lease_runtime: Option<Arc<crate::lease_runtime::LeaseRuntimeTable>>,
+    _lease_runtime: Option<Arc<crate::lease_runtime::LeaseRuntimeTable>>,
     /// Pending candidates awaiting confirmation (block_id -> first_seen_ms)
-    pending_candidates: Arc<RwLock<HashMap<BlockId, u64>>>,
+    _pending_candidates: Arc<RwLock<HashMap<BlockId, u64>>>,
     /// Unified destructive gate
     destructive_gate: Arc<DestructiveGate>,
 }
@@ -52,12 +52,12 @@ impl LeaseCleanupService {
         Self {
             raft_node,
             storage,
-            worker_manager,
+            _worker_manager: worker_manager,
             lease_gate,
             metrics,
             last_log_ms,
-            lease_runtime,
-            pending_candidates,
+            _lease_runtime: lease_runtime,
+            _pending_candidates: pending_candidates,
             destructive_gate,
         }
     }

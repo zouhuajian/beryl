@@ -67,14 +67,16 @@ pub struct RepairPlanner {
     ///
     /// RepairPlanner does NOT directly create Evict tasks from orphan_queue.
     /// The final decision and task creation happens in MaintenanceService.
-    orphan_queue: Arc<OrphanQueue>,
+    _orphan_queue: Arc<OrphanQueue>,
 }
 
 impl RepairPlanner {
     pub fn new(_repair_queue: Arc<RepairQueue>, orphan_queue: Arc<OrphanQueue>) -> Self {
         // Note: repair_queue parameter kept for backward compatibility but not used
         // Planner now outputs actions instead of enqueuing directly
-        Self { orphan_queue }
+        Self {
+            _orphan_queue: orphan_queue,
+        }
     }
 
     /// Plan replication actions for a block (pure planning, no side effects).

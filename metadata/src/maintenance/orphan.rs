@@ -27,8 +27,8 @@ use super::intents::DeleteIntentBuilder;
 /// Pending orphan block (waiting for grace period or second confirmation).
 #[derive(Debug, Clone)]
 pub struct PendingOrphan {
-    block_id: BlockId,
-    worker_id: WorkerId,
+    _block_id: BlockId,
+    _worker_id: WorkerId,
     first_seen_ms: u64,
     last_seen_ms: u64,
     seen_count: u32,
@@ -37,8 +37,8 @@ pub struct PendingOrphan {
 impl PendingOrphan {
     fn new(block_id: BlockId, worker_id: WorkerId, now_ms: u64) -> Self {
         Self {
-            block_id,
-            worker_id,
+            _block_id: block_id,
+            _worker_id: worker_id,
             first_seen_ms: now_ms,
             last_seen_ms: now_ms,
             seen_count: 1,
@@ -64,14 +64,14 @@ pub struct OrphanBlockCleaner {
     raft_node: Arc<AppRaftNode>,
     storage: Arc<RocksDBStorage>,
     worker_manager: Arc<WorkerManager>,
-    repair_queue: Arc<RepairQueue>,
+    _repair_queue: Arc<RepairQueue>,
     orphan_queue: Arc<OrphanQueue>,
     orphan_gate: Arc<RwLock<TaskGate>>,
     orphan_pending: Arc<RwLock<HashMap<BlockId, PendingOrphan>>>,
     metrics: Arc<MetadataMetrics>,
     last_log_ms: Arc<RwLock<u64>>,
     /// Unified destructive gate
-    destructive_gate: Arc<DestructiveGate>,
+    _destructive_gate: Arc<DestructiveGate>,
     /// Mount table for computing mount_epoch when convergence gating is enabled.
     mount_table: Arc<MountTable>,
 }
@@ -95,13 +95,13 @@ impl OrphanBlockCleaner {
             raft_node,
             storage,
             worker_manager,
-            repair_queue,
+            _repair_queue: repair_queue,
             orphan_queue,
             orphan_gate,
             orphan_pending,
             metrics,
             last_log_ms,
-            destructive_gate,
+            _destructive_gate: destructive_gate,
             mount_table,
         }
     }

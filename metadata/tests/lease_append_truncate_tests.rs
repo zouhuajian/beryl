@@ -5,9 +5,8 @@
 
 use metadata::inode_lease::{InodeLeaseManager, WriteMode};
 use types::fs::InodeId;
+use types::ids::ClientId;
 use types::ids::{BlockId, BlockIndex, DataHandleId};
-use types::ids::{ClientId, LeaseId, MountId};
-use types::lease::FencingToken;
 use types::CallId;
 
 #[test]
@@ -18,7 +17,7 @@ fn test_lease_conflict() {
     let client2 = ClientId::new(2);
 
     // Client1 acquires lease
-    let (lease_id1, epoch1, _) = manager
+    let (_lease_id1, epoch1, _) = manager
         .try_acquire(inode_id, client1, Some(CallId::new()), WriteMode::Write, None)
         .unwrap();
 
@@ -50,10 +49,10 @@ fn test_lease_expire_and_steal() {
     let manager = InodeLeaseManager::default();
     let inode_id = InodeId::new(1);
     let client1 = ClientId::new(1);
-    let client2 = ClientId::new(2);
+    let _client2 = ClientId::new(2);
 
     // Client1 acquires lease
-    let (lease_id1, epoch1, _) = manager
+    let (_lease_id1, _epoch1, _) = manager
         .try_acquire(inode_id, client1, Some(CallId::new()), WriteMode::Write, None)
         .unwrap();
 
@@ -82,7 +81,7 @@ fn test_lease_fencing() {
     manager.release(inode_id, lease_id1, epoch1);
 
     // Client2 acquires lease (after client1 released)
-    let (lease_id2, epoch2, _) = manager
+    let (_lease_id2, epoch2, _) = manager
         .try_acquire(inode_id, client2, Some(CallId::new()), WriteMode::Write, Some(epoch1))
         .unwrap();
 

@@ -4,8 +4,9 @@
 use super::*;
 use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
 use crate::raft::{AppRaftStateMachine, Command, DedupKey, RocksDBStorage};
-use crate::service::domain::{Freshness, ReleaseSessionInput, RequestContext};
+use crate::service::domain::{Freshness, OpenWriteInput, ReleaseSessionInput, RequestContext};
 use crate::state::{BlockMetaState, LeaseState, MemoryStateStore, RouteEpoch};
+use crate::worker::{HealthStatus, WorkerManager};
 use async_trait::async_trait;
 use common::error::canonical::{ErrorCode as CanonicalErrorCode, RefreshReason};
 use common::header::{AuthnType, RequestHeader, RpcErrorCode};
@@ -132,8 +133,33 @@ fn fs_core_with_mount(mount_id: MountId, mount_epoch: u64, group_id: ShardGroupI
     FsCore::new_default(Arc::new(MemoryStateStore::new()), mount_table)
 }
 
+fn worker_manager_for_write_targets() -> Arc<WorkerManager> {
+    let manager = Arc::new(WorkerManager::new(60));
+    for raw in 1..=3 {
+        let worker_id = types::ids::WorkerId::new(raw);
+        manager
+            .register_worker(worker_id, format!("127.0.0.1:{}", 9000 + raw), 1, 10 + raw, None)
+            .unwrap();
+        manager
+            .update_runtime(
+                worker_id,
+                1,
+                10 + raw,
+                1024 * 1024,
+                0,
+                1024 * 1024,
+                0,
+                0,
+                HealthStatus::Healthy,
+            )
+            .unwrap();
+    }
+    manager
+}
+
 fn install_write_session(fs_core: &FsCore, inode_id: InodeId, mount_id: MountId) -> u64 {
     let writer = ClientId::new(7);
+    let data_handle_id = DataHandleId::new(424_242);
     let (lease_id, lease_epoch, _) = fs_core
         .inode_lease_manager_for_test()
         .try_acquire(
@@ -147,10 +173,11 @@ fn install_write_session(fs_core: &FsCore, inode_id: InodeId, mount_id: MountId)
     fs_core.write_session_manager_for_test().create_session(
         inode_id,
         mount_id,
+        data_handle_id,
         lease_id,
         lease_epoch,
         FencingToken {
-            block_id: BlockId::new(DataHandleId::new(inode_id.as_raw()), BlockIndex::new(0)),
+            block_id: BlockId::new(data_handle_id, BlockIndex::new(0)),
             owner: writer,
             epoch: lease_epoch,
         },
@@ -366,6 +393,82 @@ async fn fs_core_release_facade_remains_idempotent_for_missing_session() {
 
     assert_eq!(success.group_id, None);
     assert_eq!(success.mount_epoch, None);
+}
+
+#[tokio::test]
+async fn open_write_targets_use_inode_current_data_handle() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(51);
+    let group_id = ShardGroupId::new(9);
+    let inode_id = InodeId::new(510);
+    let data_handle_id = DataHandleId::new(9510);
+    storage
+        .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+        .unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    fs_core.set_storage(storage);
+    fs_core.set_worker_manager(worker_manager_for_write_targets());
+
+    let success = fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id,
+            desired_len: Some(4096),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("open_write should succeed");
+
+    assert_ne!(inode_id.as_raw(), data_handle_id.as_raw());
+    assert!(!success.payload.write_targets.is_empty());
+    for target in &success.payload.write_targets {
+        assert_eq!(target.block_id.data_handle_id, data_handle_id);
+    }
+    assert_eq!(
+        success.payload.session_key.fencing_token.block_id.data_handle_id,
+        data_handle_id
+    );
+    let session = fs_core
+        .write_session_for_handle(success.payload.session_key.file_handle)
+        .expect("session should be stored");
+    assert_eq!(session.data_handle_id, data_handle_id);
+}
+
+#[tokio::test]
+async fn open_write_rejects_file_missing_current_data_handle() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(52);
+    let inode_id = InodeId::new(520);
+    storage
+        .put_inode(&Inode::new_file(
+            inode_id,
+            FileAttrs::new(),
+            mount_id,
+            DataHandleId::new(0),
+        ))
+        .unwrap();
+
+    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(10));
+    fs_core.set_storage(storage);
+    fs_core.set_worker_manager(worker_manager_for_write_targets());
+
+    let failure = fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id,
+            desired_len: Some(4096),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(failure.error.message.contains("missing current_data_handle_id"));
 }
 
 #[tokio::test]

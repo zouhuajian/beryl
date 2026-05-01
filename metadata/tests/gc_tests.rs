@@ -4,12 +4,10 @@
 //! Tests for GC (Garbage Collection) and refcount management.
 
 use metadata::raft::RocksDBStorage;
-use metadata::state::{DeleteIntent, DeleteIntentReason, DeleteIntentStatus};
-use metadata::worker::{RepairQueue, RepairTask};
 use std::sync::Arc;
 use tempfile::TempDir;
 use types::fs::Extent;
-use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+use types::ids::{BlockId, BlockIndex, DataHandleId};
 
 #[test]
 fn test_refcount_increment_on_commit() {

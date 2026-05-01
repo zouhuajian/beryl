@@ -143,8 +143,8 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         AppSnapshotBuilder {
             storage: Arc::clone(&self.storage),
-            state_machine: Arc::clone(&self.state_machine),
-            state: Arc::clone(&self.state),
+            _state_machine: Arc::clone(&self.state_machine),
+            _state: Arc::clone(&self.state),
         }
     }
 
@@ -271,8 +271,8 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
 /// Snapshot builder for Raft.
 pub struct AppSnapshotBuilder {
     storage: Arc<RocksDBStorage>,
-    state_machine: Arc<AppRaftStateMachine>,
-    state: Arc<RwLock<AppMetadataRaftState>>,
+    _state_machine: Arc<AppRaftStateMachine>,
+    _state: Arc<RwLock<AppMetadataRaftState>>,
 }
 
 impl openraft::storage::RaftSnapshotBuilder<MetadataRaftTypeConfig> for AppSnapshotBuilder {
@@ -739,7 +739,7 @@ mod tests {
     use crate::mount::MountTable;
     use crate::raft::state_machine::AppRaftStateMachine;
     use crate::state::RouteEpoch;
-    use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine as _};
+    use openraft::storage::RaftSnapshotBuilder;
     use openraft::LeaderId;
     use tempfile::TempDir;
 
@@ -770,6 +770,7 @@ mod tests {
 
         storage_a.put_route_epoch(RouteEpoch::new(7)).unwrap();
         storage_a.put_applied_seq(9).unwrap();
+        storage_a.set_next_inode_id(types::fs::InodeId::new(77)).unwrap();
 
         // Write a simple entry into another CF to ensure multi-CF round-trip.
         let cf = storage_a.cf("block_ref_counts").unwrap();
@@ -824,6 +825,11 @@ mod tests {
         let raw = storage_b.db().get_cf(cf_b, b"block1").unwrap().unwrap();
         let decoded: u64 = decode_u64(&raw).unwrap();
         assert_eq!(decoded, 1234);
+        assert_eq!(
+            storage_b.get_next_inode_id().unwrap(),
+            Some(types::fs::InodeId::new(77))
+        );
+        assert_eq!(storage_b.allocate_inode_id().unwrap(), types::fs::InodeId::new(77));
 
         // get_current_snapshot should return the just-built snapshot.
         println!("loading current snapshot");

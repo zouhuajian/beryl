@@ -85,17 +85,18 @@ mod tests {
         let mount_table = MountTable::new();
         let mount_id = MountId::new(1);
         let root_inode_id = InodeId::new(100);
-        let mut attrs = FileAttrs::new();
+        let root_data_handle_id = DataHandleId::new(4_200);
+        let attrs = FileAttrs::new();
         let inode = Inode::new(
             root_inode_id,
             InodeKind::Dir,
             attrs.clone(),
             mount_id,
-            types::ids::DataHandleId::new(0),
+            root_data_handle_id,
         );
         storage.put_inode(&inode).unwrap();
         storage
-            .put_data_handle_owner(DataHandleId::new(root_inode_id.as_raw()), root_inode_id)
+            .put_data_handle_owner(root_data_handle_id, root_inode_id)
             .unwrap();
 
         let owner_group = ShardGroupId::new(7);
@@ -115,7 +116,7 @@ mod tests {
         fixed_inode.mount_id = mount_entry.mount_id;
         storage.put_inode(&fixed_inode).unwrap();
 
-        let block_id = BlockId::new(DataHandleId::new(root_inode_id.as_raw()), BlockIndex::new(0));
+        let block_id = BlockId::new(root_data_handle_id, BlockIndex::new(0));
         let resolved = owner_group_for_block(&storage, &mount_table, block_id).unwrap();
         assert_eq!(resolved, owner_group);
     }

@@ -39,7 +39,7 @@ pub struct MetadataFileSystemServiceImpl {
     path_resolver: PathResolver,
     fs_core: Arc<FsCore>,
     guard_chain: GuardChain,
-    metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
+    _metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
 }
 
 macro_rules! response_with_header {
@@ -152,7 +152,7 @@ impl MetadataFileSystemServiceImpl {
             path_resolver,
             fs_core,
             guard_chain,
-            metrics,
+            _metrics: metrics,
         }
     }
 

@@ -467,7 +467,7 @@ impl DeleteExecutor {
             // Update execution state
             {
                 let mut state = self.execution_state.write();
-                for (intent_id, block_id) in &blocks {
+                for (intent_id, _block_id) in &blocks {
                     if let Some(exec_state) = state.get_mut(intent_id) {
                         exec_state.status = IntentExecutionStatus::InFlight {
                             worker_id,
@@ -507,7 +507,7 @@ impl DeleteExecutor {
             for (intent_id, exec_state) in state.iter() {
                 if let IntentExecutionStatus::InFlight {
                     worker_id: target_worker,
-                    task_id,
+                    task_id: _,
                     ..
                 } = &exec_state.status
                 {
@@ -557,14 +557,6 @@ impl DeleteExecutor {
                         }
                     }
                 })
-            };
-
-            let reason = match intent.reason {
-                crate::state::DeleteIntentReason::Gc => "GC: unreferenced block",
-                crate::state::DeleteIntentReason::Orphan => "Orphan: not in metadata",
-                crate::state::DeleteIntentReason::Lease => "Lease: expired lease",
-                crate::state::DeleteIntentReason::Manual => "Manual: admin request",
-                crate::state::DeleteIntentReason::OverRep => "OverRep: excess replica eviction",
             };
 
             let block_ids_proto: Vec<proto::common::BlockIdProto> = block_ids
@@ -809,9 +801,6 @@ impl DeleteExecutor {
                     }
                 }
             }
-            _ => {
-                // Unknown status, ignore
-            }
         }
     }
 
@@ -820,7 +809,7 @@ impl DeleteExecutor {
         const CLEANUP_TTL_MS: u64 = 60 * 60 * 1000; // 1 hour
 
         let mut state = self.execution_state.write();
-        state.retain(|intent_id, exec_state| {
+        state.retain(|_intent_id, exec_state| {
             let should_retain = match &exec_state.status {
                 IntentExecutionStatus::Pending | IntentExecutionStatus::InFlight { .. } => true,
                 IntentExecutionStatus::Completed { completed_at_ms } => {
@@ -968,7 +957,7 @@ impl DeleteExecutor {
     }
 
     /// Check if reconcile condition is satisfied (block no longer in blockreport).
-    fn check_reconcile_completion(&self, intent_id: u64, now_ms: u64) -> bool {
+    fn check_reconcile_completion(&self, intent_id: u64, _now_ms: u64) -> bool {
         let exec_state_opt = {
             let state = self.execution_state.read();
             state.get(&intent_id).cloned()

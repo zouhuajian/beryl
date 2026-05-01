@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use types::fs::Extent;
 use types::fs::InodeId;
-use types::ids::{ClientId, LeaseId, MountId};
+use types::ids::{ClientId, DataHandleId, LeaseId, MountId};
 use types::lease::FencingToken;
 
 /// Write session (runtime-only, not persisted to Raft).
@@ -23,6 +23,8 @@ pub struct WriteSession {
     pub inode_id: InodeId,
     /// Mount ID.
     pub mount_id: MountId,
+    /// Data handle used by this write session.
+    pub data_handle_id: DataHandleId,
     /// Lease ID / fencing token for this write session.
     pub lease_id: LeaseId,
     /// Lease epoch (for fencing validation).
@@ -81,6 +83,7 @@ impl WriteSessionManager {
         &self,
         inode_id: InodeId,
         mount_id: MountId,
+        data_handle_id: DataHandleId,
         lease_id: LeaseId,
         lease_epoch: u64,
         fencing_token: FencingToken,
@@ -99,6 +102,7 @@ impl WriteSessionManager {
         let session = WriteSession {
             inode_id,
             mount_id,
+            data_handle_id,
             lease_id,
             lease_epoch,
             fencing_token,

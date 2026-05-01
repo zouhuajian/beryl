@@ -15,7 +15,7 @@ use proto::worker::worker_data_service_client::WorkerDataServiceClient;
 use proto::worker::CommitWriteRequestProto;
 use std::time::{SystemTime, UNIX_EPOCH};
 use types::fs::FsErrorCode;
-use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+use types::ids::{BlockId, BlockIndex, WorkerId};
 use types::lease::FencingToken;
 
 impl FsCore {
@@ -260,6 +260,19 @@ impl<'a> WriteSessionCoordinator<'a> {
             );
         }
 
+        let data_handle_id = inode.current_data_handle_id;
+        if data_handle_id.as_raw() == 0 {
+            return self.core.failure_from_error(
+                &req.ctx,
+                MetadataError::Internal(format!("File inode {} is missing current_data_handle_id", inode_id)),
+                None,
+                None,
+            );
+        }
+        if let Err(err) = storage.validate_data_handle_owner(data_handle_id, Some(inode_id)) {
+            return self.core.failure_from_error(&req.ctx, err, None, None);
+        }
+
         let (group_id, mount_epoch) =
             match self
                 .core
@@ -318,7 +331,6 @@ impl<'a> WriteSessionCoordinator<'a> {
         };
 
         let open_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        let data_handle_id = DataHandleId::new(inode_id.as_raw());
         let desired_len = req.desired_len.unwrap_or(4 * 1024 * 1024);
         let block_size = 4 * 1024 * 1024;
         let num_blocks = ((desired_len + block_size - 1) / block_size).max(1).min(10);
@@ -407,6 +419,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         let file_handle = self.core.write_session_manager.create_session(
             inode_id,
             inode.mount_id,
+            data_handle_id,
             lease_id,
             lease_epoch,
             session_token,
@@ -601,6 +614,20 @@ impl<'a> WriteSessionCoordinator<'a> {
         }
 
         let extents = req.intent.extents;
+        for extent in &extents {
+            if extent.block_id.data_handle_id != session.data_handle_id {
+                return self.core.fatal_fs_failure(
+                    &req.ctx,
+                    FsErrorCode::EInval,
+                    format!(
+                        "Extent block data_handle_id {} does not match write session data_handle_id {}",
+                        extent.block_id.data_handle_id, session.data_handle_id
+                    ),
+                    group_id,
+                    mount_epoch,
+                );
+            }
+        }
         if session.mode == crate::inode_lease::WriteMode::Append {
             let mut expected_offset = session.base_size;
             for extent in &extents {

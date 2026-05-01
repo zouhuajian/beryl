@@ -43,7 +43,7 @@ pub struct MetadataWorkerServiceImpl {
     repair_queue: Arc<RepairQueue>,
     orphan_queue: Arc<OrphanQueue>,
     repair_planner: Arc<RepairPlanner>,
-    command_sender: Arc<CommandSender>,
+    _command_sender: Arc<CommandSender>,
     delete_executor: Option<Arc<DeleteExecutor>>,
     metrics: Arc<WorkerMetrics>,
     slot_metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
@@ -70,7 +70,7 @@ impl MetadataWorkerServiceImpl {
             repair_queue,
             orphan_queue,
             repair_planner,
-            command_sender,
+            _command_sender: command_sender,
             delete_executor: None, // Will be set via set_delete_executor
             metrics,
             slot_metrics: None, // Will be set via set_slot_metrics
@@ -558,11 +558,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         let needs_full_sync = self.worker_manager.needs_full_sync(worker_id);
 
         // Leader-only: lease allocation for full reports
-        let mut can_full_report = false;
-        let mut full_report_lease_token = 0u64;
-        let mut backoff_ms = 0u32;
-
-        if is_leader {
+        let (can_full_report, full_report_lease_token, backoff_ms) = if is_leader {
             if needs_full_sync {
                 // Try to allocate lease
                 let metadata_epoch = self.worker_manager.get_metadata_epoch();
@@ -579,10 +575,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     .await
                 {
                     // Lease allocated
-                    can_full_report = true;
-                    full_report_lease_token = token;
-                    backoff_ms = 0;
-
                     // Update metrics (keep slot_metrics for backward compatibility)
                     if let Some(ref slot_metrics) = self.slot_metrics {
                         slot_metrics
@@ -601,11 +593,9 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                             },
                         )),
                     });
+                    (true, token, 0)
                 } else {
                     // Lease allocation failed (rate-limited)
-                    can_full_report = false;
-                    full_report_lease_token = 0;
-
                     // Update metrics
                     if let Some(ref slot_metrics) = self.slot_metrics {
                         slot_metrics
@@ -617,7 +607,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     use rand::Rng;
                     let base_ms = 5000; // 5 seconds base
                     let jitter_ms = rand::thread_rng().gen_range(0..25000); // 0-25 seconds jitter
-                    backoff_ms = (base_ms + jitter_ms) as u32;
+                    let backoff_ms = (base_ms + jitter_ms) as u32;
 
                     commands.push(WorkerCommandProto {
                         task_id: 0, // No task ID for control commands
@@ -627,19 +617,16 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                             },
                         )),
                     });
+                    (false, 0, backoff_ms)
                 }
             } else {
                 // Worker doesn't need full sync
-                can_full_report = false;
-                full_report_lease_token = 0;
-                backoff_ms = 0;
+                (false, 0, 0)
             }
         } else {
             // Follower: no lease allocation
-            can_full_report = false;
-            full_report_lease_token = 0;
-            backoff_ms = 0;
-        }
+            (false, 0, 0)
+        };
 
         // Leader-only: process task acknowledgments and get pending commands
         if is_leader {
@@ -685,7 +672,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         request: Request<BlockReportRequestProto>,
     ) -> Result<Response<BlockReportResponseProto>, Status> {
         let req = request.into_inner();
-        let caller_ctx = extract_and_inject_context(&req.header);
+        let _caller_ctx = extract_and_inject_context(&req.header);
 
         let worker_id = WorkerId::new(req.worker_id);
         let report_type = req.report_type();
@@ -753,7 +740,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                         // Note: Lease metrics can be added later
                         result
                     }
-                    Err(e) => {
+                    Err(_e) => {
                         // Rate limited: return retry_after_ms
                         let retry_after_ms = {
                             use rand::Rng;
@@ -818,7 +805,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     .apply_delta_report(worker_id, added_blocks.clone(), removed_blocks.clone())
                 {
                     Ok(result) => result,
-                    Err(e) => {
+                    Err(_e) => {
                         // Full sync required: return RequestFullBlockReport command
                         let metadata_epoch = self.worker_manager.get_metadata_epoch();
                         return Ok(Response::new(BlockReportResponseProto {
@@ -929,7 +916,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         );
 
         // Leader-only: get pending commands (follower returns empty)
-        let mut commands = if is_leader {
+        let commands = if is_leader {
             self.get_pending_commands(worker_id, 1)
         } else {
             Vec::new()

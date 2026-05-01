@@ -362,6 +362,28 @@ impl FsCore {
             types::fs::InodeData::File { extents, .. } => extents.clone(),
             _ => Vec::new(),
         };
+        let data_handle_id = inode.current_data_handle_id;
+        if data_handle_id.as_raw() == 0 {
+            return self.failure_from_error(
+                &req.ctx,
+                MetadataError::Internal(format!("File inode {} is missing current_data_handle_id", req.inode_id)),
+                group_id,
+                mount_epoch,
+            );
+        }
+        for extent in &extents {
+            if extent.block_id.data_handle_id != data_handle_id {
+                return self.failure_from_error(
+                    &req.ctx,
+                    MetadataError::Internal(format!(
+                        "Extent block data_handle_id {} does not match inode {} current_data_handle_id {}",
+                        extent.block_id.data_handle_id, req.inode_id, data_handle_id
+                    )),
+                    group_id,
+                    mount_epoch,
+                );
+            }
+        }
 
         let filtered_extents: Vec<Extent> = if let Some(range) = req.range {
             extents

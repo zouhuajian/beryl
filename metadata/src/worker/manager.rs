@@ -616,9 +616,6 @@ impl WorkerManager {
             ));
         }
 
-        let descriptors = self.descriptors.read();
-        let runtime = self.runtime.read();
-
         // Collect worker info with comprehensive scoring
         let mut candidates: Vec<(WorkerId, WorkerInfo, PlacementScore)> = live_workers
             .iter()
@@ -701,10 +698,10 @@ impl WorkerManager {
 
         PlacementScore {
             total: total_score,
-            capacity: capacity_score,
-            load_penalty,
-            health: health_score,
-            fault_domain_bonus,
+            _capacity: capacity_score,
+            _load_penalty: load_penalty,
+            _health: health_score,
+            _fault_domain_bonus: fault_domain_bonus,
             fault_domain: worker.fault_domain.clone(),
         }
     }
@@ -838,7 +835,6 @@ impl WorkerManager {
 
     /// Check if block report is converged (convenience method with default parameters).
     pub fn is_blockreport_converged(&self, now_ms: u64) -> BlockReportConvergenceSnapshot {
-        const DEFAULT_ACTIVE_TTL_MS: u64 = 180_000; // 3 minutes (or use heartbeat_timeout_sec * 1000)
         const DEFAULT_THRESHOLD: f64 = 0.80;
 
         let active_ttl_ms = self.heartbeat_timeout_sec * 1000;
@@ -863,10 +859,10 @@ impl WorkerManager {
 #[derive(Clone, Debug)]
 struct PlacementScore {
     total: i64,
-    capacity: i64,
-    load_penalty: i64,
-    health: i64,
-    fault_domain_bonus: i64,
+    _capacity: i64,
+    _load_penalty: i64,
+    _health: i64,
+    _fault_domain_bonus: i64,
     fault_domain: Option<String>,
 }
 

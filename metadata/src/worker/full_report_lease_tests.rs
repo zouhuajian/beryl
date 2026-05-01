@@ -5,8 +5,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::worker::full_report_lease::{FullReportLease, FullReportLeaseManager};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::worker::full_report_lease::FullReportLeaseManager;
     use tokio::runtime::Runtime;
     use types::group_watermark::MountEpoch;
     use types::ids::{ShardGroupId, WorkerId};
@@ -76,7 +75,7 @@ mod tests {
         let worker_id = WorkerId::new(1);
         let token = rt.block_on(manager.try_allocate(worker_id, None, metadata_epoch, mount_epoch));
         assert!(token.is_some());
-        let token = token.unwrap();
+        let _token = token.unwrap();
 
         // Wait for expiration
         std::thread::sleep(std::time::Duration::from_millis(150));

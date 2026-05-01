@@ -46,6 +46,7 @@ fn test_write_session_manager() {
     let handle = manager.create_session(
         inode_id,
         mount_id,
+        DataHandleId::new(1),
         lease_id,
         1, // lease_epoch
         fencing_token,

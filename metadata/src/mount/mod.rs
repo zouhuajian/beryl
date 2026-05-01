@@ -17,6 +17,13 @@ use types::ids::{MountId, ShardGroupId};
 pub const ROOT_MOUNT_PREFIX: &str = "/";
 pub const ROOT_INODE_ID: InodeId = InodeId::new(1);
 
+pub(crate) fn mount_prefix_matches_path(prefix: &str, path: &str) -> bool {
+    if prefix == ROOT_MOUNT_PREFIX {
+        return path.starts_with('/');
+    }
+    path == prefix || path.strip_prefix(prefix).is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 /// Mount kind: internal (no UFS) or UFS-backed.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -244,7 +251,7 @@ impl MountTable {
         let mut best_prefix_len = 0;
 
         for (prefix, &mount_id) in prefix_index.iter() {
-            if unified_path.starts_with(prefix) {
+            if mount_prefix_matches_path(prefix, unified_path) {
                 let prefix_len = prefix.len();
                 if prefix_len > best_prefix_len {
                     if let Some(entry) = entries.get(&mount_id) {
@@ -358,6 +365,72 @@ mod tests {
         assert!(result.is_some());
         let (ufs_uri, _) = result.unwrap();
         assert_eq!(ufs_uri, "s3://bucket2");
+    }
+
+    #[test]
+    fn test_mount_prefix_component_boundaries() {
+        let table = MountTable::new();
+
+        use types::fs::InodeId;
+        use types::ids::ShardGroupId;
+        table
+            .create_mount(
+                "/".to_string(),
+                MountKind::External,
+                Some("ufs://root".to_string()),
+                DataIoPolicy::Allow,
+                ShardGroupId::new(1),
+                InodeId::new(1),
+            )
+            .unwrap();
+        table
+            .create_mount(
+                "/mnt".to_string(),
+                MountKind::External,
+                Some("ufs://mnt".to_string()),
+                DataIoPolicy::Allow,
+                ShardGroupId::new(2),
+                InodeId::new(2),
+            )
+            .unwrap();
+        table
+            .create_mount(
+                "/mnt/s3".to_string(),
+                MountKind::External,
+                Some("ufs://s3".to_string()),
+                DataIoPolicy::Allow,
+                ShardGroupId::new(3),
+                InodeId::new(3),
+            )
+            .unwrap();
+
+        let (uri, relative) = table.resolve_path("/other/file").unwrap().unwrap();
+        assert_eq!(uri, "ufs://root");
+        assert_eq!(relative, "other/file");
+
+        let (uri, relative) = table.resolve_path("/mnt/s3").unwrap().unwrap();
+        assert_eq!(uri, "ufs://s3");
+        assert_eq!(relative, "");
+
+        let (uri, relative) = table.resolve_path("/mnt/s3/file").unwrap().unwrap();
+        assert_eq!(uri, "ufs://s3");
+        assert_eq!(relative, "file");
+
+        let (uri, relative) = table.resolve_path("/mnt/s3/").unwrap().unwrap();
+        assert_eq!(uri, "ufs://s3");
+        assert_eq!(relative, "");
+
+        let (uri, relative) = table.resolve_path("/mnt/s3x").unwrap().unwrap();
+        assert_eq!(uri, "ufs://mnt");
+        assert_eq!(relative, "s3x");
+
+        let (uri, relative) = table.resolve_path("/mnt2").unwrap().unwrap();
+        assert_eq!(uri, "ufs://root");
+        assert_eq!(relative, "mnt2");
+
+        let (uri, relative) = table.resolve_path("/mnt/s30/a").unwrap().unwrap();
+        assert_eq!(uri, "ufs://mnt");
+        assert_eq!(relative, "s30/a");
     }
 
     /// Test mount persistence and consistency: write -> load -> resolve -> delete -> verify

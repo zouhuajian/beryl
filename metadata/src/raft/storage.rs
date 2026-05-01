@@ -64,6 +64,7 @@ const DEDUP_VERSION_KEY: &str = "dedup_version";
 const DEDUP_FORMAT_VERSION: u64 = 3;
 const DEDUP_TTL_MS: u64 = 10 * 60 * 1000; // 10 minutes; TODO: make configurable
 const DEDUP_MAX_ENTRIES: usize = if cfg!(debug_assertions) { 128 } else { 10_000 };
+const NEXT_INODE_ID_KEY: &[u8] = b"next_inode_id";
 
 // FS column families
 const CF_INODES: &str = "inodes"; // inode/{inode_id_be} -> Inode
@@ -664,6 +665,69 @@ impl RocksDBStorage {
             .map_err(|e| MetadataError::Internal(format!("RocksDB write error: {}", e)))?;
 
         Ok(DataHandleId::new(current_id))
+    }
+
+    /// Read the durable next inode ID allocator value.
+    pub fn get_next_inode_id(&self) -> MetadataResult<Option<InodeId>> {
+        let cf_meta = self
+            .db
+            .cf_handle(CF_META)
+            .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
+
+        match self.db.get_cf(cf_meta, NEXT_INODE_ID_KEY) {
+            Ok(Some(value)) => {
+                let id: u64 = decode_from_slice(&value, standard())
+                    .map_err(|e| MetadataError::Internal(format!("Failed to deserialize next_inode_id: {}", e)))?
+                    .0;
+                Ok(Some(InodeId::new(id)))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
+        }
+    }
+
+    /// Persist the durable next inode ID allocator value.
+    pub fn set_next_inode_id(&self, next_inode_id: InodeId) -> MetadataResult<()> {
+        let cf_meta = self
+            .db
+            .cf_handle(CF_META)
+            .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
+        let value = encode_to_vec(&next_inode_id.as_raw(), standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize next_inode_id: {}", e)))?;
+
+        self.db
+            .put_cf(cf_meta, NEXT_INODE_ID_KEY, value)
+            .map_err(|e| MetadataError::Internal(format!("RocksDB error: {}", e)))?;
+        Ok(())
+    }
+
+    /// Allocate an inode ID from replicated RocksDB state.
+    pub fn allocate_inode_id(&self) -> MetadataResult<InodeId> {
+        let cf_meta = self
+            .db
+            .cf_handle(CF_META)
+            .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
+
+        let current_id = match self.get_next_inode_id()? {
+            Some(id) => id.as_raw(),
+            None => {
+                // Migration fallback for stores created before the allocator was replicated:
+                // derive the next value from existing inode keys once, then persist the allocator.
+                self.max_inode_id()?.map(|id| id.as_raw() + 1).unwrap_or(2)
+            }
+        };
+
+        let next_id = current_id + 1;
+        let next_id_value = encode_to_vec(&next_id, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize next_inode_id: {}", e)))?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(cf_meta, NEXT_INODE_ID_KEY, next_id_value);
+
+        self.db
+            .write(batch)
+            .map_err(|e| MetadataError::Internal(format!("RocksDB write error: {}", e)))?;
+
+        Ok(InodeId::new(current_id))
     }
 
     /// Persist mapping from data_handle_id -> inode_id for routing from data plane back to namespace.
@@ -1360,6 +1424,37 @@ impl RocksDBStorage {
         Ok(())
     }
 
+    /// Return the largest inode ID currently present in storage.
+    pub fn max_inode_id(&self) -> MetadataResult<Option<InodeId>> {
+        let cf = self
+            .db
+            .cf_handle(CF_INODES)
+            .ok_or_else(|| MetadataError::Internal("Inodes CF not found".to_string()))?;
+
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut max_inode_id = None;
+        for item in iter {
+            let (key, _) =
+                item.map_err(|e| MetadataError::Internal(format!("RocksDB iterator error (inodes): {}", e)))?;
+            let key = key.as_ref();
+            if !key.starts_with(b"inode/") || key.len() != b"inode/".len() + 8 {
+                continue;
+            }
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(&key[b"inode/".len()..]);
+            let inode_id = InodeId::new(u64::from_be_bytes(raw));
+            max_inode_id = Some(max_inode_id.map_or(inode_id, |current: InodeId| {
+                if inode_id.as_raw() > current.as_raw() {
+                    inode_id
+                } else {
+                    current
+                }
+            }));
+        }
+
+        Ok(max_inode_id)
+    }
+
     /// Delete inode.
     pub fn delete_inode(&self, inode_id: InodeId) -> MetadataResult<()> {
         let cf = self
@@ -1748,6 +1843,27 @@ mod tests {
         let reopened = RocksDBStorage::open(&db_path).unwrap();
         let third = reopened.get_and_increment_data_handle_id().unwrap();
         assert!(third.as_raw() > second.as_raw());
+    }
+
+    #[test]
+    fn test_inode_allocator_migrates_from_existing_inodes_and_persists() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("inode_allocator_db");
+        {
+            let storage = RocksDBStorage::open(&db_path).unwrap();
+            storage
+                .put_inode(&Inode::new_dir(InodeId::new(42), FileAttrs::new(), MountId::new(1)))
+                .unwrap();
+
+            let first = storage.allocate_inode_id().unwrap();
+            let second = storage.allocate_inode_id().unwrap();
+            assert_eq!(first, InodeId::new(43));
+            assert_eq!(second, InodeId::new(44));
+        }
+
+        let reopened = RocksDBStorage::open(&db_path).unwrap();
+        let third = reopened.allocate_inode_id().unwrap();
+        assert_eq!(third, InodeId::new(45));
     }
 
     fn setup_dir_with_entries(parent_inode_id: InodeId, entries: &[(&str, InodeId)]) -> (TempDir, RocksDBStorage) {

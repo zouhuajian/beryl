@@ -7,7 +7,7 @@
 //! It does NOT write any path indices to storage - it only reads from dentry/inode CFs.
 
 use crate::error::{MetadataError, MetadataResult};
-use crate::mount::{MountEntry, MountTable};
+use crate::mount::{mount_prefix_matches_path, MountEntry, MountTable};
 use crate::raft::RocksDBStorage;
 use std::sync::Arc;
 use types::fs::InodeId;
@@ -121,7 +121,7 @@ impl PathResolver {
 
         for mount in mounts {
             let prefix = &mount.mount_prefix;
-            if normalized.starts_with(prefix) {
+            if mount_prefix_matches_path(prefix, &normalized) {
                 let prefix_len = prefix.len();
                 if prefix_len > best_prefix_len {
                     // Extract relative path components
@@ -345,6 +345,29 @@ mod tests {
 
         let (mount, _) = resolver.resolve_mount("/mnt/s3/file.txt").unwrap();
         assert_eq!(mount.mount_prefix, "/mnt/s3"); // Should match longer prefix
+
+        mount_table
+            .create_mount(
+                "/".to_string(),
+                crate::mount::MountKind::Internal,
+                None,
+                crate::mount::DataIoPolicy::Forbid,
+                ShardGroupId::new(3),
+                InodeId::new(3),
+            )
+            .unwrap();
+
+        let (mount, components) = resolver.resolve_mount("/mnt2/file.txt").unwrap();
+        assert_eq!(mount.mount_prefix, "/");
+        assert_eq!(components, vec!["mnt2", "file.txt"]);
+
+        let (mount, components) = resolver.resolve_mount("/mnt/s3x/file.txt").unwrap();
+        assert_eq!(mount.mount_prefix, "/mnt");
+        assert_eq!(components, vec!["s3x", "file.txt"]);
+
+        let (mount, components) = resolver.resolve_mount("/mnt/s3/").unwrap();
+        assert_eq!(mount.mount_prefix, "/mnt/s3");
+        assert!(components.is_empty());
     }
 
     #[test]

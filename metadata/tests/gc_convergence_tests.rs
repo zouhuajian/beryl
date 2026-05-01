@@ -13,7 +13,7 @@ use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
 #[test]
 fn test_gc_dedup_single_inject() {
     let temp_dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(temp_dir.path()).unwrap());
+    let _storage = Arc::new(RocksDBStorage::open(temp_dir.path()).unwrap());
     let repair_queue = Arc::new(RepairQueue::with_config(1000, 3, 60_000, 1_000, 60_000, 10));
 
     let block_id = BlockId::new(DataHandleId::new(1), BlockIndex::new(0));
@@ -45,7 +45,7 @@ fn test_gc_dedup_single_inject() {
 #[test]
 fn test_gc_skip_inflight() {
     let temp_dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(temp_dir.path()).unwrap());
+    let _storage = Arc::new(RocksDBStorage::open(temp_dir.path()).unwrap());
     let repair_queue = Arc::new(RepairQueue::with_config(1000, 3, 60_000, 1_000, 60_000, 10));
 
     let block_id = BlockId::new(DataHandleId::new(1), BlockIndex::new(0));

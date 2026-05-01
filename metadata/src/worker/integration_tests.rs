@@ -182,15 +182,9 @@ mod integration_tests {
         let worker4 = WorkerId::new(4);
 
         // Check replication: current=1, target=3, available=[2,3,4]
-        planner
-            .check_replication(
-                block_id,
-                &[worker1],
-                3,
-                &[worker1, worker2, worker3, worker4],
-                &repair_queue,
-            )
-            .unwrap();
+        for action in planner.plan_replication(block_id, &[worker1], 3, &[worker1, worker2, worker3, worker4]) {
+            repair_queue.enqueue(action.to_task()).unwrap();
+        }
 
         // Verify task enqueued (should have 2 tasks, one per target worker)
         assert_eq!(repair_queue.len_pending(), 2);
@@ -391,9 +385,9 @@ mod integration_tests {
         // Check replication: current=1, target=3, available=[1,2,3,4]
         // Use explicit worker list to ensure deterministic selection
         let live_workers = vec![worker1, worker2, worker3, worker4];
-        planner
-            .check_replication(block_id, &[worker1], 3, &live_workers, &repair_queue)
-            .unwrap();
+        for action in planner.plan_replication(block_id, &[worker1], 3, &live_workers) {
+            repair_queue.enqueue(action.to_task()).unwrap();
+        }
 
         // Verify repair tasks enqueued (should have 2 tasks, one per target worker)
         assert_eq!(repair_queue.len_pending(), 2);
@@ -463,7 +457,7 @@ mod integration_tests {
             replication_factor: Some(3),
             reason: None,
         };
-        let task_id = repair_queue.enqueue(repair_task).unwrap();
+        let _task_id = repair_queue.enqueue(repair_task).unwrap();
         assert_eq!(repair_queue.len_pending(), 1);
 
         // Try to poll the Repair task - should be blocked by Delete

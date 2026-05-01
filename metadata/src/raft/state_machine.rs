@@ -37,8 +37,7 @@ fn meta_err_to_fs_errno(err: &MetadataError) -> Option<FsErrorCode> {
 pub struct AppRaftStateMachine {
     storage: Arc<RocksDBStorage>,
     mount_table: Arc<MountTable>,
-    next_mount_id: Arc<RwLock<u64>>,
-    next_inode_id: Arc<RwLock<u64>>,
+    _next_mount_id: Arc<RwLock<u64>>,
     applied_seq: Arc<RwLock<u64>>,
 }
 
@@ -47,8 +46,7 @@ impl AppRaftStateMachine {
         Self {
             storage,
             mount_table,
-            next_mount_id: Arc::new(RwLock::new(1)),
-            next_inode_id: Arc::new(RwLock::new(1)),
+            _next_mount_id: Arc::new(RwLock::new(1)),
             applied_seq: Arc::new(RwLock::new(0)),
         }
     }
@@ -679,12 +677,9 @@ impl AppRaftStateMachine {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
     }
 
-    /// Helper: Generate next inode ID.
-    fn next_inode_id(&self) -> InodeId {
-        let mut next_id = self.next_inode_id.write();
-        let inode_id = InodeId::new(*next_id);
-        *next_id += 1;
-        inode_id
+    /// Helper: allocate the next inode ID from replicated storage.
+    fn next_inode_id(&self) -> MetadataResult<InodeId> {
+        self.storage.allocate_inode_id()
     }
 
     fn next_data_handle_id(&self) -> MetadataResult<DataHandleId> {
@@ -716,7 +711,7 @@ impl AppRaftStateMachine {
             }
 
             // Generate inode ID
-            let inode_id = self.next_inode_id();
+            let inode_id = self.next_inode_id()?;
             let now_ms = self.now_ms();
 
             // Initialize attrs
@@ -773,7 +768,7 @@ impl AppRaftStateMachine {
             }
 
             // Generate inode ID
-            let inode_id = self.next_inode_id();
+            let inode_id = self.next_inode_id()?;
             let data_handle_id = self.next_data_handle_id()?;
             let now_ms = self.now_ms();
 
@@ -1132,6 +1127,23 @@ impl AppRaftStateMachine {
                     "Inode is not a file: {}",
                     inode_id
                 )));
+            }
+
+            let expected_data_handle_id = inode.current_data_handle_id;
+            if expected_data_handle_id.as_raw() == 0 {
+                return Err(MetadataError::Internal(format!(
+                    "File inode {} is missing current_data_handle_id",
+                    inode_id
+                )));
+            }
+
+            for extent in &extents {
+                if extent.block_id.data_handle_id != expected_data_handle_id {
+                    return Err(MetadataError::InvalidArgument(format!(
+                        "Extent block data_handle_id {} does not match inode {} current_data_handle_id {}",
+                        extent.block_id.data_handle_id, inode_id, expected_data_handle_id
+                    )));
+                }
             }
 
             let now_ms = self.now_ms();
@@ -1513,6 +1525,179 @@ mod tests {
             .unwrap()
             .expect("mapping should exist");
         assert_eq!(mapped, inode_id, "data handle owner mapping must match created inode");
+    }
+
+    #[test]
+    fn create_allocates_distinct_inode_ids() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let parent_inode_id = InodeId::new(10);
+        storage
+            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1)))
+            .unwrap();
+
+        let first = sm
+            .apply(
+                Command::Create {
+                    dedup: dedup_for_test(30),
+                    parent_inode_id,
+                    name: "first".to_string(),
+                    attrs: FileAttrs::new(),
+                    layout: FileLayout::new(4096, 4096, 1),
+                },
+                1,
+            )
+            .unwrap();
+        let second = sm
+            .apply(
+                Command::Create {
+                    dedup: dedup_for_test(31),
+                    parent_inode_id,
+                    name: "second".to_string(),
+                    attrs: FileAttrs::new(),
+                    layout: FileLayout::new(4096, 4096, 1),
+                },
+                2,
+            )
+            .unwrap();
+
+        let first_inode_id = match first {
+            AppDataResponse::Fs(FsCommandResult::Ok(ok)) => ok.inode_id.unwrap(),
+            other => panic!("unexpected response: {:?}", other),
+        };
+        let second_inode_id = match second {
+            AppDataResponse::Fs(FsCommandResult::Ok(ok)) => ok.inode_id.unwrap(),
+            other => panic!("unexpected response: {:?}", other),
+        };
+        assert_ne!(first_inode_id, second_inode_id);
+    }
+
+    #[test]
+    fn create_continues_inode_allocator_after_reopen() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state_machine_inode_allocator");
+        let parent_inode_id = InodeId::new(100);
+        let first_inode_id = {
+            let storage = Arc::new(RocksDBStorage::open(&db_path).unwrap());
+            storage
+                .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1)))
+                .unwrap();
+            let mount_table = Arc::new(MountTable::new());
+            let sm = AppRaftStateMachine::new(Arc::clone(&storage), mount_table);
+            let response = sm
+                .apply(
+                    Command::Create {
+                        dedup: dedup_for_test(32),
+                        parent_inode_id,
+                        name: "before-reopen".to_string(),
+                        attrs: FileAttrs::new(),
+                        layout: FileLayout::new(4096, 4096, 1),
+                    },
+                    1,
+                )
+                .unwrap();
+            match response {
+                AppDataResponse::Fs(FsCommandResult::Ok(ok)) => ok.inode_id.unwrap(),
+                other => panic!("unexpected response: {:?}", other),
+            }
+        };
+
+        let storage = Arc::new(RocksDBStorage::open(&db_path).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), mount_table);
+        let response = sm
+            .apply(
+                Command::Create {
+                    dedup: dedup_for_test(33),
+                    parent_inode_id,
+                    name: "after-reopen".to_string(),
+                    attrs: FileAttrs::new(),
+                    layout: FileLayout::new(4096, 4096, 1),
+                },
+                2,
+            )
+            .unwrap();
+        let second_inode_id = match response {
+            AppDataResponse::Fs(FsCommandResult::Ok(ok)) => ok.inode_id.unwrap(),
+            other => panic!("unexpected response: {:?}", other),
+        };
+
+        assert_ne!(first_inode_id, second_inode_id);
+        assert!(second_inode_id.as_raw() > first_inode_id.as_raw());
+    }
+
+    #[test]
+    fn close_write_extents_must_use_inode_data_handle() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let inode_id = InodeId::new(7);
+        let data_handle_id = DataHandleId::new(99);
+        let inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
+        storage.put_inode(&inode).unwrap();
+        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+        sm.apply(
+            Command::CloseWrite {
+                dedup: dedup_for_test(34),
+                inode_id,
+                extents: vec![types::fs::Extent {
+                    file_offset: 0,
+                    block_id,
+                    block_offset: 0,
+                    len: 11,
+                    file_version: None,
+                    block_stamp: None,
+                }],
+                final_size: 11,
+                lease_id: types::ids::LeaseId::new(1),
+                open_epoch: 1,
+                lease_epoch: 1,
+            },
+            1,
+        )
+        .unwrap();
+        let updated = storage.get_inode(inode_id).unwrap().unwrap();
+        match updated.data {
+            types::fs::InodeData::File { extents, .. } => {
+                assert_eq!(extents[0].block_id.data_handle_id, data_handle_id)
+            }
+            other => panic!("unexpected inode data: {:?}", other),
+        }
+
+        let mismatch = sm.apply(
+            Command::CloseWrite {
+                dedup: dedup_for_test(35),
+                inode_id,
+                extents: vec![types::fs::Extent {
+                    file_offset: 11,
+                    // Intentional invalid fixture: extents must use inode.current_data_handle_id.
+                    block_id: BlockId::new(DataHandleId::new(inode_id.as_raw()), BlockIndex::new(1)),
+                    block_offset: 0,
+                    len: 1,
+                    file_version: None,
+                    block_stamp: None,
+                }],
+                final_size: 12,
+                lease_id: types::ids::LeaseId::new(1),
+                open_epoch: 1,
+                lease_epoch: 2,
+            },
+            2,
+        );
+        assert!(matches!(
+            mismatch,
+            Ok(AppDataResponse::Fs(FsCommandResult::Err(FsErrnoResult {
+                errno: FsErrorCode::EInval,
+                ..
+            })))
+        ));
     }
     #[test]
     #[ignore = "pending identity-pivot follow-ups"]
