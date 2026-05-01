@@ -96,6 +96,19 @@ pub struct AppliedResult {
     pub size_bytes: u32,
 }
 
+/// Namespace rename writes that must commit as one RocksDB batch.
+pub struct RenameAtomicUpdate<'a> {
+    pub src_parent_inode_id: InodeId,
+    pub src_name: &'a str,
+    pub dst_parent_inode_id: InodeId,
+    pub dst_name: &'a str,
+    pub src_inode_id: InodeId,
+    pub overwritten_inode_id: Option<InodeId>,
+    pub updated_src_parent: Option<&'a Inode>,
+    pub updated_dst_parent: Option<&'a Inode>,
+    pub updated_src_inode: &'a Inode,
+}
+
 /// RocksDB storage backend.
 pub struct RocksDBStorage {
     db: Arc<DB>,
@@ -1424,6 +1437,114 @@ impl RocksDBStorage {
         Ok(())
     }
 
+    fn batch_put_inode(batch: &mut WriteBatch, cf: &ColumnFamily, inode: &Inode) -> MetadataResult<()> {
+        let key = Self::encode_inode_key(inode.inode_id);
+        let value = serde_json::to_vec(inode)
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize Inode: {}", e)))?;
+        batch.put_cf(cf, key, value);
+        Ok(())
+    }
+
+    /// Atomically persist a create-file namespace mutation.
+    pub fn create_file_atomic(
+        &self,
+        parent_inode_id: InodeId,
+        name: &str,
+        inode: &Inode,
+        updated_parent: &Inode,
+        layout: FileLayout,
+    ) -> MetadataResult<()> {
+        let cf_inodes = self.cf(CF_INODES)?;
+        let cf_dentries = self.cf(CF_DENTRIES)?;
+        let cf_meta = self.cf(CF_META)?;
+
+        let mut batch = WriteBatch::default();
+        Self::batch_put_inode(&mut batch, cf_inodes, inode)?;
+        Self::batch_put_inode(&mut batch, cf_inodes, updated_parent)?;
+        batch.put_cf(
+            cf_dentries,
+            Self::encode_dentry_key(parent_inode_id, name),
+            inode.inode_id.to_be_bytes(),
+        );
+
+        let layout_key = format!("layout:{}", inode.inode_id.as_raw());
+        let layout_value = encode_to_vec(&layout, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize file layout: {}", e)))?;
+        batch.put_cf(cf_meta, layout_key.as_bytes(), layout_value);
+
+        let data_handle_id = inode.current_data_handle_id;
+        let owner_key = format!("data_handle_owner:{}", data_handle_id.as_raw());
+        let owner_value = encode_to_vec(&inode.inode_id.as_raw(), standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize inode_id: {}", e)))?;
+        batch.put_cf(cf_meta, owner_key.as_bytes(), owner_value);
+
+        self.write_batch(batch)
+    }
+
+    /// Atomically persist a mkdir namespace mutation.
+    pub fn create_dir_atomic(
+        &self,
+        parent_inode_id: InodeId,
+        name: &str,
+        inode: &Inode,
+        updated_parent: &Inode,
+    ) -> MetadataResult<()> {
+        let cf_inodes = self.cf(CF_INODES)?;
+        let cf_dentries = self.cf(CF_DENTRIES)?;
+
+        let mut batch = WriteBatch::default();
+        Self::batch_put_inode(&mut batch, cf_inodes, inode)?;
+        Self::batch_put_inode(&mut batch, cf_inodes, updated_parent)?;
+        batch.put_cf(
+            cf_dentries,
+            Self::encode_dentry_key(parent_inode_id, name),
+            inode.inode_id.to_be_bytes(),
+        );
+
+        self.write_batch(batch)
+    }
+
+    /// Atomically persist a rename namespace mutation.
+    ///
+    /// Overwritten targets must be prevalidated by the state machine as safe namespace-only removals.
+    /// 
+    /// TODO: Full overwrite cleanup should batch target inode/dentry removal with
+    /// target layout, data_handle_owner, block refcount, and delete-intent updates.
+    pub fn rename_atomic(&self, update: RenameAtomicUpdate<'_>) -> MetadataResult<()> {
+        let cf_inodes = self.cf(CF_INODES)?;
+        let cf_dentries = self.cf(CF_DENTRIES)?;
+
+        let mut batch = WriteBatch::default();
+
+        if let Some(inode_id) = update.overwritten_inode_id {
+            batch.delete_cf(cf_inodes, Self::encode_inode_key(inode_id));
+            batch.delete_cf(
+                cf_dentries,
+                Self::encode_dentry_key(update.dst_parent_inode_id, update.dst_name),
+            );
+        }
+
+        batch.delete_cf(
+            cf_dentries,
+            Self::encode_dentry_key(update.src_parent_inode_id, update.src_name),
+        );
+        batch.put_cf(
+            cf_dentries,
+            Self::encode_dentry_key(update.dst_parent_inode_id, update.dst_name),
+            update.src_inode_id.to_be_bytes(),
+        );
+
+        if let Some(parent) = update.updated_src_parent {
+            Self::batch_put_inode(&mut batch, cf_inodes, parent)?;
+        }
+        if let Some(parent) = update.updated_dst_parent {
+            Self::batch_put_inode(&mut batch, cf_inodes, parent)?;
+        }
+        Self::batch_put_inode(&mut batch, cf_inodes, update.updated_src_inode)?;
+
+        self.write_batch(batch)
+    }
+
     /// Return the largest inode ID currently present in storage.
     pub fn max_inode_id(&self) -> MetadataResult<Option<InodeId>> {
         let cf = self
@@ -1864,6 +1985,98 @@ mod tests {
         let reopened = RocksDBStorage::open(&db_path).unwrap();
         let third = reopened.allocate_inode_id().unwrap();
         assert_eq!(third, InodeId::new(45));
+    }
+
+    #[test]
+    fn create_file_atomic_persists_namespace_and_data_handle_owner() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+
+        let parent_inode_id = InodeId::new(10);
+        let mut parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        storage.put_inode(&parent).unwrap();
+
+        let inode_id = InodeId::new(11);
+        let data_handle_id = DataHandleId::new(12);
+        let inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id, data_handle_id);
+        parent.attrs.update_mtime_ctime(100);
+        let layout = FileLayout::new(4096, 4096, 1);
+
+        storage
+            .create_file_atomic(parent_inode_id, "file", &inode, &parent, layout.clone())
+            .unwrap();
+
+        let stored_inode = storage.get_inode(inode_id).unwrap().unwrap();
+        assert_eq!(stored_inode.current_data_handle_id, data_handle_id);
+        assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), Some(inode_id));
+        assert_eq!(storage.get_layout(inode_id).unwrap(), layout);
+        assert_eq!(
+            storage.get_inode_by_data_handle(data_handle_id).unwrap(),
+            Some(inode_id)
+        );
+        assert_eq!(storage.get_inode(parent_inode_id).unwrap().unwrap().attrs.mtime_ms, 100);
+    }
+
+    #[test]
+    fn create_dir_atomic_persists_inode_and_dentry() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+
+        let parent_inode_id = InodeId::new(20);
+        let mut parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        storage.put_inode(&parent).unwrap();
+
+        let inode_id = InodeId::new(21);
+        let inode = Inode::new_dir(inode_id, FileAttrs::new(), parent.mount_id);
+        parent.attrs.update_mtime_ctime(200);
+
+        storage
+            .create_dir_atomic(parent_inode_id, "dir", &inode, &parent)
+            .unwrap();
+
+        assert!(storage.get_inode(inode_id).unwrap().unwrap().kind.is_dir());
+        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), Some(inode_id));
+        assert_eq!(storage.get_inode(parent_inode_id).unwrap().unwrap().attrs.mtime_ms, 200);
+    }
+
+    #[test]
+    fn rename_atomic_moves_dentry_and_preserves_inode() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+
+        let src_parent_id = InodeId::new(30);
+        let dst_parent_id = InodeId::new(31);
+        let inode_id = InodeId::new(32);
+        let mut src_parent = Inode::new_dir(src_parent_id, FileAttrs::new(), MountId::new(1));
+        let mut dst_parent = Inode::new_dir(dst_parent_id, FileAttrs::new(), MountId::new(1));
+        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), DataHandleId::new(33));
+
+        storage.put_inode(&src_parent).unwrap();
+        storage.put_inode(&dst_parent).unwrap();
+        storage.put_inode(&inode).unwrap();
+        storage.put_dentry(src_parent_id, "old", inode_id).unwrap();
+
+        src_parent.attrs.update_mtime_ctime(300);
+        dst_parent.attrs.update_mtime_ctime(300);
+        inode.attrs.update_ctime(300);
+
+        storage
+            .rename_atomic(crate::raft::storage::RenameAtomicUpdate {
+                src_parent_inode_id: src_parent_id,
+                src_name: "old",
+                dst_parent_inode_id: dst_parent_id,
+                dst_name: "new",
+                src_inode_id: inode_id,
+                overwritten_inode_id: None,
+                updated_src_parent: Some(&src_parent),
+                updated_dst_parent: Some(&dst_parent),
+                updated_src_inode: &inode,
+            })
+            .unwrap();
+
+        assert_eq!(storage.get_dentry(src_parent_id, "old").unwrap(), None);
+        assert_eq!(storage.get_dentry(dst_parent_id, "new").unwrap(), Some(inode_id));
+        assert!(storage.get_inode(inode_id).unwrap().is_some());
     }
 
     fn setup_dir_with_entries(parent_inode_id: InodeId, entries: &[(&str, InodeId)]) -> (TempDir, RocksDBStorage) {

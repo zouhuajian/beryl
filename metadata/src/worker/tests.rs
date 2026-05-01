@@ -91,6 +91,31 @@ mod tests {
     }
 
     #[test]
+    fn test_worker_heartbeat_detects_descriptor_change() {
+        let manager = WorkerManager::new(60);
+        let worker_id = WorkerId::new(1);
+
+        manager
+            .register_worker(worker_id, "127.0.0.1:9090".to_string(), 1, 100, None)
+            .unwrap();
+
+        let unchanged = manager
+            .update_runtime(worker_id, 1, 100, 1000, 500, 500, 0, 0, HealthStatus::Healthy)
+            .unwrap();
+        assert!(!unchanged);
+
+        let epoch_changed = manager
+            .update_runtime(worker_id, 1, 101, 1000, 500, 500, 0, 0, HealthStatus::Healthy)
+            .unwrap();
+        assert!(epoch_changed);
+
+        let transport_changed = manager
+            .update_runtime(worker_id, 2, 100, 1000, 500, 500, 0, 0, HealthStatus::Healthy)
+            .unwrap();
+        assert!(transport_changed);
+    }
+
+    #[test]
     fn test_incremental_before_full_rejected() {
         let manager = WorkerManager::new(60);
         let worker_id = WorkerId::new(1);

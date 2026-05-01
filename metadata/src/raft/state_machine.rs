@@ -8,7 +8,7 @@
 use crate::error::{to_canonical_fs, MetadataError, MetadataResult};
 use crate::mount::MountTable;
 use crate::raft::command::Command;
-use crate::raft::storage::{AppliedResult, RocksDBStorage};
+use crate::raft::storage::{AppliedResult, RenameAtomicUpdate, RocksDBStorage};
 use crate::raft::types::{
     AppDataResponse, BlockCommandResult, DeleteIntentsResult, FsCommandResult, FsErrnoResult, FsOkResult,
     LeaseCommandResult, MountCommandResult, ShardGroupInfo, WorkerCommandResult,
@@ -32,6 +32,8 @@ fn meta_err_to_fs_errno(err: &MetadataError) -> Option<FsErrorCode> {
         _ => None,
     }
 }
+
+const RENAME_OVERWRITE_CLEANUP_UNIMPLEMENTED: &str = "rename overwrite target cleanup is not implemented yet";
 
 /// Raft state machine.
 pub struct AppRaftStateMachine {
@@ -721,16 +723,14 @@ impl AppRaftStateMachine {
             // Create directory inode (inherit mount_id from parent)
             let inode = Inode::new_dir(inode_id, attrs, parent_inode.mount_id);
 
-            // Use WriteBatch for atomicity: write inode + dentry
-            self.storage.put_inode(&inode)?;
-            self.storage.put_dentry(parent_inode_id, &name, inode_id)?;
-
             // Update parent directory mtime/ctime
             let mut parent_attrs = parent_inode.attrs.clone();
             parent_attrs.update_mtime_ctime(now_ms);
             let mut updated_parent = parent_inode.clone();
             updated_parent.attrs = parent_attrs;
-            self.storage.put_inode(&updated_parent)?;
+
+            self.storage
+                .create_dir_atomic(parent_inode_id, &name, &inode, &updated_parent)?;
 
             Ok(FsOkResult {
                 inode_id: Some(inode_id),
@@ -779,20 +779,14 @@ impl AppRaftStateMachine {
             // Create file inode (inherit mount_id from parent) with a freshly allocated data handle.
             let inode = Inode::new_file(inode_id, attrs, parent_inode.mount_id, data_handle_id);
 
-            // Persist data_handle_id -> inode mapping for routing and recovery.
-            self.storage.put_data_handle_owner(data_handle_id, inode_id)?;
-            self.storage.put_layout(inode_id, layout)?;
-
-            // Store inode and dentry
-            self.storage.put_inode(&inode)?;
-            self.storage.put_dentry(parent_inode_id, &name, inode_id)?;
-
             // Update parent directory mtime/ctime
             let mut parent_attrs = parent_inode.attrs.clone();
             parent_attrs.update_mtime_ctime(now_ms);
             let mut updated_parent = parent_inode.clone();
             updated_parent.attrs = parent_attrs;
-            self.storage.put_inode(&updated_parent)?;
+
+            self.storage
+                .create_file_atomic(parent_inode_id, &name, &inode, &updated_parent, layout)?;
 
             Ok(FsOkResult {
                 inode_id: Some(inode_id),
@@ -972,6 +966,8 @@ impl AppRaftStateMachine {
                 .get_inode(src_inode_id)?
                 .ok_or_else(|| MetadataError::NotFound(format!("Source inode not found: {}", src_inode_id)))?;
 
+            let mut overwritten_inode_id = None;
+
             // Check if destination exists
             if let Some(dst_inode_id) = self.storage.get_dentry(dst_parent_inode_id, &dst_name)? {
                 // NOREPLACE flag set -> fail when destination exists
@@ -998,27 +994,19 @@ impl AppRaftStateMachine {
                             "Cannot overwrite non-empty directory".to_string(),
                         ));
                     }
-                    // Delete destination directory
-                    self.storage.delete_inode(dst_inode_id)?;
                 } else {
                     if dst_inode.kind.is_dir() {
                         return Err(MetadataError::IsDir("Cannot overwrite directory with file".to_string()));
                     }
-                    // Delete destination file
-                    self.storage.delete_inode(dst_inode_id)?;
                 }
-                // Delete destination dentry
-                self.storage.delete_dentry(dst_parent_inode_id, &dst_name)?;
+                self.validate_rename_overwrite_target_is_safe(&dst_inode)?;
+                overwritten_inode_id = Some(dst_inode_id);
             }
 
             let now_ms = self.now_ms();
 
-            // Atomic rename: delete source dentry, create destination dentry
-            self.storage.delete_dentry(src_parent_inode_id, &src_name)?;
-            self.storage.put_dentry(dst_parent_inode_id, &dst_name, src_inode_id)?;
-
             // Update parent directories mtime/ctime
-            if src_parent_inode_id != dst_parent_inode_id {
+            let (updated_src_parent, updated_dst_parent) = if src_parent_inode_id != dst_parent_inode_id {
                 // Different parents - update both
                 let src_parent = self
                     .storage
@@ -1026,18 +1014,17 @@ impl AppRaftStateMachine {
                     .ok_or_else(|| MetadataError::Internal("Source parent disappeared".to_string()))?;
                 let mut src_attrs = src_parent.attrs.clone();
                 src_attrs.update_mtime_ctime(now_ms);
-                let mut updated_src_parent = src_parent.clone();
-                updated_src_parent.attrs = src_attrs;
-                self.storage.put_inode(&updated_src_parent)?;
+                let mut src_parent = src_parent.clone();
+                src_parent.attrs = src_attrs;
                 let dst_parent = self
                     .storage
                     .get_inode(dst_parent_inode_id)?
                     .ok_or_else(|| MetadataError::Internal("Destination parent disappeared".to_string()))?;
                 let mut dst_attrs = dst_parent.attrs.clone();
                 dst_attrs.update_mtime_ctime(now_ms);
-                let mut updated_dst_parent = dst_parent.clone();
-                updated_dst_parent.attrs = dst_attrs;
-                self.storage.put_inode(&updated_dst_parent)?;
+                let mut dst_parent = dst_parent.clone();
+                dst_parent.attrs = dst_attrs;
+                (Some(src_parent), Some(dst_parent))
             } else {
                 let parent = self
                     .storage
@@ -1045,22 +1032,59 @@ impl AppRaftStateMachine {
                     .ok_or_else(|| MetadataError::Internal("Parent disappeared".to_string()))?;
                 let mut attrs = parent.attrs.clone();
                 attrs.update_mtime_ctime(now_ms);
-                let mut updated_parent = parent.clone();
-                updated_parent.attrs = attrs;
-                self.storage.put_inode(&updated_parent)?;
-            }
+                let mut parent = parent.clone();
+                parent.attrs = attrs;
+                (Some(parent), None)
+            };
 
             // Update source inode ctime
             let mut src_attrs = src_inode.attrs.clone();
             src_attrs.update_ctime(now_ms);
             let mut updated_src_inode = src_inode.clone();
             updated_src_inode.attrs = src_attrs;
-            self.storage.put_inode(&updated_src_inode)?;
+
+            self.storage.rename_atomic(RenameAtomicUpdate {
+                src_parent_inode_id,
+                src_name: &src_name,
+                dst_parent_inode_id,
+                dst_name: &dst_name,
+                src_inode_id,
+                overwritten_inode_id,
+                updated_src_parent: updated_src_parent.as_ref(),
+                updated_dst_parent: updated_dst_parent.as_ref(),
+                updated_src_inode: &updated_src_inode,
+            })?;
 
             Ok(FsOkResult::default())
         })();
 
         Self::fs_command_result(result)
+    }
+
+    fn validate_rename_overwrite_target_is_safe(&self, dst_inode: &Inode) -> MetadataResult<()> {
+        // TODO: Short-term behavior rejects complex overwrite targets to avoid orphaning target
+        // layout/data_handle/block metadata. Future overwrite cleanup must batch target inode/dentry
+        // removal with target layout, data_handle_owner, block refcount, and delete-intent updates.
+        if !dst_inode.kind.is_dir() {
+            return Err(MetadataError::InvalidArgument(format!(
+                "{} for inode {}",
+                RENAME_OVERWRITE_CLEANUP_UNIMPLEMENTED, dst_inode.inode_id
+            )));
+        }
+        if dst_inode.current_data_handle_id.as_raw() != 0 {
+            return Err(MetadataError::InvalidArgument(format!(
+                "{} for inode {} with data_handle_id {}",
+                RENAME_OVERWRITE_CLEANUP_UNIMPLEMENTED, dst_inode.inode_id, dst_inode.current_data_handle_id
+            )));
+        }
+        match self.storage.get_layout(dst_inode.inode_id) {
+            Ok(_) => Err(MetadataError::InvalidArgument(format!(
+                "{} for inode {} with layout",
+                RENAME_OVERWRITE_CLEANUP_UNIMPLEMENTED, dst_inode.inode_id
+            ))),
+            Err(MetadataError::NotFound(_)) => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 
     /// Apply SetAttr command.
@@ -1525,6 +1549,178 @@ mod tests {
             .unwrap()
             .expect("mapping should exist");
         assert_eq!(mapped, inode_id, "data handle owner mapping must match created inode");
+        assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), Some(inode_id));
+        assert_eq!(storage.get_layout(inode_id).unwrap(), FileLayout::new(4096, 4096, 1));
+    }
+
+    #[test]
+    fn mkdir_persists_inode_and_dentry() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let parent_inode_id = InodeId::new(10);
+        storage
+            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1)))
+            .unwrap();
+
+        let raw = sm
+            .apply(
+                Command::Mkdir {
+                    dedup: dedup_for_test(29),
+                    parent_inode_id,
+                    name: "dir".to_string(),
+                    attrs: FileAttrs::new(),
+                },
+                1,
+            )
+            .unwrap();
+        let inode_id = match raw {
+            AppDataResponse::Fs(FsCommandResult::Ok(ok)) => ok.inode_id.expect("inode id should be returned"),
+            other => panic!("unexpected apply response: {:?}", other),
+        };
+
+        assert!(storage.get_inode(inode_id).unwrap().unwrap().kind.is_dir());
+        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), Some(inode_id));
+    }
+
+    #[test]
+    fn rename_moves_dentry_and_preserves_inode() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let parent_inode_id = InodeId::new(10);
+        storage
+            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1)))
+            .unwrap();
+
+        let created = sm
+            .apply(
+                Command::Create {
+                    dedup: dedup_for_test(36),
+                    parent_inode_id,
+                    name: "old".to_string(),
+                    attrs: FileAttrs::new(),
+                    layout: FileLayout::new(4096, 4096, 1),
+                },
+                1,
+            )
+            .unwrap();
+        let inode_id = match created {
+            AppDataResponse::Fs(FsCommandResult::Ok(ok)) => ok.inode_id.unwrap(),
+            other => panic!("unexpected apply response: {:?}", other),
+        };
+
+        sm.apply(
+            Command::Rename {
+                dedup: dedup_for_test(37),
+                src_parent_inode_id: parent_inode_id,
+                src_name: "old".to_string(),
+                dst_parent_inode_id: parent_inode_id,
+                dst_name: "new".to_string(),
+                flags: 0,
+            },
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(storage.get_dentry(parent_inode_id, "old").unwrap(), None);
+        assert_eq!(storage.get_dentry(parent_inode_id, "new").unwrap(), Some(inode_id));
+        assert!(storage.get_inode(inode_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn rename_overwrite_file_with_data_state_is_rejected_without_cleanup() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let parent_inode_id = InodeId::new(10);
+        storage
+            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1)))
+            .unwrap();
+
+        let source = sm
+            .apply(
+                Command::Create {
+                    dedup: dedup_for_test(38),
+                    parent_inode_id,
+                    name: "source".to_string(),
+                    attrs: FileAttrs::new(),
+                    layout: FileLayout::new(4096, 4096, 1),
+                },
+                1,
+            )
+            .unwrap();
+        let source_inode_id = match source {
+            AppDataResponse::Fs(FsCommandResult::Ok(ok)) => ok.inode_id.unwrap(),
+            other => panic!("unexpected apply response: {:?}", other),
+        };
+
+        let target = sm
+            .apply(
+                Command::Create {
+                    dedup: dedup_for_test(39),
+                    parent_inode_id,
+                    name: "target".to_string(),
+                    attrs: FileAttrs::new(),
+                    layout: FileLayout::new(8192, 8192, 1),
+                },
+                2,
+            )
+            .unwrap();
+        let target_inode_id = match target {
+            AppDataResponse::Fs(FsCommandResult::Ok(ok)) => ok.inode_id.unwrap(),
+            other => panic!("unexpected apply response: {:?}", other),
+        };
+        let target_inode = storage.get_inode(target_inode_id).unwrap().unwrap();
+        let target_handle = target_inode.current_data_handle_id;
+
+        let rejected = sm
+            .apply(
+                Command::Rename {
+                    dedup: dedup_for_test(40),
+                    src_parent_inode_id: parent_inode_id,
+                    src_name: "source".to_string(),
+                    dst_parent_inode_id: parent_inode_id,
+                    dst_name: "target".to_string(),
+                    flags: 0,
+                },
+                3,
+            )
+            .unwrap();
+
+        match rejected {
+            AppDataResponse::Fs(FsCommandResult::Err(err)) => {
+                assert_eq!(err.errno, FsErrorCode::EInval);
+                assert!(err
+                    .message
+                    .contains("rename overwrite target cleanup is not implemented yet"));
+            }
+            other => panic!("unexpected apply response: {:?}", other),
+        }
+
+        assert_eq!(
+            storage.get_dentry(parent_inode_id, "source").unwrap(),
+            Some(source_inode_id)
+        );
+        assert_eq!(
+            storage.get_dentry(parent_inode_id, "target").unwrap(),
+            Some(target_inode_id)
+        );
+        assert!(storage.get_inode(target_inode_id).unwrap().is_some());
+        assert_eq!(
+            storage.get_layout(target_inode_id).unwrap(),
+            FileLayout::new(8192, 8192, 1)
+        );
+        assert_eq!(
+            storage.get_inode_by_data_handle(target_handle).unwrap(),
+            Some(target_inode_id)
+        );
     }
 
     #[test]

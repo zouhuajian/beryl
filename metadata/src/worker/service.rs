@@ -11,12 +11,13 @@ use super::repair::{
     ErrorClass, OrphanQueue, RepairPlanner, RepairQueue, RepairTask, RepairTaskId, RepairTaskRecord, TaskAckStatus,
 };
 use crate::error::MetadataResult;
-use crate::raft::AppRaftNode;
 use crate::raft::Command;
+use crate::raft::{AppDataResponse, AppRaftNode};
 use crate::service::extract_and_inject_context;
 use ::common::header::ResponseHeader;
 use proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProto;
 use proto::metadata::*;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
@@ -385,6 +386,29 @@ impl MetadataWorkerServiceImpl {
     }
 }
 
+async fn persist_worker_descriptor_then_register<F>(
+    worker_manager: &WorkerManager,
+    worker_id: WorkerId,
+    address: String,
+    net_transport_kind: i32,
+    worker_epoch: u64,
+    fault_domain: Option<String>,
+    persist_descriptor: F,
+) -> Result<(), Status>
+where
+    F: Future<Output = MetadataResult<AppDataResponse>>,
+{
+    persist_descriptor
+        .await
+        .map_err(|e| Status::internal(format!("Failed to propose command: {}", e)))?;
+
+    worker_manager
+        .register_worker(worker_id, address, net_transport_kind, worker_epoch, fault_domain)
+        .map_err(|e| Status::internal(format!("Failed to register worker: {}", e)))?;
+
+    Ok(())
+}
+
 #[tonic::async_trait]
 #[tonic::async_trait]
 impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
@@ -451,32 +475,26 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             }
         };
 
-        // Register worker in manager (in-memory for now)
-        self.worker_manager
-            .register_worker(
-                worker_id,
-                address.clone(),
-                net_transport_kind,
-                worker_epoch,
-                None, // TODO: Extract fault_domain from labels
-            )
-            .map_err(|e| Status::internal(format!("Failed to register worker: {}", e)))?;
-
         // Create command and propose to Raft (only descriptor, no runtime)
         let command = Command::UpsertWorkerDescriptor {
             dedup: crate::raft::DedupKey::new(_caller_ctx.client.client_id, _caller_ctx.client.call_id),
             worker_id,
-            address: format!("{}:{}", endpoint.host, endpoint.port),
+            address: address.clone(),
             net_transport_kind,
             worker_epoch,
             fault_domain: None, // TODO: Extract fault_domain from labels
         };
 
-        // Propose to Raft
-        self.raft_node
-            .propose(command)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to propose command: {}", e)))?;
+        persist_worker_descriptor_then_register(
+            self.worker_manager.as_ref(),
+            worker_id,
+            address.clone(),
+            net_transport_kind,
+            worker_epoch,
+            None, // TODO: Extract fault_domain from labels
+            self.raft_node.propose(command),
+        )
+        .await?;
 
         info!(worker_id = worker_id.as_raw(), "Worker registered");
 
@@ -964,5 +982,79 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         Ok(Response::new(WorkerReportPresenceResponseProto {
             header: Some((&response_header).into()),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::MetadataError;
+
+    #[tokio::test]
+    async fn register_worker_does_not_store_descriptor_when_propose_fails() {
+        let manager = WorkerManager::new(60);
+        let worker_id = WorkerId::new(7);
+
+        let result = persist_worker_descriptor_then_register(
+            &manager,
+            worker_id,
+            "127.0.0.1:9090".to_string(),
+            1,
+            100,
+            None,
+            async { Err(MetadataError::Internal("propose failed".to_string())) },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(manager.get_descriptor(worker_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn register_worker_stores_descriptor_after_propose_succeeds() {
+        let manager = WorkerManager::new(60);
+        let worker_id = WorkerId::new(7);
+
+        persist_worker_descriptor_then_register(
+            &manager,
+            worker_id,
+            "127.0.0.1:9090".to_string(),
+            1,
+            100,
+            None,
+            async { Ok(AppDataResponse::None) },
+        )
+        .await
+        .unwrap();
+
+        let descriptor = manager.get_descriptor(worker_id).unwrap();
+        assert_eq!(descriptor.worker_id, worker_id);
+        assert_eq!(descriptor.address, "127.0.0.1:9090");
+        assert_eq!(descriptor.net_transport_kind, 1);
+        assert_eq!(descriptor.worker_epoch, 100);
+    }
+
+    #[tokio::test]
+    async fn repeated_register_remains_idempotent_after_successful_propose() {
+        let manager = WorkerManager::new(60);
+        let worker_id = WorkerId::new(7);
+
+        for _ in 0..2 {
+            persist_worker_descriptor_then_register(
+                &manager,
+                worker_id,
+                "127.0.0.1:9090".to_string(),
+                1,
+                100,
+                None,
+                async { Ok(AppDataResponse::None) },
+            )
+            .await
+            .unwrap();
+        }
+
+        let descriptor = manager.get_descriptor(worker_id).unwrap();
+        assert_eq!(descriptor.worker_id, worker_id);
+        assert_eq!(descriptor.address, "127.0.0.1:9090");
     }
 }
