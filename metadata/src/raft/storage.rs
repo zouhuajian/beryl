@@ -240,6 +240,14 @@ impl RocksDBStorage {
         Ok(())
     }
 
+    fn batch_put_lease(batch: &mut WriteBatch, cf: &ColumnFamily, lease_state: &LeaseState) -> MetadataResult<()> {
+        let key = format!("{}", lease_state.block_id);
+        let value = encode_to_vec(lease_state, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize LeaseState: {}", e)))?;
+        batch.put_cf(cf, key.as_bytes(), value);
+        Ok(())
+    }
+
     /// Delete lease state.
     pub fn delete_lease(&self, block_id: BlockId) -> MetadataResult<()> {
         let cf = self
@@ -252,6 +260,35 @@ impl RocksDBStorage {
             .delete_cf(cf, key.as_bytes())
             .map_err(|e| MetadataError::Internal(format!("RocksDB error: {}", e)))?;
         Ok(())
+    }
+
+    /// Atomically persist a lease upsert with apply tracking.
+    pub fn acquire_lease_with_apply_result_atomic(
+        &self,
+        lease_state: &LeaseState,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let cf_leases = self.cf(CF_LEASES)?;
+        let mut batch = WriteBatch::default();
+        Self::batch_put_lease(&mut batch, cf_leases, lease_state)?;
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+    }
+
+    /// Atomically persist a lease release with apply tracking.
+    pub fn release_lease_with_apply_result_atomic(
+        &self,
+        block_id: BlockId,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let cf_leases = self.cf(CF_LEASES)?;
+        let mut batch = WriteBatch::default();
+        let key = format!("{}", block_id);
+        batch.delete_cf(cf_leases, key.as_bytes());
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
     }
 
     /// Get applied result for idempotency.
@@ -607,6 +644,14 @@ impl RocksDBStorage {
         Ok(())
     }
 
+    fn batch_put_shard_group(batch: &mut WriteBatch, cf: &ColumnFamily, info: &ShardGroupInfo) -> MetadataResult<()> {
+        let key = format!("{}", info.group_id.as_raw());
+        let value = encode_to_vec(info, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize ShardGroupInfo: {}", e)))?;
+        batch.put_cf(cf, key.as_bytes(), value);
+        Ok(())
+    }
+
     /// Put shard to group routing mapping.
     pub fn put_shard_routing(&self, shard_id: ShardId, group_id: ShardGroupId) -> MetadataResult<()> {
         let cf = self
@@ -620,6 +665,12 @@ impl RocksDBStorage {
             .put_cf(cf, key.as_bytes(), value.as_bytes())
             .map_err(|e| MetadataError::Internal(format!("RocksDB error: {}", e)))?;
         Ok(())
+    }
+
+    fn batch_put_shard_routing(batch: &mut WriteBatch, cf: &ColumnFamily, shard_id: ShardId, group_id: ShardGroupId) {
+        let key = format!("{}", shard_id.as_raw());
+        let value = format!("{}", group_id.as_raw());
+        batch.put_cf(cf, key.as_bytes(), value.as_bytes());
     }
 
     /// Get shard to group routing mapping.
@@ -727,6 +778,14 @@ impl RocksDBStorage {
         Ok(())
     }
 
+    fn batch_put_mount(batch: &mut WriteBatch, cf: &ColumnFamily, entry: &MountEntry) -> MetadataResult<()> {
+        let key = format!("{}", entry.mount_id.as_raw());
+        let value = encode_to_vec(entry, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize MountEntry: {}", e)))?;
+        batch.put_cf(cf, key.as_bytes(), value);
+        Ok(())
+    }
+
     /// Delete mount entry.
     pub fn delete_mount(&self, mount_id: MountId) -> MetadataResult<()> {
         let cf = self
@@ -738,6 +797,20 @@ impl RocksDBStorage {
         self.db
             .delete_cf(cf, key.as_bytes())
             .map_err(|e| MetadataError::Internal(format!("RocksDB error: {}", e)))?;
+        Ok(())
+    }
+
+    fn batch_put_route_epoch(batch: &mut WriteBatch, cf: &ColumnFamily, epoch: RouteEpoch) -> MetadataResult<()> {
+        let value = encode_to_vec(&epoch.as_u64(), standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize route_epoch: {}", e)))?;
+        batch.put_cf(cf, b"route_epoch", value);
+        Ok(())
+    }
+
+    fn batch_put_mount_version(batch: &mut WriteBatch, cf: &ColumnFamily, version: u64) -> MetadataResult<()> {
+        let value = encode_to_vec(&version, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize mount_version: {}", e)))?;
+        batch.put_cf(cf, b"mount_version", value);
         Ok(())
     }
 
@@ -1064,6 +1137,14 @@ impl RocksDBStorage {
         self.db
             .put_cf(cf, key.as_bytes(), value)
             .map_err(|e| MetadataError::Internal(format!("RocksDB error: {}", e)))?;
+        Ok(())
+    }
+
+    fn batch_put_worker(batch: &mut WriteBatch, cf: &ColumnFamily, info: &WorkerInfo) -> MetadataResult<()> {
+        let key = format!("{}", info.worker_id.as_raw());
+        let value = encode_to_vec(info, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize WorkerInfo: {}", e)))?;
+        batch.put_cf(cf, key.as_bytes(), value);
         Ok(())
     }
 
@@ -1593,6 +1674,97 @@ impl RocksDBStorage {
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize Inode: {}", e)))?;
         batch.put_cf(cf, key, value);
         Ok(())
+    }
+
+    /// Atomically persist a single inode update with apply tracking.
+    pub fn put_inode_with_apply_result_atomic(
+        &self,
+        inode: &Inode,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let cf_inodes = self.cf(CF_INODES)?;
+        let mut batch = WriteBatch::default();
+        Self::batch_put_inode(&mut batch, cf_inodes, inode)?;
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+    }
+
+    /// Atomically persist a mount creation/update with apply tracking.
+    pub fn create_mount_with_apply_result_atomic(
+        &self,
+        entry: &MountEntry,
+        root_inode_to_create: Option<&Inode>,
+        mount_version: u64,
+        route_epoch: RouteEpoch,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let cf_mounts = self.cf(CF_MOUNTS)?;
+        let cf_meta = self.cf(CF_META)?;
+        let cf_inodes = self.cf(CF_INODES)?;
+        let mut batch = WriteBatch::default();
+        if let Some(inode) = root_inode_to_create {
+            Self::batch_put_inode(&mut batch, cf_inodes, inode)?;
+        }
+        Self::batch_put_mount(&mut batch, cf_mounts, entry)?;
+        Self::batch_put_mount_version(&mut batch, cf_meta, mount_version)?;
+        Self::batch_put_route_epoch(&mut batch, cf_meta, route_epoch)?;
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+    }
+
+    /// Atomically persist a mount deletion with apply tracking.
+    pub fn delete_mount_with_apply_result_atomic(
+        &self,
+        mount_id: MountId,
+        mount_version: u64,
+        route_epoch: RouteEpoch,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let cf_mounts = self.cf(CF_MOUNTS)?;
+        let cf_meta = self.cf(CF_META)?;
+        let mut batch = WriteBatch::default();
+        let key = format!("{}", mount_id.as_raw());
+        batch.delete_cf(cf_mounts, key.as_bytes());
+        Self::batch_put_mount_version(&mut batch, cf_meta, mount_version)?;
+        Self::batch_put_route_epoch(&mut batch, cf_meta, route_epoch)?;
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+    }
+
+    /// Atomically persist shard group registration and shard routing with apply tracking.
+    pub fn add_shard_group_with_apply_result_atomic(
+        &self,
+        info: &ShardGroupInfo,
+        shard_ids: &[ShardId],
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let cf_groups = self.cf(CF_SHARD_GROUPS)?;
+        let cf_routing = self.cf(CF_SHARD_ROUTING)?;
+        let mut batch = WriteBatch::default();
+        Self::batch_put_shard_group(&mut batch, cf_groups, info)?;
+        for shard_id in shard_ids {
+            Self::batch_put_shard_routing(&mut batch, cf_routing, *shard_id, info.group_id);
+        }
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+    }
+
+    /// Atomically persist a worker descriptor with apply tracking.
+    pub fn upsert_worker_descriptor_with_apply_result_atomic(
+        &self,
+        info: &WorkerInfo,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let cf_workers = self.cf(CF_WORKERS)?;
+        let mut batch = WriteBatch::default();
+        Self::batch_put_worker(&mut batch, cf_workers, info)?;
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
     }
 
     /// Atomically persist a create-file namespace mutation.
@@ -2280,6 +2452,32 @@ mod tests {
         assert_eq!(storage.get_layout(inode_id).unwrap(), layout);
         assert!(storage.get_applied_result(&dedup).unwrap().is_some());
         assert_eq!(storage.get_applied_seq().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn put_inode_with_apply_result_atomic_persists_inode_dedup_and_seq() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+
+        let inode_id = InodeId::new(12);
+        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), DataHandleId::new(120));
+        inode.attrs.uid = 44;
+        let dedup = DedupKey::new(ClientId::new(102), types::CallId::new());
+        let applied = AppliedResult {
+            seq: 8,
+            fingerprint: CommandFingerprint(88),
+            result: AppDataResponse::Fs(crate::raft::types::FsCommandResult::ok()),
+            created_at_ms: now_millis(),
+            size_bytes: 0,
+        };
+
+        storage
+            .put_inode_with_apply_result_atomic(&inode, &dedup, applied, 8)
+            .unwrap();
+
+        assert_eq!(storage.get_inode(inode_id).unwrap().unwrap().attrs.uid, 44);
+        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
+        assert_eq!(storage.get_applied_seq().unwrap(), Some(8));
     }
 
     #[test]

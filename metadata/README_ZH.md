@@ -177,7 +177,7 @@ Raft / RocksDB 现状：
 - `RaftStateStore` 读调用 `AppRaftNode::read(false, ...)`，当前是 leader-read 检查，不是 follower read；`AppRaftNode::read(true, ...)` 有 linearizable read 分支，但主 `RaftStateStore` 路径没有使用。
 - snapshot build/install 基于 `STATE_CFS` 的 RocksDB snapshot/payload，包含 replicated state CF；install 时先 clear 对应 CF，再批量恢复。
 - inode/data handle allocator 使用 RocksDB meta key 和 `WriteBatch` 持久推进。
-- `Create`、`Mkdir`、`Rename` 已把业务 mutation、`AppliedResult` 和 `applied_seq` 放进同一个 RocksDB `WriteBatch`；其他 mutation 仍需继续收敛 apply-level atomicity。
+- `Create`、`Mkdir`、`Rename`、`SetAttr`、`SetXattr`、`RemoveXattr`、`CreateMount`、`DeleteMount`、`AddShardGroup`、`UpsertWorkerDescriptor`、`AcquireLease`、`ReleaseLease` 已把业务 mutation、`AppliedResult` 和 `applied_seq` 放进同一个 RocksDB `WriteBatch`。
 
 ## 6. Worker metadata 链路
 
@@ -290,21 +290,20 @@ Dedup / fingerprint / AppliedResult 当前边界：
 - `CommandFingerprint` 表示 command type + 语义 payload 的稳定指纹，用于校验同一 `DedupKey` 下 payload 是否一致；不能合并进 `DedupKey`。
 - `AppliedResult` 是 Raft state machine 已 apply mutation 的持久 replay record，用于 retry/replay；不是通用 RPC response cache。
 - read-only RPC 不写 `AppliedResult`；读路径依赖 `state_id`、`mount_epoch`、`route_epoch`、`worker_epoch` 和 `ResponseHeader` refresh hint。
-- `Create`、`Mkdir`、`Rename` 已把 business mutation、`AppliedResult` 和 `applied_seq` 放进同一个 RocksDB `WriteBatch`。
+- `Create`、`Mkdir`、`Rename`、`SetAttr`、`SetXattr`、`RemoveXattr`、`CreateMount`、`DeleteMount`、`AddShardGroup`、`UpsertWorkerDescriptor`、`AcquireLease`、`ReleaseLease` 已把 business mutation、`AppliedResult` 和 `applied_seq` 放进同一个 RocksDB `WriteBatch`。
 
 Mutation command apply-level atomicity inventory：
 
 | 分类 | Command |
 | --- | --- |
-| DONE | `Create`, `Mkdir`, `Rename` |
-| SIMPLE_NEXT | `SetAttr`, `SetXattr`, `RemoveXattr`, `CreateMount`, `DeleteMount`, `AddShardGroup`, `UpsertWorkerDescriptor`, `AcquireLease`, `ReleaseLease` |
+| DONE | `Create`, `Mkdir`, `Rename`, `SetAttr`, `SetXattr`, `RemoveXattr`, `CreateMount`, `DeleteMount`, `AddShardGroup`, `UpsertWorkerDescriptor`, `AcquireLease`, `ReleaseLease` |
 | COMPLEX_NEXT | `CloseWrite`, `Unlink`, `Rmdir`, `Truncate`, `CreateDeleteIntents` |
 | LEGACY_OR_UNUSED | `UpdateCommittedLength` |
 | DIRECT_ROCKSDB_TODO | worker identity / worker id allocator direct writes, delete intent status direct writes, maintenance block refcount compatibility writes, delete intent creation paths that generate intent ids before Raft propose |
 
 高优先级 correctness 风险：
 
-- RocksDB multi-key/multi-CF 原子性：`CloseWrite`、`Unlink`、`Rmdir`、`Truncate`、xattr mutation、mount mutation、worker descriptor 等尚未全部完成 apply-level atomicity。
+- RocksDB multi-key/multi-CF 原子性：`CloseWrite`、`Unlink`、`Rmdir`、`Truncate`、`CreateDeleteIntents` 和 delete-intent 状态推进尚未完成 apply-level atomicity。
 - delete intent 执行状态：Completed/Failed 由 `DeleteExecutor` 直接写 RocksDB，不走 Raft command。
 - worker identity / worker id allocator：register 前仍直接写 RocksDB，还没有对应 Raft command。
 - rename overwrite：当前会拒绝带数据状态的 overwrite target，完整 cleanup 尚未实现。
@@ -327,7 +326,7 @@ Mutation command apply-level atomicity inventory：
 必须保留并优先修正的主链路 correctness。
 
 - 保留 `FsCore`、`PathResolver`、`MountTable`、`AppRaftStateMachine`、`RocksDBStorage`、`RaftStateStore`、`ResponseHeader.error` contract、write session/fencing 主链路。
-- 继续收敛 `CloseWrite`、`Unlink`、`Rmdir`、`Truncate`、xattr、mount、worker descriptor、delete-intent 状态等多 key RocksDB mutation 的原子性。
+- 继续收敛 `CloseWrite`、`Unlink`、`Rmdir`、`Truncate`、`CreateDeleteIntents`、delete-intent 状态等复杂或后台 RocksDB mutation 的原子性。
 - 把 worker identity / worker id allocator 从直接 RocksDB 写路径收敛到 Raft apply 边界。
 - 完成 rename overwrite target 的数据状态 cleanup。
 
