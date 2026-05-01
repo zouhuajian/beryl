@@ -58,7 +58,7 @@ impl AppRaftStateMachine {
         let dedup_key = command.dedup_key().clone();
         let fingerprint = command.fingerprint();
 
-        // Check idempotency
+        // Dedup hit returns the persisted replay record without re-running the mutation.
         if let Some(applied) = self.storage.get_applied_result(&dedup_key)? {
             if applied.fingerprint != fingerprint {
                 crate::metrics::DEDUP_LOOKUP_MISMATCH_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -2238,5 +2238,42 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, MetadataError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn dedup_fingerprint_mismatch_does_not_apply_mutation_or_advance_seq() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let parent_inode_id = InodeId::new(10);
+        storage
+            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1)))
+            .unwrap();
+
+        let dedup = dedup_for_test(45);
+        let first = Command::Create {
+            dedup: dedup.clone(),
+            parent_inode_id,
+            name: "first".to_string(),
+            attrs: FileAttrs::new(),
+            layout: FileLayout::new(4096, 4096, 1),
+        };
+        let mismatch = Command::Create {
+            dedup,
+            parent_inode_id,
+            name: "second".to_string(),
+            attrs: FileAttrs::new(),
+            layout: FileLayout::new(4096, 4096, 1),
+        };
+
+        sm.apply(first, 7).unwrap();
+        let err = sm.apply(mismatch, 8).unwrap_err();
+
+        assert!(matches!(err, MetadataError::InvalidArgument(_)));
+        assert_eq!(storage.get_dentry(parent_inode_id, "second").unwrap(), None);
+        assert_eq!(storage.get_applied_seq().unwrap(), Some(7));
+        assert_eq!(sm.applied_seq(), 7);
     }
 }

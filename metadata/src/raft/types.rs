@@ -111,6 +111,9 @@ pub struct FsErrnoResult {
 }
 
 /// Deduplication key: (client_id, call_id).
+///
+/// DedupKey identifies a logical mutation request. It must not include command
+/// payload, epochs, paths, inodes, or CommandFingerprint.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct DedupKey {
     pub client_id: ClientId,
@@ -133,8 +136,11 @@ impl DedupKey {
     }
 }
 
-/// Stable fingerprint of a command payload (excluding dedup key).
-/// Used to ensure retries with the same (client_id, call_id) execute the same semantically meaningful command.
+/// Stable fingerprint of a command payload.
+///
+/// CommandFingerprint validates payload consistency under the same DedupKey. It
+/// is deliberately separate from DedupKey so call_id reuse with different
+/// payloads is detected instead of treated as a new request.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct CommandFingerprint(pub u64);
 

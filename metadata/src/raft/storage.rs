@@ -7,7 +7,7 @@
 //! - blocks/{block_id} -> BlockMetaState (serialized)
 //! - leases/{block_id} -> LeaseState (serialized)
 //! - mounts/{mount_id} -> MountEntry (serialized)
-//! - dedup/{request_id} -> AppliedResult (serialized)
+//! - dedup/{client_id}:{call_id} -> AppliedResult (serialized)
 //! - shard_groups/{group_id} -> ShardGroupInfo (serialized)
 //! - shard_routing/{shard_id} -> group_id (u64 as string)
 //! - route_epoch -> u64
@@ -86,7 +86,10 @@ pub const STATE_CFS: &[&str] = &[
     CF_DENTRIES,
 ];
 
-/// Applied result for idempotency.
+/// Persisted replay record for an applied mutation command.
+///
+/// AppliedResult stores the minimal deterministic result of an applied mutation
+/// command. It is used for retry/replay, not as a general RPC response cache.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppliedResult {
     pub seq: u64,

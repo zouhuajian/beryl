@@ -162,7 +162,7 @@ data identity / session identity：
 - `file_handle` 是 write session 身份，不是持久文件身份。
 - `fencing_token` 保护 direct client->worker 与 close/fsync 的一致性。
 - `Create` 当前会通过持久 `next_data_handle_id` 分配 `current_data_handle_id` 并写入 `data_handle_owner` 映射。
-- 当前风险：`WriteSessionCoordinator::execute_open_write()` 仍用 `DataHandleId::new(inode_id.as_raw())` 生成 block id，而不是使用 inode 上的 `current_data_handle_id`。这说明 data handle 生命周期尚未统一。
+- `open_write` / layout read 路径使用 inode 上的 `current_data_handle_id` 并校验 `data_handle_owner` 映射。
 
 block metadata 与 worker soft state 边界：
 
@@ -176,8 +176,8 @@ Raft / RocksDB 现状：
 - 仍存在直接 RocksDB 写路径：worker identity/worker id allocator 在 register 前经 leader read 取得 storage 后直接写；delete intent 状态更新由 `DeleteExecutor` 直接写 RocksDB；block refcount helper 和一些 maintenance 兼容方法直接写 RocksDB。
 - `RaftStateStore` 读调用 `AppRaftNode::read(false, ...)`，当前是 leader-read 检查，不是 follower read；`AppRaftNode::read(true, ...)` 有 linearizable read 分支，但主 `RaftStateStore` 路径没有使用。
 - snapshot build/install 基于 `STATE_CFS` 的 RocksDB snapshot/payload，包含 replicated state CF；install 时先 clear 对应 CF，再批量恢复。
-- 多 key/多 CF mutation 没有统一 batch 原子性。部分 allocator/snapshot 使用 `WriteBatch`，但 create/mkdir/rename/close_write 等 state machine apply 中仍有多个连续 `put_*` / `delete_*`。
-- inode id allocator 仍是 `AppRaftStateMachine::next_inode_id` 内存计数器，未持久化，属于高优先级 correctness 风险。
+- inode/data handle allocator 使用 RocksDB meta key 和 `WriteBatch` 持久推进。
+- `Create`、`Mkdir`、`Rename` 已把业务 mutation、`AppliedResult` 和 `applied_seq` 放进同一个 RocksDB `WriteBatch`；其他 mutation 仍需继续收敛 apply-level atomicity。
 
 ## 6. Worker metadata 链路
 
@@ -187,10 +187,10 @@ register 当前行为：
 
 - 根据 endpoint + labels 计算 identity。
 - 如果没有 suggested worker id，先通过 state machine storage 的 `get_worker_id_by_identity()` / `get_and_increment_worker_id()` / `put_worker_identity()` 直接生成和写入 worker id 映射。
-- 先调用 `WorkerManager::register_worker()` 写入内存 descriptor。
-- 再 propose `Command::UpsertWorkerDescriptor` 持久化 descriptor。
+- 通过 `Command::UpsertWorkerDescriptor` propose 并持久化 descriptor。
+- propose 成功后再调用 `WorkerManager::register_worker()` 写入内存 descriptor。
 
-这仍是“先内存后 Raft”的顺序。如果 Raft propose 失败，内存 descriptor 可能短暂领先持久状态。
+worker identity / worker id allocator 仍是 register 前的直接 RocksDB 写路径，尚未收敛进 Raft apply。
 
 heartbeat 当前行为：
 
@@ -284,18 +284,34 @@ client 侧：
 
 ## 11. 当前风险、历史包袱、TODO
 
+Dedup / fingerprint / AppliedResult 当前边界：
+
+- `DedupKey` 只表示一个逻辑 mutation 请求身份，当前是 `client_id + call_id`；不能混入 path、inode、payload、epoch 或 `CommandFingerprint`。
+- `CommandFingerprint` 表示 command type + 语义 payload 的稳定指纹，用于校验同一 `DedupKey` 下 payload 是否一致；不能合并进 `DedupKey`。
+- `AppliedResult` 是 Raft state machine 已 apply mutation 的持久 replay record，用于 retry/replay；不是通用 RPC response cache。
+- read-only RPC 不写 `AppliedResult`；读路径依赖 `state_id`、`mount_epoch`、`route_epoch`、`worker_epoch` 和 `ResponseHeader` refresh hint。
+- `Create`、`Mkdir`、`Rename` 已把 business mutation、`AppliedResult` 和 `applied_seq` 放进同一个 RocksDB `WriteBatch`。
+
+Mutation command apply-level atomicity inventory：
+
+| 分类 | Command |
+| --- | --- |
+| DONE | `Create`, `Mkdir`, `Rename` |
+| SIMPLE_NEXT | `SetAttr`, `SetXattr`, `RemoveXattr`, `CreateMount`, `DeleteMount`, `AddShardGroup`, `UpsertWorkerDescriptor`, `AcquireLease`, `ReleaseLease` |
+| COMPLEX_NEXT | `CloseWrite`, `Unlink`, `Rmdir`, `Truncate`, `CreateDeleteIntents` |
+| LEGACY_OR_UNUSED | `UpdateCommittedLength` |
+| DIRECT_ROCKSDB_TODO | worker identity / worker id allocator direct writes, delete intent status direct writes, maintenance block refcount compatibility writes, delete intent creation paths that generate intent ids before Raft propose |
+
 高优先级 correctness 风险：
 
-- `data_handle_id / open_write`：create 使用持久 data_handle allocator，但 open_write 仍用 `inode_id` 派生 `DataHandleId`，data handle 生命周期未统一。
-- inode id allocator：`next_inode_id` 是 state machine 内存计数器，未从 RocksDB/Raft snapshot 恢复，重启后有重复分配风险。
-- RocksDB multi-key/multi-CF 原子性：create/mkdir/rename/close_write 等 mutation 仍由多个 `put_*` 组成，没有统一 batch 原子提交。
-- worker register 顺序：先写 `WorkerManager` 内存 descriptor，再 propose Raft；失败时内存与持久状态可能短暂不一致。
-- delete intent 执行状态：Completed/Failed 由 DeleteExecutor 直接写 RocksDB，不走 Raft command。
+- RocksDB multi-key/multi-CF 原子性：`CloseWrite`、`Unlink`、`Rmdir`、`Truncate`、xattr mutation、mount mutation、worker descriptor 等尚未全部完成 apply-level atomicity。
+- delete intent 执行状态：Completed/Failed 由 `DeleteExecutor` 直接写 RocksDB，不走 Raft command。
+- worker identity / worker id allocator：register 前仍直接写 RocksDB，还没有对应 Raft command。
+- rename overwrite：当前会拒绝带数据状态的 overwrite target，完整 cleanup 尚未实现。
 
 当前实现限制：
 
 - `get_file_layout_by_path` 返回 extents 和 `FileBlockLocation`，但 `workers` 为空、`worker_epoch` 为 None，不能支撑完整 direct client-read route。
-- mount prefix 边界：`PathResolver` 和 `MountTable::resolve_path()` 都使用 `starts_with` 做 prefix 匹配，`/mnt/s3x` 误匹配 `/mnt/s3` 的边界风险仍需修复。
 - ACL/Ranger：配置枚举存在，但两者均未实现且 fail fast；不要写成 ACL MVP 或 Ranger stub。
 - UFS proxy：runtime 构造存在，FileSystemService 主链路未使用。
 - repair/move/evict：metadata 侧有 planner/queue/command/ack 框架，但不能证明完整端到端 repair 系统已经闭环。
@@ -308,30 +324,28 @@ client 侧：
 
 ## 12. Metadata 瘦身建议
 
-P0：必须保留并优先修正的主链路 correctness。
+必须保留并优先修正的主链路 correctness。
 
 - 保留 `FsCore`、`PathResolver`、`MountTable`、`AppRaftStateMachine`、`RocksDBStorage`、`RaftStateStore`、`ResponseHeader.error` contract、write session/fencing 主链路。
-- 优先修正 inode id allocator 持久化。
-- 统一 data_handle_id 生命周期，特别是 open_write 不能继续用 inode_id 派生 data handle。
-- 修复 mount prefix 边界。
-- 收敛 create/mkdir/rename/close_write/delete-intent 状态等多 key RocksDB mutation 的原子性。
-- 明确 worker register 内存/持久顺序，避免 register 失败后内存状态误导 heartbeat。
+- 继续收敛 `CloseWrite`、`Unlink`、`Rmdir`、`Truncate`、xattr、mount、worker descriptor、delete-intent 状态等多 key RocksDB mutation 的原子性。
+- 把 worker identity / worker id allocator 从直接 RocksDB 写路径收敛到 Raft apply 边界。
+- 完成 rename overwrite target 的数据状态 cleanup。
 
-P1：最小读写闭环。
+最小读写闭环。
 
 - 保留 FileSystemService path-first RPC、guard、readiness、leadership、NONE authz、mount/route/session freshness。
 - 保留 create/mkdir/unlink/rmdir/rename/setattr/xattr/open_write/fsync/close 的最小链路。
 - `get_file_layout_by_path` 先如实返回 extents/epoch；worker locations 未闭环前不要作为完整 direct-read route。
 - client action machine 保留 refresh/replay，但承认 path->group route 和 mount refresh API 未完成。
 
-P2：可保留框架但默认关闭或降级的后台维护能力。
+可保留框架但默认关闭或降级的后台维护能力。
 
 - MaintenanceService、RepairQueue、OrphanQueue、RepairPlanner、DeleteExecutor 可以保留为框架，但生产默认策略应保守。
 - GC、orphan cleanup、over-rep cleanup、rebalance、repair timeout requeue 可按风险分级启用。
 - DeleteExecutor 已能下发 delete command，但状态绕过 Raft，应在高风险环境中谨慎开启 destructive path。
 - replication factor、placement、fault-domain、rebalance 策略可以先保持 MVP，不要扩展成复杂策略。
 
-P3：暂缓实现的高级能力。
+暂缓实现的高级能力。
 
 - Ranger。
 - 完整 ACL。

@@ -221,7 +221,10 @@ impl Command {
         &self.dedup_key().call_id
     }
 
-    /// Stable fingerprint of the command payload (excluding dedup key).
+    /// Stable fingerprint of the command payload, excluding DedupKey.
+    ///
+    /// CommandFingerprint validates payload consistency under the same
+    /// DedupKey; do not merge it into the dedup key.
     pub fn fingerprint(&self) -> CommandFingerprint {
         let view: FingerprintView = self.into();
         let bytes = encode_to_vec(&view, standard()).expect("fingerprint serialization should not fail");
@@ -537,5 +540,71 @@ impl From<&Command> for FingerprintView {
                 name: name.clone(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn dedup(client: u64, call: u128) -> DedupKey {
+        DedupKey::new(ClientId::new(client), CallId::from_uuid(Uuid::from_u128(call)))
+    }
+
+    fn rename_command(dedup: DedupKey, dst_name: &str) -> Command {
+        Command::Rename {
+            dedup,
+            src_parent_inode_id: InodeId::new(10),
+            src_name: "old".to_string(),
+            dst_parent_inode_id: InodeId::new(20),
+            dst_name: dst_name.to_string(),
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn fingerprint_is_stable_for_same_dedup_and_same_payload() {
+        let dedup = dedup(7, 1);
+
+        let first = rename_command(dedup.clone(), "new");
+        let second = rename_command(dedup, "new");
+
+        assert_eq!(first.fingerprint(), second.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_changes_for_same_dedup_and_different_payload() {
+        let dedup = dedup(7, 2);
+
+        let first = rename_command(dedup.clone(), "new-a");
+        let second = rename_command(dedup, "new-b");
+
+        assert_ne!(first.fingerprint(), second.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_excludes_call_id() {
+        let first = rename_command(dedup(7, 3), "new");
+        let second = rename_command(dedup(7, 4), "new");
+
+        assert_ne!(first.call_id(), second.call_id());
+        assert_eq!(first.fingerprint(), second.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_includes_command_type() {
+        let unlink = Command::Unlink {
+            dedup: dedup(7, 5),
+            parent_inode_id: InodeId::new(10),
+            name: "entry".to_string(),
+        };
+        let rmdir = Command::Rmdir {
+            dedup: dedup(7, 6),
+            parent_inode_id: InodeId::new(10),
+            name: "entry".to_string(),
+        };
+
+        assert_ne!(unlink.fingerprint(), rmdir.fingerprint());
     }
 }
