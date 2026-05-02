@@ -574,6 +574,19 @@ impl RocksDBStorage {
         }
     }
 
+    fn batch_put_layout(
+        batch: &mut WriteBatch,
+        cf: &ColumnFamily,
+        inode_id: InodeId,
+        layout: FileLayout,
+    ) -> MetadataResult<()> {
+        let key = format!("layout:{}", inode_id.as_raw());
+        let value = encode_to_vec(&layout, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize file layout: {}", e)))?;
+        batch.put_cf(cf, key.as_bytes(), value);
+        Ok(())
+    }
+
     /// Get applied sequence persisted for idempotency tracking.
     pub fn get_applied_seq(&self) -> MetadataResult<Option<u64>> {
         let cf = self
@@ -1391,6 +1404,19 @@ impl RocksDBStorage {
         Ok(())
     }
 
+    fn batch_put_block_ref_count(
+        batch: &mut WriteBatch,
+        cf: &ColumnFamily,
+        block_id: BlockId,
+        count: u64,
+    ) -> MetadataResult<()> {
+        let key = format!("{}", block_id);
+        let value = encode_to_vec(&count, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize ref count: {}", e)))?;
+        batch.put_cf(cf, key.as_bytes(), value);
+        Ok(())
+    }
+
     /// Get block reference count (global, per block_id).
     pub fn get_block_ref_count(&self, block_id: BlockId) -> MetadataResult<Option<u64>> {
         let cf = self
@@ -1687,6 +1713,35 @@ impl RocksDBStorage {
         let cf_inodes = self.cf(CF_INODES)?;
         let mut batch = WriteBatch::default();
         Self::batch_put_inode(&mut batch, cf_inodes, inode)?;
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+    }
+
+    /// Atomically persist a CloseWrite commit with replay tracking.
+    pub fn close_write_with_apply_result_atomic(
+        &self,
+        inode: &Inode,
+        layout: FileLayout,
+        block_ref_increments: &[BlockId],
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let cf_inodes = self.cf(CF_INODES)?;
+        let cf_meta = self.cf(CF_META)?;
+        let cf_block_ref_counts = self.cf(CF_BLOCK_REF_COUNTS)?;
+        let mut batch = WriteBatch::default();
+
+        Self::batch_put_inode(&mut batch, cf_inodes, inode)?;
+        Self::batch_put_layout(&mut batch, cf_meta, inode.inode_id, layout)?;
+
+        let mut seen = std::collections::HashSet::with_capacity(block_ref_increments.len());
+        for block_id in block_ref_increments {
+            if seen.insert(*block_id) {
+                let new_count = self.get_block_ref_count(*block_id)?.unwrap_or(0) + 1;
+                Self::batch_put_block_ref_count(&mut batch, cf_block_ref_counts, *block_id, new_count)?;
+            }
+        }
+
         self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
     }
 
@@ -2389,7 +2444,7 @@ fn now_millis() -> u64 {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use types::fs::{FileAttrs, Inode, InodeId};
+    use types::fs::{FileAttrs, Inode, InodeData, InodeId};
     use types::ids::MountId;
     use types::{CallId, ClientId};
 
@@ -2606,6 +2661,51 @@ mod tests {
         assert_eq!(storage.get_inode(inode_id).unwrap().unwrap().attrs.uid, 44);
         assert!(storage.get_applied_result(&dedup).unwrap().is_some());
         assert_eq!(storage.get_applied_seq().unwrap(), Some(8));
+    }
+
+    #[test]
+    fn close_write_with_apply_result_atomic_persists_inode_block_refs_dedup_and_seq() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+
+        let inode_id = InodeId::new(13);
+        let data_handle_id = DataHandleId::new(130);
+        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
+        let layout = FileLayout::new(4096, 4096, 1);
+        let block_id = BlockId::new(data_handle_id, types::ids::BlockIndex::new(0));
+        if let InodeData::File { extents, lease_epoch } = &mut inode.data {
+            extents.push(types::fs::Extent {
+                file_offset: 0,
+                block_id,
+                block_offset: 0,
+                len: 64,
+                file_version: None,
+                block_stamp: None,
+            });
+            *lease_epoch = Some(3);
+        }
+        inode.attrs.size = 64;
+        storage.put_layout(inode_id, layout).unwrap();
+
+        let dedup = DedupKey::new(ClientId::new(105), types::CallId::new());
+        let applied = AppliedResult {
+            seq: 11,
+            fingerprint: CommandFingerprint(101),
+            result: AppDataResponse::Fs(crate::raft::types::FsCommandResult::ok()),
+            created_at_ms: now_millis(),
+            size_bytes: 0,
+        };
+
+        storage
+            .close_write_with_apply_result_atomic(&inode, layout, &[block_id], &dedup, applied, 11)
+            .unwrap();
+
+        let stored = storage.get_inode(inode_id).unwrap().unwrap();
+        assert_eq!(stored.attrs.size, 64);
+        assert_eq!(storage.get_layout(inode_id).unwrap(), layout);
+        assert_eq!(storage.get_block_ref_count(block_id).unwrap(), Some(1));
+        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
+        assert_eq!(storage.get_applied_seq().unwrap(), Some(11));
     }
 
     #[test]

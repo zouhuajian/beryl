@@ -2,9 +2,13 @@
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
 use super::*;
+use crate::config::RaftConfig;
 use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
-use crate::raft::{AppRaftStateMachine, Command, DedupKey, RocksDBStorage};
-use crate::service::domain::{Freshness, OpenWriteInput, ReleaseSessionInput, RequestContext};
+use crate::raft::{AppRaftNode, AppRaftStateMachine, Command, DedupKey, RocksDBStorage};
+use crate::service::domain::{
+    CloseWriteInput, CloseWriteIntent, Freshness, OpenWriteInput, PresentedFencingToken, ReleaseSessionInput,
+    RequestContext,
+};
 use crate::state::{BlockMetaState, LeaseState, MemoryStateStore, RouteEpoch};
 use crate::worker::{HealthStatus, WorkerManager};
 use async_trait::async_trait;
@@ -190,6 +194,24 @@ fn install_write_session(fs_core: &FsCore, inode_id: InodeId, mount_id: MountId)
             call_id: types::CallId::new(),
         },
     )
+}
+
+async fn single_node_raft(
+    storage: Arc<RocksDBStorage>,
+    mount_table: Arc<MountTable>,
+) -> (Arc<AppRaftNode>, Arc<AppRaftStateMachine>) {
+    let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), mount_table));
+    let raft_config = RaftConfig {
+        node_id: 1,
+        cluster_id: "test".to_string(),
+        peers: vec!["127.0.0.1:0".to_string()],
+    };
+    let raft_node = Arc::new(
+        AppRaftNode::new(1, storage, Arc::clone(&state_machine), &raft_config)
+            .await
+            .unwrap(),
+    );
+    (raft_node, state_machine)
 }
 
 #[test]
@@ -469,6 +491,212 @@ async fn open_write_rejects_file_missing_current_data_handle() {
         .unwrap_err();
 
     assert!(failure.error.message.contains("missing current_data_handle_id"));
+}
+
+#[tokio::test]
+async fn close_write_invalid_lease_or_fencing_does_not_clear_runtime_session() {
+    let mount_id = MountId::new(53);
+    let group_id = ShardGroupId::new(11);
+    let inode_id = InodeId::new(530);
+    let fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let file_handle = install_write_session(&fs_core, inode_id, mount_id);
+    let session = fs_core
+        .write_session_for_handle(file_handle)
+        .expect("session should be installed");
+
+    let wrong_lease = fs_core
+        .execute_close_write(CloseWriteInput {
+            ctx: request_context(),
+            file_handle,
+            lease_id: Some(types::ids::LeaseId::new(session.lease_id.as_raw() + 1)),
+            lease_epoch: session.lease_epoch,
+            open_epoch: session.open_epoch,
+            fencing_token: Some(PresentedFencingToken {
+                block_id: Some(session.fencing_token.block_id),
+                owner: session.fencing_token.owner.as_raw(),
+                epoch: session.fencing_token.epoch,
+            }),
+            intent: CloseWriteIntent {
+                extents: Vec::new(),
+                final_size: 0,
+            },
+            freshness: Freshness::default(),
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        wrong_lease.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
+    );
+    assert_eq!(wrong_lease.error.reason, Some(RefreshReason::SessionInvalid));
+    assert!(fs_core.write_session_for_handle(file_handle).is_some());
+    assert!(fs_core
+        .inode_lease_manager_for_test()
+        .get_active_lease(inode_id)
+        .is_some());
+
+    let wrong_fencing = fs_core
+        .execute_close_write(CloseWriteInput {
+            ctx: request_context(),
+            file_handle,
+            lease_id: Some(session.lease_id),
+            lease_epoch: session.lease_epoch,
+            open_epoch: session.open_epoch,
+            fencing_token: Some(PresentedFencingToken {
+                block_id: Some(BlockId::new(DataHandleId::new(999_999), BlockIndex::new(0))),
+                owner: session.fencing_token.owner.as_raw(),
+                epoch: session.fencing_token.epoch,
+            }),
+            intent: CloseWriteIntent {
+                extents: Vec::new(),
+                final_size: 0,
+            },
+            freshness: Freshness::default(),
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        wrong_fencing.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
+    );
+    assert_eq!(wrong_fencing.error.reason, Some(RefreshReason::SessionInvalid));
+    assert!(fs_core.write_session_for_handle(file_handle).is_some());
+    assert!(fs_core
+        .inode_lease_manager_for_test()
+        .get_active_lease(inode_id)
+        .is_some());
+}
+
+#[tokio::test]
+async fn close_write_success_replay_after_session_cleanup_returns_original_result() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(54);
+    let group_id = ShardGroupId::new(12);
+    let inode_id = InodeId::new(540);
+    let data_handle_id = DataHandleId::new(424_242);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mount_table = Arc::clone(&fs_core.mount_table);
+    let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+    fs_core.set_storage(Arc::clone(&storage));
+    fs_core.set_raft_node(raft_node);
+    storage
+        .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+        .unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let file_handle = install_write_session(&fs_core, inode_id, mount_id);
+    let session = fs_core
+        .write_session_for_handle(file_handle)
+        .expect("session should be installed");
+    let ctx = request_context();
+    let extent = types::fs::Extent {
+        file_offset: 0,
+        block_id: BlockId::new(data_handle_id, BlockIndex::new(0)),
+        block_offset: 0,
+        len: 64,
+        file_version: None,
+        block_stamp: None,
+    };
+    let request = CloseWriteInput {
+        ctx,
+        file_handle,
+        lease_id: Some(session.lease_id),
+        lease_epoch: session.lease_epoch,
+        open_epoch: session.open_epoch,
+        fencing_token: Some(PresentedFencingToken {
+            block_id: Some(session.fencing_token.block_id),
+            owner: session.fencing_token.owner.as_raw(),
+            epoch: session.fencing_token.epoch,
+        }),
+        intent: CloseWriteIntent {
+            extents: vec![extent],
+            final_size: 64,
+        },
+        freshness: Freshness::default(),
+    };
+
+    let first = fs_core
+        .execute_close_write(request.clone())
+        .await
+        .expect("first close should succeed");
+    assert_eq!(first.payload.committed_size, 64);
+    assert!(fs_core.write_session_for_handle(file_handle).is_none());
+
+    let inode_after_first = storage.get_inode(inode_id).unwrap().unwrap();
+    let block_ref_after_first = storage
+        .get_block_ref_count(BlockId::new(data_handle_id, BlockIndex::new(0)))
+        .unwrap();
+
+    let replay = fs_core
+        .execute_close_write(request.clone())
+        .await
+        .expect("same close replay should return persisted result");
+
+    assert_eq!(replay.payload.committed_size, first.payload.committed_size);
+    assert_eq!(replay.payload.file_version, first.payload.file_version);
+    assert!(fs_core.write_session_for_handle(file_handle).is_none());
+    assert_eq!(storage.get_inode(inode_id).unwrap().unwrap(), inode_after_first);
+    assert_eq!(
+        storage
+            .get_block_ref_count(BlockId::new(data_handle_id, BlockIndex::new(0)))
+            .unwrap(),
+        block_ref_after_first
+    );
+
+    let mut mismatch = request;
+    mismatch.intent.final_size = 65;
+    let mismatch_failure = fs_core
+        .execute_close_write(mismatch)
+        .await
+        .expect_err("same call_id with different close payload should fail");
+    assert_eq!(
+        mismatch_failure.error.code,
+        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
+    );
+    assert!(fs_core.write_session_for_handle(file_handle).is_none());
+    assert_eq!(storage.get_inode(inode_id).unwrap().unwrap(), inode_after_first);
+    assert_eq!(
+        storage
+            .get_block_ref_count(BlockId::new(data_handle_id, BlockIndex::new(0)))
+            .unwrap(),
+        block_ref_after_first
+    );
+}
+
+#[tokio::test]
+async fn close_write_session_missing_without_applied_result_stays_session_invalid() {
+    let fs_core = fs_core_with_mount(MountId::new(55), 9, ShardGroupId::new(13));
+
+    let failure = fs_core
+        .execute_close_write(CloseWriteInput {
+            ctx: request_context(),
+            file_handle: 999_999,
+            lease_id: Some(types::ids::LeaseId::new(1)),
+            lease_epoch: 1,
+            open_epoch: 1,
+            fencing_token: Some(PresentedFencingToken {
+                block_id: Some(BlockId::new(DataHandleId::new(1), BlockIndex::new(0))),
+                owner: 7,
+                epoch: 1,
+            }),
+            intent: CloseWriteIntent {
+                extents: Vec::new(),
+                final_size: 0,
+            },
+            freshness: Freshness::default(),
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
+    );
+    assert_eq!(failure.error.reason, Some(RefreshReason::SessionInvalid));
 }
 
 #[tokio::test]

@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
 use super::{CoreWriteOp, FsCore};
-use crate::error::MetadataError;
-use crate::raft::{Command, DedupKey};
+use crate::error::{MetadataError, MetadataResult};
+use crate::raft::{AppDataResponse, Command, DedupKey, FsCommandResult, RocksDBStorage};
 use crate::service::domain::{
     CloseWriteInput, CloseWriteOutput, CoreResult, FsyncBarrierInput, FsyncBarrierOutput, OpenWriteInput,
     OpenWriteOutput, ReleaseSessionInput, ReleaseSessionOutput, RenewLeaseInput, RenewLeaseOutput, RequestContext,
@@ -456,6 +456,14 @@ impl<'a> WriteSessionCoordinator<'a> {
     async fn execute_close_write(&self, req: CloseWriteInput) -> CoreResult<CloseWriteOutput> {
         let caller_ctx = &req.ctx.caller;
         let file_handle = req.file_handle;
+        let dedup = match self.core.dedup_key(caller_ctx) {
+            Ok(k) => k,
+            Err(err) => return self.core.failure_from_error(&req.ctx, err, None, None),
+        };
+
+        if let Some(replay) = self.replay_close_write_if_applied(&req, &dedup).await {
+            return replay;
+        }
 
         let session = match self.core.write_session_manager.get_session(file_handle) {
             Some(session) => session,
@@ -688,18 +696,6 @@ impl<'a> WriteSessionCoordinator<'a> {
             Err(failure) => return Err(failure),
         };
 
-        let dedup = match self.core.dedup_key(caller_ctx) {
-            Ok(k) => k,
-            Err(err) => {
-                return self.core.failure_from_error(
-                    &req.ctx,
-                    err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
-                    Some(ctx.mount_epoch),
-                );
-            }
-        };
-
         let command = Command::CloseWrite {
             dedup,
             inode_id: session.inode_id,
@@ -709,13 +705,25 @@ impl<'a> WriteSessionCoordinator<'a> {
             open_epoch: session.open_epoch,
             lease_epoch: request_lease_epoch,
         };
-        if let Err(err) = self.core.propose_fs_write_command(CoreWriteOp::SetAttr, command).await {
-            return self.core.failure_from_error(
-                &req.ctx,
-                err,
-                Some(ctx.namespace_owner_group_id.as_raw()),
-                Some(ctx.mount_epoch),
-            );
+        match self.core.propose_fs_write_command(CoreWriteOp::SetAttr, command).await {
+            Ok(FsCommandResult::Ok(_)) => {}
+            Ok(FsCommandResult::Err(err)) => {
+                return self.core.fatal_fs_failure(
+                    &req.ctx,
+                    err.errno,
+                    err.message,
+                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.mount_epoch),
+                );
+            }
+            Err(err) => {
+                return self.core.failure_from_error(
+                    &req.ctx,
+                    err,
+                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.mount_epoch),
+                );
+            }
         }
 
         self.core
@@ -733,6 +741,109 @@ impl<'a> WriteSessionCoordinator<'a> {
             Some(ctx.mount_epoch),
             route_epoch,
         )
+    }
+
+    async fn replay_close_write_if_applied(
+        &self,
+        req: &CloseWriteInput,
+        dedup: &DedupKey,
+    ) -> Option<CoreResult<CloseWriteOutput>> {
+        let storage = self.core.storage.as_ref()?;
+        let applied = match storage.get_applied_result(dedup) {
+            Ok(Some(applied)) => applied,
+            Ok(None) => return None,
+            Err(err) => return Some(self.core.failure_from_error(&req.ctx, err, None, None)),
+        };
+
+        let (command, group_id, mount_epoch) = match self.close_write_replay_command(req, dedup, storage) {
+            Ok(replay) => replay,
+            Err(err) => return Some(self.core.failure_from_error(&req.ctx, err, None, None)),
+        };
+        let fingerprint = command.fingerprint();
+        if applied.fingerprint != fingerprint {
+            return Some(self.core.failure_from_error(
+                &req.ctx,
+                MetadataError::InvalidArgument(format!(
+                    "call_id {} reused with different command payload",
+                    dedup.call_id
+                )),
+                group_id,
+                mount_epoch,
+            ));
+        }
+
+        let route_epoch = self.core.authoritative_route_epoch().await;
+        match applied.result {
+            AppDataResponse::Fs(FsCommandResult::Ok(_)) => Some(self.core.success_with_route_epoch(
+                &req.ctx,
+                CloseWriteOutput {
+                    committed_size: req.intent.final_size,
+                    file_version: None,
+                },
+                group_id,
+                mount_epoch,
+                route_epoch,
+            )),
+            AppDataResponse::Fs(FsCommandResult::Err(err)) => {
+                Some(
+                    self.core
+                        .fatal_fs_failure(&req.ctx, err.errno, err.message, group_id, mount_epoch),
+                )
+            }
+            _ => Some(self.core.failure_from_error(
+                &req.ctx,
+                MetadataError::InvalidArgument(format!(
+                    "applied result for call_id {} is not a CloseWrite filesystem result",
+                    dedup.call_id
+                )),
+                group_id,
+                mount_epoch,
+            )),
+        }
+    }
+
+    fn close_write_replay_command(
+        &self,
+        req: &CloseWriteInput,
+        dedup: &DedupKey,
+        storage: &RocksDBStorage,
+    ) -> MetadataResult<(Command, Option<u64>, Option<u64>)> {
+        let lease_id = req
+            .lease_id
+            .ok_or_else(|| MetadataError::InvalidArgument("Missing lease_id".to_string()))?;
+        let token = req
+            .fencing_token
+            .as_ref()
+            .ok_or_else(|| MetadataError::InvalidArgument("Missing fencing_token".to_string()))?;
+        let token_block = token
+            .block_id
+            .ok_or_else(|| MetadataError::InvalidArgument("Missing fencing_token block_id".to_string()))?;
+        let inode_id = storage
+            .get_inode_by_data_handle(token_block.data_handle_id)?
+            .ok_or_else(|| {
+                MetadataError::StaleState(format!(
+                    "Missing owner for data_handle_id {}, refresh metadata state",
+                    token_block.data_handle_id
+                ))
+            })?;
+        let inode = storage
+            .get_inode(inode_id)?
+            .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {}", inode_id)))?;
+        let (group_id, mount_epoch) = self.core.mount_hints_for_mount(inode.mount_id);
+
+        Ok((
+            Command::CloseWrite {
+                dedup: dedup.clone(),
+                inode_id,
+                extents: req.intent.extents.clone(),
+                final_size: req.intent.final_size,
+                lease_id,
+                open_epoch: req.open_epoch,
+                lease_epoch: req.lease_epoch,
+            },
+            group_id,
+            mount_epoch,
+        ))
     }
 
     async fn execute_fsync(&self, req: FsyncBarrierInput) -> CoreResult<FsyncBarrierOutput> {

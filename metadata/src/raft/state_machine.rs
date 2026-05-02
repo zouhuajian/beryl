@@ -260,14 +260,21 @@ impl AppRaftStateMachine {
                 open_epoch,
                 lease_epoch,
                 ..
-            } => AppDataResponse::Fs(self.apply_close_write(
-                inode_id,
-                extents,
-                final_size,
-                lease_id,
-                open_epoch,
-                lease_epoch,
-            )),
+            } => {
+                let result = self.apply_close_write(
+                    inode_id,
+                    extents,
+                    final_size,
+                    lease_id,
+                    open_epoch,
+                    lease_epoch,
+                    &dedup_key,
+                    fingerprint,
+                    seq,
+                )?;
+                *self.applied_seq.write() = seq;
+                return Ok(AppDataResponse::Fs(result));
+            }
             Command::Truncate {
                 inode_id,
                 new_size,
@@ -1368,8 +1375,11 @@ impl AppRaftStateMachine {
         _lease_id: types::ids::LeaseId,
         _open_epoch: u64,
         lease_epoch: u64,
-    ) -> FsCommandResult {
-        let result: MetadataResult<FsOkResult> = (|| {
+        dedup_key: &DedupKey,
+        fingerprint: CommandFingerprint,
+        seq: u64,
+    ) -> MetadataResult<FsCommandResult> {
+        let prepared: MetadataResult<(Inode, FileLayout, Vec<BlockId>, FsOkResult)> = (|| {
             // Get inode
             let mut inode = self
                 .storage
@@ -1400,6 +1410,22 @@ impl AppRaftStateMachine {
                 }
             }
 
+            for extent in &extents {
+                let extent_end = extent.file_offset.checked_add(extent.len).ok_or_else(|| {
+                    MetadataError::InvalidArgument(format!(
+                        "Extent end overflows: file_offset={}, len={}",
+                        extent.file_offset, extent.len
+                    ))
+                })?;
+                if extent_end > final_size {
+                    return Err(MetadataError::InvalidArgument(format!(
+                        "Extent extends beyond final_size: extent_end={}, final_size={}",
+                        extent_end, final_size
+                    )));
+                }
+            }
+
+            let layout = self.storage.get_layout(inode_id)?;
             let now_ms = self.now_ms();
 
             // Update inode: append extents and update size/mtime/ctime/lease_epoch
@@ -1435,19 +1461,31 @@ impl AppRaftStateMachine {
                 unique_block_ids.insert(extent.block_id);
             }
 
-            // Increment refcount for each unique block_id (in same WriteBatch via storage)
-            // This is safe because apply() already checks idempotency via request_id
-            for block_id in unique_block_ids {
-                self.storage.increment_block_ref_count(block_id)?;
-            }
-
-            // Store updated inode
-            self.storage.put_inode(&inode)?;
-
-            Ok(FsOkResult::default())
+            Ok((
+                inode,
+                layout,
+                unique_block_ids.into_iter().collect(),
+                FsOkResult::default(),
+            ))
         })();
 
-        Self::fs_command_result(result)
+        let (inode, layout, block_ref_increments, ok) = match prepared {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint, seq)
+            }
+        };
+        let result = FsCommandResult::Ok(ok);
+        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Fs(result.clone()));
+        self.storage.close_write_with_apply_result_atomic(
+            &inode,
+            layout,
+            &block_ref_increments,
+            dedup_key,
+            applied_result,
+            seq,
+        )?;
+        Ok(result)
     }
 
     /// Apply Truncate command.
@@ -2487,6 +2525,7 @@ mod tests {
         let data_handle_id = DataHandleId::new(99);
         let inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
         storage.put_inode(&inode).unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
@@ -2545,6 +2584,168 @@ mod tests {
                 ..
             })))
         ));
+    }
+
+    #[test]
+    fn close_write_success_replay_returns_original_result_without_reapplying_mutation() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let inode_id = InodeId::new(70);
+        let data_handle_id = DataHandleId::new(170);
+        let inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
+        let layout = FileLayout::new(4096, 4096, 1);
+        storage.put_inode(&inode).unwrap();
+        storage.put_layout(inode_id, layout).unwrap();
+        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+        let dedup = dedup_for_test(90);
+        let command = Command::CloseWrite {
+            dedup: dedup.clone(),
+            inode_id,
+            extents: vec![types::fs::Extent {
+                file_offset: 0,
+                block_id,
+                block_offset: 0,
+                len: 64,
+                file_version: None,
+                block_stamp: None,
+            }],
+            final_size: 64,
+            lease_id: types::ids::LeaseId::new(1),
+            open_epoch: 1,
+            lease_epoch: 3,
+        };
+
+        expect_fs_ok(sm.apply(command.clone(), 5).unwrap());
+        let first_inode = storage.get_inode(inode_id).unwrap().unwrap();
+        let first_result = match storage.get_applied_result(&dedup).unwrap().unwrap().result {
+            AppDataResponse::Fs(result) => result,
+            other => panic!("unexpected applied result: {:?}", other),
+        };
+
+        expect_fs_ok(sm.apply(command, 6).unwrap());
+        let replayed_inode = storage.get_inode(inode_id).unwrap().unwrap();
+        let replayed_result = match storage.get_applied_result(&dedup).unwrap().unwrap().result {
+            AppDataResponse::Fs(result) => result,
+            other => panic!("unexpected applied result: {:?}", other),
+        };
+
+        assert_eq!(first_result, replayed_result);
+        assert_eq!(replayed_inode, first_inode);
+        assert_eq!(storage.get_layout(inode_id).unwrap(), layout);
+        assert_eq!(storage.get_block_ref_count(block_id).unwrap(), Some(1));
+        assert_eq!(storage.get_applied_seq().unwrap(), Some(6));
+        assert_eq!(sm.applied_seq(), 6);
+    }
+
+    #[test]
+    fn close_write_extent_data_handle_mismatch_persists_error_without_half_commit() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let inode_id = InodeId::new(71);
+        let data_handle_id = DataHandleId::new(171);
+        let inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
+        let layout = FileLayout::new(4096, 4096, 1);
+        storage.put_inode(&inode).unwrap();
+        storage.put_layout(inode_id, layout).unwrap();
+        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+        let bad_block_id = BlockId::new(DataHandleId::new(999), BlockIndex::new(0));
+        let command = Command::CloseWrite {
+            dedup: dedup_for_test(91),
+            inode_id,
+            extents: vec![types::fs::Extent {
+                file_offset: 0,
+                block_id: bad_block_id,
+                block_offset: 0,
+                len: 64,
+                file_version: None,
+                block_stamp: None,
+            }],
+            final_size: 64,
+            lease_id: types::ids::LeaseId::new(1),
+            open_epoch: 1,
+            lease_epoch: 3,
+        };
+
+        expect_fs_errno(sm.apply(command.clone(), 7).unwrap(), FsErrorCode::EInval);
+        expect_fs_errno(sm.apply(command, 8).unwrap(), FsErrorCode::EInval);
+
+        let stored = storage.get_inode(inode_id).unwrap().unwrap();
+        assert_eq!(stored, inode);
+        assert_eq!(storage.get_layout(inode_id).unwrap(), layout);
+        assert_eq!(storage.get_block_ref_count(bad_block_id).unwrap(), None);
+        assert_eq!(storage.get_applied_seq().unwrap(), Some(8));
+    }
+
+    #[test]
+    fn close_write_fingerprint_mismatch_does_not_reapply_mutation() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let inode_id = InodeId::new(72);
+        let data_handle_id = DataHandleId::new(172);
+        let inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
+        let layout = FileLayout::new(4096, 4096, 1);
+        storage.put_inode(&inode).unwrap();
+        storage.put_layout(inode_id, layout).unwrap();
+        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+        let dedup = dedup_for_test(92);
+        let first_block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+        let first = Command::CloseWrite {
+            dedup: dedup.clone(),
+            inode_id,
+            extents: vec![types::fs::Extent {
+                file_offset: 0,
+                block_id: first_block_id,
+                block_offset: 0,
+                len: 64,
+                file_version: None,
+                block_stamp: None,
+            }],
+            final_size: 64,
+            lease_id: types::ids::LeaseId::new(1),
+            open_epoch: 1,
+            lease_epoch: 3,
+        };
+        let second_block_id = BlockId::new(data_handle_id, BlockIndex::new(1));
+        let mismatch = Command::CloseWrite {
+            dedup,
+            inode_id,
+            extents: vec![types::fs::Extent {
+                file_offset: 64,
+                block_id: second_block_id,
+                block_offset: 0,
+                len: 64,
+                file_version: None,
+                block_stamp: None,
+            }],
+            final_size: 128,
+            lease_id: types::ids::LeaseId::new(1),
+            open_epoch: 1,
+            lease_epoch: 3,
+        };
+
+        expect_fs_ok(sm.apply(first, 9).unwrap());
+        let first_inode = storage.get_inode(inode_id).unwrap().unwrap();
+        let err = sm.apply(mismatch, 10).unwrap_err();
+
+        assert!(matches!(err, MetadataError::InvalidArgument(_)));
+        assert_eq!(storage.get_inode(inode_id).unwrap().unwrap(), first_inode);
+        assert_eq!(storage.get_block_ref_count(first_block_id).unwrap(), Some(1));
+        assert_eq!(storage.get_block_ref_count(second_block_id).unwrap(), None);
+        assert_eq!(storage.get_applied_seq().unwrap(), Some(9));
+        assert_eq!(sm.applied_seq(), 9);
     }
     #[test]
     #[ignore = "pending identity-pivot follow-ups"]
