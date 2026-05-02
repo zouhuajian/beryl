@@ -116,6 +116,10 @@ If a compatibility bridge is intentionally required, document:
 - enum names and values should reflect domain semantics, not implementation details
 - avoid overloaded names like `version`, `epoch`, `state`, `status` without a clear domain qualifier
 - prefer `route_epoch`, `worker_epoch`, `mount_epoch`, `file_version` style specificity
+- External/public filesystem RPC names should reflect HCFS-facing operations, not low-level POSIX syscall names.
+- Use `Delete` as the public path deletion operation. Do not reintroduce public `Unlink` / `Rmdir` RPCs unless the external contract explicitly changes.
+- Avoid names like `DeletePath` when the service and request contract already make the path-facing nature clear.
+- Internal/domain mutation names may still use precise terms such as `Unlink` and `Rmdir` when they model distinct metadata semantics.
 
 ## 8. Comments and documentation inside proto
 

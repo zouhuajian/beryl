@@ -457,16 +457,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn unlink(
-        &self,
-        request: Request<UnlinkPathRequestProto>,
-    ) -> Result<Response<UnlinkPathResponseProto>, Status> {
+    async fn delete(&self, request: Request<DeleteRequestProto>) -> Result<Response<DeleteResponseProto>, Status> {
         let req = request.into_inner();
         let req_ctx = request_context_from_proto(&req.header);
         guard_or_error!(
             self,
             req,
-            UnlinkPathResponseProto,
+            DeleteResponseProto,
             self.guard_chain.check_meta_write(&req_ctx)
         );
 
@@ -475,13 +472,13 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             Ok(resolved) => resolved,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, None);
-                return error_response!(UnlinkPathResponseProto, resp_header);
+                return error_response!(DeleteResponseProto, resp_header);
             }
         };
         guard_or_error!(
             self,
             req,
-            UnlinkPathResponseProto,
+            DeleteResponseProto,
             self.guard_chain
                 .check_parent_perm(&req_ctx, PermissionBits::WRITE, &req.path, &resolved)
         );
@@ -489,14 +486,14 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             Ok(parent_inode_id) => parent_inode_id,
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
-                return error_response!(UnlinkPathResponseProto, resp_header);
+                return error_response!(DeleteResponseProto, resp_header);
             }
         };
         let name = match resolved.expect_name() {
             Ok(name) => name.to_string(),
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
-                return error_response!(UnlinkPathResponseProto, resp_header);
+                return error_response!(DeleteResponseProto, resp_header);
             }
         };
 
@@ -505,94 +502,85 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
             worker_epoch: None,
         };
-        match self
-            .fs_core
-            .execute_unlink(UnlinkInput {
-                ctx: req_ctx.clone(),
-                parent_inode_id,
-                name,
-                freshness,
-            })
-            .await
-        {
-            Ok(success) => {
-                response_with_header!(
-                    UnlinkPathResponseProto::default(),
-                    ok_header_from_core_success(&req_ctx, &success)
-                )
-            }
-            Err(failure) => {
-                let header = header_from_core_failure(&req_ctx, &failure);
-                error_response!(UnlinkPathResponseProto, header)
-            }
-        }
-    }
 
-    #[instrument(skip(self), fields(call_id, client_id))]
-    async fn rmdir(&self, request: Request<RmdirPathRequestProto>) -> Result<Response<RmdirPathResponseProto>, Status> {
-        let req = request.into_inner();
-        let req_ctx = request_context_from_proto(&req.header);
-        guard_or_error!(
-            self,
-            req,
-            RmdirPathResponseProto,
-            self.guard_chain.check_meta_write(&req_ctx)
-        );
-
-        // Resolve path
-        let resolved = match self.path_resolver.resolve_path(&req.path) {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                let resp_header = self.header_from_path_error(&req.header, err, None);
-                return error_response!(RmdirPathResponseProto, resp_header);
+        let target_inode_id = match resolved.inode_id {
+            Some(inode_id) => inode_id,
+            None => {
+                let resp_header = self.header_from_path_error(
+                    &req.header,
+                    MetadataError::NotFound(format!("Entry not found: {}", name)),
+                    Some(&resolved.mount_ctx),
+                );
+                return error_response!(DeleteResponseProto, resp_header);
             }
         };
-        guard_or_error!(
-            self,
-            req,
-            RmdirPathResponseProto,
-            self.guard_chain
-                .check_parent_perm(&req_ctx, PermissionBits::WRITE, &req.path, &resolved)
-        );
-        let parent_inode_id = match resolved.expect_parent() {
-            Ok(parent_inode_id) => parent_inode_id,
+        let target_inode = match self.path_resolver.get_inode(target_inode_id) {
+            Ok(Some(inode)) => inode,
+            Ok(None) => {
+                let resp_header = self.header_from_path_error(
+                    &req.header,
+                    MetadataError::NotFound(format!("Target inode not found: {}", target_inode_id)),
+                    Some(&resolved.mount_ctx),
+                );
+                return error_response!(DeleteResponseProto, resp_header);
+            }
             Err(err) => {
                 let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
-                return error_response!(RmdirPathResponseProto, resp_header);
-            }
-        };
-        let name = match resolved.expect_name() {
-            Ok(name) => name.to_string(),
-            Err(err) => {
-                let resp_header = self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx));
-                return error_response!(RmdirPathResponseProto, resp_header);
+                return error_response!(DeleteResponseProto, resp_header);
             }
         };
 
-        let freshness = Freshness {
-            mount_epoch: req.header.as_ref().and_then(|h| h.mount_epoch),
-            route_epoch: req.header.as_ref().and_then(|h| h.route_epoch),
-            worker_epoch: None,
-        };
-        match self
-            .fs_core
-            .execute_rmdir(RmdirInput {
-                ctx: req_ctx.clone(),
-                parent_inode_id,
-                name,
-                freshness,
-            })
-            .await
-        {
-            Ok(success) => {
-                response_with_header!(
-                    RmdirPathResponseProto::default(),
-                    ok_header_from_core_success(&req_ctx, &success)
-                )
+        if target_inode.kind.is_dir() {
+            if req.recursive {
+                let resp_header = self.header_from_path_error(
+                    &req.header,
+                    MetadataError::NotSupported("recursive delete not yet implemented".to_string()),
+                    Some(&resolved.mount_ctx),
+                );
+                return error_response!(DeleteResponseProto, resp_header);
             }
-            Err(failure) => {
-                let header = header_from_core_failure(&req_ctx, &failure);
-                error_response!(RmdirPathResponseProto, header)
+            match self
+                .fs_core
+                .execute_rmdir(RmdirInput {
+                    ctx: req_ctx.clone(),
+                    parent_inode_id,
+                    name,
+                    freshness,
+                })
+                .await
+            {
+                Ok(success) => {
+                    response_with_header!(
+                        DeleteResponseProto::default(),
+                        ok_header_from_core_success(&req_ctx, &success)
+                    )
+                }
+                Err(failure) => {
+                    let header = header_from_core_failure(&req_ctx, &failure);
+                    error_response!(DeleteResponseProto, header)
+                }
+            }
+        } else {
+            match self
+                .fs_core
+                .execute_unlink(UnlinkInput {
+                    ctx: req_ctx.clone(),
+                    parent_inode_id,
+                    name,
+                    freshness,
+                })
+                .await
+            {
+                Ok(success) => {
+                    response_with_header!(
+                        DeleteResponseProto::default(),
+                        ok_header_from_core_success(&req_ctx, &success)
+                    )
+                }
+                Err(failure) => {
+                    let header = header_from_core_failure(&req_ctx, &failure);
+                    error_response!(DeleteResponseProto, header)
+                }
             }
         }
     }

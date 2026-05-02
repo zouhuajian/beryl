@@ -1878,6 +1878,61 @@ impl RocksDBStorage {
         self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
     }
 
+    fn delete_dentry_inode_batch(
+        &self,
+        parent_inode_id: InodeId,
+        name: &str,
+        inode_id: InodeId,
+        updated_parent: &Inode,
+    ) -> MetadataResult<WriteBatch> {
+        let cf_inodes = self.cf(CF_INODES)?;
+        let cf_dentries = self.cf(CF_DENTRIES)?;
+
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(cf_dentries, Self::encode_dentry_key(parent_inode_id, name));
+        batch.delete_cf(cf_inodes, Self::encode_inode_key(inode_id));
+        Self::batch_put_inode(&mut batch, cf_inodes, updated_parent)?;
+        Ok(batch)
+    }
+
+    /// Atomically persist empty-directory deletion with apply tracking.
+    pub fn delete_empty_dir_with_apply_result_atomic(
+        &self,
+        parent_inode_id: InodeId,
+        name: &str,
+        inode_id: InodeId,
+        updated_parent: &Inode,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let batch = self.delete_dentry_inode_batch(parent_inode_id, name, inode_id, updated_parent)?;
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+    }
+
+    /// Atomically persist non-directory deletion with namespace and optional data-handle cleanup.
+    pub fn delete_empty_file_with_apply_result_atomic(
+        &self,
+        parent_inode_id: InodeId,
+        name: &str,
+        inode_id: InodeId,
+        data_handle_id: Option<DataHandleId>,
+        updated_parent: &Inode,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let cf_meta = self.cf(CF_META)?;
+        let mut batch = self.delete_dentry_inode_batch(parent_inode_id, name, inode_id, updated_parent)?;
+        let layout_key = format!("layout:{}", inode_id.as_raw());
+        batch.delete_cf(cf_meta, layout_key.as_bytes());
+        if let Some(data_handle_id) = data_handle_id {
+            let owner_key = format!("data_handle_owner:{}", data_handle_id.as_raw());
+            batch.delete_cf(cf_meta, owner_key.as_bytes());
+        }
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+    }
+
     /// Atomically persist a rename namespace mutation.
     ///
     /// Overwritten targets must be prevalidated by the state machine as safe namespace-only removals.
@@ -2393,7 +2448,7 @@ mod tests {
         let layout = FileLayout::new(4096, 4096, 1);
 
         storage
-            .create_file_atomic(parent_inode_id, "file", &inode, &parent, layout.clone())
+            .create_file_atomic(parent_inode_id, "file", &inode, &parent, layout)
             .unwrap();
 
         let stored_inode = storage.get_inode(inode_id).unwrap().unwrap();
@@ -2436,22 +2491,95 @@ mod tests {
         };
 
         storage
-            .create_file_with_apply_result_atomic(
-                parent_inode_id,
-                "file",
-                &inode,
-                &parent,
-                layout.clone(),
-                &dedup,
-                applied,
-                7,
-            )
+            .create_file_with_apply_result_atomic(parent_inode_id, "file", &inode, &parent, layout, &dedup, applied, 7)
             .unwrap();
 
         assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), Some(inode_id));
         assert_eq!(storage.get_layout(inode_id).unwrap(), layout);
         assert!(storage.get_applied_result(&dedup).unwrap().is_some());
         assert_eq!(storage.get_applied_seq().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn delete_empty_file_with_apply_result_atomic_removes_namespace_data_owner_dedup_and_seq() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+
+        let parent_inode_id = InodeId::new(10);
+        let mut parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        let inode_id = InodeId::new(11);
+        let data_handle_id = DataHandleId::new(12);
+        let inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id, data_handle_id);
+        let layout = FileLayout::new(4096, 4096, 1);
+        storage.put_inode(&parent).unwrap();
+        storage
+            .create_file_atomic(parent_inode_id, "file", &inode, &parent, layout)
+            .unwrap();
+
+        parent.attrs.update_mtime_ctime(200);
+        let dedup = DedupKey::new(ClientId::new(103), types::CallId::new());
+        let applied = AppliedResult {
+            seq: 9,
+            fingerprint: CommandFingerprint(99),
+            result: AppDataResponse::Fs(crate::raft::types::FsCommandResult::ok()),
+            created_at_ms: now_millis(),
+            size_bytes: 0,
+        };
+
+        storage
+            .delete_empty_file_with_apply_result_atomic(
+                parent_inode_id,
+                "file",
+                inode_id,
+                Some(data_handle_id),
+                &parent,
+                &dedup,
+                applied,
+                9,
+            )
+            .unwrap();
+
+        assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), None);
+        assert!(storage.get_inode(inode_id).unwrap().is_none());
+        assert!(storage.get_layout(inode_id).is_err());
+        assert_eq!(storage.get_inode_by_data_handle(data_handle_id).unwrap(), None);
+        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
+        assert_eq!(storage.get_applied_seq().unwrap(), Some(9));
+    }
+
+    #[test]
+    fn delete_empty_dir_with_apply_result_atomic_removes_namespace_dedup_and_seq() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+
+        let parent_inode_id = InodeId::new(20);
+        let mut parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        let inode_id = InodeId::new(21);
+        let inode = Inode::new_dir(inode_id, FileAttrs::new(), parent.mount_id);
+        storage.put_inode(&parent).unwrap();
+        storage
+            .create_dir_atomic(parent_inode_id, "dir", &inode, &parent)
+            .unwrap();
+
+        parent.attrs.update_mtime_ctime(300);
+        let dedup = DedupKey::new(ClientId::new(104), types::CallId::new());
+        let applied = AppliedResult {
+            seq: 10,
+            fingerprint: CommandFingerprint(100),
+            result: AppDataResponse::Fs(crate::raft::types::FsCommandResult::ok()),
+            created_at_ms: now_millis(),
+            size_bytes: 0,
+        };
+
+        storage
+            .delete_empty_dir_with_apply_result_atomic(parent_inode_id, "dir", inode_id, &parent, &dedup, applied, 10)
+            .unwrap();
+
+        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), None);
+        assert!(storage.get_inode(inode_id).unwrap().is_none());
+        assert_eq!(storage.get_inode(parent_inode_id).unwrap().unwrap().attrs.mtime_ms, 300);
+        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
+        assert_eq!(storage.get_applied_seq().unwrap(), Some(10));
     }
 
     #[test]

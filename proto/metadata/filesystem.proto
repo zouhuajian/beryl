@@ -74,21 +74,13 @@ message CreatePathResponseProto {
   fs.FileAttrsProto attrs = 4;
 }
 
-message UnlinkPathRequestProto {
+message DeleteRequestProto {
   common.RequestHeaderProto header = 1;
   string path = 2;
+  bool recursive = 3;
 }
 
-message UnlinkPathResponseProto {
-  common.ResponseHeaderProto header = 1;
-}
-
-message RmdirPathRequestProto {
-  common.RequestHeaderProto header = 1;
-  string path = 2;
-}
-
-message RmdirPathResponseProto {
+message DeleteResponseProto {
   common.ResponseHeaderProto header = 1;
 }
 
@@ -350,8 +342,7 @@ service FileSystemServiceProto {
   // Core operations
   rpc Mkdir(MkdirPathRequestProto) returns (MkdirPathResponseProto);
   rpc Create(CreatePathRequestProto) returns (CreatePathResponseProto);
-  rpc Unlink(UnlinkPathRequestProto) returns (UnlinkPathResponseProto);
-  rpc Rmdir(RmdirPathRequestProto) returns (RmdirPathResponseProto);
+  rpc Delete(DeleteRequestProto) returns (DeleteResponseProto);
   rpc Rename(RenamePathRequestProto) returns (RenamePathResponseProto);
   rpc ListStatus(ListStatusPathRequestProto) returns (ListStatusPathResponseProto);
 

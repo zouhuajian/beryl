@@ -36,8 +36,7 @@ fn path_service_keeps_complete_filesystem_service_view() {
         "async fn get_file_status",
         "async fn mkdir",
         "async fn create",
-        "async fn unlink",
-        "async fn rmdir",
+        "async fn delete",
         "async fn rename",
         "async fn list_status",
         "async fn open(",
@@ -58,6 +57,34 @@ fn path_service_keeps_complete_filesystem_service_view() {
         assert!(
             source.contains(handler),
             "path_service.rs must continue to contain `{handler}`"
+        );
+    }
+}
+
+#[test]
+fn filesystem_proto_exposes_delete_without_unlink_or_rmdir_public_rpc() {
+    let proto = include_str!("../../proto/metadata/filesystem.proto");
+    for required in [
+        "message DeleteRequestProto",
+        "message DeleteResponseProto",
+        "rpc Delete(DeleteRequestProto) returns (DeleteResponseProto)",
+        "bool recursive",
+    ] {
+        assert!(proto.contains(required), "filesystem.proto must contain `{required}`");
+    }
+    for forbidden in [
+        "rpc Unlink(",
+        "rpc Rmdir(",
+        "UnlinkPathRequestProto",
+        "UnlinkPathResponseProto",
+        "RmdirPathRequestProto",
+        "RmdirPathResponseProto",
+        "DeletePathRequestProto",
+        "DeletePathResponseProto",
+    ] {
+        assert!(
+            !proto.contains(forbidden),
+            "filesystem.proto must not expose `{forbidden}`"
         );
     }
 }

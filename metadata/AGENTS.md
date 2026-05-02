@@ -54,6 +54,10 @@ Rules:
 - external filesystem-facing behavior must align with the filesystem entrypoint contract
 - do not introduce side-channel external APIs that bypass the entrypoint contract
 - internal services may exist, but they must not become competing external authority paths
+- FileSystemService is client-facing and should expose HCFS-style filesystem operations.
+- Public path deletion is represented by `Delete`.
+- Do not expose public `Unlink` / `Rmdir` handlers from `path_service`; those names are internal domain mutations only.
+- `path_service` may dispatch `Delete` to internal `FsCore::execute_unlink` or `FsCore::execute_rmdir`, but it must remain a path-first adapter over inode/dentry authority.
 
 ### 3.3 Rename and namespace rules
 

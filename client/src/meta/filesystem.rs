@@ -19,11 +19,11 @@ use parking_lot::RwLock;
 use proto::common::{ClientInfoProto, RequestHeaderProto, ResponseHeaderProto, WorkerEndpointInfoProto};
 use proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
 use proto::metadata::{
-    CloseWriteSessionRequestProto, CloseWriteSessionResponseProto, FsyncSessionRequestProto, FsyncSessionResponseProto,
-    GetFileLayoutByPathRequestProto, GetFileLayoutByPathResponseProto, GetFileStatusRequestProto,
-    GetFileStatusResponseProto, HflushSessionRequestProto, HflushSessionResponseProto, HsyncSessionRequestProto,
-    HsyncSessionResponseProto, ListStatusPathRequestProto, ListStatusPathResponseProto, OpenWriteByPathRequestProto,
-    OpenWriteByPathResponseProto,
+    CloseWriteSessionRequestProto, CloseWriteSessionResponseProto, DeleteRequestProto, DeleteResponseProto,
+    FsyncSessionRequestProto, FsyncSessionResponseProto, GetFileLayoutByPathRequestProto,
+    GetFileLayoutByPathResponseProto, GetFileStatusRequestProto, GetFileStatusResponseProto, HflushSessionRequestProto,
+    HflushSessionResponseProto, HsyncSessionRequestProto, HsyncSessionResponseProto, ListStatusPathRequestProto,
+    ListStatusPathResponseProto, OpenWriteByPathRequestProto, OpenWriteByPathResponseProto,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -58,6 +58,8 @@ pub enum FileSystemRpcMethod {
     ListStatus,
     /// `GetFileLayoutByPath`.
     GetFileLayoutByPath,
+    /// `Delete`.
+    Delete,
     /// `OpenWriteByPath`.
     OpenWriteByPath,
     /// `FsyncSession`.
@@ -72,10 +74,11 @@ pub enum FileSystemRpcMethod {
 
 impl FileSystemRpcMethod {
     #[cfg(test)]
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::GetFileStatus,
         Self::ListStatus,
         Self::GetFileLayoutByPath,
+        Self::Delete,
         Self::OpenWriteByPath,
         Self::FsyncSession,
         Self::HsyncSession,
@@ -90,7 +93,7 @@ struct ReplayPolicyMapping {
     policy: ReplayPolicy,
 }
 
-const FILESYSTEM_RPC_REPLAY_POLICIES: [ReplayPolicyMapping; 8] = [
+const FILESYSTEM_RPC_REPLAY_POLICIES: [ReplayPolicyMapping; 9] = [
     ReplayPolicyMapping {
         method: FileSystemRpcMethod::GetFileStatus,
         policy: ReplayPolicy::IdempotentRead,
@@ -102,6 +105,10 @@ const FILESYSTEM_RPC_REPLAY_POLICIES: [ReplayPolicyMapping; 8] = [
     ReplayPolicyMapping {
         method: FileSystemRpcMethod::GetFileLayoutByPath,
         policy: ReplayPolicy::IdempotentRead,
+    },
+    ReplayPolicyMapping {
+        method: FileSystemRpcMethod::Delete,
+        policy: ReplayPolicy::Mutation,
     },
     ReplayPolicyMapping {
         method: FileSystemRpcMethod::OpenWriteByPath,
@@ -177,6 +184,9 @@ pub trait FileSystemRpc: Send + Sync {
         &self,
         request: GetFileLayoutByPathRequestProto,
     ) -> Result<GetFileLayoutByPathResponseProto, tonic::Status>;
+
+    /// Call `Delete`.
+    async fn delete(&self, request: DeleteRequestProto) -> Result<DeleteResponseProto, tonic::Status>;
 
     /// Call `OpenWriteByPath`.
     async fn open_write_by_path(
@@ -269,6 +279,14 @@ impl FileSystemRpc for TonicFileSystemRpc {
         let mut client = self.client.lock().await;
         client
             .get_file_layout_by_path(tonic::Request::new(request))
+            .await
+            .map(|resp| resp.into_inner())
+    }
+
+    async fn delete(&self, request: DeleteRequestProto) -> Result<DeleteResponseProto, tonic::Status> {
+        let mut client = self.client.lock().await;
+        client
+            .delete(tonic::Request::new(request))
             .await
             .map(|resp| resp.into_inner())
     }
@@ -411,6 +429,19 @@ impl RpcOp<GetFileLayoutByPathResponseProto> {
             Arc::new(|resp| match resp {
                 ResponseEnvelope::GetFileLayoutByPath(v) => Ok(v),
                 other => Err(unexpected_response("GetFileLayoutByPath", other.op_name())),
+            }),
+        )
+    }
+}
+
+impl RpcOp<DeleteResponseProto> {
+    /// Build an operation for `Delete`.
+    pub fn delete(request: DeleteRequestProto) -> Self {
+        Self::new(
+            RequestEnvelope::Delete(request),
+            Arc::new(|resp| match resp {
+                ResponseEnvelope::Delete(v) => Ok(v),
+                other => Err(unexpected_response("Delete", other.op_name())),
             }),
         )
     }
@@ -980,6 +1011,7 @@ enum RequestEnvelope {
     GetFileStatus(GetFileStatusRequestProto),
     ListStatus(ListStatusPathRequestProto),
     GetFileLayoutByPath(GetFileLayoutByPathRequestProto),
+    Delete(DeleteRequestProto),
     OpenWriteByPath(OpenWriteByPathRequestProto),
     FsyncSession(FsyncSessionRequestProto),
     HsyncSession(HsyncSessionRequestProto),
@@ -993,6 +1025,7 @@ impl RequestEnvelope {
             RequestEnvelope::GetFileStatus(_) => FileSystemRpcMethod::GetFileStatus,
             RequestEnvelope::ListStatus(_) => FileSystemRpcMethod::ListStatus,
             RequestEnvelope::GetFileLayoutByPath(_) => FileSystemRpcMethod::GetFileLayoutByPath,
+            RequestEnvelope::Delete(_) => FileSystemRpcMethod::Delete,
             RequestEnvelope::OpenWriteByPath(_) => FileSystemRpcMethod::OpenWriteByPath,
             RequestEnvelope::FsyncSession(_) => FileSystemRpcMethod::FsyncSession,
             RequestEnvelope::HsyncSession(_) => FileSystemRpcMethod::HsyncSession,
@@ -1007,6 +1040,7 @@ impl RequestEnvelope {
             RequestEnvelope::GetFileStatus(_) => "GetFileStatus",
             RequestEnvelope::ListStatus(_) => "ListStatus",
             RequestEnvelope::GetFileLayoutByPath(_) => "GetFileLayoutByPath",
+            RequestEnvelope::Delete(_) => "Delete",
             RequestEnvelope::OpenWriteByPath(_) => "OpenWriteByPath",
             RequestEnvelope::FsyncSession(_) => "FsyncSession",
             RequestEnvelope::HsyncSession(_) => "HsyncSession",
@@ -1020,6 +1054,7 @@ impl RequestEnvelope {
             RequestEnvelope::GetFileStatus(req) => req.header.get_or_insert_with(default_request_header_proto),
             RequestEnvelope::ListStatus(req) => req.header.get_or_insert_with(default_request_header_proto),
             RequestEnvelope::GetFileLayoutByPath(req) => req.header.get_or_insert_with(default_request_header_proto),
+            RequestEnvelope::Delete(req) => req.header.get_or_insert_with(default_request_header_proto),
             RequestEnvelope::OpenWriteByPath(req) => req.header.get_or_insert_with(default_request_header_proto),
             RequestEnvelope::FsyncSession(req) => req.header.get_or_insert_with(default_request_header_proto),
             RequestEnvelope::HsyncSession(req) => req
@@ -1041,6 +1076,7 @@ impl RequestEnvelope {
             RequestEnvelope::GetFileStatus(req) => req.header.as_ref(),
             RequestEnvelope::ListStatus(req) => req.header.as_ref(),
             RequestEnvelope::GetFileLayoutByPath(req) => req.header.as_ref(),
+            RequestEnvelope::Delete(req) => req.header.as_ref(),
             RequestEnvelope::OpenWriteByPath(req) => req.header.as_ref(),
             RequestEnvelope::FsyncSession(req) => req.header.as_ref(),
             RequestEnvelope::HsyncSession(req) => req.fsync.as_ref().and_then(|inner| inner.header.as_ref()),
@@ -1054,6 +1090,7 @@ impl RequestEnvelope {
             RequestEnvelope::GetFileStatus(req) => Some(req.path.clone()),
             RequestEnvelope::ListStatus(req) => Some(req.path.clone()),
             RequestEnvelope::GetFileLayoutByPath(req) => Some(req.path.clone()),
+            RequestEnvelope::Delete(req) => Some(req.path.clone()),
             RequestEnvelope::OpenWriteByPath(req) => Some(req.path.clone()),
             RequestEnvelope::FsyncSession(req) => sessions.get(&req.file_handle).map(|s| s.path.clone()),
             RequestEnvelope::HsyncSession(req) => req
@@ -1117,6 +1154,7 @@ enum ResponseEnvelope {
     GetFileStatus(GetFileStatusResponseProto),
     ListStatus(ListStatusPathResponseProto),
     GetFileLayoutByPath(GetFileLayoutByPathResponseProto),
+    Delete(DeleteResponseProto),
     OpenWriteByPath(OpenWriteByPathResponseProto),
     FsyncSession(FsyncSessionResponseProto),
     HsyncSession(HsyncSessionResponseProto),
@@ -1130,6 +1168,7 @@ impl ResponseEnvelope {
             ResponseEnvelope::GetFileStatus(resp) => resp.header.as_ref(),
             ResponseEnvelope::ListStatus(resp) => resp.header.as_ref(),
             ResponseEnvelope::GetFileLayoutByPath(resp) => resp.header.as_ref(),
+            ResponseEnvelope::Delete(resp) => resp.header.as_ref(),
             ResponseEnvelope::OpenWriteByPath(resp) => resp.header.as_ref(),
             ResponseEnvelope::FsyncSession(resp) => resp.header.as_ref(),
             ResponseEnvelope::HsyncSession(resp) => resp.header.as_ref(),
@@ -1143,6 +1182,7 @@ impl ResponseEnvelope {
             ResponseEnvelope::GetFileStatus(_) => "GetFileStatus",
             ResponseEnvelope::ListStatus(_) => "ListStatus",
             ResponseEnvelope::GetFileLayoutByPath(_) => "GetFileLayoutByPath",
+            ResponseEnvelope::Delete(_) => "Delete",
             ResponseEnvelope::OpenWriteByPath(_) => "OpenWriteByPath",
             ResponseEnvelope::FsyncSession(_) => "FsyncSession",
             ResponseEnvelope::HsyncSession(_) => "HsyncSession",
@@ -1163,6 +1203,7 @@ async fn execute_request_on_rpc(
             .get_file_layout_by_path(req)
             .await
             .map(ResponseEnvelope::GetFileLayoutByPath),
+        RequestEnvelope::Delete(req) => rpc.delete(req).await.map(ResponseEnvelope::Delete),
         RequestEnvelope::OpenWriteByPath(req) => {
             rpc.open_write_by_path(req).await.map(ResponseEnvelope::OpenWriteByPath)
         }
@@ -1514,6 +1555,16 @@ mod tests {
             }
         }
 
+        async fn delete(&self, request: DeleteRequestProto) -> Result<DeleteResponseProto, tonic::Status> {
+            match self.next(RequestEnvelope::Delete(request)).await? {
+                ResponseEnvelope::Delete(resp) => Ok(resp),
+                other => Err(tonic::Status::internal(format!(
+                    "expected Delete response, got {}",
+                    other.op_name()
+                ))),
+            }
+        }
+
         async fn open_write_by_path(
             &self,
             request: OpenWriteByPathRequestProto,
@@ -1827,6 +1878,31 @@ mod tests {
             .expect("transport retry should succeed");
 
         assert_eq!(rpc.calls.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn delete_uses_delete_rpc_with_mutation_policy() {
+        let rpc = Arc::new(ScriptedRpc::new(vec![ScriptedResult::Response(
+            ResponseEnvelope::Delete(DeleteResponseProto {
+                header: Some(ok_header()),
+            }),
+        )]));
+
+        let machine = ActionMachine::new(rpc.clone(), vec![]);
+        let request = DeleteRequestProto {
+            header: Some(request_header()),
+            path: "/mnt/delete.bin".to_string(),
+            recursive: false,
+        };
+
+        machine
+            .call_with_refresh(ReplayPolicy::Mutation, RpcOp::delete(request))
+            .await
+            .expect("delete should use the mutation policy");
+
+        let calls = rpc.calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].op_name(), "Delete");
     }
 
     #[tokio::test]

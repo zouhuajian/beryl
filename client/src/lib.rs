@@ -7,7 +7,7 @@
 //!
 //! # Features
 //!
-//! - HCFS-style API: `open`, `read`, `write`, `rename`, `list`, `stat`
+//! - HCFS-style API: `open`, `read`, `write`, `delete`, `rename`, `list`, `stat`
 //! - Multi-Raft group routing
 //! - Consistency levels: `strong`, `normal` (bounded-stale), `weak`
 //! - Follower reads with msync/refresh compensation

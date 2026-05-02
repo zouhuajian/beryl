@@ -10,7 +10,7 @@ use crate::error::{MetadataError, MetadataResult};
 use crate::mount::{mount_prefix_matches_path, MountEntry, MountTable};
 use crate::raft::RocksDBStorage;
 use std::sync::Arc;
-use types::fs::InodeId;
+use types::fs::{Inode, InodeId};
 use types::ids::{MountId, ShardGroupId};
 
 /// Mount context: information about the mount point for a resolved path.
@@ -281,6 +281,10 @@ impl PathResolver {
         }
 
         Ok((src_resolved, dst_resolved))
+    }
+
+    pub(crate) fn get_inode(&self, inode_id: InodeId) -> MetadataResult<Option<Inode>> {
+        self.storage.get_inode(inode_id)
     }
 }
 

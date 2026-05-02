@@ -9,9 +9,11 @@ use crate::config::ClientConfig;
 use crate::consistency::ConsistencyLevel;
 use crate::error::{ClientError, ClientResult};
 use crate::meta::MetadataClient;
+use crate::meta::{replay_policy_for_method, ActionMachine, RpcOp, TonicFileSystemRpc};
 use crate::routing::{GroupRoleCache, RouteTable, WorkerSelector};
 use bytes::Bytes;
 use common::header::RequestHeader;
+use proto::metadata::DeleteRequestProto;
 use std::sync::Arc;
 use types::fs::InodeId;
 use types::ids::DataHandleId;
@@ -196,6 +198,26 @@ impl Client {
     pub async fn rename(&self, _src: &str, _dst: &str) -> ClientResult<()> {
         // TODO: Implement rename
         Err(ClientError::Unimplemented("rename not yet implemented".to_string()))
+    }
+
+    /// Delete a file, symlink, or empty directory.
+    pub async fn delete(&self, path: &str, recursive: bool) -> ClientResult<()> {
+        let endpoint = self
+            .config
+            .metadata_endpoints
+            .first()
+            .ok_or_else(|| ClientError::Metadata("No metadata endpoints available".to_string()))?;
+        let rpc = Arc::new(TonicFileSystemRpc::connect(endpoint).await?);
+        let machine = ActionMachine::new(rpc, self.config.metadata_endpoints.clone());
+        let client_id = self.config.inner.as_flat().get_i64("client.id").unwrap_or(0) as u64;
+        let request = DeleteRequestProto {
+            header: Some((&RequestHeader::new(types::ClientId::new(client_id))).into()),
+            path: path.to_string(),
+            recursive,
+        };
+        let op = RpcOp::delete(request);
+        let policy = replay_policy_for_method(op.method());
+        machine.call_with_refresh(policy, op).await.map(|_| ())
     }
 }
 

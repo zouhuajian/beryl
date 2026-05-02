@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use types::block::{BlockPlacement, BlockState};
-use types::fs::{FileAttrs, FsErrorCode, Inode, InodeId, InodeKind};
+use types::fs::{FileAttrs, FsErrorCode, Inode, InodeData, InodeId, InodeKind};
 use types::ids::{BlockId, ClientId, DataHandleId, MountId, ShardGroupId, ShardId, WorkerId};
 use types::layout::FileLayout;
 use types::lease::{FencingToken, Lease};
@@ -212,10 +212,18 @@ impl AppRaftStateMachine {
             }
             Command::Unlink {
                 parent_inode_id, name, ..
-            } => AppDataResponse::Fs(self.apply_unlink(parent_inode_id, name)),
+            } => {
+                let result = self.apply_unlink(parent_inode_id, name, &dedup_key, fingerprint, seq)?;
+                *self.applied_seq.write() = seq;
+                return Ok(AppDataResponse::Fs(result));
+            }
             Command::Rmdir {
                 parent_inode_id, name, ..
-            } => AppDataResponse::Fs(self.apply_rmdir(parent_inode_id, name)),
+            } => {
+                let result = self.apply_rmdir(parent_inode_id, name, &dedup_key, fingerprint, seq)?;
+                *self.applied_seq.write() = seq;
+                return Ok(AppDataResponse::Fs(result));
+            }
             Command::Rename {
                 src_parent_inode_id,
                 src_name,
@@ -974,8 +982,15 @@ impl AppRaftStateMachine {
     }
 
     /// Apply Unlink command.
-    fn apply_unlink(&self, parent_inode_id: InodeId, name: String) -> FsCommandResult {
-        let result: MetadataResult<FsOkResult> = (|| {
+    fn apply_unlink(
+        &self,
+        parent_inode_id: InodeId,
+        name: String,
+        dedup_key: &DedupKey,
+        fingerprint: CommandFingerprint,
+        seq: u64,
+    ) -> MetadataResult<FsCommandResult> {
+        let prepared: MetadataResult<(InodeId, Option<DataHandleId>, Inode, FsOkResult)> = (|| {
             // Get dentry
             let child_inode_id = self
                 .storage
@@ -995,9 +1010,6 @@ impl AppRaftStateMachine {
 
             let now_ms = self.now_ms();
 
-            // Delete dentry
-            self.storage.delete_dentry(parent_inode_id, &name)?;
-
             // Update parent directory mtime/ctime
             let parent_inode = self
                 .storage
@@ -1007,69 +1019,54 @@ impl AppRaftStateMachine {
             parent_attrs.update_mtime_ctime(now_ms);
             let mut updated_parent = parent_inode.clone();
             updated_parent.attrs = parent_attrs;
-            self.storage.put_inode(&updated_parent)?;
 
-            // Collect block_ids from child inode extents before deletion
-            let removed_block_ids = match &child_inode.data {
-                types::fs::InodeData::File { extents, .. } => {
-                    let mut block_ids = std::collections::HashSet::new();
-                    for extent in extents {
-                        block_ids.insert(extent.block_id);
+            let data_handle_id = match &child_inode.data {
+                InodeData::File { extents, .. } => {
+                    if !extents.is_empty() {
+                        return Err(MetadataError::NotSupported(
+                            "delete file with extents is not yet implemented".to_string(),
+                        ));
                     }
-                    block_ids
+                    Some(child_inode.current_data_handle_id)
                 }
-                _ => std::collections::HashSet::new(),
+                InodeData::Symlink { .. } => None,
+                InodeData::Dir => return Err(MetadataError::IsDir(format!("Cannot unlink directory: {}", name))),
             };
 
-            // TODO: Mark child inode as tombstone (simple deletion)
-            // TODO: In production, would mark tombstone and let GC handle block deletion
-            self.storage.delete_inode(child_inode_id)?;
-
-            // Update block reference counts (decrement for removed blocks)
-            let now_ms = self.now_ms();
-            let mut gc_intents = Vec::new();
-            for block_id in removed_block_ids {
-                let (_new_count, reached_zero) = self.storage.decrement_block_ref_count(block_id)?;
-                if reached_zero {
-                    // Generate GC intent (will be written to CF_GC_INTENTS)
-                    let intent_id = self.storage.generate_intent_id()?;
-                    let intent = crate::state::DeleteIntent {
-                        intent_id,
-                        block_id,
-                        reason: crate::state::DeleteIntentReason::Gc,
-                        created_at_ms: now_ms,
-                        not_before_ms: now_ms, // No grace period for unlink
-                        shard_group_id: None,
-                        guard_watermark: None,
-                        mount_epoch: None,
-                        guard_state_id: types::RaftLogId {
-                            term: 0,
-                            leader_node_id: 0,
-                            index: 0,
-                        },
-                        target_workers: Vec::new(),
-                        status: crate::state::DeleteIntentStatus::Pending,
-                        finished_at_ms: None,
-                        last_error_msg: None,
-                    };
-                    gc_intents.push(intent);
-                }
-            }
-
-            // Store GC intents (if any)
-            for intent in &gc_intents {
-                self.storage.put_delete_intent(intent)?;
-            }
-
-            Ok(FsOkResult::default())
+            Ok(FsOkResult::default()).map(|ok| (child_inode_id, data_handle_id, updated_parent, ok))
         })();
 
-        Self::fs_command_result(result)
+        let (child_inode_id, data_handle_id, updated_parent, ok) = match prepared {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint, seq)
+            }
+        };
+        let result = FsCommandResult::Ok(ok);
+        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Fs(result.clone()));
+        self.storage.delete_empty_file_with_apply_result_atomic(
+            parent_inode_id,
+            &name,
+            child_inode_id,
+            data_handle_id,
+            &updated_parent,
+            dedup_key,
+            applied_result,
+            seq,
+        )?;
+        Ok(result)
     }
 
     /// Apply Rmdir command.
-    fn apply_rmdir(&self, parent_inode_id: InodeId, name: String) -> FsCommandResult {
-        let result: MetadataResult<FsOkResult> = (|| {
+    fn apply_rmdir(
+        &self,
+        parent_inode_id: InodeId,
+        name: String,
+        dedup_key: &DedupKey,
+        fingerprint: CommandFingerprint,
+        seq: u64,
+    ) -> MetadataResult<FsCommandResult> {
+        let prepared: MetadataResult<(InodeId, Inode, FsOkResult)> = (|| {
             // Get dentry
             let child_inode_id = self
                 .storage
@@ -1097,9 +1094,6 @@ impl AppRaftStateMachine {
 
             let now_ms = self.now_ms();
 
-            // Delete dentry
-            self.storage.delete_dentry(parent_inode_id, &name)?;
-
             // Update parent directory mtime/ctime
             let parent_inode = self
                 .storage
@@ -1109,15 +1103,28 @@ impl AppRaftStateMachine {
             parent_attrs.update_mtime_ctime(now_ms);
             let mut updated_parent = parent_inode.clone();
             updated_parent.attrs = parent_attrs;
-            self.storage.put_inode(&updated_parent)?;
 
-            // Delete child inode
-            self.storage.delete_inode(child_inode_id)?;
-
-            Ok(FsOkResult::default())
+            Ok(FsOkResult::default()).map(|ok| (child_inode_id, updated_parent, ok))
         })();
 
-        Self::fs_command_result(result)
+        let (child_inode_id, updated_parent, ok) = match prepared {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint, seq)
+            }
+        };
+        let result = FsCommandResult::Ok(ok);
+        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Fs(result.clone()));
+        self.storage.delete_empty_dir_with_apply_result_atomic(
+            parent_inode_id,
+            &name,
+            child_inode_id,
+            &updated_parent,
+            dedup_key,
+            applied_result,
+            seq,
+        )?;
+        Ok(result)
     }
 
     /// Apply Rename command (atomic within mount).
@@ -1678,6 +1685,13 @@ mod tests {
     fn expect_fs_ok(raw: AppDataResponse) -> FsOkResult {
         match raw {
             AppDataResponse::Fs(FsCommandResult::Ok(ok)) => ok,
+            other => panic!("unexpected apply response: {:?}", other),
+        }
+    }
+
+    fn expect_fs_errno(raw: AppDataResponse, errno: FsErrorCode) {
+        match raw {
+            AppDataResponse::Fs(FsCommandResult::Err(err)) => assert_eq!(err.errno, errno),
             other => panic!("unexpected apply response: {:?}", other),
         }
     }
@@ -2676,5 +2690,156 @@ mod tests {
         assert_eq!(storage.get_dentry(parent_inode_id, "second").unwrap(), None);
         assert_eq!(storage.get_applied_seq().unwrap(), Some(7));
         assert_eq!(sm.applied_seq(), 7);
+    }
+
+    #[test]
+    fn unlink_empty_file_deletes_namespace_data_owner_and_replays_without_mutating_again() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let parent_inode_id = InodeId::new(10);
+        let mut parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        let inode_id = InodeId::new(11);
+        let data_handle_id = DataHandleId::new(12);
+        let inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id, data_handle_id);
+        storage.put_inode(&parent).unwrap();
+        parent.attrs.update_mtime_ctime(1);
+        storage
+            .create_file_atomic(parent_inode_id, "file", &inode, &parent, FileLayout::new(4096, 4096, 1))
+            .unwrap();
+
+        let dedup = dedup_for_test(80);
+        let command = Command::Unlink {
+            dedup: dedup.clone(),
+            parent_inode_id,
+            name: "file".to_string(),
+        };
+
+        expect_fs_ok(sm.apply(command.clone(), 1).unwrap());
+        assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), None);
+        assert!(storage.get_inode(inode_id).unwrap().is_none());
+        assert_eq!(storage.get_inode_by_data_handle(data_handle_id).unwrap(), None);
+        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
+
+        expect_fs_ok(sm.apply(command, 2).unwrap());
+        assert_eq!(storage.get_applied_seq().unwrap(), Some(2));
+        assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), None);
+    }
+
+    #[test]
+    fn unlink_file_with_extents_returns_not_supported_without_half_delete() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let parent_inode_id = InodeId::new(20);
+        let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        let inode_id = InodeId::new(21);
+        let data_handle_id = DataHandleId::new(22);
+        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id, data_handle_id);
+        if let InodeData::File { extents, .. } = &mut inode.data {
+            extents.push(types::fs::Extent {
+                file_offset: 0,
+                block_id: BlockId::new(data_handle_id, BlockIndex::new(0)),
+                block_offset: 0,
+                len: 128,
+                file_version: None,
+                block_stamp: None,
+            });
+        }
+        storage.put_inode(&parent).unwrap();
+        storage.put_inode(&inode).unwrap();
+        storage.put_dentry(parent_inode_id, "file", inode_id).unwrap();
+        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+        expect_fs_errno(
+            sm.apply(
+                Command::Unlink {
+                    dedup: dedup_for_test(81),
+                    parent_inode_id,
+                    name: "file".to_string(),
+                },
+                1,
+            )
+            .unwrap(),
+            FsErrorCode::ENotsup,
+        );
+
+        assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), Some(inode_id));
+        assert!(storage.get_inode(inode_id).unwrap().is_some());
+        assert_eq!(
+            storage.get_inode_by_data_handle(data_handle_id).unwrap(),
+            Some(inode_id)
+        );
+    }
+
+    #[test]
+    fn rmdir_empty_dir_deletes_namespace_and_replays_without_mutating_again() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let parent_inode_id = InodeId::new(30);
+        let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        let inode_id = InodeId::new(31);
+        let inode = Inode::new_dir(inode_id, FileAttrs::new(), parent.mount_id);
+        storage.put_inode(&parent).unwrap();
+        storage.put_inode(&inode).unwrap();
+        storage.put_dentry(parent_inode_id, "dir", inode_id).unwrap();
+
+        let dedup = dedup_for_test(82);
+        let command = Command::Rmdir {
+            dedup: dedup.clone(),
+            parent_inode_id,
+            name: "dir".to_string(),
+        };
+
+        expect_fs_ok(sm.apply(command.clone(), 1).unwrap());
+        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), None);
+        assert!(storage.get_inode(inode_id).unwrap().is_none());
+        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
+
+        expect_fs_ok(sm.apply(command, 2).unwrap());
+        assert_eq!(storage.get_applied_seq().unwrap(), Some(2));
+        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), None);
+    }
+
+    #[test]
+    fn rmdir_non_empty_dir_returns_directory_not_empty_and_preserves_namespace() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let parent_inode_id = InodeId::new(40);
+        let dir_inode_id = InodeId::new(41);
+        let child_inode_id = InodeId::new(42);
+        let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        let dir_inode = Inode::new_dir(dir_inode_id, FileAttrs::new(), parent.mount_id);
+        let child_inode = Inode::new_file(child_inode_id, FileAttrs::new(), parent.mount_id, DataHandleId::new(42));
+        storage.put_inode(&parent).unwrap();
+        storage.put_inode(&dir_inode).unwrap();
+        storage.put_inode(&child_inode).unwrap();
+        storage.put_dentry(parent_inode_id, "dir", dir_inode_id).unwrap();
+        storage.put_dentry(dir_inode_id, "child", child_inode_id).unwrap();
+
+        let dedup = dedup_for_test(83);
+        let command = Command::Rmdir {
+            dedup: dedup.clone(),
+            parent_inode_id,
+            name: "dir".to_string(),
+        };
+
+        expect_fs_errno(sm.apply(command.clone(), 1).unwrap(), FsErrorCode::ENotEmpty);
+        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), Some(dir_inode_id));
+        assert!(storage.get_inode(dir_inode_id).unwrap().is_some());
+        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
+
+        expect_fs_errno(sm.apply(command, 2).unwrap(), FsErrorCode::ENotEmpty);
+        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), Some(dir_inode_id));
     }
 }
