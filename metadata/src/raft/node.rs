@@ -191,7 +191,7 @@ impl AppRaftNode {
             }
         }
 
-        f(&self.state_machine)
+        f(self.state_machine.as_ref())
     }
 
     /// Get Raft metrics for monitoring.

@@ -46,6 +46,13 @@ These rules apply everywhere in the repo:
 - recoverable business / protocol / consistency failures use gRPC OK + `ResponseHeader.error`
 - transport / auth / framework failures use non-OK gRPC status
 - direct client→worker paths must preserve route / epoch / fencing validation
+- Metadata state freshness is represented only by repeated `GroupStateWatermark`.
+- `GroupStateWatermark` is `{ group_id, state_id: RaftLogId }`.
+- `state_id` means state-machine applied `RaftLogId`.
+- Follower successful responses must not advance client state cache.
+- Production metadata msync is single-group; multi-group msync is future work.
+- `applied_seq` must not be reintroduced as runtime, storage, snapshot, header, or client state.
+- `route_epoch` / `mount_epoch` / `worker_epoch` are separate freshness domains.
 - breaking changes are allowed; do not keep compatibility bridges unless explicitly requested
 
 ## 2. Directory map

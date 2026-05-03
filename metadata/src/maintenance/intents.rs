@@ -11,7 +11,7 @@ use crate::mount::MountTable;
 use crate::raft::RocksDBStorage;
 use crate::state::{DeleteIntent, DeleteIntentReason};
 use std::sync::Arc;
-use types::group_watermark::{GroupWatermark, MountEpoch};
+use types::group_watermark::{GroupStateWatermark, MountEpoch};
 use types::ids::{BlockId, ShardGroupId, WorkerId};
 use types::RaftLogId;
 
@@ -39,11 +39,11 @@ impl DeleteIntentBuilder {
         guard_state_id: RaftLogId,
         target_workers: Vec<WorkerId>,
     ) -> MetadataResult<DeleteIntent> {
-        // Resolve shard_group_id from block_id (TODO-1)
-        let shard_group_id = self.resolve_shard_group_id(block_id)?;
+        // Resolve group_id from block_id (TODO-1)
+        let group_id = self.resolve_group_id(block_id)?;
 
         // Build guard_watermark
-        let guard_watermark = GroupWatermark::new(shard_group_id, guard_state_id);
+        let guard_watermark = GroupStateWatermark::new(group_id, guard_state_id);
 
         // Get mount_epoch from mount_table
         let mount_epoch = MountEpoch::new(self.mount_table.version());
@@ -54,7 +54,7 @@ impl DeleteIntentBuilder {
             reason,
             created_at_ms,
             not_before_ms,
-            shard_group_id: Some(shard_group_id),
+            shard_group_id: Some(group_id),
             guard_watermark: Some(guard_watermark),
             mount_epoch: Some(mount_epoch),
             guard_state_id,
@@ -65,8 +65,8 @@ impl DeleteIntentBuilder {
         })
     }
 
-    /// Resolve shard_group_id from block_id using inode->mount owner.
-    fn resolve_shard_group_id(&self, block_id: BlockId) -> MetadataResult<ShardGroupId> {
+    /// Resolve group_id from block_id using inode->mount owner.
+    fn resolve_group_id(&self, block_id: BlockId) -> MetadataResult<ShardGroupId> {
         owner_group_for_block(&self.storage, &self.mount_table, block_id)
     }
 }

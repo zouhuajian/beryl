@@ -411,7 +411,10 @@ fn freshness_validator_rejects_stale_state_watermark() {
     let group_id = ShardGroupId::new(4);
     let validator = FreshnessValidator::new(Arc::new(MemoryStateStore::new()), Arc::new(MountTable::new()));
     let mut ctx = request_context();
-    ctx.caller.state_id = Some(types::RaftLogId::new(1, 7, 12));
+    ctx.caller.state = vec![types::GroupStateWatermark::new(
+        group_id,
+        types::RaftLogId::new(1, 7, 12),
+    )];
 
     let failure = validator
         .validate_stale_state(
@@ -433,7 +436,7 @@ fn freshness_validator_rejects_stale_state_watermark() {
     );
     assert_eq!(failure.group_id, Some(group_id.as_raw()));
     assert_eq!(failure.mount_epoch, Some(9));
-    assert_eq!(failure.state_id, Some(types::RaftLogId::new(1, 7, 12)));
+    assert!(failure.state.is_empty());
 
     let unknown = validator
         .validate_stale_state(&ctx, None, Some(group_id.as_raw()), Some(9))
@@ -796,7 +799,6 @@ async fn same_size_truncate_uses_raft_dedup_and_rejects_payload_mismatch() {
     assert_eq!(second.payload.new_size, 1024);
     assert_eq!(storage.get_block_ref_count(block_id).unwrap(), Some(1));
     assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 0);
-    assert!(storage.get_applied_seq().unwrap().is_some());
 
     let mismatch = fs_core
         .execute_truncate(TruncateInput {
@@ -910,19 +912,16 @@ async fn create_mount_route_epoch_progression_rejects_stale_client_route_epoch()
 
     let stale_route_epoch = storage.get_route_epoch().unwrap().as_u64();
     state_machine
-        .apply(
-            Command::CreateMount {
-                dedup: DedupKey::system(),
-                mount_id,
-                mount_prefix: "/mnt/route".to_string(),
-                mount_kind: MountKind::External,
-                ufs_uri: Some("ufs://route".to_string()),
-                data_io_policy: DataIoPolicy::Allow,
-                namespace_owner_group_id: ShardGroupId::new(6),
-                root_inode_id,
-            },
-            1,
-        )
+        .apply(Command::CreateMount {
+            dedup: DedupKey::system(),
+            mount_id,
+            mount_prefix: "/mnt/route".to_string(),
+            mount_kind: MountKind::External,
+            ufs_uri: Some("ufs://route".to_string()),
+            data_io_policy: DataIoPolicy::Allow,
+            namespace_owner_group_id: ShardGroupId::new(6),
+            root_inode_id,
+        })
         .unwrap();
 
     let advanced_route_epoch = storage.get_route_epoch().unwrap().as_u64();
@@ -974,30 +973,24 @@ async fn delete_mount_route_epoch_progression_rejects_stale_client_route_epoch()
         .unwrap();
 
     state_machine
-        .apply(
-            Command::CreateMount {
-                dedup: DedupKey::system(),
-                mount_id,
-                mount_prefix: "/mnt/delete-route".to_string(),
-                mount_kind: MountKind::External,
-                ufs_uri: Some("ufs://delete-route".to_string()),
-                data_io_policy: DataIoPolicy::Allow,
-                namespace_owner_group_id: ShardGroupId::new(8),
-                root_inode_id,
-            },
-            1,
-        )
+        .apply(Command::CreateMount {
+            dedup: DedupKey::system(),
+            mount_id,
+            mount_prefix: "/mnt/delete-route".to_string(),
+            mount_kind: MountKind::External,
+            ufs_uri: Some("ufs://delete-route".to_string()),
+            data_io_policy: DataIoPolicy::Allow,
+            namespace_owner_group_id: ShardGroupId::new(8),
+            root_inode_id,
+        })
         .unwrap();
 
     let stale_route_epoch = storage.get_route_epoch().unwrap().as_u64();
     state_machine
-        .apply(
-            Command::DeleteMount {
-                dedup: DedupKey::system(),
-                mount_id,
-            },
-            2,
-        )
+        .apply(Command::DeleteMount {
+            dedup: DedupKey::system(),
+            mount_id,
+        })
         .unwrap();
 
     let advanced_route_epoch = storage.get_route_epoch().unwrap().as_u64();

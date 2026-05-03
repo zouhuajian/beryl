@@ -5,6 +5,7 @@ syntax = "proto3";
 
 package common;
 
+import "common/common.proto";
 import "common/errors.proto";
 
 // ============================================================================
@@ -64,10 +65,12 @@ message RequestHeaderProto {
   /// This is NOT a generic extension point for protocol-critical fields.
   CallerContextProto caller_context = 6;
 
-  /// Optional state ID for consistency checking (read gating) and routing.
-  /// When provided, a node must satisfy last_applied >= state_id to serve certain reads.
-  /// Leaders should return current/applied state in response headers to advance the client watermark.
-  RaftLogIdProto state_id = 7;
+  /// Client-required metadata state-machine applied watermarks.
+  /// Each entry is scoped by metadata Raft owner group. A follower may serve a
+  /// gated read only after its local applied state for the requested group has
+  /// reached the requested GroupStateWatermark.state_id. Empty means no state
+  /// freshness requirement.
+  repeated GroupStateWatermarkProto state = 7;
 
   /// Optional retry count from client perspective (0 = first attempt).
   int32 retry_count = 8;
@@ -123,6 +126,19 @@ message RaftLogIdProto {
   uint64 index = 3;
 }
 
+/// Metadata state-machine applied watermark for one owner group.
+///
+/// group_id identifies the metadata Raft owner group. state_id is that group's
+/// state-machine applied RaftLogId. It is not a committed index, append index,
+/// private apply counter, route_epoch, mount_epoch, worker_epoch, call_id, or request_id.
+message GroupStateWatermarkProto {
+  /// Metadata Raft owner group this watermark belongs to.
+  ShardGroupIdProto group_id = 1;
+
+  /// State-machine applied RaftLogId for this group.
+  RaftLogIdProto state_id = 2;
+}
+
 /// Response header carried with every RPC response.
 ///
 /// IMPORTANT gRPC note:
@@ -141,14 +157,16 @@ message ResponseHeaderProto {
   /// For errors, this field contains all error information (class, code, reason, retry_after_ms).
   optional ErrorDetailProto error = 2;
 
-  /// Client-visible state watermark returned by the server.
-  /// This is the latest state the client has "seen" from the server (typically equals last_applied_log_id),
-  /// and should be used to advance the client's consistency watermark for subsequent requests.
-  RaftLogIdProto state_id = 4;
+  /// Server-authorized client state cache update.
+  /// Leaders and msync may return one or more applied watermarks. Follower
+  /// successful responses must return this field empty. Empty means "do not
+  /// update client state cache"; stale-state is expressed only through the
+  /// canonical stale-state error.
+  repeated GroupStateWatermarkProto state = 4;
 
   /// Group ID that this response applies to (required for metadata-plane RPCs).
   /// Server must echo back the actual group_id that processed this request.
-  /// Client must use this group_id (not the request group_id) as the key for updating group->state_id cache,
+  /// Client must use this group_id (not the request group_id) as the key for updating group->watermark cache,
   /// to avoid updating the wrong group when route epoch changes.
   /// Aligns with types::ShardGroupId (u64).
   uint64 group_id = 5;

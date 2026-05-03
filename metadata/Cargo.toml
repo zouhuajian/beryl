@@ -57,6 +57,7 @@ name = "metadata"
 path = "src/bin/main.rs"
 
 [dev-dependencies]
+client = { path = "../client" }
 tempfile = { workspace = true }
 tokio-test = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }

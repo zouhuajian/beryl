@@ -7,7 +7,7 @@ use crate::{
     error::canonical::{CanonicalError, ErrorClass as CanonicalErrorClass, ErrorCode as CanonicalErrorCode},
     time::Deadline,
 };
-use types::{CallId, ClientId, RaftLogId};
+use types::{CallId, ClientId, GroupStateWatermark};
 
 /// Client information for correlation and routing.
 #[derive(Clone, Debug)]
@@ -38,8 +38,11 @@ pub struct RequestHeader {
     pub traceparent: Option<String>,
     /// Optional caller context for auditing/diagnostics.
     pub caller_context: Option<CallerContext>,
-    /// Optional state ID for consistency checking (read gating) and routing.
-    pub state_id: Option<RaftLogId>,
+    /// Client-required state-machine applied watermarks.
+    ///
+    /// Each watermark is scoped by metadata Raft owner group. Empty means the
+    /// request has no state freshness requirement.
+    pub state: Vec<GroupStateWatermark>,
     /// Optional retry count from client perspective (0 = first attempt).
     pub retry_count: i32,
     /// Optional route epoch observed by client.
@@ -89,10 +92,11 @@ pub struct ResponseHeader {
     pub status: RpcStatus,
     /// Canonical error detail (single source of truth for error semantics).
     pub canonical_error: Option<CanonicalError>,
-    /// Client-visible state watermark returned by the server.
-    /// This is the latest state the client has "seen" from the server (typically equals last_applied_log_id),
-    /// and should be used to advance the client's consistency watermark for subsequent requests.
-    pub state_id: Option<RaftLogId>,
+    /// Server-authorized client state cache updates.
+    ///
+    /// Leaders and msync may return non-empty state. Follower successful
+    /// responses must leave this empty. Empty means no cache update, not stale.
+    pub state: Vec<GroupStateWatermark>,
     /// Group ID that this response applies to (required for metadata-plane RPCs).
     /// Server must echo back the actual group_id that processed this request.
     pub group_id: Option<u64>,
@@ -187,7 +191,7 @@ impl RequestHeader {
             deadline,
             traceparent: None,
             caller_context: None,
-            state_id: None,
+            state: Vec::new(),
             retry_count: 0,
             group_id: None,
             mount_epoch: None,
@@ -199,9 +203,9 @@ impl RequestHeader {
         }
     }
 
-    /// Set the state ID for consistency checking.
-    pub fn with_state_id(mut self, state_id: RaftLogId) -> Self {
-        self.state_id = Some(state_id);
+    /// Set the state watermark vector for consistency checking.
+    pub fn with_state(mut self, state: Vec<GroupStateWatermark>) -> Self {
+        self.state = state;
         self
     }
 
@@ -255,7 +259,7 @@ impl RequestHeader {
 
     /// Create a child header (for nested calls).
     ///
-    /// Inherits client_id, deadline, traceparent, state_id, and group_id.
+    /// Inherits client_id, deadline, traceparent, state watermarks, and group_id.
     /// Generates a new call_id by default.
     pub fn child(&self) -> Self {
         Self {
@@ -267,7 +271,7 @@ impl RequestHeader {
             deadline: self.deadline,
             traceparent: self.traceparent.clone(),
             caller_context: self.caller_context.clone(),
-            state_id: self.state_id,
+            state: self.state.clone(),
             retry_count: 0,
             group_id: self.group_id,
             mount_epoch: self.mount_epoch,
@@ -290,7 +294,7 @@ impl RequestHeader {
             deadline: self.deadline,
             traceparent: self.traceparent.clone(),
             caller_context: self.caller_context.clone(),
-            state_id: self.state_id,
+            state: self.state.clone(),
             retry_count: self.retry_count + 1,
             group_id: self.group_id,
             mount_epoch: self.mount_epoch,
@@ -307,7 +311,7 @@ impl RequestHeader {
     /// This function creates metadata entries for:
     /// - x-call-id: Call ID (UUID string)
     /// - x-client-id: Client ID (u64 as string)
-    /// - x-state-id: State ID (term:leader_node_id:index as string, if present)
+    /// - x-state-id: Group state watermarks as group:term:leader_node_id:index entries
     /// - traceparent: W3C Trace Context (if present)
     /// - grpc-timeout: Deadline as gRPC timeout format (e.g., "30S")
     ///
@@ -322,7 +326,7 @@ impl RequestHeader {
     /// This function extracts:
     /// - x-call-id: Call ID
     /// - x-client-id: Client ID
-    /// - x-state-id: State ID (term:leader_node_id:index)
+    /// - x-state-id: Group state watermarks as group:term:leader_node_id:index entries
     /// - traceparent: W3C Trace Context
     /// - grpc-timeout: Deadline (converted from timeout to absolute deadline)
     ///
@@ -343,7 +347,7 @@ impl ResponseHeader {
             client,
             status: RpcStatus::Ok,
             canonical_error: None,
-            state_id: None,
+            state: Vec::new(),
             group_id: None,
             mount_epoch: None,
             route_epoch: None,
@@ -374,16 +378,16 @@ impl ResponseHeader {
             client,
             status,
             canonical_error: Some(canonical_error),
-            state_id: None,
+            state: Vec::new(),
             group_id: None,
             mount_epoch: None,
             route_epoch: None,
         }
     }
 
-    /// Set the state ID.
-    pub fn with_state_id(mut self, state_id: RaftLogId) -> Self {
-        self.state_id = Some(state_id);
+    /// Set the state watermark vector.
+    pub fn with_state(mut self, state: Vec<GroupStateWatermark>) -> Self {
+        self.state = state;
         self
     }
 

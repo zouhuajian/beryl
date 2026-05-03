@@ -131,7 +131,23 @@ Rules:
 
 Metadata must prefer actionable refresh semantics over generic failure responses.
 
-## 8. Path traversal and caching rules
+## 8. Metadata state freshness invariants
+
+Rules:
+
+- metadata state freshness is represented only by repeated `GroupStateWatermark`
+- `GroupStateWatermark` is `{ group_id, state_id: RaftLogId }`
+- `state_id` means state-machine applied `RaftLogId`
+- `state_id` must not mean committed index, append index, `applied_seq`, `route_epoch`, `mount_epoch`, `worker_epoch`, `call_id`, or `request_id`
+- `RequestHeader.state` is the client-required applied watermark
+- `ResponseHeader.state` is a server-authorized client state-cache update
+- follower successful responses must return empty `ResponseHeader.state`
+- empty `ResponseHeader.state` means "do not update client state cache"; it is not stale-state
+- stale-state must be expressed through the canonical stale-state error
+- `applied_seq` must not be reintroduced as runtime, storage, snapshot, header, or client state
+- `route_epoch`, `mount_epoch`, and `worker_epoch` are separate config freshness domains
+
+## 9. Path traversal and caching rules
 
 Rules:
 
@@ -142,7 +158,7 @@ Rules:
 
 A metadata cache that can outvote authority is a bug.
 
-## 9. Coding rules for this directory
+## 10. Coding rules for this directory
 
 - keep authority logic explicit and local
 - prefer semantically named types over generic structs/maps
@@ -151,7 +167,7 @@ A metadata cache that can outvote authority is a bug.
 - avoid helper abstractions that blur authority boundaries
 - comments should explain invariants and recovery semantics, not restate syntax
 
-## 10. Tests required for changes here
+## 11. Tests required for changes here
 
 A meaningful metadata change should usually include the relevant subset of:
 
@@ -167,7 +183,7 @@ A meaningful metadata change should usually include the relevant subset of:
 
 Tests should assert semantic class/reason fields when structured errors exist.
 
-## 11. Pre-merge checklist
+## 12. Pre-merge checklist
 
 Before submitting a metadata change, verify:
 

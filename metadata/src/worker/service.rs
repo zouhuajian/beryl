@@ -109,9 +109,13 @@ impl MetadataWorkerServiceImpl {
         if let Some(gid) = group_id {
             header = header.with_group_id(gid);
         }
-        // Add state_id if available from raft_node
-        if let Some(sid) = self.raft_node.get_last_applied_state_id() {
-            header = header.with_state_id(sid);
+        if self.raft_node.is_leader() {
+            if let (Some(gid), Some(sid)) = (group_id, self.raft_node.get_last_applied_state_id()) {
+                header = header.with_state(vec![types::GroupStateWatermark::new(
+                    types::ShardGroupId::new(gid),
+                    sid,
+                )]);
+            }
         }
         header
     }

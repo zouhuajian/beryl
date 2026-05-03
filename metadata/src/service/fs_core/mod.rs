@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use tracing::debug;
 use types::fs::{FsErrorCode, InodeId};
 use types::ids::{MountId, ShardGroupId};
-use types::RaftLogId;
+use types::{GroupStateWatermark, RaftLogId};
 
 use freshness::{FreshnessValidator, StaleStateStatus};
 
@@ -111,12 +111,23 @@ impl FsCore {
         Ok(DedupKey::new(client_id, caller_ctx.client.call_id))
     }
 
-    fn state_id_from_ctx(ctx: &RequestContext) -> Option<RaftLogId> {
-        FreshnessValidator::state_id_from_ctx(ctx)
-    }
-
     async fn authoritative_route_epoch(&self) -> Option<u64> {
         self.freshness_validator.authoritative_route_epoch().await
+    }
+
+    fn response_state_for_success(&self, group_id: Option<u64>) -> Vec<GroupStateWatermark> {
+        let (Some(group_id), Some(raft_node)) = (group_id, self.raft_node.as_ref()) else {
+            // A response without a known owner group cannot authorize a state cache advance.
+            return Vec::new();
+        };
+        if !raft_node.is_leader() {
+            return Vec::new();
+        }
+        raft_node
+            .get_last_applied_state_id()
+            .map(|state_id| GroupStateWatermark::new(ShardGroupId::new(group_id), state_id))
+            .into_iter()
+            .collect()
     }
 
     fn success<T>(
@@ -131,7 +142,7 @@ impl FsCore {
 
     fn success_with_route_epoch<T>(
         &self,
-        ctx: &RequestContext,
+        _ctx: &RequestContext,
         payload: T,
         group_id: Option<u64>,
         mount_epoch: Option<u64>,
@@ -142,7 +153,7 @@ impl FsCore {
             group_id,
             mount_epoch,
             route_epoch,
-            state_id: Self::state_id_from_ctx(ctx),
+            state: self.response_state_for_success(group_id),
         })
     }
 

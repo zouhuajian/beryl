@@ -9,7 +9,7 @@
 use crate::header::{AuthnType, RequestHeader};
 use crate::time::Deadline;
 use std::str::FromStr;
-use types::{CallId, ClientId, RaftLogId};
+use types::{CallId, ClientId, GroupStateWatermark, RaftLogId, ShardGroupId};
 
 /// Header keys for context propagation.
 pub const HEADER_CALL_ID: &str = "x-call-id";
@@ -43,9 +43,22 @@ impl RequestHeaderCodec {
             header.client.client_id.as_raw().to_string(),
         ));
 
-        // x-state-id (if present)
-        if let Some(ref state_id) = header.state_id {
-            let state_id_str = format!("{}:{}:{}", state_id.term, state_id.leader_node_id, state_id.index);
+        // x-state-id (if present): comma-separated group:term:leader:index entries.
+        if !header.state.is_empty() {
+            let state_id_str = header
+                .state
+                .iter()
+                .map(|watermark| {
+                    format!(
+                        "{}:{}:{}:{}",
+                        watermark.group_id.as_raw(),
+                        watermark.state_id.term,
+                        watermark.state_id.leader_node_id,
+                        watermark.state_id.index
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             headers.push((HEADER_STATE_ID.to_string(), state_id_str));
         }
 
@@ -111,7 +124,7 @@ impl RequestHeaderCodec {
     {
         let mut call_id = None;
         let mut client_id = None;
-        let mut state_id = None;
+        let mut state = Vec::new();
         let mut traceparent = None;
         let mut deadline_ms = None;
         let mut mount_epoch = None;
@@ -129,15 +142,21 @@ impl RequestHeaderCodec {
                     client_id = value.parse::<u64>().ok().map(ClientId::new);
                 }
                 k if k.eq_ignore_ascii_case(HEADER_STATE_ID) => {
-                    // Parse format: "term:leader_node_id:index"
-                    let parts: Vec<&str> = value.split(':').collect();
-                    if parts.len() == 3 {
-                        if let (Ok(term), Ok(leader_node_id), Ok(index)) = (
-                            parts[0].parse::<u64>(),
-                            parts[1].parse::<u64>(),
-                            parts[2].parse::<u64>(),
-                        ) {
-                            state_id = Some(RaftLogId::new(term, leader_node_id, index));
+                    // Parse format: "group:term:leader_node_id:index[,group:term:leader_node_id:index]"
+                    for entry in value.split(',') {
+                        let parts: Vec<&str> = entry.split(':').collect();
+                        if parts.len() == 4 {
+                            if let (Ok(group_id), Ok(term), Ok(leader_node_id), Ok(index)) = (
+                                parts[0].parse::<u64>(),
+                                parts[1].parse::<u64>(),
+                                parts[2].parse::<u64>(),
+                                parts[3].parse::<u64>(),
+                            ) {
+                                state.push(GroupStateWatermark::new(
+                                    ShardGroupId::new(group_id),
+                                    RaftLogId::new(term, leader_node_id, index),
+                                ));
+                            }
                         }
                     }
                 }
@@ -210,7 +229,7 @@ impl RequestHeaderCodec {
                 .unwrap_or_else(|| Deadline::from_now(std::time::Duration::from_secs(30))),
             traceparent,
             caller_context: None,
-            state_id,
+            state,
             retry_count: 0,
             group_id: None,
             mount_epoch,
@@ -260,7 +279,10 @@ mod tests {
         let client_id = ClientId::new(12345);
         let deadline = Deadline::from_now(std::time::Duration::from_secs(60));
         let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string();
-        let state_id = Some(RaftLogId::new(1, 2, 100));
+        let state = vec![GroupStateWatermark::new(
+            ShardGroupId::new(9),
+            RaftLogId::new(1, 2, 100),
+        )];
 
         let header = RequestHeader {
             client: crate::header::ClientInfo {
@@ -271,7 +293,7 @@ mod tests {
             deadline,
             traceparent: Some(traceparent.clone()),
             caller_context: None,
-            state_id,
+            state: state.clone(),
             retry_count: 0,
             group_id: None,
             mount_epoch: None,
@@ -293,7 +315,7 @@ mod tests {
         assert_eq!(decoded.client.client_id, header.client.client_id);
         assert_eq!(decoded.deadline.as_unix_ms(), header.deadline.as_unix_ms());
         assert_eq!(decoded.traceparent, header.traceparent);
-        assert_eq!(decoded.state_id, header.state_id);
+        assert_eq!(decoded.state, header.state);
     }
 
     #[test]

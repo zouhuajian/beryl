@@ -14,12 +14,15 @@ import "common/header.proto";
 //
 // This service handles routing, consistency, and cache refresh operations.
 // No inode/path semantics are introduced here.
-// Unified state_id/mount_epoch/route_epoch validation and NEED_REFRESH/MOVED error semantics.
+// State freshness uses RequestHeader.state / ResponseHeader.state with
+// GroupStateWatermark entries. route_epoch and mount_epoch remain separate
+// config freshness domains.
 
 message GetFileMetaRequestProto {
   common.RequestHeaderProto header = 1;
   // header.group_id is required
-  // header.state_id is used as min_state_id for follower read-gating (if provided)
+  // header.state carries client-required GroupStateWatermark entries for
+  // follower read-gating when the route service implements this operation.
 
   oneof target {
     uint64 inode_id = 2;
@@ -50,8 +53,11 @@ message RefreshRouteResponseProto {
 
 message MsyncRequestProto {
   common.RequestHeaderProto header = 1;
-  // header.group_id is required for msync
-  // header.state_id is used as min_state_id (if provided, wait until last_applied >= state_id)
+  // Current production Msync is single-group. The target group must be
+  // expressed by header.group_id, or by exactly one GroupStateWatermark in
+  // MsyncRequest.header.state.
+  // MsyncRequest.header.state carries the client-known / required group state
+  // watermark; if present, the leader waits until last_applied has reached it.
   // header.deadline_ms + gRPC deadline controls timeout
 
   optional bool include_readable_followers = 6;
@@ -59,8 +65,10 @@ message MsyncRequestProto {
 
 message MsyncResponseProto {
   common.ResponseHeaderProto header = 1;
-  // header.group_id must be filled (echo back the requested group_id)
-  // header.state_id must be filled (current last_applied for the group)
+  // header.group_id identifies the group that was synchronized.
+  // ResponseHeader.state carries one GroupStateWatermark only when the service
+  // can prove authoritative leader state for the requested group. Multi-group
+  // Msync remains future work.
 
   repeated uint64 readable_follower_ids = 2;
 }

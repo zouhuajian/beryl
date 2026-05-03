@@ -133,15 +133,6 @@ impl RaftLogStorage<MetadataRaftTypeConfig> for AppLogStorage {
                 })?;
         }
 
-        // Update last_applied_log_id in state
-        if let Some(last_entry) = entries.last() {
-            let mut state = self.state.write();
-            state.last_applied_log_id = Some(*last_entry.get_log_id());
-            self.storage.persist_raft_state(&state).map_err(|e| StorageError::IO {
-                source: StorageIOError::<u64>::write_logs(AnyError::new(&e)),
-            })?;
-        }
-
         // Call callback to notify that logs are flushed
         callback.log_io_completed(Ok(()));
 

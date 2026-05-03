@@ -332,14 +332,14 @@ impl OverReplicaCleanupService {
                 .with_not_before_ms(not_before_ms)
                 .with_guard_state_id(guard_state_id);
 
-            // Resolve shard_group_id and guard_watermark using inode -> mount owner group.
-            let shard_group_id = crate::maintenance::owner_group_for_block(&self.storage, &self.mount_table, block_id)
+            // Resolve group_id and guard_watermark using inode -> mount owner group.
+            let group_id = crate::maintenance::owner_group_for_block(&self.storage, &self.mount_table, block_id)
                 .map_err(|e| {
                     self.inflight_registry.release(block_id);
                     e
                 })?;
-            ctx = ctx.with_shard_group_id(shard_group_id);
-            let guard_watermark = types::group_watermark::GroupWatermark::new(shard_group_id, guard_state_id);
+            ctx = ctx.with_group_id(group_id);
+            let guard_watermark = types::group_watermark::GroupStateWatermark::new(group_id, guard_state_id);
             ctx = ctx.with_guard_watermark(guard_watermark);
             let mount_epoch = types::group_watermark::MountEpoch::new(self.mount_table.version());
             ctx = ctx.with_mount_epoch(mount_epoch);

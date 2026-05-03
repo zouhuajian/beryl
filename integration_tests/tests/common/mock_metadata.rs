@@ -3,7 +3,7 @@
 
 //! Mock metadata server for integration tests.
 
-use proto::common::{FileLayoutProto, FileMetaProto};
+use proto::common::{FileLayoutProto, FileMetaProto, GroupStateWatermarkProto, ShardGroupIdProto};
 use proto::metadata::metadata_route_service_proto_server::MetadataRouteServiceProto;
 use proto::metadata::*;
 use std::collections::HashMap;
@@ -81,7 +81,10 @@ impl MetadataRouteServiceProto for MockMetadataServer {
         let response_header = ResponseHeaderProto {
             client: req.header.as_ref().and_then(|h| h.client.clone()),
             error: None,
-            state_id: Some(state_id),
+            state: vec![GroupStateWatermarkProto {
+                group_id: Some(ShardGroupIdProto { value: group_id }),
+                state_id: Some(state_id),
+            }],
             group_id,
             mount_epoch: None,
             route_epoch: Some(route_epoch),
@@ -120,7 +123,10 @@ impl MetadataRouteServiceProto for MockMetadataServer {
         let response_header = ResponseHeaderProto {
             client: req.header.as_ref().and_then(|h| h.client.clone()),
             error: None,
-            state_id: Some(state_id),
+            state: vec![GroupStateWatermarkProto {
+                group_id: Some(ShardGroupIdProto { value: group_id }),
+                state_id: Some(state_id),
+            }],
             group_id,
             mount_epoch: None,
             route_epoch: Some(route_epoch),
@@ -159,7 +165,10 @@ impl MetadataRouteServiceProto for MockMetadataServer {
         let response_header = ResponseHeaderProto {
             client: req.header.as_ref().and_then(|h| h.client.clone()),
             error: None,
-            state_id: Some(state_id),
+            state: vec![GroupStateWatermarkProto {
+                group_id: Some(ShardGroupIdProto { value: group_id }),
+                state_id: Some(state_id),
+            }],
             group_id,
             mount_epoch: None,
             route_epoch: Some(route_epoch),
@@ -208,7 +217,10 @@ impl MetadataRouteServiceProto for MockMetadataServer {
         let response_header = ResponseHeaderProto {
             client: req.header.as_ref().and_then(|h| h.client.clone()),
             error: None,
-            state_id: Some(state_id),
+            state: vec![GroupStateWatermarkProto {
+                group_id: Some(ShardGroupIdProto { value: group_id }),
+                state_id: Some(state_id),
+            }],
             group_id,
             mount_epoch: None,
             route_epoch: Some(route_epoch),

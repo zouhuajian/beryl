@@ -206,7 +206,7 @@ impl DeleteExecutor {
             // Prefer guard_watermark if available, otherwise fallback to guard_state_id
             if let Some(guard_watermark) = intent.guard_watermark {
                 ctx = ctx
-                    .with_shard_group_id(guard_watermark.shard_group_id)
+                    .with_group_id(guard_watermark.group_id)
                     .with_guard_watermark(guard_watermark);
                 if let Some(mount_epoch) = intent.mount_epoch {
                     ctx = ctx.with_mount_epoch(mount_epoch);

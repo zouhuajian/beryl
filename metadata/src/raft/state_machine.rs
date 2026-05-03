@@ -39,7 +39,6 @@ pub struct AppRaftStateMachine {
     storage: Arc<RocksDBStorage>,
     mount_table: Arc<MountTable>,
     _next_mount_id: Arc<RwLock<u64>>,
-    applied_seq: Arc<RwLock<u64>>,
 }
 
 impl AppRaftStateMachine {
@@ -48,12 +47,11 @@ impl AppRaftStateMachine {
             storage,
             mount_table,
             _next_mount_id: Arc::new(RwLock::new(1)),
-            applied_seq: Arc::new(RwLock::new(0)),
         }
     }
 
     /// Apply a command to the state machine.
-    pub fn apply(&self, command: Command, seq: u64) -> MetadataResult<AppDataResponse> {
+    pub fn apply(&self, command: Command) -> MetadataResult<AppDataResponse> {
         let dedup_key = command.dedup_key().clone();
         let fingerprint = command.fingerprint();
 
@@ -73,8 +71,6 @@ impl AppRaftStateMachine {
                     dedup_key.call_id
                 )));
             }
-            self.storage.put_applied_seq(seq)?;
-            *self.applied_seq.write() = seq;
             return Ok(applied.result);
         }
 
@@ -91,18 +87,15 @@ impl AppRaftStateMachine {
                 placement,
                 ..
             } => {
-                let result = self.apply_allocate_block(inode_id, block_id, placement, &dedup_key, fingerprint, seq)?;
-                *self.applied_seq.write() = seq;
+                let result = self.apply_allocate_block(inode_id, block_id, placement, &dedup_key, fingerprint)?;
                 return Ok(AppDataResponse::Block(result));
             }
             Command::CommitBlock { block_id, token, .. } => {
-                let result = self.apply_commit_block(block_id, token, &dedup_key, fingerprint, seq)?;
-                *self.applied_seq.write() = seq;
+                let result = self.apply_commit_block(block_id, token, &dedup_key, fingerprint)?;
                 return Ok(AppDataResponse::Block(result));
             }
             Command::UpdateBlockState { block_id, state, .. } => {
-                let result = self.apply_update_block_state(block_id, state, &dedup_key, fingerprint, seq)?;
-                *self.applied_seq.write() = seq;
+                let result = self.apply_update_block_state(block_id, state, &dedup_key, fingerprint)?;
                 return Ok(AppDataResponse::Block(result));
             }
             Command::AcquireLease {
@@ -113,13 +106,11 @@ impl AppRaftStateMachine {
                 ..
             } => {
                 let result =
-                    self.apply_acquire_lease(block_id, client_id, epoch, expires_at_ms, &dedup_key, fingerprint, seq)?;
-                *self.applied_seq.write() = seq;
+                    self.apply_acquire_lease(block_id, client_id, epoch, expires_at_ms, &dedup_key, fingerprint)?;
                 return Ok(AppDataResponse::Lease(result));
             }
             Command::ReleaseLease { block_id, .. } => {
-                let result = self.apply_release_lease(block_id, &dedup_key, fingerprint, seq)?;
-                *self.applied_seq.write() = seq;
+                let result = self.apply_release_lease(block_id, &dedup_key, fingerprint)?;
                 return Ok(AppDataResponse::Lease(result));
             }
             Command::CreateMount {
@@ -142,14 +133,11 @@ impl AppRaftStateMachine {
                     root_inode_id,
                     &dedup_key,
                     fingerprint,
-                    seq,
                 )?;
-                *self.applied_seq.write() = seq;
                 return Ok(AppDataResponse::Mount(result));
             }
             Command::DeleteMount { mount_id, .. } => {
-                let result = self.apply_delete_mount(mount_id, &dedup_key, fingerprint, seq)?;
-                *self.applied_seq.write() = seq;
+                let result = self.apply_delete_mount(mount_id, &dedup_key, fingerprint)?;
                 return Ok(AppDataResponse::Mount(result));
             }
             Command::AddShardGroup {
@@ -158,15 +146,8 @@ impl AppRaftStateMachine {
                 initial_members,
                 ..
             } => {
-                let result = self.apply_add_shard_group(
-                    shard_group_id,
-                    shard_ids,
-                    initial_members,
-                    &dedup_key,
-                    fingerprint,
-                    seq,
-                )?;
-                *self.applied_seq.write() = seq;
+                let result =
+                    self.apply_add_shard_group(shard_group_id, shard_ids, initial_members, &dedup_key, fingerprint)?;
                 return Ok(AppDataResponse::ShardGroup(result));
             }
             Command::RegisterWorker {
@@ -185,19 +166,15 @@ impl AppRaftStateMachine {
                     fault_domain,
                     &dedup_key,
                     fingerprint,
-                    seq,
                 )?;
-                *self.applied_seq.write() = seq;
                 return Ok(AppDataResponse::Worker(result));
             }
             Command::CreateDeleteIntents { intents, .. } => {
-                let result = self.apply_create_delete_intents(intents, &dedup_key, fingerprint, seq)?;
-                *self.applied_seq.write() = seq;
+                let result = self.apply_create_delete_intents(intents, &dedup_key, fingerprint)?;
                 return Ok(AppDataResponse::DeleteIntents(result));
             }
             Command::AllocateDeleteIntents { intents, .. } => {
-                let result = self.apply_allocate_delete_intents(intents, &dedup_key, fingerprint, seq)?;
-                *self.applied_seq.write() = seq;
+                let result = self.apply_allocate_delete_intents(intents, &dedup_key, fingerprint)?;
                 return Ok(AppDataResponse::DeleteIntents(result));
             }
             Command::UpdateDeleteIntentStatus {
@@ -214,9 +191,7 @@ impl AppRaftStateMachine {
                     error_msg,
                     &dedup_key,
                     fingerprint,
-                    seq,
                 )?;
-                *self.applied_seq.write() = seq;
                 return Ok(AppDataResponse::DeleteIntentStatus(result));
             }
             Command::Mkdir {
@@ -225,9 +200,8 @@ impl AppRaftStateMachine {
                 attrs,
                 ..
             } => {
-                // Create/mkdir/rename persist namespace mutation, dedup result, and applied_seq together.
-                let result = self.apply_mkdir(parent_inode_id, name, attrs, &dedup_key, fingerprint, seq)?;
-                *self.applied_seq.write() = seq;
+                // Create/mkdir/rename persist namespace mutation, replay result together.
+                let result = self.apply_mkdir(parent_inode_id, name, attrs, &dedup_key, fingerprint)?;
                 return Ok(AppDataResponse::Fs(result));
             }
             Command::Create {
@@ -237,22 +211,19 @@ impl AppRaftStateMachine {
                 layout,
                 ..
             } => {
-                let result = self.apply_create(parent_inode_id, name, attrs, layout, &dedup_key, fingerprint, seq)?;
-                *self.applied_seq.write() = seq;
+                let result = self.apply_create(parent_inode_id, name, attrs, layout, &dedup_key, fingerprint)?;
                 return Ok(AppDataResponse::Fs(result));
             }
             Command::Unlink {
                 parent_inode_id, name, ..
             } => {
-                let result = self.apply_unlink(parent_inode_id, name, &dedup_key, fingerprint, seq)?;
-                *self.applied_seq.write() = seq;
+                let result = self.apply_unlink(parent_inode_id, name, &dedup_key, fingerprint)?;
                 return Ok(AppDataResponse::Fs(result));
             }
             Command::Rmdir {
                 parent_inode_id, name, ..
             } => {
-                let result = self.apply_rmdir(parent_inode_id, name, &dedup_key, fingerprint, seq)?;
-                *self.applied_seq.write() = seq;
+                let result = self.apply_rmdir(parent_inode_id, name, &dedup_key, fingerprint)?;
                 return Ok(AppDataResponse::Fs(result));
             }
             Command::Rename {
@@ -271,16 +242,13 @@ impl AppRaftStateMachine {
                     flags,
                     &dedup_key,
                     fingerprint,
-                    seq,
                 )?;
-                *self.applied_seq.write() = seq;
                 return Ok(AppDataResponse::Fs(result));
             }
             Command::SetAttr {
                 inode_id, mask, attrs, ..
             } => {
-                let result = self.apply_set_attr(inode_id, mask, attrs, &dedup_key, fingerprint, seq)?;
-                *self.applied_seq.write() = seq;
+                let result = self.apply_set_attr(inode_id, mask, attrs, &dedup_key, fingerprint)?;
                 return Ok(AppDataResponse::Fs(result));
             }
             Command::CloseWrite {
@@ -301,9 +269,7 @@ impl AppRaftStateMachine {
                     lease_epoch,
                     &dedup_key,
                     fingerprint,
-                    seq,
                 )?;
-                *self.applied_seq.write() = seq;
                 return Ok(AppDataResponse::Fs(result));
             }
             Command::Truncate {
@@ -313,9 +279,7 @@ impl AppRaftStateMachine {
                 lease_epoch,
                 ..
             } => {
-                let result =
-                    self.apply_truncate(inode_id, new_size, lease_id, lease_epoch, &dedup_key, fingerprint, seq)?;
-                *self.applied_seq.write() = seq;
+                let result = self.apply_truncate(inode_id, new_size, lease_id, lease_epoch, &dedup_key, fingerprint)?;
                 return Ok(AppDataResponse::Fs(result));
             }
             Command::SetXattr {
@@ -326,22 +290,18 @@ impl AppRaftStateMachine {
                 replace,
                 ..
             } => {
-                let result =
-                    self.apply_set_xattr(inode_id, name, value, create, replace, &dedup_key, fingerprint, seq)?;
-                *self.applied_seq.write() = seq;
+                let result = self.apply_set_xattr(inode_id, name, value, create, replace, &dedup_key, fingerprint)?;
                 return Ok(AppDataResponse::Fs(result));
             }
             Command::RemoveXattr { inode_id, name, .. } => {
-                let result = self.apply_remove_xattr(inode_id, name, &dedup_key, fingerprint, seq)?;
-                *self.applied_seq.write() = seq;
+                let result = self.apply_remove_xattr(inode_id, name, &dedup_key, fingerprint)?;
                 return Ok(AppDataResponse::Fs(result));
             }
         }
     }
 
-    fn make_applied_result(seq: u64, fingerprint: CommandFingerprint, result: AppDataResponse) -> AppliedResult {
+    fn make_applied_result(fingerprint: CommandFingerprint, result: AppDataResponse) -> AppliedResult {
         AppliedResult {
-            seq,
             fingerprint,
             result,
             created_at_ms: Self::replay_record_timestamp_ms(),
@@ -353,8 +313,8 @@ impl AppRaftStateMachine {
         u64::MAX
     }
 
-    fn apply_timestamp_ms(seq: u64) -> u64 {
-        seq
+    fn apply_timestamp_ms() -> u64 {
+        0
     }
 
     fn apply_allocate_block(
@@ -364,7 +324,6 @@ impl AppRaftStateMachine {
         placement: BlockPlacement,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<BlockCommandResult> {
         // Check if block already exists
         if self.storage.get_block(block_id)?.is_some() {
@@ -389,9 +348,9 @@ impl AppRaftStateMachine {
         };
 
         let result = BlockCommandResult::Allocated(block_meta.clone());
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Block(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Block(result.clone()));
         self.storage
-            .put_block_with_apply_result_atomic(&block_meta, dedup_key, applied_result, seq)?;
+            .put_block_with_apply_result_atomic(&block_meta, dedup_key, applied_result)?;
 
         Ok(result)
     }
@@ -402,7 +361,6 @@ impl AppRaftStateMachine {
         token: FencingToken,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<BlockCommandResult> {
         // Verify lease
         let lease_state = self
@@ -432,9 +390,9 @@ impl AppRaftStateMachine {
 
         block_meta.state = BlockState::Sealed;
         let result = BlockCommandResult::Committed;
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Block(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Block(result.clone()));
         self.storage
-            .put_block_with_apply_result_atomic(&block_meta, dedup_key, applied_result, seq)?;
+            .put_block_with_apply_result_atomic(&block_meta, dedup_key, applied_result)?;
 
         Ok(result)
     }
@@ -445,7 +403,6 @@ impl AppRaftStateMachine {
         state: BlockState,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<BlockCommandResult> {
         let mut block_meta = self
             .storage
@@ -454,9 +411,9 @@ impl AppRaftStateMachine {
 
         block_meta.state = state;
         let result = BlockCommandResult::StateUpdated;
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Block(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Block(result.clone()));
         self.storage
-            .put_block_with_apply_result_atomic(&block_meta, dedup_key, applied_result, seq)?;
+            .put_block_with_apply_result_atomic(&block_meta, dedup_key, applied_result)?;
 
         Ok(result)
     }
@@ -469,7 +426,6 @@ impl AppRaftStateMachine {
         expires_at_ms: u64,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<LeaseCommandResult> {
         // Ensure the data_handle_id is still bound to the expected inode (authoritative mapping).
         if let Some(meta) = self.storage.get_block(block_id)? {
@@ -502,10 +458,10 @@ impl AppRaftStateMachine {
         let lease_state = LeaseState { block_id, lease };
 
         let result = LeaseCommandResult::Acquired(lease_state);
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Lease(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Lease(result.clone()));
         if let LeaseCommandResult::Acquired(lease_state) = &result {
             self.storage
-                .acquire_lease_with_apply_result_atomic(lease_state, dedup_key, applied_result, seq)?;
+                .acquire_lease_with_apply_result_atomic(lease_state, dedup_key, applied_result)?;
         }
 
         Ok(result)
@@ -516,12 +472,11 @@ impl AppRaftStateMachine {
         block_id: BlockId,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<LeaseCommandResult> {
         let result = LeaseCommandResult::Released;
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Lease(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Lease(result.clone()));
         self.storage
-            .release_lease_with_apply_result_atomic(block_id, dedup_key, applied_result, seq)?;
+            .release_lease_with_apply_result_atomic(block_id, dedup_key, applied_result)?;
         Ok(result)
     }
 
@@ -536,7 +491,6 @@ impl AppRaftStateMachine {
         root_inode_id: InodeId,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<MountCommandResult> {
         if namespace_owner_group_id.as_raw() == 0 {
             return Err(MetadataError::InvalidArgument(
@@ -592,10 +546,8 @@ impl AppRaftStateMachine {
                 && existing.root_inode_id == root_inode_id
             {
                 let result = MountCommandResult::Upserted(existing);
-                let applied_result =
-                    Self::make_applied_result(seq, fingerprint, AppDataResponse::Mount(result.clone()));
-                self.storage
-                    .put_apply_result_and_seq_atomic(dedup_key, applied_result, seq)?;
+                let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Mount(result.clone()));
+                self.storage.put_apply_result_atomic(dedup_key, applied_result)?;
                 return Ok(result);
             }
             return Err(MetadataError::AlreadyExists(format!(
@@ -607,10 +559,8 @@ impl AppRaftStateMachine {
         if let Some(existing) = self.storage.get_mount(mount_id)? {
             if existing.mount_prefix == mount_prefix {
                 let result = MountCommandResult::Upserted(existing);
-                let applied_result =
-                    Self::make_applied_result(seq, fingerprint, AppDataResponse::Mount(result.clone()));
-                self.storage
-                    .put_apply_result_and_seq_atomic(dedup_key, applied_result, seq)?;
+                let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Mount(result.clone()));
+                self.storage.put_apply_result_atomic(dedup_key, applied_result)?;
                 return Ok(result);
             }
             return Err(MetadataError::AlreadyExists(format!(
@@ -635,7 +585,7 @@ impl AppRaftStateMachine {
                     )));
                 }
                 let mut attrs = FileAttrs::new();
-                let now_ms = Self::apply_timestamp_ms(seq);
+                let now_ms = Self::apply_timestamp_ms();
                 attrs.update_timestamps(now_ms);
                 attrs.nlink = 1;
                 let inode = Inode::new_dir(root_inode_id, attrs, mount_id);
@@ -670,7 +620,7 @@ impl AppRaftStateMachine {
 
         let new_route_epoch = self.next_authoritative_route_epoch()?;
         let result = MountCommandResult::Upserted(entry.clone());
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Mount(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Mount(result.clone()));
         self.storage.create_mount_with_apply_result_atomic(
             &entry,
             root_inode_to_create.as_ref(),
@@ -678,7 +628,6 @@ impl AppRaftStateMachine {
             new_route_epoch,
             dedup_key,
             applied_result,
-            seq,
         )?;
 
         // Synchronize in-memory MountTable (must succeed after RocksDB write)
@@ -694,7 +643,6 @@ impl AppRaftStateMachine {
         mount_id: MountId,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<MountCommandResult> {
         // Check if mount exists
         let entry = self
@@ -710,14 +658,13 @@ impl AppRaftStateMachine {
         let mount_version = self.storage.get_mount_version()?;
         let new_route_epoch = self.next_authoritative_route_epoch()?;
         let result = MountCommandResult::Deleted;
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Mount(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Mount(result.clone()));
         self.storage.delete_mount_with_apply_result_atomic(
             mount_id,
             mount_version + 1,
             new_route_epoch,
             dedup_key,
             applied_result,
-            seq,
         )?;
 
         // Synchronize in-memory MountTable (must succeed after RocksDB delete)
@@ -740,7 +687,6 @@ impl AppRaftStateMachine {
         initial_members: Vec<u64>,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<ShardGroupInfo> {
         // Check if group already exists
         if self.storage.get_shard_group(shard_group_id)?.is_some() {
@@ -760,9 +706,9 @@ impl AppRaftStateMachine {
 
         // Shard-group registration is not part of the filesystem-facing route_epoch contract.
         // FsCore stale-route validation is keyed to mount routing ownership changes instead.
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::ShardGroup(info.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::ShardGroup(info.clone()));
         self.storage
-            .add_shard_group_with_apply_result_atomic(&info, &shard_ids, dedup_key, applied_result, seq)?;
+            .add_shard_group_with_apply_result_atomic(&info, &shard_ids, dedup_key, applied_result)?;
 
         Ok(info)
     }
@@ -776,7 +722,6 @@ impl AppRaftStateMachine {
         fault_domain: Option<String>,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<WorkerCommandResult> {
         let worker_info = self.storage.prepare_worker_registration(
             &identity,
@@ -786,14 +731,9 @@ impl AppRaftStateMachine {
             fault_domain,
         )?;
         let result = WorkerCommandResult::Upserted(worker_info.worker_id);
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Worker(result.clone()));
-        self.storage.register_worker_with_apply_result_atomic(
-            &identity,
-            &worker_info,
-            dedup_key,
-            applied_result,
-            seq,
-        )?;
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Worker(result.clone()));
+        self.storage
+            .register_worker_with_apply_result_atomic(&identity, &worker_info, dedup_key, applied_result)?;
 
         Ok(result)
     }
@@ -803,16 +743,14 @@ impl AppRaftStateMachine {
         intents: Vec<crate::state::DeleteIntent>,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<DeleteIntentsResult> {
         let intent_count = intents.len();
         let result = DeleteIntentsResult {
             created: intent_count as u64,
         };
-        let applied_result =
-            Self::make_applied_result(seq, fingerprint, AppDataResponse::DeleteIntents(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::DeleteIntents(result.clone()));
         self.storage
-            .create_delete_intents_with_apply_result_atomic(intents, dedup_key, applied_result, seq)?;
+            .create_delete_intents_with_apply_result_atomic(intents, dedup_key, applied_result)?;
         Ok(result)
     }
 
@@ -821,16 +759,14 @@ impl AppRaftStateMachine {
         intents: Vec<crate::state::DeleteIntent>,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<DeleteIntentsResult> {
         let intent_count = intents.len();
         let result = DeleteIntentsResult {
             created: intent_count as u64,
         };
-        let applied_result =
-            Self::make_applied_result(seq, fingerprint, AppDataResponse::DeleteIntents(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::DeleteIntents(result.clone()));
         self.storage
-            .allocate_delete_intents_with_apply_result_atomic(intents, dedup_key, applied_result, seq)?;
+            .allocate_delete_intents_with_apply_result_atomic(intents, dedup_key, applied_result)?;
         Ok(result)
     }
 
@@ -842,11 +778,10 @@ impl AppRaftStateMachine {
         error_msg: Option<String>,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<DeleteIntentStatusResult> {
         let result = DeleteIntentStatusResult { intent_id, status };
         let applied_result =
-            Self::make_applied_result(seq, fingerprint, AppDataResponse::DeleteIntentStatus(result.clone()));
+            Self::make_applied_result(fingerprint, AppDataResponse::DeleteIntentStatus(result.clone()));
         self.storage.update_delete_intent_status_with_apply_result_atomic(
             intent_id,
             status,
@@ -854,19 +789,8 @@ impl AppRaftStateMachine {
             error_msg,
             dedup_key,
             applied_result,
-            seq,
         )?;
         Ok(result)
-    }
-
-    /// Get applied sequence number.
-    pub fn applied_seq(&self) -> u64 {
-        *self.applied_seq.read()
-    }
-
-    /// Restore applied sequence (used after snapshot install/restart).
-    pub fn set_applied_seq(&self, seq: u64) {
-        *self.applied_seq.write() = seq;
     }
 
     fn fs_command_result(result: MetadataResult<FsOkResult>) -> FsCommandResult {
@@ -907,11 +831,9 @@ impl AppRaftStateMachine {
         result: FsCommandResult,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<FsCommandResult> {
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Fs(result.clone()));
-        self.storage
-            .put_apply_result_and_seq_atomic(dedup_key, applied_result, seq)?;
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
+        self.storage.put_apply_result_atomic(dedup_key, applied_result)?;
         Ok(result)
     }
 
@@ -923,7 +845,6 @@ impl AppRaftStateMachine {
         mut attrs: FileAttrs,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<FsCommandResult> {
         let prepared: MetadataResult<(Inode, Inode, FsOkResult)> = (|| {
             // Check parent exists and is a directory
@@ -948,7 +869,7 @@ impl AppRaftStateMachine {
 
             // Generate inode ID
             let inode_id = self.next_inode_id()?;
-            let now_ms = Self::apply_timestamp_ms(seq);
+            let now_ms = Self::apply_timestamp_ms();
 
             // Initialize attrs
             attrs.update_timestamps(now_ms);
@@ -972,12 +893,10 @@ impl AppRaftStateMachine {
 
         let (inode, updated_parent, ok) = match prepared {
             Ok(prepared) => prepared,
-            Err(err) => {
-                return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint, seq)
-            }
+            Err(err) => return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint),
         };
         let result = FsCommandResult::Ok(ok);
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Fs(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
         self.storage.create_dir_with_apply_result_atomic(
             parent_inode_id,
             &name,
@@ -985,7 +904,6 @@ impl AppRaftStateMachine {
             &updated_parent,
             dedup_key,
             applied_result,
-            seq,
         )?;
         Ok(result)
     }
@@ -999,7 +917,6 @@ impl AppRaftStateMachine {
         layout: FileLayout,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<FsCommandResult> {
         let prepared: MetadataResult<(Inode, Inode, FsOkResult)> = (|| {
             // Check parent exists and is a directory
@@ -1022,7 +939,7 @@ impl AppRaftStateMachine {
             // Generate inode ID
             let inode_id = self.next_inode_id()?;
             let data_handle_id = self.next_data_handle_id()?;
-            let now_ms = Self::apply_timestamp_ms(seq);
+            let now_ms = Self::apply_timestamp_ms();
 
             // Initialize attrs
             attrs.update_timestamps(now_ms);
@@ -1046,12 +963,10 @@ impl AppRaftStateMachine {
 
         let (inode, updated_parent, ok) = match prepared {
             Ok(prepared) => prepared,
-            Err(err) => {
-                return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint, seq)
-            }
+            Err(err) => return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint),
         };
         let result = FsCommandResult::Ok(ok);
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Fs(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
         self.storage.create_file_with_apply_result_atomic(
             parent_inode_id,
             &name,
@@ -1060,7 +975,6 @@ impl AppRaftStateMachine {
             layout,
             dedup_key,
             applied_result,
-            seq,
         )?;
         Ok(result)
     }
@@ -1190,7 +1104,6 @@ impl AppRaftStateMachine {
         name: String,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<FsCommandResult> {
         let prepared: MetadataResult<(InodeId, Option<DataHandleId>, Inode, Vec<BlockId>, FsOkResult)> = (|| {
             // Get dentry
@@ -1210,7 +1123,7 @@ impl AppRaftStateMachine {
                 return Err(MetadataError::IsDir(format!("Cannot unlink directory: {}", name)));
             }
 
-            let now_ms = Self::apply_timestamp_ms(seq);
+            let now_ms = Self::apply_timestamp_ms();
 
             // Update parent directory mtime/ctime
             let parent_inode = self
@@ -1257,12 +1170,10 @@ impl AppRaftStateMachine {
 
         let (child_inode_id, data_handle_id, updated_parent, released_block_ids, ok) = match prepared {
             Ok(prepared) => prepared,
-            Err(err) => {
-                return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint, seq)
-            }
+            Err(err) => return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint),
         };
         let result = FsCommandResult::Ok(ok);
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Fs(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
         if released_block_ids.is_empty() {
             self.storage.delete_empty_file_with_apply_result_atomic(
                 parent_inode_id,
@@ -1272,7 +1183,6 @@ impl AppRaftStateMachine {
                 &updated_parent,
                 dedup_key,
                 applied_result,
-                seq,
             )?;
         } else {
             let data_handle_id = data_handle_id.ok_or_else(|| {
@@ -1285,10 +1195,9 @@ impl AppRaftStateMachine {
                 data_handle_id,
                 &updated_parent,
                 &released_block_ids,
-                Self::apply_timestamp_ms(seq),
+                Self::apply_timestamp_ms(),
                 dedup_key,
                 applied_result,
-                seq,
             )?;
         }
         Ok(result)
@@ -1301,7 +1210,6 @@ impl AppRaftStateMachine {
         name: String,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<FsCommandResult> {
         let prepared: MetadataResult<(InodeId, Inode, FsOkResult)> = (|| {
             // Get dentry
@@ -1329,7 +1237,7 @@ impl AppRaftStateMachine {
                 )));
             }
 
-            let now_ms = Self::apply_timestamp_ms(seq);
+            let now_ms = Self::apply_timestamp_ms();
 
             // Update parent directory mtime/ctime
             let parent_inode = self
@@ -1346,12 +1254,10 @@ impl AppRaftStateMachine {
 
         let (child_inode_id, updated_parent, ok) = match prepared {
             Ok(prepared) => prepared,
-            Err(err) => {
-                return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint, seq)
-            }
+            Err(err) => return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint),
         };
         let result = FsCommandResult::Ok(ok);
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Fs(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
         self.storage.delete_empty_dir_with_apply_result_atomic(
             parent_inode_id,
             &name,
@@ -1359,7 +1265,6 @@ impl AppRaftStateMachine {
             &updated_parent,
             dedup_key,
             applied_result,
-            seq,
         )?;
         Ok(result)
     }
@@ -1374,7 +1279,6 @@ impl AppRaftStateMachine {
         flags: u32,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<FsCommandResult> {
         let prepared: MetadataResult<(
             InodeId,
@@ -1433,7 +1337,7 @@ impl AppRaftStateMachine {
                 overwritten_inode_id = Some(dst_inode_id);
             }
 
-            let now_ms = Self::apply_timestamp_ms(seq);
+            let now_ms = Self::apply_timestamp_ms();
 
             // Update parent directories mtime/ctime
             let (updated_src_parent, updated_dst_parent) = if src_parent_inode_id != dst_parent_inode_id {
@@ -1487,11 +1391,11 @@ impl AppRaftStateMachine {
             match prepared {
                 Ok(prepared) => prepared,
                 Err(err) => {
-                    return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint, seq)
+                    return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint)
                 }
             };
         let result = FsCommandResult::Ok(ok);
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Fs(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
         self.storage.rename_with_apply_result_atomic(
             RenameAtomicUpdate {
                 src_parent_inode_id,
@@ -1506,7 +1410,6 @@ impl AppRaftStateMachine {
             },
             dedup_key,
             applied_result,
-            seq,
         )?;
 
         Ok(result)
@@ -1546,7 +1449,6 @@ impl AppRaftStateMachine {
         new_attrs: FileAttrs,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<FsCommandResult> {
         let prepared: MetadataResult<Inode> = (|| {
             let mut inode = self
@@ -1554,7 +1456,7 @@ impl AppRaftStateMachine {
                 .get_inode(inode_id)?
                 .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {}", inode_id)))?;
 
-            let now_ms = Self::apply_timestamp_ms(seq);
+            let now_ms = Self::apply_timestamp_ms();
 
             // Apply mask: only update fields specified by mask
             // Bit flags: 1=size, 2=mode, 4=uid, 8=gid, 16=atime, 32=mtime
@@ -1585,14 +1487,12 @@ impl AppRaftStateMachine {
 
         let inode = match prepared {
             Ok(inode) => inode,
-            Err(err) => {
-                return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint, seq)
-            }
+            Err(err) => return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint),
         };
         let result = FsCommandResult::Ok(FsOkResult::default());
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Fs(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
         self.storage
-            .put_inode_with_apply_result_atomic(&inode, dedup_key, applied_result, seq)?;
+            .put_inode_with_apply_result_atomic(&inode, dedup_key, applied_result)?;
         Ok(result)
     }
 
@@ -1607,7 +1507,6 @@ impl AppRaftStateMachine {
         lease_epoch: u64,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<FsCommandResult> {
         let prepared: MetadataResult<(Inode, FileLayout, Vec<BlockId>, FsOkResult)> = (|| {
             // Get inode
@@ -1656,7 +1555,7 @@ impl AppRaftStateMachine {
             }
 
             let layout = self.storage.get_layout(inode_id)?;
-            let now_ms = Self::apply_timestamp_ms(seq);
+            let now_ms = Self::apply_timestamp_ms();
 
             // Update inode: append extents and update size/mtime/ctime/lease_epoch
             match &mut inode.data {
@@ -1701,19 +1600,16 @@ impl AppRaftStateMachine {
 
         let (inode, layout, block_ref_increments, ok) = match prepared {
             Ok(prepared) => prepared,
-            Err(err) => {
-                return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint, seq)
-            }
+            Err(err) => return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint),
         };
         let result = FsCommandResult::Ok(ok);
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Fs(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
         self.storage.close_write_with_apply_result_atomic(
             &inode,
             layout,
             &block_ref_increments,
             dedup_key,
             applied_result,
-            seq,
         )?;
         Ok(result)
     }
@@ -1727,7 +1623,6 @@ impl AppRaftStateMachine {
         lease_epoch: u64,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<FsCommandResult> {
         let prepared: MetadataResult<(Inode, FileLayout, Vec<BlockId>, FsOkResult)> = (|| {
             // Get inode
@@ -1766,7 +1661,7 @@ impl AppRaftStateMachine {
                 ));
             }
 
-            let now_ms = Self::apply_timestamp_ms(seq);
+            let now_ms = Self::apply_timestamp_ms();
             let layout = self.storage.get_layout(inode_id)?;
             let data_handle_id = inode.current_data_handle_id;
             if data_handle_id.as_raw() == 0 {
@@ -1808,20 +1703,17 @@ impl AppRaftStateMachine {
 
         let (inode, layout, released_block_ids, ok) = match prepared {
             Ok(prepared) => prepared,
-            Err(err) => {
-                return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint, seq)
-            }
+            Err(err) => return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint),
         };
         let result = FsCommandResult::Ok(ok);
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Fs(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
         self.storage.truncate_file_with_apply_result_atomic(
             &inode,
             layout,
             &released_block_ids,
-            Self::apply_timestamp_ms(seq),
+            Self::apply_timestamp_ms(),
             dedup_key,
             applied_result,
-            seq,
         )?;
         Ok(result)
     }
@@ -1836,7 +1728,6 @@ impl AppRaftStateMachine {
         replace: bool,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<FsCommandResult> {
         let prepared: MetadataResult<Inode> = (|| {
             let mut inode = self
@@ -1853,21 +1744,19 @@ impl AppRaftStateMachine {
             }
 
             inode.xattrs.insert(name, value);
-            let now_ms = Self::apply_timestamp_ms(seq);
+            let now_ms = Self::apply_timestamp_ms();
             inode.attrs.update_ctime(now_ms);
             Ok(inode)
         })();
 
         let inode = match prepared {
             Ok(inode) => inode,
-            Err(err) => {
-                return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint, seq)
-            }
+            Err(err) => return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint),
         };
         let result = FsCommandResult::Ok(FsOkResult::default());
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Fs(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
         self.storage
-            .put_inode_with_apply_result_atomic(&inode, dedup_key, applied_result, seq)?;
+            .put_inode_with_apply_result_atomic(&inode, dedup_key, applied_result)?;
         Ok(result)
     }
 
@@ -1878,7 +1767,6 @@ impl AppRaftStateMachine {
         name: String,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
-        seq: u64,
     ) -> MetadataResult<FsCommandResult> {
         let prepared: MetadataResult<Inode> = (|| {
             let mut inode = self
@@ -1889,21 +1777,19 @@ impl AppRaftStateMachine {
             if inode.xattrs.remove(&name).is_none() {
                 return Err(MetadataError::NotFound(format!("xattr not found: {}", name)));
             }
-            let now_ms = Self::apply_timestamp_ms(seq);
+            let now_ms = Self::apply_timestamp_ms();
             inode.attrs.update_ctime(now_ms);
             Ok(inode)
         })();
 
         let inode = match prepared {
             Ok(inode) => inode,
-            Err(err) => {
-                return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint, seq)
-            }
+            Err(err) => return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint),
         };
         let result = FsCommandResult::Ok(FsOkResult::default());
-        let applied_result = Self::make_applied_result(seq, fingerprint, AppDataResponse::Fs(result.clone()));
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
         self.storage
-            .put_inode_with_apply_result_atomic(&inode, dedup_key, applied_result, seq)?;
+            .put_inode_with_apply_result_atomic(&inode, dedup_key, applied_result)?;
         Ok(result)
     }
 }
@@ -2089,7 +1975,7 @@ mod tests {
             namespace_owner_group_id: ShardGroupId::new(0),
             root_inode_id: InodeId::new(1),
         };
-        let res = sm.apply(cmd, 1);
+        let res = sm.apply(cmd);
         assert!(matches!(res, Err(MetadataError::InvalidArgument(_))));
     }
 
@@ -2122,7 +2008,7 @@ mod tests {
             namespace_owner_group_id: ShardGroupId::new(2),
             root_inode_id,
         };
-        let res = sm.apply(cmd, 2);
+        let res = sm.apply(cmd);
         assert!(matches!(res, Err(MetadataError::InvalidArgument(_))));
     }
 
@@ -2155,7 +2041,7 @@ mod tests {
             namespace_owner_group_id: ShardGroupId::new(5),
             root_inode_id,
         };
-        sm.apply(cmd, 3).unwrap();
+        sm.apply(cmd).unwrap();
 
         let entry = mount_table.get_mount(mount_id).unwrap().unwrap();
         assert_eq!(entry.namespace_owner_group_id, ShardGroupId::new(5));
@@ -2182,7 +2068,7 @@ mod tests {
             layout: FileLayout::new(4096, 4096, 1),
         };
 
-        let raw = sm.apply(cmd, 1).unwrap();
+        let raw = sm.apply(cmd).unwrap();
         let inode_id = match raw {
             AppDataResponse::Fs(FsCommandResult::Ok(ok)) => ok.inode_id.expect("inode id should be returned"),
             other => panic!("unexpected apply response: {:?}", other),
@@ -2202,7 +2088,7 @@ mod tests {
     }
 
     #[test]
-    fn create_reapply_returns_original_success_result_and_applied_seq() {
+    fn create_reapply_returns_original_success_result_and_replay_result() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
@@ -2222,14 +2108,10 @@ mod tests {
             layout: FileLayout::new(4096, 4096, 1),
         };
 
-        let first = expect_fs_ok(sm.apply(cmd.clone(), 7).unwrap());
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(7));
-        assert_eq!(sm.applied_seq(), 7);
+        let first = expect_fs_ok(sm.apply(cmd.clone()).unwrap());
 
-        let second = expect_fs_ok(sm.apply(cmd, 8).unwrap());
+        let second = expect_fs_ok(sm.apply(cmd).unwrap());
         assert_eq!(second, first);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(8));
-        assert_eq!(sm.applied_seq(), 8);
 
         let inode_id = first.inode_id.expect("inode id should be returned");
         assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), Some(inode_id));
@@ -2249,15 +2131,12 @@ mod tests {
             .unwrap();
 
         let raw = sm
-            .apply(
-                Command::Mkdir {
-                    dedup: dedup_for_test(29),
-                    parent_inode_id,
-                    name: "dir".to_string(),
-                    attrs: FileAttrs::new(),
-                },
-                1,
-            )
+            .apply(Command::Mkdir {
+                dedup: dedup_for_test(29),
+                parent_inode_id,
+                name: "dir".to_string(),
+                attrs: FileAttrs::new(),
+            })
             .unwrap();
         let inode_id = match raw {
             AppDataResponse::Fs(FsCommandResult::Ok(ok)) => ok.inode_id.expect("inode id should be returned"),
@@ -2269,7 +2148,7 @@ mod tests {
     }
 
     #[test]
-    fn mkdir_reapply_returns_original_success_result_and_applied_seq() {
+    fn mkdir_reapply_returns_original_success_result_and_replay_result() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
@@ -2288,14 +2167,10 @@ mod tests {
             attrs: FileAttrs::new(),
         };
 
-        let first = expect_fs_ok(sm.apply(cmd.clone(), 9).unwrap());
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(9));
-        assert_eq!(sm.applied_seq(), 9);
+        let first = expect_fs_ok(sm.apply(cmd.clone()).unwrap());
 
-        let second = expect_fs_ok(sm.apply(cmd, 10).unwrap());
+        let second = expect_fs_ok(sm.apply(cmd).unwrap());
         assert_eq!(second, first);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(10));
-        assert_eq!(sm.applied_seq(), 10);
 
         let inode_id = first.inode_id.expect("inode id should be returned");
         assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), Some(inode_id));
@@ -2315,33 +2190,27 @@ mod tests {
             .unwrap();
 
         let created = sm
-            .apply(
-                Command::Create {
-                    dedup: dedup_for_test(36),
-                    parent_inode_id,
-                    name: "old".to_string(),
-                    attrs: FileAttrs::new(),
-                    layout: FileLayout::new(4096, 4096, 1),
-                },
-                1,
-            )
+            .apply(Command::Create {
+                dedup: dedup_for_test(36),
+                parent_inode_id,
+                name: "old".to_string(),
+                attrs: FileAttrs::new(),
+                layout: FileLayout::new(4096, 4096, 1),
+            })
             .unwrap();
         let inode_id = match created {
             AppDataResponse::Fs(FsCommandResult::Ok(ok)) => ok.inode_id.unwrap(),
             other => panic!("unexpected apply response: {:?}", other),
         };
 
-        sm.apply(
-            Command::Rename {
-                dedup: dedup_for_test(37),
-                src_parent_inode_id: parent_inode_id,
-                src_name: "old".to_string(),
-                dst_parent_inode_id: parent_inode_id,
-                dst_name: "new".to_string(),
-                flags: 0,
-            },
-            2,
-        )
+        sm.apply(Command::Rename {
+            dedup: dedup_for_test(37),
+            src_parent_inode_id: parent_inode_id,
+            src_name: "old".to_string(),
+            dst_parent_inode_id: parent_inode_id,
+            dst_name: "new".to_string(),
+            flags: 0,
+        })
         .unwrap();
 
         assert_eq!(storage.get_dentry(parent_inode_id, "old").unwrap(), None);
@@ -2350,7 +2219,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_reapply_returns_original_success_result_and_applied_seq() {
+    fn rename_reapply_returns_original_success_result_and_replay_result() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
@@ -2362,16 +2231,13 @@ mod tests {
             .unwrap();
 
         let created = expect_fs_ok(
-            sm.apply(
-                Command::Create {
-                    dedup: dedup_for_test(43),
-                    parent_inode_id,
-                    name: "old".to_string(),
-                    attrs: FileAttrs::new(),
-                    layout: FileLayout::new(4096, 4096, 1),
-                },
-                1,
-            )
+            sm.apply(Command::Create {
+                dedup: dedup_for_test(43),
+                parent_inode_id,
+                name: "old".to_string(),
+                attrs: FileAttrs::new(),
+                layout: FileLayout::new(4096, 4096, 1),
+            })
             .unwrap(),
         );
         let inode_id = created.inode_id.unwrap();
@@ -2386,22 +2252,18 @@ mod tests {
             flags: 0,
         };
 
-        let first = expect_fs_ok(sm.apply(cmd.clone(), 2).unwrap());
+        let first = expect_fs_ok(sm.apply(cmd.clone()).unwrap());
         assert_eq!(first, FsOkResult::default());
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(2));
-        assert_eq!(sm.applied_seq(), 2);
 
-        let second = expect_fs_ok(sm.apply(cmd, 3).unwrap());
+        let second = expect_fs_ok(sm.apply(cmd).unwrap());
         assert_eq!(second, first);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(3));
-        assert_eq!(sm.applied_seq(), 3);
         assert_eq!(storage.get_dentry(parent_inode_id, "old").unwrap(), None);
         assert_eq!(storage.get_dentry(parent_inode_id, "new").unwrap(), Some(inode_id));
         assert!(storage.get_applied_result(&dedup).unwrap().is_some());
     }
 
     #[test]
-    fn attrs_and_xattrs_reapply_return_original_result_and_applied_seq() {
+    fn attrs_and_xattrs_reapply_return_original_result_and_replay_result() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
@@ -2425,12 +2287,10 @@ mod tests {
             mask: 4,
             attrs,
         };
-        let first = expect_fs_ok(sm.apply(set_attr.clone(), 11).unwrap());
+        let first = expect_fs_ok(sm.apply(set_attr.clone()).unwrap());
         let ctime_after_first = storage.get_inode(inode_id).unwrap().unwrap().attrs.ctime_ms;
-        let second = expect_fs_ok(sm.apply(set_attr, 12).unwrap());
+        let second = expect_fs_ok(sm.apply(set_attr).unwrap());
         assert_eq!(second, first);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(12));
-        assert_eq!(sm.applied_seq(), 12);
         let stored = storage.get_inode(inode_id).unwrap().unwrap();
         assert_eq!(stored.attrs.uid, 123);
         assert_eq!(stored.attrs.ctime_ms, ctime_after_first);
@@ -2443,10 +2303,9 @@ mod tests {
             create: true,
             replace: false,
         };
-        let first = expect_fs_ok(sm.apply(set_xattr.clone(), 13).unwrap());
-        let second = expect_fs_ok(sm.apply(set_xattr, 14).unwrap());
+        let first = expect_fs_ok(sm.apply(set_xattr.clone()).unwrap());
+        let second = expect_fs_ok(sm.apply(set_xattr).unwrap());
         assert_eq!(second, first);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(14));
         assert_eq!(
             storage.get_inode(inode_id).unwrap().unwrap().xattrs.get("user.key"),
             Some(&b"value".to_vec())
@@ -2457,10 +2316,9 @@ mod tests {
             inode_id,
             name: "user.key".to_string(),
         };
-        let first = expect_fs_ok(sm.apply(remove_xattr.clone(), 15).unwrap());
-        let second = expect_fs_ok(sm.apply(remove_xattr, 16).unwrap());
+        let first = expect_fs_ok(sm.apply(remove_xattr.clone()).unwrap());
+        let second = expect_fs_ok(sm.apply(remove_xattr).unwrap());
         assert_eq!(second, first);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(16));
         assert!(!storage
             .get_inode(inode_id)
             .unwrap()
@@ -2492,12 +2350,10 @@ mod tests {
             namespace_owner_group_id: ShardGroupId::new(73),
             root_inode_id,
         };
-        let first = expect_mount_upserted(sm.apply(create_mount.clone(), 17).unwrap());
-        let second = expect_mount_upserted(sm.apply(create_mount, 18).unwrap());
+        let first = expect_mount_upserted(sm.apply(create_mount.clone()).unwrap());
+        let second = expect_mount_upserted(sm.apply(create_mount).unwrap());
         assert_eq!(second.mount_id, first.mount_id);
         assert_eq!(second.config_version, first.config_version);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(18));
-        assert_eq!(sm.applied_seq(), 18);
         assert_eq!(
             mount_table.get_mount(mount_id).unwrap().unwrap().mount_prefix,
             first.mount_prefix
@@ -2508,16 +2364,14 @@ mod tests {
             dedup: dedup_for_test(74),
             mount_id,
         };
-        expect_mount_deleted(sm.apply(delete_mount.clone(), 19).unwrap());
-        expect_mount_deleted(sm.apply(delete_mount, 20).unwrap());
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(20));
-        assert_eq!(sm.applied_seq(), 20);
+        expect_mount_deleted(sm.apply(delete_mount.clone()).unwrap());
+        expect_mount_deleted(sm.apply(delete_mount).unwrap());
         assert!(storage.get_mount(mount_id).unwrap().is_none());
         assert!(mount_table.get_mount(mount_id).unwrap().is_none());
     }
 
     #[test]
-    fn shard_group_reapply_returns_original_result_and_applied_seq() {
+    fn shard_group_reapply_returns_original_result_and_replay_result() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
@@ -2530,11 +2384,9 @@ mod tests {
             initial_members: vec![1, 2],
         };
 
-        let first = expect_shard_group(sm.apply(cmd.clone(), 21).unwrap());
-        let second = expect_shard_group(sm.apply(cmd, 22).unwrap());
+        let first = expect_shard_group(sm.apply(cmd.clone()).unwrap());
+        let second = expect_shard_group(sm.apply(cmd).unwrap());
         assert_eq!(second, first);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(22));
-        assert_eq!(sm.applied_seq(), 22);
         assert_eq!(
             storage.get_shard_routing(ShardId::new(750)).unwrap(),
             Some(ShardGroupId::new(75))
@@ -2542,7 +2394,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_descriptor_reapply_returns_original_result_and_applied_seq() {
+    fn worker_descriptor_reapply_returns_original_result_and_replay_result() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
@@ -2558,10 +2410,8 @@ mod tests {
         };
 
         let worker_id = WorkerId::new(1);
-        assert_eq!(expect_worker_upserted(sm.apply(cmd.clone(), 23).unwrap()), worker_id);
-        assert_eq!(expect_worker_upserted(sm.apply(cmd, 24).unwrap()), worker_id);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(24));
-        assert_eq!(sm.applied_seq(), 24);
+        assert_eq!(expect_worker_upserted(sm.apply(cmd.clone()).unwrap()), worker_id);
+        assert_eq!(expect_worker_upserted(sm.apply(cmd).unwrap()), worker_id);
         let stored = storage.get_worker(worker_id).unwrap().unwrap();
         assert_eq!(stored.address, "127.0.0.1:17076");
         assert_eq!(stored.worker_epoch, 3);
@@ -2592,11 +2442,11 @@ mod tests {
         };
 
         assert_eq!(
-            expect_worker_upserted(sm.apply(first.clone(), 1).unwrap()),
+            expect_worker_upserted(sm.apply(first.clone()).unwrap()),
             WorkerId::new(1)
         );
-        assert_eq!(expect_worker_upserted(sm.apply(first, 2).unwrap()), WorkerId::new(1));
-        assert_eq!(expect_worker_upserted(sm.apply(second, 3).unwrap()), WorkerId::new(1));
+        assert_eq!(expect_worker_upserted(sm.apply(first).unwrap()), WorkerId::new(1));
+        assert_eq!(expect_worker_upserted(sm.apply(second).unwrap()), WorkerId::new(1));
         let stored = storage.get_worker(WorkerId::new(1)).unwrap().unwrap();
         assert_eq!(stored.address, "127.0.0.1:17061");
         assert_eq!(stored.net_transport_kind, 2);
@@ -2615,7 +2465,7 @@ mod tests {
             fault_domain: None,
         };
         assert_eq!(
-            expect_worker_upserted(reopened_sm.apply(third, 4).unwrap()),
+            expect_worker_upserted(reopened_sm.apply(third).unwrap()),
             WorkerId::new(2)
         );
     }
@@ -2639,12 +2489,10 @@ mod tests {
             ],
         };
 
-        assert_eq!(expect_delete_intents(sm.apply(command.clone(), 1).unwrap()).created, 2);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(1));
+        assert_eq!(expect_delete_intents(sm.apply(command.clone()).unwrap()).created, 2);
         assert_eq!(storage.list_pending_delete_intents(10, 10).unwrap().len(), 2);
 
-        assert_eq!(expect_delete_intents(sm.apply(command, 2).unwrap()).created, 2);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(2));
+        assert_eq!(expect_delete_intents(sm.apply(command).unwrap()).created, 2);
         assert_eq!(storage.list_pending_delete_intents(10, 10).unwrap().len(), 2);
 
         let mismatch = Command::CreateDeleteIntents {
@@ -2654,9 +2502,8 @@ mod tests {
                 BlockId::new(data_handle_id, BlockIndex::new(2)),
             )],
         };
-        assert!(matches!(sm.apply(mismatch, 3), Err(MetadataError::InvalidArgument(_))));
+        assert!(matches!(sm.apply(mismatch), Err(MetadataError::InvalidArgument(_))));
         assert!(storage.get_delete_intent(902).unwrap().is_none());
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(2));
     }
 
     #[test]
@@ -2678,13 +2525,12 @@ mod tests {
         };
 
         assert!(matches!(
-            sm.apply(command.clone(), 1),
+            sm.apply(command.clone()),
             Err(MetadataError::InvalidArgument(_))
         ));
-        assert!(matches!(sm.apply(command, 2), Err(MetadataError::InvalidArgument(_))));
+        assert!(matches!(sm.apply(command), Err(MetadataError::InvalidArgument(_))));
         assert!(storage.get_delete_intent(9060).unwrap().is_none());
         assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 0);
-        assert_eq!(storage.get_applied_seq().unwrap(), None);
     }
 
     #[test]
@@ -2706,10 +2552,10 @@ mod tests {
         };
 
         assert!(matches!(
-            sm.apply(command.clone(), 1),
+            sm.apply(command.clone()),
             Err(MetadataError::InvalidArgument(_))
         ));
-        assert!(matches!(sm.apply(command, 2), Err(MetadataError::InvalidArgument(_))));
+        assert!(matches!(sm.apply(command), Err(MetadataError::InvalidArgument(_))));
         let stored = storage
             .get_delete_intent(9070)
             .unwrap()
@@ -2718,7 +2564,6 @@ mod tests {
         assert_eq!(stored.block_id, existing.block_id);
         assert!(matches!(stored.status, crate::state::DeleteIntentStatus::Pending));
         assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 1);
-        assert_eq!(storage.get_applied_seq().unwrap(), None);
     }
 
     #[test]
@@ -2741,8 +2586,8 @@ mod tests {
             intents: vec![first, second],
         };
 
-        assert_eq!(expect_delete_intents(sm.apply(command.clone(), 1).unwrap()).created, 2);
-        assert_eq!(expect_delete_intents(sm.apply(command, 2).unwrap()).created, 2);
+        assert_eq!(expect_delete_intents(sm.apply(command.clone()).unwrap()).created, 2);
+        assert_eq!(expect_delete_intents(sm.apply(command).unwrap()).created, 2);
         assert_eq!(
             storage.get_delete_intent(5).unwrap().unwrap().block_id,
             existing.block_id
@@ -2756,7 +2601,6 @@ mod tests {
             BlockId::new(data_handle_id, BlockIndex::new(2))
         );
         assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 2);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(2));
     }
 
     #[test]
@@ -2776,7 +2620,7 @@ mod tests {
             error_msg: None,
         };
 
-        let result = expect_delete_intent_status(sm.apply(command.clone(), 1).unwrap());
+        let result = expect_delete_intent_status(sm.apply(command.clone()).unwrap());
         assert_eq!(result.intent_id, 9090);
         assert!(matches!(result.status, crate::state::DeleteIntentStatus::Completed));
         assert!(matches!(
@@ -2788,12 +2632,11 @@ mod tests {
             Some(1234)
         );
 
-        expect_delete_intent_status(sm.apply(command, 2).unwrap());
+        expect_delete_intent_status(sm.apply(command).unwrap());
         assert_eq!(
             storage.get_delete_intent(9090).unwrap().unwrap().finished_at_ms,
             Some(1234)
         );
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(2));
 
         let mismatch = Command::UpdateDeleteIntentStatus {
             dedup: dedup_for_test(909),
@@ -2802,12 +2645,11 @@ mod tests {
             finished_at_ms: Some(9999),
             error_msg: Some("different".to_string()),
         };
-        assert!(matches!(sm.apply(mismatch, 3), Err(MetadataError::InvalidArgument(_))));
+        assert!(matches!(sm.apply(mismatch), Err(MetadataError::InvalidArgument(_))));
         assert!(matches!(
             storage.get_delete_intent(9090).unwrap().unwrap().status,
             crate::state::DeleteIntentStatus::Completed
         ));
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(2));
     }
 
     #[test]
@@ -2824,8 +2666,7 @@ mod tests {
             finished_at_ms: Some(1),
             error_msg: None,
         };
-        assert!(matches!(sm.apply(missing, 1), Err(MetadataError::NotFound(_))));
-        assert_eq!(storage.get_applied_seq().unwrap(), None);
+        assert!(matches!(sm.apply(missing), Err(MetadataError::NotFound(_))));
 
         let mut completed = make_delete_intent(9101, BlockId::new(DataHandleId::new(910), BlockIndex::new(0)));
         completed.status = crate::state::DeleteIntentStatus::Completed;
@@ -2839,16 +2680,15 @@ mod tests {
             error_msg: Some("late failure".to_string()),
         };
 
-        assert!(matches!(sm.apply(invalid, 2), Err(MetadataError::InvalidArgument(_))));
+        assert!(matches!(sm.apply(invalid), Err(MetadataError::InvalidArgument(_))));
         let stored = storage.get_delete_intent(9101).unwrap().unwrap();
         assert!(matches!(stored.status, crate::state::DeleteIntentStatus::Completed));
         assert_eq!(stored.finished_at_ms, Some(10));
         assert_eq!(stored.last_error_msg, None);
-        assert_eq!(storage.get_applied_seq().unwrap(), None);
     }
 
     #[test]
-    fn truncate_shrink_within_extent_updates_inode_layout_applied_result_and_seq() {
+    fn truncate_shrink_within_extent_updates_inode_layout_applied_result_and_replay_result() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
@@ -2870,16 +2710,13 @@ mod tests {
 
         let dedup = dedup_for_test(91);
         expect_fs_ok(
-            sm.apply(
-                Command::Truncate {
-                    dedup: dedup.clone(),
-                    inode_id,
-                    new_size: 512,
-                    lease_id: lease_id_for_inode_epoch(inode_id, 2),
-                    lease_epoch: 2,
-                },
-                1,
-            )
+            sm.apply(Command::Truncate {
+                dedup: dedup.clone(),
+                inode_id,
+                new_size: 512,
+                lease_id: lease_id_for_inode_epoch(inode_id, 2),
+                lease_epoch: 2,
+            })
             .unwrap(),
         );
 
@@ -2895,7 +2732,6 @@ mod tests {
         assert_eq!(storage.get_layout(inode_id).unwrap(), FileLayout::new(4096, 4096, 1));
         assert_eq!(storage.get_block_ref_count(block_id).unwrap(), Some(1));
         assert!(storage.get_applied_result(&dedup).unwrap().is_some());
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(1));
     }
 
     #[test]
@@ -2930,16 +2766,15 @@ mod tests {
             lease_epoch: 2,
         };
 
-        expect_fs_ok(sm.apply(command.clone(), 1).unwrap());
+        expect_fs_ok(sm.apply(command.clone()).unwrap());
         assert_eq!(storage.get_block_ref_count(kept_block).unwrap(), Some(1));
         assert_eq!(storage.get_block_ref_count(dropped_block).unwrap(), None);
         assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 1);
 
-        expect_fs_ok(sm.apply(command, 2).unwrap());
+        expect_fs_ok(sm.apply(command).unwrap());
         assert_eq!(storage.get_block_ref_count(kept_block).unwrap(), Some(1));
         assert_eq!(storage.get_block_ref_count(dropped_block).unwrap(), None);
         assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 1);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(2));
     }
 
     #[test]
@@ -2964,16 +2799,13 @@ mod tests {
         storage.put_block_ref_count(shared_block, 1).unwrap();
 
         expect_fs_ok(
-            sm.apply(
-                Command::Truncate {
-                    dedup: dedup_for_test(925),
-                    inode_id,
-                    new_size: 4096,
-                    lease_id: lease_id_for_inode_epoch(inode_id, 2),
-                    lease_epoch: 2,
-                },
-                1,
-            )
+            sm.apply(Command::Truncate {
+                dedup: dedup_for_test(925),
+                inode_id,
+                new_size: 4096,
+                lease_id: lease_id_for_inode_epoch(inode_id, 2),
+                lease_epoch: 2,
+            })
             .unwrap(),
         );
 
@@ -3018,8 +2850,8 @@ mod tests {
             lease_id: lease_id_for_inode_epoch(inode_id, 2),
             lease_epoch: 2,
         };
-        expect_fs_ok(sm.apply(command.clone(), 1).unwrap());
-        expect_fs_ok(sm.apply(command, 2).unwrap());
+        expect_fs_ok(sm.apply(command.clone()).unwrap());
+        expect_fs_ok(sm.apply(command).unwrap());
 
         let mut intents = storage.list_pending_delete_intents(10, u64::MAX).unwrap();
         intents.sort_by_key(|intent| intent.intent_id);
@@ -3030,7 +2862,6 @@ mod tests {
         assert_eq!(intents[1].block_id, second_block);
         assert_eq!(storage.get_block_ref_count(first_block).unwrap(), None);
         assert_eq!(storage.get_block_ref_count(second_block).unwrap(), None);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(2));
     }
 
     #[test]
@@ -3068,7 +2899,7 @@ mod tests {
             lease_epoch: 2,
         };
 
-        expect_fs_ok(sm.apply(command.clone(), 1).unwrap());
+        expect_fs_ok(sm.apply(command.clone()).unwrap());
         let stored_existing = storage.get_delete_intent(1).unwrap().unwrap();
         assert_eq!(stored_existing.block_id, existing_block);
         let new_intent = storage.get_delete_intent(2).unwrap().unwrap();
@@ -3077,14 +2908,12 @@ mod tests {
         assert_eq!(storage.get_block_ref_count(dropped_block).unwrap(), None);
         assert_eq!(storage.get_inode(inode_id).unwrap().unwrap().attrs.size, 0);
         assert!(storage.get_applied_result(&dedup).unwrap().is_some());
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(1));
 
-        expect_fs_ok(sm.apply(command, 2).unwrap());
+        expect_fs_ok(sm.apply(command).unwrap());
         assert_eq!(storage.get_delete_intent(1).unwrap().unwrap().block_id, existing_block);
         assert_eq!(storage.get_delete_intent(2).unwrap().unwrap().block_id, dropped_block);
         assert_eq!(read_next_delete_intent_id(&storage), Some(3));
         assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 2);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(2));
     }
 
     #[test]
@@ -3123,7 +2952,7 @@ mod tests {
             lease_epoch: 2,
         };
 
-        expect_fs_ok(sm.apply(command.clone(), 1).unwrap());
+        expect_fs_ok(sm.apply(command.clone()).unwrap());
         let stored_existing = storage.get_delete_intent(10).unwrap().unwrap();
         assert_eq!(stored_existing.block_id, existing_block);
         assert!(matches!(
@@ -3133,14 +2962,12 @@ mod tests {
         assert_eq!(storage.get_delete_intent(11).unwrap().unwrap().block_id, dropped_block);
         assert_eq!(read_next_delete_intent_id(&storage), Some(12));
         assert_eq!(storage.get_block_ref_count(dropped_block).unwrap(), None);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(1));
 
-        expect_fs_ok(sm.apply(command, 2).unwrap());
+        expect_fs_ok(sm.apply(command).unwrap());
         assert_eq!(storage.get_delete_intent(10).unwrap().unwrap().block_id, existing_block);
         assert_eq!(storage.get_delete_intent(11).unwrap().unwrap().block_id, dropped_block);
         assert_eq!(read_next_delete_intent_id(&storage), Some(12));
         assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 1);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(2));
     }
 
     #[test]
@@ -3171,16 +2998,13 @@ mod tests {
         storage.put_block_ref_count(dropped_block, 1).unwrap();
 
         expect_fs_ok(
-            sm.apply(
-                Command::Truncate {
-                    dedup: dedup_for_test(932),
-                    inode_id,
-                    new_size: 0,
-                    lease_id: lease_id_for_inode_epoch(inode_id, 2),
-                    lease_epoch: 2,
-                },
-                1,
-            )
+            sm.apply(Command::Truncate {
+                dedup: dedup_for_test(932),
+                inode_id,
+                new_size: 0,
+                lease_id: lease_id_for_inode_epoch(inode_id, 2),
+                lease_epoch: 2,
+            })
             .unwrap(),
         );
 
@@ -3211,22 +3035,18 @@ mod tests {
         );
 
         expect_fs_errno(
-            sm.apply(
-                Command::Truncate {
-                    dedup: dedup_for_test(93),
-                    inode_id,
-                    new_size: 0,
-                    lease_id: lease_id_for_inode_epoch(inode_id, 2),
-                    lease_epoch: 2,
-                },
-                1,
-            )
+            sm.apply(Command::Truncate {
+                dedup: dedup_for_test(93),
+                inode_id,
+                new_size: 0,
+                lease_id: lease_id_for_inode_epoch(inode_id, 2),
+                lease_epoch: 2,
+            })
             .unwrap(),
             FsErrorCode::EInval,
         );
         assert_eq!(storage.get_inode(inode_id).unwrap().unwrap().attrs.size, 4096);
         assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 0);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(1));
 
         let correct_block = BlockId::new(inode_data_handle, BlockIndex::new(1));
         let missing_ref_inode = InodeId::new(931);
@@ -3241,16 +3061,13 @@ mod tests {
         );
 
         expect_fs_errno(
-            sm.apply(
-                Command::Truncate {
-                    dedup: dedup_for_test(94),
-                    inode_id: missing_ref_inode,
-                    new_size: 0,
-                    lease_id: lease_id_for_inode_epoch(missing_ref_inode, 2),
-                    lease_epoch: 2,
-                },
-                2,
-            )
+            sm.apply(Command::Truncate {
+                dedup: dedup_for_test(94),
+                inode_id: missing_ref_inode,
+                new_size: 0,
+                lease_id: lease_id_for_inode_epoch(missing_ref_inode, 2),
+                lease_epoch: 2,
+            })
             .unwrap(),
             FsErrorCode::EInval,
         );
@@ -3280,16 +3097,13 @@ mod tests {
         storage.put_block_ref_count(block_id, 1).unwrap();
 
         expect_fs_errno(
-            sm.apply(
-                Command::Truncate {
-                    dedup: dedup_for_test(95),
-                    inode_id,
-                    new_size: 2048,
-                    lease_id: lease_id_for_inode_epoch(inode_id, 2),
-                    lease_epoch: 2,
-                },
-                1,
-            )
+            sm.apply(Command::Truncate {
+                dedup: dedup_for_test(95),
+                inode_id,
+                new_size: 2048,
+                lease_id: lease_id_for_inode_epoch(inode_id, 2),
+                lease_epoch: 2,
+            })
             .unwrap(),
             FsErrorCode::ENotsup,
         );
@@ -3297,36 +3111,28 @@ mod tests {
 
         let dedup = dedup_for_test(96);
         expect_fs_ok(
-            sm.apply(
-                Command::Truncate {
-                    dedup: dedup.clone(),
-                    inode_id,
-                    new_size: 1024,
-                    lease_id: lease_id_for_inode_epoch(inode_id, 2),
-                    lease_epoch: 2,
-                },
-                2,
-            )
+            sm.apply(Command::Truncate {
+                dedup: dedup.clone(),
+                inode_id,
+                new_size: 1024,
+                lease_id: lease_id_for_inode_epoch(inode_id, 2),
+                lease_epoch: 2,
+            })
             .unwrap(),
         );
         assert_eq!(storage.get_block_ref_count(block_id).unwrap(), Some(1));
         assert!(storage.get_applied_result(&dedup).unwrap().is_some());
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(2));
 
-        let mismatch = sm.apply(
-            Command::Truncate {
-                dedup,
-                inode_id,
-                new_size: 512,
-                lease_id: lease_id_for_inode_epoch(inode_id, 2),
-                lease_epoch: 2,
-            },
-            3,
-        );
+        let mismatch = sm.apply(Command::Truncate {
+            dedup,
+            inode_id,
+            new_size: 512,
+            lease_id: lease_id_for_inode_epoch(inode_id, 2),
+            lease_epoch: 2,
+        });
         assert!(matches!(mismatch, Err(MetadataError::InvalidArgument(_))));
         assert_eq!(storage.get_block_ref_count(block_id).unwrap(), Some(1));
         assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 0);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(2));
     }
 
     #[test]
@@ -3351,16 +3157,13 @@ mod tests {
         storage.put_block_ref_count(block_id, 1).unwrap();
 
         expect_fs_errno(
-            sm.apply(
-                Command::Truncate {
-                    dedup: dedup_for_test(958),
-                    inode_id,
-                    new_size: 0,
-                    lease_id: types::ids::LeaseId::new(1),
-                    lease_epoch: 2,
-                },
-                1,
-            )
+            sm.apply(Command::Truncate {
+                dedup: dedup_for_test(958),
+                inode_id,
+                new_size: 0,
+                lease_id: types::ids::LeaseId::new(1),
+                lease_epoch: 2,
+            })
             .unwrap(),
             FsErrorCode::EAcces,
         );
@@ -3369,16 +3172,13 @@ mod tests {
         assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 0);
 
         expect_fs_errno(
-            sm.apply(
-                Command::Truncate {
-                    dedup: dedup_for_test(959),
-                    inode_id,
-                    new_size: 0,
-                    lease_id: lease_id_for_inode_epoch(inode_id, 1),
-                    lease_epoch: 1,
-                },
-                2,
-            )
+            sm.apply(Command::Truncate {
+                dedup: dedup_for_test(959),
+                inode_id,
+                new_size: 0,
+                lease_id: lease_id_for_inode_epoch(inode_id, 1),
+                lease_epoch: 1,
+            })
             .unwrap(),
             FsErrorCode::EAcces,
         );
@@ -3388,7 +3188,7 @@ mod tests {
     }
 
     #[test]
-    fn lease_commands_reapply_return_original_result_and_applied_seq() {
+    fn lease_commands_reapply_return_original_result_and_replay_result() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
@@ -3419,21 +3219,17 @@ mod tests {
             epoch: 1,
             expires_at_ms: 1000,
         };
-        let first = expect_lease_acquired(sm.apply(acquire.clone(), 25).unwrap());
-        let second = expect_lease_acquired(sm.apply(acquire, 26).unwrap());
+        let first = expect_lease_acquired(sm.apply(acquire.clone()).unwrap());
+        let second = expect_lease_acquired(sm.apply(acquire).unwrap());
         assert_eq!(second.lease.owner, first.lease.owner);
         assert_eq!(second.lease.epoch, first.lease.epoch);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(26));
-        assert_eq!(sm.applied_seq(), 26);
 
         let release = Command::ReleaseLease {
             dedup: dedup_for_test(78),
             block_id,
         };
-        expect_lease_released(sm.apply(release.clone(), 27).unwrap());
-        expect_lease_released(sm.apply(release, 28).unwrap());
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(28));
-        assert_eq!(sm.applied_seq(), 28);
+        expect_lease_released(sm.apply(release.clone()).unwrap());
+        expect_lease_released(sm.apply(release).unwrap());
         assert!(storage.get_lease(block_id).unwrap().is_none());
     }
 
@@ -3450,16 +3246,13 @@ mod tests {
             .unwrap();
 
         let source = sm
-            .apply(
-                Command::Create {
-                    dedup: dedup_for_test(38),
-                    parent_inode_id,
-                    name: "source".to_string(),
-                    attrs: FileAttrs::new(),
-                    layout: FileLayout::new(4096, 4096, 1),
-                },
-                1,
-            )
+            .apply(Command::Create {
+                dedup: dedup_for_test(38),
+                parent_inode_id,
+                name: "source".to_string(),
+                attrs: FileAttrs::new(),
+                layout: FileLayout::new(4096, 4096, 1),
+            })
             .unwrap();
         let source_inode_id = match source {
             AppDataResponse::Fs(FsCommandResult::Ok(ok)) => ok.inode_id.unwrap(),
@@ -3467,16 +3260,13 @@ mod tests {
         };
 
         let target = sm
-            .apply(
-                Command::Create {
-                    dedup: dedup_for_test(39),
-                    parent_inode_id,
-                    name: "target".to_string(),
-                    attrs: FileAttrs::new(),
-                    layout: FileLayout::new(8192, 8192, 1),
-                },
-                2,
-            )
+            .apply(Command::Create {
+                dedup: dedup_for_test(39),
+                parent_inode_id,
+                name: "target".to_string(),
+                attrs: FileAttrs::new(),
+                layout: FileLayout::new(8192, 8192, 1),
+            })
             .unwrap();
         let target_inode_id = match target {
             AppDataResponse::Fs(FsCommandResult::Ok(ok)) => ok.inode_id.unwrap(),
@@ -3486,17 +3276,14 @@ mod tests {
         let target_handle = target_inode.current_data_handle_id;
 
         let rejected = sm
-            .apply(
-                Command::Rename {
-                    dedup: dedup_for_test(40),
-                    src_parent_inode_id: parent_inode_id,
-                    src_name: "source".to_string(),
-                    dst_parent_inode_id: parent_inode_id,
-                    dst_name: "target".to_string(),
-                    flags: 0,
-                },
-                3,
-            )
+            .apply(Command::Rename {
+                dedup: dedup_for_test(40),
+                src_parent_inode_id: parent_inode_id,
+                src_name: "source".to_string(),
+                dst_parent_inode_id: parent_inode_id,
+                dst_name: "target".to_string(),
+                flags: 0,
+            })
             .unwrap();
 
         match rejected {
@@ -3541,28 +3328,22 @@ mod tests {
             .unwrap();
 
         let first = sm
-            .apply(
-                Command::Create {
-                    dedup: dedup_for_test(30),
-                    parent_inode_id,
-                    name: "first".to_string(),
-                    attrs: FileAttrs::new(),
-                    layout: FileLayout::new(4096, 4096, 1),
-                },
-                1,
-            )
+            .apply(Command::Create {
+                dedup: dedup_for_test(30),
+                parent_inode_id,
+                name: "first".to_string(),
+                attrs: FileAttrs::new(),
+                layout: FileLayout::new(4096, 4096, 1),
+            })
             .unwrap();
         let second = sm
-            .apply(
-                Command::Create {
-                    dedup: dedup_for_test(31),
-                    parent_inode_id,
-                    name: "second".to_string(),
-                    attrs: FileAttrs::new(),
-                    layout: FileLayout::new(4096, 4096, 1),
-                },
-                2,
-            )
+            .apply(Command::Create {
+                dedup: dedup_for_test(31),
+                parent_inode_id,
+                name: "second".to_string(),
+                attrs: FileAttrs::new(),
+                layout: FileLayout::new(4096, 4096, 1),
+            })
             .unwrap();
 
         let first_inode_id = match first {
@@ -3589,16 +3370,13 @@ mod tests {
             let mount_table = Arc::new(MountTable::new());
             let sm = AppRaftStateMachine::new(Arc::clone(&storage), mount_table);
             let response = sm
-                .apply(
-                    Command::Create {
-                        dedup: dedup_for_test(32),
-                        parent_inode_id,
-                        name: "before-reopen".to_string(),
-                        attrs: FileAttrs::new(),
-                        layout: FileLayout::new(4096, 4096, 1),
-                    },
-                    1,
-                )
+                .apply(Command::Create {
+                    dedup: dedup_for_test(32),
+                    parent_inode_id,
+                    name: "before-reopen".to_string(),
+                    attrs: FileAttrs::new(),
+                    layout: FileLayout::new(4096, 4096, 1),
+                })
                 .unwrap();
             match response {
                 AppDataResponse::Fs(FsCommandResult::Ok(ok)) => ok.inode_id.unwrap(),
@@ -3610,16 +3388,13 @@ mod tests {
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), mount_table);
         let response = sm
-            .apply(
-                Command::Create {
-                    dedup: dedup_for_test(33),
-                    parent_inode_id,
-                    name: "after-reopen".to_string(),
-                    attrs: FileAttrs::new(),
-                    layout: FileLayout::new(4096, 4096, 1),
-                },
-                2,
-            )
+            .apply(Command::Create {
+                dedup: dedup_for_test(33),
+                parent_inode_id,
+                name: "after-reopen".to_string(),
+                attrs: FileAttrs::new(),
+                layout: FileLayout::new(4096, 4096, 1),
+            })
             .unwrap();
         let second_inode_id = match response {
             AppDataResponse::Fs(FsCommandResult::Ok(ok)) => ok.inode_id.unwrap(),
@@ -3645,25 +3420,22 @@ mod tests {
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-        sm.apply(
-            Command::CloseWrite {
-                dedup: dedup_for_test(34),
-                inode_id,
-                extents: vec![types::fs::Extent {
-                    file_offset: 0,
-                    block_id,
-                    block_offset: 0,
-                    len: 11,
-                    file_version: None,
-                    block_stamp: None,
-                }],
-                final_size: 11,
-                lease_id: types::ids::LeaseId::new(1),
-                open_epoch: 1,
-                lease_epoch: 1,
-            },
-            1,
-        )
+        sm.apply(Command::CloseWrite {
+            dedup: dedup_for_test(34),
+            inode_id,
+            extents: vec![types::fs::Extent {
+                file_offset: 0,
+                block_id,
+                block_offset: 0,
+                len: 11,
+                file_version: None,
+                block_stamp: None,
+            }],
+            final_size: 11,
+            lease_id: types::ids::LeaseId::new(1),
+            open_epoch: 1,
+            lease_epoch: 1,
+        })
         .unwrap();
         let updated = storage.get_inode(inode_id).unwrap().unwrap();
         match updated.data {
@@ -3673,26 +3445,23 @@ mod tests {
             other => panic!("unexpected inode data: {:?}", other),
         }
 
-        let mismatch = sm.apply(
-            Command::CloseWrite {
-                dedup: dedup_for_test(35),
-                inode_id,
-                extents: vec![types::fs::Extent {
-                    file_offset: 11,
-                    // Intentional invalid fixture: extents must use inode.current_data_handle_id.
-                    block_id: BlockId::new(DataHandleId::new(inode_id.as_raw()), BlockIndex::new(1)),
-                    block_offset: 0,
-                    len: 1,
-                    file_version: None,
-                    block_stamp: None,
-                }],
-                final_size: 12,
-                lease_id: types::ids::LeaseId::new(1),
-                open_epoch: 1,
-                lease_epoch: 2,
-            },
-            2,
-        );
+        let mismatch = sm.apply(Command::CloseWrite {
+            dedup: dedup_for_test(35),
+            inode_id,
+            extents: vec![types::fs::Extent {
+                file_offset: 11,
+                // Intentional invalid fixture: extents must use inode.current_data_handle_id.
+                block_id: BlockId::new(DataHandleId::new(inode_id.as_raw()), BlockIndex::new(1)),
+                block_offset: 0,
+                len: 1,
+                file_version: None,
+                block_stamp: None,
+            }],
+            final_size: 12,
+            lease_id: types::ids::LeaseId::new(1),
+            open_epoch: 1,
+            lease_epoch: 2,
+        });
         assert!(matches!(
             mismatch,
             Ok(AppDataResponse::Fs(FsCommandResult::Err(FsErrnoResult {
@@ -3736,14 +3505,14 @@ mod tests {
             lease_epoch: 3,
         };
 
-        expect_fs_ok(sm.apply(command.clone(), 5).unwrap());
+        expect_fs_ok(sm.apply(command.clone()).unwrap());
         let first_inode = storage.get_inode(inode_id).unwrap().unwrap();
         let first_result = match storage.get_applied_result(&dedup).unwrap().unwrap().result {
             AppDataResponse::Fs(result) => result,
             other => panic!("unexpected applied result: {:?}", other),
         };
 
-        expect_fs_ok(sm.apply(command, 6).unwrap());
+        expect_fs_ok(sm.apply(command).unwrap());
         let replayed_inode = storage.get_inode(inode_id).unwrap().unwrap();
         let replayed_result = match storage.get_applied_result(&dedup).unwrap().unwrap().result {
             AppDataResponse::Fs(result) => result,
@@ -3754,8 +3523,6 @@ mod tests {
         assert_eq!(replayed_inode, first_inode);
         assert_eq!(storage.get_layout(inode_id).unwrap(), layout);
         assert_eq!(storage.get_block_ref_count(block_id).unwrap(), Some(1));
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(6));
-        assert_eq!(sm.applied_seq(), 6);
     }
 
     #[test]
@@ -3791,14 +3558,13 @@ mod tests {
             lease_epoch: 3,
         };
 
-        expect_fs_errno(sm.apply(command.clone(), 7).unwrap(), FsErrorCode::EInval);
-        expect_fs_errno(sm.apply(command, 8).unwrap(), FsErrorCode::EInval);
+        expect_fs_errno(sm.apply(command.clone()).unwrap(), FsErrorCode::EInval);
+        expect_fs_errno(sm.apply(command).unwrap(), FsErrorCode::EInval);
 
         let stored = storage.get_inode(inode_id).unwrap().unwrap();
         assert_eq!(stored, inode);
         assert_eq!(storage.get_layout(inode_id).unwrap(), layout);
         assert_eq!(storage.get_block_ref_count(bad_block_id).unwrap(), None);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(8));
     }
 
     #[test]
@@ -3852,16 +3618,14 @@ mod tests {
             lease_epoch: 3,
         };
 
-        expect_fs_ok(sm.apply(first, 9).unwrap());
+        expect_fs_ok(sm.apply(first).unwrap());
         let first_inode = storage.get_inode(inode_id).unwrap().unwrap();
-        let err = sm.apply(mismatch, 10).unwrap_err();
+        let err = sm.apply(mismatch).unwrap_err();
 
         assert!(matches!(err, MetadataError::InvalidArgument(_)));
         assert_eq!(storage.get_inode(inode_id).unwrap().unwrap(), first_inode);
         assert_eq!(storage.get_block_ref_count(first_block_id).unwrap(), Some(1));
         assert_eq!(storage.get_block_ref_count(second_block_id).unwrap(), None);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(9));
-        assert_eq!(sm.applied_seq(), 9);
     }
     #[test]
     #[ignore = "pending identity-pivot follow-ups"]
@@ -3882,28 +3646,22 @@ mod tests {
         };
 
         // Success path
-        sm.apply(
-            Command::AllocateBlock {
-                dedup: crate::raft::types::DedupKey::new(ClientId::new(11), CallId::new()),
-                inode_id,
-                block_id,
-                placement: placement.clone(),
-            },
-            1,
-        )
+        sm.apply(Command::AllocateBlock {
+            dedup: crate::raft::types::DedupKey::new(ClientId::new(11), CallId::new()),
+            inode_id,
+            block_id,
+            placement: placement.clone(),
+        })
         .unwrap();
 
         // Mismatch should fail
         let err = sm
-            .apply(
-                Command::AllocateBlock {
-                    dedup: crate::raft::types::DedupKey::new(ClientId::new(12), CallId::new()),
-                    inode_id: InodeId::new(999),
-                    block_id,
-                    placement,
-                },
-                2,
-            )
+            .apply(Command::AllocateBlock {
+                dedup: crate::raft::types::DedupKey::new(ClientId::new(12), CallId::new()),
+                inode_id: InodeId::new(999),
+                block_id,
+                placement,
+            })
             .unwrap_err();
         assert!(matches!(err, MetadataError::InvalidArgument(_)));
     }
@@ -3935,16 +3693,13 @@ mod tests {
         storage.put_block(&block_meta).unwrap();
 
         let lease_raw = sm
-            .apply(
-                Command::AcquireLease {
-                    dedup: dedup_for_test(20),
-                    block_id,
-                    client_id: ClientId::new(9),
-                    epoch: 1,
-                    expires_at_ms: 9999,
-                },
-                1,
-            )
+            .apply(Command::AcquireLease {
+                dedup: dedup_for_test(20),
+                block_id,
+                client_id: ClientId::new(9),
+                epoch: 1,
+                expires_at_ms: 9999,
+            })
             .unwrap();
         let lease: LeaseState = match lease_raw {
             AppDataResponse::Lease(LeaseCommandResult::Acquired(lease)) => lease,
@@ -3958,22 +3713,19 @@ mod tests {
             .put_data_handle_owner(data_handle, InodeId::new(999))
             .expect("should update mapping for test");
         let err = sm
-            .apply(
-                Command::AcquireLease {
-                    dedup: dedup_for_test(21),
-                    block_id,
-                    client_id: ClientId::new(9),
-                    epoch: 2,
-                    expires_at_ms: 19999,
-                },
-                2,
-            )
+            .apply(Command::AcquireLease {
+                dedup: dedup_for_test(21),
+                block_id,
+                client_id: ClientId::new(9),
+                epoch: 2,
+                expires_at_ms: 19999,
+            })
             .unwrap_err();
         assert!(matches!(err, MetadataError::InvalidArgument(_)));
     }
 
     #[test]
-    fn dedup_fingerprint_mismatch_does_not_apply_mutation_or_advance_seq() {
+    fn dedup_fingerprint_mismatch_does_not_apply_mutation_or_reapply_mutation() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
@@ -4000,13 +3752,11 @@ mod tests {
             layout: FileLayout::new(4096, 4096, 1),
         };
 
-        sm.apply(first, 7).unwrap();
-        let err = sm.apply(mismatch, 8).unwrap_err();
+        sm.apply(first).unwrap();
+        let err = sm.apply(mismatch).unwrap_err();
 
         assert!(matches!(err, MetadataError::InvalidArgument(_)));
         assert_eq!(storage.get_dentry(parent_inode_id, "second").unwrap(), None);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(7));
-        assert_eq!(sm.applied_seq(), 7);
     }
 
     #[test]
@@ -4034,14 +3784,13 @@ mod tests {
             name: "file".to_string(),
         };
 
-        expect_fs_ok(sm.apply(command.clone(), 1).unwrap());
+        expect_fs_ok(sm.apply(command.clone()).unwrap());
         assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), None);
         assert!(storage.get_inode(inode_id).unwrap().is_none());
         assert_eq!(storage.get_inode_by_data_handle(data_handle_id).unwrap(), None);
         assert!(storage.get_applied_result(&dedup).unwrap().is_some());
 
-        expect_fs_ok(sm.apply(command, 2).unwrap());
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(2));
+        expect_fs_ok(sm.apply(command).unwrap());
         assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), None);
     }
 
@@ -4073,7 +3822,7 @@ mod tests {
             name: "file".to_string(),
         };
 
-        expect_fs_ok(sm.apply(command.clone(), 1).unwrap());
+        expect_fs_ok(sm.apply(command.clone()).unwrap());
         assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), None);
         assert!(storage.get_inode(inode_id).unwrap().is_none());
         assert!(storage.get_layout(inode_id).is_err());
@@ -4081,10 +3830,9 @@ mod tests {
         assert_eq!(storage.get_block_ref_count(block_id).unwrap(), None);
         assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 1);
 
-        expect_fs_ok(sm.apply(command, 2).unwrap());
+        expect_fs_ok(sm.apply(command).unwrap());
         assert_eq!(storage.get_block_ref_count(block_id).unwrap(), None);
         assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 1);
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(2));
     }
 
     #[test]
@@ -4110,14 +3858,11 @@ mod tests {
         storage.put_block_ref_count(block_id, 2).unwrap();
 
         expect_fs_ok(
-            sm.apply(
-                Command::Unlink {
-                    dedup: dedup_for_test(97),
-                    parent_inode_id,
-                    name: "file".to_string(),
-                },
-                1,
-            )
+            sm.apply(Command::Unlink {
+                dedup: dedup_for_test(97),
+                parent_inode_id,
+                name: "file".to_string(),
+            })
             .unwrap(),
         );
 
@@ -4148,14 +3893,11 @@ mod tests {
         );
 
         expect_fs_errno(
-            sm.apply(
-                Command::Unlink {
-                    dedup: dedup_for_test(98),
-                    parent_inode_id,
-                    name: "file".to_string(),
-                },
-                1,
-            )
+            sm.apply(Command::Unlink {
+                dedup: dedup_for_test(98),
+                parent_inode_id,
+                name: "file".to_string(),
+            })
             .unwrap(),
             FsErrorCode::EInval,
         );
@@ -4191,13 +3933,12 @@ mod tests {
             name: "dir".to_string(),
         };
 
-        expect_fs_ok(sm.apply(command.clone(), 1).unwrap());
+        expect_fs_ok(sm.apply(command.clone()).unwrap());
         assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), None);
         assert!(storage.get_inode(inode_id).unwrap().is_none());
         assert!(storage.get_applied_result(&dedup).unwrap().is_some());
 
-        expect_fs_ok(sm.apply(command, 2).unwrap());
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(2));
+        expect_fs_ok(sm.apply(command).unwrap());
         assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), None);
     }
 
@@ -4227,12 +3968,12 @@ mod tests {
             name: "dir".to_string(),
         };
 
-        expect_fs_errno(sm.apply(command.clone(), 1).unwrap(), FsErrorCode::ENotEmpty);
+        expect_fs_errno(sm.apply(command.clone()).unwrap(), FsErrorCode::ENotEmpty);
         assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), Some(dir_inode_id));
         assert!(storage.get_inode(dir_inode_id).unwrap().is_some());
         assert!(storage.get_applied_result(&dedup).unwrap().is_some());
 
-        expect_fs_errno(sm.apply(command, 2).unwrap(), FsErrorCode::ENotEmpty);
+        expect_fs_errno(sm.apply(command).unwrap(), FsErrorCode::ENotEmpty);
         assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), Some(dir_inode_id));
     }
 }

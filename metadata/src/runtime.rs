@@ -12,7 +12,7 @@ use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use crate::readiness::{wait_for_root_ready_with_metrics, RootReadinessGate};
 use crate::service::{
     filesystem_permission_checker, FileSystemAuthorityDeps, FileSystemPolicyDeps, FileSystemRuntimeDeps,
-    MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl, SharedWorkerCommitHook,
+    MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl, MetadataRouteServiceImpl, SharedWorkerCommitHook,
 };
 use crate::state::RaftStateStore;
 use crate::ufs_proxy::UfsMetadataProxy;
@@ -25,6 +25,7 @@ use common::observe::{
     init_observability as init_common_observability, ObservabilityConfig, ObservabilityGuard, ServiceInfo,
 };
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProtoServer;
+use proto::metadata::metadata_route_service_proto_server::MetadataRouteServiceProtoServer;
 use proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProtoServer;
 use std::sync::{Arc, Mutex};
 use tokio::signal;
@@ -102,6 +103,7 @@ pub struct ReadinessHandle {
 /// Services registered on the tonic server.
 pub struct RpcServices {
     filesystem: MetadataFileSystemServiceImpl,
+    route: MetadataRouteServiceImpl,
     worker: MetadataWorkerServiceImpl,
     health: MetadataHealthServer,
 }
@@ -200,10 +202,17 @@ impl MetadataServer {
         let readiness = build_readiness(config.as_ref(), &authority).await;
         let filesystem =
             build_filesystem_service(config.as_ref(), &authority, Arc::clone(&worker.manager), &readiness).await?;
+        let route = build_route_service(&authority);
         let maintenance = build_maintenance(&authority, &worker).await;
         let worker_background = build_worker_background(&worker, &mut worker_service, &maintenance);
-        let (services, handles) =
-            compose_services(filesystem, worker_service, readiness, worker_background, maintenance);
+        let (services, handles) = compose_services(
+            filesystem,
+            route,
+            worker_service,
+            readiness,
+            worker_background,
+            maintenance,
+        );
 
         Ok(Self {
             config,
@@ -391,6 +400,9 @@ pub async fn build_readiness(config: &MetadataConfig, authority: &MetadataAuthor
     health_reporter
         .set_not_serving::<FileSystemServiceProtoServer<MetadataFileSystemServiceImpl>>()
         .await;
+    health_reporter
+        .set_not_serving::<MetadataRouteServiceProtoServer<MetadataRouteServiceImpl>>()
+        .await;
     let health_service = HealthServer::new(HealthService::from_health_reporter(health_reporter.clone()));
 
     let readiness_config = config.bootstrap.root_readiness.clone();
@@ -413,6 +425,9 @@ pub async fn build_readiness(config: &MetadataConfig, authority: &MetadataAuthor
             Ok(()) => {
                 health_reporter
                     .set_serving::<FileSystemServiceProtoServer<MetadataFileSystemServiceImpl>>()
+                    .await;
+                health_reporter
+                    .set_serving::<MetadataRouteServiceProtoServer<MetadataRouteServiceImpl>>()
                     .await;
             }
             Err(err) => {
@@ -470,9 +485,15 @@ pub async fn build_filesystem_service(
     Ok(filesystem_service)
 }
 
+/// Constructs the metadata route RPC service for client refresh and msync.
+pub fn build_route_service(authority: &MetadataAuthority) -> MetadataRouteServiceImpl {
+    MetadataRouteServiceImpl::new(Arc::clone(&authority.raft_node), authority.shard_group_id)
+}
+
 /// Separates RPC service values from lifecycle handles before entering server code.
 pub fn compose_services(
     filesystem: MetadataFileSystemServiceImpl,
+    route: MetadataRouteServiceImpl,
     worker: MetadataWorkerServiceImpl,
     readiness: Readiness,
     worker_background: WorkerBackground,
@@ -486,6 +507,7 @@ pub fn compose_services(
     (
         RpcServices {
             filesystem,
+            route,
             worker,
             health: health_service,
         },
@@ -497,12 +519,13 @@ pub fn compose_services(
     )
 }
 
-/// Registers the filesystem, worker, and health services and holds runtime handles.
+/// Registers the filesystem, route, worker, and health services and holds runtime handles.
 pub async fn serve(config: &MetadataConfig, services: RpcServices, _handles: RuntimeHandles) -> Result<(), DynError> {
     let addr = config.rpc_addr;
-    info!(addr = %addr, "Listening on (path/filesystem + worker services)");
+    info!(addr = %addr, "Listening on (path/filesystem + route + worker services)");
     Server::builder()
         .add_service(FileSystemServiceProtoServer::new(services.filesystem))
+        .add_service(MetadataRouteServiceProtoServer::new(services.route))
         .add_service(MetadataWorkerServiceProtoServer::new(services.worker))
         .add_service(services.health)
         .serve_with_shutdown(addr, shutdown_signal())
@@ -539,8 +562,19 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use crate::config::{BootstrapConfig, MetadataAuthzConfig, RaftConfig, ShardConfig, WorkerConfig};
+    use client::cache::{RouteCache, StateIdCache};
+    use client::canonical::RetryOutcome;
+    use client::meta::{MetadataClient, MetadataRpcHelper};
+    use client::routing::{GroupRoleCache, RouteTable};
+    use common::error::canonical::{CanonicalError, RefreshReason};
+    use common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
+    use proto::metadata::metadata_route_service_proto_server::MetadataRouteServiceProtoServer;
     use std::sync::OnceLock;
     use tempfile::TempDir;
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::Server;
+    use types::{ClientId, GroupStateWatermark, RaftLogId};
 
     async fn test_authority(dir: &TempDir) -> MetadataAuthority {
         let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
@@ -578,6 +612,18 @@ mod tests {
             _ufs_registry: Arc::clone(&ufs_registry),
             _ufs_metadata_proxy: Arc::new(UfsMetadataProxy::new(mount_table, ufs_registry)),
         }
+    }
+
+    async fn wait_for_leader_state(authority: &MetadataAuthority) -> RaftLogId {
+        for _ in 0..100 {
+            if authority.raft_node.is_leader() {
+                if let Some(state_id) = authority.raft_node.get_last_applied_state_id() {
+                    return state_id;
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+        panic!("single-node test authority did not expose leader last_applied state");
     }
 
     fn test_config() -> MetadataConfig {
@@ -634,14 +680,100 @@ mod tests {
             .unwrap();
         let maintenance = build_maintenance(&authority, &worker_runtime).await;
         let worker_background = build_worker_background(&worker_runtime, &mut worker_service, &maintenance);
-        let (_services, handles) =
-            compose_services(filesystem, worker_service, readiness, worker_background, maintenance);
+        let route = build_route_service(&authority);
+        let (_services, handles) = compose_services(
+            filesystem,
+            route,
+            worker_service,
+            readiness,
+            worker_background,
+            maintenance,
+        );
 
         assert_eq!(handles._worker_background._handle.task_count(), 2);
         assert_eq!(handles._maintenance._maintenance_handle.task_count(), 7);
         assert!(!handles._maintenance._delete_executor_handle.is_finished());
         assert!(Arc::strong_count(&handles._readiness.gate) >= 1);
         let _readiness_watcher_finished = handles._readiness._watcher.is_finished();
+    }
+
+    #[tokio::test]
+    async fn stale_state_client_refresh_uses_production_runtime_msync() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let authority = test_authority(&dir).await;
+        let expected_state_id = wait_for_leader_state(&authority).await;
+        let readiness = build_readiness(&config, &authority).await;
+        let (worker_runtime, mut worker_service) = build_worker_runtime(&config, &authority);
+        let filesystem = build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
+            .await
+            .unwrap();
+        let maintenance = build_maintenance(&authority, &worker_runtime).await;
+        let worker_background = build_worker_background(&worker_runtime, &mut worker_service, &maintenance);
+        let route = build_route_service(&authority);
+        let (services, _handles) = compose_services(
+            filesystem,
+            route,
+            worker_service,
+            readiness,
+            worker_background,
+            maintenance,
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(FileSystemServiceProtoServer::new(services.filesystem))
+                .add_service(MetadataWorkerServiceProtoServer::new(services.worker))
+                .add_service(MetadataRouteServiceProtoServer::new(services.route))
+                .add_service(services.health)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        let endpoint = format!("http://{}", addr);
+        let metadata_client = Arc::new(MetadataClient::new(&endpoint).await.unwrap());
+        let state_cache = Arc::new(StateIdCache::new(60));
+        let route_table = Arc::new(RouteTable::new(RouteCache::new(64, 60)));
+        let group_role = Arc::new(GroupRoleCache::new(60));
+        let helper = MetadataRpcHelper::new(Arc::clone(&state_cache), route_table, group_role, metadata_client);
+
+        let group_id = ShardGroupId::new(1);
+        let base_header = RequestHeader::new(ClientId::new(7)).with_group_id(group_id.as_raw());
+        let expected_watermark = GroupStateWatermark::new(group_id, expected_state_id);
+        let mut first = true;
+        let outcome: RetryOutcome<(ResponseHeader, ())> = helper
+            .call_with_refresh(&base_header, Some(group_id), true, |hdr| {
+                let expected_watermark = expected_watermark;
+                let is_first = first;
+                first = false;
+                async move {
+                    if is_first {
+                        let canonical = CanonicalError::need_refresh(
+                            RpcErrorCode::StaleState,
+                            RefreshReason::StaleState,
+                            "stale state",
+                        );
+                        let mut header = ResponseHeader::from_canonical(hdr.client.clone(), canonical)
+                            .with_group_id(group_id.as_raw());
+                        header.state = vec![expected_watermark];
+                        Ok((header, ()))
+                    } else {
+                        Ok((
+                            ResponseHeader::ok(hdr.client.clone()).with_group_id(group_id.as_raw()),
+                            (),
+                        ))
+                    }
+                }
+            })
+            .await
+            .expect("stale-state refresh should call production msync and retry");
+
+        assert_eq!(outcome.refreshes, 1);
+        assert_eq!(state_cache.get(&group_id).map(|w| w.state_id), Some(expected_state_id));
+        server.abort();
     }
 
     #[tokio::test]

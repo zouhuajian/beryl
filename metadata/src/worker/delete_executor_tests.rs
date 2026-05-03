@@ -58,16 +58,13 @@ mod tests {
         assert!(matches!(pending[0].status, DeleteIntentStatus::Pending));
 
         // 3. Mark as Completed
-        state_machine.apply(
-            Command::UpdateDeleteIntentStatus {
-                dedup: DedupKey::new(ClientId::new(710), CallId::new()),
-                intent_id,
-                status: DeleteIntentStatus::Completed,
-                finished_at_ms: Some(now_ms + 1000),
-                error_msg: None,
-            },
-            1,
-        )?;
+        state_machine.apply(Command::UpdateDeleteIntentStatus {
+            dedup: DedupKey::new(ClientId::new(710), CallId::new()),
+            intent_id,
+            status: DeleteIntentStatus::Completed,
+            finished_at_ms: Some(now_ms + 1000),
+            error_msg: None,
+        })?;
 
         // 4. Verify it no longer appears in list_pending
         let pending_after = storage.list_pending_delete_intents(10, now_ms)?;
@@ -85,29 +82,23 @@ mod tests {
         assert_eq!(retrieved_intent.finished_at_ms, Some(now_ms + 1000));
 
         // 6. Test idempotency: replay of the same status command should not drift timestamp.
-        state_machine.apply(
-            Command::UpdateDeleteIntentStatus {
-                dedup: DedupKey::new(ClientId::new(711), CallId::new()),
-                intent_id,
-                status: DeleteIntentStatus::Completed,
-                finished_at_ms: Some(now_ms + 1000),
-                error_msg: None,
-            },
-            2,
-        )?;
+        state_machine.apply(Command::UpdateDeleteIntentStatus {
+            dedup: DedupKey::new(ClientId::new(711), CallId::new()),
+            intent_id,
+            status: DeleteIntentStatus::Completed,
+            finished_at_ms: Some(now_ms + 1000),
+            error_msg: None,
+        })?;
 
         // 7. Completed -> Failed is an invalid authoritative transition.
         assert!(state_machine
-            .apply(
-                Command::UpdateDeleteIntentStatus {
-                    dedup: DedupKey::new(ClientId::new(712), CallId::new()),
-                    intent_id,
-                    status: DeleteIntentStatus::Failed,
-                    finished_at_ms: Some(now_ms + 3000),
-                    error_msg: Some("test error".to_string()),
-                },
-                3,
-            )
+            .apply(Command::UpdateDeleteIntentStatus {
+                dedup: DedupKey::new(ClientId::new(712), CallId::new()),
+                intent_id,
+                status: DeleteIntentStatus::Failed,
+                finished_at_ms: Some(now_ms + 3000),
+                error_msg: Some("test error".to_string()),
+            },)
             .is_err());
 
         let failed_intent = storage.get_delete_intent(intent_id)?.unwrap();
@@ -154,16 +145,13 @@ mod tests {
                 last_error_msg: None,
             };
             storage.put_delete_intent(&intent)?;
-            state_machine.apply(
-                Command::UpdateDeleteIntentStatus {
-                    dedup: DedupKey::new(ClientId::new(713), CallId::new()),
-                    intent_id,
-                    status: DeleteIntentStatus::Completed,
-                    finished_at_ms: Some(now_ms + 5000),
-                    error_msg: None,
-                },
-                1,
-            )?;
+            state_machine.apply(Command::UpdateDeleteIntentStatus {
+                dedup: DedupKey::new(ClientId::new(713), CallId::new()),
+                intent_id,
+                status: DeleteIntentStatus::Completed,
+                finished_at_ms: Some(now_ms + 5000),
+                error_msg: None,
+            })?;
         }
 
         // "Restart": open storage again

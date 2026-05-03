@@ -19,7 +19,7 @@ use std::str::FromStr;
 use types::ids::{
     BlockId, BlockIndex, ChunkId, ChunkIndex, DataHandleId, LeaseId, MountId, ShardGroupId, ShardId, StreamId, WorkerId,
 };
-use types::{CallId, ClientId, RaftLogId};
+use types::{CallId, ClientId, GroupStateWatermark, RaftLogId};
 
 // ============================================================================
 // ID Conversions
@@ -201,6 +201,32 @@ impl From<proto_common::RaftLogIdProto> for RaftLogId {
     }
 }
 
+impl TryFrom<proto_common::GroupStateWatermarkProto> for GroupStateWatermark {
+    type Error = String;
+
+    fn try_from(proto: proto_common::GroupStateWatermarkProto) -> Result<Self, Self::Error> {
+        let group_id = proto
+            .group_id
+            .ok_or_else(|| "missing group_id in GroupStateWatermarkProto".to_string())?
+            .try_into()
+            .map_err(|_| "invalid group_id in GroupStateWatermarkProto".to_string())?;
+        let state_id = proto
+            .state_id
+            .ok_or_else(|| "missing state_id in GroupStateWatermarkProto".to_string())?
+            .into();
+        Ok(GroupStateWatermark::new(group_id, state_id))
+    }
+}
+
+impl From<&GroupStateWatermark> for proto_common::GroupStateWatermarkProto {
+    fn from(watermark: &GroupStateWatermark) -> Self {
+        proto_common::GroupStateWatermarkProto {
+            group_id: Some(watermark.group_id.into()),
+            state_id: Some(watermark.state_id.into()),
+        }
+    }
+}
+
 // ============================================================================
 // RequestHeaderProto / ResponseHeaderProto Conversions
 // ============================================================================
@@ -258,7 +284,11 @@ impl TryFrom<proto_common::RequestHeaderProto> for RequestHeader {
                 Some(cc.signature)
             },
         });
-        let state_id = proto.state_id.map(RaftLogId::from);
+        let state = proto
+            .state
+            .into_iter()
+            .map(GroupStateWatermark::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
         let principal = if proto.principal.is_empty() {
             None
         } else {
@@ -288,7 +318,7 @@ impl TryFrom<proto_common::RequestHeaderProto> for RequestHeader {
             deadline,
             traceparent,
             caller_context,
-            state_id,
+            state,
             retry_count: proto.retry_count,
             route_epoch: proto.route_epoch,
             principal,
@@ -312,11 +342,11 @@ impl From<&RequestHeader> for proto_common::RequestHeaderProto {
                     context: cc.context.clone(),
                     signature: cc.signature.clone().unwrap_or_default(),
                 }),
-            state_id: header.state_id.as_ref().map(|sid| proto_common::RaftLogIdProto {
-                term: sid.term,
-                leader_node_id: sid.leader_node_id,
-                index: sid.index,
-            }),
+            state: header
+                .state
+                .iter()
+                .map(proto_common::GroupStateWatermarkProto::from)
+                .collect(),
             retry_count: header.retry_count,
             group_id: header.group_id.unwrap_or(0),
             mount_epoch: header.mount_epoch,
@@ -366,13 +396,17 @@ impl TryFrom<proto_common::ResponseHeaderProto> for ResponseHeader {
             "status must align with canonical_error presence"
         );
 
-        let state_id = proto.state_id.map(RaftLogId::from);
+        let state = proto
+            .state
+            .into_iter()
+            .map(GroupStateWatermark::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(ResponseHeader {
             client,
             status,
             canonical_error,
-            state_id,
+            state,
             group_id: if proto.group_id == 0 {
                 None
             } else {
@@ -415,11 +449,11 @@ impl From<&ResponseHeader> for proto_common::ResponseHeaderProto {
         proto_common::ResponseHeaderProto {
             client: Some((&header.client).into()),
             error: error_detail,
-            state_id: header.state_id.as_ref().map(|sid| proto_common::RaftLogIdProto {
-                term: sid.term,
-                leader_node_id: sid.leader_node_id,
-                index: sid.index,
-            }),
+            state: header
+                .state
+                .iter()
+                .map(proto_common::GroupStateWatermarkProto::from)
+                .collect(),
             group_id: header.group_id.unwrap_or(0),
             mount_epoch: header.mount_epoch,
             route_epoch: header.route_epoch,
@@ -747,7 +781,7 @@ mod tests {
                 message: "route epoch mismatch".to_string(),
                 refresh_hint: None,
             }),
-            state_id: None,
+            state: Vec::new(),
             group_id: 10,
             mount_epoch: Some(7),
             route_epoch: Some(9),
@@ -799,5 +833,23 @@ mod tests {
         );
 
         assert_eq!(proto.error, reencoded.error, "wire form must roundtrip");
+    }
+
+    #[test]
+    fn header_state_vector_roundtrip_preserves_multiple_groups() {
+        let state = vec![
+            GroupStateWatermark::new(ShardGroupId::new(1), RaftLogId::new(1, 1, 10)),
+            GroupStateWatermark::new(ShardGroupId::new(2), RaftLogId::new(2, 3, 20)),
+        ];
+
+        let request = RequestHeader::new(ClientId::new(42)).with_state(state.clone());
+        let proto_request: proto_common::RequestHeaderProto = (&request).into();
+        let decoded_request = RequestHeader::try_from(proto_request).expect("request header decode");
+        assert_eq!(decoded_request.state, state);
+
+        let response = ResponseHeader::ok(ClientInfo::new(ClientId::new(42))).with_state(state.clone());
+        let proto_response: proto_common::ResponseHeaderProto = (&response).into();
+        let decoded_response = ResponseHeader::try_from(proto_response).expect("response header decode");
+        assert_eq!(decoded_response.state, state);
     }
 }

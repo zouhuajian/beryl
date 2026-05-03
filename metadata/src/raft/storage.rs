@@ -94,7 +94,6 @@ pub const STATE_CFS: &[&str] = &[
 /// command. It is used for retry/replay, not as a general RPC response cache.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppliedResult {
-    pub seq: u64,
     pub fingerprint: CommandFingerprint,
     pub result: AppDataResponse,
     pub created_at_ms: u64,
@@ -223,12 +222,11 @@ impl RocksDBStorage {
         block_meta: &BlockMetaState,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let cf_blocks = self.cf(CF_BLOCKS)?;
         let mut batch = WriteBatch::default();
         Self::batch_put_block(&mut batch, cf_blocks, block_meta)?;
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     /// Get lease state.
@@ -295,12 +293,11 @@ impl RocksDBStorage {
         lease_state: &LeaseState,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let cf_leases = self.cf(CF_LEASES)?;
         let mut batch = WriteBatch::default();
         Self::batch_put_lease(&mut batch, cf_leases, lease_state)?;
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     /// Atomically persist a lease release with apply tracking.
@@ -309,13 +306,12 @@ impl RocksDBStorage {
         block_id: BlockId,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let cf_leases = self.cf(CF_LEASES)?;
         let mut batch = WriteBatch::default();
         let key = format!("{}", block_id);
         batch.delete_cf(cf_leases, key.as_bytes());
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     /// Get applied result for idempotency.
@@ -409,13 +405,6 @@ impl RocksDBStorage {
         Ok(())
     }
 
-    fn batch_put_applied_seq(batch: &mut WriteBatch, cf: &ColumnFamily, seq: u64) -> MetadataResult<()> {
-        let value = encode_to_vec(&seq, standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to serialize applied_seq: {}", e)))?;
-        batch.put_cf(cf, b"applied_seq", value);
-        Ok(())
-    }
-
     fn batch_enforce_dedup_size_after_insert(
         &self,
         batch: &mut WriteBatch,
@@ -466,25 +455,22 @@ impl RocksDBStorage {
         }
     }
 
-    /// Atomically append dedup tracking and applied_seq to an existing RocksDB batch.
+    /// Atomically append dedup tracking to an existing RocksDB batch.
     pub fn commit_apply_batch(
         &self,
         mut batch: WriteBatch,
         request: &DedupKey,
         result: AppliedResult,
-        seq: u64,
     ) -> MetadataResult<()> {
         let cf_dedup = self.cf(CF_DEDUP)?;
-        let cf_meta = self.cf(CF_META)?;
         let dedup_key = Self::dedup_key_bytes(request);
         let inserted_created_at_ms = result.created_at_ms;
 
         Self::batch_put_applied_result(&mut batch, cf_dedup, request, result)?;
         let evicted_size =
             self.batch_enforce_dedup_size_after_insert(&mut batch, cf_dedup, &dedup_key, inserted_created_at_ms)?;
-        Self::batch_put_applied_seq(&mut batch, cf_meta, seq)?;
 
-        // Namespace apply paths use this boundary so mutation, dedup result, and applied_seq
+        // Namespace apply paths use this boundary so mutation and dedup result
         // either all survive replay or all remain absent.
         self.write_batch(batch)?;
 
@@ -495,14 +481,9 @@ impl RocksDBStorage {
         Ok(())
     }
 
-    /// Atomically persist only dedup tracking and applied_seq.
-    pub fn put_apply_result_and_seq_atomic(
-        &self,
-        request: &DedupKey,
-        result: AppliedResult,
-        seq: u64,
-    ) -> MetadataResult<()> {
-        self.commit_apply_batch(WriteBatch::default(), request, result, seq)
+    /// Atomically persist only dedup tracking.
+    pub fn put_apply_result_atomic(&self, request: &DedupKey, result: AppliedResult) -> MetadataResult<()> {
+        self.commit_apply_batch(WriteBatch::default(), request, result)
     }
 
     /// Get the authoritative route epoch used for stale-route validation.
@@ -584,40 +565,6 @@ impl RocksDBStorage {
         let value = encode_to_vec(&layout, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize file layout: {}", e)))?;
         batch.put_cf(cf, key.as_bytes(), value);
-        Ok(())
-    }
-
-    /// Get applied sequence persisted for idempotency tracking.
-    pub fn get_applied_seq(&self) -> MetadataResult<Option<u64>> {
-        let cf = self
-            .db
-            .cf_handle(CF_META)
-            .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
-
-        match self.db.get_cf(cf, b"applied_seq") {
-            Ok(Some(value)) => {
-                let seq: u64 = decode_from_slice(&value, standard())
-                    .map_err(|e| MetadataError::Internal(format!("Failed to deserialize applied_seq: {}", e)))?
-                    .0;
-                Ok(Some(seq))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
-        }
-    }
-
-    /// Persist applied sequence.
-    pub fn put_applied_seq(&self, seq: u64) -> MetadataResult<()> {
-        let cf = self
-            .db
-            .cf_handle(CF_META)
-            .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
-        let value = encode_to_vec(&seq, standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to serialize applied_seq: {}", e)))?;
-
-        self.db
-            .put_cf(cf, b"applied_seq", value)
-            .map_err(|e| MetadataError::Internal(format!("RocksDB error: {}", e)))?;
         Ok(())
     }
 
@@ -1176,7 +1123,6 @@ impl RocksDBStorage {
         info: &WorkerInfo,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let cf_meta = self.cf(CF_META)?;
         let cf_workers = self.cf(CF_WORKERS)?;
@@ -1212,7 +1158,7 @@ impl RocksDBStorage {
             Self::batch_put_next_worker_id(&mut batch, cf_meta, next_id)?;
         }
         Self::batch_put_worker(&mut batch, cf_workers, info)?;
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     /// List all workers.
@@ -1674,7 +1620,6 @@ impl RocksDBStorage {
         error_msg: Option<String>,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let cf_delete_intents = self.cf(CF_DELETE_INTENTS)?;
         let mut intent = self
@@ -1694,7 +1639,7 @@ impl RocksDBStorage {
 
         let mut batch = WriteBatch::default();
         Self::batch_put_delete_intent(&mut batch, cf_delete_intents, &intent)?;
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     fn delete_intent_status_transition_allowed(from: DeleteIntentStatus, to: DeleteIntentStatus) -> bool {
@@ -1859,12 +1804,11 @@ impl RocksDBStorage {
         inode: &Inode,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let cf_inodes = self.cf(CF_INODES)?;
         let mut batch = WriteBatch::default();
         Self::batch_put_inode(&mut batch, cf_inodes, inode)?;
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     /// Atomically persist a CloseWrite commit with replay tracking.
@@ -1875,7 +1819,6 @@ impl RocksDBStorage {
         block_ref_increments: &[BlockId],
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let cf_inodes = self.cf(CF_INODES)?;
         let cf_meta = self.cf(CF_META)?;
@@ -1893,7 +1836,7 @@ impl RocksDBStorage {
             }
         }
 
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     /// Atomically persist a mount creation/update with apply tracking.
@@ -1905,7 +1848,6 @@ impl RocksDBStorage {
         route_epoch: RouteEpoch,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let cf_mounts = self.cf(CF_MOUNTS)?;
         let cf_meta = self.cf(CF_META)?;
@@ -1917,7 +1859,7 @@ impl RocksDBStorage {
         Self::batch_put_mount(&mut batch, cf_mounts, entry)?;
         Self::batch_put_mount_version(&mut batch, cf_meta, mount_version)?;
         Self::batch_put_route_epoch(&mut batch, cf_meta, route_epoch)?;
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     /// Atomically persist a mount deletion with apply tracking.
@@ -1928,7 +1870,6 @@ impl RocksDBStorage {
         route_epoch: RouteEpoch,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let cf_mounts = self.cf(CF_MOUNTS)?;
         let cf_meta = self.cf(CF_META)?;
@@ -1937,7 +1878,7 @@ impl RocksDBStorage {
         batch.delete_cf(cf_mounts, key.as_bytes());
         Self::batch_put_mount_version(&mut batch, cf_meta, mount_version)?;
         Self::batch_put_route_epoch(&mut batch, cf_meta, route_epoch)?;
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     /// Atomically persist shard group registration and shard routing with apply tracking.
@@ -1947,7 +1888,6 @@ impl RocksDBStorage {
         shard_ids: &[ShardId],
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let cf_groups = self.cf(CF_SHARD_GROUPS)?;
         let cf_routing = self.cf(CF_SHARD_ROUTING)?;
@@ -1956,7 +1896,7 @@ impl RocksDBStorage {
         for shard_id in shard_ids {
             Self::batch_put_shard_routing(&mut batch, cf_routing, *shard_id, info.group_id);
         }
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     /// Atomically persist a worker descriptor with apply tracking.
@@ -1965,12 +1905,11 @@ impl RocksDBStorage {
         info: &WorkerInfo,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let cf_workers = self.cf(CF_WORKERS)?;
         let mut batch = WriteBatch::default();
         Self::batch_put_worker(&mut batch, cf_workers, info)?;
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     /// Atomically persist a create-file namespace mutation.
@@ -2030,10 +1969,9 @@ impl RocksDBStorage {
         layout: FileLayout,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let batch = self.create_file_batch(parent_inode_id, name, inode, updated_parent, layout)?;
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     /// Atomically persist a mkdir namespace mutation.
@@ -2078,10 +2016,9 @@ impl RocksDBStorage {
         updated_parent: &Inode,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let batch = self.create_dir_batch(parent_inode_id, name, inode, updated_parent)?;
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     fn delete_dentry_inode_batch(
@@ -2110,10 +2047,9 @@ impl RocksDBStorage {
         updated_parent: &Inode,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let batch = self.delete_dentry_inode_batch(parent_inode_id, name, inode_id, updated_parent)?;
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     /// Atomically persist non-directory deletion with namespace and optional data-handle cleanup.
@@ -2126,7 +2062,6 @@ impl RocksDBStorage {
         updated_parent: &Inode,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let cf_meta = self.cf(CF_META)?;
         let mut batch = self.delete_dentry_inode_batch(parent_inode_id, name, inode_id, updated_parent)?;
@@ -2136,7 +2071,7 @@ impl RocksDBStorage {
             let owner_key = format!("data_handle_owner:{}", data_handle_id.as_raw());
             batch.delete_cf(cf_meta, owner_key.as_bytes());
         }
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     fn append_block_ref_decrements_to_batch(
@@ -2212,7 +2147,6 @@ impl RocksDBStorage {
         intents: Vec<crate::state::DeleteIntent>,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let cf_delete_intents = self.cf(CF_DELETE_INTENTS)?;
         let mut seen = std::collections::HashSet::with_capacity(intents.len());
@@ -2240,7 +2174,7 @@ impl RocksDBStorage {
             intent.last_error_msg = None;
             Self::batch_put_delete_intent(&mut batch, cf_delete_intents, &intent)?;
         }
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     pub fn allocate_delete_intents_with_apply_result_atomic(
@@ -2248,7 +2182,6 @@ impl RocksDBStorage {
         intents: Vec<crate::state::DeleteIntent>,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let cf_meta = self.cf(CF_META)?;
         let cf_delete_intents = self.cf(CF_DELETE_INTENTS)?;
@@ -2272,7 +2205,7 @@ impl RocksDBStorage {
                 Self::batch_put_delete_intent(&mut batch, cf_delete_intents, &intent)?;
             }
         }
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     /// Atomically persist truncate shrink effects with block lifecycle updates and apply tracking.
@@ -2284,7 +2217,6 @@ impl RocksDBStorage {
         now_ms: u64,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let cf_inodes = self.cf(CF_INODES)?;
         let cf_meta = self.cf(CF_META)?;
@@ -2302,7 +2234,7 @@ impl RocksDBStorage {
             now_ms,
         )?;
 
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     /// Atomically persist extent-bearing file deletion with block lifecycle updates and apply tracking.
@@ -2317,7 +2249,6 @@ impl RocksDBStorage {
         now_ms: u64,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let cf_meta = self.cf(CF_META)?;
         let cf_block_ref_counts = self.cf(CF_BLOCK_REF_COUNTS)?;
@@ -2336,7 +2267,7 @@ impl RocksDBStorage {
             now_ms,
         )?;
 
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     /// Atomically persist a rename namespace mutation.
@@ -2390,10 +2321,9 @@ impl RocksDBStorage {
         update: RenameAtomicUpdate<'_>,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
-        applied_seq: u64,
     ) -> MetadataResult<()> {
         let batch = self.rename_batch(update)?;
-        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     /// Return the largest inode ID currently present in storage.
@@ -2869,7 +2799,7 @@ mod tests {
     }
 
     #[test]
-    fn create_file_with_apply_result_atomic_persists_namespace_dedup_and_seq() {
+    fn create_file_with_apply_result_atomic_persists_namespace_dedup() {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
 
@@ -2884,7 +2814,6 @@ mod tests {
         let layout = FileLayout::new(4096, 4096, 1);
         let dedup = DedupKey::new(ClientId::new(101), types::CallId::new());
         let applied = AppliedResult {
-            seq: 7,
             fingerprint: CommandFingerprint(77),
             result: AppDataResponse::Fs(crate::raft::types::FsCommandResult::Ok(
                 crate::raft::types::FsOkResult {
@@ -2897,17 +2826,16 @@ mod tests {
         };
 
         storage
-            .create_file_with_apply_result_atomic(parent_inode_id, "file", &inode, &parent, layout, &dedup, applied, 7)
+            .create_file_with_apply_result_atomic(parent_inode_id, "file", &inode, &parent, layout, &dedup, applied)
             .unwrap();
 
         assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), Some(inode_id));
         assert_eq!(storage.get_layout(inode_id).unwrap(), layout);
         assert!(storage.get_applied_result(&dedup).unwrap().is_some());
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(7));
     }
 
     #[test]
-    fn delete_empty_file_with_apply_result_atomic_removes_namespace_data_owner_dedup_and_seq() {
+    fn delete_empty_file_with_apply_result_atomic_removes_namespace_data_owner_dedup() {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
 
@@ -2925,7 +2853,6 @@ mod tests {
         parent.attrs.update_mtime_ctime(200);
         let dedup = DedupKey::new(ClientId::new(103), types::CallId::new());
         let applied = AppliedResult {
-            seq: 9,
             fingerprint: CommandFingerprint(99),
             result: AppDataResponse::Fs(crate::raft::types::FsCommandResult::ok()),
             created_at_ms: now_millis(),
@@ -2941,7 +2868,6 @@ mod tests {
                 &parent,
                 &dedup,
                 applied,
-                9,
             )
             .unwrap();
 
@@ -2950,11 +2876,10 @@ mod tests {
         assert!(storage.get_layout(inode_id).is_err());
         assert_eq!(storage.get_inode_by_data_handle(data_handle_id).unwrap(), None);
         assert!(storage.get_applied_result(&dedup).unwrap().is_some());
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(9));
     }
 
     #[test]
-    fn delete_empty_dir_with_apply_result_atomic_removes_namespace_dedup_and_seq() {
+    fn delete_empty_dir_with_apply_result_atomic_removes_namespace_dedup() {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
 
@@ -2970,7 +2895,6 @@ mod tests {
         parent.attrs.update_mtime_ctime(300);
         let dedup = DedupKey::new(ClientId::new(104), types::CallId::new());
         let applied = AppliedResult {
-            seq: 10,
             fingerprint: CommandFingerprint(100),
             result: AppDataResponse::Fs(crate::raft::types::FsCommandResult::ok()),
             created_at_ms: now_millis(),
@@ -2978,18 +2902,17 @@ mod tests {
         };
 
         storage
-            .delete_empty_dir_with_apply_result_atomic(parent_inode_id, "dir", inode_id, &parent, &dedup, applied, 10)
+            .delete_empty_dir_with_apply_result_atomic(parent_inode_id, "dir", inode_id, &parent, &dedup, applied)
             .unwrap();
 
         assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), None);
         assert!(storage.get_inode(inode_id).unwrap().is_none());
         assert_eq!(storage.get_inode(parent_inode_id).unwrap().unwrap().attrs.mtime_ms, 300);
         assert!(storage.get_applied_result(&dedup).unwrap().is_some());
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(10));
     }
 
     #[test]
-    fn put_inode_with_apply_result_atomic_persists_inode_dedup_and_seq() {
+    fn put_inode_with_apply_result_atomic_persists_inode_dedup() {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
 
@@ -2998,7 +2921,6 @@ mod tests {
         inode.attrs.uid = 44;
         let dedup = DedupKey::new(ClientId::new(102), types::CallId::new());
         let applied = AppliedResult {
-            seq: 8,
             fingerprint: CommandFingerprint(88),
             result: AppDataResponse::Fs(crate::raft::types::FsCommandResult::ok()),
             created_at_ms: now_millis(),
@@ -3006,16 +2928,15 @@ mod tests {
         };
 
         storage
-            .put_inode_with_apply_result_atomic(&inode, &dedup, applied, 8)
+            .put_inode_with_apply_result_atomic(&inode, &dedup, applied)
             .unwrap();
 
         assert_eq!(storage.get_inode(inode_id).unwrap().unwrap().attrs.uid, 44);
         assert!(storage.get_applied_result(&dedup).unwrap().is_some());
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(8));
     }
 
     #[test]
-    fn close_write_with_apply_result_atomic_persists_inode_block_refs_dedup_and_seq() {
+    fn close_write_with_apply_result_atomic_persists_inode_block_refs_dedup() {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
 
@@ -3040,7 +2961,6 @@ mod tests {
 
         let dedup = DedupKey::new(ClientId::new(105), types::CallId::new());
         let applied = AppliedResult {
-            seq: 11,
             fingerprint: CommandFingerprint(101),
             result: AppDataResponse::Fs(crate::raft::types::FsCommandResult::ok()),
             created_at_ms: now_millis(),
@@ -3048,7 +2968,7 @@ mod tests {
         };
 
         storage
-            .close_write_with_apply_result_atomic(&inode, layout, &[block_id], &dedup, applied, 11)
+            .close_write_with_apply_result_atomic(&inode, layout, &[block_id], &dedup, applied)
             .unwrap();
 
         let stored = storage.get_inode(inode_id).unwrap().unwrap();
@@ -3056,7 +2976,6 @@ mod tests {
         assert_eq!(storage.get_layout(inode_id).unwrap(), layout);
         assert_eq!(storage.get_block_ref_count(block_id).unwrap(), Some(1));
         assert!(storage.get_applied_result(&dedup).unwrap().is_some());
-        assert_eq!(storage.get_applied_seq().unwrap(), Some(11));
     }
 
     #[test]
@@ -3228,7 +3147,6 @@ mod tests {
         let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
         let key = DedupKey::new(ClientId::new(42), CallId::new());
         let result = AppliedResult {
-            seq: 1,
             fingerprint: CommandFingerprint(1),
             result: AppDataResponse::None,
             created_at_ms: now_millis().saturating_sub(DEDUP_TTL_MS + 1_000),
@@ -3248,7 +3166,6 @@ mod tests {
         for _ in 0..(DEDUP_MAX_ENTRIES + 2) {
             let key = DedupKey::new(ClientId::new(7), CallId::new());
             let result = AppliedResult {
-                seq: 1,
                 fingerprint: CommandFingerprint(2),
                 result: AppDataResponse::None,
                 created_at_ms: now_millis(),

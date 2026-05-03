@@ -16,7 +16,10 @@ use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as Canonica
 use common::header::RpcErrorCode;
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use proto::common::{ClientInfoProto, RequestHeaderProto, ResponseHeaderProto, WorkerEndpointInfoProto};
+use proto::common::{
+    ClientInfoProto, GroupStateWatermarkProto, RaftLogIdProto, RequestHeaderProto, ResponseHeaderProto,
+    ShardGroupIdProto, WorkerEndpointInfoProto,
+};
 use proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
 use proto::metadata::{
     CloseWriteSessionRequestProto, CloseWriteSessionResponseProto, DeleteRequestProto, DeleteResponseProto,
@@ -691,6 +694,14 @@ impl ActionMachine {
             header.traceparent = parent_id.to_string();
         }
         header.retry_count = retry_count;
+        if header.group_id != 0 {
+            if let Some(state_id) = self.caches.state_for_group(header.group_id) {
+                header.state = vec![GroupStateWatermarkProto {
+                    group_id: Some(ShardGroupIdProto { value: header.group_id }),
+                    state_id: Some(state_id),
+                }];
+            }
+        }
 
         if let Some(path) = path_hint.as_ref() {
             if let Some(epoch) = self.caches.mount_epoch_for_path(path) {
@@ -751,6 +762,7 @@ impl ActionMachine {
         let Some(header) = header else {
             return;
         };
+        self.caches.merge_response_state(&header.state);
         let Some(path) = request.path_hint(&self.caches.sessions) else {
             return;
         };
@@ -1259,6 +1271,7 @@ struct ActionCaches {
     mount_epoch_prefix: DashMap<String, u64>,
     route_epoch_by_path: DashMap<String, u64>,
     worker_epoch_by_path: DashMap<String, u64>,
+    state_by_group: DashMap<u64, RaftLogIdProto>,
     worker_endpoints_by_path: DashMap<String, Vec<WorkerEndpointInfoProto>>,
     sessions: DashMap<u64, WriteSessionState>,
 }
@@ -1270,6 +1283,29 @@ impl ActionCaches {
 
     fn leader_endpoint(&self) -> Option<String> {
         self.leader_endpoint.read().clone()
+    }
+
+    fn state_for_group(&self, group_id: u64) -> Option<RaftLogIdProto> {
+        self.state_by_group.get(&group_id).map(|entry| entry.clone())
+    }
+
+    fn merge_response_state(&self, state: &[GroupStateWatermarkProto]) {
+        for watermark in state {
+            let Some(group_id) = watermark.group_id.as_ref().map(|group_id| group_id.value) else {
+                continue;
+            };
+            let Some(new_state) = watermark.state_id.clone() else {
+                continue;
+            };
+            let should_update = self
+                .state_by_group
+                .get(&group_id)
+                .map(|old_state| raft_log_id_is_ahead(&new_state, &old_state))
+                .unwrap_or(true);
+            if should_update {
+                self.state_by_group.insert(group_id, new_state);
+            }
+        }
     }
 
     fn record_mount_epoch(&self, path: &str, mount_epoch: u64) {
@@ -1405,7 +1441,7 @@ fn default_request_header_proto() -> RequestHeaderProto {
         deadline_ms: 0,
         traceparent: String::new(),
         caller_context: None,
-        state_id: None,
+        state: Vec::new(),
         retry_count: 0,
         route_epoch: None,
         principal: String::new(),
@@ -1413,6 +1449,11 @@ fn default_request_header_proto() -> RequestHeaderProto {
         doas: String::new(),
         authn_type: proto::common::AuthnTypeProto::Unspecified as i32,
     }
+}
+
+fn raft_log_id_is_ahead(new_state: &RaftLogIdProto, old_state: &RaftLogIdProto) -> bool {
+    (new_state.index, new_state.term, new_state.leader_node_id)
+        > (old_state.index, old_state.term, old_state.leader_node_id)
 }
 
 fn unexpected_response(expected: &str, actual: &str) -> ClientError {
@@ -1653,7 +1694,7 @@ mod tests {
             deadline_ms: 0,
             traceparent: String::new(),
             caller_context: None,
-            state_id: None,
+            state: Vec::new(),
             retry_count: 0,
             route_epoch: None,
             principal: String::new(),
@@ -1671,7 +1712,7 @@ mod tests {
                 client_name: "test-client".to_string(),
             }),
             error: None,
-            state_id: None,
+            state: Vec::new(),
             group_id: 0,
             mount_epoch: Some(7),
             route_epoch: Some(7),
@@ -1692,7 +1733,7 @@ mod tests {
                 client_name: "test-client".to_string(),
             }),
             error: Some(canonical_to_error_detail(&canonical)),
-            state_id: None,
+            state: Vec::new(),
             group_id: 0,
             mount_epoch: Some(7),
             route_epoch: Some(7),

@@ -1969,6 +1969,7 @@ dependencies = [
  "bincode",
  "bitflags",
  "bytes",
+ "client",
  "common",
  "dashmap",
  "futures",

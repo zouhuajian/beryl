@@ -13,7 +13,7 @@ use crate::worker::WorkerManager;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
-use types::group_watermark::{GroupWatermark, MountEpoch};
+use types::group_watermark::{GroupStateWatermark, MountEpoch};
 use types::ids::{BlockId, ShardGroupId};
 use types::RaftLogId;
 
@@ -53,13 +53,13 @@ pub struct DestructiveCheckContext {
     /// Block ID (if applicable).
     pub block_id: Option<BlockId>,
     /// Shard group ID (required for cross-group gate control).
-    pub shard_group_id: Option<ShardGroupId>,
+    pub group_id: Option<ShardGroupId>,
     /// Mount epoch (for route consistency checking).
     /// If provided, must match current mount_table.version().
     pub mount_epoch: Option<MountEpoch>,
-    /// Guard watermark (shard_group_id + state_id).
+    /// Guard watermark (group_id + state_id).
     /// If provided, the target shard group must have applied at least up to this state_id.
-    pub guard_watermark: Option<GroupWatermark>,
+    pub guard_watermark: Option<GroupStateWatermark>,
     /// Guard state ID (legacy, for backward compatibility).
     /// If guard_watermark is provided, this is ignored.
     pub guard_state_id: Option<RaftLogId>,
@@ -73,7 +73,7 @@ impl DestructiveCheckContext {
     pub fn new(action_type: impl Into<String>) -> Self {
         Self {
             block_id: None,
-            shard_group_id: None,
+            group_id: None,
             mount_epoch: None,
             guard_watermark: None,
             guard_state_id: None,
@@ -87,8 +87,8 @@ impl DestructiveCheckContext {
         self
     }
 
-    pub fn with_shard_group_id(mut self, shard_group_id: ShardGroupId) -> Self {
-        self.shard_group_id = Some(shard_group_id);
+    pub fn with_group_id(mut self, group_id: ShardGroupId) -> Self {
+        self.group_id = Some(group_id);
         self
     }
 
@@ -97,7 +97,7 @@ impl DestructiveCheckContext {
         self
     }
 
-    pub fn with_guard_watermark(mut self, guard_watermark: GroupWatermark) -> Self {
+    pub fn with_guard_watermark(mut self, guard_watermark: GroupStateWatermark) -> Self {
         self.guard_watermark = Some(guard_watermark);
         self
     }
@@ -167,7 +167,7 @@ impl DestructiveGate {
                         current_mount_epoch.as_u64()
                     ),
                     latest_mount_epoch: Some(current_mount_epoch),
-                    route_hint: ctx.shard_group_id.map(|gid| format!("shard_group_id={}", gid.as_raw())),
+                    route_hint: ctx.group_id.map(|gid| format!("group_id={}", gid.as_raw())),
                 });
             }
         }
@@ -203,8 +203,8 @@ impl DestructiveGate {
                 if !guard_watermark.is_reached(&current) {
                     return Ok(DestructiveCheckResult::Blocked {
                         reason: format!(
-                            "watermark_not_reached: shard_group_id={}, current={:?}, guard={:?}",
-                            guard_watermark.shard_group_id.as_raw(),
+                            "watermark_not_reached: group_id={}, current={:?}, guard={:?}",
+                            guard_watermark.group_id.as_raw(),
                             current,
                             guard_watermark.state_id
                         ),
@@ -213,10 +213,7 @@ impl DestructiveGate {
             } else {
                 // No state_id yet, block
                 return Ok(DestructiveCheckResult::Blocked {
-                    reason: format!(
-                        "state_id_not_available: shard_group_id={}",
-                        guard_watermark.shard_group_id.as_raw()
-                    ),
+                    reason: format!("state_id_not_available: group_id={}", guard_watermark.group_id.as_raw()),
                 });
             }
         } else if let Some(guard_state_id) = ctx.guard_state_id {

@@ -8,7 +8,7 @@ mod tests {
     use crate::time::Deadline;
     use crate::{RequestHeader, ResponseHeader, RpcErrorCode, RpcStatus};
     use std::time::Duration;
-    use types::ClientId;
+    use types::{ClientId, GroupStateWatermark, RaftLogId, ShardGroupId};
 
     #[test]
     fn test_client_info() {
@@ -67,5 +67,16 @@ mod tests {
             resp_error.canonical_error.as_ref().and_then(|c| c.reason.clone()),
             None | Some(RefreshReason::Unknown)
         ));
+    }
+
+    #[test]
+    fn request_and_response_headers_use_group_state_vectors() {
+        let watermark = GroupStateWatermark::new(ShardGroupId::new(7), RaftLogId::new(1, 2, 3));
+
+        let request = RequestHeader::new(ClientId::new(1)).with_state(vec![watermark]);
+        assert_eq!(request.state, vec![watermark]);
+
+        let response = ResponseHeader::ok(ClientInfo::new(ClientId::new(1))).with_state(vec![watermark]);
+        assert_eq!(response.state, vec![watermark]);
     }
 }

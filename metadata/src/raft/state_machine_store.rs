@@ -35,8 +35,8 @@ use rocksdb::{ColumnFamily, IteratorMode, ReadOptions, Snapshot as DbSnapshot, W
 
 const SNAPSHOT_MAGIC: &[u8] = b"VECT";
 const SNAPSHOT_VERSION_V1: u8 = 1;
+const SNAPSHOT_VERSION_V2: u8 = 2;
 const META_CF_NAME: &str = "meta";
-const APPLIED_SEQ_KEY: &[u8] = b"applied_seq";
 const ROUTE_EPOCH_KEY: &[u8] = b"route_epoch";
 const SNAPSHOT_BATCH_BYTES: usize = 2 * 1024 * 1024;
 const TAG_END: u8 = 0;
@@ -58,10 +58,6 @@ impl StateMachineStorage {
         state: Arc<RwLock<AppMetadataRaftState>>,
     ) -> MetadataResult<Self> {
         clean_stale_snapshot_tmp(&storage)?;
-        // Restore applied_seq into the state machine if persisted.
-        if let Some(seq) = storage.get_applied_seq()? {
-            state_machine.set_applied_seq(seq);
-        }
 
         Ok(Self {
             storage,
@@ -96,13 +92,9 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
 
             match entry.payload {
                 EntryPayload::Normal(ref cmd) => {
-                    let seq = self.state_machine.applied_seq() + 1;
-                    let result = self
-                        .state_machine
-                        .apply(cmd.clone(), seq)
-                        .map_err(|e| StorageError::IO {
-                            source: StorageIOError::<u64>::apply(log_id, AnyError::new(&e)),
-                        })?;
+                    let result = self.state_machine.apply(cmd.clone()).map_err(|e| StorageError::IO {
+                        source: StorageIOError::<u64>::apply(log_id, AnyError::new(&e)),
+                    })?;
 
                     // Update last_applied_log_id
                     let mut state = self.state.write();
@@ -170,7 +162,7 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
         let std_file = snapshot.into_std().await.map_err(|e| StorageError::IO {
             source: StorageIOError::<u64>::read_snapshot(Some(meta.signature()), AnyError::new(&e)),
         })?;
-        let header = install_snapshot_payload(&self.storage, meta, std_file)?;
+        let _header = install_snapshot_payload(&self.storage, meta, std_file)?;
 
         // Rename the received file into the final snapshot path.
         if final_path.exists() {
@@ -185,14 +177,6 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
             .map_err(|e| StorageError::IO {
                 source: StorageIOError::<u64>::write_snapshot(Some(meta.signature()), AnyError::new(&e)),
             })?;
-        // Update applied_seq and raft state.
-        self.storage
-            .put_applied_seq(header.applied_seq)
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::<u64>::write_snapshot(Some(meta.signature()), AnyError::new(&e)),
-            })?;
-        self.state_machine.set_applied_seq(header.applied_seq);
-
         {
             let mut state = self.state.write();
             state.last_applied_log_id = meta.last_log_id;
@@ -230,7 +214,6 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
         info!(
             snapshot_id = %meta.snapshot_id,
             last_log = ?meta.last_log_id,
-            applied_seq = header.applied_seq,
             bytes = size,
             elapsed_ms = started.elapsed().as_millis(),
             "Installed snapshot"
@@ -282,7 +265,6 @@ impl openraft::storage::RaftSnapshotBuilder<MetadataRaftTypeConfig> for AppSnaps
 
         let raft_state = load_raft_state_from_snapshot(&self.storage, &snap)?;
         let route_epoch = load_route_epoch_from_snapshot(&self.storage, &snap)?;
-        let applied_seq = load_applied_seq_from_snapshot(&self.storage, &snap)?;
 
         let snapshot_id = format_snapshot_id(raft_state.last_applied_log_id);
         let tmp_path = temp_snapshot_path(&self.storage, &snapshot_id);
@@ -291,7 +273,7 @@ impl openraft::storage::RaftSnapshotBuilder<MetadataRaftTypeConfig> for AppSnaps
             source: StorageIOError::<u64>::write_snapshot(None, AnyError::new(&e)),
         })?;
 
-        write_snapshot_payload(&self.storage, &snap, &mut file, applied_seq, route_epoch)?;
+        write_snapshot_payload(&self.storage, &snap, &mut file, route_epoch)?;
 
         let final_path = snapshot_file_path(&self.storage, &snapshot_id);
         if final_path.exists() {
@@ -322,13 +304,6 @@ impl openraft::storage::RaftSnapshotBuilder<MetadataRaftTypeConfig> for AppSnaps
                 source: StorageIOError::<u64>::write_snapshot(None, AnyError::new(&e)),
             })?;
 
-        // Ensure applied_seq persists alongside snapshot metadata.
-        self.storage
-            .put_applied_seq(applied_seq)
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::<u64>::write_snapshot(None, AnyError::new(&e)),
-            })?;
-
         let size = tokio::fs::metadata(&final_path)
             .await
             .map(|m| m.len())
@@ -336,7 +311,6 @@ impl openraft::storage::RaftSnapshotBuilder<MetadataRaftTypeConfig> for AppSnaps
         info!(
             snapshot_id = %snapshot_id,
             last_log = ?meta.last_log_id,
-            applied_seq = applied_seq,
             bytes = size,
             elapsed_ms = started.elapsed().as_millis(),
             "Built snapshot"
@@ -358,7 +332,6 @@ impl openraft::storage::RaftSnapshotBuilder<MetadataRaftTypeConfig> for AppSnaps
 #[derive(Serialize, Deserialize)]
 struct SnapshotHeaderV1 {
     route_epoch: u64,
-    applied_seq: u64,
 }
 
 fn snapshot_file_path(storage: &RocksDBStorage, snapshot_id: &str) -> PathBuf {
@@ -400,9 +373,8 @@ fn format_snapshot_id(last_log_id: Option<LogId<u64>>) -> String {
 fn write_header<W: Write + Seek>(writer: &mut W, header: &SnapshotHeaderV1) -> std::io::Result<()> {
     writer.seek(SeekFrom::Start(0))?;
     writer.write_all(SNAPSHOT_MAGIC)?;
-    writer.write_all(&[SNAPSHOT_VERSION_V1])?;
+    writer.write_all(&[SNAPSHOT_VERSION_V2])?;
     writer.write_all(&header.route_epoch.to_le_bytes())?;
-    writer.write_all(&header.applied_seq.to_le_bytes())?;
     Ok(())
 }
 
@@ -418,7 +390,7 @@ fn read_header<R: Read + Seek>(reader: &mut R) -> std::io::Result<SnapshotHeader
     }
     let mut version = [0u8; 1];
     reader.read_exact(&mut version)?;
-    if version[0] != SNAPSHOT_VERSION_V1 {
+    if version[0] != SNAPSHOT_VERSION_V1 && version[0] != SNAPSHOT_VERSION_V2 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unsupported snapshot version {}", version[0]),
@@ -429,13 +401,13 @@ fn read_header<R: Read + Seek>(reader: &mut R) -> std::io::Result<SnapshotHeader
     reader.read_exact(&mut buf_u64)?;
     let route_epoch = u64::from_le_bytes(buf_u64);
 
-    reader.read_exact(&mut buf_u64)?;
-    let applied_seq = u64::from_le_bytes(buf_u64);
+    if version[0] == SNAPSHOT_VERSION_V1 {
+        // Backward-compatible decode only: legacy snapshots carried an
+        // applied_seq field here. It is skipped and never restored.
+        reader.read_exact(&mut buf_u64)?;
+    }
 
-    Ok(SnapshotHeaderV1 {
-        route_epoch,
-        applied_seq,
-    })
+    Ok(SnapshotHeaderV1 { route_epoch })
 }
 
 fn write_cf_start<W: Write>(writer: &mut W, name: &str) -> std::io::Result<()> {
@@ -573,20 +545,14 @@ fn load_route_epoch_from_snapshot(
     Ok(RouteEpoch::new(epoch))
 }
 
-fn load_applied_seq_from_snapshot(storage: &RocksDBStorage, snap: &DbSnapshot<'_>) -> Result<u64, StorageError<u64>> {
-    read_u64_from_snapshot_cf(storage, snap, META_CF_NAME, APPLIED_SEQ_KEY, 0)
-}
-
 fn write_snapshot_payload(
     storage: &RocksDBStorage,
     snap: &DbSnapshot<'_>,
     file: &mut std::fs::File,
-    applied_seq: u64,
     route_epoch: RouteEpoch,
 ) -> Result<(), StorageError<u64>> {
     let header = SnapshotHeaderV1 {
         route_epoch: route_epoch.as_u64(),
-        applied_seq,
     };
     write_header(file, &header).map_err(|e| StorageError::IO {
         source: StorageIOError::<u64>::write_snapshot(None, AnyError::new(&e)),
@@ -601,28 +567,12 @@ fn write_snapshot_payload(
         })?;
 
         let mut iter = snap.iterator_cf_opt(&cf, ReadOptions::default(), IteratorMode::Start);
-        let mut wrote_applied_seq = false;
         while let Some(item) = iter.next() {
             let (key, value): (Box<[u8]>, Box<[u8]>) = item.map_err(|e| StorageError::IO {
                 source: StorageIOError::<u64>::write_snapshot(None, AnyError::new(&e)),
             })?;
 
-            if cf_name == &META_CF_NAME && key.as_ref() == APPLIED_SEQ_KEY {
-                wrote_applied_seq = true;
-            }
-
             write_kv(file, &key, &value).map_err(|e| StorageError::IO {
-                source: StorageIOError::<u64>::write_snapshot(None, AnyError::new(&e)),
-            })?;
-        }
-
-        if cf_name == &META_CF_NAME && !wrote_applied_seq {
-            let encoded = bincode::serde::encode_to_vec(&applied_seq, bincode::config::standard()).map_err(|e| {
-                StorageError::IO {
-                    source: StorageIOError::<u64>::write_snapshot(None, AnyError::new(&e)),
-                }
-            })?;
-            write_kv(file, APPLIED_SEQ_KEY, &encoded).map_err(|e| StorageError::IO {
                 source: StorageIOError::<u64>::write_snapshot(None, AnyError::new(&e)),
             })?;
         }
@@ -766,10 +716,8 @@ mod tests {
             Arc::clone(&storage_a),
             Arc::clone(&mount_table),
         ));
-        sm_a.set_applied_seq(9);
 
         storage_a.put_route_epoch(RouteEpoch::new(7)).unwrap();
-        storage_a.put_applied_seq(9).unwrap();
         storage_a.set_next_inode_id(types::fs::InodeId::new(77)).unwrap();
 
         // Write a simple entry into another CF to ensure multi-CF round-trip.
@@ -812,14 +760,6 @@ mod tests {
         println!("installed snapshot");
 
         // Validate data restored.
-        println!("checking applied_seq");
-        assert_eq!(
-            storage_b.get_applied_seq().unwrap(),
-            Some(9),
-            "applied_seq should persist"
-        );
-        assert_eq!(sm_b.applied_seq(), 9);
-
         println!("checking block ref count");
         let cf_b = storage_b.cf("block_ref_counts").unwrap();
         let raw = storage_b.db().get_cf(cf_b, b"block1").unwrap().unwrap();

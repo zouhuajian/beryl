@@ -34,8 +34,6 @@ message MountTableProto {
   repeated MountEntryProto entries = 1;
   /// Table version/epoch for conflict resolution.
   uint64 version = 2;
-  /// Last applied operation sequence (for ordering).
-  uint64 last_applied_seq = 3;
 }
 
 /// Shard range: defines the key space covered by a shard.
@@ -82,8 +80,6 @@ message ShardMapProto {
   repeated ShardGroupProto groups = 1;
   /// Map version/epoch for conflict resolution.
   uint64 version = 2;
-  /// Last applied operation sequence (for ordering).
-  uint64 last_applied_seq = 3;
 }
 
 // ============================================================================

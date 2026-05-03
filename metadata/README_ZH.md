@@ -156,7 +156,9 @@ mount / owner group / route epoch：
 - `MountEntry::namespace_owner_group_id` 是 mount 内 namespace mutation owner group。
 - `mount_epoch` 使用 `MountEntry::config_version`。
 - `route_epoch` 存在 RocksDB `meta` CF 中，`CreateMount` / `DeleteMount` 会推进；`AddShardGroup` 当前不推进 filesystem-facing `route_epoch`。
-- `state_id` 来自 Raft applied state watermark，部分 header 和 stale-state 路径会使用。
+- `state_id` 来自 state-machine applied `RaftLogId`，并且只通过 `GroupStateWatermark { group_id, state_id }` 出现在 header state vector 中。
+
+metadata state freshness 当前规范收敛为 group-scoped watermark vector：client 维护 `group_id -> state_id` cache；leader 和 production single-group msync 可以用 `ResponseHeader.state` 推进 cache；当 follower read 路径被启用或被调用时，follower 必须先校验 `RequestHeader.state` 是否已被本地 state machine apply 覆盖；follower 成功响应的 `response.state` 必须为空，表示不更新 client cache；stale 必须通过 stale-state error 触发 refresh；multi-group msync 仍是 future work。`applied_seq` 已退出长期设计，不能作为 runtime state、storage meta、snapshot 字段或 client freshness。
 
 data identity / session identity：
 
@@ -175,11 +177,11 @@ block metadata 与 worker soft state 边界：
 Raft / RocksDB 现状：
 
 - 主 filesystem mutation、mount mutation、worker descriptor、delete intent 创建都通过 `Command` propose 到 Raft apply。
-- worker register 成功路径会把 identity mapping、`next_worker_id` allocator、worker descriptor、`AppliedResult` 和 `applied_seq` 放进同一个 RocksDB `WriteBatch`；propose 成功后才更新 `WorkerManager` runtime soft state。
+- worker register 成功路径会把 identity mapping、`next_worker_id` allocator、worker descriptor 和 `AppliedResult` 放进同一个 RocksDB `WriteBatch`；propose 成功后才更新 `WorkerManager` runtime soft state。
 - `RaftStateStore` 读调用 `AppRaftNode::read(false, ...)`，当前是 leader-read 检查，不是 follower read；`AppRaftNode::read(true, ...)` 有 linearizable read 分支，但主 `RaftStateStore` 路径没有使用。
 - snapshot build/install 基于 `STATE_CFS` 的 RocksDB snapshot/payload，包含 replicated state CF；install 时先 clear 对应 CF，再批量恢复。
 - inode/data handle allocator 使用 RocksDB meta key 持久推进；destructive file layout apply path 的 zero-ref delete intent id 使用 replicated `next_delete_intent_id`，当 allocator key 缺失或落后于已有 delete intent 时，会在同一个 apply `WriteBatch` 内 deterministic bump 到 `max(existing_intent_id)+1` 后再按本次新建 pending intent 数量推进。
-- `Create`、`Mkdir`、`Rmdir`、empty-file `Unlink`、extent-bearing file `Unlink`、`Rename`、`SetAttr`、`SetXattr`、`RemoveXattr`、`CloseWrite`、`Truncate` shrink、`CreateDeleteIntents`、`AllocateDeleteIntents`、`UpdateDeleteIntentStatus`、`CreateMount`、`DeleteMount`、`AddShardGroup`、`RegisterWorker`、`AcquireLease`、`ReleaseLease` 已把业务 mutation、`AppliedResult` 和 `applied_seq` 放进同一个 RocksDB `WriteBatch`。
+- `Create`、`Mkdir`、`Rmdir`、empty-file `Unlink`、extent-bearing file `Unlink`、`Rename`、`SetAttr`、`SetXattr`、`RemoveXattr`、`CloseWrite`、`Truncate` shrink、`CreateDeleteIntents`、`AllocateDeleteIntents`、`UpdateDeleteIntentStatus`、`CreateMount`、`DeleteMount`、`AddShardGroup`、`RegisterWorker`、`AcquireLease`、`ReleaseLease` 已把业务 mutation 和 `AppliedResult` 放进同一个 RocksDB `WriteBatch`。
 
 ## 6. Worker metadata 链路
 
@@ -190,7 +192,7 @@ register 当前行为：
 - 根据 endpoint + labels 计算 identity。
 - 通过 `Command::RegisterWorker` propose 到 Raft apply。
 - apply 内如果 identity 已存在则复用原 worker_id；否则从 replicated `next_worker_id` 分配新 worker_id。
-- identity mapping、`next_worker_id`、descriptor、`AppliedResult`、`applied_seq` 同 batch 持久化。
+- identity mapping、`next_worker_id`、descriptor、`AppliedResult` 同 batch 持久化。
 - propose 成功后再调用 `WorkerManager::register_worker()` 写入内存 descriptor；propose 失败不会留下 runtime descriptor。
 
 heartbeat 当前行为：
@@ -290,15 +292,15 @@ Dedup / fingerprint / AppliedResult 当前边界：
 - `CommandFingerprint` 表示 command type + 语义 payload 的稳定指纹，用于校验同一 `DedupKey` 下 payload 是否一致；不能合并进 `DedupKey`。
 - `AppliedResult` 是 Raft state machine 已 apply mutation 的持久 replay record，用于 retry/replay；不是通用 RPC response cache。
 - read-only RPC 不写 `AppliedResult`；读路径依赖 `state_id`、`mount_epoch`、`route_epoch`、`worker_epoch` 和 `ResponseHeader` refresh hint。
-- `Create`、`Mkdir`、`Rmdir`、empty-file `Unlink`、extent-bearing file `Unlink`、`Rename`、`SetAttr`、`SetXattr`、`RemoveXattr`、`CloseWrite`、`Truncate` shrink、`CreateDeleteIntents`、`AllocateDeleteIntents`、`UpdateDeleteIntentStatus`、`CreateMount`、`DeleteMount`、`AddShardGroup`、`RegisterWorker`、`AcquireLease`、`ReleaseLease` 已把 business mutation、`AppliedResult` 和 `applied_seq` 放进同一个 RocksDB `WriteBatch`。
-- `CloseWrite` 成功 apply 时，inode 中的 committed extents/size/mtime/lease_epoch、当前已维护的 block refcount increment、稳定 `FileLayout` record、`AppliedResult` 和 `applied_seq` 通过 `close_write_with_apply_result_atomic()` 同批提交；确定性业务错误仍持久化 `AppliedResult` 以保持 replay 语义。
-- `Truncate` shrink 成功 apply 时，apply 层会先按 inode persisted `lease_epoch` 和 deterministic `lease_id=(inode_id<<64)|lease_epoch` 校验 fencing authority；通过后，inode size/mtime/lease_epoch、稳定 `FileLayout` record、被释放完整 block 的 refcount decrement、zero-ref block 的 pending delete intent、`AppliedResult` 和 `applied_seq` 通过 `truncate_file_with_apply_result_atomic()` 同批提交；grow 仍返回 structured `NotSupported`。
-- `Truncate` same-size no-op 仍进入 Raft mutation dedup/replay 路径，持久化 `AppliedResult` 和 `applied_seq`，但不改 inode/layout/refcount/delete intent。
-- Extent-bearing file `Unlink` 成功 apply 时，dentry、inode、`FileLayout`、`data_handle_owner`、被引用 block 的 refcount decrement、zero-ref block 的 pending delete intent、`AppliedResult` 和 `applied_seq` 通过 `delete_file_with_extents_and_apply_result_atomic()` 同批提交；active write session / active lease 会在 FsCore 层返回 `EBusy`，不强删。
-- `CreateDeleteIntents` 成功 apply 时，所有 pending delete intents、`AppliedResult` 和 `applied_seq` 通过 `create_delete_intents_with_apply_result_atomic()` 同批提交；同一 command 内 duplicate intent id 或 DB 中已有 intent id 会被 deterministic structured error 拒绝，且不会覆盖 existing intent。
+- `Create`、`Mkdir`、`Rmdir`、empty-file `Unlink`、extent-bearing file `Unlink`、`Rename`、`SetAttr`、`SetXattr`、`RemoveXattr`、`CloseWrite`、`Truncate` shrink、`CreateDeleteIntents`、`AllocateDeleteIntents`、`UpdateDeleteIntentStatus`、`CreateMount`、`DeleteMount`、`AddShardGroup`、`RegisterWorker`、`AcquireLease`、`ReleaseLease` 已把 business mutation 和 `AppliedResult` 放进同一个 RocksDB `WriteBatch`。
+- `CloseWrite` 成功 apply 时，inode 中的 committed extents/size/mtime/lease_epoch、当前已维护的 block refcount increment、稳定 `FileLayout` record 和 `AppliedResult` 通过 `close_write_with_apply_result_atomic()` 同批提交；确定性业务错误仍持久化 `AppliedResult` 以保持 replay 语义。
+- `Truncate` shrink 成功 apply 时，apply 层会先按 inode persisted `lease_epoch` 和 deterministic `lease_id=(inode_id<<64)|lease_epoch` 校验 fencing authority；通过后，inode size/mtime/lease_epoch、稳定 `FileLayout` record、被释放完整 block 的 refcount decrement、zero-ref block 的 pending delete intent 和 `AppliedResult` 通过 `truncate_file_with_apply_result_atomic()` 同批提交；grow 仍返回 structured `NotSupported`。
+- `Truncate` same-size no-op 仍进入 Raft mutation dedup/replay 路径，持久化 `AppliedResult`，但不改 inode/layout/refcount/delete intent。
+- Extent-bearing file `Unlink` 成功 apply 时，dentry、inode、`FileLayout`、`data_handle_owner`、被引用 block 的 refcount decrement、zero-ref block 的 pending delete intent 和 `AppliedResult` 通过 `delete_file_with_extents_and_apply_result_atomic()` 同批提交；active write session / active lease 会在 FsCore 层返回 `EBusy`，不强删。
+- `CreateDeleteIntents` 成功 apply 时，所有 pending delete intents 和 `AppliedResult` 通过 `create_delete_intents_with_apply_result_atomic()` 同批提交；同一 command 内 duplicate intent id 或 DB 中已有 intent id 会被 deterministic structured error 拒绝，且不会覆盖 existing intent。
 - GC/orphan/overrep 等 maintenance authoritative intent creation 通过 `AllocateDeleteIntents` 进入 Raft apply；command payload 中的 intent_id 必须为 `0`，apply 内使用 replicated `next_delete_intent_id` 分配真实 intent id。
-- `UpdateDeleteIntentStatus` 成功 apply 时，Pending/InFlight -> Completed/Failed 等允许的状态推进、finished timestamp / error msg、`AppliedResult` 和 `applied_seq` 同 batch 提交；missing intent、invalid transition 或 fingerprint mismatch 不更新状态。
-- `RegisterWorker` 成功 apply 时，worker identity mapping、worker descriptor、`next_worker_id` allocator、`AppliedResult` 和 `applied_seq` 同 batch 提交；same identity 复用原 worker_id 并原子更新 descriptor。
+- `UpdateDeleteIntentStatus` 成功 apply 时，Pending/InFlight -> Completed/Failed 等允许的状态推进、finished timestamp / error msg、`AppliedResult` 同 batch 提交；missing intent、invalid transition 或 fingerprint mismatch 不更新状态。
+- `RegisterWorker` 成功 apply 时，worker identity mapping、worker descriptor、`next_worker_id` allocator、`AppliedResult` 同 batch 提交；same identity 复用原 worker_id 并原子更新 descriptor。
 - destructive file layout path 中 block refcount decrement 与 zero-ref delete intent creation 已跟触发它们的 namespace/layout mutation 同 batch；zero-ref intent id 来自 replicated `next_delete_intent_id`，allocator key 缺失或落后时同 batch deterministic advance above existing delete intents，same `DedupKey` replay 不重复分配 id、不重复 decrement，也不重复创建 intent。
 
 Mutation command apply-level atomicity inventory：

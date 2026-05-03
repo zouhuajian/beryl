@@ -20,15 +20,15 @@ impl MsyncClient {
         Self { client }
     }
 
-    /// Sync metadata for a group (lightweight: only advances state_id).
+    /// Sync metadata for a group (lightweight: advances group state watermark).
     /// group_id must be set in ctx.group_id.
-    /// min_state_id (if provided) should be set in ctx.state_id.
+    /// min state (if provided) should be set in ctx.state.
     pub async fn sync(
         &self,
         ctx: &RequestHeader,
         _inode_id: Option<InodeId>, // Deprecated: use ctx.group_id instead
         _path: Option<&str>,        // Deprecated: use ctx.group_id instead
-        _min_token: Option<u64>,    // Deprecated: use ctx.state_id instead
+        _min_token: Option<u64>,    // Deprecated: use ctx.state instead
         _timeout_ms: Option<u64>,   // Deprecated: use ctx.deadline_ms instead
     ) -> ClientResult<proto::metadata::MsyncResponseProto> {
         // Check that group_id is set in ctx

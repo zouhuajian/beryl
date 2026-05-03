@@ -1,54 +1,42 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Group watermark for cross-shard-group destructive gate control.
+//! Group state watermark for metadata freshness.
 //!
-//! This module defines types for tracking state machine progress per shard group,
-//! enabling safe destructive operations across multiple Raft groups.
+//! This module defines types for tracking state-machine applied progress per
+//! metadata Raft owner group.
 
 use crate::RaftLogId;
 use crate::ids::ShardGroupId;
 use serde::{Deserialize, Serialize};
 
-/// Group watermark: tracks the applied state ID for a specific shard group.
+/// Group state watermark for a specific metadata Raft owner group.
 ///
-/// Used to ensure destructive operations only proceed when the target shard group
-/// has applied at least up to the guard state ID.
+/// `state_id` is the state-machine applied RaftLogId for `group_id`. It is not
+/// an append index, committed index, private apply counter, or any route/mount/worker epoch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct GroupWatermark {
-    /// Shard group ID this watermark applies to.
-    pub shard_group_id: ShardGroupId,
-    /// Guard state ID (term, index) that must be reached before allowing destructive operations.
+pub struct GroupStateWatermark {
+    /// Metadata Raft owner group this watermark applies to.
+    pub group_id: ShardGroupId,
+    /// Applied state-machine RaftLogId that must be reached.
     pub state_id: RaftLogId,
 }
 
-impl GroupWatermark {
-    /// Create a new GroupWatermark.
-    pub fn new(shard_group_id: ShardGroupId, state_id: RaftLogId) -> Self {
-        Self {
-            shard_group_id,
-            state_id,
-        }
+impl GroupStateWatermark {
+    /// Create a new GroupStateWatermark.
+    pub fn new(group_id: ShardGroupId, state_id: RaftLogId) -> Self {
+        Self { group_id, state_id }
     }
 
-    /// Check if this watermark has been reached by the given state ID.
-    /// Returns true if `applied_state_id >= self.state_id`.
+    /// Check if this watermark has been reached by the given applied state ID.
     pub fn is_reached(&self, applied_state_id: &RaftLogId) -> bool {
-        // Compare term first, then index
-        if applied_state_id.term > self.state_id.term {
-            return true;
-        }
-        if applied_state_id.term < self.state_id.term {
-            return false;
-        }
-        // Same term: compare index
-        applied_state_id.index >= self.state_id.index
+        applied_state_id.has_reached(&self.state_id)
     }
 
-    /// Compare two watermarks from the same shard group.
+    /// Compare two watermarks from the same group.
     /// Returns Some(Ordering) if they are from the same group, None otherwise.
     pub fn cmp_same_group(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        if self.shard_group_id != other.shard_group_id {
+        if self.group_id != other.group_id {
             return None;
         }
         Some(self.state_id.cmp(&other.state_id))
@@ -60,7 +48,7 @@ impl GroupWatermark {
 /// This ensures destructive operations are only allowed when the mount/routing
 /// configuration matches the expected epoch. Mismatch indicates route change
 /// and requires refresh.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MountEpoch(pub u64);
 
 impl MountEpoch {
@@ -72,11 +60,5 @@ impl MountEpoch {
     /// Get the epoch value.
     pub fn as_u64(&self) -> u64 {
         self.0
-    }
-}
-
-impl Default for MountEpoch {
-    fn default() -> Self {
-        Self(0)
     }
 }

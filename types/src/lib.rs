@@ -29,7 +29,7 @@ pub use acl::{
     PosixDefaultAcl, decode_posix_acl, encode_posix_acl, is_acl_xattr_key,
 };
 pub use fs::{DirEntry, Extent, FileAttrs, FsErrorCode, Inode, InodeData, InodeId, InodeKind};
-pub use group_watermark::{GroupWatermark, MountEpoch};
+pub use group_watermark::{GroupStateWatermark, MountEpoch};
 pub use ids::{
     BlockId, BlockIndex, CallId, ChunkId, ChunkIndex, ClientId, DataHandleId, LeaseId, MountId, RequestId,
     ShardGroupId, ShardId, StreamId, WorkerId,

@@ -20,8 +20,7 @@ use common::header::{RequestHeader, ResponseHeader};
 use std::sync::Arc;
 use types::fs::InodeId;
 use types::ids::ShardGroupId;
-use types::GroupWatermark;
-use types::RaftLogId;
+use types::{GroupStateWatermark, RaftLogId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RefreshDispatchAction {
@@ -81,10 +80,8 @@ impl MetadataRpcHelper {
     /// Update state_id for a group (from response header).
     /// Uses response.header.group_id as the key (not request group_id) to avoid cross-group updates.
     pub fn update_state_id_from_response(&self, response_header: &ResponseHeader) {
-        if let (Some(group_id_raw), Some(state_id)) = (response_header.group_id, response_header.state_id.as_ref()) {
-            let group_id = ShardGroupId::new(group_id_raw);
-            let watermark = GroupWatermark::new(group_id, *state_id);
-            self.state_cache.update_if_ahead(watermark);
+        if !response_header.state.is_empty() {
+            self.state_cache.merge_if_ahead(response_header.state.clone());
         }
     }
 
@@ -103,7 +100,7 @@ impl MetadataRpcHelper {
             // For read requests, fill state_id from cache
             if is_read {
                 if let Some(state_id) = self.get_state_id(&gid) {
-                    header.state_id = Some(state_id);
+                    header.state = vec![GroupStateWatermark::new(gid, state_id)];
                 }
             }
         }
@@ -162,8 +159,8 @@ impl MetadataRpcHelper {
         if let Some(gid) = hint.group_id.or(response_header.group_id) {
             next_header.group_id = Some(gid);
         }
-        if let Some(state_id) = response_header.state_id {
-            next_header.state_id = Some(state_id);
+        if !response_header.state.is_empty() {
+            next_header.state = response_header.state.clone();
         }
         if let Some(mount_epoch) = hint.mount_epoch.or(response_header.mount_epoch) {
             next_header.mount_epoch = Some(mount_epoch);
@@ -184,15 +181,23 @@ impl MetadataRpcHelper {
             }
             RefreshDispatchAction::RefreshFencing => {
                 if let Some(gid) = next_header.group_id {
-                    self.msync_group(base_header, ShardGroupId::new(gid), next_header.state_id)
-                        .await?;
+                    self.msync_group(
+                        base_header,
+                        ShardGroupId::new(gid),
+                        next_header.state.first().map(|w| w.state_id),
+                    )
+                    .await?;
                 }
                 self.refresh_route_table(base_header).await?;
             }
             RefreshDispatchAction::RefreshState => {
                 if let Some(gid) = next_header.group_id {
-                    self.msync_group(base_header, ShardGroupId::new(gid), next_header.state_id)
-                        .await?;
+                    self.msync_group(
+                        base_header,
+                        ShardGroupId::new(gid),
+                        next_header.state.first().map(|w| w.state_id),
+                    )
+                    .await?;
                 } else {
                     self.refresh_route_table(base_header).await?;
                 }
@@ -248,7 +253,7 @@ impl MetadataRpcHelper {
         let mut header = base_header.child();
         header.group_id = Some(group_id.as_raw());
         if let Some(sid) = min_state_id {
-            header.state_id = Some(sid);
+            header.state = vec![GroupStateWatermark::new(group_id, sid)];
         }
 
         // Use MetadataClient's msync method directly
@@ -601,12 +606,12 @@ mod tests {
 
         let base_header = RequestHeader::new(ClientId::new(1)).with_group_id(5);
         let mut current_header = base_header.child_with_same_call_id();
-        current_header.state_id = Some(RaftLogId::new(1, 1, 7));
+        current_header.state = vec![GroupStateWatermark::new(ShardGroupId::new(5), RaftLogId::new(1, 1, 7))];
         let canonical =
             CanonicalError::need_refresh(RpcErrorCode::StaleState, RefreshReason::StaleState, "stale state");
         let mut response_header =
             ResponseHeader::from_canonical(base_header.client.clone(), canonical.clone()).with_group_id(5);
-        response_header.state_id = Some(RaftLogId::new(1, 1, 7));
+        response_header.state = vec![GroupStateWatermark::new(ShardGroupId::new(5), RaftLogId::new(1, 1, 7))];
 
         let _ = helper
             .dispatch_refresh(

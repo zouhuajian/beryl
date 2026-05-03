@@ -44,7 +44,7 @@ impl MetadataClient {
         inode_id: Option<InodeId>,
         path: Option<&str>,
         consistency: ConsistencyLevel,
-        _min_token: Option<u64>, // Deprecated: use ctx.state_id instead
+        _min_token: Option<u64>, // Deprecated: use ctx.state instead
     ) -> ClientResult<GetFileMetaResponseProto> {
         use proto::metadata::get_file_meta_request_proto;
         let mut request = GetFileMetaRequestProto {

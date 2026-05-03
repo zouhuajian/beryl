@@ -114,7 +114,7 @@ pub struct DeleteIntent {
     /// Used for execution gating: only execute if the target shard group
     /// has applied at least up to guard_watermark.state_id.
     #[serde(default)]
-    pub guard_watermark: Option<types::group_watermark::GroupWatermark>,
+    pub guard_watermark: Option<types::group_watermark::GroupStateWatermark>,
     /// Mount epoch at intent creation time (optional).
     /// Used for route consistency checking.
     #[serde(default)]

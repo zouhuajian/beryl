@@ -12,6 +12,7 @@ pub mod domain;
 mod fs_core;
 mod guard;
 mod path_service;
+mod route_service;
 
 // pub use client_service::MetadataClientServiceImpl;
 pub use self::auth::{
@@ -32,3 +33,4 @@ pub use path_service::{
     FileSystemAuthorityDeps, FileSystemPolicyDeps, FileSystemRuntimeDeps, MetadataFileSystemServiceDeps,
     MetadataFileSystemServiceImpl,
 };
+pub use route_service::MetadataRouteServiceImpl;

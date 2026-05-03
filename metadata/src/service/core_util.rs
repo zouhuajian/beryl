@@ -16,7 +16,7 @@ use types::fs::{Extent, FsErrorCode};
 use types::ids::{BlockId, BlockIndex, DataHandleId, LeaseId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
-use types::RaftLogId;
+use types::GroupStateWatermark;
 
 pub fn request_context_from_proto(req_header: &Option<proto::common::RequestHeaderProto>) -> RequestContext {
     let caller = if let Some(proto_header) = req_header {
@@ -36,8 +36,8 @@ pub fn request_context_from_proto(req_header: &Option<proto::common::RequestHead
     if let Some(traceparent) = &caller.traceparent {
         Span::current().record("traceparent", traceparent);
     }
-    if let Some(ref state_id) = caller.state_id {
-        Span::current().record("state_id", &format!("{:?}", state_id));
+    if !caller.state.is_empty() {
+        Span::current().record("state", &format!("{:?}", caller.state));
     }
     if let Some(principal) = &caller.principal {
         Span::current().record("principal", principal);
@@ -201,10 +201,10 @@ fn build_base_response_header(
     group_id: Option<u64>,
     mount_epoch: Option<u64>,
     route_epoch: Option<u64>,
-    state_id: Option<RaftLogId>,
+    state: Vec<GroupStateWatermark>,
 ) -> proto::common::ResponseHeaderProto {
     let mut resp_header = ResponseHeader::ok(ctx.caller.client.clone()).with_group_id(group_id.unwrap_or(0));
-    resp_header.state_id = state_id.or(ctx.caller.state_id);
+    resp_header.state = state;
     let mut proto_header: proto::common::ResponseHeaderProto = (&resp_header).into();
     if let Some(epoch) = mount_epoch {
         proto_header.mount_epoch = Some(epoch);
@@ -220,9 +220,9 @@ pub fn ok_header_from_context(
     group_id: Option<u64>,
     mount_epoch: Option<u64>,
     route_epoch: Option<u64>,
-    state_id: Option<RaftLogId>,
+    state: Vec<GroupStateWatermark>,
 ) -> proto::common::ResponseHeaderProto {
-    build_base_response_header(ctx, group_id, mount_epoch, route_epoch, state_id)
+    build_base_response_header(ctx, group_id, mount_epoch, route_epoch, state)
 }
 
 pub fn header_from_canonical_error_with_context(
@@ -230,10 +230,10 @@ pub fn header_from_canonical_error_with_context(
     group_id: Option<u64>,
     mount_epoch: Option<u64>,
     route_epoch: Option<u64>,
-    state_id: Option<RaftLogId>,
+    state: Vec<GroupStateWatermark>,
     err: &CanonicalError,
 ) -> proto::common::ResponseHeaderProto {
-    let mut header = build_base_response_header(ctx, group_id, mount_epoch, route_epoch, state_id);
+    let mut header = build_base_response_header(ctx, group_id, mount_epoch, route_epoch, state);
     header.error = error_detail_from_canonical(err);
     header
 }
@@ -247,7 +247,7 @@ pub fn ok_header_from_core_success<T>(
         success.group_id,
         success.mount_epoch,
         success.route_epoch,
-        success.state_id,
+        success.state.clone(),
     )
 }
 
@@ -257,7 +257,7 @@ pub fn header_from_core_failure(ctx: &RequestContext, failure: &CoreFailure) -> 
         failure.group_id,
         failure.mount_epoch,
         failure.route_epoch,
-        failure.state_id,
+        failure.state.clone(),
         &failure.error,
     )
 }
@@ -273,13 +273,13 @@ pub(crate) fn core_failure_from_metadata_error(
 }
 
 fn core_failure_from_canonical_error(
-    ctx: &RequestContext,
+    _ctx: &RequestContext,
     err: CanonicalError,
     group_id: Option<u64>,
     mount_epoch: Option<u64>,
     route_epoch: Option<u64>,
 ) -> CoreFailure {
-    CoreFailure::new(err, group_id, mount_epoch, route_epoch, ctx.caller.state_id)
+    CoreFailure::new(err, group_id, mount_epoch, route_epoch, Vec::new())
 }
 
 pub(crate) fn core_failure_from_error_detail(
@@ -361,7 +361,7 @@ pub fn ok_header_from_request(
     mount_epoch: Option<u64>,
 ) -> proto::common::ResponseHeaderProto {
     let ctx = request_context_from_proto(req_header);
-    ok_header_from_context(&ctx, group_id, mount_epoch, None, None)
+    ok_header_from_context(&ctx, group_id, mount_epoch, None, Vec::new())
 }
 
 pub fn header_from_canonical_error(
@@ -371,7 +371,7 @@ pub fn header_from_canonical_error(
     err: &CanonicalError,
 ) -> proto::common::ResponseHeaderProto {
     let ctx = request_context_from_proto(req_header);
-    header_from_canonical_error_with_context(&ctx, group_id, mount_epoch, None, None, err)
+    header_from_canonical_error_with_context(&ctx, group_id, mount_epoch, None, Vec::new(), err)
 }
 
 pub fn file_attrs_to_proto(attrs: &types::fs::FileAttrs) -> proto::fs::FileAttrsProto {

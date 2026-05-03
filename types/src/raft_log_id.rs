@@ -35,6 +35,11 @@ impl RaftLogId {
             index,
         }
     }
+
+    /// Return true when this applied log id satisfies a required watermark.
+    pub fn has_reached(&self, required: &Self) -> bool {
+        self >= required
+    }
 }
 
 impl Ord for RaftLogId {

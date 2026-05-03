@@ -8,7 +8,7 @@ use crate::state::StateStore;
 use common::error::canonical::{RefreshHint, RefreshReason};
 use common::header::RpcErrorCode;
 use std::sync::Arc;
-use types::ids::MountId;
+use types::ids::{MountId, ShardGroupId};
 use types::RaftLogId;
 
 #[derive(Clone)]
@@ -29,10 +29,6 @@ impl FreshnessValidator {
             state_store,
             mount_table,
         }
-    }
-
-    pub(super) fn state_id_from_ctx(ctx: &RequestContext) -> Option<RaftLogId> {
-        ctx.caller.state_id
     }
 
     pub(super) async fn authoritative_route_epoch(&self) -> Option<u64> {
@@ -169,13 +165,22 @@ impl FreshnessValidator {
         group_id: Option<u64>,
         mount_epoch: Option<u64>,
     ) -> Result<StaleStateStatus, CoreFailure> {
-        let Some(required_state_id) = ctx.caller.state_id else {
+        let Some(group_id) = group_id else {
+            return Ok(StaleStateStatus::Ready);
+        };
+        let required_state_id = ctx
+            .caller
+            .state
+            .iter()
+            .find(|watermark| watermark.group_id == ShardGroupId::new(group_id))
+            .map(|watermark| watermark.state_id);
+        let Some(required_state_id) = required_state_id else {
             return Ok(StaleStateStatus::Ready);
         };
         let Some(last_applied) = last_applied else {
             return Ok(StaleStateStatus::UnknownLastApplied);
         };
-        if last_applied < required_state_id {
+        if !last_applied.has_reached(&required_state_id) {
             return Err(need_refresh_core_failure(
                 ctx,
                 RpcErrorCode::StaleState,
@@ -184,7 +189,7 @@ impl FreshnessValidator {
                     "Stale state: last_applied={:?} < required={:?}",
                     last_applied, required_state_id
                 ),
-                group_id,
+                Some(group_id),
                 mount_epoch,
                 None,
                 None,

@@ -140,7 +140,7 @@ async fn test_msync_with_mock() {
         deadline_ms: 0,
         traceparent: String::new(),
         caller_context: None,
-        state_id: None,
+        state: Vec::new(),
         retry_count: 0,
         group_id: 0,
         mount_epoch: None,

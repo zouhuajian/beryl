@@ -547,7 +547,7 @@ mod tests {
                 client_name: "test".to_string(),
             }),
             error: Some(canonical_to_error_detail(&canonical)),
-            state_id: None,
+            state: Vec::new(),
             group_id: 0,
             mount_epoch: None,
             route_epoch: None,

@@ -3,7 +3,7 @@
 
 //! State ID cache for consistency checking.
 //!
-//! This cache stores the last seen GroupWatermark per group_id for consistency checking.
+//! This cache stores the last seen GroupStateWatermark per group_id for consistency checking.
 //! Watermarks must be compared only within the same group_id.
 
 use dashmap::DashMap;
@@ -11,20 +11,20 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use types::ids::ShardGroupId;
-use types::GroupWatermark;
+use types::GroupStateWatermark;
 
 /// Cached watermark entry.
 #[derive(Clone, Debug)]
 pub struct CachedWatermark {
     /// The group watermark.
-    pub watermark: GroupWatermark,
+    pub watermark: GroupStateWatermark,
     /// When this entry was cached.
     pub cached_at: Instant,
 }
 
 impl CachedWatermark {
     /// Create a new cached watermark entry.
-    pub fn new(watermark: GroupWatermark) -> Self {
+    pub fn new(watermark: GroupStateWatermark) -> Self {
         Self {
             watermark,
             cached_at: Instant::now(),
@@ -56,7 +56,7 @@ impl StateIdCache {
 
     /// Get the cached watermark for a group.
     /// Returns None if not cached or expired.
-    pub fn get(&self, group_id: &ShardGroupId) -> Option<GroupWatermark> {
+    pub fn get(&self, group_id: &ShardGroupId) -> Option<GroupStateWatermark> {
         let cache = self.cache.read();
         cache.get(group_id).and_then(|entry| {
             if entry.is_fresh(self.ttl) {
@@ -68,17 +68,17 @@ impl StateIdCache {
     }
 
     /// Update the cached watermark for a group.
-    pub fn put(&self, watermark: GroupWatermark) {
+    pub fn put(&self, watermark: GroupStateWatermark) {
         let cache = self.cache.write();
-        cache.insert(watermark.shard_group_id, CachedWatermark::new(watermark));
+        cache.insert(watermark.group_id, CachedWatermark::new(watermark));
     }
 
     /// Update the cached watermark for a group if the new watermark is ahead.
     /// This ensures we only advance the watermark, never go backwards.
-    pub fn update_if_ahead(&self, new_watermark: GroupWatermark) {
+    pub fn update_if_ahead(&self, new_watermark: GroupStateWatermark) {
         let cache = self.cache.write();
         let should_update = cache
-            .get(&new_watermark.shard_group_id)
+            .get(&new_watermark.group_id)
             .and_then(|entry| {
                 new_watermark
                     .cmp_same_group(&entry.watermark)
@@ -87,7 +87,17 @@ impl StateIdCache {
             .unwrap_or(true);
 
         if should_update {
-            cache.insert(new_watermark.shard_group_id, CachedWatermark::new(new_watermark));
+            cache.insert(new_watermark.group_id, CachedWatermark::new(new_watermark));
+        }
+    }
+
+    /// Merge a response state vector without rolling back any group.
+    pub fn merge_if_ahead<I>(&self, watermarks: I)
+    where
+        I: IntoIterator<Item = GroupStateWatermark>,
+    {
+        for watermark in watermarks {
+            self.update_if_ahead(watermark);
         }
     }
 
@@ -96,8 +106,8 @@ impl StateIdCache {
     /// - Some(true) if cached watermark >= provided watermark (safe to read)
     /// - Some(false) if cached watermark < provided watermark (stale, need sync)
     /// - None if no cached watermark for this group or different groups
-    pub fn compare(&self, watermark: &GroupWatermark) -> Option<bool> {
-        self.get(&watermark.shard_group_id).and_then(|cached| {
+    pub fn compare(&self, watermark: &GroupStateWatermark) -> Option<bool> {
+        self.get(&watermark.group_id).and_then(|cached| {
             cached
                 .cmp_same_group(watermark)
                 .map(|ord| ord != std::cmp::Ordering::Less)
@@ -114,5 +124,28 @@ impl StateIdCache {
     pub fn clear(&self) {
         let cache = self.cache.write();
         cache.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use types::{GroupStateWatermark, RaftLogId, ShardGroupId};
+
+    #[test]
+    fn merge_if_ahead_updates_each_group_without_rollback() {
+        let cache = StateIdCache::new(60);
+        let group_a = ShardGroupId::new(10);
+        let group_b = ShardGroupId::new(20);
+
+        cache.merge_if_ahead(vec![
+            GroupStateWatermark::new(group_a, RaftLogId::new(1, 1, 10)),
+            GroupStateWatermark::new(group_b, RaftLogId::new(1, 1, 5)),
+        ]);
+        cache.merge_if_ahead(vec![GroupStateWatermark::new(group_a, RaftLogId::new(1, 1, 8))]);
+        cache.merge_if_ahead(vec![GroupStateWatermark::new(group_b, RaftLogId::new(1, 1, 6))]);
+
+        assert_eq!(cache.get(&group_a).unwrap().state_id, RaftLogId::new(1, 1, 10));
+        assert_eq!(cache.get(&group_b).unwrap().state_id, RaftLogId::new(1, 1, 6));
     }
 }
