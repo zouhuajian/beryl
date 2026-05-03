@@ -260,12 +260,11 @@ pub fn init_observability(config: &MetadataConfig) -> Result<Observability, DynE
 
     info!(
         rpc_addr = %config.rpc_addr,
+        storage_dir = %config.storage_dir.display(),
         authz_filesystem_mode = ?config.authz.filesystem.mode,
         node_id = config.raft.node_id,
-        cluster_id = %config.raft.cluster_id,
         peers_count = config.raft.peers.len(),
-        shard_num_shards = config.shard.num_shards,
-        shard_group_id = config.shard.shard_group_id,
+        authority_group_id = config.authority.group_id,
         "Configuration loaded (sensitive values redacted)"
     );
 
@@ -276,8 +275,7 @@ pub fn init_observability(config: &MetadataConfig) -> Result<Observability, DynE
 
 /// Builds authoritative storage, mount, raft, and state-store dependencies in startup order.
 pub async fn build_authority(config: &MetadataConfig) -> Result<MetadataAuthority, DynError> {
-    // TODO: use path from config
-    let db_path = std::env::var("VECTON_METADATA_DB_PATH").unwrap_or_else(|_| "data/metadata".to_string());
+    let db_path = effective_storage_dir(config);
     let storage = Arc::new(RocksDBStorage::open(&db_path).map_err(|e| format!("Failed to initialize RocksDB: {e}"))?);
 
     let mount_table = Arc::new(
@@ -298,8 +296,8 @@ pub async fn build_authority(config: &MetadataConfig) -> Result<MetadataAuthorit
         .map_err(|e| format!("Failed to initialize Raft node: {e}"))?,
     );
 
-    let shard_group_id = ShardGroupId::new(config.shard.shard_group_id);
-    ensure_root_mount(Arc::clone(&raft_node), Arc::clone(&mount_table), shard_group_id)
+    let authority_group_id = ShardGroupId::new(config.authority.group_id);
+    ensure_root_mount(Arc::clone(&raft_node), Arc::clone(&mount_table), authority_group_id)
         .await
         .map_err(|e| format!("Failed to ensure root mount: {e}"))?;
 
@@ -316,10 +314,16 @@ pub async fn build_authority(config: &MetadataConfig) -> Result<MetadataAuthorit
         raft_node,
         state_store,
         metadata_metrics: Arc::new(MetadataMetrics::new()),
-        shard_group_id,
+        shard_group_id: authority_group_id,
         _ufs_registry: ufs_registry,
         _ufs_metadata_proxy: ufs_metadata_proxy,
     })
+}
+
+fn effective_storage_dir(config: &MetadataConfig) -> std::path::PathBuf {
+    std::env::var_os("VECTON_METADATA_DB_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| config.storage_dir.clone())
 }
 
 /// Builds the required worker runtime without starting heavy background work.
@@ -561,7 +565,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BootstrapConfig, MetadataAuthzConfig, RaftConfig, ShardConfig, WorkerConfig};
+    use crate::config::{BootstrapConfig, MetadataAuthorityConfig, MetadataAuthzConfig, RaftConfig, WorkerConfig};
     use client::cache::{RouteCache, StateIdCache};
     use client::canonical::RetryOutcome;
     use client::meta::{MetadataClient, MetadataRpcHelper};
@@ -582,7 +586,6 @@ mod tests {
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
         let raft_config = RaftConfig {
             node_id: 1,
-            cluster_id: "test".to_string(),
             peers: vec!["127.0.0.1:0".to_string()],
         };
         let raft_node = Arc::new(
@@ -629,16 +632,13 @@ mod tests {
     fn test_config() -> MetadataConfig {
         MetadataConfig {
             rpc_addr: "127.0.0.1:18080".parse().unwrap(),
+            storage_dir: std::path::PathBuf::from("data/metadata"),
             authz: MetadataAuthzConfig::default(),
             raft: RaftConfig {
-                cluster_id: "test".to_string(),
                 node_id: 1,
                 peers: vec!["127.0.0.1:0".to_string()],
             },
-            shard: ShardConfig {
-                num_shards: 1,
-                shard_group_id: 1,
-            },
+            authority: MetadataAuthorityConfig { group_id: 1 },
             worker: WorkerConfig::default(),
             bootstrap: BootstrapConfig {
                 root_readiness: crate::readiness::RootReadinessConfig::default(),
@@ -800,12 +800,15 @@ mod tests {
     async fn metadata_server_build_composes_required_runtime() {
         let _guard = metadata_db_env_lock().lock().unwrap();
         let dir = TempDir::new().unwrap();
-        std::env::set_var("VECTON_METADATA_DB_PATH", dir.path());
+        std::env::remove_var("VECTON_METADATA_DB_PATH");
+        let mut config = test_config();
+        config.storage_dir = dir.path().to_path_buf();
 
-        let server = MetadataServer::build(Arc::new(test_config())).await.unwrap();
+        let server = MetadataServer::build(Arc::new(config)).await.unwrap();
 
         assert_eq!(server.config.rpc_addr, "127.0.0.1:18080".parse().unwrap());
         assert_eq!(server.authority.shard_group_id, ShardGroupId::new(1));
+        assert!(dir.path().join("CURRENT").exists());
         assert!(server
             .authority
             .mount_table
@@ -818,6 +821,23 @@ mod tests {
         assert!(!server.handles._maintenance._delete_executor_handle.is_finished());
         assert!(Arc::strong_count(&server.handles._readiness.gate) >= 1);
 
+        std::env::remove_var("VECTON_METADATA_DB_PATH");
+    }
+
+    #[tokio::test]
+    async fn vecton_metadata_db_path_overrides_config_storage_dir_for_legacy_runtime() {
+        let _guard = metadata_db_env_lock().lock().unwrap();
+        let configured = TempDir::new().unwrap();
+        let legacy_env = TempDir::new().unwrap();
+        std::env::set_var("VECTON_METADATA_DB_PATH", legacy_env.path());
+        let mut config = test_config();
+        config.storage_dir = configured.path().to_path_buf();
+
+        let authority = build_authority(&config).await.unwrap();
+
+        assert!(legacy_env.path().join("CURRENT").exists());
+        assert!(!configured.path().join("CURRENT").exists());
+        drop(authority);
         std::env::remove_var("VECTON_METADATA_DB_PATH");
     }
 

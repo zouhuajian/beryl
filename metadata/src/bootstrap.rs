@@ -85,7 +85,6 @@ mod tests {
 
         let raft_config = RaftConfig {
             node_id: 1,
-            cluster_id: "test".to_string(),
             peers: vec!["127.0.0.1:0".to_string()],
         };
         let raft_node = Arc::new(
@@ -162,7 +161,6 @@ mod tests {
 
         let raft_config = RaftConfig {
             node_id: 1,
-            cluster_id: "test".to_string(),
             peers: vec!["127.0.0.1:0".to_string()],
         };
         let raft_node = Arc::new(

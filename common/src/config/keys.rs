@@ -14,38 +14,24 @@ pub mod metadata_rpc {
     pub const PORT: &str = "metadata.rpc.port";
 }
 
+/// Metadata persistent storage configuration keys.
+pub mod metadata_storage {
+    /// Metadata RocksDB storage directory.
+    pub const DIR: &str = "metadata.storage.dir";
+}
+
 /// Metadata Raft configuration keys.
 pub mod metadata_raft {
-    /// Raft cluster ID.
-    pub const CLUSTER_ID: &str = "metadata.raft.cluster_id";
     /// Raft node ID.
     pub const NODE_ID: &str = "metadata.raft.node_id";
     /// Raft peer addresses (comma-separated).
     pub const PEERS: &str = "metadata.raft.peers";
-    /// Raft storage directory.
-    pub const STORAGE_DIR: &str = "metadata.raft.storage.dir";
-    /// Raft snapshot interval in seconds.
-    pub const SNAPSHOT_INTERVAL_SECS: &str = "metadata.raft.snapshot.interval_secs";
-    /// Raft snapshot retain count.
-    pub const SNAPSHOT_RETAIN_COUNT: &str = "metadata.raft.snapshot.retain_count";
-    /// Raft log compaction interval in seconds.
-    pub const LOG_COMPACTION_INTERVAL_SECS: &str = "metadata.raft.log.compaction_interval_secs";
-    /// Raft log retain count.
-    pub const LOG_RETAIN_COUNT: &str = "metadata.raft.log.retain_count";
-    /// Raft heartbeat interval in milliseconds.
-    pub const HEARTBEAT_INTERVAL_MS: &str = "metadata.raft.heartbeat_interval_ms";
-    /// Raft election timeout minimum in milliseconds.
-    pub const ELECTION_TIMEOUT_MIN_MS: &str = "metadata.raft.election_timeout_min_ms";
-    /// Raft election timeout maximum in milliseconds.
-    pub const ELECTION_TIMEOUT_MAX_MS: &str = "metadata.raft.election_timeout_max_ms";
 }
 
-/// Metadata shard configuration keys.
-pub mod metadata_shard {
-    /// Number of shards.
-    pub const NUM_SHARDS: &str = "metadata.shard.num_shards";
-    /// Shard group ID.
-    pub const GROUP_ID: &str = "metadata.shard.group_id";
+/// Metadata authority configuration keys.
+pub mod metadata_authority {
+    /// Authority group ID served by this metadata runtime.
+    pub const GROUP_ID: &str = "metadata.authority.group_id";
 }
 
 /// Worker RPC configuration keys.

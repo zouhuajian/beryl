@@ -24,117 +24,117 @@ metadata.rpc.addr: "0.0.0.0"
 metadata.rpc.port: 18080
 
 # Filesystem service authz mode (non-compositional: choose exactly one provider)
-# Type: string (enum: "NONE", "RANGER", "ACL")
+# Type: string (parser accepts "NONE", "RANGER", "ACL"; current runtime supports "NONE" only)
 # Default: "NONE"
-# Description: Path-entrypoint authz provider selection.
+# Description: Path-entrypoint authz provider selection. ACL/RANGER fail fast until providers exist.
 metadata.authz.filesystem.mode: "NONE"
 
-# ACL group resolver cache TTL (seconds)
-# Type: integer
-# Default: 300
-# Description: Group mapping cache TTL for ACL authorization.
-metadata.authz.groups.cache_ttl_secs: 300
+# ============================================================================
+# Metadata Storage Configuration
+# ============================================================================
 
-# ACL group resolver stale-while-error policy
-# Type: boolean
-# Default: false
-# Description: When true, expired cached group mappings may be used if backend resolve fails.
-# Security: false is fail-closed (deny on resolver error).
-metadata.authz.groups.stale_while_error: false
-
-# Optional static principal -> groups mappings used by the ACL group resolver backend.
-# Key pattern: metadata.authz.groups.mapping.<principal>
-# Value: comma-separated groups (typically numeric gids for MVP mode-bit matching).
-# Example:
-# metadata.authz.groups.mapping.1000: "100,200"
+# Metadata storage directory
+# Type: string
+# Default: "data/metadata"
+# Description: Local directory for metadata persistent state, including the RocksDB-backed metadata state, Raft log/state, and snapshot metadata. Snapshot files are materialized under this directory's snapshots/ subdirectory.
+metadata.storage.dir: "data/metadata"
 
 # ============================================================================
 # Metadata Raft Configuration (for metadata clustering)
 # ============================================================================
 
-# Metadata Raft cluster ID
-# Type: string
-# Default: "vecton-metadata"
-# Description: Unique identifier for the Raft cluster
-metadata.raft.cluster_id: "vecton-metadata"
-
 # Metadata Raft node ID
 # Type: integer
 # Default: 1
 # Range: >= 1
-# Description: Unique identifier for this Raft node (must be unique in cluster)
+# Description: Raft replica node ID. It is unique within the configured metadata authority group.
+# Authority group: no. This identifies a replica node inside a group.
+# Raft node: yes.
 metadata.raft.node_id: 1
 
 # Metadata Raft peer addresses (comma-separated)
 # Type: string (comma-separated list)
 # Default: "" (empty for single-node)
-# Description: Comma-separated list of peer addresses (e.g., "127.0.0.1:18080,127.0.0.1:18081")
+# Description: Peer metadata RPC addresses used to initialize the Raft membership.
+# Authority group: no. Peers are replica nodes of this configured group.
+# Raft node: yes.
 # Example: "127.0.0.1:18080,127.0.0.1:18081,127.0.0.1:18082"
 metadata.raft.peers: ""
 
-# Metadata Raft storage directory
-# Type: string (path)
-# Default: "./data/metadata/raft"
-# Description: Directory for storing Raft log and state
-metadata.raft.storage.dir: "./data/metadata/raft"
-
-# Metadata Raft snapshot interval (seconds)
-# Type: integer
-# Default: 3600
-# Description: Interval between Raft snapshots
-metadata.raft.snapshot.interval_secs: 3600
-
-# Metadata Raft snapshot retain count
-# Type: integer
-# Default: 3
-# Description: Number of snapshots to retain
-metadata.raft.snapshot.retain_count: 3
-
-# Metadata Raft log compaction interval (seconds)
-# Type: integer
-# Default: 300
-# Description: Interval for Raft log compaction
-metadata.raft.log.compaction_interval_secs: 300
-
-# Metadata Raft log retain count
-# Type: integer
-# Default: 1000
-# Description: Number of log entries to retain before compaction
-metadata.raft.log.retain_count: 1000
-
-# Metadata Raft heartbeat interval (milliseconds)
-# Type: integer
-# Default: 1000
-# Description: Interval between Raft heartbeats
-metadata.raft.heartbeat_interval_ms: 1000
-
-# Metadata Raft election timeout minimum (milliseconds)
-# Type: integer
-# Default: 5000
-# Description: Minimum election timeout
-metadata.raft.election_timeout_min_ms: 5000
-
-# Metadata Raft election timeout maximum (milliseconds)
-# Type: integer
-# Default: 10000
-# Description: Maximum election timeout
-metadata.raft.election_timeout_max_ms: 10000
-
 # ============================================================================
-# Metadata Shard Configuration
+# Metadata Authority Group Configuration
 # ============================================================================
 
-# Metadata shard: number of shards
-# Type: integer
-# Default: 1
-# Description: Number of shards for metadata partitioning
-metadata.shard.num_shards: 1
-
-# Metadata shard: group ID
+# Metadata authority group ID served by this metadata runtime
 # Type: integer
 # Default: 0
-# Description: Shard group identifier
-metadata.shard.group_id: 0
+# Description: Metadata authority group that owns the root namespace created by this runtime.
+# Authority group: yes.
+# Raft node: no. This is not metadata.raft.node_id.
+# Routing: not a hash shard count and not a hash-shard routing source of truth.
+metadata.authority.group_id: 0
+
+# ============================================================================
+# Metadata Bootstrap / Readiness Configuration
+# ============================================================================
+
+# Root mount readiness initial backoff (milliseconds)
+# Type: integer
+# Default: 200
+# Description: Initial retry backoff while waiting for the root mount to become ready.
+metadata.bootstrap.root_ready_initial_backoff_ms: 200
+
+# Root mount readiness maximum backoff (milliseconds)
+# Type: integer
+# Default: 5000
+# Description: Maximum retry backoff while waiting for the root mount to become ready.
+metadata.bootstrap.root_ready_max_backoff_ms: 5000
+
+# Root mount readiness warning threshold (milliseconds)
+# Type: integer
+# Default: 60000
+# Description: Emit warnings after root readiness has waited longer than this threshold.
+metadata.bootstrap.root_ready_warn_after_ms: 60000
+
+# ============================================================================
+# Metadata Repair Configuration
+# ============================================================================
+
+# Metadata repair queue maximum capacity
+# Type: integer
+# Default: 10000
+# Description: Maximum number of metadata repair tasks that can be queued.
+metadata.repair.max_queue_size: 10000
+
+# Metadata repair maximum attempts
+# Type: integer
+# Default: 3
+# Description: Maximum retry attempts before a metadata repair task is marked failed.
+metadata.repair.max_attempts: 3
+
+# Metadata repair in-flight timeout (milliseconds)
+# Type: integer
+# Default: 300000
+# Description: Timeout before an in-flight metadata repair task is retried.
+metadata.repair.inflight_timeout_ms: 300000
+
+# Metadata repair initial backoff (milliseconds)
+# Type: integer
+# Default: 1000
+# Description: Initial retry backoff for metadata repair tasks.
+metadata.repair.initial_backoff_ms: 1000
+
+# Metadata repair maximum backoff (milliseconds)
+# Type: integer
+# Default: 60000
+# Description: Maximum retry backoff for metadata repair tasks.
+metadata.repair.max_backoff_ms: 60000
+
+# Metadata repair worker in-flight limit
+# Type: integer
+# Default: 4
+# Description: Maximum concurrent metadata repair tasks assigned to one worker.
+metadata.repair.worker_inflight_limit: 4
 
 # ============================================================================
 # Worker Service Configuration
@@ -299,7 +299,8 @@ worker.metadata.backoff_duration_sec: 10
 # Worker metadata: group endpoints
 # Type: string (comma-separated "group_id:endpoint" pairs)
 # Default: "" (empty)
-# Description: Metadata group endpoints (e.g., "0:127.0.0.1:18080,1:127.0.0.1:18081")
+# Description: Metadata group endpoints for worker registration.
+# Example: "0:127.0.0.1:18080,1:metadata-1:18080"
 worker.metadata.groups: ""
 
 # Worker replication: peer connection pool size
@@ -547,12 +548,3 @@ observe.metrics.otlp.protocol: "grpc"
 # Default: 60000
 # Description: OTLP metrics export interval
 observe.metrics.otlp.interval_ms: 60000
-
-
-#  metadata.worker.max_commands_per_heartbeat	8	Max commands returned per heartbeat
-#  metadata.repair.max_queue_size	10000	Repair queue maximum capacity
-#  metadata.repair.max_attempts	3	Max retries per repair task
-#  metadata.repair.inflight_timeout_ms	300000	In-flight task timeout (5 minutes)
-#  metadata.repair.initial_backoff_ms	1000	Initial backoff (1 second)
-#  metadata.repair.max_backoff_ms	60000	Max backoff (1 minute)
-#  metadata.repair.worker_inflight_limit	4	Max concurrent tasks per worker

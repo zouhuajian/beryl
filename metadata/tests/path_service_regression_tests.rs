@@ -223,7 +223,6 @@ async fn build_env_with_raft(
     let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
     let raft_config = RaftConfig {
         node_id: 1,
-        cluster_id: "path-service-regression".to_string(),
         peers: vec!["127.0.0.1:0".to_string()],
     };
     let raft_node = Arc::new(

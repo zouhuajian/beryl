@@ -6,23 +6,24 @@
 //! Reads configuration from core-site.yaml / client-site.yaml.
 
 use crate::readiness::RootReadinessConfig;
-use common::config::CoreConfig;
+use common::config::{metadata_authority, metadata_raft, metadata_rpc, metadata_storage, CoreConfig};
 use common::error::CommonError;
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Metadata service configuration.
 #[derive(Clone, Debug)]
 pub struct MetadataConfig {
     /// RPC server address.
     pub rpc_addr: SocketAddr,
+    /// Local directory for metadata persistent state.
+    pub storage_dir: PathBuf,
     /// Authz mode configuration.
     pub authz: MetadataAuthzConfig,
     /// Raft configuration.
     pub raft: RaftConfig,
-    /// Shard configuration.
-    pub shard: ShardConfig,
+    /// Metadata authority configuration.
+    pub authority: MetadataAuthorityConfig,
     /// Worker/Repair configuration.
     pub worker: WorkerConfig,
     /// Bootstrap/readiness configuration.
@@ -67,14 +68,6 @@ pub struct FileSystemAuthzConfig {
 #[derive(Clone, Debug)]
 pub struct MetadataAuthzConfig {
     pub filesystem: FileSystemAuthzConfig,
-    pub groups: GroupResolverConfig,
-}
-
-#[derive(Clone, Debug)]
-pub struct GroupResolverConfig {
-    pub cache_ttl_secs: u64,
-    pub stale_while_error: bool,
-    pub static_mappings: BTreeMap<String, Vec<String>>,
 }
 
 impl Default for MetadataAuthzConfig {
@@ -83,17 +76,6 @@ impl Default for MetadataAuthzConfig {
             filesystem: FileSystemAuthzConfig {
                 mode: FileSystemAuthzMode::None,
             },
-            groups: GroupResolverConfig::default(),
-        }
-    }
-}
-
-impl Default for GroupResolverConfig {
-    fn default() -> Self {
-        Self {
-            cache_ttl_secs: 300,
-            stale_while_error: false,
-            static_mappings: BTreeMap::new(),
         }
     }
 }
@@ -125,43 +107,33 @@ pub struct RepairConfig {
 }
 
 /// Raft configuration.
-/// TODO(config): extend with full Raft parameters once metadata service uses Raft.
 #[derive(Clone, Debug)]
 pub struct RaftConfig {
-    /// Raft cluster ID.
-    pub cluster_id: String,
     /// Raft node ID.
     pub node_id: u64,
-    /// Raft peers (placeholder).
+    /// Raft peers inside the configured authority group.
     pub peers: Vec<String>,
 }
 
 impl Default for RaftConfig {
     fn default() -> Self {
         Self {
-            cluster_id: "vecton-metadata".to_string(),
             node_id: 1,
             peers: vec![],
         }
     }
 }
 
-/// Shard configuration.
-/// TODO(config): expand once sharding is implemented.
+/// Metadata authority group served by this runtime.
 #[derive(Clone, Debug)]
-pub struct ShardConfig {
-    /// Number of shards.
-    pub num_shards: u64,
-    /// Shard group ID.
-    pub shard_group_id: u64,
+pub struct MetadataAuthorityConfig {
+    /// Authority group ID for the root namespace owner served by this metadata runtime.
+    pub group_id: u64,
 }
 
-impl Default for ShardConfig {
+impl Default for MetadataAuthorityConfig {
     fn default() -> Self {
-        Self {
-            num_shards: 1,
-            shard_group_id: 0,
-        }
+        Self { group_id: 0 }
     }
 }
 
@@ -187,27 +159,6 @@ impl Default for WorkerConfig {
     }
 }
 
-fn parse_group_mappings(flat: &common::config::FlatConfig) -> BTreeMap<String, Vec<String>> {
-    let mut mappings = BTreeMap::new();
-    for key in flat.keys_with_prefix("metadata.authz.groups.mapping") {
-        let Some(principal) = key.strip_prefix("metadata.authz.groups.mapping.") else {
-            continue;
-        };
-        if principal.trim().is_empty() {
-            continue;
-        }
-        let raw_groups = flat.get_str(&key).unwrap_or_default();
-        let groups = raw_groups
-            .split(',')
-            .map(|part| part.trim())
-            .filter(|part| !part.is_empty())
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        mappings.insert(principal.to_string(), groups);
-    }
-    mappings
-}
-
 impl MetadataConfig {
     /// Load configuration from core-site.yaml.
     pub fn load<P: AsRef<Path>>(config_path: P) -> Result<Self, CommonError> {
@@ -221,15 +172,20 @@ impl MetadataConfig {
 
         // Read RPC address
         let addr = flat
-            .get_str("metadata.rpc.addr")
+            .get_str(metadata_rpc::ADDR)
             .unwrap_or_else(|| "0.0.0.0".to_string());
-        let port = flat.get_i64("metadata.rpc.port").unwrap_or(18080) as u16;
+        let port = flat.get_i64(metadata_rpc::PORT).unwrap_or(18080) as u16;
         let rpc_addr = format!("{}:{}", addr, port).parse().map_err(|e| {
             CommonError::new(
                 common::error::CommonErrorCode::InvalidArgument,
                 format!("Invalid metadata.rpc.addr/port: {}", e),
             )
         })?;
+
+        let storage_dir = PathBuf::from(
+            flat.get_str(metadata_storage::DIR)
+                .unwrap_or_else(|| "data/metadata".to_string()),
+        );
 
         let filesystem_mode_raw = flat
             .get_str("metadata.authz.filesystem.mode")
@@ -246,20 +202,10 @@ impl MetadataConfig {
 
         let authz = MetadataAuthzConfig {
             filesystem: FileSystemAuthzConfig { mode: filesystem_mode },
-            groups: GroupResolverConfig {
-                cache_ttl_secs: flat
-                    .get_i64("metadata.authz.groups.cache_ttl_secs")
-                    .unwrap_or(300)
-                    .max(0) as u64,
-                stale_while_error: flat
-                    .get_bool("metadata.authz.groups.stale_while_error")
-                    .unwrap_or(false),
-                static_mappings: parse_group_mappings(&flat),
-            },
         };
 
         // Read Raft config
-        let peers = if let Some(peers_str) = flat.get_str("metadata.raft.peers") {
+        let peers = if let Some(peers_str) = flat.get_str(metadata_raft::PEERS) {
             // Parse comma-separated list of peers
             peers_str
                 .split(',')
@@ -271,17 +217,12 @@ impl MetadataConfig {
         };
 
         let raft = RaftConfig {
-            cluster_id: flat
-                .get_str("metadata.raft.cluster_id")
-                .unwrap_or_else(|| "vecton-metadata".to_string()),
-            node_id: flat.get_i64("metadata.raft.node_id").unwrap_or(1) as u64,
+            node_id: flat.get_i64(metadata_raft::NODE_ID).unwrap_or(1) as u64,
             peers,
         };
 
-        // Read Shard config
-        let shard = ShardConfig {
-            num_shards: flat.get_i64("metadata.shard.num_shards").unwrap_or(1) as u64,
-            shard_group_id: flat.get_i64("metadata.shard.group_id").unwrap_or(0) as u64,
+        let authority = MetadataAuthorityConfig {
+            group_id: flat.get_i64(metadata_authority::GROUP_ID).unwrap_or(0) as u64,
         };
 
         // Read Worker/Repair config
@@ -316,9 +257,10 @@ impl MetadataConfig {
 
         Ok(Self {
             rpc_addr,
+            storage_dir,
             authz,
             raft,
-            shard,
+            authority,
             worker,
             bootstrap,
         })
@@ -329,9 +271,10 @@ impl Default for MetadataConfig {
     fn default() -> Self {
         Self {
             rpc_addr: "0.0.0.0:18080".parse().unwrap(),
+            storage_dir: PathBuf::from("data/metadata"),
             authz: MetadataAuthzConfig::default(),
             raft: RaftConfig::default(),
-            shard: ShardConfig::default(),
+            authority: MetadataAuthorityConfig::default(),
             worker: WorkerConfig::default(),
             bootstrap: BootstrapConfig {
                 root_readiness: RootReadinessConfig::default(),
@@ -349,9 +292,7 @@ mod tests {
     fn authz_mode_defaults_to_none() {
         let config = MetadataConfig::default();
         assert_eq!(config.authz.filesystem.mode, FileSystemAuthzMode::None);
-        assert_eq!(config.authz.groups.cache_ttl_secs, 300);
-        assert!(!config.authz.groups.stale_while_error);
-        assert!(config.authz.groups.static_mappings.is_empty());
+        assert_eq!(config.storage_dir, std::path::PathBuf::from("data/metadata"));
     }
 
     #[test]
@@ -364,24 +305,30 @@ mod tests {
     }
 
     #[test]
-    fn authz_group_mapping_parses_and_cache_ttl_applies() {
+    fn authority_group_id_parses_from_authority_key() {
         let mut flat = CoreConfig::default().as_flat().clone();
-        flat.set("metadata.authz.groups.cache_ttl_secs", 42i64);
-        flat.set("metadata.authz.groups.stale_while_error", true);
-        flat.set("metadata.authz.groups.mapping.alice", "10,20");
-        flat.set("metadata.authz.groups.mapping.bob", "30");
+        flat.set("metadata.authority.group_id", 7i64);
 
         let config = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap();
-        assert_eq!(config.authz.groups.cache_ttl_secs, 42);
-        assert!(config.authz.groups.stale_while_error);
-        assert_eq!(
-            config.authz.groups.static_mappings.get("alice"),
-            Some(&vec!["10".to_string(), "20".to_string()])
-        );
-        assert_eq!(
-            config.authz.groups.static_mappings.get("bob"),
-            Some(&vec!["30".to_string()])
-        );
+        assert_eq!(config.authority.group_id, 7);
+    }
+
+    #[test]
+    fn storage_dir_parses_from_metadata_storage_key() {
+        let mut flat = CoreConfig::default().as_flat().clone();
+        flat.set("metadata.storage.dir", "/var/lib/vecton/metadata");
+
+        let config = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap();
+        assert_eq!(config.storage_dir, std::path::PathBuf::from("/var/lib/vecton/metadata"));
+    }
+
+    #[test]
+    fn legacy_shard_group_id_key_is_not_a_compatibility_bridge() {
+        let mut flat = CoreConfig::default().as_flat().clone();
+        flat.set("metadata.shard.group_id", 9i64);
+
+        let config = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap();
+        assert_eq!(config.authority.group_id, 0);
     }
 
     #[test]

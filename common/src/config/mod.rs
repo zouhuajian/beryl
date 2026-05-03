@@ -16,9 +16,9 @@ pub use validate::{validate_client, validate_core};
 
 pub use keys::{
     client, client_cache, client_consistency, client_read_mode, client_retry, client_worker_direct_read,
-    client_write_mode, metadata_raft, metadata_rpc, metadata_shard, observe_logging, observe_metrics, observe_tracing,
-    worker_concurrency, worker_eviction, worker_metadata, worker_orphan, worker_replication, worker_rpc,
-    worker_storage, worker_transport, worker_ufs, worker_volume_health,
+    client_write_mode, metadata_authority, metadata_raft, metadata_rpc, metadata_storage, observe_logging,
+    observe_metrics, observe_tracing, worker_concurrency, worker_eviction, worker_metadata, worker_orphan,
+    worker_replication, worker_rpc, worker_storage, worker_transport, worker_ufs, worker_volume_health,
 };
 
 use crate::error::CommonError;
@@ -62,24 +62,19 @@ impl Default for CoreConfig {
         config.set(metadata_rpc::PORT, 18080i64);
 
         // ============================================================================
-        // Metadata Raft Configuration
+        // Metadata Storage Configuration
         // ============================================================================
-        config.set(metadata_raft::CLUSTER_ID, "vecton-metadata");
-        config.set(metadata_raft::NODE_ID, 1i64);
-        config.set(metadata_raft::STORAGE_DIR, "./data/metadata/raft");
-        config.set(metadata_raft::SNAPSHOT_INTERVAL_SECS, 3600i64);
-        config.set(metadata_raft::SNAPSHOT_RETAIN_COUNT, 3i64);
-        config.set(metadata_raft::LOG_COMPACTION_INTERVAL_SECS, 300i64);
-        config.set(metadata_raft::LOG_RETAIN_COUNT, 1000i64);
-        config.set(metadata_raft::HEARTBEAT_INTERVAL_MS, 1000i64);
-        config.set(metadata_raft::ELECTION_TIMEOUT_MIN_MS, 5000i64);
-        config.set(metadata_raft::ELECTION_TIMEOUT_MAX_MS, 10000i64);
+        config.set(metadata_storage::DIR, "data/metadata");
 
         // ============================================================================
-        // Metadata Shard Configuration
+        // Metadata Raft Configuration
         // ============================================================================
-        config.set(metadata_shard::NUM_SHARDS, 1i64);
-        config.set(metadata_shard::GROUP_ID, 0i64);
+        config.set(metadata_raft::NODE_ID, 1i64);
+
+        // ============================================================================
+        // Metadata Authority Configuration
+        // ============================================================================
+        config.set(metadata_authority::GROUP_ID, 0i64);
 
         // ============================================================================
         // Worker RPC Configuration
@@ -299,6 +294,10 @@ mod tests {
         let config = CoreConfig::default();
         assert_eq!(config.inner.get_i64(metadata_rpc::PORT), Some(18080));
         assert_eq!(config.inner.get_str(metadata_rpc::ADDR), Some("0.0.0.0".to_string()));
+        assert_eq!(
+            config.inner.get_str("metadata.storage.dir"),
+            Some("data/metadata".to_string())
+        );
         assert_eq!(config.inner.get_str(worker_transport::KIND), Some("grpc".to_string()));
     }
 
@@ -441,7 +440,17 @@ client.default_timeout_ms: 60000
         let config_path = "conf/core-site.yaml";
         if std::path::Path::new(config_path).exists() {
             let result = CoreConfig::load(config_path);
-            assert!(result.is_ok(), "Failed to load conf/core-site.yaml: {:?}", result.err());
+            let config = result.unwrap_or_else(|err| panic!("Failed to load conf/core-site.yaml: {err:?}"));
+            assert_eq!(
+                config.inner.get_str("metadata.storage.dir"),
+                Some("data/metadata".to_string())
+            );
+
+            let file_config = load_from_yaml_file(config_path).unwrap();
+            assert_eq!(
+                file_config.get_str("metadata.storage.dir"),
+                Some("data/metadata".to_string())
+            );
         }
     }
 

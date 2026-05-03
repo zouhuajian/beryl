@@ -10,7 +10,6 @@ mod command;
 mod log_store;
 mod network;
 mod node;
-mod router;
 mod snapshot;
 mod state_machine;
 mod state_machine_store;

@@ -300,17 +300,43 @@ impl WorkerConfig {
         let mut groups = Vec::new();
         // Parse metadata.groups as array or single group
         if let Some(groups_str) = worker_sub.get_str("metadata.groups") {
-            // Format: "group_id1:endpoint1,group_id2:endpoint2" or JSON array
+            // Format: "group_id1:endpoint1,group_id2:endpoint2".
             for group_str in groups_str.split(',') {
-                let parts: Vec<&str> = group_str.split(':').collect();
-                if parts.len() == 2 {
-                    if let Ok(group_id) = parts[0].trim().parse::<u64>() {
-                        groups.push(MetadataGroupConfig {
-                            group_id,
-                            endpoint: parts[1].trim().to_string(),
-                        });
-                    }
+                let group_str = group_str.trim();
+                if group_str.is_empty() {
+                    continue;
                 }
+                let (group_id_raw, endpoint_raw) = group_str.split_once(':').ok_or_else(|| {
+                    CommonError::new(
+                        CommonErrorCode::InvalidArgument,
+                        format!(
+                            "invalid worker.metadata.groups entry `{}`: missing endpoint separator",
+                            group_str
+                        ),
+                    )
+                })?;
+                let group_id = group_id_raw.trim().parse::<u64>().map_err(|e| {
+                    CommonError::new(
+                        CommonErrorCode::InvalidArgument,
+                        format!(
+                            "invalid worker.metadata.groups group_id `{}` in entry `{}`: {}",
+                            group_id_raw.trim(),
+                            group_str,
+                            e
+                        ),
+                    )
+                })?;
+                let endpoint = endpoint_raw.trim();
+                if endpoint.is_empty() {
+                    return Err(CommonError::new(
+                        CommonErrorCode::InvalidArgument,
+                        format!("invalid worker.metadata.groups entry `{}`: missing endpoint", group_str),
+                    ));
+                }
+                groups.push(MetadataGroupConfig {
+                    group_id,
+                    endpoint: endpoint.to_string(),
+                });
             }
         }
         // Also check for individual group configs: metadata.group.0.endpoint, metadata.group.1.endpoint, etc.
@@ -649,6 +675,16 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    fn config_with_metadata_groups(groups: &str) -> (TempDir, CoreConfig) {
+        let temp_dir = TempDir::new().unwrap();
+        let storage_dir = temp_dir.path().join("storage");
+        fs::create_dir_all(&storage_dir).unwrap();
+        let mut flat = CoreConfig::default().as_flat().clone();
+        flat.set("worker.storage.dirs", storage_dir.display().to_string());
+        flat.set("worker.metadata.groups", groups);
+        (temp_dir, CoreConfig::from_flat(flat))
+    }
+
     #[test]
     fn test_default_config() {
         let temp_dir = TempDir::new().unwrap();
@@ -692,5 +728,67 @@ mod tests {
 
         let config = WorkerConfig::load(&config_path).unwrap();
         assert_eq!(config.storage_dirs.len(), 1);
+    }
+
+    #[test]
+    fn worker_metadata_groups_preserves_host_port_endpoint() {
+        let (_temp_dir, core_config) = config_with_metadata_groups("0:127.0.0.1:18080");
+
+        let config = WorkerConfig::from_core_config(&core_config).unwrap();
+
+        assert_eq!(config.metadata.groups.len(), 1);
+        assert_eq!(config.metadata.groups[0].group_id, 0);
+        assert_eq!(config.metadata.groups[0].endpoint, "127.0.0.1:18080");
+    }
+
+    #[test]
+    fn worker_metadata_groups_preserves_localhost_endpoint() {
+        let (_temp_dir, core_config) = config_with_metadata_groups("0:localhost:18080");
+
+        let config = WorkerConfig::from_core_config(&core_config).unwrap();
+
+        assert_eq!(config.metadata.groups.len(), 1);
+        assert_eq!(config.metadata.groups[0].group_id, 0);
+        assert_eq!(config.metadata.groups[0].endpoint, "localhost:18080");
+    }
+
+    #[test]
+    fn worker_metadata_groups_parses_multiple_host_port_endpoints() {
+        let (_temp_dir, core_config) = config_with_metadata_groups("0:metadata-0:18080,1:metadata-1:18080");
+
+        let config = WorkerConfig::from_core_config(&core_config).unwrap();
+
+        assert_eq!(config.metadata.groups.len(), 2);
+        assert_eq!(config.metadata.groups[0].group_id, 0);
+        assert_eq!(config.metadata.groups[0].endpoint, "metadata-0:18080");
+        assert_eq!(config.metadata.groups[1].group_id, 1);
+        assert_eq!(config.metadata.groups[1].endpoint, "metadata-1:18080");
+    }
+
+    #[test]
+    fn worker_metadata_groups_rejects_invalid_group_id() {
+        let (_temp_dir, core_config) = config_with_metadata_groups("abc:127.0.0.1:18080");
+
+        let err = WorkerConfig::from_core_config(&core_config).unwrap_err();
+
+        assert!(err.message.contains("invalid worker.metadata.groups group_id"));
+    }
+
+    #[test]
+    fn worker_metadata_groups_rejects_missing_endpoint() {
+        let (_temp_dir, core_config) = config_with_metadata_groups("0:");
+
+        let err = WorkerConfig::from_core_config(&core_config).unwrap_err();
+
+        assert!(err.message.contains("missing endpoint"));
+    }
+
+    #[test]
+    fn worker_metadata_groups_empty_string_is_empty() {
+        let (_temp_dir, core_config) = config_with_metadata_groups("");
+
+        let config = WorkerConfig::from_core_config(&core_config).unwrap();
+
+        assert!(config.metadata.groups.is_empty());
     }
 }
