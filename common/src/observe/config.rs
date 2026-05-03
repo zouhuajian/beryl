@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Observability configuration.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ObservabilityConfig {
     /// Logging configuration.
     pub logging: LoggingConfig,
@@ -16,17 +16,6 @@ pub struct ObservabilityConfig {
     pub metrics: MetricsConfig,
     /// Resource attributes.
     pub resource: ResourceConfig,
-}
-
-impl Default for ObservabilityConfig {
-    fn default() -> Self {
-        Self {
-            logging: LoggingConfig::default(),
-            tracing: TracingConfig::default(),
-            metrics: MetricsConfig::default(),
-            resource: ResourceConfig::default(),
-        }
-    }
 }
 
 /// Logging configuration.
@@ -186,7 +175,7 @@ impl Default for OtlpMetricsConfig {
 }
 
 /// Resource attributes configuration.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ResourceConfig {
     /// Service name.
     pub service_name: Option<String>,
@@ -200,19 +189,6 @@ pub struct ResourceConfig {
     pub node_name: Option<String>,
     /// Cluster name.
     pub cluster: Option<String>,
-}
-
-impl Default for ResourceConfig {
-    fn default() -> Self {
-        Self {
-            service_name: None,
-            service_version: None,
-            environment: None,
-            instance_id: None,
-            node_name: None,
-            cluster: None,
-        }
-    }
 }
 
 /// Service information for observability initialization.

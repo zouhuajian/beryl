@@ -6,7 +6,7 @@
 use std::fmt;
 
 /// Capability flags indicating what operations a UFS backend supports.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Capability {
     /// Backend supports native rename/move operation.
     pub supports_rename: bool,
@@ -16,17 +16,6 @@ pub struct Capability {
     pub supports_dir: bool,
     /// Rename fallback (copy + delete) is enabled.
     pub rename_fallback_enabled: bool,
-}
-
-impl Default for Capability {
-    fn default() -> Self {
-        Self {
-            supports_rename: false,
-            supports_recursive_delete: false,
-            supports_dir: false,
-            rename_fallback_enabled: false,
-        }
-    }
 }
 
 impl Capability {

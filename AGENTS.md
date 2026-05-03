@@ -52,6 +52,8 @@ These rules apply everywhere in the repo:
 - Follower successful responses must not advance client state cache.
 - Production metadata msync is single-group; multi-group msync is future work.
 - `applied_seq` must not be reintroduced as runtime, storage, snapshot, header, or client state.
+- Do not add legacy `applied_seq` snapshot decode fallback.
+- Do not bump snapshot version just to preserve removed `applied_seq` compatibility unless a real external compatibility requirement exists.
 - `route_epoch` / `mount_epoch` / `worker_epoch` are separate freshness domains.
 - breaking changes are allowed; do not keep compatibility bridges unless explicitly requested
 

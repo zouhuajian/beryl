@@ -14,20 +14,15 @@ use crate::local_io::IoUringIoEngine;
 use crate::local_io::SpdkIoEngine;
 
 /// Local I/O engine kind selection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LocalIoKind {
     /// File system I/O (default)
+    #[default]
     Fs,
     /// io_uring I/O (Linux only)
     IoUring,
     /// SPDK I/O
     Spdk,
-}
-
-impl Default for LocalIoKind {
-    fn default() -> Self {
-        LocalIoKind::Fs
-    }
 }
 
 /// Local I/O engine configuration.

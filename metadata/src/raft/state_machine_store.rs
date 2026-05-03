@@ -35,7 +35,6 @@ use rocksdb::{ColumnFamily, IteratorMode, ReadOptions, Snapshot as DbSnapshot, W
 
 const SNAPSHOT_MAGIC: &[u8] = b"VECT";
 const SNAPSHOT_VERSION_V1: u8 = 1;
-const SNAPSHOT_VERSION_V2: u8 = 2;
 const META_CF_NAME: &str = "meta";
 const ROUTE_EPOCH_KEY: &[u8] = b"route_epoch";
 const SNAPSHOT_BATCH_BYTES: usize = 2 * 1024 * 1024;
@@ -373,7 +372,7 @@ fn format_snapshot_id(last_log_id: Option<LogId<u64>>) -> String {
 fn write_header<W: Write + Seek>(writer: &mut W, header: &SnapshotHeaderV1) -> std::io::Result<()> {
     writer.seek(SeekFrom::Start(0))?;
     writer.write_all(SNAPSHOT_MAGIC)?;
-    writer.write_all(&[SNAPSHOT_VERSION_V2])?;
+    writer.write_all(&[SNAPSHOT_VERSION_V1])?;
     writer.write_all(&header.route_epoch.to_le_bytes())?;
     Ok(())
 }
@@ -390,7 +389,7 @@ fn read_header<R: Read + Seek>(reader: &mut R) -> std::io::Result<SnapshotHeader
     }
     let mut version = [0u8; 1];
     reader.read_exact(&mut version)?;
-    if version[0] != SNAPSHOT_VERSION_V1 && version[0] != SNAPSHOT_VERSION_V2 {
+    if version[0] != SNAPSHOT_VERSION_V1 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unsupported snapshot version {}", version[0]),
@@ -400,12 +399,6 @@ fn read_header<R: Read + Seek>(reader: &mut R) -> std::io::Result<SnapshotHeader
     let mut buf_u64 = [0u8; 8];
     reader.read_exact(&mut buf_u64)?;
     let route_epoch = u64::from_le_bytes(buf_u64);
-
-    if version[0] == SNAPSHOT_VERSION_V1 {
-        // Backward-compatible decode only: legacy snapshots carried an
-        // applied_seq field here. It is skipped and never restored.
-        reader.read_exact(&mut buf_u64)?;
-    }
 
     Ok(SnapshotHeaderV1 { route_epoch })
 }
@@ -691,6 +684,7 @@ mod tests {
     use crate::state::RouteEpoch;
     use openraft::storage::RaftSnapshotBuilder;
     use openraft::LeaderId;
+    use std::io::Cursor;
     use tempfile::TempDir;
 
     fn sample_raft_state() -> AppMetadataRaftState {
@@ -701,6 +695,21 @@ mod tests {
             committed: None,
             membership: openraft::Membership::new(vec![], None),
         }
+    }
+
+    #[test]
+    fn snapshot_header_v1_is_current_format_without_extra_fields() {
+        let mut cursor = Cursor::new(Vec::new());
+        write_header(&mut cursor, &SnapshotHeaderV1 { route_epoch: 7 }).unwrap();
+
+        let bytes = cursor.into_inner();
+        assert_eq!(&bytes[..4], SNAPSHOT_MAGIC);
+        assert_eq!(bytes[4], SNAPSHOT_VERSION_V1);
+        assert_eq!(bytes.len(), SNAPSHOT_MAGIC.len() + 1 + 8);
+
+        let mut cursor = Cursor::new(bytes);
+        let header = read_header(&mut cursor).unwrap();
+        assert_eq!(header.route_epoch, 7);
     }
 
     #[tokio::test]

@@ -51,18 +51,6 @@ impl RetryPolicy {
         }
     }
 
-    /// Create a default retry policy for all operations.
-    pub fn default() -> Self {
-        Self {
-            max_retries: 3,
-            max_elapsed: None,
-            idempotent_only: false,
-            base_backoff: Duration::from_millis(100),
-            max_backoff: Duration::from_secs(5),
-            retry_on: |e| e.is_retryable(),
-        }
-    }
-
     /// Check if retries are enabled.
     pub fn is_enabled(&self) -> bool {
         self.max_retries > 0
@@ -131,17 +119,17 @@ where
         }
 
         // Check max elapsed time
-        if let Some(max_elapsed) = policy.max_elapsed {
-            if start.elapsed() > max_elapsed {
-                let err = last_error
-                    .unwrap_or_else(|| CommonError::new(CommonErrorCode::Timeout, "max elapsed time exceeded"));
-                warn!(
-                    attempt,
-                    elapsed_ms = start.elapsed().as_millis(),
-                    "retry stopped due to max elapsed time"
-                );
-                return Err(err);
-            }
+        if let Some(max_elapsed) = policy.max_elapsed
+            && start.elapsed() > max_elapsed
+        {
+            let err =
+                last_error.unwrap_or_else(|| CommonError::new(CommonErrorCode::Timeout, "max elapsed time exceeded"));
+            warn!(
+                attempt,
+                elapsed_ms = start.elapsed().as_millis(),
+                "retry stopped due to max elapsed time"
+            );
+            return Err(err);
         }
 
         // Execute the operation
@@ -199,6 +187,19 @@ where
 
                 tokio::time::sleep(effective_backoff).await;
             }
+        }
+    }
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            max_elapsed: None,
+            idempotent_only: false,
+            base_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(5),
+            retry_on: |e| e.is_retryable(),
         }
     }
 }

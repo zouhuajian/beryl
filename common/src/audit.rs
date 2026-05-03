@@ -164,10 +164,10 @@ impl AuditLogger {
                 // Create new symlink (Unix only, Windows would need different approach)
                 #[cfg(unix)]
                 {
-                    if let Some(target) = new_log_path.file_name() {
-                        if let Err(e) = std::os::unix::fs::symlink(target, &symlink_path) {
-                            warn!(error = %e, "Failed to create audit.log symlink");
-                        }
+                    if let Some(target) = new_log_path.file_name()
+                        && let Err(e) = std::os::unix::fs::symlink(target, &symlink_path)
+                    {
+                        warn!(error = %e, "Failed to create audit.log symlink");
                     }
                 }
             }

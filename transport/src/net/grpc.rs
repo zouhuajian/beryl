@@ -166,7 +166,7 @@ impl GrpcTransport {
                 }
 
                 // Execute request with timeout using common::timeout_at
-                let _result = match timeout_at(ctx.deadline, f()).await {
+                match timeout_at(ctx.deadline, f()).await {
                     Ok(Ok(resp)) => {
                         let latency_ms = start.elapsed();
                         let _error_kind = ErrorKind::Ok;
@@ -237,7 +237,7 @@ impl GrpcTransport {
 
         self.execute_unary_with_retry(crate::net::methods::worker_data::READ_CHUNK, ctx, move || {
             let channel = connection_clone.clone();
-            let req = request.clone();
+            let req = request;
             let ctx_for_metadata = ctx_clone.clone();
 
             async move {
@@ -349,11 +349,11 @@ impl GrpcTransport {
         let response_stream = client
             .read_range(request_builder)
             .await
-            .map_err(|e| TransportError::from(e))?
+            .map_err(TransportError::from)?
             .into_inner();
 
         // Convert tonic stream to transport stream
-        let transport_stream = response_stream.map(|item| item.map_err(|e| TransportError::from(e)));
+        let transport_stream = response_stream.map(|item| item.map_err(TransportError::from));
 
         Ok(Box::new(transport_stream))
     }

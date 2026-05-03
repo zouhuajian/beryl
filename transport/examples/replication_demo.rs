@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chunk_ref = ChunkRef::new(block_id, 0);
 
     let chunk_slice = ChunkSlice {
-        chunk: chunk_ref.clone(),
+        chunk: chunk_ref,
         offset_in_chunk: 0,
         len: 1024,
     };

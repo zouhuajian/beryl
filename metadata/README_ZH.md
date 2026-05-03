@@ -158,7 +158,7 @@ mount / owner group / route epoch：
 - `route_epoch` 存在 RocksDB `meta` CF 中，`CreateMount` / `DeleteMount` 会推进；`AddShardGroup` 当前不推进 filesystem-facing `route_epoch`。
 - `state_id` 来自 state-machine applied `RaftLogId`，并且只通过 `GroupStateWatermark { group_id, state_id }` 出现在 header state vector 中。
 
-metadata state freshness 当前规范收敛为 group-scoped watermark vector：client 维护 `group_id -> state_id` cache；leader 和 production single-group msync 可以用 `ResponseHeader.state` 推进 cache；当 follower read 路径被启用或被调用时，follower 必须先校验 `RequestHeader.state` 是否已被本地 state machine apply 覆盖；follower 成功响应的 `response.state` 必须为空，表示不更新 client cache；stale 必须通过 stale-state error 触发 refresh；multi-group msync 仍是 future work。`applied_seq` 已退出长期设计，不能作为 runtime state、storage meta、snapshot 字段或 client freshness。
+metadata state freshness 当前规范收敛为 group-scoped watermark vector：client 维护 `group_id -> state_id` cache；leader 和 production single-group msync 可以用 `ResponseHeader.state` 推进 cache；当 follower read 路径被启用或被调用时，follower 必须先校验 `RequestHeader.state` 是否已被本地 state machine apply 覆盖；follower 成功响应的 `response.state` 必须为空，表示不更新 client cache；stale 必须通过 stale-state error 触发 refresh；multi-group msync 仍是 future work。`applied_seq` 已从 runtime state、storage meta、snapshot header/payload 和 client freshness 中移除；当前 snapshot V1 是最新标准格式，不包含 `applied_seq`，开发期不保留旧 snapshot `applied_seq` 兼容。metadata freshness 只依赖 `GroupStateWatermark` / `last_applied_log_id`。
 
 data identity / session identity：
 
@@ -179,7 +179,7 @@ Raft / RocksDB 现状：
 - 主 filesystem mutation、mount mutation、worker descriptor、delete intent 创建都通过 `Command` propose 到 Raft apply。
 - worker register 成功路径会把 identity mapping、`next_worker_id` allocator、worker descriptor 和 `AppliedResult` 放进同一个 RocksDB `WriteBatch`；propose 成功后才更新 `WorkerManager` runtime soft state。
 - `RaftStateStore` 读调用 `AppRaftNode::read(false, ...)`，当前是 leader-read 检查，不是 follower read；`AppRaftNode::read(true, ...)` 有 linearizable read 分支，但主 `RaftStateStore` 路径没有使用。
-- snapshot build/install 基于 `STATE_CFS` 的 RocksDB snapshot/payload，包含 replicated state CF；install 时先 clear 对应 CF，再批量恢复。
+- snapshot build/install 基于 `STATE_CFS` 的 RocksDB snapshot/payload，包含 replicated state CF；install 时先 clear 对应 CF，再批量恢复。当前 snapshot V1 header 只保存 snapshot 解释所需的 route epoch，不读写 `applied_seq`，也不提供旧 `applied_seq` bytes 的兼容读取。
 - inode/data handle allocator 使用 RocksDB meta key 持久推进；destructive file layout apply path 的 zero-ref delete intent id 使用 replicated `next_delete_intent_id`，当 allocator key 缺失或落后于已有 delete intent 时，会在同一个 apply `WriteBatch` 内 deterministic bump 到 `max(existing_intent_id)+1` 后再按本次新建 pending intent 数量推进。
 - `Create`、`Mkdir`、`Rmdir`、empty-file `Unlink`、extent-bearing file `Unlink`、`Rename`、`SetAttr`、`SetXattr`、`RemoveXattr`、`CloseWrite`、`Truncate` shrink、`CreateDeleteIntents`、`AllocateDeleteIntents`、`UpdateDeleteIntentStatus`、`CreateMount`、`DeleteMount`、`AddShardGroup`、`RegisterWorker`、`AcquireLease`、`ReleaseLease` 已把业务 mutation 和 `AppliedResult` 放进同一个 RocksDB `WriteBatch`。
 

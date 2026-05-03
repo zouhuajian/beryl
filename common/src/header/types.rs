@@ -4,7 +4,7 @@
 //! Header type definitions.
 
 use crate::{
-    error::canonical::{CanonicalError, ErrorClass as CanonicalErrorClass, ErrorCode as CanonicalErrorCode},
+    error::canonical::{CanonicalError, ErrorClass as CanonicalErrorClass},
     time::Deadline,
 };
 use types::{CallId, ClientId, GroupStateWatermark};
@@ -69,18 +69,13 @@ pub struct CallerContext {
 }
 
 /// Authentication type marker for request identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AuthnType {
+    #[default]
     Unspecified,
     Simple,
     Kerberos,
     Token,
-}
-
-impl Default for AuthnType {
-    fn default() -> Self {
-        Self::Unspecified
-    }
 }
 
 /// Response header carried with every RPC response.
@@ -395,23 +390,5 @@ impl ResponseHeader {
     pub fn with_group_id(mut self, group_id: u64) -> Self {
         self.group_id = Some(group_id);
         self
-    }
-
-    fn rpc_error_from_canonical(canonical_error: &CanonicalError) -> Option<RpcError> {
-        if matches!(canonical_error.class, CanonicalErrorClass::Ok) {
-            return None;
-        }
-        let code = match &canonical_error.code {
-            Some(CanonicalErrorCode::RpcCode(code)) => *code,
-            // Fs errno and missing codes fall back to Application for backward compatibility.
-            _ => RpcErrorCode::Application,
-        };
-        Some(RpcError {
-            code,
-            message: canonical_error.message.clone(),
-            error_type: None,
-            retryable: matches!(canonical_error.class, CanonicalErrorClass::Retryable),
-            retry_after_ms: canonical_error.retry_after_ms,
-        })
     }
 }

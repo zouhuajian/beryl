@@ -131,7 +131,7 @@ impl DestructiveGate {
 
     /// Check if a destructive action is allowed.
     ///
-    /// Cross-shard-group gate control with mount_epoch + state_id watermark.
+    /// Cross-shard-group gate control with mount freshness and metadata state watermark.
     ///
     /// This implements the enhanced invariants:
     /// 1. leader-only

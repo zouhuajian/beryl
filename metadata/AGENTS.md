@@ -145,6 +145,8 @@ Rules:
 - empty `ResponseHeader.state` means "do not update client state cache"; it is not stale-state
 - stale-state must be expressed through the canonical stale-state error
 - `applied_seq` must not be reintroduced as runtime, storage, snapshot, header, or client state
+- do not add legacy `applied_seq` snapshot decode fallback
+- do not bump snapshot version just to preserve removed `applied_seq` compatibility unless a real external compatibility requirement exists
 - `route_epoch`, `mount_epoch`, and `worker_epoch` are separate config freshness domains
 
 ## 9. Path traversal and caching rules

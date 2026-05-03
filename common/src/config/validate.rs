@@ -14,62 +14,63 @@ use crate::error::{CommonError, CommonErrorCode};
 /// Validate core-site configuration.
 pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
     // Validate metadata.rpc.port range
-    if let Some(port) = config.get_i64(metadata_rpc::PORT) {
-        if !(1..=65535).contains(&port) {
-            return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
-                format!("{} must be in range 1-65535, got {}", metadata_rpc::PORT, port),
-            ));
-        }
+    if let Some(port) = config.get_i64(metadata_rpc::PORT)
+        && !(1..=65535).contains(&port)
+    {
+        return Err(CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            format!("{} must be in range 1-65535, got {}", metadata_rpc::PORT, port),
+        ));
     }
 
     // Validate metadata.raft.node_id
-    if let Some(node_id) = config.get_i64(metadata_raft::NODE_ID) {
-        if node_id < 1 {
-            return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
-                format!("{} must be >= 1, got {}", metadata_raft::NODE_ID, node_id),
-            ));
-        }
+    if let Some(node_id) = config.get_i64(metadata_raft::NODE_ID)
+        && node_id < 1
+    {
+        return Err(CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            format!("{} must be >= 1, got {}", metadata_raft::NODE_ID, node_id),
+        ));
     }
 
     // Validate worker.rpc.bind format (basic check)
-    if let Some(bind) = config.get_str(worker_rpc::BIND) {
-        if bind.parse::<std::net::SocketAddr>().is_err() && !bind.contains(':') {
-            return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
-                format!("{} must be a valid socket address, got {}", worker_rpc::BIND, bind),
-            ));
-        }
+    if let Some(bind) = config.get_str(worker_rpc::BIND)
+        && bind.parse::<std::net::SocketAddr>().is_err()
+        && !bind.contains(':')
+    {
+        return Err(CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            format!("{} must be a valid socket address, got {}", worker_rpc::BIND, bind),
+        ));
     }
 
     // Validate worker.storage.block_size and chunk_size
-    if let Some(block_size) = config.get_bytes(worker_storage::BLOCK_SIZE) {
-        if let Some(chunk_size) = config.get_bytes(worker_storage::CHUNK_SIZE) {
-            if chunk_size > block_size {
-                return Err(CommonError::new(
-                    CommonErrorCode::InvalidArgument,
-                    format!(
-                        "{} ({}) must be <= {} ({})",
-                        worker_storage::CHUNK_SIZE,
-                        chunk_size,
-                        worker_storage::BLOCK_SIZE,
-                        block_size
-                    ),
-                ));
-            }
-            if block_size % chunk_size != 0 {
-                return Err(CommonError::new(
-                    CommonErrorCode::InvalidArgument,
-                    format!(
-                        "{} ({}) must be divisible by {} ({})",
-                        worker_storage::BLOCK_SIZE,
-                        block_size,
-                        worker_storage::CHUNK_SIZE,
-                        chunk_size
-                    ),
-                ));
-            }
+    if let Some(block_size) = config.get_bytes(worker_storage::BLOCK_SIZE)
+        && let Some(chunk_size) = config.get_bytes(worker_storage::CHUNK_SIZE)
+    {
+        if chunk_size > block_size {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!(
+                    "{} ({}) must be <= {} ({})",
+                    worker_storage::CHUNK_SIZE,
+                    chunk_size,
+                    worker_storage::BLOCK_SIZE,
+                    block_size
+                ),
+            ));
+        }
+        if block_size % chunk_size != 0 {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!(
+                    "{} ({}) must be divisible by {} ({})",
+                    worker_storage::BLOCK_SIZE,
+                    block_size,
+                    worker_storage::CHUNK_SIZE,
+                    chunk_size
+                ),
+            ));
         }
     }
 
@@ -109,25 +110,25 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
                     format!("{} must be > 0", key),
                 ));
             }
-        } else if let Some(ms) = config.get_i64(key) {
-            if ms <= 0 {
-                return Err(CommonError::new(
-                    CommonErrorCode::InvalidArgument,
-                    format!("{} must be > 0", key),
-                ));
-            }
+        } else if let Some(ms) = config.get_i64(key)
+            && ms <= 0
+        {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!("{} must be > 0", key),
+            ));
         }
     }
 
     // Validate other timeouts
     for key in &[worker_ufs::TIMEOUT_MS, worker_replication::CHUNK_TIMEOUT_MS] {
-        if let Some(ms) = config.get_i64(key) {
-            if ms <= 0 {
-                return Err(CommonError::new(
-                    CommonErrorCode::InvalidArgument,
-                    format!("{} must be > 0", key),
-                ));
-            }
+        if let Some(ms) = config.get_i64(key)
+            && ms <= 0
+        {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!("{} must be > 0", key),
+            ));
         }
     }
 
@@ -165,65 +166,62 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
 
     // Validate UFS instance max_inflight
     for key in config.keys() {
-        if key.starts_with("ufs.") && key.ends_with(".max_inflight") {
-            if let Some(max) = config.get_usize(key) {
-                if max == 0 {
-                    return Err(CommonError::new(
-                        CommonErrorCode::InvalidArgument,
-                        format!("{} must be > 0", key),
-                    ));
-                }
-            }
+        if key.starts_with("ufs.")
+            && key.ends_with(".max_inflight")
+            && let Some(max) = config.get_usize(key)
+            && max == 0
+        {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!("{} must be > 0", key),
+            ));
         }
     }
 
     // Validate observe ports
-    if let Some(bind) = config.get_str(observe_metrics::PROMETHEUS_BIND) {
-        if let Some(port_str) = bind.split(':').last() {
-            if let Ok(port) = port_str.parse::<i64>() {
-                if !(1..=65535).contains(&port) {
-                    return Err(CommonError::new(
-                        CommonErrorCode::InvalidArgument,
-                        format!(
-                            "{} port must be in range 1-65535, got {}",
-                            observe_metrics::PROMETHEUS_BIND,
-                            port
-                        ),
-                    ));
-                }
-            }
-        }
+    if let Some(bind) = config.get_str(observe_metrics::PROMETHEUS_BIND)
+        && let Some(port_str) = bind.rsplit(':').next()
+        && let Ok(port) = port_str.parse::<i64>()
+        && !(1..=65535).contains(&port)
+    {
+        return Err(CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            format!(
+                "{} port must be in range 1-65535, got {}",
+                observe_metrics::PROMETHEUS_BIND,
+                port
+            ),
+        ));
     }
 
     // Validate eviction watermarks
-    if let Some(high_str) = config.get_str(worker_eviction::HIGH_WATERMARK) {
-        if let Ok(high) = high_str.parse::<f64>() {
-            if !(0.0..=1.0).contains(&high) {
-                return Err(CommonError::new(
-                    CommonErrorCode::InvalidArgument,
-                    format!(
-                        "{} must be in range 0.0-1.0, got {}",
-                        worker_eviction::HIGH_WATERMARK,
-                        high
-                    ),
-                ));
-            }
-            if let Some(low_str) = config.get_str(worker_eviction::LOW_WATERMARK) {
-                if let Ok(low) = low_str.parse::<f64>() {
-                    if low >= high {
-                        return Err(CommonError::new(
-                            CommonErrorCode::InvalidArgument,
-                            format!(
-                                "{} ({}) must be < {} ({})",
-                                worker_eviction::LOW_WATERMARK,
-                                low,
-                                worker_eviction::HIGH_WATERMARK,
-                                high
-                            ),
-                        ));
-                    }
-                }
-            }
+    if let Some(high_str) = config.get_str(worker_eviction::HIGH_WATERMARK)
+        && let Ok(high) = high_str.parse::<f64>()
+    {
+        if !(0.0..=1.0).contains(&high) {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!(
+                    "{} must be in range 0.0-1.0, got {}",
+                    worker_eviction::HIGH_WATERMARK,
+                    high
+                ),
+            ));
+        }
+        if let Some(low_str) = config.get_str(worker_eviction::LOW_WATERMARK)
+            && let Ok(low) = low_str.parse::<f64>()
+            && low >= high
+        {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!(
+                    "{} ({}) must be < {} ({})",
+                    worker_eviction::LOW_WATERMARK,
+                    low,
+                    worker_eviction::HIGH_WATERMARK,
+                    high
+                ),
+            ));
         }
     }
 
@@ -233,13 +231,13 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
 /// Validate client-site configuration.
 pub fn validate_client(config: &FlatConfig) -> Result<(), CommonError> {
     // Validate client.default_timeout_ms
-    if let Some(ms) = config.get_i64(client::DEFAULT_TIMEOUT_MS) {
-        if ms <= 0 {
-            return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
-                format!("{} must be > 0", client::DEFAULT_TIMEOUT_MS),
-            ));
-        }
+    if let Some(ms) = config.get_i64(client::DEFAULT_TIMEOUT_MS)
+        && ms <= 0
+    {
+        return Err(CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            format!("{} must be > 0", client::DEFAULT_TIMEOUT_MS),
+        ));
     }
 
     // Validate client.metadata.endpoints (at least one endpoint)
@@ -321,34 +319,33 @@ pub fn validate_client(config: &FlatConfig) -> Result<(), CommonError> {
         client_cache::ROUTE_TTL_SECS,
         client_worker_direct_read::CACHE_TTL_SECS,
     ] {
-        if let Some(ttl) = config.get_i64(key) {
-            if ttl <= 0 {
-                return Err(CommonError::new(
-                    CommonErrorCode::InvalidArgument,
-                    format!("{} must be > 0", key),
-                ));
-            }
+        if let Some(ttl) = config.get_i64(key)
+            && ttl <= 0
+        {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!("{} must be > 0", key),
+            ));
         }
     }
 
     // Validate retry configuration
-    if let Some(max_retries) = config.get_i64(client_retry::MAX_RETRIES) {
-        if max_retries < 0 {
-            return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
-                format!("{} must be >= 0, got {}", client_retry::MAX_RETRIES, max_retries),
-            ));
-        }
+    if let Some(max_retries) = config.get_i64(client_retry::MAX_RETRIES)
+        && max_retries < 0
+    {
+        return Err(CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            format!("{} must be >= 0, got {}", client_retry::MAX_RETRIES, max_retries),
+        ));
     }
-    if let Some(multiplier_str) = config.get_str(client_retry::BACKOFF_MULTIPLIER) {
-        if let Ok(multiplier) = multiplier_str.parse::<f64>() {
-            if multiplier <= 0.0 {
-                return Err(CommonError::new(
-                    CommonErrorCode::InvalidArgument,
-                    format!("{} must be > 0, got {}", client_retry::BACKOFF_MULTIPLIER, multiplier),
-                ));
-            }
-        }
+    if let Some(multiplier_str) = config.get_str(client_retry::BACKOFF_MULTIPLIER)
+        && let Ok(multiplier) = multiplier_str.parse::<f64>()
+        && multiplier <= 0.0
+    {
+        return Err(CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            format!("{} must be > 0, got {}", client_retry::BACKOFF_MULTIPLIER, multiplier),
+        ));
     }
 
     Ok(())

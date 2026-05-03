@@ -292,7 +292,7 @@ impl fmt::Display for CommonErrorCode {
 }
 
 /// Metadata attached to errors for debugging and observability.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ErrorMeta {
     /// Call ID associated with this error.
     pub call_id: Option<types::CallId>,
@@ -302,17 +302,6 @@ pub struct ErrorMeta {
     pub peer: Option<String>,
     /// Whether this error is retryable.
     pub retryable: bool,
-}
-
-impl Default for ErrorMeta {
-    fn default() -> Self {
-        Self {
-            call_id: None,
-            op: None,
-            peer: None,
-            retryable: false,
-        }
-    }
 }
 
 /// Common error type used across all modules.

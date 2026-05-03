@@ -57,15 +57,28 @@ impl<C: Connection> ConnectionPool<C> {
         factory: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = TransportResult<C>> + Send>>,
     ) -> TransportResult<Arc<C>> {
         // Check if connection exists and is healthy
-        {
-            let mut conns = self.connections.write();
-            if let Some(pooled) = conns.get_mut(addr) {
-                if pooled.connection.is_healthy().await {
-                    pooled.metadata.mark_used();
-                    return Ok(Arc::clone(&pooled.connection));
-                } else {
-                    // Remove unhealthy connection
-                    debug!("Removing unhealthy connection to {}", addr);
+        let existing = {
+            let conns = self.connections.read();
+            conns.get(addr).map(|pooled| Arc::clone(&pooled.connection))
+        };
+        if let Some(connection) = existing {
+            if connection.is_healthy().await {
+                let mut conns = self.connections.write();
+                if let Some(pooled) = conns.get_mut(addr) {
+                    if Arc::ptr_eq(&pooled.connection, &connection) {
+                        pooled.metadata.mark_used();
+                    }
+                }
+                return Ok(connection);
+            } else {
+                // Remove unhealthy connection
+                debug!("Removing unhealthy connection to {}", addr);
+                let mut conns = self.connections.write();
+                if conns
+                    .get(addr)
+                    .map(|pooled| Arc::ptr_eq(&pooled.connection, &connection))
+                    .unwrap_or(false)
+                {
                     conns.remove(addr);
                 }
             }
@@ -103,24 +116,32 @@ impl<C: Connection> ConnectionPool<C> {
 
     /// Clean up idle connections.
     pub async fn cleanup_idle(&self) {
-        let mut conns = self.connections.write();
-        let mut to_remove = Vec::new();
+        let to_close = {
+            let mut conns = self.connections.write();
+            let mut to_remove = Vec::new();
 
-        for (addr, pooled) in conns.iter() {
-            if pooled.metadata.idle_time() > self.max_idle_time {
-                to_remove.push(addr.clone());
+            for (addr, pooled) in conns.iter() {
+                if pooled.metadata.idle_time() > self.max_idle_time {
+                    to_remove.push(addr.clone());
+                }
             }
-        }
 
-        for addr in to_remove {
-            debug!("Removing idle connection to {}", addr);
-            if let Some(pooled) = conns.remove(&addr) {
+            let mut to_close = Vec::with_capacity(to_remove.len());
+            for addr in to_remove {
+                debug!("Removing idle connection to {}", addr);
+                if let Some(pooled) = conns.remove(&addr) {
+                    to_close.push(pooled.connection);
+                }
+            }
+            to_close
+        };
+
+        for connection in to_close {
+            if let Ok(conn) = Arc::try_unwrap(connection) {
                 // Try to close gracefully
-                if let Ok(conn) = Arc::try_unwrap(pooled.connection) {
-                    let mut conn = conn;
-                    if let Err(e) = conn.close().await {
-                        warn!("Error closing idle connection: {}", e);
-                    }
+                let mut conn = conn;
+                if let Err(e) = conn.close().await {
+                    warn!("Error closing idle connection: {}", e);
                 }
             }
         }

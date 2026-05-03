@@ -145,18 +145,18 @@ impl RequestHeaderCodec {
                     // Parse format: "group:term:leader_node_id:index[,group:term:leader_node_id:index]"
                     for entry in value.split(',') {
                         let parts: Vec<&str> = entry.split(':').collect();
-                        if parts.len() == 4 {
-                            if let (Ok(group_id), Ok(term), Ok(leader_node_id), Ok(index)) = (
+                        if parts.len() == 4
+                            && let (Ok(group_id), Ok(term), Ok(leader_node_id), Ok(index)) = (
                                 parts[0].parse::<u64>(),
                                 parts[1].parse::<u64>(),
                                 parts[2].parse::<u64>(),
                                 parts[3].parse::<u64>(),
-                            ) {
-                                state.push(GroupStateWatermark::new(
-                                    ShardGroupId::new(group_id),
-                                    RaftLogId::new(term, leader_node_id, index),
-                                ));
-                            }
+                            )
+                        {
+                            state.push(GroupStateWatermark::new(
+                                ShardGroupId::new(group_id),
+                                RaftLogId::new(term, leader_node_id, index),
+                            ));
                         }
                     }
                 }
@@ -200,14 +200,14 @@ impl RequestHeaderCodec {
                     } else {
                         None
                     };
-                    if deadline_ms.is_none() {
-                        if let Some(ms) = timeout_ms {
-                            let now_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as i64;
-                            deadline_ms = Some(now_ms + ms as i64);
-                        }
+                    if deadline_ms.is_none()
+                        && let Some(ms) = timeout_ms
+                    {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as i64;
+                        deadline_ms = Some(now_ms + ms as i64);
                     }
                 }
                 k if k.eq_ignore_ascii_case(HEADER_DEADLINE_MS) => {

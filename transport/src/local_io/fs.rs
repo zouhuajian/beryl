@@ -42,30 +42,25 @@ impl LocalIoEngine for FsIoEngine {
                 .write(true)
                 .truncate(true)
                 .open(&path)
-                .map_err(|e| IoError::Io(e))?;
+                .map_err(IoError::Io)?;
 
-            file.write_all(&data).map_err(|e| IoError::Io(e))?;
+            file.write_all(&data).map_err(IoError::Io)?;
 
             // Optional: sync data to disk
             #[cfg(target_family = "unix")]
             {
-                file.sync_data().map_err(|e| IoError::Io(e))?;
+                file.sync_data().map_err(IoError::Io)?;
             }
 
             #[cfg(not(target_family = "unix"))]
             {
-                file.sync_all().map_err(|e| IoError::Io(e))?;
+                file.sync_all().map_err(IoError::Io)?;
             }
 
             Ok(())
         })
         .await
-        .map_err(|e| {
-            IoError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("spawn_blocking failed: {}", e),
-            ))
-        })?
+        .map_err(|e| IoError::Io(std::io::Error::other(format!("spawn_blocking failed: {}", e))))?
     }
 
     async fn read_range(&self, path: &Path, offset: u64, len: usize) -> IoResult<Bytes> {
@@ -77,7 +72,7 @@ impl LocalIoEngine for FsIoEngine {
                 use std::fs::File;
                 use std::os::unix::fs::FileExt;
 
-                let file = File::open(&path).map_err(|e| IoError::Io(e))?;
+                let file = File::open(&path).map_err(IoError::Io)?;
 
                 let mut buf = vec![0u8; len];
                 let mut total_read = 0;
@@ -116,12 +111,7 @@ impl LocalIoEngine for FsIoEngine {
             }
         })
         .await
-        .map_err(|e| {
-            IoError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("spawn_blocking failed: {}", e),
-            ))
-        })?
+        .map_err(|e| IoError::Io(std::io::Error::other(format!("spawn_blocking failed: {}", e))))?
     }
 
     async fn sync(&self, path: &Path) -> IoResult<()> {
@@ -130,27 +120,22 @@ impl LocalIoEngine for FsIoEngine {
         tokio::task::spawn_blocking(move || {
             use std::fs::File;
 
-            let file = File::open(&path).map_err(|e| IoError::Io(e))?;
+            let file = File::open(&path).map_err(IoError::Io)?;
 
             #[cfg(target_family = "unix")]
             {
-                file.sync_data().map_err(|e| IoError::Io(e))?;
+                file.sync_data().map_err(IoError::Io)?;
             }
 
             #[cfg(not(target_family = "unix"))]
             {
-                file.sync_all().map_err(|e| IoError::Io(e))?;
+                file.sync_all().map_err(IoError::Io)?;
             }
 
             Ok(())
         })
         .await
-        .map_err(|e| {
-            IoError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("spawn_blocking failed: {}", e),
-            ))
-        })?
+        .map_err(|e| IoError::Io(std::io::Error::other(format!("spawn_blocking failed: {}", e))))?
     }
 }
 

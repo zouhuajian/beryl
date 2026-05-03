@@ -53,7 +53,7 @@ pub struct ChunkBitmap {
 impl ChunkBitmap {
     pub fn with_capacity_for(layout: &FileLayout) -> Self {
         let n = layout.chunks_per_block() as usize;
-        let words = (n + 63) / 64;
+        let words = n.div_ceil(64);
         Self { bits: vec![0; words] }
     }
 
@@ -82,4 +82,21 @@ pub struct ChunkData {
     pub slice: ChunkSlice,
     pub data: Bytes,
     pub checksum32: u32, // optional; CRC32C recommended in impl layer
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout_with_chunks(chunks: u32) -> FileLayout {
+        FileLayout::new(chunks * 4096, 4096, 1)
+    }
+
+    #[test]
+    fn chunk_bitmap_sizes_words_by_chunks_per_block_boundaries() {
+        assert_eq!(ChunkBitmap::with_capacity_for(&layout_with_chunks(0)).bits.len(), 0);
+        assert_eq!(ChunkBitmap::with_capacity_for(&layout_with_chunks(1)).bits.len(), 1);
+        assert_eq!(ChunkBitmap::with_capacity_for(&layout_with_chunks(64)).bits.len(), 1);
+        assert_eq!(ChunkBitmap::with_capacity_for(&layout_with_chunks(65)).bits.len(), 2);
+    }
 }

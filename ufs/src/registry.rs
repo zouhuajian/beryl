@@ -155,7 +155,7 @@ impl UfsRegistry {
     /// The returned `Arc` is independent of the registry's internal state.
     pub fn get(&self, id: &UfsId) -> Option<Arc<dyn UfsAccess>> {
         let instances = self.instances.read();
-        instances.get(id).map(|arc| Arc::clone(arc))
+        instances.get(id).map(Arc::clone)
     }
 
     /// Lists all registered UFS IDs.

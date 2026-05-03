@@ -17,20 +17,15 @@ use crate::net::quic::QuicTransport;
 use crate::net::rdma::RdmaTransport;
 
 /// Network transport kind selection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NetTransportKind {
     /// gRPC transport (default, HTTP/2 based)
+    #[default]
     Grpc,
     /// QUIC transport
     Quic,
     /// RDMA transport
     Rdma,
-}
-
-impl Default for NetTransportKind {
-    fn default() -> Self {
-        NetTransportKind::Grpc
-    }
 }
 
 /// Network transport configuration.

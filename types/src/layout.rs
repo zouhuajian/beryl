@@ -26,7 +26,7 @@ impl FileLayout {
     #[inline]
     pub fn chunks_per_block(&self) -> u32 {
         // Allow the last block to be partial while keeping per-block chunk counts based on the full block size for bitmap sizing.
-        (self.block_size + self.chunk_size - 1) / self.chunk_size
+        self.block_size.div_ceil(self.chunk_size)
     }
 
     /// Calculate block index from file offset.
@@ -141,5 +141,20 @@ impl core::str::FromStr for PlacementPolicy {
             "rack" | "rackaware" | "RackAware" => Ok(Self::RackAware),
             _ => Err(TypeParseError::new("PlacementPolicy")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunks_per_block_handles_div_ceil_boundaries() {
+        assert_eq!(FileLayout::new(0, 4096, 1).chunks_per_block(), 0);
+        assert_eq!(FileLayout::new(4096, 4096, 1).chunks_per_block(), 1);
+        assert_eq!(FileLayout::new(8192, 4096, 1).chunks_per_block(), 2);
+        assert_eq!(FileLayout::new(8193, 4096, 1).chunks_per_block(), 3);
+        assert_eq!(FileLayout::new(1, 4096, 1).chunks_per_block(), 1);
+        assert_eq!(FileLayout::new(5 * 4096 + 1, 4096, 1).chunks_per_block(), 6);
     }
 }

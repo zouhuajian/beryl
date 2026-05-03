@@ -7,7 +7,6 @@
 //! or minimal-copy strategies.
 
 use crate::error::TransportResult;
-use bytes::Bytes;
 use proto::common::ChunkIdProto as ProtoChunkId;
 use proto::worker::{ChunkDataProto as ProtoChunkData, ChunkSliceProto as ProtoChunkSlice};
 use types::chunk::{ChunkData, ChunkSlice};
@@ -30,7 +29,7 @@ pub fn chunk_data_to_proto(chunk: &ChunkData) -> ProtoChunkData {
 
 /// Convert proto ChunkData to domain ChunkData.
 ///
-/// This uses Bytes::from() which creates a single allocation (no extra copy).
+/// This moves the protobuf Bytes payload into the domain value without copying.
 pub fn chunk_data_from_proto(proto: ProtoChunkData) -> TransportResult<ChunkData> {
     let slice = proto
         .slice
@@ -40,7 +39,7 @@ pub fn chunk_data_from_proto(proto: ProtoChunkData) -> TransportResult<ChunkData
 
     Ok(ChunkData {
         slice: chunk_slice_from_proto(&slice)?,
-        data: Bytes::from(proto.data), // Single allocation: Vec<u8> -> Bytes
+        data: proto.data,
         checksum32: proto.checksum32,
     })
 }
@@ -92,6 +91,7 @@ pub fn chunk_slice_from_proto(proto: &ProtoChunkSlice) -> TransportResult<ChunkS
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use types::chunk::ChunkRef;
     use types::ids::{BlockId, BlockIndex, DataHandleId};
 
