@@ -6,13 +6,14 @@
 //! All write operations are converted to Command and applied through Raft.
 
 use crate::raft::types::{CommandFingerprint, DedupKey};
+use crate::state::DeleteIntentStatus;
 use bincode::config::standard;
 use bincode::serde::encode_to_vec;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use types::block::{BlockPlacement, BlockState};
 use types::fs::{FileAttrs, InodeId};
-use types::ids::{BlockId, ClientId, DataHandleId, MountId, ShardGroupId, ShardId, WorkerId};
+use types::ids::{BlockId, ClientId, DataHandleId, MountId, ShardGroupId, ShardId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
 use types::CallId;
@@ -84,11 +85,10 @@ pub enum Command {
         initial_members: Vec<u64>, // node IDs
     },
 
-    /// Upsert worker descriptor (low-frequency, authoritative).
-    /// This replaces RegisterWorker and is the only worker-related command that writes to Raft.
-    UpsertWorkerDescriptor {
+    /// Register worker identity and descriptor through the Raft apply boundary.
+    RegisterWorker {
         dedup: DedupKey,
-        worker_id: WorkerId,
+        identity: String,
         address: String,
         net_transport_kind: i32,
         worker_epoch: u64,
@@ -99,6 +99,21 @@ pub enum Command {
     CreateDeleteIntents {
         dedup: DedupKey,
         intents: Vec<crate::state::DeleteIntent>,
+    },
+
+    /// Allocate delete intent IDs in Raft apply and create the provided intent payloads.
+    AllocateDeleteIntents {
+        dedup: DedupKey,
+        intents: Vec<crate::state::DeleteIntent>,
+    },
+
+    /// Update authoritative delete intent execution status.
+    UpdateDeleteIntentStatus {
+        dedup: DedupKey,
+        intent_id: u64,
+        status: DeleteIntentStatus,
+        finished_at_ms: Option<u64>,
+        error_msg: Option<String>,
     },
 
     /// Create directory (Mkdir).
@@ -201,8 +216,10 @@ impl Command {
             | Command::CreateMount { dedup, .. }
             | Command::DeleteMount { dedup, .. }
             | Command::AddShardGroup { dedup, .. }
-            | Command::UpsertWorkerDescriptor { dedup, .. }
+            | Command::RegisterWorker { dedup, .. }
             | Command::CreateDeleteIntents { dedup, .. }
+            | Command::AllocateDeleteIntents { dedup, .. }
+            | Command::UpdateDeleteIntentStatus { dedup, .. }
             | Command::Mkdir { dedup, .. }
             | Command::Create { dedup, .. }
             | Command::Unlink { dedup, .. }
@@ -282,8 +299,8 @@ enum FingerprintView {
         shard_ids: Vec<ShardId>,
         initial_members: Vec<u64>,
     },
-    UpsertWorkerDescriptor {
-        worker_id: WorkerId,
+    RegisterWorker {
+        identity: String,
         address: String,
         net_transport_kind: i32,
         worker_epoch: u64,
@@ -291,6 +308,15 @@ enum FingerprintView {
     },
     CreateDeleteIntents {
         intents: Vec<crate::state::DeleteIntent>,
+    },
+    AllocateDeleteIntents {
+        intents: Vec<crate::state::DeleteIntent>,
+    },
+    UpdateDeleteIntentStatus {
+        intent_id: u64,
+        status: DeleteIntentStatus,
+        finished_at_ms: Option<u64>,
+        error_msg: Option<String>,
     },
     Mkdir {
         parent_inode_id: InodeId,
@@ -421,15 +447,15 @@ impl From<&Command> for FingerprintView {
                 shard_ids: shard_ids.clone(),
                 initial_members: initial_members.clone(),
             },
-            Command::UpsertWorkerDescriptor {
-                worker_id,
+            Command::RegisterWorker {
+                identity,
                 address,
                 net_transport_kind,
                 worker_epoch,
                 fault_domain,
                 ..
-            } => FingerprintView::UpsertWorkerDescriptor {
-                worker_id: *worker_id,
+            } => FingerprintView::RegisterWorker {
+                identity: identity.clone(),
                 address: address.clone(),
                 net_transport_kind: *net_transport_kind,
                 worker_epoch: *worker_epoch,
@@ -437,6 +463,21 @@ impl From<&Command> for FingerprintView {
             },
             Command::CreateDeleteIntents { intents, .. } => FingerprintView::CreateDeleteIntents {
                 intents: intents.clone(),
+            },
+            Command::AllocateDeleteIntents { intents, .. } => FingerprintView::AllocateDeleteIntents {
+                intents: intents.clone(),
+            },
+            Command::UpdateDeleteIntentStatus {
+                intent_id,
+                status,
+                finished_at_ms,
+                error_msg,
+                ..
+            } => FingerprintView::UpdateDeleteIntentStatus {
+                intent_id: *intent_id,
+                status: *status,
+                finished_at_ms: *finished_at_ms,
+                error_msg: error_msg.clone(),
             },
             Command::Mkdir {
                 parent_inode_id,

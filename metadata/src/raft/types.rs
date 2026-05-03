@@ -4,6 +4,7 @@
 //! Raft type definitions for metadata service.
 
 use crate::raft::snapshot::SnapshotFile;
+use crate::state::DeleteIntentStatus;
 use openraft::RaftTypeConfig;
 use serde::{Deserialize, Serialize};
 use types::fs::{FsErrorCode, InodeId};
@@ -79,6 +80,8 @@ pub enum AppDataResponse {
     Worker(WorkerCommandResult),
     /// Delete intent creation count.
     DeleteIntents(DeleteIntentsResult),
+    /// Delete intent status update.
+    DeleteIntentStatus(DeleteIntentStatusResult),
     /// Explicitly empty result.
     None,
 }
@@ -176,6 +179,13 @@ pub enum WorkerCommandResult {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeleteIntentsResult {
     pub created: u64,
+}
+
+/// Delete intent status update result.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeleteIntentStatusResult {
+    pub intent_id: u64,
+    pub status: DeleteIntentStatus,
 }
 
 /// Shard group information.

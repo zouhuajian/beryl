@@ -7,7 +7,7 @@ use crate::service::domain::{
     AccessInput, AccessOutput, CoreResult, FileBlockLocation, GetAttrInput, GetAttrOutput, GetFileLayoutInput,
     GetFileLayoutOutput, GetXattrInput, GetXattrOutput, InodeMountGuardInputs, LinkInput, LinkOutput, ListXattrInput,
     ListXattrOutput, LookupInput, LookupOutput, OpenInput, OpenOutput, ReadDirEntry, ReadDirInput, ReadDirOutput,
-    ReadlinkInput, ReadlinkOutput, RequestContext, StatFsInput, StatFsOutput, SymlinkInput, SymlinkOutput,
+    ReadlinkInput, ReadlinkOutput, RequestContext, StatFsInput, StatFsOutput, SymlinkInput, SymlinkOutput, WorkerHint,
 };
 use types::fs::{Extent, InodeId};
 
@@ -398,14 +398,34 @@ impl FsCore {
             extents
         };
 
+        let worker_manager = self.worker_manager.as_ref();
         let locations: Vec<FileBlockLocation> = filtered_extents
             .iter()
-            .map(|extent| FileBlockLocation {
-                block_id: extent.block_id,
-                file_offset: extent.file_offset,
-                len: extent.len,
-                workers: Vec::new(),
-                worker_epoch: None,
+            .map(|extent| {
+                let mut workers = Vec::new();
+                if let Some(worker_manager) = worker_manager {
+                    let mut worker_ids = worker_manager.get_block_locations(extent.block_id);
+                    worker_ids.sort_by_key(|worker_id| worker_id.as_raw());
+                    workers.reserve(worker_ids.len());
+                    for worker_id in worker_ids {
+                        if let Some(descriptor) = worker_manager.get_descriptor(worker_id) {
+                            workers.push(WorkerHint {
+                                worker_id,
+                                endpoint: descriptor.address,
+                                net_transport_kind: descriptor.net_transport_kind,
+                                worker_epoch: descriptor.worker_epoch,
+                            });
+                        }
+                    }
+                }
+                let worker_epoch = workers.iter().map(|worker| worker.worker_epoch).max();
+                FileBlockLocation {
+                    block_id: extent.block_id,
+                    file_offset: extent.file_offset,
+                    len: extent.len,
+                    workers,
+                    worker_epoch,
+                }
             })
             .collect();
 

@@ -29,7 +29,7 @@ use crate::metrics::{
 };
 use crate::mount::MountEntry;
 use crate::raft::types::{AppDataResponse, AppMetadataRaftState, CommandFingerprint, DedupKey, ShardGroupInfo};
-use crate::state::{BlockMetaState, LeaseState, RouteEpoch};
+use crate::state::{BlockMetaState, DeleteIntentStatus, LeaseState, RouteEpoch};
 use crate::worker::WorkerInfo;
 use bincode::config::standard;
 use bincode::serde::{decode_from_slice, encode_to_vec};
@@ -65,6 +65,8 @@ const DEDUP_FORMAT_VERSION: u64 = 3;
 const DEDUP_TTL_MS: u64 = 10 * 60 * 1000; // 10 minutes; TODO: make configurable
 const DEDUP_MAX_ENTRIES: usize = if cfg!(debug_assertions) { 128 } else { 10_000 };
 const NEXT_INODE_ID_KEY: &[u8] = b"next_inode_id";
+const NEXT_DELETE_INTENT_ID_KEY: &[u8] = b"next_delete_intent_id";
+const NEXT_WORKER_ID_KEY: &[u8] = b"next_worker_id";
 
 // FS column families
 const CF_INODES: &str = "inodes"; // inode/{inode_id_be} -> Inode
@@ -204,6 +206,31 @@ impl RocksDBStorage {
         Ok(())
     }
 
+    fn batch_put_block(
+        batch: &mut WriteBatch,
+        cf_blocks: &rocksdb::ColumnFamily,
+        block_meta: &BlockMetaState,
+    ) -> MetadataResult<()> {
+        let key = format!("{}", block_meta.block_id);
+        let value = encode_to_vec(block_meta, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize BlockMetaState: {}", e)))?;
+        batch.put_cf(cf_blocks, key.as_bytes(), value);
+        Ok(())
+    }
+
+    pub fn put_block_with_apply_result_atomic(
+        &self,
+        block_meta: &BlockMetaState,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let cf_blocks = self.cf(CF_BLOCKS)?;
+        let mut batch = WriteBatch::default();
+        Self::batch_put_block(&mut batch, cf_blocks, block_meta)?;
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+    }
+
     /// Get lease state.
     pub fn get_lease(&self, block_id: BlockId) -> MetadataResult<Option<LeaseState>> {
         let cf = self
@@ -299,6 +326,10 @@ impl RocksDBStorage {
             DEDUP_EVICTED_TTL_TOTAL.fetch_add(evicted as u64, Ordering::Relaxed);
         }
 
+        self.get_applied_result_without_ttl_eviction(request)
+    }
+
+    pub fn get_applied_result_without_ttl_eviction(&self, request: &DedupKey) -> MetadataResult<Option<AppliedResult>> {
         let cf = self
             .db
             .cf_handle(CF_DEDUP)
@@ -385,33 +416,6 @@ impl RocksDBStorage {
         Ok(())
     }
 
-    fn batch_delete_expired_dedup(
-        &self,
-        batch: &mut WriteBatch,
-        cf: &ColumnFamily,
-        now_ms: u64,
-    ) -> MetadataResult<usize> {
-        let mut evicted = 0usize;
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        for item in iter {
-            let (key, value) =
-                item.map_err(|e| MetadataError::Internal(format!("RocksDB iterator error (dedup ttl): {}", e)))?;
-            let applied: AppliedResult = match decode_from_slice(&value, standard()) {
-                Ok((ar, _)) => ar,
-                Err(_) => {
-                    batch.delete_cf(cf, key);
-                    evicted += 1;
-                    continue;
-                }
-            };
-            if now_ms.saturating_sub(applied.created_at_ms) > DEDUP_TTL_MS {
-                batch.delete_cf(cf, key);
-                evicted += 1;
-            }
-        }
-        Ok(evicted)
-    }
-
     fn batch_enforce_dedup_size_after_insert(
         &self,
         batch: &mut WriteBatch,
@@ -475,7 +479,6 @@ impl RocksDBStorage {
         let dedup_key = Self::dedup_key_bytes(request);
         let inserted_created_at_ms = result.created_at_ms;
 
-        let evicted_ttl = self.batch_delete_expired_dedup(&mut batch, cf_dedup, now_millis())?;
         Self::batch_put_applied_result(&mut batch, cf_dedup, request, result)?;
         let evicted_size =
             self.batch_enforce_dedup_size_after_insert(&mut batch, cf_dedup, &dedup_key, inserted_created_at_ms)?;
@@ -485,9 +488,6 @@ impl RocksDBStorage {
         // either all survive replay or all remain absent.
         self.write_batch(batch)?;
 
-        if evicted_ttl > 0 {
-            DEDUP_EVICTED_TTL_TOTAL.fetch_add(evicted_ttl as u64, Ordering::Relaxed);
-        }
         if evicted_size > 0 {
             DEDUP_EVICTED_SIZE_TOTAL.fetch_add(evicted_size as u64, Ordering::Relaxed);
         }
@@ -846,41 +846,6 @@ impl RocksDBStorage {
         }
     }
 
-    /// Get next worker ID (atomic increment).
-    pub fn get_and_increment_worker_id(&self) -> MetadataResult<WorkerId> {
-        use rocksdb::WriteBatch;
-
-        let cf_meta = self
-            .db
-            .cf_handle(CF_META)
-            .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
-
-        // Read current value
-        let current_id = match self.db.get_cf(cf_meta, b"next_worker_id") {
-            Ok(Some(value)) => {
-                let id: u64 = decode_from_slice(&value, standard())
-                    .map_err(|e| MetadataError::Internal(format!("Failed to deserialize next_worker_id: {}", e)))?
-                    .0;
-                id
-            }
-            Ok(None) => 1, // Start from 1
-            Err(e) => return Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
-        };
-
-        // Atomic increment using WriteBatch
-        let mut batch = WriteBatch::default();
-        let next_id = current_id + 1;
-        let next_id_value = encode_to_vec(&next_id, standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to serialize next_worker_id: {}", e)))?;
-        batch.put_cf(cf_meta, b"next_worker_id", next_id_value);
-
-        self.db
-            .write(batch)
-            .map_err(|e| MetadataError::Internal(format!("RocksDB write error: {}", e)))?;
-
-        Ok(WorkerId::new(current_id))
-    }
-
     /// Get next data handle ID (atomic increment, data-plane identity allocator).
     pub fn get_and_increment_data_handle_id(&self) -> MetadataResult<DataHandleId> {
         use rocksdb::WriteBatch;
@@ -1059,25 +1024,41 @@ impl RocksDBStorage {
         }
     }
 
-    /// Map worker identity to worker ID.
-    pub fn put_worker_identity(&self, identity: &str, worker_id: WorkerId) -> MetadataResult<()> {
-        use rocksdb::WriteBatch;
+    fn stored_next_worker_id(&self) -> MetadataResult<u64> {
+        let cf_meta = self.cf(CF_META)?;
+        match self.db.get_cf(cf_meta, NEXT_WORKER_ID_KEY) {
+            Ok(Some(value)) => {
+                let id: u64 = decode_from_slice(&value, standard())
+                    .map_err(|e| MetadataError::Internal(format!("Failed to deserialize next_worker_id: {}", e)))?
+                    .0;
+                Ok(id)
+            }
+            Ok(None) => Ok(1),
+            Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
+        }
+    }
 
-        let cf_meta = self
-            .db
-            .cf_handle(CF_META)
-            .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
+    fn batch_put_worker_identity(
+        batch: &mut WriteBatch,
+        cf_meta: &ColumnFamily,
+        identity: &str,
+        worker_id: WorkerId,
+    ) -> MetadataResult<()> {
         let key = format!("worker_identity:{}", identity);
         let value = encode_to_vec(&worker_id.as_raw(), standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize worker_id: {}", e)))?;
-
-        let mut batch = WriteBatch::default();
         batch.put_cf(cf_meta, key.as_bytes(), value);
+        Ok(())
+    }
 
-        self.db
-            .write(batch)
-            .map_err(|e| MetadataError::Internal(format!("RocksDB write error: {}", e)))?;
-
+    fn batch_put_next_worker_id(
+        batch: &mut WriteBatch,
+        cf_meta: &ColumnFamily,
+        next_worker_id: u64,
+    ) -> MetadataResult<()> {
+        let value = encode_to_vec(&next_worker_id, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize next_worker_id: {}", e)))?;
+        batch.put_cf(cf_meta, NEXT_WORKER_ID_KEY, value);
         Ok(())
     }
 
@@ -1159,6 +1140,79 @@ impl RocksDBStorage {
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize WorkerInfo: {}", e)))?;
         batch.put_cf(cf, key.as_bytes(), value);
         Ok(())
+    }
+
+    pub fn prepare_worker_registration(
+        &self,
+        identity: &str,
+        address: String,
+        net_transport_kind: i32,
+        worker_epoch: u64,
+        fault_domain: Option<String>,
+    ) -> MetadataResult<WorkerInfo> {
+        let worker_id = match self.get_worker_id_by_identity(identity)? {
+            Some(worker_id) => worker_id,
+            None => WorkerId::new(self.stored_next_worker_id()?),
+        };
+        Ok(WorkerInfo {
+            worker_id,
+            address,
+            net_transport_kind,
+            worker_epoch,
+            capacity_total: 0,
+            capacity_used: 0,
+            capacity_available: 0,
+            active_reads: 0,
+            active_writes: 0,
+            health: crate::worker::HealthStatus::Healthy,
+            last_heartbeat: 0,
+            fault_domain,
+        })
+    }
+
+    pub fn register_worker_with_apply_result_atomic(
+        &self,
+        identity: &str,
+        info: &WorkerInfo,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let cf_meta = self.cf(CF_META)?;
+        let cf_workers = self.cf(CF_WORKERS)?;
+        let existing_id = self.get_worker_id_by_identity(identity)?;
+        if let Some(existing_id) = existing_id {
+            if existing_id != info.worker_id {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "worker identity {} maps to {}, not {}",
+                    identity,
+                    existing_id.as_raw(),
+                    info.worker_id.as_raw()
+                )));
+            }
+        } else {
+            let current = self.stored_next_worker_id()?;
+            if info.worker_id.as_raw() != current {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "worker id allocator expected {}, got {}",
+                    current,
+                    info.worker_id.as_raw()
+                )));
+            }
+        }
+
+        let mut batch = WriteBatch::default();
+        if existing_id.is_none() {
+            let next_id = info
+                .worker_id
+                .as_raw()
+                .checked_add(1)
+                .ok_or_else(|| MetadataError::Internal("worker id allocator overflow".to_string()))?;
+            Self::batch_put_worker_identity(&mut batch, cf_meta, identity, info.worker_id)?;
+            Self::batch_put_next_worker_id(&mut batch, cf_meta, next_id)?;
+        }
+        Self::batch_put_worker(&mut batch, cf_workers, info)?;
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
     }
 
     /// List all workers.
@@ -1417,6 +1471,11 @@ impl RocksDBStorage {
         Ok(())
     }
 
+    fn batch_delete_block_ref_count(batch: &mut WriteBatch, cf: &ColumnFamily, block_id: BlockId) {
+        let key = format!("{}", block_id);
+        batch.delete_cf(cf, key.as_bytes());
+    }
+
     /// Get block reference count (global, per block_id).
     pub fn get_block_ref_count(&self, block_id: BlockId) -> MetadataResult<Option<u64>> {
         let cf = self
@@ -1528,6 +1587,18 @@ impl RocksDBStorage {
         Ok(())
     }
 
+    fn batch_put_delete_intent(
+        batch: &mut WriteBatch,
+        cf: &ColumnFamily,
+        intent: &crate::state::DeleteIntent,
+    ) -> MetadataResult<()> {
+        let key = format!("{}", intent.intent_id);
+        let value = encode_to_vec(intent, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize DeleteIntent: {}", e)))?;
+        batch.put_cf(cf, key.as_bytes(), value);
+        Ok(())
+    }
+
     /// Get delete intent by intent_id.
     pub fn get_delete_intent(&self, intent_id: u64) -> MetadataResult<Option<crate::state::DeleteIntent>> {
         let cf = self
@@ -1595,35 +1666,49 @@ impl RocksDBStorage {
         Ok(intents)
     }
 
-    /// Update delete intent status (for execution progress, not via Raft).
-    /// This is idempotent: repeated writes of the same status should not error.
-    pub fn update_delete_intent_status(
+    pub fn update_delete_intent_status_with_apply_result_atomic(
         &self,
         intent_id: u64,
-        status: crate::state::DeleteIntentStatus,
+        status: DeleteIntentStatus,
         finished_at_ms: Option<u64>,
         error_msg: Option<String>,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
     ) -> MetadataResult<()> {
-        // Get existing intent
-        let mut intent = match self.get_delete_intent(intent_id)? {
-            Some(intent) => intent,
-            None => {
-                // Intent not found - this is acceptable (may have been deleted)
-                return Ok(());
-            }
-        };
+        let cf_delete_intents = self.cf(CF_DELETE_INTENTS)?;
+        let mut intent = self
+            .get_delete_intent(intent_id)?
+            .ok_or_else(|| MetadataError::NotFound(format!("Delete intent not found: {}", intent_id)))?;
 
-        // Update status (idempotent: if already in the same status, no-op)
-        intent.status = status;
-        intent.finished_at_ms = finished_at_ms;
-        if let Some(msg) = error_msg {
-            intent.last_error_msg = Some(msg);
+        if !Self::delete_intent_status_transition_allowed(intent.status, status) {
+            return Err(MetadataError::InvalidArgument(format!(
+                "invalid delete intent status transition for {}: {:?} -> {:?}",
+                intent_id, intent.status, status
+            )));
         }
 
-        // Persist updated intent
-        self.put_delete_intent(&intent)?;
+        intent.status = status;
+        intent.finished_at_ms = finished_at_ms;
+        intent.last_error_msg = error_msg;
 
-        Ok(())
+        let mut batch = WriteBatch::default();
+        Self::batch_put_delete_intent(&mut batch, cf_delete_intents, &intent)?;
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+    }
+
+    fn delete_intent_status_transition_allowed(from: DeleteIntentStatus, to: DeleteIntentStatus) -> bool {
+        matches!(
+            (from, to),
+            (DeleteIntentStatus::Pending, DeleteIntentStatus::Pending)
+                | (DeleteIntentStatus::Pending, DeleteIntentStatus::Completed)
+                | (DeleteIntentStatus::Pending, DeleteIntentStatus::Failed)
+                | (DeleteIntentStatus::InFlight, DeleteIntentStatus::InFlight)
+                | (DeleteIntentStatus::InFlight, DeleteIntentStatus::Completed)
+                | (DeleteIntentStatus::InFlight, DeleteIntentStatus::Failed)
+                | (DeleteIntentStatus::Completed, DeleteIntentStatus::Completed)
+                | (DeleteIntentStatus::Failed, DeleteIntentStatus::Failed)
+        )
     }
 
     /// Delete delete intent (after execution/ack).
@@ -1642,14 +1727,80 @@ impl RocksDBStorage {
         Ok(())
     }
 
-    /// Generate a new intent ID (monotonically increasing).
-    /// Uses timestamp-based ID with sequence number for uniqueness.
-    pub fn generate_intent_id(&self) -> MetadataResult<u64> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        // Use timestamp as base, add random component for uniqueness
-        // In production, could use atomic counter or UUID
-        Ok(now_ms << 16 | (rand::random::<u16>() as u64))
+    fn stored_next_delete_intent_id(&self) -> MetadataResult<Option<u64>> {
+        let cf_meta = self.cf(CF_META)?;
+        match self.db.get_cf(cf_meta, NEXT_DELETE_INTENT_ID_KEY) {
+            Ok(Some(value)) => {
+                let id: u64 = decode_from_slice(&value, standard())
+                    .map_err(|e| {
+                        MetadataError::Internal(format!("Failed to deserialize next_delete_intent_id: {}", e))
+                    })?
+                    .0;
+                Ok(Some(id))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
+        }
+    }
+
+    fn max_delete_intent_id(&self) -> MetadataResult<Option<u64>> {
+        use rocksdb::IteratorMode;
+
+        let cf = self.cf(CF_DELETE_INTENTS)?;
+        let iter = self.db.iterator_cf(cf, IteratorMode::Start);
+        let mut max_id = None;
+        for item in iter {
+            let (key, value) = item.map_err(|e| MetadataError::Internal(format!("RocksDB iterator error: {}", e)))?;
+            let key_str = std::str::from_utf8(&key)
+                .map_err(|e| MetadataError::Internal(format!("Malformed delete intent key: {}", e)))?;
+            let key_id = key_str
+                .parse::<u64>()
+                .map_err(|e| MetadataError::Internal(format!("Malformed delete intent id key: {}", e)))?;
+            let intent: crate::state::DeleteIntent = decode_from_slice(&value, standard())
+                .map_err(|e| MetadataError::Internal(format!("Failed to deserialize DeleteIntent: {}", e)))?
+                .0;
+            if intent.intent_id != key_id {
+                return Err(MetadataError::Internal(format!(
+                    "Delete intent key/value id mismatch: key={}, value={}",
+                    key_id, intent.intent_id
+                )));
+            }
+            max_id = Some(max_id.map_or(key_id, |current: u64| current.max(key_id)));
+        }
+        Ok(max_id)
+    }
+
+    fn reserve_delete_intent_ids_in_batch(
+        &self,
+        batch: &mut WriteBatch,
+        cf_meta: &ColumnFamily,
+        count: u64,
+    ) -> MetadataResult<u64> {
+        let current = self.stored_next_delete_intent_id()?.unwrap_or(1);
+        let max_existing_next = self
+            .max_delete_intent_id()?
+            .map(|id| {
+                id.checked_add(1)
+                    .ok_or_else(|| MetadataError::Internal("delete intent id allocator overflow".to_string()))
+            })
+            .transpose()?
+            .unwrap_or(1);
+        let first_id = current.max(max_existing_next);
+        let next_id = first_id
+            .checked_add(count)
+            .ok_or_else(|| MetadataError::Internal("delete intent id allocator overflow".to_string()))?;
+        for intent_id in first_id..next_id {
+            if self.get_delete_intent(intent_id)?.is_some() {
+                return Err(MetadataError::Internal(format!(
+                    "Reserved delete intent id already exists: {}",
+                    intent_id
+                )));
+            }
+        }
+        let value = encode_to_vec(&next_id, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize next_delete_intent_id: {}", e)))?;
+        batch.put_cf(cf_meta, NEXT_DELETE_INTENT_ID_KEY, value);
+        Ok(first_id)
     }
 
     /// Encode inode key: "inode/" + 8 bytes BE (inode_id)
@@ -1985,6 +2136,206 @@ impl RocksDBStorage {
             let owner_key = format!("data_handle_owner:{}", data_handle_id.as_raw());
             batch.delete_cf(cf_meta, owner_key.as_bytes());
         }
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+    }
+
+    fn append_block_ref_decrements_to_batch(
+        &self,
+        batch: &mut WriteBatch,
+        cf_block_ref_counts: &ColumnFamily,
+        cf_delete_intents: &ColumnFamily,
+        released_block_ids: &[BlockId],
+        now_ms: u64,
+    ) -> MetadataResult<()> {
+        let cf_meta = self.cf(CF_META)?;
+        let mut seen = std::collections::HashSet::with_capacity(released_block_ids.len());
+        let mut unique_blocks = Vec::with_capacity(released_block_ids.len());
+        for block_id in released_block_ids {
+            if seen.insert(*block_id) {
+                unique_blocks.push(*block_id);
+            }
+        }
+        unique_blocks.sort_by_key(|block_id| (block_id.data_handle_id.as_raw(), block_id.index.as_raw()));
+
+        let mut zero_ref_blocks = Vec::new();
+        for block_id in &unique_blocks {
+            let current = self.get_block_ref_count(*block_id)?.ok_or_else(|| {
+                MetadataError::InvalidArgument(format!("Missing block refcount for released block {}", block_id))
+            })?;
+            if current == 0 {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "Block refcount underflow for released block {}",
+                    block_id
+                )));
+            }
+
+            if current == 1 {
+                Self::batch_delete_block_ref_count(batch, cf_block_ref_counts, *block_id);
+                zero_ref_blocks.push(*block_id);
+            } else {
+                Self::batch_put_block_ref_count(batch, cf_block_ref_counts, *block_id, current - 1)?;
+            }
+        }
+
+        if !zero_ref_blocks.is_empty() {
+            let first_intent_id =
+                self.reserve_delete_intent_ids_in_batch(batch, cf_meta, zero_ref_blocks.len() as u64)?;
+            for (offset, block_id) in zero_ref_blocks.into_iter().enumerate() {
+                let intent = crate::state::DeleteIntent {
+                    intent_id: first_intent_id + offset as u64,
+                    block_id,
+                    reason: crate::state::DeleteIntentReason::Gc,
+                    created_at_ms: now_ms,
+                    not_before_ms: now_ms,
+                    shard_group_id: None,
+                    guard_watermark: None,
+                    mount_epoch: None,
+                    guard_state_id: types::RaftLogId {
+                        term: 0,
+                        leader_node_id: 0,
+                        index: 0,
+                    },
+                    target_workers: Vec::new(),
+                    status: crate::state::DeleteIntentStatus::Pending,
+                    finished_at_ms: None,
+                    last_error_msg: None,
+                };
+                Self::batch_put_delete_intent(batch, cf_delete_intents, &intent)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Atomically persist delete intents with apply tracking.
+    pub fn create_delete_intents_with_apply_result_atomic(
+        &self,
+        intents: Vec<crate::state::DeleteIntent>,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let cf_delete_intents = self.cf(CF_DELETE_INTENTS)?;
+        let mut seen = std::collections::HashSet::with_capacity(intents.len());
+        for intent in &intents {
+            if !seen.insert(intent.intent_id) {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "Duplicate delete intent id in command: {}",
+                    intent.intent_id
+                )));
+            }
+        }
+        for intent in &intents {
+            if self.get_delete_intent(intent.intent_id)?.is_some() {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "Delete intent id already exists: {}",
+                    intent.intent_id
+                )));
+            }
+        }
+
+        let mut batch = WriteBatch::default();
+        for mut intent in intents {
+            intent.status = crate::state::DeleteIntentStatus::Pending;
+            intent.finished_at_ms = None;
+            intent.last_error_msg = None;
+            Self::batch_put_delete_intent(&mut batch, cf_delete_intents, &intent)?;
+        }
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+    }
+
+    pub fn allocate_delete_intents_with_apply_result_atomic(
+        &self,
+        intents: Vec<crate::state::DeleteIntent>,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let cf_meta = self.cf(CF_META)?;
+        let cf_delete_intents = self.cf(CF_DELETE_INTENTS)?;
+        for intent in &intents {
+            if intent.intent_id != 0 {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "Allocated delete intent command must use intent_id=0, got {}",
+                    intent.intent_id
+                )));
+            }
+        }
+
+        let mut batch = WriteBatch::default();
+        if !intents.is_empty() {
+            let first_intent_id = self.reserve_delete_intent_ids_in_batch(&mut batch, cf_meta, intents.len() as u64)?;
+            for (offset, mut intent) in intents.into_iter().enumerate() {
+                intent.intent_id = first_intent_id + offset as u64;
+                intent.status = crate::state::DeleteIntentStatus::Pending;
+                intent.finished_at_ms = None;
+                intent.last_error_msg = None;
+                Self::batch_put_delete_intent(&mut batch, cf_delete_intents, &intent)?;
+            }
+        }
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+    }
+
+    /// Atomically persist truncate shrink effects with block lifecycle updates and apply tracking.
+    pub fn truncate_file_with_apply_result_atomic(
+        &self,
+        inode: &Inode,
+        layout: FileLayout,
+        released_block_ids: &[BlockId],
+        now_ms: u64,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let cf_inodes = self.cf(CF_INODES)?;
+        let cf_meta = self.cf(CF_META)?;
+        let cf_block_ref_counts = self.cf(CF_BLOCK_REF_COUNTS)?;
+        let cf_delete_intents = self.cf(CF_DELETE_INTENTS)?;
+        let mut batch = WriteBatch::default();
+
+        Self::batch_put_inode(&mut batch, cf_inodes, inode)?;
+        Self::batch_put_layout(&mut batch, cf_meta, inode.inode_id, layout)?;
+        self.append_block_ref_decrements_to_batch(
+            &mut batch,
+            cf_block_ref_counts,
+            cf_delete_intents,
+            released_block_ids,
+            now_ms,
+        )?;
+
+        self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
+    }
+
+    /// Atomically persist extent-bearing file deletion with block lifecycle updates and apply tracking.
+    pub fn delete_file_with_extents_and_apply_result_atomic(
+        &self,
+        parent_inode_id: InodeId,
+        name: &str,
+        inode_id: InodeId,
+        data_handle_id: DataHandleId,
+        updated_parent: &Inode,
+        released_block_ids: &[BlockId],
+        now_ms: u64,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+        applied_seq: u64,
+    ) -> MetadataResult<()> {
+        let cf_meta = self.cf(CF_META)?;
+        let cf_block_ref_counts = self.cf(CF_BLOCK_REF_COUNTS)?;
+        let cf_delete_intents = self.cf(CF_DELETE_INTENTS)?;
+        let mut batch = self.delete_dentry_inode_batch(parent_inode_id, name, inode_id, updated_parent)?;
+
+        let layout_key = format!("layout:{}", inode_id.as_raw());
+        batch.delete_cf(cf_meta, layout_key.as_bytes());
+        let owner_key = format!("data_handle_owner:{}", data_handle_id.as_raw());
+        batch.delete_cf(cf_meta, owner_key.as_bytes());
+        self.append_block_ref_decrements_to_batch(
+            &mut batch,
+            cf_block_ref_counts,
+            cf_delete_intents,
+            released_block_ids,
+            now_ms,
+        )?;
+
         self.commit_apply_batch(batch, dedup_key, applied_result, applied_seq)
     }
 

@@ -334,11 +334,8 @@ impl OrphanBlockCleaner {
                     // Create DeleteIntent
                     const GRACE_WINDOW_MS: u64 = 10 * 60 * 1000; // 10 minutes default grace window
                     let not_before_ms = now_ms + GRACE_WINDOW_MS;
-                    let intent_id = now_ms * 1_000_000 + (block_id.data_handle_id.as_raw() % 1_000_000);
-
-                    // Build intent using DeleteIntentBuilder
                     match intent_builder.build(
-                        intent_id,
+                        0,
                         block_id,
                         DeleteIntentReason::Orphan,
                         now_ms,
@@ -348,7 +345,7 @@ impl OrphanBlockCleaner {
                     ) {
                         Ok(intent) => {
                             use crate::raft::{Command, DedupKey};
-                            let command = Command::CreateDeleteIntents {
+                            let command = Command::AllocateDeleteIntents {
                                 dedup: DedupKey::system(),
                                 intents: vec![intent],
                             };

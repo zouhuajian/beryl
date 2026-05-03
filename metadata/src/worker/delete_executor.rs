@@ -15,8 +15,8 @@ use crate::error::MetadataResult;
 use crate::inflight_registry::{InflightKind, InflightRegistry};
 use crate::metrics::MetadataMetrics;
 use crate::mount::MountTable;
-use crate::raft::{AppRaftNode, RocksDBStorage};
-use crate::state::DeleteIntent;
+use crate::raft::{AppRaftNode, Command, DedupKey, RocksDBStorage};
+use crate::state::{DeleteIntent, DeleteIntentStatus};
 use crate::worker::manager::WorkerManager;
 use crate::worker::repair::{ErrorClass, TaskAckStatus};
 use parking_lot::RwLock;
@@ -59,7 +59,7 @@ enum IntentExecutionStatus {
     Failed { failed_at_ms: u64, reason: String },
 }
 
-/// Per-intent execution state (memory-only, with optional RocksDB persistence).
+/// Per-intent execution state. Terminal authoritative status is persisted through Raft.
 #[derive(Clone)]
 struct IntentExecutionState {
     intent: DeleteIntent,
@@ -615,7 +615,7 @@ impl DeleteExecutor {
     }
 
     /// Process task acknowledgments (called from Heartbeat handler).
-    pub fn process_task_acks(&self, worker_id: WorkerId, acks: &[TaskAckProto]) {
+    pub async fn process_task_acks(&self, worker_id: WorkerId, acks: &[TaskAckProto]) {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 
         for ack in acks {
@@ -640,7 +640,7 @@ impl DeleteExecutor {
             }
 
             if let Some(intent_id) = intent_id_opt {
-                self.handle_ack(intent_id, worker_id, ack, now_ms);
+                self.handle_ack(intent_id, worker_id, ack, now_ms).await;
             } else {
                 // Task ID not found - might be from repair queue, ignore
                 debug!(
@@ -653,7 +653,7 @@ impl DeleteExecutor {
     }
 
     /// Handle a single ack.
-    fn handle_ack(&self, intent_id: u64, worker_id: WorkerId, ack: &TaskAckProto, now_ms: u64) {
+    async fn handle_ack(&self, intent_id: u64, worker_id: WorkerId, ack: &TaskAckProto, now_ms: u64) {
         let status = match ack.status() {
             proto::metadata::TaskAckStatusProto::TaskAckStatusSuccess => TaskAckStatus::Success,
             proto::metadata::TaskAckStatusProto::TaskAckStatusFailed => TaskAckStatus::Failed,
@@ -670,7 +670,7 @@ impl DeleteExecutor {
 
         // Handle per-block results if available (DeleteBlocksCommand)
         if !ack.block_results.is_empty() {
-            self.handle_per_block_ack(intent_id, worker_id, ack, now_ms);
+            self.handle_per_block_ack(intent_id, worker_id, ack, now_ms).await;
             return;
         }
 
@@ -693,7 +693,7 @@ impl DeleteExecutor {
                     // Check reconcile condition (blockreport convergence)
                     let reconcile_completed = self.check_reconcile_completion(intent_id, now_ms);
                     if reconcile_completed {
-                        self.mark_intent_completed(intent_id, now_ms, true);
+                        self.mark_intent_completed(intent_id, now_ms, true).await;
                     } else {
                         // Ack completed but reconcile pending - mark as ack-only completed
                         debug!(intent_id, "DeleteIntent ack completed, waiting for reconcile");
@@ -709,8 +709,8 @@ impl DeleteExecutor {
                 if !is_retryable {
                     // Non-retryable failure
                     let (block_id_opt, target_worker_opt, error_msg) = {
-                        let mut state = self.execution_state.write();
-                        if let Some(exec_state) = state.get_mut(&intent_id) {
+                        let state = self.execution_state.read();
+                        if let Some(exec_state) = state.get(&intent_id) {
                             let block_id = exec_state.intent.block_id;
                             let target_worker =
                                 if let IntentExecutionStatus::InFlight { worker_id, .. } = &exec_state.status {
@@ -719,29 +719,38 @@ impl DeleteExecutor {
                                     None
                                 };
                             let error_msg = ack.error_message.clone();
-                            exec_state.status = IntentExecutionStatus::Failed {
-                                failed_at_ms: now_ms,
-                                reason: error_msg.clone(),
-                            };
                             (Some(block_id), target_worker, error_msg)
                         } else {
                             (None, None, ack.error_message.clone())
                         }
                     };
 
-                    // Persist failed status to RocksDB (idempotent)
-                    if let Err(e) = self.storage.update_delete_intent_status(
-                        intent_id,
-                        crate::state::DeleteIntentStatus::Failed,
-                        Some(now_ms),
-                        Some(error_msg.clone()),
-                    ) {
+                    // Persist failed status through Raft before changing runtime state.
+                    if let Err(e) = self
+                        .propose_delete_intent_status(
+                            intent_id,
+                            DeleteIntentStatus::Failed,
+                            Some(now_ms),
+                            Some(error_msg.clone()),
+                        )
+                        .await
+                    {
                         warn!(
                             intent_id,
                             error = %e,
                             "Failed to persist DeleteIntent failed status"
                         );
-                        // Continue anyway
+                        return;
+                    }
+
+                    {
+                        let mut state = self.execution_state.write();
+                        if let Some(exec_state) = state.get_mut(&intent_id) {
+                            exec_state.status = IntentExecutionStatus::Failed {
+                                failed_at_ms: now_ms,
+                                reason: error_msg.clone(),
+                            };
+                        }
                     }
 
                     // Cleanup in-flight tracking
@@ -833,7 +842,7 @@ impl DeleteExecutor {
     }
 
     /// Handle per-block ack results (DeleteBlocksCommand).
-    fn handle_per_block_ack(&self, intent_id: u64, worker_id: WorkerId, ack: &TaskAckProto, now_ms: u64) {
+    async fn handle_per_block_ack(&self, intent_id: u64, worker_id: WorkerId, ack: &TaskAckProto, now_ms: u64) {
         let block_id_opt = {
             let state = self.execution_state.read();
             state.get(&intent_id).map(|exec_state| exec_state.intent.block_id)
@@ -884,7 +893,7 @@ impl DeleteExecutor {
                         // Check reconcile condition (blockreport convergence)
                         let reconcile_completed = self.check_reconcile_completion(intent_id, now_ms);
                         if reconcile_completed {
-                            self.mark_intent_completed(intent_id, now_ms, true);
+                            self.mark_intent_completed(intent_id, now_ms, true).await;
                         } else {
                             debug!(intent_id, "DeleteIntent ack completed, waiting for reconcile");
                         }
@@ -923,7 +932,7 @@ impl DeleteExecutor {
                         error = %error_msg,
                         "Delete operation failed permanently"
                     );
-                    self.mark_intent_failed(intent_id, now_ms, error_msg);
+                    self.mark_intent_failed(intent_id, now_ms, error_msg).await;
                 }
                 _ => {
                     warn!(
@@ -1018,34 +1027,59 @@ impl DeleteExecutor {
         }
     }
 
+    async fn propose_delete_intent_status(
+        &self,
+        intent_id: u64,
+        status: DeleteIntentStatus,
+        finished_at_ms: Option<u64>,
+        error_msg: Option<String>,
+    ) -> MetadataResult<()> {
+        let command = Command::UpdateDeleteIntentStatus {
+            dedup: DedupKey::system(),
+            intent_id,
+            status,
+            finished_at_ms,
+            error_msg,
+        };
+        self.raft_node.propose(command).await.map(|_| ())
+    }
+
     /// Mark intent as completed (ack + reconcile both satisfied).
-    fn mark_intent_completed(&self, intent_id: u64, now_ms: u64, reconciled: bool) {
-        // Update execution state
-        let block_id = {
-            let mut state = self.execution_state.write();
-            if let Some(exec_state) = state.get_mut(&intent_id) {
-                exec_state.status = IntentExecutionStatus::Completed {
-                    completed_at_ms: now_ms,
-                };
-                Some(exec_state.intent.block_id)
-            } else {
-                None
+    async fn mark_intent_completed(&self, intent_id: u64, now_ms: u64, reconciled: bool) {
+        let (block_id, target_worker) = {
+            let state = self.execution_state.read();
+            match state.get(&intent_id) {
+                Some(exec_state) => {
+                    let target_worker = match &exec_state.status {
+                        IntentExecutionStatus::InFlight { worker_id, .. } => Some(*worker_id),
+                        _ => None,
+                    };
+                    (Some(exec_state.intent.block_id), target_worker)
+                }
+                None => (None, None),
             }
         };
 
         if let Some(block_id) = block_id {
-            // Persist completed status to RocksDB (idempotent)
-            if let Err(e) = self.storage.update_delete_intent_status(
-                intent_id,
-                crate::state::DeleteIntentStatus::Completed,
-                Some(now_ms),
-                None,
-            ) {
+            if let Err(e) = self
+                .propose_delete_intent_status(intent_id, DeleteIntentStatus::Completed, Some(now_ms), None)
+                .await
+            {
                 warn!(
                     intent_id,
                     error = %e,
                     "Failed to persist DeleteIntent completed status"
                 );
+                return;
+            }
+
+            {
+                let mut state = self.execution_state.write();
+                if let Some(exec_state) = state.get_mut(&intent_id) {
+                    exec_state.status = IntentExecutionStatus::Completed {
+                        completed_at_ms: now_ms,
+                    };
+                }
             }
 
             // Update metrics
@@ -1063,25 +1097,15 @@ impl DeleteExecutor {
             }
 
             // Cleanup in-flight tracking
-            {
-                let exec_state_guard = self.execution_state.read();
-                if let Some(exec_state) = exec_state_guard.get(&intent_id) {
-                    if let IntentExecutionStatus::InFlight {
-                        worker_id: target_worker,
-                        ..
-                    } = &exec_state.status
-                    {
-                        let mut worker_inflight = self.worker_inflight.write();
-                        let mut block_inflight = self.block_inflight.write();
-                        if let Some(in_flight) = worker_inflight.get_mut(&target_worker) {
-                            in_flight.count = in_flight.count.saturating_sub(1);
-                            in_flight.blocks.remove(&block_id);
-                        }
-                        block_inflight.remove(&block_id);
-                        // Release inflight registry lock
-                        self.inflight_registry.release(block_id);
-                    }
+            if let Some(target_worker) = target_worker {
+                let mut worker_inflight = self.worker_inflight.write();
+                let mut block_inflight = self.block_inflight.write();
+                if let Some(in_flight) = worker_inflight.get_mut(&target_worker) {
+                    in_flight.count = in_flight.count.saturating_sub(1);
+                    in_flight.blocks.remove(&block_id);
                 }
+                block_inflight.remove(&block_id);
+                self.inflight_registry.release(block_id);
             }
 
             info!(
@@ -1094,55 +1118,59 @@ impl DeleteExecutor {
     }
 
     /// Mark intent as failed.
-    fn mark_intent_failed(&self, intent_id: u64, now_ms: u64, reason: String) {
-        let block_id = {
-            let mut state = self.execution_state.write();
-            if let Some(exec_state) = state.get_mut(&intent_id) {
-                exec_state.status = IntentExecutionStatus::Failed {
-                    failed_at_ms: now_ms,
-                    reason: reason.clone(),
-                };
-                Some(exec_state.intent.block_id)
-            } else {
-                None
+    async fn mark_intent_failed(&self, intent_id: u64, now_ms: u64, reason: String) {
+        let (block_id, target_worker) = {
+            let state = self.execution_state.read();
+            match state.get(&intent_id) {
+                Some(exec_state) => {
+                    let target_worker = match &exec_state.status {
+                        IntentExecutionStatus::InFlight { worker_id, .. } => Some(*worker_id),
+                        _ => None,
+                    };
+                    (Some(exec_state.intent.block_id), target_worker)
+                }
+                None => (None, None),
             }
         };
 
         if let Some(block_id) = block_id {
-            // Persist failed status to RocksDB
-            if let Err(e) = self.storage.update_delete_intent_status(
-                intent_id,
-                crate::state::DeleteIntentStatus::Failed,
-                Some(now_ms),
-                Some(reason.clone()),
-            ) {
+            if let Err(e) = self
+                .propose_delete_intent_status(
+                    intent_id,
+                    DeleteIntentStatus::Failed,
+                    Some(now_ms),
+                    Some(reason.clone()),
+                )
+                .await
+            {
                 warn!(
                     intent_id,
                     error = %e,
                     "Failed to persist DeleteIntent failed status"
                 );
+                return;
+            }
+
+            {
+                let mut state = self.execution_state.write();
+                if let Some(exec_state) = state.get_mut(&intent_id) {
+                    exec_state.status = IntentExecutionStatus::Failed {
+                        failed_at_ms: now_ms,
+                        reason: reason.clone(),
+                    };
+                }
             }
 
             // Cleanup in-flight tracking
-            {
-                let exec_state_guard = self.execution_state.read();
-                if let Some(exec_state) = exec_state_guard.get(&intent_id) {
-                    if let IntentExecutionStatus::InFlight {
-                        worker_id: target_worker,
-                        ..
-                    } = &exec_state.status
-                    {
-                        let mut worker_inflight = self.worker_inflight.write();
-                        let mut block_inflight = self.block_inflight.write();
-                        if let Some(in_flight) = worker_inflight.get_mut(&target_worker) {
-                            in_flight.count = in_flight.count.saturating_sub(1);
-                            in_flight.blocks.remove(&block_id);
-                        }
-                        block_inflight.remove(&block_id);
-                        // Release inflight registry lock
-                        self.inflight_registry.release(block_id);
-                    }
+            if let Some(target_worker) = target_worker {
+                let mut worker_inflight = self.worker_inflight.write();
+                let mut block_inflight = self.block_inflight.write();
+                if let Some(in_flight) = worker_inflight.get_mut(&target_worker) {
+                    in_flight.count = in_flight.count.saturating_sub(1);
+                    in_flight.blocks.remove(&block_id);
                 }
+                block_inflight.remove(&block_id);
+                self.inflight_registry.release(block_id);
             }
 
             error!(

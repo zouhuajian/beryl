@@ -12,7 +12,7 @@ use super::repair::{
 };
 use crate::error::MetadataResult;
 use crate::raft::Command;
-use crate::raft::{AppDataResponse, AppRaftNode};
+use crate::raft::{AppDataResponse, AppRaftNode, WorkerCommandResult};
 use crate::service::extract_and_inject_context;
 use ::common::header::ResponseHeader;
 use proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProto;
@@ -315,10 +315,10 @@ impl MetadataWorkerServiceImpl {
     }
 
     /// Process task acknowledgments from worker.
-    fn process_task_acks(&self, worker_id: WorkerId, acks: &[proto::metadata::TaskAckProto]) {
+    async fn process_task_acks(&self, worker_id: WorkerId, acks: &[proto::metadata::TaskAckProto]) {
         // Process acks for delete executor (if available)
         if let Some(ref delete_executor) = self.delete_executor {
-            delete_executor.process_task_acks(worker_id, acks);
+            delete_executor.process_task_acks(worker_id, acks).await;
         }
 
         // Process acks for repair queue (existing logic)
@@ -388,25 +388,33 @@ impl MetadataWorkerServiceImpl {
 
 async fn persist_worker_descriptor_then_register<F>(
     worker_manager: &WorkerManager,
-    worker_id: WorkerId,
     address: String,
     net_transport_kind: i32,
     worker_epoch: u64,
     fault_domain: Option<String>,
     persist_descriptor: F,
-) -> Result<(), Status>
+) -> Result<WorkerId, Status>
 where
     F: Future<Output = MetadataResult<AppDataResponse>>,
 {
-    persist_descriptor
+    let worker_id = match persist_descriptor
         .await
-        .map_err(|e| Status::internal(format!("Failed to propose command: {}", e)))?;
+        .map_err(|e| Status::internal(format!("Failed to propose command: {}", e)))?
+    {
+        AppDataResponse::Worker(WorkerCommandResult::Upserted(worker_id)) => worker_id,
+        other => {
+            return Err(Status::internal(format!(
+                "RegisterWorker returned unexpected Raft response: {:?}",
+                other
+            )))
+        }
+    };
 
     worker_manager
         .register_worker(worker_id, address, net_transport_kind, worker_epoch, fault_domain)
         .map_err(|e| Status::internal(format!("Failed to register worker: {}", e)))?;
 
-    Ok(())
+    Ok(worker_id)
 }
 
 #[tonic::async_trait]
@@ -423,7 +431,11 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         // Extract all needed fields before any moves
         let net_transport_kind = req.net_transport_kind() as i32; // Convert enum to i32
         let worker_epoch = req.worker_epoch;
-        let suggested_worker_id = req.suggested_worker_id;
+        if req.suggested_worker_id != 0 {
+            return Err(Status::invalid_argument(
+                "suggested_worker_id is no longer authoritative; worker id is allocated by Raft",
+            ));
+        }
         let labels = req.labels;
         let endpoint = req
             .endpoint
@@ -448,46 +460,17 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             format!("{:x}", hasher.finalize())
         };
 
-        // Get storage from raft_node to access worker_id generation
-        let storage = self
-            .raft_node
-            .read(false, |sm| Ok(sm.storage()))
-            .await
-            .map_err(|e| Status::internal(format!("Failed to read from state machine: {}", e)))?;
-
-        // Generate or use suggested worker_id
-        let worker_id = if suggested_worker_id > 0 {
-            WorkerId::new(suggested_worker_id)
-        } else {
-            // Try to get existing worker_id by identity
-            if let Ok(Some(existing_id)) = storage.get_worker_id_by_identity(&identity) {
-                existing_id
-            } else {
-                // Generate new worker_id atomically
-                let new_id = storage
-                    .get_and_increment_worker_id()
-                    .map_err(|e| Status::internal(format!("Failed to generate worker_id: {}", e)))?;
-                // Map identity to worker_id
-                storage
-                    .put_worker_identity(&identity, new_id)
-                    .map_err(|e| Status::internal(format!("Failed to map worker identity: {}", e)))?;
-                new_id
-            }
-        };
-
-        // Create command and propose to Raft (only descriptor, no runtime)
-        let command = Command::UpsertWorkerDescriptor {
+        let command = Command::RegisterWorker {
             dedup: crate::raft::DedupKey::new(_caller_ctx.client.client_id, _caller_ctx.client.call_id),
-            worker_id,
+            identity,
             address: address.clone(),
             net_transport_kind,
             worker_epoch,
             fault_domain: None, // TODO: Extract fault_domain from labels
         };
 
-        persist_worker_descriptor_then_register(
+        let worker_id = persist_worker_descriptor_then_register(
             self.worker_manager.as_ref(),
-            worker_id,
             address.clone(),
             net_transport_kind,
             worker_epoch,
@@ -650,7 +633,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         if is_leader {
             // Process task acknowledgments (if any)
             if !req.acks.is_empty() {
-                self.process_task_acks(worker_id, &req.acks);
+                self.process_task_acks(worker_id, &req.acks).await;
             }
 
             // Get pending commands from delete executor (if available)
@@ -995,16 +978,11 @@ mod tests {
         let manager = WorkerManager::new(60);
         let worker_id = WorkerId::new(7);
 
-        let result = persist_worker_descriptor_then_register(
-            &manager,
-            worker_id,
-            "127.0.0.1:9090".to_string(),
-            1,
-            100,
-            None,
-            async { Err(MetadataError::Internal("propose failed".to_string())) },
-        )
-        .await;
+        let result =
+            persist_worker_descriptor_then_register(&manager, "127.0.0.1:9090".to_string(), 1, 100, None, async {
+                Err(MetadataError::Internal("propose failed".to_string()))
+            })
+            .await;
 
         assert!(result.is_err());
         assert!(manager.get_descriptor(worker_id).is_none());
@@ -1015,17 +993,13 @@ mod tests {
         let manager = WorkerManager::new(60);
         let worker_id = WorkerId::new(7);
 
-        persist_worker_descriptor_then_register(
-            &manager,
-            worker_id,
-            "127.0.0.1:9090".to_string(),
-            1,
-            100,
-            None,
-            async { Ok(AppDataResponse::None) },
-        )
-        .await
-        .unwrap();
+        let returned_worker_id =
+            persist_worker_descriptor_then_register(&manager, "127.0.0.1:9090".to_string(), 1, 100, None, async {
+                Ok(AppDataResponse::Worker(WorkerCommandResult::Upserted(worker_id)))
+            })
+            .await
+            .unwrap();
+        assert_eq!(returned_worker_id, worker_id);
 
         let descriptor = manager.get_descriptor(worker_id).unwrap();
         assert_eq!(descriptor.worker_id, worker_id);
@@ -1040,15 +1014,9 @@ mod tests {
         let worker_id = WorkerId::new(7);
 
         for _ in 0..2 {
-            persist_worker_descriptor_then_register(
-                &manager,
-                worker_id,
-                "127.0.0.1:9090".to_string(),
-                1,
-                100,
-                None,
-                async { Ok(AppDataResponse::None) },
-            )
+            persist_worker_descriptor_then_register(&manager, "127.0.0.1:9090".to_string(), 1, 100, None, async {
+                Ok(AppDataResponse::Worker(WorkerCommandResult::Upserted(worker_id)))
+            })
             .await
             .unwrap();
         }

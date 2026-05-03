@@ -354,6 +354,44 @@ impl FsCore {
             Err(err) => return Err(err),
         };
 
+        if let Some(storage) = self.storage.as_ref() {
+            match storage.get_dentry(req.parent_inode_id, &req.name) {
+                Ok(Some(child_inode_id)) => match storage.get_inode(child_inode_id) {
+                    Ok(Some(inode)) if inode.kind.is_file() => {
+                        if self.write_session_manager.has_active_session(child_inode_id)
+                            || self.inode_lease_manager.has_active_lease(child_inode_id)
+                        {
+                            return self.fatal_fs_failure(
+                                &req.ctx,
+                                types::fs::FsErrorCode::EBusy,
+                                format!("File has an active write session or lease: {}", child_inode_id),
+                                Some(ctx.namespace_owner_group_id.as_raw()),
+                                Some(ctx.mount_epoch),
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        return self.failure_from_error(
+                            &req.ctx,
+                            err,
+                            Some(ctx.namespace_owner_group_id.as_raw()),
+                            Some(ctx.mount_epoch),
+                        );
+                    }
+                },
+                Ok(None) => {}
+                Err(err) => {
+                    return self.failure_from_error(
+                        &req.ctx,
+                        err,
+                        Some(ctx.namespace_owner_group_id.as_raw()),
+                        Some(ctx.mount_epoch),
+                    );
+                }
+            }
+        }
+
         let dedup = match self.dedup_key(&req.ctx.caller) {
             Ok(k) => k,
             Err(err) => {
@@ -716,15 +754,6 @@ impl FsCore {
                 mount_epoch,
             );
         }
-        if req.new_size == current_size {
-            return self.success(
-                &req.ctx,
-                TruncateOutput { new_size: req.new_size },
-                group_id,
-                mount_epoch,
-            );
-        }
-
         let route_ctx = match self.route_ctx_for_write(&req.ctx, CoreWriteOp::SetAttr, &[req.inode_id], req.freshness) {
             Ok(ctx) => ctx,
             Err(err) => return Err(err),

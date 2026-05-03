@@ -359,8 +359,7 @@ impl WorkerManager {
         descriptors.get(&worker_id).cloned()
     }
 
-    /// Register or update a worker descriptor (in-memory, before Raft apply).
-    /// This is called during register_worker RPC before proposing to Raft.
+    /// Register or update a worker descriptor in runtime soft state after Raft apply succeeds.
     pub fn register_worker(
         &self,
         worker_id: WorkerId,

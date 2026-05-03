@@ -6,8 +6,8 @@ use crate::config::RaftConfig;
 use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
 use crate::raft::{AppRaftNode, AppRaftStateMachine, Command, DedupKey, RocksDBStorage};
 use crate::service::domain::{
-    CloseWriteInput, CloseWriteIntent, Freshness, OpenWriteInput, PresentedFencingToken, ReleaseSessionInput,
-    RequestContext,
+    CloseWriteInput, CloseWriteIntent, Freshness, GetFileLayoutInput, OpenWriteInput, PresentedFencingToken,
+    ReleaseSessionInput, RequestContext, TruncateInput, UnlinkInput,
 };
 use crate::state::{BlockMetaState, LeaseState, MemoryStateStore, RouteEpoch};
 use crate::worker::{HealthStatus, WorkerManager};
@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use types::block::{BlockPlacement, BlockState};
 use types::fs::{FileAttrs, Inode};
-use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, MountId, ShardGroupId};
+use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, MountId, ShardGroupId, WorkerId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
 
@@ -159,6 +159,73 @@ fn worker_manager_for_write_targets() -> Arc<WorkerManager> {
             .unwrap();
     }
     manager
+}
+
+#[tokio::test]
+async fn get_file_layout_returns_worker_locations_from_worker_manager() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(48);
+    let group_id = ShardGroupId::new(8);
+    let inode_id = InodeId::new(480);
+    let data_handle_id = DataHandleId::new(9480);
+    let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let worker_manager = Arc::new(WorkerManager::new(60));
+    for (raw, port) in [(2, 9102), (1, 9101)] {
+        let worker_id = WorkerId::new(raw);
+        worker_manager
+            .register_worker(worker_id, format!("127.0.0.1:{port}"), 1, 20 + raw, None)
+            .unwrap();
+        worker_manager
+            .update_runtime(worker_id, 1, 20 + raw, 1024, 0, 1024, 0, 0, HealthStatus::Healthy)
+            .unwrap();
+        worker_manager.update_locations(worker_id, vec![block_id]).unwrap();
+    }
+    fs_core.set_storage(Arc::clone(&storage));
+    fs_core.set_worker_manager(worker_manager);
+
+    let mut attrs = FileAttrs::new();
+    attrs.size = 512;
+    let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+    inode.data = types::fs::InodeData::File {
+        extents: vec![types::fs::Extent {
+            file_offset: 0,
+            block_id,
+            block_offset: 0,
+            len: 512,
+            file_version: None,
+            block_stamp: None,
+        }],
+        lease_epoch: None,
+    };
+    storage.put_inode(&inode).unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let success = fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx: request_context(),
+            inode_id,
+            range: None,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("layout read succeeds");
+
+    assert_eq!(success.payload.locations.len(), 1);
+    let location = &success.payload.locations[0];
+    assert_eq!(location.block_id, block_id);
+    assert_eq!(
+        location
+            .workers
+            .iter()
+            .map(|worker| worker.worker_id)
+            .collect::<Vec<_>>(),
+        vec![WorkerId::new(1), WorkerId::new(2)]
+    );
+    assert_eq!(location.worker_epoch, Some(22));
+    assert_eq!(location.workers[0].endpoint, "127.0.0.1:9101");
 }
 
 fn install_write_session(fs_core: &FsCore, inode_id: InodeId, mount_id: MountId) -> u64 {
@@ -665,6 +732,135 @@ async fn close_write_success_replay_after_session_cleanup_returns_original_resul
             .unwrap(),
         block_ref_after_first
     );
+}
+
+#[tokio::test]
+async fn same_size_truncate_uses_raft_dedup_and_rejects_payload_mismatch() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(541);
+    let group_id = ShardGroupId::new(121);
+    let inode_id = InodeId::new(5410);
+    let data_handle_id = DataHandleId::new(5411);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mount_table = Arc::clone(&fs_core.mount_table);
+    let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+    fs_core.set_storage(Arc::clone(&storage));
+    fs_core.set_raft_node(raft_node);
+
+    let mut inode = Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id);
+    inode.attrs.size = 1024;
+    storage.put_inode(&inode).unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+    let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+    storage.put_block_ref_count(block_id, 1).unwrap();
+
+    let (lease_id, lease_epoch, _) = fs_core
+        .inode_lease_manager_for_test()
+        .try_acquire(
+            inode_id,
+            ClientId::new(7),
+            Some(types::CallId::new()),
+            crate::inode_lease::WriteMode::Write,
+            Some(1),
+        )
+        .expect("lease acquired");
+    if let types::fs::InodeData::File {
+        lease_epoch: stored, ..
+    } = &mut inode.data
+    {
+        *stored = Some(1);
+    }
+    storage.put_inode(&inode).unwrap();
+
+    let ctx = request_context();
+    let request = TruncateInput {
+        ctx: ctx.clone(),
+        inode_id,
+        new_size: 1024,
+        lease_id: Some(lease_id),
+        lease_epoch,
+        freshness: Freshness::default(),
+    };
+
+    let first = fs_core
+        .execute_truncate(request.clone())
+        .await
+        .expect("same-size truncate should succeed");
+    assert_eq!(first.payload.new_size, 1024);
+    let second = fs_core
+        .execute_truncate(request)
+        .await
+        .expect("same-size truncate replay should succeed");
+    assert_eq!(second.payload.new_size, 1024);
+    assert_eq!(storage.get_block_ref_count(block_id).unwrap(), Some(1));
+    assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 0);
+    assert!(storage.get_applied_seq().unwrap().is_some());
+
+    let mismatch = fs_core
+        .execute_truncate(TruncateInput {
+            ctx,
+            inode_id,
+            new_size: 512,
+            lease_id: Some(lease_id),
+            lease_epoch,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect_err("same call_id with different truncate payload should fail");
+    assert_eq!(
+        mismatch.error.code,
+        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
+    );
+    assert_eq!(storage.get_inode(inode_id).unwrap().unwrap().attrs.size, 1024);
+    assert_eq!(storage.get_block_ref_count(block_id).unwrap(), Some(1));
+    assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn delete_file_with_active_write_session_returns_busy_without_namespace_mutation() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(55);
+    let group_id = ShardGroupId::new(13);
+    let parent_inode_id = InodeId::new(550);
+    let inode_id = InodeId::new(551);
+    let data_handle_id = DataHandleId::new(552);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mount_table = Arc::clone(&fs_core.mount_table);
+    let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+    fs_core.set_storage(Arc::clone(&storage));
+    fs_core.set_raft_node(raft_node);
+
+    storage
+        .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
+        .unwrap();
+    storage
+        .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+        .unwrap();
+    storage.put_dentry(parent_inode_id, "busy", inode_id).unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+    let file_handle = install_write_session(&fs_core, inode_id, mount_id);
+
+    let failure = fs_core
+        .execute_unlink(UnlinkInput {
+            ctx: request_context(),
+            parent_inode_id,
+            name: "busy".to_string(),
+            freshness: Freshness::default(),
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EBusy))
+    );
+    assert!(fs_core.write_session_for_handle(file_handle).is_some());
+    assert_eq!(storage.get_dentry(parent_inode_id, "busy").unwrap(), Some(inode_id));
+    assert!(storage.get_inode(inode_id).unwrap().is_some());
 }
 
 #[tokio::test]

@@ -6,11 +6,14 @@
 #[cfg(test)]
 mod tests {
     use crate::error::MetadataResult;
-    use crate::raft::RocksDBStorage;
+    use crate::mount::MountTable;
+    use crate::raft::{AppRaftStateMachine, Command, DedupKey, RocksDBStorage};
     use crate::state::{DeleteIntent, DeleteIntentReason, DeleteIntentStatus};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
-    use types::ids::{BlockId, BlockIndex, DataHandleId};
+    use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId};
+    use types::CallId;
     use types::RaftLogId;
 
     #[tokio::test]
@@ -18,7 +21,8 @@ mod tests {
         // Setup: Create temporary RocksDB
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test_db");
-        let storage = RocksDBStorage::open(&db_path)?;
+        let storage = Arc::new(RocksDBStorage::open(&db_path)?);
+        let state_machine = AppRaftStateMachine::new(Arc::clone(&storage), Arc::new(MountTable::new()));
 
         // Create a test intent
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -54,7 +58,16 @@ mod tests {
         assert!(matches!(pending[0].status, DeleteIntentStatus::Pending));
 
         // 3. Mark as Completed
-        storage.update_delete_intent_status(intent_id, DeleteIntentStatus::Completed, Some(now_ms + 1000), None)?;
+        state_machine.apply(
+            Command::UpdateDeleteIntentStatus {
+                dedup: DedupKey::new(ClientId::new(710), CallId::new()),
+                intent_id,
+                status: DeleteIntentStatus::Completed,
+                finished_at_ms: Some(now_ms + 1000),
+                error_msg: None,
+            },
+            1,
+        )?;
 
         // 4. Verify it no longer appears in list_pending
         let pending_after = storage.list_pending_delete_intents(10, now_ms)?;
@@ -71,20 +84,35 @@ mod tests {
         assert!(matches!(retrieved_intent.status, DeleteIntentStatus::Completed));
         assert_eq!(retrieved_intent.finished_at_ms, Some(now_ms + 1000));
 
-        // 6. Test idempotency: write Completed again should not error
-        storage.update_delete_intent_status(intent_id, DeleteIntentStatus::Completed, Some(now_ms + 2000), None)?;
-
-        // 7. Test Failed status
-        storage.update_delete_intent_status(
-            intent_id,
-            DeleteIntentStatus::Failed,
-            Some(now_ms + 3000),
-            Some("test error".to_string()),
+        // 6. Test idempotency: replay of the same status command should not drift timestamp.
+        state_machine.apply(
+            Command::UpdateDeleteIntentStatus {
+                dedup: DedupKey::new(ClientId::new(711), CallId::new()),
+                intent_id,
+                status: DeleteIntentStatus::Completed,
+                finished_at_ms: Some(now_ms + 1000),
+                error_msg: None,
+            },
+            2,
         )?;
 
+        // 7. Completed -> Failed is an invalid authoritative transition.
+        assert!(state_machine
+            .apply(
+                Command::UpdateDeleteIntentStatus {
+                    dedup: DedupKey::new(ClientId::new(712), CallId::new()),
+                    intent_id,
+                    status: DeleteIntentStatus::Failed,
+                    finished_at_ms: Some(now_ms + 3000),
+                    error_msg: Some("test error".to_string()),
+                },
+                3,
+            )
+            .is_err());
+
         let failed_intent = storage.get_delete_intent(intent_id)?.unwrap();
-        assert!(matches!(failed_intent.status, DeleteIntentStatus::Failed));
-        assert_eq!(failed_intent.last_error_msg, Some("test error".to_string()));
+        assert!(matches!(failed_intent.status, DeleteIntentStatus::Completed));
+        assert_eq!(failed_intent.last_error_msg, None);
 
         // 8. Verify Failed intent also doesn't appear in pending
         let pending_after_failed = storage.list_pending_delete_intents(10, now_ms)?;
@@ -107,7 +135,8 @@ mod tests {
 
         // Create and complete an intent
         {
-            let storage = RocksDBStorage::open(&db_path)?;
+            let storage = Arc::new(RocksDBStorage::open(&db_path)?);
+            let state_machine = AppRaftStateMachine::new(Arc::clone(&storage), Arc::new(MountTable::new()));
             let intent = DeleteIntent {
                 intent_id,
                 block_id,
@@ -125,7 +154,16 @@ mod tests {
                 last_error_msg: None,
             };
             storage.put_delete_intent(&intent)?;
-            storage.update_delete_intent_status(intent_id, DeleteIntentStatus::Completed, Some(now_ms + 5000), None)?;
+            state_machine.apply(
+                Command::UpdateDeleteIntentStatus {
+                    dedup: DedupKey::new(ClientId::new(713), CallId::new()),
+                    intent_id,
+                    status: DeleteIntentStatus::Completed,
+                    finished_at_ms: Some(now_ms + 5000),
+                    error_msg: None,
+                },
+                1,
+            )?;
         }
 
         // "Restart": open storage again

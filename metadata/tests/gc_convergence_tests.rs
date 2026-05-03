@@ -83,7 +83,7 @@ fn test_gc_intent_refcount_double_check() {
 
     // Create intent with refcount > 0
     storage.put_block_ref_count(block_id, 1).unwrap();
-    let intent_id = storage.generate_intent_id().unwrap();
+    let intent_id = 1;
     let intent = DeleteIntent {
         intent_id,
         block_id,

@@ -370,10 +370,8 @@ impl OverReplicaCleanupService {
                 }
             }
 
-            // Create intent
-            let intent_id = self.storage.generate_intent_id()?;
             let intent = self.intent_builder.build(
-                intent_id,
+                0,
                 block_id,
                 DeleteIntentReason::OverRep,
                 now_ms,
@@ -384,7 +382,7 @@ impl OverReplicaCleanupService {
 
             // Propose intent via Raft
             use crate::raft::{Command, DedupKey};
-            let command = Command::CreateDeleteIntents {
+            let command = Command::AllocateDeleteIntents {
                 dedup: DedupKey::system(),
                 intents: vec![intent.clone()],
             };
@@ -396,7 +394,6 @@ impl OverReplicaCleanupService {
                         .overrep_intents_created_total
                         .fetch_add(1, Ordering::Relaxed);
                     info!(
-                        intent_id,
                         block_id = %block_id,
                         target_workers = ?target_workers,
                         current_replicas = candidate.current_replicas,

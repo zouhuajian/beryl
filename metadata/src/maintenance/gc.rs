@@ -446,7 +446,7 @@ impl GcService {
 
             // Generate intents
             let mut intents = Vec::new();
-            for (idx, block_id) in eligible_blocks.iter().enumerate() {
+            for block_id in &eligible_blocks {
                 // Unified gate check before creating intent
                 let ctx = DestructiveCheckContext::new("gc_create_delete_intent")
                     .with_block_id(*block_id)
@@ -482,12 +482,8 @@ impl GcService {
                         continue;
                     }
                 }
-                // Generate intent_id: use timestamp (ms) * 1000000 + index to ensure uniqueness
-                let intent_id = now_ms * 1_000_000 + (idx as u64);
-
-                // Build intent using DeleteIntentBuilder
                 match intent_builder.build(
-                    intent_id,
+                    0,
                     *block_id,
                     DeleteIntentReason::Gc,
                     now_ms,
@@ -515,7 +511,7 @@ impl GcService {
 
             // Batch propose CreateDeleteIntents
             use crate::raft::{Command, DedupKey};
-            let command = Command::CreateDeleteIntents {
+            let command = Command::AllocateDeleteIntents {
                 dedup: DedupKey::system(),
                 intents,
             };
@@ -590,7 +586,7 @@ impl GcService {
 
         // Process GC intents created earlier in the sweep pass
         // This is called after sweep to process intents created by unlink/truncate
-        if let Err(e) = self.process_gc_intents() {
+        if let Err(e) = self.process_gc_intents().await {
             warn!(error = %e, "Failed to process GC intents during GC cycle");
         }
 
@@ -602,7 +598,7 @@ impl GcService {
     /// This method scans CF_GC_INTENTS for PENDING intents with reason=Gc,
     /// double-checks refcount, and injects RepairTask::Evict into RepairQueue.
     /// Called by MaintenanceService as part of GC cycle.
-    pub fn process_gc_intents(&self) -> MetadataResult<usize> {
+    pub async fn process_gc_intents(&self) -> MetadataResult<usize> {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 
         // List pending intents
@@ -689,12 +685,14 @@ impl GcService {
                     block_id = %intent.block_id,
                     "Intent completed: no known locations"
                 );
-                if let Err(e) = self.storage.update_delete_intent_status(
-                    intent.intent_id,
-                    DeleteIntentStatus::Completed,
-                    Some(now_ms),
-                    None,
-                ) {
+                let command = crate::raft::Command::UpdateDeleteIntentStatus {
+                    dedup: crate::raft::DedupKey::system(),
+                    intent_id: intent.intent_id,
+                    status: DeleteIntentStatus::Completed,
+                    finished_at_ms: Some(now_ms),
+                    error_msg: None,
+                };
+                if let Err(e) = self.raft_node.propose(command).await {
                     warn!(
                         intent_id = intent.intent_id,
                         error = %e,
@@ -741,19 +739,7 @@ impl GcService {
             }
 
             if enqueued_count > 0 {
-                // Mark intent as InFlight
-                if let Err(e) = self.storage.update_delete_intent_status(
-                    intent.intent_id,
-                    DeleteIntentStatus::InFlight,
-                    None, // finished_at_ms
-                    None, // error_msg
-                ) {
-                    warn!(
-                        intent_id = intent.intent_id,
-                        error = %e,
-                        "Failed to update intent status to InFlight"
-                    );
-                }
+                // InFlight is runtime soft state; authoritative terminal status is updated after ack/reconcile.
                 processed += 1;
             } else {
                 // No tasks enqueued, release inflight lock
