@@ -745,6 +745,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn msync_request_proto_shape_is_header_only() {
+        let request = crate::metadata::MsyncRequestProto { header: None };
+        assert!(request.header.is_none());
+    }
+
+    #[test]
+    fn msync_response_proto_shape_is_header_and_state() {
+        let response = crate::metadata::MsyncResponseProto {
+            header: None,
+            state: None,
+        };
+        assert!(response.header.is_none());
+        assert!(response.state.is_none());
+    }
+
+    #[test]
     fn test_data_handle_id_conversion() {
         let data_handle_id = DataHandleId::new(42);
         let proto_id: proto_common::DataHandleIdProto = data_handle_id.into();

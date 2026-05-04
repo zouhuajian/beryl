@@ -35,45 +35,24 @@ impl MsyncHandler {
             }
         };
         let client = header.client.clone();
-        let requested_state = match Self::parse_state(req.state) {
-            Ok(state) => state,
-            Err(message) => {
-                return Self::error_response(
-                    client,
-                    header.group_id.map(ShardGroupId::new),
-                    Self::fatal_invalid_header(message),
-                );
-            }
-        };
 
         let Some(header_group_id) = header.group_id.map(ShardGroupId::new) else {
             return Self::error_response(
                 client,
-                Some(requested_state.group_id),
+                None,
                 Self::fatal_invalid_header("MsyncRequestProto requires header.group_id"),
             );
         };
-        if header_group_id != requested_state.group_id {
-            return Self::error_response(
-                client,
-                Some(header_group_id),
-                Self::fatal_invalid_header(format!(
-                    "Msync RequestHeader group_id {} does not match state watermark group_id {}",
-                    header_group_id.as_raw(),
-                    requested_state.group_id.as_raw()
-                )),
-            );
-        }
-        if requested_state.group_id != self.shard_group_id {
+        if header_group_id != self.shard_group_id {
             let canonical = CanonicalError::need_refresh(
-                RpcErrorCode::RouteEpochMismatch,
-                RefreshReason::RouteEpochMismatch,
+                RpcErrorCode::ShardMoved,
+                RefreshReason::Moved,
                 format!(
                     "requested group {} is not served by this metadata runtime",
-                    requested_state.group_id.as_raw()
+                    header_group_id.as_raw()
                 ),
             );
-            return Self::error_response(client, Some(requested_state.group_id), canonical);
+            return Self::error_response(client, Some(header_group_id), canonical);
         }
 
         if !self.raft_node.is_leader() {
@@ -82,7 +61,7 @@ impl MsyncHandler {
                 RefreshReason::NotLeader,
                 "msync requires leader",
             );
-            return Self::error_response(client, Some(requested_state.group_id), canonical);
+            return Self::error_response(client, Some(header_group_id), canonical);
         }
 
         let Some(last_applied) = self.raft_node.get_last_applied_state_id() else {
@@ -91,20 +70,8 @@ impl MsyncHandler {
                 Some(10),
                 "last_applied_log_id is not available for msync",
             );
-            return Self::error_response(client, Some(requested_state.group_id), canonical);
+            return Self::error_response(client, Some(header_group_id), canonical);
         };
-
-        if !last_applied.has_reached(&requested_state.state_id) {
-            let canonical = CanonicalError::retryable(
-                RpcErrorCode::NodeUnavailable,
-                Some(10),
-                format!(
-                    "msync state not reached: current={last_applied:?}, required={:?}",
-                    requested_state.state_id
-                ),
-            );
-            return Self::error_response(client, Some(requested_state.group_id), canonical);
-        }
 
         let authoritative = GroupStateWatermark::new(self.shard_group_id, last_applied);
         MsyncResponseProto {
@@ -117,9 +84,9 @@ impl MsyncHandler {
     pub fn unavailable(req: MsyncRequestProto) -> MsyncResponseProto {
         let client = client_from_proto(req.header.as_ref());
         let group_id = req
-            .state
-            .and_then(|state| state.group_id)
-            .map(|group_id| ShardGroupId::new(group_id.value));
+            .header
+            .as_ref()
+            .and_then(|header| (header.group_id != 0).then_some(ShardGroupId::new(header.group_id)));
         Self::error_response(
             client,
             group_id,
@@ -140,15 +107,6 @@ impl MsyncHandler {
         };
         let client = client_from_proto(Some(&proto));
         RequestHeader::try_from(proto).map_err(|err| (client, format!("invalid Msync RequestHeader: {err}")))
-    }
-
-    fn parse_state(proto: Option<proto::common::GroupStateWatermarkProto>) -> Result<GroupStateWatermark, String> {
-        let Some(proto) = proto else {
-            return Err("MsyncRequestProto requires state watermark".to_string());
-        };
-        proto
-            .try_into()
-            .map_err(|err| format!("invalid Msync state watermark: {err}"))
     }
 
     fn error_response(

@@ -22,23 +22,20 @@ impl MsyncClient {
 
     /// Sync metadata for a group (lightweight: advances group state watermark).
     /// group_id must be set in ctx.group_id.
-    /// min state (if provided) should be set in ctx.state.
     pub async fn sync(
         &self,
         ctx: &RequestHeader,
-        _inode_id: Option<InodeId>, // Deprecated: use ctx.group_id instead
-        _path: Option<&str>,        // Deprecated: use ctx.group_id instead
-        _min_token: Option<u64>,    // Deprecated: use ctx.state instead
-        _timeout_ms: Option<u64>,   // Deprecated: use ctx.deadline_ms instead
+        _legacy_inode_id: Option<InodeId>,
+        _legacy_path: Option<&str>,
+        _legacy_min_token: Option<u64>,
+        _timeout_ms: Option<u64>,
     ) -> ClientResult<proto::metadata::MsyncResponseProto> {
-        // Check that group_id is set in ctx
         if ctx.group_id.is_none() {
             return Err(ClientError::Metadata(
                 "MsyncRequestProto requires ctx.group_id to be set".to_string(),
             ));
         }
 
-        // Use MetadataClient's msync method
         self.client.msync(ctx).await
     }
 }

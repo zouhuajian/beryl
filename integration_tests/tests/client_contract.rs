@@ -91,7 +91,7 @@ async fn test_msync_with_mock() {
 
     use proto::common::ClientInfoProto;
     use proto::common::RequestHeaderProto;
-    let mut header = RequestHeaderProto {
+    let header = RequestHeaderProto {
         client: Some(ClientInfoProto {
             call_id: "test-call-id".to_string(),
             client_id: 1,
@@ -102,7 +102,7 @@ async fn test_msync_with_mock() {
         caller_context: None,
         state: Vec::new(),
         retry_count: 0,
-        group_id: 0,
+        group_id: 1,
         mount_epoch: None,
         route_epoch: None,
         principal: String::new(),
@@ -110,25 +110,52 @@ async fn test_msync_with_mock() {
         doas: String::new(),
         authn_type: proto::common::AuthnTypeProto::Unspecified as i32,
     };
-    header.group_id = 0;
 
-    let request = tonic::Request::new(MsyncRequestProto {
-        header: Some(header),
-        state: Some(proto::common::GroupStateWatermarkProto {
-            group_id: Some(proto::common::ShardGroupIdProto { value: 0 }),
-            state_id: Some(proto::common::RaftLogIdProto {
-                term: 0,
-                leader_node_id: 0,
-                index: 0,
-            }),
-        }),
-    });
+    let request = tonic::Request::new(MsyncRequestProto { header: Some(header) });
 
     let response = mock_server.msync(request).await;
     assert!(response.is_ok());
     let resp = response.unwrap().into_inner();
     assert!(resp.header.is_some());
     assert!(resp.state.is_some());
+}
+
+#[tokio::test]
+async fn test_msync_mock_rejects_missing_group_id() {
+    init_logging();
+
+    let mock_server = MockMetadataServer::new(1, vec![2, 3]);
+    let request = tonic::Request::new(MsyncRequestProto {
+        header: Some(proto::common::RequestHeaderProto {
+            client: Some(proto::common::ClientInfoProto {
+                call_id: "test-call-id".to_string(),
+                client_id: 1,
+                client_name: "test-client".to_string(),
+            }),
+            deadline_ms: 0,
+            traceparent: String::new(),
+            caller_context: None,
+            state: Vec::new(),
+            retry_count: 0,
+            group_id: 0,
+            mount_epoch: None,
+            route_epoch: None,
+            principal: String::new(),
+            real_user: String::new(),
+            doas: String::new(),
+            authn_type: proto::common::AuthnTypeProto::Unspecified as i32,
+        }),
+    });
+
+    let response = mock_server
+        .msync(request)
+        .await
+        .expect("mock msync uses gRPC OK for application errors")
+        .into_inner();
+
+    let header = response.header.expect("response header");
+    assert!(header.error.is_some());
+    assert!(response.state.is_none());
 }
 
 /// Mount epoch mismatch should surface as NEED_REFRESH and be auto-retired after applying hints.

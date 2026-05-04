@@ -35,19 +35,10 @@ impl MetadataClient {
     /// Msync: lightweight sync to advance state_id for a group.
     /// group_id must be set in ctx.group_id.
     pub async fn msync(&self, ctx: &RequestHeader) -> ClientResult<MsyncResponseProto> {
-        let group_id = ctx
-            .group_id
+        let header = minimal_msync_header(ctx)
             .ok_or_else(|| ClientError::Metadata("MsyncRequestProto requires ctx.group_id to be set".to_string()))?;
-        let state_id = ctx
-            .state
-            .iter()
-            .find(|watermark| watermark.group_id.as_raw() == group_id)
-            .map(|watermark| watermark.state_id)
-            .unwrap_or_default();
-        let state = types::GroupStateWatermark::new(types::ids::ShardGroupId::new(group_id), state_id);
         let request = MsyncRequestProto {
-            header: Some(ctx.into()),
-            state: Some((&state).into()),
+            header: Some((&header).into()),
         };
 
         let mut client = (*self.filesystem_client).clone();
@@ -58,5 +49,39 @@ impl MetadataClient {
             .into_inner();
 
         Ok(response)
+    }
+}
+
+pub(crate) fn minimal_msync_header(ctx: &RequestHeader) -> Option<RequestHeader> {
+    ctx.group_id?;
+    let mut header = ctx.child();
+    header.state.clear();
+    header.mount_epoch = None;
+    header.route_epoch = None;
+    Some(header)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::minimal_msync_header;
+    use common::header::RequestHeader;
+    use types::ids::ShardGroupId;
+    use types::{ClientId, GroupStateWatermark, RaftLogId};
+
+    #[test]
+    fn minimal_msync_header_strips_state_and_epoch_context() {
+        let group_id = ShardGroupId::new(7);
+        let mut header = RequestHeader::new(ClientId::new(1)).with_group_id(group_id.as_raw());
+        header.state = vec![GroupStateWatermark::new(group_id, RaftLogId::new(1, 2, 3))];
+        header.mount_epoch = Some(11);
+        header.route_epoch = Some(13);
+
+        let msync_header = minimal_msync_header(&header).expect("valid msync header");
+
+        assert_eq!(msync_header.group_id, Some(group_id.as_raw()));
+        assert!(msync_header.state.is_empty());
+        assert_eq!(msync_header.mount_epoch, None);
+        assert_eq!(msync_header.route_epoch, None);
+        assert_eq!(msync_header.client.client_id, header.client.client_id);
     }
 }

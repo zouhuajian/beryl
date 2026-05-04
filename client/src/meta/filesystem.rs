@@ -26,7 +26,8 @@ use proto::metadata::{
     FsyncSessionRequestProto, FsyncSessionResponseProto, GetFileLayoutByPathRequestProto,
     GetFileLayoutByPathResponseProto, GetFileStatusRequestProto, GetFileStatusResponseProto, HflushSessionRequestProto,
     HflushSessionResponseProto, HsyncSessionRequestProto, HsyncSessionResponseProto, ListStatusPathRequestProto,
-    ListStatusPathResponseProto, OpenWriteByPathRequestProto, OpenWriteByPathResponseProto,
+    ListStatusPathResponseProto, MsyncRequestProto, MsyncResponseProto, OpenWriteByPathRequestProto,
+    OpenWriteByPathResponseProto,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -221,6 +222,9 @@ pub trait FileSystemRpc: Send + Sync {
         request: CloseWriteSessionRequestProto,
     ) -> Result<CloseWriteSessionResponseProto, tonic::Status>;
 
+    /// Call `Msync`.
+    async fn msync(&self, request: MsyncRequestProto) -> Result<MsyncResponseProto, tonic::Status>;
+
     /// Reconnect to a different metadata endpoint (leader refresh path).
     async fn reconnect(&self, _endpoint: &str) -> ClientResult<()> {
         Ok(())
@@ -345,6 +349,14 @@ impl FileSystemRpc for TonicFileSystemRpc {
         let mut client = self.client.lock().await;
         client
             .close_write_session(tonic::Request::new(request))
+            .await
+            .map(|resp| resp.into_inner())
+    }
+
+    async fn msync(&self, request: MsyncRequestProto) -> Result<MsyncResponseProto, tonic::Status> {
+        let mut client = self.client.lock().await;
+        client
+            .msync(tonic::Request::new(request))
             .await
             .map(|resp| resp.into_inner())
     }
@@ -640,8 +652,17 @@ impl ActionMachine {
                                 }));
                             }
                             refresh_attempts += 1;
-                            self.handle_need_refresh(&replay_policy, reason, &canonical, &mut request)
-                                .await?;
+                            let hint = self.build_refresh_hint(&request, header, &canonical);
+                            let response_header = header.cloned();
+                            self.handle_need_refresh(
+                                &replay_policy,
+                                reason,
+                                &canonical,
+                                hint,
+                                response_header,
+                                &mut request,
+                            )
+                            .await?;
                         }
                         ErrorClass::Ok => {
                             self.update_success_caches(&request, &response);
@@ -758,6 +779,37 @@ impl ActionMachine {
         }
     }
 
+    fn build_refresh_hint_for_header(
+        &self,
+        header: Option<&ResponseHeaderProto>,
+        canonical: &CanonicalError,
+    ) -> RefreshHint {
+        let canonical_hint = canonical.refresh_hint.as_ref();
+        let group_id = canonical_hint
+            .and_then(|hint| hint.group_id)
+            .or_else(|| header.and_then(|h| if h.group_id == 0 { None } else { Some(h.group_id) }));
+        let endpoint_hint = canonical_hint
+            .and_then(|hint| hint.worker_endpoints.first())
+            .map(|endpoint| crate::canonical::EndpointHint {
+                worker_id: endpoint.worker_id,
+                endpoint: endpoint.endpoint.clone(),
+                net_transport_kind: endpoint.net_transport_kind,
+                worker_epoch: endpoint.worker_epoch,
+            });
+
+        RefreshHint {
+            group_id,
+            route_epoch: canonical_hint
+                .and_then(|hint| hint.route_epoch)
+                .or_else(|| header.and_then(|h| h.route_epoch)),
+            mount_epoch: canonical_hint
+                .and_then(|hint| hint.mount_epoch)
+                .or_else(|| header.and_then(|h| h.mount_epoch)),
+            worker_epoch: canonical_hint.and_then(|hint| hint.worker_epoch),
+            endpoint_hint,
+        }
+    }
+
     fn update_header_hints(&self, request: &RequestEnvelope, header: Option<&ResponseHeaderProto>) -> bool {
         let Some(header) = header else {
             return false;
@@ -832,6 +884,8 @@ impl ActionMachine {
         replay_policy: &ReplayPolicy,
         reason: RefreshReason,
         canonical: &CanonicalError,
+        hint: RefreshHint,
+        response_header: Option<ResponseHeaderProto>,
         request: &mut RequestEnvelope,
     ) -> ClientResult<()> {
         if self.should_reopen_session(replay_policy, reason, canonical, request) {
@@ -840,11 +894,120 @@ impl ActionMachine {
         }
 
         match reason {
+            RefreshReason::StaleState => self.refresh_state(hint, response_header.as_ref(), request).await,
             RefreshReason::NotLeader => self.refresh_leader(canonical, request).await,
             RefreshReason::MountEpochMismatch => self.refresh_mount(canonical, request).await,
             RefreshReason::RouteEpochMismatch => self.refresh_layout_context(canonical, request).await,
             RefreshReason::WorkerEpochMismatch => self.refresh_worker(canonical, request).await,
-            _ => self.refresh_layout_context(canonical, request).await,
+            RefreshReason::BlockStampMismatch => Err(self.unsupported_refresh_error(reason)),
+            RefreshReason::Moved
+            | RefreshReason::Fencing
+            | RefreshReason::EpochMismatch
+            | RefreshReason::SessionInvalid
+            | RefreshReason::SessionExpired
+            | RefreshReason::Unknown => Err(self.unsupported_refresh_error(reason)),
+        }
+    }
+
+    fn unsupported_refresh_error(&self, reason: RefreshReason) -> ClientError {
+        ClientError::Metadata(format!("unsupported FileSystemService refresh reason: {:?}", reason))
+    }
+
+    async fn refresh_state(
+        &self,
+        hint: RefreshHint,
+        response_header: Option<&ResponseHeaderProto>,
+        request: &RequestEnvelope,
+    ) -> ClientResult<()> {
+        let group_id = hint
+            .group_id
+            .or_else(|| {
+                request
+                    .header()
+                    .and_then(|header| (header.group_id != 0).then_some(header.group_id))
+            })
+            .ok_or_else(|| ClientError::Metadata("state refresh is unavailable without group_id".to_string()))?;
+
+        let required_state = response_header.and_then(|header| {
+            header
+                .state
+                .iter()
+                .find(|watermark| watermark.group_id.as_ref().map(|gid| gid.value) == Some(group_id))
+                .and_then(|watermark| watermark.state_id)
+        });
+
+        let header_template = request.header().cloned().unwrap_or_else(default_request_header_proto);
+        let request = MsyncRequestProto {
+            header: Some(minimal_msync_header_proto(header_template, group_id)),
+        };
+        let response = self.rpc.msync(request).await.map_err(ClientError::from)?;
+
+        match parse_rpc_envelope(Ok(()), response.header.as_ref()) {
+            RpcEnvelope::Ok => {}
+            RpcEnvelope::CanonicalError(canonical) => {
+                return Err(self.refresh_canonical_error_for_msync(response.header.as_ref(), canonical));
+            }
+            RpcEnvelope::TransportError(status) => return Err(ClientError::from(status)),
+        }
+
+        let response_state = response
+            .state
+            .ok_or_else(|| ClientError::Metadata("MsyncResponseProto missing state".to_string()))?;
+        let response_group = response_state
+            .group_id
+            .as_ref()
+            .map(|group_id| group_id.value)
+            .ok_or_else(|| ClientError::Metadata("MsyncResponseProto state missing group_id".to_string()))?;
+        if response_group != group_id {
+            return Err(ClientError::Metadata(format!(
+                "MsyncResponseProto state group_id {} does not match requested group_id {}",
+                response_group, group_id
+            )));
+        }
+        let response_state_id = response_state
+            .state_id
+            .ok_or_else(|| ClientError::Metadata("MsyncResponseProto state missing state_id".to_string()))?;
+        if let Some(required_state) = required_state {
+            if !raft_log_id_has_reached(&response_state_id, &required_state) {
+                return Err(ClientError::Metadata(format!(
+                    "Msync response state not reached: current={:?}, required={:?}",
+                    response_state_id, required_state
+                )));
+            }
+        }
+        self.caches.merge_response_state(&[GroupStateWatermarkProto {
+            group_id: Some(ShardGroupIdProto { value: group_id }),
+            state_id: Some(response_state_id),
+        }]);
+
+        Ok(())
+    }
+
+    fn refresh_canonical_error_for_msync(
+        &self,
+        header: Option<&ResponseHeaderProto>,
+        canonical: CanonicalError,
+    ) -> ClientError {
+        if is_authz_denial(&canonical) {
+            return ClientError::from(ClientAction::Fail { canonical });
+        }
+        match canonical.class {
+            ErrorClass::NeedRefresh => {
+                let reason = canonical
+                    .reason
+                    .unwrap_or_else(|| refresh_reason_from_code(canonical.code.clone()));
+                ClientError::from(ClientAction::Refresh {
+                    reason,
+                    hint: self.build_refresh_hint_for_header(header, &canonical),
+                    canonical,
+                })
+            }
+            ErrorClass::Retryable => ClientError::from(ClientAction::Retry {
+                after_ms: canonical.retry_after_ms,
+                canonical,
+            }),
+            ErrorClass::Fatal => ClientError::from(ClientAction::Fail { canonical }),
+            ErrorClass::Ok => ClientError::Metadata("msync returned canonical OK error state".to_string()),
         }
     }
 
@@ -1234,6 +1397,8 @@ enum ResponseEnvelope {
     GetFileStatus(GetFileStatusResponseProto),
     ListStatus(ListStatusPathResponseProto),
     GetFileLayoutByPath(GetFileLayoutByPathResponseProto),
+    #[cfg(test)]
+    Msync(MsyncResponseProto),
     Delete(DeleteResponseProto),
     OpenWriteByPath(OpenWriteByPathResponseProto),
     FsyncSession(FsyncSessionResponseProto),
@@ -1248,6 +1413,8 @@ impl ResponseEnvelope {
             ResponseEnvelope::GetFileStatus(resp) => resp.header.as_ref(),
             ResponseEnvelope::ListStatus(resp) => resp.header.as_ref(),
             ResponseEnvelope::GetFileLayoutByPath(resp) => resp.header.as_ref(),
+            #[cfg(test)]
+            ResponseEnvelope::Msync(resp) => resp.header.as_ref(),
             ResponseEnvelope::Delete(resp) => resp.header.as_ref(),
             ResponseEnvelope::OpenWriteByPath(resp) => resp.header.as_ref(),
             ResponseEnvelope::FsyncSession(resp) => resp.header.as_ref(),
@@ -1262,6 +1429,8 @@ impl ResponseEnvelope {
             ResponseEnvelope::GetFileStatus(_) => "GetFileStatus",
             ResponseEnvelope::ListStatus(_) => "ListStatus",
             ResponseEnvelope::GetFileLayoutByPath(_) => "GetFileLayoutByPath",
+            #[cfg(test)]
+            ResponseEnvelope::Msync(_) => "Msync",
             ResponseEnvelope::Delete(_) => "Delete",
             ResponseEnvelope::OpenWriteByPath(_) => "OpenWriteByPath",
             ResponseEnvelope::FsyncSession(_) => "FsyncSession",
@@ -1354,7 +1523,7 @@ impl ActionCaches {
     }
 
     fn state_for_group(&self, group_id: u64) -> Option<RaftLogIdProto> {
-        self.state_by_group.get(&group_id).map(|entry| entry.clone())
+        self.state_by_group.get(&group_id).map(|entry| *entry)
     }
 
     fn merge_response_state(&self, state: &[GroupStateWatermarkProto]) {
@@ -1362,7 +1531,7 @@ impl ActionCaches {
             let Some(group_id) = watermark.group_id.as_ref().map(|group_id| group_id.value) else {
                 continue;
             };
-            let Some(new_state) = watermark.state_id.clone() else {
+            let Some(new_state) = watermark.state_id else {
                 continue;
             };
             let should_update = self
@@ -1524,6 +1693,18 @@ fn raft_log_id_is_ahead(new_state: &RaftLogIdProto, old_state: &RaftLogIdProto) 
         > (old_state.index, old_state.term, old_state.leader_node_id)
 }
 
+fn raft_log_id_has_reached(current: &RaftLogIdProto, required: &RaftLogIdProto) -> bool {
+    current == required || raft_log_id_is_ahead(current, required)
+}
+
+fn minimal_msync_header_proto(mut header: RequestHeaderProto, group_id: u64) -> RequestHeaderProto {
+    header.group_id = group_id;
+    header.state.clear();
+    header.mount_epoch = None;
+    header.route_epoch = None;
+    header
+}
+
 fn unexpected_response(expected: &str, actual: &str) -> ClientError {
     ClientError::Metadata(format!(
         "unexpected response envelope: expected {}, got {}",
@@ -1592,13 +1773,20 @@ mod tests {
     use tokio::sync::Mutex;
 
     enum ScriptedResult {
-        Response(ResponseEnvelope),
+        Response(Box<ResponseEnvelope>),
         Status(tonic::Status),
+    }
+
+    impl ScriptedResult {
+        fn response(response: ResponseEnvelope) -> Self {
+            Self::Response(Box::new(response))
+        }
     }
 
     struct ScriptedRpc {
         scripted: Mutex<VecDeque<ScriptedResult>>,
         calls: Mutex<Vec<RequestEnvelope>>,
+        msync_calls: Mutex<Vec<MsyncRequestProto>>,
         reconnects: Mutex<Vec<String>>,
         endpoint: RwLock<Option<String>>,
     }
@@ -1608,6 +1796,7 @@ mod tests {
             Self {
                 scripted: Mutex::new(VecDeque::from(scripted)),
                 calls: Mutex::new(Vec::new()),
+                msync_calls: Mutex::new(Vec::new()),
                 reconnects: Mutex::new(Vec::new()),
                 endpoint: RwLock::new(Some("http://127.0.0.1:18080".to_string())),
             }
@@ -1616,7 +1805,7 @@ mod tests {
         async fn next(&self, request: RequestEnvelope) -> Result<ResponseEnvelope, tonic::Status> {
             self.calls.lock().await.push(request);
             match self.scripted.lock().await.pop_front() {
-                Some(ScriptedResult::Response(resp)) => Ok(resp),
+                Some(ScriptedResult::Response(resp)) => Ok(*resp),
                 Some(ScriptedResult::Status(status)) => Err(status),
                 None => Err(tonic::Status::internal("script exhausted")),
             }
@@ -1739,6 +1928,21 @@ mod tests {
             }
         }
 
+        async fn msync(&self, request: MsyncRequestProto) -> Result<MsyncResponseProto, tonic::Status> {
+            self.msync_calls.lock().await.push(request);
+            match self.scripted.lock().await.pop_front() {
+                Some(ScriptedResult::Response(resp)) => match *resp {
+                    ResponseEnvelope::Msync(resp) => Ok(resp),
+                    other => Err(tonic::Status::internal(format!(
+                        "expected Msync response, got {}",
+                        other.op_name()
+                    ))),
+                },
+                Some(ScriptedResult::Status(status)) => Err(status),
+                None => Err(tonic::Status::internal("script exhausted")),
+            }
+        }
+
         async fn reconnect(&self, endpoint: &str) -> ClientResult<()> {
             self.reconnects.lock().await.push(endpoint.to_string());
             *self.endpoint.write() = Some(endpoint.to_string());
@@ -1816,9 +2020,158 @@ mod tests {
         }
     }
 
+    fn err_header_with_group_and_state(
+        canonical: CanonicalError,
+        group_id: u64,
+        state_id: RaftLogIdProto,
+    ) -> ResponseHeaderProto {
+        let mut header = err_header(canonical);
+        header.group_id = group_id;
+        header.state = vec![GroupStateWatermarkProto {
+            group_id: Some(ShardGroupIdProto { value: group_id }),
+            state_id: Some(state_id),
+        }];
+        header
+    }
+
+    fn msync_response(group_id: u64, state_id: RaftLogIdProto) -> MsyncResponseProto {
+        MsyncResponseProto {
+            header: Some(ResponseHeaderProto {
+                client: Some(ClientInfoProto {
+                    call_id: CallId::new().to_string(),
+                    client_id: 1,
+                    client_name: "test-client".to_string(),
+                }),
+                error: None,
+                state: Vec::new(),
+                group_id,
+                mount_epoch: None,
+                route_epoch: None,
+            }),
+            state: Some(GroupStateWatermarkProto {
+                group_id: Some(ShardGroupIdProto { value: group_id }),
+                state_id: Some(state_id),
+            }),
+        }
+    }
+
     async fn call_machine<T>(machine: &ActionMachine, op: RpcOp<T>) -> ClientResult<T> {
         let policy = replay_policy_for_method(op.method());
         machine.call_with_refresh(policy, op).await
+    }
+
+    #[tokio::test]
+    async fn stale_state_refresh_uses_msync_then_replays_without_layout_refresh() {
+        let group_id = 5;
+        let required_state = RaftLogIdProto {
+            term: 1,
+            leader_node_id: 1,
+            index: 10,
+        };
+        let canonical =
+            CanonicalError::need_refresh(RpcErrorCode::StaleState, RefreshReason::StaleState, "stale state");
+
+        let rpc = Arc::new(ScriptedRpc::new(vec![
+            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+                header: Some(err_header_with_group_and_state(canonical, group_id, required_state)),
+                ..Default::default()
+            })),
+            ScriptedResult::response(ResponseEnvelope::Msync(msync_response(group_id, required_state))),
+            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+                header: Some(ok_header()),
+                ..Default::default()
+            })),
+        ]));
+
+        let machine = ActionMachine::new(rpc.clone(), vec![]);
+        let mut header = request_header();
+        header.group_id = group_id;
+        header.state = vec![GroupStateWatermarkProto {
+            group_id: Some(ShardGroupIdProto { value: group_id }),
+            state_id: Some(RaftLogIdProto {
+                term: 99,
+                leader_node_id: 99,
+                index: 99,
+            }),
+        }];
+        header.mount_epoch = Some(11);
+        header.route_epoch = Some(13);
+        let request = GetFileStatusRequestProto {
+            header: Some(header),
+            path: "/mnt/stale.bin".to_string(),
+        };
+
+        call_machine(&machine, RpcOp::get_file_status(request))
+            .await
+            .expect("stale state refresh should use msync and replay");
+
+        let calls = rpc.calls.lock().await;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].op_name(), "GetFileStatus");
+        assert_eq!(calls[1].op_name(), "GetFileStatus");
+        let replay_header = calls[1].header().expect("replay header");
+        assert_eq!(replay_header.group_id, group_id);
+        assert_eq!(replay_header.state.len(), 1);
+        assert_eq!(replay_header.state[0].state_id, Some(required_state));
+        drop(calls);
+
+        let msync_calls = rpc.msync_calls.lock().await;
+        assert_eq!(msync_calls.len(), 1);
+        let msync_header = msync_calls[0].header.as_ref().expect("msync header");
+        assert_eq!(msync_header.group_id, group_id);
+        assert!(msync_header.state.is_empty());
+        assert_eq!(msync_header.mount_epoch, None);
+        assert_eq!(msync_header.route_epoch, None);
+    }
+
+    #[tokio::test]
+    async fn unsupported_refresh_reasons_fail_without_msync_or_layout_refresh() {
+        for (code, reason) in [
+            (RpcErrorCode::BlockStampMismatch, RefreshReason::BlockStampMismatch),
+            (RpcErrorCode::Fencing, RefreshReason::Fencing),
+            (RpcErrorCode::EpochMismatch, RefreshReason::EpochMismatch),
+        ] {
+            let canonical = CanonicalError::need_refresh(code, reason, "unsupported refresh");
+            let rpc = Arc::new(ScriptedRpc::new(vec![
+                ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+                    header: Some(err_header(canonical)),
+                    ..Default::default()
+                })),
+                ScriptedResult::response(ResponseEnvelope::GetFileLayoutByPath(
+                    GetFileLayoutByPathResponseProto {
+                        header: Some(ok_header()),
+                        locations: vec![proto::metadata::FileBlockLocationProto::default()],
+                        ..Default::default()
+                    },
+                )),
+                ScriptedResult::response(ResponseEnvelope::Msync(msync_response(
+                    1,
+                    RaftLogIdProto {
+                        term: 1,
+                        leader_node_id: 1,
+                        index: 1,
+                    },
+                ))),
+            ]));
+            let machine = ActionMachine::new(rpc.clone(), vec![]);
+            let request = GetFileStatusRequestProto {
+                header: Some(request_header()),
+                path: "/mnt/unsupported.bin".to_string(),
+            };
+
+            let err = call_machine(&machine, RpcOp::get_file_status(request))
+                .await
+                .expect_err("unsupported refresh reason must fail");
+
+            match err {
+                ClientError::Metadata(message) => {
+                    assert!(message.contains("unsupported FileSystemService refresh reason"));
+                }
+                other => panic!("expected explicit unsupported refresh error, got {:?}", other),
+            }
+            assert_eq!(rpc.calls.lock().await.len(), 1);
+            assert_eq!(rpc.msync_calls.lock().await.len(), 0);
+        }
     }
 
     #[tokio::test]
@@ -1834,17 +2187,17 @@ mod tests {
         );
 
         let rpc = Arc::new(ScriptedRpc::new(vec![
-            ScriptedResult::Response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
                 header: Some(err_header(canonical)),
                 ..Default::default()
             })),
-            ScriptedResult::Response(ResponseEnvelope::GetFileLayoutByPath(
+            ScriptedResult::response(ResponseEnvelope::GetFileLayoutByPath(
                 GetFileLayoutByPathResponseProto {
                     header: Some(ok_header()),
                     ..Default::default()
                 },
             )),
-            ScriptedResult::Response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
                 header: Some(ok_header()),
                 ..Default::default()
             })),
@@ -1885,11 +2238,11 @@ mod tests {
         );
 
         let rpc = Arc::new(ScriptedRpc::new(vec![
-            ScriptedResult::Response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
                 header: Some(err_header(canonical)),
                 ..Default::default()
             })),
-            ScriptedResult::Response(ResponseEnvelope::GetFileLayoutByPath(
+            ScriptedResult::response(ResponseEnvelope::GetFileLayoutByPath(
                 GetFileLayoutByPathResponseProto {
                     header: Some(ok_header_with_route(17)),
                     locations: vec![proto::metadata::FileBlockLocationProto {
@@ -1907,7 +2260,7 @@ mod tests {
                     ..Default::default()
                 },
             )),
-            ScriptedResult::Response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
                 header: Some(ok_header()),
                 ..Default::default()
             })),
@@ -1928,9 +2281,103 @@ mod tests {
         assert_eq!(calls[0].op_name(), "GetFileStatus");
         assert_eq!(calls[1].op_name(), "GetFileLayoutByPath");
         assert_eq!(calls[2].op_name(), "GetFileStatus");
+        assert_eq!(rpc.msync_calls.lock().await.len(), 0);
 
         let replay_header = calls[2].header().expect("replay header");
         assert_eq!(replay_header.route_epoch, Some(17));
+    }
+
+    #[tokio::test]
+    async fn mount_epoch_refresh_does_not_call_msync() {
+        let canonical = CanonicalError::need_refresh_with_hint(
+            RpcErrorCode::MountEpochMismatch,
+            RefreshReason::MountEpochMismatch,
+            CanonicalRefreshHint {
+                mount_epoch: Some(19),
+                ..Default::default()
+            },
+            "mount epoch mismatch",
+        );
+
+        let rpc = Arc::new(ScriptedRpc::new(vec![
+            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+                header: Some(err_header(canonical)),
+                ..Default::default()
+            })),
+            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+                header: Some(ok_header()),
+                attrs: Some(proto::fs::FileAttrsProto::default()),
+                ..Default::default()
+            })),
+            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+                header: Some(ok_header()),
+                ..Default::default()
+            })),
+        ]));
+
+        let machine = ActionMachine::new(rpc.clone(), vec![]);
+        let request = GetFileStatusRequestProto {
+            header: Some(request_header()),
+            path: "/mnt/mount.bin".to_string(),
+        };
+
+        call_machine(&machine, RpcOp::get_file_status(request))
+            .await
+            .expect("mount refresh should replay");
+
+        let calls = rpc.calls.lock().await;
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].op_name(), "GetFileStatus");
+        assert_eq!(calls[1].op_name(), "GetFileStatus");
+        assert_eq!(calls[2].op_name(), "GetFileStatus");
+        assert_eq!(rpc.msync_calls.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn worker_epoch_refresh_uses_worker_hint_without_msync() {
+        let canonical = CanonicalError::need_refresh_with_hint(
+            RpcErrorCode::WorkerEpochMismatch,
+            RefreshReason::WorkerEpochMismatch,
+            CanonicalRefreshHint {
+                worker_epoch: Some(23),
+                worker_endpoints: vec![common::error::canonical::WorkerEndpointHint {
+                    worker_id: 99,
+                    endpoint: "127.0.0.1:19090".to_string(),
+                    net_transport_kind: proto::common::NetTransportKindProto::NetTransportKindGrpc as i32,
+                    worker_epoch: 23,
+                }],
+                worker_resolve_required: false,
+                ..Default::default()
+            },
+            "worker epoch mismatch",
+        );
+
+        let rpc = Arc::new(ScriptedRpc::new(vec![
+            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+                header: Some(err_header(canonical)),
+                ..Default::default()
+            })),
+            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+                header: Some(ok_header()),
+                ..Default::default()
+            })),
+        ]));
+
+        let machine = ActionMachine::new(rpc.clone(), vec![]);
+        let request = GetFileStatusRequestProto {
+            header: Some(request_header()),
+            path: "/mnt/worker.bin".to_string(),
+        };
+
+        call_machine(&machine, RpcOp::get_file_status(request))
+            .await
+            .expect("worker hint refresh should replay");
+
+        let calls = rpc.calls.lock().await;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].op_name(), "GetFileStatus");
+        assert_eq!(calls[1].op_name(), "GetFileStatus");
+        assert_eq!(rpc.msync_calls.lock().await.len(), 0);
     }
 
     #[tokio::test]
@@ -1948,17 +2395,17 @@ mod tests {
             CanonicalError::need_refresh(RpcErrorCode::NotLeader, RefreshReason::NotLeader, "refresh not leader");
 
         let rpc = Arc::new(ScriptedRpc::new(vec![
-            ScriptedResult::Response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
                 header: Some(err_header(initial)),
                 ..Default::default()
             })),
-            ScriptedResult::Response(ResponseEnvelope::GetFileLayoutByPath(
+            ScriptedResult::response(ResponseEnvelope::GetFileLayoutByPath(
                 GetFileLayoutByPathResponseProto {
                     header: Some(err_header(refresh_error)),
                     ..Default::default()
                 },
             )),
-            ScriptedResult::Response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
                 header: Some(ok_header()),
                 ..Default::default()
             })),
@@ -1997,18 +2444,18 @@ mod tests {
         );
 
         let rpc = Arc::new(ScriptedRpc::new(vec![
-            ScriptedResult::Response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
                 header: Some(err_header(canonical)),
                 ..Default::default()
             })),
-            ScriptedResult::Response(ResponseEnvelope::GetFileLayoutByPath(
+            ScriptedResult::response(ResponseEnvelope::GetFileLayoutByPath(
                 GetFileLayoutByPathResponseProto {
                     header: Some(ok_header_without_refresh_hints()),
                     locations: Vec::new(),
                     ..Default::default()
                 },
             )),
-            ScriptedResult::Response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
                 header: Some(ok_header()),
                 ..Default::default()
             })),
@@ -2041,7 +2488,7 @@ mod tests {
     async fn permission_denied_is_terminal_without_replay() {
         let canonical = CanonicalError::fatal_fs(FsErrorCode::EAcces, "permission denied");
 
-        let rpc = Arc::new(ScriptedRpc::new(vec![ScriptedResult::Response(
+        let rpc = Arc::new(ScriptedRpc::new(vec![ScriptedResult::response(
             ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
                 header: Some(err_header(canonical)),
                 ..Default::default()
@@ -2076,7 +2523,7 @@ mod tests {
     async fn grpc_unavailable_retries_with_bound() {
         let rpc = Arc::new(ScriptedRpc::new(vec![
             ScriptedResult::Status(tonic::Status::unavailable("temporary outage")),
-            ScriptedResult::Response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
                 header: Some(ok_header()),
                 ..Default::default()
             })),
@@ -2103,7 +2550,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_uses_delete_rpc_with_mutation_policy() {
-        let rpc = Arc::new(ScriptedRpc::new(vec![ScriptedResult::Response(
+        let rpc = Arc::new(ScriptedRpc::new(vec![ScriptedResult::response(
             ResponseEnvelope::Delete(DeleteResponseProto {
                 header: Some(ok_header()),
             }),
@@ -2170,12 +2617,12 @@ mod tests {
         };
 
         let rpc = Arc::new(ScriptedRpc::new(vec![
-            ScriptedResult::Response(ResponseEnvelope::OpenWriteByPath(open_resp_1.clone())),
-            ScriptedResult::Response(ResponseEnvelope::FsyncSession(FsyncSessionResponseProto {
+            ScriptedResult::response(ResponseEnvelope::OpenWriteByPath(open_resp_1.clone())),
+            ScriptedResult::response(ResponseEnvelope::FsyncSession(FsyncSessionResponseProto {
                 header: Some(err_header(invalid_session)),
             })),
-            ScriptedResult::Response(ResponseEnvelope::OpenWriteByPath(open_resp_2.clone())),
-            ScriptedResult::Response(ResponseEnvelope::FsyncSession(FsyncSessionResponseProto {
+            ScriptedResult::response(ResponseEnvelope::OpenWriteByPath(open_resp_2.clone())),
+            ScriptedResult::response(ResponseEnvelope::FsyncSession(FsyncSessionResponseProto {
                 header: Some(ok_header()),
             })),
         ]));
@@ -2268,12 +2715,12 @@ mod tests {
         };
 
         let rpc = Arc::new(ScriptedRpc::new(vec![
-            ScriptedResult::Response(ResponseEnvelope::OpenWriteByPath(open_resp_1.clone())),
-            ScriptedResult::Response(ResponseEnvelope::FsyncSession(FsyncSessionResponseProto {
+            ScriptedResult::response(ResponseEnvelope::OpenWriteByPath(open_resp_1.clone())),
+            ScriptedResult::response(ResponseEnvelope::FsyncSession(FsyncSessionResponseProto {
                 header: Some(err_header(expired_session)),
             })),
-            ScriptedResult::Response(ResponseEnvelope::OpenWriteByPath(open_resp_2.clone())),
-            ScriptedResult::Response(ResponseEnvelope::FsyncSession(FsyncSessionResponseProto {
+            ScriptedResult::response(ResponseEnvelope::OpenWriteByPath(open_resp_2.clone())),
+            ScriptedResult::response(ResponseEnvelope::FsyncSession(FsyncSessionResponseProto {
                 header: Some(ok_header()),
             })),
         ]));
@@ -2351,8 +2798,8 @@ mod tests {
         };
 
         let rpc = Arc::new(ScriptedRpc::new(vec![
-            ScriptedResult::Response(ResponseEnvelope::OpenWriteByPath(open_resp.clone())),
-            ScriptedResult::Response(ResponseEnvelope::FsyncSession(FsyncSessionResponseProto {
+            ScriptedResult::response(ResponseEnvelope::OpenWriteByPath(open_resp.clone())),
+            ScriptedResult::response(ResponseEnvelope::FsyncSession(FsyncSessionResponseProto {
                 header: Some(err_header(fatal_unknown)),
             })),
         ]));

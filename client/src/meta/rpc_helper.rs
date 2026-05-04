@@ -161,12 +161,16 @@ impl MetadataRpcHelper {
             }
             RefreshDispatchAction::RefreshState => {
                 if let Some(gid) = next_header.group_id {
-                    self.msync_group(
-                        base_header,
-                        ShardGroupId::new(gid),
-                        next_header.state.first().map(|w| w.state_id),
-                    )
-                    .await?;
+                    let group_id = ShardGroupId::new(gid);
+                    let required_state = next_header
+                        .state
+                        .iter()
+                        .find(|watermark| watermark.group_id == group_id)
+                        .copied();
+                    let response_state = self.msync_group(base_header, group_id).await?;
+                    if let Some(required_state) = required_state {
+                        Self::ensure_msync_reached_required_state(response_state, required_state)?;
+                    }
                 } else {
                     self.fail_route_refresh_without_context(base_header).await?;
                 }
@@ -217,15 +221,11 @@ impl MetadataRpcHelper {
         &self,
         base_header: &RequestHeader,
         group_id: ShardGroupId,
-        min_state_id: Option<RaftLogId>,
-    ) -> ClientResult<()> {
+    ) -> ClientResult<GroupStateWatermark> {
         let mut header = base_header.child();
         header.group_id = Some(group_id.as_raw());
-        if let Some(sid) = min_state_id {
-            header.state = vec![GroupStateWatermark::new(group_id, sid)];
-        }
+        header.state.clear();
 
-        // Use MetadataClient's msync method directly
         let response = self.metadata_client.msync(&header).await?;
 
         let resp_header = response
@@ -247,14 +247,28 @@ impl MetadataRpcHelper {
                 group_id.as_raw()
             )));
         }
-        let previous = self.state_cache.get(&group_id);
         self.state_cache.update_if_ahead(response_state);
-        if self.state_cache.get(&group_id) == previous {
-            return Err(ClientError::Metadata(
-                "Msync did not advance the client state cache".to_string(),
-            ));
-        }
 
+        Ok(response_state)
+    }
+
+    fn ensure_msync_reached_required_state(
+        response_state: GroupStateWatermark,
+        required_state: GroupStateWatermark,
+    ) -> ClientResult<()> {
+        if response_state.group_id != required_state.group_id {
+            return Err(ClientError::Metadata(format!(
+                "MsyncResponseProto state group_id {} does not match required group_id {}",
+                response_state.group_id.as_raw(),
+                required_state.group_id.as_raw()
+            )));
+        }
+        if !response_state.state_id.has_reached(&required_state.state_id) {
+            return Err(ClientError::Metadata(format!(
+                "Msync response state not reached: current={:?}, required={:?}",
+                response_state.state_id, required_state.state_id
+            )));
+        }
         Ok(())
     }
 
@@ -497,6 +511,8 @@ mod tests {
     #[derive(Clone)]
     struct DispatchFileSystemService {
         msync_calls: Arc<AtomicUsize>,
+        response_index: u64,
+        observed_header_state_len: Arc<AtomicUsize>,
     }
 
     impl DispatchFileSystemService {
@@ -517,19 +533,21 @@ mod tests {
         ) -> Result<Response<MsyncResponseProto>, Status> {
             self.msync_calls.fetch_add(1, Ordering::SeqCst);
             let req = request.into_inner();
+            self.observed_header_state_len.store(
+                req.header.as_ref().map_or(0, |header| header.state.len()),
+                Ordering::SeqCst,
+            );
             let group_id = req
                 .header
                 .as_ref()
                 .and_then(|h| if h.group_id != 0 { Some(h.group_id) } else { None });
-            let state = req.state.or_else(|| {
-                group_id.map(|gid| proto::common::GroupStateWatermarkProto {
-                    group_id: Some(proto::common::ShardGroupIdProto { value: gid }),
-                    state_id: Some(proto::common::RaftLogIdProto {
-                        term: 1,
-                        leader_node_id: 1,
-                        index: 1,
-                    }),
-                })
+            let state = group_id.map(|gid| proto::common::GroupStateWatermarkProto {
+                group_id: Some(proto::common::ShardGroupIdProto { value: gid }),
+                state_id: Some(proto::common::RaftLogIdProto {
+                    term: 1,
+                    leader_node_id: 1,
+                    index: self.response_index,
+                }),
             });
             Ok(Response::new(MsyncResponseProto {
                 header: Some(Self::ok_header(group_id)),
@@ -567,7 +585,7 @@ mod tests {
         let helper = build_helper(&endpoint).await;
 
         let base_header = RequestHeader::new(ClientId::new(1));
-        let result = helper.msync_group(&base_header, ShardGroupId::new(7), None).await;
+        let result = helper.msync_group(&base_header, ShardGroupId::new(7)).await;
         assert!(result.is_err());
         assert!(helper.get_state_id(&ShardGroupId::new(7)).is_none());
     }
@@ -589,6 +607,8 @@ mod tests {
         let msync_calls = Arc::new(AtomicUsize::new(0));
         let service = DispatchFileSystemService {
             msync_calls: msync_calls.clone(),
+            response_index: 7,
+            observed_header_state_len: Arc::new(AtomicUsize::new(0)),
         };
 
         let addr = start_dispatch_server(service).await;
@@ -632,6 +652,8 @@ mod tests {
         let msync_calls = Arc::new(AtomicUsize::new(0));
         let service = DispatchFileSystemService {
             msync_calls: msync_calls.clone(),
+            response_index: 7,
+            observed_header_state_len: Arc::new(AtomicUsize::new(0)),
         };
 
         let addr = start_dispatch_server(service).await;
@@ -669,6 +691,8 @@ mod tests {
         let msync_calls = Arc::new(AtomicUsize::new(0));
         let service = DispatchFileSystemService {
             msync_calls: msync_calls.clone(),
+            response_index: 7,
+            observed_header_state_len: Arc::new(AtomicUsize::new(0)),
         };
 
         let addr = start_dispatch_server(service).await;
@@ -710,6 +734,8 @@ mod tests {
         let msync_calls = Arc::new(AtomicUsize::new(0));
         let service = DispatchFileSystemService {
             msync_calls: msync_calls.clone(),
+            response_index: 7,
+            observed_header_state_len: Arc::new(AtomicUsize::new(0)),
         };
 
         let addr = start_dispatch_server(service).await;
@@ -743,5 +769,45 @@ mod tests {
             .expect("stale state dispatch");
 
         assert_eq!(msync_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_msync_group_merges_response_state_without_sending_header_state() {
+        let msync_calls = Arc::new(AtomicUsize::new(0));
+        let observed_header_state_len = Arc::new(AtomicUsize::new(usize::MAX));
+        let service = DispatchFileSystemService {
+            msync_calls: msync_calls.clone(),
+            response_index: 11,
+            observed_header_state_len: observed_header_state_len.clone(),
+        };
+
+        let addr = start_dispatch_server(service).await;
+        let endpoint = format!("http://{}", addr);
+        let helper = build_helper(&endpoint).await;
+
+        let group_id = ShardGroupId::new(6);
+        let mut base_header = RequestHeader::new(ClientId::new(1)).with_group_id(group_id.as_raw());
+        base_header.state = vec![GroupStateWatermark::new(group_id, RaftLogId::new(1, 1, 99))];
+
+        let response_state = helper
+            .msync_group(&base_header, group_id)
+            .await
+            .expect("msync_group should merge server state");
+
+        assert_eq!(response_state.state_id, RaftLogId::new(1, 1, 11));
+        assert_eq!(helper.get_state_id(&group_id), Some(RaftLogId::new(1, 1, 11)));
+        assert_eq!(msync_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observed_header_state_len.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_msync_required_watermark_comparison_is_client_side() {
+        let group_id = ShardGroupId::new(6);
+        let response_state = GroupStateWatermark::new(group_id, RaftLogId::new(1, 1, 10));
+        let required_state = GroupStateWatermark::new(group_id, RaftLogId::new(1, 1, 11));
+
+        let result = MetadataRpcHelper::ensure_msync_reached_required_state(response_state, required_state);
+
+        assert!(result.is_err());
     }
 }

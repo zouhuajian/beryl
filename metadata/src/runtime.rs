@@ -644,16 +644,11 @@ mod tests {
         })
     }
 
-    async fn call_msync(
-        service: &MetadataFileSystemServiceImpl,
-        header: RequestHeader,
-        state: GroupStateWatermark,
-    ) -> MsyncResponseProto {
+    async fn call_msync(service: &MetadataFileSystemServiceImpl, header: RequestHeader) -> MsyncResponseProto {
         <MetadataFileSystemServiceImpl as FileSystemServiceProto>::msync(
             service,
             tonic::Request::new(MsyncRequestProto {
                 header: Some((&header).into()),
-                state: Some((&state).into()),
             }),
         )
         .await
@@ -818,12 +813,10 @@ mod tests {
         .await
         .unwrap();
         let group_id = ShardGroupId::new(1);
-        let requested_state = GroupStateWatermark::new(group_id, expected_state_id);
 
         let response = call_msync(
             &service,
             RequestHeader::new(ClientId::new(7)).with_group_id(group_id.as_raw()),
-            requested_state,
         )
         .await;
         let header = parse_msync_header(&response);
@@ -838,7 +831,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn msync_rejects_mismatched_header_group_and_state_group() {
+    async fn msync_does_not_compare_client_header_state() {
+        let dir = TempDir::new().unwrap();
+        let authority = test_authority(&dir).await;
+        let expected_state_id = wait_for_leader_state(&authority).await;
+        let readiness = build_readiness(&test_config(), &authority).await;
+        let (worker_runtime, _worker_service) = build_worker_runtime(&test_config(), &authority);
+        let service = build_filesystem_service(
+            &test_config(),
+            &authority,
+            Arc::clone(&worker_runtime.manager),
+            &readiness,
+        )
+        .await
+        .unwrap();
+        let group_id = ShardGroupId::new(1);
+        let mut header = RequestHeader::new(ClientId::new(7)).with_group_id(group_id.as_raw());
+        header.state = vec![GroupStateWatermark::new(group_id, RaftLogId::new(99, 99, u64::MAX))];
+
+        let response = call_msync(&service, header).await;
+        let response_header = parse_msync_header(&response);
+
+        assert!(response_header.canonical_error.is_none());
+        assert_eq!(
+            response.state,
+            Some((&GroupStateWatermark::new(group_id, expected_state_id)).into())
+        );
+    }
+
+    #[tokio::test]
+    async fn msync_rejects_missing_header_group_id() {
         let dir = TempDir::new().unwrap();
         let authority = test_authority(&dir).await;
         wait_for_leader_state(&authority).await;
@@ -853,14 +875,9 @@ mod tests {
         .await
         .unwrap();
 
-        let response = call_msync(
-            &service,
-            RequestHeader::new(ClientId::new(7)).with_group_id(1),
-            GroupStateWatermark::new(ShardGroupId::new(2), RaftLogId::new(1, 1, 1)),
-        )
-        .await;
+        let response = call_msync(&service, RequestHeader::new(ClientId::new(7))).await;
         let header = parse_msync_header(&response);
-        let canonical = header.canonical_error.expect("mismatched header error");
+        let canonical = header.canonical_error.expect("missing header group error");
 
         assert!(header.state.is_empty());
         assert!(response.state.is_none());
@@ -888,7 +905,6 @@ mod tests {
         let response = call_msync(
             &service,
             RequestHeader::new(ClientId::new(7)).with_group_id(group_id.as_raw()),
-            GroupStateWatermark::new(group_id, RaftLogId::new(1, 1, 1)),
         )
         .await;
         let header = parse_msync_header(&response);
@@ -897,7 +913,8 @@ mod tests {
         assert!(header.state.is_empty());
         assert!(response.state.is_none());
         assert_eq!(canonical.class, ErrorClass::NeedRefresh);
-        assert_eq!(canonical.reason, Some(RefreshReason::RouteEpochMismatch));
+        assert_eq!(canonical.code, Some(ErrorCode::RpcCode(RpcErrorCode::ShardMoved)));
+        assert_eq!(canonical.reason, Some(RefreshReason::Moved));
     }
 
     #[tokio::test]
@@ -905,12 +922,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let service = nonleader_filesystem_service(&dir).await;
 
-        let response = call_msync(
-            &service,
-            RequestHeader::new(ClientId::new(7)).with_group_id(1),
-            GroupStateWatermark::new(ShardGroupId::new(1), RaftLogId::new(1, 1, 1)),
-        )
-        .await;
+        let response = call_msync(&service, RequestHeader::new(ClientId::new(7)).with_group_id(1)).await;
         let header = parse_msync_header(&response);
         let canonical = header.canonical_error.expect("not-leader error");
 

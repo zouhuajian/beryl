@@ -3,7 +3,10 @@
 
 //! Mock metadata server for integration tests.
 
-use proto::common::{GroupStateWatermarkProto, RaftLogIdProto, ShardGroupIdProto};
+use ::common::error::canonical::{CanonicalError, ErrorClass, ErrorCode};
+use ::common::header::RpcErrorCode;
+use proto::common::{GroupStateWatermarkProto, RaftLogIdProto, ResponseHeaderProto, ShardGroupIdProto};
+use proto::convert::canonical_to_error_detail;
 use proto::metadata::*;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -30,24 +33,37 @@ impl MockMetadataServer {
     pub async fn msync(&self, request: Request<MsyncRequestProto>) -> Result<Response<MsyncResponseProto>, Status> {
         let req = request.into_inner();
 
-        let group_id = if let Some(ref header) = req.header {
-            if header.group_id != 0 {
-                header.group_id
-            } else {
-                0
-            }
-        } else {
-            0
+        let Some(group_id) = req
+            .header
+            .as_ref()
+            .and_then(|header| (header.group_id != 0).then_some(header.group_id))
+        else {
+            return Ok(Response::new(MsyncResponseProto {
+                header: Some(ResponseHeaderProto {
+                    client: req.header.as_ref().and_then(|h| h.client.clone()),
+                    error: Some(canonical_to_error_detail(&CanonicalError {
+                        class: ErrorClass::Fatal,
+                        code: Some(ErrorCode::RpcCode(RpcErrorCode::InvalidHeader)),
+                        reason: None,
+                        retry_after_ms: None,
+                        message: "MsyncRequestProto requires header.group_id".to_string(),
+                        refresh_hint: None,
+                    })),
+                    state: Vec::new(),
+                    group_id: 0,
+                    mount_epoch: None,
+                    route_epoch: None,
+                }),
+                state: None,
+            }));
         };
 
-        use proto::common::ResponseHeaderProto;
-
         let route_epoch = *self.route_epoch.read().await;
-        let state_id = req.state.and_then(|state| state.state_id).unwrap_or(RaftLogIdProto {
+        let state_id = RaftLogIdProto {
             term: 1,
             leader_node_id: self.leader_id,
             index: route_epoch,
-        });
+        };
 
         let response_header = ResponseHeaderProto {
             client: req.header.as_ref().and_then(|h| h.client.clone()),

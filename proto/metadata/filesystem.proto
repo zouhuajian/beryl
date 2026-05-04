@@ -374,16 +374,12 @@ message ReleaseSessionResponseProto {
 
 message MsyncRequestProto {
   common.RequestHeaderProto header = 1;
-
-  // Client-required metadata state watermark for the target raft group.
-  // Must belong to the same group as header.group_id.
-  common.GroupStateWatermarkProto state = 2;
 }
 
 message MsyncResponseProto {
   common.ResponseHeaderProto header = 1;
 
-  // Server-authoritative current metadata state watermark for the serving raft group.
+  // Authoritative current metadata state watermark of the serving raft group.
   common.GroupStateWatermarkProto state = 2;
 }
 
