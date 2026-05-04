@@ -8,7 +8,6 @@ package metadata;
 import "common/common.proto";
 import "common/header.proto";
 import "fs/types.proto";
-import "metadata/fs.proto";
 
 // ============================================================================
 // FileSystemService (external/public filesystem entrypoint)
@@ -22,6 +21,40 @@ import "metadata/fs.proto";
 // Authoritative model contract:
 // - Path is adapter input only.
 // - inode/dentry/attrs remain authoritative identity and storage model.
+
+// ============================================================================
+// Shared filesystem API payloads
+// ============================================================================
+
+message WriteTargetProto {
+  // Target block for the write.
+  common.BlockIdProto block_id = 1;
+  // Worker endpoints authorized to accept the write.
+  repeated common.WorkerEndpointInfoProto worker_endpoints = 2;
+  // Fencing token associated with the block.
+  common.FencingTokenProto fencing_token = 3;
+}
+
+enum WriteModeProto {
+  WRITE_MODE_UNSPECIFIED = 0;
+  // Write mode: can write at any offset.
+  WRITE_MODE_WRITE = 1;
+  // Append mode: writes must start from file_size.
+  WRITE_MODE_APPEND = 2;
+}
+
+message FileBlockLocationProto {
+  // Block slice this location covers.
+  common.BlockIdProto block_id = 1;
+  // File offset that this block maps to.
+  uint64 file_offset = 2;
+  // Length in bytes covered by this block.
+  uint64 len = 3;
+  // Worker endpoints that currently host the block.
+  repeated common.WorkerEndpointInfoProto workers = 4;
+  // Optional worker freshness epoch.
+  optional uint64 worker_epoch = 5;
+}
 
 // ============================================================================
 // GetFileStatus (merged stat API)
@@ -335,6 +368,25 @@ message ReleaseSessionResponseProto {
   common.ResponseHeaderProto header = 1;
 }
 
+// ============================================================================
+// Metadata state sync
+// ============================================================================
+
+message MsyncRequestProto {
+  common.RequestHeaderProto header = 1;
+
+  // Client-required metadata state watermark for the target raft group.
+  // Must belong to the same group as header.group_id.
+  common.GroupStateWatermarkProto state = 2;
+}
+
+message MsyncResponseProto {
+  common.ResponseHeaderProto header = 1;
+
+  // Server-authoritative current metadata state watermark for the serving raft group.
+  common.GroupStateWatermarkProto state = 2;
+}
+
 service FileSystemServiceProto {
   // Stat
   rpc GetFileStatus(GetFileStatusRequestProto) returns (GetFileStatusResponseProto);
@@ -373,4 +425,7 @@ service FileSystemServiceProto {
   rpc HsyncSession(HsyncSessionRequestProto) returns (HsyncSessionResponseProto);
   rpc HflushSession(HflushSessionRequestProto) returns (HflushSessionResponseProto);
   rpc ReleaseSession(ReleaseSessionRequestProto) returns (ReleaseSessionResponseProto);
+
+  // Metadata state freshness for one local raft group.
+  rpc Msync(MsyncRequestProto) returns (MsyncResponseProto);
 }

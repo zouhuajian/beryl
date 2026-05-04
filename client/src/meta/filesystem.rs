@@ -758,54 +758,72 @@ impl ActionMachine {
         }
     }
 
-    fn update_header_hints(&self, request: &RequestEnvelope, header: Option<&ResponseHeaderProto>) {
+    fn update_header_hints(&self, request: &RequestEnvelope, header: Option<&ResponseHeaderProto>) -> bool {
         let Some(header) = header else {
-            return;
+            return false;
         };
+        let mut refreshed = !header.state.is_empty();
         self.caches.merge_response_state(&header.state);
         let Some(path) = request.path_hint(&self.caches.sessions) else {
-            return;
+            return refreshed;
         };
         if let Some(mount_epoch) = header.mount_epoch {
             self.caches.record_mount_epoch(&path, mount_epoch);
+            refreshed = true;
         }
         if let Some(route_epoch) = header.route_epoch {
             self.caches.record_route_epoch(&path, route_epoch);
+            refreshed = true;
         }
+        refreshed
     }
 
-    fn update_success_caches(&self, request: &RequestEnvelope, response: &ResponseEnvelope) {
+    fn update_success_caches(&self, request: &RequestEnvelope, response: &ResponseEnvelope) -> bool {
         if let Some(endpoint) = self.rpc.current_endpoint() {
             self.caches.set_leader_endpoint(normalize_endpoint(&endpoint));
         }
 
-        self.update_payload_hints(request, response);
+        self.update_payload_hints(request, response)
     }
 
-    fn update_payload_hints(&self, request: &RequestEnvelope, response: &ResponseEnvelope) {
+    fn update_payload_hints(&self, request: &RequestEnvelope, response: &ResponseEnvelope) -> bool {
         match (request, response) {
             (RequestEnvelope::GetFileLayoutByPath(req), ResponseEnvelope::GetFileLayoutByPath(resp)) => {
                 let path = req.path.clone();
+                let mut refreshed = resp.header.as_ref().and_then(|header| header.route_epoch).is_some()
+                    || !resp.locations.is_empty()
+                    || !resp.extents.is_empty();
                 if let Some(route_epoch) = resp.header.as_ref().and_then(|header| header.route_epoch) {
                     self.caches.record_route_epoch(&path, route_epoch);
                 }
                 let (workers, worker_epoch) = workers_from_layout(resp);
+                refreshed = refreshed || !workers.is_empty() || worker_epoch.is_some();
                 self.caches.record_worker_info(&path, workers, worker_epoch);
+                refreshed
             }
             (RequestEnvelope::OpenWriteByPath(req), ResponseEnvelope::OpenWriteByPath(resp)) => {
                 let path = req.path.clone();
+                let mut refreshed = resp.header.as_ref().and_then(|header| header.route_epoch).is_some()
+                    || resp.file_handle != 0
+                    || !resp.write_targets.is_empty();
                 if let Some(route_epoch) = resp.header.as_ref().and_then(|header| header.route_epoch) {
                     self.caches.record_route_epoch(&path, route_epoch);
                 }
                 let (workers, worker_epoch) = workers_from_open(resp);
+                refreshed = refreshed || !workers.is_empty() || worker_epoch.is_some();
                 self.caches.record_worker_info(&path, workers, worker_epoch);
                 self.caches
                     .upsert_session(WriteSessionState::from_open_request(req, resp));
+                refreshed
+            }
+            (RequestEnvelope::GetFileStatus(_), ResponseEnvelope::GetFileStatus(resp)) => {
+                resp.inode_id.is_some() || resp.attrs.is_some() || resp.inode.is_some()
             }
             (RequestEnvelope::CloseWriteSession(req), ResponseEnvelope::CloseWriteSession(_)) => {
                 self.caches.remove_session(req.file_handle);
+                true
             }
-            _ => {}
+            _ => false,
         }
     }
 
@@ -824,9 +842,9 @@ impl ActionMachine {
         match reason {
             RefreshReason::NotLeader => self.refresh_leader(canonical, request).await,
             RefreshReason::MountEpochMismatch => self.refresh_mount(canonical, request).await,
-            RefreshReason::RouteEpochMismatch => self.refresh_route(canonical, request).await,
+            RefreshReason::RouteEpochMismatch => self.refresh_layout_context(canonical, request).await,
             RefreshReason::WorkerEpochMismatch => self.refresh_worker(canonical, request).await,
-            _ => self.refresh_route(canonical, request).await,
+            _ => self.refresh_layout_context(canonical, request).await,
         }
     }
 
@@ -877,15 +895,26 @@ impl ActionMachine {
             .and_then(|hint| hint.leader_endpoint.clone())
             .or_else(|| self.caches.leader_endpoint())
             .or_else(|| self.next_metadata_endpoint());
+        let mut refreshed = false;
 
         if let Some(endpoint) = candidate {
             let endpoint = normalize_endpoint(&endpoint);
-            self.rpc.reconnect(&endpoint).await?;
-            self.caches.set_leader_endpoint(endpoint.clone());
+            if self.rpc.current_endpoint().as_deref() != Some(endpoint.as_str()) {
+                self.rpc.reconnect(&endpoint).await?;
+                self.caches.set_leader_endpoint(endpoint.clone());
+                refreshed = true;
+            }
         }
 
         if let Some(path) = request.path_hint(&self.caches.sessions) {
-            self.refresh_route_for_path(&path, request.header().cloned()).await?;
+            self.refresh_layout_for_path(&path, request.header().cloned()).await?;
+            refreshed = true;
+        }
+
+        if !refreshed {
+            return Err(ClientError::Metadata(
+                "leader refresh is unavailable without a new leader endpoint or path context".to_string(),
+            ));
         }
 
         Ok(())
@@ -898,18 +927,20 @@ impl ActionMachine {
             }
             self.refresh_status_for_path(&path, request.header().cloned()).await
         } else {
-            self.refresh_route(canonical, request).await
+            self.refresh_layout_context(canonical, request).await
         }
     }
 
-    async fn refresh_route(&self, canonical: &CanonicalError, request: &RequestEnvelope) -> ClientResult<()> {
+    async fn refresh_layout_context(&self, canonical: &CanonicalError, request: &RequestEnvelope) -> ClientResult<()> {
         if let Some(path) = request.path_hint(&self.caches.sessions) {
             if let Some(route_epoch) = canonical.refresh_hint.as_ref().and_then(|hint| hint.route_epoch) {
                 self.caches.record_route_epoch(&path, route_epoch);
             }
-            self.refresh_route_for_path(&path, request.header().cloned()).await
+            self.refresh_layout_for_path(&path, request.header().cloned()).await
         } else {
-            Ok(())
+            Err(ClientError::Metadata(
+                "route refresh is unavailable without path or session context".to_string(),
+            ))
         }
     }
 
@@ -932,9 +963,11 @@ impl ActionMachine {
                     return Ok(());
                 }
             }
-            self.refresh_route_for_path(&path, request.header().cloned()).await
+            self.refresh_layout_for_path(&path, request.header().cloned()).await
         } else {
-            Ok(())
+            Err(ClientError::Metadata(
+                "worker refresh is unavailable without path or session context".to_string(),
+            ))
         }
     }
 
@@ -950,7 +983,7 @@ impl ActionMachine {
         self.run_best_effort_refresh(request).await
     }
 
-    async fn refresh_route_for_path(
+    async fn refresh_layout_for_path(
         &self,
         path: &str,
         header_template: Option<RequestHeaderProto>,
@@ -983,19 +1016,54 @@ impl ActionMachine {
             }
         };
 
-        self.update_header_hints(&request, response.header());
-        self.update_payload_hints(&request, &response);
-
         match parse_rpc_envelope(Ok(()), response.header()) {
-            RpcEnvelope::Ok => Ok(()),
-            RpcEnvelope::CanonicalError(canonical) => {
-                if is_authz_denial(&canonical) {
-                    Err(ClientError::from(ClientAction::Fail { canonical }))
-                } else {
+            RpcEnvelope::Ok => {
+                let header_refreshed = self.update_header_hints(&request, response.header());
+                let payload_refreshed = self.update_payload_hints(&request, &response);
+                let refreshed = header_refreshed || payload_refreshed;
+                if refreshed {
                     Ok(())
+                } else {
+                    Err(ClientError::Metadata(format!(
+                        "{} refresh did not update or confirm a concrete cache/state/layout/endpoint result",
+                        response.op_name()
+                    )))
                 }
             }
+            RpcEnvelope::CanonicalError(canonical) => {
+                Err(self.refresh_canonical_error(&request, response.header(), canonical))
+            }
             RpcEnvelope::TransportError(status) => Err(ClientError::from(status)),
+        }
+    }
+
+    fn refresh_canonical_error(
+        &self,
+        request: &RequestEnvelope,
+        header: Option<&ResponseHeaderProto>,
+        canonical: CanonicalError,
+    ) -> ClientError {
+        if is_authz_denial(&canonical) {
+            return ClientError::from(ClientAction::Fail { canonical });
+        }
+
+        match canonical.class {
+            ErrorClass::NeedRefresh => {
+                let reason = canonical
+                    .reason
+                    .unwrap_or_else(|| refresh_reason_from_code(canonical.code.clone()));
+                ClientError::from(ClientAction::Refresh {
+                    reason,
+                    hint: self.build_refresh_hint(request, header, &canonical),
+                    canonical,
+                })
+            }
+            ErrorClass::Retryable => ClientError::from(ClientAction::Retry {
+                after_ms: canonical.retry_after_ms,
+                canonical,
+            }),
+            ErrorClass::Fatal => ClientError::from(ClientAction::Fail { canonical }),
+            ErrorClass::Ok => ClientError::Metadata("refresh returned canonical OK error state".to_string()),
         }
     }
 
@@ -1725,6 +1793,14 @@ mod tests {
         header
     }
 
+    fn ok_header_without_refresh_hints() -> ResponseHeaderProto {
+        let mut header = ok_header();
+        header.state.clear();
+        header.mount_epoch = None;
+        header.route_epoch = None;
+        header
+    }
+
     fn err_header(canonical: CanonicalError) -> ResponseHeaderProto {
         ResponseHeaderProto {
             client: Some(ClientInfoProto {
@@ -1855,6 +1931,110 @@ mod tests {
 
         let replay_header = calls[2].header().expect("replay header");
         assert_eq!(replay_header.route_epoch, Some(17));
+    }
+
+    #[tokio::test]
+    async fn refresh_layout_propagates_canonical_error_without_replay() {
+        let initial = CanonicalError::need_refresh_with_hint(
+            RpcErrorCode::RouteEpochMismatch,
+            RefreshReason::RouteEpochMismatch,
+            CanonicalRefreshHint {
+                route_epoch: Some(17),
+                ..Default::default()
+            },
+            "route epoch mismatch",
+        );
+        let refresh_error =
+            CanonicalError::need_refresh(RpcErrorCode::NotLeader, RefreshReason::NotLeader, "refresh not leader");
+
+        let rpc = Arc::new(ScriptedRpc::new(vec![
+            ScriptedResult::Response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+                header: Some(err_header(initial)),
+                ..Default::default()
+            })),
+            ScriptedResult::Response(ResponseEnvelope::GetFileLayoutByPath(
+                GetFileLayoutByPathResponseProto {
+                    header: Some(err_header(refresh_error)),
+                    ..Default::default()
+                },
+            )),
+            ScriptedResult::Response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+                header: Some(ok_header()),
+                ..Default::default()
+            })),
+        ]));
+
+        let machine = ActionMachine::new(rpc.clone(), vec![]);
+        let request = GetFileStatusRequestProto {
+            header: Some(request_header()),
+            path: "/mnt/route-refresh-error.bin".to_string(),
+        };
+
+        let err = call_machine(&machine, RpcOp::get_file_status(request))
+            .await
+            .expect_err("refresh canonical error must stop replay");
+
+        match err {
+            ClientError::Action(ClientAction::Refresh { reason, .. }) => {
+                assert_eq!(reason, RefreshReason::NotLeader);
+            }
+            other => panic!("expected refresh canonical error, got {:?}", other),
+        }
+
+        let calls = rpc.calls.lock().await;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].op_name(), "GetFileStatus");
+        assert_eq!(calls[1].op_name(), "GetFileLayoutByPath");
+    }
+
+    #[tokio::test]
+    async fn refresh_layout_rejects_success_response_without_concrete_refresh() {
+        let canonical = CanonicalError::need_refresh_with_hint(
+            RpcErrorCode::RouteEpochMismatch,
+            RefreshReason::RouteEpochMismatch,
+            CanonicalRefreshHint::default(),
+            "route epoch mismatch",
+        );
+
+        let rpc = Arc::new(ScriptedRpc::new(vec![
+            ScriptedResult::Response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+                header: Some(err_header(canonical)),
+                ..Default::default()
+            })),
+            ScriptedResult::Response(ResponseEnvelope::GetFileLayoutByPath(
+                GetFileLayoutByPathResponseProto {
+                    header: Some(ok_header_without_refresh_hints()),
+                    locations: Vec::new(),
+                    ..Default::default()
+                },
+            )),
+            ScriptedResult::Response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
+                header: Some(ok_header()),
+                ..Default::default()
+            })),
+        ]));
+
+        let machine = ActionMachine::new(rpc.clone(), vec![]);
+        let request = GetFileStatusRequestProto {
+            header: Some(request_header()),
+            path: "/mnt/route-refresh-empty.bin".to_string(),
+        };
+
+        let err = call_machine(&machine, RpcOp::get_file_status(request))
+            .await
+            .expect_err("empty refresh response must stop replay");
+
+        match err {
+            ClientError::Metadata(message) => {
+                assert!(message.contains("did not update or confirm"));
+            }
+            other => panic!("expected explicit no-op refresh error, got {:?}", other),
+        }
+
+        let calls = rpc.calls.lock().await;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].op_name(), "GetFileStatus");
+        assert_eq!(calls[1].op_name(), "GetFileLayoutByPath");
     }
 
     #[tokio::test]

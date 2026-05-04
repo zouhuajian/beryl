@@ -39,6 +39,6 @@ impl MsyncClient {
         }
 
         // Use MetadataClient's msync method
-        self.client.msync(ctx, false).await
+        self.client.msync(ctx).await
     }
 }

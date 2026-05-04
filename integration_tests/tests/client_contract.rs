@@ -12,15 +12,14 @@ use client::canonical::{
 };
 use client::config::ClientConfig;
 use client::error::ClientError;
-use common::{create_test_file_meta, init_logging, MockMetadataServer, MockWorkerServer};
-use proto::metadata::{MsyncRequestProto, RefreshRouteRequestProto};
+use common::{init_logging, MockMetadataServer, MockWorkerServer};
+use proto::metadata::MsyncRequestProto;
 use proto::worker::worker_data_service_server::WorkerDataService;
 use proto::worker::ReadChunkRequestProto;
 use proto::worker::{ChunkDataProto, ChunkSliceProto};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tonic::Request;
-use types::ids::DataHandleId;
 
 /// Test client initialization stays lightweight without contacting endpoints.
 #[tokio::test]
@@ -83,51 +82,12 @@ async fn test_direct_worker_read_version_mismatch() {
     assert!(status.message().contains("Version mismatch"));
 }
 
-/// Test GetFileMeta with mock metadata server.
-#[tokio::test]
-async fn test_get_file_meta_with_mock() {
-    init_logging();
-
-    let mock_server = MockMetadataServer::new(1, vec![2, 3]);
-    let data_handle_id = DataHandleId::new(100);
-    let file_meta = create_test_file_meta(100, 1, 1);
-    mock_server.add_file(data_handle_id, file_meta).await;
-
-    let retrieved: Option<proto::common::FileMetaProto> = mock_server.get_file(data_handle_id).await;
-    assert!(retrieved.is_some());
-    assert_eq!(retrieved.unwrap().data_handle_id, 100);
-}
-
-/// Test RefreshRoute with mock metadata server.
-#[tokio::test]
-async fn test_refresh_route_with_mock() {
-    init_logging();
-
-    use proto::metadata::metadata_route_service_proto_server::MetadataRouteServiceProto;
-
-    let mock_server = MockMetadataServer::new(1, vec![2, 3]);
-
-    let request = tonic::Request::new(RefreshRouteRequestProto {
-        header: None,
-        inode_id: None,
-    });
-
-    let response = <MockMetadataServer as MetadataRouteServiceProto>::refresh_route(&mock_server, request).await;
-    assert!(response.is_ok());
-    let resp = response.unwrap().into_inner();
-    assert_eq!(resp.route_epoch, 1);
-}
-
 /// Test Msync with mock metadata server.
 #[tokio::test]
 async fn test_msync_with_mock() {
     init_logging();
-    use proto::metadata::metadata_route_service_proto_server::MetadataRouteServiceProto;
 
     let mock_server = MockMetadataServer::new(1, vec![2, 3]);
-    let data_handle_id = DataHandleId::new(100);
-    let file_meta = create_test_file_meta(100, 1, 1);
-    mock_server.add_file(data_handle_id, file_meta).await;
 
     use proto::common::ClientInfoProto;
     use proto::common::RequestHeaderProto;
@@ -154,14 +114,21 @@ async fn test_msync_with_mock() {
 
     let request = tonic::Request::new(MsyncRequestProto {
         header: Some(header),
-        include_readable_followers: Some(false),
+        state: Some(proto::common::GroupStateWatermarkProto {
+            group_id: Some(proto::common::ShardGroupIdProto { value: 0 }),
+            state_id: Some(proto::common::RaftLogIdProto {
+                term: 0,
+                leader_node_id: 0,
+                index: 0,
+            }),
+        }),
     });
 
-    let response = <MockMetadataServer as MetadataRouteServiceProto>::msync(&mock_server, request).await;
+    let response = mock_server.msync(request).await;
     assert!(response.is_ok());
     let resp = response.unwrap().into_inner();
     assert!(resp.header.is_some());
-    assert_eq!(resp.readable_follower_ids.len(), 0);
+    assert!(resp.state.is_some());
 }
 
 /// Mount epoch mismatch should surface as NEED_REFRESH and be auto-retired after applying hints.

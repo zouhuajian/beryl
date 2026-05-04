@@ -11,8 +11,8 @@ mod core_util;
 pub mod domain;
 mod fs_core;
 mod guard;
+mod msync;
 mod path_service;
-mod route_service;
 
 // pub use client_service::MetadataClientServiceImpl;
 pub use self::auth::{
@@ -29,8 +29,8 @@ pub use core_util::{
 pub(crate) use fs_core::FsCore;
 pub use fs_core::SharedWorkerCommitHook;
 pub use guard::{GuardChain, GuardFailure, LeadershipChecker};
+pub use msync::MsyncHandler;
 pub use path_service::{
     FileSystemAuthorityDeps, FileSystemPolicyDeps, FileSystemRuntimeDeps, MetadataFileSystemServiceDeps,
     MetadataFileSystemServiceImpl,
 };
-pub use route_service::MetadataRouteServiceImpl;

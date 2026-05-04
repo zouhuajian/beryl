@@ -159,6 +159,7 @@ fn build_env(
             mount_table,
             storage: Arc::clone(&storage),
             raft_node: None,
+            shard_group_id: ShardGroupId::new(1),
         },
         runtime: FileSystemRuntimeDeps {
             write_session_manager,
@@ -250,6 +251,7 @@ async fn build_env_with_raft(
             mount_table,
             storage: Arc::clone(&storage),
             raft_node: Some(raft_node),
+            shard_group_id: ShardGroupId::new(1),
         },
         runtime: FileSystemRuntimeDeps {
             write_session_manager,

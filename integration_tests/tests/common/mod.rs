@@ -8,7 +8,7 @@ pub mod mock_metadata;
 pub mod mock_worker;
 
 pub use logging::init_logging;
-pub use mock_metadata::{create_test_file_meta, MockMetadataServer};
+pub use mock_metadata::MockMetadataServer;
 pub use mock_worker::MockWorkerServer;
 
 /// Create a temporary directory for integration tests.

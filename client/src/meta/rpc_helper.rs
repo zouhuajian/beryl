@@ -8,7 +8,7 @@
 //! - Group ID routing (path -> group_id)
 //! - State ID watermark management (group_id -> state_id cache)
 //! - Follower read selection
-//! - Error handling and retry (STALE_STATE -> Msync, NOT_LEADER -> refresh route)
+//! - Error handling and retry (STALE_STATE -> Msync, route refresh stays filesystem-owned)
 
 use crate::cache::StateIdCache;
 use crate::canonical::{retry_metadata_once, validate_header_or_action, RefreshDispatchContext, RetryOutcome};
@@ -24,10 +24,7 @@ use types::{GroupStateWatermark, RaftLogId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RefreshDispatchAction {
-    RefreshMountAndRoute,
-    RefreshRoute,
-    RefreshWorker,
-    RefreshFencing,
+    UnsupportedRouteRefresh,
     RefreshState,
 }
 
@@ -38,7 +35,7 @@ pub struct MetadataRpcHelper {
     /// Route table (path/data_handle_id -> group_id).
     route_table: Arc<RouteTable>,
     /// Group role cache (group_id -> leader/followers).
-    group_role: Arc<GroupRoleCache>,
+    _group_role: Arc<GroupRoleCache>,
     /// Metadata client.
     metadata_client: Arc<MetadataClient>,
 }
@@ -54,13 +51,13 @@ impl MetadataRpcHelper {
         Self {
             state_cache,
             route_table,
-            group_role,
+            _group_role: group_role,
             metadata_client,
         }
     }
 
     /// Resolve path to group_id.
-    /// Returns None if path cannot be resolved (need to call GetRouteTable first).
+    /// Returns None if path cannot be resolved by the local route cache.
     pub fn resolve_path_to_group(&self, _path: &str) -> Option<ShardGroupId> {
         // TODO: Implement path -> data_handle_id -> group_id resolution
         // For now, return None to indicate need for route table refresh
@@ -121,16 +118,8 @@ impl MetadataRpcHelper {
 
     fn refresh_action_for_reason(reason: RefreshReason) -> RefreshDispatchAction {
         match reason {
-            RefreshReason::MountEpochMismatch => RefreshDispatchAction::RefreshMountAndRoute,
-            RefreshReason::RouteEpochMismatch | RefreshReason::NotLeader => RefreshDispatchAction::RefreshRoute,
-            RefreshReason::WorkerEpochMismatch => RefreshDispatchAction::RefreshWorker,
-            RefreshReason::Fencing | RefreshReason::SessionInvalid | RefreshReason::SessionExpired => {
-                RefreshDispatchAction::RefreshFencing
-            }
-            RefreshReason::StaleState | RefreshReason::BlockStampMismatch | RefreshReason::EpochMismatch => {
-                RefreshDispatchAction::RefreshState
-            }
-            _ => RefreshDispatchAction::RefreshRoute,
+            RefreshReason::StaleState => RefreshDispatchAction::RefreshState,
+            _ => RefreshDispatchAction::UnsupportedRouteRefresh,
         }
     }
 
@@ -167,28 +156,8 @@ impl MetadataRpcHelper {
         }
 
         match action {
-            RefreshDispatchAction::RefreshMountAndRoute => {
-                // TODO(ERR-4): replace route refresh fallback with dedicated mount-table refresh
-                // once a mount refresh API is available on the metadata service.
-                self.refresh_route_table(base_header).await?;
-            }
-            RefreshDispatchAction::RefreshRoute => {
-                self.refresh_route_table(base_header).await?;
-            }
-            RefreshDispatchAction::RefreshWorker => {
-                // Best available worker metadata refresh in metadata-plane helper.
-                self.refresh_route_table(base_header).await?;
-            }
-            RefreshDispatchAction::RefreshFencing => {
-                if let Some(gid) = next_header.group_id {
-                    self.msync_group(
-                        base_header,
-                        ShardGroupId::new(gid),
-                        next_header.state.first().map(|w| w.state_id),
-                    )
-                    .await?;
-                }
-                self.refresh_route_table(base_header).await?;
+            RefreshDispatchAction::UnsupportedRouteRefresh => {
+                self.fail_route_refresh_without_context(base_header).await?;
             }
             RefreshDispatchAction::RefreshState => {
                 if let Some(gid) = next_header.group_id {
@@ -199,7 +168,7 @@ impl MetadataRpcHelper {
                     )
                     .await?;
                 } else {
-                    self.refresh_route_table(base_header).await?;
+                    self.fail_route_refresh_without_context(base_header).await?;
                 }
             }
         }
@@ -257,7 +226,7 @@ impl MetadataRpcHelper {
         }
 
         // Use MetadataClient's msync method directly
-        let response = self.metadata_client.msync(&header, false).await?;
+        let response = self.metadata_client.msync(&header).await?;
 
         let resp_header = response
             .header
@@ -266,39 +235,34 @@ impl MetadataRpcHelper {
             .try_into()
             .map_err(|e| ClientError::Metadata(format!("Failed to parse response header: {}", e)))?;
         self.handle_response_header(&resp_header)?;
+        let response_state: GroupStateWatermark = response
+            .state
+            .ok_or_else(|| ClientError::Metadata("MsyncResponseProto missing state".to_string()))?
+            .try_into()
+            .map_err(|e| ClientError::Metadata(format!("Failed to parse msync response state: {}", e)))?;
+        if response_state.group_id != group_id {
+            return Err(ClientError::Metadata(format!(
+                "MsyncResponseProto state group_id {} does not match requested group_id {}",
+                response_state.group_id.as_raw(),
+                group_id.as_raw()
+            )));
+        }
+        let previous = self.state_cache.get(&group_id);
+        self.state_cache.update_if_ahead(response_state);
+        if self.state_cache.get(&group_id) == previous {
+            return Err(ClientError::Metadata(
+                "Msync did not advance the client state cache".to_string(),
+            ));
+        }
 
         Ok(())
     }
 
-    /// Refresh route table from metadata service.
-    pub async fn refresh_route_table(&self, base_header: &RequestHeader) -> ClientResult<()> {
-        let header = base_header.child();
-        let response = self.metadata_client.get_route_table(&header).await?;
-
-        let resp_header = response
-            .header
-            .ok_or_else(|| ClientError::Metadata("Missing response header".to_string()))?;
-        let resp_header: ResponseHeader = resp_header
-            .try_into()
-            .map_err(|e| ClientError::Metadata(format!("Failed to parse response header: {}", e)))?;
-        self.handle_response_header(&resp_header)?;
-
-        let route_epoch = response.route_epoch;
-        self.route_table
-            .update_from_route_table(route_epoch, response.shard_to_group);
-
-        // Update group role cache
-        for (group_id_raw, leader_id) in &response.group_to_leader {
-            let group_id = ShardGroupId::new(*group_id_raw);
-            let followers = response
-                .group_to_followers
-                .get(group_id_raw)
-                .map(|nl| nl.node_ids.clone())
-                .unwrap_or_default();
-            self.group_role.update(group_id, Some(*leader_id), followers);
-        }
-
-        Ok(())
+    /// Route-cache refresh is unavailable without a FileSystemService operation-specific path.
+    pub async fn fail_route_refresh_without_context(&self, _base_header: &RequestHeader) -> ClientResult<()> {
+        Err(ClientError::Metadata(
+            "route cache refresh is unavailable without operation context".to_string(),
+        ))
     }
 }
 
@@ -311,9 +275,7 @@ mod tests {
     use common::error::canonical::CanonicalError;
     use common::header::RequestHeader;
     use common::header::{ClientInfo, ResponseHeader, RpcErrorCode};
-    use proto::metadata::metadata_route_service_proto_server::{
-        MetadataRouteServiceProto, MetadataRouteServiceProtoServer,
-    };
+    use proto::metadata::file_system_service_proto_server::{FileSystemServiceProto, FileSystemServiceProtoServer};
     use proto::metadata::*;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -324,8 +286,166 @@ mod tests {
     use types::ids::ShardGroupId;
     use types::ClientId;
 
+    macro_rules! impl_test_filesystem_service {
+        ($ty:ty) => {
+            #[tonic::async_trait]
+            impl FileSystemServiceProto for $ty {
+                async fn get_file_status(
+                    &self,
+                    _request: Request<GetFileStatusRequestProto>,
+                ) -> Result<Response<GetFileStatusResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn mkdir(
+                    &self,
+                    _request: Request<MkdirPathRequestProto>,
+                ) -> Result<Response<MkdirPathResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn create(
+                    &self,
+                    _request: Request<CreatePathRequestProto>,
+                ) -> Result<Response<CreatePathResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn delete(
+                    &self,
+                    _request: Request<DeleteRequestProto>,
+                ) -> Result<Response<DeleteResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn rename(
+                    &self,
+                    _request: Request<RenamePathRequestProto>,
+                ) -> Result<Response<RenamePathResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn list_status(
+                    &self,
+                    _request: Request<ListStatusPathRequestProto>,
+                ) -> Result<Response<ListStatusPathResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn open(
+                    &self,
+                    _request: Request<OpenPathRequestProto>,
+                ) -> Result<Response<OpenPathResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn release(
+                    &self,
+                    _request: Request<ReleasePathRequestProto>,
+                ) -> Result<Response<ReleasePathResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn fsync(
+                    &self,
+                    _request: Request<FsyncPathRequestProto>,
+                ) -> Result<Response<FsyncPathResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn hsync(
+                    &self,
+                    _request: Request<HsyncPathRequestProto>,
+                ) -> Result<Response<HsyncPathResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn hflush(
+                    &self,
+                    _request: Request<HflushPathRequestProto>,
+                ) -> Result<Response<HflushPathResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn truncate(
+                    &self,
+                    _request: Request<TruncatePathRequestProto>,
+                ) -> Result<Response<TruncatePathResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn set_xattr(
+                    &self,
+                    _request: Request<SetXattrPathRequestProto>,
+                ) -> Result<Response<SetXattrPathResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn get_xattr(
+                    &self,
+                    _request: Request<GetXattrPathRequestProto>,
+                ) -> Result<Response<GetXattrPathResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn list_xattr(
+                    &self,
+                    _request: Request<ListXattrPathRequestProto>,
+                ) -> Result<Response<ListXattrPathResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn remove_xattr(
+                    &self,
+                    _request: Request<RemoveXattrPathRequestProto>,
+                ) -> Result<Response<RemoveXattrPathResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn get_file_layout_by_path(
+                    &self,
+                    _request: Request<GetFileLayoutByPathRequestProto>,
+                ) -> Result<Response<GetFileLayoutByPathResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn open_write_by_path(
+                    &self,
+                    _request: Request<OpenWriteByPathRequestProto>,
+                ) -> Result<Response<OpenWriteByPathResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn close_write_session(
+                    &self,
+                    _request: Request<CloseWriteSessionRequestProto>,
+                ) -> Result<Response<CloseWriteSessionResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn renew_write_session_lease(
+                    &self,
+                    _request: Request<RenewWriteSessionLeaseRequestProto>,
+                ) -> Result<Response<RenewWriteSessionLeaseResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn fsync_session(
+                    &self,
+                    _request: Request<FsyncSessionRequestProto>,
+                ) -> Result<Response<FsyncSessionResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn hsync_session(
+                    &self,
+                    _request: Request<HsyncSessionRequestProto>,
+                ) -> Result<Response<HsyncSessionResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn hflush_session(
+                    &self,
+                    _request: Request<HflushSessionRequestProto>,
+                ) -> Result<Response<HflushSessionResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn release_session(
+                    &self,
+                    _request: Request<ReleaseSessionRequestProto>,
+                ) -> Result<Response<ReleaseSessionResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn msync(
+                    &self,
+                    request: Request<MsyncRequestProto>,
+                ) -> Result<Response<MsyncResponseProto>, Status> {
+                    self.handle_msync(request).await
+                }
+            }
+        };
+    }
+
     #[derive(Clone, Default)]
-    struct MockRouteService;
+    struct MockFileSystemService;
 
     fn error_header(group_id: Option<u64>) -> proto::common::ResponseHeaderProto {
         let canonical = CanonicalError::need_refresh(
@@ -343,23 +463,11 @@ mod tests {
         (&header).into()
     }
 
-    #[tonic::async_trait]
-    impl MetadataRouteServiceProto for MockRouteService {
-        async fn get_file_meta(
+    impl MockFileSystemService {
+        async fn handle_msync(
             &self,
-            _request: Request<GetFileMetaRequestProto>,
-        ) -> Result<Response<GetFileMetaResponseProto>, Status> {
-            Err(Status::unimplemented("not implemented"))
-        }
-
-        async fn refresh_route(
-            &self,
-            _request: Request<RefreshRouteRequestProto>,
-        ) -> Result<Response<RefreshRouteResponseProto>, Status> {
-            Err(Status::unimplemented("not implemented"))
-        }
-
-        async fn msync(&self, request: Request<MsyncRequestProto>) -> Result<Response<MsyncResponseProto>, Status> {
+            request: Request<MsyncRequestProto>,
+        ) -> Result<Response<MsyncResponseProto>, Status> {
             let req = request.into_inner();
             let group_id = req
                 .header
@@ -367,30 +475,18 @@ mod tests {
                 .and_then(|h| if h.group_id != 0 { Some(h.group_id) } else { None });
             Ok(Response::new(MsyncResponseProto {
                 header: Some(error_header(group_id)),
-                readable_follower_ids: vec![],
-            }))
-        }
-
-        async fn get_route_table(
-            &self,
-            _request: Request<GetRouteTableRequestProto>,
-        ) -> Result<Response<GetRouteTableResponseProto>, Status> {
-            Ok(Response::new(GetRouteTableResponseProto {
-                header: Some(error_header(None)),
-                route_epoch: 42,
-                shard_to_group: Default::default(),
-                group_to_leader: Default::default(),
-                group_to_followers: Default::default(),
+                state: None,
             }))
         }
     }
+    impl_test_filesystem_service!(MockFileSystemService);
 
     async fn start_mock_server() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             Server::builder()
-                .add_service(MetadataRouteServiceProtoServer::new(MockRouteService::default()))
+                .add_service(FileSystemServiceProtoServer::new(MockFileSystemService))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
@@ -399,12 +495,11 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct DispatchRouteService {
-        route_calls: Arc<AtomicUsize>,
+    struct DispatchFileSystemService {
         msync_calls: Arc<AtomicUsize>,
     }
 
-    impl DispatchRouteService {
+    impl DispatchFileSystemService {
         fn ok_header(group_id: Option<u64>) -> proto::common::ResponseHeaderProto {
             let header = if let Some(gid) = group_id {
                 ResponseHeader::ok(ClientInfo::new(ClientId::new(1))).with_group_id(gid)
@@ -415,56 +510,41 @@ mod tests {
         }
     }
 
-    #[tonic::async_trait]
-    impl MetadataRouteServiceProto for DispatchRouteService {
-        async fn get_file_meta(
+    impl DispatchFileSystemService {
+        async fn handle_msync(
             &self,
-            _request: Request<GetFileMetaRequestProto>,
-        ) -> Result<Response<GetFileMetaResponseProto>, Status> {
-            Err(Status::unimplemented("not implemented"))
-        }
-
-        async fn refresh_route(
-            &self,
-            _request: Request<RefreshRouteRequestProto>,
-        ) -> Result<Response<RefreshRouteResponseProto>, Status> {
-            Err(Status::unimplemented("not implemented"))
-        }
-
-        async fn msync(&self, request: Request<MsyncRequestProto>) -> Result<Response<MsyncResponseProto>, Status> {
+            request: Request<MsyncRequestProto>,
+        ) -> Result<Response<MsyncResponseProto>, Status> {
             self.msync_calls.fetch_add(1, Ordering::SeqCst);
             let req = request.into_inner();
             let group_id = req
                 .header
                 .as_ref()
                 .and_then(|h| if h.group_id != 0 { Some(h.group_id) } else { None });
+            let state = req.state.or_else(|| {
+                group_id.map(|gid| proto::common::GroupStateWatermarkProto {
+                    group_id: Some(proto::common::ShardGroupIdProto { value: gid }),
+                    state_id: Some(proto::common::RaftLogIdProto {
+                        term: 1,
+                        leader_node_id: 1,
+                        index: 1,
+                    }),
+                })
+            });
             Ok(Response::new(MsyncResponseProto {
                 header: Some(Self::ok_header(group_id)),
-                readable_follower_ids: vec![],
-            }))
-        }
-
-        async fn get_route_table(
-            &self,
-            _request: Request<GetRouteTableRequestProto>,
-        ) -> Result<Response<GetRouteTableResponseProto>, Status> {
-            self.route_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Response::new(GetRouteTableResponseProto {
-                header: Some(Self::ok_header(None)),
-                route_epoch: 99,
-                shard_to_group: Default::default(),
-                group_to_leader: Default::default(),
-                group_to_followers: Default::default(),
+                state,
             }))
         }
     }
+    impl_test_filesystem_service!(DispatchFileSystemService);
 
-    async fn start_dispatch_server(service: DispatchRouteService) -> SocketAddr {
+    async fn start_dispatch_server(service: DispatchFileSystemService) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             Server::builder()
-                .add_service(MetadataRouteServiceProtoServer::new(service))
+                .add_service(FileSystemServiceProtoServer::new(service))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
@@ -493,23 +573,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_refresh_route_table_fails_on_header_error() {
+    async fn test_route_refresh_without_context_returns_error() {
         let addr = start_mock_server().await;
         let endpoint = format!("http://{}", addr);
         let helper = build_helper(&endpoint).await;
 
         let base_header = RequestHeader::new(ClientId::new(1));
-        let result = helper.refresh_route_table(&base_header).await;
+        let result = helper.fail_route_refresh_without_context(&base_header).await;
         assert!(result.is_err());
         assert_eq!(helper.route_table.route_epoch(), 0);
     }
 
     #[tokio::test]
-    async fn test_dispatch_refresh_mount_epoch_uses_route_refresh() {
-        let route_calls = Arc::new(AtomicUsize::new(0));
+    async fn test_dispatch_refresh_mount_epoch_returns_explicit_unavailable_error() {
         let msync_calls = Arc::new(AtomicUsize::new(0));
-        let service = DispatchRouteService {
-            route_calls: route_calls.clone(),
+        let service = DispatchFileSystemService {
             msync_calls: msync_calls.clone(),
         };
 
@@ -528,7 +606,7 @@ mod tests {
             ResponseHeader::from_canonical(base_header.client.clone(), canonical.clone()).with_group_id(9);
         response_header.mount_epoch = Some(42);
 
-        let next_header = helper
+        let result = helper
             .dispatch_refresh(
                 &base_header,
                 current_header,
@@ -543,20 +621,16 @@ mod tests {
                     response_header,
                 },
             )
-            .await
-            .expect("mount refresh dispatch");
+            .await;
 
-        assert_eq!(next_header.mount_epoch, Some(42));
-        assert_eq!(route_calls.load(Ordering::SeqCst), 1);
+        assert!(result.is_err());
         assert_eq!(msync_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn test_dispatch_refresh_not_leader_uses_route_refresh() {
-        let route_calls = Arc::new(AtomicUsize::new(0));
+    async fn test_dispatch_refresh_not_leader_returns_explicit_unavailable_error() {
         let msync_calls = Arc::new(AtomicUsize::new(0));
-        let service = DispatchRouteService {
-            route_calls: route_calls.clone(),
+        let service = DispatchFileSystemService {
             msync_calls: msync_calls.clone(),
         };
 
@@ -570,7 +644,7 @@ mod tests {
         let response_header =
             ResponseHeader::from_canonical(base_header.client.clone(), canonical.clone()).with_group_id(7);
 
-        let _ = helper
+        let result = helper
             .dispatch_refresh(
                 &base_header,
                 current_header,
@@ -584,19 +658,57 @@ mod tests {
                     response_header,
                 },
             )
-            .await
-            .expect("route refresh dispatch");
+            .await;
 
-        assert_eq!(route_calls.load(Ordering::SeqCst), 1);
+        assert!(result.is_err());
+        assert_eq!(msync_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_refresh_block_stamp_returns_explicit_unavailable_error_without_msync() {
+        let msync_calls = Arc::new(AtomicUsize::new(0));
+        let service = DispatchFileSystemService {
+            msync_calls: msync_calls.clone(),
+        };
+
+        let addr = start_dispatch_server(service).await;
+        let endpoint = format!("http://{}", addr);
+        let helper = build_helper(&endpoint).await;
+
+        let base_header = RequestHeader::new(ClientId::new(1)).with_group_id(8);
+        let current_header = base_header.child_with_same_call_id();
+        let canonical = CanonicalError::need_refresh(
+            RpcErrorCode::BlockStampMismatch,
+            RefreshReason::BlockStampMismatch,
+            "block stamp mismatch",
+        );
+        let response_header =
+            ResponseHeader::from_canonical(base_header.client.clone(), canonical.clone()).with_group_id(8);
+
+        let result = helper
+            .dispatch_refresh(
+                &base_header,
+                current_header,
+                RefreshDispatchContext {
+                    reason: RefreshReason::BlockStampMismatch,
+                    hint: crate::canonical::RefreshHint {
+                        group_id: Some(8),
+                        ..Default::default()
+                    },
+                    canonical,
+                    response_header,
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
         assert_eq!(msync_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn test_dispatch_refresh_stale_state_uses_msync() {
-        let route_calls = Arc::new(AtomicUsize::new(0));
         let msync_calls = Arc::new(AtomicUsize::new(0));
-        let service = DispatchRouteService {
-            route_calls: route_calls.clone(),
+        let service = DispatchFileSystemService {
             msync_calls: msync_calls.clone(),
         };
 
@@ -630,7 +742,6 @@ mod tests {
             .await
             .expect("stale state dispatch");
 
-        assert_eq!(route_calls.load(Ordering::SeqCst), 0);
         assert_eq!(msync_calls.load(Ordering::SeqCst), 1);
     }
 }

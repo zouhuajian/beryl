@@ -17,6 +17,7 @@ use super::domain::{
     UnlinkInput,
 };
 use super::guard::{GuardChain, GuardFailure, LeadershipChecker};
+use super::MsyncHandler;
 use super::{
     extent_from_proto, extent_to_proto, fencing_to_proto, file_attrs_from_proto, file_attrs_to_proto,
     file_layout_from_proto, header_from_canonical_error, header_from_core_failure, lease_id_from_proto,
@@ -39,6 +40,7 @@ pub struct MetadataFileSystemServiceImpl {
     path_resolver: PathResolver,
     fs_core: Arc<FsCore>,
     guard_chain: GuardChain,
+    msync: Option<MsyncHandler>,
     _metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
 }
 
@@ -76,6 +78,7 @@ pub struct FileSystemAuthorityDeps {
     pub mount_table: Arc<MountTable>,
     pub storage: Arc<RocksDBStorage>,
     pub raft_node: Option<Arc<crate::raft::AppRaftNode>>,
+    pub shard_group_id: types::ids::ShardGroupId,
 }
 
 pub struct FileSystemRuntimeDeps {
@@ -104,6 +107,7 @@ impl MetadataFileSystemServiceImpl {
             mount_table,
             storage,
             raft_node,
+            shard_group_id,
         } = authority;
         let FileSystemRuntimeDeps {
             write_session_manager,
@@ -147,11 +151,15 @@ impl MetadataFileSystemServiceImpl {
             .with_readiness_gate(readiness_gate)
             .with_leadership_checker(leadership_checker)
             .with_permission_checker(permission_checker);
+        let msync = raft_node
+            .as_ref()
+            .map(|raft_node| MsyncHandler::new(Arc::clone(raft_node), shard_group_id));
 
         Self {
             path_resolver,
             fs_core,
             guard_chain,
+            msync,
             _metrics: metrics,
         }
     }
@@ -181,6 +189,15 @@ impl MetadataFileSystemServiceImpl {
 
 #[tonic::async_trait]
 impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
+    async fn msync(&self, request: Request<MsyncRequestProto>) -> Result<Response<MsyncResponseProto>, Status> {
+        let req = request.into_inner();
+        let response = match self.msync.as_ref() {
+            Some(msync) => msync.handle(req),
+            None => MsyncHandler::unavailable(req),
+        };
+        Ok(Response::new(response))
+    }
+
     #[instrument(skip(self), fields(call_id, client_id))]
     async fn get_file_status(
         &self,
