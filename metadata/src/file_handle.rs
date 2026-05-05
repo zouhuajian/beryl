@@ -73,7 +73,7 @@ impl FileHandleManager {
 
         // Add to file_to_handles map
         let mut file_map = self.file_to_handles.write();
-        file_map.entry(data_handle_id).or_insert_with(Vec::new).push(handle);
+        file_map.entry(data_handle_id).or_default().push(handle);
 
         handle
     }

@@ -29,6 +29,8 @@ impl DeleteIntentBuilder {
     /// Build a DeleteIntent with all required fields.
     ///
     /// Returns error if router is not available or resolution fails (fail-closed).
+    // Delete intent creation persists explicit guard fields; an args wrapper adds no domain value.
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         &self,
         intent_id: u64,

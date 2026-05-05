@@ -43,6 +43,12 @@ pub struct TaskGate {
     last_success_ts: u64,
 }
 
+impl Default for TaskGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TaskGate {
     pub fn new() -> Self {
         Self {

@@ -430,7 +430,7 @@ impl DeleteExecutor {
                     // Add to batch
                     worker_commands
                         .entry(*worker_id)
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push((*intent_id, intent.block_id));
                 }
             }
@@ -521,7 +521,7 @@ impl DeleteExecutor {
         // Group by intent_id (for batching)
         let mut intent_blocks: HashMap<u64, Vec<BlockId>> = HashMap::new();
         for (intent_id, block_id) in blocks_to_evict.into_iter().take(max) {
-            intent_blocks.entry(intent_id).or_insert_with(Vec::new).push(block_id);
+            intent_blocks.entry(intent_id).or_default().push(block_id);
         }
 
         // Generate commands
@@ -595,7 +595,7 @@ impl DeleteExecutor {
                 blocks: block_ids_proto
                     .iter()
                     .map(|proto_bid| proto::metadata::DeleteBlockRequestProto {
-                        block_id: Some(proto_bid.clone()),
+                        block_id: Some(*proto_bid),
                         expected_state: String::new(), // TODO: Add expected state check
                     })
                     .collect(),
@@ -685,7 +685,7 @@ impl DeleteExecutor {
                         exec_state.acked_workers.insert(worker_id);
 
                         // Check completion condition (ack only, no reconcile yet)
-                        completed = self.check_ack_completion(&exec_state);
+                        completed = self.check_ack_completion(exec_state);
                     }
                 }
 
@@ -800,7 +800,7 @@ impl DeleteExecutor {
                             {
                                 let mut worker_inflight = self.worker_inflight.write();
                                 let mut block_inflight = self.block_inflight.write();
-                                if let Some(in_flight) = worker_inflight.get_mut(&target_worker) {
+                                if let Some(in_flight) = worker_inflight.get_mut(target_worker) {
                                     in_flight.count = in_flight.count.saturating_sub(1);
                                     in_flight.blocks.remove(&block_id);
                                 }
@@ -885,7 +885,7 @@ impl DeleteExecutor {
                         let mut state = self.execution_state.write();
                         if let Some(exec_state) = state.get_mut(&intent_id) {
                             exec_state.acked_workers.insert(worker_id);
-                            ack_completed = self.check_ack_completion(&exec_state);
+                            ack_completed = self.check_ack_completion(exec_state);
                         }
                     }
 

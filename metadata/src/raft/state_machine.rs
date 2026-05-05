@@ -53,6 +53,9 @@ struct PreparedRename {
     updated_src_inode: Inode,
 }
 
+type PreparedUnlink = (InodeId, Option<DataHandleId>, Inode, Vec<BlockId>, FsOkResult);
+type PreparedCloseWrite = (Inode, FileLayout, Vec<BlockId>, Vec<BlockId>, u64, FsOkResult);
+
 impl AppRaftStateMachine {
     pub fn new(storage: Arc<RocksDBStorage>, mount_table: Arc<MountTable>) -> Self {
         Self {
@@ -88,11 +91,9 @@ impl AppRaftStateMachine {
 
         // Apply command
         match command {
-            Command::UpdateCommittedLength { .. } => {
-                return Err(MetadataError::InvalidArgument(
-                    "Legacy file-based commands are no longer supported. Use inode-based commands instead.".to_string(),
-                ));
-            }
+            Command::UpdateCommittedLength { .. } => Err(MetadataError::InvalidArgument(
+                "Legacy file-based commands are no longer supported. Use inode-based commands instead.".to_string(),
+            )),
             Command::AllocateBlock {
                 inode_id,
                 block_id,
@@ -100,15 +101,15 @@ impl AppRaftStateMachine {
                 ..
             } => {
                 let result = self.apply_allocate_block(inode_id, block_id, placement, &dedup_key, fingerprint)?;
-                return Ok(AppDataResponse::Block(result));
+                Ok(AppDataResponse::Block(result))
             }
             Command::CommitBlock { block_id, token, .. } => {
                 let result = self.apply_commit_block(block_id, token, &dedup_key, fingerprint)?;
-                return Ok(AppDataResponse::Block(result));
+                Ok(AppDataResponse::Block(result))
             }
             Command::UpdateBlockState { block_id, state, .. } => {
                 let result = self.apply_update_block_state(block_id, state, &dedup_key, fingerprint)?;
-                return Ok(AppDataResponse::Block(result));
+                Ok(AppDataResponse::Block(result))
             }
             Command::AcquireLease {
                 block_id,
@@ -119,11 +120,11 @@ impl AppRaftStateMachine {
             } => {
                 let result =
                     self.apply_acquire_lease(block_id, client_id, epoch, expires_at_ms, &dedup_key, fingerprint)?;
-                return Ok(AppDataResponse::Lease(result));
+                Ok(AppDataResponse::Lease(result))
             }
             Command::ReleaseLease { block_id, .. } => {
                 let result = self.apply_release_lease(block_id, &dedup_key, fingerprint)?;
-                return Ok(AppDataResponse::Lease(result));
+                Ok(AppDataResponse::Lease(result))
             }
             Command::CreateMount {
                 mount_id,
@@ -146,11 +147,11 @@ impl AppRaftStateMachine {
                     &dedup_key,
                     fingerprint,
                 )?;
-                return Ok(AppDataResponse::Mount(result));
+                Ok(AppDataResponse::Mount(result))
             }
             Command::DeleteMount { mount_id, .. } => {
                 let result = self.apply_delete_mount(mount_id, &dedup_key, fingerprint)?;
-                return Ok(AppDataResponse::Mount(result));
+                Ok(AppDataResponse::Mount(result))
             }
             Command::AddShardGroup {
                 shard_group_id,
@@ -160,7 +161,7 @@ impl AppRaftStateMachine {
             } => {
                 let result =
                     self.apply_add_shard_group(shard_group_id, shard_ids, initial_members, &dedup_key, fingerprint)?;
-                return Ok(AppDataResponse::ShardGroup(result));
+                Ok(AppDataResponse::ShardGroup(result))
             }
             Command::RegisterWorker {
                 identity,
@@ -179,15 +180,15 @@ impl AppRaftStateMachine {
                     &dedup_key,
                     fingerprint,
                 )?;
-                return Ok(AppDataResponse::Worker(result));
+                Ok(AppDataResponse::Worker(result))
             }
             Command::CreateDeleteIntents { intents, .. } => {
                 let result = self.apply_create_delete_intents(intents, &dedup_key, fingerprint)?;
-                return Ok(AppDataResponse::DeleteIntents(result));
+                Ok(AppDataResponse::DeleteIntents(result))
             }
             Command::AllocateDeleteIntents { intents, .. } => {
                 let result = self.apply_allocate_delete_intents(intents, &dedup_key, fingerprint)?;
-                return Ok(AppDataResponse::DeleteIntents(result));
+                Ok(AppDataResponse::DeleteIntents(result))
             }
             Command::UpdateDeleteIntentStatus {
                 intent_id,
@@ -204,7 +205,7 @@ impl AppRaftStateMachine {
                     &dedup_key,
                     fingerprint,
                 )?;
-                return Ok(AppDataResponse::DeleteIntentStatus(result));
+                Ok(AppDataResponse::DeleteIntentStatus(result))
             }
             Command::Mkdir {
                 parent_inode_id,
@@ -214,7 +215,7 @@ impl AppRaftStateMachine {
             } => {
                 // Create/mkdir/rename persist namespace mutation, replay result together.
                 let result = self.apply_mkdir(parent_inode_id, name, attrs, &dedup_key, fingerprint)?;
-                return Ok(AppDataResponse::Fs(result));
+                Ok(AppDataResponse::Fs(result))
             }
             Command::Create {
                 parent_inode_id,
@@ -224,19 +225,19 @@ impl AppRaftStateMachine {
                 ..
             } => {
                 let result = self.apply_create(parent_inode_id, name, attrs, layout, &dedup_key, fingerprint)?;
-                return Ok(AppDataResponse::Fs(result));
+                Ok(AppDataResponse::Fs(result))
             }
             Command::Unlink {
                 parent_inode_id, name, ..
             } => {
                 let result = self.apply_unlink(parent_inode_id, name, &dedup_key, fingerprint)?;
-                return Ok(AppDataResponse::Fs(result));
+                Ok(AppDataResponse::Fs(result))
             }
             Command::Rmdir {
                 parent_inode_id, name, ..
             } => {
                 let result = self.apply_rmdir(parent_inode_id, name, &dedup_key, fingerprint)?;
-                return Ok(AppDataResponse::Fs(result));
+                Ok(AppDataResponse::Fs(result))
             }
             Command::Rename {
                 src_parent_inode_id,
@@ -255,13 +256,13 @@ impl AppRaftStateMachine {
                     &dedup_key,
                     fingerprint,
                 )?;
-                return Ok(AppDataResponse::Fs(result));
+                Ok(AppDataResponse::Fs(result))
             }
             Command::SetAttr {
                 inode_id, mask, attrs, ..
             } => {
                 let result = self.apply_set_attr(inode_id, mask, attrs, &dedup_key, fingerprint)?;
-                return Ok(AppDataResponse::Fs(result));
+                Ok(AppDataResponse::Fs(result))
             }
             Command::CloseWrite {
                 inode_id,
@@ -284,7 +285,7 @@ impl AppRaftStateMachine {
                     &dedup_key,
                     fingerprint,
                 )?;
-                return Ok(AppDataResponse::Fs(result));
+                Ok(AppDataResponse::Fs(result))
             }
             Command::Truncate {
                 inode_id,
@@ -294,7 +295,7 @@ impl AppRaftStateMachine {
                 ..
             } => {
                 let result = self.apply_truncate(inode_id, new_size, lease_id, lease_epoch, &dedup_key, fingerprint)?;
-                return Ok(AppDataResponse::Fs(result));
+                Ok(AppDataResponse::Fs(result))
             }
             Command::SetXattr {
                 inode_id,
@@ -305,11 +306,11 @@ impl AppRaftStateMachine {
                 ..
             } => {
                 let result = self.apply_set_xattr(inode_id, name, value, create, replace, &dedup_key, fingerprint)?;
-                return Ok(AppDataResponse::Fs(result));
+                Ok(AppDataResponse::Fs(result))
             }
             Command::RemoveXattr { inode_id, name, .. } => {
                 let result = self.apply_remove_xattr(inode_id, name, &dedup_key, fingerprint)?;
-                return Ok(AppDataResponse::Fs(result));
+                Ok(AppDataResponse::Fs(result))
             }
         }
     }
@@ -494,6 +495,8 @@ impl AppRaftStateMachine {
         Ok(result)
     }
 
+    // Raft apply helpers mirror command payload fields for replay clarity.
+    #[allow(clippy::too_many_arguments)]
     fn apply_create_mount(
         &self,
         mount_id: MountId,
@@ -727,6 +730,8 @@ impl AppRaftStateMachine {
         Ok(info)
     }
 
+    // Raft apply helpers mirror command payload fields for replay clarity.
+    #[allow(clippy::too_many_arguments)]
     fn apply_register_worker(
         &self,
         identity: String,
@@ -1130,7 +1135,7 @@ impl AppRaftStateMachine {
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
     ) -> MetadataResult<FsCommandResult> {
-        let prepared: MetadataResult<(InodeId, Option<DataHandleId>, Inode, Vec<BlockId>, FsOkResult)> = (|| {
+        let prepared: MetadataResult<PreparedUnlink> = (|| {
             // Get dentry
             let child_inode_id = self
                 .storage
@@ -1295,6 +1300,8 @@ impl AppRaftStateMachine {
     }
 
     /// Apply Rename command (atomic within mount).
+    // Raft apply helpers mirror command payload fields for replay clarity.
+    #[allow(clippy::too_many_arguments)]
     fn apply_rename(
         &self,
         src_parent_inode_id: InodeId,
@@ -1574,6 +1581,8 @@ impl AppRaftStateMachine {
     }
 
     /// Apply CloseWrite command.
+    // Raft apply helpers mirror command payload fields for replay clarity.
+    #[allow(clippy::too_many_arguments)]
     fn apply_close_write(
         &self,
         inode_id: InodeId,
@@ -1586,7 +1595,7 @@ impl AppRaftStateMachine {
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
     ) -> MetadataResult<FsCommandResult> {
-        let prepared: MetadataResult<(Inode, FileLayout, Vec<BlockId>, Vec<BlockId>, u64, FsOkResult)> = (|| {
+        let prepared: MetadataResult<PreparedCloseWrite> = (|| {
             let mut inode = self
                 .storage
                 .get_inode(inode_id)?
@@ -1937,6 +1946,8 @@ impl AppRaftStateMachine {
     }
 
     /// Apply set xattr command.
+    // Raft apply helpers mirror command payload fields for replay clarity.
+    #[allow(clippy::too_many_arguments)]
     fn apply_set_xattr(
         &self,
         inode_id: InodeId,

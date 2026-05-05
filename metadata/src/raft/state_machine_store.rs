@@ -467,6 +467,8 @@ fn read_kv<R: Read>(reader: &mut R) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
 }
 
 // Decode a bincode-encoded u64 with consistent error mapping.
+// openraft fixes this boundary to StorageError; boxing would add adapter churn.
+#[allow(clippy::result_large_err)]
 fn decode_u64(bytes: &[u8]) -> Result<u64, StorageError<u64>> {
     bincode::serde::decode_from_slice(bytes, bincode::config::standard())
         .map(|(v, _)| v)
@@ -475,6 +477,8 @@ fn decode_u64(bytes: &[u8]) -> Result<u64, StorageError<u64>> {
         })
 }
 
+// openraft fixes this boundary to StorageError; boxing would add adapter churn.
+#[allow(clippy::result_large_err)]
 fn write_snapshot_batch(
     storage: &RocksDBStorage,
     batch: WriteBatch,
@@ -486,6 +490,8 @@ fn write_snapshot_batch(
 }
 
 // Read a u64 value from a snapshot column family, returning a default when missing.
+// openraft fixes this boundary to StorageError; boxing would add adapter churn.
+#[allow(clippy::result_large_err)]
 fn read_u64_from_snapshot_cf(
     storage: &RocksDBStorage,
     snap: &DbSnapshot<'_>,
@@ -509,6 +515,8 @@ fn read_u64_from_snapshot_cf(
     }
 }
 
+// openraft fixes this boundary to StorageError; boxing would add adapter churn.
+#[allow(clippy::result_large_err)]
 fn load_raft_state_from_snapshot(
     storage: &RocksDBStorage,
     snap: &DbSnapshot<'_>,
@@ -530,6 +538,8 @@ fn load_raft_state_from_snapshot(
     }
 }
 
+// openraft fixes this boundary to StorageError; boxing would add adapter churn.
+#[allow(clippy::result_large_err)]
 fn load_route_epoch_from_snapshot(
     storage: &RocksDBStorage,
     snap: &DbSnapshot<'_>,
@@ -538,6 +548,8 @@ fn load_route_epoch_from_snapshot(
     Ok(RouteEpoch::new(epoch))
 }
 
+// openraft fixes this boundary to StorageError; boxing would add adapter churn.
+#[allow(clippy::result_large_err)]
 fn write_snapshot_payload(
     storage: &RocksDBStorage,
     snap: &DbSnapshot<'_>,
@@ -559,8 +571,8 @@ fn write_snapshot_payload(
             source: StorageIOError::<u64>::write_snapshot(None, AnyError::new(&e)),
         })?;
 
-        let mut iter = snap.iterator_cf_opt(&cf, ReadOptions::default(), IteratorMode::Start);
-        while let Some(item) = iter.next() {
+        let iter = snap.iterator_cf_opt(&cf, ReadOptions::default(), IteratorMode::Start);
+        for item in iter {
             let (key, value): (Box<[u8]>, Box<[u8]>) = item.map_err(|e| StorageError::IO {
                 source: StorageIOError::<u64>::write_snapshot(None, AnyError::new(&e)),
             })?;
@@ -585,6 +597,8 @@ fn write_snapshot_payload(
     Ok(())
 }
 
+// openraft fixes this boundary to StorageError; boxing would add adapter churn.
+#[allow(clippy::result_large_err)]
 fn install_snapshot_payload(
     storage: &RocksDBStorage,
     meta: &SnapshotMeta<u64, MetadataNode>,
@@ -614,7 +628,7 @@ fn install_snapshot_payload(
         match tag {
             TAG_END => break,
             TAG_CF_START => {
-                if batch.len() > 0 {
+                if !batch.is_empty() {
                     write_snapshot_batch(storage, batch, Some(meta.signature()))?;
                     batch = WriteBatch::default();
                 }
@@ -652,7 +666,7 @@ fn install_snapshot_payload(
                 }
             }
             TAG_CF_END => {
-                if batch.len() > 0 {
+                if !batch.is_empty() {
                     write_snapshot_batch(storage, batch, Some(meta.signature()))?;
                     batch = WriteBatch::default();
                 }
@@ -669,7 +683,7 @@ fn install_snapshot_payload(
         }
     }
 
-    if batch.len() > 0 {
+    if !batch.is_empty() {
         write_snapshot_batch(storage, batch, Some(meta.signature()))?;
     }
 
@@ -736,7 +750,7 @@ mod tests {
             .put_cf(
                 cf,
                 b"block1",
-                &bincode::serde::encode_to_vec(&1234u64, bincode::config::standard()).unwrap(),
+                bincode::serde::encode_to_vec(1234u64, bincode::config::standard()).unwrap(),
             )
             .unwrap();
 

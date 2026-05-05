@@ -36,8 +36,9 @@ pub struct BootstrapConfig {
     pub root_readiness: RootReadinessConfig,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FileSystemAuthzMode {
+    #[default]
     None,
     Ranger,
     Acl,
@@ -51,12 +52,6 @@ impl FileSystemAuthzMode {
             "ACL" => Some(Self::Acl),
             _ => None,
         }
-    }
-}
-
-impl Default for FileSystemAuthzMode {
-    fn default() -> Self {
-        Self::None
     }
 }
 
@@ -125,16 +120,10 @@ impl Default for RaftConfig {
 }
 
 /// Metadata authority group served by this runtime.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct MetadataAuthorityConfig {
     /// Authority group ID for the root namespace owner served by this metadata runtime.
     pub group_id: u64,
-}
-
-impl Default for MetadataAuthorityConfig {
-    fn default() -> Self {
-        Self { group_id: 0 }
-    }
 }
 
 impl Default for RepairConfig {

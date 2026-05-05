@@ -172,7 +172,7 @@ fn test_fs_handlers_do_not_emit_rpc_application() {
     let mut findings = Vec::new();
 
     for rel in FS_HANDLER_FILES {
-        if FS_RPC_APPLICATION_ALLOWLIST.iter().any(|allowed| *rel == *allowed) {
+        if FS_RPC_APPLICATION_ALLOWLIST.contains(rel) {
             continue;
         }
         let path = manifest_dir.join(rel);

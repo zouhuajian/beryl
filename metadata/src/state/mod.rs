@@ -68,9 +68,10 @@ pub enum DeleteIntentReason {
 }
 
 /// Delete intent execution status (persisted in RocksDB).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum DeleteIntentStatus {
     /// Pending: not yet started execution.
+    #[default]
     Pending,
     /// InFlight: command sent, waiting for ack.
     InFlight,
@@ -78,12 +79,6 @@ pub enum DeleteIntentStatus {
     Completed,
     /// Failed: non-retryable failure.
     Failed,
-}
-
-impl Default for DeleteIntentStatus {
-    fn default() -> Self {
-        DeleteIntentStatus::Pending
-    }
 }
 
 /// Delete intent for block deletion.

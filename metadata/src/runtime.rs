@@ -555,6 +555,7 @@ mod tests {
     use std::sync::OnceLock;
     use tempfile::TempDir;
     use tokio::net::TcpListener;
+    use tokio::sync::Mutex as AsyncMutex;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
     use types::{ClientId, GroupStateWatermark, RaftLogId};
@@ -767,7 +768,6 @@ mod tests {
         let mut first = true;
         let outcome: RetryOutcome<(ResponseHeader, ())> = helper
             .call_with_refresh(&base_header, Some(group_id), true, |hdr| {
-                let expected_watermark = expected_watermark;
                 let is_first = first;
                 first = false;
                 async move {
@@ -955,7 +955,7 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_server_build_composes_required_runtime() {
-        let _guard = metadata_db_env_lock().lock().unwrap();
+        let _guard = metadata_db_env_lock().lock().await;
         let dir = TempDir::new().unwrap();
         std::env::remove_var("VECTON_METADATA_DB_PATH");
         let mut config = test_config();
@@ -983,7 +983,7 @@ mod tests {
 
     #[tokio::test]
     async fn vecton_metadata_db_path_overrides_config_storage_dir_for_legacy_runtime() {
-        let _guard = metadata_db_env_lock().lock().unwrap();
+        let _guard = metadata_db_env_lock().lock().await;
         let configured = TempDir::new().unwrap();
         let legacy_env = TempDir::new().unwrap();
         std::env::set_var("VECTON_METADATA_DB_PATH", legacy_env.path());
@@ -1021,8 +1021,8 @@ mod tests {
         }
     }
 
-    fn metadata_db_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    fn metadata_db_env_lock() -> &'static AsyncMutex<()> {
+        static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| AsyncMutex::new(()))
     }
 }

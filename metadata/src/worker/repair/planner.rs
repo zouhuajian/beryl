@@ -265,7 +265,7 @@ impl RepairPlanner {
         let actions = self.plan_replication(block_id, current_locations, replication_factor, available_workers);
 
         for action in actions {
-            let task = action.to_task();
+            let task = action.into_task();
             if let Err(e) = repair_queue.enqueue(task) {
                 tracing::warn!(
                     block_id = %block_id,
@@ -299,7 +299,7 @@ impl RepairPlanner {
 
         for action in actions {
             let block_id = action.block_id();
-            let task = action.to_task();
+            let task = action.into_task();
             if let Err(e) = repair_queue.enqueue(task) {
                 tracing::warn!(
                     block_id = %block_id,

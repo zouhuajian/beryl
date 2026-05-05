@@ -28,7 +28,7 @@ pub fn request_context_from_proto(req_header: &Option<proto::common::RequestHead
         RequestHeader::new(types::ClientId::new(0))
     };
 
-    Span::current().record("call_id", &caller.client.call_id.to_string());
+    Span::current().record("call_id", caller.client.call_id.to_string());
     Span::current().record("client_id", caller.client.client_id.as_raw());
     if let Some(ref client_name) = caller.client.client_name {
         Span::current().record("client_name", client_name);
@@ -37,7 +37,7 @@ pub fn request_context_from_proto(req_header: &Option<proto::common::RequestHead
         Span::current().record("traceparent", traceparent);
     }
     if !caller.state.is_empty() {
-        Span::current().record("state", &format!("{:?}", caller.state));
+        Span::current().record("state", format!("{:?}", caller.state));
     }
     if let Some(principal) = &caller.principal {
         Span::current().record("principal", principal);
@@ -181,7 +181,7 @@ fn map_refresh_hint_to_proto(hint: Option<&RefreshHint>) -> Option<proto::common
         worker_endpoints: hint
             .worker_endpoints
             .iter()
-            .map(|endpoint| map_worker_endpoint_hint_to_proto(endpoint))
+            .map(map_worker_endpoint_hint_to_proto)
             .collect(),
         worker_resolve_required: hint.worker_resolve_required,
     })
@@ -282,6 +282,8 @@ fn core_failure_from_canonical_error(
     CoreFailure::new(err, group_id, mount_epoch, route_epoch, Vec::new())
 }
 
+// Refresh failures must keep caller and server hint fields explicit.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn need_refresh_core_failure(
     ctx: &RequestContext,
     rpc_code: RpcErrorCode,

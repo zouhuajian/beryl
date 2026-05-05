@@ -38,6 +38,8 @@ pub struct LeaseCleanupService {
 
 impl LeaseCleanupService {
     /// Create a new LeaseCleanupService.
+    // Constructor mirrors maintenance runtime wiring; grouping dependencies would hide ownership.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         raft_node: Arc<AppRaftNode>,
         storage: Arc<RocksDBStorage>,

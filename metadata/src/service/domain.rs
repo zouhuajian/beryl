@@ -101,7 +101,7 @@ pub struct CoreSuccess<T> {
 
 #[derive(Clone, Debug)]
 pub struct CoreFailure {
-    pub error: CanonicalError,
+    pub error: Box<CanonicalError>,
     pub group_id: Option<u64>,
     pub mount_epoch: Option<u64>,
     pub route_epoch: Option<u64>,
@@ -117,7 +117,7 @@ impl CoreFailure {
         state: Vec<GroupStateWatermark>,
     ) -> Self {
         Self {
-            error,
+            error: Box::new(error),
             group_id,
             mount_epoch,
             route_epoch,

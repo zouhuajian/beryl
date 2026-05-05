@@ -215,7 +215,7 @@ impl MetadataWorkerServiceImpl {
                                 &live_workers_after,
                             );
                             for action in actions {
-                                let task = action.to_task();
+                                let task = action.into_task();
                                 if let Err(e) = repair_queue.enqueue(task) {
                                     warn!(
                                         block_id = %block_id,
@@ -771,7 +771,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                             ),
                             report_seq: req.last_report_seq,
                             commands: vec![],
-                            retry_after_ms: retry_after_ms,
+                            retry_after_ms,
                         }));
                     }
                 }
@@ -886,7 +886,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                         &live_workers,
                     );
                     for action in actions {
-                        let task = action.to_task();
+                        let task = action.into_task();
                         if let Err(e) = self.repair_queue.enqueue(task) {
                             warn!(block_id = %block_id, error = %e, "Failed to enqueue replication task");
                         }

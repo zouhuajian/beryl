@@ -80,7 +80,7 @@ pub type BlockLocations = HashMap<BlockId, Vec<WorkerId>>;
 
 /// Worker sync state: tracks whether a worker has completed full sync with this metadata node.
 /// This is per-metadata-node state (memory-only, soft-state).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct WorkerSyncState {
     /// Metadata epoch/instance_id (to detect metadata restarts).
     pub metadata_epoch: u64,
@@ -90,17 +90,6 @@ pub struct WorkerSyncState {
     pub last_full_ts: u64,
     /// Last sequence number (for INCREMENTAL dedup, optional).
     pub last_seq: u64,
-}
-
-impl Default for WorkerSyncState {
-    fn default() -> Self {
-        Self {
-            metadata_epoch: 0,
-            full_received: false,
-            last_full_ts: 0,
-            last_seq: 0,
-        }
-    }
 }
 
 /// Block report convergence snapshot for maintenance safety gate.
@@ -380,6 +369,8 @@ impl WorkerManager {
 
     /// Update worker runtime (fanout heartbeat, memory-only, no Raft).
     /// Returns true if descriptor fields changed (requires re-register).
+    // Heartbeat fields mirror the worker report wire payload; grouping would obscure drift checks.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_runtime(
         &self,
         worker_id: WorkerId,
@@ -542,7 +533,7 @@ impl WorkerManager {
             .collect();
 
         for block_id in &reported_blocks {
-            let workers = locations.entry(*block_id).or_insert_with(Vec::new);
+            let workers = locations.entry(*block_id).or_default();
             if !workers.contains(&worker_id) {
                 workers.push(worker_id);
             }
@@ -723,7 +714,7 @@ impl WorkerManager {
             }
 
             // Get fault domain for this worker
-            let fault_domain = score.fault_domain.as_ref().map(|d| d.as_str()).unwrap_or("default");
+            let fault_domain = score.fault_domain.as_deref().unwrap_or("default");
 
             // If we haven't used this fault domain yet, or we need more workers
             if !used_fault_domains.contains(fault_domain) || selected.len() < count {

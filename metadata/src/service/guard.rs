@@ -39,7 +39,7 @@ impl LeadershipChecker for AppRaftNode {
 
 #[derive(Clone, Debug)]
 pub struct GuardFailure {
-    pub err: CanonicalError,
+    pub err: Box<CanonicalError>,
     pub group_id: Option<u64>,
     pub mount_epoch: Option<u64>,
 }
@@ -47,7 +47,7 @@ pub struct GuardFailure {
 impl GuardFailure {
     fn new(err: CanonicalError) -> Self {
         Self {
-            err,
+            err: Box::new(err),
             group_id: None,
             mount_epoch: None,
         }

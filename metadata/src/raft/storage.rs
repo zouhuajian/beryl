@@ -44,6 +44,8 @@ use types::fs::{Inode, InodeId};
 use types::ids::{BlockId, DataHandleId, MountId, ShardGroupId, ShardId, WorkerId};
 use types::layout::FileLayout;
 
+type DentryPage = (Vec<(String, InodeId)>, Option<Vec<u8>>, bool);
+
 /// Column family names for RocksDB.
 const CF_BLOCKS: &str = "blocks";
 const CF_LEASES: &str = "leases";
@@ -519,7 +521,7 @@ impl RocksDBStorage {
             .db
             .cf_handle(CF_META)
             .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
-        let value = encode_to_vec(&epoch.as_u64(), standard())
+        let value = encode_to_vec(epoch.as_u64(), standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize route_epoch: {}", e)))?;
 
         self.db
@@ -535,7 +537,7 @@ impl RocksDBStorage {
             .cf_handle(CF_META)
             .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
         let key = format!("layout:{}", inode_id.as_raw());
-        let value = encode_to_vec(&layout, standard())
+        let value = encode_to_vec(layout, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize file layout: {}", e)))?;
 
         self.db
@@ -570,7 +572,7 @@ impl RocksDBStorage {
         layout: FileLayout,
     ) -> MetadataResult<()> {
         let key = format!("layout:{}", inode_id.as_raw());
-        let value = encode_to_vec(&layout, standard())
+        let value = encode_to_vec(layout, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize file layout: {}", e)))?;
         batch.put_cf(cf, key.as_bytes(), value);
         Ok(())
@@ -769,14 +771,14 @@ impl RocksDBStorage {
     }
 
     fn batch_put_route_epoch(batch: &mut WriteBatch, cf: &ColumnFamily, epoch: RouteEpoch) -> MetadataResult<()> {
-        let value = encode_to_vec(&epoch.as_u64(), standard())
+        let value = encode_to_vec(epoch.as_u64(), standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize route_epoch: {}", e)))?;
         batch.put_cf(cf, b"route_epoch", value);
         Ok(())
     }
 
     fn batch_put_mount_version(batch: &mut WriteBatch, cf: &ColumnFamily, version: u64) -> MetadataResult<()> {
-        let value = encode_to_vec(&version, standard())
+        let value = encode_to_vec(version, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize mount_version: {}", e)))?;
         batch.put_cf(cf, b"mount_version", value);
         Ok(())
@@ -825,7 +827,7 @@ impl RocksDBStorage {
         // Atomic increment using WriteBatch
         let mut batch = WriteBatch::default();
         let next_id = current_id + 1;
-        let next_id_value = encode_to_vec(&next_id, standard())
+        let next_id_value = encode_to_vec(next_id, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize next_data_handle_id: {}", e)))?;
         batch.put_cf(cf_meta, b"next_data_handle_id", next_id_value);
 
@@ -861,7 +863,7 @@ impl RocksDBStorage {
             .db
             .cf_handle(CF_META)
             .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
-        let value = encode_to_vec(&next_inode_id.as_raw(), standard())
+        let value = encode_to_vec(next_inode_id.as_raw(), standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize next_inode_id: {}", e)))?;
 
         self.db
@@ -887,7 +889,7 @@ impl RocksDBStorage {
         };
 
         let next_id = current_id + 1;
-        let next_id_value = encode_to_vec(&next_id, standard())
+        let next_id_value = encode_to_vec(next_id, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize next_inode_id: {}", e)))?;
         let mut batch = WriteBatch::default();
         batch.put_cf(cf_meta, NEXT_INODE_ID_KEY, next_id_value);
@@ -906,7 +908,7 @@ impl RocksDBStorage {
             .cf_handle(CF_META)
             .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
         let key = format!("data_handle_owner:{}", data_handle_id.as_raw());
-        let value = encode_to_vec(&inode_id.as_raw(), standard())
+        let value = encode_to_vec(inode_id.as_raw(), standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize inode_id: {}", e)))?;
 
         self.db
@@ -1000,7 +1002,7 @@ impl RocksDBStorage {
         worker_id: WorkerId,
     ) -> MetadataResult<()> {
         let key = format!("worker_identity:{}", identity);
-        let value = encode_to_vec(&worker_id.as_raw(), standard())
+        let value = encode_to_vec(worker_id.as_raw(), standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize worker_id: {}", e)))?;
         batch.put_cf(cf_meta, key.as_bytes(), value);
         Ok(())
@@ -1011,7 +1013,7 @@ impl RocksDBStorage {
         cf_meta: &ColumnFamily,
         next_worker_id: u64,
     ) -> MetadataResult<()> {
-        let value = encode_to_vec(&next_worker_id, standard())
+        let value = encode_to_vec(next_worker_id, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize next_worker_id: {}", e)))?;
         batch.put_cf(cf_meta, NEXT_WORKER_ID_KEY, value);
         Ok(())
@@ -1023,7 +1025,7 @@ impl RocksDBStorage {
             .db
             .cf_handle(CF_META)
             .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
-        let value = encode_to_vec(&version, standard())
+        let value = encode_to_vec(version, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize mount_version: {}", e)))?;
 
         self.db
@@ -1403,7 +1405,7 @@ impl RocksDBStorage {
             .cf_handle(CF_BLOCK_REF_COUNTS)
             .ok_or_else(|| MetadataError::Internal("BlockRefCounts CF not found".to_string()))?;
         let key = format!("{}", block_id);
-        let value = encode_to_vec(&count, standard())
+        let value = encode_to_vec(count, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize ref count: {}", e)))?;
 
         self.db
@@ -1419,7 +1421,7 @@ impl RocksDBStorage {
         count: u64,
     ) -> MetadataResult<()> {
         let key = format!("{}", block_id);
-        let value = encode_to_vec(&count, standard())
+        let value = encode_to_vec(count, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize ref count: {}", e)))?;
         batch.put_cf(cf, key.as_bytes(), value);
         Ok(())
@@ -1750,7 +1752,7 @@ impl RocksDBStorage {
                 )));
             }
         }
-        let value = encode_to_vec(&next_id, standard())
+        let value = encode_to_vec(next_id, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize next_delete_intent_id: {}", e)))?;
         batch.put_cf(cf_meta, NEXT_DELETE_INTENT_ID_KEY, value);
         Ok(first_id)
@@ -1820,6 +1822,8 @@ impl RocksDBStorage {
     }
 
     /// Atomically persist a CloseWrite commit with replay tracking.
+    // Atomic storage helpers keep every column-family mutation visible at the call boundary.
+    #[allow(clippy::too_many_arguments)]
     pub fn close_write_with_apply_result_atomic(
         &self,
         inode: &Inode,
@@ -1964,13 +1968,13 @@ impl RocksDBStorage {
         );
 
         let layout_key = format!("layout:{}", inode.inode_id.as_raw());
-        let layout_value = encode_to_vec(&layout, standard())
+        let layout_value = encode_to_vec(layout, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize file layout: {}", e)))?;
         batch.put_cf(cf_meta, layout_key.as_bytes(), layout_value);
 
         let data_handle_id = inode.current_data_handle_id;
         let owner_key = format!("data_handle_owner:{}", data_handle_id.as_raw());
-        let owner_value = encode_to_vec(&inode.inode_id.as_raw(), standard())
+        let owner_value = encode_to_vec(inode.inode_id.as_raw(), standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize inode_id: {}", e)))?;
         batch.put_cf(cf_meta, owner_key.as_bytes(), owner_value);
 
@@ -1978,6 +1982,8 @@ impl RocksDBStorage {
     }
 
     /// Atomically persist create-file mutation with apply tracking.
+    // Atomic storage helpers keep every column-family mutation visible at the call boundary.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_file_with_apply_result_atomic(
         &self,
         parent_inode_id: InodeId,
@@ -2071,6 +2077,8 @@ impl RocksDBStorage {
     }
 
     /// Atomically persist non-directory deletion with namespace and optional data-handle cleanup.
+    // Atomic storage helpers keep every column-family mutation visible at the call boundary.
+    #[allow(clippy::too_many_arguments)]
     pub fn delete_empty_file_with_apply_result_atomic(
         &self,
         parent_inode_id: InodeId,
@@ -2256,6 +2264,8 @@ impl RocksDBStorage {
     }
 
     /// Atomically persist extent-bearing file deletion with block lifecycle updates and apply tracking.
+    // Atomic storage helpers keep every column-family mutation visible at the call boundary.
+    #[allow(clippy::too_many_arguments)]
     pub fn delete_file_with_extents_and_apply_result_atomic(
         &self,
         parent_inode_id: InodeId,
@@ -2504,7 +2514,7 @@ impl RocksDBStorage {
         parent_inode_id: InodeId,
         cursor_key: Option<&[u8]>,
         max_entries: Option<usize>,
-    ) -> MetadataResult<(Vec<(String, InodeId)>, Option<Vec<u8>>, bool)> {
+    ) -> MetadataResult<DentryPage> {
         let cf = self
             .db
             .cf_handle(CF_DENTRIES)
@@ -2584,10 +2594,10 @@ impl RocksDBStorage {
     pub fn clear_cfs(&self, cf_names: &[&str], batch_bytes: usize) -> MetadataResult<()> {
         for cf_name in cf_names {
             let cf = self.cf(cf_name)?;
-            let mut iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+            let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
             let mut batch = WriteBatch::default();
 
-            while let Some(item) = iter.next() {
+            for item in iter {
                 let (key, _) = item.map_err(|e| MetadataError::Internal(format!("RocksDB iterator error: {}", e)))?;
                 batch.delete_cf(cf, key);
 
@@ -2597,7 +2607,7 @@ impl RocksDBStorage {
                 }
             }
 
-            if batch.len() > 0 {
+            if !batch.is_empty() {
                 self.write_batch(batch)?;
             }
         }
@@ -2734,7 +2744,7 @@ fn reset_dedup_if_stale(db: &DB) -> MetadataResult<()> {
         batch.delete_cf(dedup_cf, key);
     }
 
-    let version_bytes = encode_to_vec(&DEDUP_FORMAT_VERSION, standard())
+    let version_bytes = encode_to_vec(DEDUP_FORMAT_VERSION, standard())
         .map_err(|e| MetadataError::Internal(format!("Failed to encode dedup_version: {}", e)))?;
     batch.put_cf(meta_cf, DEDUP_VERSION_KEY, version_bytes);
     db.write(batch)

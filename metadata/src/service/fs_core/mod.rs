@@ -181,6 +181,8 @@ impl FsCore {
         ))
     }
 
+    // Refresh failures must keep caller and server hint fields explicit.
+    #[allow(clippy::too_many_arguments)]
     fn need_refresh_failure_with_hint<T>(
         &self,
         ctx: &RequestContext,

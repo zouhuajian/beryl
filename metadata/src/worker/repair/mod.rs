@@ -108,7 +108,7 @@ mod tests {
     }
 
     #[test]
-    fn test_action_to_task() {
+    fn test_action_into_task() {
         let block_id = make_block_id(1, 0);
         let target_worker = make_worker_id(2);
         let src_workers = vec![make_worker_id(1)];
@@ -121,7 +121,7 @@ mod tests {
             reason: Some("Test".to_string()),
         };
 
-        let task = action.to_task();
+        let task = action.into_task();
         match task {
             RepairTask::Replicate {
                 block_id: bid,

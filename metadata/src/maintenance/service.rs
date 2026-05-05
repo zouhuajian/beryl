@@ -87,6 +87,8 @@ pub struct MaintenanceService {
 
 impl MaintenanceService {
     /// Create a new maintenance service.
+    // Constructor mirrors maintenance runtime wiring; grouping dependencies would hide ownership.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         raft_node: Arc<AppRaftNode>,
         storage: Arc<RocksDBStorage>,
@@ -111,6 +113,8 @@ impl MaintenanceService {
     }
 
     /// Create a new maintenance service with optional shared inflight registry.
+    // Constructor mirrors maintenance runtime wiring; grouping dependencies would hide ownership.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_inflight_registry(
         raft_node: Arc<AppRaftNode>,
         storage: Arc<RocksDBStorage>,
@@ -332,7 +336,7 @@ impl MaintenanceService {
                         let actions = repair_planner.plan_rebalance(&worker_manager);
                         for action in actions {
                             let block_id = action.block_id();
-                            let task = action.to_task();
+                            let task = action.into_task();
                             if let Err(e) = repair_queue.enqueue(task) {
                                 error!(block_id = %block_id, error = %e, "Failed to enqueue rebalance task");
                             }
@@ -398,7 +402,7 @@ impl MaintenanceService {
     /// Increment reference count for a block.
     pub fn increment_ref_count(&self, data_handle_id: DataHandleId, block_id: BlockId) {
         let mut ref_counts = self.block_ref_counts.write();
-        let file_refs = ref_counts.entry(data_handle_id).or_insert_with(HashMap::new);
+        let file_refs = ref_counts.entry(data_handle_id).or_default();
         let count = file_refs.entry(block_id).or_insert(0);
         *count += 1;
 

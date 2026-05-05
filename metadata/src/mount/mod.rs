@@ -35,15 +35,11 @@ pub enum MountKind {
 /// Data IO policy for a mount.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum DataIoPolicy {
+    #[default]
     Allow,
     Forbid,
-}
-
-impl Default for DataIoPolicy {
-    fn default() -> Self {
-        Self::Allow
-    }
 }
 
 /// Mount entry: maps vecton path prefix to UFS URI.

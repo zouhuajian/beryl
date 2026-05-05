@@ -92,6 +92,8 @@ pub struct OverReplicaCleanupService {
 
 impl OverReplicaCleanupService {
     /// Create a new OverReplicaCleanupService.
+    // Constructor mirrors maintenance runtime wiring; grouping dependencies would hide ownership.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         raft_node: Arc<AppRaftNode>,
         storage: Arc<RocksDBStorage>,
@@ -334,9 +336,8 @@ impl OverReplicaCleanupService {
 
             // Resolve group_id and guard_watermark using inode -> mount owner group.
             let group_id = crate::maintenance::owner_group_for_block(&self.storage, &self.mount_table, block_id)
-                .map_err(|e| {
+                .inspect_err(|_e| {
                     self.inflight_registry.release(block_id);
-                    e
                 })?;
             ctx = ctx.with_group_id(group_id);
             let guard_watermark = types::group_watermark::GroupStateWatermark::new(group_id, guard_state_id);
@@ -484,7 +485,7 @@ impl OverReplicaCleanupService {
         let mut domain_groups: HashMap<String, Vec<usize>> = HashMap::new();
         for (idx, replica) in replicas.iter().enumerate() {
             if let Some(ref domain) = replica.fault_domain {
-                domain_groups.entry(domain.clone()).or_insert_with(Vec::new).push(idx);
+                domain_groups.entry(domain.clone()).or_default().push(idx);
             }
         }
 

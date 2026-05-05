@@ -40,9 +40,9 @@ mod tests {
         assert_eq!(tokens.len(), 10);
 
         // Release 5 leases
-        for i in 0..5 {
+        for (i, token) in tokens.iter().enumerate().take(5) {
             let worker_id = WorkerId::new((i + 1) as u64);
-            rt.block_on(manager.verify_and_release(tokens[i], worker_id, metadata_epoch, mount_epoch));
+            rt.block_on(manager.verify_and_release(*token, worker_id, metadata_epoch, mount_epoch));
         }
 
         // Now should be able to allocate 5 more
@@ -270,8 +270,7 @@ mod tests {
         assert_eq!(count, 5);
 
         // Release 2 leases
-        for i in 0..2 {
-            let (worker_id, token) = &tokens[i];
+        for (worker_id, token) in tokens.iter().take(2) {
             rt.block_on(manager.verify_and_release(*token, *worker_id, metadata_epoch, mount_epoch));
         }
 

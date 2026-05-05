@@ -138,6 +138,11 @@ impl OrphanQueue {
         self.orphans.read().len()
     }
 
+    /// Check if the queue has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.orphans.read().is_empty()
+    }
+
     /// Clear all orphans.
     pub fn clear(&self) {
         let mut orphans = self.orphans.write();

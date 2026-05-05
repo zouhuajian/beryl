@@ -41,7 +41,7 @@ pub enum RepairAction {
 
 impl RepairAction {
     /// Convert action to RepairTask for execution.
-    pub fn to_task(self) -> RepairTask {
+    pub fn into_task(self) -> RepairTask {
         match self {
             RepairAction::Replicate {
                 block_id,

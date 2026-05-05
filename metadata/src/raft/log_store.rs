@@ -86,7 +86,7 @@ impl RaftLogStorage<MetadataRaftTypeConfig> for AppLogStorage {
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
         let mut state = self.state.write();
-        state.vote = Some(vote.clone());
+        state.vote = Some(*vote);
         self.storage.persist_raft_state(&state).map_err(|e| StorageError::IO {
             source: StorageIOError::<u64>::write_vote(AnyError::new(&e)),
         })?;
@@ -95,7 +95,7 @@ impl RaftLogStorage<MetadataRaftTypeConfig> for AppLogStorage {
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
         let state = self.state.read();
-        Ok(state.vote.clone())
+        Ok(state.vote)
     }
 
     async fn save_committed(&mut self, committed: Option<LogId<u64>>) -> Result<(), StorageError<u64>> {
@@ -227,6 +227,8 @@ impl RaftLogReader<MetadataRaftTypeConfig> for AppLogReader {
 }
 
 // Keep log entry decoding in one place so error mapping stays consistent.
+// openraft fixes this boundary to StorageError; boxing would add adapter churn.
+#[allow(clippy::result_large_err)]
 fn decode_log_entry(index: u64, data: &[u8]) -> Result<Entry<MetadataRaftTypeConfig>, StorageError<u64>> {
     serde_json::from_slice(data).map_err(|e| StorageError::IO {
         source: StorageIOError::<u64>::read_log_at_index(index, AnyError::new(&e)),

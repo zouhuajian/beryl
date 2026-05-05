@@ -117,7 +117,7 @@ fn test_truncate_shrink_extents() {
     // Unit test here just verifies the logic structure
     use types::fs::Extent;
 
-    let extents = vec![
+    let extents = [
         Extent {
             file_offset: 0,
             block_id: BlockId::new(DataHandleId::new(1), BlockIndex::new(0)),

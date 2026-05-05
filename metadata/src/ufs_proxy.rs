@@ -39,13 +39,13 @@ impl UfsMetadataProxy {
         // Format: "s3://bucket/path" or "hdfs://namenode/path" or "fs:///local/path"
         // For now, we use a simple heuristic: extract the scheme and use it as UFS ID
         // In production, this should be more sophisticated
-        let ufs_id = if ufs_uri.starts_with("s3://") {
+        let ufs_id = if let Some(stripped) = ufs_uri.strip_prefix("s3://") {
             // Extract bucket name as UFS ID (simplified)
-            let parts: Vec<&str> = ufs_uri[5..].splitn(2, '/').collect();
+            let parts: Vec<&str> = stripped.splitn(2, '/').collect();
             ufs::UfsId::new(parts[0])
-        } else if ufs_uri.starts_with("hdfs://") {
+        } else if let Some(stripped) = ufs_uri.strip_prefix("hdfs://") {
             // Extract namenode as UFS ID (simplified)
-            let parts: Vec<&str> = ufs_uri[7..].splitn(2, '/').collect();
+            let parts: Vec<&str> = stripped.splitn(2, '/').collect();
             ufs::UfsId::new(parts[0])
         } else if ufs_uri.starts_with("fs://") {
             ufs::UfsId::new("local-fs")
@@ -75,11 +75,11 @@ impl UfsMetadataProxy {
             .ok_or_else(|| MetadataError::NotFound(format!("No mount found for path: {}", vecton_path)))?;
 
         // Parse UFS URI to extract UFS ID (same logic as resolve_ufs)
-        let ufs_id = if ufs_uri.starts_with("s3://") {
-            let parts: Vec<&str> = ufs_uri[5..].splitn(2, '/').collect();
+        let ufs_id = if let Some(stripped) = ufs_uri.strip_prefix("s3://") {
+            let parts: Vec<&str> = stripped.splitn(2, '/').collect();
             ufs::UfsId::new(parts[0])
-        } else if ufs_uri.starts_with("hdfs://") {
-            let parts: Vec<&str> = ufs_uri[7..].splitn(2, '/').collect();
+        } else if let Some(stripped) = ufs_uri.strip_prefix("hdfs://") {
+            let parts: Vec<&str> = stripped.splitn(2, '/').collect();
             ufs::UfsId::new(parts[0])
         } else if ufs_uri.starts_with("fs://") {
             ufs::UfsId::new("local-fs")
