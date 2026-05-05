@@ -4,7 +4,7 @@
 //! Tests for worker client.
 
 #[cfg(test)]
-mod tests {
+mod worker_client_tests {
     use super::super::client::WorkerEndpointInfo;
     use transport::net::NetTransportKind;
     use types::ids::WorkerId;

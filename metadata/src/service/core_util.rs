@@ -544,6 +544,8 @@ pub fn write_target_to_proto(target: &WriteTarget) -> proto::metadata::WriteTarg
             data_handle_id: target.block_id.data_handle_id.as_raw(),
             block_index: target.block_id.index.as_raw(),
         }),
+        file_offset: target.file_offset,
+        len: target.len,
         worker_endpoints: target.worker_endpoints.iter().map(worker_hint_to_proto).collect(),
         fencing_token: Some(fencing_to_proto(target.fencing_token)),
     }

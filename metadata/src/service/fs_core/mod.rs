@@ -12,9 +12,7 @@ use super::core_util::{
     core_failure_from_error_detail, core_failure_from_metadata_error, fatal_fs_core_failure, need_refresh_core_failure,
     terminal_rpc_core_failure,
 };
-use super::domain::{
-    CoreFailure, CoreResult, CoreSuccess, Freshness, InodeOwner, PresentedFencingToken, RequestContext,
-};
+use super::domain::{CoreFailure, CoreResult, CoreSuccess, Freshness, PresentedFencingToken, RequestContext};
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::MountTable;
 use crate::raft::{AppDataResponse, AppRaftNode, Command, DedupKey, FsCommandResult, RocksDBStorage};
@@ -265,7 +263,7 @@ impl FsCore {
     }
 
     fn replay_hint(intent: &str) -> String {
-        format!("refresh metadata and re-open write session, then replay {}", intent)
+        format!("refresh metadata and reopen write handle, then replay {}", intent)
     }
 
     pub(crate) fn mount_hints_for_mount(&self, mount_id: MountId) -> (Option<u64>, Option<u64>) {
@@ -280,16 +278,6 @@ impl FsCore {
     ) -> Result<(Option<u64>, Option<u64>), CoreFailure> {
         self.freshness_validator
             .validate_mount_epoch_for_mount(ctx, freshness, mount_id)
-    }
-
-    pub(crate) fn validate_mount_freshness(
-        &self,
-        ctx: &RequestContext,
-        freshness: Freshness,
-        mount_id: MountId,
-    ) -> Result<(Option<u64>, Option<u64>), CoreFailure> {
-        self.freshness_validator
-            .validate_mount_freshness(ctx, freshness, mount_id)
     }
 
     async fn validate_route_epoch(
@@ -385,28 +373,6 @@ impl FsCore {
                 None,
             )
         })
-    }
-
-    fn owner_from_inode(inode: &types::fs::Inode) -> InodeOwner {
-        InodeOwner {
-            uid: inode.attrs.uid,
-            gid: inode.attrs.gid,
-        }
-    }
-
-    fn owner_for_inode_id(
-        &self,
-        req_ctx: &RequestContext,
-        storage: &RocksDBStorage,
-        inode_id: InodeId,
-    ) -> Result<Option<InodeOwner>, CoreFailure> {
-        let inode = match storage.get_inode(inode_id) {
-            Ok(inode) => inode,
-            Err(err) => {
-                return Err(core_failure_from_metadata_error(req_ctx, err, None, None, None));
-            }
-        };
-        Ok(inode.as_ref().map(Self::owner_from_inode))
     }
 
     fn route_fs_write_ctx(&self, op: CoreWriteOp, parent_inode_ids: &[InodeId]) -> MetadataResult<RoutedFsWriteCtx> {

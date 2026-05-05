@@ -63,15 +63,6 @@ impl FreshnessValidator {
         self.validate_mount_epoch_for_mount_with_replay(ctx, freshness, mount_id, Some("request"))
     }
 
-    pub(super) fn validate_mount_freshness(
-        &self,
-        ctx: &RequestContext,
-        freshness: Freshness,
-        mount_id: MountId,
-    ) -> Result<(Option<u64>, Option<u64>), CoreFailure> {
-        self.validate_mount_epoch_for_mount_with_replay(ctx, freshness, mount_id, None)
-    }
-
     fn validate_mount_epoch_for_mount_with_replay(
         &self,
         ctx: &RequestContext,
@@ -199,6 +190,6 @@ impl FreshnessValidator {
     }
 
     fn replay_hint(intent: &str) -> String {
-        format!("refresh metadata and re-open write session, then replay {}", intent)
+        format!("refresh metadata and reopen write handle, then replay {}", intent)
     }
 }

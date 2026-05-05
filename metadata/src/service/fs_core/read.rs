@@ -4,12 +4,11 @@
 use super::FsCore;
 use crate::error::MetadataError;
 use crate::service::domain::{
-    AccessInput, AccessOutput, CoreResult, FileBlockLocation, GetAttrInput, GetAttrOutput, GetFileLayoutInput,
-    GetFileLayoutOutput, GetXattrInput, GetXattrOutput, InodeMountGuardInputs, LinkInput, LinkOutput, ListXattrInput,
-    ListXattrOutput, LookupInput, LookupOutput, OpenInput, OpenOutput, ReadDirEntry, ReadDirInput, ReadDirOutput,
-    ReadlinkInput, ReadlinkOutput, RequestContext, StatFsInput, StatFsOutput, SymlinkInput, SymlinkOutput, WorkerHint,
+    CoreResult, FileBlockLocation, GetAttrInput, GetAttrOutput, GetFileLayoutInput, GetFileLayoutOutput,
+    InodeMountGuardInputs, ReadDirEntry, ReadDirInput, ReadDirOutput, RequestContext, WorkerHint,
 };
 use types::fs::{Extent, InodeId};
+use types::ids::DataHandleId;
 
 impl FsCore {
     pub(crate) async fn plan_inode_mount(
@@ -41,52 +40,6 @@ impl FsCore {
             },
             None,
             None,
-        )
-    }
-
-    pub(crate) async fn execute_lookup(&self, req: LookupInput) -> CoreResult<LookupOutput> {
-        let storage = match self.storage_for_ctx(&req.ctx) {
-            Ok(storage) => storage,
-            Err(failure) => return Err(failure),
-        };
-
-        let child_inode_id = match storage.get_dentry(req.parent_inode_id, &req.name) {
-            Ok(Some(child_inode_id)) => child_inode_id,
-            Ok(None) => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::NotFound(format!(
-                        "Entry not found: parent={}, name={}",
-                        req.parent_inode_id, req.name
-                    )),
-                    None,
-                    None,
-                );
-            }
-            Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
-        };
-
-        let child_inode = match storage.get_inode(child_inode_id) {
-            Ok(Some(child_inode)) => child_inode,
-            Ok(None) => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::NotFound(format!("Inode not found: {}", child_inode_id)),
-                    None,
-                    None,
-                );
-            }
-            Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
-        };
-
-        let (group_id, mount_epoch) = self.mount_hints_for_mount(child_inode.mount_id);
-        let route_epoch = self.authoritative_route_epoch().await;
-        self.success_with_route_epoch(
-            &req.ctx,
-            LookupOutput { inode: child_inode },
-            group_id,
-            mount_epoch,
-            route_epoch,
         )
     }
 
@@ -127,6 +80,37 @@ impl FsCore {
             mount_epoch,
             route_epoch,
         )
+    }
+
+    pub(crate) async fn inode_for_data_handle(
+        &self,
+        req_ctx: &RequestContext,
+        data_handle_id: DataHandleId,
+    ) -> CoreResult<InodeId> {
+        let storage = match self.storage.as_ref() {
+            Some(storage) => storage,
+            None => {
+                return self.failure_from_error(
+                    req_ctx,
+                    MetadataError::Internal("Storage not available".to_string()),
+                    None,
+                    None,
+                );
+            }
+        };
+        let inode_id = match storage.get_inode_by_data_handle(data_handle_id) {
+            Ok(Some(inode_id)) => inode_id,
+            Ok(None) => {
+                return self.failure_from_error(
+                    req_ctx,
+                    MetadataError::NotFound(format!("data_handle_id not found: {}", data_handle_id)),
+                    None,
+                    None,
+                );
+            }
+            Err(err) => return self.failure_from_error(req_ctx, err, None, None),
+        };
+        self.success(req_ctx, inode_id, None, None)
     }
 
     pub(crate) async fn execute_read_dir(&self, req: ReadDirInput) -> CoreResult<ReadDirOutput> {
@@ -194,117 +178,6 @@ impl FsCore {
             mount_epoch,
             route_epoch,
         )
-    }
-
-    pub(crate) async fn execute_open(&self, req: OpenInput) -> CoreResult<OpenOutput> {
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-            }
-        };
-
-        let inode = match storage.get_inode(req.inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::NotFound(format!("Inode not found: {}", req.inode_id)),
-                    None,
-                    None,
-                );
-            }
-            Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
-        };
-
-        let _flags = req.flags;
-        let (group_id, mount_epoch) = self.mount_hints_for_mount(inode.mount_id);
-        let route_epoch = self.authoritative_route_epoch().await;
-        self.success_with_route_epoch(
-            &req.ctx,
-            OpenOutput { file_handle: 0 },
-            group_id,
-            mount_epoch,
-            route_epoch,
-        )
-    }
-
-    pub(crate) async fn execute_get_xattr(&self, req: GetXattrInput) -> CoreResult<GetXattrOutput> {
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-            }
-        };
-
-        let inode = match storage.get_inode(req.inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::NotFound(format!("Inode not found: {}", req.inode_id)),
-                    None,
-                    None,
-                );
-            }
-            Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
-        };
-
-        let value = match inode.xattrs.get(&req.name) {
-            Some(value) => value.clone(),
-            None => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::NotFound(format!("xattr not found: {}", req.name)),
-                    None,
-                    None,
-                );
-            }
-        };
-
-        let (group_id, mount_epoch) = self.mount_hints_for_mount(inode.mount_id);
-        self.success(&req.ctx, GetXattrOutput { value }, group_id, mount_epoch)
-    }
-
-    pub(crate) async fn execute_list_xattr(&self, req: ListXattrInput) -> CoreResult<ListXattrOutput> {
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-            }
-        };
-
-        let inode = match storage.get_inode(req.inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::NotFound(format!("Inode not found: {}", req.inode_id)),
-                    None,
-                    None,
-                );
-            }
-            Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
-        };
-
-        let names = inode.xattrs.keys().cloned().collect::<Vec<_>>();
-        let (group_id, mount_epoch) = self.mount_hints_for_mount(inode.mount_id);
-        self.success(&req.ctx, ListXattrOutput { names }, group_id, mount_epoch)
     }
 
     pub(crate) async fn execute_get_file_layout(&self, req: GetFileLayoutInput) -> CoreResult<GetFileLayoutOutput> {
@@ -439,52 +312,6 @@ impl FsCore {
             group_id,
             mount_epoch,
             route_epoch,
-        )
-    }
-
-    pub(crate) async fn execute_stat_fs(&self, req: StatFsInput) -> CoreResult<StatFsOutput> {
-        self.failure_from_error(
-            &req.ctx,
-            MetadataError::NotSupported("StatFs not yet implemented".to_string()),
-            None,
-            None,
-        )
-    }
-
-    pub(crate) async fn execute_access(&self, req: AccessInput) -> CoreResult<AccessOutput> {
-        let _ = req.mode;
-        self.failure_from_error(
-            &req.ctx,
-            MetadataError::NotSupported("Access not yet implemented".to_string()),
-            None,
-            None,
-        )
-    }
-
-    pub(crate) async fn execute_symlink(&self, req: SymlinkInput) -> CoreResult<SymlinkOutput> {
-        self.failure_from_error(
-            &req.ctx,
-            MetadataError::NotSupported("Symlink not yet implemented".to_string()),
-            None,
-            None,
-        )
-    }
-
-    pub(crate) async fn execute_readlink(&self, req: ReadlinkInput) -> CoreResult<ReadlinkOutput> {
-        self.failure_from_error(
-            &req.ctx,
-            MetadataError::NotSupported("Readlink not yet implemented".to_string()),
-            None,
-            None,
-        )
-    }
-
-    pub(crate) async fn execute_link(&self, req: LinkInput) -> CoreResult<LinkOutput> {
-        self.failure_from_error(
-            &req.ctx,
-            MetadataError::NotSupported("Link not yet implemented".to_string()),
-            None,
-            None,
         )
     }
 }

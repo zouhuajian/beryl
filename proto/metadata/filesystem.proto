@@ -10,101 +10,105 @@ import "common/header.proto";
 import "fs/types.proto";
 
 // ============================================================================
-// FileSystemService (external/public filesystem entrypoint)
+// FileSystemServiceProto
 // ============================================================================
 //
-// Error envelope contract:
-// - RPC-level business/protocol/recoverable errors MUST return gRPC OK.
-// - Failure semantics MUST be carried via ResponseHeaderProto.error (CanonicalError envelope).
-// - Non-OK gRPC Status is reserved for transport/auth/framework failures only.
+// FileSystemServiceProto is the external metadata/control-plane API.
 //
-// Authoritative model contract:
-// - Path is adapter input only.
-// - inode/dentry/attrs remain authoritative identity and storage model.
+// Error contract:
+// - Recoverable business, protocol, and consistency failures return gRPC OK.
+// - ResponseHeaderProto.error carries the canonical error envelope.
+// - Non-OK gRPC status is reserved for transport, auth, and framework failures.
+//
+// Authority contract:
+// - Path is an adapter entrypoint.
+// - inode, data_handle, block, lease, fencing, and epoch identities carry the
+//   consistency contract.
+// - WriteSession is an internal implementation concept and is not a public RPC
+//   name or message name.
 
 // ============================================================================
-// Shared filesystem API payloads
+// Shared external payloads
 // ============================================================================
 
-message WriteTargetProto {
-  // Target block for the write.
-  common.BlockIdProto block_id = 1;
-  // Worker endpoints authorized to accept the write.
-  repeated common.WorkerEndpointInfoProto worker_endpoints = 2;
-  // Fencing token associated with the block.
-  common.FencingTokenProto fencing_token = 3;
+message WriteHandleProto {
+  uint64 handle_id = 1;
+  common.LeaseIdProto lease_id = 2;
+  uint64 lease_epoch = 3;
+  uint64 open_epoch = 4;
+  common.FencingTokenProto fencing_token = 5;
 }
 
-enum WriteModeProto {
-  WRITE_MODE_UNSPECIFIED = 0;
-  // Write mode: can write at any offset.
-  WRITE_MODE_WRITE = 1;
-  // Append mode: writes must start from file_size.
-  WRITE_MODE_APPEND = 2;
+enum CreateDispositionProto {
+  CREATE_DISPOSITION_UNSPECIFIED = 0;
+  CREATE_NEW = 1;
+  OVERWRITE = 2;
+}
+
+message WriteTargetProto {
+  common.BlockIdProto block_id = 1;
+  uint64 file_offset = 2;
+  uint64 len = 3;
+  repeated common.WorkerEndpointInfoProto worker_endpoints = 4;
+  common.FencingTokenProto fencing_token = 5;
+}
+
+message CommittedBlockProto {
+  common.BlockIdProto block_id = 1;
+  uint64 file_offset = 2;
+  uint64 len = 3;
+  optional bytes checksum = 4;
 }
 
 message FileBlockLocationProto {
-  // Block slice this location covers.
   common.BlockIdProto block_id = 1;
-  // File offset that this block maps to.
   uint64 file_offset = 2;
-  // Length in bytes covered by this block.
   uint64 len = 3;
-  // Worker endpoints that currently host the block.
   repeated common.WorkerEndpointInfoProto workers = 4;
-  // Optional worker freshness epoch.
   optional uint64 worker_epoch = 5;
 }
 
 // ============================================================================
-// GetFileStatus (merged stat API)
+// Namespace
 // ============================================================================
 
-message GetFileStatusRequestProto {
+message GetStatusRequestProto {
   common.RequestHeaderProto header = 1;
-  // Absolute or relative path (UTF-8).
   string path = 2;
 }
 
-message GetFileStatusResponseProto {
+message GetStatusResponseProto {
   common.ResponseHeaderProto header = 1;
-  // Stable identity in authoritative inode model.
   fs.InodeIdProto inode_id = 2;
-  // File attributes.
   fs.FileAttrsProto attrs = 3;
-  // Optional inode projection for convenience.
-  optional fs.InodeProto inode = 4;
 }
 
-// ============================================================================
-// Core path-based operations (existing adapter messages retained where needed)
-// ============================================================================
+message ListStatusRequestProto {
+  common.RequestHeaderProto header = 1;
+  string path = 2;
+  bool recursive = 3;
+  bytes cursor = 4;
+  uint32 limit = 5;
+}
 
-message MkdirPathRequestProto {
+message ListStatusResponseProto {
+  common.ResponseHeaderProto header = 1;
+  repeated fs.DirEntryProto entries = 2;
+  bytes next_cursor = 3;
+  bool eof = 4;
+}
+
+message CreateDirectoryRequestProto {
   common.RequestHeaderProto header = 1;
   string path = 2;
   fs.FileAttrsProto attrs = 3;
   bool create_parents = 4;
 }
 
-message MkdirPathResponseProto {
-  common.ResponseHeaderProto header = 1;
-  fs.InodeProto inode = 2;
-  fs.FileAttrsProto attrs = 3;
-}
-
-message CreatePathRequestProto {
-  common.RequestHeaderProto header = 1;
-  string path = 2;
-  fs.FileAttrsProto attrs = 3;
-  common.FileLayoutProto layout = 4;
-}
-
-message CreatePathResponseProto {
+message CreateDirectoryResponseProto {
   common.ResponseHeaderProto header = 1;
   fs.InodeIdProto inode_id = 2;
-  optional fs.InodeProto inode = 3;
-  fs.FileAttrsProto attrs = 4;
+  fs.FileAttrsProto attrs = 3;
 }
 
 message DeleteRequestProto {
@@ -117,259 +121,164 @@ message DeleteResponseProto {
   common.ResponseHeaderProto header = 1;
 }
 
-message RenamePathRequestProto {
+message RenameRequestProto {
   common.RequestHeaderProto header = 1;
   string src_path = 2;
   string dst_path = 3;
   uint32 flags = 4;
 }
 
-message RenamePathResponseProto {
-  common.ResponseHeaderProto header = 1;
-}
-
-message ListStatusPathRequestProto {
-  common.RequestHeaderProto header = 1;
-  string path = 2;
-  bool recursive = 3;
-  bytes cursor = 4;
-  uint32 limit = 5;
-}
-
-message ListStatusPathResponseProto {
-  common.ResponseHeaderProto header = 1;
-  repeated fs.DirEntryProto entries = 2;
-  bytes next_cursor = 3;
-  bool eof = 4;
-}
-
-message OpenPathRequestProto {
-  common.RequestHeaderProto header = 1;
-  string path = 2;
-  uint32 flags = 3;
-}
-
-message OpenPathResponseProto {
-  common.ResponseHeaderProto header = 1;
-  uint64 file_handle = 2;
-}
-
-message ReleasePathRequestProto {
-  common.RequestHeaderProto header = 1;
-  uint64 file_handle = 2;
-}
-
-message ReleasePathResponseProto {
-  common.ResponseHeaderProto header = 1;
-}
-
-message FsyncPathRequestProto {
-  common.RequestHeaderProto header = 1;
-  oneof target {
-    string path = 2;
-    uint64 file_handle = 3;
-  }
-  uint32 flags = 4;
-}
-
-message FsyncPathResponseProto {
-  common.ResponseHeaderProto header = 1;
-}
-
-message HsyncPathRequestProto {
-  FsyncPathRequestProto fsync = 1;
-}
-
-message HsyncPathResponseProto {
-  common.ResponseHeaderProto header = 1;
-}
-
-message HflushPathRequestProto {
-  FsyncPathRequestProto fsync = 1;
-}
-
-message HflushPathResponseProto {
-  common.ResponseHeaderProto header = 1;
-}
-
-message TruncatePathRequestProto {
-  common.RequestHeaderProto header = 1;
-  string path = 2;
-  uint64 new_size = 3;
-  common.LeaseIdProto lease_id = 4;
-  uint64 lease_epoch = 5;
-}
-
-message TruncatePathResponseProto {
-  common.ResponseHeaderProto header = 1;
-  uint64 new_size = 2;
-}
-
-message SetXattrPathRequestProto {
-  common.RequestHeaderProto header = 1;
-  string path = 2;
-  string name = 3;
-  bytes value = 4;
-  bool create = 5;
-  bool replace = 6;
-}
-
-message SetXattrPathResponseProto {
-  common.ResponseHeaderProto header = 1;
-}
-
-message GetXattrPathRequestProto {
-  common.RequestHeaderProto header = 1;
-  string path = 2;
-  string name = 3;
-}
-
-message GetXattrPathResponseProto {
-  common.ResponseHeaderProto header = 1;
-  bytes value = 2;
-}
-
-message ListXattrPathRequestProto {
-  common.RequestHeaderProto header = 1;
-  string path = 2;
-}
-
-message ListXattrPathResponseProto {
-  common.ResponseHeaderProto header = 1;
-  repeated string names = 2;
-}
-
-message RemoveXattrPathRequestProto {
-  common.RequestHeaderProto header = 1;
-  string path = 2;
-  string name = 3;
-}
-
-message RemoveXattrPathResponseProto {
+message RenameResponseProto {
   common.ResponseHeaderProto header = 1;
 }
 
 // ============================================================================
-// Layout/read helper with route freshness contract
+// Read
 // ============================================================================
 
-message GetFileLayoutByPathRequestProto {
+message OpenFileRequestProto {
   common.RequestHeaderProto header = 1;
   string path = 2;
   optional common.ByteRangeProto range = 3;
+  bool include_locations = 4;
 }
 
-message GetFileLayoutByPathResponseProto {
+message OpenFileResponseProto {
   common.ResponseHeaderProto header = 1;
-  repeated fs.ExtentProto extents = 2;
-  uint64 file_size = 3;
-  repeated metadata.FileBlockLocationProto locations = 4;
+  fs.InodeIdProto inode_id = 2;
+  common.DataHandleIdProto data_handle_id = 3;
+  uint64 file_size = 4;
+  optional uint64 file_version = 5;
+  repeated FileBlockLocationProto locations = 6;
+}
+
+message GetBlockLocationsRequestProto {
+  common.RequestHeaderProto header = 1;
+  oneof target {
+    string path = 2;
+    fs.InodeIdProto inode_id = 3;
+    common.DataHandleIdProto data_handle_id = 4;
+  }
+  optional common.ByteRangeProto range = 5;
+}
+
+message GetBlockLocationsResponseProto {
+  common.ResponseHeaderProto header = 1;
+  fs.InodeIdProto inode_id = 2;
+  common.DataHandleIdProto data_handle_id = 3;
+  uint64 file_size = 4;
+  repeated FileBlockLocationProto locations = 5;
 }
 
 // ============================================================================
-// Write session APIs (external clients should not call InodeService directly)
+// Write
 // ============================================================================
 
-// Validation contract:
-// - mount freshness: RequestHeader.mount_epoch
-// - lease/session fencing: lease_id + lease_epoch + open_epoch + fencing_token
-// - route freshness: RequestHeader.route_epoch (when provided)
-// - worker freshness: worker_epoch (when provided)
-//
-// Mismatch mapping:
-// - epoch/route/worker/session staleness -> NEED_REFRESH
-// - semantic/argument violations -> FATAL (errno)
+message CreateFileRequestProto {
+  common.RequestHeaderProto header = 1;
+  string path = 2;
+  fs.FileAttrsProto attrs = 3;
+  common.FileLayoutProto layout = 4;
+  CreateDispositionProto disposition = 5;
+  optional uint64 desired_len = 6;
+}
 
-message OpenWriteByPathRequestProto {
+message CreateFileResponseProto {
+  common.ResponseHeaderProto header = 1;
+  WriteHandleProto write_handle = 2;
+  fs.InodeIdProto inode_id = 3;
+  common.DataHandleIdProto data_handle_id = 4;
+  uint64 base_size = 5;
+  // P0 contract: CreateFile does not issue write targets; callers must use AddBlock.
+  repeated WriteTargetProto initial_targets = 6;
+  uint64 expires_at_ms = 7;
+}
+
+message AppendFileRequestProto {
   common.RequestHeaderProto header = 1;
   string path = 2;
   optional uint64 desired_len = 3;
-  metadata.WriteModeProto mode = 4;
 }
 
-message OpenWriteByPathResponseProto {
+message AppendFileResponseProto {
   common.ResponseHeaderProto header = 1;
-  uint64 file_handle = 2;
-  common.LeaseIdProto lease_id = 3;
-  common.FencingTokenProto fencing_token = 4;
-  repeated metadata.WriteTargetProto write_targets = 5;
-  uint64 base_size = 6;
-  uint64 open_epoch = 7;
-  uint64 lease_epoch = 8;
-  uint64 expires_at_ms = 9;
+  WriteHandleProto write_handle = 2;
+  fs.InodeIdProto inode_id = 3;
+  common.DataHandleIdProto data_handle_id = 4;
+  uint64 base_size = 5;
+  // P0 contract: AppendFile does not issue write targets; callers must use AddBlock.
+  repeated WriteTargetProto initial_targets = 6;
+  uint64 expires_at_ms = 7;
 }
 
-message CloseWriteSessionRequestProto {
+message AddBlockRequestProto {
   common.RequestHeaderProto header = 1;
-  uint64 file_handle = 2;
-  common.LeaseIdProto lease_id = 3;
-  common.FencingTokenProto fencing_token = 4;
-  repeated fs.ExtentProto extents = 5;
-  uint64 final_size = 6;
-  uint64 open_epoch = 7;
-  uint64 lease_epoch = 8;
+  WriteHandleProto write_handle = 2;
+  optional uint64 desired_len = 3;
 }
 
-message CloseWriteSessionResponseProto {
+message AddBlockResponseProto {
+  common.ResponseHeaderProto header = 1;
+  WriteTargetProto target = 2;
+}
+
+message CommitFileRequestProto {
+  common.RequestHeaderProto header = 1;
+  WriteHandleProto write_handle = 2;
+  common.DataHandleIdProto data_handle_id = 3;
+  repeated CommittedBlockProto committed_blocks = 4;
+  uint64 final_size = 5;
+}
+
+message CommitFileResponseProto {
   common.ResponseHeaderProto header = 1;
   uint64 committed_size = 2;
   optional uint64 file_version = 3;
 }
 
-message RenewWriteSessionLeaseRequestProto {
+message AbortFileWriteRequestProto {
   common.RequestHeaderProto header = 1;
-  uint64 file_handle = 2;
-  common.LeaseIdProto lease_id = 3;
-  uint64 lease_epoch = 4;
+  WriteHandleProto write_handle = 2;
 }
 
-message RenewWriteSessionLeaseResponseProto {
+message AbortFileWriteResponseProto {
+  common.ResponseHeaderProto header = 1;
+}
+
+message RenewLeaseRequestProto {
+  common.RequestHeaderProto header = 1;
+  WriteHandleProto write_handle = 2;
+}
+
+message RenewLeaseResponseProto {
   common.ResponseHeaderProto header = 1;
   uint64 expires_at_ms = 2;
 }
 
-message FsyncSessionRequestProto {
+message HflushRequestProto {
   common.RequestHeaderProto header = 1;
-  uint64 file_handle = 2;
-  uint32 flags = 3;
-  optional common.LeaseIdProto lease_id = 4;
-  optional uint64 lease_epoch = 5;
-  optional common.FencingTokenProto fencing_token = 6;
-  optional uint64 worker_epoch = 7;
-  optional uint64 target_size = 8;
+  WriteHandleProto write_handle = 2;
+  optional uint64 target_size = 3;
+  uint32 flags = 4;
 }
 
-message FsyncSessionResponseProto {
+message HflushResponseProto {
   common.ResponseHeaderProto header = 1;
 }
 
-message HsyncSessionRequestProto {
-  FsyncSessionRequestProto fsync = 1;
-}
-
-message HsyncSessionResponseProto {
-  common.ResponseHeaderProto header = 1;
-}
-
-message HflushSessionRequestProto {
-  FsyncSessionRequestProto fsync = 1;
-}
-
-message HflushSessionResponseProto {
-  common.ResponseHeaderProto header = 1;
-}
-
-message ReleaseSessionRequestProto {
+message HsyncRequestProto {
   common.RequestHeaderProto header = 1;
-  uint64 file_handle = 2;
+  WriteHandleProto write_handle = 2;
+  optional uint64 target_size = 3;
+  uint32 flags = 4;
 }
 
-message ReleaseSessionResponseProto {
+message HsyncResponseProto {
   common.ResponseHeaderProto header = 1;
 }
 
 // ============================================================================
-// Metadata state sync
+// Metadata state freshness
 // ============================================================================
 
 message MsyncRequestProto {
@@ -378,50 +287,33 @@ message MsyncRequestProto {
 
 message MsyncResponseProto {
   common.ResponseHeaderProto header = 1;
-
-  // Authoritative current metadata state watermark of the serving raft group.
   common.GroupStateWatermarkProto state = 2;
 }
 
 service FileSystemServiceProto {
-  // Stat
-  rpc GetFileStatus(GetFileStatusRequestProto) returns (GetFileStatusResponseProto);
-
-  // Core operations
-  rpc Mkdir(MkdirPathRequestProto) returns (MkdirPathResponseProto);
-  rpc Create(CreatePathRequestProto) returns (CreatePathResponseProto);
+  // namespace
+  rpc GetStatus(GetStatusRequestProto) returns (GetStatusResponseProto);
+  rpc ListStatus(ListStatusRequestProto) returns (ListStatusResponseProto);
+  rpc CreateDirectory(CreateDirectoryRequestProto) returns (CreateDirectoryResponseProto);
   rpc Delete(DeleteRequestProto) returns (DeleteResponseProto);
-  rpc Rename(RenamePathRequestProto) returns (RenamePathResponseProto);
-  rpc ListStatus(ListStatusPathRequestProto) returns (ListStatusPathResponseProto);
+  rpc Rename(RenameRequestProto) returns (RenameResponseProto);
 
-  // Optional open/release helpers
-  rpc Open(OpenPathRequestProto) returns (OpenPathResponseProto);
-  rpc Release(ReleasePathRequestProto) returns (ReleasePathResponseProto);
+  // read
+  rpc OpenFile(OpenFileRequestProto) returns (OpenFileResponseProto);
+  rpc GetBlockLocations(GetBlockLocationsRequestProto) returns (GetBlockLocationsResponseProto);
 
-  // Path target data sync helpers
-  rpc Fsync(FsyncPathRequestProto) returns (FsyncPathResponseProto);
-  rpc Hsync(HsyncPathRequestProto) returns (HsyncPathResponseProto);
-  rpc Hflush(HflushPathRequestProto) returns (HflushPathResponseProto);
+  // write
+  rpc CreateFile(CreateFileRequestProto) returns (CreateFileResponseProto);
+  rpc AppendFile(AppendFileRequestProto) returns (AppendFileResponseProto);
+  rpc AddBlock(AddBlockRequestProto) returns (AddBlockResponseProto);
+  rpc CommitFile(CommitFileRequestProto) returns (CommitFileResponseProto);
+  rpc AbortFileWrite(AbortFileWriteRequestProto) returns (AbortFileWriteResponseProto);
+  rpc RenewLease(RenewLeaseRequestProto) returns (RenewLeaseResponseProto);
 
-  // Truncate and xattr
-  rpc Truncate(TruncatePathRequestProto) returns (TruncatePathResponseProto);
-  rpc SetXattr(SetXattrPathRequestProto) returns (SetXattrPathResponseProto);
-  rpc GetXattr(GetXattrPathRequestProto) returns (GetXattrPathResponseProto);
-  rpc ListXattr(ListXattrPathRequestProto) returns (ListXattrPathResponseProto);
-  rpc RemoveXattr(RemoveXattrPathRequestProto) returns (RemoveXattrPathResponseProto);
+  // write visibility / durability barriers
+  rpc Hflush(HflushRequestProto) returns (HflushResponseProto);
+  rpc Hsync(HsyncRequestProto) returns (HsyncResponseProto);
 
-  // Layout helper
-  rpc GetFileLayoutByPath(GetFileLayoutByPathRequestProto) returns (GetFileLayoutByPathResponseProto);
-
-  // Write-session flow for external clients
-  rpc OpenWriteByPath(OpenWriteByPathRequestProto) returns (OpenWriteByPathResponseProto);
-  rpc CloseWriteSession(CloseWriteSessionRequestProto) returns (CloseWriteSessionResponseProto);
-  rpc RenewWriteSessionLease(RenewWriteSessionLeaseRequestProto) returns (RenewWriteSessionLeaseResponseProto);
-  rpc FsyncSession(FsyncSessionRequestProto) returns (FsyncSessionResponseProto);
-  rpc HsyncSession(HsyncSessionRequestProto) returns (HsyncSessionResponseProto);
-  rpc HflushSession(HflushSessionRequestProto) returns (HflushSessionResponseProto);
-  rpc ReleaseSession(ReleaseSessionRequestProto) returns (ReleaseSessionResponseProto);
-
-  // Metadata state freshness for one local raft group.
+  // freshness
   rpc Msync(MsyncRequestProto) returns (MsyncResponseProto);
 }

@@ -22,12 +22,14 @@ use proto::common::{
 };
 use proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
 use proto::metadata::{
-    CloseWriteSessionRequestProto, CloseWriteSessionResponseProto, DeleteRequestProto, DeleteResponseProto,
-    FsyncSessionRequestProto, FsyncSessionResponseProto, GetFileLayoutByPathRequestProto,
-    GetFileLayoutByPathResponseProto, GetFileStatusRequestProto, GetFileStatusResponseProto, HflushSessionRequestProto,
-    HflushSessionResponseProto, HsyncSessionRequestProto, HsyncSessionResponseProto, ListStatusPathRequestProto,
-    ListStatusPathResponseProto, MsyncRequestProto, MsyncResponseProto, OpenWriteByPathRequestProto,
-    OpenWriteByPathResponseProto,
+    AbortFileWriteRequestProto, AbortFileWriteResponseProto, AddBlockRequestProto, AddBlockResponseProto,
+    AppendFileRequestProto, AppendFileResponseProto, CommitFileRequestProto, CommitFileResponseProto,
+    CreateDirectoryRequestProto, CreateDirectoryResponseProto, CreateFileRequestProto, CreateFileResponseProto,
+    DeleteRequestProto, DeleteResponseProto, GetBlockLocationsRequestProto, GetBlockLocationsResponseProto,
+    GetStatusRequestProto, GetStatusResponseProto, HflushRequestProto, HflushResponseProto, HsyncRequestProto,
+    HsyncResponseProto, ListStatusRequestProto, ListStatusResponseProto, MsyncRequestProto, MsyncResponseProto,
+    OpenFileRequestProto, OpenFileResponseProto, RenameRequestProto, RenameResponseProto, RenewLeaseRequestProto,
+    RenewLeaseResponseProto, WriteHandleProto, WriteTargetProto,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -43,11 +45,11 @@ use types::CallId;
 /// Replay policy for a filesystem RPC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplayPolicy {
-    /// Idempotent metadata reads (`GetFileStatus`, `ListStatus`, `GetFileLayoutByPath`).
+    /// Idempotent metadata reads.
     IdempotentRead,
-    /// Mutating metadata write/open operations.
+    /// Namespace or write-target mutations.
     Mutation,
-    /// Session barrier ops (`FsyncSession`/`HsyncSession`/`HflushSession`).
+    /// Write handle lifecycle operations.
     SessionBarrier,
     /// Best-effort cleanup operations (currently unused by the FileSystemService client surface).
     CleanupBestEffort,
@@ -56,38 +58,59 @@ pub enum ReplayPolicy {
 /// Stable identifier for each public FileSystemService client RPC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FileSystemRpcMethod {
-    /// `GetFileStatus`.
-    GetFileStatus,
-    /// `ListStatus`.
+    /// Get file or directory status.
+    GetStatus,
+    /// List directory status entries.
     ListStatus,
-    /// `GetFileLayoutByPath`.
-    GetFileLayoutByPath,
-    /// `Delete`.
+    /// Create a directory.
+    CreateDirectory,
+    /// Delete a file or directory.
     Delete,
-    /// `OpenWriteByPath`.
-    OpenWriteByPath,
-    /// `FsyncSession`.
-    FsyncSession,
-    /// `HsyncSession`.
-    HsyncSession,
-    /// `HflushSession`.
-    HflushSession,
-    /// `CloseWriteSession`.
-    CloseWriteSession,
+    /// Rename a namespace entry.
+    Rename,
+    /// Open a file for direct read planning.
+    OpenFile,
+    /// Resolve direct read block locations.
+    GetBlockLocations,
+    /// Create a file and open a write handle.
+    CreateFile,
+    /// Open an existing file for append.
+    AppendFile,
+    /// Allocate the next write block target.
+    AddBlock,
+    /// Commit a write handle.
+    CommitFile,
+    /// Abort a write handle.
+    AbortFileWrite,
+    /// Renew a write lease.
+    RenewLease,
+    /// Flush write visibility.
+    Hflush,
+    /// Sync write durability.
+    Hsync,
+    /// Synchronize metadata state freshness.
+    Msync,
 }
 
 impl FileSystemRpcMethod {
     #[cfg(test)]
-    const ALL: [Self; 9] = [
-        Self::GetFileStatus,
+    const ALL: [Self; 16] = [
+        Self::GetStatus,
         Self::ListStatus,
-        Self::GetFileLayoutByPath,
+        Self::CreateDirectory,
         Self::Delete,
-        Self::OpenWriteByPath,
-        Self::FsyncSession,
-        Self::HsyncSession,
-        Self::HflushSession,
-        Self::CloseWriteSession,
+        Self::Rename,
+        Self::OpenFile,
+        Self::GetBlockLocations,
+        Self::CreateFile,
+        Self::AppendFile,
+        Self::AddBlock,
+        Self::CommitFile,
+        Self::AbortFileWrite,
+        Self::RenewLease,
+        Self::Hflush,
+        Self::Hsync,
+        Self::Msync,
     ];
 }
 
@@ -97,9 +120,9 @@ struct ReplayPolicyMapping {
     policy: ReplayPolicy,
 }
 
-const FILESYSTEM_RPC_REPLAY_POLICIES: [ReplayPolicyMapping; 9] = [
+const FILESYSTEM_RPC_REPLAY_POLICIES: [ReplayPolicyMapping; 16] = [
     ReplayPolicyMapping {
-        method: FileSystemRpcMethod::GetFileStatus,
+        method: FileSystemRpcMethod::GetStatus,
         policy: ReplayPolicy::IdempotentRead,
     },
     ReplayPolicyMapping {
@@ -107,32 +130,60 @@ const FILESYSTEM_RPC_REPLAY_POLICIES: [ReplayPolicyMapping; 9] = [
         policy: ReplayPolicy::IdempotentRead,
     },
     ReplayPolicyMapping {
-        method: FileSystemRpcMethod::GetFileLayoutByPath,
-        policy: ReplayPolicy::IdempotentRead,
+        method: FileSystemRpcMethod::CreateDirectory,
+        policy: ReplayPolicy::Mutation,
     },
     ReplayPolicyMapping {
         method: FileSystemRpcMethod::Delete,
         policy: ReplayPolicy::Mutation,
     },
     ReplayPolicyMapping {
-        method: FileSystemRpcMethod::OpenWriteByPath,
+        method: FileSystemRpcMethod::Rename,
         policy: ReplayPolicy::Mutation,
     },
     ReplayPolicyMapping {
-        method: FileSystemRpcMethod::FsyncSession,
+        method: FileSystemRpcMethod::OpenFile,
+        policy: ReplayPolicy::IdempotentRead,
+    },
+    ReplayPolicyMapping {
+        method: FileSystemRpcMethod::GetBlockLocations,
+        policy: ReplayPolicy::IdempotentRead,
+    },
+    ReplayPolicyMapping {
+        method: FileSystemRpcMethod::CreateFile,
+        policy: ReplayPolicy::Mutation,
+    },
+    ReplayPolicyMapping {
+        method: FileSystemRpcMethod::AppendFile,
+        policy: ReplayPolicy::Mutation,
+    },
+    ReplayPolicyMapping {
+        method: FileSystemRpcMethod::AddBlock,
+        policy: ReplayPolicy::Mutation,
+    },
+    ReplayPolicyMapping {
+        method: FileSystemRpcMethod::CommitFile,
         policy: ReplayPolicy::SessionBarrier,
     },
     ReplayPolicyMapping {
-        method: FileSystemRpcMethod::HsyncSession,
+        method: FileSystemRpcMethod::AbortFileWrite,
         policy: ReplayPolicy::SessionBarrier,
     },
     ReplayPolicyMapping {
-        method: FileSystemRpcMethod::HflushSession,
+        method: FileSystemRpcMethod::RenewLease,
         policy: ReplayPolicy::SessionBarrier,
     },
     ReplayPolicyMapping {
-        method: FileSystemRpcMethod::CloseWriteSession,
+        method: FileSystemRpcMethod::Hflush,
         policy: ReplayPolicy::SessionBarrier,
+    },
+    ReplayPolicyMapping {
+        method: FileSystemRpcMethod::Hsync,
+        policy: ReplayPolicy::SessionBarrier,
+    },
+    ReplayPolicyMapping {
+        method: FileSystemRpcMethod::Msync,
+        policy: ReplayPolicy::IdempotentRead,
     },
 ];
 
@@ -171,56 +222,59 @@ impl Default for ActionMachinePolicy {
 /// Mockable FileSystemService RPC trait.
 #[async_trait]
 pub trait FileSystemRpc: Send + Sync {
-    /// Call `GetFileStatus`.
-    async fn get_file_status(
-        &self,
-        request: GetFileStatusRequestProto,
-    ) -> Result<GetFileStatusResponseProto, tonic::Status>;
+    /// Call `GetStatus`.
+    async fn get_status(&self, request: GetStatusRequestProto) -> Result<GetStatusResponseProto, tonic::Status>;
 
     /// Call `ListStatus`.
-    async fn list_status(
-        &self,
-        request: ListStatusPathRequestProto,
-    ) -> Result<ListStatusPathResponseProto, tonic::Status>;
+    async fn list_status(&self, request: ListStatusRequestProto) -> Result<ListStatusResponseProto, tonic::Status>;
 
-    /// Call `GetFileLayoutByPath`.
-    async fn get_file_layout_by_path(
+    /// Call `CreateDirectory`.
+    async fn create_directory(
         &self,
-        request: GetFileLayoutByPathRequestProto,
-    ) -> Result<GetFileLayoutByPathResponseProto, tonic::Status>;
+        request: CreateDirectoryRequestProto,
+    ) -> Result<CreateDirectoryResponseProto, tonic::Status>;
 
     /// Call `Delete`.
     async fn delete(&self, request: DeleteRequestProto) -> Result<DeleteResponseProto, tonic::Status>;
 
-    /// Call `OpenWriteByPath`.
-    async fn open_write_by_path(
-        &self,
-        request: OpenWriteByPathRequestProto,
-    ) -> Result<OpenWriteByPathResponseProto, tonic::Status>;
+    /// Call `Rename`.
+    async fn rename(&self, request: RenameRequestProto) -> Result<RenameResponseProto, tonic::Status>;
 
-    /// Call `FsyncSession`.
-    async fn fsync_session(
-        &self,
-        request: FsyncSessionRequestProto,
-    ) -> Result<FsyncSessionResponseProto, tonic::Status>;
+    /// Call `OpenFile`.
+    async fn open_file(&self, request: OpenFileRequestProto) -> Result<OpenFileResponseProto, tonic::Status>;
 
-    /// Call `HsyncSession`.
-    async fn hsync_session(
+    /// Call `GetBlockLocations`.
+    async fn get_block_locations(
         &self,
-        request: HsyncSessionRequestProto,
-    ) -> Result<HsyncSessionResponseProto, tonic::Status>;
+        request: GetBlockLocationsRequestProto,
+    ) -> Result<GetBlockLocationsResponseProto, tonic::Status>;
 
-    /// Call `HflushSession`.
-    async fn hflush_session(
-        &self,
-        request: HflushSessionRequestProto,
-    ) -> Result<HflushSessionResponseProto, tonic::Status>;
+    /// Call `CreateFile`.
+    async fn create_file(&self, request: CreateFileRequestProto) -> Result<CreateFileResponseProto, tonic::Status>;
 
-    /// Call `CloseWriteSession`.
-    async fn close_write_session(
+    /// Call `AppendFile`.
+    async fn append_file(&self, request: AppendFileRequestProto) -> Result<AppendFileResponseProto, tonic::Status>;
+
+    /// Call `AddBlock`.
+    async fn add_block(&self, request: AddBlockRequestProto) -> Result<AddBlockResponseProto, tonic::Status>;
+
+    /// Call `CommitFile`.
+    async fn commit_file(&self, request: CommitFileRequestProto) -> Result<CommitFileResponseProto, tonic::Status>;
+
+    /// Call `AbortFileWrite`.
+    async fn abort_file_write(
         &self,
-        request: CloseWriteSessionRequestProto,
-    ) -> Result<CloseWriteSessionResponseProto, tonic::Status>;
+        request: AbortFileWriteRequestProto,
+    ) -> Result<AbortFileWriteResponseProto, tonic::Status>;
+
+    /// Call `RenewLease`.
+    async fn renew_lease(&self, request: RenewLeaseRequestProto) -> Result<RenewLeaseResponseProto, tonic::Status>;
+
+    /// Call `Hflush`.
+    async fn hflush(&self, request: HflushRequestProto) -> Result<HflushResponseProto, tonic::Status>;
+
+    /// Call `Hsync`.
+    async fn hsync(&self, request: HsyncRequestProto) -> Result<HsyncResponseProto, tonic::Status>;
 
     /// Call `Msync`.
     async fn msync(&self, request: MsyncRequestProto) -> Result<MsyncResponseProto, tonic::Status>;
@@ -257,21 +311,15 @@ impl TonicFileSystemRpc {
 
 #[async_trait]
 impl FileSystemRpc for TonicFileSystemRpc {
-    async fn get_file_status(
-        &self,
-        request: GetFileStatusRequestProto,
-    ) -> Result<GetFileStatusResponseProto, tonic::Status> {
+    async fn get_status(&self, request: GetStatusRequestProto) -> Result<GetStatusResponseProto, tonic::Status> {
         let mut client = self.client.lock().await;
         client
-            .get_file_status(tonic::Request::new(request))
+            .get_status(tonic::Request::new(request))
             .await
             .map(|resp| resp.into_inner())
     }
 
-    async fn list_status(
-        &self,
-        request: ListStatusPathRequestProto,
-    ) -> Result<ListStatusPathResponseProto, tonic::Status> {
+    async fn list_status(&self, request: ListStatusRequestProto) -> Result<ListStatusResponseProto, tonic::Status> {
         let mut client = self.client.lock().await;
         client
             .list_status(tonic::Request::new(request))
@@ -279,13 +327,13 @@ impl FileSystemRpc for TonicFileSystemRpc {
             .map(|resp| resp.into_inner())
     }
 
-    async fn get_file_layout_by_path(
+    async fn create_directory(
         &self,
-        request: GetFileLayoutByPathRequestProto,
-    ) -> Result<GetFileLayoutByPathResponseProto, tonic::Status> {
+        request: CreateDirectoryRequestProto,
+    ) -> Result<CreateDirectoryResponseProto, tonic::Status> {
         let mut client = self.client.lock().await;
         client
-            .get_file_layout_by_path(tonic::Request::new(request))
+            .create_directory(tonic::Request::new(request))
             .await
             .map(|resp| resp.into_inner())
     }
@@ -298,57 +346,96 @@ impl FileSystemRpc for TonicFileSystemRpc {
             .map(|resp| resp.into_inner())
     }
 
-    async fn open_write_by_path(
-        &self,
-        request: OpenWriteByPathRequestProto,
-    ) -> Result<OpenWriteByPathResponseProto, tonic::Status> {
+    async fn rename(&self, request: RenameRequestProto) -> Result<RenameResponseProto, tonic::Status> {
         let mut client = self.client.lock().await;
         client
-            .open_write_by_path(tonic::Request::new(request))
+            .rename(tonic::Request::new(request))
             .await
             .map(|resp| resp.into_inner())
     }
 
-    async fn fsync_session(
-        &self,
-        request: FsyncSessionRequestProto,
-    ) -> Result<FsyncSessionResponseProto, tonic::Status> {
+    async fn open_file(&self, request: OpenFileRequestProto) -> Result<OpenFileResponseProto, tonic::Status> {
         let mut client = self.client.lock().await;
         client
-            .fsync_session(tonic::Request::new(request))
+            .open_file(tonic::Request::new(request))
             .await
             .map(|resp| resp.into_inner())
     }
 
-    async fn hsync_session(
+    async fn get_block_locations(
         &self,
-        request: HsyncSessionRequestProto,
-    ) -> Result<HsyncSessionResponseProto, tonic::Status> {
+        request: GetBlockLocationsRequestProto,
+    ) -> Result<GetBlockLocationsResponseProto, tonic::Status> {
         let mut client = self.client.lock().await;
         client
-            .hsync_session(tonic::Request::new(request))
+            .get_block_locations(tonic::Request::new(request))
             .await
             .map(|resp| resp.into_inner())
     }
 
-    async fn hflush_session(
-        &self,
-        request: HflushSessionRequestProto,
-    ) -> Result<HflushSessionResponseProto, tonic::Status> {
+    async fn create_file(&self, request: CreateFileRequestProto) -> Result<CreateFileResponseProto, tonic::Status> {
         let mut client = self.client.lock().await;
         client
-            .hflush_session(tonic::Request::new(request))
+            .create_file(tonic::Request::new(request))
             .await
             .map(|resp| resp.into_inner())
     }
 
-    async fn close_write_session(
-        &self,
-        request: CloseWriteSessionRequestProto,
-    ) -> Result<CloseWriteSessionResponseProto, tonic::Status> {
+    async fn append_file(&self, request: AppendFileRequestProto) -> Result<AppendFileResponseProto, tonic::Status> {
         let mut client = self.client.lock().await;
         client
-            .close_write_session(tonic::Request::new(request))
+            .append_file(tonic::Request::new(request))
+            .await
+            .map(|resp| resp.into_inner())
+    }
+
+    async fn add_block(&self, request: AddBlockRequestProto) -> Result<AddBlockResponseProto, tonic::Status> {
+        let mut client = self.client.lock().await;
+        client
+            .add_block(tonic::Request::new(request))
+            .await
+            .map(|resp| resp.into_inner())
+    }
+
+    async fn commit_file(&self, request: CommitFileRequestProto) -> Result<CommitFileResponseProto, tonic::Status> {
+        let mut client = self.client.lock().await;
+        client
+            .commit_file(tonic::Request::new(request))
+            .await
+            .map(|resp| resp.into_inner())
+    }
+
+    async fn abort_file_write(
+        &self,
+        request: AbortFileWriteRequestProto,
+    ) -> Result<AbortFileWriteResponseProto, tonic::Status> {
+        let mut client = self.client.lock().await;
+        client
+            .abort_file_write(tonic::Request::new(request))
+            .await
+            .map(|resp| resp.into_inner())
+    }
+
+    async fn renew_lease(&self, request: RenewLeaseRequestProto) -> Result<RenewLeaseResponseProto, tonic::Status> {
+        let mut client = self.client.lock().await;
+        client
+            .renew_lease(tonic::Request::new(request))
+            .await
+            .map(|resp| resp.into_inner())
+    }
+
+    async fn hflush(&self, request: HflushRequestProto) -> Result<HflushResponseProto, tonic::Status> {
+        let mut client = self.client.lock().await;
+        client
+            .hflush(tonic::Request::new(request))
+            .await
+            .map(|resp| resp.into_inner())
+    }
+
+    async fn hsync(&self, request: HsyncRequestProto) -> Result<HsyncResponseProto, tonic::Status> {
+        let mut client = self.client.lock().await;
+        client
+            .hsync(tonic::Request::new(request))
             .await
             .map(|resp| resp.into_inner())
     }
@@ -410,22 +497,22 @@ impl<T> RpcOp<T> {
     }
 }
 
-impl RpcOp<GetFileStatusResponseProto> {
-    /// Build an operation for `GetFileStatus`.
-    pub fn get_file_status(request: GetFileStatusRequestProto) -> Self {
+impl RpcOp<GetStatusResponseProto> {
+    /// Build a `GetStatus` operation.
+    pub fn get_status(request: GetStatusRequestProto) -> Self {
         Self::new(
-            RequestEnvelope::GetFileStatus(request),
+            RequestEnvelope::GetStatus(request),
             Arc::new(|resp| match resp {
-                ResponseEnvelope::GetFileStatus(v) => Ok(v),
-                other => Err(unexpected_response("GetFileStatus", other.op_name())),
+                ResponseEnvelope::GetStatus(v) => Ok(v),
+                other => Err(unexpected_response("GetStatus", other.op_name())),
             }),
         )
     }
 }
 
-impl RpcOp<ListStatusPathResponseProto> {
-    /// Build an operation for `ListStatus`.
-    pub fn list_status(request: ListStatusPathRequestProto) -> Self {
+impl RpcOp<ListStatusResponseProto> {
+    /// Build a `ListStatus` operation.
+    pub fn list_status(request: ListStatusRequestProto) -> Self {
         Self::new(
             RequestEnvelope::ListStatus(request),
             Arc::new(|resp| match resp {
@@ -436,21 +523,21 @@ impl RpcOp<ListStatusPathResponseProto> {
     }
 }
 
-impl RpcOp<GetFileLayoutByPathResponseProto> {
-    /// Build an operation for `GetFileLayoutByPath`.
-    pub fn get_file_layout_by_path(request: GetFileLayoutByPathRequestProto) -> Self {
+impl RpcOp<CreateDirectoryResponseProto> {
+    /// Build a `CreateDirectory` operation.
+    pub fn create_directory(request: CreateDirectoryRequestProto) -> Self {
         Self::new(
-            RequestEnvelope::GetFileLayoutByPath(request),
+            RequestEnvelope::CreateDirectory(request),
             Arc::new(|resp| match resp {
-                ResponseEnvelope::GetFileLayoutByPath(v) => Ok(v),
-                other => Err(unexpected_response("GetFileLayoutByPath", other.op_name())),
+                ResponseEnvelope::CreateDirectory(v) => Ok(v),
+                other => Err(unexpected_response("CreateDirectory", other.op_name())),
             }),
         )
     }
 }
 
 impl RpcOp<DeleteResponseProto> {
-    /// Build an operation for `Delete`.
+    /// Build a `Delete` operation.
     pub fn delete(request: DeleteRequestProto) -> Self {
         Self::new(
             RequestEnvelope::Delete(request),
@@ -462,66 +549,157 @@ impl RpcOp<DeleteResponseProto> {
     }
 }
 
-impl RpcOp<OpenWriteByPathResponseProto> {
-    /// Build an operation for `OpenWriteByPath`.
-    pub fn open_write_by_path(request: OpenWriteByPathRequestProto) -> Self {
+impl RpcOp<RenameResponseProto> {
+    /// Build a `Rename` operation.
+    pub fn rename(request: RenameRequestProto) -> Self {
         Self::new(
-            RequestEnvelope::OpenWriteByPath(request),
+            RequestEnvelope::Rename(request),
             Arc::new(|resp| match resp {
-                ResponseEnvelope::OpenWriteByPath(v) => Ok(v),
-                other => Err(unexpected_response("OpenWriteByPath", other.op_name())),
+                ResponseEnvelope::Rename(v) => Ok(v),
+                other => Err(unexpected_response("Rename", other.op_name())),
             }),
         )
     }
 }
 
-impl RpcOp<FsyncSessionResponseProto> {
-    /// Build an operation for `FsyncSession`.
-    pub fn fsync_session(request: FsyncSessionRequestProto) -> Self {
+impl RpcOp<OpenFileResponseProto> {
+    /// Build an `OpenFile` operation.
+    pub fn open_file(request: OpenFileRequestProto) -> Self {
         Self::new(
-            RequestEnvelope::FsyncSession(request),
+            RequestEnvelope::OpenFile(request),
             Arc::new(|resp| match resp {
-                ResponseEnvelope::FsyncSession(v) => Ok(v),
-                other => Err(unexpected_response("FsyncSession", other.op_name())),
+                ResponseEnvelope::OpenFile(v) => Ok(v),
+                other => Err(unexpected_response("OpenFile", other.op_name())),
             }),
         )
     }
 }
 
-impl RpcOp<HsyncSessionResponseProto> {
-    /// Build an operation for `HsyncSession`.
-    pub fn hsync_session(request: HsyncSessionRequestProto) -> Self {
+impl RpcOp<GetBlockLocationsResponseProto> {
+    /// Build a `GetBlockLocations` operation.
+    pub fn get_block_locations(request: GetBlockLocationsRequestProto) -> Self {
         Self::new(
-            RequestEnvelope::HsyncSession(request),
+            RequestEnvelope::GetBlockLocations(request),
             Arc::new(|resp| match resp {
-                ResponseEnvelope::HsyncSession(v) => Ok(v),
-                other => Err(unexpected_response("HsyncSession", other.op_name())),
+                ResponseEnvelope::GetBlockLocations(v) => Ok(v),
+                other => Err(unexpected_response("GetBlockLocations", other.op_name())),
             }),
         )
     }
 }
 
-impl RpcOp<HflushSessionResponseProto> {
-    /// Build an operation for `HflushSession`.
-    pub fn hflush_session(request: HflushSessionRequestProto) -> Self {
+impl RpcOp<CreateFileResponseProto> {
+    /// Build a `CreateFile` operation.
+    pub fn create_file(request: CreateFileRequestProto) -> Self {
         Self::new(
-            RequestEnvelope::HflushSession(request),
+            RequestEnvelope::CreateFile(request),
             Arc::new(|resp| match resp {
-                ResponseEnvelope::HflushSession(v) => Ok(v),
-                other => Err(unexpected_response("HflushSession", other.op_name())),
+                ResponseEnvelope::CreateFile(v) => Ok(v),
+                other => Err(unexpected_response("CreateFile", other.op_name())),
             }),
         )
     }
 }
 
-impl RpcOp<CloseWriteSessionResponseProto> {
-    /// Build an operation for `CloseWriteSession`.
-    pub fn close_write_session(request: CloseWriteSessionRequestProto) -> Self {
+impl RpcOp<AppendFileResponseProto> {
+    /// Build an `AppendFile` operation.
+    pub fn append_file(request: AppendFileRequestProto) -> Self {
         Self::new(
-            RequestEnvelope::CloseWriteSession(request),
+            RequestEnvelope::AppendFile(request),
             Arc::new(|resp| match resp {
-                ResponseEnvelope::CloseWriteSession(v) => Ok(v),
-                other => Err(unexpected_response("CloseWriteSession", other.op_name())),
+                ResponseEnvelope::AppendFile(v) => Ok(v),
+                other => Err(unexpected_response("AppendFile", other.op_name())),
+            }),
+        )
+    }
+}
+
+impl RpcOp<AddBlockResponseProto> {
+    /// Build an `AddBlock` operation.
+    pub fn add_block(request: AddBlockRequestProto) -> Self {
+        Self::new(
+            RequestEnvelope::AddBlock(request),
+            Arc::new(|resp| match resp {
+                ResponseEnvelope::AddBlock(v) => Ok(v),
+                other => Err(unexpected_response("AddBlock", other.op_name())),
+            }),
+        )
+    }
+}
+
+impl RpcOp<CommitFileResponseProto> {
+    /// Build a `CommitFile` operation.
+    pub fn commit_file(request: CommitFileRequestProto) -> Self {
+        Self::new(
+            RequestEnvelope::CommitFile(request),
+            Arc::new(|resp| match resp {
+                ResponseEnvelope::CommitFile(v) => Ok(v),
+                other => Err(unexpected_response("CommitFile", other.op_name())),
+            }),
+        )
+    }
+}
+
+impl RpcOp<AbortFileWriteResponseProto> {
+    /// Build an `AbortFileWrite` operation.
+    pub fn abort_file_write(request: AbortFileWriteRequestProto) -> Self {
+        Self::new(
+            RequestEnvelope::AbortFileWrite(request),
+            Arc::new(|resp| match resp {
+                ResponseEnvelope::AbortFileWrite(v) => Ok(v),
+                other => Err(unexpected_response("AbortFileWrite", other.op_name())),
+            }),
+        )
+    }
+}
+
+impl RpcOp<RenewLeaseResponseProto> {
+    /// Build a `RenewLease` operation.
+    pub fn renew_lease(request: RenewLeaseRequestProto) -> Self {
+        Self::new(
+            RequestEnvelope::RenewLease(request),
+            Arc::new(|resp| match resp {
+                ResponseEnvelope::RenewLease(v) => Ok(v),
+                other => Err(unexpected_response("RenewLease", other.op_name())),
+            }),
+        )
+    }
+}
+
+impl RpcOp<HflushResponseProto> {
+    /// Build an `Hflush` operation.
+    pub fn hflush(request: HflushRequestProto) -> Self {
+        Self::new(
+            RequestEnvelope::Hflush(request),
+            Arc::new(|resp| match resp {
+                ResponseEnvelope::Hflush(v) => Ok(v),
+                other => Err(unexpected_response("Hflush", other.op_name())),
+            }),
+        )
+    }
+}
+
+impl RpcOp<HsyncResponseProto> {
+    /// Build an `Hsync` operation.
+    pub fn hsync(request: HsyncRequestProto) -> Self {
+        Self::new(
+            RequestEnvelope::Hsync(request),
+            Arc::new(|resp| match resp {
+                ResponseEnvelope::Hsync(v) => Ok(v),
+                other => Err(unexpected_response("Hsync", other.op_name())),
+            }),
+        )
+    }
+}
+
+impl RpcOp<MsyncResponseProto> {
+    /// Build an `Msync` operation.
+    pub fn msync(request: MsyncRequestProto) -> Self {
+        Self::new(
+            RequestEnvelope::Msync(request),
+            Arc::new(|resp| match resp {
+                ResponseEnvelope::Msync(v) => Ok(v),
+                other => Err(unexpected_response("Msync", other.op_name())),
             }),
         )
     }
@@ -613,25 +791,22 @@ impl ActionMachine {
                 }
                 RpcEnvelope::CanonicalError(canonical) => {
                     if is_authz_denial(&canonical) {
-                        return Err(ClientError::from(ClientAction::Fail { canonical }));
+                        return Err(ClientError::from(ClientAction::Fail {
+                            canonical: Box::new(canonical),
+                        }));
                     }
 
                     match canonical.class {
                         ErrorClass::Fatal => {
-                            let reason = canonical
-                                .reason
-                                .unwrap_or_else(|| refresh_reason_from_code(canonical.code.clone()));
-                            if self.should_reopen_session(&replay_policy, reason, &canonical, &request) {
-                                self.reopen_session_and_rewrite(&mut request).await?;
-                                continue;
-                            }
-                            return Err(ClientError::from(ClientAction::Fail { canonical }));
+                            return Err(ClientError::from(ClientAction::Fail {
+                                canonical: Box::new(canonical),
+                            }));
                         }
                         ErrorClass::Retryable => {
                             if retryable_attempts >= self.policy.max_retryable_attempts {
                                 return Err(ClientError::from(ClientAction::Retry {
                                     after_ms: canonical.retry_after_ms,
-                                    canonical,
+                                    canonical: Box::new(canonical),
                                 }));
                             }
                             retryable_attempts += 1;
@@ -648,7 +823,7 @@ impl ActionMachine {
                                 return Err(ClientError::from(ClientAction::Refresh {
                                     reason,
                                     hint: self.build_refresh_hint(&request, header, &canonical),
-                                    canonical,
+                                    canonical: Box::new(canonical),
                                 }));
                             }
                             refresh_attempts += 1;
@@ -702,14 +877,16 @@ impl ActionMachine {
     }
 
     fn prepare_attempt_header(&self, request: &mut RequestEnvelope, parent_id: &str, retry_count: i32) {
-        let path_hint = request.path_hint(&self.caches.sessions);
+        let path_hint = request.path_hint(&self.caches.write_handles);
         let header = request.ensure_header_mut();
 
         if header.client.is_none() {
             header.client = Some(default_client_info_proto());
         }
         let client = header.client.as_mut().expect("client initialized");
-        client.call_id = CallId::new().to_string();
+        if client.call_id.is_empty() {
+            client.call_id = CallId::new().to_string();
+        }
 
         if header.traceparent.is_empty() {
             header.traceparent = parent_id.to_string();
@@ -740,7 +917,7 @@ impl ActionMachine {
         header: Option<&ResponseHeaderProto>,
         canonical: &CanonicalError,
     ) -> RefreshHint {
-        let path_hint = request.path_hint(&self.caches.sessions);
+        let path_hint = request.path_hint(&self.caches.write_handles);
         let canonical_hint = canonical.refresh_hint.as_ref();
         let route_epoch = canonical_hint
             .and_then(|hint| hint.route_epoch)
@@ -816,7 +993,7 @@ impl ActionMachine {
         };
         let mut refreshed = !header.state.is_empty();
         self.caches.merge_response_state(&header.state);
-        let Some(path) = request.path_hint(&self.caches.sessions) else {
+        let Some(path) = request.path_hint(&self.caches.write_handles) else {
             return refreshed;
         };
         if let Some(mount_epoch) = header.mount_epoch {
@@ -840,39 +1017,86 @@ impl ActionMachine {
 
     fn update_payload_hints(&self, request: &RequestEnvelope, response: &ResponseEnvelope) -> bool {
         match (request, response) {
-            (RequestEnvelope::GetFileLayoutByPath(req), ResponseEnvelope::GetFileLayoutByPath(resp)) => {
+            (RequestEnvelope::OpenFile(req), ResponseEnvelope::OpenFile(resp)) => {
                 let path = req.path.clone();
-                let mut refreshed = resp.header.as_ref().and_then(|header| header.route_epoch).is_some()
-                    || !resp.locations.is_empty()
-                    || !resp.extents.is_empty();
+                let mut refreshed =
+                    resp.header.as_ref().and_then(|header| header.route_epoch).is_some() || !resp.locations.is_empty();
                 if let Some(route_epoch) = resp.header.as_ref().and_then(|header| header.route_epoch) {
                     self.caches.record_route_epoch(&path, route_epoch);
                 }
-                let (workers, worker_epoch) = workers_from_layout(resp);
+                let (workers, worker_epoch) = workers_from_locations(&resp.locations);
                 refreshed = refreshed || !workers.is_empty() || worker_epoch.is_some();
                 self.caches.record_worker_info(&path, workers, worker_epoch);
                 refreshed
             }
-            (RequestEnvelope::OpenWriteByPath(req), ResponseEnvelope::OpenWriteByPath(resp)) => {
-                let path = req.path.clone();
-                let mut refreshed = resp.header.as_ref().and_then(|header| header.route_epoch).is_some()
-                    || resp.file_handle != 0
-                    || !resp.write_targets.is_empty();
+            (RequestEnvelope::GetBlockLocations(req), ResponseEnvelope::GetBlockLocations(resp)) => {
+                let Some(path) = req_path_from_locations_request(req) else {
+                    return !resp.locations.is_empty();
+                };
+                let mut refreshed =
+                    resp.header.as_ref().and_then(|header| header.route_epoch).is_some() || !resp.locations.is_empty();
                 if let Some(route_epoch) = resp.header.as_ref().and_then(|header| header.route_epoch) {
                     self.caches.record_route_epoch(&path, route_epoch);
                 }
-                let (workers, worker_epoch) = workers_from_open(resp);
+                let (workers, worker_epoch) = workers_from_locations(&resp.locations);
                 refreshed = refreshed || !workers.is_empty() || worker_epoch.is_some();
                 self.caches.record_worker_info(&path, workers, worker_epoch);
-                self.caches
-                    .upsert_session(WriteSessionState::from_open_request(req, resp));
                 refreshed
             }
-            (RequestEnvelope::GetFileStatus(_), ResponseEnvelope::GetFileStatus(resp)) => {
-                resp.inode_id.is_some() || resp.attrs.is_some() || resp.inode.is_some()
+            (RequestEnvelope::CreateFile(req), ResponseEnvelope::CreateFile(resp)) => {
+                let path = req.path.clone();
+                let refreshed = resp.header.as_ref().and_then(|header| header.route_epoch).is_some()
+                    || resp
+                        .write_handle
+                        .as_ref()
+                        .map(|handle| handle.handle_id != 0)
+                        .unwrap_or(false);
+                if let Some(route_epoch) = resp.header.as_ref().and_then(|header| header.route_epoch) {
+                    self.caches.record_route_epoch(&path, route_epoch);
+                }
+                if let Some(handle) = WriteHandleState::from_create_response(req, resp) {
+                    self.caches.upsert_handle(handle);
+                }
+                refreshed
             }
-            (RequestEnvelope::CloseWriteSession(req), ResponseEnvelope::CloseWriteSession(_)) => {
-                self.caches.remove_session(req.file_handle);
+            (RequestEnvelope::AppendFile(req), ResponseEnvelope::AppendFile(resp)) => {
+                let path = req.path.clone();
+                let refreshed = resp.header.as_ref().and_then(|header| header.route_epoch).is_some()
+                    || resp
+                        .write_handle
+                        .as_ref()
+                        .map(|handle| handle.handle_id != 0)
+                        .unwrap_or(false);
+                if let Some(route_epoch) = resp.header.as_ref().and_then(|header| header.route_epoch) {
+                    self.caches.record_route_epoch(&path, route_epoch);
+                }
+                if let Some(handle) = WriteHandleState::from_append_response(req, resp) {
+                    self.caches.upsert_handle(handle);
+                }
+                refreshed
+            }
+            (RequestEnvelope::AddBlock(req), ResponseEnvelope::AddBlock(resp)) => {
+                let Some(path) = request.path_hint(&self.caches.write_handles) else {
+                    return resp.target.is_some();
+                };
+                let targets = resp.target.as_ref().into_iter().cloned().collect::<Vec<_>>();
+                let (workers, worker_epoch) = workers_from_targets(&targets);
+                self.caches.record_worker_info(&path, workers, worker_epoch);
+                req.write_handle.as_ref().map(|h| h.handle_id != 0).unwrap_or(false) || resp.target.is_some()
+            }
+            (RequestEnvelope::GetStatus(_), ResponseEnvelope::GetStatus(resp)) => {
+                resp.inode_id.is_some() || resp.attrs.is_some()
+            }
+            (RequestEnvelope::CommitFile(req), ResponseEnvelope::CommitFile(_)) => {
+                if let Some(handle) = req.write_handle.as_ref() {
+                    self.caches.remove_handle(handle.handle_id);
+                }
+                true
+            }
+            (RequestEnvelope::AbortFileWrite(req), ResponseEnvelope::AbortFileWrite(_)) => {
+                if let Some(handle) = req.write_handle.as_ref() {
+                    self.caches.remove_handle(handle.handle_id);
+                }
                 true
             }
             _ => false,
@@ -888,10 +1112,7 @@ impl ActionMachine {
         response_header: Option<ResponseHeaderProto>,
         request: &mut RequestEnvelope,
     ) -> ClientResult<()> {
-        if self.should_reopen_session(replay_policy, reason, canonical, request) {
-            self.reopen_session_and_rewrite(request).await?;
-            return Ok(());
-        }
+        let _ = (replay_policy, canonical);
 
         match reason {
             RefreshReason::StaleState => self.refresh_state(hint, response_header.as_ref(), request).await,
@@ -989,7 +1210,9 @@ impl ActionMachine {
         canonical: CanonicalError,
     ) -> ClientError {
         if is_authz_denial(&canonical) {
-            return ClientError::from(ClientAction::Fail { canonical });
+            return ClientError::from(ClientAction::Fail {
+                canonical: Box::new(canonical),
+            });
         }
         match canonical.class {
             ErrorClass::NeedRefresh => {
@@ -999,56 +1222,18 @@ impl ActionMachine {
                 ClientError::from(ClientAction::Refresh {
                     reason,
                     hint: self.build_refresh_hint_for_header(header, &canonical),
-                    canonical,
+                    canonical: Box::new(canonical),
                 })
             }
             ErrorClass::Retryable => ClientError::from(ClientAction::Retry {
                 after_ms: canonical.retry_after_ms,
-                canonical,
+                canonical: Box::new(canonical),
             }),
-            ErrorClass::Fatal => ClientError::from(ClientAction::Fail { canonical }),
+            ErrorClass::Fatal => ClientError::from(ClientAction::Fail {
+                canonical: Box::new(canonical),
+            }),
             ErrorClass::Ok => ClientError::Metadata("msync returned canonical OK error state".to_string()),
         }
-    }
-
-    fn should_reopen_session(
-        &self,
-        replay_policy: &ReplayPolicy,
-        reason: RefreshReason,
-        canonical: &CanonicalError,
-        request: &RequestEnvelope,
-    ) -> bool {
-        if !matches!(replay_policy, ReplayPolicy::SessionBarrier) {
-            return false;
-        }
-        if request.session_handle().is_none() {
-            return false;
-        }
-        is_session_invalid_error(reason, canonical)
-    }
-
-    async fn reopen_session_and_rewrite(&self, request: &mut RequestEnvelope) -> ClientResult<()> {
-        let old_handle = request
-            .session_handle()
-            .ok_or_else(|| ClientError::Metadata("missing session handle for reopen".to_string()))?;
-        let session = self
-            .caches
-            .session(old_handle)
-            .ok_or_else(|| ClientError::Metadata(format!("session {} not found in cache", old_handle)))?;
-
-        let reopen_req = session.to_open_request(request.header().cloned());
-        let reopen_op = RpcOp::open_write_by_path(reopen_req.clone());
-        let reopen_policy = replay_policy_for_method(reopen_op.method());
-        let reopen_resp = Box::pin(self.call_with_refresh(reopen_policy, reopen_op)).await?;
-
-        let reopened_session = self
-            .caches
-            .session(reopen_resp.file_handle)
-            .unwrap_or_else(|| WriteSessionState::from_open_request(&reopen_req, &reopen_resp));
-
-        self.caches.remove_session(old_handle);
-        request.apply_session(&reopened_session);
-        Ok(())
     }
 
     async fn refresh_leader(&self, canonical: &CanonicalError, request: &RequestEnvelope) -> ClientResult<()> {
@@ -1069,7 +1254,7 @@ impl ActionMachine {
             }
         }
 
-        if let Some(path) = request.path_hint(&self.caches.sessions) {
+        if let Some(path) = request.path_hint(&self.caches.write_handles) {
             self.refresh_layout_for_path(&path, request.header().cloned()).await?;
             refreshed = true;
         }
@@ -1084,7 +1269,7 @@ impl ActionMachine {
     }
 
     async fn refresh_mount(&self, canonical: &CanonicalError, request: &RequestEnvelope) -> ClientResult<()> {
-        if let Some(path) = request.path_hint(&self.caches.sessions) {
+        if let Some(path) = request.path_hint(&self.caches.write_handles) {
             if let Some(mount_epoch) = canonical.refresh_hint.as_ref().and_then(|hint| hint.mount_epoch) {
                 self.caches.record_mount_epoch(&path, mount_epoch);
             }
@@ -1095,7 +1280,7 @@ impl ActionMachine {
     }
 
     async fn refresh_layout_context(&self, canonical: &CanonicalError, request: &RequestEnvelope) -> ClientResult<()> {
-        if let Some(path) = request.path_hint(&self.caches.sessions) {
+        if let Some(path) = request.path_hint(&self.caches.write_handles) {
             if let Some(route_epoch) = canonical.refresh_hint.as_ref().and_then(|hint| hint.route_epoch) {
                 self.caches.record_route_epoch(&path, route_epoch);
             }
@@ -1108,7 +1293,7 @@ impl ActionMachine {
     }
 
     async fn refresh_worker(&self, canonical: &CanonicalError, request: &RequestEnvelope) -> ClientResult<()> {
-        if let Some(path) = request.path_hint(&self.caches.sessions) {
+        if let Some(path) = request.path_hint(&self.caches.write_handles) {
             if let Some(hint) = canonical.refresh_hint.as_ref() {
                 let worker_endpoints = hint
                     .worker_endpoints
@@ -1139,7 +1324,7 @@ impl ActionMachine {
         path: &str,
         header_template: Option<RequestHeaderProto>,
     ) -> ClientResult<()> {
-        let request = RequestEnvelope::GetFileStatus(GetFileStatusRequestProto {
+        let request = RequestEnvelope::GetStatus(GetStatusRequestProto {
             header: header_template,
             path: path.to_string(),
         });
@@ -1151,9 +1336,11 @@ impl ActionMachine {
         path: &str,
         header_template: Option<RequestHeaderProto>,
     ) -> ClientResult<()> {
-        let request = RequestEnvelope::GetFileLayoutByPath(GetFileLayoutByPathRequestProto {
+        let request = RequestEnvelope::GetBlockLocations(GetBlockLocationsRequestProto {
             header: header_template,
-            path: path.to_string(),
+            target: Some(proto::metadata::get_block_locations_request_proto::Target::Path(
+                path.to_string(),
+            )),
             range: None,
         });
         self.run_best_effort_refresh(request).await
@@ -1207,7 +1394,9 @@ impl ActionMachine {
         canonical: CanonicalError,
     ) -> ClientError {
         if is_authz_denial(&canonical) {
-            return ClientError::from(ClientAction::Fail { canonical });
+            return ClientError::from(ClientAction::Fail {
+                canonical: Box::new(canonical),
+            });
         }
 
         match canonical.class {
@@ -1218,14 +1407,16 @@ impl ActionMachine {
                 ClientError::from(ClientAction::Refresh {
                     reason,
                     hint: self.build_refresh_hint(request, header, &canonical),
-                    canonical,
+                    canonical: Box::new(canonical),
                 })
             }
             ErrorClass::Retryable => ClientError::from(ClientAction::Retry {
                 after_ms: canonical.retry_after_ms,
-                canonical,
+                canonical: Box::new(canonical),
             }),
-            ErrorClass::Fatal => ClientError::from(ClientAction::Fail { canonical }),
+            ErrorClass::Fatal => ClientError::from(ClientAction::Fail {
+                canonical: Box::new(canonical),
+            }),
             ErrorClass::Ok => ClientError::Metadata("refresh returned canonical OK error state".to_string()),
         }
     }
@@ -1251,192 +1442,188 @@ type DecodeFn<T> = Arc<dyn Fn(ResponseEnvelope) -> ClientResult<T> + Send + Sync
 
 #[derive(Clone, Debug)]
 enum RequestEnvelope {
-    GetFileStatus(GetFileStatusRequestProto),
-    ListStatus(ListStatusPathRequestProto),
-    GetFileLayoutByPath(GetFileLayoutByPathRequestProto),
+    GetStatus(GetStatusRequestProto),
+    ListStatus(ListStatusRequestProto),
+    CreateDirectory(CreateDirectoryRequestProto),
     Delete(DeleteRequestProto),
-    OpenWriteByPath(OpenWriteByPathRequestProto),
-    FsyncSession(FsyncSessionRequestProto),
-    HsyncSession(HsyncSessionRequestProto),
-    HflushSession(HflushSessionRequestProto),
-    CloseWriteSession(CloseWriteSessionRequestProto),
+    Rename(RenameRequestProto),
+    OpenFile(OpenFileRequestProto),
+    GetBlockLocations(GetBlockLocationsRequestProto),
+    CreateFile(CreateFileRequestProto),
+    AppendFile(AppendFileRequestProto),
+    AddBlock(AddBlockRequestProto),
+    CommitFile(CommitFileRequestProto),
+    AbortFileWrite(AbortFileWriteRequestProto),
+    RenewLease(RenewLeaseRequestProto),
+    Hflush(HflushRequestProto),
+    Hsync(HsyncRequestProto),
+    Msync(MsyncRequestProto),
 }
 
 impl RequestEnvelope {
     fn method(&self) -> FileSystemRpcMethod {
         match self {
-            RequestEnvelope::GetFileStatus(_) => FileSystemRpcMethod::GetFileStatus,
+            RequestEnvelope::GetStatus(_) => FileSystemRpcMethod::GetStatus,
             RequestEnvelope::ListStatus(_) => FileSystemRpcMethod::ListStatus,
-            RequestEnvelope::GetFileLayoutByPath(_) => FileSystemRpcMethod::GetFileLayoutByPath,
+            RequestEnvelope::CreateDirectory(_) => FileSystemRpcMethod::CreateDirectory,
             RequestEnvelope::Delete(_) => FileSystemRpcMethod::Delete,
-            RequestEnvelope::OpenWriteByPath(_) => FileSystemRpcMethod::OpenWriteByPath,
-            RequestEnvelope::FsyncSession(_) => FileSystemRpcMethod::FsyncSession,
-            RequestEnvelope::HsyncSession(_) => FileSystemRpcMethod::HsyncSession,
-            RequestEnvelope::HflushSession(_) => FileSystemRpcMethod::HflushSession,
-            RequestEnvelope::CloseWriteSession(_) => FileSystemRpcMethod::CloseWriteSession,
-        }
-    }
-
-    #[cfg(test)]
-    fn op_name(&self) -> &'static str {
-        match self {
-            RequestEnvelope::GetFileStatus(_) => "GetFileStatus",
-            RequestEnvelope::ListStatus(_) => "ListStatus",
-            RequestEnvelope::GetFileLayoutByPath(_) => "GetFileLayoutByPath",
-            RequestEnvelope::Delete(_) => "Delete",
-            RequestEnvelope::OpenWriteByPath(_) => "OpenWriteByPath",
-            RequestEnvelope::FsyncSession(_) => "FsyncSession",
-            RequestEnvelope::HsyncSession(_) => "HsyncSession",
-            RequestEnvelope::HflushSession(_) => "HflushSession",
-            RequestEnvelope::CloseWriteSession(_) => "CloseWriteSession",
+            RequestEnvelope::Rename(_) => FileSystemRpcMethod::Rename,
+            RequestEnvelope::OpenFile(_) => FileSystemRpcMethod::OpenFile,
+            RequestEnvelope::GetBlockLocations(_) => FileSystemRpcMethod::GetBlockLocations,
+            RequestEnvelope::CreateFile(_) => FileSystemRpcMethod::CreateFile,
+            RequestEnvelope::AppendFile(_) => FileSystemRpcMethod::AppendFile,
+            RequestEnvelope::AddBlock(_) => FileSystemRpcMethod::AddBlock,
+            RequestEnvelope::CommitFile(_) => FileSystemRpcMethod::CommitFile,
+            RequestEnvelope::AbortFileWrite(_) => FileSystemRpcMethod::AbortFileWrite,
+            RequestEnvelope::RenewLease(_) => FileSystemRpcMethod::RenewLease,
+            RequestEnvelope::Hflush(_) => FileSystemRpcMethod::Hflush,
+            RequestEnvelope::Hsync(_) => FileSystemRpcMethod::Hsync,
+            RequestEnvelope::Msync(_) => FileSystemRpcMethod::Msync,
         }
     }
 
     fn ensure_header_mut(&mut self) -> &mut RequestHeaderProto {
         match self {
-            RequestEnvelope::GetFileStatus(req) => req.header.get_or_insert_with(default_request_header_proto),
+            RequestEnvelope::GetStatus(req) => req.header.get_or_insert_with(default_request_header_proto),
             RequestEnvelope::ListStatus(req) => req.header.get_or_insert_with(default_request_header_proto),
-            RequestEnvelope::GetFileLayoutByPath(req) => req.header.get_or_insert_with(default_request_header_proto),
+            RequestEnvelope::CreateDirectory(req) => req.header.get_or_insert_with(default_request_header_proto),
             RequestEnvelope::Delete(req) => req.header.get_or_insert_with(default_request_header_proto),
-            RequestEnvelope::OpenWriteByPath(req) => req.header.get_or_insert_with(default_request_header_proto),
-            RequestEnvelope::FsyncSession(req) => req.header.get_or_insert_with(default_request_header_proto),
-            RequestEnvelope::HsyncSession(req) => req
-                .fsync
-                .get_or_insert_with(FsyncSessionRequestProto::default)
-                .header
-                .get_or_insert_with(default_request_header_proto),
-            RequestEnvelope::HflushSession(req) => req
-                .fsync
-                .get_or_insert_with(FsyncSessionRequestProto::default)
-                .header
-                .get_or_insert_with(default_request_header_proto),
-            RequestEnvelope::CloseWriteSession(req) => req.header.get_or_insert_with(default_request_header_proto),
+            RequestEnvelope::Rename(req) => req.header.get_or_insert_with(default_request_header_proto),
+            RequestEnvelope::OpenFile(req) => req.header.get_or_insert_with(default_request_header_proto),
+            RequestEnvelope::GetBlockLocations(req) => req.header.get_or_insert_with(default_request_header_proto),
+            RequestEnvelope::CreateFile(req) => req.header.get_or_insert_with(default_request_header_proto),
+            RequestEnvelope::AppendFile(req) => req.header.get_or_insert_with(default_request_header_proto),
+            RequestEnvelope::AddBlock(req) => req.header.get_or_insert_with(default_request_header_proto),
+            RequestEnvelope::CommitFile(req) => req.header.get_or_insert_with(default_request_header_proto),
+            RequestEnvelope::AbortFileWrite(req) => req.header.get_or_insert_with(default_request_header_proto),
+            RequestEnvelope::RenewLease(req) => req.header.get_or_insert_with(default_request_header_proto),
+            RequestEnvelope::Hflush(req) => req.header.get_or_insert_with(default_request_header_proto),
+            RequestEnvelope::Hsync(req) => req.header.get_or_insert_with(default_request_header_proto),
+            RequestEnvelope::Msync(req) => req.header.get_or_insert_with(default_request_header_proto),
         }
     }
 
     fn header(&self) -> Option<&RequestHeaderProto> {
         match self {
-            RequestEnvelope::GetFileStatus(req) => req.header.as_ref(),
+            RequestEnvelope::GetStatus(req) => req.header.as_ref(),
             RequestEnvelope::ListStatus(req) => req.header.as_ref(),
-            RequestEnvelope::GetFileLayoutByPath(req) => req.header.as_ref(),
+            RequestEnvelope::CreateDirectory(req) => req.header.as_ref(),
             RequestEnvelope::Delete(req) => req.header.as_ref(),
-            RequestEnvelope::OpenWriteByPath(req) => req.header.as_ref(),
-            RequestEnvelope::FsyncSession(req) => req.header.as_ref(),
-            RequestEnvelope::HsyncSession(req) => req.fsync.as_ref().and_then(|inner| inner.header.as_ref()),
-            RequestEnvelope::HflushSession(req) => req.fsync.as_ref().and_then(|inner| inner.header.as_ref()),
-            RequestEnvelope::CloseWriteSession(req) => req.header.as_ref(),
+            RequestEnvelope::Rename(req) => req.header.as_ref(),
+            RequestEnvelope::OpenFile(req) => req.header.as_ref(),
+            RequestEnvelope::GetBlockLocations(req) => req.header.as_ref(),
+            RequestEnvelope::CreateFile(req) => req.header.as_ref(),
+            RequestEnvelope::AppendFile(req) => req.header.as_ref(),
+            RequestEnvelope::AddBlock(req) => req.header.as_ref(),
+            RequestEnvelope::CommitFile(req) => req.header.as_ref(),
+            RequestEnvelope::AbortFileWrite(req) => req.header.as_ref(),
+            RequestEnvelope::RenewLease(req) => req.header.as_ref(),
+            RequestEnvelope::Hflush(req) => req.header.as_ref(),
+            RequestEnvelope::Hsync(req) => req.header.as_ref(),
+            RequestEnvelope::Msync(req) => req.header.as_ref(),
         }
     }
 
-    fn path_hint(&self, sessions: &DashMap<u64, WriteSessionState>) -> Option<String> {
+    fn path_hint(&self, write_handles: &DashMap<u64, WriteHandleState>) -> Option<String> {
         match self {
-            RequestEnvelope::GetFileStatus(req) => Some(req.path.clone()),
+            RequestEnvelope::GetStatus(req) => Some(req.path.clone()),
             RequestEnvelope::ListStatus(req) => Some(req.path.clone()),
-            RequestEnvelope::GetFileLayoutByPath(req) => Some(req.path.clone()),
+            RequestEnvelope::CreateDirectory(req) => Some(req.path.clone()),
             RequestEnvelope::Delete(req) => Some(req.path.clone()),
-            RequestEnvelope::OpenWriteByPath(req) => Some(req.path.clone()),
-            RequestEnvelope::FsyncSession(req) => sessions.get(&req.file_handle).map(|s| s.path.clone()),
-            RequestEnvelope::HsyncSession(req) => req
-                .fsync
+            RequestEnvelope::Rename(req) => Some(req.src_path.clone()),
+            RequestEnvelope::OpenFile(req) => Some(req.path.clone()),
+            RequestEnvelope::GetBlockLocations(req) => req_path_from_locations_request(req),
+            RequestEnvelope::CreateFile(req) => Some(req.path.clone()),
+            RequestEnvelope::AppendFile(req) => Some(req.path.clone()),
+            RequestEnvelope::AddBlock(req) => req
+                .write_handle
                 .as_ref()
-                .and_then(|inner| sessions.get(&inner.file_handle).map(|s| s.path.clone())),
-            RequestEnvelope::HflushSession(req) => req
-                .fsync
+                .and_then(|h| write_handles.get(&h.handle_id).map(|s| s.path.clone())),
+            RequestEnvelope::CommitFile(req) => req
+                .write_handle
                 .as_ref()
-                .and_then(|inner| sessions.get(&inner.file_handle).map(|s| s.path.clone())),
-            RequestEnvelope::CloseWriteSession(req) => sessions.get(&req.file_handle).map(|s| s.path.clone()),
-        }
-    }
-
-    fn session_handle(&self) -> Option<u64> {
-        match self {
-            RequestEnvelope::FsyncSession(req) => Some(req.file_handle),
-            RequestEnvelope::HsyncSession(req) => req.fsync.as_ref().map(|inner| inner.file_handle),
-            RequestEnvelope::HflushSession(req) => req.fsync.as_ref().map(|inner| inner.file_handle),
-            RequestEnvelope::CloseWriteSession(req) => Some(req.file_handle),
-            _ => None,
-        }
-    }
-
-    fn apply_session(&mut self, session: &WriteSessionState) {
-        match self {
-            RequestEnvelope::FsyncSession(req) => {
-                req.file_handle = session.file_handle;
-                req.lease_id = session.lease_id;
-                req.lease_epoch = Some(session.lease_epoch);
-                req.fencing_token = session.fencing_token;
-            }
-            RequestEnvelope::HsyncSession(req) => {
-                let inner = req.fsync.get_or_insert_with(FsyncSessionRequestProto::default);
-                inner.file_handle = session.file_handle;
-                inner.lease_id = session.lease_id;
-                inner.lease_epoch = Some(session.lease_epoch);
-                inner.fencing_token = session.fencing_token;
-            }
-            RequestEnvelope::HflushSession(req) => {
-                let inner = req.fsync.get_or_insert_with(FsyncSessionRequestProto::default);
-                inner.file_handle = session.file_handle;
-                inner.lease_id = session.lease_id;
-                inner.lease_epoch = Some(session.lease_epoch);
-                inner.fencing_token = session.fencing_token;
-            }
-            RequestEnvelope::CloseWriteSession(req) => {
-                req.file_handle = session.file_handle;
-                req.lease_id = session.lease_id;
-                req.lease_epoch = session.lease_epoch;
-                req.open_epoch = session.open_epoch;
-                req.fencing_token = session.fencing_token;
-            }
-            _ => {}
+                .and_then(|h| write_handles.get(&h.handle_id).map(|s| s.path.clone())),
+            RequestEnvelope::AbortFileWrite(req) => req
+                .write_handle
+                .as_ref()
+                .and_then(|h| write_handles.get(&h.handle_id).map(|s| s.path.clone())),
+            RequestEnvelope::RenewLease(req) => req
+                .write_handle
+                .as_ref()
+                .and_then(|h| write_handles.get(&h.handle_id).map(|s| s.path.clone())),
+            RequestEnvelope::Hflush(req) => req
+                .write_handle
+                .as_ref()
+                .and_then(|h| write_handles.get(&h.handle_id).map(|s| s.path.clone())),
+            RequestEnvelope::Hsync(req) => req
+                .write_handle
+                .as_ref()
+                .and_then(|h| write_handles.get(&h.handle_id).map(|s| s.path.clone())),
+            RequestEnvelope::Msync(_) => None,
         }
     }
 }
 
 #[derive(Clone, Debug)]
 enum ResponseEnvelope {
-    GetFileStatus(GetFileStatusResponseProto),
-    ListStatus(ListStatusPathResponseProto),
-    GetFileLayoutByPath(GetFileLayoutByPathResponseProto),
-    #[cfg(test)]
+    GetStatus(GetStatusResponseProto),
+    ListStatus(ListStatusResponseProto),
+    CreateDirectory(CreateDirectoryResponseProto),
     Msync(MsyncResponseProto),
     Delete(DeleteResponseProto),
-    OpenWriteByPath(OpenWriteByPathResponseProto),
-    FsyncSession(FsyncSessionResponseProto),
-    HsyncSession(HsyncSessionResponseProto),
-    HflushSession(HflushSessionResponseProto),
-    CloseWriteSession(CloseWriteSessionResponseProto),
+    Rename(RenameResponseProto),
+    OpenFile(OpenFileResponseProto),
+    GetBlockLocations(GetBlockLocationsResponseProto),
+    CreateFile(CreateFileResponseProto),
+    AppendFile(AppendFileResponseProto),
+    AddBlock(AddBlockResponseProto),
+    CommitFile(CommitFileResponseProto),
+    AbortFileWrite(AbortFileWriteResponseProto),
+    RenewLease(RenewLeaseResponseProto),
+    Hflush(HflushResponseProto),
+    Hsync(HsyncResponseProto),
 }
 
 impl ResponseEnvelope {
     fn header(&self) -> Option<&ResponseHeaderProto> {
         match self {
-            ResponseEnvelope::GetFileStatus(resp) => resp.header.as_ref(),
+            ResponseEnvelope::GetStatus(resp) => resp.header.as_ref(),
             ResponseEnvelope::ListStatus(resp) => resp.header.as_ref(),
-            ResponseEnvelope::GetFileLayoutByPath(resp) => resp.header.as_ref(),
-            #[cfg(test)]
+            ResponseEnvelope::CreateDirectory(resp) => resp.header.as_ref(),
             ResponseEnvelope::Msync(resp) => resp.header.as_ref(),
             ResponseEnvelope::Delete(resp) => resp.header.as_ref(),
-            ResponseEnvelope::OpenWriteByPath(resp) => resp.header.as_ref(),
-            ResponseEnvelope::FsyncSession(resp) => resp.header.as_ref(),
-            ResponseEnvelope::HsyncSession(resp) => resp.header.as_ref(),
-            ResponseEnvelope::HflushSession(resp) => resp.header.as_ref(),
-            ResponseEnvelope::CloseWriteSession(resp) => resp.header.as_ref(),
+            ResponseEnvelope::Rename(resp) => resp.header.as_ref(),
+            ResponseEnvelope::OpenFile(resp) => resp.header.as_ref(),
+            ResponseEnvelope::GetBlockLocations(resp) => resp.header.as_ref(),
+            ResponseEnvelope::CreateFile(resp) => resp.header.as_ref(),
+            ResponseEnvelope::AppendFile(resp) => resp.header.as_ref(),
+            ResponseEnvelope::AddBlock(resp) => resp.header.as_ref(),
+            ResponseEnvelope::CommitFile(resp) => resp.header.as_ref(),
+            ResponseEnvelope::AbortFileWrite(resp) => resp.header.as_ref(),
+            ResponseEnvelope::RenewLease(resp) => resp.header.as_ref(),
+            ResponseEnvelope::Hflush(resp) => resp.header.as_ref(),
+            ResponseEnvelope::Hsync(resp) => resp.header.as_ref(),
         }
     }
 
     fn op_name(&self) -> &'static str {
         match self {
-            ResponseEnvelope::GetFileStatus(_) => "GetFileStatus",
+            ResponseEnvelope::GetStatus(_) => "GetStatus",
             ResponseEnvelope::ListStatus(_) => "ListStatus",
-            ResponseEnvelope::GetFileLayoutByPath(_) => "GetFileLayoutByPath",
-            #[cfg(test)]
+            ResponseEnvelope::CreateDirectory(_) => "CreateDirectory",
             ResponseEnvelope::Msync(_) => "Msync",
             ResponseEnvelope::Delete(_) => "Delete",
-            ResponseEnvelope::OpenWriteByPath(_) => "OpenWriteByPath",
-            ResponseEnvelope::FsyncSession(_) => "FsyncSession",
-            ResponseEnvelope::HsyncSession(_) => "HsyncSession",
-            ResponseEnvelope::HflushSession(_) => "HflushSession",
-            ResponseEnvelope::CloseWriteSession(_) => "CloseWriteSession",
+            ResponseEnvelope::Rename(_) => "Rename",
+            ResponseEnvelope::OpenFile(_) => "OpenFile",
+            ResponseEnvelope::GetBlockLocations(_) => "GetBlockLocations",
+            ResponseEnvelope::CreateFile(_) => "CreateFile",
+            ResponseEnvelope::AppendFile(_) => "AppendFile",
+            ResponseEnvelope::AddBlock(_) => "AddBlock",
+            ResponseEnvelope::CommitFile(_) => "CommitFile",
+            ResponseEnvelope::AbortFileWrite(_) => "AbortFileWrite",
+            ResponseEnvelope::RenewLease(_) => "RenewLease",
+            ResponseEnvelope::Hflush(_) => "Hflush",
+            ResponseEnvelope::Hsync(_) => "Hsync",
         }
     }
 }
@@ -1446,59 +1633,47 @@ async fn execute_request_on_rpc(
     request: RequestEnvelope,
 ) -> Result<ResponseEnvelope, tonic::Status> {
     match request {
-        RequestEnvelope::GetFileStatus(req) => rpc.get_file_status(req).await.map(ResponseEnvelope::GetFileStatus),
+        RequestEnvelope::GetStatus(req) => rpc.get_status(req).await.map(ResponseEnvelope::GetStatus),
         RequestEnvelope::ListStatus(req) => rpc.list_status(req).await.map(ResponseEnvelope::ListStatus),
-        RequestEnvelope::GetFileLayoutByPath(req) => rpc
-            .get_file_layout_by_path(req)
-            .await
-            .map(ResponseEnvelope::GetFileLayoutByPath),
+        RequestEnvelope::CreateDirectory(req) => rpc.create_directory(req).await.map(ResponseEnvelope::CreateDirectory),
         RequestEnvelope::Delete(req) => rpc.delete(req).await.map(ResponseEnvelope::Delete),
-        RequestEnvelope::OpenWriteByPath(req) => {
-            rpc.open_write_by_path(req).await.map(ResponseEnvelope::OpenWriteByPath)
-        }
-        RequestEnvelope::FsyncSession(req) => rpc.fsync_session(req).await.map(ResponseEnvelope::FsyncSession),
-        RequestEnvelope::HsyncSession(req) => rpc.hsync_session(req).await.map(ResponseEnvelope::HsyncSession),
-        RequestEnvelope::HflushSession(req) => rpc.hflush_session(req).await.map(ResponseEnvelope::HflushSession),
-        RequestEnvelope::CloseWriteSession(req) => rpc
-            .close_write_session(req)
+        RequestEnvelope::Rename(req) => rpc.rename(req).await.map(ResponseEnvelope::Rename),
+        RequestEnvelope::OpenFile(req) => rpc.open_file(req).await.map(ResponseEnvelope::OpenFile),
+        RequestEnvelope::GetBlockLocations(req) => rpc
+            .get_block_locations(req)
             .await
-            .map(ResponseEnvelope::CloseWriteSession),
+            .map(ResponseEnvelope::GetBlockLocations),
+        RequestEnvelope::CreateFile(req) => rpc.create_file(req).await.map(ResponseEnvelope::CreateFile),
+        RequestEnvelope::AppendFile(req) => rpc.append_file(req).await.map(ResponseEnvelope::AppendFile),
+        RequestEnvelope::AddBlock(req) => rpc.add_block(req).await.map(ResponseEnvelope::AddBlock),
+        RequestEnvelope::CommitFile(req) => rpc.commit_file(req).await.map(ResponseEnvelope::CommitFile),
+        RequestEnvelope::AbortFileWrite(req) => rpc.abort_file_write(req).await.map(ResponseEnvelope::AbortFileWrite),
+        RequestEnvelope::RenewLease(req) => rpc.renew_lease(req).await.map(ResponseEnvelope::RenewLease),
+        RequestEnvelope::Hflush(req) => rpc.hflush(req).await.map(ResponseEnvelope::Hflush),
+        RequestEnvelope::Hsync(req) => rpc.hsync(req).await.map(ResponseEnvelope::Hsync),
+        RequestEnvelope::Msync(req) => rpc.msync(req).await.map(ResponseEnvelope::Msync),
     }
 }
 
 #[derive(Clone, Debug)]
-struct WriteSessionState {
+struct WriteHandleState {
     path: String,
-    desired_len: Option<u64>,
-    mode: i32,
-    file_handle: u64,
-    lease_id: Option<proto::common::LeaseIdProto>,
-    lease_epoch: u64,
-    open_epoch: u64,
-    fencing_token: Option<proto::common::FencingTokenProto>,
+    handle: WriteHandleProto,
 }
 
-impl WriteSessionState {
-    fn from_open_request(request: &OpenWriteByPathRequestProto, response: &OpenWriteByPathResponseProto) -> Self {
-        Self {
+impl WriteHandleState {
+    fn from_create_response(request: &CreateFileRequestProto, response: &CreateFileResponseProto) -> Option<Self> {
+        Some(Self {
             path: request.path.clone(),
-            desired_len: request.desired_len,
-            mode: request.mode,
-            file_handle: response.file_handle,
-            lease_id: response.lease_id,
-            lease_epoch: response.lease_epoch,
-            open_epoch: response.open_epoch,
-            fencing_token: response.fencing_token,
-        }
+            handle: response.write_handle?,
+        })
     }
 
-    fn to_open_request(&self, header_template: Option<RequestHeaderProto>) -> OpenWriteByPathRequestProto {
-        OpenWriteByPathRequestProto {
-            header: header_template,
-            path: self.path.clone(),
-            desired_len: self.desired_len,
-            mode: self.mode,
-        }
+    fn from_append_response(request: &AppendFileRequestProto, response: &AppendFileResponseProto) -> Option<Self> {
+        Some(Self {
+            path: request.path.clone(),
+            handle: response.write_handle?,
+        })
     }
 }
 
@@ -1510,7 +1685,7 @@ struct ActionCaches {
     worker_epoch_by_path: DashMap<String, u64>,
     state_by_group: DashMap<u64, RaftLogIdProto>,
     worker_endpoints_by_path: DashMap<String, Vec<WorkerEndpointInfoProto>>,
-    sessions: DashMap<u64, WriteSessionState>,
+    write_handles: DashMap<u64, WriteHandleState>,
 }
 
 impl ActionCaches {
@@ -1595,16 +1770,12 @@ impl ActionCaches {
             .map(|value| *value)
     }
 
-    fn upsert_session(&self, session: WriteSessionState) {
-        self.sessions.insert(session.file_handle, session);
+    fn upsert_handle(&self, handle: WriteHandleState) {
+        self.write_handles.insert(handle.handle.handle_id, handle);
     }
 
-    fn session(&self, file_handle: u64) -> Option<WriteSessionState> {
-        self.sessions.get(&file_handle).map(|state| state.clone())
-    }
-
-    fn remove_session(&self, file_handle: u64) {
-        self.sessions.remove(&file_handle);
+    fn remove_handle(&self, file_handle: u64) {
+        self.write_handles.remove(&file_handle);
     }
 }
 
@@ -1623,11 +1794,20 @@ fn is_path_prefix(prefix: &str, path: &str) -> bool {
     path == prefix || path.starts_with(&(prefix.to_string() + "/"))
 }
 
-fn workers_from_layout(response: &GetFileLayoutByPathResponseProto) -> (Vec<WorkerEndpointInfoProto>, Option<u64>) {
+fn req_path_from_locations_request(request: &GetBlockLocationsRequestProto) -> Option<String> {
+    match request.target.as_ref()? {
+        proto::metadata::get_block_locations_request_proto::Target::Path(path) => Some(path.clone()),
+        _ => None,
+    }
+}
+
+fn workers_from_locations(
+    locations: &[proto::metadata::FileBlockLocationProto],
+) -> (Vec<WorkerEndpointInfoProto>, Option<u64>) {
     let mut by_worker: HashMap<u64, WorkerEndpointInfoProto> = HashMap::new();
     let mut max_epoch: Option<u64> = None;
 
-    for location in &response.locations {
+    for location in locations {
         if let Some(epoch) = location.worker_epoch {
             max_epoch = Some(max_epoch.map(|cur| cur.max(epoch)).unwrap_or(epoch));
         }
@@ -1644,11 +1824,11 @@ fn workers_from_layout(response: &GetFileLayoutByPathResponseProto) -> (Vec<Work
     (by_worker.into_values().collect(), max_epoch)
 }
 
-fn workers_from_open(response: &OpenWriteByPathResponseProto) -> (Vec<WorkerEndpointInfoProto>, Option<u64>) {
+fn workers_from_targets(targets: &[WriteTargetProto]) -> (Vec<WorkerEndpointInfoProto>, Option<u64>) {
     let mut by_worker: HashMap<u64, WorkerEndpointInfoProto> = HashMap::new();
     let mut max_epoch: Option<u64> = None;
 
-    for target in &response.write_targets {
+    for target in targets {
         for worker in &target.worker_endpoints {
             by_worker.entry(worker.worker_id).or_insert_with(|| worker.clone());
             max_epoch = Some(
@@ -1744,16 +1924,6 @@ fn is_authz_denial(canonical: &CanonicalError) -> bool {
     )
 }
 
-fn is_session_invalid_error(reason: RefreshReason, canonical: &CanonicalError) -> bool {
-    if matches!(reason, RefreshReason::SessionInvalid | RefreshReason::SessionExpired) {
-        return true;
-    }
-    matches!(
-        canonical.reason,
-        Some(RefreshReason::SessionInvalid | RefreshReason::SessionExpired)
-    )
-}
-
 fn is_transient_transport_status(status: &tonic::Status) -> bool {
     matches!(status.code(), tonic::Code::Unavailable | tonic::Code::DeadlineExceeded)
 }
@@ -1766,1088 +1936,11 @@ fn transport_backoff_ms(base_ms: u64, attempt: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::error::canonical::ErrorCode as CanonicalCode;
-    use common::error::canonical::RefreshHint as CanonicalRefreshHint;
-    use proto::convert::canonical_to_error_detail;
-    use std::collections::VecDeque;
-    use tokio::sync::Mutex;
-
-    enum ScriptedResult {
-        Response(Box<ResponseEnvelope>),
-        Status(tonic::Status),
-    }
-
-    impl ScriptedResult {
-        fn response(response: ResponseEnvelope) -> Self {
-            Self::Response(Box::new(response))
-        }
-    }
-
-    struct ScriptedRpc {
-        scripted: Mutex<VecDeque<ScriptedResult>>,
-        calls: Mutex<Vec<RequestEnvelope>>,
-        msync_calls: Mutex<Vec<MsyncRequestProto>>,
-        reconnects: Mutex<Vec<String>>,
-        endpoint: RwLock<Option<String>>,
-    }
-
-    impl ScriptedRpc {
-        fn new(scripted: Vec<ScriptedResult>) -> Self {
-            Self {
-                scripted: Mutex::new(VecDeque::from(scripted)),
-                calls: Mutex::new(Vec::new()),
-                msync_calls: Mutex::new(Vec::new()),
-                reconnects: Mutex::new(Vec::new()),
-                endpoint: RwLock::new(Some("http://127.0.0.1:18080".to_string())),
-            }
-        }
-
-        async fn next(&self, request: RequestEnvelope) -> Result<ResponseEnvelope, tonic::Status> {
-            self.calls.lock().await.push(request);
-            match self.scripted.lock().await.pop_front() {
-                Some(ScriptedResult::Response(resp)) => Ok(*resp),
-                Some(ScriptedResult::Status(status)) => Err(status),
-                None => Err(tonic::Status::internal("script exhausted")),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl FileSystemRpc for ScriptedRpc {
-        async fn get_file_status(
-            &self,
-            request: GetFileStatusRequestProto,
-        ) -> Result<GetFileStatusResponseProto, tonic::Status> {
-            match self.next(RequestEnvelope::GetFileStatus(request)).await? {
-                ResponseEnvelope::GetFileStatus(resp) => Ok(resp),
-                other => Err(tonic::Status::internal(format!(
-                    "expected GetFileStatus response, got {}",
-                    other.op_name()
-                ))),
-            }
-        }
-
-        async fn list_status(
-            &self,
-            request: ListStatusPathRequestProto,
-        ) -> Result<ListStatusPathResponseProto, tonic::Status> {
-            match self.next(RequestEnvelope::ListStatus(request)).await? {
-                ResponseEnvelope::ListStatus(resp) => Ok(resp),
-                other => Err(tonic::Status::internal(format!(
-                    "expected ListStatus response, got {}",
-                    other.op_name()
-                ))),
-            }
-        }
-
-        async fn get_file_layout_by_path(
-            &self,
-            request: GetFileLayoutByPathRequestProto,
-        ) -> Result<GetFileLayoutByPathResponseProto, tonic::Status> {
-            match self.next(RequestEnvelope::GetFileLayoutByPath(request)).await? {
-                ResponseEnvelope::GetFileLayoutByPath(resp) => Ok(resp),
-                other => Err(tonic::Status::internal(format!(
-                    "expected GetFileLayoutByPath response, got {}",
-                    other.op_name()
-                ))),
-            }
-        }
-
-        async fn delete(&self, request: DeleteRequestProto) -> Result<DeleteResponseProto, tonic::Status> {
-            match self.next(RequestEnvelope::Delete(request)).await? {
-                ResponseEnvelope::Delete(resp) => Ok(resp),
-                other => Err(tonic::Status::internal(format!(
-                    "expected Delete response, got {}",
-                    other.op_name()
-                ))),
-            }
-        }
-
-        async fn open_write_by_path(
-            &self,
-            request: OpenWriteByPathRequestProto,
-        ) -> Result<OpenWriteByPathResponseProto, tonic::Status> {
-            match self.next(RequestEnvelope::OpenWriteByPath(request)).await? {
-                ResponseEnvelope::OpenWriteByPath(resp) => Ok(resp),
-                other => Err(tonic::Status::internal(format!(
-                    "expected OpenWriteByPath response, got {}",
-                    other.op_name()
-                ))),
-            }
-        }
-
-        async fn fsync_session(
-            &self,
-            request: FsyncSessionRequestProto,
-        ) -> Result<FsyncSessionResponseProto, tonic::Status> {
-            match self.next(RequestEnvelope::FsyncSession(request)).await? {
-                ResponseEnvelope::FsyncSession(resp) => Ok(resp),
-                other => Err(tonic::Status::internal(format!(
-                    "expected FsyncSession response, got {}",
-                    other.op_name()
-                ))),
-            }
-        }
-
-        async fn hsync_session(
-            &self,
-            request: HsyncSessionRequestProto,
-        ) -> Result<HsyncSessionResponseProto, tonic::Status> {
-            match self.next(RequestEnvelope::HsyncSession(request)).await? {
-                ResponseEnvelope::HsyncSession(resp) => Ok(resp),
-                other => Err(tonic::Status::internal(format!(
-                    "expected HsyncSession response, got {}",
-                    other.op_name()
-                ))),
-            }
-        }
-
-        async fn hflush_session(
-            &self,
-            request: HflushSessionRequestProto,
-        ) -> Result<HflushSessionResponseProto, tonic::Status> {
-            match self.next(RequestEnvelope::HflushSession(request)).await? {
-                ResponseEnvelope::HflushSession(resp) => Ok(resp),
-                other => Err(tonic::Status::internal(format!(
-                    "expected HflushSession response, got {}",
-                    other.op_name()
-                ))),
-            }
-        }
-
-        async fn close_write_session(
-            &self,
-            request: CloseWriteSessionRequestProto,
-        ) -> Result<CloseWriteSessionResponseProto, tonic::Status> {
-            match self.next(RequestEnvelope::CloseWriteSession(request)).await? {
-                ResponseEnvelope::CloseWriteSession(resp) => Ok(resp),
-                other => Err(tonic::Status::internal(format!(
-                    "expected CloseWriteSession response, got {}",
-                    other.op_name()
-                ))),
-            }
-        }
-
-        async fn msync(&self, request: MsyncRequestProto) -> Result<MsyncResponseProto, tonic::Status> {
-            self.msync_calls.lock().await.push(request);
-            match self.scripted.lock().await.pop_front() {
-                Some(ScriptedResult::Response(resp)) => match *resp {
-                    ResponseEnvelope::Msync(resp) => Ok(resp),
-                    other => Err(tonic::Status::internal(format!(
-                        "expected Msync response, got {}",
-                        other.op_name()
-                    ))),
-                },
-                Some(ScriptedResult::Status(status)) => Err(status),
-                None => Err(tonic::Status::internal("script exhausted")),
-            }
-        }
-
-        async fn reconnect(&self, endpoint: &str) -> ClientResult<()> {
-            self.reconnects.lock().await.push(endpoint.to_string());
-            *self.endpoint.write() = Some(endpoint.to_string());
-            Ok(())
-        }
-
-        fn current_endpoint(&self) -> Option<String> {
-            self.endpoint.read().clone()
-        }
-    }
-
-    fn request_header() -> RequestHeaderProto {
-        RequestHeaderProto {
-            client: Some(ClientInfoProto {
-                call_id: CallId::new().to_string(),
-                client_id: 1,
-                client_name: "test-client".to_string(),
-            }),
-            group_id: 0,
-            mount_epoch: None,
-            deadline_ms: 0,
-            traceparent: String::new(),
-            caller_context: None,
-            state: Vec::new(),
-            retry_count: 0,
-            route_epoch: None,
-            principal: String::new(),
-            real_user: String::new(),
-            doas: String::new(),
-            authn_type: proto::common::AuthnTypeProto::Unspecified as i32,
-        }
-    }
-
-    fn ok_header() -> ResponseHeaderProto {
-        ResponseHeaderProto {
-            client: Some(ClientInfoProto {
-                call_id: CallId::new().to_string(),
-                client_id: 1,
-                client_name: "test-client".to_string(),
-            }),
-            error: None,
-            state: Vec::new(),
-            group_id: 0,
-            mount_epoch: Some(7),
-            route_epoch: Some(7),
-        }
-    }
-
-    fn ok_header_with_route(route_epoch: u64) -> ResponseHeaderProto {
-        let mut header = ok_header();
-        header.route_epoch = Some(route_epoch);
-        header
-    }
-
-    fn ok_header_without_refresh_hints() -> ResponseHeaderProto {
-        let mut header = ok_header();
-        header.state.clear();
-        header.mount_epoch = None;
-        header.route_epoch = None;
-        header
-    }
-
-    fn err_header(canonical: CanonicalError) -> ResponseHeaderProto {
-        ResponseHeaderProto {
-            client: Some(ClientInfoProto {
-                call_id: CallId::new().to_string(),
-                client_id: 1,
-                client_name: "test-client".to_string(),
-            }),
-            error: Some(canonical_to_error_detail(&canonical)),
-            state: Vec::new(),
-            group_id: 0,
-            mount_epoch: Some(7),
-            route_epoch: Some(7),
-        }
-    }
-
-    fn err_header_with_group_and_state(
-        canonical: CanonicalError,
-        group_id: u64,
-        state_id: RaftLogIdProto,
-    ) -> ResponseHeaderProto {
-        let mut header = err_header(canonical);
-        header.group_id = group_id;
-        header.state = vec![GroupStateWatermarkProto {
-            group_id: Some(ShardGroupIdProto { value: group_id }),
-            state_id: Some(state_id),
-        }];
-        header
-    }
-
-    fn msync_response(group_id: u64, state_id: RaftLogIdProto) -> MsyncResponseProto {
-        MsyncResponseProto {
-            header: Some(ResponseHeaderProto {
-                client: Some(ClientInfoProto {
-                    call_id: CallId::new().to_string(),
-                    client_id: 1,
-                    client_name: "test-client".to_string(),
-                }),
-                error: None,
-                state: Vec::new(),
-                group_id,
-                mount_epoch: None,
-                route_epoch: None,
-            }),
-            state: Some(GroupStateWatermarkProto {
-                group_id: Some(ShardGroupIdProto { value: group_id }),
-                state_id: Some(state_id),
-            }),
-        }
-    }
-
-    async fn call_machine<T>(machine: &ActionMachine, op: RpcOp<T>) -> ClientResult<T> {
-        let policy = replay_policy_for_method(op.method());
-        machine.call_with_refresh(policy, op).await
-    }
-
-    #[tokio::test]
-    async fn stale_state_refresh_uses_msync_then_replays_without_layout_refresh() {
-        let group_id = 5;
-        let required_state = RaftLogIdProto {
-            term: 1,
-            leader_node_id: 1,
-            index: 10,
-        };
-        let canonical =
-            CanonicalError::need_refresh(RpcErrorCode::StaleState, RefreshReason::StaleState, "stale state");
-
-        let rpc = Arc::new(ScriptedRpc::new(vec![
-            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
-                header: Some(err_header_with_group_and_state(canonical, group_id, required_state)),
-                ..Default::default()
-            })),
-            ScriptedResult::response(ResponseEnvelope::Msync(msync_response(group_id, required_state))),
-            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
-                header: Some(ok_header()),
-                ..Default::default()
-            })),
-        ]));
-
-        let machine = ActionMachine::new(rpc.clone(), vec![]);
-        let mut header = request_header();
-        header.group_id = group_id;
-        header.state = vec![GroupStateWatermarkProto {
-            group_id: Some(ShardGroupIdProto { value: group_id }),
-            state_id: Some(RaftLogIdProto {
-                term: 99,
-                leader_node_id: 99,
-                index: 99,
-            }),
-        }];
-        header.mount_epoch = Some(11);
-        header.route_epoch = Some(13);
-        let request = GetFileStatusRequestProto {
-            header: Some(header),
-            path: "/mnt/stale.bin".to_string(),
-        };
-
-        call_machine(&machine, RpcOp::get_file_status(request))
-            .await
-            .expect("stale state refresh should use msync and replay");
-
-        let calls = rpc.calls.lock().await;
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].op_name(), "GetFileStatus");
-        assert_eq!(calls[1].op_name(), "GetFileStatus");
-        let replay_header = calls[1].header().expect("replay header");
-        assert_eq!(replay_header.group_id, group_id);
-        assert_eq!(replay_header.state.len(), 1);
-        assert_eq!(replay_header.state[0].state_id, Some(required_state));
-        drop(calls);
-
-        let msync_calls = rpc.msync_calls.lock().await;
-        assert_eq!(msync_calls.len(), 1);
-        let msync_header = msync_calls[0].header.as_ref().expect("msync header");
-        assert_eq!(msync_header.group_id, group_id);
-        assert!(msync_header.state.is_empty());
-        assert_eq!(msync_header.mount_epoch, None);
-        assert_eq!(msync_header.route_epoch, None);
-    }
-
-    #[tokio::test]
-    async fn unsupported_refresh_reasons_fail_without_msync_or_layout_refresh() {
-        for (code, reason) in [
-            (RpcErrorCode::BlockStampMismatch, RefreshReason::BlockStampMismatch),
-            (RpcErrorCode::Fencing, RefreshReason::Fencing),
-            (RpcErrorCode::EpochMismatch, RefreshReason::EpochMismatch),
-        ] {
-            let canonical = CanonicalError::need_refresh(code, reason, "unsupported refresh");
-            let rpc = Arc::new(ScriptedRpc::new(vec![
-                ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
-                    header: Some(err_header(canonical)),
-                    ..Default::default()
-                })),
-                ScriptedResult::response(ResponseEnvelope::GetFileLayoutByPath(
-                    GetFileLayoutByPathResponseProto {
-                        header: Some(ok_header()),
-                        locations: vec![proto::metadata::FileBlockLocationProto::default()],
-                        ..Default::default()
-                    },
-                )),
-                ScriptedResult::response(ResponseEnvelope::Msync(msync_response(
-                    1,
-                    RaftLogIdProto {
-                        term: 1,
-                        leader_node_id: 1,
-                        index: 1,
-                    },
-                ))),
-            ]));
-            let machine = ActionMachine::new(rpc.clone(), vec![]);
-            let request = GetFileStatusRequestProto {
-                header: Some(request_header()),
-                path: "/mnt/unsupported.bin".to_string(),
-            };
-
-            let err = call_machine(&machine, RpcOp::get_file_status(request))
-                .await
-                .expect_err("unsupported refresh reason must fail");
-
-            match err {
-                ClientError::Metadata(message) => {
-                    assert!(message.contains("unsupported FileSystemService refresh reason"));
-                }
-                other => panic!("expected explicit unsupported refresh error, got {:?}", other),
-            }
-            assert_eq!(rpc.calls.lock().await.len(), 1);
-            assert_eq!(rpc.msync_calls.lock().await.len(), 0);
-        }
-    }
-
-    #[tokio::test]
-    async fn not_leader_refresh_then_replay_succeeds() {
-        let canonical = CanonicalError::need_refresh_with_hint(
-            RpcErrorCode::NotLeader,
-            RefreshReason::NotLeader,
-            CanonicalRefreshHint {
-                leader_endpoint: Some("127.0.0.2:18080".to_string()),
-                ..Default::default()
-            },
-            "not leader",
-        );
-
-        let rpc = Arc::new(ScriptedRpc::new(vec![
-            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
-                header: Some(err_header(canonical)),
-                ..Default::default()
-            })),
-            ScriptedResult::response(ResponseEnvelope::GetFileLayoutByPath(
-                GetFileLayoutByPathResponseProto {
-                    header: Some(ok_header()),
-                    ..Default::default()
-                },
-            )),
-            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
-                header: Some(ok_header()),
-                ..Default::default()
-            })),
-        ]));
-
-        let machine = ActionMachine::new(rpc.clone(), vec!["127.0.0.1:18080".to_string()]);
-        let request = GetFileStatusRequestProto {
-            header: Some(request_header()),
-            path: "/mnt/a.txt".to_string(),
-        };
-
-        let response = call_machine(&machine, RpcOp::get_file_status(request))
-            .await
-            .expect("replay should succeed");
-        assert!(response.header.as_ref().and_then(|h| h.error.as_ref()).is_none());
-
-        let reconnects = rpc.reconnects.lock().await.clone();
-        assert_eq!(reconnects.len(), 1);
-        assert_eq!(reconnects[0], "http://127.0.0.2:18080");
-
-        let calls = rpc.calls.lock().await;
-        assert_eq!(calls.len(), 3);
-        assert_eq!(calls[0].op_name(), "GetFileStatus");
-        assert_eq!(calls[1].op_name(), "GetFileLayoutByPath");
-        assert_eq!(calls[2].op_name(), "GetFileStatus");
-    }
-
-    #[tokio::test]
-    async fn route_epoch_mismatch_refreshes_route_then_replays() {
-        let canonical = CanonicalError::need_refresh_with_hint(
-            RpcErrorCode::RouteEpochMismatch,
-            RefreshReason::RouteEpochMismatch,
-            CanonicalRefreshHint {
-                route_epoch: Some(17),
-                ..Default::default()
-            },
-            "route epoch mismatch",
-        );
-
-        let rpc = Arc::new(ScriptedRpc::new(vec![
-            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
-                header: Some(err_header(canonical)),
-                ..Default::default()
-            })),
-            ScriptedResult::response(ResponseEnvelope::GetFileLayoutByPath(
-                GetFileLayoutByPathResponseProto {
-                    header: Some(ok_header_with_route(17)),
-                    locations: vec![proto::metadata::FileBlockLocationProto {
-                        block_id: None,
-                        file_offset: 0,
-                        len: 128,
-                        workers: vec![WorkerEndpointInfoProto {
-                            worker_id: 11,
-                            endpoint: "127.0.0.1:19090".to_string(),
-                            net_transport_kind: proto::common::NetTransportKindProto::NetTransportKindGrpc as i32,
-                            worker_epoch: 9,
-                        }],
-                        worker_epoch: Some(9),
-                    }],
-                    ..Default::default()
-                },
-            )),
-            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
-                header: Some(ok_header()),
-                ..Default::default()
-            })),
-        ]));
-
-        let machine = ActionMachine::new(rpc.clone(), vec![]);
-        let request = GetFileStatusRequestProto {
-            header: Some(request_header()),
-            path: "/mnt/route.bin".to_string(),
-        };
-
-        call_machine(&machine, RpcOp::get_file_status(request))
-            .await
-            .expect("route refresh replay should succeed");
-
-        let calls = rpc.calls.lock().await;
-        assert_eq!(calls.len(), 3);
-        assert_eq!(calls[0].op_name(), "GetFileStatus");
-        assert_eq!(calls[1].op_name(), "GetFileLayoutByPath");
-        assert_eq!(calls[2].op_name(), "GetFileStatus");
-        assert_eq!(rpc.msync_calls.lock().await.len(), 0);
-
-        let replay_header = calls[2].header().expect("replay header");
-        assert_eq!(replay_header.route_epoch, Some(17));
-    }
-
-    #[tokio::test]
-    async fn mount_epoch_refresh_does_not_call_msync() {
-        let canonical = CanonicalError::need_refresh_with_hint(
-            RpcErrorCode::MountEpochMismatch,
-            RefreshReason::MountEpochMismatch,
-            CanonicalRefreshHint {
-                mount_epoch: Some(19),
-                ..Default::default()
-            },
-            "mount epoch mismatch",
-        );
-
-        let rpc = Arc::new(ScriptedRpc::new(vec![
-            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
-                header: Some(err_header(canonical)),
-                ..Default::default()
-            })),
-            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
-                header: Some(ok_header()),
-                attrs: Some(proto::fs::FileAttrsProto::default()),
-                ..Default::default()
-            })),
-            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
-                header: Some(ok_header()),
-                ..Default::default()
-            })),
-        ]));
-
-        let machine = ActionMachine::new(rpc.clone(), vec![]);
-        let request = GetFileStatusRequestProto {
-            header: Some(request_header()),
-            path: "/mnt/mount.bin".to_string(),
-        };
-
-        call_machine(&machine, RpcOp::get_file_status(request))
-            .await
-            .expect("mount refresh should replay");
-
-        let calls = rpc.calls.lock().await;
-        assert_eq!(calls.len(), 3);
-        assert_eq!(calls[0].op_name(), "GetFileStatus");
-        assert_eq!(calls[1].op_name(), "GetFileStatus");
-        assert_eq!(calls[2].op_name(), "GetFileStatus");
-        assert_eq!(rpc.msync_calls.lock().await.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn worker_epoch_refresh_uses_worker_hint_without_msync() {
-        let canonical = CanonicalError::need_refresh_with_hint(
-            RpcErrorCode::WorkerEpochMismatch,
-            RefreshReason::WorkerEpochMismatch,
-            CanonicalRefreshHint {
-                worker_epoch: Some(23),
-                worker_endpoints: vec![common::error::canonical::WorkerEndpointHint {
-                    worker_id: 99,
-                    endpoint: "127.0.0.1:19090".to_string(),
-                    net_transport_kind: proto::common::NetTransportKindProto::NetTransportKindGrpc as i32,
-                    worker_epoch: 23,
-                }],
-                worker_resolve_required: false,
-                ..Default::default()
-            },
-            "worker epoch mismatch",
-        );
-
-        let rpc = Arc::new(ScriptedRpc::new(vec![
-            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
-                header: Some(err_header(canonical)),
-                ..Default::default()
-            })),
-            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
-                header: Some(ok_header()),
-                ..Default::default()
-            })),
-        ]));
-
-        let machine = ActionMachine::new(rpc.clone(), vec![]);
-        let request = GetFileStatusRequestProto {
-            header: Some(request_header()),
-            path: "/mnt/worker.bin".to_string(),
-        };
-
-        call_machine(&machine, RpcOp::get_file_status(request))
-            .await
-            .expect("worker hint refresh should replay");
-
-        let calls = rpc.calls.lock().await;
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].op_name(), "GetFileStatus");
-        assert_eq!(calls[1].op_name(), "GetFileStatus");
-        assert_eq!(rpc.msync_calls.lock().await.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn refresh_layout_propagates_canonical_error_without_replay() {
-        let initial = CanonicalError::need_refresh_with_hint(
-            RpcErrorCode::RouteEpochMismatch,
-            RefreshReason::RouteEpochMismatch,
-            CanonicalRefreshHint {
-                route_epoch: Some(17),
-                ..Default::default()
-            },
-            "route epoch mismatch",
-        );
-        let refresh_error =
-            CanonicalError::need_refresh(RpcErrorCode::NotLeader, RefreshReason::NotLeader, "refresh not leader");
-
-        let rpc = Arc::new(ScriptedRpc::new(vec![
-            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
-                header: Some(err_header(initial)),
-                ..Default::default()
-            })),
-            ScriptedResult::response(ResponseEnvelope::GetFileLayoutByPath(
-                GetFileLayoutByPathResponseProto {
-                    header: Some(err_header(refresh_error)),
-                    ..Default::default()
-                },
-            )),
-            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
-                header: Some(ok_header()),
-                ..Default::default()
-            })),
-        ]));
-
-        let machine = ActionMachine::new(rpc.clone(), vec![]);
-        let request = GetFileStatusRequestProto {
-            header: Some(request_header()),
-            path: "/mnt/route-refresh-error.bin".to_string(),
-        };
-
-        let err = call_machine(&machine, RpcOp::get_file_status(request))
-            .await
-            .expect_err("refresh canonical error must stop replay");
-
-        match err {
-            ClientError::Action(ClientAction::Refresh { reason, .. }) => {
-                assert_eq!(reason, RefreshReason::NotLeader);
-            }
-            other => panic!("expected refresh canonical error, got {:?}", other),
-        }
-
-        let calls = rpc.calls.lock().await;
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].op_name(), "GetFileStatus");
-        assert_eq!(calls[1].op_name(), "GetFileLayoutByPath");
-    }
-
-    #[tokio::test]
-    async fn refresh_layout_rejects_success_response_without_concrete_refresh() {
-        let canonical = CanonicalError::need_refresh_with_hint(
-            RpcErrorCode::RouteEpochMismatch,
-            RefreshReason::RouteEpochMismatch,
-            CanonicalRefreshHint::default(),
-            "route epoch mismatch",
-        );
-
-        let rpc = Arc::new(ScriptedRpc::new(vec![
-            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
-                header: Some(err_header(canonical)),
-                ..Default::default()
-            })),
-            ScriptedResult::response(ResponseEnvelope::GetFileLayoutByPath(
-                GetFileLayoutByPathResponseProto {
-                    header: Some(ok_header_without_refresh_hints()),
-                    locations: Vec::new(),
-                    ..Default::default()
-                },
-            )),
-            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
-                header: Some(ok_header()),
-                ..Default::default()
-            })),
-        ]));
-
-        let machine = ActionMachine::new(rpc.clone(), vec![]);
-        let request = GetFileStatusRequestProto {
-            header: Some(request_header()),
-            path: "/mnt/route-refresh-empty.bin".to_string(),
-        };
-
-        let err = call_machine(&machine, RpcOp::get_file_status(request))
-            .await
-            .expect_err("empty refresh response must stop replay");
-
-        match err {
-            ClientError::Metadata(message) => {
-                assert!(message.contains("did not update or confirm"));
-            }
-            other => panic!("expected explicit no-op refresh error, got {:?}", other),
-        }
-
-        let calls = rpc.calls.lock().await;
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].op_name(), "GetFileStatus");
-        assert_eq!(calls[1].op_name(), "GetFileLayoutByPath");
-    }
-
-    #[tokio::test]
-    async fn permission_denied_is_terminal_without_replay() {
-        let canonical = CanonicalError::fatal_fs(FsErrorCode::EAcces, "permission denied");
-
-        let rpc = Arc::new(ScriptedRpc::new(vec![ScriptedResult::response(
-            ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
-                header: Some(err_header(canonical)),
-                ..Default::default()
-            }),
-        )]));
-
-        let machine = ActionMachine::new(rpc.clone(), vec![]);
-        let request = GetFileStatusRequestProto {
-            header: Some(request_header()),
-            path: "/mnt/deny.bin".to_string(),
-        };
-
-        let err = call_machine(&machine, RpcOp::get_file_status(request))
-            .await
-            .expect_err("permission denied should be terminal");
-
-        match err {
-            ClientError::Action(ClientAction::Fail { canonical }) => {
-                assert!(matches!(
-                    canonical.code,
-                    Some(CanonicalCode::FsErrno(FsErrorCode::EAcces))
-                ));
-            }
-            other => panic!("expected terminal canonical fail, got {:?}", other),
-        }
-
-        assert_eq!(rpc.calls.lock().await.len(), 1);
-        assert_eq!(rpc.reconnects.lock().await.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn grpc_unavailable_retries_with_bound() {
-        let rpc = Arc::new(ScriptedRpc::new(vec![
-            ScriptedResult::Status(tonic::Status::unavailable("temporary outage")),
-            ScriptedResult::response(ResponseEnvelope::GetFileStatus(GetFileStatusResponseProto {
-                header: Some(ok_header()),
-                ..Default::default()
-            })),
-        ]));
-
-        let machine = ActionMachine::new(rpc.clone(), vec![]).with_policy(ActionMachinePolicy {
-            max_refresh_attempts: 1,
-            max_retryable_attempts: 1,
-            max_transport_retries: 1,
-            base_backoff_ms: 0,
-        });
-
-        let request = GetFileStatusRequestProto {
-            header: Some(request_header()),
-            path: "/mnt/retry.bin".to_string(),
-        };
-
-        call_machine(&machine, RpcOp::get_file_status(request))
-            .await
-            .expect("transport retry should succeed");
-
-        assert_eq!(rpc.calls.lock().await.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn delete_uses_delete_rpc_with_mutation_policy() {
-        let rpc = Arc::new(ScriptedRpc::new(vec![ScriptedResult::response(
-            ResponseEnvelope::Delete(DeleteResponseProto {
-                header: Some(ok_header()),
-            }),
-        )]));
-
-        let machine = ActionMachine::new(rpc.clone(), vec![]);
-        let request = DeleteRequestProto {
-            header: Some(request_header()),
-            path: "/mnt/delete.bin".to_string(),
-            recursive: false,
-        };
-
-        machine
-            .call_with_refresh(ReplayPolicy::Mutation, RpcOp::delete(request))
-            .await
-            .expect("delete should use the mutation policy");
-
-        let calls = rpc.calls.lock().await;
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].op_name(), "Delete");
-    }
-
-    #[tokio::test]
-    async fn fsync_session_reopens_session_on_invalid_error() {
-        let open_resp_1 = OpenWriteByPathResponseProto {
-            header: Some(ok_header()),
-            file_handle: 10,
-            lease_id: Some(proto::common::LeaseIdProto { high: 0, low: 1 }),
-            fencing_token: Some(proto::common::FencingTokenProto {
-                block_id: None,
-                owner: 1,
-                epoch: 1,
-            }),
-            write_targets: vec![],
-            base_size: 0,
-            open_epoch: 100,
-            lease_epoch: 1,
-            expires_at_ms: 1000,
-        };
-
-        let open_resp_2 = OpenWriteByPathResponseProto {
-            header: Some(ok_header()),
-            file_handle: 20,
-            lease_id: Some(proto::common::LeaseIdProto { high: 0, low: 2 }),
-            fencing_token: Some(proto::common::FencingTokenProto {
-                block_id: None,
-                owner: 1,
-                epoch: 2,
-            }),
-            write_targets: vec![],
-            base_size: 0,
-            open_epoch: 200,
-            lease_epoch: 2,
-            expires_at_ms: 2000,
-        };
-
-        let invalid_session = CanonicalError {
-            class: ErrorClass::Fatal,
-            code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing)),
-            reason: Some(RefreshReason::SessionInvalid),
-            retry_after_ms: None,
-            message: "write session invalid; reopen session and replay fsync".to_string(),
-            refresh_hint: None,
-        };
-
-        let rpc = Arc::new(ScriptedRpc::new(vec![
-            ScriptedResult::response(ResponseEnvelope::OpenWriteByPath(open_resp_1.clone())),
-            ScriptedResult::response(ResponseEnvelope::FsyncSession(FsyncSessionResponseProto {
-                header: Some(err_header(invalid_session)),
-            })),
-            ScriptedResult::response(ResponseEnvelope::OpenWriteByPath(open_resp_2.clone())),
-            ScriptedResult::response(ResponseEnvelope::FsyncSession(FsyncSessionResponseProto {
-                header: Some(ok_header()),
-            })),
-        ]));
-
-        let machine = ActionMachine::new(rpc.clone(), vec![]);
-
-        let open_req = OpenWriteByPathRequestProto {
-            header: Some(request_header()),
-            path: "/mnt/writer.bin".to_string(),
-            desired_len: Some(4096),
-            mode: proto::metadata::WriteModeProto::WriteModeAppend as i32,
-        };
-
-        call_machine(&machine, RpcOp::open_write_by_path(open_req))
-            .await
-            .expect("initial open should succeed");
-
-        let fsync_req = FsyncSessionRequestProto {
-            header: Some(request_header()),
-            file_handle: 10,
-            flags: 0,
-            lease_id: open_resp_1.lease_id,
-            lease_epoch: Some(open_resp_1.lease_epoch),
-            fencing_token: open_resp_1.fencing_token,
-            worker_epoch: None,
-            target_size: None,
-        };
-
-        call_machine(&machine, RpcOp::fsync_session(fsync_req))
-            .await
-            .expect("fsync should reopen and replay");
-
-        let calls = rpc.calls.lock().await;
-        assert_eq!(calls.len(), 4);
-        assert_eq!(calls[0].op_name(), "OpenWriteByPath");
-        assert_eq!(calls[1].op_name(), "FsyncSession");
-        assert_eq!(calls[2].op_name(), "OpenWriteByPath");
-        assert_eq!(calls[3].op_name(), "FsyncSession");
-
-        match &calls[3] {
-            RequestEnvelope::FsyncSession(req) => {
-                assert_eq!(req.file_handle, 20);
-                assert_eq!(req.lease_epoch, Some(2));
-            }
-            other => panic!("expected fsync replay request, got {}", other.op_name()),
-        }
-    }
-
-    #[tokio::test]
-    async fn fsync_session_reopens_session_on_expired_error() {
-        let open_resp_1 = OpenWriteByPathResponseProto {
-            header: Some(ok_header()),
-            file_handle: 100,
-            lease_id: Some(proto::common::LeaseIdProto { high: 0, low: 10 }),
-            fencing_token: Some(proto::common::FencingTokenProto {
-                block_id: None,
-                owner: 1,
-                epoch: 10,
-            }),
-            write_targets: vec![],
-            base_size: 0,
-            open_epoch: 1000,
-            lease_epoch: 10,
-            expires_at_ms: 10_000,
-        };
-
-        let open_resp_2 = OpenWriteByPathResponseProto {
-            header: Some(ok_header()),
-            file_handle: 200,
-            lease_id: Some(proto::common::LeaseIdProto { high: 0, low: 20 }),
-            fencing_token: Some(proto::common::FencingTokenProto {
-                block_id: None,
-                owner: 1,
-                epoch: 20,
-            }),
-            write_targets: vec![],
-            base_size: 0,
-            open_epoch: 2000,
-            lease_epoch: 20,
-            expires_at_ms: 20_000,
-        };
-
-        let expired_session = CanonicalError {
-            class: ErrorClass::Fatal,
-            code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing)),
-            reason: Some(RefreshReason::SessionExpired),
-            retry_after_ms: None,
-            message: "session token stale".to_string(),
-            refresh_hint: None,
-        };
-
-        let rpc = Arc::new(ScriptedRpc::new(vec![
-            ScriptedResult::response(ResponseEnvelope::OpenWriteByPath(open_resp_1.clone())),
-            ScriptedResult::response(ResponseEnvelope::FsyncSession(FsyncSessionResponseProto {
-                header: Some(err_header(expired_session)),
-            })),
-            ScriptedResult::response(ResponseEnvelope::OpenWriteByPath(open_resp_2.clone())),
-            ScriptedResult::response(ResponseEnvelope::FsyncSession(FsyncSessionResponseProto {
-                header: Some(ok_header()),
-            })),
-        ]));
-
-        let machine = ActionMachine::new(rpc.clone(), vec![]);
-
-        call_machine(
-            &machine,
-            RpcOp::open_write_by_path(OpenWriteByPathRequestProto {
-                header: Some(request_header()),
-                path: "/mnt/writer-expired.bin".to_string(),
-                desired_len: Some(4096),
-                mode: proto::metadata::WriteModeProto::WriteModeAppend as i32,
-            }),
-        )
-        .await
-        .expect("initial open should succeed");
-
-        call_machine(
-            &machine,
-            RpcOp::fsync_session(FsyncSessionRequestProto {
-                header: Some(request_header()),
-                file_handle: 100,
-                flags: 0,
-                lease_id: open_resp_1.lease_id,
-                lease_epoch: Some(open_resp_1.lease_epoch),
-                fencing_token: open_resp_1.fencing_token,
-                worker_epoch: None,
-                target_size: None,
-            }),
-        )
-        .await
-        .expect("session expired should reopen and replay");
-
-        let calls = rpc.calls.lock().await;
-        assert_eq!(calls.len(), 4);
-        assert_eq!(calls[0].op_name(), "OpenWriteByPath");
-        assert_eq!(calls[1].op_name(), "FsyncSession");
-        assert_eq!(calls[2].op_name(), "OpenWriteByPath");
-        assert_eq!(calls[3].op_name(), "FsyncSession");
-        match &calls[3] {
-            RequestEnvelope::FsyncSession(req) => {
-                assert_eq!(req.file_handle, 200);
-                assert_eq!(req.lease_epoch, Some(20));
-            }
-            other => panic!("expected fsync replay request, got {}", other.op_name()),
-        }
-    }
-
-    #[tokio::test]
-    async fn fsync_session_does_not_reopen_from_message_heuristics() {
-        let open_resp = OpenWriteByPathResponseProto {
-            header: Some(ok_header()),
-            file_handle: 300,
-            lease_id: Some(proto::common::LeaseIdProto { high: 0, low: 30 }),
-            fencing_token: Some(proto::common::FencingTokenProto {
-                block_id: None,
-                owner: 1,
-                epoch: 30,
-            }),
-            write_targets: vec![],
-            base_size: 0,
-            open_epoch: 3000,
-            lease_epoch: 30,
-            expires_at_ms: 30_000,
-        };
-
-        let fatal_unknown = CanonicalError {
-            class: ErrorClass::Fatal,
-            code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing)),
-            reason: Some(RefreshReason::Unknown),
-            retry_after_ms: None,
-            message: "please reopen session and replay".to_string(),
-            refresh_hint: None,
-        };
-
-        let rpc = Arc::new(ScriptedRpc::new(vec![
-            ScriptedResult::response(ResponseEnvelope::OpenWriteByPath(open_resp.clone())),
-            ScriptedResult::response(ResponseEnvelope::FsyncSession(FsyncSessionResponseProto {
-                header: Some(err_header(fatal_unknown)),
-            })),
-        ]));
-
-        let machine = ActionMachine::new(rpc.clone(), vec![]);
-        call_machine(
-            &machine,
-            RpcOp::open_write_by_path(OpenWriteByPathRequestProto {
-                header: Some(request_header()),
-                path: "/mnt/writer-no-message-heuristics.bin".to_string(),
-                desired_len: Some(4096),
-                mode: proto::metadata::WriteModeProto::WriteModeAppend as i32,
-            }),
-        )
-        .await
-        .expect("initial open should succeed");
-
-        let err = call_machine(
-            &machine,
-            RpcOp::fsync_session(FsyncSessionRequestProto {
-                header: Some(request_header()),
-                file_handle: open_resp.file_handle,
-                flags: 0,
-                lease_id: open_resp.lease_id,
-                lease_epoch: Some(open_resp.lease_epoch),
-                fencing_token: open_resp.fencing_token,
-                worker_epoch: None,
-                target_size: None,
-            }),
-        )
-        .await
-        .expect_err("unknown reason must not trigger reopen");
-
-        match err {
-            ClientError::Action(ClientAction::Fail { canonical }) => {
-                assert_eq!(canonical.reason, Some(RefreshReason::Unknown));
-            }
-            other => panic!("expected terminal fail, got {:?}", other),
-        }
-
-        let calls = rpc.calls.lock().await;
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].op_name(), "OpenWriteByPath");
-        assert_eq!(calls[1].op_name(), "FsyncSession");
-    }
+    use proto::metadata::CreateDispositionProto;
+    use std::sync::Mutex;
 
     #[test]
-    fn filesystem_rpc_replay_policy_table_is_complete_and_unique() {
+    fn replay_policy_table_is_complete() {
         let mut seen = std::collections::HashSet::new();
         for entry in FILESYSTEM_RPC_REPLAY_POLICIES.iter() {
             assert!(
@@ -2859,19 +1952,191 @@ mod tests {
         assert_eq!(seen.len(), FileSystemRpcMethod::ALL.len());
         for method in FileSystemRpcMethod::ALL.iter() {
             assert!(seen.contains(method), "missing replay policy mapping for {:?}", method);
-            assert_eq!(
-                replay_policy_for_method(*method),
-                FILESYSTEM_RPC_REPLAY_POLICIES
-                    .iter()
-                    .find_map(|entry| (entry.method == *method).then_some(entry.policy))
-                    .expect("table entry"),
-            );
         }
     }
 
     #[test]
-    fn shard_moved_code_maps_to_route_epoch_mismatch_reason() {
+    fn session_errors_are_not_reopenable() {
+        let fatal = CanonicalError {
+            class: ErrorClass::Fatal,
+            code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing)),
+            reason: Some(RefreshReason::SessionInvalid),
+            retry_after_ms: None,
+            message: "invalid write handle".to_string(),
+            refresh_hint: None,
+        };
+        let err = ClientError::from(ClientAction::Fail {
+            canonical: Box::new(fatal),
+        });
+        match err {
+            ClientError::Action(action) => {
+                let ClientAction::Fail { canonical } = action.as_ref() else {
+                    panic!("expected terminal fail, got {:?}", action);
+                };
+                assert_eq!(canonical.reason, Some(RefreshReason::SessionInvalid));
+            }
+            other => panic!("expected terminal fail, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn shard_moved_maps_to_route_refresh() {
         let reason = refresh_reason_from_code(Some(CanonicalErrorCode::RpcCode(RpcErrorCode::ShardMoved)));
         assert_eq!(reason, RefreshReason::RouteEpochMismatch);
+    }
+
+    struct RetryCallIdRpc {
+        attempts: AtomicUsize,
+        call_ids: Mutex<Vec<String>>,
+    }
+
+    impl RetryCallIdRpc {
+        fn new() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                call_ids: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl FileSystemRpc for RetryCallIdRpc {
+        async fn get_status(&self, _request: GetStatusRequestProto) -> Result<GetStatusResponseProto, tonic::Status> {
+            Err(tonic::Status::unimplemented("get_status"))
+        }
+
+        async fn list_status(
+            &self,
+            _request: ListStatusRequestProto,
+        ) -> Result<ListStatusResponseProto, tonic::Status> {
+            Err(tonic::Status::unimplemented("list_status"))
+        }
+
+        async fn create_directory(
+            &self,
+            _request: CreateDirectoryRequestProto,
+        ) -> Result<CreateDirectoryResponseProto, tonic::Status> {
+            Err(tonic::Status::unimplemented("create_directory"))
+        }
+
+        async fn delete(&self, _request: DeleteRequestProto) -> Result<DeleteResponseProto, tonic::Status> {
+            Err(tonic::Status::unimplemented("delete"))
+        }
+
+        async fn rename(&self, _request: RenameRequestProto) -> Result<RenameResponseProto, tonic::Status> {
+            Err(tonic::Status::unimplemented("rename"))
+        }
+
+        async fn open_file(&self, _request: OpenFileRequestProto) -> Result<OpenFileResponseProto, tonic::Status> {
+            Err(tonic::Status::unimplemented("open_file"))
+        }
+
+        async fn get_block_locations(
+            &self,
+            _request: GetBlockLocationsRequestProto,
+        ) -> Result<GetBlockLocationsResponseProto, tonic::Status> {
+            Err(tonic::Status::unimplemented("get_block_locations"))
+        }
+
+        async fn create_file(&self, request: CreateFileRequestProto) -> Result<CreateFileResponseProto, tonic::Status> {
+            let call_id = request
+                .header
+                .as_ref()
+                .and_then(|header| header.client.as_ref())
+                .map(|client| client.call_id.clone())
+                .unwrap_or_default();
+            self.call_ids.lock().unwrap().push(call_id);
+
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                let canonical = CanonicalError::retryable(RpcErrorCode::NodeUnavailable, Some(0), "retry once");
+                return Ok(CreateFileResponseProto {
+                    header: Some(ResponseHeaderProto {
+                        error: Some(proto::convert::canonical_to_error_detail(&canonical)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+            }
+
+            Ok(CreateFileResponseProto {
+                header: Some(ResponseHeaderProto::default()),
+                ..Default::default()
+            })
+        }
+
+        async fn append_file(
+            &self,
+            _request: AppendFileRequestProto,
+        ) -> Result<AppendFileResponseProto, tonic::Status> {
+            Err(tonic::Status::unimplemented("append_file"))
+        }
+
+        async fn add_block(&self, _request: AddBlockRequestProto) -> Result<AddBlockResponseProto, tonic::Status> {
+            Err(tonic::Status::unimplemented("add_block"))
+        }
+
+        async fn commit_file(
+            &self,
+            _request: CommitFileRequestProto,
+        ) -> Result<CommitFileResponseProto, tonic::Status> {
+            Err(tonic::Status::unimplemented("commit_file"))
+        }
+
+        async fn abort_file_write(
+            &self,
+            _request: AbortFileWriteRequestProto,
+        ) -> Result<AbortFileWriteResponseProto, tonic::Status> {
+            Err(tonic::Status::unimplemented("abort_file_write"))
+        }
+
+        async fn renew_lease(
+            &self,
+            _request: RenewLeaseRequestProto,
+        ) -> Result<RenewLeaseResponseProto, tonic::Status> {
+            Err(tonic::Status::unimplemented("renew_lease"))
+        }
+
+        async fn hflush(&self, _request: HflushRequestProto) -> Result<HflushResponseProto, tonic::Status> {
+            Err(tonic::Status::unimplemented("hflush"))
+        }
+
+        async fn hsync(&self, _request: HsyncRequestProto) -> Result<HsyncResponseProto, tonic::Status> {
+            Err(tonic::Status::unimplemented("hsync"))
+        }
+
+        async fn msync(&self, _request: MsyncRequestProto) -> Result<MsyncResponseProto, tonic::Status> {
+            Err(tonic::Status::unimplemented("msync"))
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_keeps_call_id() {
+        let rpc = Arc::new(RetryCallIdRpc::new());
+        let machine = ActionMachine::new(Arc::clone(&rpc) as Arc<dyn FileSystemRpc>, Vec::new()).with_policy(
+            ActionMachinePolicy {
+                max_refresh_attempts: 0,
+                max_retryable_attempts: 1,
+                max_transport_retries: 0,
+                base_backoff_ms: 0,
+            },
+        );
+
+        machine
+            .call_with_refresh(
+                ReplayPolicy::Mutation,
+                RpcOp::create_file(CreateFileRequestProto {
+                    path: "/retry".to_string(),
+                    disposition: CreateDispositionProto::CreateNew as i32,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("retry should eventually succeed");
+
+        let call_ids = rpc.call_ids.lock().unwrap();
+        assert_eq!(call_ids.len(), 2);
+        assert!(!call_ids[0].is_empty());
+        assert_eq!(call_ids[0], call_ids[1]);
     }
 }

@@ -6,8 +6,8 @@ use crate::config::RaftConfig;
 use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
 use crate::raft::{AppRaftNode, AppRaftStateMachine, Command, DedupKey, RocksDBStorage};
 use crate::service::domain::{
-    CloseWriteInput, CloseWriteIntent, Freshness, GetFileLayoutInput, OpenWriteInput, PresentedFencingToken,
-    ReleaseSessionInput, RequestContext, TruncateInput, UnlinkInput,
+    AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CommittedBlock, CoreResult, Freshness,
+    GetFileLayoutInput, OpenWriteInput, PresentedFencingToken, RequestContext, SessionKey, UnlinkInput, WriteTarget,
 };
 use crate::state::{BlockMetaState, LeaseState, MemoryStateStore, RouteEpoch};
 use crate::worker::{HealthStatus, WorkerManager};
@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use types::block::{BlockPlacement, BlockState};
 use types::fs::{FileAttrs, Inode};
-use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, MountId, ShardGroupId, WorkerId};
+use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, LeaseId, MountId, ShardGroupId, WorkerId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
 
@@ -241,26 +241,164 @@ fn install_write_session(fs_core: &FsCore, inode_id: InodeId, mount_id: MountId)
             None,
         )
         .expect("lease acquired");
-    fs_core.write_session_manager_for_test().create_session(
+    fs_core
+        .write_session_manager_for_test()
+        .create_session(crate::write_session::CreateSessionInput {
+            inode_id,
+            mount_id,
+            data_handle_id,
+            lease_id,
+            lease_epoch,
+            fencing_token: FencingToken {
+                block_id: BlockId::new(data_handle_id, BlockIndex::new(0)),
+                owner: writer,
+                epoch: lease_epoch,
+            },
+            open_epoch: 1234,
+            base_size: 0,
+            mode: crate::inode_lease::WriteMode::Write,
+            write_targets: vec![proto::metadata::WriteTargetProto {
+                block_id: Some(proto::common::BlockIdProto {
+                    data_handle_id: data_handle_id.as_raw(),
+                    block_index: 0,
+                }),
+                file_offset: 0,
+                len: 64,
+                worker_endpoints: Vec::new(),
+                fencing_token: Some(proto::common::FencingTokenProto {
+                    block_id: Some(proto::common::BlockIdProto {
+                        data_handle_id: data_handle_id.as_raw(),
+                        block_index: 0,
+                    }),
+                    owner: writer.as_raw(),
+                    epoch: lease_epoch,
+                }),
+            }],
+            writer_identity: crate::write_session::WriterIdentity {
+                client_id: writer,
+                call_id: types::CallId::new(),
+            },
+        })
+}
+
+fn presented_session_token(session: &crate::write_session::WriteSession) -> PresentedFencingToken {
+    PresentedFencingToken {
+        block_id: Some(session.fencing_token.block_id),
+        owner: session.fencing_token.owner.as_raw(),
+        epoch: session.fencing_token.epoch,
+    }
+}
+
+fn abort_input_for_session(
+    session: &crate::write_session::WriteSession,
+    file_handle: u64,
+    ctx: RequestContext,
+) -> AbortWriteInput {
+    AbortWriteInput {
+        ctx,
+        file_handle,
+        lease_id: Some(session.lease_id),
+        lease_epoch: session.lease_epoch,
+        open_epoch: session.open_epoch,
+        fencing_token: Some(presented_session_token(session)),
+        freshness: Freshness::default(),
+    }
+}
+
+fn committed_block(block_id: BlockId, file_offset: u64, len: u64) -> CommittedBlock {
+    CommittedBlock {
+        block_id,
+        file_offset,
+        len,
+    }
+}
+
+fn presented_key_token(key: &SessionKey) -> PresentedFencingToken {
+    PresentedFencingToken {
+        block_id: Some(key.fencing_token.block_id),
+        owner: key.fencing_token.owner.as_raw(),
+        epoch: key.fencing_token.epoch,
+    }
+}
+
+async fn add_block_for_key(fs_core: &FsCore, key: &SessionKey, desired_len: u64) -> WriteTarget {
+    fs_core
+        .execute_add_block(AddBlockInput {
+            ctx: request_context(),
+            file_handle: key.file_handle,
+            lease_id: Some(key.lease_id),
+            lease_epoch: key.lease_epoch,
+            open_epoch: key.open_epoch,
+            fencing_token: Some(presented_key_token(key)),
+            desired_len: Some(desired_len),
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("AddBlock should succeed")
+        .payload
+        .target
+}
+
+async fn commit_for_key(
+    fs_core: &FsCore,
+    key: &SessionKey,
+    committed_blocks: Vec<CommittedBlock>,
+    final_size: u64,
+) -> CoreResult<crate::service::domain::CloseWriteOutput> {
+    fs_core
+        .execute_close_write(CloseWriteInput {
+            ctx: request_context(),
+            file_handle: key.file_handle,
+            lease_id: Some(key.lease_id),
+            lease_epoch: key.lease_epoch,
+            open_epoch: key.open_epoch,
+            fencing_token: Some(presented_key_token(key)),
+            intent: CloseWriteIntent {
+                committed_blocks,
+                final_size,
+            },
+            freshness: Freshness::default(),
+        })
+        .await
+}
+
+struct WriteFlowEnv {
+    _dir: TempDir,
+    storage: Arc<RocksDBStorage>,
+    fs_core: FsCore,
+    inode_id: InodeId,
+    data_handle_id: DataHandleId,
+}
+
+async fn write_flow_env(base_size: u64) -> WriteFlowEnv {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(57 + base_size);
+    let group_id = ShardGroupId::new(15 + base_size);
+    let inode_id = InodeId::new(570 + base_size);
+    let data_handle_id = DataHandleId::new(9570 + base_size);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mount_table = Arc::clone(&fs_core.mount_table);
+    let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+    fs_core.set_storage(Arc::clone(&storage));
+    fs_core.set_raft_node(raft_node);
+    fs_core.set_worker_manager(worker_manager_for_write_targets());
+
+    let mut attrs = FileAttrs::new();
+    attrs.size = base_size;
+    storage
+        .put_inode(&Inode::new_file(inode_id, attrs, mount_id, data_handle_id))
+        .unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    WriteFlowEnv {
+        _dir: dir,
+        storage,
+        fs_core,
         inode_id,
-        mount_id,
         data_handle_id,
-        lease_id,
-        lease_epoch,
-        FencingToken {
-            block_id: BlockId::new(data_handle_id, BlockIndex::new(0)),
-            owner: writer,
-            epoch: lease_epoch,
-        },
-        1234,
-        0,
-        crate::inode_lease::WriteMode::Write,
-        Vec::new(),
-        crate::write_session::WriterIdentity {
-            client_id: writer,
-            call_id: types::CallId::new(),
-        },
-    )
+    }
 }
 
 async fn single_node_raft(
@@ -278,39 +416,6 @@ async fn single_node_raft(
             .unwrap(),
     );
     (raft_node, state_machine)
-}
-
-#[test]
-fn validate_mount_freshness_returns_mount_epoch_need_refresh_without_replay_suffix() {
-    let mount_id = MountId::new(11);
-    let group_id = ShardGroupId::new(3);
-    let fs_core = fs_core_with_mount(mount_id, 9, group_id);
-    let ctx = request_context();
-
-    let failure = fs_core
-        .validate_mount_freshness(
-            &ctx,
-            Freshness {
-                mount_epoch: Some(4),
-                route_epoch: None,
-                worker_epoch: None,
-            },
-            mount_id,
-        )
-        .unwrap_err();
-
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::MountEpochMismatch))
-    );
-    assert_eq!(failure.error.reason, Some(RefreshReason::MountEpochMismatch));
-    assert_eq!(failure.error.message, "mount_epoch mismatch: client=4, server=9");
-    let hint = failure.error.refresh_hint.expect("refresh hint");
-    assert_eq!(hint.group_id, Some(group_id.as_raw()));
-    assert_eq!(hint.mount_epoch, Some(9));
-    assert_eq!(failure.group_id, Some(group_id.as_raw()));
-    assert_eq!(failure.mount_epoch, Some(9));
-    assert_eq!(failure.route_epoch, None);
 }
 
 #[test]
@@ -352,7 +457,7 @@ fn freshness_validator_rejects_routed_write_mount_epoch_with_replay_hint() {
     assert_eq!(failure.error.reason, Some(RefreshReason::MountEpochMismatch));
     assert_eq!(
         failure.error.message,
-        "mount_epoch mismatch: client=4, server=9; refresh metadata and re-open write session, then replay request"
+        "mount_epoch mismatch: client=4, server=9; refresh metadata and reopen write handle, then replay request"
     );
     let hint = failure.error.refresh_hint.expect("refresh hint");
     assert_eq!(hint.group_id, Some(group_id.as_raw()));
@@ -395,7 +500,7 @@ fn routed_write_mount_epoch_mismatch_preserves_metrics_and_wire_shape() {
     assert_eq!(failure.error.reason, Some(RefreshReason::MountEpochMismatch));
     assert_eq!(
         failure.error.message,
-        "mount_epoch mismatch: client=4, server=9; refresh metadata and re-open write session, then replay request"
+        "mount_epoch mismatch: client=4, server=9; refresh metadata and reopen write handle, then replay request"
     );
     let hint = failure.error.refresh_hint.expect("refresh hint");
     assert_eq!(hint.group_id, Some(5));
@@ -444,20 +549,20 @@ fn freshness_validator_rejects_stale_state_watermark() {
 }
 
 #[tokio::test]
-async fn write_session_coordinator_release_cleans_up_runtime_state() {
+async fn abort_releases_lease() {
     let mount_id = MountId::new(41);
     let group_id = ShardGroupId::new(4);
     let inode_id = InodeId::new(410);
     let fs_core = fs_core_with_mount(mount_id, 9, group_id);
     let file_handle = install_write_session(&fs_core, inode_id, mount_id);
+    let session = fs_core
+        .write_session_for_handle(file_handle)
+        .expect("session should be installed");
 
     let success = fs_core
-        .execute_release(ReleaseSessionInput {
-            ctx: request_context(),
-            file_handle,
-        })
+        .execute_abort_write(abort_input_for_session(&session, file_handle, request_context()))
         .await
-        .expect("release succeeds");
+        .expect("abort succeeds");
 
     assert!(fs_core.write_session_for_handle(file_handle).is_none());
     assert!(fs_core
@@ -469,21 +574,89 @@ async fn write_session_coordinator_release_cleans_up_runtime_state() {
 }
 
 #[tokio::test]
-async fn fs_core_release_facade_remains_idempotent_for_missing_session() {
-    let mount_id = MountId::new(42);
-    let group_id = ShardGroupId::new(5);
-    let fs_core = fs_core_with_mount(mount_id, 9, group_id);
+async fn abort_checks_handle() {
+    let mount_id = MountId::new(43);
+    let inode_id = InodeId::new(430);
+    let fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(6));
 
-    let success = fs_core
-        .execute_release(ReleaseSessionInput {
+    let failure = fs_core
+        .execute_abort_write(AbortWriteInput {
             ctx: request_context(),
             file_handle: 999,
+            lease_id: Some(LeaseId::new(1)),
+            lease_epoch: 1,
+            open_epoch: 1,
+            fencing_token: Some(PresentedFencingToken {
+                block_id: Some(BlockId::new(DataHandleId::new(1), BlockIndex::new(0))),
+                owner: 7,
+                epoch: 1,
+            }),
+            freshness: Freshness::default(),
         })
         .await
-        .expect("release succeeds");
+        .expect_err("missing write handle must be rejected");
 
-    assert_eq!(success.group_id, None);
-    assert_eq!(success.mount_epoch, None);
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
+    );
+    assert_eq!(failure.error.reason, Some(RefreshReason::SessionInvalid));
+
+    let file_handle = install_write_session(&fs_core, inode_id, mount_id);
+    let session = fs_core
+        .write_session_for_handle(file_handle)
+        .expect("session should be installed");
+    let mut stale = abort_input_for_session(&session, file_handle, request_context());
+    stale.lease_epoch += 1;
+
+    let stale_failure = fs_core
+        .execute_abort_write(stale)
+        .await
+        .expect_err("stale abort handle must be rejected");
+
+    assert_eq!(
+        stale_failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
+    );
+    assert_eq!(stale_failure.error.reason, Some(RefreshReason::SessionInvalid));
+    assert!(fs_core.write_session_for_handle(file_handle).is_some());
+    assert!(fs_core
+        .inode_lease_manager_for_test()
+        .get_active_lease(inode_id)
+        .is_some());
+}
+
+#[tokio::test]
+async fn open_write_cleans_lease_on_error() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(50);
+    let inode_id = InodeId::new(500);
+    let data_handle_id = DataHandleId::new(9500);
+    storage
+        .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+        .unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(7));
+    fs_core.set_storage(storage);
+
+    let failure = fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id,
+            desired_len: Some(4096),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect_err("missing worker manager should fail open_write");
+
+    assert!(failure.error.message.contains("Worker manager not available"));
+    assert!(fs_core
+        .inode_lease_manager_for_test()
+        .get_active_lease(inode_id)
+        .is_none());
 }
 
 #[tokio::test]
@@ -563,6 +736,50 @@ async fn open_write_rejects_file_missing_current_data_handle() {
 }
 
 #[tokio::test]
+async fn create_then_add_block() {
+    let env = write_flow_env(0).await;
+    let open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(512),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("open write should succeed");
+    let key = open.payload.session_key;
+    let session_before = env
+        .fs_core
+        .write_session_for_handle(key.file_handle)
+        .expect("session should be stored");
+    assert_eq!(session_before.next_target_index, 0);
+    assert!(session_before.issued_targets.is_empty());
+
+    let target = add_block_for_key(&env.fs_core, &key, 512).await;
+    assert_eq!(target.block_id.data_handle_id, env.data_handle_id);
+    assert_eq!(target.file_offset, 0);
+    assert_eq!(target.len, 512);
+    assert!(target.worker_endpoints[0].endpoint.starts_with("127.0.0.1:900"));
+    assert!(!target.worker_endpoints[0].endpoint.ends_with(":0"));
+    let session_after_add = env
+        .fs_core
+        .write_session_for_handle(key.file_handle)
+        .expect("session should remain open");
+    assert_eq!(session_after_add.next_target_index, 1);
+    assert_eq!(session_after_add.issued_targets.len(), 1);
+
+    let committed = committed_block(target.block_id, target.file_offset, target.len);
+    let success = commit_for_key(&env.fs_core, &key, vec![committed], 512)
+        .await
+        .expect("commit should succeed");
+    assert_eq!(success.payload.committed_size, 512);
+    assert!(env.fs_core.write_session_for_handle(key.file_handle).is_none());
+    assert_eq!(env.storage.get_inode(env.inode_id).unwrap().unwrap().attrs.size, 512);
+}
+
+#[tokio::test]
 async fn close_write_invalid_lease_or_fencing_does_not_clear_runtime_session() {
     let mount_id = MountId::new(53);
     let group_id = ShardGroupId::new(11);
@@ -586,7 +803,7 @@ async fn close_write_invalid_lease_or_fencing_does_not_clear_runtime_session() {
                 epoch: session.fencing_token.epoch,
             }),
             intent: CloseWriteIntent {
-                extents: Vec::new(),
+                committed_blocks: Vec::new(),
                 final_size: 0,
             },
             freshness: Freshness::default(),
@@ -618,7 +835,7 @@ async fn close_write_invalid_lease_or_fencing_does_not_clear_runtime_session() {
                 epoch: session.fencing_token.epoch,
             }),
             intent: CloseWriteIntent {
-                extents: Vec::new(),
+                committed_blocks: Vec::new(),
                 final_size: 0,
             },
             freshness: Freshness::default(),
@@ -636,6 +853,146 @@ async fn close_write_invalid_lease_or_fencing_does_not_clear_runtime_session() {
         .inode_lease_manager_for_test()
         .get_active_lease(inode_id)
         .is_some());
+}
+
+#[tokio::test]
+async fn commit_rejects_unissued_block() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(56);
+    let group_id = ShardGroupId::new(14);
+    let inode_id = InodeId::new(560);
+    let data_handle_id = DataHandleId::new(424_242);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mount_table = Arc::clone(&fs_core.mount_table);
+    let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+    fs_core.set_storage(Arc::clone(&storage));
+    fs_core.set_raft_node(raft_node);
+    storage
+        .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+        .unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let file_handle = install_write_session(&fs_core, inode_id, mount_id);
+    let session = fs_core
+        .write_session_for_handle(file_handle)
+        .expect("session should be installed");
+    let failure = fs_core
+        .execute_close_write(CloseWriteInput {
+            ctx: request_context(),
+            file_handle,
+            lease_id: Some(session.lease_id),
+            lease_epoch: session.lease_epoch,
+            open_epoch: session.open_epoch,
+            fencing_token: Some(PresentedFencingToken {
+                block_id: Some(session.fencing_token.block_id),
+                owner: session.fencing_token.owner.as_raw(),
+                epoch: session.fencing_token.epoch,
+            }),
+            intent: CloseWriteIntent {
+                committed_blocks: vec![committed_block(BlockId::new(data_handle_id, BlockIndex::new(0)), 0, 64)],
+                final_size: 64,
+            },
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect_err("unissued block must be rejected");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
+    );
+    assert!(fs_core.write_session_for_handle(file_handle).is_some());
+}
+
+#[tokio::test]
+async fn commit_rejects_duplicate_block() {
+    let env = write_flow_env(0).await;
+    let open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(256),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("open write should succeed");
+    let key = open.payload.session_key;
+    let target = add_block_for_key(&env.fs_core, &key, 256).await;
+    let block = committed_block(target.block_id, target.file_offset, target.len);
+
+    let failure = commit_for_key(&env.fs_core, &key, vec![block.clone(), block], 256)
+        .await
+        .expect_err("duplicate committed block must be rejected");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
+    );
+    assert!(env.fs_core.write_session_for_handle(key.file_handle).is_some());
+}
+
+#[tokio::test]
+async fn commit_rejects_offset_mismatch() {
+    let env = write_flow_env(0).await;
+    let open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(256),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("open write should succeed");
+    let key = open.payload.session_key;
+    let target = add_block_for_key(&env.fs_core, &key, 256).await;
+    let committed = committed_block(target.block_id, target.file_offset + 1, target.len);
+
+    let failure = commit_for_key(&env.fs_core, &key, vec![committed], 257)
+        .await
+        .expect_err("offset mismatch must be rejected");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
+    );
+    assert!(env.fs_core.write_session_for_handle(key.file_handle).is_some());
+}
+
+#[tokio::test]
+async fn append_uses_base_size() {
+    let env = write_flow_env(128).await;
+    let open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(64),
+            mode: crate::inode_lease::WriteMode::Append,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("append open should succeed");
+    let key = open.payload.session_key;
+    assert_eq!(open.payload.base_size, 128);
+    let target = add_block_for_key(&env.fs_core, &key, 64).await;
+    assert_eq!(target.file_offset, 128);
+
+    let wrong_offset = committed_block(target.block_id, 0, target.len);
+    let failure = commit_for_key(&env.fs_core, &key, vec![wrong_offset], 64)
+        .await
+        .expect_err("append commit must start at base_size");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
+    );
+    assert!(env.fs_core.write_session_for_handle(key.file_handle).is_some());
 }
 
 #[tokio::test]
@@ -661,15 +1018,11 @@ async fn close_write_success_replay_after_session_cleanup_returns_original_resul
     let session = fs_core
         .write_session_for_handle(file_handle)
         .expect("session should be installed");
+    fs_core
+        .write_session_manager_for_test()
+        .allocate_target(file_handle, None)
+        .expect("target should be issued");
     let ctx = request_context();
-    let extent = types::fs::Extent {
-        file_offset: 0,
-        block_id: BlockId::new(data_handle_id, BlockIndex::new(0)),
-        block_offset: 0,
-        len: 64,
-        file_version: None,
-        block_stamp: None,
-    };
     let request = CloseWriteInput {
         ctx,
         file_handle,
@@ -682,7 +1035,7 @@ async fn close_write_success_replay_after_session_cleanup_returns_original_resul
             epoch: session.fencing_token.epoch,
         }),
         intent: CloseWriteIntent {
-            extents: vec![extent],
+            committed_blocks: vec![committed_block(BlockId::new(data_handle_id, BlockIndex::new(0)), 0, 64)],
             final_size: 64,
         },
         freshness: Freshness::default(),
@@ -734,89 +1087,6 @@ async fn close_write_success_replay_after_session_cleanup_returns_original_resul
             .unwrap(),
         block_ref_after_first
     );
-}
-
-#[tokio::test]
-async fn same_size_truncate_uses_raft_dedup_and_rejects_payload_mismatch() {
-    let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
-    let mount_id = MountId::new(541);
-    let group_id = ShardGroupId::new(121);
-    let inode_id = InodeId::new(5410);
-    let data_handle_id = DataHandleId::new(5411);
-    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
-    let mount_table = Arc::clone(&fs_core.mount_table);
-    let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
-    fs_core.set_storage(Arc::clone(&storage));
-    fs_core.set_raft_node(raft_node);
-
-    let mut inode = Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id);
-    inode.attrs.size = 1024;
-    storage.put_inode(&inode).unwrap();
-    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
-    let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-    storage.put_block_ref_count(block_id, 1).unwrap();
-
-    let (lease_id, lease_epoch, _) = fs_core
-        .inode_lease_manager_for_test()
-        .try_acquire(
-            inode_id,
-            ClientId::new(7),
-            Some(types::CallId::new()),
-            crate::inode_lease::WriteMode::Write,
-            Some(1),
-        )
-        .expect("lease acquired");
-    if let types::fs::InodeData::File {
-        lease_epoch: stored, ..
-    } = &mut inode.data
-    {
-        *stored = Some(1);
-    }
-    storage.put_inode(&inode).unwrap();
-
-    let ctx = request_context();
-    let request = TruncateInput {
-        ctx: ctx.clone(),
-        inode_id,
-        new_size: 1024,
-        lease_id: Some(lease_id),
-        lease_epoch,
-        freshness: Freshness::default(),
-    };
-
-    let first = fs_core
-        .execute_truncate(request.clone())
-        .await
-        .expect("same-size truncate should succeed");
-    assert_eq!(first.payload.new_size, 1024);
-    let second = fs_core
-        .execute_truncate(request)
-        .await
-        .expect("same-size truncate replay should succeed");
-    assert_eq!(second.payload.new_size, 1024);
-    assert_eq!(storage.get_block_ref_count(block_id).unwrap(), Some(1));
-    assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 0);
-
-    let mismatch = fs_core
-        .execute_truncate(TruncateInput {
-            ctx,
-            inode_id,
-            new_size: 512,
-            lease_id: Some(lease_id),
-            lease_epoch,
-            freshness: Freshness::default(),
-        })
-        .await
-        .expect_err("same call_id with different truncate payload should fail");
-    assert_eq!(
-        mismatch.error.code,
-        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
-    );
-    assert_eq!(storage.get_inode(inode_id).unwrap().unwrap().attrs.size, 1024);
-    assert_eq!(storage.get_block_ref_count(block_id).unwrap(), Some(1));
-    assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -881,7 +1151,7 @@ async fn close_write_session_missing_without_applied_result_stays_session_invali
                 epoch: 1,
             }),
             intent: CloseWriteIntent {
-                extents: Vec::new(),
+                committed_blocks: Vec::new(),
                 final_size: 0,
             },
             freshness: Freshness::default(),
@@ -942,7 +1212,7 @@ async fn create_mount_route_epoch_progression_rejects_stale_client_route_epoch()
             },
             Some(6),
             Some(1),
-            "OpenWriteByPath",
+            "OpenWrite",
         )
         .await
         .unwrap_err();

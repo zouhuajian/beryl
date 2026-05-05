@@ -6,7 +6,7 @@
 
 `metadata` 是 Vecton 的文件系统元数据权威面，负责 inode、dentry、attrs、mount、Raft mutation、worker descriptor、block metadata、delete intent 和请求一致性错误语义。
 
-`metadata` 不做数据面 IO。读写数据应由 client 直接访问 worker；metadata 只返回或维护数据路径所需的控制面信息，例如 layout、write session、fencing token、block metadata、worker soft state 和 refresh hint。
+`metadata` 不做数据面 IO。读写数据应由 client 直接访问 worker；metadata 只返回或维护数据路径所需的控制面信息，例如 read plan、write handle、fencing token、block metadata、worker soft state 和 refresh hint。
 
 当前主链路是：
 
@@ -94,7 +94,7 @@ root mount bootstrap 当前行为：
 
 ## 4. 请求主链路
 
-当前对外 filesystem RPC 入口是 `MetadataFileSystemServiceImpl`，实现 `proto::metadata::FileSystemServiceProto`。`proto/metadata/filesystem.proto` 中关于 “external clients should not call InodeService directly” 的注释是历史痕迹；当前 `metadata/src/service` 没有独立 Rust `InodeService` 服务实现。
+当前对外 filesystem RPC 入口是 `MetadataFileSystemServiceImpl`，实现 `proto::metadata::FileSystemServiceProto`。该 service 是 external metadata/control-plane API：namespace 仍以 path 作为入口，读写一致性身份由 inode、data_handle、block、lease、fencing 和 epoch 承载。
 
 对外 client-facing 删除 API 统一是 `FileSystemService.Delete(DeleteRequestProto)`。public filesystem service 不再暴露 `Unlink` / `Rmdir` RPC，也没有 `DeletePath` API。`DeleteRequestProto` 使用 `path` + `recursive`：regular file 和 symlink 走内部 non-directory delete，empty directory delete 走内部 directory delete；`recursive=true` 删除目录当前返回 `NotSupported("recursive delete not yet implemented")`。
 
@@ -117,9 +117,9 @@ flowchart LR
 `FsCore` 当前子模块：
 
 - `mod.rs`：共享 core state、route/write context、dedup、error/header helper、Raft propose 辅助。
-- `read.rs`：getattr、readdir、xattr、layout、statfs/access/symlink 等读类或未实现方法。
-- `mutation.rs`：create、mkdir、内部 `unlink` / `rmdir`、rename、setattr、xattr、mount mutation 等。这里的 `Unlink` / `Rmdir` 是 domain mutation 名称，用于区分 non-directory delete 和 empty-directory delete，不是 public RPC。
-- `write_session.rs`：open/renew/release/close/fsync/hsync/hflush/truncate write session 链路。
+- `read.rs`：GetStatus/ListStatus 所需 attrs、readdir，以及 GetBlockLocations/OpenFile 所需 read plan。
+- `mutation.rs`：create、mkdir、内部 `unlink` / `rmdir`、rename、mount mutation 等。这里的 `Unlink` / `Rmdir` 是 domain mutation 名称，用于区分 non-directory delete 和 empty-directory delete，不是 public RPC。
+- `write_session.rs`：CreateFile/AppendFile/AddBlock/CommitFile/AbortFileWrite/RenewLease/Hflush/Hsync 背后的内部 `WriteSession` 链路；`WriteSession` 不是 public RPC 命名。
 - `freshness.rs`：mount_epoch、route_epoch、state_id 校验。
 - `tests.rs`：FsCore 局部合同测试。
 
@@ -131,7 +131,7 @@ Guard 链路当前实际生效内容：
 - `check_data_write()`：readiness + leadership + data IO policy。
 - `check_perm()` / `check_parent_perm()` / `check_super()` / `check_set_attr_perm()`：委托 `PermissionChecker`。
 
-mount/route/session/fencing freshness 仍在 `FsCore` / `WriteSessionCoordinator`，不在 guard 中。`GuardChain` 不检查 `mount_epoch`、`route_epoch`、`state_id`、write session、lease、fencing token 或 `worker_epoch`。
+mount/route/write-handle/fencing freshness 仍在 `FsCore` / `WriteSessionCoordinator`，不在 guard 中。`GuardChain` 不检查 `mount_epoch`、`route_epoch`、`state_id`、write handle、lease、fencing token 或 `worker_epoch`。
 
 Authz 当前状态：
 
@@ -163,10 +163,10 @@ metadata state freshness 当前规范收敛为 group-scoped watermark vector：c
 data identity / session identity：
 
 - `data_handle_id` 是数据面身份，`BlockId = data_handle_id + block_index`。
-- `file_handle` 是 write session 身份，不是持久文件身份。
-- `fencing_token` 保护 direct client->worker 与 close/fsync 的一致性。
-- `Create` 当前会通过持久 `next_data_handle_id` 分配 `current_data_handle_id` 并写入 `data_handle_owner` 映射。
-- `open_write` / layout read 路径使用 inode 上的 `current_data_handle_id` 并校验 `data_handle_owner` 映射。
+- `WriteHandleProto.handle_id` 是一次写生命周期身份，不是持久文件身份；内部实现仍使用 `WriteSession` 管理该生命周期。
+- `fencing_token` 保护 direct client->worker 与 CommitFile/Hflush/Hsync 的一致性。
+- `CreateFile` 当前会通过内部 `Command::Create` 和持久 `next_data_handle_id` 分配 `current_data_handle_id` 并写入 `data_handle_owner` 映射，然后进入写生命周期。
+- `CreateFile` / `AppendFile` / `GetBlockLocations` 路径使用 inode 上的 `current_data_handle_id` 并校验 `data_handle_owner` 映射。
 
 block metadata 与 worker soft state 边界：
 
@@ -181,7 +181,7 @@ Raft / RocksDB 现状：
 - `RaftStateStore` 读调用 `AppRaftNode::read(false, ...)`，当前是 leader-read 检查，不是 follower read；`AppRaftNode::read(true, ...)` 有 linearizable read 分支，但主 `RaftStateStore` 路径没有使用。
 - snapshot build/install 基于 `STATE_CFS` 的 RocksDB snapshot/payload，包含 replicated state CF；install 时先 clear 对应 CF，再批量恢复。当前 snapshot V1 header 只保存 snapshot 解释所需的 route epoch，不读写 `applied_seq`，也不提供旧 `applied_seq` bytes 的兼容读取。
 - inode/data handle allocator 使用 RocksDB meta key 持久推进；destructive file layout apply path 的 zero-ref delete intent id 使用 replicated `next_delete_intent_id`，当 allocator key 缺失或落后于已有 delete intent 时，会在同一个 apply `WriteBatch` 内 deterministic bump 到 `max(existing_intent_id)+1` 后再按本次新建 pending intent 数量推进。
-- `Create`、`Mkdir`、`Rmdir`、empty-file `Unlink`、extent-bearing file `Unlink`、`Rename`、`SetAttr`、`SetXattr`、`RemoveXattr`、`CloseWrite`、`Truncate` shrink、`CreateDeleteIntents`、`AllocateDeleteIntents`、`UpdateDeleteIntentStatus`、`CreateMount`、`DeleteMount`、`AddShardGroup`、`RegisterWorker`、`AcquireLease`、`ReleaseLease` 已把业务 mutation 和 `AppliedResult` 放进同一个 RocksDB `WriteBatch`。
+- `Create`、`Mkdir`、`Rmdir`、empty-file `Unlink`、extent-bearing file `Unlink`、`Rename`、内部 layout/write-handle mutation、`CreateDeleteIntents`、`AllocateDeleteIntents`、`UpdateDeleteIntentStatus`、`CreateMount`、`DeleteMount`、`AddShardGroup`、`RegisterWorker`、`AcquireLease`、`ReleaseLease` 已把业务 mutation 和 `AppliedResult` 放进同一个 RocksDB `WriteBatch`。
 
 ## 6. Worker metadata 链路
 
@@ -262,10 +262,10 @@ metadata 侧：
 client 侧：
 
 - `client/src/canonical.rs` 明确解析 non-OK gRPC、gRPC OK + header error、gRPC OK + no error 三种 envelope。
-- `client/src/meta/filesystem.rs` 的 action machine 根据 `RefreshReason` 做 route/mount/worker/session refresh/replay。
+- `client/src/meta/filesystem.rs` 的 action machine 根据 `RefreshReason` 做 route/mount/worker/state refresh/replay；session invalid、lease expired、fencing mismatch、authz denial 等 terminal failure 不盲目 replay。
 - `client/src/meta/rpc_helper.rs::resolve_path_to_group()` 仍返回 `None`，group route 尚未完成。
 - mount refresh 没有专用 API，当前 fallback 到 route/status refresh。
-- `GetFileLayoutByPath` 可返回 `route_epoch`/`mount_epoch` hint，并在 `WorkerManager` 有 live block locations 时填充最小 worker route hints；这些 locations 是 soft route hint，不是 block presence authority。
+- `GetBlockLocations` 可返回 `route_epoch`/`mount_epoch` hint，并在 `WorkerManager` 有 live block locations 时填充 external `FileBlockLocationProto` worker route hints；这些 locations 是 soft route hint，不是 block presence authority。
 - MOVED 仍 de-scope，`ShardMoved` 只走 route refresh 行为。
 
 ## 10. 当前已完成整理
@@ -292,11 +292,11 @@ Dedup / fingerprint / AppliedResult 当前边界：
 - `CommandFingerprint` 表示 command type + 语义 payload 的稳定指纹，用于校验同一 `DedupKey` 下 payload 是否一致；不能合并进 `DedupKey`。
 - `AppliedResult` 是 Raft state machine 已 apply mutation 的持久 replay record，用于 retry/replay；不是通用 RPC response cache。
 - read-only RPC 不写 `AppliedResult`；读路径依赖 `state_id`、`mount_epoch`、`route_epoch`、`worker_epoch` 和 `ResponseHeader` refresh hint。
-- `Create`、`Mkdir`、`Rmdir`、empty-file `Unlink`、extent-bearing file `Unlink`、`Rename`、`SetAttr`、`SetXattr`、`RemoveXattr`、`CloseWrite`、`Truncate` shrink、`CreateDeleteIntents`、`AllocateDeleteIntents`、`UpdateDeleteIntentStatus`、`CreateMount`、`DeleteMount`、`AddShardGroup`、`RegisterWorker`、`AcquireLease`、`ReleaseLease` 已把 business mutation 和 `AppliedResult` 放进同一个 RocksDB `WriteBatch`。
-- `CloseWrite` 成功 apply 时，inode 中的 committed extents/size/mtime/lease_epoch、当前已维护的 block refcount increment、稳定 `FileLayout` record 和 `AppliedResult` 通过 `close_write_with_apply_result_atomic()` 同批提交；确定性业务错误仍持久化 `AppliedResult` 以保持 replay 语义。
+- `Create`、`Mkdir`、`Rmdir`、empty-file `Unlink`、extent-bearing file `Unlink`、`Rename`、内部 layout/write-handle mutation、`CreateDeleteIntents`、`AllocateDeleteIntents`、`UpdateDeleteIntentStatus`、`CreateMount`、`DeleteMount`、`AddShardGroup`、`RegisterWorker`、`AcquireLease`、`ReleaseLease` 已把 business mutation 和 `AppliedResult` 放进同一个 RocksDB `WriteBatch`。
+- CommitFile 背后的 internal close-write apply 成功时，inode 中的 committed extents/size/mtime/lease_epoch、block refcount increment/decrement、稳定 `FileLayout` record 和 `AppliedResult` 通过 `close_write_with_apply_result_atomic()` 同批提交；OVERWRITE 会替换 committed extents 并释放旧 block 引用；确定性业务错误仍持久化 `AppliedResult` 以保持 replay 语义。
 - `Truncate` shrink 成功 apply 时，apply 层会先按 inode persisted `lease_epoch` 和 deterministic `lease_id=(inode_id<<64)|lease_epoch` 校验 fencing authority；通过后，inode size/mtime/lease_epoch、稳定 `FileLayout` record、被释放完整 block 的 refcount decrement、zero-ref block 的 pending delete intent 和 `AppliedResult` 通过 `truncate_file_with_apply_result_atomic()` 同批提交；grow 仍返回 structured `NotSupported`。
 - `Truncate` same-size no-op 仍进入 Raft mutation dedup/replay 路径，持久化 `AppliedResult`，但不改 inode/layout/refcount/delete intent。
-- Extent-bearing file `Unlink` 成功 apply 时，dentry、inode、`FileLayout`、`data_handle_owner`、被引用 block 的 refcount decrement、zero-ref block 的 pending delete intent 和 `AppliedResult` 通过 `delete_file_with_extents_and_apply_result_atomic()` 同批提交；active write session / active lease 会在 FsCore 层返回 `EBusy`，不强删。
+- Extent-bearing file `Unlink` 成功 apply 时，dentry、inode、`FileLayout`、`data_handle_owner`、被引用 block 的 refcount decrement、zero-ref block 的 pending delete intent 和 `AppliedResult` 通过 `delete_file_with_extents_and_apply_result_atomic()` 同批提交；active internal write session / active lease 会在 FsCore 层返回 `EBusy`，不强删。
 - `CreateDeleteIntents` 成功 apply 时，所有 pending delete intents 和 `AppliedResult` 通过 `create_delete_intents_with_apply_result_atomic()` 同批提交；同一 command 内 duplicate intent id 或 DB 中已有 intent id 会被 deterministic structured error 拒绝，且不会覆盖 existing intent。
 - GC/orphan/overrep 等 maintenance authoritative intent creation 通过 `AllocateDeleteIntents` 进入 Raft apply；command payload 中的 intent_id 必须为 `0`，apply 内使用 replicated `next_delete_intent_id` 分配真实 intent id。
 - `UpdateDeleteIntentStatus` 成功 apply 时，Pending/InFlight -> Completed/Failed 等允许的状态推进、finished timestamp / error msg、`AppliedResult` 同 batch 提交；missing intent、invalid transition 或 fingerprint mismatch 不更新状态。
@@ -307,7 +307,7 @@ Mutation command apply-level atomicity inventory：
 
 | 分类 | Command |
 | --- | --- |
-| DONE | `Create`, `Mkdir`, `Rmdir`, empty-file `Unlink`, extent-bearing file `Unlink`, `Rename`, `SetAttr`, `SetXattr`, `RemoveXattr`, `CloseWrite`, `Truncate` shrink, `CreateDeleteIntents`, `AllocateDeleteIntents`, `UpdateDeleteIntentStatus`, `CreateMount`, `DeleteMount`, `AddShardGroup`, `RegisterWorker`, `AcquireLease`, `ReleaseLease` |
+| DONE | `Create`, `Mkdir`, `Rmdir`, empty-file `Unlink`, extent-bearing file `Unlink`, `Rename`, internal write-handle commit, `CreateDeleteIntents`, `AllocateDeleteIntents`, `UpdateDeleteIntentStatus`, `CreateMount`, `DeleteMount`, `AddShardGroup`, `RegisterWorker`, `AcquireLease`, `ReleaseLease` |
 | COMPLEX_NEXT | rename overwrite target cleanup, recursive directory delete |
 | LEGACY_OR_UNUSED | `UpdateCommittedLength` |
 | DIRECT_ROCKSDB_TODO | maintenance block refcount compatibility writes outside the file-layout mutation path |
@@ -319,7 +319,7 @@ Mutation command apply-level atomicity inventory：
 
 当前实现限制：
 
-- `get_file_layout_by_path` 返回 extents 和 `FileBlockLocation`；当 `WorkerManager` 有 live block locations 时会填充 workers 和 `worker_epoch` route hints。它不做 load-aware、fault-domain、nearest-worker 调度，也不触发 repair。
+- `OpenFile` / `GetBlockLocations` 是 public read-plan API；响应只返回 external `FileBlockLocation`，内部 extents 不通过 public schema 暴露。当 `WorkerManager` 有 live block locations 时会填充 workers 和 `worker_epoch` route hints。它不做 load-aware、fault-domain、nearest-worker 调度，也不触发 repair。
 - ACL/Ranger：配置枚举存在，但两者均未实现且 fail fast；不要写成 ACL MVP 或 Ranger stub。
 - UFS proxy：runtime 构造存在，FileSystemService 主链路未使用。
 - repair/move/evict：metadata 侧有 planner/queue/command/ack 框架，但不能证明完整端到端 repair 系统已经闭环。
@@ -334,15 +334,15 @@ Mutation command apply-level atomicity inventory：
 
 必须保留并优先修正的主链路 correctness。
 
-- 保留 `FsCore`、`PathResolver`、`MountTable`、`AppRaftStateMachine`、`RocksDBStorage`、`RaftStateStore`、`ResponseHeader.error` contract、write session/fencing 主链路。
+- 保留 `FsCore`、`PathResolver`、`MountTable`、`AppRaftStateMachine`、`RocksDBStorage`、`RaftStateStore`、`ResponseHeader.error` contract、内部 write session/fencing 主链路。
 - 继续收敛 rename overwrite cleanup、recursive directory delete 等复杂或后台 RocksDB mutation 的原子性。
 - 完成 rename overwrite target 的数据状态 cleanup。
 
 最小读写闭环。
 
-- 保留 FileSystemService path-first RPC、guard、readiness、leadership、NONE authz、mount/route/session freshness。
-- 保留 create/mkdir/unlink/rmdir/rename/setattr/xattr/open_write/fsync/close 的最小链路。
-- `get_file_layout_by_path` 如实返回 extents/epoch 和最小 worker route hints；不要把 worker locations 写成 metadata authority，也不要描述成完整调度系统。
+- 保留 FileSystemService external metadata/control-plane RPC、guard、readiness、leadership、NONE authz、mount/route/write-handle freshness。
+- 保留 GetStatus/ListStatus/CreateDirectory/Delete/Rename/OpenFile/GetBlockLocations/CreateFile/AppendFile/AddBlock/CommitFile/AbortFileWrite/RenewLease/Hflush/Hsync/Msync 的最小链路。
+- `GetBlockLocations` 如实返回 external block locations/epoch 和最小 worker route hints；不要把 worker locations 写成 metadata authority，也不要描述成完整调度系统。
 - client action machine 保留 refresh/replay，但承认 path->group route 和 mount refresh API 未完成。
 
 可保留框架但默认关闭或降级的后台维护能力。
@@ -366,13 +366,13 @@ Mutation command apply-level atomicity inventory：
 
 不能为了瘦身删除的模块或合同：
 
-- `FsCore`，因为它承载 domain freshness、mutation、write session/fencing。
+- `FsCore`，因为它承载 domain freshness、mutation、内部 write session/fencing。
 - `MountTable`，因为 mount resolve、mount_epoch、namespace owner group 依赖它。
 - `AppRaftStateMachine` / `AppRaftNode` / `RaftStateStore`，因为 authoritative mutation 依赖 Raft apply。
 - `RocksDBStorage`，因为持久 state 和 snapshot/install 依赖它。
 - `common` header/error contract，尤其 gRPC OK + `ResponseHeader.error`。
 - `MetadataFileSystemServiceImpl` 外部入口。
-- write session manager、inode lease manager、fencing token 链路。
+- write session manager、inode lease manager、fencing token 链路；其中 write session manager 是内部实现对象，不是 public RPC surface。
 
 ## 13. 快速阅读路径
 

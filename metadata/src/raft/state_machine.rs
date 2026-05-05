@@ -258,6 +258,7 @@ impl AppRaftStateMachine {
                 lease_id,
                 open_epoch,
                 lease_epoch,
+                replace_extents,
                 ..
             } => {
                 let result = self.apply_close_write(
@@ -267,6 +268,7 @@ impl AppRaftStateMachine {
                     lease_id,
                     open_epoch,
                     lease_epoch,
+                    replace_extents,
                     &dedup_key,
                     fingerprint,
                 )?;
@@ -1505,10 +1507,11 @@ impl AppRaftStateMachine {
         _lease_id: types::ids::LeaseId,
         _open_epoch: u64,
         lease_epoch: u64,
+        replace_extents: bool,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
     ) -> MetadataResult<FsCommandResult> {
-        let prepared: MetadataResult<(Inode, FileLayout, Vec<BlockId>, FsOkResult)> = (|| {
+        let prepared: MetadataResult<(Inode, FileLayout, Vec<BlockId>, Vec<BlockId>, u64, FsOkResult)> = (|| {
             // Get inode
             let mut inode = self
                 .storage
@@ -1557,15 +1560,27 @@ impl AppRaftStateMachine {
             let layout = self.storage.get_layout(inode_id)?;
             let now_ms = Self::apply_timestamp_ms();
 
-            // Update inode: append extents and update size/mtime/ctime/lease_epoch
+            let mut existing_block_ids = std::collections::HashSet::new();
+            let mut new_block_ids = std::collections::HashSet::new();
+            for extent in &extents {
+                new_block_ids.insert(extent.block_id);
+            }
+
+            // Update inode: publish extents and update size/mtime/ctime/lease_epoch.
             match &mut inode.data {
                 types::fs::InodeData::File {
                     extents: existing_extents,
                     lease_epoch: stored_lease_epoch,
                     ..
                 } => {
-                    // Append new extents
-                    existing_extents.extend(extents.clone());
+                    for extent in existing_extents.iter() {
+                        existing_block_ids.insert(extent.block_id);
+                    }
+                    if replace_extents {
+                        *existing_extents = extents.clone();
+                    } else {
+                        existing_extents.extend(extents.clone());
+                    }
                     // Update lease_epoch (persisted for fencing after restart)
                     *stored_lease_epoch = Some(lease_epoch);
                 }
@@ -1581,24 +1596,33 @@ impl AppRaftStateMachine {
             inode.attrs.size = final_size;
             inode.attrs.update_mtime_ctime(now_ms);
 
-            // Update block reference counts (increment for new extents)
+            // Update block reference counts.
             // Note: Idempotency is handled at the apply() level via request_id check.
-            // If this command was already applied, we skip refcount updates (extents already appended).
-            // Collect unique block_ids from new extents (per inode, count once per block_id)
-            let mut unique_block_ids = std::collections::HashSet::new();
-            for extent in &extents {
-                unique_block_ids.insert(extent.block_id);
-            }
+            // If this command was already applied, we skip refcount updates.
+            let block_ref_increments = new_block_ids
+                .difference(&existing_block_ids)
+                .copied()
+                .collect::<Vec<_>>();
+            let block_ref_decrements = if replace_extents {
+                existing_block_ids
+                    .difference(&new_block_ids)
+                    .copied()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
 
             Ok((
                 inode,
                 layout,
-                unique_block_ids.into_iter().collect(),
+                block_ref_increments,
+                block_ref_decrements,
+                now_ms,
                 FsOkResult::default(),
             ))
         })();
 
-        let (inode, layout, block_ref_increments, ok) = match prepared {
+        let (inode, layout, block_ref_increments, block_ref_decrements, now_ms, ok) = match prepared {
             Ok(prepared) => prepared,
             Err(err) => return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint),
         };
@@ -1608,6 +1632,8 @@ impl AppRaftStateMachine {
             &inode,
             layout,
             &block_ref_increments,
+            &block_ref_decrements,
+            now_ms,
             dedup_key,
             applied_result,
         )?;
@@ -3435,6 +3461,7 @@ mod tests {
             lease_id: types::ids::LeaseId::new(1),
             open_epoch: 1,
             lease_epoch: 1,
+            replace_extents: false,
         })
         .unwrap();
         let updated = storage.get_inode(inode_id).unwrap().unwrap();
@@ -3461,6 +3488,7 @@ mod tests {
             lease_id: types::ids::LeaseId::new(1),
             open_epoch: 1,
             lease_epoch: 2,
+            replace_extents: false,
         });
         assert!(matches!(
             mismatch,
@@ -3469,6 +3497,68 @@ mod tests {
                 ..
             })))
         ));
+    }
+
+    #[test]
+    fn close_write_replace_extents_releases_old_blocks() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let inode_id = InodeId::new(70);
+        let data_handle_id = DataHandleId::new(1700);
+        let old_block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+        let new_block_id = BlockId::new(data_handle_id, BlockIndex::new(1));
+        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
+        inode.attrs.size = 64;
+        if let types::fs::InodeData::File { extents, .. } = &mut inode.data {
+            extents.push(types::fs::Extent {
+                file_offset: 0,
+                block_id: old_block_id,
+                block_offset: 0,
+                len: 64,
+                file_version: None,
+                block_stamp: None,
+            });
+        }
+        storage.put_inode(&inode).unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+        storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+        storage.put_block_ref_count(old_block_id, 1).unwrap();
+
+        expect_fs_ok(
+            sm.apply(Command::CloseWrite {
+                dedup: dedup_for_test(36),
+                inode_id,
+                extents: vec![types::fs::Extent {
+                    file_offset: 0,
+                    block_id: new_block_id,
+                    block_offset: 0,
+                    len: 32,
+                    file_version: None,
+                    block_stamp: None,
+                }],
+                final_size: 32,
+                lease_id: types::ids::LeaseId::new(1),
+                open_epoch: 1,
+                lease_epoch: 2,
+                replace_extents: true,
+            })
+            .unwrap(),
+        );
+
+        let updated = storage.get_inode(inode_id).unwrap().unwrap();
+        match updated.data {
+            types::fs::InodeData::File { extents, .. } => {
+                assert_eq!(extents.len(), 1);
+                assert_eq!(extents[0].block_id, new_block_id);
+            }
+            other => panic!("unexpected inode data: {:?}", other),
+        }
+        assert_eq!(storage.get_block_ref_count(old_block_id).unwrap(), None);
+        assert_eq!(storage.get_block_ref_count(new_block_id).unwrap(), Some(1));
+        assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 1);
     }
 
     #[test]
@@ -3503,6 +3593,7 @@ mod tests {
             lease_id: types::ids::LeaseId::new(1),
             open_epoch: 1,
             lease_epoch: 3,
+            replace_extents: false,
         };
 
         expect_fs_ok(sm.apply(command.clone()).unwrap());
@@ -3556,6 +3647,7 @@ mod tests {
             lease_id: types::ids::LeaseId::new(1),
             open_epoch: 1,
             lease_epoch: 3,
+            replace_extents: false,
         };
 
         expect_fs_errno(sm.apply(command.clone()).unwrap(), FsErrorCode::EInval);
@@ -3599,6 +3691,7 @@ mod tests {
             lease_id: types::ids::LeaseId::new(1),
             open_epoch: 1,
             lease_epoch: 3,
+            replace_extents: false,
         };
         let second_block_id = BlockId::new(data_handle_id, BlockIndex::new(1));
         let mismatch = Command::CloseWrite {
@@ -3616,6 +3709,7 @@ mod tests {
             lease_id: types::ids::LeaseId::new(1),
             open_epoch: 1,
             lease_epoch: 3,
+            replace_extents: false,
         };
 
         expect_fs_ok(sm.apply(first).unwrap());

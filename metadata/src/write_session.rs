@@ -4,8 +4,9 @@
 //! Write session management for the data plane.
 //!
 //! WriteSession is a runtime-only structure (not persisted to Raft).
-//! It tracks open write sessions and is cleaned up on CloseWrite or TTL expiry.
+//! It tracks internal write sessions and is cleaned up on CommitFile, AbortFileWrite, or TTL expiry.
 
+use crate::inode_lease::WriteMode;
 use parking_lot::RwLock;
 use proto::metadata::WriteTargetProto;
 use std::collections::HashMap;
@@ -36,18 +37,22 @@ pub struct WriteSession {
     /// Base file size at open time (for append-only validation).
     pub base_size: u64,
     /// Write mode (WRITE or APPEND).
-    pub mode: crate::inode_lease::WriteMode,
+    pub mode: WriteMode,
     /// Pending extents (accumulated before close).
     pub pending_extents: Vec<Extent>,
     /// Pending size (accumulated before close).
     pub pending_size: u64,
     /// Write targets (worker endpoints) for barrier.
     pub write_targets: Vec<WriteTargetProto>,
+    /// Targets already issued to the client through AddBlock.
+    pub issued_targets: Vec<WriteTargetProto>,
+    /// Next write target to hand out through AddBlock.
+    pub next_target_index: usize,
     /// Writer identity (client_id / call_id).
     pub writer_identity: WriterIdentity,
     /// Created timestamp (for TTL cleanup).
     pub created_at_ms: u64,
-    /// Last observed written length (for fsync target size).
+    /// Last observed written length (for Hflush/Hsync target size).
     pub last_written: u64,
 }
 
@@ -56,6 +61,21 @@ pub struct WriteSession {
 pub struct WriterIdentity {
     pub client_id: ClientId,
     pub call_id: types::CallId,
+}
+
+/// Inputs needed to create a runtime write session.
+pub struct CreateSessionInput {
+    pub inode_id: InodeId,
+    pub mount_id: MountId,
+    pub data_handle_id: DataHandleId,
+    pub lease_id: LeaseId,
+    pub lease_epoch: u64,
+    pub fencing_token: FencingToken,
+    pub open_epoch: u64,
+    pub base_size: u64,
+    pub mode: WriteMode,
+    pub write_targets: Vec<WriteTargetProto>,
+    pub writer_identity: WriterIdentity,
 }
 
 /// Write session manager (in-memory, leader-only).
@@ -79,20 +99,7 @@ impl WriteSessionManager {
     }
 
     /// Create a new write session.
-    pub fn create_session(
-        &self,
-        inode_id: InodeId,
-        mount_id: MountId,
-        data_handle_id: DataHandleId,
-        lease_id: LeaseId,
-        lease_epoch: u64,
-        fencing_token: FencingToken,
-        open_epoch: u64,
-        base_size: u64,
-        mode: crate::inode_lease::WriteMode,
-        write_targets: Vec<proto::metadata::WriteTargetProto>,
-        writer_identity: WriterIdentity,
-    ) -> u64 {
+    pub fn create_session(&self, input: CreateSessionInput) -> u64 {
         let mut next_id = self.next_file_handle.write();
         let file_handle = *next_id;
         *next_id += 1;
@@ -100,25 +107,40 @@ impl WriteSessionManager {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 
         let session = WriteSession {
-            inode_id,
-            mount_id,
-            data_handle_id,
-            lease_id,
-            lease_epoch,
-            fencing_token,
-            open_epoch,
-            base_size,
-            mode,
+            inode_id: input.inode_id,
+            mount_id: input.mount_id,
+            data_handle_id: input.data_handle_id,
+            lease_id: input.lease_id,
+            lease_epoch: input.lease_epoch,
+            fencing_token: input.fencing_token,
+            open_epoch: input.open_epoch,
+            base_size: input.base_size,
+            mode: input.mode,
             pending_extents: Vec::new(),
             pending_size: 0,
-            write_targets,
-            writer_identity,
+            write_targets: input.write_targets,
+            issued_targets: Vec::new(),
+            next_target_index: 0,
+            writer_identity: input.writer_identity,
             created_at_ms: now_ms,
-            last_written: base_size,
+            last_written: input.base_size,
         };
 
         self.sessions.write().insert(file_handle, session);
         file_handle
+    }
+
+    /// Allocate the next precomputed write target for a session.
+    pub fn allocate_target(&self, file_handle: u64, desired_len: Option<u64>) -> Option<WriteTargetProto> {
+        let mut sessions = self.sessions.write();
+        let session = sessions.get_mut(&file_handle)?;
+        let mut target = session.write_targets.get(session.next_target_index).cloned()?;
+        if let Some(len) = desired_len {
+            target.len = len.min(target.len).max(1);
+        }
+        session.next_target_index += 1;
+        session.issued_targets.push(target.clone());
+        Some(target)
     }
 
     /// Update the last_written watermark for a session.
@@ -137,7 +159,7 @@ impl WriteSessionManager {
         self.sessions.read().get(&file_handle).cloned()
     }
 
-    /// Remove a write session (on close or error).
+    /// Remove a write session (on commit, abort, or error).
     pub fn remove_session(&self, file_handle: u64) -> Option<WriteSession> {
         self.sessions.write().remove(&file_handle)
     }
@@ -181,6 +203,6 @@ impl WriteSessionManager {
 
 impl Default for WriteSessionManager {
     fn default() -> Self {
-        Self::new(3600_000) // 1 hour default TTL
+        Self::new(3_600_000) // 1 hour default TTL
     }
 }

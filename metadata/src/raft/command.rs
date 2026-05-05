@@ -177,6 +177,7 @@ pub enum Command {
         lease_id: types::ids::LeaseId,
         open_epoch: u64,
         lease_epoch: u64,
+        replace_extents: bool,
     },
     /// Truncate file (shrink).
     Truncate {

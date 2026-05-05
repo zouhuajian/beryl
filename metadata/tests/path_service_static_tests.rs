@@ -33,30 +33,26 @@ fn path_service_keeps_complete_filesystem_service_view() {
     let source = include_str!("../src/service/path_service.rs");
     assert!(source.contains("impl FileSystemServiceProto for MetadataFileSystemServiceImpl"));
     for handler in [
-        "async fn get_file_status",
-        "async fn mkdir",
-        "async fn create",
+        "async fn get_status",
+        "async fn list_status",
+        "async fn create_directory",
         "async fn delete",
         "async fn rename",
-        "async fn list_status",
-        "async fn open(",
-        "async fn release",
-        "async fn fsync",
-        "async fn truncate",
-        "async fn set_xattr",
-        "async fn get_xattr",
-        "async fn list_xattr",
-        "async fn remove_xattr",
-        "async fn get_file_layout_by_path",
-        "async fn open_write_by_path",
-        "async fn close_write_session",
-        "async fn renew_write_session_lease",
-        "async fn fsync_session",
-        "async fn release_session",
+        "async fn open_file",
+        "async fn get_block_locations",
+        "async fn create_file",
+        "async fn append_file",
+        "async fn add_block",
+        "async fn commit_file",
+        "async fn abort_file_write",
+        "async fn renew_lease",
+        "async fn hflush",
+        "async fn hsync",
+        "async fn msync",
     ] {
         assert!(
             source.contains(handler),
-            "path_service.rs must continue to contain `{handler}`"
+            "path_service.rs must contain new external API handler `{handler}`"
         );
     }
 }
@@ -90,13 +86,71 @@ fn filesystem_proto_exposes_delete_without_unlink_or_rmdir_public_rpc() {
 }
 
 #[test]
+fn status_hides_inode() {
+    let proto = include_str!("../../proto/metadata/filesystem.proto");
+    let start = proto
+        .find("message GetStatusResponseProto")
+        .expect("GetStatusResponseProto must exist");
+    let tail = &proto[start..];
+    let end = tail.find("\n}\n").expect("GetStatusResponseProto must close");
+    let body = &tail[..end];
+
+    assert!(
+        !body.contains("InodeProto"),
+        "GetStatusResponseProto must not expose internal fs.InodeProto"
+    );
+}
+
+#[test]
+fn create_directory_hides_inode() {
+    let proto = include_str!("../../proto/metadata/filesystem.proto");
+    let start = proto
+        .find("message CreateDirectoryResponseProto")
+        .expect("CreateDirectoryResponseProto must exist");
+    let tail = &proto[start..];
+    let end = tail.find("\n}\n").expect("CreateDirectoryResponseProto must close");
+    let body = &tail[..end];
+
+    assert!(
+        !body.contains("InodeProto"),
+        "CreateDirectoryResponseProto must not expose internal fs.InodeProto"
+    );
+    assert!(
+        body.contains("fs.InodeIdProto inode_id = 2"),
+        "CreateDirectoryResponseProto must expose only inode_id"
+    );
+    assert!(
+        body.contains("fs.FileAttrsProto attrs = 3"),
+        "CreateDirectoryResponseProto must expose attrs"
+    );
+}
+
+#[test]
+fn block_locations_hide_extents() {
+    let proto = include_str!("../../proto/metadata/filesystem.proto");
+    let start = proto
+        .find("message GetBlockLocationsResponseProto")
+        .expect("GetBlockLocationsResponseProto must exist");
+    let tail = &proto[start..];
+    let end = tail.find("\n}\n").expect("GetBlockLocationsResponseProto must close");
+    let body = &tail[..end];
+
+    assert!(
+        !body.contains("ExtentProto"),
+        "GetBlockLocationsResponseProto must use external block locations, not fs.ExtentProto"
+    );
+}
+
+#[test]
 fn session_rpc_handlers_do_not_call_permission_checker() {
     let source = include_str!("../src/service/path_service.rs");
     for handler in [
-        "async fn close_write_session",
-        "async fn renew_write_session_lease",
-        "async fn fsync_session",
-        "async fn release_session",
+        "async fn add_block",
+        "async fn commit_file",
+        "async fn abort_file_write",
+        "async fn renew_lease",
+        "async fn hflush",
+        "async fn hsync",
     ] {
         let start = source
             .find(handler)

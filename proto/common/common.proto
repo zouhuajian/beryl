@@ -11,7 +11,7 @@ package common;
 
 /// Data handle identity for the data-plane.
 /// A DataHandleId identifies a concrete data instance bound to an inode at a specific point in time
-/// (e.g., after create, after a committed write session, or after a version switch).
+/// (e.g., after create, after a committed write handle, or after a version switch).
 /// It is NOT a namespace identity and MUST NOT be used for directory semantics or rename routing.
 message DataHandleIdProto {
   uint64 value = 1;

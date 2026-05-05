@@ -3,7 +3,7 @@
 
 //! Tests for the write path (OpenWrite/CloseWrite).
 
-use metadata::write_session::WriteSessionManager;
+use metadata::write_session::{CreateSessionInput, WriteSessionManager};
 use types::fs::{Extent, InodeId};
 use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, LeaseId, MountId};
 use types::lease::FencingToken;
@@ -43,19 +43,19 @@ fn test_write_session_manager() {
         call_id: CallId::new(),
     };
 
-    let handle = manager.create_session(
+    let handle = manager.create_session(CreateSessionInput {
         inode_id,
         mount_id,
-        DataHandleId::new(1),
+        data_handle_id: DataHandleId::new(1),
         lease_id,
-        1, // lease_epoch
+        lease_epoch: 1,
         fencing_token,
-        1,                                       // open_epoch
-        0,                                       // base_size
-        metadata::inode_lease::WriteMode::Write, // mode
-        Vec::new(),
+        open_epoch: 1,
+        base_size: 0,
+        mode: metadata::inode_lease::WriteMode::Write,
+        write_targets: Vec::new(),
         writer_identity,
-    );
+    });
 
     // Verify session exists
     assert!(manager.get_session(handle).is_some());

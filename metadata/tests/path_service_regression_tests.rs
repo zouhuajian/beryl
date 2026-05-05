@@ -20,8 +20,8 @@ use proto::common::{
 };
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::{
-    DeleteRequestProto, FsyncSessionRequestProto, GetFileStatusRequestProto, MkdirPathRequestProto,
-    OpenWriteByPathRequestProto, WriteModeProto,
+    AppendFileRequestProto, CreateDirectoryRequestProto, DeleteRequestProto, GetStatusRequestProto, HflushRequestProto,
+    WriteHandleProto,
 };
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
@@ -102,8 +102,8 @@ fn assert_session_invalid_fencing_refresh(err: &proto::common::ErrorDetailProto)
         other => panic!("expected Fencing rpc code, got {:?}", other),
     }
     assert!(
-        err.message.contains("write session not found"),
-        "expected missing-session detail in message: {}",
+        err.message.contains("write handle not found"),
+        "expected missing write-handle detail in message: {}",
         err.message
     );
 }
@@ -283,9 +283,9 @@ async fn readiness_precedence_blocks_before_path_resolution() {
         Arc::new(NonePermissionChecker)
     });
 
-    let response = FileSystemServiceProto::get_file_status(
+    let response = FileSystemServiceProto::get_status(
         &env.service,
-        Request::new(GetFileStatusRequestProto {
+        Request::new(GetStatusRequestProto {
             header: header(1),
             path: "".to_string(),
         }),
@@ -312,9 +312,9 @@ async fn leadership_precedence_write_returns_not_leader_before_not_found() {
         |_| Arc::new(NonePermissionChecker),
     );
 
-    let response = FileSystemServiceProto::mkdir(
+    let response = FileSystemServiceProto::create_directory(
         &env.service,
-        Request::new(MkdirPathRequestProto {
+        Request::new(CreateDirectoryRequestProto {
             header: header(2),
             path: "/mnt/test/missing/child".to_string(),
             attrs: None,
@@ -347,13 +347,12 @@ async fn leadership_precedence_data_io_returns_not_leader_before_root_policy_err
         .put_dentry(env.root_inode_id, "file", file_inode_id)
         .expect("put test file dentry");
 
-    let response = FileSystemServiceProto::open_write_by_path(
+    let response = FileSystemServiceProto::append_file(
         &env.service,
-        Request::new(OpenWriteByPathRequestProto {
+        Request::new(AppendFileRequestProto {
             header: header(3),
             path: "/file".to_string(),
             desired_len: Some(0),
-            mode: WriteModeProto::WriteModeWrite as i32,
         }),
     )
     .await
@@ -382,13 +381,12 @@ async fn root_mount_data_io_gate_is_enforced() {
         .put_dentry(env.root_inode_id, "file", file_inode_id)
         .expect("put test file dentry");
 
-    let response = FileSystemServiceProto::open_write_by_path(
+    let response = FileSystemServiceProto::append_file(
         &env.service,
-        Request::new(OpenWriteByPathRequestProto {
+        Request::new(AppendFileRequestProto {
             header: header(8),
             path: "/file".to_string(),
             desired_len: Some(0),
-            mode: WriteModeProto::WriteModeWrite as i32,
         }),
     )
     .await
@@ -405,7 +403,7 @@ async fn root_mount_data_io_gate_is_enforced() {
 }
 
 #[tokio::test]
-async fn fsync_session_missing_session_preserves_refresh_header_contract() {
+async fn hflush_missing_handle_preserves_refresh_header_contract() {
     let env = build_env(
         "/mnt/test",
         DataIoPolicy::Allow,
@@ -414,11 +412,14 @@ async fn fsync_session_missing_session_preserves_refresh_header_contract() {
         |_| Arc::new(NonePermissionChecker),
     );
 
-    let response = FileSystemServiceProto::fsync_session(
+    let response = FileSystemServiceProto::hflush(
         &env.service,
-        Request::new(FsyncSessionRequestProto {
+        Request::new(HflushRequestProto {
             header: header(12),
-            file_handle: 99,
+            write_handle: Some(WriteHandleProto {
+                handle_id: 99,
+                ..Default::default()
+            }),
             ..Default::default()
         }),
     )

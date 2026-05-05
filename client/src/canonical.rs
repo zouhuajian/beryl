@@ -65,24 +65,24 @@ pub enum ClientAction {
         /// Structured refresh hints from response header.
         hint: RefreshHint,
         /// Original canonical error.
-        canonical: CanonicalError,
+        canonical: Box<CanonicalError>,
     },
     /// Client may retry after delay.
     Retry {
         /// Retry delay in milliseconds.
         after_ms: Option<u64>,
         /// Original canonical error.
-        canonical: CanonicalError,
+        canonical: Box<CanonicalError>,
     },
     /// Unrecoverable business failure.
     Fail {
         /// Original canonical error.
-        canonical: CanonicalError,
+        canonical: Box<CanonicalError>,
     },
     /// gRPC transport/auth/framework failure (non-OK status).
     TransportFail {
         /// Original tonic status.
-        status: tonic::Status,
+        status: Box<tonic::Status>,
     },
 }
 
@@ -252,14 +252,16 @@ fn validate_canonical_with_hint(canonical: CanonicalError, hint: RefreshHint) ->
             Err(ClientAction::Refresh {
                 reason,
                 hint,
-                canonical,
+                canonical: Box::new(canonical),
             })
         }
         ErrorClass::Retryable => Err(ClientAction::Retry {
             after_ms: canonical.retry_after_ms,
-            canonical,
+            canonical: Box::new(canonical),
         }),
-        ErrorClass::Fatal => Err(ClientAction::Fail { canonical }),
+        ErrorClass::Fatal => Err(ClientAction::Fail {
+            canonical: Box::new(canonical),
+        }),
     }
 }
 
@@ -341,16 +343,20 @@ where
         let (resp_header, payload) = match rpc_result {
             Ok(ok) => ok,
             Err(err) => match err {
-                ClientError::Action(ClientAction::TransportFail { status }) => {
-                    if transport_retries < policy.max_transport_retries && is_transient_transport_status(&status) {
-                        let backoff_ms = transport_backoff_ms(policy.transport_retry_base_ms, transport_retries + 1);
-                        transport_retries += 1;
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                        current_header = current_header.child_with_same_call_id();
-                        continue;
+                ClientError::Action(action) => match *action {
+                    ClientAction::TransportFail { status } => {
+                        if transport_retries < policy.max_transport_retries && is_transient_transport_status(&status) {
+                            let backoff_ms =
+                                transport_backoff_ms(policy.transport_retry_base_ms, transport_retries + 1);
+                            transport_retries += 1;
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                            current_header = current_header.child_with_same_call_id();
+                            continue;
+                        }
+                        return Err(ClientError::from(ClientAction::TransportFail { status }));
                     }
-                    return Err(ClientError::Action(ClientAction::TransportFail { status }));
-                }
+                    other => return Err(ClientError::from(other)),
+                },
                 other => return Err(other),
             },
         };
@@ -378,12 +384,13 @@ where
                     }));
                 }
                 refreshes += 1;
-                last_canonical_error = Some(canonical.clone());
+                let canonical_value = canonical.as_ref().clone();
+                last_canonical_error = Some(canonical_value.clone());
                 current_header = dispatch_refresh(
                     RefreshDispatchContext {
                         reason,
                         hint,
-                        canonical,
+                        canonical: canonical_value,
                         response_header: resp_header,
                     },
                     current_header,
@@ -395,7 +402,7 @@ where
                     return Err(ClientError::from(ClientAction::Retry { after_ms, canonical }));
                 }
                 retries += 1;
-                last_canonical_error = Some(canonical.clone());
+                last_canonical_error = Some(canonical.as_ref().clone());
                 if let Some(delay) = after_ms {
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
@@ -440,7 +447,7 @@ impl ClientAction {
         match self {
             ClientAction::Refresh { canonical, .. }
             | ClientAction::Retry { canonical, .. }
-            | ClientAction::Fail { canonical } => Some(canonical),
+            | ClientAction::Fail { canonical } => Some(canonical.as_ref()),
             ClientAction::Ok | ClientAction::TransportFail { .. } => None,
         }
     }
@@ -448,7 +455,7 @@ impl ClientAction {
 
 impl From<ClientAction> for ClientError {
     fn from(action: ClientAction) -> Self {
-        ClientError::Action(action)
+        ClientError::Action(Box::new(action))
     }
 }
 

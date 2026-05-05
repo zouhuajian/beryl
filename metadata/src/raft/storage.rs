@@ -1817,12 +1817,15 @@ impl RocksDBStorage {
         inode: &Inode,
         layout: FileLayout,
         block_ref_increments: &[BlockId],
+        block_ref_decrements: &[BlockId],
+        now_ms: u64,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
     ) -> MetadataResult<()> {
         let cf_inodes = self.cf(CF_INODES)?;
         let cf_meta = self.cf(CF_META)?;
         let cf_block_ref_counts = self.cf(CF_BLOCK_REF_COUNTS)?;
+        let cf_delete_intents = self.cf(CF_DELETE_INTENTS)?;
         let mut batch = WriteBatch::default();
 
         Self::batch_put_inode(&mut batch, cf_inodes, inode)?;
@@ -1835,6 +1838,13 @@ impl RocksDBStorage {
                 Self::batch_put_block_ref_count(&mut batch, cf_block_ref_counts, *block_id, new_count)?;
             }
         }
+        self.append_block_ref_decrements_to_batch(
+            &mut batch,
+            cf_block_ref_counts,
+            cf_delete_intents,
+            block_ref_decrements,
+            now_ms,
+        )?;
 
         self.commit_apply_batch(batch, dedup_key, applied_result)
     }
@@ -2968,7 +2978,7 @@ mod tests {
         };
 
         storage
-            .close_write_with_apply_result_atomic(&inode, layout, &[block_id], &dedup, applied)
+            .close_write_with_apply_result_atomic(&inode, layout, &[block_id], &[], 1, &dedup, applied)
             .unwrap();
 
         let stored = storage.get_inode(inode_id).unwrap().unwrap();

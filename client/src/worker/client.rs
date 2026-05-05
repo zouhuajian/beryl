@@ -50,7 +50,7 @@ impl WorkerEndpointInfo {
         Self {
             worker_id: WorkerId::new(proto.worker_id),
             endpoint: proto.endpoint,
-            net_transport_kind: proto.net_transport_kind as i32,
+            net_transport_kind: proto.net_transport_kind,
             worker_epoch: proto.worker_epoch,
         }
     }
@@ -100,9 +100,10 @@ impl WorkerClient {
     /// not from client configuration. This ensures client uses the protocol
     /// that the worker actually supports.
     pub async fn new(
-        endpoint_info: WorkerEndpointInfo,
+        mut endpoint_info: WorkerEndpointInfo,
         default_config: Option<NetTransportConfig>,
     ) -> ClientResult<Self> {
+        endpoint_info.endpoint = normalize_worker_endpoint(&endpoint_info.endpoint);
         // Use default config or create a reasonable default
         let default_config = default_config.unwrap_or_else(|| {
             NetTransportConfig::default()
@@ -177,7 +178,8 @@ impl WorkerClient {
     }
 
     /// Update endpoint info (for metadata refresh scenarios).
-    pub async fn update_endpoint_info(&mut self, new_info: WorkerEndpointInfo) -> ClientResult<()> {
+    pub async fn update_endpoint_info(&mut self, mut new_info: WorkerEndpointInfo) -> ClientResult<()> {
+        new_info.endpoint = normalize_worker_endpoint(&new_info.endpoint);
         // If transport kind changed, rebuild transport
         if new_info.net_transport_kind != self.endpoint_info.net_transport_kind {
             let transport_kind = WorkerEndpointInfo::net_transport_kind_to_transport_kind(new_info.net_transport_kind);
@@ -211,6 +213,7 @@ impl WorkerClient {
     }
 
     /// Read a chunk with automatic refresh on protocol mismatch or stale endpoint.
+    #[expect(clippy::too_many_arguments, reason = "worker read API keeps wire fields explicit")]
     pub async fn read_chunk(
         &mut self,
         ctx: &RequestHeader,
@@ -219,16 +222,7 @@ impl WorkerClient {
         len: u32,
         expected_version: Option<u64>,
         read_mode: ReadMode,
-        refresh_fn: Option<
-            Box<
-                dyn Fn(
-                        WorkerId,
-                    )
-                        -> std::pin::Pin<Box<dyn std::future::Future<Output = ClientResult<WorkerEndpointInfo>> + Send>>
-                    + Send
-                    + Sync,
-            >,
-        >,
+        refresh_fn: Option<MetadataRefreshFn>,
     ) -> ClientResult<(Bytes, u64)> {
         let request = proto::worker::ReadChunkRequestProto {
             chunk: Some(chunk_ref_to_proto(chunk)),
@@ -266,7 +260,6 @@ impl WorkerClient {
 
             let result = self
                 .call_with_transport("read_chunk", &request_ctx, &connection, |transport, conn| {
-                    let request = request.clone();
                     let ctx = request_ctx.clone();
                     async move { transport.call_read_chunk(conn.as_ref(), request, ctx).await }
                 })
@@ -335,6 +328,7 @@ impl WorkerClient {
     }
 
     /// Read a file range with automatic refresh on protocol mismatch or stale endpoint.
+    #[expect(clippy::too_many_arguments, reason = "worker read API keeps wire fields explicit")]
     pub async fn read_range(
         &mut self,
         ctx: &RequestHeader,
@@ -343,16 +337,7 @@ impl WorkerClient {
         prefer_worker_ids: Vec<WorkerId>,
         expected_version: Option<u64>,
         read_mode: ReadMode,
-        refresh_fn: Option<
-            Box<
-                dyn Fn(
-                        WorkerId,
-                    )
-                        -> std::pin::Pin<Box<dyn std::future::Future<Output = ClientResult<WorkerEndpointInfo>> + Send>>
-                    + Send
-                    + Sync,
-            >,
-        >,
+        refresh_fn: Option<MetadataRefreshFn>,
     ) -> ClientResult<(Vec<Bytes>, u64)> {
         let request = proto::worker::ReadRangeRequestProto {
             data_handle_id: data_handle_id.as_u64(),
@@ -409,7 +394,7 @@ impl WorkerClient {
                         let chunk_data = chunk
                             .data
                             .ok_or_else(|| self.missing_field_error("chunk.data", "read_range", &request_ctx))?;
-                        chunks.push(Bytes::from(chunk_data.data));
+                        chunks.push(chunk_data.data);
                         if chunk.current_version > 0 {
                             version = chunk.current_version;
                         }
@@ -476,7 +461,7 @@ impl WorkerClient {
                     hint,
                     canonical,
                 }) => {
-                    last_canonical_error = Some(canonical.clone());
+                    last_canonical_error = Some(canonical.as_ref().clone());
                     if refreshes > 0 {
                         return Err(ClientError::from(ClientAction::Refresh {
                             reason,
@@ -555,7 +540,7 @@ impl WorkerClient {
                     continue;
                 }
                 Err(ClientAction::Retry { after_ms, canonical }) => {
-                    last_canonical_error = Some(canonical.clone());
+                    last_canonical_error = Some(canonical.as_ref().clone());
                     if retries > 0 {
                         return Err(ClientError::from(ClientAction::Retry { after_ms, canonical }));
                     }
@@ -570,7 +555,9 @@ impl WorkerClient {
         }
 
         if let Some(canonical) = last_canonical_error {
-            return Err(ClientError::from(ClientAction::Fail { canonical }));
+            return Err(ClientError::from(ClientAction::Fail {
+                canonical: Box::new(canonical),
+            }));
         }
         Err(ClientError::Worker("write_chunk retry loop exhausted".to_string()))
     }
@@ -639,7 +626,7 @@ impl WorkerClient {
         let chunk_data = response
             .data
             .ok_or_else(|| self.missing_field_error("data", rpc_name, ctx))?;
-        Ok((Bytes::from(chunk_data.data), response.current_version))
+        Ok((chunk_data.data, response.current_version))
     }
 
     fn missing_field_error(&self, field: &str, rpc_name: &str, ctx: &RequestHeader) -> ClientError {
@@ -681,6 +668,14 @@ impl WorkerClient {
     /// Get worker endpoint info.
     pub fn endpoint_info(&self) -> &WorkerEndpointInfo {
         &self.endpoint_info
+    }
+}
+
+fn normalize_worker_endpoint(endpoint: &str) -> String {
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{}", endpoint)
     }
 }
 

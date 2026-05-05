@@ -199,10 +199,7 @@ impl MetadataRpcHelper {
         let mut call = call;
         let outcome = retry_metadata_once(
             initial_header,
-            move |hdr| {
-                let fut = call(hdr.clone());
-                async move { fut.await }
-            },
+            move |hdr| call(hdr.clone()),
             |dispatch_ctx, current_header| {
                 let base_header = base_header.clone();
                 async move { self.dispatch_refresh(&base_header, current_header, dispatch_ctx).await }
@@ -304,22 +301,22 @@ mod tests {
         ($ty:ty) => {
             #[tonic::async_trait]
             impl FileSystemServiceProto for $ty {
-                async fn get_file_status(
+                async fn get_status(
                     &self,
-                    _request: Request<GetFileStatusRequestProto>,
-                ) -> Result<Response<GetFileStatusResponseProto>, Status> {
+                    _request: Request<GetStatusRequestProto>,
+                ) -> Result<Response<GetStatusResponseProto>, Status> {
                     Err(Status::unimplemented("not implemented"))
                 }
-                async fn mkdir(
+                async fn list_status(
                     &self,
-                    _request: Request<MkdirPathRequestProto>,
-                ) -> Result<Response<MkdirPathResponseProto>, Status> {
+                    _request: Request<ListStatusRequestProto>,
+                ) -> Result<Response<ListStatusResponseProto>, Status> {
                     Err(Status::unimplemented("not implemented"))
                 }
-                async fn create(
+                async fn create_directory(
                     &self,
-                    _request: Request<CreatePathRequestProto>,
-                ) -> Result<Response<CreatePathResponseProto>, Status> {
+                    _request: Request<CreateDirectoryRequestProto>,
+                ) -> Result<Response<CreateDirectoryResponseProto>, Status> {
                     Err(Status::unimplemented("not implemented"))
                 }
                 async fn delete(
@@ -330,122 +327,68 @@ mod tests {
                 }
                 async fn rename(
                     &self,
-                    _request: Request<RenamePathRequestProto>,
-                ) -> Result<Response<RenamePathResponseProto>, Status> {
+                    _request: Request<RenameRequestProto>,
+                ) -> Result<Response<RenameResponseProto>, Status> {
                     Err(Status::unimplemented("not implemented"))
                 }
-                async fn list_status(
+                async fn open_file(
                     &self,
-                    _request: Request<ListStatusPathRequestProto>,
-                ) -> Result<Response<ListStatusPathResponseProto>, Status> {
+                    _request: Request<OpenFileRequestProto>,
+                ) -> Result<Response<OpenFileResponseProto>, Status> {
                     Err(Status::unimplemented("not implemented"))
                 }
-                async fn open(
+                async fn get_block_locations(
                     &self,
-                    _request: Request<OpenPathRequestProto>,
-                ) -> Result<Response<OpenPathResponseProto>, Status> {
+                    _request: Request<GetBlockLocationsRequestProto>,
+                ) -> Result<Response<GetBlockLocationsResponseProto>, Status> {
                     Err(Status::unimplemented("not implemented"))
                 }
-                async fn release(
+                async fn create_file(
                     &self,
-                    _request: Request<ReleasePathRequestProto>,
-                ) -> Result<Response<ReleasePathResponseProto>, Status> {
+                    _request: Request<CreateFileRequestProto>,
+                ) -> Result<Response<CreateFileResponseProto>, Status> {
                     Err(Status::unimplemented("not implemented"))
                 }
-                async fn fsync(
+                async fn append_file(
                     &self,
-                    _request: Request<FsyncPathRequestProto>,
-                ) -> Result<Response<FsyncPathResponseProto>, Status> {
+                    _request: Request<AppendFileRequestProto>,
+                ) -> Result<Response<AppendFileResponseProto>, Status> {
                     Err(Status::unimplemented("not implemented"))
                 }
-                async fn hsync(
+                async fn add_block(
                     &self,
-                    _request: Request<HsyncPathRequestProto>,
-                ) -> Result<Response<HsyncPathResponseProto>, Status> {
+                    _request: Request<AddBlockRequestProto>,
+                ) -> Result<Response<AddBlockResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn commit_file(
+                    &self,
+                    _request: Request<CommitFileRequestProto>,
+                ) -> Result<Response<CommitFileResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn abort_file_write(
+                    &self,
+                    _request: Request<AbortFileWriteRequestProto>,
+                ) -> Result<Response<AbortFileWriteResponseProto>, Status> {
+                    Err(Status::unimplemented("not implemented"))
+                }
+                async fn renew_lease(
+                    &self,
+                    _request: Request<RenewLeaseRequestProto>,
+                ) -> Result<Response<RenewLeaseResponseProto>, Status> {
                     Err(Status::unimplemented("not implemented"))
                 }
                 async fn hflush(
                     &self,
-                    _request: Request<HflushPathRequestProto>,
-                ) -> Result<Response<HflushPathResponseProto>, Status> {
+                    _request: Request<HflushRequestProto>,
+                ) -> Result<Response<HflushResponseProto>, Status> {
                     Err(Status::unimplemented("not implemented"))
                 }
-                async fn truncate(
+                async fn hsync(
                     &self,
-                    _request: Request<TruncatePathRequestProto>,
-                ) -> Result<Response<TruncatePathResponseProto>, Status> {
-                    Err(Status::unimplemented("not implemented"))
-                }
-                async fn set_xattr(
-                    &self,
-                    _request: Request<SetXattrPathRequestProto>,
-                ) -> Result<Response<SetXattrPathResponseProto>, Status> {
-                    Err(Status::unimplemented("not implemented"))
-                }
-                async fn get_xattr(
-                    &self,
-                    _request: Request<GetXattrPathRequestProto>,
-                ) -> Result<Response<GetXattrPathResponseProto>, Status> {
-                    Err(Status::unimplemented("not implemented"))
-                }
-                async fn list_xattr(
-                    &self,
-                    _request: Request<ListXattrPathRequestProto>,
-                ) -> Result<Response<ListXattrPathResponseProto>, Status> {
-                    Err(Status::unimplemented("not implemented"))
-                }
-                async fn remove_xattr(
-                    &self,
-                    _request: Request<RemoveXattrPathRequestProto>,
-                ) -> Result<Response<RemoveXattrPathResponseProto>, Status> {
-                    Err(Status::unimplemented("not implemented"))
-                }
-                async fn get_file_layout_by_path(
-                    &self,
-                    _request: Request<GetFileLayoutByPathRequestProto>,
-                ) -> Result<Response<GetFileLayoutByPathResponseProto>, Status> {
-                    Err(Status::unimplemented("not implemented"))
-                }
-                async fn open_write_by_path(
-                    &self,
-                    _request: Request<OpenWriteByPathRequestProto>,
-                ) -> Result<Response<OpenWriteByPathResponseProto>, Status> {
-                    Err(Status::unimplemented("not implemented"))
-                }
-                async fn close_write_session(
-                    &self,
-                    _request: Request<CloseWriteSessionRequestProto>,
-                ) -> Result<Response<CloseWriteSessionResponseProto>, Status> {
-                    Err(Status::unimplemented("not implemented"))
-                }
-                async fn renew_write_session_lease(
-                    &self,
-                    _request: Request<RenewWriteSessionLeaseRequestProto>,
-                ) -> Result<Response<RenewWriteSessionLeaseResponseProto>, Status> {
-                    Err(Status::unimplemented("not implemented"))
-                }
-                async fn fsync_session(
-                    &self,
-                    _request: Request<FsyncSessionRequestProto>,
-                ) -> Result<Response<FsyncSessionResponseProto>, Status> {
-                    Err(Status::unimplemented("not implemented"))
-                }
-                async fn hsync_session(
-                    &self,
-                    _request: Request<HsyncSessionRequestProto>,
-                ) -> Result<Response<HsyncSessionResponseProto>, Status> {
-                    Err(Status::unimplemented("not implemented"))
-                }
-                async fn hflush_session(
-                    &self,
-                    _request: Request<HflushSessionRequestProto>,
-                ) -> Result<Response<HflushSessionResponseProto>, Status> {
-                    Err(Status::unimplemented("not implemented"))
-                }
-                async fn release_session(
-                    &self,
-                    _request: Request<ReleaseSessionRequestProto>,
-                ) -> Result<Response<ReleaseSessionResponseProto>, Status> {
+                    _request: Request<HsyncRequestProto>,
+                ) -> Result<Response<HsyncResponseProto>, Status> {
                     Err(Status::unimplemented("not implemented"))
                 }
                 async fn msync(

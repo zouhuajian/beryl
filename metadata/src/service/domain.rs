@@ -5,7 +5,7 @@
 
 use common::error::canonical::CanonicalError;
 use common::header::{AuthnType, RequestHeader};
-use types::fs::{Extent, FileAttrs, Inode, InodeId, InodeKind};
+use types::fs::{Extent, FileAttrs, InodeId, InodeKind};
 use types::ids::{BlockId, DataHandleId, LeaseId, MountId, WorkerId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
@@ -56,13 +56,22 @@ pub struct WorkerHint {
 #[derive(Clone, Debug)]
 pub struct WriteTarget {
     pub block_id: BlockId,
+    pub file_offset: u64,
+    pub len: u64,
     pub worker_endpoints: Vec<WorkerHint>,
     pub fencing_token: FencingToken,
 }
 
 #[derive(Clone, Debug)]
+pub struct CommittedBlock {
+    pub block_id: BlockId,
+    pub file_offset: u64,
+    pub len: u64,
+}
+
+#[derive(Clone, Debug)]
 pub struct CloseWriteIntent {
-    pub extents: Vec<Extent>,
+    pub committed_blocks: Vec<CommittedBlock>,
     pub final_size: u64,
 }
 
@@ -123,18 +132,6 @@ pub type CoreResult<T> = Result<CoreSuccess<T>, CoreFailure>;
 pub struct GetAttrInput {
     pub ctx: RequestContext,
     pub inode_id: InodeId,
-}
-
-#[derive(Clone, Debug)]
-pub struct LookupInput {
-    pub ctx: RequestContext,
-    pub parent_inode_id: InodeId,
-    pub name: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct LookupOutput {
-    pub inode: Inode,
 }
 
 #[derive(Clone, Debug)]
@@ -233,196 +230,6 @@ pub struct ReadDirOutput {
     pub eof: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct OpenInput {
-    pub ctx: RequestContext,
-    pub inode_id: InodeId,
-    pub flags: i32,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct OpenOutput {
-    pub file_handle: u64,
-}
-
-#[derive(Clone, Debug)]
-pub struct TruncateInput {
-    pub ctx: RequestContext,
-    pub inode_id: InodeId,
-    pub new_size: u64,
-    pub lease_id: Option<LeaseId>,
-    pub lease_epoch: u64,
-    pub freshness: Freshness,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct TruncateOutput {
-    pub new_size: u64,
-}
-
-#[derive(Clone, Debug)]
-pub struct SetAttrInput {
-    pub ctx: RequestContext,
-    pub inode_id: InodeId,
-    pub mask: u32,
-    pub attrs: FileAttrs,
-    pub freshness: Freshness,
-}
-
-#[derive(Clone, Debug)]
-pub struct SetAttrOutput {
-    pub attrs: FileAttrs,
-}
-
-#[derive(Clone, Debug)]
-pub struct SetXattrInput {
-    pub ctx: RequestContext,
-    pub inode_id: InodeId,
-    pub name: String,
-    pub value: Vec<u8>,
-    pub create: bool,
-    pub replace: bool,
-    pub freshness: Freshness,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct SetXattrOutput;
-
-#[derive(Clone, Debug)]
-pub struct GetXattrInput {
-    pub ctx: RequestContext,
-    pub inode_id: InodeId,
-    pub name: String,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct GetXattrOutput {
-    pub value: Vec<u8>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ListXattrInput {
-    pub ctx: RequestContext,
-    pub inode_id: InodeId,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ListXattrOutput {
-    pub names: Vec<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct RemoveXattrInput {
-    pub ctx: RequestContext,
-    pub inode_id: InodeId,
-    pub name: String,
-    pub freshness: Freshness,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct RemoveXattrOutput;
-
-#[derive(Clone, Debug)]
-pub struct StatFsInput {
-    pub ctx: RequestContext,
-    pub inode_id: InodeId,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StatFsOutput {
-    pub total_blocks: u64,
-    pub free_blocks: u64,
-    pub available_blocks: u64,
-    pub block_size: u64,
-}
-
-#[derive(Clone, Debug)]
-pub struct AccessInput {
-    pub ctx: RequestContext,
-    pub inode_id: InodeId,
-    pub mode: u32,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AccessOutput {
-    pub granted: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct SymlinkInput {
-    pub ctx: RequestContext,
-    pub parent_inode_id: InodeId,
-    pub name: String,
-    pub target: String,
-    pub attrs: FileAttrs,
-    pub freshness: Freshness,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct SymlinkOutput {
-    pub inode: Option<Inode>,
-    pub attrs: Option<FileAttrs>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ReadlinkInput {
-    pub ctx: RequestContext,
-    pub inode_id: InodeId,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ReadlinkOutput {
-    pub target: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct LinkInput {
-    pub ctx: RequestContext,
-    pub src_inode_id: InodeId,
-    pub dst_parent_inode_id: InodeId,
-    pub dst_name: String,
-    pub freshness: Freshness,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct LinkOutput {
-    pub inode: Option<Inode>,
-    pub attrs: Option<FileAttrs>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct InodeOwner {
-    pub uid: u32,
-    pub gid: u32,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct DeleteOpPlan {
-    pub parent_inode_id: InodeId,
-    pub target_inode_id: Option<InodeId>,
-    pub parent_owner: Option<InodeOwner>,
-    pub target_owner: Option<InodeOwner>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct RenameOpPlan {
-    pub src_parent_inode_id: InodeId,
-    pub dst_parent_inode_id: InodeId,
-    pub src_inode_id: Option<InodeId>,
-    pub dst_inode_id: Option<InodeId>,
-    pub src_parent_owner: Option<InodeOwner>,
-    pub src_owner: Option<InodeOwner>,
-    pub dst_parent_owner: Option<InodeOwner>,
-    pub dst_owner: Option<InodeOwner>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct SessionGuardInputs {
-    pub file_handle: u64,
-    pub inode_id: Option<InodeId>,
-    pub mount_id: Option<MountId>,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct InodeMountGuardInputs {
     pub inode_id: InodeId,
@@ -430,13 +237,18 @@ pub struct InodeMountGuardInputs {
 }
 
 #[derive(Clone, Debug)]
-pub struct ReleaseSessionInput {
+pub struct AbortWriteInput {
     pub ctx: RequestContext,
     pub file_handle: u64,
+    pub lease_id: Option<LeaseId>,
+    pub lease_epoch: u64,
+    pub open_epoch: u64,
+    pub fencing_token: Option<PresentedFencingToken>,
+    pub freshness: Freshness,
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct ReleaseSessionOutput;
+pub struct AbortWriteOutput;
 
 #[derive(Clone, Debug)]
 pub struct GetFileLayoutInput {
@@ -464,10 +276,29 @@ pub struct OpenWriteInput {
 
 #[derive(Clone, Debug)]
 pub struct OpenWriteOutput {
+    pub inode_id: InodeId,
+    pub data_handle_id: DataHandleId,
     pub session_key: SessionKey,
     pub write_targets: Vec<WriteTarget>,
     pub base_size: u64,
     pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct AddBlockInput {
+    pub ctx: RequestContext,
+    pub file_handle: u64,
+    pub lease_id: Option<LeaseId>,
+    pub lease_epoch: u64,
+    pub open_epoch: u64,
+    pub fencing_token: Option<PresentedFencingToken>,
+    pub desired_len: Option<u64>,
+    pub freshness: Freshness,
+}
+
+#[derive(Clone, Debug)]
+pub struct AddBlockOutput {
+    pub target: WriteTarget,
 }
 
 #[derive(Clone, Debug)]
