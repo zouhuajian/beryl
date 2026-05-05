@@ -100,6 +100,14 @@ pub struct AppliedResult {
     pub size_bytes: u32,
 }
 
+/// Overwritten rename target state that must be removed with the namespace move.
+pub struct RenameOverwriteCleanup<'a> {
+    pub inode_id: InodeId,
+    pub data_handle_id: Option<DataHandleId>,
+    pub released_block_ids: &'a [BlockId],
+    pub now_ms: u64,
+}
+
 /// Namespace rename writes that must commit as one RocksDB batch.
 pub struct RenameAtomicUpdate<'a> {
     pub src_parent_inode_id: InodeId,
@@ -107,7 +115,7 @@ pub struct RenameAtomicUpdate<'a> {
     pub dst_parent_inode_id: InodeId,
     pub dst_name: &'a str,
     pub src_inode_id: InodeId,
-    pub overwritten_inode_id: Option<InodeId>,
+    pub overwritten_target: Option<RenameOverwriteCleanup<'a>>,
     pub updated_src_parent: Option<&'a Inode>,
     pub updated_dst_parent: Option<&'a Inode>,
     pub updated_src_inode: &'a Inode,
@@ -2281,11 +2289,6 @@ impl RocksDBStorage {
     }
 
     /// Atomically persist a rename namespace mutation.
-    ///
-    /// Overwritten targets must be prevalidated by the state machine as safe namespace-only removals.
-    ///
-    /// TODO: Full overwrite cleanup should batch target inode/dentry removal with
-    /// target layout, data_handle_owner, block refcount, and delete-intent updates.
     pub fn rename_atomic(&self, update: RenameAtomicUpdate<'_>) -> MetadataResult<()> {
         self.write_batch(self.rename_batch(update)?)
     }
@@ -2293,15 +2296,31 @@ impl RocksDBStorage {
     fn rename_batch(&self, update: RenameAtomicUpdate<'_>) -> MetadataResult<WriteBatch> {
         let cf_inodes = self.cf(CF_INODES)?;
         let cf_dentries = self.cf(CF_DENTRIES)?;
+        let cf_meta = self.cf(CF_META)?;
+        let cf_block_ref_counts = self.cf(CF_BLOCK_REF_COUNTS)?;
+        let cf_delete_intents = self.cf(CF_DELETE_INTENTS)?;
 
         let mut batch = WriteBatch::default();
 
-        if let Some(inode_id) = update.overwritten_inode_id {
-            batch.delete_cf(cf_inodes, Self::encode_inode_key(inode_id));
+        if let Some(cleanup) = update.overwritten_target {
+            batch.delete_cf(cf_inodes, Self::encode_inode_key(cleanup.inode_id));
             batch.delete_cf(
                 cf_dentries,
                 Self::encode_dentry_key(update.dst_parent_inode_id, update.dst_name),
             );
+            let layout_key = format!("layout:{}", cleanup.inode_id.as_raw());
+            batch.delete_cf(cf_meta, layout_key.as_bytes());
+            if let Some(data_handle_id) = cleanup.data_handle_id {
+                let owner_key = format!("data_handle_owner:{}", data_handle_id.as_raw());
+                batch.delete_cf(cf_meta, owner_key.as_bytes());
+            }
+            self.append_block_ref_decrements_to_batch(
+                &mut batch,
+                cf_block_ref_counts,
+                cf_delete_intents,
+                cleanup.released_block_ids,
+                cleanup.now_ms,
+            )?;
         }
 
         batch.delete_cf(
@@ -3039,7 +3058,7 @@ mod tests {
                 dst_parent_inode_id: dst_parent_id,
                 dst_name: "new",
                 src_inode_id: inode_id,
-                overwritten_inode_id: None,
+                overwritten_target: None,
                 updated_src_parent: Some(&src_parent),
                 updated_dst_parent: Some(&dst_parent),
                 updated_src_inode: &inode,

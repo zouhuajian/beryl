@@ -664,6 +664,24 @@ mod tests {
     }
 
     #[test]
+    fn rename_fingerprint_covers_overwrite_target() {
+        let dedup = dedup(7, 20);
+        let overwrite_target = rename_command(dedup.clone(), "target-a");
+        let different_target = rename_command(dedup.clone(), "target-b");
+        let no_replace = Command::Rename {
+            dedup,
+            src_parent_inode_id: InodeId::new(10),
+            src_name: "old".to_string(),
+            dst_parent_inode_id: InodeId::new(20),
+            dst_name: "target-a".to_string(),
+            flags: 1,
+        };
+
+        assert_ne!(overwrite_target.fingerprint(), different_target.fingerprint());
+        assert_ne!(overwrite_target.fingerprint(), no_replace.fingerprint());
+    }
+
+    #[test]
     fn fingerprint_excludes_call_id() {
         let first = rename_command(dedup(7, 3), "new");
         let second = rename_command(dedup(7, 4), "new");

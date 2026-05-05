@@ -433,6 +433,42 @@ impl FsCore {
             }
         }
 
+        match storage.get_dentry(req.dst_parent_inode_id, &req.dst_name) {
+            Ok(Some(dst_inode_id)) => match storage.get_inode(dst_inode_id) {
+                Ok(Some(inode)) if inode.kind.is_file() => {
+                    if self.write_session_manager.has_active_session(dst_inode_id)
+                        || self.inode_lease_manager.has_active_lease(dst_inode_id)
+                    {
+                        return self.fatal_fs_failure(
+                            &req.ctx,
+                            types::fs::FsErrorCode::EBusy,
+                            format!("Rename target has an active write session or lease: {}", dst_inode_id),
+                            Some(ctx.namespace_owner_group_id.as_raw()),
+                            Some(ctx.mount_epoch),
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    return self.failure_from_error(
+                        &req.ctx,
+                        err,
+                        Some(ctx.namespace_owner_group_id.as_raw()),
+                        Some(ctx.mount_epoch),
+                    );
+                }
+            },
+            Ok(None) => {}
+            Err(err) => {
+                return self.failure_from_error(
+                    &req.ctx,
+                    err,
+                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.mount_epoch),
+                );
+            }
+        }
+
         let dedup = match self.dedup_key(&req.ctx.caller) {
             Ok(k) => k,
             Err(err) => {

@@ -7,8 +7,8 @@ use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
 use crate::raft::{AppRaftNode, AppRaftStateMachine, Command, DedupKey, RocksDBStorage};
 use crate::service::domain::{
     AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CommittedBlock, CoreResult, Freshness,
-    GetAttrInput, GetFileLayoutInput, OpenWriteInput, PresentedFencingToken, ReadDirInput, RenewLeaseInput,
-    RequestContext, SessionKey, UnlinkInput, WriteTarget,
+    GetAttrInput, GetFileLayoutInput, OpenWriteInput, PresentedFencingToken, ReadDirInput, RenameInput,
+    RenewLeaseInput, RequestContext, SessionKey, UnlinkInput, WriteTarget,
 };
 use crate::state::{BlockMetaState, LeaseState, MemoryStateStore, RouteEpoch};
 use crate::worker::{HealthStatus, WorkerManager};
@@ -1863,6 +1863,137 @@ async fn delete_file_with_active_write_session_returns_busy_without_namespace_mu
     assert!(fs_core.write_session_for_handle(file_handle).is_some());
     assert_eq!(storage.get_dentry(parent_inode_id, "busy").unwrap(), Some(inode_id));
     assert!(storage.get_inode(inode_id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn rename_rejects_active_write_target() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(56);
+    let group_id = ShardGroupId::new(14);
+    let parent_inode_id = InodeId::new(560);
+    let source_inode_id = InodeId::new(561);
+    let target_inode_id = InodeId::new(562);
+    let source_handle = DataHandleId::new(563);
+    let target_handle = DataHandleId::new(564);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mount_table = Arc::clone(&fs_core.mount_table);
+    let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+    fs_core.set_storage(Arc::clone(&storage));
+    fs_core.set_raft_node(raft_node);
+
+    storage
+        .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
+        .unwrap();
+    storage
+        .put_inode(&Inode::new_file(
+            source_inode_id,
+            FileAttrs::new(),
+            mount_id,
+            source_handle,
+        ))
+        .unwrap();
+    storage
+        .put_inode(&Inode::new_file(
+            target_inode_id,
+            FileAttrs::new(),
+            mount_id,
+            target_handle,
+        ))
+        .unwrap();
+    storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
+    storage.put_dentry(parent_inode_id, "target", target_inode_id).unwrap();
+    storage
+        .put_layout(source_inode_id, FileLayout::new(4096, 4096, 1))
+        .unwrap();
+    storage
+        .put_layout(target_inode_id, FileLayout::new(4096, 4096, 1))
+        .unwrap();
+    storage.put_data_handle_owner(source_handle, source_inode_id).unwrap();
+    storage.put_data_handle_owner(target_handle, target_inode_id).unwrap();
+    let file_handle = install_write_session(&fs_core, target_inode_id, mount_id);
+
+    let failure = fs_core
+        .execute_rename(RenameInput {
+            ctx: request_context(),
+            src_parent_inode_id: parent_inode_id,
+            src_name: "source".to_string(),
+            dst_parent_inode_id: parent_inode_id,
+            dst_name: "target".to_string(),
+            flags: 0,
+            freshness: Freshness::default(),
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EBusy))
+    );
+    assert!(fs_core.write_session_for_handle(file_handle).is_some());
+    assert_eq!(
+        storage.get_dentry(parent_inode_id, "source").unwrap(),
+        Some(source_inode_id)
+    );
+    assert_eq!(
+        storage.get_dentry(parent_inode_id, "target").unwrap(),
+        Some(target_inode_id)
+    );
+    assert!(storage.get_inode(target_inode_id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn rename_rejects_cross_mount() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let src_mount_id = MountId::new(57);
+    let dst_mount_id = MountId::new(58);
+    let src_parent_inode_id = InodeId::new(570);
+    let dst_parent_inode_id = InodeId::new(580);
+    let source_inode_id = InodeId::new(571);
+    let mut fs_core = fs_core_with_mount(src_mount_id, 9, ShardGroupId::new(15));
+    fs_core.set_storage(Arc::clone(&storage));
+
+    storage
+        .put_inode(&Inode::new_dir(src_parent_inode_id, FileAttrs::new(), src_mount_id))
+        .unwrap();
+    storage
+        .put_inode(&Inode::new_dir(dst_parent_inode_id, FileAttrs::new(), dst_mount_id))
+        .unwrap();
+    storage
+        .put_inode(&Inode::new_file(
+            source_inode_id,
+            FileAttrs::new(),
+            src_mount_id,
+            DataHandleId::new(571),
+        ))
+        .unwrap();
+    storage
+        .put_dentry(src_parent_inode_id, "source", source_inode_id)
+        .unwrap();
+
+    let failure = fs_core
+        .execute_rename(RenameInput {
+            ctx: request_context(),
+            src_parent_inode_id,
+            src_name: "source".to_string(),
+            dst_parent_inode_id,
+            dst_name: "target".to_string(),
+            flags: 0,
+            freshness: Freshness::default(),
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EXDev))
+    );
+    assert_eq!(
+        storage.get_dentry(src_parent_inode_id, "source").unwrap(),
+        Some(source_inode_id)
+    );
+    assert_eq!(storage.get_dentry(dst_parent_inode_id, "target").unwrap(), None);
 }
 
 #[tokio::test]

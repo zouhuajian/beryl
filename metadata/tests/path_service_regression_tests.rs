@@ -743,7 +743,7 @@ async fn delete_missing_path_returns_structured_header_error() {
 }
 
 #[tokio::test]
-async fn delete_directory_recursive_true_returns_not_supported_header_error() {
+async fn recursive_delete_is_not_supported() {
     let env = build_env(
         "/mnt/test",
         DataIoPolicy::Allow,
@@ -778,6 +778,78 @@ async fn delete_directory_recursive_true_returns_not_supported_header_error() {
         other => panic!("expected ENOTSUP fs errno, got {:?}", other),
     }
     assert!(err.message.contains("recursive delete not yet implemented"));
+}
+
+#[tokio::test]
+async fn recursive_delete_does_not_mutate_tree() {
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let dir_inode_id = InodeId::new(4101);
+    let child_inode_id = InodeId::new(4102);
+    let data_handle_id = DataHandleId::new(4103);
+    let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+    let mut child_inode = Inode::new_file(child_inode_id, FileAttrs::new(), env.mount_id, data_handle_id);
+    child_inode.attrs.size = 64;
+    if let types::fs::InodeData::File { extents, lease_epoch } = &mut child_inode.data {
+        *extents = vec![Extent {
+            file_offset: 0,
+            block_id,
+            block_offset: 0,
+            len: 64,
+            file_version: None,
+            block_stamp: None,
+        }];
+        *lease_epoch = Some(1);
+    }
+    env.storage
+        .put_inode(&Inode::new_dir(dir_inode_id, FileAttrs::new(), env.mount_id))
+        .expect("put test directory inode");
+    env.storage.put_inode(&child_inode).expect("put test child inode");
+    env.storage
+        .put_dentry(env.root_inode_id, "dir", dir_inode_id)
+        .expect("put test directory dentry");
+    env.storage
+        .put_dentry(dir_inode_id, "child", child_inode_id)
+        .expect("put test child dentry");
+    env.storage
+        .put_layout(child_inode_id, FileLayout::new(4096, 4096, 1))
+        .expect("put test child layout");
+    env.storage
+        .put_data_handle_owner(data_handle_id, child_inode_id)
+        .expect("put test child owner");
+    env.storage
+        .put_block_ref_count(block_id, 1)
+        .expect("put test block refcount");
+
+    let response = FileSystemServiceProto::delete(
+        &env.service,
+        Request::new(DeleteRequestProto {
+            header: header(141),
+            path: "/mnt/test/dir".to_string(),
+            recursive: true,
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+
+    let err = header_error(response.header);
+    assert_fs_errno(&err, FsErrnoProto::FsErrnoEnotsup);
+    assert_eq!(
+        env.storage.get_dentry(env.root_inode_id, "dir").unwrap(),
+        Some(dir_inode_id)
+    );
+    assert_eq!(
+        env.storage.get_dentry(dir_inode_id, "child").unwrap(),
+        Some(child_inode_id)
+    );
+    assert!(env.storage.get_inode(dir_inode_id).unwrap().is_some());
+    assert!(env.storage.get_inode(child_inode_id).unwrap().is_some());
+    assert_eq!(
+        env.storage.get_inode_by_data_handle(data_handle_id).unwrap(),
+        Some(child_inode_id)
+    );
+    assert_eq!(env.storage.get_block_ref_count(block_id).unwrap(), Some(1));
+    assert_eq!(env.storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 0);
 }
 
 #[tokio::test]

@@ -184,7 +184,7 @@ Raft / RocksDB 现状：
 - `RaftStateStore` 读调用 `AppRaftNode::read(false, ...)`，当前是 leader-read 检查，不是 follower read；`AppRaftNode::read(true, ...)` 有 linearizable read 分支，但主 `RaftStateStore` 路径没有使用。
 - snapshot build/install 基于 `STATE_CFS` 的 RocksDB snapshot/payload，包含 replicated state CF；install 时先 clear 对应 CF，再批量恢复。当前 snapshot V1 header 只保存 snapshot 解释所需的 route epoch，不读写 `applied_seq`，也不提供旧 `applied_seq` bytes 的兼容读取。
 - inode/data handle allocator 使用 RocksDB meta key 持久推进；destructive file layout apply path 的 zero-ref delete intent id 使用 replicated `next_delete_intent_id`，当 allocator key 缺失或落后于已有 delete intent 时，会在同一个 apply `WriteBatch` 内 deterministic bump 到 `max(existing_intent_id)+1` 后再按本次新建 pending intent 数量推进。
-- `Create`、`Mkdir`、`Rmdir`、empty-file `Unlink`、extent-bearing file `Unlink`、`Rename`、内部 layout/write-handle mutation、`CreateDeleteIntents`、`AllocateDeleteIntents`、`UpdateDeleteIntentStatus`、`CreateMount`、`DeleteMount`、`AddShardGroup`、`RegisterWorker`、`AcquireLease`、`ReleaseLease` 已把业务 mutation 和 `AppliedResult` 放进同一个 RocksDB `WriteBatch`。
+- `Create`、`Mkdir`、`Rmdir`、empty-file `Unlink`、extent-bearing file `Unlink`、`Rename`（包括 overwrite target cleanup）、内部 layout/write-handle mutation、`CreateDeleteIntents`、`AllocateDeleteIntents`、`UpdateDeleteIntentStatus`、`CreateMount`、`DeleteMount`、`AddShardGroup`、`RegisterWorker`、`AcquireLease`、`ReleaseLease` 已把业务 mutation 和 `AppliedResult` 放进同一个 RocksDB `WriteBatch`。
 
 ## 6. Worker metadata 链路
 
@@ -296,30 +296,30 @@ Dedup / fingerprint / AppliedResult 当前边界：
 - `AppliedResult` 是 Raft state machine 已 apply mutation 的持久 replay record，用于 retry/replay；不是通用 RPC response cache。
 - read-only RPC 不写 `AppliedResult`；读路径依赖 `state_id`、`mount_epoch`、`route_epoch`、`worker_epoch` 和 `ResponseHeader` refresh hint。
 - `file_version` 当前不是独立 inode schema 字段；metadata 使用文件 inode 中已持久化的 file lease epoch 作为最小安全版本来源。`CommitFile` 成功 apply 时把本次 `lease_epoch` 作为返回的 `file_version`，同时写入 committed extents；`OpenFile` / `GetBlockLocations` 返回当前 committed file 的版本。后续如果需要独立 durable file version，应在 inode/layout schema 中显式建模，而不是伪造与 correctness 无关的值。
-- `Create`、`Mkdir`、`Rmdir`、empty-file `Unlink`、extent-bearing file `Unlink`、`Rename`、内部 layout/write-handle mutation、`CreateDeleteIntents`、`AllocateDeleteIntents`、`UpdateDeleteIntentStatus`、`CreateMount`、`DeleteMount`、`AddShardGroup`、`RegisterWorker`、`AcquireLease`、`ReleaseLease` 已把 business mutation 和 `AppliedResult` 放进同一个 RocksDB `WriteBatch`。
+- `Create`、`Mkdir`、`Rmdir`、empty-file `Unlink`、extent-bearing file `Unlink`、`Rename`（包括覆盖目标 cleanup）、内部 layout/write-handle mutation、`CreateDeleteIntents`、`AllocateDeleteIntents`、`UpdateDeleteIntentStatus`、`CreateMount`、`DeleteMount`、`AddShardGroup`、`RegisterWorker`、`AcquireLease`、`ReleaseLease` 已把 business mutation 和 `AppliedResult` 放进同一个 RocksDB `WriteBatch`。
 - CommitFile 背后的 internal close-write apply 成功时，inode 中的 committed extents/size/mtime/lease_epoch、block refcount increment/decrement、稳定 `FileLayout` record 和 `AppliedResult` 通过 `close_write_with_apply_result_atomic()` 同批提交；OVERWRITE 会替换 committed extents 并释放旧 block 引用；确定性业务错误仍持久化 `AppliedResult` 以保持 replay 语义。
 - `Truncate` shrink 成功 apply 时，apply 层会先按 inode persisted `lease_epoch` 和 deterministic `lease_id=(inode_id<<64)|lease_epoch` 校验 fencing authority；通过后，inode size/mtime/lease_epoch、稳定 `FileLayout` record、被释放完整 block 的 refcount decrement、zero-ref block 的 pending delete intent 和 `AppliedResult` 通过 `truncate_file_with_apply_result_atomic()` 同批提交；grow 仍返回 structured `NotSupported`。
 - `Truncate` same-size no-op 仍进入 Raft mutation dedup/replay 路径，持久化 `AppliedResult`，但不改 inode/layout/refcount/delete intent。
 - Extent-bearing file `Unlink` 成功 apply 时，dentry、inode、`FileLayout`、`data_handle_owner`、被引用 block 的 refcount decrement、zero-ref block 的 pending delete intent 和 `AppliedResult` 通过 `delete_file_with_extents_and_apply_result_atomic()` 同批提交；active internal write session / active lease 会在 FsCore 层返回 `EBusy`，不强删。
+- `Rename` 覆盖 regular file target 时，FsCore 会先拒绝 active internal write session / active lease；Raft apply 成功路径会在同一个 RocksDB `WriteBatch` 内移动 source dentry，删除 old target dentry/inode、old target `FileLayout`、old target `data_handle_owner`，递减 old target committed extents 的 block refcount，并为 zero-ref block 创建 pending delete intent。source file 的 inode/data_handle/layout 成为 dst path 的身份；old dst layout 不再可达。覆盖 non-empty directory target 返回 structured `DirectoryNotEmpty`，不会局部修改 namespace。
 - `CreateDeleteIntents` 成功 apply 时，所有 pending delete intents 和 `AppliedResult` 通过 `create_delete_intents_with_apply_result_atomic()` 同批提交；同一 command 内 duplicate intent id 或 DB 中已有 intent id 会被 deterministic structured error 拒绝，且不会覆盖 existing intent。
 - GC/orphan/overrep 等 maintenance authoritative intent creation 通过 `AllocateDeleteIntents` 进入 Raft apply；command payload 中的 intent_id 必须为 `0`，apply 内使用 replicated `next_delete_intent_id` 分配真实 intent id。
 - `UpdateDeleteIntentStatus` 成功 apply 时，Pending/InFlight -> Completed/Failed 等允许的状态推进、finished timestamp / error msg、`AppliedResult` 同 batch 提交；missing intent、invalid transition 或 fingerprint mismatch 不更新状态。
 - `RegisterWorker` 成功 apply 时，worker identity mapping、worker descriptor、`next_worker_id` allocator、`AppliedResult` 同 batch 提交；same identity 复用原 worker_id 并原子更新 descriptor。
-- destructive file layout path 中 block refcount decrement 与 zero-ref delete intent creation 已跟触发它们的 namespace/layout mutation 同 batch；zero-ref intent id 来自 replicated `next_delete_intent_id`，allocator key 缺失或落后时同 batch deterministic advance above existing delete intents，same `DedupKey` replay 不重复分配 id、不重复 decrement，也不重复创建 intent。
+- destructive file layout path 中 block refcount decrement 与 zero-ref delete intent creation 已跟触发它们的 namespace/layout mutation 同 batch，包括 extent-bearing `Unlink`、truncate shrink、close-write overwrite 和 rename overwrite target cleanup。zero-ref intent id 来自 replicated `next_delete_intent_id`，allocator key 缺失或落后时同 batch deterministic advance above existing delete intents，same `DedupKey` replay 不重复分配 id、不重复 decrement，也不重复创建 intent。
 
 Mutation command apply-level atomicity inventory：
 
 | 分类 | Command |
 | --- | --- |
-| DONE | `Create`, `Mkdir`, `Rmdir`, empty-file `Unlink`, extent-bearing file `Unlink`, `Rename`, internal write-handle commit, `CreateDeleteIntents`, `AllocateDeleteIntents`, `UpdateDeleteIntentStatus`, `CreateMount`, `DeleteMount`, `AddShardGroup`, `RegisterWorker`, `AcquireLease`, `ReleaseLease` |
-| COMPLEX_NEXT | rename overwrite target cleanup, recursive directory delete |
+| DONE | `Create`, `Mkdir`, `Rmdir`, empty-file `Unlink`, extent-bearing file `Unlink`, `Rename` with overwrite target cleanup, internal write-handle commit, `CreateDeleteIntents`, `AllocateDeleteIntents`, `UpdateDeleteIntentStatus`, `CreateMount`, `DeleteMount`, `AddShardGroup`, `RegisterWorker`, `AcquireLease`, `ReleaseLease` |
+| COMPLEX_NEXT | recursive directory delete |
 | LEGACY_OR_UNUSED | `UpdateCommittedLength` |
 | DIRECT_ROCKSDB_TODO | maintenance block refcount compatibility writes outside the file-layout mutation path |
 
 高优先级 correctness 风险：
 
-- Recursive directory delete 未实现；`Delete(recursive=true)` 对目录返回 `NotSupported`。
-- rename overwrite：当前会拒绝带数据状态的 overwrite target，完整 cleanup 尚未实现。
+- Recursive directory delete 未实现；`Delete(recursive=true)` 对目录返回 `NotSupported`，不遍历、不局部删除、不创建 delete intent。
 
 当前实现限制：
 
@@ -339,8 +339,7 @@ Mutation command apply-level atomicity inventory：
 必须保留并优先修正的主链路 correctness。
 
 - 保留 `FsCore`、`PathResolver`、`MountTable`、`AppRaftStateMachine`、`RocksDBStorage`、`RaftStateStore`、`ResponseHeader.error` contract、内部 write session/fencing 主链路。
-- 继续收敛 rename overwrite cleanup、recursive directory delete 等复杂或后台 RocksDB mutation 的原子性。
-- 完成 rename overwrite target 的数据状态 cleanup。
+- 继续收敛 recursive directory delete 等复杂或后台 RocksDB mutation 的原子性；在具备完整 bounded traversal、批量 apply 和恢复语义前，不实现半成品递归删除。
 
 最小读写闭环。
 
@@ -354,7 +353,7 @@ Mutation command apply-level atomicity inventory：
 
 - MaintenanceService、RepairQueue、OrphanQueue、RepairPlanner、DeleteExecutor 可以保留为框架，但生产默认策略应保守。
 - GC、orphan cleanup、over-rep cleanup、rebalance、repair timeout requeue 可按风险分级启用。
-- DeleteExecutor 已能下发 delete command；Completed/Failed 状态通过 Raft command 收口，但 physical deletion 仍取决于 worker ack 和后续 block report reconcile，不代表 metadata apply 本身执行了数据面 IO。
+- DeleteExecutor 已能下发 delete command；metadata apply 可以创建 pending delete intent，但 physical deletion 仍取决于 worker ack 和后续 block report reconcile，不代表 metadata apply 本身执行了数据面 IO。
 - replication factor、placement、fault-domain、rebalance 策略可以先保持 MVP，不要扩展成复杂策略。
 
 暂缓实现的高级能力。
