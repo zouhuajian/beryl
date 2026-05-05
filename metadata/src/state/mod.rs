@@ -3,7 +3,8 @@
 
 //! State storage abstraction for metadata service.
 //!
-//! This module defines the state machine interface that will be replaced
+//! The production runtime uses `RaftStateStore`. The in-memory implementation
+//! remains available for regression tests and small FsCore helpers.
 
 mod memory;
 mod raft_store;
@@ -84,8 +85,8 @@ pub enum DeleteIntentStatus {
 /// Delete intent for block deletion.
 ///
 /// This is an authoritative, recoverable, low-frequency intent that is persisted in Raft.
-/// High-frequency execution progress should NOT be written to Raft.
-/// Execution status (Completed/Failed) is persisted directly to RocksDB (not via Raft).
+/// Current DeleteExecutor status transitions use `Command::UpdateDeleteIntentStatus`.
+/// Do not use this model as justification for direct RocksDB status writes.
 ///
 /// Enhanced with shard_group_id and guard_watermark for cross-group gate control.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -131,7 +132,11 @@ pub struct DeleteIntent {
 }
 
 /// State store trait.
-/// TODO(state): replace with a Raft-backed state machine.
+///
+/// This interface is wider than the current production freshness reads because
+/// it still carries block/lease mutation methods used by older abstractions and
+/// tests. The production implementation is `RaftStateStore`; `MemoryStateStore`
+/// is test support.
 #[async_trait]
 pub trait StateStore: Send + Sync {
     // NOTE: FileMeta and file-based operations have been removed.

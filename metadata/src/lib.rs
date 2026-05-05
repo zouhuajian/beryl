@@ -1,46 +1,53 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Metadata service for Vecton.
+//! Metadata authority implementation for Vecton.
 //!
-//! This crate provides the metadata service that manages:
-//! - **Inode/dentry-based filesystem**: Authoritative storage model using inodes and dentries
-//! - **File and block metadata**: Block placement, leases, and data plane metadata
-//! - **Mount table**: UFS path mapping with namespace routing
-//! - **Raft state machine**: Distributed consensus for metadata operations
+//! This crate owns the filesystem metadata authority: inodes, dentries,
+//! attributes, mounts, metadata-level freshness, write-session fencing, worker
+//! descriptors, block metadata, and the Raft state machine that commits
+//! metadata mutations.
 //!
 //! # Architecture
 //!
+//! ## Runtime Entry Points
+//!
+//! The process entrypoint builds a `MetadataServer` runtime. The externally
+//! registered metadata/control-plane services are:
+//!
+//! - `MetadataFileSystemServiceImpl`: implements the external
+//!   `FileSystemService` path-based metadata/control-plane API.
+//! - `MetadataWorkerServiceImpl`: handles worker registration, heartbeat, block
+//!   reports, task acknowledgements, and retained worker RPC compatibility
+//!   surfaces.
+//!
+//! Metadata does not perform data-plane IO. Clients read and write data
+//! directly through workers; this crate only maintains or returns metadata and
+//! control-plane information needed by that path.
+//!
 //! ## Filesystem Model
 //!
-//! The metadata service uses an **inode/dentry-based filesystem model**:
+//! The current model is inode-centric:
 //!
-//! - **Inodes**: Authoritative identity for filesystem objects (files, directories, symlinks)
-//! - **Dentries**: Directory entries mapping (parent_inode_id, name) → child_inode_id
-//! - **Paths are NOT authoritative**: All path operations must resolve through the dentry tree
-//!
-//! See `docs/metadata-fs-model.md` for detailed documentation.
-//!
-//! ## Services
-//!
-//! - **FileSystemServiceProto**: External path-based filesystem entrypoint (path → walk → FS service)
-//! - **MetadataClientService**: Supports data_handle_id-based data plane operations
-//!
-//! See `docs/metadata-services.md` for service architecture.
+//! - **Inodes** are the authoritative identity for filesystem objects.
+//! - **Dentries** map `(parent_inode_id, name)` to child inode IDs.
+//! - **Paths are adapters**, not persisted sources of truth. Path operations
+//!   resolve through mount selection and dentry traversal.
 //!
 //! ## State Storage
 //!
-//! - **RocksDB**: Persistent storage for inodes, dentries, blocks, leases, mounts
-//! - **Raft**: Distributed consensus for write operations
-//! - **StateStore trait**: Abstraction for state machine operations
+//! - **RocksDB** stores authoritative metadata state and Raft-backed replicated
+//!   state.
+//! - **Raft** commits metadata mutations at authority boundaries.
+//! - **RaftStateStore** is the production `StateStore` implementation.
+//!   `MemoryStateStore` is retained for tests and local helpers.
 //!
-//! ## Routing and Consistency
+//! ## Freshness and Current Limitations
 //!
-//! - **FS write routing**: All FS writes route to `mount.namespace_owner_group_id` for atomic rename
-//! - **Read consistency**: Follower read gating via state_id comparison
-//! - **Mount epoch**: Validates mount configuration freshness
-//!
-//! See `docs/metadata-routing-and-consistency.md` for details.
+//! `GroupStateWatermark` carries state-machine applied `RaftLogId` freshness.
+//! `route_epoch`, `mount_epoch`, and `worker_epoch` remain separate freshness
+//! domains. Current no-op, legacy unsupported, and partially wired boundaries
+//! are tracked in `metadata/README_ZH.md`.
 
 pub mod bootstrap;
 pub mod config;

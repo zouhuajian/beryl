@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Command sender: sends repair commands to workers.
+//! Legacy worker push-command hook.
 //!
-//! This module implements the client-side logic for sending commands from
-//! metadata to workers via gRPC.
+//! Current worker command delivery is heartbeat pull: workers poll metadata via
+//! heartbeat and the leader returns commands in the heartbeat response. This
+//! type is retained as a narrow legacy hook for existing wiring, but it does not
+//! create a worker gRPC client and does not push commands.
 
 use crate::error::MetadataResult;
-// Removed unused import: MetadataWorkerServiceClient
 use parking_lot::RwLock;
 use proto::metadata::*;
 use std::collections::HashMap;
@@ -16,7 +17,10 @@ use tokio::time::Duration;
 use tracing::{error, info, warn};
 use types::ids::WorkerId;
 
-/// Command sender for sending commands to workers.
+/// Legacy command-sender handle.
+///
+/// Worker commands are not delivered through this type in the current runtime.
+/// Actual delivery is heartbeat pull from `MetadataWorkerServiceImpl`.
 pub struct CommandSender {
     /// Worker address cache: worker_id -> address
     worker_addresses: Arc<RwLock<HashMap<WorkerId, String>>>,
@@ -46,23 +50,21 @@ impl CommandSender {
         addresses.remove(&worker_id);
     }
 
-    /// Send a command to a worker.
+    /// Retain the legacy push-command API without sending a command.
     ///
-    /// NOTE: System uses heartbeat pull mode - commands are returned via HeartbeatResponse.command.
-    /// This method is kept for compatibility but is a NOOP. Commands are sent through
-    /// the heartbeat pull mechanism (worker polls via Heartbeat RPC, metadata returns command in response).
+    /// Current command delivery is heartbeat pull: metadata returns commands in
+    /// `HeartbeatResponse.command` when a worker polls. This method is a no-op
+    /// legacy hook and must not be treated as a queued push path.
     pub async fn send_command(&self, worker_id: WorkerId, command: WorkerCommandProto) -> MetadataResult<()> {
-        // NOOP: Commands are sent via HeartbeatResponse.command (pull mode)
-        // No need to create gRPC client or push commands actively
-        // Worker will receive commands when it sends Heartbeat requests
+        // No-op: workers receive commands only through heartbeat pull.
         let _addresses = self.worker_addresses.read();
 
         info!(
             worker_id = worker_id.as_raw(),
-            "Command queued (will be sent via heartbeat pull mode)"
+            "Push command hook ignored; worker commands are delivered by heartbeat pull"
         );
 
-        // Log command for debugging
+        // Keep command shape visible in logs while making delivery semantics explicit.
         match command.command {
             Some(proto::metadata::worker_command_proto::Command::Replicate(replicate)) => {
                 info!(

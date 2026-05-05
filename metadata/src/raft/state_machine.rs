@@ -89,11 +89,7 @@ impl AppRaftStateMachine {
             return Ok(applied.result);
         }
 
-        // Apply command
         match command {
-            Command::UpdateCommittedLength { .. } => Err(MetadataError::InvalidArgument(
-                "Legacy file-based commands are no longer supported. Use inode-based commands instead.".to_string(),
-            )),
             Command::AllocateBlock {
                 inode_id,
                 block_id,

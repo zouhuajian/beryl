@@ -19,7 +19,7 @@ pub mod orphan;
 pub mod overrep;
 pub mod service;
 
-// Re-export for backward compatibility
+// Re-export the current maintenance surface from one module-level entrypoint.
 pub use gate::{GateCheckResult, GateState, TaskGate};
 pub use gc::{GcCandidate, GcService, BLOCKREPORT_CONVERGENCE_THRESHOLD};
 pub use intents::DeleteIntentBuilder;

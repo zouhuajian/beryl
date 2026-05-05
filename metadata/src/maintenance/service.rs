@@ -148,10 +148,10 @@ impl MaintenanceService {
         let mut block_ref_counts = HashMap::new();
         match storage.get_all_block_ref_counts() {
             Ok(ref_counts) => {
-                // Convert from global block_id refcount to data_handle_id:block_id format for backward compatibility
-                // Note: This is a simplified mapping - in production, should track data_handle_id from extents
+                // Preserve the legacy in-memory view from the global block refcount
+                // store. Authoritative file-layout mutations update refcounts in
+                // Raft apply batches; this cache must not be treated as authority.
                 for (block_id, count) in ref_counts {
-                    // For now, use data_handle_id from block_id (block_id contains data_handle_id)
                     let data_handle_id = block_id.data_handle_id;
                     let file_refs = block_ref_counts.entry(data_handle_id).or_insert_with(HashMap::new);
                     file_refs.insert(block_id, count as u32);
@@ -399,21 +399,29 @@ impl MaintenanceService {
         MaintenanceHandle { tasks }
     }
 
-    /// Increment reference count for a block.
+    /// Increment reference count through the legacy maintenance helper.
+    ///
+    /// No current metadata caller was found in the focused cleanup scan. This
+    /// direct RocksDB write path is not part of the authoritative Raft apply
+    /// closure used by file-layout mutations.
     pub fn increment_ref_count(&self, data_handle_id: DataHandleId, block_id: BlockId) {
         let mut ref_counts = self.block_ref_counts.write();
         let file_refs = ref_counts.entry(data_handle_id).or_default();
         let count = file_refs.entry(block_id).or_insert(0);
         *count += 1;
 
-        // Note: New refcount system is global per block_id, not per data_handle_id:block_id
-        // This method is kept for backward compatibility but uses global refcount
+        // Legacy helper only: production file-layout mutations update the global
+        // block refcount inside their authoritative apply batch.
         if let Err(e) = self.storage.put_block_ref_count(block_id, *count as u64) {
             warn!(data_handle_id = ?data_handle_id, block_id = %block_id, error = %e, "Failed to persist block ref count");
         }
     }
 
-    /// Decrement reference count for a block.
+    /// Decrement reference count through the legacy maintenance helper.
+    ///
+    /// No current metadata caller was found in the focused cleanup scan. This
+    /// direct RocksDB write path is not part of the authoritative Raft apply
+    /// closure used by file-layout mutations.
     pub fn decrement_ref_count(&self, data_handle_id: DataHandleId, block_id: BlockId) {
         let mut ref_counts = self.block_ref_counts.write();
         if let Some(file_refs) = ref_counts.get_mut(&data_handle_id) {
@@ -423,12 +431,14 @@ impl MaintenanceService {
 
                 if new_count == 0 {
                     file_refs.remove(&block_id);
-                    // Note: New refcount system is global per block_id
+                    // Legacy helper only: production file-layout mutations update the global
+                    // block refcount inside their authoritative apply batch.
                     if let Err(e) = self.storage.delete_block_ref_count(block_id) {
                         warn!(data_handle_id = ?data_handle_id, block_id = %block_id, error = %e, "Failed to delete block ref count");
                     }
                 } else {
-                    // Note: New refcount system is global per block_id
+                    // Legacy helper only: production file-layout mutations update the global
+                    // block refcount inside their authoritative apply batch.
                     if let Err(e) = self.storage.put_block_ref_count(block_id, new_count as u64) {
                         warn!(data_handle_id = ?data_handle_id, block_id = %block_id, error = %e, "Failed to persist block ref count");
                     }

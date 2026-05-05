@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use types::block::{BlockPlacement, BlockState};
 use types::fs::{FileAttrs, InodeId};
-use types::ids::{BlockId, ClientId, DataHandleId, MountId, ShardGroupId, ShardId};
+use types::ids::{BlockId, ClientId, MountId, ShardGroupId, ShardId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
 use types::CallId;
@@ -36,13 +36,6 @@ pub enum FileCommitMode {
 /// Raft command for state machine operations.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Command {
-    /// Update committed length.
-    UpdateCommittedLength {
-        dedup: DedupKey,
-        data_handle_id: DataHandleId,
-        committed_length: u64,
-    },
-
     /// Allocate a new block.
     AllocateBlock {
         dedup: DedupKey,
@@ -203,6 +196,9 @@ pub enum Command {
         lease_epoch: u64,
     },
     /// Set or update xattr.
+    ///
+    /// Internal command only: the current public FileSystemService surface does
+    /// not expose xattr RPCs.
     SetXattr {
         dedup: DedupKey,
         inode_id: InodeId,
@@ -212,6 +208,9 @@ pub enum Command {
         replace: bool,
     },
     /// Remove xattr.
+    ///
+    /// Internal command only: the current public FileSystemService surface does
+    /// not expose xattr RPCs.
     RemoveXattr {
         dedup: DedupKey,
         inode_id: InodeId,
@@ -223,8 +222,7 @@ impl Command {
     /// Get the dedup key for idempotency checking.
     pub fn dedup_key(&self) -> &DedupKey {
         match self {
-            Command::UpdateCommittedLength { dedup, .. }
-            | Command::AllocateBlock { dedup, .. }
+            Command::AllocateBlock { dedup, .. }
             | Command::CommitBlock { dedup, .. }
             | Command::UpdateBlockState { dedup, .. }
             | Command::AcquireLease { dedup, .. }
@@ -272,10 +270,6 @@ impl Command {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum FingerprintView {
-    UpdateCommittedLength {
-        data_handle_id: DataHandleId,
-        committed_length: u64,
-    },
     AllocateBlock {
         inode_id: InodeId,
         block_id: BlockId,
@@ -396,14 +390,6 @@ enum FingerprintView {
 impl From<&Command> for FingerprintView {
     fn from(cmd: &Command) -> Self {
         match cmd {
-            Command::UpdateCommittedLength {
-                data_handle_id,
-                committed_length,
-                ..
-            } => FingerprintView::UpdateCommittedLength {
-                data_handle_id: *data_handle_id,
-                committed_length: *committed_length,
-            },
             Command::AllocateBlock {
                 inode_id,
                 block_id,
@@ -606,6 +592,7 @@ impl From<&Command> for FingerprintView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use types::ids::DataHandleId;
     use uuid::Uuid;
 
     fn dedup(client: u64, call: u128) -> DedupKey {

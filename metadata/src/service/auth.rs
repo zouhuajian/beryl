@@ -7,8 +7,8 @@
 //! the default allow-all implementation. Current active behavior is the NONE
 //! allow-all mode. Vecton currently supports only the NONE permission mode in
 //! this metadata service. ACL and Ranger providers are
-//! expected future implementations and must be added as explicit
-//! `PermissionChecker` implementations with tests before they can be enabled.
+//! expected future implementations: their config values fail fast until explicit
+//! `PermissionChecker` implementations and tests exist.
 
 use crate::config::FileSystemAuthzMode;
 use crate::metrics::AUTHZ_ALLOW_NONE_TOTAL;

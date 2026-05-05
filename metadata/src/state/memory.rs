@@ -3,8 +3,8 @@
 
 //! In-memory state store implementation.
 //!
-//! This is a placeholder implementation using HashMap.
-//! TODO(state): replace with Raft-backed state machine.
+//! This HashMap-backed store is test support. Production metadata runtime uses
+//! `RaftStateStore`; do not treat this type as metadata authority.
 
 use super::{BlockMetaState, LeaseState, RouteEpoch, StateStore};
 use crate::error::{MetadataError, MetadataResult};
@@ -15,7 +15,7 @@ use types::block::{BlockPlacement, BlockState};
 use types::ids::{BlockId, ClientId};
 use types::lease::Lease;
 
-/// In-memory state store.
+/// In-memory `StateStore` for tests and lightweight helpers.
 pub struct MemoryStateStore {
     blocks: Arc<RwLock<HashMap<BlockId, BlockMetaState>>>,
     leases: Arc<RwLock<HashMap<BlockId, LeaseState>>>,

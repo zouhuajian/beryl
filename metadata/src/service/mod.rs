@@ -3,8 +3,9 @@
 
 //! Metadata service implementation.
 //!
-//! Implements MetadataClientService RPC handlers with proper context propagation
-//! and error handling.
+//! Implements the FileSystemService adapter, guard chain, FsCore domain layer,
+//! msync handler, and permission-checking extension point used by the metadata
+//! runtime.
 
 pub mod auth;
 mod core_util;
@@ -14,7 +15,6 @@ mod guard;
 mod msync;
 mod path_service;
 
-// pub use client_service::MetadataClientServiceImpl;
 pub use self::auth::{
     filesystem_permission_checker, NonePermissionChecker, PermissionBits, PermissionChecker, SetAttrPerm,
 };

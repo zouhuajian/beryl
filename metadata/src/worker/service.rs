@@ -944,9 +944,12 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    /// DEPRECATED: This method is deprecated. Use BlockReport instead for strongly-consistent
-    /// block presence reporting. This method is kept for backward compatibility but
-    /// does not perform any actual work.
+    /// Deprecated no-op presence RPC.
+    ///
+    /// `block_report` is the current authoritative input for block presence.
+    /// This retained worker RPC only acknowledges the request so older callers
+    /// do not mistake a successful transport response for committed presence
+    /// state.
     async fn report_presence(
         &self,
         request: Request<WorkerReportPresenceRequestProto>,
@@ -954,8 +957,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         let req = request.into_inner();
         let _caller_ctx = extract_and_inject_context(&req.header);
 
-        // Legacy presence reporting - just acknowledge (no-op)
-        // DEPRECATED: For strongly-consistent reporting, use BlockReport instead
+        // Deprecated no-op: block_report owns current block presence updates.
         let group_id = if let Some(ref header) = req.header {
             if header.group_id != 0 {
                 Some(header.group_id)

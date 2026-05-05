@@ -5,6 +5,8 @@
 //!
 //! This module provides metadata operations (list/stat/rename/delete) that
 //! proxy requests to the underlying UFS based on mount table resolution.
+//! The runtime constructs this proxy today, but `MetadataFileSystemServiceImpl`
+//! does not call it on the namespace read/write path.
 
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::MountTable;
