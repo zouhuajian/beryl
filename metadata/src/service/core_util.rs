@@ -282,22 +282,6 @@ fn core_failure_from_canonical_error(
     CoreFailure::new(err, group_id, mount_epoch, route_epoch, Vec::new())
 }
 
-pub(crate) fn core_failure_from_error_detail(
-    ctx: &RequestContext,
-    detail: proto::common::ErrorDetailProto,
-    group_id: Option<u64>,
-    mount_epoch: Option<u64>,
-    route_epoch: Option<u64>,
-) -> CoreFailure {
-    core_failure_from_canonical_error(
-        ctx,
-        proto::convert::error_detail_to_canonical(&detail),
-        group_id,
-        mount_epoch,
-        route_epoch,
-    )
-}
-
 pub(crate) fn need_refresh_core_failure(
     ctx: &RequestContext,
     rpc_code: RpcErrorCode,

@@ -307,6 +307,8 @@ pub struct RenewLeaseInput {
     pub file_handle: u64,
     pub lease_id: Option<LeaseId>,
     pub lease_epoch: u64,
+    pub open_epoch: u64,
+    pub fencing_token: Option<PresentedFencingToken>,
     pub freshness: Freshness,
 }
 
@@ -332,19 +334,3 @@ pub struct CloseWriteOutput {
     pub committed_size: u64,
     pub file_version: Option<u64>,
 }
-
-#[derive(Clone, Debug)]
-pub struct FsyncBarrierInput {
-    pub ctx: RequestContext,
-    pub inode_id: InodeId,
-    pub file_handle: Option<u64>,
-    pub lease_id: Option<LeaseId>,
-    pub lease_epoch: Option<u64>,
-    pub fencing_token: Option<PresentedFencingToken>,
-    pub target_size: Option<u64>,
-    pub flags: i32,
-    pub freshness: Freshness,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct FsyncBarrierOutput;

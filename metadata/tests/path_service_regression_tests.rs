@@ -20,8 +20,8 @@ use proto::common::{
 };
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::{
-    AppendFileRequestProto, CreateDirectoryRequestProto, DeleteRequestProto, GetStatusRequestProto, HflushRequestProto,
-    WriteHandleProto,
+    AppendFileRequestProto, CreateDirectoryRequestProto, CreateDispositionProto, CreateFileRequestProto,
+    DeleteRequestProto, GetStatusRequestProto, HflushRequestProto, HsyncRequestProto, WriteHandleProto,
 };
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
@@ -93,19 +93,6 @@ fn assert_not_leader(err: &proto::common::ErrorDetailProto) {
         Some(ErrorCodeProto::RpcCode(code)) if code == RpcErrorCodeProto::RpcErrCodeNotLeader as i32 => {}
         other => panic!("expected NotLeader rpc code, got {:?}", other),
     }
-}
-
-fn assert_session_invalid_fencing_refresh(err: &proto::common::ErrorDetailProto) {
-    assert_eq!(err.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-    match err.code {
-        Some(ErrorCodeProto::RpcCode(code)) if code == RpcErrorCodeProto::RpcErrCodeFencing as i32 => {}
-        other => panic!("expected Fencing rpc code, got {:?}", other),
-    }
-    assert!(
-        err.message.contains("write handle not found"),
-        "expected missing write-handle detail in message: {}",
-        err.message
-    );
 }
 
 fn build_env(
@@ -403,7 +390,7 @@ async fn root_mount_data_io_gate_is_enforced() {
 }
 
 #[tokio::test]
-async fn hflush_missing_handle_preserves_refresh_header_contract() {
+async fn hflush_is_not_supported() {
     let env = build_env(
         "/mnt/test",
         DataIoPolicy::Allow,
@@ -411,6 +398,18 @@ async fn hflush_missing_handle_preserves_refresh_header_contract() {
         Some(Arc::new(AlwaysLeader)),
         |_| Arc::new(NonePermissionChecker),
     );
+    let file_inode_id = InodeId::new(9001);
+    let data_handle_id = DataHandleId::new(9001);
+    let mut attrs = FileAttrs::new();
+    attrs.size = 123;
+    env.storage
+        .put_inode(&Inode::new_file(file_inode_id, attrs, env.mount_id, data_handle_id))
+        .expect("put test file inode");
+    env.storage
+        .put_layout(file_inode_id, FileLayout::new(4096, 4096, 1))
+        .expect("put test layout");
+    let before_inode = env.storage.get_inode(file_inode_id).unwrap();
+    let before_layout = env.storage.get_layout(file_inode_id).unwrap();
 
     let response = FileSystemServiceProto::hflush(
         &env.service,
@@ -427,7 +426,86 @@ async fn hflush_missing_handle_preserves_refresh_header_contract() {
     .expect("transport status must remain OK")
     .into_inner();
     let err = header_error(response.header);
-    assert_session_invalid_fencing_refresh(&err);
+    assert_fs_errno(&err, FsErrnoProto::FsErrnoEnotsup);
+    assert!(err.message.contains("Hflush is reserved"));
+    assert_eq!(env.storage.get_inode(file_inode_id).unwrap(), before_inode);
+    assert_eq!(env.storage.get_layout(file_inode_id).unwrap(), before_layout);
+}
+
+#[tokio::test]
+async fn hsync_is_not_supported() {
+    let env = build_env(
+        "/mnt/test",
+        DataIoPolicy::Allow,
+        None,
+        Some(Arc::new(AlwaysLeader)),
+        |_| Arc::new(NonePermissionChecker),
+    );
+    let file_inode_id = InodeId::new(9002);
+    let data_handle_id = DataHandleId::new(9002);
+    let mut attrs = FileAttrs::new();
+    attrs.size = 456;
+    env.storage
+        .put_inode(&Inode::new_file(file_inode_id, attrs, env.mount_id, data_handle_id))
+        .expect("put test file inode");
+    env.storage
+        .put_layout(file_inode_id, FileLayout::new(4096, 4096, 1))
+        .expect("put test layout");
+    let before_inode = env.storage.get_inode(file_inode_id).unwrap();
+    let before_layout = env.storage.get_layout(file_inode_id).unwrap();
+
+    let response = FileSystemServiceProto::hsync(
+        &env.service,
+        Request::new(HsyncRequestProto {
+            header: header(19),
+            write_handle: Some(WriteHandleProto {
+                handle_id: 99,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+    let err = header_error(response.header);
+    assert_fs_errno(&err, FsErrnoProto::FsErrnoEnotsup);
+    assert!(err.message.contains("Hsync is reserved"));
+    assert_eq!(env.storage.get_inode(file_inode_id).unwrap(), before_inode);
+    assert_eq!(env.storage.get_layout(file_inode_id).unwrap(), before_layout);
+}
+
+#[tokio::test]
+async fn create_file_failure_leaves_no_inode() {
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+
+    let response = FileSystemServiceProto::create_file(
+        &env.service,
+        Request::new(CreateFileRequestProto {
+            header: header(20),
+            path: "/mnt/test/new-file".to_string(),
+            attrs: Some(proto::fs::FileAttrsProto {
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+                ..Default::default()
+            }),
+            layout: Some(proto::common::FileLayoutProto {
+                block_size: 4096,
+                chunk_size: 4096,
+                replication: 1,
+            }),
+            disposition: CreateDispositionProto::CreateNew as i32,
+            desired_len: Some(4096),
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+
+    let err = header_error(response.header);
+    assert_eq!(err.error_class, ErrorClassProto::ErrorClassRetryable as i32);
+    assert_eq!(env.storage.get_dentry(env.root_inode_id, "new-file").unwrap(), None);
 }
 
 #[tokio::test]

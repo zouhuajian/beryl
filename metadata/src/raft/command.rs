@@ -18,6 +18,21 @@ use types::layout::FileLayout;
 use types::lease::FencingToken;
 use types::CallId;
 
+/// File layout publication semantics for a committed write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileCommitMode {
+    /// Replace the existing authoritative file layout with the committed blocks.
+    ///
+    /// Used by CreateFile(CREATE_NEW) and CreateFile(OVERWRITE). Even CREATE_NEW
+    /// publishes a complete new layout rather than appending to prior state.
+    Replace,
+    /// Append the committed blocks after the existing authoritative file layout.
+    ///
+    /// Used by AppendFile. The committed block range must start from the
+    /// current file size / append base size.
+    Append,
+}
+
 /// Raft command for state machine operations.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Command {
@@ -177,7 +192,7 @@ pub enum Command {
         lease_id: types::ids::LeaseId,
         open_epoch: u64,
         lease_epoch: u64,
-        replace_extents: bool,
+        commit_mode: FileCommitMode,
     },
     /// Truncate file (shrink).
     Truncate {
@@ -357,6 +372,7 @@ enum FingerprintView {
         lease_id: types::ids::LeaseId,
         open_epoch: u64,
         lease_epoch: u64,
+        commit_mode: FileCommitMode,
     },
     Truncate {
         inode_id: InodeId,
@@ -542,6 +558,7 @@ impl From<&Command> for FingerprintView {
                 lease_id,
                 open_epoch,
                 lease_epoch,
+                commit_mode,
                 ..
             } => FingerprintView::CloseWrite {
                 inode_id: *inode_id,
@@ -550,6 +567,7 @@ impl From<&Command> for FingerprintView {
                 lease_id: *lease_id,
                 open_epoch: *open_epoch,
                 lease_epoch: *lease_epoch,
+                commit_mode: *commit_mode,
             },
             Command::Truncate {
                 inode_id,
@@ -605,6 +623,26 @@ mod tests {
         }
     }
 
+    fn close_write_command(dedup: DedupKey, commit_mode: FileCommitMode) -> Command {
+        Command::CloseWrite {
+            dedup,
+            inode_id: InodeId::new(20),
+            extents: vec![types::fs::Extent {
+                file_offset: 0,
+                block_id: BlockId::new(DataHandleId::new(30), types::ids::BlockIndex::new(0)),
+                block_offset: 0,
+                len: 64,
+                file_version: None,
+                block_stamp: None,
+            }],
+            final_size: 64,
+            lease_id: types::ids::LeaseId::new(40),
+            open_epoch: 50,
+            lease_epoch: 60,
+            commit_mode,
+        }
+    }
+
     #[test]
     fn fingerprint_is_stable_for_same_dedup_and_same_payload() {
         let dedup = dedup(7, 1);
@@ -648,5 +686,14 @@ mod tests {
         };
 
         assert_ne!(unlink.fingerprint(), rmdir.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_includes_commit_mode() {
+        let dedup = dedup(7, 7);
+        let replace = close_write_command(dedup.clone(), FileCommitMode::Replace);
+        let append = close_write_command(dedup, FileCommitMode::Append);
+
+        assert_ne!(replace.fingerprint(), append.fingerprint());
     }
 }

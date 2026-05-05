@@ -16,7 +16,7 @@ mod state_machine_store;
 mod storage;
 mod types;
 
-pub use command::Command;
+pub use command::{Command, FileCommitMode};
 pub use log_store::{AppLogReader, AppLogStorage};
 pub use network::{Network, NetworkFactory};
 pub use node::AppRaftNode;

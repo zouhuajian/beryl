@@ -9,8 +9,7 @@ mod read;
 mod write_session;
 
 use super::core_util::{
-    core_failure_from_error_detail, core_failure_from_metadata_error, fatal_fs_core_failure, need_refresh_core_failure,
-    terminal_rpc_core_failure,
+    core_failure_from_metadata_error, fatal_fs_core_failure, need_refresh_core_failure, terminal_rpc_core_failure,
 };
 use super::domain::{CoreFailure, CoreResult, CoreSuccess, Freshness, PresentedFencingToken, RequestContext};
 use crate::error::{MetadataError, MetadataResult};
@@ -59,7 +58,7 @@ pub(crate) struct FsCore {
     write_session_manager: Arc<crate::write_session::WriteSessionManager>,
     worker_manager: Option<Arc<crate::worker::WorkerManager>>,
     inode_lease_manager: Arc<crate::inode_lease::InodeLeaseManager>,
-    worker_commit_hook: SharedWorkerCommitHook,
+    _worker_commit_hook: SharedWorkerCommitHook,
 }
 
 impl FsCore {
@@ -79,7 +78,7 @@ impl FsCore {
             write_session_manager,
             worker_manager: None,
             inode_lease_manager,
-            worker_commit_hook,
+            _worker_commit_hook: worker_commit_hook,
         }
     }
 
@@ -176,23 +175,6 @@ impl FsCore {
         Err(core_failure_from_metadata_error(
             ctx,
             err,
-            group_id,
-            mount_epoch,
-            route_epoch,
-        ))
-    }
-
-    fn failure_from_error_detail_with_route_epoch<T>(
-        &self,
-        ctx: &RequestContext,
-        detail: proto::common::ErrorDetailProto,
-        group_id: Option<u64>,
-        mount_epoch: Option<u64>,
-        route_epoch: Option<u64>,
-    ) -> CoreResult<T> {
-        Err(core_failure_from_error_detail(
-            ctx,
-            detail,
             group_id,
             mount_epoch,
             route_epoch,

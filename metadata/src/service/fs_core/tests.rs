@@ -7,7 +7,8 @@ use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
 use crate::raft::{AppRaftNode, AppRaftStateMachine, Command, DedupKey, RocksDBStorage};
 use crate::service::domain::{
     AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CommittedBlock, CoreResult, Freshness,
-    GetFileLayoutInput, OpenWriteInput, PresentedFencingToken, RequestContext, SessionKey, UnlinkInput, WriteTarget,
+    GetFileLayoutInput, OpenWriteInput, PresentedFencingToken, RenewLeaseInput, RequestContext, SessionKey,
+    UnlinkInput, WriteTarget,
 };
 use crate::state::{BlockMetaState, LeaseState, MemoryStateStore, RouteEpoch};
 use crate::worker::{HealthStatus, WorkerManager};
@@ -295,6 +296,22 @@ fn abort_input_for_session(
     ctx: RequestContext,
 ) -> AbortWriteInput {
     AbortWriteInput {
+        ctx,
+        file_handle,
+        lease_id: Some(session.lease_id),
+        lease_epoch: session.lease_epoch,
+        open_epoch: session.open_epoch,
+        fencing_token: Some(presented_session_token(session)),
+        freshness: Freshness::default(),
+    }
+}
+
+fn renew_input_for_session(
+    session: &crate::write_session::WriteSession,
+    file_handle: u64,
+    ctx: RequestContext,
+) -> RenewLeaseInput {
+    RenewLeaseInput {
         ctx,
         file_handle,
         lease_id: Some(session.lease_id),
@@ -624,6 +641,128 @@ async fn abort_checks_handle() {
         .inode_lease_manager_for_test()
         .get_active_lease(inode_id)
         .is_some());
+}
+
+#[tokio::test]
+async fn renew_lease_checks_open_epoch() {
+    let mount_id = MountId::new(44);
+    let inode_id = InodeId::new(440);
+    let fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(6));
+    let file_handle = install_write_session(&fs_core, inode_id, mount_id);
+    let session = fs_core
+        .write_session_for_handle(file_handle)
+        .expect("session should be installed");
+
+    fs_core
+        .execute_renew_inode_lease(renew_input_for_session(&session, file_handle, request_context()))
+        .await
+        .expect("valid full write handle should renew lease");
+
+    let mut stale_open = renew_input_for_session(&session, file_handle, request_context());
+    stale_open.open_epoch += 1;
+    let failure = fs_core
+        .execute_renew_inode_lease(stale_open)
+        .await
+        .expect_err("open_epoch mismatch must be rejected");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::EpochMismatch))
+    );
+    assert_eq!(failure.error.reason, Some(RefreshReason::SessionInvalid));
+}
+
+#[tokio::test]
+async fn renew_lease_checks_fencing() {
+    let mount_id = MountId::new(45);
+    let inode_id = InodeId::new(450);
+    let fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(6));
+    let file_handle = install_write_session(&fs_core, inode_id, mount_id);
+    let session = fs_core
+        .write_session_for_handle(file_handle)
+        .expect("session should be installed");
+
+    let mut stale_fencing = renew_input_for_session(&session, file_handle, request_context());
+    stale_fencing.fencing_token = Some(PresentedFencingToken {
+        block_id: Some(BlockId::new(DataHandleId::new(999_999), BlockIndex::new(0))),
+        owner: session.fencing_token.owner.as_raw(),
+        epoch: session.fencing_token.epoch,
+    });
+    let failure = fs_core
+        .execute_renew_inode_lease(stale_fencing)
+        .await
+        .expect_err("fencing token mismatch must be rejected");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
+    );
+    assert_eq!(failure.error.reason, Some(RefreshReason::SessionInvalid));
+
+    let mut missing_fencing = renew_input_for_session(&session, file_handle, request_context());
+    missing_fencing.fencing_token = None;
+    let missing = fs_core
+        .execute_renew_inode_lease(missing_fencing)
+        .await
+        .expect_err("missing fencing token must be rejected");
+
+    assert_eq!(
+        missing.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
+    );
+    assert_eq!(missing.error.reason, Some(RefreshReason::SessionInvalid));
+}
+
+#[tokio::test]
+async fn renew_lease_rejects_lease_epoch_mismatch() {
+    let mount_id = MountId::new(46);
+    let inode_id = InodeId::new(460);
+    let fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(6));
+    let file_handle = install_write_session(&fs_core, inode_id, mount_id);
+    let session = fs_core
+        .write_session_for_handle(file_handle)
+        .expect("session should be installed");
+
+    let mut stale = renew_input_for_session(&session, file_handle, request_context());
+    stale.lease_epoch += 1;
+    let failure = fs_core
+        .execute_renew_inode_lease(stale)
+        .await
+        .expect_err("lease_epoch mismatch must be rejected");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
+    );
+    assert_eq!(failure.error.reason, Some(RefreshReason::SessionInvalid));
+}
+
+#[tokio::test]
+async fn renew_lease_rejects_missing_or_stale_handle() {
+    let fs_core = fs_core_with_mount(MountId::new(47), 9, ShardGroupId::new(6));
+
+    let failure = fs_core
+        .execute_renew_inode_lease(RenewLeaseInput {
+            ctx: request_context(),
+            file_handle: 404,
+            lease_id: Some(LeaseId::new(1)),
+            lease_epoch: 1,
+            open_epoch: 1,
+            fencing_token: Some(PresentedFencingToken {
+                block_id: Some(BlockId::new(DataHandleId::new(1), BlockIndex::new(0))),
+                owner: 7,
+                epoch: 1,
+            }),
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect_err("missing write handle must be rejected");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
+    );
+    assert_eq!(failure.error.reason, Some(RefreshReason::SessionInvalid));
 }
 
 #[tokio::test]
@@ -996,7 +1135,7 @@ async fn append_uses_base_size() {
 }
 
 #[tokio::test]
-async fn close_write_success_replay_after_session_cleanup_returns_original_result() {
+async fn replay_keeps_replace_commit_mode() {
     let dir = TempDir::new().unwrap();
     let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
     let mount_id = MountId::new(54);
@@ -1087,6 +1226,54 @@ async fn close_write_success_replay_after_session_cleanup_returns_original_resul
             .unwrap(),
         block_ref_after_first
     );
+}
+
+#[tokio::test]
+async fn replay_keeps_append_commit_mode() {
+    let env = write_flow_env(64).await;
+    let open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(64),
+            mode: crate::inode_lease::WriteMode::Append,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("append open should succeed");
+    let key = open.payload.session_key;
+    let target = add_block_for_key(&env.fs_core, &key, 64).await;
+    assert_eq!(target.file_offset, 64);
+    let request = CloseWriteInput {
+        ctx: request_context(),
+        file_handle: key.file_handle,
+        lease_id: Some(key.lease_id),
+        lease_epoch: key.lease_epoch,
+        open_epoch: key.open_epoch,
+        fencing_token: Some(presented_key_token(&key)),
+        intent: CloseWriteIntent {
+            committed_blocks: vec![committed_block(target.block_id, target.file_offset, target.len)],
+            final_size: 128,
+        },
+        freshness: Freshness::default(),
+    };
+
+    let first = env
+        .fs_core
+        .execute_close_write(request.clone())
+        .await
+        .expect("append close should succeed");
+    assert_eq!(first.payload.committed_size, 128);
+    assert!(env.fs_core.write_session_for_handle(key.file_handle).is_none());
+
+    let replay = env
+        .fs_core
+        .execute_close_write(request)
+        .await
+        .expect("append close replay should recover original commit mode");
+    assert_eq!(replay.payload.committed_size, first.payload.committed_size);
+    assert!(env.fs_core.write_session_for_handle(key.file_handle).is_none());
 }
 
 #[tokio::test]

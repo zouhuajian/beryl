@@ -12,15 +12,15 @@
 
 use super::domain::{
     AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CommittedBlock, CreateInput, FileRange,
-    Freshness, FsyncBarrierInput, GetAttrInput, GetFileLayoutInput, MkdirInput, OpenWriteInput, ReadDirInput,
-    RenameInput, RenewLeaseInput, RmdirInput, UnlinkInput,
+    Freshness, GetAttrInput, GetFileLayoutInput, MkdirInput, OpenWriteInput, ReadDirInput, RenameInput,
+    RenewLeaseInput, RmdirInput, UnlinkInput,
 };
 use super::guard::{GuardChain, GuardFailure, LeadershipChecker};
 use super::MsyncHandler;
 use super::{
     fencing_to_proto, file_attrs_from_proto, file_attrs_to_proto, file_layout_from_proto, header_from_canonical_error,
-    header_from_core_failure, lease_id_from_proto, lease_id_to_proto, location_to_proto, need_refresh_header,
-    ok_header_from_core_success, presented_fencing_from_proto, request_context_from_proto, write_target_to_proto,
+    header_from_core_failure, lease_id_from_proto, lease_id_to_proto, location_to_proto, ok_header_from_core_success,
+    presented_fencing_from_proto, request_context_from_proto, write_target_to_proto,
 };
 use super::{FsCore, PermissionBits, PermissionChecker, SharedWorkerCommitHook};
 use crate::error::{to_canonical_fs, MetadataError};
@@ -1099,6 +1099,15 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                             )
                         }
                     };
+                    if let Some(failure) = self.fs_core.preflight_open_write_runtime(
+                        &req_ctx,
+                        req.desired_len,
+                        layout,
+                        Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                        Some(resolved.mount_ctx.mount_epoch),
+                    ) {
+                        return error_response!(CreateFileResponseProto, header_from_core_failure(&req_ctx, &failure));
+                    }
                     let create = self
                         .fs_core
                         .execute_create(CreateInput {
@@ -1186,6 +1195,15 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     )
                 }
             };
+            if let Some(failure) = self.fs_core.preflight_open_write_runtime(
+                &req_ctx,
+                req.desired_len,
+                layout,
+                Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                Some(resolved.mount_ctx.mount_epoch),
+            ) {
+                return error_response!(CreateFileResponseProto, header_from_core_failure(&req_ctx, &failure));
+            }
             match self
                 .fs_core
                 .execute_create(CreateInput {
@@ -1549,6 +1567,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 file_handle: handle.handle_id,
                 lease_id: lease_id_from_proto(handle.lease_id),
                 lease_epoch: handle.lease_epoch,
+                open_epoch: handle.open_epoch,
+                fencing_token: presented_fencing_from_proto(handle.fencing_token),
                 freshness: Self::freshness_from_header(&req.header),
             })
             .await
@@ -1574,54 +1594,17 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             HflushResponseProto,
             self.guard_chain.check_meta_write(&req_ctx)
         );
-        let handle = match Self::write_handle_or_error(&req.header, req.write_handle) {
-            Ok(handle) => handle,
-            Err(header) => return response_with_header!(HflushResponseProto::default(), *header),
-        };
-        let session = match self.fs_core.write_session_for_handle(handle.handle_id) {
-            Some(session) => session,
-            None => {
-                let header = need_refresh_header(
-                    &req.header,
-                    common::header::RpcErrorCode::Fencing,
-                    common::error::canonical::RefreshReason::SessionInvalid,
-                    "write handle not found; refresh and reopen before replaying Hflush",
-                    None,
-                    None,
-                );
-                return response_with_header!(HflushResponseProto::default(), header);
-            }
-        };
-        guard_or_error!(
-            self,
-            req,
+        error_response!(
             HflushResponseProto,
-            self.guard_chain.check_data_write(&req_ctx, session.mount_id)
-        );
-        match self
-            .fs_core
-            .execute_hflush(FsyncBarrierInput {
-                ctx: req_ctx.clone(),
-                inode_id: session.inode_id,
-                file_handle: Some(handle.handle_id),
-                lease_id: lease_id_from_proto(handle.lease_id),
-                lease_epoch: Some(handle.lease_epoch),
-                fencing_token: presented_fencing_from_proto(handle.fencing_token),
-                target_size: req.target_size,
-                flags: req.flags as i32,
-                freshness: Self::freshness_from_header(&req.header),
-            })
-            .await
-        {
-            Ok(success) => response_with_header!(
-                HflushResponseProto::default(),
-                ok_header_from_core_success(&req_ctx, &success)
-            ),
-            Err(failure) => response_with_header!(
-                HflushResponseProto::default(),
-                header_from_core_failure(&req_ctx, &failure)
-            ),
-        }
+            self.header_from_path_error(
+                &req.header,
+                MetadataError::NotSupported(
+                    "Hflush is reserved but not supported until metadata visibility barrier semantics are defined"
+                        .to_string(),
+                ),
+                None,
+            )
+        )
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -1634,54 +1617,17 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             HsyncResponseProto,
             self.guard_chain.check_meta_write(&req_ctx)
         );
-        let handle = match Self::write_handle_or_error(&req.header, req.write_handle) {
-            Ok(handle) => handle,
-            Err(header) => return response_with_header!(HsyncResponseProto::default(), *header),
-        };
-        let session = match self.fs_core.write_session_for_handle(handle.handle_id) {
-            Some(session) => session,
-            None => {
-                let header = need_refresh_header(
-                    &req.header,
-                    common::header::RpcErrorCode::Fencing,
-                    common::error::canonical::RefreshReason::SessionInvalid,
-                    "write handle not found; refresh and reopen before replaying Hsync",
-                    None,
-                    None,
-                );
-                return response_with_header!(HsyncResponseProto::default(), header);
-            }
-        };
-        guard_or_error!(
-            self,
-            req,
+        error_response!(
             HsyncResponseProto,
-            self.guard_chain.check_data_write(&req_ctx, session.mount_id)
-        );
-        match self
-            .fs_core
-            .execute_hsync(FsyncBarrierInput {
-                ctx: req_ctx.clone(),
-                inode_id: session.inode_id,
-                file_handle: Some(handle.handle_id),
-                lease_id: lease_id_from_proto(handle.lease_id),
-                lease_epoch: Some(handle.lease_epoch),
-                fencing_token: presented_fencing_from_proto(handle.fencing_token),
-                target_size: req.target_size,
-                flags: req.flags as i32,
-                freshness: Self::freshness_from_header(&req.header),
-            })
-            .await
-        {
-            Ok(success) => response_with_header!(
-                HsyncResponseProto::default(),
-                ok_header_from_core_success(&req_ctx, &success)
-            ),
-            Err(failure) => response_with_header!(
-                HsyncResponseProto::default(),
-                header_from_core_failure(&req_ctx, &failure)
-            ),
-        }
+            self.header_from_path_error(
+                &req.header,
+                MetadataError::NotSupported(
+                    "Hsync is reserved but not supported until metadata durability barrier semantics are defined"
+                        .to_string(),
+                ),
+                None,
+            )
+        )
     }
 }
 

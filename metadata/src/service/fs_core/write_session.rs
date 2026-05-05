@@ -3,21 +3,22 @@
 
 use super::{CoreWriteOp, FsCore};
 use crate::error::{MetadataError, MetadataResult};
-use crate::raft::{AppDataResponse, Command, DedupKey, FsCommandResult, RocksDBStorage};
+use crate::raft::{
+    AppDataResponse, Command, CommandFingerprint, DedupKey, FileCommitMode, FsCommandResult, RocksDBStorage,
+};
 use crate::service::domain::{
     AbortWriteInput, AbortWriteOutput, AddBlockInput, AddBlockOutput, CloseWriteInput, CloseWriteIntent,
-    CloseWriteOutput, CommittedBlock, CoreResult, FsyncBarrierInput, FsyncBarrierOutput, OpenWriteInput,
-    OpenWriteOutput, RenewLeaseInput, RenewLeaseOutput, SessionKey, WorkerHint, WriteTarget,
+    CloseWriteOutput, CommittedBlock, CoreResult, OpenWriteInput, OpenWriteOutput, RenewLeaseInput, RenewLeaseOutput,
+    RequestContext, SessionKey, WorkerHint, WriteTarget,
 };
 use common::error::canonical::{RefreshHint, RefreshReason, WorkerEndpointHint};
 use common::header::RpcErrorCode;
 use proto::metadata::WriteTargetProto;
-use proto::worker::worker_data_service_client::WorkerDataServiceClient;
-use proto::worker::CommitWriteRequestProto;
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use types::fs::{Extent, FsErrorCode};
 use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+use types::layout::FileLayout;
 use types::lease::FencingToken;
 
 impl FsCore {
@@ -37,24 +38,23 @@ impl FsCore {
         WriteSessionCoordinator::new(self).execute_open_write(req).await
     }
 
+    pub(crate) fn preflight_open_write_runtime(
+        &self,
+        ctx: &RequestContext,
+        desired_len: Option<u64>,
+        layout: FileLayout,
+        group_id: Option<u64>,
+        mount_epoch: Option<u64>,
+    ) -> Option<crate::service::domain::CoreFailure> {
+        WriteSessionCoordinator::new(self).preflight_open_write_runtime(ctx, desired_len, layout, group_id, mount_epoch)
+    }
+
     pub(crate) async fn execute_add_block(&self, req: AddBlockInput) -> CoreResult<AddBlockOutput> {
         WriteSessionCoordinator::new(self).execute_add_block(req).await
     }
 
     pub(crate) async fn execute_close_write(&self, req: CloseWriteInput) -> CoreResult<CloseWriteOutput> {
         WriteSessionCoordinator::new(self).execute_close_write(req).await
-    }
-
-    pub(crate) async fn execute_fsync(&self, req: FsyncBarrierInput) -> CoreResult<FsyncBarrierOutput> {
-        WriteSessionCoordinator::new(self).execute_fsync(req).await
-    }
-
-    pub(crate) async fn execute_hsync(&self, req: FsyncBarrierInput) -> CoreResult<FsyncBarrierOutput> {
-        self.execute_fsync(req).await
-    }
-
-    pub(crate) async fn execute_hflush(&self, req: FsyncBarrierInput) -> CoreResult<FsyncBarrierOutput> {
-        self.execute_fsync(req).await
     }
 }
 
@@ -103,6 +103,13 @@ struct WriteSessionCoordinator<'a> {
 impl<'a> WriteSessionCoordinator<'a> {
     fn new(core: &'a FsCore) -> Self {
         Self { core }
+    }
+
+    fn commit_mode_for_session(session: &crate::write_session::WriteSession) -> FileCommitMode {
+        match session.mode {
+            crate::inode_lease::WriteMode::Write => FileCommitMode::Replace,
+            crate::inode_lease::WriteMode::Append => FileCommitMode::Append,
+        }
     }
 
     async fn execute_abort_write(&self, req: AbortWriteInput) -> CoreResult<AbortWriteOutput> {
@@ -293,6 +300,50 @@ impl<'a> WriteSessionCoordinator<'a> {
             );
         }
 
+        if req.open_epoch != session.open_epoch {
+            return self.core.session_terminal_failure(
+                &req.ctx,
+                RefreshReason::SessionInvalid,
+                RpcErrorCode::EpochMismatch,
+                format!(
+                    "open_epoch mismatch: expected {}, got {}; RenewLease cannot be replayed automatically",
+                    session.open_epoch, req.open_epoch,
+                ),
+                group_id,
+                mount_epoch,
+            );
+        }
+
+        let req_token = match req.fencing_token.as_ref() {
+            Some(token) => token,
+            None => {
+                return self.core.session_terminal_failure(
+                    &req.ctx,
+                    RefreshReason::SessionInvalid,
+                    RpcErrorCode::Fencing,
+                    format!(
+                        "missing fencing_token for handle={}; RenewLease cannot be replayed automatically",
+                        file_handle,
+                    ),
+                    group_id,
+                    mount_epoch,
+                );
+            }
+        };
+        if !FsCore::fencing_token_matches_session(&session, req_token) {
+            return self.core.session_terminal_failure(
+                &req.ctx,
+                RefreshReason::SessionInvalid,
+                RpcErrorCode::Fencing,
+                format!(
+                    "fencing_token mismatch for handle={}; RenewLease cannot be replayed automatically",
+                    file_handle,
+                ),
+                group_id,
+                mount_epoch,
+            );
+        }
+
         let expires_at_ms = match self
             .core
             .inode_lease_manager
@@ -423,7 +474,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             None => {
                 return self.core.failure_from_error(
                     &req.ctx,
-                    MetadataError::Internal("Worker manager not available".to_string()),
+                    MetadataError::ServiceUnavailable("Worker manager not available".to_string()),
                     group_id,
                     mount_epoch,
                 );
@@ -471,7 +522,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             if worker_endpoints.is_empty() {
                 return self.core.failure_from_error(
                     &req.ctx,
-                    MetadataError::Internal("selected placement has no live worker endpoints".to_string()),
+                    MetadataError::ServiceUnavailable("selected placement has no live worker endpoints".to_string()),
                     group_id,
                     mount_epoch,
                 );
@@ -1141,7 +1192,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             lease_id: session.lease_id,
             open_epoch: session.open_epoch,
             lease_epoch: request_lease_epoch,
-            replace_extents: session.mode == crate::inode_lease::WriteMode::Write,
+            commit_mode: Self::commit_mode_for_session(&session),
         };
         match self.core.propose_fs_write_command(CoreWriteOp::SetAttr, command).await {
             Ok(FsCommandResult::Ok(_)) => {}
@@ -1193,10 +1244,11 @@ impl<'a> WriteSessionCoordinator<'a> {
             Err(err) => return Some(self.core.failure_from_error(&req.ctx, err, None, None)),
         };
 
-        let (command, group_id, mount_epoch) = match self.close_write_replay_command(req, dedup, storage) {
-            Ok(replay) => replay,
-            Err(err) => return Some(self.core.failure_from_error(&req.ctx, err, None, None)),
-        };
+        let (command, group_id, mount_epoch) =
+            match self.close_write_replay_command(req, dedup, storage, applied.fingerprint) {
+                Ok(replay) => replay,
+                Err(err) => return Some(self.core.failure_from_error(&req.ctx, err, None, None)),
+            };
         let fingerprint = command.fingerprint();
         if applied.fingerprint != fingerprint {
             return Some(self.core.failure_from_error(
@@ -1245,6 +1297,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         req: &CloseWriteInput,
         dedup: &DedupKey,
         storage: &RocksDBStorage,
+        applied_fingerprint: CommandFingerprint,
     ) -> MetadataResult<(Command, Option<u64>, Option<u64>)> {
         let lease_id = req
             .lease_id
@@ -1269,7 +1322,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {}", inode_id)))?;
         let (group_id, mount_epoch) = self.core.mount_hints_for_mount(inode.mount_id);
 
-        let extents = req
+        let extents: Vec<_> = req
             .intent
             .committed_blocks
             .iter()
@@ -1283,367 +1336,87 @@ impl<'a> WriteSessionCoordinator<'a> {
             })
             .collect();
 
-        Ok((
-            Command::CloseWrite {
-                dedup: dedup.clone(),
-                inode_id,
-                extents,
-                final_size: req.intent.final_size,
-                lease_id,
-                open_epoch: req.open_epoch,
-                lease_epoch: req.lease_epoch,
-                replace_extents: false,
-            },
-            group_id,
-            mount_epoch,
-        ))
+        let build_command = |commit_mode| Command::CloseWrite {
+            dedup: dedup.clone(),
+            inode_id,
+            extents: extents.clone(),
+            final_size: req.intent.final_size,
+            lease_id,
+            open_epoch: req.open_epoch,
+            lease_epoch: req.lease_epoch,
+            commit_mode,
+        };
+
+        let replace = build_command(FileCommitMode::Replace);
+        let append = build_command(FileCommitMode::Append);
+        let command = if replace.fingerprint() == applied_fingerprint {
+            replace
+        } else if append.fingerprint() == applied_fingerprint {
+            append
+        } else {
+            return Err(MetadataError::InvalidArgument(format!(
+                "call_id {} reused with different command payload",
+                dedup.call_id
+            )));
+        };
+
+        Ok((command, group_id, mount_epoch))
     }
 
-    async fn execute_fsync(&self, req: FsyncBarrierInput) -> CoreResult<FsyncBarrierOutput> {
-        let caller_ctx = &req.ctx.caller;
-        let inode_id = req.inode_id;
-
-        let storage = match self.core.storage.as_ref() {
-            Some(storage) => storage,
+    pub(crate) fn preflight_open_write_runtime(
+        &self,
+        req_ctx: &RequestContext,
+        desired_len: Option<u64>,
+        layout: FileLayout,
+        group_id: Option<u64>,
+        mount_epoch: Option<u64>,
+    ) -> Option<crate::service::domain::CoreFailure> {
+        let worker_manager = match self.core.worker_manager.as_ref() {
+            Some(worker_manager) => worker_manager,
             None => {
-                return self.core.failure_from_error(
-                    &req.ctx,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-            }
-        };
-
-        let inode = match storage.get_inode(inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                return self.core.failure_from_error(
-                    &req.ctx,
-                    MetadataError::NotFound(format!("Inode not found: {}", inode_id)),
-                    None,
-                    None,
-                );
-            }
-            Err(err) => return self.core.failure_from_error(&req.ctx, err, None, None),
-        };
-
-        if !inode.kind.is_file() {
-            return self.core.failure_from_error(
-                &req.ctx,
-                MetadataError::IsDir(format!("Inode is not a file: {}", inode_id)),
-                None,
-                None,
-            );
-        }
-
-        let (group_id, mount_epoch) =
-            match self
-                .core
-                .validate_mount_epoch_for_mount(&req.ctx, req.freshness, inode.mount_id)
-            {
-                Ok(hints) => hints,
-                Err(err) => return Err(err),
-            };
-
-        let route_epoch = match self
-            .core
-            .validate_route_epoch(&req.ctx, req.freshness, group_id, mount_epoch, "WriteBarrier")
-            .await
-        {
-            Ok(route_epoch) => route_epoch,
-            Err(err) => return Err(err),
-        };
-
-        let mut lease_id = req.lease_id;
-        let mut lease_epoch = req.lease_epoch.unwrap_or(0);
-        let presented_token = req.fencing_token;
-        let mut fencing_token = presented_token.as_ref().and_then(|token| {
-            token.block_id.map(|block_id| FencingToken {
-                block_id,
-                owner: types::ids::ClientId::new(token.owner),
-                epoch: token.epoch,
-            })
-        });
-        let mut commit_workers: Vec<proto::common::WorkerEndpointInfoProto> = Vec::new();
-        let mut target_size = req.target_size.unwrap_or(inode.attrs.size);
-
-        if let Some(handle) = req.file_handle {
-            let session = match self.core.write_session_manager.get_session(handle) {
-                Some(session) => session,
-                None => {
-                    return self.core.session_terminal_failure(
-                        &req.ctx,
-                        RefreshReason::SessionInvalid,
-                        RpcErrorCode::Fencing,
-                        format!(
-                            "write handle not found for handle={}; write barrier cannot be replayed automatically",
-                            handle,
-                        ),
+                return self
+                    .core
+                    .failure_from_error::<()>(
+                        req_ctx,
+                        MetadataError::ServiceUnavailable("Worker manager not available".to_string()),
                         group_id,
                         mount_epoch,
-                    );
-                }
-            };
-
-            if session.inode_id != inode_id {
-                return self.core.session_terminal_failure(
-                    &req.ctx,
-                    RefreshReason::SessionInvalid,
-                    RpcErrorCode::EpochMismatch,
-                    format!(
-                        "write handle {} does not match inode {}; write barrier cannot be replayed automatically",
-                        handle, inode_id,
-                    ),
-                    group_id,
-                    mount_epoch,
-                );
-            }
-
-            if lease_id.is_none() {
-                lease_id = Some(session.lease_id);
-            }
-            if lease_epoch == 0 {
-                lease_epoch = session.lease_epoch;
-            }
-            if presented_token.is_none() {
-                fencing_token = Some(session.fencing_token);
-            } else if let Some(token) = presented_token.as_ref() {
-                if !FsCore::fencing_token_matches_session(&session, token) {
-                    return self.core.session_terminal_failure(
-                        &req.ctx,
-                        RefreshReason::SessionInvalid,
-                        RpcErrorCode::Fencing,
-                        format!(
-                            "fencing_token mismatch for handle={}; write barrier cannot be replayed automatically",
-                            handle,
-                        ),
-                        group_id,
-                        mount_epoch,
-                    );
-                }
-            }
-
-            for wt in &session.write_targets {
-                commit_workers.extend(wt.worker_endpoints.clone());
-            }
-            target_size = target_size.max(session.base_size).max(session.last_written);
-
-            if let Some(client_worker_epoch) = req.freshness.worker_epoch {
-                let mismatch = session
-                    .write_targets
-                    .iter()
-                    .flat_map(|t| t.worker_endpoints.iter())
-                    .any(|ep| ep.worker_epoch != client_worker_epoch);
-                if mismatch {
-                    let server_worker_epoch = session
-                        .write_targets
-                        .iter()
-                        .flat_map(|t| t.worker_endpoints.iter())
-                        .map(|ep| ep.worker_epoch)
-                        .max();
-                    let hint = worker_refresh_hint_from_session(&session, server_worker_epoch, false);
-                    return self.core.need_refresh_failure_with_hint(
-                        &req.ctx,
-                        RpcErrorCode::WorkerEpochMismatch,
-                        RefreshReason::WorkerEpochMismatch,
-                        format!(
-                            "worker_epoch mismatch: client={}, session_targets differ; {}",
-                            client_worker_epoch,
-                            FsCore::replay_hint("WriteBarrier")
-                        ),
-                        group_id,
-                        mount_epoch,
-                        route_epoch,
-                        Some(hint),
-                    );
-                }
-            }
-        }
-
-        let lease_id_typed = match lease_id {
-            Some(lease_id) => lease_id,
-            None => {
-                return self.core.failure_from_error(
-                    &req.ctx,
-                    MetadataError::InvalidArgument("Missing lease_id".to_string()),
-                    group_id,
-                    mount_epoch,
-                );
+                    )
+                    .err();
             }
         };
 
-        if self
-            .core
-            .inode_lease_manager
-            .validate_lease(inode_id, lease_id_typed, lease_epoch)
-            .is_err()
-        {
-            return self.core.session_terminal_failure(
-                &req.ctx,
-                RefreshReason::SessionExpired,
-                RpcErrorCode::Fencing,
-                format!(
-                    "lease validation rejected for inode={}; write lease expired and write barrier cannot be replayed automatically",
-                    inode_id,
-                ),
-                group_id,
-                mount_epoch,
-            );
-        }
-
-        if commit_workers.is_empty() {
-            target_size = target_size.max(inode.attrs.size);
-        } else {
-            let mut tasks = Vec::with_capacity(commit_workers.len());
-            let effective_route_epoch = req.freshness.route_epoch.or(req.ctx.route_epoch).unwrap_or(0);
-            for ep in commit_workers {
-                let endpoint = format!("http://{}", ep.endpoint);
-                let header_client = proto::common::ClientInfoProto {
-                    call_id: caller_ctx.client.call_id.to_string(),
-                    client_id: caller_ctx.client.client_id.as_raw(),
-                    client_name: caller_ctx.client.client_name.clone().unwrap_or_default(),
-                };
-                let commit_req = CommitWriteRequestProto {
-                    header: Some(proto::worker::DataRequestHeaderProto {
-                        client: Some(header_client.clone()),
-                        traceparent: req.ctx.traceparent.clone().unwrap_or_default(),
-                    }),
-                    block_id: fencing_token
-                        .as_ref()
-                        .map(|t| proto::common::BlockIdProto {
-                            data_handle_id: t.block_id.data_handle_id.as_raw(),
-                            block_index: t.block_id.index.as_raw(),
-                        })
-                        .or_else(|| {
-                            Some(proto::common::BlockIdProto {
-                                data_handle_id: inode.current_data_handle_id.as_raw(),
-                                block_index: 0,
-                            })
-                        }),
-                    token: fencing_token.as_ref().map(|t| proto::common::FencingTokenProto {
-                        block_id: Some(proto::common::BlockIdProto {
-                            data_handle_id: t.block_id.data_handle_id.as_raw(),
-                            block_index: t.block_id.index.as_raw(),
-                        }),
-                        owner: t.owner.as_raw(),
-                        epoch: t.epoch,
-                    }),
-                    lease_epoch,
-                    route_epoch: effective_route_epoch,
-                    worker_epoch: ep.worker_epoch,
-                    file_version: 0,
-                    committed_length: target_size,
-                };
-                if let Some(hook) = self.core.worker_commit_hook.lock().unwrap().clone() {
-                    let req_clone = commit_req.clone();
-                    tasks.push(tokio::spawn(async move {
-                        Ok::<proto::worker::CommitWriteResponseProto, MetadataError>(hook(req_clone))
-                    }));
-                    continue;
-                }
-                let mut client = match WorkerDataServiceClient::connect(endpoint.clone()).await {
-                    Ok(client) => client,
-                    Err(e) => {
-                        return self.core.failure_from_error(
-                            &req.ctx,
-                            MetadataError::ServiceUnavailable(format!("Failed to connect worker {}: {}", endpoint, e)),
-                            group_id,
-                            mount_epoch,
-                        );
-                    }
-                };
-                tasks.push(tokio::spawn(async move {
-                    client
-                        .commit_write(commit_req)
-                        .await
-                        .map(|resp| resp.into_inner())
-                        .map_err(|status| {
-                            MetadataError::ServiceUnavailable(format!("Worker commit failed: {}", status))
-                        })
-                }));
-            }
-
-            for t in tasks {
-                let inner = match t.await {
-                    Ok(Ok(resp)) => resp,
-                    Ok(Err(err)) => {
-                        return self.core.failure_from_error(&req.ctx, err, group_id, mount_epoch);
-                    }
-                    Err(e) => {
-                        return self.core.failure_from_error(
-                            &req.ctx,
-                            MetadataError::ServiceUnavailable(format!("Join error: {}", e)),
-                            group_id,
-                            mount_epoch,
-                        );
-                    }
-                };
-                if let Some(err) = inner.header.and_then(|h| h.error) {
-                    return self.core.failure_from_error_detail_with_route_epoch(
-                        &req.ctx,
-                        err,
-                        group_id,
-                        mount_epoch,
-                        route_epoch,
-                    );
-                }
-            }
-        }
-
-        let mut attrs = inode.attrs.clone();
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        attrs.size = attrs.size.max(target_size);
-        attrs.update_mtime_ctime(now_ms);
-
-        let ctx = match self.core.route_ctx_for_write_with_error_hints(
-            &req.ctx,
-            CoreWriteOp::SetAttr,
-            &[inode_id],
-            req.freshness,
-            group_id,
-            mount_epoch,
-        ) {
-            Ok(ctx) => ctx,
-            Err(failure) => return Err(failure),
-        };
-
-        let dedup = if caller_ctx.client.client_id.as_raw() == 0 {
-            DedupKey::system()
-        } else {
-            match self.core.dedup_key(caller_ctx) {
-                Ok(k) => k,
+        let desired_len = desired_len.unwrap_or(4 * 1024 * 1024);
+        let block_size = (layout.block_size as u64).max(1);
+        let num_blocks = desired_len.div_ceil(block_size).clamp(1, 10);
+        for _ in 0..num_blocks {
+            let placement = match worker_manager.select_workers_for_placement(3, None) {
+                Ok(placement) => placement,
                 Err(err) => {
-                    return self.core.failure_from_error(
-                        &req.ctx,
-                        err,
-                        Some(ctx.namespace_owner_group_id.as_raw()),
-                        Some(ctx.mount_epoch),
-                    );
+                    return self
+                        .core
+                        .failure_from_error::<()>(req_ctx, err, group_id, mount_epoch)
+                        .err()
                 }
+            };
+            let has_live_endpoint = placement
+                .all_workers()
+                .any(|worker_id| worker_manager.get_worker(worker_id).is_some());
+            if !has_live_endpoint {
+                return self
+                    .core
+                    .failure_from_error::<()>(
+                        req_ctx,
+                        MetadataError::ServiceUnavailable(
+                            "selected placement has no live worker endpoints".to_string(),
+                        ),
+                        group_id,
+                        mount_epoch,
+                    )
+                    .err();
             }
-        };
-        let command = Command::SetAttr {
-            dedup,
-            inode_id,
-            mask: 1 | 32,
-            attrs,
-        };
-        if let Err(err) = self.core.propose_fs_write_command(CoreWriteOp::SetAttr, command).await {
-            return self.core.failure_from_error(
-                &req.ctx,
-                err,
-                Some(ctx.namespace_owner_group_id.as_raw()),
-                Some(ctx.mount_epoch),
-            );
         }
 
-        self.core.success_with_route_epoch(
-            &req.ctx,
-            FsyncBarrierOutput,
-            Some(ctx.namespace_owner_group_id.as_raw()),
-            Some(ctx.mount_epoch),
-            route_epoch,
-        )
+        None
     }
 }

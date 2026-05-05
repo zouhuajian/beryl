@@ -164,9 +164,10 @@ data identity / session identity：
 
 - `data_handle_id` 是数据面身份，`BlockId = data_handle_id + block_index`。
 - `WriteHandleProto.handle_id` 是一次写生命周期身份，不是持久文件身份；内部实现仍使用 `WriteSession` 管理该生命周期。
-- `fencing_token` 保护 direct client->worker 与 CommitFile/Hflush/Hsync 的一致性。
+- `fencing_token` 保护 direct client->worker 与 CommitFile 的一致性。
 - `CreateFile` 当前会通过内部 `Command::Create` 和持久 `next_data_handle_id` 分配 `current_data_handle_id` 并写入 `data_handle_owner` 映射，然后进入写生命周期。
 - `CreateFile` / `AppendFile` / `GetBlockLocations` 路径使用 inode 上的 `current_data_handle_id` 并校验 `data_handle_owner` 映射。
+- `Hflush` / `Hsync` 保留 public RPC，但当前明确返回 structured NotSupported；在 visible/durable barrier 设计完成前，不更新 file size、layout 或 version。
 
 block metadata 与 worker soft state 边界：
 
@@ -342,6 +343,7 @@ Mutation command apply-level atomicity inventory：
 
 - 保留 FileSystemService external metadata/control-plane RPC、guard、readiness、leadership、NONE authz、mount/route/write-handle freshness。
 - 保留 GetStatus/ListStatus/CreateDirectory/Delete/Rename/OpenFile/GetBlockLocations/CreateFile/AppendFile/AddBlock/CommitFile/AbortFileWrite/RenewLease/Hflush/Hsync/Msync 的最小链路。
+- `Hflush` / `Hsync` 当前只是 reserved RPC，返回 NotSupported，不描述为可见性或持久性 barrier。
 - `GetBlockLocations` 如实返回 external block locations/epoch 和最小 worker route hints；不要把 worker locations 写成 metadata authority，也不要描述成完整调度系统。
 - client action machine 保留 refresh/replay，但承认 path->group route 和 mount refresh API 未完成。
 
