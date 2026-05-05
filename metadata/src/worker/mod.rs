@@ -9,6 +9,7 @@
 //! - Block locations convergence
 //! - Repair queue and scheduling skeleton
 
+mod command_router;
 mod delete_executor;
 #[cfg(test)]
 mod delete_executor_tests;
@@ -26,6 +27,7 @@ mod tests;
 #[cfg(test)]
 mod integration_tests;
 
+pub(crate) use command_router::{DeleteCommandSource, RepairCommandSource, WorkerCommandRouter};
 pub use delete_executor::{DeleteExecutor, DeleteExecutorHandle};
 pub use full_report_lease::{FullReportLease, FullReportLeaseManager};
 pub use manager::{HealthStatus, WorkerDescriptor, WorkerInfo, WorkerManager};

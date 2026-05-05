@@ -15,8 +15,8 @@ use crate::service::{
 };
 use crate::state::RaftStateStore;
 use crate::worker::{
-    DeleteExecutor, DeleteExecutorHandle, MetadataWorkerServiceImpl, OrphanQueue, RepairPlanner, RepairQueue,
-    WorkerBackgroundHandle, WorkerManager,
+    DeleteCommandSource, DeleteExecutor, DeleteExecutorHandle, MetadataWorkerServiceImpl, OrphanQueue,
+    RepairCommandSource, RepairPlanner, RepairQueue, WorkerBackgroundHandle, WorkerCommandRouter, WorkerManager,
 };
 use crate::{MetadataConfig, MountTable};
 use common::observe::{
@@ -70,6 +70,7 @@ struct WorkerRepairState {
 /// Worker-owned background lifecycle started after authority and maintenance are available.
 pub struct WorkerBackground {
     _repair: WorkerRepairState,
+    _command_router: Arc<WorkerCommandRouter>,
     _handle: WorkerBackgroundHandle,
 }
 
@@ -166,13 +167,30 @@ impl WorkerRuntime {
         self.repair.clone()
     }
 
-    /// Connects maintenance delete execution before starting worker background tasks.
+    /// Builds the worker command router after maintenance-owned command sources exist.
+    fn command_router(&self, delete_executor: Arc<DeleteExecutor>) -> Arc<WorkerCommandRouter> {
+        const MAX_DELETE_COMMANDS_PER_HEARTBEAT: usize = 4;
+        const MAX_REPAIR_COMMANDS_PER_HEARTBEAT: usize = 8;
+
+        let mut router = WorkerCommandRouter::new();
+        router.register_source(
+            Arc::new(DeleteCommandSource::new(delete_executor)),
+            MAX_DELETE_COMMANDS_PER_HEARTBEAT,
+        );
+        router.register_source(
+            Arc::new(RepairCommandSource::new(Arc::clone(&self.repair.repair_queue))),
+            MAX_REPAIR_COMMANDS_PER_HEARTBEAT,
+        );
+        Arc::new(router)
+    }
+
+    /// Connects command routing before starting worker background tasks.
     fn start_background(
         &self,
         service: &mut MetadataWorkerServiceImpl,
-        delete_executor: Arc<DeleteExecutor>,
+        command_router: Arc<WorkerCommandRouter>,
     ) -> WorkerBackgroundHandle {
-        service.set_delete_executor(delete_executor);
+        service.set_command_router(command_router);
         service.start_background_tasks()
     }
 }
@@ -354,10 +372,12 @@ pub fn build_worker_background(
     service: &mut MetadataWorkerServiceImpl,
     maintenance: &Maintenance,
 ) -> WorkerBackground {
-    let handle = worker.start_background(service, Arc::clone(&maintenance.delete_executor));
+    let command_router = worker.command_router(Arc::clone(&maintenance.delete_executor));
+    let handle = worker.start_background(service, Arc::clone(&command_router));
 
     WorkerBackground {
         _repair: worker.repair_state(),
+        _command_router: command_router,
         _handle: handle,
     }
 }
@@ -666,6 +686,7 @@ mod tests {
             &worker_background._repair.shared_inflight_registry,
             &worker_runtime.repair.shared_inflight_registry
         ));
+        assert_eq!(worker_background._command_router.source_count(), 2);
         assert!(Arc::strong_count(&maintenance.delete_executor) >= 3);
         assert_eq!(maintenance._maintenance_handle.task_count(), 7);
         assert!(!maintenance._delete_executor_handle.is_finished());

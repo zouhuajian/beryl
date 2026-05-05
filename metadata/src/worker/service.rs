@@ -3,12 +3,10 @@
 
 //! MetadataWorkerService implementation.
 
-use super::delete_executor::DeleteExecutor;
+use super::command_router::WorkerCommandRouter;
 use super::manager::WorkerManager;
 use super::metrics::WorkerMetrics;
-use super::repair::{
-    ErrorClass, OrphanQueue, RepairPlanner, RepairQueue, RepairTask, RepairTaskId, RepairTaskRecord, TaskAckStatus,
-};
+use super::repair::{OrphanQueue, RepairPlanner, RepairQueue};
 use crate::error::{to_canonical_rpc, MetadataError, MetadataResult};
 use crate::raft::Command;
 use crate::raft::{AppDataResponse, AppRaftNode, WorkerCommandResult};
@@ -43,7 +41,7 @@ pub struct MetadataWorkerServiceImpl {
     repair_queue: Arc<RepairQueue>,
     orphan_queue: Arc<OrphanQueue>,
     repair_planner: Arc<RepairPlanner>,
-    delete_executor: Option<Arc<DeleteExecutor>>,
+    command_router: Option<Arc<WorkerCommandRouter>>,
     metrics: Arc<WorkerMetrics>,
     slot_metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
     /// Mount table used to compute mount_epoch for lease gating (TODO-2).
@@ -68,16 +66,16 @@ impl MetadataWorkerServiceImpl {
             repair_queue,
             orphan_queue,
             repair_planner,
-            delete_executor: None, // Will be set via set_delete_executor
+            command_router: None,
             metrics,
             slot_metrics: None, // Will be set via set_slot_metrics
             mount_table,
         }
     }
 
-    /// Set delete executor (called after storage is available).
-    pub fn set_delete_executor(&mut self, delete_executor: Arc<DeleteExecutor>) {
-        self.delete_executor = Some(delete_executor);
+    /// Set command router after maintenance-owned command sources are available.
+    pub(crate) fn set_command_router(&mut self, command_router: Arc<WorkerCommandRouter>) {
+        self.command_router = Some(command_router);
     }
 
     /// Set slot metrics (called after metrics are available).
@@ -229,151 +227,6 @@ impl MetadataWorkerServiceImpl {
         WorkerBackgroundHandle {
             _lease_metrics_task: lease_metrics_task,
             _dead_worker_cleanup_task: dead_worker_cleanup_task,
-        }
-    }
-
-    /// Get pending commands for a worker from repair queue.
-    fn get_pending_commands(&self, worker_id: WorkerId, max: usize) -> Vec<WorkerCommandProto> {
-        // Poll tasks for this worker
-        let records = self.repair_queue.poll_for_worker(worker_id, max);
-
-        // Convert records to commands
-        records
-            .into_iter()
-            .filter_map(|record| self.record_to_command(record))
-            .collect()
-    }
-
-    /// Convert repair task record to worker command.
-    fn record_to_command(&self, record: RepairTaskRecord) -> Option<WorkerCommandProto> {
-        let task_id = record.id.0;
-        let command = match record.task {
-            RepairTask::Replicate {
-                block_id,
-                src_workers: _,
-                target_worker,
-                ..
-            } => {
-                let proto_block_id = proto::common::BlockIdProto {
-                    data_handle_id: block_id.data_handle_id.as_raw(),
-                    block_index: block_id.index.as_raw(),
-                };
-
-                Some(proto::metadata::worker_command_proto::Command::Replicate(
-                    ReplicateCommandProto {
-                        block_id: Some(proto_block_id),
-                        target_worker_ids: vec![target_worker.as_raw()],
-                    },
-                ))
-            }
-            RepairTask::Evict {
-                block_id,
-                reason,
-                target_worker: _,
-            } => {
-                let proto_block_id = proto::common::BlockIdProto {
-                    data_handle_id: block_id.data_handle_id.as_raw(),
-                    block_index: block_id.index.as_raw(),
-                };
-
-                Some(proto::metadata::worker_command_proto::Command::Evict(
-                    EvictCommandProto {
-                        block_ids: vec![proto_block_id],
-                        reason,
-                        intent_id: 0, // Legacy EvictCommandProto - no intent_id
-                        op_kind: proto::metadata::DeleteOpKindProto::DeleteOpKindDelete as i32,
-                        not_before_ms: 0,
-                        expected_epoch: 0,
-                    },
-                ))
-            }
-            RepairTask::MoveCopy {
-                block_id,
-                from_worker,
-                to_worker,
-            } => {
-                // MoveCopy command: to_worker pulls from from_worker
-                let proto_block_id = proto::common::BlockIdProto {
-                    data_handle_id: block_id.data_handle_id.as_raw(),
-                    block_index: block_id.index.as_raw(),
-                };
-
-                Some(proto::metadata::worker_command_proto::Command::MoveCopy(
-                    proto::metadata::MoveCopyCommandProto {
-                        block_id: Some(proto_block_id),
-                        from_worker_id: from_worker.as_raw(),
-                        to_worker_id: to_worker.as_raw(),
-                    },
-                ))
-            }
-        };
-
-        command.map(|cmd| WorkerCommandProto {
-            task_id,
-            command: Some(cmd),
-        })
-    }
-
-    /// Process task acknowledgments from worker.
-    async fn process_task_acks(&self, worker_id: WorkerId, acks: &[proto::metadata::TaskAckProto]) {
-        // Process acks for delete executor (if available)
-        if let Some(ref delete_executor) = self.delete_executor {
-            delete_executor.process_task_acks(worker_id, acks).await;
-        }
-
-        // Process acks for repair queue (existing logic)
-        for ack in acks {
-            let task_id = RepairTaskId(ack.task_id);
-            let status = match ack.status() {
-                proto::metadata::TaskAckStatusProto::TaskAckStatusSuccess => TaskAckStatus::Success,
-                proto::metadata::TaskAckStatusProto::TaskAckStatusFailed => TaskAckStatus::Failed,
-                proto::metadata::TaskAckStatusProto::TaskAckStatusRetryableFailed => TaskAckStatus::RetryableFailed,
-                _ => {
-                    warn!(task_id = task_id.0, "Unknown ack status, treating as failed");
-                    TaskAckStatus::Failed
-                }
-            };
-
-            let message = if ack.error_message.is_empty() {
-                None
-            } else {
-                Some(ack.error_message.clone())
-            };
-
-            // Parse error class from proto
-            let error_class = match ack.error_class() {
-                proto::metadata::ErrorClassProto::ErrorClassOk => Some(ErrorClass::Ok),
-                proto::metadata::ErrorClassProto::ErrorClassRetryable => Some(ErrorClass::Retryable),
-                proto::metadata::ErrorClassProto::ErrorClassFatal => Some(ErrorClass::Fatal),
-                proto::metadata::ErrorClassProto::ErrorClassNeedRefresh => Some(ErrorClass::NeedRefresh),
-                _ => None, // Will use default based on status
-            };
-
-            match self.repair_queue.ack(task_id, worker_id, status, message, error_class) {
-                Ok(Some(followup_task)) => {
-                    // MoveCopy succeeded, enqueue Evict task
-                    if let Err(e) = self.repair_queue.enqueue(followup_task) {
-                        warn!(
-                            task_id = task_id.0,
-                            error = %e,
-                            "Failed to enqueue followup Evict task after MoveCopy"
-                        );
-                    } else {
-                        info!(task_id = task_id.0, "MoveCopy completed, enqueued followup Evict task");
-                    }
-                }
-                Ok(None) => {
-                    // Normal completion, no followup
-                }
-                Err(e) => {
-                    warn!(
-                        task_id = task_id.0,
-                        worker_id = worker_id.as_raw(),
-                        error = %e,
-                        "Failed to process task ack"
-                    );
-                }
-            }
         }
     }
 
@@ -631,23 +484,20 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 
         // Leader-only: process task acknowledgments and get pending commands
         if is_leader {
-            // Process task acknowledgments (if any)
-            if !req.acks.is_empty() {
-                self.process_task_acks(worker_id, &req.acks).await;
-            }
+            if let Some(ref command_router) = self.command_router {
+                if !req.acks.is_empty() {
+                    command_router.handle_acks(worker_id, &req.acks).await;
+                }
 
-            // Get pending commands from delete executor (if available)
-            if let Some(ref delete_executor) = self.delete_executor {
-                const MAX_DELETE_COMMANDS_PER_HEARTBEAT: usize = 4;
-                let mut delete_commands =
-                    delete_executor.get_pending_commands(worker_id, MAX_DELETE_COMMANDS_PER_HEARTBEAT);
-                commands.append(&mut delete_commands);
+                const MAX_COMMANDS_PER_HEARTBEAT: usize = 12;
+                commands.extend(command_router.poll_commands(worker_id, MAX_COMMANDS_PER_HEARTBEAT));
+            } else if !req.acks.is_empty() {
+                warn!(
+                    worker_id = worker_id.as_raw(),
+                    ack_count = req.acks.len(),
+                    "Ignoring worker command acks because command router is not configured"
+                );
             }
-
-            // Get pending commands from repair queue
-            const MAX_COMMANDS_PER_HEARTBEAT: usize = 8;
-            let mut repair_commands = self.get_pending_commands(worker_id, MAX_COMMANDS_PER_HEARTBEAT);
-            commands.append(&mut repair_commands);
         }
 
         Ok(Response::new(HeartbeatResponseProto {
@@ -918,7 +768,10 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 
         // Leader-only: get pending commands (follower returns empty)
         let commands = if is_leader {
-            self.get_pending_commands(worker_id, 1)
+            self.command_router
+                .as_ref()
+                .map(|command_router| command_router.poll_commands(worker_id, 1))
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
