@@ -2975,7 +2975,12 @@ mod tests {
         let mut inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
         let layout = FileLayout::new(4096, 4096, 1);
         let block_id = BlockId::new(data_handle_id, types::ids::BlockIndex::new(0));
-        if let InodeData::File { extents, lease_epoch } = &mut inode.data {
+        if let InodeData::File {
+            extents,
+            file_version,
+            lease_epoch,
+        } = &mut inode.data
+        {
             extents.push(types::fs::Extent {
                 file_offset: 0,
                 block_id,
@@ -2984,6 +2989,7 @@ mod tests {
                 file_version: None,
                 block_stamp: None,
             });
+            *file_version = Some(3);
             *lease_epoch = Some(3);
         }
         inode.attrs.size = 64;

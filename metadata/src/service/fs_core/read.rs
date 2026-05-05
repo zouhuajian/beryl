@@ -49,9 +49,7 @@ impl FsCore {
 
     fn file_version_for_inode(inode: &types::fs::Inode) -> Option<u64> {
         match &inode.data {
-            types::fs::InodeData::File { extents, lease_epoch } => {
-                lease_epoch.or_else(|| extents.iter().filter_map(|extent| extent.file_version).max())
-            }
+            types::fs::InodeData::File { file_version, .. } => *file_version,
             _ => None,
         }
     }

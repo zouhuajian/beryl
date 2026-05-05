@@ -1094,6 +1094,15 @@ impl AppRaftStateMachine {
         Ok(())
     }
 
+    fn next_file_version(inode_id: InodeId, current_file_version: Option<u64>) -> MetadataResult<u64> {
+        current_file_version.unwrap_or(0).checked_add(1).ok_or_else(|| {
+            MetadataError::Internal(format!(
+                "file_version overflow for inode {} at {:?}",
+                inode_id, current_file_version
+            ))
+        })
+    }
+
     fn validate_released_block_refcounts(&self, released_block_ids: &[BlockId]) -> MetadataResult<()> {
         let mut seen = std::collections::HashSet::with_capacity(released_block_ids.len());
         for block_id in released_block_ids {
@@ -1491,13 +1500,15 @@ impl AppRaftStateMachine {
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
     ) -> MetadataResult<FsCommandResult> {
-        let prepared: MetadataResult<Inode> = (|| {
+        let prepared: MetadataResult<(Inode, FsOkResult)> = (|| {
             let mut inode = self
                 .storage
                 .get_inode(inode_id)?
                 .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {}", inode_id)))?;
 
             let now_ms = Self::apply_timestamp_ms();
+            let size_changes_visible_file_state =
+                inode.kind.is_file() && mask & 1 != 0 && new_attrs.size != inode.attrs.size;
 
             // Apply mask: only update fields specified by mask
             // Bit flags: 1=size, 2=mode, 4=uid, 8=gid, 16=atime, 32=mtime
@@ -1523,14 +1534,39 @@ impl AppRaftStateMachine {
             // Always update ctime
             inode.attrs.ctime_ms = now_ms;
 
-            Ok(inode)
+            let file_version = if size_changes_visible_file_state {
+                match &mut inode.data {
+                    InodeData::File {
+                        extents, file_version, ..
+                    } => {
+                        let next = Self::next_file_version(inode_id, *file_version)?;
+                        for extent in extents.iter_mut() {
+                            extent.file_version = Some(next);
+                        }
+                        *file_version = Some(next);
+                        Some(next)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            Ok((
+                inode,
+                FsOkResult {
+                    inode_id: Some(inode_id),
+                    file_version,
+                    ..FsOkResult::default()
+                },
+            ))
         })();
 
-        let inode = match prepared {
-            Ok(inode) => inode,
+        let (inode, ok) = match prepared {
+            Ok(prepared) => prepared,
             Err(err) => return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint),
         };
-        let result = FsCommandResult::Ok(FsOkResult::default());
+        let result = FsCommandResult::Ok(ok);
         let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
         self.storage
             .put_inode_with_apply_result_atomic(&inode, dedup_key, applied_result)?;
@@ -1582,12 +1618,14 @@ impl AppRaftStateMachine {
 
             let mut existing_block_ids = std::collections::HashSet::new();
             let old_size = inode.attrs.size;
-            let existing_extents_snapshot = match &inode.data {
-                InodeData::File { extents, .. } => {
+            let (existing_extents_snapshot, current_file_version) = match &inode.data {
+                InodeData::File {
+                    extents, file_version, ..
+                } => {
                     for extent in extents {
                         existing_block_ids.insert(extent.block_id);
                     }
-                    extents.clone()
+                    (extents.clone(), *file_version)
                 }
                 _ => {
                     return Err(MetadataError::InvalidArgument(format!(
@@ -1598,7 +1636,7 @@ impl AppRaftStateMachine {
             };
 
             let mut committed_block_ids = std::collections::HashSet::with_capacity(extents.len());
-            let file_version = lease_epoch;
+            let file_version = Self::next_file_version(inode_id, current_file_version)?;
             let mut ordered_extents = extents;
             ordered_extents.sort_by_key(|extent| (extent.file_offset, extent.block_id.index.as_raw()));
             let mut previous_end = None;
@@ -1689,13 +1727,14 @@ impl AppRaftStateMachine {
                 }
             }
 
-            // Update inode: publish extents and update size/mtime/ctime/lease_epoch.
+            // Update inode: publish extents and update size/mtime/ctime/file_version/lease_epoch.
             for extent in &mut ordered_extents {
                 extent.file_version = Some(file_version);
             }
             match &mut inode.data {
                 types::fs::InodeData::File {
                     extents: existing_extents,
+                    file_version: stored_file_version,
                     lease_epoch: stored_lease_epoch,
                     ..
                 } => {
@@ -1707,6 +1746,10 @@ impl AppRaftStateMachine {
                             existing_extents.extend(ordered_extents.clone());
                         }
                     }
+                    for extent in existing_extents.iter_mut() {
+                        extent.file_version = Some(file_version);
+                    }
+                    *stored_file_version = Some(file_version);
                     // Update lease_epoch (persisted for fencing after restart)
                     *stored_lease_epoch = Some(lease_epoch);
                 }
@@ -1794,9 +1837,13 @@ impl AppRaftStateMachine {
                 )));
             }
 
-            let stored_lease_epoch = match &inode.data {
-                types::fs::InodeData::File { lease_epoch, .. } => *lease_epoch,
-                _ => None,
+            let (stored_lease_epoch, current_file_version) = match &inode.data {
+                types::fs::InodeData::File {
+                    lease_epoch,
+                    file_version,
+                    ..
+                } => (*lease_epoch, *file_version),
+                _ => (None, None),
             };
             Self::validate_truncate_lease(inode_id, stored_lease_epoch, lease_id, lease_epoch)?;
 
@@ -1829,15 +1876,21 @@ impl AppRaftStateMachine {
             self.storage
                 .validate_data_handle_owner(data_handle_id, Some(inode_id))?;
 
+            let next_file_version = Self::next_file_version(inode_id, current_file_version)?;
             let released_block_ids = match &mut inode.data {
                 types::fs::InodeData::File {
                     extents,
+                    file_version: stored_file_version,
                     lease_epoch: stored_lease_epoch,
                     ..
                 } => {
                     let (new_extents, released_block_ids) =
                         Self::truncate_layout_to_size(inode_id, data_handle_id, extents, new_size)?;
                     *extents = new_extents;
+                    for extent in extents.iter_mut() {
+                        extent.file_version = Some(next_file_version);
+                    }
+                    *stored_file_version = Some(next_file_version);
                     *stored_lease_epoch = Some(lease_epoch);
                     released_block_ids
                 }
@@ -1854,7 +1907,16 @@ impl AppRaftStateMachine {
             inode.attrs.size = new_size;
             inode.attrs.update_mtime_ctime(now_ms);
 
-            Ok((inode, layout, released_block_ids, FsOkResult::default()))
+            Ok((
+                inode,
+                layout,
+                released_block_ids,
+                FsOkResult {
+                    inode_id: Some(inode_id),
+                    data_handle_id: Some(data_handle_id),
+                    file_version: Some(next_file_version),
+                },
+            ))
         })();
 
         let (inode, layout, released_block_ids, ok) = match prepared {
@@ -2116,6 +2178,7 @@ mod tests {
         if let InodeData::File {
             extents: stored_extents,
             lease_epoch,
+            ..
         } = &mut inode.data
         {
             *stored_extents = extents;
@@ -2909,8 +2972,15 @@ mod tests {
         let inode = storage.get_inode(inode_id).unwrap().unwrap();
         assert_eq!(inode.attrs.size, 512);
         match inode.data {
-            InodeData::File { extents, lease_epoch } => {
-                assert_eq!(extents, vec![extent(block_id, 0, 512)]);
+            InodeData::File {
+                extents,
+                lease_epoch,
+                file_version,
+            } => {
+                let mut expected_extent = extent(block_id, 0, 512);
+                expected_extent.file_version = Some(1);
+                assert_eq!(extents, vec![expected_extent]);
+                assert_eq!(file_version, Some(1));
                 assert_eq!(lease_epoch, Some(2));
             }
             other => panic!("unexpected inode data: {:?}", other),
@@ -3000,7 +3070,11 @@ mod tests {
         let inode = storage.get_inode(inode_id).unwrap().unwrap();
         assert_eq!(inode.attrs.size, 4096);
         match inode.data {
-            InodeData::File { extents, .. } => assert_eq!(extents, vec![extent(shared_block, 0, 4096)]),
+            InodeData::File { extents, .. } => {
+                let mut expected_extent = extent(shared_block, 0, 4096);
+                expected_extent.file_version = Some(1);
+                assert_eq!(extents, vec![expected_extent]);
+            }
             other => panic!("unexpected inode data: {:?}", other),
         }
         assert_eq!(storage.get_layout(inode_id).unwrap(), FileLayout::new(4096, 4096, 1));

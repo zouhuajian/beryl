@@ -57,23 +57,27 @@ message ExtentProto {
   uint64 block_offset = 3;
   /// Length of this extent in bytes.
   uint64 len = 4;
-  /// File version (optional, for future use).
+  /// File version for the committed file state that owns this extent.
   optional uint64 file_version = 5;
   /// Block stamp (optional, for direct read validation).
   optional uint64 block_stamp = 6;
 }
 
-/// Inode file data (block map + lease persistence).
+/// Inode file data (block map + visible state version + lease persistence).
 message InodeFileProto {
   /// File extents (block map).
   /// Supports append-only write path.
   repeated ExtentProto extents = 1;
+  /// Visible file state version.
+  /// Advanced by authoritative metadata apply when committed content, size,
+  /// current data_handle, or committed read-plan state changes.
+  optional uint64 file_version = 2;
   /// Lease epoch (monotonically increasing, for fencing).
   /// Persisted for lease management.
-  optional uint64 lease_epoch = 2;
+  optional uint64 lease_epoch = 3;
   /// Current lease ID (optional, for diagnostics/recovery).
   /// Used for lease management.
-  optional common.LeaseIdProto lease_id = 3;
+  optional common.LeaseIdProto lease_id = 4;
 }
 
 /// Inode directory data (payload intentionally empty).

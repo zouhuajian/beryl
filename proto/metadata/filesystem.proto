@@ -148,9 +148,8 @@ message OpenFileResponseProto {
   fs.InodeIdProto inode_id = 2;
   common.DataHandleIdProto data_handle_id = 3;
   uint64 file_size = 4;
-  // Metadata file version for the current committed file contents.
-  // Current implementation uses the persisted file lease_epoch written at the
-  // authoritative commit boundary.
+  // Durable visible file state version for the current committed read plan.
+  // It advances when cached OpenFile/GetBlockLocations data may be invalid.
   optional uint64 file_version = 5;
   repeated FileBlockLocationProto locations = 6;
 }
@@ -238,8 +237,7 @@ message CommitFileRequestProto {
 message CommitFileResponseProto {
   common.ResponseHeaderProto header = 1;
   uint64 committed_size = 2;
-  // Metadata file version published by the successful commit.
-  // Current implementation uses the persisted file lease_epoch for this commit.
+  // Durable visible file state version published by the successful commit.
   optional uint64 file_version = 3;
 }
 

@@ -198,6 +198,7 @@ async fn get_file_layout_returns_worker_locations_from_worker_manager() {
             file_version: None,
             block_stamp: None,
         }],
+        file_version: Some(1),
         lease_epoch: None,
     };
     storage.put_inode(&inode).unwrap();
@@ -468,6 +469,7 @@ async fn get_locations_handles_empty_range() {
             file_version: Some(4),
             block_stamp: None,
         }],
+        file_version: Some(4),
         lease_epoch: Some(4),
     };
     let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(23));
@@ -514,6 +516,7 @@ async fn get_locations_filters_range() {
                 block_stamp: None,
             })
             .collect(),
+        file_version: Some(5),
         lease_epoch: Some(5),
     };
     let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(24));
@@ -731,6 +734,45 @@ async fn write_flow_env(base_size: u64) -> WriteFlowEnv {
         fs_core,
         inode_id,
         data_handle_id,
+    }
+}
+
+fn seed_committed_file_version(env: &WriteFlowEnv, file_version: u64, lease_epoch: u64) {
+    let block_id = BlockId::new(env.data_handle_id, BlockIndex::new(0));
+    let mut inode = env
+        .storage
+        .get_inode(env.inode_id)
+        .unwrap()
+        .expect("test inode should exist");
+    inode.attrs.size = 64;
+    match &mut inode.data {
+        types::fs::InodeData::File {
+            extents,
+            file_version: stored_file_version,
+            lease_epoch: stored_lease_epoch,
+        } => {
+            *extents = vec![types::fs::Extent {
+                file_offset: 0,
+                block_id,
+                block_offset: 0,
+                len: 64,
+                file_version: Some(file_version),
+                block_stamp: None,
+            }];
+            *stored_file_version = Some(file_version);
+            *stored_lease_epoch = Some(lease_epoch);
+        }
+        other => panic!("unexpected inode data: {:?}", other),
+    }
+    env.storage.put_inode(&inode).unwrap();
+    env.storage.put_block_ref_count(block_id, 1).unwrap();
+}
+
+fn stored_file_version(storage: &RocksDBStorage, inode_id: InodeId) -> Option<u64> {
+    let inode = storage.get_inode(inode_id).unwrap().expect("test inode should exist");
+    match inode.data {
+        types::fs::InodeData::File { file_version, .. } => file_version,
+        other => panic!("unexpected inode data: {:?}", other),
     }
 }
 
@@ -1191,6 +1233,39 @@ async fn open_write_rejects_file_missing_current_data_handle() {
 }
 
 #[tokio::test]
+async fn commit_advances_file_version() {
+    let env = write_flow_env(64).await;
+    seed_committed_file_version(&env, 41, 900);
+
+    let open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(64),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("replace open should succeed");
+    let key = open.payload.session_key;
+    assert!(key.lease_epoch > 41);
+    let target = add_block_for_key(&env.fs_core, &key, 64).await;
+
+    let close = commit_for_key(
+        &env.fs_core,
+        &key,
+        vec![committed_block(target.block_id, target.file_offset, target.len)],
+        64,
+    )
+    .await
+    .expect("replace commit should succeed");
+
+    assert_eq!(close.payload.file_version, Some(42));
+    assert_eq!(stored_file_version(&env.storage, env.inode_id), Some(42));
+}
+
+#[tokio::test]
 async fn create_then_add_block() {
     let env = write_flow_env(0).await;
     let open = env
@@ -1230,13 +1305,13 @@ async fn create_then_add_block() {
         .await
         .expect("commit should succeed");
     assert_eq!(success.payload.committed_size, 512);
-    assert_eq!(success.payload.file_version, Some(key.lease_epoch));
+    assert_eq!(success.payload.file_version, Some(1));
     assert!(env.fs_core.write_session_for_handle(key.file_handle).is_none());
     assert_eq!(env.storage.get_inode(env.inode_id).unwrap().unwrap().attrs.size, 512);
 }
 
 #[tokio::test]
-async fn commit_file_returns_version() {
+async fn create_new_commit_returns_initial_file_version() {
     let env = write_flow_env(0).await;
     let open = env
         .fs_core
@@ -1261,33 +1336,13 @@ async fn commit_file_returns_version() {
     .await
     .expect("commit should succeed");
 
-    assert_eq!(close.payload.file_version, Some(key.lease_epoch));
+    assert_eq!(close.payload.file_version, Some(1));
 }
 
 #[tokio::test]
-async fn open_file_returns_version() {
-    let env = write_flow_env(0).await;
-    let open = env
-        .fs_core
-        .execute_open_write(OpenWriteInput {
-            ctx: request_context(),
-            inode_id: env.inode_id,
-            desired_len: Some(64),
-            mode: crate::inode_lease::WriteMode::Write,
-            freshness: Freshness::default(),
-        })
-        .await
-        .expect("open write should succeed");
-    let key = open.payload.session_key;
-    let target = add_block_for_key(&env.fs_core, &key, 64).await;
-    let close = commit_for_key(
-        &env.fs_core,
-        &key,
-        vec![committed_block(target.block_id, target.file_offset, target.len)],
-        64,
-    )
-    .await
-    .expect("commit should succeed");
+async fn open_returns_file_version() {
+    let env = write_flow_env(64).await;
+    seed_committed_file_version(&env, 41, 900);
 
     let read = env
         .fs_core
@@ -1301,11 +1356,11 @@ async fn open_file_returns_version() {
         .await
         .expect("open/read layout should succeed");
 
-    assert_eq!(read.payload.file_version, close.payload.file_version);
+    assert_eq!(read.payload.file_version, Some(41));
 }
 
 #[tokio::test]
-async fn version_changes_after_commit() {
+async fn append_advances_file_version() {
     let env = write_flow_env(0).await;
     let first_open = env
         .fs_core
@@ -1359,11 +1414,33 @@ async fn version_changes_after_commit() {
     .await
     .expect("second commit should succeed");
 
-    assert!(second_close.payload.file_version > first_close.payload.file_version);
+    assert_eq!(first_close.payload.file_version, Some(1));
+    assert_eq!(second_close.payload.file_version, Some(2));
+    assert_eq!(stored_file_version(&env.storage, env.inode_id), Some(2));
 }
 
 #[tokio::test]
-async fn get_locations_matches_file_version() {
+async fn locations_return_file_version() {
+    let env = write_flow_env(64).await;
+    seed_committed_file_version(&env, 41, 900);
+
+    let locations = env
+        .fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            range: None,
+            requested_data_handle_id: Some(env.data_handle_id),
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("locations should succeed");
+
+    assert_eq!(locations.payload.file_version, Some(41));
+}
+
+#[tokio::test]
+async fn worker_report_does_not_change_file_version() {
     let env = write_flow_env(0).await;
     let open = env
         .fs_core
@@ -1387,6 +1464,14 @@ async fn get_locations_matches_file_version() {
     .await
     .expect("commit should succeed");
 
+    let worker_manager = env.fs_core.worker_manager.as_ref().expect("worker manager");
+    worker_manager
+        .update_locations(WorkerId::new(1), vec![target.block_id])
+        .expect("worker report should update soft locations");
+    worker_manager
+        .update_runtime(WorkerId::new(1), 1, 99, 1024, 1, 2048, 2, 3, HealthStatus::Healthy)
+        .expect("worker runtime should update soft state");
+
     let locations = env
         .fs_core
         .execute_get_file_layout(GetFileLayoutInput {
@@ -1399,7 +1484,9 @@ async fn get_locations_matches_file_version() {
         .await
         .expect("locations should succeed");
 
-    assert_eq!(locations.payload.file_version, close.payload.file_version);
+    assert_eq!(close.payload.file_version, Some(1));
+    assert_eq!(locations.payload.file_version, Some(1));
+    assert_eq!(stored_file_version(&env.storage, env.inode_id), Some(1));
 }
 
 #[tokio::test]
@@ -1679,7 +1766,7 @@ async fn append_uses_base_size() {
 }
 
 #[tokio::test]
-async fn replay_keeps_replace_commit_mode() {
+async fn replay_keeps_file_version() {
     let dir = TempDir::new().unwrap();
     let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
     let mount_id = MountId::new(54);
@@ -1940,6 +2027,82 @@ async fn rename_rejects_active_write_target() {
         Some(target_inode_id)
     );
     assert!(storage.get_inode(target_inode_id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn rename_keeps_file_version() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(59);
+    let group_id = ShardGroupId::new(16);
+    let parent_inode_id = InodeId::new(590);
+    let source_inode_id = InodeId::new(591);
+    let target_inode_id = InodeId::new(592);
+    let source_handle = DataHandleId::new(593);
+    let target_handle = DataHandleId::new(594);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mount_table = Arc::clone(&fs_core.mount_table);
+    let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+    fs_core.set_storage(Arc::clone(&storage));
+    fs_core.set_raft_node(raft_node);
+
+    storage
+        .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
+        .unwrap();
+    let mut source = Inode::new_file(source_inode_id, FileAttrs::new(), mount_id, source_handle);
+    if let types::fs::InodeData::File {
+        file_version,
+        lease_epoch,
+        ..
+    } = &mut source.data
+    {
+        *file_version = Some(77);
+        *lease_epoch = Some(900);
+    }
+    let mut target = Inode::new_file(target_inode_id, FileAttrs::new(), mount_id, target_handle);
+    if let types::fs::InodeData::File {
+        file_version,
+        lease_epoch,
+        ..
+    } = &mut target.data
+    {
+        *file_version = Some(12);
+        *lease_epoch = Some(12);
+    }
+    storage.put_inode(&source).unwrap();
+    storage.put_inode(&target).unwrap();
+    storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
+    storage.put_dentry(parent_inode_id, "target", target_inode_id).unwrap();
+    storage
+        .put_layout(source_inode_id, FileLayout::new(4096, 4096, 1))
+        .unwrap();
+    storage
+        .put_layout(target_inode_id, FileLayout::new(4096, 4096, 1))
+        .unwrap();
+    storage.put_data_handle_owner(source_handle, source_inode_id).unwrap();
+    storage.put_data_handle_owner(target_handle, target_inode_id).unwrap();
+
+    fs_core
+        .execute_rename(RenameInput {
+            ctx: request_context(),
+            src_parent_inode_id: parent_inode_id,
+            src_name: "source".to_string(),
+            dst_parent_inode_id: parent_inode_id,
+            dst_name: "target".to_string(),
+            flags: 0,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("same-mount overwrite rename should succeed");
+
+    assert_eq!(storage.get_dentry(parent_inode_id, "source").unwrap(), None);
+    assert_eq!(
+        storage.get_dentry(parent_inode_id, "target").unwrap(),
+        Some(source_inode_id)
+    );
+    assert_eq!(stored_file_version(&storage, source_inode_id), Some(77));
+    assert!(storage.get_inode(target_inode_id).unwrap().is_none());
+    assert_eq!(storage.get_inode_by_data_handle(target_handle).unwrap(), None);
 }
 
 #[tokio::test]

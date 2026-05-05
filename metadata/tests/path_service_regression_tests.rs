@@ -509,6 +509,7 @@ async fn get_locations_rejects_stale_handle() {
             file_version: Some(4),
             block_stamp: None,
         }],
+        file_version: Some(4),
         lease_epoch: Some(4),
     };
     env.storage.put_inode(&inode).expect("put file inode");
@@ -569,6 +570,7 @@ async fn get_locations_accepts_current_handle() {
             file_version: Some(4),
             block_stamp: None,
         }],
+        file_version: Some(4),
         lease_epoch: Some(4),
     };
     env.storage.put_inode(&inode).expect("put file inode");
@@ -635,6 +637,7 @@ async fn get_locations_by_path_uses_current_handle() {
             file_version: Some(8),
             block_stamp: None,
         }],
+        file_version: Some(8),
         lease_epoch: Some(8),
     };
     env.storage.put_inode(&inode).expect("put file inode");
@@ -789,7 +792,12 @@ async fn recursive_delete_does_not_mutate_tree() {
     let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
     let mut child_inode = Inode::new_file(child_inode_id, FileAttrs::new(), env.mount_id, data_handle_id);
     child_inode.attrs.size = 64;
-    if let types::fs::InodeData::File { extents, lease_epoch } = &mut child_inode.data {
+    if let types::fs::InodeData::File {
+        extents,
+        file_version,
+        lease_epoch,
+    } = &mut child_inode.data
+    {
         *extents = vec![Extent {
             file_offset: 0,
             block_id,
@@ -798,6 +806,7 @@ async fn recursive_delete_does_not_mutate_tree() {
             file_version: None,
             block_stamp: None,
         }];
+        *file_version = Some(1);
         *lease_epoch = Some(1);
     }
     env.storage
