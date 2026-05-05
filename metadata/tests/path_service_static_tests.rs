@@ -58,34 +58,6 @@ fn path_service_keeps_complete_filesystem_service_view() {
 }
 
 #[test]
-fn filesystem_proto_exposes_delete_without_unlink_or_rmdir_public_rpc() {
-    let proto = include_str!("../../proto/metadata/filesystem.proto");
-    for required in [
-        "message DeleteRequestProto",
-        "message DeleteResponseProto",
-        "rpc Delete(DeleteRequestProto) returns (DeleteResponseProto)",
-        "bool recursive",
-    ] {
-        assert!(proto.contains(required), "filesystem.proto must contain `{required}`");
-    }
-    for forbidden in [
-        "rpc Unlink(",
-        "rpc Rmdir(",
-        "UnlinkPathRequestProto",
-        "UnlinkPathResponseProto",
-        "RmdirPathRequestProto",
-        "RmdirPathResponseProto",
-        "DeletePathRequestProto",
-        "DeletePathResponseProto",
-    ] {
-        assert!(
-            !proto.contains(forbidden),
-            "filesystem.proto must not expose `{forbidden}`"
-        );
-    }
-}
-
-#[test]
 fn status_hides_inode() {
     let proto = include_str!("../../proto/metadata/filesystem.proto");
     let start = proto

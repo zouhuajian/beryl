@@ -68,7 +68,6 @@ pub mod readiness;
 pub mod runtime;
 pub mod service;
 pub mod state;
-pub mod ufs_proxy;
 pub mod worker;
 pub mod write_session;
 

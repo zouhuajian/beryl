@@ -195,27 +195,6 @@ pub enum Command {
         lease_id: types::ids::LeaseId,
         lease_epoch: u64,
     },
-    /// Set or update xattr.
-    ///
-    /// Internal command only: the current public FileSystemService surface does
-    /// not expose xattr RPCs.
-    SetXattr {
-        dedup: DedupKey,
-        inode_id: InodeId,
-        name: String,
-        value: Vec<u8>,
-        create: bool,
-        replace: bool,
-    },
-    /// Remove xattr.
-    ///
-    /// Internal command only: the current public FileSystemService surface does
-    /// not expose xattr RPCs.
-    RemoveXattr {
-        dedup: DedupKey,
-        inode_id: InodeId,
-        name: String,
-    },
 }
 
 impl Command {
@@ -241,9 +220,7 @@ impl Command {
             | Command::Rename { dedup, .. }
             | Command::SetAttr { dedup, .. }
             | Command::CloseWrite { dedup, .. }
-            | Command::Truncate { dedup, .. }
-            | Command::SetXattr { dedup, .. }
-            | Command::RemoveXattr { dedup, .. } => dedup,
+            | Command::Truncate { dedup, .. } => dedup,
         }
     }
 
@@ -373,17 +350,6 @@ enum FingerprintView {
         new_size: u64,
         lease_id: types::ids::LeaseId,
         lease_epoch: u64,
-    },
-    SetXattr {
-        inode_id: InodeId,
-        name: String,
-        value: Vec<u8>,
-        create: bool,
-        replace: bool,
-    },
-    RemoveXattr {
-        inode_id: InodeId,
-        name: String,
     },
 }
 
@@ -566,24 +532,6 @@ impl From<&Command> for FingerprintView {
                 new_size: *new_size,
                 lease_id: *lease_id,
                 lease_epoch: *lease_epoch,
-            },
-            Command::SetXattr {
-                inode_id,
-                name,
-                value,
-                create,
-                replace,
-                ..
-            } => FingerprintView::SetXattr {
-                inode_id: *inode_id,
-                name: name.clone(),
-                value: value.clone(),
-                create: *create,
-                replace: *replace,
-            },
-            Command::RemoveXattr { inode_id, name, .. } => FingerprintView::RemoveXattr {
-                inode_id: *inode_id,
-                name: name.clone(),
             },
         }
     }

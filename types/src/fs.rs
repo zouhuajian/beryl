@@ -8,7 +8,6 @@
 
 use crate::ids::{DataHandleId, MountId};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::fmt;
 
 /// Inode identifier (64-bit).
@@ -256,9 +255,6 @@ pub struct Inode {
     /// This is the authoritative link from namespace (inode) to data-plane blocks.
     /// Non-file inodes should use DataHandleId::new(0) and ignore this field.
     pub current_data_handle_id: DataHandleId,
-    /// Extended attributes (authoritative, persisted).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub xattrs: BTreeMap<String, Vec<u8>>,
 }
 
 impl Inode {
@@ -286,7 +282,6 @@ impl Inode {
             data,
             mount_id,
             current_data_handle_id,
-            xattrs: BTreeMap::new(),
         }
     }
 
@@ -314,7 +309,6 @@ impl Inode {
             data: InodeData::Symlink { target: Some(target) },
             mount_id,
             current_data_handle_id: DataHandleId::new(0),
-            xattrs: BTreeMap::new(),
         }
     }
 }

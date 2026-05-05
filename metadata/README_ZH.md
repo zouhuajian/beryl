@@ -20,7 +20,7 @@
 
 - 不把 path 写成 persisted source of truth；path 只是 dentry/inode traversal 的输入适配。
 - 不把 worker block locations 写成 block presence authority；它是 `WorkerManager` 内存 soft state。
-- 不把 UFS proxy 写成 FileSystemService 主路径能力；runtime 构造存在，但 namespace read/write 没有调用它。
+- 不把 external mount 写成 UFS-backed namespace；当前没有 UFS metadata proxy 代码，也没有 FileSystemService 主路径接入。
 - 不把 repair/rebalance/delete 写成完整生产级自治系统；它们是已接入的后台框架和部分闭环。
 
 ## 2. 当前实现总览
@@ -57,7 +57,7 @@ flowchart TB
     DeleteExec --> WorkerMgr
     DeleteExec --> Raft
 
-    Runtime -. "构造存在，FileSystem 主路径未使用" .-> UFS["UfsRegistry / UfsMetadataProxy"]
+    Mount -. "仅保留 external mount metadata 表达" .-> UFS["UFS-backed namespace 未接入"]
 ```
 
 当前状态汇总：
@@ -67,8 +67,8 @@ flowchart TB
 | 已实现 | 薄 `main.rs`、runtime composition、root readiness、FileSystemService 新 16 RPC、inode/dentry/attrs authority、mount_epoch/route_epoch/state watermark freshness、durable single `file_version`、write lifecycle 主链路、worker register 持久化、block report soft locations、delete intent Raft apply/status 更新。 |
 | 部分实现 | maintenance/repair/delete framework、worker command heartbeat pull、full block report lease、GC/orphan/overrep intent creation、repair queue ack/retry、client refresh/replay 配合。 |
 | 未实现 | recursive directory delete、Hflush/Hsync barrier、ACL/Ranger、完整 UFS-backed namespace、生产级 repair/move/evict/rebalance 策略、多 group msync、follower read 全路径、专用 mount refresh API、path->group route cache。 |
-| 历史残留 | `report_presence` proto RPC 入口仍存在但返回 deprecated/NotSupported、`MemoryStateStore` route-epoch 测试 helper、`SetXattr` / `RemoveXattr` internal apply 无 public RPC、若干 stale code comments/docs references。 |
-| 可保留但暂缓 | RepairPlanner/RepairQueue/OrphanQueue、DeleteExecutor、MaintenanceService、UFS proxy、authz extension point。 |
+| 历史残留 | `report_presence` proto RPC 入口仍存在但返回 deprecated/NotSupported、`MemoryStateStore` route-epoch 测试 helper、若干 stale code comments/docs references。 |
+| 可保留但暂缓 | RepairPlanner/RepairQueue/OrphanQueue、DeleteExecutor、MaintenanceService、authz extension point。 |
 
 ## 3. 启动链路
 
@@ -83,7 +83,7 @@ flowchart TB
 
 | 阶段 | 当前事实 | 状态 |
 | --- | --- | --- |
-| `build_authority()` | 打开 RocksDB，加载 `MountTable`，构造 `AppRaftStateMachine` / `AppRaftNode`，执行 root mount bootstrap，构造 `RaftStateStore`、`UfsRegistry`、`UfsMetadataProxy`。 | 已实现 |
+| `build_authority()` | 打开 RocksDB，加载 `MountTable`，构造 `AppRaftStateMachine` / `AppRaftNode`，执行 root mount bootstrap，构造 `RaftStateStore`。 | 已实现 |
 | `build_worker_runtime()` | 创建 required `WorkerRuntime`、`WorkerManager`、repair/orphan queue、planner，并构造 `MetadataWorkerServiceImpl`。 | 已实现 |
 | `build_readiness()` | 启动 root readiness watcher，HealthService 初始 not-serving，root ready 后标记 serving。 | 已实现 |
 | `build_filesystem_service()` | 构造 write session manager、inode lease manager、permission checker、`PathResolver`、`FsCore`、`GuardChain`、`MsyncHandler`。 | 已实现 |
@@ -96,7 +96,7 @@ flowchart TB
 optional vs required：
 
 - worker runtime 当前是 required subsystem；不存在 disabled-worker metadata runtime。
-- UFS registry/proxy 是构造存在但主路径未使用的 subsystem。
+- UFS metadata proxy 已删除；external mount 仍只是 metadata 表达，不是 FileSystemService 主路径能力。
 - maintenance/delete/worker background 启动存在，但其能力成熟度不能等同于完整自治后台系统。
 
 ## 4. FileSystem 主链路
@@ -168,8 +168,8 @@ public surface 当前没有旧 FUSE/POSIX 残留 RPC：
 - 没有 public `OpenPath`、`ReleasePath`、`TruncatePath`。
 - 没有 public `OpenWriteByPath`、`CloseWriteSession`、`RenewWriteSessionLease`。
 - 没有 public `Unlink` / `Rmdir`；对外删除统一是 `Delete(DeleteRequestProto)`。
+- 没有 public xattr API；历史 internal xattr command/apply path 已删除。
 - `Unlink` / `Rmdir` 仍是 FsCore/Raft 内部 domain mutation 名称。
-- `SetXattr` / `RemoveXattr` 只在 internal `Command` / state machine 层存在，当前没有 public FileSystem RPC 或主链路 caller。
 
 ## 7. Write lifecycle 当前状态
 
@@ -246,10 +246,11 @@ Raft apply 当前统一做 dedup：
 | 分类 | Command / path |
 | --- | --- |
 | DONE | `Create`, `Mkdir`, `Rmdir`, empty-file `Unlink`, extent-bearing file `Unlink`, `Rename` including overwrite target cleanup, `CloseWrite`, `Truncate` shrink, `CreateDeleteIntents`, `AllocateDeleteIntents`, `UpdateDeleteIntentStatus`, `CreateMount`, `DeleteMount`, `AddShardGroup`, `RegisterWorker`, `AcquireLease`, `ReleaseLease`, block allocate/state/commit paths。 |
-| STRUCTURED_ERROR_REPLAY | deterministic FS business errors for create/mkdir/unlink/rmdir/rename/close-write/truncate/xattr are persisted as `AppliedResult` when they happen inside apply preparation. |
-| INTERNAL_NO_PUBLIC_API | `SetXattr` / `RemoveXattr` apply and dedup exist, but no public FileSystem RPC/caller was found in the scan. |
+| STRUCTURED_ERROR_REPLAY | deterministic FS business errors for create/mkdir/unlink/rmdir/rename/close-write/truncate are persisted as `AppliedResult` when they happen inside apply preparation. |
 已清理：
 
+- `SetXattr` / `RemoveXattr` internal legacy command、fingerprint、state-machine apply helper 和 replay 测试残留已删除；metadata 当前不支持 public xattr API。
+- inode domain / proto 中不再保留历史 `xattrs` 字段。
 - `UpdateCommittedLength` legacy command path 已删除。Committed length mutation 语义不再作为独立 command 存在；当前 committed file state 通过 `CommitFile` / `CloseWrite` apply 和 durable `file_version` 维护。
 - `CommandSender` push-mode no-op legacy hook 已删除。当前 worker command 只通过 heartbeat pull 返回。
 - `StateStore` 已收窄为 route freshness 读取接口；旧 block/lease mutation trait 方法已删除。
@@ -329,15 +330,14 @@ block report：
 
 - `MountKind::External` 和 `ufs_uri` 可在 mount metadata 中表达。
 - `MountTable::resolve_path()` 可把统一路径映射为 UFS URI + relative path。
-- `UfsMetadataProxy` 实现了 stat/list/rename/delete/exists 等代理方法。
-- runtime 构造 `UfsRegistry` 和 `UfsMetadataProxy`，并保存在 `MetadataAuthority` 私有字段。
 
 未闭环：
 
-- `MetadataFileSystemServiceImpl` 没有注入或调用 `UfsMetadataProxy`。
+- metadata runtime proxy construction and retained authority fields have been deleted.
+- `MetadataFileSystemServiceImpl` 没有 UFS metadata proxy 注入或调用。
 - 当前 FileSystem namespace read/write 主路径仍走 inode/dentry/attrs/Raft/RocksDB。
 - external mount 只是 metadata 表达和 data IO policy 的部分存在，不是完整 UFS-backed namespace。
-- UFS proxy 内部 URI -> UFS id 解析仍是简化 heuristic。
+- 当前没有 UFS-backed namespace read/write、rename/delete/list/stat 主路径。
 
 ## 13. Error model 与 refresh 闭环
 
@@ -394,7 +394,7 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 - `MemoryStateStore` 已收窄为 route-epoch tests/helper，production runtime 使用 `RaftStateStore`。
 - `StateStore` 已从旧 block/lease mutation abstraction 收窄为 route freshness read trait。
 - `state::DeleteIntent` 注释已修正：当前 `DeleteExecutor` status transition 使用 `Command::UpdateDeleteIntentStatus`，不能把 direct RocksDB status write 写成当前主链路。
-- `UfsMetadataProxy` 注释已明确 runtime 构造存在，但 FileSystemService namespace read/write 主路径未调用。
+- UFS metadata proxy future hook 已删除；README 只保留 external mount metadata 表达事实。
 - `maintenance/mod.rs` re-export 注释已去掉 backward-compatibility wording；public surface 是否继续收窄仍作为后续候选。
 - `MaintenanceService::increment_ref_count()` / `decrement_ref_count()` direct RocksDB helper 已删除。
 
@@ -404,14 +404,13 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 
 - Recursive directory delete 未实现；`Delete(recursive=true)` 对目录返回 `NotSupported`，不遍历、不局部删除、不创建 delete intent。
 - `Hflush` / `Hsync` 不是 barrier，只是 structured `NotSupported`。
-- UFS proxy 未接入 FileSystemService 主路径。
+- UFS-backed namespace 未实现、未接入 FileSystemService 主路径，且 metadata runtime 不再保留 UFS metadata proxy。
 - ACL/Ranger 配置存在但 fail fast，不是 MVP/stub。
 - repair/delete/rebalance 不能描述为完整生产级自治系统。
 - multi-group msync、follower read 全路径、MOVED/shard migration、专用 mount refresh API 未实现。
 
 历史残留：
 
-- `SetXattr` / `RemoveXattr` apply 存在，当前没有 public FileSystem RPC/caller。
 - `MemoryStateStore` 仍作为 route-epoch test helper 暴露在 `metadata::state`，不是生产 authority。
 - `report_presence` 受 proto surface 约束仍必须实现，但当前只返回 deprecated/NotSupported。
 - `metadata/src/maintenance/mod.rs` 仍是 maintenance public re-export 聚合入口；本轮只清理 stale wording，不收窄 export surface。
@@ -427,9 +426,7 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 
 | 文件/模块 | 当前引用情况 | 为什么可疑 | 建议 | 风险 |
 | --- | --- | --- | --- | --- |
-| `metadata/src/ufs_proxy.rs` + `MetadataAuthority::_ufs_*` | runtime 构造并持有；FileSystemService 主路径未调用 | external mount 容易被误写成完整 UFS-backed namespace | 可保留但降级为“构造存在/暂缓接入”；若短期不做 UFS，可后续删除候选 | 删除会影响 mount external 表达测试和未来 UFS 接入入口 |
 | `metadata/src/state/memory.rs` / `MemoryStateStore` | regression/FsCore tests 使用；保留在 `metadata::state` 下 | 生产 runtime 使用 `RaftStateStore`，但 integration tests 仍需构造 route-epoch store | 已收窄为 route-epoch helper；后续如有测试辅助 crate 可继续取消 public state exposure | 直接删除会破坏现有 tests |
-| `Command::SetXattr` / `RemoveXattr` | state machine apply/tests 存在；FileSystem public RPC/caller 未发现 | internal capability 无 public surface，容易误判成 xattr 已实现 | 后续再审：保留内部能力或删除候选 | 可能影响未来 xattr API；删除需同步 tests |
 | `WorkerManager::try_start_full_sync`、`max_concurrent_full_syncs`、`concurrent_full_syncs` | deprecated path；tests 仍覆盖 | full report 已转为 lease manager；旧 counter 语义残留 | 删除候选，先改 tests | 直接删会破坏 tests 和可能的兼容调用 |
 | `metadata/src/maintenance/mod.rs` re-export surface | 对外 re-export 多个 maintenance 类型 | 聚合层可能扩大 public surface | 保留但后续收窄 public exports | 过早收窄会影响 tests/imports |
 | `docs/architecture/*` | 本轮扫描未发现 `docs/architecture` 目录 | 用户指定的背景目录当前不存在 | 无需处理；后续若新增再审 | 无 |
@@ -456,7 +453,6 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 - `OrphanQueue`
 - `RepairPlanner`
 - `DeleteExecutor`
-- UFS proxy
 - authz extension point
 
 优先瘦身方向：
@@ -465,7 +461,7 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 - 把 no-op / placeholder 明确降级，不写成能力。
 - 对 direct RocksDB compatibility write 保持审计压力，不把它混入 authoritative Raft apply closure。
 - 对 maintenance/repair/rebalance 只保留当前能证明的闭环，避免扩展策略复杂度。
-- 对 UFS 和 ACL/Ranger 保持 fail-fast/未接入描述，避免隐式 allow-all 或半成品代理。
+- 对 external mount 和 ACL/Ranger 保持 fail-fast/未接入描述，避免隐式 allow-all 或半成品代理。
 
 ## 19. 快速阅读路径
 
@@ -498,8 +494,7 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 25. `metadata/src/maintenance/gc.rs`
 26. `metadata/src/maintenance/orphan.rs`
 27. `metadata/src/maintenance/overrep.rs`
-28. `metadata/src/ufs_proxy.rs`
-29. `metadata/tests/path_service_regression_tests.rs`
-30. `metadata/tests/service_error_contract_tests.rs`
+28. `metadata/tests/path_service_regression_tests.rs`
+29. `metadata/tests/service_error_contract_tests.rs`
 
 不要从旧 docs 或模块名反推能力；以这些代码路径当前行为为准。

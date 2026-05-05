@@ -293,21 +293,6 @@ impl AppRaftStateMachine {
                 let result = self.apply_truncate(inode_id, new_size, lease_id, lease_epoch, &dedup_key, fingerprint)?;
                 Ok(AppDataResponse::Fs(result))
             }
-            Command::SetXattr {
-                inode_id,
-                name,
-                value,
-                create,
-                replace,
-                ..
-            } => {
-                let result = self.apply_set_xattr(inode_id, name, value, create, replace, &dedup_key, fingerprint)?;
-                Ok(AppDataResponse::Fs(result))
-            }
-            Command::RemoveXattr { inode_id, name, .. } => {
-                let result = self.apply_remove_xattr(inode_id, name, &dedup_key, fingerprint)?;
-                Ok(AppDataResponse::Fs(result))
-            }
         }
     }
 
@@ -1940,83 +1925,6 @@ impl AppRaftStateMachine {
         )?;
         Ok(result)
     }
-
-    /// Apply set xattr command.
-    // Raft apply helpers mirror command payload fields for replay clarity.
-    #[allow(clippy::too_many_arguments)]
-    fn apply_set_xattr(
-        &self,
-        inode_id: InodeId,
-        name: String,
-        value: Vec<u8>,
-        create: bool,
-        replace: bool,
-        dedup_key: &DedupKey,
-        fingerprint: CommandFingerprint,
-    ) -> MetadataResult<FsCommandResult> {
-        let prepared: MetadataResult<Inode> = (|| {
-            let mut inode = self
-                .storage
-                .get_inode(inode_id)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {}", inode_id)))?;
-
-            let exists = inode.xattrs.contains_key(&name);
-            if create && exists {
-                return Err(MetadataError::AlreadyExists(format!("xattr already exists: {}", name)));
-            }
-            if replace && !exists {
-                return Err(MetadataError::NotFound(format!("xattr not found: {}", name)));
-            }
-
-            inode.xattrs.insert(name, value);
-            let now_ms = Self::apply_timestamp_ms();
-            inode.attrs.update_ctime(now_ms);
-            Ok(inode)
-        })();
-
-        let inode = match prepared {
-            Ok(inode) => inode,
-            Err(err) => return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint),
-        };
-        let result = FsCommandResult::Ok(FsOkResult::default());
-        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
-        self.storage
-            .put_inode_with_apply_result_atomic(&inode, dedup_key, applied_result)?;
-        Ok(result)
-    }
-
-    /// Apply remove xattr command.
-    fn apply_remove_xattr(
-        &self,
-        inode_id: InodeId,
-        name: String,
-        dedup_key: &DedupKey,
-        fingerprint: CommandFingerprint,
-    ) -> MetadataResult<FsCommandResult> {
-        let prepared: MetadataResult<Inode> = (|| {
-            let mut inode = self
-                .storage
-                .get_inode(inode_id)?
-                .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {}", inode_id)))?;
-
-            if inode.xattrs.remove(&name).is_none() {
-                return Err(MetadataError::NotFound(format!("xattr not found: {}", name)));
-            }
-            let now_ms = Self::apply_timestamp_ms();
-            inode.attrs.update_ctime(now_ms);
-            Ok(inode)
-        })();
-
-        let inode = match prepared {
-            Ok(inode) => inode,
-            Err(err) => return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint),
-        };
-        let result = FsCommandResult::Ok(FsOkResult::default());
-        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
-        self.storage
-            .put_inode_with_apply_result_atomic(&inode, dedup_key, applied_result)?;
-        Ok(result)
-    }
 }
 
 #[cfg(test)]
@@ -2519,7 +2427,7 @@ mod tests {
     }
 
     #[test]
-    fn attrs_and_xattrs_reapply_return_original_result_and_replay_result() {
+    fn set_attr_reapply_returns_original_result_and_replay_result() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
@@ -2550,37 +2458,6 @@ mod tests {
         let stored = storage.get_inode(inode_id).unwrap().unwrap();
         assert_eq!(stored.attrs.uid, 123);
         assert_eq!(stored.attrs.ctime_ms, ctime_after_first);
-
-        let set_xattr = Command::SetXattr {
-            dedup: dedup_for_test(71),
-            inode_id,
-            name: "user.key".to_string(),
-            value: b"value".to_vec(),
-            create: true,
-            replace: false,
-        };
-        let first = expect_fs_ok(sm.apply(set_xattr.clone()).unwrap());
-        let second = expect_fs_ok(sm.apply(set_xattr).unwrap());
-        assert_eq!(second, first);
-        assert_eq!(
-            storage.get_inode(inode_id).unwrap().unwrap().xattrs.get("user.key"),
-            Some(&b"value".to_vec())
-        );
-
-        let remove_xattr = Command::RemoveXattr {
-            dedup: dedup_for_test(72),
-            inode_id,
-            name: "user.key".to_string(),
-        };
-        let first = expect_fs_ok(sm.apply(remove_xattr.clone()).unwrap());
-        let second = expect_fs_ok(sm.apply(remove_xattr).unwrap());
-        assert_eq!(second, first);
-        assert!(!storage
-            .get_inode(inode_id)
-            .unwrap()
-            .unwrap()
-            .xattrs
-            .contains_key("user.key"));
     }
 
     #[test]

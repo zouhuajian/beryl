@@ -15,7 +15,6 @@ use crate::service::{
     MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl, SharedWorkerCommitHook,
 };
 use crate::state::RaftStateStore;
-use crate::ufs_proxy::UfsMetadataProxy;
 use crate::worker::{
     DeleteExecutor, DeleteExecutorHandle, MetadataWorkerServiceImpl, OrphanQueue, RepairPlanner, RepairQueue,
     WorkerBackgroundHandle, WorkerManager,
@@ -34,7 +33,6 @@ use tonic_health::pb::health_server::HealthServer;
 use tonic_health::server::{HealthReporter, HealthService};
 use tracing::info;
 use types::ids::ShardGroupId;
-use ufs::UfsRegistry;
 
 pub type DynError = Box<dyn std::error::Error>;
 
@@ -53,8 +51,6 @@ pub struct MetadataAuthority {
     pub state_store: Arc<dyn crate::state::StateStore>,
     pub metadata_metrics: Arc<MetadataMetrics>,
     pub shard_group_id: ShardGroupId,
-    _ufs_registry: Arc<UfsRegistry>,
-    _ufs_metadata_proxy: Arc<UfsMetadataProxy>,
 }
 
 /// Required worker runtime soft state shared by worker RPC and background work.
@@ -293,11 +289,6 @@ pub async fn build_authority(config: &MetadataConfig) -> Result<MetadataAuthorit
         .map_err(|e| format!("Failed to ensure root mount: {e}"))?;
 
     let state_store: Arc<dyn crate::state::StateStore> = Arc::new(RaftStateStore::new(Arc::clone(&raft_node)));
-    let ufs_registry = Arc::new(UfsRegistry::new());
-    let ufs_metadata_proxy = Arc::new(UfsMetadataProxy::new(
-        Arc::clone(&mount_table),
-        Arc::clone(&ufs_registry),
-    ));
 
     Ok(MetadataAuthority {
         storage,
@@ -306,8 +297,6 @@ pub async fn build_authority(config: &MetadataConfig) -> Result<MetadataAuthorit
         state_store,
         metadata_metrics: Arc::new(MetadataMetrics::new()),
         shard_group_id: authority_group_id,
-        _ufs_registry: ufs_registry,
-        _ufs_metadata_proxy: ufs_metadata_proxy,
     })
 }
 
@@ -583,7 +572,6 @@ mod tests {
         ensure_root_mount(Arc::clone(&raft_node), Arc::clone(&mount_table), shard_group_id)
             .await
             .unwrap();
-        let ufs_registry = Arc::new(UfsRegistry::new());
 
         MetadataAuthority {
             storage,
@@ -592,8 +580,6 @@ mod tests {
             state_store: Arc::new(RaftStateStore::new(raft_node)),
             metadata_metrics: Arc::new(MetadataMetrics::new()),
             shard_group_id,
-            _ufs_registry: Arc::clone(&ufs_registry),
-            _ufs_metadata_proxy: Arc::new(UfsMetadataProxy::new(mount_table, ufs_registry)),
         }
     }
 

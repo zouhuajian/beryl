@@ -108,14 +108,6 @@ message InodeProto {
   /// Mount ID: identifies which mount this inode belongs to.
   /// Enables O(1) mount resolution during FS write routing.
   common.MountIdProto mount_id = 7;
-  /// Extended attributes (authoritative).
-  repeated XattrProto xattrs = 8;
-}
-
-/// Xattr entry.
-message XattrProto {
-  string name = 1;
-  bytes value = 2;
 }
 
 /// Directory entry (name + inode reference).
