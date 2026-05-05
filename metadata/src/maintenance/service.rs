@@ -28,7 +28,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use types::ids::{BlockId, DataHandleId};
 
 /// Active worker TTL in milliseconds (default: 3 minutes, or use heartbeat_timeout_sec * 1000).
@@ -397,57 +397,6 @@ impl MaintenanceService {
         info!("Maintenance service started with fail-closed gates");
 
         MaintenanceHandle { tasks }
-    }
-
-    /// Increment reference count through the legacy maintenance helper.
-    ///
-    /// No current metadata caller was found in the focused cleanup scan. This
-    /// direct RocksDB write path is not part of the authoritative Raft apply
-    /// closure used by file-layout mutations.
-    pub fn increment_ref_count(&self, data_handle_id: DataHandleId, block_id: BlockId) {
-        let mut ref_counts = self.block_ref_counts.write();
-        let file_refs = ref_counts.entry(data_handle_id).or_default();
-        let count = file_refs.entry(block_id).or_insert(0);
-        *count += 1;
-
-        // Legacy helper only: production file-layout mutations update the global
-        // block refcount inside their authoritative apply batch.
-        if let Err(e) = self.storage.put_block_ref_count(block_id, *count as u64) {
-            warn!(data_handle_id = ?data_handle_id, block_id = %block_id, error = %e, "Failed to persist block ref count");
-        }
-    }
-
-    /// Decrement reference count through the legacy maintenance helper.
-    ///
-    /// No current metadata caller was found in the focused cleanup scan. This
-    /// direct RocksDB write path is not part of the authoritative Raft apply
-    /// closure used by file-layout mutations.
-    pub fn decrement_ref_count(&self, data_handle_id: DataHandleId, block_id: BlockId) {
-        let mut ref_counts = self.block_ref_counts.write();
-        if let Some(file_refs) = ref_counts.get_mut(&data_handle_id) {
-            if let Some(count) = file_refs.get_mut(&block_id) {
-                *count = count.saturating_sub(1);
-                let new_count = *count;
-
-                if new_count == 0 {
-                    file_refs.remove(&block_id);
-                    // Legacy helper only: production file-layout mutations update the global
-                    // block refcount inside their authoritative apply batch.
-                    if let Err(e) = self.storage.delete_block_ref_count(block_id) {
-                        warn!(data_handle_id = ?data_handle_id, block_id = %block_id, error = %e, "Failed to delete block ref count");
-                    }
-                } else {
-                    // Legacy helper only: production file-layout mutations update the global
-                    // block refcount inside their authoritative apply batch.
-                    if let Err(e) = self.storage.put_block_ref_count(block_id, new_count as u64) {
-                        warn!(data_handle_id = ?data_handle_id, block_id = %block_id, error = %e, "Failed to persist block ref count");
-                    }
-                }
-            }
-            if file_refs.is_empty() {
-                ref_counts.remove(&data_handle_id);
-            }
-        }
     }
 }
 

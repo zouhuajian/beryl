@@ -10,7 +10,7 @@ use crate::service::domain::{
     GetAttrInput, GetFileLayoutInput, OpenWriteInput, PresentedFencingToken, ReadDirInput, RenameInput,
     RenewLeaseInput, RequestContext, SessionKey, UnlinkInput, WriteTarget,
 };
-use crate::state::{BlockMetaState, LeaseState, MemoryStateStore, RouteEpoch};
+use crate::state::{MemoryStateStore, RouteEpoch};
 use crate::worker::{HealthStatus, WorkerManager};
 use async_trait::async_trait;
 use common::error::canonical::{ErrorCode as CanonicalErrorCode, RefreshReason};
@@ -18,7 +18,6 @@ use common::header::{AuthnType, RequestHeader, RpcErrorCode};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
-use types::block::{BlockPlacement, BlockState};
 use types::fs::{FileAttrs, Inode};
 use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, LeaseId, MountId, ShardGroupId, WorkerId};
 use types::layout::FileLayout;
@@ -53,57 +52,8 @@ impl FsCore {
     }
 }
 
-fn unsupported_test_store_op<T>() -> MetadataResult<T> {
-    Err(MetadataError::Internal(
-        "storage-backed route_epoch test store only supports route_epoch".to_string(),
-    ))
-}
-
 #[async_trait]
 impl StateStore for StorageBackedRouteEpochStore {
-    async fn get_block(&self, _block_id: BlockId) -> MetadataResult<Option<BlockMetaState>> {
-        unsupported_test_store_op()
-    }
-
-    async fn create_block(
-        &self,
-        _inode_id: InodeId,
-        _block_id: BlockId,
-        _placement: BlockPlacement,
-    ) -> MetadataResult<BlockMetaState> {
-        unsupported_test_store_op()
-    }
-
-    async fn update_block_state(&self, _block_id: BlockId, _state: BlockState) -> MetadataResult<()> {
-        unsupported_test_store_op()
-    }
-
-    async fn get_lease(&self, _block_id: BlockId) -> MetadataResult<Option<LeaseState>> {
-        unsupported_test_store_op()
-    }
-
-    async fn acquire_lease(
-        &self,
-        _block_id: BlockId,
-        _client_id: ClientId,
-        _epoch: u64,
-        _expires_at_ms: u64,
-    ) -> MetadataResult<LeaseState> {
-        unsupported_test_store_op()
-    }
-
-    async fn release_lease(&self, _block_id: BlockId) -> MetadataResult<()> {
-        unsupported_test_store_op()
-    }
-
-    async fn get_inode(&self, _inode_id: InodeId) -> MetadataResult<Option<Inode>> {
-        unsupported_test_store_op()
-    }
-
-    async fn get_layout(&self, _inode_id: InodeId) -> MetadataResult<FileLayout> {
-        unsupported_test_store_op()
-    }
-
     async fn get_route_epoch(&self) -> MetadataResult<RouteEpoch> {
         self.storage.get_route_epoch()
     }

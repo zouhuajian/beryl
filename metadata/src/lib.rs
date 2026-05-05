@@ -39,8 +39,8 @@
 //! - **RocksDB** stores authoritative metadata state and Raft-backed replicated
 //!   state.
 //! - **Raft** commits metadata mutations at authority boundaries.
-//! - **RaftStateStore** is the production `StateStore` implementation.
-//!   `MemoryStateStore` is retained for tests and local helpers.
+//! - **RaftStateStore** is the production route-epoch `StateStore`
+//!   implementation. `MemoryStateStore` is retained under `state` for tests.
 //!
 //! ## Freshness and Current Limitations
 //!
@@ -77,4 +77,4 @@ pub use config::MetadataConfig;
 pub use error::{MetadataError, MetadataResult};
 pub use mount::MountTable;
 pub use readiness::{wait_for_root_ready, RootReadinessConfig, RootReadinessGate};
-pub use state::{MemoryStateStore, RouteEpoch, StateStore};
+pub use state::{RouteEpoch, StateStore};

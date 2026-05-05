@@ -67,7 +67,7 @@ flowchart TB
 | 已实现 | 薄 `main.rs`、runtime composition、root readiness、FileSystemService 新 16 RPC、inode/dentry/attrs authority、mount_epoch/route_epoch/state watermark freshness、durable single `file_version`、write lifecycle 主链路、worker register 持久化、block report soft locations、delete intent Raft apply/status 更新。 |
 | 部分实现 | maintenance/repair/delete framework、worker command heartbeat pull、full block report lease、GC/orphan/overrep intent creation、repair queue ack/retry、client refresh/replay 配合。 |
 | 未实现 | recursive directory delete、Hflush/Hsync barrier、ACL/Ranger、完整 UFS-backed namespace、生产级 repair/move/evict/rebalance 策略、多 group msync、follower read 全路径、专用 mount refresh API、path->group route cache。 |
-| 历史残留 | `report_presence`、`MemoryStateStore` 测试/placeholder、`CommandSender` push-mode no-op、StateStore 中部分 block/lease mutation API、若干 stale code comments/docs references。 |
+| 历史残留 | `report_presence` proto RPC 入口仍存在但返回 deprecated/NotSupported、`MemoryStateStore` route-epoch 测试 helper、`SetXattr` / `RemoveXattr` internal apply 无 public RPC、若干 stale code comments/docs references。 |
 | 可保留但暂缓 | RepairPlanner/RepairQueue/OrphanQueue、DeleteExecutor、MaintenanceService、UFS proxy、authz extension point。 |
 
 ## 3. 启动链路
@@ -248,18 +248,19 @@ Raft apply 当前统一做 dedup：
 | DONE | `Create`, `Mkdir`, `Rmdir`, empty-file `Unlink`, extent-bearing file `Unlink`, `Rename` including overwrite target cleanup, `CloseWrite`, `Truncate` shrink, `CreateDeleteIntents`, `AllocateDeleteIntents`, `UpdateDeleteIntentStatus`, `CreateMount`, `DeleteMount`, `AddShardGroup`, `RegisterWorker`, `AcquireLease`, `ReleaseLease`, block allocate/state/commit paths。 |
 | STRUCTURED_ERROR_REPLAY | deterministic FS business errors for create/mkdir/unlink/rmdir/rename/close-write/truncate/xattr are persisted as `AppliedResult` when they happen inside apply preparation. |
 | INTERNAL_NO_PUBLIC_API | `SetXattr` / `RemoveXattr` apply and dedup exist, but no public FileSystem RPC/caller was found in the scan. |
-| DIRECT_ROCKSDB_TODO | `MaintenanceService::increment_ref_count()` / `decrement_ref_count()` still directly write block refcount compatibility state outside a Raft command path; no current caller found in metadata scan. |
-
 已清理：
 
 - `UpdateCommittedLength` legacy command path 已删除。Committed length mutation 语义不再作为独立 command 存在；当前 committed file state 通过 `CommitFile` / `CloseWrite` apply 和 durable `file_version` 维护。
+- `CommandSender` push-mode no-op legacy hook 已删除。当前 worker command 只通过 heartbeat pull 返回。
+- `StateStore` 已收窄为 route freshness 读取接口；旧 block/lease mutation trait 方法已删除。
+- `MaintenanceService::increment_ref_count()` / `decrement_ref_count()` direct RocksDB helper 已删除；当前 file-layout refcount mutation 仍走 Raft apply batch。
 
 snapshot / state store：
 
 - `state_machine_store.rs` snapshot V1 header carries route epoch; snapshot payload covers replicated state CFs.
 - No runtime/storage/snapshot/header/client `applied_seq` path should be reintroduced.
-- `RaftStateStore` uses `AppRaftNode::read(false, ...)`, current path is leader-read, not follower read.
-- `MemoryStateStore` is placeholder/test support, not production authority.
+- `RaftStateStore` uses `AppRaftNode::read(false, ...)` for route epoch, current path is leader-read, not follower read.
+- `MemoryStateStore` is route-epoch test support under `metadata::state`, not production authority.
 
 ## 10. Worker metadata 链路
 
@@ -289,7 +290,7 @@ block report：
 `report_presence`：
 
 - RPC 仍存在。
-- 当前是 deprecated/no-op，只返回 ack。
+- 当前返回 structured deprecated/NotSupported header，不更新 presence。
 - README 和外部文档不能把它描述成强一致 presence 来源；当前主来源是 `block_report`。
 
 ## 11. Maintenance / Repair / Delete 当前状态
@@ -374,8 +375,11 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 - durable single `file_version` 已完成；不引入 `layout_version`。
 - rename overwrite regular-file target cleanup 已进入 atomic apply path。
 - worker descriptor 持久态与 heartbeat/block location soft state 已分离。
-- block report 是当前 block presence 主来源；`report_presence` 是 deprecated/no-op。
+- block report 是当前 block presence 主来源；`report_presence` proto 入口仍存在，但返回 deprecated/NotSupported。
 - `UpdateDeleteIntentStatus` 已通过 Raft command 持久化，不再应描述为直接 RocksDB status update。
+- `CommandSender` push-mode no-op hook 已删除；worker command delivery 只保留 heartbeat pull。
+- `StateStore` 只保留 route epoch 读取；旧 block/lease mutation trait surface 已删除。
+- `MaintenanceService` direct refcount helper 已删除；block refcount 的生产 mutation 仍在 authoritative apply batch 内完成。
 
 ## 15. 文档/历史残留清理状态
 
@@ -384,14 +388,15 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 - `metadata/src/lib.rs` crate docs 已改为当前 `MetadataServer` runtime、`MetadataFileSystemServiceImpl`、`MetadataWorkerServiceImpl` 和 FileSystemService external API 事实；不再引用当前 checkout 缺失的 metadata docs path，也不再描述旧 client service 名称。
 - `metadata/src/service/mod.rs` module docs 已改为当前 FileSystemService adapter / GuardChain / FsCore / msync / auth extension point 事实。
 - 当前 checkout 未包含 `docs/architecture` 目录；README 不把该目录写成当前可读实现文档。
-- `report_presence` 已明确为 deprecated/no-op；当前 block presence authoritative input 是 `block_report`。
-- `metadata/src/worker/command_sender.rs` 已明确为 heartbeat-pull 模型下的 no-op legacy hook，不是 push queue 或 push transport。
+- `report_presence` 已降级为 deprecated/NotSupported 响应；当前 block presence authoritative input 是 `block_report`。
+- `metadata/src/worker/command_sender.rs` 已删除；当前没有 push queue 或 push transport hook。
 - `Command::UpdateCommittedLength` legacy command path 已删除；scan 未发现当前 public caller。
-- `MemoryStateStore` 已明确为 tests/helpers 使用，production runtime 使用 `RaftStateStore`。
-- `StateStore` 已明确为比当前生产 freshness read 更宽的旧抽象接口，保留为后续收窄候选。
+- `MemoryStateStore` 已收窄为 route-epoch tests/helper，production runtime 使用 `RaftStateStore`。
+- `StateStore` 已从旧 block/lease mutation abstraction 收窄为 route freshness read trait。
 - `state::DeleteIntent` 注释已修正：当前 `DeleteExecutor` status transition 使用 `Command::UpdateDeleteIntentStatus`，不能把 direct RocksDB status write 写成当前主链路。
 - `UfsMetadataProxy` 注释已明确 runtime 构造存在，但 FileSystemService namespace read/write 主路径未调用。
 - `maintenance/mod.rs` re-export 注释已去掉 backward-compatibility wording；public surface 是否继续收窄仍作为后续候选。
+- `MaintenanceService::increment_ref_count()` / `decrement_ref_count()` direct RocksDB helper 已删除。
 
 ## 16. 当前风险、历史包袱、TODO
 
@@ -407,16 +412,14 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 历史残留：
 
 - `SetXattr` / `RemoveXattr` apply 存在，当前没有 public FileSystem RPC/caller。
-- `MemoryStateStore` 和 `StateStore` 的部分 block/lease mutation API 已主要服务测试或旧抽象。
-- `CommandSender` 是 push-mode no-op；实际 worker command 通过 heartbeat pull。
-- `CommandSender`、`MemoryStateStore`、`StateStore` 仍保留为代码表面；本轮只修正文档/注释，不删除生产代码。
+- `MemoryStateStore` 仍作为 route-epoch test helper 暴露在 `metadata::state`，不是生产 authority。
+- `report_presence` 受 proto surface 约束仍必须实现，但当前只返回 deprecated/NotSupported。
 - `metadata/src/maintenance/mod.rs` 仍是 maintenance public re-export 聚合入口；本轮只清理 stale wording，不收窄 export surface。
 
 验证状态：
 
-- 本轮 cleanup 已确认 `cargo fmt --all --check`、`cargo check -p metadata --all-targets`、`cargo test -p metadata --all-targets`、`cargo clippy -p metadata --all-targets -- -D warnings` 当前通过。
+- 本轮 cleanup 已确认 `cargo fmt --all --check`、`cargo test -p metadata --all-targets`、`cargo clippy -p metadata --all-targets -- -D warnings` 和 `git diff --check` 当前通过。
 - `cargo fmt --all --check` 仍输出 stable rustfmt 对 unstable import 配置的 warning，但命令退出码为 0。
-- `git diff --check` 结果以本轮交付说明为准。
 
 ## 17. 多余 / 不必要设计候选
 
@@ -425,12 +428,9 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 | 文件/模块 | 当前引用情况 | 为什么可疑 | 建议 | 风险 |
 | --- | --- | --- | --- | --- |
 | `metadata/src/ufs_proxy.rs` + `MetadataAuthority::_ufs_*` | runtime 构造并持有；FileSystemService 主路径未调用 | external mount 容易被误写成完整 UFS-backed namespace | 可保留但降级为“构造存在/暂缓接入”；若短期不做 UFS，可后续删除候选 | 删除会影响 mount external 表达测试和未来 UFS 接入入口 |
-| `metadata/src/state/memory.rs` / `MemoryStateStore` | regression/FsCore tests 使用；lib.rs re-export | 生产 runtime 使用 `RaftStateStore`，但 test helper 仍在 public state surface | 保留为 test helper，后续考虑移入测试辅助并取消 public re-export | 直接删除会破坏现有 tests |
-| `metadata/src/state/mod.rs::StateStore` block/lease mutation methods | production freshness 主要用 `get_route_epoch()`；部分 mutation method 无 metadata caller | trait 比当前 FsCore 需要更宽，保留旧 data-control/block lease 抽象痕迹 | 后续再审，收窄为 freshness/read trait 或拆分 | 可能影响 `RaftStateStore` tests/旧 data-control 入口 |
+| `metadata/src/state/memory.rs` / `MemoryStateStore` | regression/FsCore tests 使用；保留在 `metadata::state` 下 | 生产 runtime 使用 `RaftStateStore`，但 integration tests 仍需构造 route-epoch store | 已收窄为 route-epoch helper；后续如有测试辅助 crate 可继续取消 public state exposure | 直接删除会破坏现有 tests |
 | `Command::SetXattr` / `RemoveXattr` | state machine apply/tests 存在；FileSystem public RPC/caller 未发现 | internal capability 无 public surface，容易误判成 xattr 已实现 | 后续再审：保留内部能力或删除候选 | 可能影响未来 xattr API；删除需同步 tests |
-| `metadata/src/worker/command_sender.rs` | `MetadataWorkerServiceImpl` 持有 `_command_sender`；实际 send 是 heartbeat pull no-op | push-mode 抽象残留，当前只保留 no-op hook | 降级/合并/删除候选 | 如果未来恢复 push command，需要替代入口 |
 | `WorkerManager::try_start_full_sync`、`max_concurrent_full_syncs`、`concurrent_full_syncs` | deprecated path；tests 仍覆盖 | full report 已转为 lease manager；旧 counter 语义残留 | 删除候选，先改 tests | 直接删会破坏 tests 和可能的兼容调用 |
-| `MaintenanceService::increment_ref_count()` / `decrement_ref_count()` | scan 未发现 metadata caller；直接写 RocksDB block refcount | 绕开 Raft command/apply atomicity；README 不能把它算入闭环 | 删除候选或改为只读/测试辅助；如需保留必须重新路由 | 若外部 crate 调用 public method，删除会 breaking |
 | `metadata/src/maintenance/mod.rs` re-export surface | 对外 re-export 多个 maintenance 类型 | 聚合层可能扩大 public surface | 保留但后续收窄 public exports | 过早收窄会影响 tests/imports |
 | `docs/architecture/*` | 本轮扫描未发现 `docs/architecture` 目录 | 用户指定的背景目录当前不存在 | 无需处理；后续若新增再审 | 无 |
 

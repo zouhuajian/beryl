@@ -4,7 +4,7 @@
 //! State storage abstraction for metadata service.
 //!
 //! The production runtime uses `RaftStateStore`. The in-memory implementation
-//! remains available for regression tests and small FsCore helpers.
+//! remains available only as route-epoch test support.
 
 mod memory;
 mod raft_store;
@@ -16,7 +16,7 @@ use crate::error::MetadataResult;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use types::block::{BlockPlacement, BlockState};
-use types::ids::{BlockId, ClientId, DataHandleId};
+use types::ids::{BlockId, DataHandleId};
 use types::lease::Lease;
 
 /// Authoritative route epoch used by metadata stale-route validation.
@@ -131,56 +131,12 @@ pub struct DeleteIntent {
     pub last_error_msg: Option<String>,
 }
 
-/// State store trait.
+/// State store trait for freshness reads needed by `FsCore`.
 ///
-/// This interface is wider than the current production freshness reads because
-/// it still carries block/lease mutation methods used by older abstractions and
-/// tests. The production implementation is `RaftStateStore`; `MemoryStateStore`
-/// is test support.
+/// Authoritative metadata mutations go through Raft commands and apply batches.
+/// This trait intentionally exposes only the current route freshness read.
 #[async_trait]
 pub trait StateStore: Send + Sync {
-    // NOTE: FileMeta and file-based operations have been removed.
-    // All file metadata is now stored in inodes. Use the FS service (inode/dentry-based) instead.
-    // Path is not authoritative storage. All path operations must go through the FS service (inode/dentry-based).
-
-    // NOTE: list_files has been removed. Path-based listing is not authoritative.
-    // Use the FS service ReadDir operation (inode/dentry-based) instead.
-
-    /// Get block metadata.
-    async fn get_block(&self, block_id: BlockId) -> MetadataResult<Option<BlockMetaState>>;
-
-    /// Create or update block metadata.
-    async fn create_block(
-        &self,
-        inode_id: types::fs::InodeId,
-        block_id: BlockId,
-        placement: BlockPlacement,
-    ) -> MetadataResult<BlockMetaState>;
-
-    /// Update block state.
-    async fn update_block_state(&self, block_id: BlockId, state: BlockState) -> MetadataResult<()>;
-
-    /// Get lease for a block.
-    async fn get_lease(&self, block_id: BlockId) -> MetadataResult<Option<LeaseState>>;
-
-    /// Acquire or renew lease.
-    async fn acquire_lease(
-        &self,
-        block_id: BlockId,
-        client_id: ClientId,
-        epoch: u64,
-        expires_at_ms: u64,
-    ) -> MetadataResult<LeaseState>;
-
-    /// Release lease.
-    async fn release_lease(&self, block_id: BlockId) -> MetadataResult<()>;
-
-    /// Get inode by id.
-    async fn get_inode(&self, inode_id: types::fs::InodeId) -> MetadataResult<Option<types::fs::Inode>>;
-
-    /// Get layout for an inode (authoritative).
-    async fn get_layout(&self, inode_id: types::fs::InodeId) -> MetadataResult<types::layout::FileLayout>;
-
     /// Get the current authoritative route epoch.
     async fn get_route_epoch(&self) -> MetadataResult<RouteEpoch>;
 }

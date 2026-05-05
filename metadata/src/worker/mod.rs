@@ -9,7 +9,6 @@
 //! - Block locations convergence
 //! - Repair queue and scheduling skeleton
 
-mod command_sender;
 mod delete_executor;
 #[cfg(test)]
 mod delete_executor_tests;
@@ -27,7 +26,6 @@ mod tests;
 #[cfg(test)]
 mod integration_tests;
 
-pub use command_sender::CommandSender;
 pub use delete_executor::{DeleteExecutor, DeleteExecutorHandle};
 pub use full_report_lease::{FullReportLease, FullReportLeaseManager};
 pub use manager::{HealthStatus, WorkerDescriptor, WorkerInfo, WorkerManager};

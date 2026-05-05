@@ -3,14 +3,13 @@
 
 //! MetadataWorkerService implementation.
 
-use super::command_sender::CommandSender;
 use super::delete_executor::DeleteExecutor;
 use super::manager::WorkerManager;
 use super::metrics::WorkerMetrics;
 use super::repair::{
     ErrorClass, OrphanQueue, RepairPlanner, RepairQueue, RepairTask, RepairTaskId, RepairTaskRecord, TaskAckStatus,
 };
-use crate::error::MetadataResult;
+use crate::error::{to_canonical_rpc, MetadataError, MetadataResult};
 use crate::raft::Command;
 use crate::raft::{AppDataResponse, AppRaftNode, WorkerCommandResult};
 use crate::service::extract_and_inject_context;
@@ -44,7 +43,6 @@ pub struct MetadataWorkerServiceImpl {
     repair_queue: Arc<RepairQueue>,
     orphan_queue: Arc<OrphanQueue>,
     repair_planner: Arc<RepairPlanner>,
-    _command_sender: Arc<CommandSender>,
     delete_executor: Option<Arc<DeleteExecutor>>,
     metrics: Arc<WorkerMetrics>,
     slot_metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
@@ -62,7 +60,6 @@ impl MetadataWorkerServiceImpl {
     ) -> Self {
         let repair_planner = Arc::new(RepairPlanner::new(Arc::clone(&repair_queue), Arc::clone(&orphan_queue)));
 
-        let command_sender = Arc::new(CommandSender::new(3, 100)); // 3 retries, 100ms base backoff
         let metrics = Arc::new(WorkerMetrics::new());
 
         Self {
@@ -71,7 +68,6 @@ impl MetadataWorkerServiceImpl {
             repair_queue,
             orphan_queue,
             repair_planner,
-            _command_sender: command_sender,
             delete_executor: None, // Will be set via set_delete_executor
             metrics,
             slot_metrics: None, // Will be set via set_slot_metrics
@@ -944,12 +940,11 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    /// Deprecated no-op presence RPC.
+    /// Deprecated presence RPC.
     ///
     /// `block_report` is the current authoritative input for block presence.
-    /// This retained worker RPC only acknowledges the request so older callers
-    /// do not mistake a successful transport response for committed presence
-    /// state.
+    /// The proto method is retained, but it returns a structured unsupported
+    /// header so callers cannot mistake it for committed presence state.
     async fn report_presence(
         &self,
         request: Request<WorkerReportPresenceRequestProto>,
@@ -957,7 +952,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         let req = request.into_inner();
         let _caller_ctx = extract_and_inject_context(&req.header);
 
-        // Deprecated no-op: block_report owns current block presence updates.
         let group_id = if let Some(ref header) = req.header {
             if header.group_id != 0 {
                 Some(header.group_id)
@@ -967,7 +961,16 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         } else {
             None
         };
-        let response_header = self.create_response_header_from_request(&req.header, group_id);
+        let ok_header = self.create_response_header_from_request(&req.header, group_id);
+        let mut response_header = ResponseHeader::from_canonical(
+            ok_header.client.clone(),
+            to_canonical_rpc(MetadataError::NotSupported(
+                "report_presence is deprecated; use block_report".to_string(),
+            )),
+        );
+        if let Some(group_id) = group_id {
+            response_header = response_header.with_group_id(group_id);
+        }
         Ok(Response::new(WorkerReportPresenceResponseProto {
             header: Some((&response_header).into()),
         }))
