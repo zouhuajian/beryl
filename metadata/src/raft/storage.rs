@@ -2829,6 +2829,7 @@ mod tests {
                 crate::raft::types::FsOkResult {
                     inode_id: Some(inode_id),
                     data_handle_id: Some(data_handle_id),
+                    file_version: None,
                 },
             )),
             created_at_ms: now_millis(),

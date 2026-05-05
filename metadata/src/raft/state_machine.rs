@@ -889,6 +889,7 @@ impl AppRaftStateMachine {
             Ok(FsOkResult {
                 inode_id: Some(inode_id),
                 data_handle_id: None,
+                file_version: None,
             })
             .map(|ok| (inode, updated_parent, ok))
         })();
@@ -959,6 +960,7 @@ impl AppRaftStateMachine {
             Ok(FsOkResult {
                 inode_id: Some(inode_id),
                 data_handle_id: Some(data_handle_id),
+                file_version: None,
             })
             .map(|ok| (inode, updated_parent, ok))
         })();
@@ -1559,6 +1561,7 @@ impl AppRaftStateMachine {
             };
 
             let mut committed_block_ids = std::collections::HashSet::with_capacity(extents.len());
+            let file_version = lease_epoch;
             let mut ordered_extents = extents;
             ordered_extents.sort_by_key(|extent| (extent.file_offset, extent.block_id.index.as_raw()));
             let mut previous_end = None;
@@ -1650,6 +1653,9 @@ impl AppRaftStateMachine {
             }
 
             // Update inode: publish extents and update size/mtime/ctime/lease_epoch.
+            for extent in &mut ordered_extents {
+                extent.file_version = Some(file_version);
+            }
             match &mut inode.data {
                 types::fs::InodeData::File {
                     extents: existing_extents,
@@ -1701,7 +1707,11 @@ impl AppRaftStateMachine {
                 block_ref_increments,
                 block_ref_decrements,
                 now_ms,
-                FsOkResult::default(),
+                FsOkResult {
+                    inode_id: Some(inode_id),
+                    data_handle_id: Some(expected_data_handle_id),
+                    file_version: Some(file_version),
+                },
             ))
         })();
 

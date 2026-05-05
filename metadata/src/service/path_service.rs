@@ -331,6 +331,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             .execute_get_attr(GetAttrInput {
                 ctx: req_ctx.clone(),
                 inode_id,
+                freshness: Self::freshness_from_header(&req.header),
             })
             .await
         {
@@ -686,6 +687,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 parent_inode_id: inode_id,
                 cursor_key,
                 max_entries,
+                freshness: Self::freshness_from_header(&req.header),
             })
             .await
         {
@@ -805,6 +807,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 ctx: req_ctx.clone(),
                 inode_id,
                 range,
+                requested_data_handle_id: None,
                 freshness: Self::freshness_from_header(&req.header),
             })
             .await
@@ -817,7 +820,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         inode_id: Some(Self::inode_proto(inode_id)),
                         data_handle_id: Some(Self::data_handle_proto(inode.current_data_handle_id)),
                         file_size: payload.file_size,
-                        file_version: None,
+                        file_version: payload.file_version,
                         locations: if req.include_locations {
                             payload.locations.iter().map(location_to_proto).collect()
                         } else {
@@ -846,6 +849,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             self.guard_chain.check_meta_read(&req_ctx)
         );
 
+        let mut requested_data_handle_id = None;
         let inode_id = match req.target.clone() {
             Some(get_block_locations_request_proto::Target::Path(path)) => {
                 let resolved = match self.path_resolver.resolve_inode(&path) {
@@ -902,6 +906,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             }
             Some(get_block_locations_request_proto::Target::DataHandleId(data_handle)) => {
                 let data_handle_id = DataHandleId::new(data_handle.value);
+                requested_data_handle_id = Some(data_handle_id);
                 let inode_id = match self.fs_core.inode_for_data_handle(&req_ctx, data_handle_id).await {
                     Ok(success) => success.payload,
                     Err(failure) => {
@@ -969,6 +974,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 ctx: req_ctx.clone(),
                 inode_id,
                 range,
+                requested_data_handle_id,
                 freshness: Self::freshness_from_header(&req.header),
             })
             .await
@@ -981,6 +987,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         inode_id: Some(Self::inode_proto(inode_id)),
                         data_handle_id: Some(Self::data_handle_proto(inode.current_data_handle_id)),
                         file_size: payload.file_size,
+                        file_version: payload.file_version,
                         locations: payload.locations.iter().map(location_to_proto).collect(),
                         ..Default::default()
                     },

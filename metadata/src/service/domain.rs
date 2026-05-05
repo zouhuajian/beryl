@@ -132,6 +132,7 @@ pub type CoreResult<T> = Result<CoreSuccess<T>, CoreFailure>;
 pub struct GetAttrInput {
     pub ctx: RequestContext,
     pub inode_id: InodeId,
+    pub freshness: Freshness,
 }
 
 #[derive(Clone, Debug)]
@@ -213,6 +214,7 @@ pub struct ReadDirInput {
     pub parent_inode_id: InodeId,
     pub cursor_key: Option<Vec<u8>>,
     pub max_entries: Option<usize>,
+    pub freshness: Freshness,
 }
 
 #[derive(Clone, Debug)]
@@ -255,6 +257,7 @@ pub struct GetFileLayoutInput {
     pub ctx: RequestContext,
     pub inode_id: InodeId,
     pub range: Option<FileRange>,
+    pub requested_data_handle_id: Option<DataHandleId>,
     pub freshness: Freshness,
 }
 
@@ -262,6 +265,7 @@ pub struct GetFileLayoutInput {
 pub struct GetFileLayoutOutput {
     pub extents: Vec<Extent>,
     pub file_size: u64,
+    pub file_version: Option<u64>,
     pub locations: Vec<FileBlockLocation>,
 }
 

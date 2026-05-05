@@ -15,19 +15,20 @@ use metadata::service::{
 };
 use metadata::state::MemoryStateStore;
 use proto::common::{
-    error_detail_proto::Code as ErrorCodeProto, ErrorClassProto, FsErrnoProto, RequestHeaderProto, ResponseHeaderProto,
-    RpcErrorCodeProto,
+    error_detail_proto::Code as ErrorCodeProto, DataHandleIdProto, ErrorClassProto, FsErrnoProto, RefreshReasonProto,
+    RequestHeaderProto, ResponseHeaderProto, RpcErrorCodeProto,
 };
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::{
-    AppendFileRequestProto, CreateDirectoryRequestProto, CreateDispositionProto, CreateFileRequestProto,
-    DeleteRequestProto, GetStatusRequestProto, HflushRequestProto, HsyncRequestProto, WriteHandleProto,
+    get_block_locations_request_proto, AppendFileRequestProto, CreateDirectoryRequestProto, CreateDispositionProto,
+    CreateFileRequestProto, DeleteRequestProto, GetBlockLocationsRequestProto, GetStatusRequestProto,
+    HflushRequestProto, HsyncRequestProto, WriteHandleProto,
 };
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tonic::Request;
-use types::fs::{FileAttrs, Inode, InodeId};
-use types::ids::{DataHandleId, ShardGroupId};
+use types::fs::{Extent, FileAttrs, Inode, InodeId};
+use types::ids::{BlockId, BlockIndex, DataHandleId, ShardGroupId};
 use types::layout::FileLayout;
 use types::ClientId;
 
@@ -93,6 +94,19 @@ fn assert_not_leader(err: &proto::common::ErrorDetailProto) {
         Some(ErrorCodeProto::RpcCode(code)) if code == RpcErrorCodeProto::RpcErrCodeNotLeader as i32 => {}
         other => panic!("expected NotLeader rpc code, got {:?}", other),
     }
+}
+
+fn assert_need_refresh_rpc(
+    err: &proto::common::ErrorDetailProto,
+    expected_code: RpcErrorCodeProto,
+    expected_reason: RefreshReasonProto,
+) {
+    assert_eq!(err.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+    match err.code {
+        Some(ErrorCodeProto::RpcCode(code)) if code == expected_code as i32 => {}
+        other => panic!("expected {:?} rpc code, got {:?}", expected_code, other),
+    }
+    assert_eq!(err.refresh_reason, expected_reason as i32);
 }
 
 fn build_env(
@@ -473,6 +487,196 @@ async fn hsync_is_not_supported() {
     assert!(err.message.contains("Hsync is reserved"));
     assert_eq!(env.storage.get_inode(file_inode_id).unwrap(), before_inode);
     assert_eq!(env.storage.get_layout(file_inode_id).unwrap(), before_layout);
+}
+
+#[tokio::test]
+async fn get_locations_rejects_stale_handle() {
+    let env = build_env("/", DataIoPolicy::Allow, None, Some(Arc::new(AlwaysLeader)), |_| {
+        Arc::new(NonePermissionChecker)
+    });
+    let file_inode_id = InodeId::new(9101);
+    let current_handle = DataHandleId::new(99101);
+    let stale_handle = DataHandleId::new(99100);
+    let mut attrs = FileAttrs::new();
+    attrs.size = 128;
+    let mut inode = Inode::new_file(file_inode_id, attrs, env.mount_id, current_handle);
+    inode.data = types::fs::InodeData::File {
+        extents: vec![Extent {
+            file_offset: 0,
+            block_id: BlockId::new(current_handle, BlockIndex::new(0)),
+            block_offset: 0,
+            len: 128,
+            file_version: Some(4),
+            block_stamp: None,
+        }],
+        lease_epoch: Some(4),
+    };
+    env.storage.put_inode(&inode).expect("put file inode");
+    env.storage
+        .put_dentry(env.root_inode_id, "file", file_inode_id)
+        .expect("put file dentry");
+    env.storage
+        .put_layout(file_inode_id, FileLayout::new(4096, 4096, 1))
+        .expect("put layout");
+    env.storage
+        .put_data_handle_owner(current_handle, file_inode_id)
+        .expect("put current owner");
+    env.storage
+        .put_data_handle_owner(stale_handle, file_inode_id)
+        .expect("put stale owner");
+
+    let response = FileSystemServiceProto::get_block_locations(
+        &env.service,
+        Request::new(GetBlockLocationsRequestProto {
+            header: header(21),
+            target: Some(get_block_locations_request_proto::Target::DataHandleId(
+                DataHandleIdProto {
+                    value: stale_handle.as_raw(),
+                },
+            )),
+            range: None,
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+
+    let err = header_error(response.header);
+    assert_need_refresh_rpc(
+        &err,
+        RpcErrorCodeProto::RpcErrCodeStaleState,
+        RefreshReasonProto::RefreshReasonStaleState,
+    );
+    assert!(err.message.contains("not current data_handle_id"));
+}
+
+#[tokio::test]
+async fn get_locations_accepts_current_handle() {
+    let env = build_env("/", DataIoPolicy::Allow, None, Some(Arc::new(AlwaysLeader)), |_| {
+        Arc::new(NonePermissionChecker)
+    });
+    let file_inode_id = InodeId::new(9102);
+    let current_handle = DataHandleId::new(99102);
+    let mut attrs = FileAttrs::new();
+    attrs.size = 128;
+    let mut inode = Inode::new_file(file_inode_id, attrs, env.mount_id, current_handle);
+    inode.data = types::fs::InodeData::File {
+        extents: vec![Extent {
+            file_offset: 0,
+            block_id: BlockId::new(current_handle, BlockIndex::new(0)),
+            block_offset: 0,
+            len: 128,
+            file_version: Some(4),
+            block_stamp: None,
+        }],
+        lease_epoch: Some(4),
+    };
+    env.storage.put_inode(&inode).expect("put file inode");
+    env.storage
+        .put_dentry(env.root_inode_id, "file", file_inode_id)
+        .expect("put file dentry");
+    env.storage
+        .put_layout(file_inode_id, FileLayout::new(4096, 4096, 1))
+        .expect("put layout");
+    env.storage
+        .put_data_handle_owner(current_handle, file_inode_id)
+        .expect("put current owner");
+
+    let response = FileSystemServiceProto::get_block_locations(
+        &env.service,
+        Request::new(GetBlockLocationsRequestProto {
+            header: header(22),
+            target: Some(get_block_locations_request_proto::Target::DataHandleId(
+                DataHandleIdProto {
+                    value: current_handle.as_raw(),
+                },
+            )),
+            range: None,
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+
+    assert_success_header(response.header);
+    assert_eq!(
+        response.data_handle_id.expect("data handle").value,
+        current_handle.as_raw()
+    );
+    assert_eq!(response.file_version, Some(4));
+    assert_eq!(response.locations.len(), 1);
+    assert_eq!(
+        response.locations[0]
+            .block_id
+            .as_ref()
+            .expect("block id")
+            .data_handle_id,
+        current_handle.as_raw()
+    );
+}
+
+#[tokio::test]
+async fn get_locations_by_path_uses_current_handle() {
+    let env = build_env("/", DataIoPolicy::Allow, None, Some(Arc::new(AlwaysLeader)), |_| {
+        Arc::new(NonePermissionChecker)
+    });
+    let file_inode_id = InodeId::new(9103);
+    let current_handle = DataHandleId::new(99103);
+    let stale_handle = DataHandleId::new(99104);
+    let mut attrs = FileAttrs::new();
+    attrs.size = 128;
+    let mut inode = Inode::new_file(file_inode_id, attrs, env.mount_id, current_handle);
+    inode.data = types::fs::InodeData::File {
+        extents: vec![Extent {
+            file_offset: 0,
+            block_id: BlockId::new(current_handle, BlockIndex::new(0)),
+            block_offset: 0,
+            len: 128,
+            file_version: Some(8),
+            block_stamp: None,
+        }],
+        lease_epoch: Some(8),
+    };
+    env.storage.put_inode(&inode).expect("put file inode");
+    env.storage
+        .put_dentry(env.root_inode_id, "file", file_inode_id)
+        .expect("put file dentry");
+    env.storage
+        .put_layout(file_inode_id, FileLayout::new(4096, 4096, 1))
+        .expect("put layout");
+    env.storage
+        .put_data_handle_owner(current_handle, file_inode_id)
+        .expect("put current owner");
+    env.storage
+        .put_data_handle_owner(stale_handle, file_inode_id)
+        .expect("put stale owner");
+
+    let response = FileSystemServiceProto::get_block_locations(
+        &env.service,
+        Request::new(GetBlockLocationsRequestProto {
+            header: header(23),
+            target: Some(get_block_locations_request_proto::Target::Path("/file".to_string())),
+            range: None,
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+
+    assert_success_header(response.header);
+    assert_eq!(
+        response.data_handle_id.expect("data handle").value,
+        current_handle.as_raw()
+    );
+    assert_eq!(response.file_version, Some(8));
+    assert_eq!(
+        response.locations[0]
+            .block_id
+            .as_ref()
+            .expect("block id")
+            .data_handle_id,
+        current_handle.as_raw()
+    );
 }
 
 #[tokio::test]

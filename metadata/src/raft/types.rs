@@ -104,6 +104,7 @@ impl FsCommandResult {
 pub struct FsOkResult {
     pub inode_id: Option<InodeId>,
     pub data_handle_id: Option<DataHandleId>,
+    pub file_version: Option<u64>,
 }
 
 /// FS errno surfaced by apply.

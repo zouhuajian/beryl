@@ -7,8 +7,8 @@ use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
 use crate::raft::{AppRaftNode, AppRaftStateMachine, Command, DedupKey, RocksDBStorage};
 use crate::service::domain::{
     AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CommittedBlock, CoreResult, Freshness,
-    GetFileLayoutInput, OpenWriteInput, PresentedFencingToken, RenewLeaseInput, RequestContext, SessionKey,
-    UnlinkInput, WriteTarget,
+    GetAttrInput, GetFileLayoutInput, OpenWriteInput, PresentedFencingToken, ReadDirInput, RenewLeaseInput,
+    RequestContext, SessionKey, UnlinkInput, WriteTarget,
 };
 use crate::state::{BlockMetaState, LeaseState, MemoryStateStore, RouteEpoch};
 use crate::worker::{HealthStatus, WorkerManager};
@@ -209,6 +209,7 @@ async fn get_file_layout_returns_worker_locations_from_worker_manager() {
             ctx: request_context(),
             inode_id,
             range: None,
+            requested_data_handle_id: None,
             freshness: Freshness::default(),
         })
         .await
@@ -227,6 +228,321 @@ async fn get_file_layout_returns_worker_locations_from_worker_manager() {
     );
     assert_eq!(location.worker_epoch, Some(22));
     assert_eq!(location.workers[0].endpoint, "127.0.0.1:9101");
+}
+
+#[tokio::test]
+async fn get_status_rejects_stale_mount_epoch() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(70);
+    let inode_id = InodeId::new(700);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(17));
+    fs_core.set_storage(Arc::clone(&storage));
+    storage
+        .put_inode(&Inode::new_file(
+            inode_id,
+            FileAttrs::new(),
+            mount_id,
+            DataHandleId::new(9700),
+        ))
+        .unwrap();
+
+    let failure = fs_core
+        .execute_get_attr(GetAttrInput {
+            ctx: request_context(),
+            inode_id,
+            freshness: Freshness {
+                mount_epoch: Some(8),
+                route_epoch: None,
+                worker_epoch: None,
+            },
+        })
+        .await
+        .expect_err("stale mount_epoch must reject GetStatus");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::MountEpochMismatch))
+    );
+    assert_eq!(failure.error.reason, Some(RefreshReason::MountEpochMismatch));
+    assert_eq!(failure.group_id, Some(17));
+    assert_eq!(failure.mount_epoch, Some(9));
+}
+
+#[tokio::test]
+async fn list_status_rejects_stale_mount_epoch() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(71);
+    let parent_inode_id = InodeId::new(710);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(18));
+    fs_core.set_storage(Arc::clone(&storage));
+    storage
+        .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
+        .unwrap();
+
+    let failure = fs_core
+        .execute_read_dir(ReadDirInput {
+            ctx: request_context(),
+            parent_inode_id,
+            cursor_key: None,
+            max_entries: None,
+            freshness: Freshness {
+                mount_epoch: Some(8),
+                route_epoch: None,
+                worker_epoch: None,
+            },
+        })
+        .await
+        .expect_err("stale mount_epoch must reject ListStatus");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::MountEpochMismatch))
+    );
+    assert_eq!(failure.error.reason, Some(RefreshReason::MountEpochMismatch));
+    assert_eq!(failure.group_id, Some(18));
+    assert_eq!(failure.mount_epoch, Some(9));
+}
+
+#[tokio::test]
+async fn open_file_rejects_stale_route_epoch() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(72);
+    let inode_id = InodeId::new(720);
+    let data_handle_id = DataHandleId::new(9720);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(19));
+    fs_core.set_storage(Arc::clone(&storage));
+    storage
+        .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+        .unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let failure = fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx: request_context(),
+            inode_id,
+            range: None,
+            requested_data_handle_id: None,
+            freshness: Freshness {
+                mount_epoch: None,
+                route_epoch: Some(0),
+                worker_epoch: None,
+            },
+        })
+        .await
+        .expect_err("stale route_epoch must reject OpenFile");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::RouteEpochMismatch))
+    );
+    assert_eq!(failure.error.reason, Some(RefreshReason::RouteEpochMismatch));
+    assert_eq!(failure.route_epoch, Some(1));
+}
+
+#[tokio::test]
+async fn get_locations_rejects_stale_route_epoch() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(73);
+    let inode_id = InodeId::new(730);
+    let data_handle_id = DataHandleId::new(9730);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(20));
+    fs_core.set_storage(Arc::clone(&storage));
+    storage
+        .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+        .unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let failure = fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx: request_context(),
+            inode_id,
+            range: None,
+            requested_data_handle_id: Some(data_handle_id),
+            freshness: Freshness {
+                mount_epoch: None,
+                route_epoch: Some(0),
+                worker_epoch: None,
+            },
+        })
+        .await
+        .expect_err("stale route_epoch must reject GetBlockLocations");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::RouteEpochMismatch))
+    );
+    assert_eq!(failure.error.reason, Some(RefreshReason::RouteEpochMismatch));
+    assert_eq!(failure.route_epoch, Some(1));
+}
+
+#[tokio::test]
+async fn read_success_returns_freshness_hints() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(74);
+    let inode_id = InodeId::new(740);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(21));
+    fs_core.set_storage(Arc::clone(&storage));
+    storage
+        .put_inode(&Inode::new_file(
+            inode_id,
+            FileAttrs::new(),
+            mount_id,
+            DataHandleId::new(9740),
+        ))
+        .unwrap();
+
+    let success = fs_core
+        .execute_get_attr(GetAttrInput {
+            ctx: request_context(),
+            inode_id,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("read should succeed");
+
+    assert_eq!(success.group_id, Some(21));
+    assert_eq!(success.mount_epoch, Some(9));
+    assert_eq!(success.route_epoch, Some(1));
+}
+
+#[tokio::test]
+async fn get_locations_rejects_range_overflow() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(75);
+    let inode_id = InodeId::new(750);
+    let data_handle_id = DataHandleId::new(9750);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(22));
+    fs_core.set_storage(Arc::clone(&storage));
+    storage
+        .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+        .unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let failure = fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx: request_context(),
+            inode_id,
+            range: Some(crate::service::domain::FileRange {
+                offset: u64::MAX,
+                len: 1,
+            }),
+            requested_data_handle_id: None,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect_err("overflowing range must be rejected");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
+    );
+    assert!(failure.error.message.contains("range end overflows"));
+}
+
+#[tokio::test]
+async fn get_locations_handles_empty_range() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(76);
+    let inode_id = InodeId::new(760);
+    let data_handle_id = DataHandleId::new(9760);
+    let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+    let mut attrs = FileAttrs::new();
+    attrs.size = 512;
+    let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+    inode.data = types::fs::InodeData::File {
+        extents: vec![types::fs::Extent {
+            file_offset: 0,
+            block_id,
+            block_offset: 0,
+            len: 512,
+            file_version: Some(4),
+            block_stamp: None,
+        }],
+        lease_epoch: Some(4),
+    };
+    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(23));
+    fs_core.set_storage(Arc::clone(&storage));
+    storage.put_inode(&inode).unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let success = fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx: request_context(),
+            inode_id,
+            range: Some(crate::service::domain::FileRange { offset: 0, len: 0 }),
+            requested_data_handle_id: None,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("empty range should be stable");
+
+    assert!(success.payload.extents.is_empty());
+    assert!(success.payload.locations.is_empty());
+    assert_eq!(success.payload.file_size, 512);
+    assert_eq!(success.payload.file_version, Some(4));
+}
+
+#[tokio::test]
+async fn get_locations_filters_range() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(77);
+    let inode_id = InodeId::new(770);
+    let data_handle_id = DataHandleId::new(9770);
+    let mut attrs = FileAttrs::new();
+    attrs.size = 300;
+    let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+    inode.data = types::fs::InodeData::File {
+        extents: (0_u32..3)
+            .map(|idx| types::fs::Extent {
+                file_offset: u64::from(idx) * 100,
+                block_id: BlockId::new(data_handle_id, BlockIndex::new(idx)),
+                block_offset: 0,
+                len: 100,
+                file_version: Some(5),
+                block_stamp: None,
+            })
+            .collect(),
+        lease_epoch: Some(5),
+    };
+    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(24));
+    fs_core.set_storage(Arc::clone(&storage));
+    storage.put_inode(&inode).unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let success = fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx: request_context(),
+            inode_id,
+            range: Some(crate::service::domain::FileRange { offset: 50, len: 150 }),
+            requested_data_handle_id: None,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("range filter should succeed");
+
+    assert_eq!(
+        success
+            .payload
+            .locations
+            .iter()
+            .map(|location| location.block_id.index.as_raw())
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(success.payload.file_version, Some(5));
 }
 
 fn install_write_session(fs_core: &FsCore, inode_id: InodeId, mount_id: MountId) -> u64 {
@@ -914,8 +1230,236 @@ async fn create_then_add_block() {
         .await
         .expect("commit should succeed");
     assert_eq!(success.payload.committed_size, 512);
+    assert_eq!(success.payload.file_version, Some(key.lease_epoch));
     assert!(env.fs_core.write_session_for_handle(key.file_handle).is_none());
     assert_eq!(env.storage.get_inode(env.inode_id).unwrap().unwrap().attrs.size, 512);
+}
+
+#[tokio::test]
+async fn commit_file_returns_version() {
+    let env = write_flow_env(0).await;
+    let open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(64),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("open write should succeed");
+    let key = open.payload.session_key;
+    let target = add_block_for_key(&env.fs_core, &key, 64).await;
+
+    let close = commit_for_key(
+        &env.fs_core,
+        &key,
+        vec![committed_block(target.block_id, target.file_offset, target.len)],
+        64,
+    )
+    .await
+    .expect("commit should succeed");
+
+    assert_eq!(close.payload.file_version, Some(key.lease_epoch));
+}
+
+#[tokio::test]
+async fn open_file_returns_version() {
+    let env = write_flow_env(0).await;
+    let open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(64),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("open write should succeed");
+    let key = open.payload.session_key;
+    let target = add_block_for_key(&env.fs_core, &key, 64).await;
+    let close = commit_for_key(
+        &env.fs_core,
+        &key,
+        vec![committed_block(target.block_id, target.file_offset, target.len)],
+        64,
+    )
+    .await
+    .expect("commit should succeed");
+
+    let read = env
+        .fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            range: None,
+            requested_data_handle_id: None,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("open/read layout should succeed");
+
+    assert_eq!(read.payload.file_version, close.payload.file_version);
+}
+
+#[tokio::test]
+async fn version_changes_after_commit() {
+    let env = write_flow_env(0).await;
+    let first_open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(64),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("first open should succeed");
+    let first_key = first_open.payload.session_key;
+    let first_target = add_block_for_key(&env.fs_core, &first_key, 64).await;
+    let first_close = commit_for_key(
+        &env.fs_core,
+        &first_key,
+        vec![committed_block(
+            first_target.block_id,
+            first_target.file_offset,
+            first_target.len,
+        )],
+        64,
+    )
+    .await
+    .expect("first commit should succeed");
+
+    let second_open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(64),
+            mode: crate::inode_lease::WriteMode::Append,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("append open should succeed");
+    let second_key = second_open.payload.session_key;
+    let second_target = add_block_for_key(&env.fs_core, &second_key, 64).await;
+    let second_close = commit_for_key(
+        &env.fs_core,
+        &second_key,
+        vec![committed_block(
+            second_target.block_id,
+            second_target.file_offset,
+            second_target.len,
+        )],
+        128,
+    )
+    .await
+    .expect("second commit should succeed");
+
+    assert!(second_close.payload.file_version > first_close.payload.file_version);
+}
+
+#[tokio::test]
+async fn get_locations_matches_file_version() {
+    let env = write_flow_env(0).await;
+    let open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(64),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("open write should succeed");
+    let key = open.payload.session_key;
+    let target = add_block_for_key(&env.fs_core, &key, 64).await;
+    let close = commit_for_key(
+        &env.fs_core,
+        &key,
+        vec![committed_block(target.block_id, target.file_offset, target.len)],
+        64,
+    )
+    .await
+    .expect("commit should succeed");
+
+    let locations = env
+        .fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            range: None,
+            requested_data_handle_id: Some(env.data_handle_id),
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("locations should succeed");
+
+    assert_eq!(locations.payload.file_version, close.payload.file_version);
+}
+
+#[tokio::test]
+async fn get_locations_rejects_stale_state_watermark() {
+    let env = write_flow_env(0).await;
+    let open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(64),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("open write should succeed");
+    let key = open.payload.session_key;
+    let target = add_block_for_key(&env.fs_core, &key, 64).await;
+    commit_for_key(
+        &env.fs_core,
+        &key,
+        vec![committed_block(target.block_id, target.file_offset, target.len)],
+        64,
+    )
+    .await
+    .expect("commit should succeed");
+
+    let current_state = env
+        .fs_core
+        .raft_node
+        .as_ref()
+        .and_then(|raft_node| raft_node.get_last_applied_state_id())
+        .expect("commit should advance applied state");
+    let mut ctx = request_context();
+    ctx.caller.state.push(types::GroupStateWatermark::new(
+        ShardGroupId::new(15),
+        types::RaftLogId {
+            term: current_state.term,
+            leader_node_id: current_state.leader_node_id,
+            index: current_state.index + 1,
+        },
+    ));
+
+    let failure = env
+        .fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx,
+            inode_id: env.inode_id,
+            range: None,
+            requested_data_handle_id: Some(env.data_handle_id),
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect_err("read should reject state watermark beyond local applied state");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::StaleState))
+    );
+    assert_eq!(failure.error.reason, Some(RefreshReason::StaleState));
 }
 
 #[tokio::test]

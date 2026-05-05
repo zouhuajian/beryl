@@ -1194,8 +1194,8 @@ impl<'a> WriteSessionCoordinator<'a> {
             lease_epoch: request_lease_epoch,
             commit_mode: Self::commit_mode_for_session(&session),
         };
-        match self.core.propose_fs_write_command(CoreWriteOp::SetAttr, command).await {
-            Ok(FsCommandResult::Ok(_)) => {}
+        let file_version = match self.core.propose_fs_write_command(CoreWriteOp::SetAttr, command).await {
+            Ok(FsCommandResult::Ok(ok)) => ok.file_version,
             Ok(FsCommandResult::Err(err)) => {
                 return self.core.fatal_fs_failure(
                     &req.ctx,
@@ -1213,7 +1213,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     Some(ctx.mount_epoch),
                 );
             }
-        }
+        };
 
         self.core
             .inode_lease_manager
@@ -1224,7 +1224,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             &req.ctx,
             CloseWriteOutput {
                 committed_size: req.intent.final_size,
-                file_version: None,
+                file_version,
             },
             Some(ctx.namespace_owner_group_id.as_raw()),
             Some(ctx.mount_epoch),
@@ -1264,11 +1264,11 @@ impl<'a> WriteSessionCoordinator<'a> {
 
         let route_epoch = self.core.authoritative_route_epoch().await;
         match applied.result {
-            AppDataResponse::Fs(FsCommandResult::Ok(_)) => Some(self.core.success_with_route_epoch(
+            AppDataResponse::Fs(FsCommandResult::Ok(ok)) => Some(self.core.success_with_route_epoch(
                 &req.ctx,
                 CloseWriteOutput {
                     committed_size: req.intent.final_size,
-                    file_version: None,
+                    file_version: ok.file_version,
                 },
                 group_id,
                 mount_epoch,

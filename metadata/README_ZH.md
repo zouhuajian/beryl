@@ -160,13 +160,15 @@ mount / owner group / route epoch：
 
 metadata state freshness 当前规范收敛为 group-scoped watermark vector：client 维护 `group_id -> state_id` cache；leader 和 production single-group msync 可以用 `ResponseHeader.state` 推进 cache；当 follower read 路径被启用或被调用时，follower 必须先校验 `RequestHeader.state` 是否已被本地 state machine apply 覆盖；follower 成功响应的 `response.state` 必须为空，表示不更新 client cache；stale 必须通过 stale-state error 触发 refresh；multi-group msync 仍是 future work。`applied_seq` 已从 runtime state、storage meta、snapshot header/payload 和 client freshness 中移除；当前 snapshot V1 是最新标准格式，不包含 `applied_seq`，开发期不保留旧 snapshot `applied_seq` 兼容。metadata freshness 只依赖 `GroupStateWatermark` / `last_applied_log_id`。
 
+read freshness 当前在 `FsCore` 中统一：`GetStatus`、`ListStatus`、`OpenFile`、`GetBlockLocations` 都会按目标 inode 的 mount 校验 request header 中的 `mount_epoch`，按 authoritative route epoch 校验 `route_epoch`，并在请求携带 `GroupStateWatermark` 时校验本地 applied state。成功响应在已知 mount/group 时返回 `group_id`、`mount_epoch`、`route_epoch`；只有 leader 且有 applied state 时才会返回 `ResponseHeader.state` 推进 client cache，follower success 仍必须保持 state 为空。
+
 data identity / session identity：
 
 - `data_handle_id` 是数据面身份，`BlockId = data_handle_id + block_index`。
 - `WriteHandleProto.handle_id` 是一次写生命周期身份，不是持久文件身份；内部实现仍使用 `WriteSession` 管理该生命周期。
 - `fencing_token` 保护 direct client->worker 与 CommitFile 的一致性。
 - `CreateFile` 当前会通过内部 `Command::Create` 和持久 `next_data_handle_id` 分配 `current_data_handle_id` 并写入 `data_handle_owner` 映射，然后进入写生命周期。
-- `CreateFile` / `AppendFile` / `GetBlockLocations` 路径使用 inode 上的 `current_data_handle_id` 并校验 `data_handle_owner` 映射。
+- `CreateFile` / `AppendFile` / `GetBlockLocations` 路径使用 inode 上的 `current_data_handle_id` 并校验 `data_handle_owner` 映射。`GetBlockLocations(data_handle_id)` 会先通过 `data_handle_owner` 找到 owner inode，再显式校验请求的 handle 是否仍等于 inode 的 `current_data_handle_id`；不匹配时返回 structured `NEED_REFRESH` / `StaleState`，因为这代表 client 持有过期 metadata。
 - `Hflush` / `Hsync` 保留 public RPC，但当前明确返回 structured NotSupported；在 visible/durable barrier 设计完成前，不更新 file size、layout 或 version。
 
 block metadata 与 worker soft state 边界：
@@ -293,6 +295,7 @@ Dedup / fingerprint / AppliedResult 当前边界：
 - `CommandFingerprint` 表示 command type + 语义 payload 的稳定指纹，用于校验同一 `DedupKey` 下 payload 是否一致；不能合并进 `DedupKey`。
 - `AppliedResult` 是 Raft state machine 已 apply mutation 的持久 replay record，用于 retry/replay；不是通用 RPC response cache。
 - read-only RPC 不写 `AppliedResult`；读路径依赖 `state_id`、`mount_epoch`、`route_epoch`、`worker_epoch` 和 `ResponseHeader` refresh hint。
+- `file_version` 当前不是独立 inode schema 字段；metadata 使用文件 inode 中已持久化的 file lease epoch 作为最小安全版本来源。`CommitFile` 成功 apply 时把本次 `lease_epoch` 作为返回的 `file_version`，同时写入 committed extents；`OpenFile` / `GetBlockLocations` 返回当前 committed file 的版本。后续如果需要独立 durable file version，应在 inode/layout schema 中显式建模，而不是伪造与 correctness 无关的值。
 - `Create`、`Mkdir`、`Rmdir`、empty-file `Unlink`、extent-bearing file `Unlink`、`Rename`、内部 layout/write-handle mutation、`CreateDeleteIntents`、`AllocateDeleteIntents`、`UpdateDeleteIntentStatus`、`CreateMount`、`DeleteMount`、`AddShardGroup`、`RegisterWorker`、`AcquireLease`、`ReleaseLease` 已把 business mutation 和 `AppliedResult` 放进同一个 RocksDB `WriteBatch`。
 - CommitFile 背后的 internal close-write apply 成功时，inode 中的 committed extents/size/mtime/lease_epoch、block refcount increment/decrement、稳定 `FileLayout` record 和 `AppliedResult` 通过 `close_write_with_apply_result_atomic()` 同批提交；OVERWRITE 会替换 committed extents 并释放旧 block 引用；确定性业务错误仍持久化 `AppliedResult` 以保持 replay 语义。
 - `Truncate` shrink 成功 apply 时，apply 层会先按 inode persisted `lease_epoch` 和 deterministic `lease_id=(inode_id<<64)|lease_epoch` 校验 fencing authority；通过后，inode size/mtime/lease_epoch、稳定 `FileLayout` record、被释放完整 block 的 refcount decrement、zero-ref block 的 pending delete intent 和 `AppliedResult` 通过 `truncate_file_with_apply_result_atomic()` 同批提交；grow 仍返回 structured `NotSupported`。
@@ -320,7 +323,7 @@ Mutation command apply-level atomicity inventory：
 
 当前实现限制：
 
-- `OpenFile` / `GetBlockLocations` 是 public read-plan API；响应只返回 external `FileBlockLocation`，内部 extents 不通过 public schema 暴露。当 `WorkerManager` 有 live block locations 时会填充 workers 和 `worker_epoch` route hints。它不做 load-aware、fault-domain、nearest-worker 调度，也不触发 repair。
+- `OpenFile` / `GetBlockLocations` 是 public read-plan API；响应只返回 external `FileBlockLocation`，内部 extents 不通过 public schema 暴露。当 `WorkerManager` 有 live block locations 时会填充 workers 和 `worker_epoch` route hints。range filter 使用 checked arithmetic；`offset + len` 溢出返回 structured invalid argument，`len = 0` 返回空 locations 且保持 OK。它不做 load-aware、fault-domain、nearest-worker 调度，也不触发 repair。
 - ACL/Ranger：配置枚举存在，但两者均未实现且 fail fast；不要写成 ACL MVP 或 Ranger stub。
 - UFS proxy：runtime 构造存在，FileSystemService 主链路未使用。
 - repair/move/evict：metadata 侧有 planner/queue/command/ack 框架，但不能证明完整端到端 repair 系统已经闭环。
@@ -344,7 +347,7 @@ Mutation command apply-level atomicity inventory：
 - 保留 FileSystemService external metadata/control-plane RPC、guard、readiness、leadership、NONE authz、mount/route/write-handle freshness。
 - 保留 GetStatus/ListStatus/CreateDirectory/Delete/Rename/OpenFile/GetBlockLocations/CreateFile/AppendFile/AddBlock/CommitFile/AbortFileWrite/RenewLease/Hflush/Hsync/Msync 的最小链路。
 - `Hflush` / `Hsync` 当前只是 reserved RPC，返回 NotSupported，不描述为可见性或持久性 barrier。
-- `GetBlockLocations` 如实返回 external block locations/epoch 和最小 worker route hints；不要把 worker locations 写成 metadata authority，也不要描述成完整调度系统。
+- `GetBlockLocations` 如实返回 external block locations/epoch、`file_version` 和最小 worker route hints；data_handle target 必须匹配 inode 当前 handle。不要把 worker locations 写成 metadata authority，也不要描述成完整调度系统。
 - client action machine 保留 refresh/replay，但承认 path->group route 和 mount refresh API 未完成。
 
 可保留框架但默认关闭或降级的后台维护能力。

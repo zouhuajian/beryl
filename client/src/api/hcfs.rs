@@ -809,6 +809,7 @@ mod tests {
                 data_handle_id: Some(DataHandleIdProto { value: 42 }),
                 file_size: self.file_size(),
                 locations: self.locations.clone(),
+                file_version: Some(9),
             }))
         }
 
