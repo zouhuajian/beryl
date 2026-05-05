@@ -268,7 +268,6 @@ impl MaintenanceService {
                 Arc::clone(&self.lease_gate),
                 Arc::clone(&self.metrics),
                 Arc::clone(&self.last_lease_log_ms),
-                None, // Will be set via set_lease_runtime
                 Arc::new(RwLock::new(HashMap::new())),
                 Arc::clone(&self.destructive_gate),
             ));

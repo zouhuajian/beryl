@@ -2,6 +2,8 @@
 
 本文只描述当前仓库 `metadata` crate 的真实实现状态。未闭环能力会明确标为“部分实现”“未实现”“历史残留”“可保留但暂缓”或“可疑候选”。不要从旧设计文档或模块名反推能力。
 
+P0 架构边界和后续重组计划见 [`ARCHITECTURE_ZH.md`](ARCHITECTURE_ZH.md)。
+
 ## 1. Metadata 当前定位
 
 `metadata` 是 Vecton 的文件系统元数据权威面，当前负责：
@@ -87,7 +89,7 @@ flowchart TB
 | `build_worker_runtime()` | 创建 required `WorkerRuntime`、`WorkerManager`、repair/orphan queue、planner，并构造 `MetadataWorkerServiceImpl`。 | 已实现 |
 | `build_readiness()` | 启动 root readiness watcher，HealthService 初始 not-serving，root ready 后标记 serving。 | 已实现 |
 | `build_filesystem_service()` | 构造 write session manager、inode lease manager、permission checker、`PathResolver`、`FsCore`、`GuardChain`、`MsyncHandler`。 | 已实现 |
-| `build_maintenance()` | 启动 lease runtime、`MaintenanceService`、`DeleteExecutor`。 | 已接入，部分闭环 |
+| `build_maintenance()` | 启动 `MaintenanceService`、`DeleteExecutor`；standalone `lease_runtime` 半接入路径已删除。 | 已接入，部分闭环 |
 | `build_worker_background()` | 给 worker service 注入 `DeleteExecutor`，启动 worker background tasks。 | 已接入 |
 | `serve()` | 注册 FileSystemService、MetadataWorkerService、HealthService，并持有 `RuntimeHandles`。 | 已实现 |
 
@@ -180,7 +182,7 @@ public surface 当前没有旧 FUSE/POSIX 残留 RPC：
 3. `AddBlock`：校验 write handle、lease、open_epoch、fencing token、route/mount freshness，从 `WorkerManager` 选择 write target，返回 block target。
 4. `CommitFile`：校验 committed block 与 request `data_handle_id` 一致，进入 internal close-write apply。
 5. `AbortFileWrite`：关闭内部 session/lease，不发布新 committed layout。
-6. `RenewLease`：更新内部 inode lease runtime，不写 Raft。
+6. `RenewLease`：更新内部 `InodeLeaseManager` 状态，不写 Raft。
 
 commit/version 当前事实：
 
@@ -306,6 +308,8 @@ block report：
 - repair timeout requeue。
 - over-replication cleanup。
 
+Standalone `metadata/src/lease_runtime.rs` 已删除；当前 lease cleanup 只从 RocksDB authoritative lease state 扫描过期 lease，不再持有未消费的 runtime warmup table。
+
 已接入：
 
 - `MaintenanceService` 在 runtime 中启动。
@@ -417,8 +421,9 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 
 验证状态：
 
-- 本轮 cleanup 已确认 `cargo fmt --all --check`、`cargo test -p metadata --all-targets`、`cargo clippy -p metadata --all-targets -- -D warnings` 和 `git diff --check` 当前通过。
+- P1 cleanup 已确认 `cargo fmt --all --check`、`cargo test -p metadata --all-targets`、`cargo clippy -p metadata --all-targets -- -D warnings`、`git diff --check` 和 `cargo test --workspace --all-targets` 当前通过。
 - `cargo fmt --all --check` 仍输出 stable rustfmt 对 unstable import 配置的 warning，但命令退出码为 0。
+- `cargo test --workspace --all-targets` 仍输出 worker / integration_tests 既有 warning，但命令退出码为 0。
 
 ## 17. 多余 / 不必要设计候选
 

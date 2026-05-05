@@ -29,7 +29,6 @@ pub struct LeaseCleanupService {
     lease_gate: Arc<RwLock<TaskGate>>,
     metrics: Arc<MetadataMetrics>,
     last_log_ms: Arc<RwLock<u64>>,
-    _lease_runtime: Option<Arc<crate::lease_runtime::LeaseRuntimeTable>>,
     /// Pending candidates awaiting confirmation (block_id -> first_seen_ms)
     _pending_candidates: Arc<RwLock<HashMap<BlockId, u64>>>,
     /// Unified destructive gate
@@ -47,7 +46,6 @@ impl LeaseCleanupService {
         lease_gate: Arc<RwLock<TaskGate>>,
         metrics: Arc<MetadataMetrics>,
         last_log_ms: Arc<RwLock<u64>>,
-        lease_runtime: Option<Arc<crate::lease_runtime::LeaseRuntimeTable>>,
         pending_candidates: Arc<RwLock<HashMap<BlockId, u64>>>,
         destructive_gate: Arc<DestructiveGate>,
     ) -> Self {
@@ -58,22 +56,12 @@ impl LeaseCleanupService {
             lease_gate,
             metrics,
             last_log_ms,
-            _lease_runtime: lease_runtime,
             _pending_candidates: pending_candidates,
             destructive_gate,
         }
     }
 
-    /// Set lease runtime table (called during initialization).
-    pub fn set_lease_runtime(&self, _lease_runtime: Arc<crate::lease_runtime::LeaseRuntimeTable>) {
-        // Note: This is a workaround since we can't mutate Arc fields.
-        // In practice, this should be set during construction.
-        // For now, we'll use a different approach: pass runtime via method parameter or use interior mutability.
-        // This is a limitation of the current design - we'll need to refactor to use Arc<RwLock<Option<...>>> or similar.
-    }
-
     /// Cleanup expired leases with self-healing: always scan, but only release if gate allows.
-    /// Uses soft/hard TTL and runtime table for high-frequency renewals.
     pub async fn cleanup_expired_leases(&self) -> MetadataResult<()> {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 

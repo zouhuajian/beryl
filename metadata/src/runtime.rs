@@ -5,7 +5,6 @@
 
 use crate::ensure_root_mount;
 use crate::inflight_registry::InflightRegistry;
-use crate::lease_runtime::LeaseRuntimeTable;
 use crate::maintenance::{MaintenanceHandle, MaintenanceService};
 use crate::metrics::MetadataMetrics;
 use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
@@ -76,7 +75,6 @@ pub struct WorkerBackground {
 
 /// Metadata maintenance lifecycle independent of worker RPC serving.
 pub struct Maintenance {
-    _lease_runtime: Arc<LeaseRuntimeTable>,
     _maintenance_service: Arc<MaintenanceService>,
     delete_executor: Arc<DeleteExecutor>,
     _maintenance_handle: MaintenanceHandle,
@@ -319,7 +317,6 @@ pub fn build_worker_runtime(
 /// Starts metadata maintenance side effects after authority and worker state exist.
 pub async fn build_maintenance(authority: &MetadataAuthority, worker: &WorkerRuntime) -> Maintenance {
     let repair = worker.repair_state();
-    let lease_runtime = start_lease_runtime(authority).await;
 
     let maintenance_service = Arc::new(MaintenanceService::new_with_inflight_registry(
         Arc::clone(&authority.raft_node),
@@ -344,23 +341,11 @@ pub async fn build_maintenance(authority: &MetadataAuthority, worker: &WorkerRun
     let delete_executor_handle = delete_executor.start();
 
     Maintenance {
-        _lease_runtime: lease_runtime,
         _maintenance_service: maintenance_service,
         delete_executor,
         _maintenance_handle: maintenance_handle,
         _delete_executor_handle: delete_executor_handle,
     }
-}
-
-/// Preserves lease warmup behavior behind a named startup step.
-async fn start_lease_runtime(authority: &MetadataAuthority) -> Arc<LeaseRuntimeTable> {
-    let lease_runtime = Arc::new(LeaseRuntimeTable::new(30_000, 10_000, 30_000));
-    if authority.raft_node.is_leader() {
-        lease_runtime.start_warmup();
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        lease_runtime.complete_warmup();
-    }
-    lease_runtime
 }
 
 /// Starts worker-owned background work after authority and maintenance are available.

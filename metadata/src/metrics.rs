@@ -61,9 +61,6 @@ pub struct MetadataMetrics {
     // RenewLease metrics
     pub renew_lease_total: Arc<AtomicU64>,
     pub renew_lease_failed_total: Arc<AtomicU64>,
-    // Lease runtime metrics
-    pub lease_runtime_ready: Arc<AtomicUsize>, // 0 or 1
-    pub lease_runtime_entries: Arc<AtomicUsize>,
     // Lease cleanup metrics (enhanced)
     pub lease_cleanup_soft_expired_total: Arc<AtomicU64>,
     pub lease_cleanup_hard_expired_total: Arc<AtomicU64>,
@@ -185,8 +182,6 @@ impl MetadataMetrics {
             leases_cleaned_total: Arc::new(AtomicU64::new(0)),
             renew_lease_total: Arc::new(AtomicU64::new(0)),
             renew_lease_failed_total: Arc::new(AtomicU64::new(0)),
-            lease_runtime_ready: Arc::new(AtomicUsize::new(0)),
-            lease_runtime_entries: Arc::new(AtomicUsize::new(0)),
             lease_cleanup_soft_expired_total: Arc::new(AtomicU64::new(0)),
             lease_cleanup_hard_expired_total: Arc::new(AtomicU64::new(0)),
             ufs_operations_total: Arc::new(AtomicU64::new(0)),
@@ -343,16 +338,6 @@ impl MetadataMetrics {
         metrics.push(format!(
             "metadata_renew_lease_failed_total {}",
             self.renew_lease_failed_total.load(Ordering::Relaxed)
-        ));
-        metrics.push("# HELP metadata_lease_runtime_ready Whether lease runtime is ready (0 or 1)".to_string());
-        metrics.push(format!(
-            "metadata_lease_runtime_ready {}",
-            self.lease_runtime_ready.load(Ordering::Relaxed)
-        ));
-        metrics.push("# HELP metadata_lease_runtime_entries Number of entries in lease runtime table".to_string());
-        metrics.push(format!(
-            "metadata_lease_runtime_entries {}",
-            self.lease_runtime_entries.load(Ordering::Relaxed)
         ));
         metrics
             .push("# HELP metadata_lease_cleanup_soft_expired_total Total number of soft-expired leases".to_string());
