@@ -3,13 +3,13 @@
 
 //! Repair signal handling for worker block-report deltas.
 
-use super::{OrphanQueue, RepairPlanner, RepairQueue};
+use super::{OrphanQueue, RepairPlanner, RepairPolicy, RepairQueue};
 use crate::error::MetadataResult;
 use crate::raft::AppRaftNode;
 use crate::worker::WorkerManager;
 use async_trait::async_trait;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{debug, warn};
 use types::ids::{BlockId, WorkerId};
 
 /// Soft-state block-report delta handed off from worker RPC ingress.
@@ -30,12 +30,12 @@ pub struct RepairSignalQueueLengths {
 /// Summary returned to worker ingress for logging and coarse metrics.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepairSignalOutcome {
-    pub blocks_checked: usize,
-    pub orphan_blocks: usize,
+    pub added_blocks_seen: usize,
+    pub removed_blocks_seen: usize,
+    pub orphan_signals: usize,
     pub repair_tasks_enqueued: usize,
     pub enqueue_failures: usize,
     pub skipped_blocks: usize,
-    pub removed_blocks_ignored: usize,
     pub queue_lengths: Option<RepairSignalQueueLengths>,
 }
 
@@ -52,6 +52,7 @@ pub struct RepairSignalHandlerDeps {
     pub repair_queue: Arc<RepairQueue>,
     pub orphan_queue: Arc<OrphanQueue>,
     pub repair_planner: Arc<RepairPlanner>,
+    pub repair_policy: RepairPolicy,
 }
 
 /// Handles repair signals derived from worker block-report deltas.
@@ -61,6 +62,7 @@ pub struct RepairSignalHandler {
     repair_queue: Arc<RepairQueue>,
     orphan_queue: Arc<OrphanQueue>,
     repair_planner: Arc<RepairPlanner>,
+    repair_policy: RepairPolicy,
 }
 
 impl RepairSignalHandler {
@@ -71,6 +73,7 @@ impl RepairSignalHandler {
             repair_queue: deps.repair_queue,
             orphan_queue: deps.orphan_queue,
             repair_planner: deps.repair_planner,
+            repair_policy: deps.repair_policy,
         }
     }
 
@@ -80,29 +83,59 @@ impl RepairSignalHandler {
             repair_queue_len: self.repair_queue.len_pending(),
         }
     }
+
+    async fn block_exists(&self, block_id: BlockId) -> MetadataResult<bool> {
+        Ok(self.raft_node.read(false, |sm| sm.get_block(block_id)).await?.is_some())
+    }
+
+    fn plan_and_enqueue(&self, block_id: BlockId, outcome: &mut RepairSignalOutcome) {
+        let current_locations = self.worker_manager.get_block_locations(block_id);
+        let live_workers = self.worker_manager.list_live_workers();
+        let replication_factor = self.repair_policy.default_replication_factor;
+        let actions =
+            self.repair_planner
+                .plan_replication(block_id, &current_locations, replication_factor, &live_workers);
+
+        if actions.is_empty() {
+            outcome.skipped_blocks += 1;
+            return;
+        }
+
+        for action in actions {
+            let task = action.into_task();
+            if let Err(e) = self.repair_queue.enqueue(task) {
+                outcome.enqueue_failures += 1;
+                warn!(
+                    block_id = %block_id,
+                    error = %e,
+                    "Failed to enqueue replication task from block report signal"
+                );
+            } else {
+                outcome.repair_tasks_enqueued += 1;
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl RepairSignalSink for RepairSignalHandler {
     async fn handle_block_report_delta(&self, delta: BlockReportDelta) -> MetadataResult<RepairSignalOutcome> {
         let mut outcome = RepairSignalOutcome {
-            removed_blocks_ignored: delta.removed_blocks.len(),
+            added_blocks_seen: delta.added_blocks.len(),
+            removed_blocks_seen: delta.removed_blocks.len(),
             ..RepairSignalOutcome::default()
         };
 
         if !self.raft_node.is_leader() {
-            outcome.skipped_blocks = delta.added_blocks.len();
+            outcome.skipped_blocks = delta.added_blocks.len() + delta.removed_blocks.len();
             outcome.queue_lengths = Some(self.queue_lengths());
             return Ok(outcome);
         }
 
         for block_id in delta.added_blocks {
-            outcome.blocks_checked += 1;
-            let block_exists = self.raft_node.read(false, |sm| sm.get_block(block_id)).await?;
-
-            if block_exists.is_none() {
+            if !self.block_exists(block_id).await? {
                 self.orphan_queue.add(block_id, delta.worker_id);
-                outcome.orphan_blocks += 1;
+                outcome.orphan_signals += 1;
                 warn!(
                     block_id = %block_id,
                     worker_id = delta.worker_id.as_raw(),
@@ -111,25 +144,21 @@ impl RepairSignalSink for RepairSignalHandler {
                 continue;
             }
 
-            let current_locations = self.worker_manager.get_block_locations(block_id);
-            let live_workers = self.worker_manager.list_live_workers();
-            let replication_factor = 3u8;
-            let actions =
-                self.repair_planner
-                    .plan_replication(block_id, &current_locations, replication_factor, &live_workers);
-            for action in actions {
-                let task = action.into_task();
-                if let Err(e) = self.repair_queue.enqueue(task) {
-                    outcome.enqueue_failures += 1;
-                    warn!(
-                        block_id = %block_id,
-                        error = %e,
-                        "Failed to enqueue replication task from block report signal"
-                    );
-                } else {
-                    outcome.repair_tasks_enqueued += 1;
-                }
+            self.plan_and_enqueue(block_id, &mut outcome);
+        }
+
+        for block_id in delta.removed_blocks {
+            if !self.block_exists(block_id).await? {
+                outcome.skipped_blocks += 1;
+                debug!(
+                    block_id = %block_id,
+                    worker_id = delta.worker_id.as_raw(),
+                    "Ignoring removed block report signal for missing metadata"
+                );
+                continue;
             }
+
+            self.plan_and_enqueue(block_id, &mut outcome);
         }
 
         outcome.queue_lengths = Some(self.queue_lengths());

@@ -4,7 +4,7 @@
 //! Lost-worker cleanup and affected-block repair scheduling.
 
 use crate::error::MetadataResult;
-use crate::maintenance::repair::{RepairPlanner, RepairQueue};
+use crate::maintenance::repair::{RepairPlanner, RepairPolicy, RepairQueue};
 use crate::raft::AppRaftNode;
 use crate::worker::WorkerManager;
 use std::collections::HashSet;
@@ -17,6 +17,7 @@ pub struct LostWorkerCleanupDeps {
     pub worker_manager: Arc<WorkerManager>,
     pub repair_queue: Arc<RepairQueue>,
     pub repair_planner: Arc<RepairPlanner>,
+    pub repair_policy: RepairPolicy,
 }
 
 /// Summary for one lost-worker cleanup scan.
@@ -35,6 +36,7 @@ pub struct LostWorkerCleanupService {
     worker_manager: Arc<WorkerManager>,
     repair_queue: Arc<RepairQueue>,
     repair_planner: Arc<RepairPlanner>,
+    repair_policy: RepairPolicy,
 }
 
 impl LostWorkerCleanupService {
@@ -44,10 +46,15 @@ impl LostWorkerCleanupService {
             worker_manager: deps.worker_manager,
             repair_queue: deps.repair_queue,
             repair_planner: deps.repair_planner,
+            repair_policy: deps.repair_policy,
         }
     }
 
     pub async fn run_once(&self) -> MetadataResult<LostWorkerCleanupOutcome> {
+        if !self.raft_node.is_leader() {
+            return Ok(LostWorkerCleanupOutcome::default());
+        }
+
         let live_workers = self.worker_manager.list_live_workers();
         let all_workers = self.worker_manager.list_all_workers();
         let live_set: HashSet<_> = live_workers.iter().copied().collect();
@@ -55,13 +62,6 @@ impl LostWorkerCleanupService {
             .into_iter()
             .filter(|worker| !live_set.contains(worker))
             .collect();
-
-        if !self.raft_node.is_leader() {
-            return Ok(LostWorkerCleanupOutcome {
-                skipped_dead_workers: dead_workers.len(),
-                ..LostWorkerCleanupOutcome::default()
-            });
-        }
 
         let mut outcome = LostWorkerCleanupOutcome::default();
         for dead_worker in dead_workers {
@@ -73,7 +73,7 @@ impl LostWorkerCleanupService {
             let live_workers_after = self.worker_manager.list_live_workers();
             for block_id in affected_blocks {
                 let current_locations = self.worker_manager.get_block_locations(block_id);
-                let replication_factor = 3u8;
+                let replication_factor = self.repair_policy.default_replication_factor;
                 let actions = self.repair_planner.plan_replication(
                     block_id,
                     &current_locations,
@@ -103,7 +103,7 @@ impl LostWorkerCleanupService {
 #[cfg(test)]
 mod tests {
     use crate::maintenance::lost_worker::{LostWorkerCleanupDeps, LostWorkerCleanupService};
-    use crate::maintenance::repair::{OrphanQueue, RepairPlanner, RepairQueue};
+    use crate::maintenance::repair::{OrphanQueue, RepairPlanner, RepairPolicy, RepairQueue};
     use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
     use crate::worker::{HealthStatus, WorkerManager};
     use crate::MountTable;
@@ -169,12 +169,29 @@ mod tests {
         repair_queue: Arc<RepairQueue>,
         orphan_queue: Arc<OrphanQueue>,
     ) -> LostWorkerCleanupService {
+        service_with_policy(
+            raft_node,
+            worker_manager,
+            repair_queue,
+            orphan_queue,
+            RepairPolicy::default(),
+        )
+    }
+
+    fn service_with_policy(
+        raft_node: Arc<AppRaftNode>,
+        worker_manager: Arc<WorkerManager>,
+        repair_queue: Arc<RepairQueue>,
+        orphan_queue: Arc<OrphanQueue>,
+        repair_policy: RepairPolicy,
+    ) -> LostWorkerCleanupService {
         let repair_planner = Arc::new(RepairPlanner::new(orphan_queue));
         LostWorkerCleanupService::new(LostWorkerCleanupDeps {
             raft_node,
             worker_manager,
             repair_queue,
             repair_planner,
+            repair_policy,
         })
     }
 
@@ -241,6 +258,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dead_worker_cleanup_uses_repair_policy_default_replication_factor() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = test_raft(&dir, true).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let repair_queue = Arc::new(RepairQueue::new(100));
+        let orphan_queue = Arc::new(OrphanQueue::new(100));
+        let source = WorkerId::new(1);
+        let target_a = WorkerId::new(2);
+        let target_b = WorkerId::new(3);
+        let dead = WorkerId::new(4);
+        let block_id = BlockId::new(DataHandleId::new(13), BlockIndex::new(0));
+        live_worker(&worker_manager, source);
+        live_worker(&worker_manager, target_a);
+        live_worker(&worker_manager, target_b);
+        registered_dead_worker(&worker_manager, dead);
+        worker_manager.update_locations(source, vec![block_id]).unwrap();
+        worker_manager.update_locations(dead, vec![block_id]).unwrap();
+
+        let outcome = service_with_policy(
+            Arc::clone(&raft_node),
+            Arc::clone(&worker_manager),
+            Arc::clone(&repair_queue),
+            Arc::clone(&orphan_queue),
+            RepairPolicy {
+                default_replication_factor: 2,
+            },
+        )
+        .run_once()
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.removed_workers, 1);
+        assert_eq!(outcome.affected_blocks, 1);
+        assert_eq!(outcome.repair_tasks_enqueued, 1);
+        let mut records = repair_queue.poll_for_worker(target_a, 1);
+        records.extend(repair_queue.poll_for_worker(target_b, 1));
+        assert_eq!(records.len(), 1);
+        match records.remove(0).task {
+            crate::maintenance::repair::RepairTask::Replicate { replication_factor, .. } => {
+                assert_eq!(replication_factor, Some(2))
+            }
+            other => panic!("expected replicate task, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn nonleader_lost_worker_cleanup_is_noop() {
         let dir = TempDir::new().unwrap();
         let raft_node = test_raft(&dir, false).await;
@@ -263,7 +326,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome.removed_workers, 0);
-        assert_eq!(outcome.skipped_dead_workers, 1);
+        assert_eq!(outcome.skipped_dead_workers, 0);
         assert_eq!(worker_manager.get_worker_blocks(dead), vec![block_id]);
         assert_eq!(repair_queue.len_pending(), 0);
     }

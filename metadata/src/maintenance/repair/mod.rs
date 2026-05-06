@@ -13,6 +13,7 @@
 mod actions;
 mod orphan;
 mod planner;
+mod policy;
 mod queue;
 mod signal;
 mod types;
@@ -20,6 +21,7 @@ mod types;
 pub use actions::RepairAction;
 pub use orphan::{OrphanMetrics, OrphanQueue};
 pub use planner::RepairPlanner;
+pub use policy::RepairPolicy;
 pub use queue::RepairQueue;
 pub use signal::{
     BlockReportDelta, RepairSignalHandler, RepairSignalHandlerDeps, RepairSignalOutcome, RepairSignalQueueLengths,
@@ -116,6 +118,22 @@ mod tests {
         repair_queue: Arc<RepairQueue>,
         orphan_queue: Arc<OrphanQueue>,
     ) -> RepairSignalHandler {
+        signal_handler_with_policy(
+            raft_node,
+            worker_manager,
+            repair_queue,
+            orphan_queue,
+            RepairPolicy::default(),
+        )
+    }
+
+    fn signal_handler_with_policy(
+        raft_node: Arc<AppRaftNode>,
+        worker_manager: Arc<WorkerManager>,
+        repair_queue: Arc<RepairQueue>,
+        orphan_queue: Arc<OrphanQueue>,
+        repair_policy: RepairPolicy,
+    ) -> RepairSignalHandler {
         let repair_planner = Arc::new(RepairPlanner::new(Arc::clone(&orphan_queue)));
         RepairSignalHandler::new(RepairSignalHandlerDeps {
             raft_node,
@@ -123,6 +141,7 @@ mod tests {
             repair_queue,
             orphan_queue,
             repair_planner,
+            repair_policy,
         })
     }
 
@@ -158,10 +177,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome.blocks_checked, 1);
+        assert_eq!(outcome.added_blocks_seen, 1);
+        assert_eq!(outcome.removed_blocks_seen, 0);
         assert_eq!(outcome.repair_tasks_enqueued, 2);
-        assert_eq!(outcome.orphan_blocks, 0);
-        assert_eq!(outcome.removed_blocks_ignored, 0);
+        assert_eq!(outcome.orphan_signals, 0);
         assert_eq!(repair_queue.len_pending(), 2);
         assert_eq!(orphan_queue.len(), 0);
     }
@@ -193,24 +212,67 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome.blocks_checked, 1);
-        assert_eq!(outcome.orphan_blocks, 1);
+        assert_eq!(outcome.added_blocks_seen, 1);
+        assert_eq!(outcome.removed_blocks_seen, 0);
+        assert_eq!(outcome.orphan_signals, 1);
         assert_eq!(outcome.repair_tasks_enqueued, 0);
         assert_eq!(orphan_queue.len(), 1);
         assert_eq!(repair_queue.len_pending(), 0);
     }
 
     #[tokio::test]
-    async fn block_report_signal_ignores_removed_blocks() {
+    async fn block_report_signal_enqueues_replication_when_removed_block_exists() {
         let dir = TempDir::new().unwrap();
         let (storage, raft_node) = test_raft(&dir, true).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
         let repair_queue = Arc::new(RepairQueue::new(100));
         let orphan_queue = Arc::new(OrphanQueue::new(100));
         let block_id = make_block_id(9, 0);
+        let removed_worker = make_worker_id(1);
+        let source_a = make_worker_id(2);
+        let source_b = make_worker_id(3);
+        let target = make_worker_id(4);
+        live_worker(&worker_manager, removed_worker);
+        live_worker(&worker_manager, source_a);
+        live_worker(&worker_manager, source_b);
+        live_worker(&worker_manager, target);
+        worker_manager.update_locations(source_a, vec![block_id]).unwrap();
+        worker_manager.update_locations(source_b, vec![block_id]).unwrap();
+        put_block(&storage, block_id, source_a);
+
+        let handler = signal_handler(
+            Arc::clone(&raft_node),
+            Arc::clone(&worker_manager),
+            Arc::clone(&repair_queue),
+            Arc::clone(&orphan_queue),
+        );
+        let outcome = handler
+            .handle_block_report_delta(BlockReportDelta {
+                worker_id: removed_worker,
+                added_blocks: Vec::new(),
+                removed_blocks: vec![block_id],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.added_blocks_seen, 0);
+        assert_eq!(outcome.removed_blocks_seen, 1);
+        assert_eq!(outcome.repair_tasks_enqueued, 1);
+        assert_eq!(outcome.orphan_signals, 0);
+        assert_eq!(repair_queue.len_pending(), 1);
+        assert_eq!(orphan_queue.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn block_report_signal_removed_missing_block_is_not_orphan_or_repair() {
+        let dir = TempDir::new().unwrap();
+        let (_storage, raft_node) = test_raft(&dir, true).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let repair_queue = Arc::new(RepairQueue::new(100));
+        let orphan_queue = Arc::new(OrphanQueue::new(100));
+        let block_id = make_block_id(90, 0);
         let worker_id = make_worker_id(1);
         live_worker(&worker_manager, worker_id);
-        put_block(&storage, block_id, worker_id);
 
         let handler = signal_handler(
             Arc::clone(&raft_node),
@@ -227,10 +289,54 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome.blocks_checked, 0);
-        assert_eq!(outcome.removed_blocks_ignored, 1);
+        assert_eq!(outcome.added_blocks_seen, 0);
+        assert_eq!(outcome.removed_blocks_seen, 1);
+        assert_eq!(outcome.orphan_signals, 0);
         assert_eq!(outcome.repair_tasks_enqueued, 0);
-        assert_eq!(outcome.orphan_blocks, 0);
+        assert_eq!(outcome.skipped_blocks, 1);
+        assert_eq!(repair_queue.len_pending(), 0);
+        assert_eq!(orphan_queue.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn block_report_signal_removed_existing_block_with_enough_replicas_enqueues_nothing() {
+        let dir = TempDir::new().unwrap();
+        let (storage, raft_node) = test_raft(&dir, true).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let repair_queue = Arc::new(RepairQueue::new(100));
+        let orphan_queue = Arc::new(OrphanQueue::new(100));
+        let block_id = make_block_id(91, 0);
+        let removed_worker = make_worker_id(1);
+        let worker_a = make_worker_id(2);
+        let worker_b = make_worker_id(3);
+        let worker_c = make_worker_id(4);
+        live_worker(&worker_manager, removed_worker);
+        live_worker(&worker_manager, worker_a);
+        live_worker(&worker_manager, worker_b);
+        live_worker(&worker_manager, worker_c);
+        worker_manager.update_locations(worker_a, vec![block_id]).unwrap();
+        worker_manager.update_locations(worker_b, vec![block_id]).unwrap();
+        worker_manager.update_locations(worker_c, vec![block_id]).unwrap();
+        put_block(&storage, block_id, worker_a);
+
+        let handler = signal_handler(
+            Arc::clone(&raft_node),
+            Arc::clone(&worker_manager),
+            Arc::clone(&repair_queue),
+            Arc::clone(&orphan_queue),
+        );
+        let outcome = handler
+            .handle_block_report_delta(BlockReportDelta {
+                worker_id: removed_worker,
+                added_blocks: Vec::new(),
+                removed_blocks: vec![block_id],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.removed_blocks_seen, 1);
+        assert_eq!(outcome.repair_tasks_enqueued, 0);
+        assert_eq!(outcome.orphan_signals, 0);
         assert_eq!(repair_queue.len_pending(), 0);
         assert_eq!(orphan_queue.len(), 0);
     }
@@ -256,13 +362,101 @@ mod tests {
             .handle_block_report_delta(BlockReportDelta {
                 worker_id,
                 added_blocks: vec![block_id],
+                removed_blocks: vec![block_id],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.added_blocks_seen, 1);
+        assert_eq!(outcome.removed_blocks_seen, 1);
+        assert_eq!(outcome.skipped_blocks, 2);
+        assert_eq!(repair_queue.len_pending(), 0);
+        assert_eq!(orphan_queue.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn block_report_signal_uses_repair_policy_default_replication_factor() {
+        let dir = TempDir::new().unwrap();
+        let (storage, raft_node) = test_raft(&dir, true).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let repair_queue = Arc::new(RepairQueue::new(100));
+        let orphan_queue = Arc::new(OrphanQueue::new(100));
+        let block_id = make_block_id(92, 0);
+        let worker_a = make_worker_id(1);
+        let worker_b = make_worker_id(2);
+        let worker_c = make_worker_id(3);
+        live_worker(&worker_manager, worker_a);
+        live_worker(&worker_manager, worker_b);
+        live_worker(&worker_manager, worker_c);
+        worker_manager.update_locations(worker_a, vec![block_id]).unwrap();
+        put_block(&storage, block_id, worker_a);
+
+        let handler = signal_handler_with_policy(
+            Arc::clone(&raft_node),
+            Arc::clone(&worker_manager),
+            Arc::clone(&repair_queue),
+            Arc::clone(&orphan_queue),
+            RepairPolicy {
+                default_replication_factor: 2,
+            },
+        );
+        let outcome = handler
+            .handle_block_report_delta(BlockReportDelta {
+                worker_id: worker_a,
+                added_blocks: vec![block_id],
                 removed_blocks: Vec::new(),
             })
             .await
             .unwrap();
 
-        assert_eq!(outcome.blocks_checked, 0);
-        assert_eq!(outcome.skipped_blocks, 1);
+        assert_eq!(outcome.repair_tasks_enqueued, 1);
+        assert_eq!(repair_queue.len_pending(), 1);
+        let mut records = repair_queue.poll_for_worker(worker_b, 1);
+        records.extend(repair_queue.poll_for_worker(worker_c, 1));
+        assert_eq!(records.len(), 1);
+        match records.remove(0).task {
+            RepairTask::Replicate { replication_factor, .. } => assert_eq!(replication_factor, Some(2)),
+            other => panic!("expected replicate task, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn block_report_signal_counts_enqueue_failures_and_continues() {
+        let dir = TempDir::new().unwrap();
+        let (storage, raft_node) = test_raft(&dir, true).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let repair_queue = Arc::new(RepairQueue::new(0));
+        let orphan_queue = Arc::new(OrphanQueue::new(100));
+        let block_a = make_block_id(93, 0);
+        let block_b = make_block_id(94, 0);
+        let source = make_worker_id(1);
+        let target_a = make_worker_id(2);
+        let target_b = make_worker_id(3);
+        live_worker(&worker_manager, source);
+        live_worker(&worker_manager, target_a);
+        live_worker(&worker_manager, target_b);
+        worker_manager.update_locations(source, vec![block_a, block_b]).unwrap();
+        put_block(&storage, block_a, source);
+        put_block(&storage, block_b, source);
+
+        let handler = signal_handler(
+            Arc::clone(&raft_node),
+            Arc::clone(&worker_manager),
+            Arc::clone(&repair_queue),
+            Arc::clone(&orphan_queue),
+        );
+        let outcome = handler
+            .handle_block_report_delta(BlockReportDelta {
+                worker_id: source,
+                added_blocks: vec![block_a, block_b],
+                removed_blocks: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.added_blocks_seen, 2);
+        assert_eq!(outcome.repair_tasks_enqueued, 0);
+        assert_eq!(outcome.enqueue_failures, 4);
         assert_eq!(repair_queue.len_pending(), 0);
         assert_eq!(orphan_queue.len(), 0);
     }

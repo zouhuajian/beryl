@@ -7,7 +7,8 @@ use crate::ensure_root_mount;
 use crate::inflight_registry::InflightRegistry;
 use crate::maintenance::delete::{DeleteExecutor, DeleteExecutorHandle};
 use crate::maintenance::repair::{
-    OrphanQueue, RepairPlanner, RepairQueue, RepairSignalHandler, RepairSignalHandlerDeps, RepairSignalSink,
+    OrphanQueue, RepairPlanner, RepairPolicy, RepairQueue, RepairSignalHandler, RepairSignalHandlerDeps,
+    RepairSignalSink,
 };
 use crate::maintenance::{MaintenanceHandle, MaintenanceService};
 use crate::metrics::MetadataMetrics;
@@ -67,6 +68,7 @@ pub(crate) struct MaintenanceRepairState {
     repair_queue: Arc<RepairQueue>,
     orphan_queue: Arc<OrphanQueue>,
     repair_planner: Arc<RepairPlanner>,
+    repair_policy: RepairPolicy,
     shared_inflight_registry: Arc<InflightRegistry>,
 }
 
@@ -129,11 +131,13 @@ impl MaintenanceRepairState {
         let repair_queue = Arc::new(repair_queue);
         let orphan_queue = Arc::new(OrphanQueue::new(10_000));
         let repair_planner = Arc::new(RepairPlanner::new(Arc::clone(&orphan_queue)));
+        let repair_policy = RepairPolicy::default();
 
         Self {
             repair_queue,
             orphan_queue,
             repair_planner,
+            repair_policy,
             shared_inflight_registry,
         }
     }
@@ -158,6 +162,7 @@ impl WorkerRuntime {
                 repair_queue: Arc::clone(&repair.repair_queue),
                 orphan_queue: Arc::clone(&repair.orphan_queue),
                 repair_planner: Arc::clone(&repair.repair_planner),
+                repair_policy: repair.repair_policy,
             }));
         let mut service = MetadataWorkerServiceImpl::new(
             Arc::clone(&authority.raft_node),
@@ -359,6 +364,7 @@ pub(crate) async fn build_maintenance(
         Arc::clone(&authority.metadata_metrics),
         Some(Arc::clone(&repair.shared_inflight_registry)),
         Arc::clone(&authority.mount_table),
+        repair.repair_policy,
     ));
     let maintenance_handle = maintenance_service.start();
 

@@ -22,7 +22,7 @@ metadata 的目标定位是：
 
 ## 2. 当前基线：暂不重构的内容
 
-当前 P0-P4.6 阶段不应重开这些大模块：
+当前 P0-P4.7 阶段不应重开这些大模块：
 
 - `service/path_service.rs`
 - `service/fs_core/*`
@@ -308,7 +308,14 @@ P4.6：
 - 已完成：block report repair signal detection/planning/enqueue 收敛到 `maintenance/repair/signal.rs`。
 - 已完成：dead-worker scan、`remove_dead_worker` 和 affected block repair scheduling 收敛到 `maintenance/lost_worker.rs`，由 `MaintenanceService` 启动。
 - `WorkerCommandRouter` 仍只负责 repair/delete command poll/ack，不承担 repair signal routing。
-- `removed_blocks` 仍不触发 under-rep planning；本阶段只迁移边界，不做行为增强。
+
+P4.7：
+
+- 已完成：block report `removed_blocks` 已纳入 `RepairSignalHandler`；handler 基于当前 live locations 判断是否需要 under-rep repair planning。
+- 已完成：added missing block 仍只进入 `OrphanQueue`；removed missing block 不进入 orphan，也不创建 delete intent。
+- 已完成：repair signal 与 lost-worker planning 使用 `maintenance/repair/RepairPolicy` 的默认 replication factor。
+- `RepairPolicy` 当前只是集中默认值 placeholder，不是 per-file/per-block placement policy。
+- repair signal / lost-worker 仍是保守后台维护能力，不描述为完整生产级自治 repair 系统。
 
 P5：
 

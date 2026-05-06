@@ -16,7 +16,7 @@ use super::gc::{GcCandidate, GcService};
 use super::lease_cleanup::LeaseCleanupService;
 use super::lost_worker::{LostWorkerCleanupDeps, LostWorkerCleanupService};
 use super::orphan::{OrphanBlockCleaner, PendingOrphan};
-use super::repair::{OrphanQueue, RepairPlanner, RepairQueue};
+use super::repair::{OrphanQueue, RepairPlanner, RepairPolicy, RepairQueue};
 
 use crate::destructive_gate::DestructiveGate;
 use crate::inflight_registry::InflightRegistry;
@@ -57,6 +57,7 @@ pub struct MaintenanceService {
     repair_queue: Arc<RepairQueue>,
     orphan_queue: Arc<OrphanQueue>,
     repair_planner: Arc<RepairPlanner>,
+    repair_policy: RepairPolicy,
     block_ref_counts: Arc<RwLock<BlockRefCounts>>,
     metrics: Arc<MetadataMetrics>,
     // Gates for each task
@@ -111,6 +112,7 @@ impl MaintenanceService {
             metrics,
             None, // Will create default if None
             mount_table,
+            RepairPolicy::default(),
         )
     }
 
@@ -127,6 +129,7 @@ impl MaintenanceService {
         metrics: Arc<MetadataMetrics>,
         inflight_registry: Option<Arc<InflightRegistry>>,
         mount_table: Arc<crate::mount::MountTable>,
+        repair_policy: RepairPolicy,
     ) -> Self {
         // Create unified destructive gate
         let mount_table_for_gate = Arc::clone(&mount_table);
@@ -181,6 +184,7 @@ impl MaintenanceService {
             repair_queue,
             orphan_queue,
             repair_planner,
+            repair_policy,
             block_ref_counts: Arc::new(RwLock::new(block_ref_counts)),
             metrics,
             gc_gate: Arc::new(RwLock::new(gc_gate)),
@@ -328,6 +332,7 @@ impl MaintenanceService {
                 worker_manager: Arc::clone(&self.worker_manager),
                 repair_queue: Arc::clone(&self.repair_queue),
                 repair_planner: Arc::clone(&self.repair_planner),
+                repair_policy: self.repair_policy,
             }));
 
             let lost_worker = Arc::clone(&lost_worker_service);
@@ -398,6 +403,7 @@ impl MaintenanceService {
                 Arc::clone(&self.destructive_gate),
                 Arc::clone(&self.inflight_registry),
                 Arc::clone(&self.mount_table),
+                self.repair_policy,
             ));
 
             let overrep = Arc::clone(&overrep_service);

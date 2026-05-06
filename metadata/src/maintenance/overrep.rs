@@ -27,6 +27,7 @@ use types::block::BlockState;
 use types::ids::{BlockId, WorkerId};
 
 use super::delete::DeleteIntentBuilder;
+use super::repair::RepairPolicy;
 
 /// Over-replication candidate tracked across scans.
 #[derive(Debug, Clone)]
@@ -88,6 +89,7 @@ pub struct OverReplicaCleanupService {
     inflight_registry: Arc<InflightRegistry>,
     mount_table: Arc<MountTable>,
     intent_builder: DeleteIntentBuilder,
+    repair_policy: RepairPolicy,
 }
 
 impl OverReplicaCleanupService {
@@ -103,6 +105,7 @@ impl OverReplicaCleanupService {
         destructive_gate: Arc<DestructiveGate>,
         inflight_registry: Arc<InflightRegistry>,
         mount_table: Arc<MountTable>,
+        repair_policy: RepairPolicy,
     ) -> Self {
         let intent_builder = DeleteIntentBuilder::new(Arc::clone(&mount_table), Arc::clone(&storage));
 
@@ -116,6 +119,7 @@ impl OverReplicaCleanupService {
             inflight_registry,
             mount_table,
             intent_builder,
+            repair_policy,
         }
     }
 
@@ -155,8 +159,11 @@ impl OverReplicaCleanupService {
             let current_locations = self.worker_manager.get_block_locations(block_id);
             let current_replicas = current_locations.len() as u32;
 
-            // Get desired replicas from file layout
-            let desired_replicas = self.get_desired_replicas(block_id).await.unwrap_or(3); // Default: 3
+            // Get desired replicas from file layout or the current repair policy placeholder.
+            let desired_replicas = self
+                .get_desired_replicas(block_id)
+                .await
+                .unwrap_or(self.repair_policy.default_replication_factor as u32);
 
             if current_replicas > desired_replicas {
                 // Over-replicated: mark for update
@@ -215,13 +222,9 @@ impl OverReplicaCleanupService {
     /// Get desired replica count for a block (from file layout).
     ///
     /// NOTE: FileMeta has been removed. Layout information is now stored in inodes.
-    /// For now, we return a default replication factor. In the future, this should
-    /// be retrieved from the inode's file data or a separate layout storage.
+    /// For now, this uses RepairPolicy default until per-block policy exists.
     async fn get_desired_replicas(&self, _block_id: BlockId) -> Option<u32> {
-        // LEGACY: FileMeta removed. Layout is now in inode, but we need data_handle_id -> inode_id mapping.
-        // For now, return default replication factor (3).
-        // TODO: Implement proper lookup from inode or layout storage.
-        Some(3)
+        Some(self.repair_policy.default_replication_factor as u32)
     }
 
     /// Create intents for eligible candidates.

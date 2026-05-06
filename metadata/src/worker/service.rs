@@ -627,38 +627,27 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         // Fanout: all nodes update presence (memory-only, no Raft)
         // No Raft propose for UpdateBlockLocations
 
-        // Leader-only: hand block-report repair signals to maintenance.
+        // Hand block-report repair signals to maintenance. The handler owns the leader gate.
         let is_leader = self.raft_node.is_leader();
-        if is_leader {
-            let outcome = self
-                .repair_signal_handler
-                .handle_block_report_delta(BlockReportDelta {
-                    worker_id,
-                    added_blocks: added_blocks.clone(),
-                    removed_blocks: removed_blocks.clone(),
-                })
-                .await
-                .map_err(|e| Status::internal(format!("Failed to handle repair signal: {}", e)))?;
-            if let Some(queue_lengths) = outcome.queue_lengths {
-                self.metrics.update_orphan_queue_len(queue_lengths.orphan_queue_len);
-                self.metrics.update_repair_queue_len(queue_lengths.repair_queue_len);
-            }
-            if outcome.enqueue_failures > 0 {
-                warn!(
-                    worker_id = worker_id.as_raw(),
-                    enqueue_failures = outcome.enqueue_failures,
-                    "Repair signal handler could not enqueue some planned tasks"
-                );
-            }
-        } else {
-            if !added_blocks.is_empty() || !removed_blocks.is_empty() {
-                warn!(
-                    worker_id = worker_id.as_raw(),
-                    added_blocks = added_blocks.len(),
-                    removed_blocks = removed_blocks.len(),
-                    "Follower stored block report soft state without repair signal planning"
-                );
-            }
+        let outcome = self
+            .repair_signal_handler
+            .handle_block_report_delta(BlockReportDelta {
+                worker_id,
+                added_blocks: added_blocks.clone(),
+                removed_blocks: removed_blocks.clone(),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("Failed to handle repair signal: {}", e)))?;
+        if let Some(queue_lengths) = outcome.queue_lengths {
+            self.metrics.update_orphan_queue_len(queue_lengths.orphan_queue_len);
+            self.metrics.update_repair_queue_len(queue_lengths.repair_queue_len);
+        }
+        if outcome.enqueue_failures > 0 {
+            warn!(
+                worker_id = worker_id.as_raw(),
+                enqueue_failures = outcome.enqueue_failures,
+                "Repair signal handler could not enqueue some planned tasks"
+            );
         }
 
         // Generate new report sequence (monotonically increasing)
@@ -799,6 +788,19 @@ mod tests {
         raft_node
     }
 
+    async fn nonleader_raft(dir: &TempDir) -> Arc<AppRaftNode> {
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), mount_table));
+        let raft_config = crate::config::RaftConfig {
+            node_id: 1,
+            peers: Vec::new(),
+        };
+        let raft_node = Arc::new(AppRaftNode::new(1, storage, state_machine, &raft_config).await.unwrap());
+        assert!(!raft_node.is_leader());
+        raft_node
+    }
+
     fn block_proto(block_id: BlockId) -> proto::common::BlockIdProto {
         proto::common::BlockIdProto {
             data_handle_id: block_id.data_handle_id.as_raw(),
@@ -908,5 +910,56 @@ mod tests {
         assert_eq!(deltas[0].worker_id, worker_id);
         assert_eq!(deltas[0].added_blocks, vec![block_id]);
         assert!(deltas[0].removed_blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn follower_block_report_delegates_repair_signal_to_handler_noop_gate() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_id = WorkerId::new(8);
+        let block_id = BlockId::new(DataHandleId::new(80), BlockIndex::new(0));
+        worker_manager
+            .register_worker(worker_id, "127.0.0.1:9091".to_string(), 1, 100, None)
+            .unwrap();
+        worker_manager
+            .update_runtime(worker_id, 1, 100, 1_000, 500, 500, 0, 0, HealthStatus::Healthy)
+            .unwrap();
+        worker_manager.mark_full_sync_complete(worker_id);
+        worker_manager.update_locations(worker_id, vec![block_id]).unwrap();
+        let signal_sink = Arc::new(RecordingRepairSignalSink::default());
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            Arc::clone(&worker_manager),
+            Arc::clone(&signal_sink) as Arc<dyn RepairSignalSink>,
+            Arc::new(MountTable::new()),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+            &service,
+            Request::new(BlockReportRequestProto {
+                header: None,
+                worker_id: worker_id.as_raw(),
+                report_type: BlockReportTypeProto::BlockReportTypeIncremental as i32,
+                full_entries: Vec::new(),
+                delta_entries: vec![BlockReportEntryDeltaProto {
+                    block_id: Some(block_proto(block_id)),
+                    op: BlockReportDeltaOpProto::BlockReportDeltaOpRemove as i32,
+                    chunk_bitmap: None,
+                }],
+                last_report_seq: 52,
+                full_report_lease_token: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.report_seq, 53);
+        let deltas = signal_sink.deltas.lock();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].worker_id, worker_id);
+        assert!(deltas[0].added_blocks.is_empty());
+        assert_eq!(deltas[0].removed_blocks, vec![block_id]);
     }
 }
