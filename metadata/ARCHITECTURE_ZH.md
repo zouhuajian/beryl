@@ -22,7 +22,7 @@ metadata 的目标定位是：
 
 ## 2. 当前基线：暂不重构的内容
 
-当前 P0-P4.7 阶段不应重开这些大模块：
+当前 P0-P5 阶段不应重开这些大模块：
 
 - `service/path_service.rs`
 - `service/fs_core/*`
@@ -263,11 +263,12 @@ safety 是后台维护的横切能力，主要服务 GC、orphan、overrep、rep
 | `file_handle.rs` | REMOVED_IN_P1 | 只剩自身定义和 crate export，没有真实 caller；write path 由 `WriteSessionManager` + `InodeLeaseManager` 承担。 |
 | `data_io.rs` | REDUCED_IN_P1 | 只保留 GuardChain 当前实际使用的 Read/Write policy；后续可并入 `fs/guard` 或更明确的 policy 子模块。 |
 | `lease_runtime.rs` | REMOVED_IN_P1 | 只有 runtime 创建/warmup/持有和 lease cleanup 半接入字段，没有真实消费链路；已删除名义 runtime。 |
-| `destructive_gate.rs` | KEEP_BUT_MOVE | 后续归入 `maintenance/safety`。 |
-| `inflight_registry.rs` | KEEP_BUT_MOVE | 后续归入 `maintenance/safety`。 |
+| `destructive_gate.rs` | CRATE_PRIVATE_KEEP_BUT_MOVE | 已收窄为 crate-private；后续可归入 `maintenance/safety`。 |
+| `inflight_registry.rs` | CRATE_PRIVATE_KEEP_BUT_MOVE | 已收窄为 crate-private；后续可归入 `maintenance/safety`。 |
 | `path_resolver.rs` | KEEP_BUT_MOVE | 后续归入 `fs`，语义不动。 |
 | `write_session.rs` / `inode_lease.rs` | KEEP_BUT_MOVE | 后续归入 `fs/write`，但 write-session、lease、fencing 语义不动。 |
-| `metrics.rs` | KEEP_BUT_REDUCE | 后续按 subsystem 拆分到 fs/worker/maintenance/repair/delete metrics。 |
+| `metrics.rs` | REDUCED_IN_P5 | 删除无 updater 的零值导出；保留真实 runtime updater 的共享导出。后续可按 fs/worker/maintenance/authz 拆分。 |
+| `maintenance/repair/metrics.rs` | MOVED_IN_P5 | repair queue/task metrics 归入 maintenance repair owner。 |
 
 ## 10. 分阶段计划
 
@@ -319,9 +320,11 @@ P4.7：
 
 P5：
 
-- metrics 拆分。
-- `lib.rs` exports 收敛。
-- metadata README 完整更新。
+- 已完成：`lib.rs` 将 `data_io`、`destructive_gate`、`inflight_registry`、`metrics`、`raft_conv` 收窄为 crate-private；`MetadataMetrics` 只通过必要类型 re-export 暴露。
+- 已完成：`maintenance/mod.rs` 不再 re-export GC/orphan/overrep/lost-worker/gate/delete/repair internals；公开面只保留 `MaintenanceService` / `MaintenanceHandle` 和显式 `maintenance::repair` 子模块。
+- 已完成：`worker/mod.rs` 不再 re-export full-report lease internals 或 worker metrics；repair/delete ownership 类型仍不从 worker 暴露。
+- 已完成：repair queue metrics 从 `worker/metrics.rs` 移到 `maintenance/repair/metrics.rs`；`OrphanMetrics`、无 caller authz counters、无 updater metadata counters 和旧 `gc_ready`/request-latency/delete-inflight 零值导出已删除。
+- 暂缓：`metrics.rs` 未拆成目录模块，因为当前共享导出仍被 readiness、FsCore、maintenance、delete executor、worker full-report lease 多处共同更新；本轮先瘦身和 owner 归位，避免把 metrics split 变成大面积 import churn。
 
 执行约束：
 

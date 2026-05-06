@@ -37,6 +37,7 @@ pub struct DeleteExecutorHandle {
 }
 
 impl DeleteExecutorHandle {
+    #[cfg(test)]
     pub fn is_finished(&self) -> bool {
         self._task.is_finished()
     }
@@ -278,7 +279,7 @@ impl DeleteExecutor {
                 continue;
             }
 
-            // Check inflight registry: ensure block is not in repair/write/rebalance
+            // Check inflight registry against other maintenance actions.
             // Use appropriate InflightKind based on intent reason
             let inflight_kind = match intent.reason {
                 crate::state::DeleteIntentReason::OverRep => InflightKind::OverRepEvict,
@@ -291,7 +292,7 @@ impl DeleteExecutor {
                 debug!(
                     intent_id = intent.intent_id,
                     block_id = %intent.block_id,
-                    "Intent execution blocked: block is in-flight for repair/write/rebalance"
+                    "Intent execution blocked: block is in-flight for another maintenance action"
                 );
                 continue;
             }
@@ -813,6 +814,7 @@ impl DeleteExecutor {
     }
 
     /// Get current in-flight count (for metrics).
+    #[cfg(test)]
     pub fn get_inflight_count(&self) -> usize {
         let state = self.execution_state.read();
         state

@@ -85,13 +85,4 @@ impl RepairAction {
             | RepairAction::EvictReplica { block_id, .. } => *block_id,
         }
     }
-
-    /// Get target worker for this action (if applicable).
-    pub fn target_worker(&self) -> Option<WorkerId> {
-        match self {
-            RepairAction::Replicate { target_worker, .. } => Some(*target_worker),
-            RepairAction::MoveCopy { to_worker, .. } => Some(*to_worker),
-            RepairAction::EvictReplica { target_worker, .. } => Some(*target_worker),
-        }
-    }
 }

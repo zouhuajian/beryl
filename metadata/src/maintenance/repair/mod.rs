@@ -11,22 +11,21 @@
 //! - `orphan.rs`: OrphanQueue (orphan block tracking)
 
 mod actions;
+mod metrics;
 mod orphan;
 mod planner;
 mod policy;
 mod queue;
-mod signal;
+pub(crate) mod signal;
 mod types;
 
 pub use actions::RepairAction;
-pub use orphan::{OrphanMetrics, OrphanQueue};
+pub(crate) use metrics::RepairMetrics;
+pub use orphan::OrphanQueue;
 pub use planner::RepairPlanner;
 pub use policy::RepairPolicy;
 pub use queue::RepairQueue;
-pub use signal::{
-    BlockReportDelta, RepairSignalHandler, RepairSignalHandlerDeps, RepairSignalOutcome, RepairSignalQueueLengths,
-    RepairSignalSink,
-};
+pub(crate) use signal::{BlockReportDelta, RepairSignalHandler, RepairSignalHandlerDeps, RepairSignalSink};
 pub use types::{
     ErrorClass, RepairDedupKey, RepairTask, RepairTaskId, RepairTaskRecord, RepairTaskState, TaskAckStatus,
 };
@@ -869,5 +868,58 @@ mod tests {
         // Wait for second orphan to become eligible
         thread::sleep(Duration::from_millis(50));
         assert_eq!(queue.len_eligible(), 2);
+    }
+
+    #[test]
+    fn replica_eviction_dedup_returns_existing_task_id() {
+        let repair_queue = Arc::new(RepairQueue::with_config(1000, 3, 60_000, 1_000, 60_000, 10));
+
+        let block_id = make_block_id(1, 0);
+        let target_worker = make_worker_id(1);
+
+        let task_id1 = repair_queue
+            .enqueue(RepairTask::EvictReplica {
+                target_worker,
+                block_id,
+                reason: "excess replica cleanup".to_string(),
+            })
+            .unwrap();
+
+        let task_id2 = repair_queue
+            .enqueue(RepairTask::EvictReplica {
+                target_worker,
+                block_id,
+                reason: "move follow-up duplicate".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(task_id1, task_id2);
+        assert_eq!(repair_queue.len_pending(), 1);
+    }
+
+    #[test]
+    fn replica_eviction_same_block_different_worker_has_distinct_task() {
+        let repair_queue = Arc::new(RepairQueue::with_config(1000, 3, 60_000, 1_000, 60_000, 10));
+
+        let block_id = make_block_id(1, 0);
+
+        repair_queue
+            .enqueue(RepairTask::EvictReplica {
+                target_worker: make_worker_id(1),
+                block_id,
+                reason: "excess replica cleanup".to_string(),
+            })
+            .unwrap();
+
+        let second_task_id = repair_queue
+            .enqueue(RepairTask::EvictReplica {
+                target_worker: make_worker_id(2),
+                block_id,
+                reason: "different target replica cleanup".to_string(),
+            })
+            .unwrap();
+
+        assert_ne!(second_task_id.0, 0);
+        assert_eq!(repair_queue.len_pending(), 2);
     }
 }

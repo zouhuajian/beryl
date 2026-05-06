@@ -23,52 +23,6 @@ pub struct OrphanQueue {
     max_queue_size: usize,
     /// Minimum age in milliseconds before an orphan can be processed (grace period).
     min_age_ms: u64,
-    /// Optional metrics collector for observability.
-    metrics: Option<Arc<OrphanMetrics>>,
-}
-
-/// Metrics for orphan queue.
-pub struct OrphanMetrics {
-    pub queue_len: std::sync::atomic::AtomicUsize,
-    pub orphan_added_total: std::sync::atomic::AtomicU64,
-    pub orphan_dropped_total: std::sync::atomic::AtomicU64,
-    pub orphan_processed_total: std::sync::atomic::AtomicU64,
-}
-
-impl OrphanMetrics {
-    pub fn new() -> Self {
-        Self {
-            queue_len: std::sync::atomic::AtomicUsize::new(0),
-            orphan_added_total: std::sync::atomic::AtomicU64::new(0),
-            orphan_dropped_total: std::sync::atomic::AtomicU64::new(0),
-            orphan_processed_total: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
-    pub fn update_queue_len(&self, len: usize) {
-        self.queue_len.store(len, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn inc_orphan_added(&self) {
-        self.orphan_added_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn inc_orphan_dropped(&self) {
-        self.orphan_dropped_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn inc_orphan_processed(&self) {
-        self.orphan_processed_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-impl Default for OrphanMetrics {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl OrphanQueue {
@@ -83,13 +37,7 @@ impl OrphanQueue {
             orphans: Arc::new(RwLock::new(VecDeque::new())),
             max_queue_size,
             min_age_ms,
-            metrics: None,
         }
-    }
-
-    /// Set metrics for observability.
-    pub fn set_metrics(&mut self, metrics: Arc<OrphanMetrics>) {
-        self.metrics = Some(metrics);
     }
 
     /// Add an orphan block.
@@ -104,9 +52,6 @@ impl OrphanQueue {
                 worker_id = worker_id.as_raw(),
                 "Orphan queue is full, dropping orphan block"
             );
-            if let Some(ref metrics) = self.metrics {
-                metrics.inc_orphan_dropped();
-            }
             return;
         }
 
@@ -123,14 +68,6 @@ impl OrphanQueue {
             worker_id,
             added_at_ms: now_ms,
         });
-
-        // Update metrics
-        let len = orphans.len();
-        drop(orphans);
-        if let Some(ref metrics) = self.metrics {
-            metrics.inc_orphan_added();
-            metrics.update_queue_len(len);
-        }
     }
 
     /// Get queue length.
@@ -147,11 +84,6 @@ impl OrphanQueue {
     pub fn clear(&self) {
         let mut orphans = self.orphans.write();
         orphans.clear();
-        let len = orphans.len();
-        drop(orphans);
-        if let Some(ref metrics) = self.metrics {
-            metrics.update_queue_len(len);
-        }
     }
 
     /// Dequeue an orphan block that has passed the min-age grace period.
@@ -166,12 +98,6 @@ impl OrphanQueue {
 
         if let Some(idx) = eligible_idx {
             let entry = orphans.remove(idx).unwrap();
-            let len = orphans.len();
-            drop(orphans);
-            if let Some(ref metrics) = self.metrics {
-                metrics.inc_orphan_processed();
-                metrics.update_queue_len(len);
-            }
             Some((entry.block_id, entry.worker_id))
         } else {
             None

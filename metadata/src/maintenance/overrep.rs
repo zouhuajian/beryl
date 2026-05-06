@@ -248,7 +248,7 @@ impl OverReplicaCleanupService {
         let mut skipped_state = 0;
 
         for (block_id, candidate) in candidates_to_process {
-            // Check inflight registry: skip if block is in repair/write/rebalance
+            // Check inflight registry against other maintenance actions.
             if !self
                 .inflight_registry
                 .try_acquire(block_id, InflightKind::OverRepEvict, None)?
@@ -256,7 +256,7 @@ impl OverReplicaCleanupService {
                 skipped_conflict += 1;
                 debug!(
                     block_id = %block_id,
-                    "Skipping overrep cleanup: block in-flight for repair/write/rebalance"
+                    "Skipping overrep cleanup: block in-flight for another maintenance action"
                 );
                 continue;
             }

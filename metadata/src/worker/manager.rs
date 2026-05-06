@@ -246,7 +246,7 @@ impl WorkerManager {
     }
 
     /// Get lease manager.
-    pub fn lease_manager(&self) -> Arc<super::full_report_lease::FullReportLeaseManager> {
+    pub(crate) fn lease_manager(&self) -> Arc<super::full_report_lease::FullReportLeaseManager> {
         Arc::clone(&self.lease_manager)
     }
 

@@ -32,9 +32,6 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
 use types::ids::{BlockId, DataHandleId};
 
-/// Active worker TTL in milliseconds (default: 3 minutes, or use heartbeat_timeout_sec * 1000).
-pub const ACTIVE_TTL_MS: u64 = 180_000;
-
 /// Reference count for blocks (data_handle_id -> block_id -> count).
 type BlockRefCounts = HashMap<DataHandleId, HashMap<BlockId, u32>>;
 
@@ -89,37 +86,10 @@ pub struct MaintenanceService {
 }
 
 impl MaintenanceService {
-    /// Create a new maintenance service.
-    // Constructor mirrors maintenance runtime wiring; grouping dependencies would hide ownership.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        raft_node: Arc<AppRaftNode>,
-        storage: Arc<RocksDBStorage>,
-        worker_manager: Arc<WorkerManager>,
-        repair_queue: Arc<RepairQueue>,
-        orphan_queue: Arc<OrphanQueue>,
-        repair_planner: Arc<RepairPlanner>,
-        metrics: Arc<MetadataMetrics>,
-        mount_table: Arc<crate::mount::MountTable>,
-    ) -> Self {
-        Self::new_with_inflight_registry(
-            raft_node,
-            storage,
-            worker_manager,
-            repair_queue,
-            orphan_queue,
-            repair_planner,
-            metrics,
-            None, // Will create default if None
-            mount_table,
-            RepairPolicy::default(),
-        )
-    }
-
     /// Create a new maintenance service with optional shared inflight registry.
     // Constructor mirrors maintenance runtime wiring; grouping dependencies would hide ownership.
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_inflight_registry(
+    pub(crate) fn new_with_inflight_registry(
         raft_node: Arc<AppRaftNode>,
         storage: Arc<RocksDBStorage>,
         worker_manager: Arc<WorkerManager>,
@@ -209,7 +179,7 @@ impl MaintenanceService {
     }
 
     /// Start all background maintenance tasks.
-    pub fn start(&self) -> MaintenanceHandle {
+    pub(crate) fn start(&self) -> MaintenanceHandle {
         let mut tasks = Vec::with_capacity(8);
 
         // Start GC task with self-healing

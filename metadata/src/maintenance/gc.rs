@@ -412,16 +412,16 @@ impl GcService {
                 };
 
             if should_delete {
-                // Check inflight registry: ensure block is not in repair/write/rebalance
+                // Check inflight registry against other maintenance actions.
                 if !self
                     .inflight_registry
                     .try_acquire(*block_id, InflightKind::Delete, None)?
                 {
-                    // Block is in-flight for repair/write/rebalance - skip
+                    // Block is in-flight for another maintenance action - skip
                     debug!(
                         task = "gc",
                         block_id = %block_id,
-                        "Skipping block: already in-flight for repair/write/rebalance"
+                        "Skipping block: already in-flight for another maintenance action"
                     );
                     self.metrics.gc_skipped_total.fetch_add(1, Ordering::Relaxed);
                     continue;

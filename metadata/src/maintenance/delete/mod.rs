@@ -9,5 +9,5 @@ mod intent;
 #[cfg(test)]
 mod executor_tests;
 
-pub use executor::{DeleteExecutor, DeleteExecutorHandle};
-pub use intent::DeleteIntentBuilder;
+pub(crate) use executor::{DeleteExecutor, DeleteExecutorHandle};
+pub(crate) use intent::DeleteIntentBuilder;

@@ -15,23 +15,6 @@ pub enum GateState {
     Ready,
     /// Gate is degraded, only statistics allowed.
     Degraded,
-    /// Gate is blocked, no actions allowed.
-    Blocked,
-}
-
-impl GateState {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            GateState::Ready => "ready",
-            GateState::Degraded => "degraded",
-            GateState::Blocked => "blocked",
-        }
-    }
-
-    /// Check if destructive actions are allowed.
-    pub fn allows_destructive(&self) -> bool {
-        matches!(self, GateState::Ready)
-    }
 }
 
 /// Gate for a maintenance task.
@@ -39,7 +22,6 @@ pub struct TaskGate {
     enabled: bool,
     state: GateState,
     last_error: String,
-    last_error_ts: u64,
     last_success_ts: u64,
 }
 
@@ -55,7 +37,6 @@ impl TaskGate {
             enabled: true,
             state: GateState::Ready,
             last_error: String::new(),
-            last_error_ts: 0,
             last_success_ts: 0,
         }
     }
@@ -75,15 +56,11 @@ impl TaskGate {
             GateState::Ready => GateCheckResult::Ready,
             GateState::Degraded => GateCheckResult::Degraded {
                 reason: self.last_error.clone(),
-                last_error_ts: self.last_error_ts,
-            },
-            GateState::Blocked => GateCheckResult::Blocked {
-                reason: self.last_error.clone(),
             },
         }
     }
 
-    pub fn set_degraded(&mut self, reason: String, error: String, now_ms: u64) {
+    pub fn set_degraded(&mut self, reason: String, error: String, _now_ms: u64) {
         if self.state != GateState::Degraded {
             info!(
                 task = "maintenance",
@@ -96,7 +73,6 @@ impl TaskGate {
         }
         self.state = GateState::Degraded;
         self.last_error = error;
-        self.last_error_ts = now_ms;
     }
 
     pub fn set_ready(&mut self, now_ms: u64) {
@@ -127,29 +103,13 @@ impl TaskGate {
             self.last_success_ts = now_ms;
         }
     }
-
-    pub fn set_blocked(&mut self, reason: String, error: String, now_ms: u64) {
-        if self.state != GateState::Blocked {
-            info!(
-                task = "maintenance",
-                old_state = ?self.state,
-                new_state = "blocked",
-                reason = %reason,
-                error = %error,
-                "Maintenance gate state transition"
-            );
-        }
-        self.state = GateState::Blocked;
-        self.last_error = error;
-        self.last_error_ts = now_ms;
-    }
 }
 
 /// Result of gate check.
 #[derive(Debug)]
 pub enum GateCheckResult {
     Ready,
-    Degraded { reason: String, last_error_ts: u64 },
+    Degraded { reason: String },
     Blocked { reason: String },
 }
 

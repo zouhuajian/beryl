@@ -1,36 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Maintenance module: background tasks for GC, lease cleanup, orphan cleanup, repair, and delete.
+//! Maintenance subsystem entrypoint.
 //!
-//! This module has been refactored from a single large file into multiple focused modules:
-//! - gate.rs: TaskGate and unified check_destructive_allowed() entry point ✅
-//! - delete/: DeleteIntentBuilder and DeleteExecutor ✅
-//! - repair/: RepairQueue, RepairPlanner, and OrphanQueue ✅
-//! - gc.rs: GcService ✅
-//! - orphan.rs: OrphanBlockCleaner ✅
-//! - lease_cleanup.rs: LeaseCleanupService ✅
-//! - lost_worker.rs: LostWorkerCleanupService ✅
-//! - service.rs: MaintenanceService orchestration ✅
+//! The public surface is intentionally small. Repair, delete, GC, orphan,
+//! over-replica cleanup, lost-worker cleanup, and destructive gates are
+//! maintenance-owned implementation details wired by `MaintenanceService`.
 
-pub mod delete;
-pub mod gate;
-pub mod gc;
-pub mod lease_cleanup;
-pub mod lost_worker;
-pub mod orphan;
-pub mod overrep;
+pub(crate) mod delete;
+mod gate;
+mod gc;
+mod lease_cleanup;
+mod lost_worker;
+mod orphan;
+mod overrep;
 pub mod repair;
-pub mod service;
+mod service;
 
-// Re-export the current maintenance surface from one module-level entrypoint.
-pub use delete::{DeleteExecutor, DeleteExecutorHandle, DeleteIntentBuilder};
-pub use gate::{GateCheckResult, GateState, TaskGate};
-pub use gc::{GcCandidate, GcService, BLOCKREPORT_CONVERGENCE_THRESHOLD};
-pub use lease_cleanup::LeaseCleanupService;
-pub use lost_worker::{LostWorkerCleanupDeps, LostWorkerCleanupOutcome, LostWorkerCleanupService};
-pub use orphan::{OrphanBlockCleaner, PendingOrphan};
-pub use overrep::{OverRepCandidate, OverReplicaCleanupService};
 pub use service::{MaintenanceHandle, MaintenanceService};
 
 use crate::error::{MetadataError, MetadataResult};
@@ -40,7 +26,7 @@ use types::ids::{BlockId, ShardGroupId};
 
 /// Resolve the owner group for a block by looking up its inode and mount entry.
 /// Uses the authoritative data_handle_id -> inode_id mapping persisted in metadata.
-pub fn owner_group_for_block(
+pub(crate) fn owner_group_for_block(
     storage: &RocksDBStorage,
     mount_table: &MountTable,
     block_id: BlockId,

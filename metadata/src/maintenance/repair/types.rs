@@ -16,8 +16,6 @@ pub enum RepairTaskState {
     Pending { next_visible_at_ms: u64 },
     /// Task is in-flight (assigned to a worker).
     InFlight { worker_id: WorkerId, deadline_ms: u64 },
-    /// Task completed successfully.
-    Done,
     /// Task failed permanently (exceeded max retries).
     Failed { reason: String },
 }
@@ -55,15 +53,6 @@ impl RepairTask {
             RepairTask::Replicate { block_id, .. }
             | RepairTask::MoveCopy { block_id, .. }
             | RepairTask::EvictReplica { block_id, .. } => *block_id,
-        }
-    }
-
-    /// Get target worker for this task (if applicable).
-    pub fn target_worker(&self) -> Option<WorkerId> {
-        match self {
-            RepairTask::Replicate { target_worker, .. } => Some(*target_worker),
-            RepairTask::MoveCopy { to_worker, .. } => Some(*to_worker),
-            RepairTask::EvictReplica { target_worker, .. } => Some(*target_worker),
         }
     }
 
@@ -135,7 +124,6 @@ pub struct RepairTaskRecord {
     pub task: RepairTask,
     pub state: RepairTaskState,
     pub attempt: u32,
-    pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub dedup_key: RepairDedupKey,
 }

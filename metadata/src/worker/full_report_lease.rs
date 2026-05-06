@@ -4,7 +4,7 @@
 //! Full block report lease manager evolved from the slot manager.
 //!
 //! This module implements a lease-based mechanism for controlling full block report concurrency,
-//! replacing the previous slot-based approach. Leases include token, epoch, and TTL for
+//! replacing the previous slot-based approach. Leases include epoch and TTL for
 //! better consistency across leader changes and route updates.
 
 use std::collections::HashMap;
@@ -18,8 +18,6 @@ use types::ids::{ShardGroupId, WorkerId};
 /// Full block report lease.
 #[derive(Clone, Debug)]
 pub struct FullReportLease {
-    /// Lease token (unique identifier).
-    pub token: u64,
     /// Worker ID that holds this lease.
     pub worker_id: WorkerId,
     /// Shard group ID (or global if None).
@@ -30,8 +28,6 @@ pub struct FullReportLease {
     pub mount_epoch: Option<MountEpoch>,
     /// Expiration timestamp (milliseconds since epoch).
     pub expire_ms: u64,
-    /// Created timestamp (milliseconds since epoch).
-    pub created_at_ms: u64,
 }
 
 impl FullReportLease {
@@ -151,13 +147,11 @@ impl FullReportLeaseManager {
         let expire_ms = now_ms + self.lease_ttl_ms;
 
         let lease = FullReportLease {
-            token,
             worker_id,
             shard_group_id,
             target_metadata_epoch,
             mount_epoch,
             expire_ms,
-            created_at_ms: now_ms,
         };
 
         leases.insert(token, lease.clone());
@@ -253,6 +247,7 @@ impl FullReportLeaseManager {
     }
 
     /// Invalidate all leases (e.g., on leader change).
+    #[cfg(test)]
     pub async fn invalidate_all(&self) {
         let mut leases = self.leases.write().await;
         let mut worker_tokens = self.worker_tokens.write().await;

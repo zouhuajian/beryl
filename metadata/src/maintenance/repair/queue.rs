@@ -3,12 +3,12 @@
 
 //! Repair queue: state machine, deduplication, and retry for repair tasks.
 
+use super::metrics::RepairMetrics;
 use super::types::{
     ErrorClass, RepairDedupKey, RepairTask, RepairTaskId, RepairTaskRecord, RepairTaskState, TaskAckStatus,
 };
 use crate::error::{MetadataError, MetadataResult};
 use crate::inflight_registry::{InflightKind, InflightRegistry};
-use crate::worker::metrics::RepairMetrics;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -130,7 +130,7 @@ impl RepairQueue {
         )
     }
 
-    pub fn with_config_and_metrics(
+    pub(crate) fn with_config_and_metrics(
         max_queue_size: usize,
         max_attempts: u32,
         inflight_timeout_ms: u64,
@@ -151,11 +151,6 @@ impl RepairQueue {
             metrics,
             inflight_registry: None,
         }
-    }
-
-    /// Set metrics for observability.
-    pub fn set_metrics(&mut self, metrics: Arc<RepairMetrics>) {
-        self.metrics = Some(metrics);
     }
 
     /// Set inflight registry for cross-operation mutual exclusion.
@@ -187,7 +182,7 @@ impl RepairQueue {
             if let Some(existing_record) = state.records.get(existing_id) {
                 // Check if existing task is still active (not Done/Failed)
                 match &existing_record.state {
-                    RepairTaskState::Done | RepairTaskState::Failed { .. } => {
+                    RepairTaskState::Failed { .. } => {
                         // Old task is done, allow new one
                     }
                     RepairTaskState::Pending { .. } | RepairTaskState::InFlight { .. } => {
@@ -222,7 +217,6 @@ impl RepairQueue {
                 next_visible_at_ms: now_ms,
             },
             attempt: 0,
-            created_at_ms: now_ms,
             updated_at_ms: now_ms,
             dedup_key: dedup_key.clone(),
         };
@@ -323,7 +317,7 @@ impl RepairQueue {
                     };
 
                     if matches {
-                        // Check inflight registry: ensure block is not in delete/write/rebalance
+                        // Check inflight registry against other maintenance actions.
                         let block_id = record.task.block_id();
                         let acquire_ok = if let Some(ref inflight_registry) = self.inflight_registry {
                             // Try to acquire inflight lock for Repair (highest priority)
@@ -334,14 +328,12 @@ impl RepairQueue {
                             ) {
                                 Ok(true) => true,
                                 Ok(false) => {
-                                    // Block is in-flight for delete/write/rebalance - skip this task
+                                    // Block is already owned by another maintenance action.
                                     debug!(
                                         task_id = task_id.0,
                                         block_id = %block_id,
-                                        "Repair task blocked: block is in-flight for delete/write/rebalance"
+                                        "Repair task blocked by inflight maintenance action"
                                     );
-                                    // Note: RepairMetrics may not have this metric, we'll add it if needed
-                                    // For now, we'll just log
                                     false
                                 }
                                 Err(e) => {

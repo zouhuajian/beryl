@@ -46,7 +46,7 @@ pub struct MetadataWorkerServiceImpl {
 }
 
 impl MetadataWorkerServiceImpl {
-    pub fn new(
+    pub(crate) fn new(
         raft_node: Arc<AppRaftNode>,
         worker_manager: Arc<WorkerManager>,
         repair_signal_handler: Arc<dyn RepairSignalSink>,
@@ -71,7 +71,7 @@ impl MetadataWorkerServiceImpl {
     }
 
     /// Set slot metrics (called after metrics are available).
-    pub fn set_slot_metrics(&mut self, metrics: Arc<crate::metrics::MetadataMetrics>) {
+    pub(crate) fn set_slot_metrics(&mut self, metrics: Arc<crate::metrics::MetadataMetrics>) {
         self.slot_metrics = Some(metrics);
     }
 
@@ -102,7 +102,7 @@ impl MetadataWorkerServiceImpl {
     }
 
     /// Start worker-local background tasks.
-    pub fn start_background_tasks(&self) -> WorkerBackgroundHandle {
+    pub(crate) fn start_background_tasks(&self) -> WorkerBackgroundHandle {
         // Start lease metrics update task
         let lease_metrics_task = if let Some(ref slot_metrics) = self.slot_metrics {
             let lease_manager = self.worker_manager.lease_manager();
@@ -741,9 +741,8 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 mod tests {
     use super::*;
     use crate::error::MetadataError;
-    use crate::maintenance::repair::{
-        BlockReportDelta, RepairSignalOutcome, RepairSignalQueueLengths, RepairSignalSink,
-    };
+    use crate::maintenance::repair::signal::{RepairSignalOutcome, RepairSignalQueueLengths};
+    use crate::maintenance::repair::{BlockReportDelta, RepairSignalSink};
     use crate::raft::{AppRaftStateMachine, RocksDBStorage};
     use crate::worker::HealthStatus;
     use crate::MountTable;

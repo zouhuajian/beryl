@@ -33,20 +33,6 @@ pub enum DestructiveCheckResult {
     },
 }
 
-impl DestructiveCheckResult {
-    pub fn is_allowed(&self) -> bool {
-        matches!(self, DestructiveCheckResult::Allowed)
-    }
-
-    pub fn reason(&self) -> Option<&str> {
-        match self {
-            DestructiveCheckResult::Allowed => None,
-            DestructiveCheckResult::Blocked { reason } => Some(reason),
-            DestructiveCheckResult::NeedRefresh { reason, .. } => Some(reason),
-        }
-    }
-}
-
 /// Context for destructive action check.
 #[derive(Clone, Debug)]
 pub struct DestructiveCheckContext {

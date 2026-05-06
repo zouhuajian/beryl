@@ -115,7 +115,7 @@ pub struct RuntimeHandles {
 
 impl MaintenanceRepairState {
     fn new(config: &MetadataConfig) -> Self {
-        let repair_metrics = Arc::new(crate::worker::metrics::RepairMetrics::new());
+        let repair_metrics = Arc::new(crate::maintenance::repair::RepairMetrics::new());
         let repair_config = &config.worker.repair;
         let mut repair_queue = RepairQueue::with_config_and_metrics(
             repair_config.max_queue_size,
