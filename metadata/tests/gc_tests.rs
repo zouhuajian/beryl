@@ -60,8 +60,8 @@ fn test_refcount_decrement_below_zero_clamped() {
     assert!(reached_zero);
 }
 
-// Note: GC intent processing tests are now in maintenance/gc.rs tests
-// This test file focuses on refcount and intent creation tests
+// DeleteIntent execution is covered by maintenance/delete executor tests.
+// This file focuses on refcount and intent creation primitives.
 
 #[test]
 fn test_unique_block_ids_per_inode() {

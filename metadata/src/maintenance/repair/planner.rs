@@ -16,10 +16,7 @@
 
 use super::actions::RepairAction;
 use super::orphan::OrphanQueue;
-use super::queue::RepairQueue;
-use crate::error::MetadataResult;
 use std::sync::Arc;
-use tracing::info;
 use types::ids::{BlockId, WorkerId};
 
 /// Repair planner for converting system state anomalies into repair actions.
@@ -42,10 +39,10 @@ use types::ids::{BlockId, WorkerId};
 ///
 /// - RepairAction::Replicate (when replication factor not met)
 /// - RepairAction::MoveCopy (when rebalancing needed)
-/// - RepairAction::EvictReplica (for excess replicas - future extension)
+/// - RepairAction::EvictReplica (for excess replicas and move-copy follow-ups)
 ///
-/// Note: Evict tasks for orphan blocks are created by MaintenanceService after
-/// secondary confirmation, not by RepairPlanner.
+/// Orphan/GC physical deletion is represented by DeleteIntent and consumed by
+/// DeleteExecutor, not by RepairPlanner.
 pub struct RepairPlanner {
     /// Orphan queue stores *suspected* orphan blocks reported by workers.
     ///
@@ -56,24 +53,13 @@ pub struct RepairPlanner {
     /// - These are candidates for cleanup, but require confirmation
     /// - This queue serves as input to repair decision logic
     ///
-    /// # Processing Flow
-    ///
-    /// 1. Workers report suspected orphan blocks → added to orphan_queue
-    /// 2. MaintenanceService periodically processes orphan_queue
-    /// 3. For each (block_id, worker_id):
-    ///    - Secondary confirmation: query metadata state again
-    ///    - If confirmed orphan: enqueue RepairTask::Evict
-    ///    - If false positive: discard
-    ///
-    /// RepairPlanner does NOT directly create Evict tasks from orphan_queue.
-    /// The final decision and task creation happens in MaintenanceService.
+    /// RepairPlanner does NOT directly create delete work from orphan_queue.
+    /// Confirmed orphan cleanup is converted to DeleteIntent by maintenance.
     _orphan_queue: Arc<OrphanQueue>,
 }
 
 impl RepairPlanner {
-    pub fn new(_repair_queue: Arc<RepairQueue>, orphan_queue: Arc<OrphanQueue>) -> Self {
-        // Note: repair_queue parameter kept for backward compatibility but not used
-        // Planner now outputs actions instead of enqueuing directly
+    pub fn new(orphan_queue: Arc<OrphanQueue>) -> Self {
         Self {
             _orphan_queue: orphan_queue,
         }
@@ -244,76 +230,5 @@ impl RepairPlanner {
         }
 
         actions
-    }
-
-    // Backward compatibility methods: these enqueue actions automatically
-    // TODO: Remove these after migrating all callers to use plan_* methods
-
-    /// Check replication and enqueue repair tasks (backward compatibility).
-    ///
-    /// # Deprecated
-    /// Use `plan_replication()` instead and enqueue actions manually.
-    #[deprecated(note = "Use plan_replication() instead")]
-    pub fn check_replication(
-        &self,
-        block_id: BlockId,
-        current_locations: &[WorkerId],
-        replication_factor: u8,
-        available_workers: &[WorkerId],
-        repair_queue: &RepairQueue,
-    ) -> MetadataResult<()> {
-        let actions = self.plan_replication(block_id, current_locations, replication_factor, available_workers);
-
-        for action in actions {
-            let task = action.into_task();
-            if let Err(e) = repair_queue.enqueue(task) {
-                tracing::warn!(
-                    block_id = %block_id,
-                    error = %e,
-                    "Failed to enqueue replication task"
-                );
-            } else {
-                info!(
-                    block_id = %block_id,
-                    current_replicas = current_locations.len(),
-                    target_replicas = replication_factor,
-                    "Enqueued replication task"
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Check load balance and enqueue rebalancing tasks (backward compatibility).
-    ///
-    /// # Deprecated
-    /// Use `plan_rebalance()` instead and enqueue actions manually.
-    #[deprecated(note = "Use plan_rebalance() instead")]
-    pub fn check_rebalance(
-        &self,
-        worker_manager: &crate::worker::WorkerManager,
-        repair_queue: &RepairQueue,
-    ) -> MetadataResult<()> {
-        let actions = self.plan_rebalance(worker_manager);
-
-        for action in actions {
-            let block_id = action.block_id();
-            let task = action.into_task();
-            if let Err(e) = repair_queue.enqueue(task) {
-                tracing::warn!(
-                    block_id = %block_id,
-                    error = %e,
-                    "Failed to enqueue rebalance task"
-                );
-            } else {
-                info!(
-                    block_id = %block_id,
-                    "Enqueued rebalance task"
-                );
-            }
-        }
-
-        Ok(())
     }
 }

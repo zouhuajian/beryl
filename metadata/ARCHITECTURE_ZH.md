@@ -127,10 +127,10 @@ worker 不应该拥有：
 - GC/orphan/overrep 策略。
 - lost worker 后的 repair scheduling。
 
-未来应引入：
+当前已引入：
 
-- `WorkerCommandHub` 或 `WorkerCommandSource`，集中承接 maintenance 内部各 command source。
-- `WorkerService` 只面向 command hub，不直接依赖 repair/delete executor。
+- `WorkerCommandRouter` / `WorkerCommandSource`，集中承接 maintenance 内部各 command source。
+- `WorkerService` 只面向 command router，不直接执行 repair/delete polling 或 ack routing。
 - worker heartbeat ack 必须带 source namespace，避免 repair/delete 使用同一 `task_id` 空间时发生冲突或误确认。
 
 预期依赖方向：
@@ -138,7 +138,7 @@ worker 不应该拥有：
 ```text
 WorkerService
 -> WorkerManager
--> WorkerCommandHub
+-> WorkerCommandRouter
 -> maintenance repair/delete command sources
 ```
 
@@ -178,8 +178,8 @@ repair 负责：
 - under-replica 规划。
 - over-replica 副本移除规划。
 - move/copy repair 规划。
-- `RepairQueue`：dedup、retry、backoff、inflight、ack、timeout。
-- `RepairExecutor`：将 repair task 转成 worker command source。
+- `maintenance/repair/RepairQueue`：dedup、retry、backoff、inflight、ack、timeout。
+- `worker/command_router.rs` 中的 repair source adapter：将 repair task 转成 worker heartbeat command。
 
 repair 不负责：
 
@@ -190,9 +190,9 @@ repair 不负责：
 
 命名与路径建议：
 
-- `RepairTask::Evict` 后续应改名为 `EvictReplica`，表达这是 repair/rebalance 语境下的副本驱逐，不是通用删除。
+- `RepairTask::EvictReplica` 表达 repair/rebalance 语境下的副本驱逐，不是通用删除。
 - 通用删除不应走 `RepairQueue`。
-- repair command 应通过 command hub 交给 worker heartbeat transport，而不是让 worker 模块直接持有 repair 队列。
+- repair command 通过 `WorkerCommandRouter` 交给 worker heartbeat transport；worker 模块只保留 transport adapter。
 
 ## 7. delete 边界
 
@@ -212,7 +212,7 @@ delete 负责：
 
 - GC/orphan/overrep 只创建 `DeleteIntent`。
 - `DeleteExecutor` 是唯一消费 `DeleteIntent` 并执行物理删除的组件。
-- 不再保留 GC -> `RepairQueue::Evict` 的重复路径。
+- 不再保留 GC -> `RepairQueue` generic delete task 的重复路径。
 
 delete 不负责决定副本健康、lost worker repair 或 worker liveness；这些信号来自 maintenance repair/lost_worker 和 worker runtime。
 
@@ -279,20 +279,21 @@ P1：
 
 P2：
 
-- 引入 `WorkerCommandHub`。
-- `WorkerService` 不再直接依赖 `RepairQueue` / `DeleteExecutor`。
+- 引入 `WorkerCommandRouter`。
+- `WorkerService` 不再直接执行 repair/delete command polling 和 ack routing。
 - 解决 ack source namespace / `task_id` 冲突。
 
 P3：
 
-- worker/repair 移入 `maintenance/repair`。
-- 尽量机械移动，不改行为。
+- 已完成：worker/repair 移入 `maintenance/repair`。
+- `RepairTask::Evict` / `RepairDedupKey::Evict` 已收窄命名为 `EvictReplica`。
+- repair queue/planner 行为保持为 metadata 侧维护能力；worker 侧只保留 heartbeat command source adapter。
 
 P4：
 
-- `worker/delete_executor.rs` 与 `maintenance/intents.rs` 收敛到 `maintenance/delete`。
+- 已完成：`worker/delete_executor.rs` 与 `maintenance/intents.rs` 收敛到 `maintenance/delete`。
 - GC/orphan/overrep 统一只创建 `DeleteIntent`。
-- `DeleteExecutor` 成为唯一 `DeleteIntent` consumer。
+- `DeleteExecutor` 是唯一 `DeleteIntent` consumer；GC 不再保留 intent -> `RepairQueue` 的重复物理删除路径。
 
 P5：
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Repair module: queue, planner, and orphan management for block repair operations.
+//! Repair module: queue, planner, and orphan management for maintenance repair operations.
 //!
 //! This module is organized as follows:
 //! - `types.rs`: Core types (RepairTaskId, RepairTask, RepairTaskState, etc.)
@@ -16,13 +16,10 @@ mod planner;
 mod queue;
 mod types;
 
-// Re-export public types for backward compatibility
-#[allow(unused_imports)]
 pub use actions::RepairAction;
 pub use orphan::{OrphanMetrics, OrphanQueue};
 pub use planner::RepairPlanner;
 pub use queue::RepairQueue;
-#[allow(unused_imports)]
 pub use types::{
     ErrorClass, RepairDedupKey, RepairTask, RepairTaskId, RepairTaskRecord, RepairTaskState, TaskAckStatus,
 };
@@ -78,8 +75,7 @@ mod tests {
     #[test]
     fn test_planner_plan_replication() {
         let orphan_queue = Arc::new(OrphanQueue::new(100));
-        let repair_queue = Arc::new(RepairQueue::new(100));
-        let planner = RepairPlanner::new(repair_queue, orphan_queue);
+        let planner = RepairPlanner::new(orphan_queue);
 
         let block_id = make_block_id(1, 0);
         let current_locations = vec![make_worker_id(1)];
@@ -175,6 +171,41 @@ mod tests {
         assert_eq!(queue.len_total(), 0);
         assert_eq!(queue.len_pending(), 0);
         assert_eq!(queue.len_inflight(), 0);
+    }
+
+    #[test]
+    fn test_move_copy_success_returns_replica_eviction_followup() {
+        let queue = RepairQueue::new(1000);
+        let block_id = make_block_id(1, 0);
+        let from_worker = make_worker_id(1);
+        let to_worker = make_worker_id(2);
+
+        let task = RepairTask::MoveCopy {
+            block_id,
+            from_worker,
+            to_worker,
+        };
+
+        let _task_id = queue.enqueue(task).unwrap();
+        let records = queue.poll_for_worker(to_worker, 10);
+        assert_eq!(records.len(), 1);
+
+        let followup = queue
+            .ack(records[0].id, to_worker, TaskAckStatus::Success, None, None)
+            .unwrap();
+
+        match followup {
+            Some(RepairTask::EvictReplica {
+                target_worker,
+                block_id: followup_block_id,
+                reason,
+            }) => {
+                assert_eq!(target_worker, from_worker);
+                assert_eq!(followup_block_id, block_id);
+                assert!(reason.contains("MoveCopy completed"));
+            }
+            other => panic!("expected EvictReplica follow-up, got {other:?}"),
+        }
     }
 
     #[test]
@@ -283,8 +314,7 @@ mod tests {
     #[test]
     fn test_planner_stable_output() {
         let orphan_queue = Arc::new(OrphanQueue::new(100));
-        let repair_queue = Arc::new(RepairQueue::new(100));
-        let planner = RepairPlanner::new(repair_queue, orphan_queue);
+        let planner = RepairPlanner::new(orphan_queue);
 
         let block_id = make_block_id(1, 0);
         let current_locations = vec![make_worker_id(1)];
@@ -314,8 +344,7 @@ mod tests {
     fn test_planner_overrep_evict_replicas() {
         // Verify over-replication scenario produces EvictReplica actions.
         let orphan_queue = Arc::new(OrphanQueue::new(100));
-        let repair_queue = Arc::new(RepairQueue::new(100));
-        let planner = RepairPlanner::new(repair_queue, orphan_queue);
+        let planner = RepairPlanner::new(orphan_queue);
 
         let block_id = make_block_id(1, 0);
         let current_locations = vec![

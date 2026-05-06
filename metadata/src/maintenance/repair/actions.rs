@@ -31,7 +31,7 @@ pub enum RepairAction {
         from_worker: WorkerId,
         to_worker: WorkerId,
     },
-    /// Evict a replica from a worker (for orphan cleanup or excess replica removal).
+    /// Evict an excess or move follow-up replica from a worker.
     EvictReplica {
         block_id: BlockId,
         target_worker: WorkerId,
@@ -69,7 +69,7 @@ impl RepairAction {
                 block_id,
                 target_worker,
                 reason,
-            } => RepairTask::Evict {
+            } => RepairTask::EvictReplica {
                 block_id,
                 target_worker,
                 reason,

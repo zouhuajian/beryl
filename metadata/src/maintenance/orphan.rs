@@ -11,7 +11,7 @@ use crate::metrics::MetadataMetrics;
 use crate::mount::MountTable;
 use crate::raft::{AppRaftNode, RocksDBStorage};
 use crate::state::DeleteIntentReason;
-use crate::worker::{OrphanQueue, RepairQueue, WorkerManager};
+use crate::worker::WorkerManager;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -20,9 +20,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 use types::ids::{BlockId, WorkerId};
 
+use super::delete::DeleteIntentBuilder;
 use super::gate::{GateCheckResult, TaskGate};
 use super::gc::BLOCKREPORT_CONVERGENCE_THRESHOLD;
-use super::intents::DeleteIntentBuilder;
+use super::repair::OrphanQueue;
 
 /// Pending orphan block (waiting for grace period or second confirmation).
 #[derive(Debug, Clone)]
@@ -64,7 +65,6 @@ pub struct OrphanBlockCleaner {
     raft_node: Arc<AppRaftNode>,
     storage: Arc<RocksDBStorage>,
     worker_manager: Arc<WorkerManager>,
-    _repair_queue: Arc<RepairQueue>,
     orphan_queue: Arc<OrphanQueue>,
     orphan_gate: Arc<RwLock<TaskGate>>,
     orphan_pending: Arc<RwLock<HashMap<BlockId, PendingOrphan>>>,
@@ -84,7 +84,6 @@ impl OrphanBlockCleaner {
         raft_node: Arc<AppRaftNode>,
         storage: Arc<RocksDBStorage>,
         worker_manager: Arc<WorkerManager>,
-        repair_queue: Arc<RepairQueue>,
         orphan_queue: Arc<OrphanQueue>,
         orphan_gate: Arc<RwLock<TaskGate>>,
         orphan_pending: Arc<RwLock<HashMap<BlockId, PendingOrphan>>>,
@@ -97,7 +96,6 @@ impl OrphanBlockCleaner {
             raft_node,
             storage,
             worker_manager,
-            _repair_queue: repair_queue,
             orphan_queue,
             orphan_gate,
             orphan_pending,

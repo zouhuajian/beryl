@@ -11,8 +11,8 @@ use crate::inflight_registry::{InflightKind, InflightRegistry};
 use crate::metrics::MetadataMetrics;
 use crate::mount::MountTable;
 use crate::raft::{AppRaftNode, RocksDBStorage};
-use crate::state::{DeleteIntentReason, DeleteIntentStatus};
-use crate::worker::{RepairQueue, RepairTask, WorkerManager};
+use crate::state::DeleteIntentReason;
+use crate::worker::WorkerManager;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -20,11 +20,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 use types::block::BlockState;
-use types::ids::WorkerId;
 use types::ids::{BlockId, BlockIndex, DataHandleId};
 
+use super::delete::DeleteIntentBuilder;
 use super::gate::{GateCheckResult, GateState, TaskGate};
-use super::intents::DeleteIntentBuilder;
 
 /// Block report convergence threshold (default: 80% of active workers must have full report).
 pub const BLOCKREPORT_CONVERGENCE_THRESHOLD: f64 = 0.80;
@@ -72,12 +71,11 @@ impl GcCandidate {
 /// Responsibilities:
 /// - Mark pass: scan blocks, collect candidates (refcount=0)
 /// - Sweep pass: create DeleteIntents for eligible candidates (via Raft)
-/// - Intent processing: process DeleteIntents (reason=Gc), inject RepairTask::Evict
+/// - Delete execution: DeleteExecutor consumes pending DeleteIntents
 pub struct GcService {
     raft_node: Arc<AppRaftNode>,
     storage: Arc<RocksDBStorage>,
     worker_manager: Arc<WorkerManager>,
-    repair_queue: Arc<RepairQueue>,
     block_ref_counts: Arc<RwLock<BlockRefCounts>>,
     gc_gate: Arc<RwLock<TaskGate>>,
     metrics: Arc<MetadataMetrics>,
@@ -88,8 +86,6 @@ pub struct GcService {
     inflight_registry: Arc<InflightRegistry>,
     /// Mount table for computing mount_epoch when convergence gating is enabled.
     mount_table: Arc<MountTable>,
-    /// Configuration for intent processing
-    max_intents_per_scan: usize,
 }
 
 impl GcService {
@@ -100,7 +96,6 @@ impl GcService {
         raft_node: Arc<AppRaftNode>,
         storage: Arc<RocksDBStorage>,
         worker_manager: Arc<WorkerManager>,
-        repair_queue: Arc<RepairQueue>,
         block_ref_counts: Arc<RwLock<BlockRefCounts>>,
         gc_gate: Arc<RwLock<TaskGate>>,
         metrics: Arc<MetadataMetrics>,
@@ -114,7 +109,6 @@ impl GcService {
             raft_node,
             storage,
             worker_manager,
-            repair_queue,
             block_ref_counts,
             gc_gate,
             metrics,
@@ -123,7 +117,6 @@ impl GcService {
             destructive_gate,
             inflight_registry,
             mount_table,
-            max_intents_per_scan: 100, // Default: 100 intents per scan
         }
     }
 
@@ -533,7 +526,10 @@ impl GcService {
                     self.metrics
                         .maintenance_gc_created_intents_total
                         .fetch_add(intents_created as u64, Ordering::Relaxed);
-                    // Remove from candidates after successful creation
+                    for block_id in &eligible_blocks {
+                        self.inflight_registry.release(*block_id);
+                    }
+                    // Remove from candidates after successful creation.
                     to_remove.extend(eligible_blocks);
                 }
                 Err(e) => {
@@ -546,6 +542,9 @@ impl GcService {
                     self.metrics
                         .delete_intents_create_failed_total
                         .fetch_add(eligible_blocks.len() as u64, Ordering::Relaxed);
+                    for block_id in &eligible_blocks {
+                        self.inflight_registry.release(*block_id);
+                    }
                     skipped_total += eligible_blocks.len();
                 }
             }
@@ -586,187 +585,7 @@ impl GcService {
             debug!(task = "gc", "GC sweep pass completed: no intents created");
         }
 
-        // Process GC intents created earlier in the sweep pass
-        // This is called after sweep to process intents created by unlink/truncate
-        if let Err(e) = self.process_gc_intents().await {
-            warn!(error = %e, "Failed to process GC intents during GC cycle");
-        }
-
         Ok(())
-    }
-
-    /// Process pending GC intents and inject repair tasks.
-    ///
-    /// This method scans CF_GC_INTENTS for PENDING intents with reason=Gc,
-    /// double-checks refcount, and injects RepairTask::Evict into RepairQueue.
-    /// Called by MaintenanceService as part of GC cycle.
-    pub async fn process_gc_intents(&self) -> MetadataResult<usize> {
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-
-        // List pending intents
-        let intents = self
-            .storage
-            .list_pending_delete_intents(self.max_intents_per_scan, now_ms)?;
-
-        // Filter to only GC intents
-        let gc_intents: Vec<_> = intents
-            .into_iter()
-            .filter(|intent| intent.reason == DeleteIntentReason::Gc)
-            .collect();
-
-        if gc_intents.is_empty() {
-            return Ok(0);
-        }
-
-        debug!(
-            count = gc_intents.len(),
-            "Processing {} pending GC intents",
-            gc_intents.len()
-        );
-
-        let mut processed = 0;
-        let mut skipped = 0;
-
-        for intent in &gc_intents {
-            // Double-check refcount (conservative)
-            match self.storage.get_block_ref_count(intent.block_id)? {
-                Some(count) if count > 0 => {
-                    // Block still has references, skip
-                    debug!(
-                        intent_id = intent.intent_id,
-                        block_id = %intent.block_id,
-                        refcount = count,
-                        "Skipping intent: block still has references"
-                    );
-                    skipped += 1;
-                    continue;
-                }
-                Some(0) | None => {
-                    // Refcount is 0, proceed
-                }
-                Some(_) => {
-                    // This case is already covered above, but needed for exhaustiveness
-                    unreachable!()
-                }
-            }
-
-            // Check inflight registry: ensure block is not in repair/write/rebalance
-            if !self
-                .inflight_registry
-                .try_acquire(intent.block_id, InflightKind::Delete, None)?
-            {
-                debug!(
-                    intent_id = intent.intent_id,
-                    block_id = %intent.block_id,
-                    "Skipping intent: block is in-flight for repair/write/rebalance"
-                );
-                skipped += 1;
-                continue;
-            }
-
-            // Check if block already has an active repair task in RepairQueue (conservative check)
-            // This prevents GC from injecting tasks for blocks that are already being processed
-            if self.repair_queue.is_block_inflight(intent.block_id) {
-                debug!(
-                    intent_id = intent.intent_id,
-                    block_id = %intent.block_id,
-                    "Skipping intent: block already has active repair task"
-                );
-                self.inflight_registry.release(intent.block_id);
-                skipped += 1;
-                continue;
-            }
-
-            // Get target workers for this block
-            let target_workers = self.get_target_workers_for_block(intent.block_id)?;
-
-            if target_workers.is_empty() {
-                // No known locations - mark as completed (block already gone)
-                debug!(
-                    intent_id = intent.intent_id,
-                    block_id = %intent.block_id,
-                    "Intent completed: no known locations"
-                );
-                let command = crate::raft::Command::UpdateDeleteIntentStatus {
-                    dedup: crate::raft::DedupKey::system(),
-                    intent_id: intent.intent_id,
-                    status: DeleteIntentStatus::Completed,
-                    finished_at_ms: Some(now_ms),
-                    error_msg: None,
-                };
-                if let Err(e) = self.raft_node.propose(command).await {
-                    warn!(
-                        intent_id = intent.intent_id,
-                        error = %e,
-                        "Failed to update intent status to Completed"
-                    );
-                }
-                self.inflight_registry.release(intent.block_id);
-                processed += 1;
-                continue;
-            }
-
-            // Inject repair task for each target worker
-            // RepairQueue dedup ensures: same (block_id, target_worker) -> same task_id (no duplicate)
-            let mut enqueued_count = 0;
-            for target_worker in target_workers {
-                let task = RepairTask::Evict {
-                    target_worker,
-                    block_id: intent.block_id,
-                    reason: format!("GC: unreferenced block (intent_id={})", intent.intent_id),
-                };
-
-                match self.repair_queue.enqueue(task) {
-                    Ok(task_id) => {
-                        debug!(
-                            intent_id = intent.intent_id,
-                            block_id = %intent.block_id,
-                            target_worker = %target_worker,
-                            task_id = task_id.0,
-                            "Injected Evict task for GC intent (dedup handled by RepairQueue)"
-                        );
-                        enqueued_count += 1;
-                    }
-                    Err(e) => {
-                        warn!(
-                            intent_id = intent.intent_id,
-                            block_id = %intent.block_id,
-                            target_worker = %target_worker,
-                            error = %e,
-                            "Failed to enqueue Evict task"
-                        );
-                        // Continue with other workers
-                    }
-                }
-            }
-
-            if enqueued_count > 0 {
-                // InFlight is runtime soft state; authoritative terminal status is updated after ack/reconcile.
-                processed += 1;
-            } else {
-                // No tasks enqueued, release inflight lock
-                self.inflight_registry.release(intent.block_id);
-                skipped += 1;
-            }
-        }
-
-        info!(
-            processed,
-            skipped,
-            total = gc_intents.len(),
-            "GC intent processing: {} processed, {} skipped",
-            processed,
-            skipped
-        );
-
-        Ok(processed)
-    }
-
-    /// Get target workers for a block (workers that have this block).
-    fn get_target_workers_for_block(&self, block_id: BlockId) -> MetadataResult<Vec<WorkerId>> {
-        // Get block locations from worker manager
-        let locations = self.worker_manager.get_block_locations(block_id);
-        Ok(locations)
     }
 
     /// Reload block reference counts (self-healing).

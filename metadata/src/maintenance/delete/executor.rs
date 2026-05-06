@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Delete executor: executes DeleteIntent by sending Evict commands to workers.
+//! Delete executor: executes DeleteIntent by sending DeleteBlocks commands to workers.
 //!
 //! This module implements:
 //! - Periodic polling of pending DeleteIntents
@@ -13,12 +13,12 @@
 use crate::destructive_gate::{DestructiveCheckContext, DestructiveGate};
 use crate::error::MetadataResult;
 use crate::inflight_registry::{InflightKind, InflightRegistry};
+use crate::maintenance::repair::{ErrorClass, TaskAckStatus};
 use crate::metrics::MetadataMetrics;
 use crate::mount::MountTable;
 use crate::raft::{AppRaftNode, Command, DedupKey, RocksDBStorage};
 use crate::state::{DeleteIntent, DeleteIntentStatus};
-use crate::worker::manager::WorkerManager;
-use crate::worker::repair::{ErrorClass, TaskAckStatus};
+use crate::worker::WorkerManager;
 use parking_lot::RwLock;
 use proto::metadata::*;
 use std::collections::{HashMap, HashSet};
@@ -110,6 +110,7 @@ impl DeleteExecutor {
         worker_manager: Arc<WorkerManager>,
         metrics: Arc<MetadataMetrics>,
         mount_table: Arc<MountTable>,
+        inflight_registry: Arc<InflightRegistry>,
     ) -> Self {
         // Create unified destructive gate
         let destructive_gate = Arc::new(DestructiveGate::new(
@@ -117,9 +118,6 @@ impl DeleteExecutor {
             Arc::clone(&worker_manager),
             mount_table,
         ));
-
-        // Create inflight registry (default TTL: 5 minutes)
-        let inflight_registry = Arc::new(InflightRegistry::new(5 * 60 * 1000));
 
         Self {
             raft_node,
@@ -158,7 +156,7 @@ impl DeleteExecutor {
     }
 
     /// Run one execution cycle.
-    async fn run_once(&self) -> MetadataResult<()> {
+    pub(super) async fn run_once(&self) -> MetadataResult<()> {
         // Leader-only check
         if !self.raft_node.is_leader() {
             return Ok(()); // Only run on leader
@@ -370,19 +368,6 @@ impl DeleteExecutor {
                     }
                 }
 
-                // Check inflight registry (cross-operation mutual exclusion)
-                if !self
-                    .inflight_registry
-                    .try_acquire(intent.block_id, InflightKind::Delete, None)?
-                {
-                    debug!(
-                        intent_id = intent_id,
-                        block_id = %intent.block_id,
-                        "Skipping intent: block is in-flight for repair/write/rebalance"
-                    );
-                    continue;
-                }
-
                 // Get block locations
                 let locations = self.worker_manager.get_block_locations(intent.block_id);
 
@@ -488,7 +473,7 @@ impl DeleteExecutor {
                 worker_id = worker_id.as_raw(),
                 task_id,
                 block_count = blocks.len(),
-                "Generated EvictCommand for worker"
+                "Generated DeleteBlocksCommand for worker"
             );
         }
 
@@ -818,17 +803,12 @@ impl DeleteExecutor {
         const CLEANUP_TTL_MS: u64 = 60 * 60 * 1000; // 1 hour
 
         let mut state = self.execution_state.write();
-        state.retain(|_intent_id, exec_state| {
-            let should_retain = match &exec_state.status {
-                IntentExecutionStatus::Pending | IntentExecutionStatus::InFlight { .. } => true,
-                IntentExecutionStatus::Completed { completed_at_ms } => {
-                    now_ms.saturating_sub(*completed_at_ms) < CLEANUP_TTL_MS
-                }
-                IntentExecutionStatus::Failed { failed_at_ms, .. } => {
-                    now_ms.saturating_sub(*failed_at_ms) < CLEANUP_TTL_MS
-                }
-            };
-            !should_retain
+        state.retain(|_intent_id, exec_state| match &exec_state.status {
+            IntentExecutionStatus::Pending | IntentExecutionStatus::InFlight { .. } => true,
+            IntentExecutionStatus::Completed { completed_at_ms } => {
+                now_ms.saturating_sub(*completed_at_ms) < CLEANUP_TTL_MS
+            }
+            IntentExecutionStatus::Failed { failed_at_ms, .. } => now_ms.saturating_sub(*failed_at_ms) < CLEANUP_TTL_MS,
         });
     }
 

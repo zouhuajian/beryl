@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
-use types::ids::{BlockId, WorkerId};
+use types::ids::WorkerId;
 
 /// Internal state for RepairQueue (protected by single mutex to avoid deadlocks).
 struct RepairQueueState {
@@ -68,7 +68,7 @@ struct MetricsUpdate {
 
 /// Repair queue with state machine, deduplication, and retry.
 ///
-/// Manages the lifecycle of repair tasks (Replicate, MoveCopy, Evict) with:
+/// Manages the lifecycle of repair tasks (Replicate, MoveCopy, EvictReplica) with:
 /// - State tracking: Pending → InFlight → Done/Failed
 /// - Deduplication: Prevents duplicate tasks based on dedup keys
 /// - Worker-level rate limiting: Limits concurrent tasks per worker
@@ -319,7 +319,7 @@ impl RepairQueue {
                     let matches = match &record.task {
                         RepairTask::Replicate { target_worker, .. } => *target_worker == worker_id,
                         RepairTask::MoveCopy { to_worker, .. } => *to_worker == worker_id,
-                        RepairTask::Evict { target_worker, .. } => *target_worker == worker_id,
+                        RepairTask::EvictReplica { target_worker, .. } => *target_worker == worker_id,
                     };
 
                     if matches {
@@ -355,7 +355,7 @@ impl RepairQueue {
                                 }
                             }
                         } else {
-                            // No inflight registry configured, allow (backward compatibility)
+                            // Tests and isolated queue users may run without cross-operation gating.
                             true
                         };
 
@@ -462,13 +462,13 @@ impl RepairQueue {
 
         match status {
             TaskAckStatus::Success => {
-                // Check if this is a MoveCopy that needs to trigger Evict
+                // Check if this is a MoveCopy that needs to trigger replica eviction.
                 if let RepairTask::MoveCopy {
                     block_id, from_worker, ..
                 } = &record.task
                 {
-                    // Create followup Evict task for from_worker (single block)
-                    followup_task = Some(RepairTask::Evict {
+                    // Create a follow-up replica eviction task for from_worker.
+                    followup_task = Some(RepairTask::EvictReplica {
                         target_worker: *from_worker,
                         block_id: *block_id,
                         reason: format!("MoveCopy completed (task_id={})", task_id.0),
@@ -748,31 +748,5 @@ impl RepairQueue {
         state.records.clear();
         state.dedup.clear();
         state.worker_inflight.clear();
-    }
-
-    /// Check if a block has an active (pending or in-flight) repair task.
-    /// Used by GC to avoid injecting duplicate tasks.
-    pub fn is_block_inflight(&self, block_id: BlockId) -> bool {
-        let state = self.state.lock();
-        // Check if any active task (Pending or InFlight) references this block_id
-        state.records.values().any(|record| {
-            record.task.block_id() == block_id
-                && matches!(
-                    &record.state,
-                    RepairTaskState::Pending { .. } | RepairTaskState::InFlight { .. }
-                )
-        })
-    }
-
-    // Legacy compatibility methods (deprecated, use new API)
-    #[deprecated(note = "Use enqueue() instead")]
-    pub fn dequeue(&self) -> Option<RepairTask> {
-        warn!("dequeue() is deprecated, use poll_for_worker() instead");
-        None
-    }
-
-    #[deprecated(note = "Use len_pending() instead")]
-    pub fn len(&self) -> usize {
-        self.len_total()
     }
 }

@@ -6,8 +6,8 @@
 use super::command_router::WorkerCommandRouter;
 use super::manager::WorkerManager;
 use super::metrics::WorkerMetrics;
-use super::repair::{OrphanQueue, RepairPlanner, RepairQueue};
 use crate::error::{to_canonical_rpc, MetadataError, MetadataResult};
+use crate::maintenance::repair::{OrphanQueue, RepairPlanner, RepairQueue};
 use crate::raft::Command;
 use crate::raft::{AppDataResponse, AppRaftNode, WorkerCommandResult};
 use crate::service::extract_and_inject_context;
@@ -56,7 +56,7 @@ impl MetadataWorkerServiceImpl {
         orphan_queue: Arc<OrphanQueue>,
         mount_table: Arc<crate::mount::MountTable>,
     ) -> Self {
-        let repair_planner = Arc::new(RepairPlanner::new(Arc::clone(&repair_queue), Arc::clone(&orphan_queue)));
+        let repair_planner = Arc::new(RepairPlanner::new(Arc::clone(&orphan_queue)));
 
         let metrics = Arc::new(WorkerMetrics::new());
 

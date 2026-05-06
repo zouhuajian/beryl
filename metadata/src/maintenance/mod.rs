@@ -1,28 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Maintenance module: background tasks for GC, lease cleanup, and orphan block cleanup.
+//! Maintenance module: background tasks for GC, lease cleanup, orphan cleanup, repair, and delete.
 //!
 //! This module has been refactored from a single large file into multiple focused modules:
 //! - gate.rs: TaskGate and unified check_destructive_allowed() entry point ✅
-//! - intents.rs: DeleteIntentBuilder for unified intent creation ✅
+//! - delete/: DeleteIntentBuilder and DeleteExecutor ✅
+//! - repair/: RepairQueue, RepairPlanner, and OrphanQueue ✅
 //! - gc.rs: GcService ✅
 //! - orphan.rs: OrphanBlockCleaner ✅
 //! - lease_cleanup.rs: LeaseCleanupService ✅
 //! - service.rs: MaintenanceService orchestration ✅
 
+pub mod delete;
 pub mod gate;
 pub mod gc;
-pub mod intents;
 pub mod lease_cleanup;
 pub mod orphan;
 pub mod overrep;
+pub mod repair;
 pub mod service;
 
 // Re-export the current maintenance surface from one module-level entrypoint.
+pub use delete::{DeleteExecutor, DeleteExecutorHandle, DeleteIntentBuilder};
 pub use gate::{GateCheckResult, GateState, TaskGate};
 pub use gc::{GcCandidate, GcService, BLOCKREPORT_CONVERGENCE_THRESHOLD};
-pub use intents::DeleteIntentBuilder;
 pub use lease_cleanup::LeaseCleanupService;
 pub use orphan::{OrphanBlockCleaner, PendingOrphan};
 pub use overrep::{OverRepCandidate, OverReplicaCleanupService};

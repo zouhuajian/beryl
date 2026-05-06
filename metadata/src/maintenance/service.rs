@@ -10,18 +10,18 @@
 //! - maintenance/gc.rs: GcService
 //! - maintenance/orphan.rs: OrphanBlockCleaner
 //! - maintenance/lease_cleanup.rs: LeaseCleanupService
-//! - maintenance/intents.rs: DeleteIntentBuilder
 
 use super::gate::TaskGate;
 use super::gc::{GcCandidate, GcService};
 use super::lease_cleanup::LeaseCleanupService;
 use super::orphan::{OrphanBlockCleaner, PendingOrphan};
+use super::repair::{OrphanQueue, RepairPlanner, RepairQueue};
 
 use crate::destructive_gate::DestructiveGate;
 use crate::inflight_registry::InflightRegistry;
 use crate::metrics::MetadataMetrics;
 use crate::raft::{AppRaftNode, RocksDBStorage};
-use crate::worker::{OrphanQueue, RepairPlanner, RepairQueue, WorkerManager};
+use crate::worker::WorkerManager;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -211,7 +211,6 @@ impl MaintenanceService {
                 Arc::clone(&self.raft_node),
                 Arc::clone(&self.storage),
                 Arc::clone(&self.worker_manager),
-                Arc::clone(&self.repair_queue),
                 Arc::clone(&self.block_ref_counts),
                 Arc::clone(&self.gc_gate),
                 Arc::clone(&self.metrics),
@@ -294,7 +293,6 @@ impl MaintenanceService {
                 Arc::clone(&self.raft_node),
                 Arc::clone(&self.storage),
                 Arc::clone(&self.worker_manager),
-                Arc::clone(&self.repair_queue),
                 Arc::clone(&self.orphan_queue),
                 Arc::clone(&self.orphan_gate),
                 Arc::clone(&self.orphan_pending),

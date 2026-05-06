@@ -26,7 +26,7 @@ use tracing::{debug, error, info, warn};
 use types::block::BlockState;
 use types::ids::{BlockId, WorkerId};
 
-use super::intents::DeleteIntentBuilder;
+use super::delete::DeleteIntentBuilder;
 
 /// Over-replication candidate tracked across scans.
 #[derive(Debug, Clone)]
@@ -371,7 +371,7 @@ impl OverReplicaCleanupService {
                 }
             }
 
-            let intent = self.intent_builder.build(
+            let intent = match self.intent_builder.build(
                 0,
                 block_id,
                 DeleteIntentReason::OverRep,
@@ -379,7 +379,13 @@ impl OverReplicaCleanupService {
                 not_before_ms,
                 guard_state_id,
                 target_workers.clone(),
-            )?;
+            ) {
+                Ok(intent) => intent,
+                Err(e) => {
+                    self.inflight_registry.release(block_id);
+                    return Err(e);
+                }
+            };
 
             // Propose intent via Raft
             use crate::raft::{Command, DedupKey};
@@ -401,7 +407,7 @@ impl OverReplicaCleanupService {
                         desired_replicas = candidate.desired_replicas,
                         "Created OverRep eviction intent"
                     );
-                    // Keep inflight lock until intent is executed
+                    self.inflight_registry.release(block_id);
                 }
                 Err(e) => {
                     self.inflight_registry.release(block_id);

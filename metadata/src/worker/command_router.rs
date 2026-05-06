@@ -3,8 +3,8 @@
 
 //! Worker command routing boundary between worker RPC and command sources.
 
-use super::delete_executor::DeleteExecutor;
-use super::repair::{ErrorClass, RepairQueue, RepairTask, RepairTaskId, RepairTaskRecord, TaskAckStatus};
+use crate::maintenance::delete::DeleteExecutor;
+use crate::maintenance::repair::{ErrorClass, RepairQueue, RepairTask, RepairTaskId, RepairTaskRecord, TaskAckStatus};
 use parking_lot::Mutex;
 use proto::metadata::{
     worker_command_proto, DeleteBlockStatusProto, ErrorClassProto, EvictCommandProto, MoveCopyCommandProto,
@@ -237,7 +237,7 @@ impl RepairCommandSource {
                     target_worker_ids: vec![target_worker.as_raw()],
                 }))
             }
-            RepairTask::Evict {
+            RepairTask::EvictReplica {
                 block_id,
                 reason,
                 target_worker: _,
@@ -251,7 +251,7 @@ impl RepairCommandSource {
                     block_ids: vec![proto_block_id],
                     reason,
                     intent_id: 0,
-                    op_kind: proto::metadata::DeleteOpKindProto::DeleteOpKindDelete as i32,
+                    op_kind: proto::metadata::DeleteOpKindProto::DeleteOpKindReplicaEvict as i32,
                     not_before_ms: 0,
                     expected_epoch: 0,
                 }))
@@ -332,10 +332,13 @@ impl WorkerCommandSource for RepairCommandSource {
                     warn!(
                         task_id = task_id.0,
                         error = %e,
-                        "Failed to enqueue followup Evict task after MoveCopy"
+                        "Failed to enqueue follow-up replica eviction task after MoveCopy"
                     );
                 } else {
-                    info!(task_id = task_id.0, "MoveCopy completed, enqueued followup Evict task");
+                    info!(
+                        task_id = task_id.0,
+                        "MoveCopy completed, enqueued follow-up replica eviction task"
+                    );
                 }
             }
             Ok(None) => {}

@@ -5,6 +5,8 @@
 
 use crate::ensure_root_mount;
 use crate::inflight_registry::InflightRegistry;
+use crate::maintenance::delete::{DeleteExecutor, DeleteExecutorHandle};
+use crate::maintenance::repair::{OrphanQueue, RepairPlanner, RepairQueue};
 use crate::maintenance::{MaintenanceHandle, MaintenanceService};
 use crate::metrics::MetadataMetrics;
 use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
@@ -15,8 +17,8 @@ use crate::service::{
 };
 use crate::state::RaftStateStore;
 use crate::worker::{
-    DeleteCommandSource, DeleteExecutor, DeleteExecutorHandle, MetadataWorkerServiceImpl, OrphanQueue,
-    RepairCommandSource, RepairPlanner, RepairQueue, WorkerBackgroundHandle, WorkerCommandRouter, WorkerManager,
+    DeleteCommandSource, MetadataWorkerServiceImpl, RepairCommandSource, WorkerBackgroundHandle, WorkerCommandRouter,
+    WorkerManager,
 };
 use crate::{MetadataConfig, MountTable};
 use common::observe::{
@@ -110,7 +112,7 @@ pub struct RuntimeHandles {
 
 impl WorkerRepairState {
     fn new(config: &MetadataConfig) -> Self {
-        let repair_metrics = Arc::new(crate::worker::RepairMetrics::new());
+        let repair_metrics = Arc::new(crate::worker::metrics::RepairMetrics::new());
         let repair_config = &config.worker.repair;
         let mut repair_queue = RepairQueue::with_config_and_metrics(
             repair_config.max_queue_size,
@@ -125,7 +127,7 @@ impl WorkerRepairState {
         repair_queue.set_inflight_registry(Arc::clone(&shared_inflight_registry));
         let repair_queue = Arc::new(repair_queue);
         let orphan_queue = Arc::new(OrphanQueue::new(10_000));
-        let repair_planner = Arc::new(RepairPlanner::new(Arc::clone(&repair_queue), Arc::clone(&orphan_queue)));
+        let repair_planner = Arc::new(RepairPlanner::new(Arc::clone(&orphan_queue)));
 
         Self {
             repair_queue,
@@ -355,6 +357,7 @@ pub async fn build_maintenance(authority: &MetadataAuthority, worker: &WorkerRun
         Arc::clone(&worker.manager),
         Arc::clone(&authority.metadata_metrics),
         Arc::clone(&authority.mount_table),
+        Arc::clone(&repair.shared_inflight_registry),
     ));
     let delete_executor_handle = delete_executor.start();
 

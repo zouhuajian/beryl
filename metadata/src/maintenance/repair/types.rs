@@ -33,15 +33,15 @@ pub enum RepairTask {
         replication_factor: Option<u8>,
         reason: Option<String>,
     },
-    /// Move copy: copy block from source to target worker (copy then delete).
-    /// After successful copy + verify, metadata will enqueue Evict task for from_worker.
+    /// Move copy: copy block from source to target worker.
+    /// After successful copy + verify, metadata enqueues replica eviction for from_worker.
     MoveCopy {
         block_id: BlockId,
         from_worker: WorkerId,
         to_worker: WorkerId,
     },
-    /// Evict a single block from a worker.
-    Evict {
+    /// Evict one replica from a worker after repair planning.
+    EvictReplica {
         target_worker: WorkerId,
         block_id: BlockId,
         reason: String,
@@ -54,7 +54,7 @@ impl RepairTask {
         match self {
             RepairTask::Replicate { block_id, .. }
             | RepairTask::MoveCopy { block_id, .. }
-            | RepairTask::Evict { block_id, .. } => *block_id,
+            | RepairTask::EvictReplica { block_id, .. } => *block_id,
         }
     }
 
@@ -63,7 +63,7 @@ impl RepairTask {
         match self {
             RepairTask::Replicate { target_worker, .. } => Some(*target_worker),
             RepairTask::MoveCopy { to_worker, .. } => Some(*to_worker),
-            RepairTask::Evict { target_worker, .. } => Some(*target_worker),
+            RepairTask::EvictReplica { target_worker, .. } => Some(*target_worker),
         }
     }
 
@@ -72,7 +72,7 @@ impl RepairTask {
         match self {
             RepairTask::Replicate { .. } => "replicate",
             RepairTask::MoveCopy { .. } => "move_copy",
-            RepairTask::Evict { .. } => "evict",
+            RepairTask::EvictReplica { .. } => "evict_replica",
         }
     }
 }
@@ -89,7 +89,7 @@ pub enum RepairDedupKey {
         from_worker: WorkerId,
         to_worker: WorkerId,
     },
-    Evict {
+    EvictReplica {
         block_id: BlockId,
         target_worker: WorkerId,
     },
@@ -116,11 +116,11 @@ impl RepairDedupKey {
                 from_worker: *from_worker,
                 to_worker: *to_worker,
             },
-            RepairTask::Evict {
+            RepairTask::EvictReplica {
                 block_id,
                 target_worker,
                 ..
-            } => RepairDedupKey::Evict {
+            } => RepairDedupKey::EvictReplica {
                 block_id: *block_id,
                 target_worker: *target_worker,
             },

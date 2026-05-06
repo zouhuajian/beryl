@@ -3,8 +3,9 @@
 
 //! Integration tests for worker management and block reporting.
 
+use crate::maintenance::repair::{OrphanQueue, RepairPlanner, RepairQueue, RepairTask};
 use crate::worker::manager::HealthStatus;
-use crate::worker::{OrphanQueue, RepairPlanner, RepairQueue, RepairTask, WorkerManager};
+use crate::worker::WorkerManager;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
@@ -171,7 +172,7 @@ async fn test_dead_worker_cleanup() {
 async fn test_repair_queue_workflow() {
     let repair_queue = Arc::new(RepairQueue::new(100));
     let orphan_queue = Arc::new(OrphanQueue::new(100));
-    let planner = RepairPlanner::new(repair_queue.clone(), orphan_queue);
+    let planner = RepairPlanner::new(orphan_queue);
 
     let block_id = BlockId::new(DataHandleId::new(1), BlockIndex::new(0));
     let worker1 = WorkerId::new(1);
@@ -341,7 +342,7 @@ async fn test_replication_check_triggers_repair() {
     let manager = Arc::new(WorkerManager::new(60));
     let repair_queue = Arc::new(RepairQueue::new(100));
     let orphan_queue = Arc::new(OrphanQueue::new(100));
-    let planner = RepairPlanner::new(repair_queue.clone(), orphan_queue);
+    let planner = RepairPlanner::new(orphan_queue);
 
     let block_id = BlockId::new(DataHandleId::new(1), BlockIndex::new(0));
     let worker1 = WorkerId::new(1);
@@ -432,7 +433,7 @@ async fn test_inflight_conflict_blocks_repair() {
     // Integration regression: repair tasks must wait while Delete holds the inflight lock.
     // Test that Repair task is blocked when block is in-flight for Delete
     use crate::inflight_registry::{InflightKind, InflightRegistry};
-    use crate::worker::repair::{RepairQueue, RepairTask};
+    use crate::maintenance::repair::{RepairQueue, RepairTask};
 
     let inflight_registry = Arc::new(InflightRegistry::new(5 * 60 * 1000));
     let mut repair_queue = RepairQueue::new(100);
@@ -483,7 +484,7 @@ async fn test_inflight_conflict_blocks_repair() {
             .ack(
                 records[0].id,
                 worker1,
-                crate::worker::repair::TaskAckStatus::Success,
+                crate::maintenance::repair::TaskAckStatus::Success,
                 None,
                 None,
             )
@@ -498,7 +499,7 @@ async fn test_inflight_conflict_blocks_repair() {
 async fn test_inflight_repair_blocks_delete() {
     // Test that Repair (higher priority) blocks Delete (lower priority)
     use crate::inflight_registry::{InflightKind, InflightRegistry};
-    use crate::worker::repair::{RepairQueue, RepairTask};
+    use crate::maintenance::repair::{RepairQueue, RepairTask};
 
     let inflight_registry = Arc::new(InflightRegistry::new(5 * 60 * 1000));
     let mut repair_queue = RepairQueue::new(100);
@@ -531,7 +532,7 @@ async fn test_inflight_repair_blocks_delete() {
         .ack(
             task_id,
             worker1,
-            crate::worker::repair::TaskAckStatus::Success,
+            crate::maintenance::repair::TaskAckStatus::Success,
             None,
             None,
         )
