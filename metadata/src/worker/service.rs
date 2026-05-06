@@ -7,7 +7,7 @@ use super::command_router::WorkerCommandRouter;
 use super::manager::WorkerManager;
 use super::metrics::WorkerMetrics;
 use crate::error::{to_canonical_rpc, MetadataError, MetadataResult};
-use crate::maintenance::repair::{OrphanQueue, RepairPlanner, RepairQueue};
+use crate::maintenance::repair::{BlockReportDelta, RepairSignalSink};
 use crate::raft::Command;
 use crate::raft::{AppDataResponse, AppRaftNode, WorkerCommandResult};
 use crate::service::extract_and_inject_context;
@@ -25,12 +25,11 @@ use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
 /// Worker service background task handles.
 pub struct WorkerBackgroundHandle {
     _lease_metrics_task: Option<JoinHandle<()>>,
-    _dead_worker_cleanup_task: JoinHandle<()>,
 }
 
 impl WorkerBackgroundHandle {
     pub fn task_count(&self) -> usize {
-        usize::from(self._lease_metrics_task.is_some()) + 1
+        usize::from(self._lease_metrics_task.is_some())
     }
 }
 
@@ -38,9 +37,7 @@ impl WorkerBackgroundHandle {
 pub struct MetadataWorkerServiceImpl {
     raft_node: Arc<AppRaftNode>,
     worker_manager: Arc<WorkerManager>,
-    repair_queue: Arc<RepairQueue>,
-    orphan_queue: Arc<OrphanQueue>,
-    repair_planner: Arc<RepairPlanner>,
+    repair_signal_handler: Arc<dyn RepairSignalSink>,
     command_router: Option<Arc<WorkerCommandRouter>>,
     metrics: Arc<WorkerMetrics>,
     slot_metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
@@ -52,20 +49,15 @@ impl MetadataWorkerServiceImpl {
     pub fn new(
         raft_node: Arc<AppRaftNode>,
         worker_manager: Arc<WorkerManager>,
-        repair_queue: Arc<RepairQueue>,
-        orphan_queue: Arc<OrphanQueue>,
+        repair_signal_handler: Arc<dyn RepairSignalSink>,
         mount_table: Arc<crate::mount::MountTable>,
     ) -> Self {
-        let repair_planner = Arc::new(RepairPlanner::new(Arc::clone(&orphan_queue)));
-
         let metrics = Arc::new(WorkerMetrics::new());
 
         Self {
             raft_node,
             worker_manager,
-            repair_queue,
-            orphan_queue,
-            repair_planner,
+            repair_signal_handler,
             command_router: None,
             metrics,
             slot_metrics: None, // Will be set via set_slot_metrics
@@ -81,11 +73,6 @@ impl MetadataWorkerServiceImpl {
     /// Set slot metrics (called after metrics are available).
     pub fn set_slot_metrics(&mut self, metrics: Arc<crate::metrics::MetadataMetrics>) {
         self.slot_metrics = Some(metrics);
-    }
-
-    /// Get repair planner (for external use).
-    pub fn repair_planner(&self) -> Arc<RepairPlanner> {
-        Arc::clone(&self.repair_planner)
     }
 
     /// Helper: create a response header from request header with group_id.
@@ -114,7 +101,7 @@ impl MetadataWorkerServiceImpl {
         header
     }
 
-    /// Start background task for worker dead cleanup, replication check, and lease metrics update.
+    /// Start worker-local background tasks.
     pub fn start_background_tasks(&self) -> WorkerBackgroundHandle {
         // Start lease metrics update task
         let lease_metrics_task = if let Some(ref slot_metrics) = self.slot_metrics {
@@ -167,66 +154,8 @@ impl MetadataWorkerServiceImpl {
             None
         };
 
-        let worker_manager = Arc::clone(&self.worker_manager);
-        let repair_planner = Arc::clone(&self.repair_planner);
-        let repair_queue = Arc::clone(&self.repair_queue);
-        let raft_node = Arc::clone(&self.raft_node);
-
-        let dead_worker_cleanup_task = tokio::spawn(async move {
-            use tokio::time::{interval, Duration};
-            // TODO: Check interval secs needs from core-site.yaml
-            let mut interval = interval(Duration::from_secs(30)); // Check every 30 seconds
-
-            loop {
-                interval.tick().await;
-
-                // Get live workers
-                let live_workers = worker_manager.list_live_workers();
-                let all_workers = worker_manager.list_all_workers();
-
-                // Find dead workers
-                let dead_workers: Vec<WorkerId> =
-                    all_workers.into_iter().filter(|w| !live_workers.contains(w)).collect();
-
-                // Remove dead workers and trigger replication check (leader-only)
-                // Note: This background task runs on all nodes, but only leader should process
-                // We check leader status here to avoid unnecessary work on followers
-                if raft_node.is_leader() {
-                    for dead_worker in dead_workers {
-                        info!(worker_id = dead_worker.as_raw(), "Removing dead worker");
-                        let affected_blocks = worker_manager.remove_dead_worker(dead_worker);
-
-                        // Trigger replication check for affected blocks
-                        let live_workers_after = worker_manager.list_live_workers();
-                        for block_id in affected_blocks {
-                            let current_locations = worker_manager.get_block_locations(block_id);
-                            // TODO: Get from BlockMeta if available
-                            let replication_factor = 3u8;
-                            let actions = repair_planner.plan_replication(
-                                block_id,
-                                &current_locations,
-                                replication_factor,
-                                &live_workers_after,
-                            );
-                            for action in actions {
-                                let task = action.into_task();
-                                if let Err(e) = repair_queue.enqueue(task) {
-                                    warn!(
-                                        block_id = %block_id,
-                                        error = %e,
-                                        "Failed to enqueue replication task after worker removal"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
         WorkerBackgroundHandle {
             _lease_metrics_task: lease_metrics_task,
-            _dead_worker_cleanup_task: dead_worker_cleanup_task,
         }
     }
 
@@ -698,46 +627,37 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         // Fanout: all nodes update presence (memory-only, no Raft)
         // No Raft propose for UpdateBlockLocations
 
-        // Leader-only: trigger repair/orphan processing
-        // Performance optimization: only check added_blocks (not all reported_blocks)
-        // This avoids O(n) synchronous raft_node.read calls for unchanged blocks
+        // Leader-only: hand block-report repair signals to maintenance.
         let is_leader = self.raft_node.is_leader();
         if is_leader {
-            // Only check newly added blocks for orphan detection and replication
-            // This reduces lock contention from O(n) to O(added_blocks.len())
-            for block_id in &added_blocks {
-                let block_exists = self
-                    .raft_node
-                    .read(false, |sm| sm.get_block(*block_id))
-                    .await
-                    .map_err(|e| Status::internal(format!("Failed to read block: {}", e)))?;
-
-                if block_exists.is_none() {
-                    self.orphan_queue.add(*block_id, worker_id);
-                    warn!(
-                        block_id = %block_id,
-                        worker_id = worker_id.as_raw(),
-                        "Orphan block detected"
-                    );
-                } else {
-                    // Trigger replication check for this block
-                    let current_locations = self.worker_manager.get_block_locations(*block_id);
-                    let live_workers = self.worker_manager.list_live_workers();
-                    // Get replication factor from block metadata (default to 3 if not available)
-                    let replication_factor = 3u8; // TODO: Get from BlockMeta if available
-                    let actions = self.repair_planner.plan_replication(
-                        *block_id,
-                        &current_locations,
-                        replication_factor,
-                        &live_workers,
-                    );
-                    for action in actions {
-                        let task = action.into_task();
-                        if let Err(e) = self.repair_queue.enqueue(task) {
-                            warn!(block_id = %block_id, error = %e, "Failed to enqueue replication task");
-                        }
-                    }
-                }
+            let outcome = self
+                .repair_signal_handler
+                .handle_block_report_delta(BlockReportDelta {
+                    worker_id,
+                    added_blocks: added_blocks.clone(),
+                    removed_blocks: removed_blocks.clone(),
+                })
+                .await
+                .map_err(|e| Status::internal(format!("Failed to handle repair signal: {}", e)))?;
+            if let Some(queue_lengths) = outcome.queue_lengths {
+                self.metrics.update_orphan_queue_len(queue_lengths.orphan_queue_len);
+                self.metrics.update_repair_queue_len(queue_lengths.repair_queue_len);
+            }
+            if outcome.enqueue_failures > 0 {
+                warn!(
+                    worker_id = worker_id.as_raw(),
+                    enqueue_failures = outcome.enqueue_failures,
+                    "Repair signal handler could not enqueue some planned tasks"
+                );
+            }
+        } else {
+            if !added_blocks.is_empty() || !removed_blocks.is_empty() {
+                warn!(
+                    worker_id = worker_id.as_raw(),
+                    added_blocks = added_blocks.len(),
+                    removed_blocks = removed_blocks.len(),
+                    "Follower stored block report soft state without repair signal planning"
+                );
             }
         }
 
@@ -754,8 +674,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         self.metrics.record_blockreport_blocks(total_blocks as u64);
         let locations_size = self.worker_manager.get_all_locations_count();
         self.metrics.update_locations_size(locations_size);
-        self.metrics.update_orphan_queue_len(self.orphan_queue.len());
-        self.metrics.update_repair_queue_len(self.repair_queue.len_pending());
 
         info!(
             worker_id = worker_id.as_raw(),
@@ -834,6 +752,59 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 mod tests {
     use super::*;
     use crate::error::MetadataError;
+    use crate::maintenance::repair::{
+        BlockReportDelta, RepairSignalOutcome, RepairSignalQueueLengths, RepairSignalSink,
+    };
+    use crate::raft::{AppRaftStateMachine, RocksDBStorage};
+    use crate::worker::HealthStatus;
+    use crate::MountTable;
+    use parking_lot::Mutex;
+    use tempfile::TempDir;
+
+    #[derive(Default)]
+    struct RecordingRepairSignalSink {
+        deltas: Mutex<Vec<BlockReportDelta>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RepairSignalSink for RecordingRepairSignalSink {
+        async fn handle_block_report_delta(&self, delta: BlockReportDelta) -> MetadataResult<RepairSignalOutcome> {
+            self.deltas.lock().push(delta);
+            Ok(RepairSignalOutcome {
+                queue_lengths: Some(RepairSignalQueueLengths {
+                    orphan_queue_len: 0,
+                    repair_queue_len: 0,
+                }),
+                ..RepairSignalOutcome::default()
+            })
+        }
+    }
+
+    async fn leader_raft(dir: &TempDir) -> Arc<AppRaftNode> {
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), mount_table));
+        let raft_config = crate::config::RaftConfig {
+            node_id: 1,
+            peers: vec!["127.0.0.1:0".to_string()],
+        };
+        let raft_node = Arc::new(AppRaftNode::new(1, storage, state_machine, &raft_config).await.unwrap());
+        for _ in 0..100 {
+            if raft_node.is_leader() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+        assert!(raft_node.is_leader());
+        raft_node
+    }
+
+    fn block_proto(block_id: BlockId) -> proto::common::BlockIdProto {
+        proto::common::BlockIdProto {
+            data_handle_id: block_id.data_handle_id.as_raw(),
+            block_index: block_id.index.as_raw(),
+        }
+    }
 
     #[tokio::test]
     async fn register_worker_does_not_store_descriptor_when_propose_fails() {
@@ -886,5 +857,56 @@ mod tests {
         let descriptor = manager.get_descriptor(worker_id).unwrap();
         assert_eq!(descriptor.worker_id, worker_id);
         assert_eq!(descriptor.address, "127.0.0.1:9090");
+    }
+
+    #[tokio::test]
+    async fn block_report_applies_soft_state_and_delegates_repair_signal() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = leader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_id = WorkerId::new(7);
+        let block_id = BlockId::new(DataHandleId::new(70), BlockIndex::new(0));
+        worker_manager
+            .register_worker(worker_id, "127.0.0.1:9090".to_string(), 1, 100, None)
+            .unwrap();
+        worker_manager
+            .update_runtime(worker_id, 1, 100, 1_000, 500, 500, 0, 0, HealthStatus::Healthy)
+            .unwrap();
+        worker_manager.mark_full_sync_complete(worker_id);
+        let signal_sink = Arc::new(RecordingRepairSignalSink::default());
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            Arc::clone(&worker_manager),
+            Arc::clone(&signal_sink) as Arc<dyn RepairSignalSink>,
+            Arc::new(MountTable::new()),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+            &service,
+            Request::new(BlockReportRequestProto {
+                header: None,
+                worker_id: worker_id.as_raw(),
+                report_type: BlockReportTypeProto::BlockReportTypeIncremental as i32,
+                full_entries: Vec::new(),
+                delta_entries: vec![BlockReportEntryDeltaProto {
+                    block_id: Some(block_proto(block_id)),
+                    op: BlockReportDeltaOpProto::BlockReportDeltaOpAdd as i32,
+                    chunk_bitmap: None,
+                }],
+                last_report_seq: 41,
+                full_report_lease_token: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.report_seq, 42);
+        assert_eq!(worker_manager.get_block_locations(block_id), vec![worker_id]);
+        let deltas = signal_sink.deltas.lock();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].worker_id, worker_id);
+        assert_eq!(deltas[0].added_blocks, vec![block_id]);
+        assert!(deltas[0].removed_blocks.is_empty());
     }
 }

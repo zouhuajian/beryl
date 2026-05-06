@@ -10,12 +10,14 @@
 //! - gc.rs: GcService ✅
 //! - orphan.rs: OrphanBlockCleaner ✅
 //! - lease_cleanup.rs: LeaseCleanupService ✅
+//! - lost_worker.rs: LostWorkerCleanupService ✅
 //! - service.rs: MaintenanceService orchestration ✅
 
 pub mod delete;
 pub mod gate;
 pub mod gc;
 pub mod lease_cleanup;
+pub mod lost_worker;
 pub mod orphan;
 pub mod overrep;
 pub mod repair;
@@ -26,6 +28,7 @@ pub use delete::{DeleteExecutor, DeleteExecutorHandle, DeleteIntentBuilder};
 pub use gate::{GateCheckResult, GateState, TaskGate};
 pub use gc::{GcCandidate, GcService, BLOCKREPORT_CONVERGENCE_THRESHOLD};
 pub use lease_cleanup::LeaseCleanupService;
+pub use lost_worker::{LostWorkerCleanupDeps, LostWorkerCleanupOutcome, LostWorkerCleanupService};
 pub use orphan::{OrphanBlockCleaner, PendingOrphan};
 pub use overrep::{OverRepCandidate, OverReplicaCleanupService};
 pub use service::{MaintenanceHandle, MaintenanceService};

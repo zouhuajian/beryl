@@ -22,7 +22,7 @@ metadata 的目标定位是：
 
 ## 2. 当前基线：暂不重构的内容
 
-当前 P0-P4.5 阶段不应重开这些大模块：
+当前 P0-P4.6 阶段不应重开这些大模块：
 
 - `service/path_service.rs`
 - `service/fs_core/*`
@@ -93,6 +93,7 @@ metadata/src/
       actions.rs
       planner.rs
       queue.rs
+      signal.rs
       types.rs
     delete/
       mod.rs
@@ -116,6 +117,7 @@ worker 应该拥有：
 - block report full/delta 解析与 soft-state block locations。
 - full report lease / storm control。
 - heartbeat command transport。
+- 将 block report delta 交给 maintenance/repair signal handler。
 
 worker 不应该拥有：
 
@@ -124,11 +126,13 @@ worker 不应该拥有：
 - `DeleteExecutor`。
 - GC/orphan/overrep 策略。
 - lost worker 后的 repair scheduling。
+- orphan detection、replication planning 或 repair enqueue。
 
 当前已引入：
 
 - `WorkerCommandRouter` / `WorkerCommandSource`，集中承接 maintenance 内部各 command source。
 - `WorkerService` 只面向 command router，不直接执行 repair/delete polling 或 ack routing。
+- `WorkerService` 的 block report 只更新 `WorkerManager` soft-state block locations，并调用 `maintenance/repair/signal.rs` 处理 repair signal。
 - worker heartbeat ack 必须带 source namespace，避免 repair/delete 使用同一 `task_id` 空间时发生冲突或误确认。
 
 预期依赖方向：
@@ -136,6 +140,7 @@ worker 不应该拥有：
 ```text
 WorkerService
 -> WorkerManager
+-> maintenance/repair RepairSignalHandler
 -> WorkerCommandRouter
 -> maintenance repair/delete command sources
 ```
@@ -160,6 +165,8 @@ maintenance 的职责：
 - 周期性扫描。
 - 发现异常。
 - 触发 repair/delete。
+- 处理 block-report repair signal。
+- 扫描 lost worker 并为 affected blocks 规划 repair。
 - 做 destructive gate。
 - 做 inflight conflict protection。
 - 维护后台任务 retry、backoff、timeout、ack、reconcile 等状态。
@@ -177,6 +184,7 @@ repair 负责：
 - over-replica 副本移除规划。
 - move/copy repair 规划。
 - `maintenance/repair/RepairQueue`：dedup、retry、backoff、inflight、ack、timeout。
+- `maintenance/repair/signal.rs`：处理 worker block report delta 中的 repair/orphan signal。
 - `worker/command_router.rs` 中的 repair source adapter：将 repair task 转成 worker heartbeat command。
 
 repair 不负责：
@@ -287,13 +295,20 @@ P3：
 - 已完成：worker/repair 移入 `maintenance/repair`。
 - `RepairTask::Evict` / `RepairDedupKey::Evict` 已收窄命名为 `EvictReplica`。
 - repair queue/planner 行为保持为 metadata 侧维护能力；worker 侧只保留 heartbeat command source adapter。
-- P4.5 审计事实：`metadata/src/worker` 下已无 `repair/` 目录；`WorkerService` 不再直接做 repair command polling/ack routing，但当前仍保留 block-report/dead-worker repair signal injection 到 `maintenance/repair` queue/planner，后续若继续收敛应单独设计，不属于本轮。
 
 P4：
 
 - 已完成：`worker/delete_executor.rs` 与 `maintenance/intents.rs` 收敛到 `maintenance/delete`。
 - GC/orphan/overrep 统一只创建 `DeleteIntent`。
 - `DeleteExecutor` 是唯一 `DeleteIntent` consumer；GC 不再保留 intent -> `RepairQueue` 的重复物理删除路径。
+
+P4.6：
+
+- 已完成：`WorkerService` 不再直接持有 `RepairQueue` / `RepairPlanner` / `OrphanQueue`。
+- 已完成：block report repair signal detection/planning/enqueue 收敛到 `maintenance/repair/signal.rs`。
+- 已完成：dead-worker scan、`remove_dead_worker` 和 affected block repair scheduling 收敛到 `maintenance/lost_worker.rs`，由 `MaintenanceService` 启动。
+- `WorkerCommandRouter` 仍只负责 repair/delete command poll/ack，不承担 repair signal routing。
+- `removed_blocks` 仍不触发 under-rep planning；本阶段只迁移边界，不做行为增强。
 
 P5：
 

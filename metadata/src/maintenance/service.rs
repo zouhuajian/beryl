@@ -14,6 +14,7 @@
 use super::gate::TaskGate;
 use super::gc::{GcCandidate, GcService};
 use super::lease_cleanup::LeaseCleanupService;
+use super::lost_worker::{LostWorkerCleanupDeps, LostWorkerCleanupService};
 use super::orphan::{OrphanBlockCleaner, PendingOrphan};
 use super::repair::{OrphanQueue, RepairPlanner, RepairQueue};
 
@@ -74,6 +75,7 @@ pub struct MaintenanceService {
     gc_interval_sec: u64,
     lease_cleanup_interval_sec: u64,
     orphan_cleanup_interval_sec: u64,
+    lost_worker_cleanup_interval_sec: u64,
     rebalance_interval_sec: u64,
     timeout_check_interval_sec: u64,
     // Self-healing intervals
@@ -189,9 +191,10 @@ impl MaintenanceService {
             last_gc_log_ms: Arc::new(RwLock::new(0)),
             last_lease_log_ms: Arc::new(RwLock::new(0)),
             last_orphan_log_ms: Arc::new(RwLock::new(0)),
-            gc_interval_sec: 300,             // 5 minutes
-            lease_cleanup_interval_sec: 60,   // 1 minute
-            orphan_cleanup_interval_sec: 10,  // 10 seconds
+            gc_interval_sec: 300,            // 5 minutes
+            lease_cleanup_interval_sec: 60,  // 1 minute
+            orphan_cleanup_interval_sec: 10, // 10 seconds
+            lost_worker_cleanup_interval_sec: 30,
             rebalance_interval_sec: 300,      // 5 minutes
             timeout_check_interval_sec: 10,   // 10 seconds
             refcount_reload_interval_sec: 30, // 30 seconds for self-healing
@@ -203,7 +206,7 @@ impl MaintenanceService {
 
     /// Start all background maintenance tasks.
     pub fn start(&self) -> MaintenanceHandle {
-        let mut tasks = Vec::with_capacity(7);
+        let mut tasks = Vec::with_capacity(8);
 
         // Start GC task with self-healing
         {
@@ -313,6 +316,28 @@ impl MaintenanceService {
                         if let Err(e) = orphan.run_once().await {
                             error!(task = "orphan_cleanup", error = %e, "Orphan cleanup task failed");
                         }
+                    }
+                }
+            }));
+        }
+
+        // Start lost-worker cleanup task.
+        {
+            let lost_worker_service = Arc::new(LostWorkerCleanupService::new(LostWorkerCleanupDeps {
+                raft_node: Arc::clone(&self.raft_node),
+                worker_manager: Arc::clone(&self.worker_manager),
+                repair_queue: Arc::clone(&self.repair_queue),
+                repair_planner: Arc::clone(&self.repair_planner),
+            }));
+
+            let lost_worker = Arc::clone(&lost_worker_service);
+            let interval_sec = self.lost_worker_cleanup_interval_sec;
+            tasks.push(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(interval_sec));
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = lost_worker.run_once().await {
+                        error!(task = "lost_worker_cleanup", error = %e, "Lost-worker cleanup task failed");
                     }
                 }
             }));
