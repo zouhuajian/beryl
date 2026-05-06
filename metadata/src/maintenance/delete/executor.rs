@@ -17,7 +17,7 @@ use crate::maintenance::repair::{ErrorClass, TaskAckStatus};
 use crate::metrics::MetadataMetrics;
 use crate::mount::MountTable;
 use crate::raft::{AppRaftNode, Command, DedupKey, RocksDBStorage};
-use crate::state::{DeleteIntent, DeleteIntentStatus};
+use crate::state::{DeleteIntent, DeleteIntentReason, DeleteIntentStatus};
 use crate::worker::WorkerManager;
 use parking_lot::RwLock;
 use proto::metadata::*;
@@ -65,6 +65,7 @@ enum IntentExecutionStatus {
 struct IntentExecutionState {
     intent: DeleteIntent,
     status: IntentExecutionStatus,
+    registry_held: bool,
     /// Track which workers have successfully acked.
     acked_workers: HashSet<WorkerId>,
     /// Track which workers we've sent commands to.
@@ -79,6 +80,14 @@ struct WorkerInFlight {
     blocks: HashSet<BlockId>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DeleteTaskRoute {
+    intent_id: u64,
+    worker_id: WorkerId,
+    task_id: u64,
+    block_id: BlockId,
+}
+
 /// Delete executor service.
 pub struct DeleteExecutor {
     raft_node: Arc<AppRaftNode>,
@@ -91,6 +100,8 @@ pub struct DeleteExecutor {
     worker_inflight: Arc<RwLock<HashMap<WorkerId, WorkerInFlight>>>,
     /// Per-block in-flight tracking: block_id -> intent_id (single-flight guarantee)
     block_inflight: Arc<RwLock<HashMap<BlockId, u64>>>,
+    /// Worker task routing: task_id -> intent route.
+    task_routes: Arc<RwLock<HashMap<u64, DeleteTaskRoute>>>,
     /// Next task ID (monotonically increasing).
     next_task_id: Arc<AtomicU64>,
     /// Configuration
@@ -128,6 +139,7 @@ impl DeleteExecutor {
             execution_state: Arc::new(RwLock::new(HashMap::new())),
             worker_inflight: Arc::new(RwLock::new(HashMap::new())),
             block_inflight: Arc::new(RwLock::new(HashMap::new())),
+            task_routes: Arc::new(RwLock::new(HashMap::new())),
             next_task_id: Arc::new(AtomicU64::new(1)),
             poll_interval_sec: 10, // 10 seconds
             max_intents_per_poll: 100,
@@ -305,6 +317,7 @@ impl DeleteExecutor {
                     IntentExecutionState {
                         intent: intent.clone(),
                         status: IntentExecutionStatus::Pending,
+                        registry_held: true,
                         acked_workers: HashSet::new(),
                         sent_to_workers: HashSet::new(),
                     },
@@ -352,73 +365,85 @@ impl DeleteExecutor {
         let mut worker_commands: HashMap<WorkerId, Vec<(u64, BlockId)>> = HashMap::new();
 
         // Collect pending intents that need commands
-        {
+        let pending_intents: Vec<(u64, DeleteIntent)> = {
             let state = self.execution_state.read();
-            for (intent_id, exec_state) in state.iter() {
-                if !matches!(exec_state.status, IntentExecutionStatus::Pending) {
-                    continue;
-                }
-
-                let intent = &exec_state.intent;
-
-                // Check per-block single-flight (local tracking)
-                {
-                    let block_inflight = self.block_inflight.read();
-                    if block_inflight.contains_key(&intent.block_id) {
-                        continue; // Block already in-flight (local)
+            state
+                .iter()
+                .filter_map(|(intent_id, exec_state)| {
+                    if matches!(exec_state.status, IntentExecutionStatus::Pending) {
+                        Some((*intent_id, exec_state.intent.clone()))
+                    } else {
+                        None
                     }
+                })
+                .collect()
+        };
+
+        for (intent_id, intent) in pending_intents {
+            // Check per-block single-flight (local tracking)
+            {
+                let block_inflight = self.block_inflight.read();
+                if block_inflight.contains_key(&intent.block_id) {
+                    continue; // Block already in-flight (local)
                 }
+            }
 
-                // Get block locations
-                let locations = self.worker_manager.get_block_locations(intent.block_id);
+            if !self.ensure_registry_held(intent_id, intent.block_id, intent.reason)? {
+                continue;
+            }
 
-                // Determine target workers
-                let target_workers = if !intent.target_workers.is_empty() {
-                    // Use explicit target_workers (e.g., for Orphan)
-                    intent.target_workers.clone()
-                } else {
-                    // Use all known locations (for GC)
-                    locations
-                };
+            // Get block locations
+            let locations = self.worker_manager.get_block_locations(intent.block_id);
 
-                if target_workers.is_empty() {
-                    // No known locations - mark as completed (block already gone)
-                    debug!(
-                        intent_id = intent_id,
-                        block_id = %intent.block_id,
-                        "Intent completed: no known locations"
-                    );
+            // Determine target workers
+            let target_workers = if !intent.target_workers.is_empty() {
+                // Use explicit target_workers (e.g., for Orphan)
+                intent.target_workers.clone()
+            } else {
+                // Use all known locations (for GC)
+                locations
+            };
+
+            if target_workers.is_empty() {
+                // No known locations - mark as completed (block already gone)
+                debug!(
+                    intent_id,
+                    block_id = %intent.block_id,
+                    "Intent completed: no known locations"
+                );
+                {
                     let mut state = self.execution_state.write();
-                    if let Some(exec_state) = state.get_mut(intent_id) {
+                    if let Some(exec_state) = state.get_mut(&intent_id) {
                         exec_state.status = IntentExecutionStatus::Completed {
                             completed_at_ms: now_ms,
                         };
                     }
-                    continue;
+                }
+                self.release_registry_held(intent_id, intent.block_id);
+                continue;
+            }
+
+            // Check per-worker concurrency limit
+            for worker_id in &target_workers {
+                let mut worker_inflight = self.worker_inflight.write();
+                let in_flight = worker_inflight.entry(*worker_id).or_insert_with(|| WorkerInFlight {
+                    count: 0,
+                    blocks: HashSet::new(),
+                });
+
+                if in_flight.count >= self.max_concurrent_per_worker {
+                    continue; // Worker at capacity
                 }
 
-                // Check per-worker concurrency limit
-                for worker_id in &target_workers {
-                    let mut worker_inflight = self.worker_inflight.write();
-                    let in_flight = worker_inflight.entry(*worker_id).or_insert_with(|| WorkerInFlight {
-                        count: 0,
-                        blocks: HashSet::new(),
-                    });
-
-                    if in_flight.count >= self.max_concurrent_per_worker {
-                        continue; // Worker at capacity
-                    }
-
-                    if in_flight.blocks.contains(&intent.block_id) {
-                        continue; // Block already in-flight for this worker
-                    }
-
-                    // Add to batch
-                    worker_commands
-                        .entry(*worker_id)
-                        .or_default()
-                        .push((*intent_id, intent.block_id));
+                if in_flight.blocks.contains(&intent.block_id) {
+                    continue; // Block already in-flight for this worker
                 }
+
+                // Add to batch
+                worker_commands
+                    .entry(*worker_id)
+                    .or_default()
+                    .push((intent_id, intent.block_id));
             }
         }
 
@@ -428,32 +453,32 @@ impl DeleteExecutor {
                 continue;
             }
 
-            // Generate task_id
-            let task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
-
             // Update in-flight tracking
             {
                 let mut worker_inflight = self.worker_inflight.write();
+                let mut block_inflight = self.block_inflight.write();
+                let mut task_routes = self.task_routes.write();
+                let mut state = self.execution_state.write();
                 let in_flight = worker_inflight.entry(worker_id).or_insert_with(|| WorkerInFlight {
                     count: 0,
                     blocks: HashSet::new(),
                 });
 
                 for (intent_id, block_id) in &blocks {
+                    let task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
                     in_flight.count += 1;
                     in_flight.blocks.insert(*block_id);
-
-                    // Update block_inflight (already acquired in inflight_registry)
-                    let mut block_inflight = self.block_inflight.write();
                     block_inflight.insert(*block_id, *intent_id);
-                    // Note: inflight_registry lock was already acquired in generate_commands
-                }
-            }
+                    task_routes.insert(
+                        task_id,
+                        DeleteTaskRoute {
+                            intent_id: *intent_id,
+                            worker_id,
+                            task_id,
+                            block_id: *block_id,
+                        },
+                    );
 
-            // Update execution state
-            {
-                let mut state = self.execution_state.write();
-                for (intent_id, _block_id) in &blocks {
                     if let Some(exec_state) = state.get_mut(intent_id) {
                         exec_state.status = IntentExecutionStatus::InFlight {
                             worker_id,
@@ -472,13 +497,111 @@ impl DeleteExecutor {
 
             debug!(
                 worker_id = worker_id.as_raw(),
-                task_id,
                 block_count = blocks.len(),
                 "Generated DeleteBlocksCommand for worker"
             );
         }
 
         Ok(())
+    }
+
+    fn ensure_registry_held(
+        &self,
+        intent_id: u64,
+        block_id: BlockId,
+        reason: DeleteIntentReason,
+    ) -> MetadataResult<bool> {
+        {
+            let state = self.execution_state.read();
+            if state
+                .get(&intent_id)
+                .map(|exec_state| exec_state.registry_held)
+                .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+        }
+
+        let inflight_kind = match reason {
+            DeleteIntentReason::OverRep => InflightKind::OverRepEvict,
+            _ => InflightKind::Delete,
+        };
+        if !self.inflight_registry.try_acquire(block_id, inflight_kind, None)? {
+            debug!(
+                intent_id,
+                block_id = %block_id,
+                "Intent execution blocked: block is in-flight for another maintenance action"
+            );
+            return Ok(false);
+        }
+
+        let mut state = self.execution_state.write();
+        let Some(exec_state) = state.get_mut(&intent_id) else {
+            self.inflight_registry.release(block_id);
+            return Ok(false);
+        };
+        if !matches!(exec_state.status, IntentExecutionStatus::Pending) {
+            self.inflight_registry.release(block_id);
+            return Ok(false);
+        }
+        exec_state.registry_held = true;
+        Ok(true)
+    }
+
+    fn release_registry_held(&self, intent_id: u64, block_id: BlockId) {
+        let should_release = {
+            let mut state = self.execution_state.write();
+            if let Some(exec_state) = state.get_mut(&intent_id) {
+                let was_held = exec_state.registry_held;
+                exec_state.registry_held = false;
+                was_held
+            } else {
+                false
+            }
+        };
+        if should_release {
+            self.inflight_registry.release(block_id);
+        }
+    }
+
+    fn release_inflight_route(&self, route: DeleteTaskRoute) {
+        {
+            let mut worker_inflight = self.worker_inflight.write();
+            if let Some(in_flight) = worker_inflight.get_mut(&route.worker_id) {
+                in_flight.count = in_flight.count.saturating_sub(1);
+                in_flight.blocks.remove(&route.block_id);
+            }
+        }
+        {
+            let mut block_inflight = self.block_inflight.write();
+            if block_inflight.get(&route.block_id).copied() == Some(route.intent_id) {
+                block_inflight.remove(&route.block_id);
+            }
+        }
+        self.task_routes.write().remove(&route.task_id);
+        self.release_registry_held(route.intent_id, route.block_id);
+    }
+
+    fn release_inflight_routes_for_intent(&self, intent_id: u64) {
+        let routes: Vec<DeleteTaskRoute> = {
+            let task_routes = self.task_routes.read();
+            task_routes
+                .values()
+                .filter(|route| route.intent_id == intent_id)
+                .copied()
+                .collect()
+        };
+        for route in routes {
+            self.release_inflight_route(route);
+        }
+    }
+
+    fn reset_intent_for_retry(&self, route: DeleteTaskRoute) {
+        self.release_inflight_route(route);
+        let mut state = self.execution_state.write();
+        if let Some(exec_state) = state.get_mut(&route.intent_id) {
+            exec_state.status = IntentExecutionStatus::Pending;
+        }
     }
 
     /// Get pending commands for a worker (called from Heartbeat handler).
@@ -605,41 +728,49 @@ impl DeleteExecutor {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 
         for ack in acks {
-            // Find intent by task_id (we need to track task_id -> intent_id mapping)
-            // For now, we'll search through execution_state
-            let mut intent_id_opt = None;
-            {
-                let state = self.execution_state.read();
-                for (intent_id, exec_state) in state.iter() {
-                    if let IntentExecutionStatus::InFlight {
-                        worker_id: target_worker,
-                        task_id,
-                        ..
-                    } = &exec_state.status
-                    {
-                        if *target_worker == worker_id && *task_id == ack.task_id {
-                            intent_id_opt = Some(*intent_id);
-                            break;
-                        }
-                    }
-                }
-            }
+            let route = {
+                let task_routes = self.task_routes.read();
+                task_routes.get(&ack.task_id).copied()
+            };
 
-            if let Some(intent_id) = intent_id_opt {
-                self.handle_ack(intent_id, worker_id, ack, now_ms).await;
-            } else {
+            let Some(route) = route else {
                 // Task ID not found - might be from repair queue, ignore
                 debug!(
                     worker_id = worker_id.as_raw(),
                     task_id = ack.task_id,
                     "TaskAck for unknown task_id (might be from repair queue)"
                 );
+                continue;
+            };
+
+            if route.worker_id != worker_id {
+                warn!(
+                    worker_id = worker_id.as_raw(),
+                    expected_worker_id = route.worker_id.as_raw(),
+                    task_id = ack.task_id,
+                    "Ignoring DeleteIntent ack from unexpected worker"
+                );
+                continue;
             }
+
+            if ack.intent_id != 0 && ack.intent_id != route.intent_id {
+                warn!(
+                    worker_id = worker_id.as_raw(),
+                    task_id = ack.task_id,
+                    ack_intent_id = ack.intent_id,
+                    route_intent_id = route.intent_id,
+                    "Ignoring DeleteIntent ack with mismatched intent_id"
+                );
+                continue;
+            }
+
+            self.handle_ack(route, worker_id, ack, now_ms).await;
         }
     }
 
     /// Handle a single ack.
-    async fn handle_ack(&self, intent_id: u64, worker_id: WorkerId, ack: &TaskAckProto, now_ms: u64) {
+    async fn handle_ack(&self, route: DeleteTaskRoute, worker_id: WorkerId, ack: &TaskAckProto, now_ms: u64) {
+        let intent_id = route.intent_id;
         let status = match ack.status() {
             proto::metadata::TaskAckStatusProto::TaskAckStatusSuccess => TaskAckStatus::Success,
             proto::metadata::TaskAckStatusProto::TaskAckStatusFailed => TaskAckStatus::Failed,
@@ -656,7 +787,7 @@ impl DeleteExecutor {
 
         // Handle per-block results if available (DeleteBlocksCommand)
         if !ack.block_results.is_empty() {
-            self.handle_per_block_ack(intent_id, worker_id, ack, now_ms).await;
+            self.handle_per_block_ack(route, worker_id, ack, now_ms).await;
             return;
         }
 
@@ -694,22 +825,7 @@ impl DeleteExecutor {
 
                 if !is_retryable {
                     // Non-retryable failure
-                    let (block_id_opt, target_worker_opt, error_msg) = {
-                        let state = self.execution_state.read();
-                        if let Some(exec_state) = state.get(&intent_id) {
-                            let block_id = exec_state.intent.block_id;
-                            let target_worker =
-                                if let IntentExecutionStatus::InFlight { worker_id, .. } = &exec_state.status {
-                                    Some(*worker_id)
-                                } else {
-                                    None
-                                };
-                            let error_msg = ack.error_message.clone();
-                            (Some(block_id), target_worker, error_msg)
-                        } else {
-                            (None, None, ack.error_message.clone())
-                        }
-                    };
+                    let error_msg = ack.error_message.clone();
 
                     // Persist failed status through Raft before changing runtime state.
                     if let Err(e) = self
@@ -739,18 +855,7 @@ impl DeleteExecutor {
                         }
                     }
 
-                    // Cleanup in-flight tracking
-                    if let (Some(block_id), Some(target_worker)) = (block_id_opt, target_worker_opt) {
-                        let mut worker_inflight = self.worker_inflight.write();
-                        let mut block_inflight = self.block_inflight.write();
-                        if let Some(in_flight) = worker_inflight.get_mut(&target_worker) {
-                            in_flight.count = in_flight.count.saturating_sub(1);
-                            in_flight.blocks.remove(&block_id);
-                        }
-                        block_inflight.remove(&block_id);
-                        // Release inflight registry lock
-                        self.inflight_registry.release(block_id);
-                    }
+                    self.release_inflight_routes_for_intent(intent_id);
 
                     self.metrics
                         .delete_executor_requests_failed_total
@@ -765,35 +870,7 @@ impl DeleteExecutor {
                 } else {
                     // Retryable: will retry in next cycle
                     self.metrics.delete_intents_retry_total.fetch_add(1, Ordering::Relaxed);
-
-                    // Reset to Pending for retry
-                    {
-                        let mut state = self.execution_state.write();
-                        if let Some(exec_state) = state.get_mut(&intent_id) {
-                            exec_state.status = IntentExecutionStatus::Pending;
-                        }
-                    }
-
-                    // Cleanup in-flight tracking (allow retry)
-                    {
-                        let exec_state_guard = self.execution_state.read();
-                        if let Some(exec_state) = exec_state_guard.get(&intent_id) {
-                            let block_id = exec_state.intent.block_id;
-                            if let IntentExecutionStatus::InFlight {
-                                worker_id: target_worker,
-                                ..
-                            } = &exec_state.status
-                            {
-                                let mut worker_inflight = self.worker_inflight.write();
-                                let mut block_inflight = self.block_inflight.write();
-                                if let Some(in_flight) = worker_inflight.get_mut(target_worker) {
-                                    in_flight.count = in_flight.count.saturating_sub(1);
-                                    in_flight.blocks.remove(&block_id);
-                                }
-                                block_inflight.remove(&block_id);
-                            }
-                        }
-                    }
+                    self.reset_intent_for_retry(route);
                 }
             }
         }
@@ -823,8 +900,23 @@ impl DeleteExecutor {
             .count()
     }
 
+    #[cfg(test)]
+    pub(super) fn worker_inflight_count_for_test(&self, worker_id: WorkerId) -> usize {
+        self.worker_inflight
+            .read()
+            .get(&worker_id)
+            .map(|in_flight| in_flight.count)
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(super) fn block_inflight_contains_for_test(&self, block_id: BlockId) -> bool {
+        self.block_inflight.read().contains_key(&block_id)
+    }
+
     /// Handle per-block ack results (DeleteBlocksCommand).
-    async fn handle_per_block_ack(&self, intent_id: u64, worker_id: WorkerId, ack: &TaskAckProto, now_ms: u64) {
+    async fn handle_per_block_ack(&self, route: DeleteTaskRoute, worker_id: WorkerId, ack: &TaskAckProto, now_ms: u64) {
+        let intent_id = route.intent_id;
         let block_id_opt = {
             let state = self.execution_state.read();
             state.get(&intent_id).map(|exec_state| exec_state.intent.block_id)
@@ -889,7 +981,8 @@ impl DeleteExecutor {
                         worker_id = worker_id.as_raw(),
                         "Delete operation in progress, will retry"
                     );
-                    // Don't mark as acked, will retry
+                    self.metrics.delete_intents_retry_total.fetch_add(1, Ordering::Relaxed);
+                    self.reset_intent_for_retry(route);
                 }
                 proto::metadata::DeleteBlockStatusProto::DeleteBlockStatusBusy
                 | proto::metadata::DeleteBlockStatusProto::DeleteBlockStatusConflict => {
@@ -902,7 +995,8 @@ impl DeleteExecutor {
                         retry_after_ms,
                         "Delete operation blocked by conflict, will retry"
                     );
-                    // Don't mark as acked, will retry after backoff
+                    self.metrics.delete_intents_retry_total.fetch_add(1, Ordering::Relaxed);
+                    self.reset_intent_for_retry(route);
                 }
                 proto::metadata::DeleteBlockStatusProto::DeleteBlockStatusFailedFatal => {
                     // Permanent failure
@@ -1028,18 +1122,9 @@ impl DeleteExecutor {
 
     /// Mark intent as completed (ack + reconcile both satisfied).
     async fn mark_intent_completed(&self, intent_id: u64, now_ms: u64, reconciled: bool) {
-        let (block_id, target_worker) = {
+        let block_id = {
             let state = self.execution_state.read();
-            match state.get(&intent_id) {
-                Some(exec_state) => {
-                    let target_worker = match &exec_state.status {
-                        IntentExecutionStatus::InFlight { worker_id, .. } => Some(*worker_id),
-                        _ => None,
-                    };
-                    (Some(exec_state.intent.block_id), target_worker)
-                }
-                None => (None, None),
-            }
+            state.get(&intent_id).map(|exec_state| exec_state.intent.block_id)
         };
 
         if let Some(block_id) = block_id {
@@ -1078,17 +1163,7 @@ impl DeleteExecutor {
                     .fetch_add(1, Ordering::Relaxed);
             }
 
-            // Cleanup in-flight tracking
-            if let Some(target_worker) = target_worker {
-                let mut worker_inflight = self.worker_inflight.write();
-                let mut block_inflight = self.block_inflight.write();
-                if let Some(in_flight) = worker_inflight.get_mut(&target_worker) {
-                    in_flight.count = in_flight.count.saturating_sub(1);
-                    in_flight.blocks.remove(&block_id);
-                }
-                block_inflight.remove(&block_id);
-                self.inflight_registry.release(block_id);
-            }
+            self.release_inflight_routes_for_intent(intent_id);
 
             info!(
                 intent_id,
@@ -1101,18 +1176,9 @@ impl DeleteExecutor {
 
     /// Mark intent as failed.
     async fn mark_intent_failed(&self, intent_id: u64, now_ms: u64, reason: String) {
-        let (block_id, target_worker) = {
+        let block_id = {
             let state = self.execution_state.read();
-            match state.get(&intent_id) {
-                Some(exec_state) => {
-                    let target_worker = match &exec_state.status {
-                        IntentExecutionStatus::InFlight { worker_id, .. } => Some(*worker_id),
-                        _ => None,
-                    };
-                    (Some(exec_state.intent.block_id), target_worker)
-                }
-                None => (None, None),
-            }
+            state.get(&intent_id).map(|exec_state| exec_state.intent.block_id)
         };
 
         if let Some(block_id) = block_id {
@@ -1143,17 +1209,7 @@ impl DeleteExecutor {
                 }
             }
 
-            // Cleanup in-flight tracking
-            if let Some(target_worker) = target_worker {
-                let mut worker_inflight = self.worker_inflight.write();
-                let mut block_inflight = self.block_inflight.write();
-                if let Some(in_flight) = worker_inflight.get_mut(&target_worker) {
-                    in_flight.count = in_flight.count.saturating_sub(1);
-                    in_flight.blocks.remove(&block_id);
-                }
-                block_inflight.remove(&block_id);
-                self.inflight_registry.release(block_id);
-            }
+            self.release_inflight_routes_for_intent(intent_id);
 
             error!(
                 intent_id,

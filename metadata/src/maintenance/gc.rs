@@ -441,12 +441,14 @@ impl GcService {
 
             // Generate intents
             let mut intents = Vec::new();
+            let mut built_blocks = Vec::new();
+            let mut build_skipped = 0;
             for block_id in &eligible_blocks {
                 // Unified gate check before creating intent
+                // The grace window is persisted on the intent and enforced by DeleteExecutor.
                 let ctx = DestructiveCheckContext::new("gc_create_delete_intent")
                     .with_block_id(*block_id)
-                    .with_guard_state_id(guard_state_id)
-                    .with_not_before_ms(not_before_ms);
+                    .with_guard_state_id(guard_state_id);
 
                 match self.destructive_gate.check_destructive_allowed(&ctx)? {
                     crate::destructive_gate::DestructiveCheckResult::Allowed => {
@@ -462,6 +464,7 @@ impl GcService {
                             "Skipping DeleteIntent creation: gate check failed"
                         );
                         self.metrics.gc_skipped_total.fetch_add(1, Ordering::Relaxed);
+                        build_skipped += 1;
                         continue;
                     }
                     crate::destructive_gate::DestructiveCheckResult::NeedRefresh { reason, .. } => {
@@ -474,6 +477,7 @@ impl GcService {
                             "Skipping DeleteIntent creation: mount epoch mismatch, need refresh"
                         );
                         self.metrics.gc_skipped_total.fetch_add(1, Ordering::Relaxed);
+                        build_skipped += 1;
                         continue;
                     }
                 }
@@ -488,6 +492,7 @@ impl GcService {
                 ) {
                     Ok(intent) => {
                         intents.push(intent);
+                        built_blocks.push(*block_id);
                     }
                     Err(e) => {
                         // Fail-closed: router missing or unable to resolve, skip creating DeleteIntent
@@ -499,53 +504,64 @@ impl GcService {
                         );
                         self.inflight_registry.release(*block_id);
                         self.metrics.gc_skipped_total.fetch_add(1, Ordering::Relaxed);
+                        build_skipped += 1;
                         continue;
                     }
                 }
             }
+            skipped_total += build_skipped;
 
-            // Batch propose CreateDeleteIntents
-            use crate::raft::{Command, DedupKey};
-            let command = Command::AllocateDeleteIntents {
-                dedup: DedupKey::system(),
-                intents,
-            };
+            if intents.is_empty() {
+                debug!(
+                    task = "gc",
+                    eligible_count = eligible_blocks.len(),
+                    skipped_count = build_skipped,
+                    "No GC DeleteIntents built after gate and owner resolution checks"
+                );
+            } else {
+                // Batch propose CreateDeleteIntents
+                use crate::raft::{Command, DedupKey};
+                let command = Command::AllocateDeleteIntents {
+                    dedup: DedupKey::system(),
+                    intents,
+                };
 
-            match self.raft_node.propose(command).await {
-                Ok(_) => {
-                    intents_created = eligible_blocks.len();
-                    info!(
-                        task = "gc",
-                        count = intents_created,
-                        "Created delete intents for GC (batch operation)"
-                    );
-                    // Update metrics
-                    self.metrics
-                        .delete_intents_created_total
-                        .fetch_add(intents_created as u64, Ordering::Relaxed);
-                    self.metrics
-                        .maintenance_gc_created_intents_total
-                        .fetch_add(intents_created as u64, Ordering::Relaxed);
-                    for block_id in &eligible_blocks {
-                        self.inflight_registry.release(*block_id);
+                match self.raft_node.propose(command).await {
+                    Ok(_) => {
+                        intents_created = built_blocks.len();
+                        info!(
+                            task = "gc",
+                            count = intents_created,
+                            "Created delete intents for GC (batch operation)"
+                        );
+                        // Update metrics
+                        self.metrics
+                            .delete_intents_created_total
+                            .fetch_add(intents_created as u64, Ordering::Relaxed);
+                        self.metrics
+                            .maintenance_gc_created_intents_total
+                            .fetch_add(intents_created as u64, Ordering::Relaxed);
+                        for block_id in &built_blocks {
+                            self.inflight_registry.release(*block_id);
+                        }
+                        // Remove from candidates after successful creation.
+                        to_remove.extend(built_blocks);
                     }
-                    // Remove from candidates after successful creation.
-                    to_remove.extend(eligible_blocks);
-                }
-                Err(e) => {
-                    warn!(
-                        task = "gc",
-                        count = eligible_blocks.len(),
-                        error = %e,
-                        "Failed to propose CreateDeleteIntents command"
-                    );
-                    self.metrics
-                        .delete_intents_create_failed_total
-                        .fetch_add(eligible_blocks.len() as u64, Ordering::Relaxed);
-                    for block_id in &eligible_blocks {
-                        self.inflight_registry.release(*block_id);
+                    Err(e) => {
+                        warn!(
+                            task = "gc",
+                            count = built_blocks.len(),
+                            error = %e,
+                            "Failed to propose CreateDeleteIntents command"
+                        );
+                        self.metrics
+                            .delete_intents_create_failed_total
+                            .fetch_add(built_blocks.len() as u64, Ordering::Relaxed);
+                        for block_id in &built_blocks {
+                            self.inflight_registry.release(*block_id);
+                        }
+                        skipped_total += built_blocks.len();
                     }
-                    skipped_total += eligible_blocks.len();
                 }
             }
         }
@@ -676,5 +692,217 @@ impl GcService {
         }
 
         Ok(blocks)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RaftConfig;
+    use crate::mount::{DataIoPolicy, MountKind};
+    use crate::raft::AppRaftStateMachine;
+    use crate::state::{BlockMetaState, DeleteIntentStatus};
+    use crate::worker::WorkerManager;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+    use tempfile::TempDir;
+    use types::block::{BlockPlacement, BlockState};
+    use types::fs::{FileAttrs, Inode, InodeId};
+    use types::ids::{ShardGroupId, WorkerId};
+
+    struct GcTestEnv {
+        _temp_dir: TempDir,
+        storage: Arc<RocksDBStorage>,
+        mount_table: Arc<MountTable>,
+        metrics: Arc<MetadataMetrics>,
+        candidates: Arc<RwLock<HashMap<BlockId, GcCandidate>>>,
+        service: GcService,
+    }
+
+    async fn new_gc_test_env() -> MetadataResult<GcTestEnv> {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(temp_dir.path())?);
+        let mount_table = Arc::new(MountTable::new());
+        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
+        let raft_config = RaftConfig {
+            node_id: 1,
+            peers: vec!["127.0.0.1:0".to_string()],
+        };
+        let raft_node = Arc::new(
+            AppRaftNode::new(
+                raft_config.node_id,
+                Arc::clone(&storage),
+                Arc::clone(&state_machine),
+                &raft_config,
+            )
+            .await
+            .unwrap(),
+        );
+        wait_for_test_leader(&raft_node).await;
+
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let block_ref_counts = Arc::new(RwLock::new(HashMap::new()));
+        let gc_gate = Arc::new(RwLock::new(TaskGate::new()));
+        let metrics = Arc::new(MetadataMetrics::new());
+        let candidates = Arc::new(RwLock::new(HashMap::new()));
+        let last_log_ms = Arc::new(RwLock::new(0));
+        let destructive_gate = Arc::new(DestructiveGate::new(
+            Arc::clone(&raft_node),
+            Arc::clone(&worker_manager),
+            Arc::clone(&mount_table),
+        ));
+        let inflight_registry = Arc::new(InflightRegistry::new(5 * 60 * 1000));
+        let service = GcService::new(
+            raft_node,
+            storage.clone(),
+            worker_manager,
+            block_ref_counts,
+            gc_gate,
+            Arc::clone(&metrics),
+            Arc::clone(&candidates),
+            last_log_ms,
+            destructive_gate,
+            inflight_registry,
+            Arc::clone(&mount_table),
+        );
+
+        Ok(GcTestEnv {
+            _temp_dir: temp_dir,
+            storage,
+            mount_table,
+            metrics,
+            candidates,
+            service,
+        })
+    }
+
+    async fn wait_for_test_leader(raft_node: &AppRaftNode) {
+        for _ in 0..100 {
+            if raft_node.is_leader() && raft_node.get_last_applied_state_id().is_some() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+        assert!(raft_node.is_leader());
+        assert!(raft_node.get_last_applied_state_id().is_some());
+    }
+
+    fn put_sealed_block(storage: &RocksDBStorage, block_id: BlockId, inode_id: InodeId) -> MetadataResult<()> {
+        storage.put_block(&BlockMetaState {
+            block_id,
+            inode_id,
+            data_handle_id: block_id.data_handle_id,
+            state: BlockState::Sealed,
+            placement: BlockPlacement {
+                primary: WorkerId::new(1),
+                replicas: Vec::new(),
+            },
+            committed_length: 4096,
+        })
+    }
+
+    fn bind_block_to_mount_owner(
+        storage: &RocksDBStorage,
+        mount_table: &MountTable,
+        block_id: BlockId,
+        inode_id: InodeId,
+        owner_group: ShardGroupId,
+    ) -> MetadataResult<()> {
+        let mount_entry = mount_table.create_mount(
+            format!("/gc-{}", block_id.data_handle_id.as_raw()),
+            MountKind::External,
+            Some("ufs://gc-test".to_string()),
+            DataIoPolicy::Allow,
+            owner_group,
+            InodeId::new(10),
+        )?;
+        let inode = Inode::new_file(
+            inode_id,
+            FileAttrs::new(),
+            mount_entry.mount_id,
+            block_id.data_handle_id,
+        );
+        storage.put_inode(&inode)?;
+        storage.put_data_handle_owner(block_id.data_handle_id, inode_id)?;
+        Ok(())
+    }
+
+    fn seed_eligible_candidate(candidates: &RwLock<HashMap<BlockId, GcCandidate>>, block_id: BlockId) {
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        candidates.write().insert(
+            block_id,
+            GcCandidate {
+                first_seen_ms: now_ms - 11 * 60 * 1000,
+                last_seen_ms: now_ms - 11 * 60 * 1000,
+                seen_count: 2,
+                last_reason: "test".to_string(),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_intent_build_failure_does_not_remove_unbuilt_candidate() -> MetadataResult<()> {
+        let env = new_gc_test_env().await?;
+        let failed_block = BlockId::new(DataHandleId::new(901), BlockIndex::new(0));
+        let built_block = BlockId::new(DataHandleId::new(902), BlockIndex::new(0));
+        put_sealed_block(&env.storage, failed_block, InodeId::new(901))?;
+        put_sealed_block(&env.storage, built_block, InodeId::new(902))?;
+        bind_block_to_mount_owner(
+            &env.storage,
+            &env.mount_table,
+            built_block,
+            InodeId::new(902),
+            ShardGroupId::new(7),
+        )?;
+        seed_eligible_candidate(&env.candidates, failed_block);
+        seed_eligible_candidate(&env.candidates, built_block);
+
+        env.service.run_gc().await?;
+
+        let candidates = env.candidates.read();
+        assert!(candidates.contains_key(&failed_block));
+        assert!(!candidates.contains_key(&built_block));
+        drop(candidates);
+
+        let intents = env.storage.list_pending_delete_intents(10, u64::MAX)?;
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].block_id, built_block);
+        assert!(matches!(intents[0].status, DeleteIntentStatus::Pending));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gc_intent_build_failure_counts_only_built_intents() -> MetadataResult<()> {
+        let env = new_gc_test_env().await?;
+        let failed_block = BlockId::new(DataHandleId::new(911), BlockIndex::new(0));
+        let built_block = BlockId::new(DataHandleId::new(912), BlockIndex::new(0));
+        put_sealed_block(&env.storage, failed_block, InodeId::new(911))?;
+        put_sealed_block(&env.storage, built_block, InodeId::new(912))?;
+        bind_block_to_mount_owner(
+            &env.storage,
+            &env.mount_table,
+            built_block,
+            InodeId::new(912),
+            ShardGroupId::new(8),
+        )?;
+        seed_eligible_candidate(&env.candidates, failed_block);
+        seed_eligible_candidate(&env.candidates, built_block);
+
+        env.service.run_gc().await?;
+
+        assert_eq!(env.metrics.delete_intents_created_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            env.metrics.maintenance_gc_created_intents_total.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(env.metrics.gc_actions_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            env.metrics.delete_intents_create_failed_total.load(Ordering::Relaxed),
+            0
+        );
+
+        Ok(())
     }
 }

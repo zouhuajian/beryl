@@ -13,7 +13,10 @@ mod tests {
     use crate::raft::{AppRaftNode, AppRaftStateMachine, Command, DedupKey, RocksDBStorage};
     use crate::state::{BlockMetaState, DeleteIntent, DeleteIntentReason, DeleteIntentStatus};
     use crate::worker::{HealthStatus, WorkerManager};
-    use proto::metadata::{worker_command_proto, DeleteBlocksCommandProto};
+    use proto::metadata::{
+        worker_command_proto, DeleteBlockResultProto, DeleteBlockStatusProto, DeleteBlocksCommandProto,
+        ErrorClassProto, TaskAckProto, TaskAckStatusProto, WorkerCommandProto,
+    };
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
@@ -22,6 +25,178 @@ mod tests {
     use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, WorkerId};
     use types::CallId;
     use types::RaftLogId;
+
+    struct DeleteExecutorTestEnv {
+        _temp_dir: TempDir,
+        storage: Arc<RocksDBStorage>,
+        worker_manager: Arc<WorkerManager>,
+        executor: DeleteExecutor,
+        inflight_registry: Arc<InflightRegistry>,
+    }
+
+    async fn new_delete_executor_test_env() -> MetadataResult<DeleteExecutorTestEnv> {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_db_executor");
+        let storage = Arc::new(RocksDBStorage::open(&db_path)?);
+        let mount_table = Arc::new(MountTable::new());
+        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
+        let raft_config = RaftConfig {
+            node_id: 1,
+            peers: vec!["127.0.0.1:0".to_string()],
+        };
+        let raft_node = Arc::new(
+            AppRaftNode::new(
+                raft_config.node_id,
+                Arc::clone(&storage),
+                Arc::clone(&state_machine),
+                &raft_config,
+            )
+            .await
+            .unwrap(),
+        );
+        wait_for_test_leader(&raft_node).await;
+
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        worker_manager.increment_metadata_epoch();
+        let inflight_registry = Arc::new(InflightRegistry::new(5 * 60 * 1000));
+        let executor = DeleteExecutor::new(
+            Arc::clone(&raft_node),
+            Arc::clone(&storage),
+            Arc::clone(&worker_manager),
+            Arc::new(crate::metrics::MetadataMetrics::new()),
+            mount_table,
+            Arc::clone(&inflight_registry),
+        );
+
+        Ok(DeleteExecutorTestEnv {
+            _temp_dir: temp_dir,
+            storage,
+            worker_manager,
+            executor,
+            inflight_registry,
+        })
+    }
+
+    async fn wait_for_test_leader(raft_node: &AppRaftNode) {
+        for _ in 0..100 {
+            if raft_node.is_leader() && raft_node.get_last_applied_state_id().is_some() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+        assert!(raft_node.is_leader());
+        assert!(raft_node.get_last_applied_state_id().is_some());
+    }
+
+    fn add_live_worker_with_blocks(
+        worker_manager: &WorkerManager,
+        worker_id: WorkerId,
+        blocks: Vec<BlockId>,
+    ) -> MetadataResult<()> {
+        worker_manager.register_worker(worker_id, "127.0.0.1:8080".to_string(), 1, 100, None)?;
+        worker_manager.update_runtime(worker_id, 1, 100, 1000, 500, 500, 0, 0, HealthStatus::Healthy)?;
+        worker_manager.apply_full_report(worker_id, blocks)?;
+        Ok(())
+    }
+
+    fn put_sealed_block(storage: &RocksDBStorage, block_id: BlockId, worker_id: WorkerId) -> MetadataResult<()> {
+        storage.put_block(&BlockMetaState {
+            block_id,
+            inode_id: InodeId::new(99 + block_id.index.as_raw() as u64),
+            data_handle_id: block_id.data_handle_id,
+            state: BlockState::Sealed,
+            placement: BlockPlacement {
+                primary: worker_id,
+                replicas: Vec::new(),
+            },
+            committed_length: 4096,
+        })
+    }
+
+    fn put_pending_delete_intent(storage: &RocksDBStorage, intent_id: u64, block_id: BlockId) -> MetadataResult<()> {
+        storage.put_delete_intent(&DeleteIntent {
+            intent_id,
+            block_id,
+            reason: DeleteIntentReason::Gc,
+            created_at_ms: 0,
+            not_before_ms: 0,
+            shard_group_id: None,
+            guard_watermark: None,
+            mount_epoch: None,
+            guard_state_id: RaftLogId::default(),
+            target_workers: Vec::new(),
+            status: DeleteIntentStatus::Pending,
+            finished_at_ms: None,
+            last_error_msg: None,
+        })
+    }
+
+    fn delete_command(command: &WorkerCommandProto) -> (u64, BlockId) {
+        match command.command.as_ref() {
+            Some(worker_command_proto::Command::DeleteBlocks(DeleteBlocksCommandProto {
+                intent_id, blocks, ..
+            })) => {
+                let block_id = blocks[0].block_id.unwrap();
+                (
+                    *intent_id,
+                    BlockId::new(
+                        DataHandleId::new(block_id.data_handle_id),
+                        BlockIndex::new(block_id.block_index),
+                    ),
+                )
+            }
+            other => panic!("expected DeleteBlocks command, got {other:?}"),
+        }
+    }
+
+    fn success_delete_ack(task_id: u64, intent_id: u64, block_id: BlockId) -> TaskAckProto {
+        TaskAckProto {
+            task_id,
+            status: TaskAckStatusProto::TaskAckStatusSuccess as i32,
+            error_message: String::new(),
+            error_class: ErrorClassProto::ErrorClassOk as i32,
+            error_code: String::new(),
+            verify_ok: true,
+            block_results: vec![DeleteBlockResultProto {
+                block_id: Some(proto::common::BlockIdProto {
+                    data_handle_id: block_id.data_handle_id.as_raw(),
+                    block_index: block_id.index.as_raw(),
+                }),
+                status: DeleteBlockStatusProto::DeleteBlockStatusDeleted as i32,
+                error_class: ErrorClassProto::ErrorClassOk as i32,
+                retry_after_ms: 0,
+                message: String::new(),
+            }],
+            intent_id,
+        }
+    }
+
+    fn retryable_delete_ack(task_id: u64, intent_id: u64) -> TaskAckProto {
+        TaskAckProto {
+            task_id,
+            status: TaskAckStatusProto::TaskAckStatusRetryableFailed as i32,
+            error_message: "temporary worker failure".to_string(),
+            error_class: ErrorClassProto::ErrorClassRetryable as i32,
+            error_code: String::new(),
+            verify_ok: false,
+            block_results: Vec::new(),
+            intent_id,
+        }
+    }
+
+    async fn prepare_two_intents_same_worker() -> MetadataResult<(DeleteExecutorTestEnv, WorkerId, BlockId, BlockId)> {
+        let env = new_delete_executor_test_env().await?;
+        let worker_id = WorkerId::new(1);
+        let first_block = BlockId::new(DataHandleId::new(71), BlockIndex::new(0));
+        let second_block = BlockId::new(DataHandleId::new(72), BlockIndex::new(0));
+        put_sealed_block(&env.storage, first_block, worker_id)?;
+        put_sealed_block(&env.storage, second_block, worker_id)?;
+        add_live_worker_with_blocks(&env.worker_manager, worker_id, vec![first_block, second_block])?;
+        put_pending_delete_intent(&env.storage, 101, first_block)?;
+        put_pending_delete_intent(&env.storage, 102, second_block)?;
+        env.executor.run_once().await?;
+        Ok((env, worker_id, first_block, second_block))
+    }
 
     #[tokio::test]
     async fn test_delete_intent_status_persistence() -> MetadataResult<()> {
@@ -301,6 +476,117 @@ mod tests {
             }
             other => panic!("expected DeleteBlocks command, got {other:?}"),
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_delete_intents_same_worker_get_distinct_task_ids() -> MetadataResult<()> {
+        let (env, worker_id, _first_block, _second_block) = prepare_two_intents_same_worker().await?;
+
+        let commands = env.executor.get_pending_commands(worker_id, 10);
+        assert_eq!(commands.len(), 2);
+        assert_ne!(commands[0].task_id, commands[1].task_id);
+
+        let mut intent_ids = commands
+            .iter()
+            .map(|command| delete_command(command).0)
+            .collect::<Vec<_>>();
+        intent_ids.sort_unstable();
+        assert_eq!(intent_ids, vec![101, 102]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ack_for_first_task_completes_only_first_intent() -> MetadataResult<()> {
+        let (env, worker_id, first_block, second_block) = prepare_two_intents_same_worker().await?;
+        let commands = env.executor.get_pending_commands(worker_id, 10);
+        let first_command = commands
+            .iter()
+            .find(|command| delete_command(command).0 == 101)
+            .expect("first intent command");
+
+        env.worker_manager.apply_full_report(worker_id, vec![second_block])?;
+        env.executor
+            .process_task_acks(
+                worker_id,
+                &[success_delete_ack(first_command.task_id, 101, first_block)],
+            )
+            .await;
+
+        assert!(matches!(
+            env.storage.get_delete_intent(101)?.unwrap().status,
+            DeleteIntentStatus::Completed
+        ));
+        assert!(matches!(
+            env.storage.get_delete_intent(102)?.unwrap().status,
+            DeleteIntentStatus::Pending
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ack_for_second_task_completes_only_second_intent() -> MetadataResult<()> {
+        let (env, worker_id, first_block, second_block) = prepare_two_intents_same_worker().await?;
+        let commands = env.executor.get_pending_commands(worker_id, 10);
+        let second_command = commands
+            .iter()
+            .find(|command| delete_command(command).0 == 102)
+            .expect("second intent command");
+
+        env.worker_manager.apply_full_report(worker_id, vec![first_block])?;
+        env.executor
+            .process_task_acks(
+                worker_id,
+                &[success_delete_ack(second_command.task_id, 102, second_block)],
+            )
+            .await;
+
+        assert!(matches!(
+            env.storage.get_delete_intent(101)?.unwrap().status,
+            DeleteIntentStatus::Pending
+        ));
+        assert!(matches!(
+            env.storage.get_delete_intent(102)?.unwrap().status,
+            DeleteIntentStatus::Completed
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retryable_delete_ack_allows_command_to_be_regenerated() -> MetadataResult<()> {
+        let env = new_delete_executor_test_env().await?;
+        let worker_id = WorkerId::new(1);
+        let block_id = BlockId::new(DataHandleId::new(81), BlockIndex::new(0));
+        put_sealed_block(&env.storage, block_id, worker_id)?;
+        add_live_worker_with_blocks(&env.worker_manager, worker_id, vec![block_id])?;
+        put_pending_delete_intent(&env.storage, 201, block_id)?;
+        env.executor.run_once().await?;
+
+        let commands = env.executor.get_pending_commands(worker_id, 10);
+        assert_eq!(commands.len(), 1);
+        let old_task_id = commands[0].task_id;
+
+        env.executor
+            .process_task_acks(worker_id, &[retryable_delete_ack(old_task_id, 201)])
+            .await;
+
+        assert_eq!(env.executor.get_inflight_count(), 0);
+        assert_eq!(env.executor.worker_inflight_count_for_test(worker_id), 0);
+        assert!(!env.executor.block_inflight_contains_for_test(block_id));
+        assert!(env
+            .inflight_registry
+            .try_acquire(block_id, crate::inflight_registry::InflightKind::Delete, None)?);
+        env.inflight_registry.release(block_id);
+
+        env.executor.run_once().await?;
+        let retried_commands = env.executor.get_pending_commands(worker_id, 10);
+        assert_eq!(retried_commands.len(), 1);
+        assert_eq!(delete_command(&retried_commands[0]).0, 201);
+        assert_ne!(retried_commands[0].task_id, old_task_id);
 
         Ok(())
     }

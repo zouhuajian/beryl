@@ -58,18 +58,19 @@ mod tests {
     use types::BlockIndex;
 
     #[test]
-    #[ignore = "pending identity-pivot alignment for maintenance ownership"]
     fn owner_group_errors_when_inode_missing() {
         let dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::open(dir.path()).unwrap();
         let mount_table = MountTable::new();
         let block_id = BlockId::new(DataHandleId::new(42), BlockIndex::new(0));
+        storage
+            .put_data_handle_owner(block_id.data_handle_id, InodeId::new(42))
+            .unwrap();
         let err = owner_group_for_block(&storage, &mount_table, block_id).unwrap_err();
         assert!(format!("{err:?}").contains("Inode"));
     }
 
     #[test]
-    #[ignore = "pending identity-pivot alignment for maintenance ownership"]
     fn owner_group_resolves_mount_owner() {
         let dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::open(dir.path()).unwrap();
