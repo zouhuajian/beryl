@@ -16,13 +16,13 @@ metadata 的目标定位是：
 - 不新增 `block_lifecycle` 顶层模块。
 - 不新增 `safety` 顶层模块。
 - repair、delete、safety 都是 maintenance 内部能力。
-- worker 不拥有 repair/delete，只通过 command hub 暴露 heartbeat command transport。
+- worker 不拥有 repair/delete command polling/ack routing，只通过 command router 暴露 heartbeat command transport。
 
 这次重组的核心目标不是把所有相关文件一次性搬到理想目录，而是先把 ownership 写清楚：filesystem authority 主链路保持稳定，worker 只做 worker ingress 和运行态，maintenance 统一承载后台维护、repair、delete 与 destructive safety。
 
 ## 2. 当前基线：暂不重构的内容
 
-当前 P0/P1/P2 阶段不应重开这些大模块：
+当前 P0-P4.5 阶段不应重开这些大模块：
 
 - `service/path_service.rs`
 - `service/fs_core/*`
@@ -75,7 +75,7 @@ metadata/src/
     manager.rs
     block_report.rs
     full_report_lease.rs
-    command_hub.rs
+    command_router.rs
     metrics.rs
 
   maintenance/
@@ -94,8 +94,6 @@ metadata/src/
       planner.rs
       queue.rs
       types.rs
-      executor.rs
-      metrics.rs
     delete/
       mod.rs
       intent.rs
@@ -105,7 +103,7 @@ metadata/src/
 分阶段原则：
 
 - P0 只写架构文档，不移动文件。
-- P1/P2/P3 分阶段推进低风险清理、command hub 解耦和机械移动。
+- P1/P2/P3/P4 分阶段推进低风险清理、command router 解耦和机械移动。
 - 当前 `raft/`、`mount/`、`state/` 暂时保留顶层，避免 import churn。
 - 不引入 `block_lifecycle` 顶层模块；block 相关生命周期动作应落在 maintenance 内部的 repair/delete/gc/orphan/overrep/safety 边界下。
 
@@ -193,6 +191,7 @@ repair 不负责：
 - `RepairTask::EvictReplica` 表达 repair/rebalance 语境下的副本驱逐，不是通用删除。
 - 通用删除不应走 `RepairQueue`。
 - repair command 通过 `WorkerCommandRouter` 交给 worker heartbeat transport；worker 模块只保留 transport adapter。
+- 当前没有 `maintenance/repair/executor.rs`；repair command source adapter 仍在 `worker/command_router.rs`，后续是否抽出单独 executor 另行决定。
 
 ## 7. delete 边界
 
@@ -288,6 +287,7 @@ P3：
 - 已完成：worker/repair 移入 `maintenance/repair`。
 - `RepairTask::Evict` / `RepairDedupKey::Evict` 已收窄命名为 `EvictReplica`。
 - repair queue/planner 行为保持为 metadata 侧维护能力；worker 侧只保留 heartbeat command source adapter。
+- P4.5 审计事实：`metadata/src/worker` 下已无 `repair/` 目录；`WorkerService` 不再直接做 repair command polling/ack routing，但当前仍保留 block-report/dead-worker repair signal injection 到 `maintenance/repair` queue/planner，后续若继续收敛应单独设计，不属于本轮。
 
 P4：
 

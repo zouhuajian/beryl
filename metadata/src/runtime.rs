@@ -57,12 +57,12 @@ pub struct MetadataAuthority {
 /// Required worker runtime soft state shared by worker RPC and background work.
 pub struct WorkerRuntime {
     pub manager: Arc<WorkerManager>,
-    repair: WorkerRepairState,
+    maintenance_repair: MaintenanceRepairState,
 }
 
-/// Worker repair state shared by worker RPC, worker background, and maintenance.
+/// Maintenance repair state shared by worker RPC ingress, worker background, and maintenance.
 #[derive(Clone)]
-struct WorkerRepairState {
+struct MaintenanceRepairState {
     repair_queue: Arc<RepairQueue>,
     orphan_queue: Arc<OrphanQueue>,
     repair_planner: Arc<RepairPlanner>,
@@ -71,7 +71,7 @@ struct WorkerRepairState {
 
 /// Worker-owned background lifecycle started after authority and maintenance are available.
 pub struct WorkerBackground {
-    _repair: WorkerRepairState,
+    _maintenance_repair: MaintenanceRepairState,
     _command_router: Arc<WorkerCommandRouter>,
     _handle: WorkerBackgroundHandle,
 }
@@ -110,7 +110,7 @@ pub struct RuntimeHandles {
     _readiness: ReadinessHandle,
 }
 
-impl WorkerRepairState {
+impl MaintenanceRepairState {
     fn new(config: &MetadataConfig) -> Self {
         let repair_metrics = Arc::new(crate::worker::metrics::RepairMetrics::new());
         let repair_config = &config.worker.repair;
@@ -145,9 +145,12 @@ impl WorkerRuntime {
         manager.increment_metadata_epoch();
         info!("Metadata epoch initialized: {}", manager.get_metadata_epoch());
 
-        let repair = WorkerRepairState::new(config);
+        let maintenance_repair = MaintenanceRepairState::new(config);
 
-        Self { manager, repair }
+        Self {
+            manager,
+            maintenance_repair,
+        }
     }
 
     /// Builds the worker RPC service from required runtime state.
@@ -155,8 +158,8 @@ impl WorkerRuntime {
         let mut service = MetadataWorkerServiceImpl::new(
             Arc::clone(&authority.raft_node),
             Arc::clone(&self.manager),
-            Arc::clone(&self.repair.repair_queue),
-            Arc::clone(&self.repair.orphan_queue),
+            Arc::clone(&self.maintenance_repair.repair_queue),
+            Arc::clone(&self.maintenance_repair.orphan_queue),
             Arc::clone(&authority.mount_table),
         );
         service.set_slot_metrics(Arc::clone(&authority.metadata_metrics));
@@ -164,9 +167,9 @@ impl WorkerRuntime {
         service
     }
 
-    /// Shares repair state without making worker capability optional.
-    fn repair_state(&self) -> WorkerRepairState {
-        self.repair.clone()
+    /// Shares maintenance repair state without making worker capability optional.
+    fn maintenance_repair_state(&self) -> MaintenanceRepairState {
+        self.maintenance_repair.clone()
     }
 
     /// Builds the worker command router after maintenance-owned command sources exist.
@@ -180,7 +183,9 @@ impl WorkerRuntime {
             MAX_DELETE_COMMANDS_PER_HEARTBEAT,
         );
         router.register_source(
-            Arc::new(RepairCommandSource::new(Arc::clone(&self.repair.repair_queue))),
+            Arc::new(RepairCommandSource::new(Arc::clone(
+                &self.maintenance_repair.repair_queue,
+            ))),
             MAX_REPAIR_COMMANDS_PER_HEARTBEAT,
         );
         Arc::new(router)
@@ -336,7 +341,7 @@ pub fn build_worker_runtime(
 
 /// Starts metadata maintenance side effects after authority and worker state exist.
 pub async fn build_maintenance(authority: &MetadataAuthority, worker: &WorkerRuntime) -> Maintenance {
-    let repair = worker.repair_state();
+    let repair = worker.maintenance_repair_state();
 
     let maintenance_service = Arc::new(MaintenanceService::new_with_inflight_registry(
         Arc::clone(&authority.raft_node),
@@ -379,7 +384,7 @@ pub fn build_worker_background(
     let handle = worker.start_background(service, Arc::clone(&command_router));
 
     WorkerBackground {
-        _repair: worker.repair_state(),
+        _maintenance_repair: worker.maintenance_repair_state(),
         _command_router: command_router,
         _handle: handle,
     }
@@ -686,8 +691,8 @@ mod tests {
         let maintenance = build_maintenance(&authority, &worker_runtime).await;
         let worker_background = build_worker_background(&worker_runtime, &mut worker_service, &maintenance);
         assert!(Arc::ptr_eq(
-            &worker_background._repair.shared_inflight_registry,
-            &worker_runtime.repair.shared_inflight_registry
+            &worker_background._maintenance_repair.shared_inflight_registry,
+            &worker_runtime.maintenance_repair.shared_inflight_registry
         ));
         assert_eq!(worker_background._command_router.source_count(), 2);
         assert!(Arc::strong_count(&maintenance.delete_executor) >= 3);
@@ -934,16 +939,22 @@ mod tests {
         let config = test_config();
         let authority = test_authority(&dir).await;
         let (worker_runtime, _worker_service) = build_worker_runtime(&config, &authority);
-        let repair = worker_runtime.repair_state();
+        let repair = worker_runtime.maintenance_repair_state();
 
-        assert!(Arc::ptr_eq(&worker_runtime.repair.repair_queue, &repair.repair_queue));
-        assert!(Arc::ptr_eq(&worker_runtime.repair.orphan_queue, &repair.orphan_queue));
         assert!(Arc::ptr_eq(
-            &worker_runtime.repair.repair_planner,
+            &worker_runtime.maintenance_repair.repair_queue,
+            &repair.repair_queue
+        ));
+        assert!(Arc::ptr_eq(
+            &worker_runtime.maintenance_repair.orphan_queue,
+            &repair.orphan_queue
+        ));
+        assert!(Arc::ptr_eq(
+            &worker_runtime.maintenance_repair.repair_planner,
             &repair.repair_planner
         ));
         assert!(Arc::ptr_eq(
-            &worker_runtime.repair.shared_inflight_registry,
+            &worker_runtime.maintenance_repair.shared_inflight_registry,
             &repair.shared_inflight_registry
         ));
     }
