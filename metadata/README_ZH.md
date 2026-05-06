@@ -72,7 +72,7 @@ flowchart TB
 | 已实现 | 薄 `main.rs`、runtime composition、root readiness、FileSystemService 新 16 RPC、inode/dentry/attrs authority、mount_epoch/route_epoch/state watermark freshness、durable single `file_version`、write lifecycle 主链路、worker register 持久化、block report soft locations、delete intent Raft apply/status 更新。 |
 | 部分实现 | maintenance/repair/delete framework、worker command heartbeat pull、full block report lease、GC/orphan/overrep intent creation、repair queue ack/retry、client refresh/replay 配合。 |
 | 未实现 | recursive directory delete、Hflush/Hsync barrier、ACL/Ranger、完整 UFS-backed namespace、生产级 repair/move/evict/rebalance 策略、多 group msync、follower read 全路径、专用 mount refresh API、path->group route cache。 |
-| 历史残留 | `report_presence` proto RPC 入口仍存在但返回 deprecated/NotSupported、`MemoryStateStore` route-epoch 测试 helper。 |
+| 历史残留 | `MemoryStateStore` route-epoch 测试 helper。 |
 | 可保留但暂缓 | maintenance/repair 的 RepairPlanner/RepairQueue/OrphanQueue、maintenance/delete 的 DeleteExecutor、MaintenanceService、authz extension point、共享 `metrics.rs` 导出聚合。 |
 
 ## 3. 启动链路
@@ -271,7 +271,7 @@ snapshot / state store：
 
 ## 10. Worker metadata 链路
 
-`MetadataWorkerServiceImpl` 当前处理 worker register、heartbeat、block report、task ack、deprecated report_presence。
+`MetadataWorkerServiceImpl` 当前处理 worker register、heartbeat、block report、task ack。
 
 register：
 
@@ -296,11 +296,11 @@ block report：
 - `RepairSignalHandler` 对 added blocks 做当前 repair signal 处理：metadata 中缺失的 block 进入 `OrphanQueue`，存在的 block 基于 current locations/live workers/replication factor 规划并 enqueue repair task。
 - `removed_blocks` 会在 `WorkerManager` soft-state 已更新后交给 `RepairSignalHandler`：metadata 中存在的 block 基于当前 locations 触发 repair planning；metadata 中缺失的 removed block 不进入 `OrphanQueue`，也不创建 delete intent。
 
-`report_presence`：
+旧 `report_presence`：
 
-- RPC 仍存在。
-- 当前返回 structured deprecated/NotSupported header，不更新 presence。
-- README 和外部文档不能把它描述成强一致 presence 来源；当前主来源是 `block_report`。
+- proto RPC 和服务实现已删除。
+- 当前 block presence 主来源是 `block_report`。
+- 旧调用方必须迁移到 full / incremental block report；不再保留 deprecated/NotSupported 兼容入口。
 
 ## 11. Maintenance / Repair / Delete 当前状态
 
@@ -391,7 +391,7 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 - durable single `file_version` 已完成；不引入 `layout_version`。
 - rename overwrite regular-file target cleanup 已进入 atomic apply path。
 - worker descriptor 持久态与 heartbeat/block location soft state 已分离。
-- block report 是当前 block presence 主来源；`report_presence` proto 入口仍存在，但返回 deprecated/NotSupported。
+- block report 是当前 block presence 主来源；旧 `report_presence` proto 入口已删除。
 - block-report repair signal handling 已迁入 `maintenance/repair/signal.rs`；`MetadataWorkerServiceImpl` 不再直接做 orphan detection、replication planning 或 repair enqueue。
 - dead-worker scan 和 affected block repair scheduling 已迁入 `maintenance/lost_worker.rs`；`WorkerBackground` 不再做 dead-worker repair scheduling。
 - `UpdateDeleteIntentStatus` 已通过 Raft command 持久化，不再应描述为直接 RocksDB status update。
@@ -407,7 +407,7 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 - `metadata/src/lib.rs` crate docs 已改为当前 `MetadataServer` runtime、`MetadataFileSystemServiceImpl`、`MetadataWorkerServiceImpl` 和 FileSystemService external API 事实；不再引用当前 checkout 缺失的 metadata docs path，也不再描述旧 client service 名称。
 - `metadata/src/service/mod.rs` module docs 已改为当前 FileSystemService adapter / GuardChain / FsCore / msync / auth extension point 事实。
 - 当前 checkout 未包含 `docs/architecture` 目录；README 不把该目录写成当前可读实现文档。
-- `report_presence` 已降级为 deprecated/NotSupported 响应；当前 block presence authoritative input 是 `block_report`。
+- 旧 `report_presence` proto RPC 和服务实现已删除；当前 block presence authoritative input 是 `block_report`。
 - `metadata/src/worker/command_sender.rs` 已删除；当前没有 push queue 或 push transport hook。
 - `Command::UpdateCommittedLength` legacy command path 已删除；scan 未发现当前 public caller。
 - `MemoryStateStore` 已收窄为 route-epoch tests/helper，production runtime 使用 `RaftStateStore`。
@@ -437,7 +437,7 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 历史残留：
 
 - `MemoryStateStore` 仍作为 route-epoch test helper 暴露在 `metadata::state`，不是生产 authority。
-- `report_presence` 受 proto surface 约束仍必须实现，但当前只返回 deprecated/NotSupported。
+- 旧 `report_presence` proto surface 已删除；旧调用方需要迁移到 `block_report`。
 - `metrics.rs` 仍是共享 Prometheus 导出聚合入口；已删除无 updater 零值项，但尚未按 fs/worker/maintenance/authz 完全拆分。
 
 验证状态：

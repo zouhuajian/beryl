@@ -6,7 +6,7 @@
 use super::command_router::WorkerCommandRouter;
 use super::manager::WorkerManager;
 use super::metrics::WorkerMetrics;
-use crate::error::{to_canonical_rpc, MetadataError, MetadataResult};
+use crate::error::MetadataResult;
 use crate::maintenance::repair::{BlockReportDelta, RepairSignalSink};
 use crate::raft::Command;
 use crate::raft::{AppDataResponse, AppRaftNode, WorkerCommandResult};
@@ -696,43 +696,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             report_seq,
             commands,
             retry_after_ms: 0,
-        }))
-    }
-
-    #[instrument(skip(self), fields(call_id, client_id))]
-    /// Deprecated presence RPC.
-    ///
-    /// `block_report` is the current authoritative input for block presence.
-    /// The proto method is retained, but it returns a structured unsupported
-    /// header so callers cannot mistake it for committed presence state.
-    async fn report_presence(
-        &self,
-        request: Request<WorkerReportPresenceRequestProto>,
-    ) -> Result<Response<WorkerReportPresenceResponseProto>, Status> {
-        let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
-
-        let group_id = if let Some(ref header) = req.header {
-            if header.group_id != 0 {
-                Some(header.group_id)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let ok_header = self.create_response_header_from_request(&req.header, group_id);
-        let mut response_header = ResponseHeader::from_canonical(
-            ok_header.client.clone(),
-            to_canonical_rpc(MetadataError::NotSupported(
-                "report_presence is deprecated; use block_report".to_string(),
-            )),
-        );
-        if let Some(group_id) = group_id {
-            response_header = response_header.with_group_id(group_id);
-        }
-        Ok(Response::new(WorkerReportPresenceResponseProto {
-            header: Some((&response_header).into()),
         }))
     }
 }

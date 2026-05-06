@@ -100,17 +100,6 @@ pub struct CommitLengthResp {
     pub committed_length: u64,
 }
 
-/// Optional: worker reports presence summary to meta (weakly consistent).
-#[derive(Clone, Debug)]
-pub struct ReportPresenceReq {
-    pub block_id: BlockId,
-    pub worker: WorkerId,
-    pub summary: ChunkBitmap,
-}
-
-#[derive(Clone, Debug)]
-pub struct ReportPresenceResp {}
-
 /// ---------------- Data Plane (Worker) ----------------
 
 #[derive(Clone, Debug)]

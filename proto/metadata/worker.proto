@@ -347,26 +347,6 @@ message BlockReportResponseProto {
 }
 
 // ============================================================================
-// Worker → Metadata RPC: Presence Reporting (compatibility)
-// ============================================================================
-
-/// Legacy presence reporting (weakly-consistent, lightweight).
-/// This is kept for compatibility with existing ReportPresence RPC.
-/// For strongly-consistent reporting, use BlockReport instead.
-/// Note: Renamed to avoid conflict with metadata/client.proto's ReportPresenceRequest.
-message WorkerReportPresenceRequestProto {
-  common.RequestHeaderProto header = 1;
-  uint64 data_handle_id = 2;
-  uint32 block_index = 3;
-  uint64 worker_id = 4;
-  common.ChunkBitmapProto bitmap = 5;
-}
-
-message WorkerReportPresenceResponseProto {
-  common.ResponseHeaderProto header = 1;
-}
-
-// ============================================================================
 // Metadata Worker Service
 // ============================================================================
 
@@ -379,8 +359,4 @@ service MetadataWorkerServiceProto {
   
   /// Block report: worker reports blocks/chunks it holds.
   rpc BlockReport(BlockReportRequestProto) returns (BlockReportResponseProto);
-  
-  /// Legacy presence reporting (weakly-consistent).
-  /// Note: Renamed from ReportPresence to avoid conflict with metadata/client.proto.
-  rpc ReportPresence(WorkerReportPresenceRequestProto) returns (WorkerReportPresenceResponseProto);
 }
