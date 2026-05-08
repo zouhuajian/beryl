@@ -243,10 +243,10 @@ impl AppRaftStateMachine {
                 let result = self.apply_unlink(parent_inode_id, name, &dedup_key, fingerprint)?;
                 Ok(AppDataResponse::Fs(result))
             }
-            Command::Rmdir {
+            Command::DeleteEmptyDir {
                 parent_inode_id, name, ..
             } => {
-                let result = self.apply_rmdir(parent_inode_id, name, &dedup_key, fingerprint)?;
+                let result = self.apply_delete_empty_dir(parent_inode_id, name, &dedup_key, fingerprint)?;
                 Ok(AppDataResponse::Fs(result))
             }
             Command::DeleteTree {
@@ -1234,8 +1234,8 @@ impl AppRaftStateMachine {
         Ok(result)
     }
 
-    /// Apply Rmdir command.
-    fn apply_rmdir(
+    /// Apply empty-directory delete command.
+    fn apply_delete_empty_dir(
         &self,
         parent_inode_id: InodeId,
         name: String,
@@ -4981,7 +4981,7 @@ mod tests {
     }
 
     #[test]
-    fn rmdir_empty_dir_deletes_namespace_and_replays_without_mutating_again() {
+    fn delete_empty_dir_deletes_namespace_and_replays_without_mutating_again() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
@@ -4996,7 +4996,7 @@ mod tests {
         storage.put_dentry(parent_inode_id, "dir", inode_id).unwrap();
 
         let dedup = dedup_for_test(82);
-        let command = Command::Rmdir {
+        let command = Command::DeleteEmptyDir {
             dedup: dedup.clone(),
             parent_inode_id,
             name: "dir".to_string(),
@@ -5012,7 +5012,7 @@ mod tests {
     }
 
     #[test]
-    fn rmdir_non_empty_dir_returns_directory_not_empty_and_preserves_namespace() {
+    fn delete_empty_dir_non_empty_dir_returns_directory_not_empty_and_preserves_namespace() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
@@ -5031,7 +5031,7 @@ mod tests {
         storage.put_dentry(dir_inode_id, "child", child_inode_id).unwrap();
 
         let dedup = dedup_for_test(83);
-        let command = Command::Rmdir {
+        let command = Command::DeleteEmptyDir {
             dedup: dedup.clone(),
             parent_inode_id,
             name: "dir".to_string(),

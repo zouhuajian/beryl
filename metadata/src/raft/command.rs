@@ -148,8 +148,8 @@ pub enum Command {
         name: String,
     },
 
-    /// Remove directory (Rmdir).
-    Rmdir {
+    /// Delete an empty directory.
+    DeleteEmptyDir {
         dedup: DedupKey,
         parent_inode_id: InodeId,
         name: String,
@@ -223,7 +223,7 @@ impl Command {
             | Command::Mkdir { dedup, .. }
             | Command::Create { dedup, .. }
             | Command::Unlink { dedup, .. }
-            | Command::Rmdir { dedup, .. }
+            | Command::DeleteEmptyDir { dedup, .. }
             | Command::DeleteTree { dedup, .. }
             | Command::Rename { dedup, .. }
             | Command::SetAttr { dedup, .. }
@@ -328,7 +328,7 @@ enum FingerprintView {
         parent_inode_id: InodeId,
         name: String,
     },
-    Rmdir {
+    DeleteEmptyDir {
         parent_inode_id: InodeId,
         name: String,
     },
@@ -488,9 +488,9 @@ impl From<&Command> for FingerprintView {
                 parent_inode_id: *parent_inode_id,
                 name: name.clone(),
             },
-            Command::Rmdir {
+            Command::DeleteEmptyDir {
                 parent_inode_id, name, ..
-            } => FingerprintView::Rmdir {
+            } => FingerprintView::DeleteEmptyDir {
                 parent_inode_id: *parent_inode_id,
                 name: name.clone(),
             },
@@ -650,13 +650,13 @@ mod tests {
             parent_inode_id: InodeId::new(10),
             name: "entry".to_string(),
         };
-        let rmdir = Command::Rmdir {
+        let delete_empty_dir = Command::DeleteEmptyDir {
             dedup: dedup(7, 6),
             parent_inode_id: InodeId::new(10),
             name: "entry".to_string(),
         };
 
-        assert_ne!(unlink.fingerprint(), rmdir.fingerprint());
+        assert_ne!(unlink.fingerprint(), delete_empty_dir.fingerprint());
     }
 
     #[test]

@@ -5,8 +5,8 @@ use super::{CoreWriteOp, FsCore, StaleStateStatus};
 use crate::error::MetadataError;
 use crate::raft::{AppDataResponse, Command, FsCommandResult};
 use crate::service::domain::{
-    CoreResult, CreateInput, CreateOutput, DeleteTreeInput, DeleteTreeOutput, MkdirInput, MkdirOutput, RenameInput,
-    RenameOutput, RmdirInput, RmdirOutput, UnlinkInput, UnlinkOutput,
+    CoreResult, CreateInput, CreateOutput, DeleteEmptyDirInput, DeleteEmptyDirOutput, DeleteTreeInput,
+    DeleteTreeOutput, MkdirInput, MkdirOutput, RenameInput, RenameOutput, UnlinkInput, UnlinkOutput,
 };
 use std::sync::atomic::Ordering;
 
@@ -252,8 +252,13 @@ impl FsCore {
         }
     }
 
-    pub(crate) async fn execute_rmdir(&self, req: RmdirInput) -> CoreResult<RmdirOutput> {
-        let ctx = match self.route_ctx_for_write(&req.ctx, CoreWriteOp::Rmdir, &[req.parent_inode_id], req.freshness) {
+    pub(crate) async fn execute_delete_empty_dir(&self, req: DeleteEmptyDirInput) -> CoreResult<DeleteEmptyDirOutput> {
+        let ctx = match self.route_ctx_for_write(
+            &req.ctx,
+            CoreWriteOp::DeleteEmptyDir,
+            &[req.parent_inode_id],
+            req.freshness,
+        ) {
             Ok(ctx) => ctx,
             Err(err) => return Err(err),
         };
@@ -272,8 +277,8 @@ impl FsCore {
 
         let result = match self
             .propose_fs_write_command(
-                CoreWriteOp::Rmdir,
-                Command::Rmdir {
+                CoreWriteOp::DeleteEmptyDir,
+                Command::DeleteEmptyDir {
                     dedup,
                     parent_inode_id: req.parent_inode_id,
                     name: req.name,
@@ -295,7 +300,7 @@ impl FsCore {
         match result {
             FsCommandResult::Ok(_) => self.success(
                 &req.ctx,
-                RmdirOutput,
+                DeleteEmptyDirOutput,
                 Some(ctx.namespace_owner_group_id.as_raw()),
                 Some(ctx.mount_epoch),
             ),

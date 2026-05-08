@@ -11,9 +11,9 @@
 //! Domain freshness, session, lease, and fencing semantics remain in FsCore.
 
 use super::domain::{
-    AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CommittedBlock, CreateInput, DeleteTreeInput,
-    FileRange, Freshness, GetAttrInput, GetFileLayoutInput, MkdirInput, OpenWriteInput, ReadDirInput, RenameInput,
-    RenewLeaseInput, RmdirInput, UnlinkInput,
+    AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CommittedBlock, CreateInput,
+    DeleteEmptyDirInput, DeleteTreeInput, FileRange, Freshness, GetAttrInput, GetFileLayoutInput, MkdirInput,
+    OpenWriteInput, ReadDirInput, RenameInput, RenewLeaseInput, UnlinkInput,
 };
 use super::guard::{GuardChain, GuardFailure, LeadershipChecker};
 use super::MsyncHandler;
@@ -506,7 +506,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 .map(|success| ok_header_from_core_success(&req_ctx, &success))
         } else if target_inode.as_ref().is_some_and(|inode| inode.kind.is_dir()) {
             self.fs_core
-                .execute_rmdir(RmdirInput {
+                .execute_delete_empty_dir(DeleteEmptyDirInput {
                     ctx: req_ctx.clone(),
                     parent_inode_id,
                     name,

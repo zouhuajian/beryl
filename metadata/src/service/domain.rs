@@ -184,7 +184,7 @@ pub struct UnlinkInput {
 pub struct UnlinkOutput;
 
 #[derive(Clone, Debug)]
-pub struct RmdirInput {
+pub struct DeleteEmptyDirInput {
     pub ctx: RequestContext,
     pub parent_inode_id: InodeId,
     pub name: String,
@@ -192,7 +192,7 @@ pub struct RmdirInput {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct RmdirOutput;
+pub struct DeleteEmptyDirOutput;
 
 #[derive(Clone, Debug)]
 pub struct DeleteTreeInput {

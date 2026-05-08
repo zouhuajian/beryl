@@ -174,9 +174,9 @@ public surface 当前没有旧 FUSE/POSIX 残留 RPC：
 
 - 没有 public `OpenPath`、`ReleasePath`、`TruncatePath`。
 - 没有 public `OpenWriteByPath`、`CloseWriteSession`、`RenewWriteSessionLease`。
-- 没有 public `Unlink` / `Rmdir`；对外删除统一是 `Delete(DeleteRequestProto)`。
+- 没有 public file-delete / empty-directory-delete RPC；对外删除统一是 `Delete(DeleteRequestProto)`。
 - 没有 public xattr API；历史 internal xattr command/apply path 已删除。
-- `Unlink` / `Rmdir` 仍是 FsCore/Raft 内部 domain mutation 名称。
+- `Unlink` / `DeleteEmptyDir` 仍是 FsCore/Raft 内部 domain mutation 名称。
 
 ## 7. Write lifecycle 当前状态
 
@@ -252,8 +252,8 @@ Raft apply 当前统一做 dedup：
 
 | 分类 | Command / path |
 | --- | --- |
-| DONE | `Create`, `Mkdir`, `Rmdir`, empty-file `Unlink`, extent-bearing file `Unlink`, `Rename` including overwrite target cleanup, `CloseWrite`, `Truncate` shrink, `CreateDeleteIntents`, `AllocateDeleteIntents`, `UpdateDeleteIntentStatus`, `CreateMount`, `DeleteMount`, `AddShardGroup`, `RegisterWorker`, `AcquireLease`, `ReleaseLease`, block allocate/state/commit paths。 |
-| STRUCTURED_ERROR_REPLAY | deterministic FS business errors for create/mkdir/unlink/rmdir/rename/close-write/truncate are persisted as `AppliedResult` when they happen inside apply preparation. |
+| DONE | `Create`, `Mkdir`, `DeleteEmptyDir`, empty-file `Unlink`, extent-bearing file `Unlink`, `Rename` including overwrite target cleanup, `CloseWrite`, `Truncate` shrink, `CreateDeleteIntents`, `AllocateDeleteIntents`, `UpdateDeleteIntentStatus`, `CreateMount`, `DeleteMount`, `AddShardGroup`, `RegisterWorker`, `AcquireLease`, `ReleaseLease`, block allocate/state/commit paths。 |
+| STRUCTURED_ERROR_REPLAY | deterministic FS business errors for create/mkdir/unlink/delete-empty-dir/rename/close-write/truncate are persisted as `AppliedResult` when they happen inside apply preparation. |
 已清理：
 
 - `SetXattr` / `RemoveXattr` internal legacy command、fingerprint、state-machine apply helper 和 replay 测试残留已删除；metadata 当前不支持 public xattr API。
@@ -388,7 +388,7 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 - `path_service.rs` 保持完整 FileSystemService adapter 文件；没有第二套 public metadata authority。
 - `FsCore` 已拆成 read/mutation/write_session/freshness 子模块。
 - guard 与 domain freshness 分离。
-- public delete API 统一为 `Delete`；`Unlink` / `Rmdir` 是内部 domain mutation。
+- public delete API 统一为 `Delete`；`Unlink` / `DeleteEmptyDir` 是内部 domain mutation。
 - durable single `file_version` 已完成；不引入 `layout_version`。
 - rename overwrite regular-file target cleanup 已进入 atomic apply path。
 - worker descriptor 持久态与 heartbeat/block location soft state 已分离。

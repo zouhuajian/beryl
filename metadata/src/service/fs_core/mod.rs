@@ -44,7 +44,7 @@ enum CoreWriteOp {
     Create,
     Mkdir,
     Unlink,
-    Rmdir,
+    DeleteEmptyDir,
     DeleteTree,
     Rename,
     SetAttr,
@@ -447,11 +447,11 @@ impl FsCore {
                 CoreWriteOp::Unlink => {
                     metrics.fs_raft_appends_unlink.fetch_add(1, Ordering::Relaxed);
                 }
-                CoreWriteOp::Rmdir => {
-                    metrics.fs_raft_appends_rmdir.fetch_add(1, Ordering::Relaxed);
+                CoreWriteOp::DeleteEmptyDir => {
+                    metrics.fs_raft_appends_directory_delete.fetch_add(1, Ordering::Relaxed);
                 }
                 CoreWriteOp::DeleteTree => {
-                    metrics.fs_raft_appends_rmdir.fetch_add(1, Ordering::Relaxed);
+                    metrics.fs_raft_appends_directory_delete.fetch_add(1, Ordering::Relaxed);
                 }
                 CoreWriteOp::Rename => {
                     metrics.fs_raft_appends_rename.fetch_add(1, Ordering::Relaxed);
