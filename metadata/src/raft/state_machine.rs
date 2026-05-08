@@ -8,7 +8,9 @@
 use crate::error::{to_canonical_fs, MetadataError, MetadataResult};
 use crate::mount::MountTable;
 use crate::raft::command::{Command, FileCommitMode};
-use crate::raft::storage::{AppliedResult, RenameAtomicUpdate, RenameOverwriteCleanup, RocksDBStorage};
+use crate::raft::storage::{
+    AppliedResult, DeleteTreeAtomicUpdate, DeleteTreeEntry, RenameAtomicUpdate, RenameOverwriteCleanup, RocksDBStorage,
+};
 use crate::raft::types::{
     AppDataResponse, BlockCommandResult, CommandFingerprint, DedupKey, DeleteIntentStatusResult, DeleteIntentsResult,
     FsCommandResult, FsErrnoResult, FsOkResult, LeaseCommandResult, MountCommandResult, ShardGroupInfo,
@@ -51,6 +53,18 @@ struct PreparedRename {
     updated_src_parent: Option<Inode>,
     updated_dst_parent: Option<Inode>,
     updated_src_inode: Inode,
+}
+
+struct PreparedDeleteTree {
+    updated_parent: Inode,
+    entries: Vec<DeleteTreeEntry>,
+    block_ref_decrements: Vec<(BlockId, u64)>,
+}
+
+struct DeleteTreePlan {
+    root_mount_id: MountId,
+    entries: Vec<DeleteTreeEntry>,
+    block_ref_decrements: std::collections::HashMap<BlockId, u64>,
 }
 
 type PreparedUnlink = (InodeId, Option<DataHandleId>, Inode, Vec<BlockId>, FsOkResult);
@@ -233,6 +247,12 @@ impl AppRaftStateMachine {
                 parent_inode_id, name, ..
             } => {
                 let result = self.apply_rmdir(parent_inode_id, name, &dedup_key, fingerprint)?;
+                Ok(AppDataResponse::Fs(result))
+            }
+            Command::DeleteTree {
+                parent_inode_id, name, ..
+            } => {
+                let result = self.apply_delete_tree(parent_inode_id, name, &dedup_key, fingerprint)?;
                 Ok(AppDataResponse::Fs(result))
             }
             Command::Rename {
@@ -611,7 +631,7 @@ impl AppRaftStateMachine {
             mount_kind,
             ufs_uri,
             data_io_policy,
-            config_version: new_version,
+            mount_version: new_version,
             namespace_owner_group_id,
             root_inode_id,
         };
@@ -1278,6 +1298,179 @@ impl AppRaftStateMachine {
             applied_result,
         )?;
         Ok(result)
+    }
+
+    fn apply_delete_tree(
+        &self,
+        parent_inode_id: InodeId,
+        name: String,
+        dedup_key: &DedupKey,
+        fingerprint: CommandFingerprint,
+    ) -> MetadataResult<FsCommandResult> {
+        let prepared: MetadataResult<PreparedDeleteTree> = (|| {
+            let root_inode_id = self
+                .storage
+                .get_dentry(parent_inode_id, &name)?
+                .ok_or_else(|| MetadataError::NotFound(format!("Directory not found: {}", name)))?;
+            let root_inode = self
+                .storage
+                .get_inode(root_inode_id)?
+                .ok_or_else(|| MetadataError::NotFound(format!("Root inode not found: {}", root_inode_id)))?;
+            if !root_inode.kind.is_dir() {
+                return Err(MetadataError::NotDir(format!("Not a directory: {}", name)));
+            }
+            self.reject_mount_root_delete(root_inode_id)?;
+
+            let parent_inode = self
+                .storage
+                .get_inode(parent_inode_id)?
+                .ok_or_else(|| MetadataError::Internal("Parent inode disappeared".to_string()))?;
+            if !parent_inode.kind.is_dir() {
+                return Err(MetadataError::NotDir(format!(
+                    "Parent is not a directory: {}",
+                    parent_inode_id
+                )));
+            }
+            if parent_inode.mount_id != root_inode.mount_id {
+                return Err(MetadataError::CrossMountRename(
+                    "recursive delete cannot cross mount boundary".to_string(),
+                ));
+            }
+
+            let now_ms = Self::apply_timestamp_ms();
+            let mut parent_attrs = parent_inode.attrs.clone();
+            parent_attrs.update_mtime_ctime(now_ms);
+            let mut updated_parent = parent_inode;
+            updated_parent.attrs = parent_attrs;
+
+            let mut plan = DeleteTreePlan {
+                root_mount_id: updated_parent.mount_id,
+                entries: Vec::new(),
+                block_ref_decrements: std::collections::HashMap::new(),
+            };
+            self.prepare_delete_tree_node(parent_inode_id, name, root_inode_id, root_inode, &mut plan)?;
+            let mut block_ref_decrements: Vec<_> = plan.block_ref_decrements.into_iter().collect();
+            block_ref_decrements
+                .sort_by_key(|(block_id, _)| (block_id.data_handle_id.as_raw(), block_id.index.as_raw()));
+            self.validate_block_ref_decrement_counts(&block_ref_decrements)?;
+
+            Ok(PreparedDeleteTree {
+                updated_parent,
+                entries: plan.entries,
+                block_ref_decrements,
+            })
+        })();
+
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(err) => return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint),
+        };
+        let result = FsCommandResult::Ok(FsOkResult::default());
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
+        self.storage.delete_tree_with_apply_result_atomic(
+            DeleteTreeAtomicUpdate {
+                entries: &prepared.entries,
+                updated_parent: &prepared.updated_parent,
+                block_ref_decrements: &prepared.block_ref_decrements,
+                now_ms: Self::apply_timestamp_ms(),
+            },
+            dedup_key,
+            applied_result,
+        )?;
+        Ok(result)
+    }
+
+    fn prepare_delete_tree_node(
+        &self,
+        parent_inode_id: InodeId,
+        name: String,
+        inode_id: InodeId,
+        inode: Inode,
+        plan: &mut DeleteTreePlan,
+    ) -> MetadataResult<()> {
+        if inode.mount_id != plan.root_mount_id || self.is_mount_root_inode(inode_id) {
+            return Err(MetadataError::CrossMountRename(
+                "recursive delete cannot cross mount boundary".to_string(),
+            ));
+        }
+
+        let (data_handle_id, layout) = match &inode.data {
+            InodeData::Dir => {
+                let mut children = self.storage.list_dentries(inode_id)?;
+                children.sort_by(|left, right| left.0.cmp(&right.0));
+                for (child_name, child_inode_id) in children {
+                    let child_inode = self
+                        .storage
+                        .get_inode(child_inode_id)?
+                        .ok_or_else(|| MetadataError::NotFound(format!("Child inode not found: {}", child_inode_id)))?;
+                    self.prepare_delete_tree_node(inode_id, child_name, child_inode_id, child_inode, plan)?;
+                }
+                (None, None)
+            }
+            InodeData::File { extents, .. } => {
+                let data_handle_id = inode.current_data_handle_id;
+                if data_handle_id.as_raw() == 0 {
+                    return Err(MetadataError::Internal(format!(
+                        "File inode {} is missing current_data_handle_id",
+                        inode_id
+                    )));
+                }
+                self.storage
+                    .validate_data_handle_owner(data_handle_id, Some(inode_id))?;
+                let layout = self.storage.get_layout(inode_id).map_err(|err| match err {
+                    MetadataError::NotFound(_) => {
+                        MetadataError::InvalidArgument(format!("Missing layout for file inode {}", inode_id))
+                    }
+                    err => err,
+                })?;
+                for block_id in Self::collect_unique_released_blocks(inode_id, data_handle_id, extents)? {
+                    *plan.block_ref_decrements.entry(block_id).or_insert(0) += 1;
+                }
+                (Some(data_handle_id), Some(layout))
+            }
+            InodeData::Symlink { .. } => (None, None),
+        };
+
+        plan.entries.push(DeleteTreeEntry {
+            parent_inode_id,
+            name,
+            inode_id,
+            data_handle_id,
+            layout,
+        });
+        Ok(())
+    }
+
+    fn reject_mount_root_delete(&self, inode_id: InodeId) -> MetadataResult<()> {
+        if inode_id == crate::mount::ROOT_INODE_ID || self.is_mount_root_inode(inode_id) {
+            return Err(MetadataError::InvalidArgument(format!(
+                "Cannot delete mount root inode {}",
+                inode_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn is_mount_root_inode(&self, inode_id: InodeId) -> bool {
+        self.mount_table
+            .list_mounts()
+            .iter()
+            .any(|entry| entry.root_inode_id == inode_id)
+    }
+
+    fn validate_block_ref_decrement_counts(&self, block_ref_decrements: &[(BlockId, u64)]) -> MetadataResult<()> {
+        for (block_id, decrement) in block_ref_decrements {
+            let current = self.storage.get_block_ref_count(*block_id)?.ok_or_else(|| {
+                MetadataError::InvalidArgument(format!("Missing block refcount for released block {}", block_id))
+            })?;
+            if current < *decrement {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "Block refcount underflow for released block {}",
+                    block_id
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Apply Rename command (atomic within mount).
@@ -2486,7 +2679,7 @@ mod tests {
         let first = expect_mount_upserted(sm.apply(create_mount.clone()).unwrap());
         let second = expect_mount_upserted(sm.apply(create_mount).unwrap());
         assert_eq!(second.mount_id, first.mount_id);
-        assert_eq!(second.config_version, first.config_version);
+        assert_eq!(second.mount_version, first.mount_version);
         assert_eq!(
             mount_table.get_mount(mount_id).unwrap().unwrap().mount_prefix,
             first.mount_prefix
@@ -4851,5 +5044,224 @@ mod tests {
 
         expect_fs_errno(sm.apply(command).unwrap(), FsErrorCode::ENotEmpty);
         assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), Some(dir_inode_id));
+    }
+
+    #[test]
+    fn delete_tree_nested_extent_files_delete_layout_refs_intents_and_replay_once() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let parent_inode_id = InodeId::new(70);
+        let dir_inode_id = InodeId::new(71);
+        let subdir_inode_id = InodeId::new(72);
+        let first_inode_id = InodeId::new(73);
+        let second_inode_id = InodeId::new(74);
+        let first_handle = DataHandleId::new(73);
+        let second_handle = DataHandleId::new(74);
+        let first_block = BlockId::new(first_handle, BlockIndex::new(0));
+        let second_block = BlockId::new(second_handle, BlockIndex::new(0));
+        let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        let dir_inode = Inode::new_dir(dir_inode_id, FileAttrs::new(), parent.mount_id);
+        let subdir_inode = Inode::new_dir(subdir_inode_id, FileAttrs::new(), parent.mount_id);
+        storage.put_inode(&parent).unwrap();
+        storage.put_inode(&dir_inode).unwrap();
+        storage.put_inode(&subdir_inode).unwrap();
+        storage.put_dentry(parent_inode_id, "dir", dir_inode_id).unwrap();
+        storage.put_dentry(dir_inode_id, "sub", subdir_inode_id).unwrap();
+        install_file_with_extents(
+            &storage,
+            dir_inode_id,
+            "first",
+            first_inode_id,
+            first_handle,
+            vec![extent(first_block, 0, 64)],
+            64,
+        );
+        install_file_with_extents(
+            &storage,
+            subdir_inode_id,
+            "second",
+            second_inode_id,
+            second_handle,
+            vec![extent(second_block, 0, 128)],
+            128,
+        );
+        storage.put_block_ref_count(first_block, 1).unwrap();
+        storage.put_block_ref_count(second_block, 1).unwrap();
+
+        let command = Command::DeleteTree {
+            dedup: dedup_for_test(99),
+            parent_inode_id,
+            name: "dir".to_string(),
+        };
+
+        expect_fs_ok(sm.apply(command.clone()).unwrap());
+        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), None);
+        for inode_id in [dir_inode_id, subdir_inode_id, first_inode_id, second_inode_id] {
+            assert!(storage.get_inode(inode_id).unwrap().is_none());
+        }
+        assert!(storage.get_layout(first_inode_id).is_err());
+        assert!(storage.get_layout(second_inode_id).is_err());
+        assert_eq!(storage.get_inode_by_data_handle(first_handle).unwrap(), None);
+        assert_eq!(storage.get_inode_by_data_handle(second_handle).unwrap(), None);
+        assert_eq!(storage.get_block_ref_count(first_block).unwrap(), None);
+        assert_eq!(storage.get_block_ref_count(second_block).unwrap(), None);
+        assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 2);
+
+        expect_fs_ok(sm.apply(command).unwrap());
+        assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn delete_tree_missing_refcount_returns_error_without_half_delete() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let parent_inode_id = InodeId::new(75);
+        let dir_inode_id = InodeId::new(76);
+        let file_inode_id = InodeId::new(77);
+        let data_handle_id = DataHandleId::new(77);
+        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+        let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        let dir_inode = Inode::new_dir(dir_inode_id, FileAttrs::new(), parent.mount_id);
+        storage.put_inode(&parent).unwrap();
+        storage.put_inode(&dir_inode).unwrap();
+        storage.put_dentry(parent_inode_id, "dir", dir_inode_id).unwrap();
+        install_file_with_extents(
+            &storage,
+            dir_inode_id,
+            "file",
+            file_inode_id,
+            data_handle_id,
+            vec![extent(block_id, 0, 64)],
+            64,
+        );
+
+        let command = Command::DeleteTree {
+            dedup: dedup_for_test(100),
+            parent_inode_id,
+            name: "dir".to_string(),
+        };
+
+        expect_fs_errno(sm.apply(command.clone()).unwrap(), FsErrorCode::EInval);
+        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), Some(dir_inode_id));
+        assert_eq!(storage.get_dentry(dir_inode_id, "file").unwrap(), Some(file_inode_id));
+        assert!(storage.get_inode(dir_inode_id).unwrap().is_some());
+        assert!(storage.get_inode(file_inode_id).unwrap().is_some());
+        assert_eq!(
+            storage.get_inode_by_data_handle(data_handle_id).unwrap(),
+            Some(file_inode_id)
+        );
+        assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 0);
+
+        expect_fs_errno(sm.apply(command).unwrap(), FsErrorCode::EInval);
+        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), Some(dir_inode_id));
+    }
+
+    #[test]
+    fn delete_tree_missing_layout_returns_error_without_half_delete_and_replay_is_stable() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let parent_inode_id = InodeId::new(81);
+        let dir_inode_id = InodeId::new(82);
+        let file_inode_id = InodeId::new(83);
+        let data_handle_id = DataHandleId::new(83);
+        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+        let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        let dir_inode = Inode::new_dir(dir_inode_id, FileAttrs::new(), parent.mount_id);
+        let mut file_inode = Inode::new_file(file_inode_id, FileAttrs::new(), parent.mount_id, data_handle_id);
+        file_inode.attrs.size = 64;
+        if let InodeData::File {
+            extents,
+            file_version,
+            lease_epoch,
+        } = &mut file_inode.data
+        {
+            *extents = vec![extent(block_id, 0, 64)];
+            *file_version = Some(1);
+            *lease_epoch = Some(1);
+        }
+        storage.put_inode(&parent).unwrap();
+        storage.put_inode(&dir_inode).unwrap();
+        storage.put_inode(&file_inode).unwrap();
+        storage.put_dentry(parent_inode_id, "dir", dir_inode_id).unwrap();
+        storage.put_dentry(dir_inode_id, "file", file_inode_id).unwrap();
+        storage.put_data_handle_owner(data_handle_id, file_inode_id).unwrap();
+        storage.put_block_ref_count(block_id, 1).unwrap();
+
+        let dedup = dedup_for_test(102);
+        let command = Command::DeleteTree {
+            dedup: dedup.clone(),
+            parent_inode_id,
+            name: "dir".to_string(),
+        };
+
+        expect_fs_errno(sm.apply(command.clone()).unwrap(), FsErrorCode::EInval);
+        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), Some(dir_inode_id));
+        assert_eq!(storage.get_dentry(dir_inode_id, "file").unwrap(), Some(file_inode_id));
+        assert!(storage.get_inode(dir_inode_id).unwrap().is_some());
+        assert!(storage.get_inode(file_inode_id).unwrap().is_some());
+        assert_eq!(
+            storage.get_inode_by_data_handle(data_handle_id).unwrap(),
+            Some(file_inode_id)
+        );
+        assert_eq!(storage.get_block_ref_count(block_id).unwrap(), Some(1));
+        assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 0);
+        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
+
+        expect_fs_errno(sm.apply(command).unwrap(), FsErrorCode::EInval);
+        assert_eq!(storage.get_dentry(parent_inode_id, "dir").unwrap(), Some(dir_inode_id));
+        assert_eq!(storage.get_dentry(dir_inode_id, "file").unwrap(), Some(file_inode_id));
+        assert_eq!(storage.get_block_ref_count(block_id).unwrap(), Some(1));
+        assert_eq!(storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn delete_tree_fingerprint_mismatch_preserves_second_tree() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let parent_inode_id = InodeId::new(78);
+        let first_dir = InodeId::new(79);
+        let second_dir = InodeId::new(80);
+        let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        storage.put_inode(&parent).unwrap();
+        storage
+            .put_inode(&Inode::new_dir(first_dir, FileAttrs::new(), parent.mount_id))
+            .unwrap();
+        storage
+            .put_inode(&Inode::new_dir(second_dir, FileAttrs::new(), parent.mount_id))
+            .unwrap();
+        storage.put_dentry(parent_inode_id, "first", first_dir).unwrap();
+        storage.put_dentry(parent_inode_id, "second", second_dir).unwrap();
+        let dedup = dedup_for_test(101);
+
+        expect_fs_ok(
+            sm.apply(Command::DeleteTree {
+                dedup: dedup.clone(),
+                parent_inode_id,
+                name: "first".to_string(),
+            })
+            .unwrap(),
+        );
+        let mismatch = sm.apply(Command::DeleteTree {
+            dedup,
+            parent_inode_id,
+            name: "second".to_string(),
+        });
+
+        assert!(matches!(mismatch, Err(MetadataError::InvalidArgument(_))));
+        assert_eq!(storage.get_dentry(parent_inode_id, "first").unwrap(), None);
+        assert_eq!(storage.get_dentry(parent_inode_id, "second").unwrap(), Some(second_dir));
+        assert!(storage.get_inode(second_dir).unwrap().is_some());
     }
 }

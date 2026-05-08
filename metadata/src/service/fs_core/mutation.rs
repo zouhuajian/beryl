@@ -3,10 +3,10 @@
 
 use super::{CoreWriteOp, FsCore, StaleStateStatus};
 use crate::error::MetadataError;
-use crate::raft::{Command, FsCommandResult};
+use crate::raft::{AppDataResponse, Command, FsCommandResult};
 use crate::service::domain::{
-    CoreResult, CreateInput, CreateOutput, MkdirInput, MkdirOutput, RenameInput, RenameOutput, RmdirInput, RmdirOutput,
-    UnlinkInput, UnlinkOutput,
+    CoreResult, CreateInput, CreateOutput, DeleteTreeInput, DeleteTreeOutput, MkdirInput, MkdirOutput, RenameInput,
+    RenameOutput, RmdirInput, RmdirOutput, UnlinkInput, UnlinkOutput,
 };
 use std::sync::atomic::Ordering;
 
@@ -307,6 +307,150 @@ impl FsCore {
                 Some(ctx.mount_epoch),
             ),
         }
+    }
+
+    pub(crate) async fn execute_delete_tree(&self, req: DeleteTreeInput) -> CoreResult<DeleteTreeOutput> {
+        let ctx =
+            match self.route_ctx_for_write(&req.ctx, CoreWriteOp::DeleteTree, &[req.parent_inode_id], req.freshness) {
+                Ok(ctx) => ctx,
+                Err(err) => return Err(err),
+            };
+
+        let dedup = match self.dedup_key(&req.ctx.caller) {
+            Ok(k) => k,
+            Err(err) => {
+                return self.failure_from_error(
+                    &req.ctx,
+                    err,
+                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.mount_epoch),
+                );
+            }
+        };
+        let command = Command::DeleteTree {
+            dedup: dedup.clone(),
+            parent_inode_id: req.parent_inode_id,
+            name: req.name.clone(),
+        };
+        let fingerprint = command.fingerprint();
+
+        if let Some(storage) = self.storage.as_ref() {
+            match storage.get_applied_result(&dedup) {
+                Ok(Some(existing)) => {
+                    if existing.fingerprint != fingerprint {
+                        return self.failure_from_error(
+                            &req.ctx,
+                            MetadataError::InvalidArgument(format!(
+                                "call_id {} reused with different command payload",
+                                dedup.call_id
+                            )),
+                            Some(ctx.namespace_owner_group_id.as_raw()),
+                            Some(ctx.mount_epoch),
+                        );
+                    }
+                    let result = match existing.result {
+                        AppDataResponse::Fs(result) => result,
+                        _ => FsCommandResult::ok(),
+                    };
+                    return self.delete_tree_result(&req, &ctx, result);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    return self.failure_from_error(
+                        &req.ctx,
+                        err,
+                        Some(ctx.namespace_owner_group_id.as_raw()),
+                        Some(ctx.mount_epoch),
+                    );
+                }
+            }
+
+            if let Err(err) = self.preflight_delete_tree_runtime(storage, req.parent_inode_id, &req.name) {
+                return self.failure_from_error(
+                    &req.ctx,
+                    err,
+                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.mount_epoch),
+                );
+            }
+        }
+
+        let result = match self.propose_fs_write_command(CoreWriteOp::DeleteTree, command).await {
+            Ok(result) => result,
+            Err(err) => {
+                return self.failure_from_error(
+                    &req.ctx,
+                    err,
+                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.mount_epoch),
+                );
+            }
+        };
+
+        self.delete_tree_result(&req, &ctx, result)
+    }
+
+    fn delete_tree_result(
+        &self,
+        req: &DeleteTreeInput,
+        ctx: &super::RoutedFsWriteCtx,
+        result: FsCommandResult,
+    ) -> CoreResult<DeleteTreeOutput> {
+        match result {
+            FsCommandResult::Ok(_) => self.success(
+                &req.ctx,
+                DeleteTreeOutput,
+                Some(ctx.namespace_owner_group_id.as_raw()),
+                Some(ctx.mount_epoch),
+            ),
+            FsCommandResult::Err(err) => self.fatal_fs_failure(
+                &req.ctx,
+                err.errno,
+                err.message,
+                Some(ctx.namespace_owner_group_id.as_raw()),
+                Some(ctx.mount_epoch),
+            ),
+        }
+    }
+
+    fn preflight_delete_tree_runtime(
+        &self,
+        storage: &crate::raft::RocksDBStorage,
+        parent_inode_id: types::fs::InodeId,
+        name: &str,
+    ) -> Result<(), MetadataError> {
+        let Some(root_inode_id) = storage.get_dentry(parent_inode_id, name)? else {
+            return Ok(());
+        };
+        let Some(root_inode) = storage.get_inode(root_inode_id)? else {
+            return Ok(());
+        };
+        let mount_id = root_inode.mount_id;
+        let mut stack = vec![(root_inode_id, root_inode)];
+
+        while let Some((inode_id, inode)) = stack.pop() {
+            if inode.mount_id != mount_id {
+                continue;
+            }
+            if inode.kind.is_file()
+                && (self.write_session_manager.has_active_session(inode_id)
+                    || self.inode_lease_manager.has_active_lease(inode_id))
+            {
+                return Err(MetadataError::Busy(format!(
+                    "File has an active write session or lease: {}",
+                    inode_id
+                )));
+            }
+            if inode.kind.is_dir() {
+                for (_, child_inode_id) in storage.list_dentries(inode_id)? {
+                    if let Some(child_inode) = storage.get_inode(child_inode_id)? {
+                        stack.push((child_inode_id, child_inode));
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub(crate) async fn execute_rename(&self, req: RenameInput) -> CoreResult<RenameOutput> {

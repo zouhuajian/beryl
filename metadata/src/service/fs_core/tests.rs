@@ -80,7 +80,7 @@ fn fs_core_with_mount(mount_id: MountId, mount_epoch: u64, group_id: ShardGroupI
             mount_kind: MountKind::Internal,
             ufs_uri: None,
             data_io_policy: DataIoPolicy::Allow,
-            config_version: mount_epoch,
+            mount_version: mount_epoch,
             namespace_owner_group_id: group_id,
             root_inode_id: ROOT_INODE_ID,
         })
@@ -755,7 +755,7 @@ fn freshness_validator_rejects_routed_write_mount_epoch_with_replay_hint() {
             mount_kind: MountKind::Internal,
             ufs_uri: None,
             data_io_policy: DataIoPolicy::Allow,
-            config_version: 9,
+            mount_version: 9,
             namespace_owner_group_id: group_id,
             root_inode_id: ROOT_INODE_ID,
         })

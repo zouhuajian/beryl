@@ -10,7 +10,7 @@ mod tests {
     use crate::error::MetadataResult;
     use crate::inflight_registry::InflightRegistry;
     use crate::mount::MountTable;
-    use crate::raft::{AppRaftNode, AppRaftStateMachine, Command, DedupKey, RocksDBStorage};
+    use crate::raft::{AppDataResponse, AppRaftNode, AppRaftStateMachine, Command, DedupKey, RocksDBStorage};
     use crate::state::{BlockMetaState, DeleteIntent, DeleteIntentReason, DeleteIntentStatus};
     use crate::worker::{HealthStatus, WorkerManager};
     use proto::metadata::{
@@ -182,6 +182,41 @@ mod tests {
             block_results: Vec::new(),
             intent_id,
         }
+    }
+
+    fn fatal_delete_ack(task_id: u64, intent_id: u64, block_id: BlockId, message: &str) -> TaskAckProto {
+        TaskAckProto {
+            task_id,
+            status: TaskAckStatusProto::TaskAckStatusFailed as i32,
+            error_message: message.to_string(),
+            error_class: ErrorClassProto::ErrorClassFatal as i32,
+            error_code: String::new(),
+            verify_ok: false,
+            block_results: vec![DeleteBlockResultProto {
+                block_id: Some(proto::common::BlockIdProto {
+                    data_handle_id: block_id.data_handle_id.as_raw(),
+                    block_index: block_id.index.as_raw(),
+                }),
+                status: DeleteBlockStatusProto::DeleteBlockStatusFailedFatal as i32,
+                error_class: ErrorClassProto::ErrorClassFatal as i32,
+                retry_after_ms: 0,
+                message: message.to_string(),
+            }],
+            intent_id,
+        }
+    }
+
+    fn delete_intent_status_results(storage: &RocksDBStorage) -> MetadataResult<Vec<(u64, DeleteIntentStatus)>> {
+        let mut results = storage
+            .applied_results_for_test()?
+            .into_iter()
+            .filter_map(|applied| match applied.result {
+                AppDataResponse::DeleteIntentStatus(result) => Some((result.intent_id, result.status)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        results.sort_by_key(|(intent_id, _)| *intent_id);
+        Ok(results)
     }
 
     async fn prepare_two_intents_same_worker() -> MetadataResult<(DeleteExecutorTestEnv, WorkerId, BlockId, BlockId)> {
@@ -499,38 +534,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ack_for_first_task_completes_only_first_intent() -> MetadataResult<()> {
+    async fn ack_routes_by_task_id_and_persists_each_completion_through_raft() -> MetadataResult<()> {
         let (env, worker_id, first_block, second_block) = prepare_two_intents_same_worker().await?;
         let commands = env.executor.get_pending_commands(worker_id, 10);
         let first_command = commands
             .iter()
             .find(|command| delete_command(command).0 == 101)
             .expect("first intent command");
-
-        env.worker_manager.apply_full_report(worker_id, vec![second_block])?;
-        env.executor
-            .process_task_acks(
-                worker_id,
-                &[success_delete_ack(first_command.task_id, 101, first_block)],
-            )
-            .await;
-
-        assert!(matches!(
-            env.storage.get_delete_intent(101)?.unwrap().status,
-            DeleteIntentStatus::Completed
-        ));
-        assert!(matches!(
-            env.storage.get_delete_intent(102)?.unwrap().status,
-            DeleteIntentStatus::Pending
-        ));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn ack_for_second_task_completes_only_second_intent() -> MetadataResult<()> {
-        let (env, worker_id, first_block, second_block) = prepare_two_intents_same_worker().await?;
-        let commands = env.executor.get_pending_commands(worker_id, 10);
         let second_command = commands
             .iter()
             .find(|command| delete_command(command).0 == 102)
@@ -552,6 +562,87 @@ mod tests {
             env.storage.get_delete_intent(102)?.unwrap().status,
             DeleteIntentStatus::Completed
         ));
+        assert_eq!(
+            delete_intent_status_results(&env.storage)?,
+            vec![(102, DeleteIntentStatus::Completed)]
+        );
+
+        env.worker_manager.apply_full_report(worker_id, Vec::new())?;
+        env.executor
+            .process_task_acks(
+                worker_id,
+                &[success_delete_ack(first_command.task_id, 101, first_block)],
+            )
+            .await;
+
+        assert!(matches!(
+            env.storage.get_delete_intent(101)?.unwrap().status,
+            DeleteIntentStatus::Completed
+        ));
+        assert_eq!(
+            delete_intent_status_results(&env.storage)?,
+            vec![
+                (101, DeleteIntentStatus::Completed),
+                (102, DeleteIntentStatus::Completed)
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fatal_delete_ack_persists_failed_status_through_raft() -> MetadataResult<()> {
+        let env = new_delete_executor_test_env().await?;
+        let worker_id = WorkerId::new(1);
+        let block_id = BlockId::new(DataHandleId::new(82), BlockIndex::new(0));
+        put_sealed_block(&env.storage, block_id, worker_id)?;
+        add_live_worker_with_blocks(&env.worker_manager, worker_id, vec![block_id])?;
+        put_pending_delete_intent(&env.storage, 301, block_id)?;
+        env.executor.run_once().await?;
+
+        let commands = env.executor.get_pending_commands(worker_id, 10);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(delete_command(&commands[0]), (301, block_id));
+
+        env.executor
+            .process_task_acks(
+                worker_id,
+                &[fatal_delete_ack(
+                    commands[0].task_id,
+                    301,
+                    block_id,
+                    "disk delete failed",
+                )],
+            )
+            .await;
+
+        let stored = env.storage.get_delete_intent(301)?.unwrap();
+        assert!(matches!(stored.status, DeleteIntentStatus::Failed));
+        assert_eq!(stored.last_error_msg.as_deref(), Some("disk delete failed"));
+        assert_eq!(
+            delete_intent_status_results(&env.storage)?,
+            vec![(301, DeleteIntentStatus::Failed)]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_location_completion_persists_completed_status_through_raft() -> MetadataResult<()> {
+        let env = new_delete_executor_test_env().await?;
+        let worker_id = WorkerId::new(1);
+        let block_id = BlockId::new(DataHandleId::new(83), BlockIndex::new(0));
+        put_sealed_block(&env.storage, block_id, worker_id)?;
+        put_pending_delete_intent(&env.storage, 401, block_id)?;
+
+        env.executor.run_once().await?;
+
+        let stored = env.storage.get_delete_intent(401)?.unwrap();
+        assert!(matches!(stored.status, DeleteIntentStatus::Completed));
+        assert_eq!(
+            delete_intent_status_results(&env.storage)?,
+            vec![(401, DeleteIntentStatus::Completed)]
+        );
 
         Ok(())
     }

@@ -77,7 +77,8 @@ Rules:
 - mount routing follows namespace/mount ownership semantics, not generic hashing
 - longest-prefix match must be unambiguous
 - child mount prefixes override parent prefixes
-- mount changes must carry monotonic versioning such as `mount_epoch` / `config_version`
+- mount changes must carry monotonic per-entry versioning: Rust `MountEntry.mount_version` and proto `MountEntryProto.mount_version` are exposed externally as `mount_epoch`
+- `MountTable::version()` is a table-level version counter, not a per-entry mount version getter
 - ownership, redirect, and refresh semantics must remain machine-usable
 - leader/group mismatch must return structured refreshable errors, not opaque failures
 

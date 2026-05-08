@@ -145,7 +145,8 @@ namespace / mount / route 当前事实：
 
 - `MountTable::load_from_storage()` 启动时从 RocksDB mounts CF 载入；Raft apply `CreateMount` / `DeleteMount` 后同步更新内存表。
 - `namespace_owner_group_id` 是 mount 内 filesystem mutation owner group。
-- `mount_epoch` 使用 `MountEntry::config_version`。
+- `MountEntry.mount_version` / `MountEntryProto.mount_version` 是 per-mount entry version，对外作为 `mount_epoch` freshness token 使用。
+- `MountTable::version()` 是 table-level version counter，不是 per-entry `MountEntry.mount_version` getter。
 - `route_epoch` 存在 RocksDB meta CF；`CreateMount` / `DeleteMount` 推进；`AddShardGroup` 当前不推进 filesystem-facing `route_epoch`。
 - rename/delete/create/mkdir 等 namespace mutation 通过 `Command` propose 到 Raft authority。
 - same-mount rename 是当前实现边界；cross-mount rename 返回 structured EXDEV/CrossMountRename。
@@ -229,7 +230,7 @@ worker location 边界：
 
 freshness 当前事实：
 
-- `mount_epoch` 校验 request header 和 mount entry `config_version`。
+- `mount_epoch` 校验 request header 和 mount entry `mount_version`。
 - `route_epoch` 校验 request/header 和 authoritative RocksDB route epoch。
 - `state_id` 只通过 repeated `GroupStateWatermark { group_id, state_id }` 表达。
 - `state_id` 表示 state-machine applied `RaftLogId`，不是 committed index、route_epoch、mount_epoch、worker_epoch 或旧 `applied_seq`。

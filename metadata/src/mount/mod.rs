@@ -52,7 +52,7 @@ pub struct MountEntry {
     pub mount_kind: MountKind,
     pub ufs_uri: Option<String>, // e.g., "s3://bucket/path"
     pub data_io_policy: DataIoPolicy,
-    pub config_version: u64,
+    pub mount_version: u64,
     /// Namespace owner group ID: all FS write operations within this mount
     /// must route to this single Raft group for atomic rename within mount.
     pub namespace_owner_group_id: ShardGroupId,
@@ -96,7 +96,7 @@ impl MountTable {
         for entry in mounts {
             let mount_id_raw = entry.mount_id.as_raw();
             max_mount_id = max_mount_id.max(mount_id_raw);
-            max_version = max_version.max(entry.config_version);
+            max_version = max_version.max(entry.mount_version);
 
             // Check for duplicate prefix (data corruption)
             if prefix_index.contains_key(&entry.mount_prefix) {
@@ -153,7 +153,7 @@ impl MountTable {
             mount_kind,
             ufs_uri,
             data_io_policy,
-            config_version: *version,
+            mount_version: *version,
             namespace_owner_group_id,
             root_inode_id,
         };
@@ -210,8 +210,8 @@ impl MountTable {
         entries.insert(entry.mount_id, entry.clone());
         prefix_index.insert(entry.mount_prefix, entry.mount_id);
 
-        // Update version to match entry's config_version (from RocksDB)
-        *version = entry.config_version.max(*version);
+        // Update version to match entry's mount_version (from RocksDB)
+        *version = entry.mount_version.max(*version);
 
         Ok(())
     }
@@ -445,7 +445,7 @@ mod tests {
             mount_kind: MountKind::External,
             ufs_uri: Some("s3://bucket1/path".to_string()),
             data_io_policy: DataIoPolicy::Allow,
-            config_version: 1,
+            mount_version: 1,
             namespace_owner_group_id: ShardGroupId::new(1),
             root_inode_id: InodeId::new(1),
         };
@@ -455,7 +455,7 @@ mod tests {
             mount_kind: MountKind::External,
             ufs_uri: Some("oss://bucket2/path".to_string()),
             data_io_policy: DataIoPolicy::Allow,
-            config_version: 2,
+            mount_version: 2,
             namespace_owner_group_id: ShardGroupId::new(2),
             root_inode_id: InodeId::new(2),
         };

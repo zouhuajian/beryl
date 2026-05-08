@@ -155,6 +155,13 @@ pub enum Command {
         name: String,
     },
 
+    /// Recursively delete a directory tree.
+    DeleteTree {
+        dedup: DedupKey,
+        parent_inode_id: InodeId,
+        name: String,
+    },
+
     /// Rename (atomic within mount).
     Rename {
         dedup: DedupKey,
@@ -217,6 +224,7 @@ impl Command {
             | Command::Create { dedup, .. }
             | Command::Unlink { dedup, .. }
             | Command::Rmdir { dedup, .. }
+            | Command::DeleteTree { dedup, .. }
             | Command::Rename { dedup, .. }
             | Command::SetAttr { dedup, .. }
             | Command::CloseWrite { dedup, .. }
@@ -321,6 +329,10 @@ enum FingerprintView {
         name: String,
     },
     Rmdir {
+        parent_inode_id: InodeId,
+        name: String,
+    },
+    DeleteTree {
         parent_inode_id: InodeId,
         name: String,
     },
@@ -479,6 +491,12 @@ impl From<&Command> for FingerprintView {
             Command::Rmdir {
                 parent_inode_id, name, ..
             } => FingerprintView::Rmdir {
+                parent_inode_id: *parent_inode_id,
+                name: name.clone(),
+            },
+            Command::DeleteTree {
+                parent_inode_id, name, ..
+            } => FingerprintView::DeleteTree {
                 parent_inode_id: *parent_inode_id,
                 name: name.clone(),
             },

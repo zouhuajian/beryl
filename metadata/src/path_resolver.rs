@@ -223,7 +223,7 @@ impl PathResolver {
         Ok(ResolvedPath {
             mount_ctx: MountContext {
                 mount_id: mount_entry.mount_id,
-                mount_epoch: mount_entry.config_version,
+                mount_epoch: mount_entry.mount_version,
                 owner_group_id: mount_entry.namespace_owner_group_id,
                 root_inode_id: mount_entry.root_inode_id,
             },
@@ -254,7 +254,7 @@ impl PathResolver {
         Ok(ResolvedPath {
             mount_ctx: MountContext {
                 mount_id: mount_entry.mount_id,
-                mount_epoch: mount_entry.config_version,
+                mount_epoch: mount_entry.mount_version,
                 owner_group_id: mount_entry.namespace_owner_group_id,
                 root_inode_id: mount_entry.root_inode_id,
             },

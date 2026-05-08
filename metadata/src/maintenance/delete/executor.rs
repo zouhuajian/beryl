@@ -411,15 +411,7 @@ impl DeleteExecutor {
                     block_id = %intent.block_id,
                     "Intent completed: no known locations"
                 );
-                {
-                    let mut state = self.execution_state.write();
-                    if let Some(exec_state) = state.get_mut(&intent_id) {
-                        exec_state.status = IntentExecutionStatus::Completed {
-                            completed_at_ms: now_ms,
-                        };
-                    }
-                }
-                self.release_registry_held(intent_id, intent.block_id);
+                self.mark_intent_completed(intent_id, now_ms, true).await;
                 continue;
             }
 
@@ -1164,6 +1156,7 @@ impl DeleteExecutor {
             }
 
             self.release_inflight_routes_for_intent(intent_id);
+            self.release_registry_held(intent_id, block_id);
 
             info!(
                 intent_id,
@@ -1210,6 +1203,7 @@ impl DeleteExecutor {
             }
 
             self.release_inflight_routes_for_intent(intent_id);
+            self.release_registry_held(intent_id, block_id);
 
             error!(
                 intent_id,

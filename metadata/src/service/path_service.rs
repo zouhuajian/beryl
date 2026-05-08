@@ -11,8 +11,8 @@
 //! Domain freshness, session, lease, and fencing semantics remain in FsCore.
 
 use super::domain::{
-    AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CommittedBlock, CreateInput, FileRange,
-    Freshness, GetAttrInput, GetFileLayoutInput, MkdirInput, OpenWriteInput, ReadDirInput, RenameInput,
+    AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CommittedBlock, CreateInput, DeleteTreeInput,
+    FileRange, Freshness, GetAttrInput, GetFileLayoutInput, MkdirInput, OpenWriteInput, ReadDirInput, RenameInput,
     RenewLeaseInput, RmdirInput, UnlinkInput,
 };
 use super::guard::{GuardChain, GuardFailure, LeadershipChecker};
@@ -470,51 +470,41 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
         };
-        let target_inode_id = match resolved.inode_id {
-            Some(inode_id) => inode_id,
-            None => {
-                return error_response!(
-                    DeleteResponseProto,
-                    self.header_from_path_error(
-                        &req.header,
-                        MetadataError::NotFound(format!("Entry not found: {}", name)),
-                        Some(&resolved.mount_ctx),
+        let target_inode = match resolved.inode_id {
+            Some(target_inode_id) => match self.path_resolver.get_inode(target_inode_id) {
+                Ok(Some(inode)) => Some(inode),
+                Ok(None) => {
+                    return error_response!(
+                        DeleteResponseProto,
+                        self.header_from_path_error(
+                            &req.header,
+                            MetadataError::NotFound(format!("Target inode not found: {}", target_inode_id)),
+                            Some(&resolved.mount_ctx),
+                        )
                     )
-                )
-            }
-        };
-        let target_inode = match self.path_resolver.get_inode(target_inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                return error_response!(
-                    DeleteResponseProto,
-                    self.header_from_path_error(
-                        &req.header,
-                        MetadataError::NotFound(format!("Target inode not found: {}", target_inode_id)),
-                        Some(&resolved.mount_ctx),
+                }
+                Err(err) => {
+                    return error_response!(
+                        DeleteResponseProto,
+                        self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx))
                     )
-                )
-            }
-            Err(err) => {
-                return error_response!(
-                    DeleteResponseProto,
-                    self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx))
-                )
-            }
+                }
+            },
+            None => None,
         };
 
         let freshness = Self::freshness_from_header(&req.header);
-        let result = if target_inode.kind.is_dir() {
-            if req.recursive {
-                return error_response!(
-                    DeleteResponseProto,
-                    self.header_from_path_error(
-                        &req.header,
-                        MetadataError::NotSupported("recursive delete not yet implemented".to_string()),
-                        Some(&resolved.mount_ctx),
-                    )
-                );
-            }
+        let result = if req.recursive && target_inode.as_ref().map(|inode| inode.kind.is_dir()).unwrap_or(true) {
+            self.fs_core
+                .execute_delete_tree(DeleteTreeInput {
+                    ctx: req_ctx.clone(),
+                    parent_inode_id,
+                    name,
+                    freshness,
+                })
+                .await
+                .map(|success| ok_header_from_core_success(&req_ctx, &success))
+        } else if target_inode.as_ref().is_some_and(|inode| inode.kind.is_dir()) {
             self.fs_core
                 .execute_rmdir(RmdirInput {
                     ctx: req_ctx.clone(),
@@ -525,6 +515,16 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 .await
                 .map(|success| ok_header_from_core_success(&req_ctx, &success))
         } else {
+            if target_inode.is_none() {
+                return error_response!(
+                    DeleteResponseProto,
+                    self.header_from_path_error(
+                        &req.header,
+                        MetadataError::NotFound(format!("Entry not found: {}", name)),
+                        Some(&resolved.mount_ctx),
+                    )
+                );
+            }
             self.fs_core
                 .execute_unlink(UnlinkInput {
                     ctx: req_ctx.clone(),

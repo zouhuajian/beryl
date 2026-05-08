@@ -195,6 +195,17 @@ pub struct RmdirInput {
 pub struct RmdirOutput;
 
 #[derive(Clone, Debug)]
+pub struct DeleteTreeInput {
+    pub ctx: RequestContext,
+    pub parent_inode_id: InodeId,
+    pub name: String,
+    pub freshness: Freshness,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DeleteTreeOutput;
+
+#[derive(Clone, Debug)]
 pub struct RenameInput {
     pub ctx: RequestContext,
     pub src_parent_inode_id: InodeId,

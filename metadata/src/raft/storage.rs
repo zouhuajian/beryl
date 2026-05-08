@@ -123,6 +123,23 @@ pub struct RenameAtomicUpdate<'a> {
     pub updated_src_inode: &'a Inode,
 }
 
+/// One namespace entry removed by a post-order recursive delete plan.
+pub struct DeleteTreeEntry {
+    pub parent_inode_id: InodeId,
+    pub name: String,
+    pub inode_id: InodeId,
+    pub data_handle_id: Option<DataHandleId>,
+    pub layout: Option<FileLayout>,
+}
+
+/// Recursive delete writes that must commit as one RocksDB batch.
+pub struct DeleteTreeAtomicUpdate<'a> {
+    pub entries: &'a [DeleteTreeEntry],
+    pub updated_parent: &'a Inode,
+    pub block_ref_decrements: &'a [(BlockId, u64)],
+    pub now_ms: u64,
+}
+
 /// RocksDB storage backend.
 pub struct RocksDBStorage {
     db: Arc<DB>,
@@ -2108,7 +2125,6 @@ impl RocksDBStorage {
         released_block_ids: &[BlockId],
         now_ms: u64,
     ) -> MetadataResult<()> {
-        let cf_meta = self.cf(CF_META)?;
         let mut seen = std::collections::HashSet::with_capacity(released_block_ids.len());
         let mut unique_blocks = Vec::with_capacity(released_block_ids.len());
         for block_id in released_block_ids {
@@ -2117,24 +2133,46 @@ impl RocksDBStorage {
             }
         }
         unique_blocks.sort_by_key(|block_id| (block_id.data_handle_id.as_raw(), block_id.index.as_raw()));
+        let decrement_counts = unique_blocks
+            .into_iter()
+            .map(|block_id| (block_id, 1))
+            .collect::<Vec<_>>();
 
+        self.append_block_ref_decrement_counts_to_batch(
+            batch,
+            cf_block_ref_counts,
+            cf_delete_intents,
+            &decrement_counts,
+            now_ms,
+        )
+    }
+
+    fn append_block_ref_decrement_counts_to_batch(
+        &self,
+        batch: &mut WriteBatch,
+        cf_block_ref_counts: &ColumnFamily,
+        cf_delete_intents: &ColumnFamily,
+        block_ref_decrements: &[(BlockId, u64)],
+        now_ms: u64,
+    ) -> MetadataResult<()> {
+        let cf_meta = self.cf(CF_META)?;
         let mut zero_ref_blocks = Vec::new();
-        for block_id in &unique_blocks {
+        for (block_id, decrement) in block_ref_decrements {
             let current = self.get_block_ref_count(*block_id)?.ok_or_else(|| {
                 MetadataError::InvalidArgument(format!("Missing block refcount for released block {}", block_id))
             })?;
-            if current == 0 {
+            if *decrement == 0 || current < *decrement {
                 return Err(MetadataError::InvalidArgument(format!(
                     "Block refcount underflow for released block {}",
                     block_id
                 )));
             }
 
-            if current == 1 {
+            if current == *decrement {
                 Self::batch_delete_block_ref_count(batch, cf_block_ref_counts, *block_id);
                 zero_ref_blocks.push(*block_id);
             } else {
-                Self::batch_put_block_ref_count(batch, cf_block_ref_counts, *block_id, current - 1)?;
+                Self::batch_put_block_ref_count(batch, cf_block_ref_counts, *block_id, current - *decrement)?;
             }
         }
 
@@ -2165,6 +2203,44 @@ impl RocksDBStorage {
             }
         }
         Ok(())
+    }
+
+    /// Atomically persist a recursive tree delete with block lifecycle updates and apply tracking.
+    pub fn delete_tree_with_apply_result_atomic(
+        &self,
+        update: DeleteTreeAtomicUpdate<'_>,
+        dedup_key: &DedupKey,
+        applied_result: AppliedResult,
+    ) -> MetadataResult<()> {
+        let cf_inodes = self.cf(CF_INODES)?;
+        let cf_dentries = self.cf(CF_DENTRIES)?;
+        let cf_meta = self.cf(CF_META)?;
+        let cf_block_ref_counts = self.cf(CF_BLOCK_REF_COUNTS)?;
+        let cf_delete_intents = self.cf(CF_DELETE_INTENTS)?;
+        let mut batch = WriteBatch::default();
+
+        for entry in update.entries {
+            batch.delete_cf(cf_dentries, Self::encode_dentry_key(entry.parent_inode_id, &entry.name));
+            batch.delete_cf(cf_inodes, Self::encode_inode_key(entry.inode_id));
+            if entry.layout.is_some() {
+                let layout_key = format!("layout:{}", entry.inode_id.as_raw());
+                batch.delete_cf(cf_meta, layout_key.as_bytes());
+            }
+            if let Some(data_handle_id) = entry.data_handle_id {
+                let owner_key = format!("data_handle_owner:{}", data_handle_id.as_raw());
+                batch.delete_cf(cf_meta, owner_key.as_bytes());
+            }
+        }
+        Self::batch_put_inode(&mut batch, cf_inodes, update.updated_parent)?;
+        self.append_block_ref_decrement_counts_to_batch(
+            &mut batch,
+            cf_block_ref_counts,
+            cf_delete_intents,
+            update.block_ref_decrements,
+            update.now_ms,
+        )?;
+
+        self.commit_apply_batch(batch, dedup_key, applied_result)
     }
 
     /// Atomically persist delete intents with apply tracking.
@@ -2711,6 +2787,24 @@ impl RocksDBStorage {
             count += 1;
         }
         Ok(count)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn applied_results_for_test(&self) -> MetadataResult<Vec<AppliedResult>> {
+        let cf = self
+            .db
+            .cf_handle(CF_DEDUP)
+            .ok_or_else(|| MetadataError::Internal("Dedup CF not found".to_string()))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut results = Vec::new();
+        for item in iter {
+            let (_, value) =
+                item.map_err(|e| MetadataError::Internal(format!("RocksDB iterator error (dedup test): {}", e)))?;
+            let (applied, _) = decode_from_slice::<AppliedResult, _>(&value, standard())
+                .map_err(|e| MetadataError::Internal(format!("Failed to deserialize test applied result: {}", e)))?;
+            results.push(applied);
+        }
+        Ok(results)
     }
 }
 

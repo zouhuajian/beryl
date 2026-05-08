@@ -150,7 +150,7 @@ mod tests {
             mount_kind: MountKind::Internal,
             ufs_uri: None,
             data_io_policy: DataIoPolicy::Forbid,
-            config_version: 1,
+            mount_version: 1,
             namespace_owner_group_id: ShardGroupId::new(1),
             root_inode_id: bad_root_inode,
         };

@@ -45,6 +45,7 @@ enum CoreWriteOp {
     Mkdir,
     Unlink,
     Rmdir,
+    DeleteTree,
     Rename,
     SetAttr,
 }
@@ -393,7 +394,7 @@ impl FsCore {
             op = ?op,
             mount_id = %mount_id.as_raw(),
             owner_group_id = %mount_entry.namespace_owner_group_id.as_raw(),
-            mount_epoch = mount_entry.config_version,
+            mount_epoch = mount_entry.mount_version,
             "FS write routed to mount namespace owner group"
         );
 
@@ -406,7 +407,7 @@ impl FsCore {
         Ok(RoutedFsWriteCtx {
             mount_id,
             namespace_owner_group_id: mount_entry.namespace_owner_group_id,
-            mount_epoch: mount_entry.config_version,
+            mount_epoch: mount_entry.mount_version,
         })
     }
 
@@ -447,6 +448,9 @@ impl FsCore {
                     metrics.fs_raft_appends_unlink.fetch_add(1, Ordering::Relaxed);
                 }
                 CoreWriteOp::Rmdir => {
+                    metrics.fs_raft_appends_rmdir.fetch_add(1, Ordering::Relaxed);
+                }
+                CoreWriteOp::DeleteTree => {
                     metrics.fs_raft_appends_rmdir.fetch_add(1, Ordering::Relaxed);
                 }
                 CoreWriteOp::Rename => {
