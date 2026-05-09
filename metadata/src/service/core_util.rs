@@ -12,7 +12,7 @@ use common::error::canonical::{
 };
 use common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
 use tracing::Span;
-use types::fs::{Extent, FsErrorCode};
+use types::fs::FsErrorCode;
 use types::ids::{BlockId, BlockIndex, DataHandleId, LeaseId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
@@ -481,37 +481,6 @@ pub fn fencing_to_proto(token: FencingToken) -> proto::common::FencingTokenProto
         }),
         owner: token.owner.as_raw(),
         epoch: token.epoch,
-    }
-}
-
-pub fn extent_from_proto(extent: proto::fs::ExtentProto) -> Result<Extent, MetadataError> {
-    let block = extent
-        .block_id
-        .ok_or_else(|| MetadataError::InvalidArgument("Missing block_id in extent".to_string()))?;
-    Ok(Extent {
-        file_offset: extent.file_offset,
-        block_id: BlockId::new(
-            DataHandleId::new(block.data_handle_id),
-            BlockIndex::new(block.block_index),
-        ),
-        block_offset: extent.block_offset,
-        len: extent.len,
-        file_version: extent.file_version,
-        block_stamp: extent.block_stamp,
-    })
-}
-
-pub fn extent_to_proto(extent: &Extent) -> proto::fs::ExtentProto {
-    proto::fs::ExtentProto {
-        file_offset: extent.file_offset,
-        block_id: Some(proto::common::BlockIdProto {
-            data_handle_id: extent.block_id.data_handle_id.as_raw(),
-            block_index: extent.block_id.index.as_raw(),
-        }),
-        block_offset: extent.block_offset,
-        len: extent.len,
-        file_version: extent.file_version,
-        block_stamp: extent.block_stamp,
     }
 }
 
