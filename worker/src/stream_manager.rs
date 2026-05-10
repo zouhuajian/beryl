@@ -15,12 +15,7 @@ use tracing::{debug, info};
 use types::chunk::ByteRange;
 use types::ids::{BlockId, StreamId};
 
-/// Stream operation mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StreamMode {
-    Read,
-    Write,
-}
+pub use crate::core::StreamMode;
 
 /// Stream state for tracking active streams.
 #[derive(Clone, Debug)]

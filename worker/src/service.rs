@@ -1,16 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! WorkerDataService gRPC placeholder implementation.
-//!
-//! This phase owns the wire-contract cutover only. The real block-local stream
-//! execution path is intentionally left for a later worker data-plane phase.
+//! WorkerDataService gRPC adapter.
 
 use std::pin::Pin;
 use std::sync::Arc;
-use tonic::{Request, Response, Status};
 
-use common::audit::AuditLogger;
 use proto::common::{
     error_detail_proto, ClientInfoProto, ErrorClassProto, ErrorDetailProto, FsErrnoProto, RefreshReasonProto,
 };
@@ -21,109 +16,43 @@ use proto::worker::{
     OpenWriteStreamRequestProto, OpenWriteStreamResponseProto, ReadStreamRequestProto, ReadStreamResponseProto,
     WriteStreamRequestProto, WriteStreamResponseProto,
 };
-use types::ids::{ShardGroupId, WorkerId};
+use tonic::{Request, Response, Status};
 use types::layout::FileLayout;
 
-use crate::block_manager::BlockManager;
-use crate::block_store::BlockStore;
-use crate::stream_manager::StreamManager;
-use crate::ufs_fill::UfsFiller;
+use crate::convert::{
+    proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_open_request,
+    proto_to_write_open_request, stream_id_to_proto,
+};
+use crate::core::WorkerCore;
+use crate::error::WorkerError;
 
 /// Worker data service implementation.
 #[derive(Clone)]
 pub struct WorkerDataServiceImpl {
-    block_store: Arc<BlockStore>,
-    block_manager: Option<Arc<BlockManager>>,
-    audit_logger: Arc<AuditLogger>,
-    layout: FileLayout,
-    worker_id: WorkerId,
-    worker_epoch: u64,
-    default_group_id: ShardGroupId,
-    ufs_filler: Option<Arc<UfsFiller>>,
-    replication_client: Option<Arc<dyn crate::block_manager::ReplicationClient + Send + Sync>>,
-    stream_manager: Arc<StreamManager>,
+    core: Arc<WorkerCore>,
 }
 
 impl WorkerDataServiceImpl {
-    pub fn new(
-        block_store: Arc<BlockStore>,
-        audit_logger: Arc<AuditLogger>,
-        layout: FileLayout,
-        worker_id: WorkerId,
-        worker_epoch: u64,
-    ) -> Self {
-        let block_manager = Arc::new(BlockManager::new(Arc::clone(&block_store), layout.clone()));
+    pub fn new(layout: FileLayout) -> Self {
         Self {
-            block_store,
-            block_manager: Some(block_manager),
-            audit_logger,
-            layout,
-            worker_id,
-            worker_epoch,
-            default_group_id: ShardGroupId::new(0),
-            ufs_filler: None,
-            replication_client: None,
-            stream_manager: Arc::new(StreamManager::with_default_timeout()),
+            core: Arc::new(WorkerCore::new(layout.chunk_size)),
         }
     }
 
-    /// Create with replication client for later stream replication wiring.
-    pub fn with_replication(
-        block_store: Arc<BlockStore>,
-        audit_logger: Arc<AuditLogger>,
-        layout: FileLayout,
-        worker_id: WorkerId,
-        worker_epoch: u64,
-        replication_client: Arc<dyn crate::block_manager::ReplicationClient + Send + Sync>,
-    ) -> Self {
-        let block_manager = Arc::new(BlockManager::new(Arc::clone(&block_store), layout.clone()));
-        Self {
-            block_store,
-            block_manager: Some(block_manager),
-            audit_logger,
-            layout,
-            worker_id,
-            worker_epoch,
-            default_group_id: ShardGroupId::new(0),
-            ufs_filler: None,
-            replication_client: Some(replication_client),
-            stream_manager: Arc::new(StreamManager::with_default_timeout()),
-        }
-    }
-
-    /// Create with UFS filler retained for construction compatibility only.
-    pub fn with_ufs_filler(
-        block_store: Arc<BlockStore>,
-        audit_logger: Arc<AuditLogger>,
-        layout: FileLayout,
-        worker_id: WorkerId,
-        worker_epoch: u64,
-        ufs_filler: Arc<UfsFiller>,
-    ) -> Self {
-        let block_manager = Arc::new(BlockManager::new(Arc::clone(&block_store), layout.clone()));
-        Self {
-            block_store,
-            block_manager: Some(block_manager),
-            audit_logger,
-            layout,
-            worker_id,
-            worker_epoch,
-            default_group_id: ShardGroupId::new(0),
-            ufs_filler: Some(ufs_filler),
-            replication_client: None,
-            stream_manager: Arc::new(StreamManager::with_default_timeout()),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn stream_manager_for_test(&self) -> Arc<StreamManager> {
-        Arc::clone(&self.stream_manager)
-    }
-
-    fn placeholder_header(header: Option<DataRequestHeaderProto>, operation: &str) -> DataResponseHeaderProto {
+    fn placeholder_response_header(
+        header: Option<DataRequestHeaderProto>,
+        error: WorkerError,
+    ) -> DataResponseHeaderProto {
         DataResponseHeaderProto {
             client: Some(header.and_then(|h| h.client).unwrap_or_else(Self::default_client)),
-            error: Some(Self::unimplemented_error(operation)),
+            error: Some(Self::error_detail(&error)),
+        }
+    }
+
+    fn ok_response_header(header: Option<DataRequestHeaderProto>) -> DataResponseHeaderProto {
+        DataResponseHeaderProto {
+            client: Some(header.and_then(|h| h.client).unwrap_or_else(Self::default_client)),
+            error: None,
         }
     }
 
@@ -135,15 +64,37 @@ impl WorkerDataServiceImpl {
         }
     }
 
-    fn unimplemented_error(operation: &str) -> ErrorDetailProto {
+    fn error_detail(error: &WorkerError) -> ErrorDetailProto {
+        let fs_errno = match error {
+            WorkerError::InvalidArgument(_) => FsErrnoProto::FsErrnoEinval,
+            WorkerError::NotFound(_) => FsErrnoProto::FsErrnoEnoent,
+            WorkerError::PermissionDenied(_) => FsErrnoProto::FsErrnoEacces,
+            WorkerError::ResourceExhausted(_) => FsErrnoProto::FsErrnoEagain,
+            WorkerError::Unimplemented(_) => FsErrnoProto::FsErrnoEnotimpl,
+            _ => FsErrnoProto::FsErrnoEnotsup,
+        };
+        let error_class = if error.is_retryable() {
+            ErrorClassProto::ErrorClassRetryable
+        } else {
+            ErrorClassProto::ErrorClassFatal
+        };
+
         ErrorDetailProto {
-            error_class: ErrorClassProto::ErrorClassFatal as i32,
-            code: Some(error_detail_proto::Code::FsErrno(FsErrnoProto::FsErrnoEnotimpl as i32)),
+            error_class: error_class as i32,
+            code: Some(error_detail_proto::Code::FsErrno(fs_errno as i32)),
             refresh_reason: RefreshReasonProto::RefreshReasonUnknown as i32,
-            retry_after_ms: None,
-            message: format!("{operation} stream-v2 worker execution is not implemented in phase 1"),
+            retry_after_ms: error.metadata().retry_after_ms,
+            message: error.to_string(),
             refresh_hint: None,
         }
+    }
+
+    fn unimplemented_status(operation: &'static str) -> Status {
+        Status::unimplemented(format!("{operation} worker core is not implemented"))
+    }
+
+    pub(crate) fn write_stream_placeholder_status() -> Status {
+        Self::unimplemented_status("WriteStream")
     }
 }
 
@@ -156,24 +107,47 @@ impl WorkerDataService for WorkerDataServiceImpl {
         request: Request<OpenReadStreamRequestProto>,
     ) -> Result<Response<OpenReadStreamResponseProto>, Status> {
         let request = request.into_inner();
-        Ok(Response::new(OpenReadStreamResponseProto {
-            header: Some(Self::placeholder_header(request.header, "OpenReadStream")),
-            stream_id: None,
-            frame_size: 0,
-            window_bytes: 0,
-            block_stamp: 0,
-            committed_length: 0,
-            chunk_size: self.layout.chunk_size,
-        }))
+        let header = request.header.clone();
+        let response = match proto_to_read_open_request(request) {
+            Ok(domain) => match self.core.open_read(domain).await {
+                Ok(result) => OpenReadStreamResponseProto {
+                    header: Some(Self::ok_response_header(header)),
+                    stream_id: Some(stream_id_to_proto(result.stream_id)),
+                    frame_size: result.frame_size,
+                    window_bytes: result.window_bytes,
+                    block_stamp: result.block_stamp,
+                    committed_length: result.committed_length,
+                    chunk_size: result.chunk_size,
+                },
+                Err(error) => OpenReadStreamResponseProto {
+                    header: Some(Self::placeholder_response_header(header, error)),
+                    stream_id: None,
+                    frame_size: 0,
+                    window_bytes: 0,
+                    block_stamp: 0,
+                    committed_length: 0,
+                    chunk_size: self.core.chunk_size(),
+                },
+            },
+            Err(error) => OpenReadStreamResponseProto {
+                header: Some(Self::placeholder_response_header(header, error)),
+                stream_id: None,
+                frame_size: 0,
+                window_bytes: 0,
+                block_stamp: 0,
+                committed_length: 0,
+                chunk_size: self.core.chunk_size(),
+            },
+        };
+
+        Ok(Response::new(response))
     }
 
     async fn read_stream(
         &self,
         _request: Request<ReadStreamRequestProto>,
     ) -> Result<Response<Self::ReadStreamStream>, Status> {
-        Err(Status::unimplemented(
-            "ReadStream stream-v2 worker execution is not implemented in phase 1",
-        ))
+        Err(Self::unimplemented_status("ReadStream"))
     }
 
     async fn open_write_stream(
@@ -181,24 +155,47 @@ impl WorkerDataService for WorkerDataServiceImpl {
         request: Request<OpenWriteStreamRequestProto>,
     ) -> Result<Response<OpenWriteStreamResponseProto>, Status> {
         let request = request.into_inner();
-        Ok(Response::new(OpenWriteStreamResponseProto {
-            header: Some(Self::placeholder_header(request.header, "OpenWriteStream")),
-            stream_id: None,
-            frame_size: 0,
-            window_bytes: 0,
-            block_stamp: 0,
-            committed_length: 0,
-            chunk_size: self.layout.chunk_size,
-        }))
+        let header = request.header.clone();
+        let response = match proto_to_write_open_request(request) {
+            Ok(domain) => match self.core.open_write(domain).await {
+                Ok(result) => OpenWriteStreamResponseProto {
+                    header: Some(Self::ok_response_header(header)),
+                    stream_id: Some(stream_id_to_proto(result.stream_id)),
+                    frame_size: result.frame_size,
+                    window_bytes: result.window_bytes,
+                    block_stamp: result.block_stamp,
+                    committed_length: result.committed_length,
+                    chunk_size: result.chunk_size,
+                },
+                Err(error) => OpenWriteStreamResponseProto {
+                    header: Some(Self::placeholder_response_header(header, error)),
+                    stream_id: None,
+                    frame_size: 0,
+                    window_bytes: 0,
+                    block_stamp: 0,
+                    committed_length: 0,
+                    chunk_size: self.core.chunk_size(),
+                },
+            },
+            Err(error) => OpenWriteStreamResponseProto {
+                header: Some(Self::placeholder_response_header(header, error)),
+                stream_id: None,
+                frame_size: 0,
+                window_bytes: 0,
+                block_stamp: 0,
+                committed_length: 0,
+                chunk_size: self.core.chunk_size(),
+            },
+        };
+
+        Ok(Response::new(response))
     }
 
     async fn write_stream(
         &self,
         _request: Request<tonic::Streaming<WriteStreamRequestProto>>,
     ) -> Result<Response<WriteStreamResponseProto>, Status> {
-        Err(Status::unimplemented(
-            "WriteStream stream-v2 worker execution is not implemented in phase 1",
-        ))
+        Err(Self::write_stream_placeholder_status())
     }
 
     async fn commit_write(
@@ -206,12 +203,31 @@ impl WorkerDataService for WorkerDataServiceImpl {
         request: Request<CommitWriteRequestProto>,
     ) -> Result<Response<CommitWriteResponseProto>, Status> {
         let request = request.into_inner();
-        Ok(Response::new(CommitWriteResponseProto {
-            header: Some(Self::placeholder_header(request.header, "CommitWrite")),
-            committed_length: 0,
-            block_stamp: 0,
-            persisted_through: 0,
-        }))
+        let header = request.header.clone();
+        let response = match proto_to_commit_write_request(request) {
+            Ok(domain) => match self.core.commit_write(domain).await {
+                Ok(result) => CommitWriteResponseProto {
+                    header: Some(Self::ok_response_header(header)),
+                    committed_length: result.committed_length,
+                    block_stamp: result.block_stamp,
+                    persisted_through: result.persisted_through,
+                },
+                Err(error) => CommitWriteResponseProto {
+                    header: Some(Self::placeholder_response_header(header, error)),
+                    committed_length: 0,
+                    block_stamp: 0,
+                    persisted_through: 0,
+                },
+            },
+            Err(error) => CommitWriteResponseProto {
+                header: Some(Self::placeholder_response_header(header, error)),
+                committed_length: 0,
+                block_stamp: 0,
+                persisted_through: 0,
+            },
+        };
+
+        Ok(Response::new(response))
     }
 
     async fn abort_write(
@@ -219,9 +235,24 @@ impl WorkerDataService for WorkerDataServiceImpl {
         request: Request<AbortWriteRequestProto>,
     ) -> Result<Response<AbortWriteResponseProto>, Status> {
         let request = request.into_inner();
-        Ok(Response::new(AbortWriteResponseProto {
-            header: Some(Self::placeholder_header(request.header, "AbortWrite")),
-            aborted: false,
-        }))
+        let header = request.header.clone();
+        let response = match proto_to_abort_write_request(request) {
+            Ok(domain) => match self.core.abort_write(domain).await {
+                Ok(result) => AbortWriteResponseProto {
+                    header: Some(Self::ok_response_header(header)),
+                    aborted: result.aborted,
+                },
+                Err(error) => AbortWriteResponseProto {
+                    header: Some(Self::placeholder_response_header(header, error)),
+                    aborted: false,
+                },
+            },
+            Err(error) => AbortWriteResponseProto {
+                header: Some(Self::placeholder_response_header(header, error)),
+                aborted: false,
+            },
+        };
+
+        Ok(Response::new(response))
     }
 }

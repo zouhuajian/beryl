@@ -6,9 +6,22 @@
 #[cfg(test)]
 mod tests {
     use crate::block_store::BlockStore;
+    use crate::convert::{
+        proto_to_commit_write_request, proto_to_read_open_request, proto_to_write_frame, proto_to_write_open_request,
+    };
+    use crate::core::RangeMapper;
+    use crate::service::WorkerDataServiceImpl;
     use crate::ufs_fill::UfsFiller;
     use crate::volume_manager::VolumeManager;
     use bytes::Bytes;
+    use proto::common::{
+        BlockIdProto, ByteRangeProto, ClientInfoProto, ErrorClassProto, FencingTokenProto, FsErrnoProto, StreamIdProto,
+    };
+    use proto::worker::worker_data_service_server::WorkerDataService;
+    use proto::worker::{
+        AbortWriteRequestProto, CommitWriteRequestProto, DataRequestHeaderProto, OpenReadStreamRequestProto,
+        OpenWriteStreamRequestProto, ReadStreamRequestProto, WriteStreamRequestProto,
+    };
     use std::sync::Arc;
     use tempfile::TempDir;
     use types::chunk::{ByteRange, ChunkRef, ChunkSlice};
@@ -18,6 +31,337 @@ mod tests {
 
     fn create_test_layout() -> FileLayout {
         FileLayout::new(32 * 1024 * 1024, 1024 * 1024, 3) // 32MB blocks, 1MB chunks
+    }
+
+    fn test_block_id_proto() -> BlockIdProto {
+        BlockIdProto {
+            data_handle_id: 7,
+            block_index: 3,
+        }
+    }
+
+    fn test_stream_id_proto() -> StreamIdProto {
+        StreamIdProto { high: 1, low: 42 }
+    }
+
+    fn test_token_proto() -> FencingTokenProto {
+        FencingTokenProto {
+            block_id: Some(test_block_id_proto()),
+            owner: 9,
+            epoch: 11,
+        }
+    }
+
+    fn test_header() -> DataRequestHeaderProto {
+        DataRequestHeaderProto {
+            client: Some(ClientInfoProto {
+                call_id: "call-1".to_string(),
+                client_id: 9,
+                client_name: "worker-test".to_string(),
+            }),
+            traceparent: String::new(),
+        }
+    }
+
+    fn assert_unimplemented_header(header: Option<proto::worker::DataResponseHeaderProto>) {
+        let error = header.expect("missing header").error.expect("missing error");
+        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
+        assert_eq!(
+            error.code,
+            Some(proto::common::error_detail_proto::Code::FsErrno(
+                FsErrnoProto::FsErrnoEnotimpl as i32
+            ))
+        );
+        assert!(error.message.contains("not implemented"));
+    }
+
+    #[test]
+    fn range_mapper_maps_range_inside_single_chunk() {
+        let slices = RangeMapper::map_range(ByteRange { offset: 100, len: 200 }, 1024).unwrap();
+
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].chunk_index, ChunkIndex::new(0));
+        assert_eq!(slices[0].offset_in_chunk, 100);
+        assert_eq!(slices[0].len, 200);
+    }
+
+    #[test]
+    fn range_mapper_maps_range_across_two_chunks() {
+        let slices = RangeMapper::map_range(ByteRange { offset: 900, len: 300 }, 1024).unwrap();
+
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0].chunk_index, ChunkIndex::new(0));
+        assert_eq!(slices[0].offset_in_chunk, 900);
+        assert_eq!(slices[0].len, 124);
+        assert_eq!(slices[1].chunk_index, ChunkIndex::new(1));
+        assert_eq!(slices[1].offset_in_chunk, 0);
+        assert_eq!(slices[1].len, 176);
+    }
+
+    #[test]
+    fn range_mapper_maps_range_starting_at_chunk_boundary() {
+        let slices = RangeMapper::map_range(ByteRange { offset: 1024, len: 100 }, 1024).unwrap();
+
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].chunk_index, ChunkIndex::new(1));
+        assert_eq!(slices[0].offset_in_chunk, 0);
+        assert_eq!(slices[0].len, 100);
+    }
+
+    #[test]
+    fn range_mapper_maps_empty_range_to_no_slices() {
+        let slices = RangeMapper::map_range(ByteRange { offset: 512, len: 0 }, 1024).unwrap();
+
+        assert!(slices.is_empty());
+    }
+
+    #[test]
+    fn range_mapper_maps_non_aligned_range() {
+        let slices = RangeMapper::map_range(
+            ByteRange {
+                offset: 1537,
+                len: 2000,
+            },
+            1024,
+        )
+        .unwrap();
+
+        assert_eq!(slices.len(), 3);
+        assert_eq!(slices[0].chunk_index, ChunkIndex::new(1));
+        assert_eq!(slices[0].offset_in_chunk, 513);
+        assert_eq!(slices[0].len, 511);
+        assert_eq!(slices[1].chunk_index, ChunkIndex::new(2));
+        assert_eq!(slices[1].offset_in_chunk, 0);
+        assert_eq!(slices[1].len, 1024);
+        assert_eq!(slices[2].chunk_index, ChunkIndex::new(3));
+        assert_eq!(slices[2].offset_in_chunk, 0);
+        assert_eq!(slices[2].len, 465);
+    }
+
+    #[test]
+    fn converts_open_read_stream_request_to_domain() {
+        let request = OpenReadStreamRequestProto {
+            header: Some(test_header()),
+            block_id: Some(test_block_id_proto()),
+            byte_range: Some(ByteRangeProto { offset: 128, len: 4096 }),
+            block_stamp: 0,
+            frame_size: 8192,
+        };
+
+        let domain = proto_to_read_open_request(request).unwrap();
+
+        assert_eq!(domain.block_id.data_handle_id, DataHandleId::new(7));
+        assert_eq!(domain.block_id.index, BlockIndex::new(3));
+        assert_eq!(domain.byte_range, ByteRange { offset: 128, len: 4096 });
+        assert_eq!(domain.block_stamp, 0);
+        assert_eq!(domain.frame_size, 8192);
+    }
+
+    #[test]
+    fn converts_open_write_stream_request_to_domain() {
+        let request = OpenWriteStreamRequestProto {
+            header: Some(test_header()),
+            block_id: Some(test_block_id_proto()),
+            token: Some(test_token_proto()),
+            block_stamp: 17,
+            frame_size: 8192,
+        };
+
+        let domain = proto_to_write_open_request(request).unwrap();
+
+        assert_eq!(domain.block_id.data_handle_id, DataHandleId::new(7));
+        assert_eq!(domain.token.owner, types::ClientId::new(9));
+        assert_eq!(domain.token.epoch, 11);
+        assert_eq!(domain.block_stamp, 17);
+        assert_eq!(domain.frame_size, 8192);
+    }
+
+    #[test]
+    fn converts_write_stream_request_to_domain_without_copying_payload() {
+        let data = Bytes::from_static(b"frame-data");
+        let request = WriteStreamRequestProto {
+            stream_id: Some(test_stream_id_proto()),
+            seq: 5,
+            offset_in_block: 2048,
+            data: data.clone(),
+            checksum32: 123,
+        };
+
+        let domain = proto_to_write_frame(request).unwrap();
+
+        assert_eq!(domain.stream_id.as_raw(), (1u128 << 64) | 42);
+        assert_eq!(domain.seq, 5);
+        assert_eq!(domain.offset_in_block, 2048);
+        assert_eq!(domain.data, data);
+        assert_eq!(domain.data.as_ptr(), data.as_ptr());
+        assert_eq!(domain.checksum32, 123);
+    }
+
+    #[test]
+    fn converts_commit_write_request_to_domain() {
+        let request = CommitWriteRequestProto {
+            header: Some(test_header()),
+            stream_id: Some(test_stream_id_proto()),
+            block_id: Some(test_block_id_proto()),
+            token: Some(test_token_proto()),
+            commit_seq: 8,
+            committed_length: 4096,
+            require_sync: true,
+        };
+
+        let domain = proto_to_commit_write_request(request).unwrap();
+
+        assert_eq!(domain.stream_id.as_raw(), (1u128 << 64) | 42);
+        assert_eq!(domain.block_id.data_handle_id, DataHandleId::new(7));
+        assert_eq!(domain.token.epoch, 11);
+        assert_eq!(domain.commit_seq, 8);
+        assert_eq!(domain.committed_length, 4096);
+        assert!(domain.require_sync);
+    }
+
+    #[test]
+    fn conversion_reports_missing_required_fields() {
+        let read_err = proto_to_read_open_request(OpenReadStreamRequestProto {
+            header: Some(test_header()),
+            block_id: None,
+            byte_range: Some(ByteRangeProto { offset: 0, len: 1 }),
+            block_stamp: 0,
+            frame_size: 1024,
+        })
+        .unwrap_err();
+        assert!(read_err.to_string().contains("missing block_id"));
+
+        let write_open_err = proto_to_write_open_request(OpenWriteStreamRequestProto {
+            header: Some(test_header()),
+            block_id: Some(test_block_id_proto()),
+            token: None,
+            block_stamp: 0,
+            frame_size: 1024,
+        })
+        .unwrap_err();
+        assert!(write_open_err.to_string().contains("missing token"));
+
+        let write_frame_err = proto_to_write_frame(WriteStreamRequestProto {
+            stream_id: None,
+            seq: 1,
+            offset_in_block: 0,
+            data: Bytes::new(),
+            checksum32: 0,
+        })
+        .unwrap_err();
+        assert!(write_frame_err.to_string().contains("missing stream_id"));
+
+        let commit_err = proto_to_commit_write_request(CommitWriteRequestProto {
+            header: Some(test_header()),
+            stream_id: None,
+            block_id: Some(test_block_id_proto()),
+            token: Some(test_token_proto()),
+            commit_seq: 1,
+            committed_length: 1,
+            require_sync: false,
+        })
+        .unwrap_err();
+        assert!(commit_err.to_string().contains("missing stream_id"));
+    }
+
+    #[tokio::test]
+    async fn service_open_and_commit_placeholders_return_data_header_errors() {
+        let service = WorkerDataServiceImpl::new(FileLayout::new(8192, 1024, 1));
+
+        let open_read = service
+            .open_read_stream(tonic::Request::new(OpenReadStreamRequestProto {
+                header: Some(test_header()),
+                block_id: Some(test_block_id_proto()),
+                byte_range: Some(ByteRangeProto { offset: 0, len: 1024 }),
+                block_stamp: 0,
+                frame_size: 1024,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_unimplemented_header(open_read.header);
+
+        let open_write = service
+            .open_write_stream(tonic::Request::new(OpenWriteStreamRequestProto {
+                header: Some(test_header()),
+                block_id: Some(test_block_id_proto()),
+                token: Some(test_token_proto()),
+                block_stamp: 0,
+                frame_size: 1024,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_unimplemented_header(open_write.header);
+
+        let commit = service
+            .commit_write(tonic::Request::new(CommitWriteRequestProto {
+                header: Some(test_header()),
+                stream_id: Some(test_stream_id_proto()),
+                block_id: Some(test_block_id_proto()),
+                token: Some(test_token_proto()),
+                commit_seq: 1,
+                committed_length: 1024,
+                require_sync: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_unimplemented_header(commit.header);
+
+        let abort = service
+            .abort_write(tonic::Request::new(AbortWriteRequestProto {
+                header: Some(test_header()),
+                stream_id: Some(test_stream_id_proto()),
+                block_id: Some(test_block_id_proto()),
+                token: Some(test_token_proto()),
+                reason: "client cancelled".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_unimplemented_header(abort.header);
+    }
+
+    #[tokio::test]
+    async fn service_stream_placeholders_return_unimplemented_status() {
+        let service = WorkerDataServiceImpl::new(FileLayout::new(8192, 1024, 1));
+
+        let read_status = match service
+            .read_stream(tonic::Request::new(ReadStreamRequestProto {
+                stream_id: Some(test_stream_id_proto()),
+                max_bytes: 1024,
+            }))
+            .await
+        {
+            Ok(_) => panic!("ReadStream unexpectedly succeeded"),
+            Err(status) => status,
+        };
+        assert_eq!(read_status.code(), tonic::Code::Unimplemented);
+
+        let write_status = WorkerDataServiceImpl::write_stream_placeholder_status();
+        assert_eq!(write_status.code(), tonic::Code::Unimplemented);
+    }
+
+    #[test]
+    fn worker_data_proto_excludes_old_chunk_range_api() {
+        let proto = include_str!("../../proto/worker/data.proto");
+
+        for old_name in [
+            "ReadChunk",
+            "WriteChunk",
+            "ReadRange",
+            "ReadChunkRequestProto",
+            "WriteChunkRequestProto",
+            "ReadRangeRequestProto",
+            "ChunkDataProto",
+            "ChunkSliceProto",
+        ] {
+            assert!(
+                !proto.contains(old_name),
+                "{old_name} must stay out of worker data proto"
+            );
+        }
     }
 
     #[tokio::test]

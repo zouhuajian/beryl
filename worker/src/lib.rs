@@ -10,6 +10,7 @@ pub mod combo_validator;
 pub mod command_executor;
 pub mod config;
 pub mod convert;
+pub mod core;
 pub mod data_header;
 pub mod delete_op_log;
 pub mod error;
@@ -46,6 +47,11 @@ pub use config::{
     EvictionConfig, MetadataConfig, MetadataGroupConfig, OrphanConfig, ReplicationConfig, UfsConfig,
     VolumeHealthConfig, WorkerConfig,
 };
+pub use core::{
+    AbortWriteRequest, AbortWriteResult, BlockManagerCore, BlockStoreCore, CommitWriteRequest, CommitWriteResult,
+    RangeMapper, ReadFrame, ReadOpenRequest, ReadOpenResult, StorageChunkSlice, StreamContext, StreamMode, WorkerCore,
+    WorkerCoreResult, WriteFrame, WriteOpenRequest, WriteOpenResult,
+};
 pub use error::{ErrorMetadata, WorkerError};
 pub use eviction::{EvictionManager, EvictionMetrics, WatermarkConfig};
 pub use lifecycle::{Lifecycle, WorkerState};
@@ -55,7 +61,7 @@ pub use rebalance::RebalanceManager;
 pub use replication::GrpcReplicationClient;
 pub use rpc_server::RpcServer;
 pub use service::WorkerDataServiceImpl;
-pub use stream_manager::{StreamManager, StreamMode, StreamState};
+pub use stream_manager::{StreamManager, StreamState};
 pub use ufs_fill::UfsFiller;
 pub use volume_health::{VolumeHealthManager, VolumeHealthMetrics};
 pub use volume_manager::{VolumeInfo, VolumeManager, VolumeState};

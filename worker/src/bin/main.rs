@@ -4,9 +4,7 @@
 //! Worker main entry point.
 
 use anyhow::{Context, Result};
-use common::audit::AuditLogger;
 use common::observe::{init_observability, ObservabilityConfig, ServiceInfo};
-use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info};
 use transport::{GrpcTransport, NetTransportConfig};
@@ -69,12 +67,6 @@ async fn main() -> Result<()> {
     lifecycle
         .transition(WorkerState::Bootstrapping)
         .map_err(|e| anyhow::anyhow!("Failed to transition to Bootstrapping: {}", e))?;
-
-    // Initialize audit logger
-    let audit_dir = PathBuf::from(".");
-    let audit_logger = Arc::new(
-        AuditLogger::new(&audit_dir).map_err(|e| anyhow::anyhow!("Failed to initialize audit logger: {}", e))?,
-    );
 
     // Open volumes
     let volume_manager = Arc::new(VolumeManager::new());
@@ -151,8 +143,7 @@ async fn main() -> Result<()> {
         .transition(WorkerState::RpcServing)
         .map_err(|e| anyhow::anyhow!("Failed to transition to RpcServing: {}", e))?;
 
-    // Create worker service with replication if available
-    // Note: worker_id is defined here for use in both service and metadata client
+    // Worker identity is used by metadata registration.
     let worker_id = WorkerId::new(1); // TODO(worker): obtain worker_id from metadata instead of hardcoding
 
     // Create CommandExecutor with replication if available
@@ -240,25 +231,7 @@ async fn main() -> Result<()> {
         info!("RebalanceManager started");
     }
 
-    // Create worker service with replication if available
-    let service = if let Some(replication_client) = replication_client {
-        Arc::new(WorkerDataServiceImpl::with_replication(
-            Arc::clone(&block_store),
-            Arc::clone(&audit_logger),
-            layout.clone(),
-            worker_id,
-            worker_epoch,
-            replication_client,
-        ))
-    } else {
-        Arc::new(WorkerDataServiceImpl::new(
-            Arc::clone(&block_store),
-            Arc::clone(&audit_logger),
-            layout,
-            worker_id,
-            worker_epoch,
-        ))
-    };
+    let service = Arc::new(WorkerDataServiceImpl::new(layout));
 
     // Start RPC server
     let rpc_server = RpcServer::new(config.rpc_bind.clone(), Arc::clone(&service));
