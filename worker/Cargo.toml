@@ -11,9 +11,6 @@ path = "src/bin/main.rs"
 types = { path = "../types" }
 proto = { path = "../proto" }
 common = { path = "../common" }
-ufs = { path = "../ufs" }
-transport = { path = "../transport" }
-async-trait = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
@@ -25,23 +22,12 @@ thiserror = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
-metrics = { workspace = true }
 
 # Utilities
 bytes = { workspace = true }
-parking_lot = { workspace = true }
-dashmap = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-chrono = { workspace = true }
-libc = { workspace = true }
-uuid = { workspace = true }
-rand = { workspace = true }
 
 # RPC
 tonic = { workspace = true }
-prost = { workspace = true }
-async-stream = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

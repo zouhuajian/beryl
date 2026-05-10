@@ -4474,30 +4474,16 @@ name = "worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-stream",
- "async-trait",
  "bytes",
- "chrono",
  "common",
- "dashmap",
  "futures",
- "libc",
- "metrics",
- "parking_lot",
- "prost",
  "proto",
- "rand 0.8.5",
- "serde",
- "serde_json",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "tonic",
  "tracing",
- "transport",
  "types",
- "ufs",
- "uuid",
 ]
 
 [[package]]

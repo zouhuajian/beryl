@@ -1,36 +1,49 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Unit tests for worker components.
+//! Unit tests for the worker data-plane skeleton.
 
 #[cfg(test)]
 mod tests {
-    use crate::block_store::BlockStore;
-    use crate::convert::{
-        proto_to_commit_write_request, proto_to_read_open_request, proto_to_write_frame, proto_to_write_open_request,
-    };
-    use crate::core::RangeMapper;
-    use crate::service::WorkerDataServiceImpl;
-    use crate::ufs_fill::UfsFiller;
-    use crate::volume_manager::VolumeManager;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
     use bytes::Bytes;
     use proto::common::{
-        BlockIdProto, ByteRangeProto, ClientInfoProto, ErrorClassProto, FencingTokenProto, FsErrnoProto, StreamIdProto,
+        error_detail_proto, BlockIdProto, ByteRangeProto, ClientInfoProto, ErrorClassProto, FencingTokenProto,
+        FsErrnoProto, StreamIdProto,
     };
     use proto::worker::worker_data_service_server::WorkerDataService;
     use proto::worker::{
-        AbortWriteRequestProto, CommitWriteRequestProto, DataRequestHeaderProto, OpenReadStreamRequestProto,
-        OpenWriteStreamRequestProto, ReadStreamRequestProto, WriteStreamRequestProto,
+        AbortWriteRequestProto, CommitWriteRequestProto, DataRequestHeaderProto, DataResponseHeaderProto,
+        OpenReadStreamRequestProto, OpenWriteStreamRequestProto, ReadStreamRequestProto, WriteStreamRequestProto,
     };
-    use std::sync::Arc;
-    use tempfile::TempDir;
-    use types::chunk::{ByteRange, ChunkRef, ChunkSlice};
-    use types::ids::{BlockId, BlockIndex, ChunkIndex, DataHandleId, ShardGroupId};
-    use types::layout::FileLayout;
-    use types::ClientId;
+    use types::chunk::ByteRange;
+    use types::ids::{BlockId, BlockIndex, ChunkIndex, ClientId, DataHandleId, StreamId};
+    use types::lease::FencingToken;
 
-    fn create_test_layout() -> FileLayout {
-        FileLayout::new(32 * 1024 * 1024, 1024 * 1024, 3) // 32MB blocks, 1MB chunks
+    use crate::data::convert::{
+        proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_open_request, proto_to_write_frame,
+        proto_to_write_open_request,
+    };
+    use crate::data::core::{
+        AbortWriteRequest, CommitWriteRequest, RangeMapper, ReadOpenRequest, StreamContext, StreamMode, WorkerCore,
+        WorkerCoreResult, WriteFrame, WriteOpenRequest,
+    };
+    use crate::data::service::WorkerDataServiceImpl;
+    use crate::error::WorkerError;
+    use crate::runtime::stream::{StreamManager, StreamState};
+
+    fn block_id() -> BlockId {
+        BlockId::new(DataHandleId::new(7), BlockIndex::new(3))
+    }
+
+    fn stream_id() -> StreamId {
+        StreamId::new((1u128 << 64) | 42)
+    }
+
+    fn token() -> FencingToken {
+        FencingToken::new(block_id(), ClientId::new(9), 11)
     }
 
     fn test_block_id_proto() -> BlockIdProto {
@@ -63,16 +76,76 @@ mod tests {
         }
     }
 
-    fn assert_unimplemented_header(header: Option<proto::worker::DataResponseHeaderProto>) {
+    fn assert_unimplemented<T: std::fmt::Debug>(result: WorkerCoreResult<T>, operation: &str) {
+        let error = result.expect_err("operation should be a placeholder");
+        match error {
+            WorkerError::Unimplemented(message) => {
+                assert!(message.contains(operation), "unexpected placeholder message: {message}")
+            }
+            other => panic!("expected Unimplemented, got {other:?}"),
+        }
+    }
+
+    fn assert_unimplemented_header(header: Option<DataResponseHeaderProto>) {
         let error = header.expect("missing header").error.expect("missing error");
         assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
         assert_eq!(
             error.code,
-            Some(proto::common::error_detail_proto::Code::FsErrno(
-                FsErrnoProto::FsErrnoEnotimpl as i32
-            ))
+            Some(error_detail_proto::Code::FsErrno(FsErrnoProto::FsErrnoEnotimpl as i32))
         );
         assert!(error.message.contains("not implemented"));
+    }
+
+    fn read_open_request() -> ReadOpenRequest {
+        ReadOpenRequest {
+            block_id: block_id(),
+            byte_range: ByteRange { offset: 128, len: 4096 },
+            block_stamp: 0,
+            frame_size: 8192,
+        }
+    }
+
+    fn write_open_request() -> WriteOpenRequest {
+        WriteOpenRequest {
+            block_id: block_id(),
+            token: token(),
+            block_stamp: 17,
+            frame_size: 8192,
+        }
+    }
+
+    fn commit_write_request() -> CommitWriteRequest {
+        CommitWriteRequest {
+            stream_id: stream_id(),
+            block_id: block_id(),
+            token: token(),
+            commit_seq: 8,
+            committed_length: 4096,
+            require_sync: true,
+        }
+    }
+
+    fn abort_write_request() -> AbortWriteRequest {
+        AbortWriteRequest {
+            stream_id: stream_id(),
+            block_id: block_id(),
+            token: token(),
+            reason: "client cancelled".to_string(),
+        }
+    }
+
+    fn stream_context() -> StreamContext {
+        StreamContext {
+            stream_id: stream_id(),
+            block_id: block_id(),
+            mode: StreamMode::Read,
+            frame_size: 8192,
+            window_bytes: 65_536,
+            block_stamp: 17,
+            committed_length: 4096,
+            byte_range: Some(ByteRange { offset: 0, len: 4096 }),
+            fencing_token: None,
+        }
     }
 
     #[test]
@@ -150,8 +223,7 @@ mod tests {
 
         let domain = proto_to_read_open_request(request).unwrap();
 
-        assert_eq!(domain.block_id.data_handle_id, DataHandleId::new(7));
-        assert_eq!(domain.block_id.index, BlockIndex::new(3));
+        assert_eq!(domain.block_id, block_id());
         assert_eq!(domain.byte_range, ByteRange { offset: 128, len: 4096 });
         assert_eq!(domain.block_stamp, 0);
         assert_eq!(domain.frame_size, 8192);
@@ -169,8 +241,8 @@ mod tests {
 
         let domain = proto_to_write_open_request(request).unwrap();
 
-        assert_eq!(domain.block_id.data_handle_id, DataHandleId::new(7));
-        assert_eq!(domain.token.owner, types::ClientId::new(9));
+        assert_eq!(domain.block_id, block_id());
+        assert_eq!(domain.token.owner, ClientId::new(9));
         assert_eq!(domain.token.epoch, 11);
         assert_eq!(domain.block_stamp, 17);
         assert_eq!(domain.frame_size, 8192);
@@ -189,7 +261,7 @@ mod tests {
 
         let domain = proto_to_write_frame(request).unwrap();
 
-        assert_eq!(domain.stream_id.as_raw(), (1u128 << 64) | 42);
+        assert_eq!(domain.stream_id, stream_id());
         assert_eq!(domain.seq, 5);
         assert_eq!(domain.offset_in_block, 2048);
         assert_eq!(domain.data, data);
@@ -198,8 +270,8 @@ mod tests {
     }
 
     #[test]
-    fn converts_commit_write_request_to_domain() {
-        let request = CommitWriteRequestProto {
+    fn converts_commit_and_abort_write_requests_to_domain() {
+        let commit = proto_to_commit_write_request(CommitWriteRequestProto {
             header: Some(test_header()),
             stream_id: Some(test_stream_id_proto()),
             block_id: Some(test_block_id_proto()),
@@ -207,20 +279,33 @@ mod tests {
             commit_seq: 8,
             committed_length: 4096,
             require_sync: true,
-        };
+        })
+        .unwrap();
 
-        let domain = proto_to_commit_write_request(request).unwrap();
+        assert_eq!(commit.stream_id, stream_id());
+        assert_eq!(commit.block_id, block_id());
+        assert_eq!(commit.token.epoch, 11);
+        assert_eq!(commit.commit_seq, 8);
+        assert_eq!(commit.committed_length, 4096);
+        assert!(commit.require_sync);
 
-        assert_eq!(domain.stream_id.as_raw(), (1u128 << 64) | 42);
-        assert_eq!(domain.block_id.data_handle_id, DataHandleId::new(7));
-        assert_eq!(domain.token.epoch, 11);
-        assert_eq!(domain.commit_seq, 8);
-        assert_eq!(domain.committed_length, 4096);
-        assert!(domain.require_sync);
+        let abort = proto_to_abort_write_request(AbortWriteRequestProto {
+            header: Some(test_header()),
+            stream_id: Some(test_stream_id_proto()),
+            block_id: Some(test_block_id_proto()),
+            token: Some(test_token_proto()),
+            reason: "client cancelled".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(abort.stream_id, stream_id());
+        assert_eq!(abort.block_id, block_id());
+        assert_eq!(abort.token.owner, ClientId::new(9));
+        assert_eq!(abort.reason, "client cancelled");
     }
 
     #[test]
-    fn conversion_reports_missing_required_fields() {
+    fn conversion_reports_missing_required_fields_without_panic() {
         let read_err = proto_to_read_open_request(OpenReadStreamRequestProto {
             header: Some(test_header()),
             block_id: None,
@@ -265,8 +350,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_core_open_commit_abort_placeholders_are_explicit() {
+        let core = WorkerCore::new(1024);
+
+        assert_unimplemented(core.open_read(read_open_request()).await, "OpenReadStream");
+        assert_unimplemented(core.open_write(write_open_request()).await, "OpenWriteStream");
+        assert_unimplemented(core.commit_write(commit_write_request()).await, "CommitWrite");
+        assert_unimplemented(core.abort_write(abort_write_request()).await, "AbortWrite");
+    }
+
+    #[tokio::test]
+    async fn worker_core_stream_placeholders_do_not_ack_data() {
+        let core = WorkerCore::new(1024);
+        let frame = WriteFrame {
+            stream_id: stream_id(),
+            seq: 1,
+            offset_in_block: 0,
+            data: Bytes::from_static(b"payload"),
+            checksum32: 0,
+        };
+
+        assert_unimplemented(core.read_frame(stream_id(), 1024).await, "ReadStream");
+        assert_unimplemented(core.read_stream(stream_id(), 1024).await, "ReadStream");
+        assert_unimplemented(core.write_frame(frame.clone()).await, "WriteStream");
+        assert_unimplemented(core.write_stream(frame).await, "WriteStream");
+    }
+
+    #[tokio::test]
     async fn service_open_and_commit_placeholders_return_data_header_errors() {
-        let service = WorkerDataServiceImpl::new(FileLayout::new(8192, 1024, 1));
+        let service = WorkerDataServiceImpl::new(Arc::new(WorkerCore::new(1024)));
 
         let open_read = service
             .open_read_stream(tonic::Request::new(OpenReadStreamRequestProto {
@@ -325,7 +437,7 @@ mod tests {
 
     #[tokio::test]
     async fn service_stream_placeholders_return_unimplemented_status() {
-        let service = WorkerDataServiceImpl::new(FileLayout::new(8192, 1024, 1));
+        let service = WorkerDataServiceImpl::new(Arc::new(WorkerCore::new(1024)));
 
         let read_status = match service
             .read_stream(tonic::Request::new(ReadStreamRequestProto {
@@ -343,9 +455,263 @@ mod tests {
         assert_eq!(write_status.code(), tonic::Code::Unimplemented);
     }
 
+    #[tokio::test]
+    async fn stream_manager_register_get_touch_remove_and_cleanup() {
+        let manager = StreamManager::new(Duration::from_millis(50));
+        let mut state = StreamState::new(stream_context());
+        state.last_activity = Instant::now() - Duration::from_secs(10);
+
+        manager.register(state.clone()).await;
+        assert_eq!(manager.active_count().await, 1);
+        assert_eq!(manager.get(stream_id()).await.unwrap().context.stream_id, stream_id());
+
+        assert!(manager.touch(stream_id()).await);
+        let touched = manager.get(stream_id()).await.unwrap();
+        assert!(touched.last_activity > state.last_activity);
+
+        manager.remove(stream_id()).await;
+        assert_eq!(manager.active_count().await, 0);
+
+        let mut idle = StreamState::new(stream_context());
+        idle.last_activity = Instant::now() - Duration::from_secs(10);
+        manager.register(idle).await;
+        assert_eq!(manager.cleanup_idle_streams().await, 1);
+        assert_eq!(manager.active_count().await, 0);
+    }
+
+    #[test]
+    fn worker_lib_exports_only_current_data_plane_surface() {
+        let lib = include_str!("lib.rs");
+
+        for old_module in [
+            "mod block_manager",
+            "mod block_store",
+            "mod convert",
+            "pub mod core",
+            "pub mod rpc_server",
+            "pub mod service",
+            "pub mod stream_manager",
+            "pub mod admin",
+            "pub mod combo_validator",
+            "pub mod command_executor",
+            "pub mod data_header",
+            "pub mod delete_op_log",
+            "pub mod eviction",
+            "pub mod lifecycle",
+            "pub mod metadata_client",
+            "pub mod orphan",
+            "pub mod pending_acks",
+            "pub mod pipeline",
+            "pub mod rebalance",
+            "pub mod replication",
+            "pub mod ufs_fill",
+            "pub mod volume_health",
+            "pub mod volume_manager",
+            "#[path",
+        ] {
+            assert!(
+                !lib.contains(old_module),
+                "{old_module} must stay out of worker lib exports"
+            );
+        }
+
+        for current_module in [
+            "pub mod config",
+            "pub mod data",
+            "pub mod error",
+            "pub mod runtime",
+            "pub mod store",
+        ] {
+            assert!(lib.contains(current_module), "lib.rs must declare {current_module}");
+        }
+    }
+
+    #[test]
+    fn worker_source_tree_matches_data_runtime_store_layout() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+        for required in [
+            "data/mod.rs",
+            "data/service.rs",
+            "data/convert.rs",
+            "data/core.rs",
+            "runtime/mod.rs",
+            "runtime/stream.rs",
+            "runtime/block.rs",
+            "store/mod.rs",
+            "store/block.rs",
+        ] {
+            assert!(src.join(required).exists(), "missing worker source file: {required}");
+        }
+
+        for removed in [
+            "ufs_fill.rs",
+            "replication.rs",
+            "rebalance.rs",
+            "eviction.rs",
+            "orphan.rs",
+            "command_executor.rs",
+            "pipeline.rs",
+            "delete_op_log.rs",
+            "pending_acks.rs",
+            "volume_health.rs",
+            "volume_manager.rs",
+            "metadata_client.rs",
+            "lifecycle.rs",
+            "combo_validator.rs",
+            "admin.rs",
+            "data_header.rs",
+            "rpc_server.rs",
+            "replication_tests.rs",
+            "tests/delete_op_log_tests.rs",
+        ] {
+            assert!(
+                !src.join(removed).exists(),
+                "remove inactive worker source file: {removed}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_and_binary_do_not_initialize_inactive_paths() {
+        let config = include_str!("config.rs");
+        let main = include_str!("bin/main.rs");
+
+        for forbidden in [
+            "UfsConfig",
+            "ReplicationConfig",
+            "EvictionConfig",
+            "OrphanConfig",
+            "VolumeHealthConfig",
+            "MetadataConfig",
+            "combo",
+            "fallback_transport",
+            "heartbeat",
+            "block_report",
+        ] {
+            assert!(
+                !config.contains(forbidden),
+                "config.rs must not retain inactive setting: {forbidden}"
+            );
+        }
+
+        for forbidden in [
+            "RpcServer",
+            "Ufs",
+            "Replication",
+            "MetadataClient",
+            "Rebalance",
+            "Eviction",
+            "Orphan",
+            "Lifecycle",
+            "Volume",
+        ] {
+            assert!(
+                !main.contains(forbidden),
+                "worker main must not initialize inactive path: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn core_does_not_import_wire_types() {
+        let core = include_str!("data/core.rs");
+
+        for forbidden in ["proto::", "prost", "tonic"] {
+            assert!(!core.contains(forbidden), "core.rs must not import {forbidden}");
+        }
+    }
+
+    #[test]
+    fn service_stays_adapter_only() {
+        let service = include_str!("data/service.rs");
+
+        for forbidden in [
+            "ufs",
+            "replication",
+            "tier",
+            "quorum",
+            "BlockStore",
+            "BlockManager",
+            "StreamManager",
+            "FileLayout",
+        ] {
+            assert!(
+                !service.contains(forbidden),
+                "service.rs must not depend on {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_manager_and_store_are_placeholders_without_real_io_or_replication() {
+        let block_manager = include_str!("runtime/block.rs");
+        let block_store = include_str!("store/block.rs");
+
+        for forbidden in [
+            "ReplicationClient",
+            "replicate",
+            "read_chunk",
+            "write_chunk",
+            "delete_block",
+        ] {
+            assert!(
+                !block_manager.contains(forbidden),
+                "block_manager.rs must not retain {forbidden}"
+            );
+        }
+
+        for forbidden in [
+            "tokio::fs",
+            "AsyncRead",
+            "AsyncWrite",
+            "std::fs",
+            "manifest",
+            "volume_manager",
+            ".chunk\"",
+        ] {
+            assert!(
+                !block_store.contains(forbidden),
+                "block_store.rs must not implement real local IO through {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_state_keeps_runtime_fields_out_of_open_context() {
+        let stream_manager = include_str!("runtime/stream.rs");
+        let core = include_str!("data/core.rs");
+
+        assert!(stream_manager.contains("pub context: StreamContext"));
+        assert!(
+            !core.contains("last_activity"),
+            "StreamContext must not carry runtime activity"
+        );
+
+        for duplicate in [
+            "pub chunk_size:",
+            "pub flow_control_window:",
+            "pub block_stamp:",
+            "pub committed_length:",
+        ] {
+            assert!(
+                !stream_manager.contains(duplicate),
+                "StreamState must not duplicate open context field {duplicate}"
+            );
+        }
+    }
+
     #[test]
     fn worker_data_proto_excludes_old_chunk_range_api() {
-        let proto = include_str!("../../proto/worker/data.proto");
+        let sources = [
+            include_str!("../../proto/worker/data.proto"),
+            include_str!("data/core.rs"),
+            include_str!("data/service.rs"),
+            include_str!("data/convert.rs"),
+            include_str!("runtime/block.rs"),
+            include_str!("store/block.rs"),
+            include_str!("lib.rs"),
+        ];
 
         for old_name in [
             "ReadChunk",
@@ -358,996 +724,29 @@ mod tests {
             "ChunkSliceProto",
         ] {
             assert!(
-                !proto.contains(old_name),
-                "{old_name} must stay out of worker data proto"
+                sources.iter().all(|source| !source.contains(old_name)),
+                "{old_name} must stay out of the worker data-plane skeleton"
             );
         }
     }
 
-    #[tokio::test]
-    async fn test_block_store_basic() {
-        let layout = create_test_layout();
-        let temp_dir = TempDir::new().unwrap();
-        let block_store_dir = temp_dir.path().join("block_store");
-        std::fs::create_dir_all(&block_store_dir).unwrap();
-
-        let volume_manager = Arc::new(VolumeManager::new());
-        volume_manager.open_volumes(&[block_store_dir.clone()]).unwrap();
-        let block_store = Arc::new(BlockStore::new(
-            volume_manager,
-            block_store_dir.join("manifest.json"),
-            layout.block_size,
-            layout.chunk_size,
-        ));
-        block_store.init().await.unwrap();
-
-        let data_handle_id = DataHandleId::new(1);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-        let chunk_idx = ChunkIndex::new(0);
-        let group_id = ShardGroupId::new(0);
-
-        // Write chunk
-        let data = Bytes::from(vec![1u8; 1024 * 1024]);
-        let chunk_ref = ChunkRef::new(block_id, chunk_idx.as_raw());
-        let mut stream = tokio::io::BufReader::new(std::io::Cursor::new(data.clone()));
-        block_store
-            .write_chunk_stream(group_id, chunk_ref, &mut stream)
-            .await
-            .unwrap();
-
-        // Read chunk
-        let slice = ChunkSlice {
-            chunk: ChunkRef::new(block_id, chunk_idx.as_raw()),
-            offset_in_chunk: 0,
-            len: layout.chunk_size,
-        };
-        let read_data = block_store.read_chunk_stream(group_id, slice).await.unwrap().unwrap();
-        assert_eq!(read_data, data);
-
-        // Check presence
-        assert!(block_store.has_chunk(group_id, block_id, chunk_idx));
-    }
-
-    #[tokio::test]
-    async fn test_block_store_slice_read() {
-        let layout = create_test_layout();
-        let temp_dir = TempDir::new().unwrap();
-        let block_store_dir = temp_dir.path().join("block_store");
-        std::fs::create_dir_all(&block_store_dir).unwrap();
-
-        let volume_manager = Arc::new(VolumeManager::new());
-        volume_manager.open_volumes(&[block_store_dir.clone()]).unwrap();
-        let block_store = Arc::new(BlockStore::new(
-            volume_manager,
-            block_store_dir.join("manifest.json"),
-            layout.block_size,
-            layout.chunk_size,
-        ));
-        block_store.init().await.unwrap();
-
-        let data_handle_id = DataHandleId::new(1);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-        let chunk_idx = ChunkIndex::new(0);
-        let group_id = ShardGroupId::new(0);
-
-        // Write chunk with known pattern
-        let mut data = vec![0u8; 1024 * 1024];
-        for i in 0..data.len() {
-            data[i] = (i % 256) as u8;
-        }
-        let chunk_ref = ChunkRef::new(block_id, chunk_idx.as_raw());
-        let mut stream = tokio::io::BufReader::new(std::io::Cursor::new(Bytes::from(data)));
-        block_store
-            .write_chunk_stream(group_id, chunk_ref, &mut stream)
-            .await
-            .unwrap();
-
-        // Read slice
-        let slice = ChunkSlice {
-            chunk: ChunkRef::new(block_id, chunk_idx.as_raw()),
-            offset_in_chunk: 100,
-            len: 50,
-        };
-        let slice_data = block_store.read_chunk_stream(group_id, slice).await.unwrap().unwrap();
-        assert_eq!(slice_data.len(), 50);
-        assert_eq!(slice_data[0], 100u8);
-    }
-
     #[test]
-    fn test_layout_range_split() {
-        let layout = create_test_layout();
-        let data_handle_id = DataHandleId::new(1);
+    fn active_worker_sources_do_not_use_staged_version_labels() {
+        let sources = [
+            include_str!("data/core.rs"),
+            include_str!("data/service.rs"),
+            include_str!("data/convert.rs"),
+            include_str!("runtime/stream.rs"),
+            include_str!("runtime/block.rs"),
+            include_str!("store/block.rs"),
+            include_str!("lib.rs"),
+        ];
 
-        // Test range that spans multiple chunks
-        let range = ByteRange {
-            offset: 500_000, // Start in middle of first chunk
-            len: 2_500_000,  // Span 3 chunks
-        };
-
-        let slices = layout.split_range_to_chunk_slices(data_handle_id, range);
-        assert_eq!(slices.len(), 3);
-
-        // First slice should start at offset 500_000 in chunk 0
-        assert_eq!(slices[0].chunk.chunk_idx, 0);
-        assert_eq!(slices[0].offset_in_chunk, 500_000);
-
-        // Last slice should end at offset 3_000_000
-        let last_slice = &slices[slices.len() - 1];
-        assert_eq!(last_slice.chunk.chunk_idx, 2);
-    }
-
-    #[test]
-    fn test_block_index_calculation() {
-        let layout = create_test_layout();
-        let block_size = 32 * 1024 * 1024; // 33_554_432 bytes
-
-        // Block 0: 0..32MB
-        assert_eq!(layout.block_index_from_offset(0).as_raw(), 0);
-        assert_eq!(layout.block_index_from_offset(16_000_000).as_raw(), 0);
-        assert_eq!(layout.block_index_from_offset(block_size - 1).as_raw(), 0);
-
-        // Block 1: 32MB..64MB
-        assert_eq!(layout.block_index_from_offset(block_size).as_raw(), 1);
-        assert_eq!(layout.block_index_from_offset(block_size + 1).as_raw(), 1);
-        assert_eq!(layout.block_index_from_offset(48_000_000).as_raw(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_ufs_filler() {
-        use crate::block_store::BlockStore;
-        use crate::volume_manager::VolumeManager;
-        use common::audit::AuditLogger;
-        use common::header::RequestHeader;
-        use std::io::Write;
-        use tempfile::TempDir;
-        use types::chunk::{ChunkRef, ChunkSlice};
-        use types::ids::ShardGroupId;
-        use types::ClientId;
-        use ufs::{BackendConfig, BackendKind, FsConfig, UfsId, UfsRegistry, UfsSpec};
-
-        let layout = create_test_layout();
-
-        // Create temporary directories
-        let temp_dir = TempDir::new().unwrap();
-        let ufs_root = temp_dir.path().join("ufs");
-        std::fs::create_dir_all(&ufs_root).unwrap();
-        let block_store_dir = temp_dir.path().join("block_store");
-        std::fs::create_dir_all(&block_store_dir).unwrap();
-        let audit_dir = temp_dir.path().join("audit");
-        std::fs::create_dir_all(&audit_dir).unwrap();
-
-        // Create UfsRegistry with a filesystem backend
-        let ufs_registry = Arc::new(UfsRegistry::new());
-        let ufs_spec = UfsSpec::new(
-            "test-ufs",
-            BackendKind::Fs,
-            BackendConfig::Fs(FsConfig {
-                root: ufs_root.to_string_lossy().to_string(),
-            }),
-        );
-        ufs_registry.upsert(ufs_spec).unwrap();
-
-        // Create BlockStore
-        let volume_manager = Arc::new(VolumeManager::new());
-        volume_manager.open_volumes(&[block_store_dir.clone()]).unwrap();
-        let block_store = Arc::new(BlockStore::new(
-            volume_manager,
-            block_store_dir.join("manifest.json"),
-            layout.block_size,
-            layout.chunk_size,
-        ));
-        block_store.init().await.unwrap();
-
-        // Create AuditLogger
-        let audit_logger = Arc::new(AuditLogger::new(&audit_dir).unwrap());
-
-        // Create UfsFiller
-        let filler = UfsFiller::new(
-            ufs_registry,
-            block_store.clone(),
-            audit_logger,
-            layout,
-            Some(UfsId::new("test-ufs")),
-            10,    // max_concurrent_per_ufs
-            5000,  // ufs_timeout_ms
-            false, // async_fill
-        );
-        filler.init_limiters(10);
-
-        let data_handle_id = DataHandleId::new(1);
-        // Seed UFS with a chunk so read-through has content.
-        let ufs_file_path = ufs_root.join(data_handle_id.as_raw().to_string());
-        let mut ufs_file = std::fs::File::create(&ufs_file_path).unwrap();
-        let test_data = vec![7u8; layout.chunk_size as usize];
-        ufs_file.write_all(&test_data).unwrap();
-        ufs_file.sync_all().unwrap();
-
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-        let chunk_idx = ChunkIndex::new(0);
-        let group_id = ShardGroupId::new(1);
-
-        // Create a chunk slice to read
-        let chunk_slice = ChunkSlice {
-            chunk: ChunkRef::new(block_id, chunk_idx.as_raw()),
-            offset_in_chunk: 0,
-            len: layout.chunk_size,
-        };
-
-        // Create caller context
-        let caller_ctx = RequestHeader::new(ClientId::new(1));
-
-        // Read chunk slice from UFS (will fill back to BlockStore)
-        let data = filler
-            .read_chunk_slice_stream(group_id, chunk_slice, &caller_ctx)
-            .await
-            .unwrap();
-
-        // Verify data was read
-        assert!(data.is_some());
-        assert_eq!(data.unwrap().len(), layout.chunk_size as usize);
-
-        // Verify chunk is now in BlockStore
-        assert!(block_store.has_chunk(group_id, block_id, chunk_idx));
-    }
-
-    // ========== Three-layer definition validation tests ==========
-
-    #[test]
-    fn test_range_to_chunks_unified() {
-        let layout = create_test_layout();
-        let data_handle_id = DataHandleId::new(1);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-
-        // Test 1: Range aligned to chunk boundaries
-        let chunks = crate::pipeline::range_to_chunks(&layout, block_id, 0, layout.chunk_size);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].0.as_raw(), 0);
-        assert_eq!(chunks[0].1, 0);
-        assert_eq!(chunks[0].2, layout.chunk_size);
-
-        // Test 2: Range spanning multiple chunks
-        let chunks = crate::pipeline::range_to_chunks(&layout, block_id, 500_000, 2_500_000);
-        assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[0].0.as_raw(), 0);
-        assert_eq!(chunks[0].1, 500_000);
-        assert_eq!(chunks[1].0.as_raw(), 1);
-        assert_eq!(chunks[1].1, 0);
-        assert_eq!(chunks[2].0.as_raw(), 2);
-        assert_eq!(chunks[2].1, 0);
-
-        // Test 3: Range at chunk boundary
-        let chunks = crate::pipeline::range_to_chunks(&layout, block_id, layout.chunk_size, layout.chunk_size);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].0.as_raw(), 1);
-        assert_eq!(chunks[0].1, 0);
-        assert_eq!(chunks[0].2, layout.chunk_size);
-
-        // Test 4: Range within single chunk (non-aligned)
-        let chunks = crate::pipeline::range_to_chunks(&layout, block_id, 100, 50);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].0.as_raw(), 0);
-        assert_eq!(chunks[0].1, 100);
-        assert_eq!(chunks[0].2, 50);
-
-        // Test 5: Empty range (len=0)
-        let chunks = crate::pipeline::range_to_chunks(&layout, block_id, 100, 0);
-        assert_eq!(chunks.len(), 0);
-
-        // Test 6: Range crossing block boundary (should handle gracefully)
-        let chunks = crate::pipeline::range_to_chunks(&layout, block_id, layout.block_size - 1000, 2000);
-        // Should return chunks within this block only
-        assert!(!chunks.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_streaming_write_with_chunk_merging() {
-        let layout = create_test_layout();
-        let temp_dir = TempDir::new().unwrap();
-        let block_store_dir = temp_dir.path().join("block_store");
-        std::fs::create_dir_all(&block_store_dir).unwrap();
-
-        let volume_manager = Arc::new(VolumeManager::new());
-        volume_manager.open_volumes(&[block_store_dir.clone()]).unwrap();
-        let block_store = Arc::new(BlockStore::new(
-            volume_manager,
-            block_store_dir.join("manifest.json"),
-            layout.block_size,
-            layout.chunk_size,
-        ));
-        block_store.init().await.unwrap();
-
-        let data_handle_id = DataHandleId::new(1);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-        let group_id = ShardGroupId::new(0);
-
-        // Write a full block (32MB) using small frames (128KB each) and merge into 1MB chunks.
-        // ChunkMerger keeps semantics aligned with the pipeline layer.
-        let frame_size = 128 * 1024; // 128KB frames
-        let num_frames = (layout.block_size as usize) / frame_size;
-        let mut merger = crate::pipeline::ChunkMerger::new(layout.chunk_size);
-        let mut current_chunk_idx = 0;
-
-        for frame_idx in 0..num_frames {
-            let frame_data = Bytes::from(vec![(frame_idx % 256) as u8; frame_size]);
-            if let Some(merged) = merger.add_chunk(frame_data) {
-                let chunk_idx = ChunkIndex::new(current_chunk_idx);
-                current_chunk_idx += 1;
-                let mut reader = std::io::Cursor::new(merged);
-                block_store
-                    .commit_chunk(group_id, block_id, chunk_idx, &mut reader)
-                    .await
-                    .unwrap();
-            }
+        for forbidden in [concat!("Pha", "se"), concat!("v", "1"), concat!("v", "2")] {
+            assert!(
+                sources.iter().all(|source| !source.contains(forbidden)),
+                "{forbidden} must stay out of active worker source text"
+            );
         }
-
-        // Flush remaining buffered data.
-        if let Some(merged) = merger.flush() {
-            let chunk_idx = ChunkIndex::new(current_chunk_idx);
-            let mut reader = std::io::Cursor::new(merged);
-            block_store
-                .commit_chunk(group_id, block_id, chunk_idx, &mut reader)
-                .await
-                .unwrap();
-        }
-
-        // Verify all chunks are committed
-        let block_meta = block_store.block_meta(group_id, block_id).unwrap().unwrap();
-        let expected_chunks = layout.chunks_per_block();
-        assert!(block_meta.is_complete(expected_chunks));
-
-        // Verify block metadata
-        assert_eq!(block_meta.committed_length, layout.block_size as u64);
-        assert_eq!(block_meta.total_size, layout.block_size as u64);
-
-        // Verify we can read back the data
-        for chunk_idx in 0..expected_chunks {
-            let data = block_store
-                .read_chunk(group_id, block_id, ChunkIndex::new(chunk_idx))
-                .await
-                .unwrap();
-            assert!(data.is_some());
-            assert_eq!(data.unwrap().len(), layout.chunk_size as usize);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_miss_fill_second_hit() {
-        use crate::block_store::BlockStore;
-        use crate::volume_manager::VolumeManager;
-        use common::audit::AuditLogger;
-        use common::header::RequestHeader;
-        use std::io::Write;
-        use tempfile::TempDir;
-        use types::chunk::{ChunkRef, ChunkSlice};
-        use types::ids::ShardGroupId;
-        use types::ClientId;
-        use ufs::{BackendConfig, BackendKind, FsConfig, UfsId, UfsRegistry, UfsSpec};
-
-        let layout = create_test_layout();
-
-        // Create temporary directories
-        let temp_dir = TempDir::new().unwrap();
-        let ufs_root = temp_dir.path().join("ufs");
-        std::fs::create_dir_all(&ufs_root).unwrap();
-        let block_store_dir = temp_dir.path().join("block_store");
-        std::fs::create_dir_all(&block_store_dir).unwrap();
-        let audit_dir = temp_dir.path().join("audit");
-        std::fs::create_dir_all(&audit_dir).unwrap();
-
-        // Create test file in UFS
-        let data_handle_id = DataHandleId::new(1);
-        let ufs_file_path = ufs_root.join(data_handle_id.as_raw().to_string());
-        let mut ufs_file = std::fs::File::create(&ufs_file_path).unwrap();
-        let test_data = vec![42u8; layout.chunk_size as usize];
-        ufs_file.write_all(&test_data).unwrap();
-        ufs_file.sync_all().unwrap();
-
-        // Create UfsRegistry
-        let ufs_registry = Arc::new(UfsRegistry::new());
-        let ufs_spec = UfsSpec::new(
-            "test-ufs",
-            BackendKind::Fs,
-            BackendConfig::Fs(FsConfig {
-                root: ufs_root.to_string_lossy().to_string(),
-            }),
-        );
-        ufs_registry.upsert(ufs_spec).unwrap();
-
-        // Create BlockStore
-        let volume_manager = Arc::new(VolumeManager::new());
-        volume_manager.open_volumes(&[block_store_dir.clone()]).unwrap();
-        let block_store = Arc::new(BlockStore::new(
-            volume_manager,
-            block_store_dir.join("manifest.json"),
-            layout.block_size,
-            layout.chunk_size,
-        ));
-        block_store.init().await.unwrap();
-
-        // Create AuditLogger
-        let audit_logger = Arc::new(AuditLogger::new(&audit_dir).unwrap());
-
-        // Create UfsFiller
-        let filler = UfsFiller::new(
-            ufs_registry,
-            block_store.clone(),
-            audit_logger,
-            layout,
-            Some(UfsId::new("test-ufs")),
-            10,
-            5000,
-            false, // sync fill
-        );
-        filler.init_limiters(10);
-
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-        let chunk_idx = ChunkIndex::new(0);
-        let group_id = ShardGroupId::new(1);
-        let caller_ctx = RequestHeader::new(ClientId::new(1));
-
-        // First read: should miss and fill from UFS
-        let chunk_slice = ChunkSlice {
-            chunk: ChunkRef::new(block_id, chunk_idx.as_raw()),
-            offset_in_chunk: 0,
-            len: layout.chunk_size,
-        };
-
-        // Verify chunk is NOT in BlockStore initially
-        assert!(!block_store.has_chunk(group_id, block_id, chunk_idx));
-
-        // Read from UFS (will fill back)
-        let first_read = filler
-            .read_chunk_slice_stream(group_id, chunk_slice, &caller_ctx)
-            .await
-            .unwrap();
-        assert!(first_read.is_some());
-        assert_eq!(first_read.unwrap(), Bytes::from(test_data.clone()));
-
-        // Verify chunk is NOW in BlockStore
-        assert!(block_store.has_chunk(group_id, block_id, chunk_idx));
-
-        // Second read: should hit locally
-        let second_read = block_store.read_chunk(group_id, block_id, chunk_idx).await.unwrap();
-        assert!(second_read.is_some());
-        assert_eq!(second_read.unwrap(), Bytes::from(test_data));
-
-        // Verify both reads return identical data
-        // (already verified above, but explicit check)
-        let first_data = filler
-            .read_chunk_slice_stream(group_id, chunk_slice, &caller_ctx)
-            .await
-            .unwrap()
-            .unwrap();
-        let second_data = block_store
-            .read_chunk(group_id, block_id, chunk_idx)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(first_data, second_data);
-    }
-
-    #[tokio::test]
-    async fn test_block_report_aggregation() {
-        let layout = create_test_layout();
-        let temp_dir = TempDir::new().unwrap();
-        let block_store_dir = temp_dir.path().join("block_store");
-        std::fs::create_dir_all(&block_store_dir).unwrap();
-
-        let volume_manager = Arc::new(VolumeManager::new());
-        volume_manager.open_volumes(&[block_store_dir.clone()]).unwrap();
-        let block_store = Arc::new(BlockStore::new(
-            volume_manager,
-            block_store_dir.join("manifest.json"),
-            layout.block_size,
-            layout.chunk_size,
-        ));
-        block_store.init().await.unwrap();
-
-        let data_handle_id = DataHandleId::new(1);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-        let group_id = ShardGroupId::new(0);
-
-        // Commit multiple chunks to the same block
-        let num_chunks = 5;
-        for chunk_idx in 0..num_chunks {
-            let chunk_data = Bytes::from(vec![chunk_idx as u8; layout.chunk_size as usize]);
-            let mut reader = std::io::Cursor::new(chunk_data);
-
-            block_store
-                .commit_chunk(group_id, block_id, ChunkIndex::new(chunk_idx), &mut reader)
-                .await
-                .unwrap();
-        }
-
-        // Get block metadata
-        let block_meta = block_store.block_meta(group_id, block_id).unwrap().unwrap();
-
-        // Verify block report is at block level (not chunk level)
-        let blocks = block_store.list_blocks(group_id);
-        assert_eq!(blocks.len(), 1); // Only one block
-
-        // Verify block metadata contains chunk bitmap
-        let committed_chunks: u32 = block_meta.chunk_bitmap.bits.iter().map(|b| b.count_ones()).sum();
-        assert_eq!(committed_chunks, num_chunks);
-
-        // Verify committed_length is sum of chunk sizes
-        assert_eq!(block_meta.committed_length, (num_chunks * layout.chunk_size) as u64);
-
-        // Verify block_id is correct
-        assert_eq!(blocks[0].block_id, block_id);
-
-        // Verify chunk bitmap reflects committed chunks
-        for chunk_idx in 0..num_chunks {
-            assert!(block_meta.has_chunk(chunk_idx));
-        }
-        // Verify uncommitted chunks are not in bitmap
-        for chunk_idx in num_chunks..layout.chunks_per_block() {
-            assert!(!block_meta.has_chunk(chunk_idx));
-        }
-    }
-
-    #[test]
-    fn test_chunk_merger() {
-        use crate::pipeline::ChunkMerger;
-        use bytes::Bytes;
-
-        let mut merger = ChunkMerger::new(1024 * 1024); // 1MB target
-
-        // Add small chunks (128KB each)
-        for i in 0..8 {
-            let chunk = Bytes::from(vec![i as u8; 128 * 1024]);
-            assert!(merger.add_chunk(chunk).is_none());
-        }
-
-        // Adding 9th chunk should trigger flush (8 * 128KB = 1MB)
-        let chunk = Bytes::from(vec![8u8; 128 * 1024]);
-        let merged = merger.add_chunk(chunk);
-        assert!(merged.is_some());
-        assert_eq!(merged.unwrap().len(), 1024 * 1024); // 1MB
-
-        // Flush remaining
-        let remaining = merger.flush();
-        assert!(remaining.is_some());
-        assert_eq!(remaining.unwrap().len(), 128 * 1024); // 128KB
-    }
-
-    // ========== BlockStore read/write tests ==========
-
-    #[tokio::test]
-    async fn test_block_store_read_range() {
-        let layout = create_test_layout();
-        let temp_dir = TempDir::new().unwrap();
-        let block_store_dir = temp_dir.path().join("block_store");
-        std::fs::create_dir_all(&block_store_dir).unwrap();
-
-        let volume_manager = Arc::new(VolumeManager::new());
-        volume_manager.open_volumes(&[block_store_dir.clone()]).unwrap();
-        let block_store = Arc::new(BlockStore::new(
-            volume_manager,
-            block_store_dir.join("manifest.json"),
-            layout.block_size,
-            layout.chunk_size,
-        ));
-        block_store.init().await.unwrap();
-
-        let data_handle_id = DataHandleId::new(1);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-        let group_id = ShardGroupId::new(0);
-
-        // Write multiple chunks
-        let num_chunks = 3;
-        let mut expected_data = Vec::new();
-        for chunk_idx in 0..num_chunks {
-            let chunk_data = vec![chunk_idx as u8; layout.chunk_size as usize];
-            expected_data.extend_from_slice(&chunk_data);
-            let mut reader = std::io::Cursor::new(Bytes::from(chunk_data));
-            block_store
-                .commit_chunk(group_id, block_id, ChunkIndex::new(chunk_idx), &mut reader)
-                .await
-                .unwrap();
-        }
-
-        // Read range spanning multiple chunks
-        let offset = layout.chunk_size / 2; // Start in middle of first chunk
-        let len = layout.chunk_size * 2; // Span 2 chunks
-        let mut reader = block_store
-            .read_range(group_id, block_id, offset, len)
-            .await
-            .unwrap()
-            .unwrap();
-
-        let mut read_data = Vec::new();
-        use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; 8192];
-        loop {
-            let n = reader.read(&mut buf).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            read_data.extend_from_slice(&buf[..n]);
-        }
-
-        // Verify data matches expected range
-        let start = offset as usize;
-        let end = (start + len as usize).min(expected_data.len());
-        assert_eq!(read_data, expected_data[start..end]);
-    }
-
-    #[tokio::test]
-    async fn test_block_store_write_multiple_chunks() {
-        let layout = create_test_layout();
-        let temp_dir = TempDir::new().unwrap();
-        let block_store_dir = temp_dir.path().join("block_store");
-        std::fs::create_dir_all(&block_store_dir).unwrap();
-
-        let volume_manager = Arc::new(VolumeManager::new());
-        volume_manager.open_volumes(&[block_store_dir.clone()]).unwrap();
-        let block_store = Arc::new(BlockStore::new(
-            volume_manager,
-            block_store_dir.join("manifest.json"),
-            layout.block_size,
-            layout.chunk_size,
-        ));
-        block_store.init().await.unwrap();
-
-        let data_handle_id = DataHandleId::new(1);
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-        let group_id = ShardGroupId::new(0);
-
-        // Write multiple chunks with different data patterns
-        let num_chunks = 5;
-        let mut written_chunks = Vec::new();
-        for chunk_idx in 0..num_chunks {
-            let chunk_data = Bytes::from(vec![(chunk_idx * 10) as u8; layout.chunk_size as usize]);
-            written_chunks.push(chunk_data.clone());
-            let chunk_ref = ChunkRef::new(block_id, ChunkIndex::new(chunk_idx).as_raw());
-            let mut stream = tokio::io::BufReader::new(std::io::Cursor::new(chunk_data));
-            block_store
-                .write_chunk_stream(group_id, chunk_ref, &mut stream)
-                .await
-                .unwrap();
-        }
-
-        // Verify all chunks are present
-        for chunk_idx in 0..num_chunks {
-            assert!(block_store.has_chunk(group_id, block_id, ChunkIndex::new(chunk_idx)));
-
-            // Verify data matches
-            let read_data = block_store
-                .read_chunk(group_id, block_id, ChunkIndex::new(chunk_idx))
-                .await
-                .unwrap();
-            assert!(read_data.is_some());
-            assert_eq!(read_data.unwrap(), written_chunks[chunk_idx as usize]);
-        }
-
-        // Verify block metadata
-        let block_meta = block_store.block_meta(group_id, block_id).unwrap().unwrap();
-        assert_eq!(block_meta.committed_length, (num_chunks * layout.chunk_size) as u64);
-    }
-
-    // ========== UFS Local filesystem tests ==========
-
-    #[tokio::test]
-    async fn test_ufs_read_write_local_fs() {
-        use common::header::RequestHeader;
-        use types::ClientId;
-        use ufs::{BackendConfig, BackendKind, FsConfig, UfsRegistry, UfsSpec};
-
-        let temp_dir = TempDir::new().unwrap();
-        let ufs_root = temp_dir.path().join("ufs");
-        std::fs::create_dir_all(&ufs_root).unwrap();
-
-        // Create UfsRegistry with Local filesystem backend
-        let ufs_registry = Arc::new(UfsRegistry::new());
-        let ufs_spec = UfsSpec::new(
-            "local-fs",
-            BackendKind::Fs,
-            BackendConfig::Fs(FsConfig {
-                root: ufs_root.to_string_lossy().to_string(),
-            }),
-        );
-        ufs_registry.upsert(ufs_spec).unwrap();
-
-        let ufs = ufs_registry.get(&ufs::UfsId::new("local-fs")).unwrap();
-        let ctx = RequestHeader::new(ClientId::new(1));
-
-        // Test write_all
-        let test_data = Bytes::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-        ufs.write_all("test_file.txt", test_data.clone(), &ctx).await.unwrap();
-
-        // Test read_all
-        let read_data = ufs.read_all("test_file.txt", &ctx).await.unwrap();
-        assert_eq!(read_data, test_data);
-
-        // Test read_range
-        let range_data = ufs.read_range("test_file.txt", 2, 4, &ctx).await.unwrap();
-        assert_eq!(range_data, Bytes::from(vec![3, 4, 5, 6]));
-
-        // Test stat
-        let status = ufs.stat("test_file.txt", &ctx).await.unwrap();
-        assert!(!status.is_dir);
-        assert_eq!(status.size, Some(10));
-
-        // Test exists
-        assert!(ufs.exists("test_file.txt", &ctx).await.unwrap());
-        assert!(!ufs.exists("nonexistent.txt", &ctx).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_ufs_fill_from_local_fs_large_file() {
-        use common::audit::AuditLogger;
-        use common::header::RequestHeader;
-        use std::io::Write;
-        use types::chunk::{ChunkRef, ChunkSlice};
-        use types::ClientId;
-        use ufs::{BackendConfig, BackendKind, FsConfig, UfsId, UfsRegistry, UfsSpec};
-
-        let layout = create_test_layout();
-        let temp_dir = TempDir::new().unwrap();
-        let ufs_root = temp_dir.path().join("ufs");
-        std::fs::create_dir_all(&ufs_root).unwrap();
-        let block_store_dir = temp_dir.path().join("block_store");
-        std::fs::create_dir_all(&block_store_dir).unwrap();
-        let audit_dir = temp_dir.path().join("audit");
-        std::fs::create_dir_all(&audit_dir).unwrap();
-
-        // Create large test file in UFS (multiple chunks)
-        let data_handle_id = DataHandleId::new(1);
-        let ufs_file_path = ufs_root.join(data_handle_id.as_raw().to_string());
-        let mut ufs_file = std::fs::File::create(&ufs_file_path).unwrap();
-        let num_chunks = 5;
-        for chunk_idx in 0..num_chunks {
-            let chunk_data = vec![(chunk_idx * 30) as u8; layout.chunk_size as usize];
-            ufs_file.write_all(&chunk_data).unwrap();
-        }
-        ufs_file.sync_all().unwrap();
-
-        // Create UfsRegistry
-        let ufs_registry = Arc::new(UfsRegistry::new());
-        let ufs_spec = UfsSpec::new(
-            "local-fs",
-            BackendKind::Fs,
-            BackendConfig::Fs(FsConfig {
-                root: ufs_root.to_string_lossy().to_string(),
-            }),
-        );
-        ufs_registry.upsert(ufs_spec).unwrap();
-
-        // Create BlockStore
-        let volume_manager = Arc::new(VolumeManager::new());
-        volume_manager.open_volumes(&[block_store_dir.clone()]).unwrap();
-        let block_store = Arc::new(BlockStore::new(
-            volume_manager,
-            block_store_dir.join("manifest.json"),
-            layout.block_size,
-            layout.chunk_size,
-        ));
-        block_store.init().await.unwrap();
-
-        // Create AuditLogger
-        let audit_logger = Arc::new(AuditLogger::new(&audit_dir).unwrap());
-
-        // Create UfsFiller
-        let filler = UfsFiller::new(
-            ufs_registry,
-            block_store.clone(),
-            audit_logger,
-            layout,
-            Some(UfsId::new("local-fs")),
-            10,
-            5000,
-            false, // sync fill
-        );
-        filler.init_limiters(10);
-
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-        let group_id = ShardGroupId::new(1);
-        let caller_ctx = RequestHeader::new(ClientId::new(1));
-
-        // Read and fill multiple chunks
-        for chunk_idx in 0..num_chunks {
-            let chunk_slice = ChunkSlice {
-                chunk: ChunkRef::new(block_id, ChunkIndex::new(chunk_idx).as_raw()),
-                offset_in_chunk: 0,
-                len: layout.chunk_size,
-            };
-
-            // Verify chunk is NOT in BlockStore initially
-            assert!(!block_store.has_chunk(group_id, block_id, ChunkIndex::new(chunk_idx)));
-
-            // Read from UFS (will fill back)
-            let data = filler
-                .read_chunk_slice_stream(group_id, chunk_slice, &caller_ctx)
-                .await
-                .unwrap();
-            assert!(data.is_some());
-            assert_eq!(data.unwrap().len(), layout.chunk_size as usize);
-
-            // Verify chunk is NOW in BlockStore
-            assert!(block_store.has_chunk(group_id, block_id, ChunkIndex::new(chunk_idx)));
-        }
-
-        // Verify all chunks are in BlockStore
-        let block_meta = block_store.block_meta(group_id, block_id).unwrap().unwrap();
-        assert_eq!(block_meta.committed_length, (num_chunks * layout.chunk_size) as u64);
-    }
-
-    #[tokio::test]
-    async fn test_ufs_fill_partial_chunk_slice() {
-        use common::audit::AuditLogger;
-        use common::header::RequestHeader;
-        use std::io::Write;
-        use types::chunk::{ChunkRef, ChunkSlice};
-        use types::ClientId;
-        use ufs::{BackendConfig, BackendKind, FsConfig, UfsId, UfsRegistry, UfsSpec};
-
-        let layout = create_test_layout();
-        let temp_dir = TempDir::new().unwrap();
-        let ufs_root = temp_dir.path().join("ufs");
-        std::fs::create_dir_all(&ufs_root).unwrap();
-        let block_store_dir = temp_dir.path().join("block_store");
-        std::fs::create_dir_all(&block_store_dir).unwrap();
-        let audit_dir = temp_dir.path().join("audit");
-        std::fs::create_dir_all(&audit_dir).unwrap();
-
-        // Create test file in UFS with known pattern
-        let data_handle_id = DataHandleId::new(1);
-        let ufs_file_path = ufs_root.join(data_handle_id.as_raw().to_string());
-        let mut ufs_file = std::fs::File::create(&ufs_file_path).unwrap();
-        let mut test_data = vec![0u8; layout.chunk_size as usize];
-        for i in 0..test_data.len() {
-            test_data[i] = (i % 256) as u8;
-        }
-        ufs_file.write_all(&test_data).unwrap();
-        ufs_file.sync_all().unwrap();
-
-        // Create UfsRegistry
-        let ufs_registry = Arc::new(UfsRegistry::new());
-        let ufs_spec = UfsSpec::new(
-            "local-fs",
-            BackendKind::Fs,
-            BackendConfig::Fs(FsConfig {
-                root: ufs_root.to_string_lossy().to_string(),
-            }),
-        );
-        ufs_registry.upsert(ufs_spec).unwrap();
-
-        // Create BlockStore
-        let volume_manager = Arc::new(VolumeManager::new());
-        volume_manager.open_volumes(&[block_store_dir.clone()]).unwrap();
-        let block_store = Arc::new(BlockStore::new(
-            volume_manager,
-            block_store_dir.join("manifest.json"),
-            layout.block_size,
-            layout.chunk_size,
-        ));
-        block_store.init().await.unwrap();
-
-        // Create AuditLogger
-        let audit_logger = Arc::new(AuditLogger::new(&audit_dir).unwrap());
-
-        // Create UfsFiller
-        let filler = UfsFiller::new(
-            ufs_registry,
-            block_store.clone(),
-            audit_logger,
-            layout,
-            Some(UfsId::new("local-fs")),
-            10,
-            5000,
-            false, // sync fill
-        );
-        filler.init_limiters(10);
-
-        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-        let chunk_idx = ChunkIndex::new(0);
-        let group_id = ShardGroupId::new(1);
-        let caller_ctx = RequestHeader::new(ClientId::new(1));
-
-        // Read partial slice (offset 100, len 200)
-        let chunk_slice = ChunkSlice {
-            chunk: ChunkRef::new(block_id, chunk_idx.as_raw()),
-            offset_in_chunk: 100,
-            len: 200,
-        };
-
-        let data = filler
-            .read_chunk_slice_stream(group_id, chunk_slice, &caller_ctx)
-            .await
-            .unwrap();
-        assert!(data.is_some());
-        let slice_data = data.unwrap();
-        assert_eq!(slice_data.len(), 200);
-
-        // Verify data matches expected slice
-        assert_eq!(slice_data[0], 100u8);
-        assert_eq!(slice_data[199], 43u8); // (100 + 199) % 256 = 43
-
-        // Verify full chunk is now in BlockStore (not just the slice)
-        assert!(block_store.has_chunk(group_id, block_id, chunk_idx));
-
-        // Verify we can read the full chunk
-        let full_chunk = block_store.read_chunk(group_id, block_id, chunk_idx).await.unwrap();
-        assert!(full_chunk.is_some());
-        assert_eq!(full_chunk.unwrap(), Bytes::from(test_data));
-    }
-
-    #[tokio::test]
-    async fn test_data_header_conversions() {
-        use crate::data_header::{DataRequestHeader, DataResponseHeader};
-        use common::header::ClientInfo;
-
-        // Test DataRequestHeader conversion
-        let client = ClientInfo::new(ClientId::new(123));
-        let req_header = DataRequestHeader::new(client.clone())
-            .with_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string());
-
-        let proto_req = req_header.to_proto();
-        assert!(proto_req.client.is_some());
-        assert_eq!(proto_req.client.as_ref().unwrap().client_id, 123);
-        assert_eq!(
-            proto_req.traceparent,
-            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-        );
-
-        let req_header_back = DataRequestHeader::from_proto(proto_req).unwrap();
-        assert_eq!(req_header_back.client.client_id.as_raw(), 123);
-        assert_eq!(
-            req_header_back.traceparent,
-            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string())
-        );
-
-        // Test DataResponseHeader conversion - OK
-        let resp_header_ok = DataResponseHeader::ok(client.clone());
-        let proto_resp_ok = resp_header_ok.to_proto();
-        // Success: error should be None
-        assert!(proto_resp_ok.error.is_none());
-
-        // Test DataResponseHeader conversion - NEED_REFRESH
-        let resp_header_refresh = DataResponseHeader::need_refresh(
-            client.clone(),
-            common::error::canonical::RefreshReason::BlockStampMismatch,
-            common::header::RpcErrorCode::BlockStampMismatch,
-            "Block stamp mismatch".to_string(),
-        );
-        let proto_resp_refresh = resp_header_refresh.to_proto();
-        assert!(proto_resp_refresh.error.is_some());
-        let error = proto_resp_refresh.error.unwrap();
-        assert_eq!(
-            error.error_class(),
-            proto::common::ErrorClassProto::ErrorClassNeedRefresh
-        );
-        assert_eq!(
-            error.refresh_reason(),
-            proto::common::RefreshReasonProto::RefreshReasonBlockStampMismatch
-        );
-        assert_eq!(error.message, "Block stamp mismatch");
-
-        // Test DataResponseHeader conversion - RETRYABLE
-        let resp_header_retry = DataResponseHeader::retryable(
-            client.clone(),
-            common::header::RpcErrorCode::NodeUnavailable,
-            Some(5000),
-            "Temporary failure".to_string(),
-        );
-        let proto_resp_retry = resp_header_retry.to_proto();
-        assert!(proto_resp_retry.error.is_some());
-        let error = proto_resp_retry.error.unwrap();
-        assert_eq!(error.error_class(), proto::common::ErrorClassProto::ErrorClassRetryable);
-        assert_eq!(error.retry_after_ms, Some(5000));
-        assert_eq!(error.message, "Temporary failure");
-
-        // Test DataResponseHeader conversion - FATAL
-        let resp_header_fatal = DataResponseHeader::fatal(
-            client,
-            common::header::RpcErrorCode::Application,
-            "Unrecoverable error".to_string(),
-        );
-        let proto_resp_fatal = resp_header_fatal.to_proto();
-        assert!(proto_resp_fatal.error.is_some());
-        let error = proto_resp_fatal.error.unwrap();
-        assert_eq!(error.error_class(), proto::common::ErrorClassProto::ErrorClassFatal);
-        assert_eq!(error.message, "Unrecoverable error");
     }
 }

@@ -17,13 +17,12 @@ use proto::worker::{
     WriteStreamRequestProto, WriteStreamResponseProto,
 };
 use tonic::{Request, Response, Status};
-use types::layout::FileLayout;
 
-use crate::convert::{
+use crate::data::convert::{
     proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_open_request,
     proto_to_write_open_request, stream_id_to_proto,
 };
-use crate::core::WorkerCore;
+use crate::data::core::WorkerCore;
 use crate::error::WorkerError;
 
 /// Worker data service implementation.
@@ -33,16 +32,11 @@ pub struct WorkerDataServiceImpl {
 }
 
 impl WorkerDataServiceImpl {
-    pub fn new(layout: FileLayout) -> Self {
-        Self {
-            core: Arc::new(WorkerCore::new(layout.chunk_size)),
-        }
+    pub fn new(core: Arc<WorkerCore>) -> Self {
+        Self { core }
     }
 
-    fn placeholder_response_header(
-        header: Option<DataRequestHeaderProto>,
-        error: WorkerError,
-    ) -> DataResponseHeaderProto {
+    fn error_response_header(header: Option<DataRequestHeaderProto>, error: WorkerError) -> DataResponseHeaderProto {
         DataResponseHeaderProto {
             client: Some(header.and_then(|h| h.client).unwrap_or_else(Self::default_client)),
             error: Some(Self::error_detail(&error)),
@@ -120,7 +114,7 @@ impl WorkerDataService for WorkerDataServiceImpl {
                     chunk_size: result.chunk_size,
                 },
                 Err(error) => OpenReadStreamResponseProto {
-                    header: Some(Self::placeholder_response_header(header, error)),
+                    header: Some(Self::error_response_header(header, error)),
                     stream_id: None,
                     frame_size: 0,
                     window_bytes: 0,
@@ -130,7 +124,7 @@ impl WorkerDataService for WorkerDataServiceImpl {
                 },
             },
             Err(error) => OpenReadStreamResponseProto {
-                header: Some(Self::placeholder_response_header(header, error)),
+                header: Some(Self::error_response_header(header, error)),
                 stream_id: None,
                 frame_size: 0,
                 window_bytes: 0,
@@ -168,7 +162,7 @@ impl WorkerDataService for WorkerDataServiceImpl {
                     chunk_size: result.chunk_size,
                 },
                 Err(error) => OpenWriteStreamResponseProto {
-                    header: Some(Self::placeholder_response_header(header, error)),
+                    header: Some(Self::error_response_header(header, error)),
                     stream_id: None,
                     frame_size: 0,
                     window_bytes: 0,
@@ -178,7 +172,7 @@ impl WorkerDataService for WorkerDataServiceImpl {
                 },
             },
             Err(error) => OpenWriteStreamResponseProto {
-                header: Some(Self::placeholder_response_header(header, error)),
+                header: Some(Self::error_response_header(header, error)),
                 stream_id: None,
                 frame_size: 0,
                 window_bytes: 0,
@@ -213,14 +207,14 @@ impl WorkerDataService for WorkerDataServiceImpl {
                     persisted_through: result.persisted_through,
                 },
                 Err(error) => CommitWriteResponseProto {
-                    header: Some(Self::placeholder_response_header(header, error)),
+                    header: Some(Self::error_response_header(header, error)),
                     committed_length: 0,
                     block_stamp: 0,
                     persisted_through: 0,
                 },
             },
             Err(error) => CommitWriteResponseProto {
-                header: Some(Self::placeholder_response_header(header, error)),
+                header: Some(Self::error_response_header(header, error)),
                 committed_length: 0,
                 block_stamp: 0,
                 persisted_through: 0,
@@ -243,12 +237,12 @@ impl WorkerDataService for WorkerDataServiceImpl {
                     aborted: result.aborted,
                 },
                 Err(error) => AbortWriteResponseProto {
-                    header: Some(Self::placeholder_response_header(header, error)),
+                    header: Some(Self::error_response_header(header, error)),
                     aborted: false,
                 },
             },
             Err(error) => AbortWriteResponseProto {
-                header: Some(Self::placeholder_response_header(header, error)),
+                header: Some(Self::error_response_header(header, error)),
                 aborted: false,
             },
         };

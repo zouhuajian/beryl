@@ -15,10 +15,6 @@ use types::ids::ShardGroupId;
 /// Worker error types.
 #[derive(Error, Debug, Clone)]
 pub enum WorkerError {
-    /// UFS (underlying file system) is unstable or unavailable.
-    #[error("UFS unstable: {0}")]
-    UfsUnstable(String),
-
     /// Leader changed (raft group leader election).
     #[error("Leader changed: {0}")]
     LeaderChanged(String),
@@ -86,17 +82,13 @@ impl WorkerError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            WorkerError::UfsUnstable(_)
-                | WorkerError::LeaderChanged(_)
-                | WorkerError::Timeout(_)
-                | WorkerError::ResourceExhausted(_)
+            WorkerError::LeaderChanged(_) | WorkerError::Timeout(_) | WorkerError::ResourceExhausted(_)
         )
     }
 
     /// Get error metadata.
     pub fn metadata(&self) -> ErrorMetadata {
         let (retryable, retry_after_ms, limit_type, leader_hint) = match self {
-            WorkerError::UfsUnstable(_) => (true, Some(1000), None, None),
             WorkerError::LeaderChanged(_) => (true, Some(500), None, None),
             WorkerError::Timeout(_) => (true, Some(100), None, None),
             WorkerError::ResourceExhausted(msg) => {
@@ -158,7 +150,6 @@ impl WorkerError {
     /// Convert to gRPC status code.
     fn to_grpc_code(&self) -> tonic::Code {
         match self {
-            WorkerError::UfsUnstable(_) => tonic::Code::Unavailable,
             WorkerError::LeaderChanged(_) => tonic::Code::Unavailable,
             WorkerError::ChunkConflict(_) => tonic::Code::FailedPrecondition,
             WorkerError::ResourceExhausted(_) => tonic::Code::ResourceExhausted,
@@ -214,9 +205,6 @@ impl From<WorkerError> for CanonicalError {
         match err {
             WorkerError::LeaderChanged(msg) => {
                 CanonicalError::need_refresh(RpcErrorCode::NotLeader, RefreshReason::NotLeader, msg)
-            }
-            WorkerError::UfsUnstable(msg) => {
-                CanonicalError::retryable(RpcErrorCode::NodeUnavailable, metadata.retry_after_ms, msg)
             }
             WorkerError::Timeout(msg) => {
                 CanonicalError::retryable(RpcErrorCode::Application, metadata.retry_after_ms, msg)
@@ -298,7 +286,6 @@ mod tests {
 
     #[test]
     fn test_retryable_errors() {
-        assert!(WorkerError::UfsUnstable("test".to_string()).is_retryable());
         assert!(WorkerError::LeaderChanged("test".to_string()).is_retryable());
         assert!(WorkerError::Timeout("test".to_string()).is_retryable());
         assert!(!WorkerError::ChunkConflict("test".to_string()).is_retryable());
@@ -307,10 +294,10 @@ mod tests {
 
     #[test]
     fn test_error_metadata() {
-        let err = WorkerError::UfsUnstable("test".to_string());
+        let err = WorkerError::LeaderChanged("leader moved".to_string());
         let metadata = err.metadata();
         assert!(metadata.retryable);
-        assert_eq!(metadata.retry_after_ms, Some(1000));
+        assert_eq!(metadata.retry_after_ms, Some(500));
 
         let err = WorkerError::ResourceExhausted("disk full".to_string());
         let metadata = err.metadata();
@@ -324,7 +311,7 @@ mod tests {
         let status = err.to_status();
         assert_eq!(status.code(), tonic::Code::NotFound);
 
-        let err = WorkerError::UfsUnstable("UFS unavailable".to_string());
+        let err = WorkerError::LeaderChanged("not leader".to_string());
         let status = err.to_status();
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert!(status.message().contains("retry_after_ms"));
