@@ -19,8 +19,8 @@ use tonic::{Request, Response, Status};
 
 /// Mock worker server for integration tests.
 ///
-/// Phase 1.1 keeps this mock intentionally limited to the Stream v2 wire
-/// surface. It does not emulate worker IO or preserve the removed v1 chunk RPCs.
+/// This mock stays intentionally limited to the stream wire surface.
+/// It does not emulate worker IO or preserve the removed chunk RPCs.
 #[derive(Clone)]
 pub struct MockWorkerServer {
     client_template: ClientInfoProto,
@@ -72,11 +72,11 @@ impl WorkerDataService for MockWorkerServer {
         Ok(Response::new(OpenReadStreamResponseProto {
             header: Some(self.placeholder_header(request.header, "OpenReadStream")),
             stream_id: None,
-            accepted_frame_size: 0,
-            flow_control_window_bytes: 0,
-            current_block_stamp: 0,
+            frame_size: 0,
+            window_bytes: 0,
+            block_stamp: 0,
             committed_length: 0,
-            storage_chunk_size: 0,
+            chunk_size: 0,
         }))
     }
 
@@ -97,11 +97,11 @@ impl WorkerDataService for MockWorkerServer {
         Ok(Response::new(OpenWriteStreamResponseProto {
             header: Some(self.placeholder_header(request.header, "OpenWriteStream")),
             stream_id: None,
-            accepted_frame_size: 0,
-            flow_control_window_bytes: 0,
-            current_block_stamp: 0,
+            frame_size: 0,
+            window_bytes: 0,
+            block_stamp: 0,
             committed_length: 0,
-            storage_chunk_size: 0,
+            chunk_size: 0,
         }))
     }
 
@@ -122,7 +122,7 @@ impl WorkerDataService for MockWorkerServer {
         Ok(Response::new(CommitWriteResponseProto {
             header: Some(self.placeholder_header(request.header, "CommitWrite")),
             committed_length: 0,
-            current_block_stamp: 0,
+            block_stamp: 0,
             persisted_through: 0,
         }))
     }

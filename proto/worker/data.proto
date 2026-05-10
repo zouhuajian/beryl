@@ -12,30 +12,62 @@ import "worker/data_header.proto";
 // Worker Data Service: block-local stream API
 // ============================================================================
 //
-// Block is the management, routing, reporting, replication, migration, eviction,
-// and repair task unit. StorageChunk is a worker-local storage, IO, checksum,
-// and valid-bitmap granularity. Repair/backfill operates on Blocks, but may
-// read, verify, transfer, and persist data in StorageChunk slices internally.
+// Block is the management, routing, reporting, replication, migration,
+// eviction, and repair task unit. StorageChunk is a worker-local IO,
+// checksum, and valid-bitmap granularity used inside block operations.
 // TransportFrame is represented by the stream request/response payloads below.
 // StorageChunk and TransportFrame are intentionally not encoded as the same
 // message.
 
 message OpenReadStreamRequestProto {
+  // Low-frequency data-plane control header.
+  // High-frequency ReadStream frames must not carry this header.
   worker.DataRequestHeaderProto header = 1;
+
+  // Target block. Worker data-plane APIs are block-local and must not parse
+  // file-level offsets or layouts.
   common.BlockIdProto block_id = 2;
-  common.ByteRangeProto range_in_block = 3;
-  uint64 expected_block_stamp = 4;
-  uint32 preferred_frame_size = 5;
+
+  // Block-local byte range to read. The offset is relative to block_id,
+  // not relative to the file/data handle.
+  common.ByteRangeProto byte_range = 3;
+
+  // Client-observed logical block stamp for direct-read validation.
+  // 0 means "skip stamp validation".
+  uint64 block_stamp = 4;
+
+  // Client-preferred transport frame payload size in bytes.
+  // The worker may clamp or adjust it and returns the accepted value.
+  // This is not the worker-local StorageChunk size.
+  uint32 frame_size = 5;
 }
 
 message OpenReadStreamResponseProto {
+  // Structured result for the Open phase.
+  // Business/protocol errors are encoded here with gRPC OK.
   worker.DataResponseHeaderProto header = 1;
+
+  // Stream session allocated by the worker. Valid only when header is OK.
   common.StreamIdProto stream_id = 2;
-  uint32 accepted_frame_size = 3;
-  uint32 flow_control_window_bytes = 4;
-  uint64 current_block_stamp = 5;
+
+  // Worker-accepted transport frame payload size in bytes.
+  // This controls network batching only and does not affect on-disk format.
+  uint32 frame_size = 3;
+
+  // Per-stream application-level in-flight byte window.
+  // This is separate from protocol-native flow control such as HTTP/2.
+  uint32 window_bytes = 4;
+
+  // Worker's current logical block stamp.
+  uint64 block_stamp = 5;
+
+  // Block-local readable committed prefix length in bytes.
+  // This is not the sum of ready chunks.
   uint64 committed_length = 6;
-  uint32 storage_chunk_size = 7;
+
+  // Worker-local StorageChunk size in bytes for this block/store format.
+  // Diagnostic only; not negotiated by Stream Open.
+  uint32 chunk_size = 7;
 }
 
 message ReadStreamRequestProto {
@@ -51,21 +83,50 @@ message ReadStreamResponseProto {
 }
 
 message OpenWriteStreamRequestProto {
+  // Low-frequency data-plane control header.
+  // High-frequency WriteStream frames must not carry this header.
   worker.DataRequestHeaderProto header = 1;
+
+  // Target block. Writes are block-local.
   common.BlockIdProto block_id = 2;
+
+  // Required fencing token issued by metadata.
+  // Worker must reject stale writers before accepting data frames.
   common.FencingTokenProto token = 3;
-  uint64 expected_block_stamp = 4;
-  uint32 preferred_frame_size = 5;
+
+  // Client-observed logical block stamp for write-open validation.
+  // 0 means "skip stamp validation".
+  uint64 block_stamp = 4;
+
+  // Client-preferred transport frame payload size in bytes.
+  // This is not the worker-local StorageChunk size.
+  uint32 frame_size = 5;
 }
 
 message OpenWriteStreamResponseProto {
+  // Structured result for the Open phase.
   worker.DataResponseHeaderProto header = 1;
+
+  // Stream session allocated by the worker. Valid only when header is OK.
   common.StreamIdProto stream_id = 2;
-  uint32 accepted_frame_size = 3;
-  uint32 flow_control_window_bytes = 4;
-  uint64 current_block_stamp = 5;
+
+  // Worker-accepted transport frame payload size in bytes.
+  uint32 frame_size = 3;
+
+  // Per-stream application-level in-flight byte window.
+  // The writer should not keep more than this many unacknowledged bytes
+  // outstanding for this stream.
+  uint32 window_bytes = 4;
+
+  // Worker's current logical block stamp.
+  uint64 block_stamp = 5;
+
+  // Block-local readable committed prefix length in bytes.
   uint64 committed_length = 6;
-  uint32 storage_chunk_size = 7;
+
+  // Worker-local StorageChunk size in bytes for this block/store format.
+  // Diagnostic only; not negotiated by Stream Open.
+  uint32 chunk_size = 7;
 }
 
 message WriteStreamRequestProto {
@@ -95,7 +156,11 @@ message CommitWriteRequestProto {
 message CommitWriteResponseProto {
   worker.DataResponseHeaderProto header = 1;
   uint64 committed_length = 2;
-  uint64 current_block_stamp = 3;
+
+  // Worker's current logical block stamp after commit.
+  uint64 block_stamp = 3;
+
+  // Highest byte offset persisted by the worker.
   uint64 persisted_through = 4;
 }
 

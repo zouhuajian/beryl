@@ -31,8 +31,8 @@ pub struct StreamState {
     pub block_id: BlockId,
     /// Stream mode (read/write).
     pub mode: StreamMode,
-    /// Range within block (for read streams).
-    pub range_in_block: Option<ByteRange>,
+    /// Block-local byte range for read streams.
+    pub byte_range: Option<ByteRange>,
     /// Current cursor/offset in the stream.
     pub cursor: u64,
     /// Negotiated chunk size.
@@ -61,7 +61,7 @@ impl StreamState {
         stream_id: StreamId,
         block_id: BlockId,
         mode: StreamMode,
-        range_in_block: Option<ByteRange>,
+        byte_range: Option<ByteRange>,
         chunk_size: u32,
         flow_control_window: u32,
         block_stamp: u64,
@@ -71,7 +71,7 @@ impl StreamState {
             stream_id,
             block_id,
             mode,
-            range_in_block,
+            byte_range,
             cursor: 0,
             chunk_size,
             flow_control_window,

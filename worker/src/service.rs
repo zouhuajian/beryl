@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! WorkerDataService v2 gRPC placeholder implementation.
+//! WorkerDataService gRPC placeholder implementation.
 //!
 //! This phase owns the wire-contract cutover only. The real block-local stream
-//! execution path is intentionally left for the next worker data-plane phase.
+//! execution path is intentionally left for a later worker data-plane phase.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -67,7 +67,7 @@ impl WorkerDataServiceImpl {
         }
     }
 
-    /// Create with replication client for later stream-v2 replication wiring.
+    /// Create with replication client for later stream replication wiring.
     pub fn with_replication(
         block_store: Arc<BlockStore>,
         audit_logger: Arc<AuditLogger>,
@@ -159,11 +159,11 @@ impl WorkerDataService for WorkerDataServiceImpl {
         Ok(Response::new(OpenReadStreamResponseProto {
             header: Some(Self::placeholder_header(request.header, "OpenReadStream")),
             stream_id: None,
-            accepted_frame_size: 0,
-            flow_control_window_bytes: 0,
-            current_block_stamp: 0,
+            frame_size: 0,
+            window_bytes: 0,
+            block_stamp: 0,
             committed_length: 0,
-            storage_chunk_size: self.layout.chunk_size,
+            chunk_size: self.layout.chunk_size,
         }))
     }
 
@@ -184,11 +184,11 @@ impl WorkerDataService for WorkerDataServiceImpl {
         Ok(Response::new(OpenWriteStreamResponseProto {
             header: Some(Self::placeholder_header(request.header, "OpenWriteStream")),
             stream_id: None,
-            accepted_frame_size: 0,
-            flow_control_window_bytes: 0,
-            current_block_stamp: 0,
+            frame_size: 0,
+            window_bytes: 0,
+            block_stamp: 0,
             committed_length: 0,
-            storage_chunk_size: self.layout.chunk_size,
+            chunk_size: self.layout.chunk_size,
         }))
     }
 
@@ -209,7 +209,7 @@ impl WorkerDataService for WorkerDataServiceImpl {
         Ok(Response::new(CommitWriteResponseProto {
             header: Some(Self::placeholder_header(request.header, "CommitWrite")),
             committed_length: 0,
-            current_block_stamp: 0,
+            block_stamp: 0,
             persisted_through: 0,
         }))
     }

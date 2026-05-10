@@ -52,7 +52,7 @@ fn block_id(data_handle_id: u64, block_index: u32) -> BlockIdProto {
     }
 }
 
-fn assert_stream_v2_unimplemented_header(header: DataResponseHeaderProto, operation: &str) {
+fn assert_stream_unimplemented_header(header: DataResponseHeaderProto, operation: &str) {
     let error = header.error.expect("placeholder response should carry error detail");
     assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
     assert_eq!(
@@ -62,7 +62,7 @@ fn assert_stream_v2_unimplemented_header(header: DataResponseHeaderProto, operat
     assert!(error.message.contains(operation));
 }
 
-/// Direct worker reads are Stream v2 placeholders until worker execution is wired.
+/// Direct worker reads are stream placeholders until worker execution is wired.
 #[tokio::test]
 async fn test_direct_worker_open_read_stream_is_explicitly_unimplemented() {
     init_logging();
@@ -71,9 +71,9 @@ async fn test_direct_worker_open_read_stream_is_explicitly_unimplemented() {
     let request = Request::new(OpenReadStreamRequestProto {
         header: Some(data_request_header("open-read-stream")),
         block_id: Some(block_id(100, 0)),
-        range_in_block: Some(ByteRangeProto { offset: 0, len: 9 }),
-        expected_block_stamp: 1,
-        preferred_frame_size: 4096,
+        byte_range: Some(ByteRangeProto { offset: 0, len: 9 }),
+        block_stamp: 1,
+        frame_size: 4096,
     });
 
     let response = WorkerDataService::open_read_stream(&mock_worker, request)
@@ -82,9 +82,9 @@ async fn test_direct_worker_open_read_stream_is_explicitly_unimplemented() {
         .into_inner();
 
     assert!(response.stream_id.is_none());
-    assert_eq!(response.accepted_frame_size, 0);
-    assert_eq!(response.flow_control_window_bytes, 0);
-    assert_stream_v2_unimplemented_header(response.header.expect("data header"), "OpenReadStream");
+    assert_eq!(response.frame_size, 0);
+    assert_eq!(response.window_bytes, 0);
+    assert_stream_unimplemented_header(response.header.expect("data header"), "OpenReadStream");
 }
 
 /// Test Msync with mock metadata server.
@@ -245,7 +245,7 @@ async fn test_mount_epoch_mismatch_refresh_and_retry() {
     assert!(outcome.result.0.canonical_error.is_none());
 }
 
-/// Direct worker writes are Stream v2 placeholders until worker execution is wired.
+/// Direct worker writes are stream placeholders until worker execution is wired.
 #[tokio::test]
 async fn test_direct_worker_open_write_stream_is_explicitly_unimplemented() {
     init_logging();
@@ -259,8 +259,8 @@ async fn test_direct_worker_open_write_stream_is_explicitly_unimplemented() {
             owner: 1,
             epoch: 1,
         }),
-        expected_block_stamp: 1,
-        preferred_frame_size: 4096,
+        block_stamp: 1,
+        frame_size: 4096,
     });
 
     let response = WorkerDataService::open_write_stream(&mock_worker, request)
@@ -269,9 +269,9 @@ async fn test_direct_worker_open_write_stream_is_explicitly_unimplemented() {
         .into_inner();
 
     assert!(response.stream_id.is_none());
-    assert_eq!(response.accepted_frame_size, 0);
-    assert_eq!(response.flow_control_window_bytes, 0);
-    assert_stream_v2_unimplemented_header(response.header.expect("data header"), "OpenWriteStream");
+    assert_eq!(response.frame_size, 0);
+    assert_eq!(response.window_bytes, 0);
+    assert_stream_unimplemented_header(response.header.expect("data header"), "OpenWriteStream");
 }
 
 /// CommitWrite is also a phase-1 placeholder and must not pretend data was persisted.
@@ -300,9 +300,9 @@ async fn test_direct_worker_commit_write_is_explicitly_unimplemented() {
         .into_inner();
 
     assert_eq!(response.committed_length, 0);
-    assert_eq!(response.current_block_stamp, 0);
+    assert_eq!(response.block_stamp, 0);
     assert_eq!(response.persisted_through, 0);
-    assert_stream_v2_unimplemented_header(response.header.expect("data header"), "CommitWrite");
+    assert_stream_unimplemented_header(response.header.expect("data header"), "CommitWrite");
 }
 
 /// Route moved: client must follow NEED_REFRESH/MOVED hint and retry.
