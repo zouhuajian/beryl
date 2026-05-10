@@ -11,11 +11,10 @@ use proto::common::{
     BlockMetaProto as ProtoBlockMeta, BlockPlacementProto as ProtoBlockPlacement, ByteRangeProto as ProtoByteRange,
     FencingTokenProto as ProtoFencingToken, FileLayoutProto as ProtoFileLayout,
 };
-use proto::worker::ChunkSliceProto as ProtoChunkSlice;
 use tonic::Status;
 
 use types::block::{BlockMeta, BlockPlacement, BlockState};
-use types::chunk::{ByteRange, ChunkRef, ChunkSlice};
+use types::chunk::{ByteRange, ChunkRef};
 use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, WorkerId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
@@ -60,32 +59,6 @@ pub fn byte_range_to_proto(range: &ByteRange) -> ProtoByteRange {
         len: range.len,
     }
 }
-
-// ========== ChunkSlice ==========
-
-pub fn proto_to_chunk_slice(proto: &ProtoChunkSlice) -> Result<ChunkSlice, Status> {
-    let chunk = proto
-        .chunk
-        .as_ref()
-        .ok_or_else(|| Status::invalid_argument("missing chunk in ChunkSlice"))?;
-    let chunk_ref = proto_to_chunk_ref(chunk)?;
-    Ok(ChunkSlice {
-        chunk: chunk_ref,
-        offset_in_chunk: proto.offset_in_chunk,
-        len: proto.len,
-    })
-}
-
-pub fn chunk_slice_to_proto(slice: &ChunkSlice) -> ProtoChunkSlice {
-    ProtoChunkSlice {
-        chunk: Some(chunk_ref_to_proto(&slice.chunk)),
-        offset_in_chunk: slice.offset_in_chunk,
-        len: slice.len,
-    }
-}
-
-// Legacy alias for backward compatibility during migration
-pub use chunk_ref_to_proto as chunk_ref_to_proto_legacy;
 
 // ========== FileLayout ==========
 

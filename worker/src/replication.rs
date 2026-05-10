@@ -15,13 +15,8 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 use common::observe::metrics::replication as replication_metrics;
-use common::{header::RequestHeader, Deadline};
-use proto::common::{BlockIdProto as ProtoBlockId, FencingTokenProto as ProtoFencingToken};
-use proto::worker::WriteChunkRequestProto;
-use transport::convert::chunk_data_to_proto;
 use transport::{GrpcConnection, GrpcTransport, NetTransport};
 use types::ids::{BlockId, ChunkIndex, ShardGroupId, WorkerId};
-use types::lease::FencingToken;
 use types::ClientId;
 
 use crate::block_manager::ReplicationClient;
@@ -170,100 +165,6 @@ impl GrpcReplicationClient {
         // Return first connection
         Ok(Arc::clone(&new_connections[0]))
     }
-
-    /// Create a WriteChunkRequest from chunk data.
-    fn create_write_request(
-        &self,
-        group_id: ShardGroupId,
-        block_id: BlockId,
-        chunk_idx: ChunkIndex,
-        data: Bytes,
-    ) -> Result<WriteChunkRequestProto> {
-        // Create chunk data
-        use types::chunk::{ChunkData, ChunkRef, ChunkSlice};
-        let chunk_ref = ChunkRef::new(block_id, chunk_idx.as_raw());
-        let chunk_slice = ChunkSlice {
-            chunk: chunk_ref,
-            offset_in_chunk: 0,
-            len: data.len() as u32,
-        };
-        let chunk_data = ChunkData {
-            slice: chunk_slice,
-            data,
-            checksum32: 0, // TODO: compute checksum
-        };
-
-        // Convert to proto
-        let proto_chunk_data = chunk_data_to_proto(&chunk_data);
-
-        // Create fencing token based on replication mode
-        let fencing_token = match self.config.fencing_mode.as_str() {
-            "strict" => {
-                // Strict mode: use block-based token
-                FencingToken::new(
-                    block_id,
-                    self.replication_client_id,
-                    1, // epoch
-                )
-            }
-            "special" => {
-                // Special mode: use special token if configured, otherwise default
-                // For now, use default token (in future, could use special_token value)
-                FencingToken::new(
-                    block_id,
-                    self.replication_client_id,
-                    1, // epoch
-                )
-            }
-            "skip" => {
-                // Skip mode: create a minimal token (will be bypassed on receiver)
-                FencingToken::new(
-                    block_id,
-                    self.replication_client_id,
-                    0, // epoch 0 indicates skip/bypass
-                )
-            }
-            _ => {
-                // Default to special mode
-                FencingToken::new(block_id, self.replication_client_id, 1)
-            }
-        };
-
-        let proto_fencing_token = ProtoFencingToken {
-            block_id: Some(ProtoBlockId {
-                data_handle_id: block_id.data_handle_id.as_raw(),
-                block_index: block_id.index.as_raw(),
-            }),
-            owner: fencing_token.owner.as_raw(),
-            epoch: fencing_token.epoch,
-        };
-
-        // Create request header
-        let ctx = RequestHeader::with_deadline(
-            self.replication_client_id,
-            Deadline::from_now(Duration::from_millis(self.config.chunk_timeout_ms as u64)),
-        );
-        let proto_header: proto::common::RequestHeaderProto = (&ctx).into();
-
-        // Generate write_id for idempotency
-        // Use a simple hash of the chunk info for idempotency
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        block_id.hash(&mut hasher);
-        chunk_idx.hash(&mut hasher);
-        let write_id = hasher.finish();
-
-        Ok(WriteChunkRequestProto {
-            token: Some(proto_fencing_token),
-            data: Some(proto_chunk_data),
-            write_id,
-            write_mode: proto::common::WriteModeProto::WriteModeBack as i32, // Default to write-back for replication
-            route_epoch: 0,
-            worker_epoch: 0,
-            file_version: 0,
-        })
-    }
 }
 
 impl ReplicationClient for GrpcReplicationClient {
@@ -297,40 +198,10 @@ impl ReplicationClient for GrpcReplicationClient {
             metrics::gauge!(replication_metrics::INFLIGHT_CHUNKS).increment(1.0);
 
             let result = async {
-                // Get connection
-                let connection = self
-                    .get_connection(target_worker)
-                    .await
-                    .context("Failed to get connection to target worker")?;
-
-                // Create write request
-                let write_request = self
-                    .create_write_request(group_id, block_id, chunk_idx, data)
-                    .context("Failed to create WriteChunkRequest")?;
-
-                // Create request context
-                let ctx = RequestHeader::with_deadline(
-                    self.replication_client_id,
-                    Deadline::from_now(Duration::from_millis(self.config.chunk_timeout_ms as u64)),
-                );
-
-                // Call WriteChunk via transport
-                let response = self
-                    .transport
-                    .call_write_chunk(&connection, write_request, ctx)
-                    .await
-                    .context("Failed to call WriteChunk via transport")?;
-
-                if response.stored {
-                    Ok(())
-                } else {
-                    Err(anyhow::anyhow!(
-                        "WriteChunk returned stored=false for worker {}, block {}, chunk {}",
-                        target_worker.as_raw(),
-                        block_id,
-                        chunk_idx.as_raw()
-                    ))
-                }
+                let _ = (group_id, block_id, chunk_idx, data);
+                Err(anyhow::anyhow!(
+                    "replication data transfer must be rewired to WorkerDataService stream v2"
+                ))
             }
             .await;
 

@@ -234,31 +234,9 @@ impl Client {
         if len == 0 || offset >= handle.file_size {
             return Ok(Bytes::new());
         }
-        let clipped_len = ((handle.file_size - offset).min(len as u64)) as u32;
-        let request = GetBlockLocationsRequestProto {
-            header: Some(self.request_header_proto()),
-            target: Some(get_block_locations_request_proto::Target::Path(handle.path.clone())),
-            range: Some(ByteRangeProto {
-                offset,
-                len: clipped_len,
-            }),
-        };
-        let response = self.call_filesystem(RpcOp::get_block_locations(request)).await?;
-        let read_plan = select_single_read_plan(&response.locations, offset, clipped_len)?;
-        let mut worker = WorkerClient::new(read_plan.worker, None).await?;
-        let ctx = self.request_header();
-        let (bytes, _version) = worker
-            .read_chunk(
-                &ctx,
-                types::chunk::ChunkRef::new(read_plan.block_id, 0),
-                read_plan.offset_in_block,
-                clipped_len,
-                handle.file_version,
-                self.config.default_read_mode,
-                None,
-            )
-            .await?;
-        Ok(bytes)
+        Err(ClientError::Unimplemented(
+            "HCFS direct read must be rewired to WorkerDataService stream v2".to_string(),
+        ))
     }
 
     /// Write to a file.
@@ -266,58 +244,10 @@ impl Client {
         if data.is_empty() {
             return Ok(());
         }
-        let data_len = data.len() as u64;
-        let write_handle = match self.prepare_write(handle, offset)? {
-            WriteStart::Ready(write_handle) => write_handle,
-            WriteStart::AbortUnsupported(write_handle) => {
-                self.abort_file_write(write_handle).await?;
-                return Err(ClientError::NotSupported(
-                    "HCFS MVP supports exactly one sequential write per create handle".to_string(),
-                ));
-            }
-        };
-
-        let target = match self.add_block(write_handle, data_len).await {
-            Ok(target) => target,
-            Err(err) => {
-                self.mark_aborted(handle);
-                let abort_result = self.abort_file_write(write_handle).await;
-                return match abort_result {
-                    Ok(()) => Err(err),
-                    Err(abort_err) => Err(ClientError::Metadata(format!(
-                        "AddBlock failed: {}; abort failed: {}",
-                        err, abort_err
-                    ))),
-                };
-            }
-        };
-
-        let write_result = self.write_target_to_worker(&target, data).await;
-        if let Err(write_err) = write_result {
-            self.mark_aborted(handle);
-            let abort_result = self.abort_file_write(write_handle).await;
-            return match abort_result {
-                Ok(()) => Err(write_err),
-                Err(abort_err) => Err(ClientError::Worker(format!(
-                    "worker write failed: {}; abort failed: {}",
-                    write_err, abort_err
-                ))),
-            };
-        }
-
-        let committed = committed_block_from_target(&target)?;
-        let mut state = handle.state.lock();
-        match &mut *state {
-            HandleState::Write(write) => {
-                write.committed_blocks.push(committed);
-                Ok(())
-            }
-            HandleState::Aborted => Err(ClientError::Metadata(
-                "write handle was aborted during write".to_string(),
-            )),
-            HandleState::Closed => Err(ClientError::Metadata("write handle is closed".to_string())),
-            HandleState::Read => Err(ClientError::Metadata("handle is not open for writing".to_string())),
-        }
+        let _ = (handle, offset);
+        Err(ClientError::Unimplemented(
+            "HCFS direct write must be rewired to WorkerDataService stream v2".to_string(),
+        ))
     }
 
     fn prepare_write(&self, handle: &Handle, offset: u64) -> ClientResult<WriteStart> {
@@ -352,59 +282,10 @@ impl Client {
     }
 
     async fn write_target_to_worker(&self, target: &WriteTargetProto, data: Bytes) -> ClientResult<()> {
-        let data_len = u32::try_from(data.len()).map_err(|_| {
-            ClientError::NotSupported("HCFS MVP single worker chunk write is limited to u32::MAX bytes".to_string())
-        })?;
-        if data.len() as u64 > target.len {
-            return Err(ClientError::Metadata(format!(
-                "worker write data length {} exceeds AddBlock target len {}",
-                data.len(),
-                target.len
-            )));
-        }
-        let block_id = block_id_from_proto(target.block_id, "WriteTargetProto.block_id")?;
-        let worker_endpoint = target
-            .worker_endpoints
-            .first()
-            .cloned()
-            .ok_or_else(|| ClientError::Metadata("WriteTargetProto has no worker endpoints".to_string()))?;
-        let token = target
-            .fencing_token
-            .ok_or_else(|| ClientError::Metadata("WriteTargetProto missing fencing_token".to_string()))?;
-        let worker_epoch = worker_endpoint.worker_epoch;
-        let mut worker = WorkerClient::new(WorkerEndpointInfo::from_proto(worker_endpoint), None).await?;
-        let request = proto::worker::WriteChunkRequestProto {
-            token: Some(token),
-            data: Some(proto::worker::ChunkDataProto {
-                slice: Some(proto::worker::ChunkSliceProto {
-                    chunk: Some(proto::common::ChunkIdProto {
-                        block: Some(block_id_to_proto(block_id)),
-                        chunk_index: 0,
-                    }),
-                    offset_in_chunk: 0,
-                    len: data_len,
-                }),
-                data,
-                checksum32: 0,
-            }),
-            write_id: self.next_write_id.fetch_add(1, Ordering::Relaxed),
-            write_mode: proto::common::WriteModeProto::from(self.config.default_write_mode) as i32,
-            route_epoch: 0,
-            worker_epoch,
-            file_version: 0,
-        };
-        let metadata_refresh = Box::new(move |_worker_id| {
-            Box::pin(async {
-                Err(ClientError::Metadata(
-                    "worker endpoint refresh is not wired for HCFS MVP write replay".to_string(),
-                ))
-            })
-                as std::pin::Pin<Box<dyn std::future::Future<Output = ClientResult<WorkerEndpointInfo>> + Send>>
-        });
-        worker
-            .write_chunk_with_refresh(&self.request_header(), request, metadata_refresh, None)
-            .await
-            .map(|_| ())
+        let _ = (target, data);
+        Err(ClientError::Unimplemented(
+            "HCFS worker write must be rewired to WorkerDataService stream v2".to_string(),
+        ))
     }
 
     /// Close a file handle.
@@ -623,17 +504,10 @@ pub struct FileStatus {
 mod tests {
     use super::*;
     use common::header::{ClientInfo, ResponseHeader};
-    use futures::Stream;
-    use proto::common::{BlockIdProto, ClientInfoProto, DataHandleIdProto, FencingTokenProto, WorkerEndpointInfoProto};
+    use proto::common::{DataHandleIdProto, FencingTokenProto};
     use proto::fs::InodeIdProto;
     use proto::metadata::file_system_service_proto_server::{FileSystemServiceProto, FileSystemServiceProtoServer};
-    use proto::metadata::get_block_locations_request_proto;
     use proto::metadata::*;
-    use proto::worker::worker_data_service_server::{WorkerDataService, WorkerDataServiceServer};
-    use proto::worker::*;
-    use std::collections::HashMap;
-    use std::net::SocketAddr;
-    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -651,40 +525,17 @@ mod tests {
     #[derive(Clone)]
     struct MockMetadata {
         state: Arc<Mutex<MetadataState>>,
-        locations: Vec<FileBlockLocationProto>,
-        worker_endpoint: WorkerEndpointInfoProto,
-    }
-
-    #[derive(Default)]
-    struct WorkerState {
-        reads: Vec<ReadChunkRequestProto>,
-        writes: Vec<WriteChunkRequestProto>,
-        blocks: HashMap<(u64, u32), Bytes>,
-    }
-
-    #[derive(Clone)]
-    struct MockWorker {
-        state: Arc<Mutex<WorkerState>>,
-        fail_write: bool,
+        file_size: u64,
     }
 
     struct TestEnv {
         client: Client,
         metadata: Arc<Mutex<MetadataState>>,
-        worker: Arc<Mutex<WorkerState>>,
     }
 
     impl MockMetadata {
-        fn new(
-            state: Arc<Mutex<MetadataState>>,
-            locations: Vec<FileBlockLocationProto>,
-            worker_endpoint: WorkerEndpointInfoProto,
-        ) -> Self {
-            Self {
-                state,
-                locations,
-                worker_endpoint,
-            }
+        fn new(state: Arc<Mutex<MetadataState>>, file_size: u64) -> Self {
+            Self { state, file_size }
         }
 
         fn record(&self, call: &'static str) {
@@ -692,11 +543,7 @@ mod tests {
         }
 
         fn file_size(&self) -> u64 {
-            self.locations
-                .iter()
-                .map(|location| location.file_offset + location.len)
-                .max()
-                .unwrap_or(5)
+            self.file_size
         }
     }
 
@@ -704,41 +551,11 @@ mod tests {
         (&ResponseHeader::ok(ClientInfo::new(ClientId::new(1)))).into()
     }
 
-    fn data_header() -> DataResponseHeaderProto {
-        DataResponseHeaderProto {
-            client: Some(ClientInfoProto {
-                call_id: "test-call".to_string(),
-                client_id: 1,
-                client_name: "hcfs-test".to_string(),
-            }),
-            error: None,
-            worker_epoch: None,
-            endpoint_hint: None,
-        }
-    }
-
-    fn block_id(index: u32) -> BlockIdProto {
-        BlockIdProto {
-            data_handle_id: 42,
-            block_index: index,
-        }
-    }
-
     fn fencing_token(epoch: u64) -> FencingTokenProto {
         FencingTokenProto {
-            block_id: Some(block_id(0)),
+            block_id: None,
             owner: 7,
             epoch,
-        }
-    }
-
-    fn file_location(worker: WorkerEndpointInfoProto, offset: u64, len: u64, index: u32) -> FileBlockLocationProto {
-        FileBlockLocationProto {
-            block_id: Some(block_id(index)),
-            file_offset: offset,
-            len,
-            workers: vec![worker],
-            worker_epoch: Some(100),
         }
     }
 
@@ -775,21 +592,16 @@ mod tests {
 
         async fn open_file(
             &self,
-            request: Request<OpenFileRequestProto>,
+            _request: Request<OpenFileRequestProto>,
         ) -> Result<Response<OpenFileResponseProto>, Status> {
             self.record("open_file");
-            let request = request.into_inner();
             Ok(Response::new(OpenFileResponseProto {
                 header: Some(ok_header()),
                 inode_id: Some(InodeIdProto { value: 11 }),
                 data_handle_id: Some(DataHandleIdProto { value: 42 }),
                 file_size: self.file_size(),
                 file_version: Some(9),
-                locations: if request.include_locations {
-                    self.locations.clone()
-                } else {
-                    Vec::new()
-                },
+                locations: Vec::new(),
             }))
         }
 
@@ -808,7 +620,7 @@ mod tests {
                 inode_id: Some(InodeIdProto { value: 11 }),
                 data_handle_id: Some(DataHandleIdProto { value: 42 }),
                 file_size: self.file_size(),
-                locations: self.locations.clone(),
+                locations: Vec::new(),
                 file_version: Some(9),
             }))
         }
@@ -851,10 +663,10 @@ mod tests {
             Ok(Response::new(AddBlockResponseProto {
                 header: Some(ok_header()),
                 target: Some(WriteTargetProto {
-                    block_id: Some(block_id(0)),
+                    block_id: None,
                     file_offset: 0,
                     len: desired_len,
-                    worker_endpoints: vec![self.worker_endpoint.clone()],
+                    worker_endpoints: Vec::new(),
                     fencing_token: Some(fencing_token(99)),
                 }),
             }))
@@ -908,158 +720,9 @@ mod tests {
         }
     }
 
-    #[tonic::async_trait]
-    impl WorkerDataService for MockWorker {
-        async fn read_chunk(
-            &self,
-            request: Request<ReadChunkRequestProto>,
-        ) -> Result<Response<ReadChunkResponseProto>, Status> {
-            let request = request.into_inner();
-            let chunk = request
-                .chunk
-                .as_ref()
-                .ok_or_else(|| Status::invalid_argument("missing chunk"))?;
-            let block = chunk
-                .block
-                .as_ref()
-                .ok_or_else(|| Status::invalid_argument("missing block"))?;
-            let data = {
-                let mut state = self.state.lock().expect("worker state");
-                state.reads.push(request);
-                state
-                    .blocks
-                    .get(&(block.data_handle_id, block.block_index))
-                    .cloned()
-                    .unwrap_or_else(|| Bytes::from_static(b"hello"))
-            };
-            let start = request.offset_in_chunk as usize;
-            let end = (start + request.len as usize).min(data.len());
-            Ok(Response::new(ReadChunkResponseProto {
-                data: Some(ChunkDataProto {
-                    slice: Some(ChunkSliceProto {
-                        chunk: Some(*chunk),
-                        offset_in_chunk: request.offset_in_chunk,
-                        len: request.len,
-                    }),
-                    data: data.slice(start..end),
-                    checksum32: 0,
-                }),
-                current_version: 9,
-            }))
-        }
-
-        async fn write_chunk(
-            &self,
-            request: Request<WriteChunkRequestProto>,
-        ) -> Result<Response<WriteChunkResponseProto>, Status> {
-            let request = request.into_inner();
-            if self.fail_write {
-                return Err(Status::internal("forced write failure"));
-            }
-            let data = request
-                .data
-                .as_ref()
-                .ok_or_else(|| Status::invalid_argument("missing data"))?;
-            let chunk = data
-                .slice
-                .as_ref()
-                .and_then(|slice| slice.chunk.as_ref())
-                .ok_or_else(|| Status::invalid_argument("missing chunk"))?;
-            let block = chunk
-                .block
-                .as_ref()
-                .ok_or_else(|| Status::invalid_argument("missing block"))?;
-            let mut state = self.state.lock().expect("worker state");
-            state.writes.push(request.clone());
-            state
-                .blocks
-                .insert((block.data_handle_id, block.block_index), data.data.clone());
-            Ok(Response::new(WriteChunkResponseProto {
-                header: Some(data_header()),
-                stored: true,
-            }))
-        }
-
-        type ReadRangeStream = Pin<Box<dyn Stream<Item = Result<ReadRangeChunkProto, Status>> + Send>>;
-
-        async fn read_range(
-            &self,
-            _request: Request<ReadRangeRequestProto>,
-        ) -> Result<Response<Self::ReadRangeStream>, Status> {
-            Err(Status::unimplemented("read_range"))
-        }
-
-        async fn open_read_stream(
-            &self,
-            _request: Request<OpenReadStreamRequestProto>,
-        ) -> Result<Response<OpenReadStreamResponseProto>, Status> {
-            Err(Status::unimplemented("open_read_stream"))
-        }
-
-        type ReadStreamStream = Pin<Box<dyn Stream<Item = Result<ReadStreamResponseProto, Status>> + Send>>;
-
-        async fn read_stream(
-            &self,
-            _request: Request<ReadStreamRequestProto>,
-        ) -> Result<Response<Self::ReadStreamStream>, Status> {
-            Err(Status::unimplemented("read_stream"))
-        }
-
-        async fn open_write_stream(
-            &self,
-            _request: Request<OpenWriteStreamRequestProto>,
-        ) -> Result<Response<OpenWriteStreamResponseProto>, Status> {
-            Err(Status::unimplemented("open_write_stream"))
-        }
-
-        async fn write_stream(
-            &self,
-            _request: Request<tonic::Streaming<WriteStreamRequestProto>>,
-        ) -> Result<Response<WriteStreamResponseProto>, Status> {
-            Err(Status::unimplemented("write_stream"))
-        }
-
-        async fn commit_write(
-            &self,
-            _request: Request<CommitWriteRequestProto>,
-        ) -> Result<Response<CommitWriteResponseProto>, Status> {
-            Err(Status::unimplemented("commit_write"))
-        }
-    }
-
-    async fn start_worker(fail_write: bool) -> (SocketAddr, Arc<Mutex<WorkerState>>) {
-        let state = Arc::new(Mutex::new(WorkerState::default()));
-        let service = MockWorker {
-            state: state.clone(),
-            fail_write,
-        };
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind worker");
-        let addr = listener.local_addr().expect("worker addr");
-        tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(WorkerDataServiceServer::new(service))
-                .serve_with_incoming(TcpListenerStream::new(listener))
-                .await
-                .expect("worker server");
-        });
-        (addr, state)
-    }
-
-    async fn start_env(
-        build_locations: impl FnOnce(WorkerEndpointInfoProto) -> Vec<FileBlockLocationProto>,
-        fail_write: bool,
-    ) -> TestEnv {
-        let (worker_addr, worker) = start_worker(fail_write).await;
-        let worker_endpoint = WorkerEndpointInfoProto {
-            worker_id: 7,
-            endpoint: worker_addr.to_string(),
-            net_transport_kind: proto::common::NetTransportKindProto::NetTransportKindGrpc as i32,
-            worker_epoch: 100,
-        };
-        let locations = build_locations(worker_endpoint.clone());
-
+    async fn start_env(file_size: u64) -> TestEnv {
         let metadata = Arc::new(Mutex::new(MetadataState::default()));
-        let service = MockMetadata::new(metadata.clone(), locations, worker_endpoint);
+        let service = MockMetadata::new(metadata.clone(), file_size);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind metadata");
         let metadata_addr = listener.local_addr().expect("metadata addr");
         tokio::spawn(async move {
@@ -1075,20 +738,16 @@ mod tests {
             ..Default::default()
         };
         let client = Client::new(config).await.expect("client");
-        TestEnv {
-            client,
-            metadata,
-            worker,
-        }
+        TestEnv { client, metadata }
     }
 
-    async fn default_env(fail_write: bool) -> TestEnv {
-        start_env(|worker| vec![file_location(worker, 0, 5, 0)], fail_write).await
+    async fn default_env() -> TestEnv {
+        start_env(5).await
     }
 
     #[tokio::test]
     async fn open_file_uses_metadata() {
-        let env = default_env(false).await;
+        let env = default_env().await;
 
         let handle = env.client.open("/file", OpenFlags::Read).await.expect("open");
 
@@ -1098,126 +757,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_uses_block_locations() {
-        let env = default_env(false).await;
+    async fn non_empty_read_is_explicitly_unimplemented_until_stream_v2_wiring() {
+        let env = default_env().await;
         let handle = env.client.open("/file", OpenFlags::Read).await.expect("open");
 
-        let bytes = env.client.read(&handle, 0, 5, None).await.expect("read");
+        let err = env.client.read(&handle, 0, 5, None).await.expect_err("read");
 
-        assert_eq!(bytes, Bytes::from_static(b"hello"));
-        let metadata = env.metadata.lock().expect("metadata");
-        assert_eq!(metadata.get_locations.len(), 1);
-        assert!(matches!(
-            metadata.get_locations[0].target.as_ref(),
-            Some(get_block_locations_request_proto::Target::Path(path)) if path == "/file"
-        ));
-        drop(metadata);
-        let worker = env.worker.lock().expect("worker");
-        assert_eq!(worker.reads.len(), 1);
-        assert_eq!(
-            worker.reads[0].chunk.as_ref().and_then(|chunk| chunk.block.as_ref()),
-            Some(&block_id(0))
-        );
-        assert_eq!(worker.reads[0].offset_in_chunk, 0);
-        assert_eq!(worker.reads[0].len, 5);
+        assert!(matches!(err, ClientError::Unimplemented(msg) if msg.contains("WorkerDataService stream v2")));
+        assert!(env.metadata.lock().expect("metadata").get_locations.is_empty());
     }
 
     #[tokio::test]
-    async fn create_write_commit_read_one_block() {
-        let env = default_env(false).await;
-        let handle = env.client.open("/file", OpenFlags::Create).await.expect("create");
+    async fn zero_length_read_returns_empty_without_worker_io() {
+        let env = default_env().await;
+        let handle = env.client.open("/file", OpenFlags::Read).await.expect("open");
 
-        env.client
-            .write(&handle, 0, Bytes::from_static(b"hello"))
-            .await
-            .expect("write");
-        env.client.close(handle).await.expect("close");
+        let bytes = env.client.read(&handle, 0, 0, None).await.expect("read");
 
-        let read_handle = env.client.open("/file", OpenFlags::Read).await.expect("open read");
-        let bytes = env.client.read(&read_handle, 0, 5, None).await.expect("read back");
-        assert_eq!(bytes, Bytes::from_static(b"hello"));
-        assert_eq!(env.worker.lock().expect("worker").writes.len(), 1);
-        assert_eq!(env.metadata.lock().expect("metadata").commit_requests.len(), 1);
+        assert!(bytes.is_empty());
+        assert!(env.metadata.lock().expect("metadata").get_locations.is_empty());
     }
 
     #[tokio::test]
-    async fn write_uses_fencing_token() {
-        let env = default_env(false).await;
-        let handle = env.client.open("/file", OpenFlags::Create).await.expect("create");
-
-        env.client
-            .write(&handle, 0, Bytes::from_static(b"hello"))
-            .await
-            .expect("write");
-
-        let worker = env.worker.lock().expect("worker");
-        let token = worker.writes[0].token.as_ref().expect("token");
-        assert_eq!(token, &fencing_token(99));
-    }
-
-    #[tokio::test]
-    async fn commit_uses_written_block() {
-        let env = default_env(false).await;
-        let handle = env.client.open("/file", OpenFlags::Create).await.expect("create");
-
-        env.client
-            .write(&handle, 0, Bytes::from_static(b"hello"))
-            .await
-            .expect("write");
-        env.client.close(handle).await.expect("close");
-
-        let metadata = env.metadata.lock().expect("metadata");
-        let commit = metadata.commit_requests.first().expect("commit request");
-        assert_eq!(commit.final_size, 5);
-        assert_eq!(commit.committed_blocks.len(), 1);
-        assert_eq!(commit.committed_blocks[0].block_id, Some(block_id(0)));
-        assert_eq!(commit.committed_blocks[0].len, 5);
-    }
-
-    #[tokio::test]
-    async fn abort_after_write_failure() {
-        let env = default_env(true).await;
+    async fn non_empty_write_is_explicitly_unimplemented_until_stream_v2_wiring() {
+        let env = default_env().await;
         let handle = env.client.open("/file", OpenFlags::Create).await.expect("create");
 
         let err = env
             .client
             .write(&handle, 0, Bytes::from_static(b"hello"))
             .await
-            .expect_err("write should fail");
+            .expect_err("write");
 
-        assert!(matches!(err, ClientError::Worker(_) | ClientError::Action(_)));
+        assert!(matches!(err, ClientError::Unimplemented(msg) if msg.contains("WorkerDataService stream v2")));
         let metadata = env.metadata.lock().expect("metadata");
-        assert_eq!(metadata.aborts, 1);
+        assert_eq!(metadata.aborts, 0);
         assert!(metadata.commit_requests.is_empty());
     }
 
     #[tokio::test]
-    async fn read_missing_location_fails() {
-        let env = start_env(|_| Vec::new(), false).await;
-        let handle = env.client.open("/file", OpenFlags::Read).await.expect("open");
+    async fn close_unwritten_create_handle_commits_empty_file() {
+        let env = default_env().await;
+        let handle = env.client.open("/file", OpenFlags::Create).await.expect("create");
 
-        let err = env.client.read(&handle, 0, 5, None).await.expect_err("read");
+        env.client.close(handle).await.expect("close");
 
-        assert!(matches!(err, ClientError::Metadata(msg) if msg.contains("block location")));
+        let metadata = env.metadata.lock().expect("metadata");
+        let commit = metadata.commit_requests.first().expect("commit request");
+        assert_eq!(commit.final_size, 0);
+        assert!(commit.committed_blocks.is_empty());
     }
 
     #[tokio::test]
-    async fn multi_block_read_not_supported() {
-        let env = start_env(
-            |worker| {
-                vec![
-                    file_location(worker.clone(), 0, 5, 0),
-                    file_location(worker.clone(), 5, 5, 1),
-                ]
-            },
-            false,
-        )
-        .await;
+    async fn read_past_eof_returns_empty_without_worker_io() {
+        let env = start_env(5).await;
         let handle = env.client.open("/file", OpenFlags::Read).await.expect("open");
 
-        let err = env.client.read(&handle, 0, 10, None).await.expect_err("read");
+        let bytes = env.client.read(&handle, 5, 5, None).await.expect("read");
 
-        assert!(matches!(err, ClientError::NotSupported(msg) if msg.contains("multi-block")));
-        assert!(env.worker.lock().expect("worker").reads.is_empty());
+        assert!(bytes.is_empty());
+        assert!(env.metadata.lock().expect("metadata").get_locations.is_empty());
     }
 }

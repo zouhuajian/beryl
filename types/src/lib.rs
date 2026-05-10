@@ -21,7 +21,6 @@ pub mod ids;
 pub mod layout;
 pub mod lease;
 pub mod raft_log_id;
-pub mod reqresp;
 pub mod stream;
 
 pub use acl::{

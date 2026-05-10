@@ -6,237 +6,128 @@ syntax = "proto3";
 package worker;
 
 import "common/common.proto";
-import "common/header.proto";
 import "worker/data_header.proto";
 
 // ============================================================================
-// Worker Data Service: Client → Worker RPC
+// Worker Data Service: block-local stream API
 // ============================================================================
 //
-// This file defines the authoritative data plane interface for worker services.
-// It supports:
-// - Chunk-based operations (ReadChunk/WriteChunk) for physical IO
-// - Range-based read operations (ReadRange) for offset/len semantics
-// - Stream-based operations (OpenReadStream/ReadStream/OpenWriteStream/WriteStream)
-//   for application-level continuous read/write semantics that may span chunks
-//
-// Zero-copy design constraints:
-// - All data fields use 'bytes' type (prost::bytes::Bytes) for zero-copy buffer references
-// - Data fields are consistently named 'data' for clarity
-// - Read responses support chunked/segmented returns to avoid large buffer concatenation
-// - Field naming aligns with types::BlockId/ChunkId/ChunkIndex/Offset/Length concepts
-
-// ============================================================================
-// Chunk Slice & Data (aligned with types::chunk)
-// ============================================================================
-
-/// Slice within a chunk.
-/// Aligns with types::chunk::ChunkSlice { chunk: ChunkId, offset_in_chunk: u32, len: u32 }.
-message ChunkSliceProto {
-  common.ChunkIdProto chunk = 1;
-  uint32 offset_in_chunk = 2;  // Offset within chunk
-  uint32 len = 3;               // Length
-}
-
-/// Chunk data payload.
-/// Aligns with types::chunk::ChunkData { slice: ChunkSlice, data: Bytes, checksum32: u32 }.
-/// Zero-copy: 'data' field uses bytes type (prost::bytes::Bytes) for zero-copy buffer references.
-message ChunkDataProto {
-  ChunkSliceProto slice = 1;
-  bytes data = 2;              // Zero-copy: bytes type for prost::bytes::Bytes
-  uint32 checksum32 = 3;
-}
-
-enum StreamKindProto {
-  STREAM_KIND_UNSPECIFIED = 0;
-  STREAM_KIND_READ = 1;
-  STREAM_KIND_WRITE = 2;
-}
-
-// ============================================================================
-// Client → Worker RPC: Chunk Operations
-// ============================================================================
-
-message ReadChunkRequestProto {
-  common.ChunkIdProto chunk = 1;
-  uint32 offset_in_chunk = 2;  // Offset within chunk
-  uint32 len = 3;               // Length
-  /// Expected block/file version (for cache validation)
-  uint64 expected_version = 4;
-  /// Read mode hint
-  common.ReadModeProto read_mode = 5;
-}
-
-message ReadChunkResponseProto {
-  ChunkDataProto data = 1;          // Zero-copy: ChunkDataProto.data uses bytes type
-  /// Current block/file version (for cache updates)
-  uint64 current_version = 2;
-}
-
-message WriteChunkRequestProto {
-  common.FencingTokenProto token = 1;
-  ChunkDataProto data = 2;          // Zero-copy: ChunkDataProto.data uses bytes type
-  /// Idempotency key: same write_id + token = same write (idempotent).
-  uint64 write_id = 3;
-  /// Write mode hint
-  common.WriteModeProto write_mode = 4;
-  /// Route epoch observed by client.
-  uint64 route_epoch = 5;
-  /// Worker epoch observed by client.
-  uint64 worker_epoch = 6;
-  /// Optional file version.
-  uint64 file_version = 7;
-}
-
-message WriteChunkResponseProto {
-  worker.DataResponseHeaderProto header = 1;
-  bool stored = 2;
-}
-
-// ============================================================================
-// Client → Worker RPC: Range Operations
-// ============================================================================
-
-message ReadRangeRequestProto {
-  uint64 data_handle_id = 1;
-  common.ByteRangeProto range = 2;  // Aligns with types::chunk::ByteRange { offset: u64, len: u32 }
-  
-  /// Optional routing hints; client may omit.
-  repeated uint64 prefer_worker_ids = 3;
-  /// Expected file version (for cache validation)
-  uint64 expected_version = 4;
-  /// Read mode hint
-  common.ReadModeProto read_mode = 5;
-}
+// Block is the management, routing, reporting, replication, migration, eviction,
+// and repair task unit. StorageChunk is a worker-local storage, IO, checksum,
+// and valid-bitmap granularity. Repair/backfill operates on Blocks, but may
+// read, verify, transfer, and persist data in StorageChunk slices internally.
+// TransportFrame is represented by the stream request/response payloads below.
+// StorageChunk and TransportFrame are intentionally not encoded as the same
+// message.
 
 message OpenReadStreamRequestProto {
   worker.DataRequestHeaderProto header = 1;
-  common.BlockIdProto block_id = 2;              // block-level binding
-  common.ByteRangeProto range_in_block = 3;      // block-local offset/len
-  uint64 expected_block_stamp = 4;               // direct read cache path; 0 means no validation
-  uint32 preferred_chunk_size = 5;               // optional: negotiate chunk_size
+  common.BlockIdProto block_id = 2;
+  common.ByteRangeProto range_in_block = 3;
+  uint64 expected_block_stamp = 4;
+  uint32 preferred_frame_size = 5;
 }
 
 message OpenReadStreamResponseProto {
   worker.DataResponseHeaderProto header = 1;
   common.StreamIdProto stream_id = 2;
-  uint32 chunk_size = 3;
-  uint32 flow_control_window = 4;
-
-  // Always filled (even on failure) for client cache update and diagnostics
+  uint32 accepted_frame_size = 3;
+  uint32 flow_control_window_bytes = 4;
   uint64 current_block_stamp = 5;
   uint64 committed_length = 6;
+  uint32 storage_chunk_size = 7;
 }
 
 message ReadStreamRequestProto {
   common.StreamIdProto stream_id = 1;
-  /// Maximum bytes to read in this request.
   uint32 max_bytes = 2;
 }
 
 message ReadStreamResponseProto {
-  ChunkDataProto data = 1;          // Zero-copy: ChunkDataProto.data uses bytes type
-  /// End of stream indicator.
-  bool eos = 2;
+  uint64 offset_in_block = 1;
+  bytes data = 2;
+  uint32 checksum32 = 3;
+  bool eos = 4;
 }
 
 message OpenWriteStreamRequestProto {
   worker.DataRequestHeaderProto header = 1;
   common.BlockIdProto block_id = 2;
-  common.FencingTokenProto token = 3;            // required, strong validation
-  uint64 expected_block_stamp = 4;               // optional: 0 means no validation
-  uint32 preferred_chunk_size = 5;
-  /// Route epoch observed by client (for refresh).
-  uint64 route_epoch = 6;
-  /// Worker epoch observed by client (for refresh).
-  uint64 worker_epoch = 7;
-  /// Optional file version expected.
-  uint64 file_version = 8;
+  common.FencingTokenProto token = 3;
+  uint64 expected_block_stamp = 4;
+  uint32 preferred_frame_size = 5;
 }
 
 message OpenWriteStreamResponseProto {
   worker.DataResponseHeaderProto header = 1;
   common.StreamIdProto stream_id = 2;
-  uint32 chunk_size = 3;
-  uint32 flow_control_window = 4;
+  uint32 accepted_frame_size = 3;
+  uint32 flow_control_window_bytes = 4;
   uint64 current_block_stamp = 5;
   uint64 committed_length = 6;
+  uint32 storage_chunk_size = 7;
 }
 
 message WriteStreamRequestProto {
   common.StreamIdProto stream_id = 1;
-  ChunkDataProto data = 2;          // Zero-copy: ChunkDataProto.data uses bytes type
-  /// Idempotency key: same write_id + stream_id = same write (idempotent).
-  uint64 write_id = 3;
-  /// Route epoch observed by client (for refresh).
-  uint64 route_epoch = 4;
-  /// Worker epoch observed by client (for refresh).
-  uint64 worker_epoch = 5;
-  /// Optional file version expected.
-  uint64 file_version = 6;
+  uint64 seq = 2;
+  uint64 offset_in_block = 3;
+  bytes data = 4;
+  uint32 checksum32 = 5;
 }
 
 message WriteStreamResponseProto {
-  worker.DataResponseHeaderProto header = 1;
-  bool stored = 2;
-  /// Acknowledged offset (for flow control).
-  uint64 acknowledged_offset = 3;
+  bool accepted = 1;
+  uint64 last_acked_seq = 2;
+  uint64 persisted_through = 3;
 }
 
 message CommitWriteRequestProto {
   worker.DataRequestHeaderProto header = 1;
-  /// Target block.
-  common.BlockIdProto block_id = 2;
-  /// Fencing token.
-  common.FencingTokenProto token = 3;
-  /// Lease epoch for validation.
-  uint64 lease_epoch = 4;
-  /// Route epoch observed by client.
-  uint64 route_epoch = 5;
-  /// Worker epoch observed by client.
-  uint64 worker_epoch = 6;
-  /// Optional file version expected.
-  uint64 file_version = 7;
-  /// Commit through offset (bytes).
-  uint64 committed_length = 8;
+  common.StreamIdProto stream_id = 2;
+  common.BlockIdProto block_id = 3;
+  common.FencingTokenProto token = 4;
+  uint64 commit_seq = 5;
+  uint64 committed_length = 6;
+  bool require_sync = 7;
 }
 
 message CommitWriteResponseProto {
   worker.DataResponseHeaderProto header = 1;
-  /// Current committed length after barrier.
   uint64 committed_length = 2;
-  /// Current block stamp.
   uint64 current_block_stamp = 3;
+  uint64 persisted_through = 4;
 }
 
-/// Streaming range read: worker can push chunk slices progressively.
-/// Zero-copy: supports segmented/chunked returns to avoid large buffer concatenation.
-/// Each ReadRangeChunkProto contains a ChunkDataProto with bytes data field for zero-copy.
-message ReadRangeChunkProto {
-  ChunkDataProto data = 1;          // Zero-copy: ChunkDataProto.data uses bytes type
-  /// Current file version (sent once, typically in first chunk)
-  uint64 current_version = 2;
+message AbortWriteRequestProto {
+  worker.DataRequestHeaderProto header = 1;
+  common.StreamIdProto stream_id = 2;
+  common.BlockIdProto block_id = 3;
+  common.FencingTokenProto token = 4;
+  string reason = 5;
 }
 
-// ============================================================================
-// Worker Data Service
-// ============================================================================
+message AbortWriteResponseProto {
+  worker.DataResponseHeaderProto header = 1;
+  bool aborted = 2;
+}
 
 service WorkerDataService {
-  // Chunk operations: physical IO at chunk granularity
-  rpc ReadChunk(ReadChunkRequestProto) returns (ReadChunkResponseProto);
-  rpc WriteChunk(WriteChunkRequestProto) returns (WriteChunkResponseProto);
-  
-  // Range operations: read by offset/len (may span multiple chunks)
-  rpc ReadRange(ReadRangeRequestProto) returns (stream ReadRangeChunkProto);
-  
-  // Stream operations: application-level continuous read/write (may span chunks)
-  rpc OpenReadStream(OpenReadStreamRequestProto) returns (OpenReadStreamResponseProto);
-  rpc ReadStream(ReadStreamRequestProto) returns (stream ReadStreamResponseProto);
-  rpc OpenWriteStream(OpenWriteStreamRequestProto) returns (OpenWriteStreamResponseProto);
-  rpc WriteStream(stream WriteStreamRequestProto) returns (WriteStreamResponseProto);
-  // CloseStream removed: use gRPC cancel/half-close + worker stream state TTL/idle timeout
+  rpc OpenReadStream(OpenReadStreamRequestProto)
+      returns (OpenReadStreamResponseProto);
 
-  // Barrier/commit for write visibility.
-  rpc CommitWrite(CommitWriteRequestProto) returns (CommitWriteResponseProto);
+  rpc ReadStream(ReadStreamRequestProto)
+      returns (stream ReadStreamResponseProto);
+
+  rpc OpenWriteStream(OpenWriteStreamRequestProto)
+      returns (OpenWriteStreamResponseProto);
+
+  rpc WriteStream(stream WriteStreamRequestProto)
+      returns (WriteStreamResponseProto);
+
+  rpc CommitWrite(CommitWriteRequestProto)
+      returns (CommitWriteResponseProto);
+
+  rpc AbortWrite(AbortWriteRequestProto)
+      returns (AbortWriteResponseProto);
 }

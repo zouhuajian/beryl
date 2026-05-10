@@ -222,67 +222,19 @@ impl GrpcTransport {
         .await
     }
 
-    /// Helper method for unary calls using generated client stubs.
-    /// This is a type-specific implementation that can be used by higher layers.
-    pub async fn call_read_chunk(
+    /// Open a block-local read stream using generated client stubs.
+    pub async fn call_open_read_stream(
         &self,
         connection: &GrpcConnection,
-        request: proto::worker::ReadChunkRequestProto,
+        request: proto::worker::OpenReadStreamRequestProto,
         ctx: RequestHeader,
-    ) -> TransportResult<proto::worker::ReadChunkResponseProto> {
+    ) -> TransportResult<proto::worker::OpenReadStreamResponseProto> {
         use proto::worker::worker_data_service_client::WorkerDataServiceClient;
 
         let connection_clone = connection.channel.clone();
         let ctx_clone = ctx.clone();
 
-        self.execute_unary_with_retry(crate::net::methods::worker_data::READ_CHUNK, ctx, move || {
-            let channel = connection_clone.clone();
-            let req = request;
-            let ctx_for_metadata = ctx_clone.clone();
-
-            async move {
-                let mut client = WorkerDataServiceClient::new(channel);
-
-                // Build request with metadata
-                let mut request_builder = Request::new(req);
-                let metadata = request_builder.metadata_mut();
-
-                // Inject context into metadata
-                inject_context_to_metadata(&ctx_for_metadata, metadata)
-                    .map_err(|e| TransportError::Protocol(format!("Failed to inject context: {}", e)))?;
-
-                // Make call
-                let response = client.read_chunk(request_builder).await.map_err(|e| {
-                    #[cfg(feature = "grpc")]
-                    {
-                        TransportError::from(e)
-                    }
-                    #[cfg(not(feature = "grpc"))]
-                    {
-                        TransportError::Internal(format!("gRPC error: {}", e))
-                    }
-                })?;
-
-                Ok(response.into_inner())
-            }
-        })
-        .await
-    }
-
-    /// Helper method for unary calls using generated client stubs.
-    /// This is a type-specific implementation that can be used by higher layers.
-    pub async fn call_write_chunk(
-        &self,
-        connection: &GrpcConnection,
-        request: proto::worker::WriteChunkRequestProto,
-        ctx: RequestHeader,
-    ) -> TransportResult<proto::worker::WriteChunkResponseProto> {
-        use proto::worker::worker_data_service_client::WorkerDataServiceClient;
-
-        let connection_clone = connection.channel.clone();
-        let ctx_clone = ctx.clone();
-
-        self.execute_unary_with_retry(crate::net::methods::worker_data::WRITE_CHUNK, ctx, move || {
+        self.execute_unary_with_retry(crate::net::methods::worker_data::OPEN_READ_STREAM, ctx, move || {
             let channel = connection_clone.clone();
             let req = request.clone();
             let ctx_for_metadata = ctx_clone.clone();
@@ -290,25 +242,16 @@ impl GrpcTransport {
             async move {
                 let mut client = WorkerDataServiceClient::new(channel);
 
-                // Build request with metadata
                 let mut request_builder = Request::new(req);
                 let metadata = request_builder.metadata_mut();
 
-                // Inject context into metadata
                 inject_context_to_metadata(&ctx_for_metadata, metadata)
                     .map_err(|e| TransportError::Protocol(format!("Failed to inject context: {}", e)))?;
 
-                // Make call
-                let response = client.write_chunk(request_builder).await.map_err(|e| {
-                    #[cfg(feature = "grpc")]
-                    {
-                        TransportError::from(e)
-                    }
-                    #[cfg(not(feature = "grpc"))]
-                    {
-                        TransportError::Internal(format!("gRPC error: {}", e))
-                    }
-                })?;
+                let response = client
+                    .open_read_stream(request_builder)
+                    .await
+                    .map_err(TransportError::from)?;
 
                 Ok(response.into_inner())
             }
@@ -316,18 +259,17 @@ impl GrpcTransport {
         .await
     }
 
-    /// Helper method for server streaming using generated client stubs.
-    pub async fn call_read_range(
+    /// Read frames from an opened block-local stream.
+    pub async fn call_read_stream(
         &self,
         connection: &GrpcConnection,
-        request: proto::worker::ReadRangeRequestProto,
+        request: proto::worker::ReadStreamRequestProto,
         ctx: RequestHeader,
     ) -> TransportResult<
-        Box<dyn futures::Stream<Item = TransportResult<proto::worker::ReadRangeChunkProto>> + Send + Unpin>,
+        Box<dyn futures::Stream<Item = TransportResult<proto::worker::ReadStreamResponseProto>> + Send + Unpin>,
     > {
         use proto::worker::worker_data_service_client::WorkerDataServiceClient;
 
-        // Check backpressure (streams count against max_inflight_streams)
         let _permit = self
             .request_limiter
             .acquire(&ctx)
@@ -337,25 +279,58 @@ impl GrpcTransport {
         let channel = connection.channel.clone();
         let mut client = WorkerDataServiceClient::new(channel);
 
-        // Build request with metadata
         let mut request_builder = Request::new(request);
         let metadata = request_builder.metadata_mut();
 
-        // Inject context into metadata
         inject_context_to_metadata(&ctx, metadata)
             .map_err(|e| TransportError::Protocol(format!("Failed to inject context: {}", e)))?;
 
-        // Make streaming call
         let response_stream = client
-            .read_range(request_builder)
+            .read_stream(request_builder)
             .await
             .map_err(TransportError::from)?
             .into_inner();
 
-        // Convert tonic stream to transport stream
         let transport_stream = response_stream.map(|item| item.map_err(TransportError::from));
 
         Ok(Box::new(transport_stream))
+    }
+
+    /// Open a block-local write stream using generated client stubs.
+    pub async fn call_open_write_stream(
+        &self,
+        connection: &GrpcConnection,
+        request: proto::worker::OpenWriteStreamRequestProto,
+        ctx: RequestHeader,
+    ) -> TransportResult<proto::worker::OpenWriteStreamResponseProto> {
+        use proto::worker::worker_data_service_client::WorkerDataServiceClient;
+
+        let connection_clone = connection.channel.clone();
+        let ctx_clone = ctx.clone();
+
+        self.execute_unary_with_retry(crate::net::methods::worker_data::OPEN_WRITE_STREAM, ctx, move || {
+            let channel = connection_clone.clone();
+            let req = request.clone();
+            let ctx_for_metadata = ctx_clone.clone();
+
+            async move {
+                let mut client = WorkerDataServiceClient::new(channel);
+
+                let mut request_builder = Request::new(req);
+                let metadata = request_builder.metadata_mut();
+
+                inject_context_to_metadata(&ctx_for_metadata, metadata)
+                    .map_err(|e| TransportError::Protocol(format!("Failed to inject context: {}", e)))?;
+
+                let response = client
+                    .open_write_stream(request_builder)
+                    .await
+                    .map_err(TransportError::from)?;
+
+                Ok(response.into_inner())
+            }
+        })
+        .await
     }
 
     /// Helper method for client streaming using generated client stubs.
@@ -391,6 +366,76 @@ impl GrpcTransport {
         Err(TransportError::NotImplemented(
             "call_write_stream requires proper stream conversion - tonic expects Stream<Item = T>, not Stream<Item = Result<T, E>>".to_string()
         ))
+    }
+
+    /// Commit an opened write stream using generated client stubs.
+    pub async fn call_commit_write(
+        &self,
+        connection: &GrpcConnection,
+        request: proto::worker::CommitWriteRequestProto,
+        ctx: RequestHeader,
+    ) -> TransportResult<proto::worker::CommitWriteResponseProto> {
+        use proto::worker::worker_data_service_client::WorkerDataServiceClient;
+
+        let connection_clone = connection.channel.clone();
+        let ctx_clone = ctx.clone();
+
+        self.execute_unary_with_retry(crate::net::methods::worker_data::COMMIT_WRITE, ctx, move || {
+            let channel = connection_clone.clone();
+            let req = request.clone();
+            let ctx_for_metadata = ctx_clone.clone();
+
+            async move {
+                let mut client = WorkerDataServiceClient::new(channel);
+                let mut request_builder = Request::new(req);
+                let metadata = request_builder.metadata_mut();
+
+                inject_context_to_metadata(&ctx_for_metadata, metadata)
+                    .map_err(|e| TransportError::Protocol(format!("Failed to inject context: {}", e)))?;
+
+                let response = client
+                    .commit_write(request_builder)
+                    .await
+                    .map_err(TransportError::from)?;
+                Ok(response.into_inner())
+            }
+        })
+        .await
+    }
+
+    /// Abort an opened write stream using generated client stubs.
+    pub async fn call_abort_write(
+        &self,
+        connection: &GrpcConnection,
+        request: proto::worker::AbortWriteRequestProto,
+        ctx: RequestHeader,
+    ) -> TransportResult<proto::worker::AbortWriteResponseProto> {
+        use proto::worker::worker_data_service_client::WorkerDataServiceClient;
+
+        let connection_clone = connection.channel.clone();
+        let ctx_clone = ctx.clone();
+
+        self.execute_unary_with_retry(crate::net::methods::worker_data::ABORT_WRITE, ctx, move || {
+            let channel = connection_clone.clone();
+            let req = request.clone();
+            let ctx_for_metadata = ctx_clone.clone();
+
+            async move {
+                let mut client = WorkerDataServiceClient::new(channel);
+                let mut request_builder = Request::new(req);
+                let metadata = request_builder.metadata_mut();
+
+                inject_context_to_metadata(&ctx_for_metadata, metadata)
+                    .map_err(|e| TransportError::Protocol(format!("Failed to inject context: {}", e)))?;
+
+                let response = client
+                    .abort_write(request_builder)
+                    .await
+                    .map_err(TransportError::from)?;
+                Ok(response.into_inner())
+            }
+        })
+        .await
     }
 }
 

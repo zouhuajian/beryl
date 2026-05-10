@@ -19,7 +19,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Configure bytes fields to use Bytes type for zero-copy
         // This allows prost to use bytes::Bytes instead of Vec<u8> for bytes fields
         // Note: bytes() accepts a single path, so we call it for each field
-        .bytes("worker.ChunkDataProto.data")
+        .bytes("worker.ReadStreamResponseProto.data")
+        .bytes("worker.WriteStreamRequestProto.data")
         .compile_protos(
             &[
                 "common/common.proto",

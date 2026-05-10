@@ -3,23 +3,16 @@
 
 //! Worker RPC client.
 
-use crate::canonical::{validate_data_header_or_action, ClientAction, RetryOutcome};
 use crate::error::{ClientError, ClientResult};
-use crate::modes::ReadMode;
-use bytes::Bytes;
-use common::error::canonical::RefreshReason;
 use common::header::RequestHeader;
-use futures::StreamExt;
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 use transport::net::{NetTransportConfig, NetTransportKind};
 use transport::NetTransport;
 use transport::{GrpcConnection, GrpcTransport, TransportError, TransportResult};
-use types::chunk::{ByteRange, ChunkRef};
-use types::ids::{DataHandleId, WorkerId};
+use types::ids::WorkerId;
 
 /// Worker endpoint information from metadata.
 #[derive(Clone, Debug)]
@@ -55,18 +48,6 @@ impl WorkerEndpointInfo {
         }
     }
 }
-
-type MetadataRefreshFn = Box<
-    dyn Fn(WorkerId) -> Pin<Box<dyn std::future::Future<Output = ClientResult<WorkerEndpointInfo>> + Send>>
-        + Send
-        + Sync,
->;
-
-type FencingRefreshFn = Box<
-    dyn Fn() -> Pin<Box<dyn std::future::Future<Output = ClientResult<proto::common::FencingTokenProto>> + Send>>
-        + Send
-        + Sync,
->;
 
 /// Client transport enum (wraps different transport implementations).
 enum ClientTransport {
@@ -212,76 +193,6 @@ impl WorkerClient {
         Ok(())
     }
 
-    /// Read a chunk with automatic refresh on protocol mismatch or stale endpoint.
-    #[expect(clippy::too_many_arguments, reason = "worker read API keeps wire fields explicit")]
-    pub async fn read_chunk(
-        &mut self,
-        ctx: &RequestHeader,
-        chunk: ChunkRef,
-        offset_in_chunk: u32,
-        len: u32,
-        expected_version: Option<u64>,
-        read_mode: ReadMode,
-        refresh_fn: Option<MetadataRefreshFn>,
-    ) -> ClientResult<(Bytes, u64)> {
-        let request = proto::worker::ReadChunkRequestProto {
-            chunk: Some(chunk_ref_to_proto(chunk)),
-            offset_in_chunk,
-            len,
-            expected_version: expected_version.unwrap_or(0),
-            read_mode: proto::common::ReadModeProto::from(read_mode) as i32,
-        };
-
-        // Try once, with refresh on failure
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-
-            // Get connection
-            let connection = match self.get_connection().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    // On connection failure, try refresh if available
-                    if attempt == 1 && refresh_fn.is_some() {
-                        if let Some(ref refresh) = refresh_fn {
-                            if let Ok(new_info) = refresh(self.endpoint_info.worker_id).await {
-                                self.handle_endpoint_refresh(new_info, ctx, "connection failure")
-                                    .await?;
-                                continue;
-                            }
-                        }
-                    }
-                    return Err(e);
-                }
-            };
-
-            // RequestHeader is an alias for CallerContext, so we can use it directly
-            let request_ctx: RequestHeader = ctx.clone();
-
-            let result = self
-                .call_with_transport("read_chunk", &request_ctx, &connection, |transport, conn| {
-                    let ctx = request_ctx.clone();
-                    async move { transport.call_read_chunk(conn.as_ref(), request, ctx).await }
-                })
-                .await;
-
-            match result {
-                Ok(response) => return self.parse_read_chunk_response("read_chunk", response, &request_ctx),
-                Err(e) => {
-                    if attempt == 1 && refresh_fn.is_some() && Self::should_refresh_on_error(&e) {
-                        if let Some(ref refresh) = refresh_fn {
-                            if let Ok(new_info) = refresh(self.endpoint_info.worker_id).await {
-                                self.handle_endpoint_refresh(new_info, ctx, "protocol mismatch").await?;
-                                continue;
-                            }
-                        }
-                    }
-                    return Err(e);
-                }
-            }
-        }
-    }
-
     /// Handle endpoint refresh: update endpoint info and log/metrics.
     async fn handle_endpoint_refresh(
         &mut self,
@@ -325,241 +236,6 @@ impl WorkerClient {
         self.update_endpoint_info(new_info).await?;
 
         Ok(())
-    }
-
-    /// Read a file range with automatic refresh on protocol mismatch or stale endpoint.
-    #[expect(clippy::too_many_arguments, reason = "worker read API keeps wire fields explicit")]
-    pub async fn read_range(
-        &mut self,
-        ctx: &RequestHeader,
-        data_handle_id: DataHandleId,
-        range: ByteRange,
-        prefer_worker_ids: Vec<WorkerId>,
-        expected_version: Option<u64>,
-        read_mode: ReadMode,
-        refresh_fn: Option<MetadataRefreshFn>,
-    ) -> ClientResult<(Vec<Bytes>, u64)> {
-        let request = proto::worker::ReadRangeRequestProto {
-            data_handle_id: data_handle_id.as_u64(),
-            range: Some(byte_range_to_proto(range)),
-            prefer_worker_ids: prefer_worker_ids.iter().map(|w| w.as_u64()).collect(),
-            expected_version: expected_version.unwrap_or(0),
-            read_mode: proto::common::ReadModeProto::from(read_mode) as i32,
-        };
-
-        // Try once, with refresh on failure
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-
-            // Get connection
-            let connection = match self.get_connection().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    // On connection failure, try refresh if available
-                    if attempt == 1 && refresh_fn.is_some() {
-                        if let Some(ref refresh) = refresh_fn {
-                            if let Ok(new_info) = refresh(self.endpoint_info.worker_id).await {
-                                self.handle_endpoint_refresh(new_info, ctx, "connection failure")
-                                    .await?;
-                                continue;
-                            }
-                        }
-                    }
-                    return Err(e);
-                }
-            };
-
-            // RequestHeader is an alias for CallerContext, so we can use it directly
-            let request_ctx: RequestHeader = ctx.clone();
-
-            let stream_result = self
-                .call_with_transport("read_range", &request_ctx, &connection, |transport, conn| {
-                    let request = request.clone();
-                    let ctx = request_ctx.clone();
-                    async move { transport.call_read_range(conn.as_ref(), request, ctx).await }
-                })
-                .await;
-
-            match stream_result {
-                Ok(mut stream) => {
-                    let mut chunks = Vec::new();
-                    let mut version = 0;
-
-                    while let Some(chunk_result) = stream.next().await {
-                        let chunk = match chunk_result {
-                            Ok(chunk) => chunk,
-                            Err(err) => return Err(self.map_transport_error(err, "read_range", &request_ctx)),
-                        };
-                        let chunk_data = chunk
-                            .data
-                            .ok_or_else(|| self.missing_field_error("chunk.data", "read_range", &request_ctx))?;
-                        chunks.push(chunk_data.data);
-                        if chunk.current_version > 0 {
-                            version = chunk.current_version;
-                        }
-                    }
-
-                    return Ok((chunks, version));
-                }
-                Err(e) => {
-                    if attempt == 1 && refresh_fn.is_some() && Self::should_refresh_on_error(&e) {
-                        if let Some(ref refresh) = refresh_fn {
-                            if let Ok(new_info) = refresh(self.endpoint_info.worker_id).await {
-                                self.handle_endpoint_refresh(new_info, ctx, "protocol mismatch").await?;
-                                continue;
-                            }
-                        }
-                    }
-                    return Err(e);
-                }
-            }
-        }
-    }
-
-    /// Write a chunk with automatic refresh on worker_epoch/fencing NEED_REFRESH.
-    pub async fn write_chunk_with_refresh(
-        &mut self,
-        ctx: &RequestHeader,
-        mut request: proto::worker::WriteChunkRequestProto,
-        metadata_refresh: MetadataRefreshFn,
-        fencing_refresh: Option<FencingRefreshFn>,
-    ) -> ClientResult<RetryOutcome<proto::worker::WriteChunkResponseProto>> {
-        if request.worker_epoch == 0 {
-            request.worker_epoch = self.endpoint_info.worker_epoch;
-        }
-
-        let mut refreshes = 0;
-        let mut retries = 0;
-        let mut last_canonical_error = None;
-        let mut attempt_request = request.clone();
-
-        for _ in 0..2 {
-            let connection = self.get_connection().await?;
-            let request_ctx: RequestHeader = ctx.clone();
-
-            let response = self
-                .call_with_transport("write_chunk", &request_ctx, &connection, |transport, conn| {
-                    let request = attempt_request.clone();
-                    let ctx = request_ctx.clone();
-                    async move { transport.call_write_chunk(conn.as_ref(), request, ctx).await }
-                })
-                .await?;
-
-            match validate_data_header_or_action(response.header.as_ref()) {
-                Ok(()) => {
-                    return Ok(RetryOutcome {
-                        result: response,
-                        refreshes,
-                        retries,
-                        transport_retries: 0,
-                        last_canonical_error,
-                    });
-                }
-                Err(ClientAction::Refresh {
-                    reason,
-                    hint,
-                    canonical,
-                }) => {
-                    last_canonical_error = Some(canonical.as_ref().clone());
-                    if refreshes > 0 {
-                        return Err(ClientError::from(ClientAction::Refresh {
-                            reason,
-                            hint,
-                            canonical,
-                        }));
-                    }
-                    refreshes = 1;
-
-                    // Always fetch authoritative endpoint/epoch from metadata.
-                    let meta_info = metadata_refresh(self.endpoint_info.worker_id).await?;
-                    if let Some(epoch) = hint.worker_epoch {
-                        if epoch != meta_info.worker_epoch {
-                            warn!(
-                                worker_id = self.endpoint_info.worker_id.as_u64(),
-                                hinted_epoch = epoch,
-                                meta_epoch = meta_info.worker_epoch,
-                                "worker hint epoch differs from metadata; using metadata"
-                            );
-                        }
-                    }
-                    // Apply metadata result to request and cached endpoint.
-                    self.handle_endpoint_refresh(meta_info.clone(), ctx, "metadata refresh")
-                        .await?;
-                    attempt_request.worker_epoch = meta_info.worker_epoch;
-
-                    match reason {
-                        RefreshReason::WorkerEpochMismatch => {
-                            // nothing else; already refreshed metadata
-                        }
-                        RefreshReason::Fencing => {
-                            if let Some(ref refresh_fn) = fencing_refresh {
-                                let token = refresh_fn().await?;
-                                attempt_request.token = Some(token);
-                            } else {
-                                return Err(ClientError::from(ClientAction::Refresh {
-                                    reason,
-                                    hint,
-                                    canonical,
-                                }));
-                            }
-                        }
-                        _ => {
-                            return Err(ClientError::from(ClientAction::Refresh {
-                                reason,
-                                hint,
-                                canonical,
-                            }))
-                        }
-                    }
-
-                    if let Some(endpoint_hint) = hint.endpoint_hint {
-                        let hint_info = WorkerEndpointInfo {
-                            worker_id: WorkerId::new(endpoint_hint.worker_id),
-                            endpoint: endpoint_hint.endpoint,
-                            net_transport_kind: endpoint_hint.net_transport_kind,
-                            worker_epoch: endpoint_hint.worker_epoch,
-                        };
-                        if hint_info.worker_epoch != meta_info.worker_epoch {
-                            warn!(
-                                worker_id = self.endpoint_info.worker_id.as_u64(),
-                                hint_epoch = hint_info.worker_epoch,
-                                meta_epoch = meta_info.worker_epoch,
-                                "endpoint hint epoch differs from metadata; ignoring hint for persistence"
-                            );
-                        }
-                    }
-
-                    metrics::counter!(
-                        "client_worker_refresh_total",
-                        "reason" => format!("{:?}", reason),
-                        "worker_id" => self.endpoint_info.worker_id.as_u64().to_string()
-                    )
-                    .increment(1);
-
-                    continue;
-                }
-                Err(ClientAction::Retry { after_ms, canonical }) => {
-                    last_canonical_error = Some(canonical.as_ref().clone());
-                    if retries > 0 {
-                        return Err(ClientError::from(ClientAction::Retry { after_ms, canonical }));
-                    }
-                    retries = 1;
-                    if let Some(delay) = after_ms {
-                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                    }
-                    continue;
-                }
-                Err(action) => return Err(ClientError::from(action)),
-            }
-        }
-
-        if let Some(canonical) = last_canonical_error {
-            return Err(ClientError::from(ClientAction::Fail {
-                canonical: Box::new(canonical),
-            }));
-        }
-        Err(ClientError::Worker("write_chunk retry loop exhausted".to_string()))
     }
 
     #[allow(unreachable_patterns)]
@@ -615,18 +291,6 @@ impl WorkerClient {
             self.transport.kind(),
             connection_kind,
         ))
-    }
-
-    fn parse_read_chunk_response(
-        &self,
-        rpc_name: &str,
-        response: proto::worker::ReadChunkResponseProto,
-        ctx: &RequestHeader,
-    ) -> ClientResult<(Bytes, u64)> {
-        let chunk_data = response
-            .data
-            .ok_or_else(|| self.missing_field_error("data", rpc_name, ctx))?;
-        Ok((chunk_data.data, response.current_version))
     }
 
     fn missing_field_error(&self, field: &str, rpc_name: &str, ctx: &RequestHeader) -> ClientError {
@@ -702,53 +366,12 @@ impl ClientConnection {
     }
 }
 
-// Helper traits for conversions
-trait DataHandleIdExt {
-    fn as_u64(&self) -> u64;
-}
-
-impl DataHandleIdExt for DataHandleId {
-    fn as_u64(&self) -> u64 {
-        self.0
-    }
-}
-
 trait WorkerIdExt {
     fn as_u64(&self) -> u64;
 }
 
 impl WorkerIdExt for WorkerId {
     fn as_u64(&self) -> u64 {
-        self.0
-    }
-}
-
-// Helper functions for conversions (avoid orphan rule issues)
-fn chunk_ref_to_proto(chunk: ChunkRef) -> proto::common::ChunkIdProto {
-    use proto::common::BlockIdProto;
-    proto::common::ChunkIdProto {
-        block: Some(BlockIdProto {
-            data_handle_id: chunk.block_id.data_handle_id.as_u64(),
-            block_index: chunk.block_id.index.as_u32(),
-        }),
-        chunk_index: chunk.chunk_idx,
-    }
-}
-
-fn byte_range_to_proto(range: ByteRange) -> proto::common::ByteRangeProto {
-    proto::common::ByteRangeProto {
-        offset: range.offset,
-        len: range.len,
-    }
-}
-
-// Helper trait for BlockIndex
-trait BlockIndexExt {
-    fn as_u32(&self) -> u32;
-}
-
-impl BlockIndexExt for types::ids::BlockIndex {
-    fn as_u32(&self) -> u32 {
         self.0
     }
 }
@@ -781,7 +404,7 @@ mod tests {
         let connection = ClientConnection::mock(NetTransportKind::Quic);
 
         let err = client
-            .call_with_transport("read_chunk", &ctx, &connection, |_, _| async { Ok(()) })
+            .call_with_transport("open_read_stream", &ctx, &connection, |_, _| async { Ok(()) })
             .await
             .unwrap_err();
 
@@ -800,22 +423,5 @@ mod tests {
         let result = WorkerClient::new(endpoint_info, None).await;
 
         assert!(matches!(result, Err(ClientError::Unimplemented(msg)) if msg.contains("unsupported transport")));
-    }
-
-    #[tokio::test]
-    async fn parse_read_chunk_missing_data_errors() {
-        let client = build_test_client();
-        let ctx = RequestHeader::new(ClientId::new(3));
-
-        let response = proto::worker::ReadChunkResponseProto {
-            data: None,
-            current_version: 0,
-        };
-
-        let err = client
-            .parse_read_chunk_response("read_chunk", response, &ctx)
-            .unwrap_err();
-
-        assert!(matches!(err, ClientError::Worker(msg) if msg.contains("missing field data")));
     }
 }

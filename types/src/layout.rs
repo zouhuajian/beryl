@@ -3,8 +3,8 @@
 
 use crate::chunk::{ByteRange, ChunkRef, ChunkSlice};
 use crate::ids::{BlockId, BlockIndex, ChunkIndex, DataHandleId};
-use crate::reqresp::TypeParseError;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// Fixed layout parameters for a file (stable once created).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -134,15 +134,19 @@ pub enum PlacementPolicy {
 }
 
 impl core::str::FromStr for PlacementPolicy {
-    type Err = TypeParseError;
+    type Err = PlacementPolicyParseError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "default" | "Default" => Ok(Self::Default),
             "rack" | "rackaware" | "RackAware" => Ok(Self::RackAware),
-            _ => Err(TypeParseError::new("PlacementPolicy")),
+            _ => Err(PlacementPolicyParseError),
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("invalid placement policy")]
+pub struct PlacementPolicyParseError;
 
 #[cfg(test)]
 mod tests {

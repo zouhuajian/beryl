@@ -5,18 +5,21 @@ mod common;
 
 use ::common::error::canonical::{CanonicalError, ErrorCode as CanonicalErrorCode, RefreshReason};
 use ::common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
-use bytes::Bytes;
 use client::api::hcfs::Client;
-use client::canonical::{
-    handle_canonical_error, retry_metadata_once, retry_metadata_with_policy, ClientAction, RetryOutcome, RetryPolicy,
-};
+use client::canonical::{retry_metadata_once, retry_metadata_with_policy, RetryOutcome, RetryPolicy};
 use client::config::ClientConfig;
 use client::error::ClientError;
 use common::{init_logging, MockMetadataServer, MockWorkerServer};
+use proto::common::{
+    error_detail_proto, BlockIdProto, ByteRangeProto, ClientInfoProto, ErrorClassProto, FencingTokenProto,
+    FsErrnoProto, StreamIdProto,
+};
 use proto::metadata::MsyncRequestProto;
 use proto::worker::worker_data_service_server::WorkerDataService;
-use proto::worker::ReadChunkRequestProto;
-use proto::worker::{ChunkDataProto, ChunkSliceProto};
+use proto::worker::{
+    CommitWriteRequestProto, DataRequestHeaderProto, DataResponseHeaderProto, OpenReadStreamRequestProto,
+    OpenWriteStreamRequestProto,
+};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tonic::Request;
@@ -31,55 +34,57 @@ async fn test_client_init() {
     assert!(client_result.is_ok() || client_result.is_err());
 }
 
-/// Test direct worker read with version mismatch fallback.
+fn data_request_header(call_id: &str) -> DataRequestHeaderProto {
+    DataRequestHeaderProto {
+        client: Some(ClientInfoProto {
+            call_id: call_id.to_string(),
+            client_id: 1,
+            client_name: "integration-test".to_string(),
+        }),
+        traceparent: String::new(),
+    }
+}
+
+fn block_id(data_handle_id: u64, block_index: u32) -> BlockIdProto {
+    BlockIdProto {
+        data_handle_id,
+        block_index,
+    }
+}
+
+fn assert_stream_v2_unimplemented_header(header: DataResponseHeaderProto, operation: &str) {
+    let error = header.error.expect("placeholder response should carry error detail");
+    assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
+    assert_eq!(
+        error.code,
+        Some(error_detail_proto::Code::FsErrno(FsErrnoProto::FsErrnoEnotimpl as i32))
+    );
+    assert!(error.message.contains(operation));
+}
+
+/// Direct worker reads are Stream v2 placeholders until worker execution is wired.
 #[tokio::test]
-async fn test_direct_worker_read_version_mismatch() {
+async fn test_direct_worker_open_read_stream_is_explicitly_unimplemented() {
     init_logging();
 
-    use proto::common::ChunkIdProto;
-
     let mock_worker = MockWorkerServer::new(1);
-    mock_worker.add_block_data(100, 0, 0, b"test data".to_vec()).await;
-    mock_worker.set_block_version(100, 0, 1).await;
-
-    let request = tonic::Request::new(ReadChunkRequestProto {
-        chunk: Some(ChunkIdProto {
-            block: Some(proto::common::BlockIdProto {
-                data_handle_id: 100,
-                block_index: 0,
-            }),
-            chunk_index: 0,
-        }),
-        offset_in_chunk: 0,
-        len: 9,
-        expected_version: 1,
-        read_mode: proto::common::ReadModeProto::ReadModeUnspecified as i32,
+    let request = Request::new(OpenReadStreamRequestProto {
+        header: Some(data_request_header("open-read-stream")),
+        block_id: Some(block_id(100, 0)),
+        range_in_block: Some(ByteRangeProto { offset: 0, len: 9 }),
+        expected_block_stamp: 1,
+        preferred_frame_size: 4096,
     });
 
-    let response = WorkerDataService::read_chunk(&mock_worker, request).await;
-    assert!(response.is_ok());
+    let response = WorkerDataService::open_read_stream(&mock_worker, request)
+        .await
+        .expect("open read placeholder should use structured response")
+        .into_inner();
 
-    mock_worker.increment_block_version(100, 0).await;
-
-    let request2 = tonic::Request::new(ReadChunkRequestProto {
-        chunk: Some(ChunkIdProto {
-            block: Some(proto::common::BlockIdProto {
-                data_handle_id: 100,
-                block_index: 0,
-            }),
-            chunk_index: 0,
-        }),
-        offset_in_chunk: 0,
-        len: 9,
-        expected_version: 1,
-        read_mode: proto::common::ReadModeProto::ReadModeUnspecified as i32,
-    });
-
-    let response2 = WorkerDataService::read_chunk(&mock_worker, request2).await;
-    assert!(response2.is_err());
-    let status = response2.unwrap_err();
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    assert!(status.message().contains("Version mismatch"));
+    assert!(response.stream_id.is_none());
+    assert_eq!(response.accepted_frame_size, 0);
+    assert_eq!(response.flow_control_window_bytes, 0);
+    assert_stream_v2_unimplemented_header(response.header.expect("data header"), "OpenReadStream");
 }
 
 /// Test Msync with mock metadata server.
@@ -240,182 +245,64 @@ async fn test_mount_epoch_mismatch_refresh_and_retry() {
     assert!(outcome.result.0.canonical_error.is_none());
 }
 
-/// Worker epoch mismatch should produce NEED_REFRESH with hints; client refreshes endpoint and retries.
+/// Direct worker writes are Stream v2 placeholders until worker execution is wired.
 #[tokio::test]
-async fn test_worker_epoch_mismatch_refresh_and_retry() {
+async fn test_direct_worker_open_write_stream_is_explicitly_unimplemented() {
     init_logging();
 
     let mock_worker = MockWorkerServer::new(1);
-    mock_worker.set_worker_epoch(2).await;
-    mock_worker.set_worker_epoch_hint_override(Some(999));
-
-    let chunk_ref = proto::common::ChunkIdProto {
-        block: Some(proto::common::BlockIdProto {
-            data_handle_id: 10,
-            block_index: 0,
-        }),
-        chunk_index: 0,
-    };
-    let chunk_slice = ChunkSliceProto {
-        chunk: Some(chunk_ref),
-        offset_in_chunk: 0,
-        len: 4,
-    };
-    let chunk_data = ChunkDataProto {
-        slice: Some(chunk_slice),
-        data: Bytes::from_static(b"ping"),
-        checksum32: 0,
-    };
-
-    let request = proto::worker::WriteChunkRequestProto {
-        token: Some(proto::common::FencingTokenProto {
-            block_id: Some(proto::common::BlockIdProto {
-                data_handle_id: 10,
-                block_index: 0,
-            }),
+    let request = Request::new(OpenWriteStreamRequestProto {
+        header: Some(data_request_header("open-write-stream")),
+        block_id: Some(block_id(10, 0)),
+        token: Some(FencingTokenProto {
+            block_id: Some(block_id(10, 0)),
             owner: 1,
             epoch: 1,
         }),
-        data: Some(chunk_data),
-        write_id: 1,
-        write_mode: proto::common::WriteModeProto::WriteModeUnspecified as i32,
-        route_epoch: 0,
-        worker_epoch: 1, // stale on purpose
-        file_version: 0,
-    };
+        expected_block_stamp: 1,
+        preferred_frame_size: 4096,
+    });
 
-    let mut attempt_request = request.clone();
-    let mut refreshes = 0;
-    let meta_refreshes = Arc::new(AtomicUsize::new(0));
+    let response = WorkerDataService::open_write_stream(&mock_worker, request)
+        .await
+        .expect("open write placeholder should use structured response")
+        .into_inner();
 
-    for attempt in 0..2 {
-        let response = WorkerDataService::write_chunk(&mock_worker, Request::new(attempt_request.clone()))
-            .await
-            .expect("service call")
-            .into_inner();
-        let header = response.header.expect("data header");
-        if let Some(err_detail) = header.error.as_ref() {
-            let canonical = proto::convert::error_detail_to_canonical(err_detail);
-            let action = handle_canonical_error(&canonical);
-            refreshes += 1;
-            assert!(matches!(
-                action,
-                Err(ClientAction::Refresh {
-                    reason: RefreshReason::WorkerEpochMismatch,
-                    ..
-                })
-            ));
-            let hinted_epoch = header.worker_epoch.expect("worker_epoch hint");
-            // Metadata refresh must be invoked and override hinted epoch.
-            let meta_epoch = {
-                meta_refreshes.fetch_add(1, Ordering::SeqCst);
-                2u64
-            };
-            assert_ne!(hinted_epoch, meta_epoch, "hint should be stale");
-            attempt_request.worker_epoch = meta_epoch;
-            assert_eq!(attempt, 0, "should refresh only once");
-            continue;
-        }
-
-        // Success after refresh
-        assert!(response.stored);
-        assert_eq!(header.worker_epoch, Some(2));
-        assert_eq!(refreshes, 1);
-        assert_eq!(meta_refreshes.load(Ordering::SeqCst), 1);
-        break;
-    }
+    assert!(response.stream_id.is_none());
+    assert_eq!(response.accepted_frame_size, 0);
+    assert_eq!(response.flow_control_window_bytes, 0);
+    assert_stream_v2_unimplemented_header(response.header.expect("data header"), "OpenWriteStream");
 }
 
-/// Fencing mismatch should trigger metadata refresh + token renewal before retry success.
+/// CommitWrite is also a phase-1 placeholder and must not pretend data was persisted.
 #[tokio::test]
-async fn test_fencing_refresh_and_retry_with_metadata() {
+async fn test_direct_worker_commit_write_is_explicitly_unimplemented() {
     init_logging();
 
     let mock_worker = MockWorkerServer::new(1);
-    mock_worker.set_worker_epoch(3).await;
-    mock_worker.set_fencing_epoch(5).await;
-
-    let chunk_ref = proto::common::ChunkIdProto {
-        block: Some(proto::common::BlockIdProto {
-            data_handle_id: 20,
-            block_index: 0,
-        }),
-        chunk_index: 0,
-    };
-    let chunk_slice = ChunkSliceProto {
-        chunk: Some(chunk_ref),
-        offset_in_chunk: 0,
-        len: 4,
-    };
-    let chunk_data = ChunkDataProto {
-        slice: Some(chunk_slice),
-        data: Bytes::from_static(b"fenc"),
-        checksum32: 0,
-    };
-
-    let request = proto::worker::WriteChunkRequestProto {
-        token: Some(proto::common::FencingTokenProto {
-            block_id: Some(proto::common::BlockIdProto {
-                data_handle_id: 20,
-                block_index: 0,
-            }),
+    let request = Request::new(CommitWriteRequestProto {
+        header: Some(data_request_header("commit-write")),
+        stream_id: Some(StreamIdProto { high: 0, low: 7 }),
+        block_id: Some(block_id(20, 0)),
+        token: Some(FencingTokenProto {
+            block_id: Some(block_id(20, 0)),
             owner: 1,
-            epoch: 1, // stale
+            epoch: 5,
         }),
-        data: Some(chunk_data),
-        write_id: 2,
-        write_mode: proto::common::WriteModeProto::WriteModeUnspecified as i32,
-        route_epoch: 0,
-        worker_epoch: 3,
-        file_version: 0,
-    };
+        commit_seq: 1,
+        committed_length: 4,
+        require_sync: true,
+    });
 
-    let mut attempt_request = request.clone();
-    let mut refreshes = 0;
-    let meta_refreshes = Arc::new(AtomicUsize::new(0));
-    let token_refreshes = Arc::new(AtomicUsize::new(0));
+    let response = WorkerDataService::commit_write(&mock_worker, request)
+        .await
+        .expect("commit placeholder should use structured response")
+        .into_inner();
 
-    for attempt in 0..2 {
-        let response = WorkerDataService::write_chunk(&mock_worker, Request::new(attempt_request.clone()))
-            .await
-            .expect("service call")
-            .into_inner();
-        let header = response.header.expect("data header");
-        if let Some(err_detail) = header.error.as_ref() {
-            let canonical = proto::convert::error_detail_to_canonical(err_detail);
-            let action = handle_canonical_error(&canonical);
-            refreshes += 1;
-            assert!(matches!(
-                action,
-                Err(ClientAction::Refresh {
-                    reason: RefreshReason::Fencing,
-                    ..
-                })
-            ));
-
-            meta_refreshes.fetch_add(1, Ordering::SeqCst);
-            attempt_request.worker_epoch = 3;
-
-            token_refreshes.fetch_add(1, Ordering::SeqCst);
-            attempt_request.token = Some(proto::common::FencingTokenProto {
-                block_id: Some(proto::common::BlockIdProto {
-                    data_handle_id: 20,
-                    block_index: 0,
-                }),
-                owner: 1,
-                epoch: 5,
-            });
-            assert_eq!(attempt, 0, "should refresh only once");
-            continue;
-        }
-
-        assert!(response.stored);
-        assert_eq!(header.worker_epoch, Some(3));
-        assert_eq!(refreshes, 1);
-        assert_eq!(meta_refreshes.load(Ordering::SeqCst), 1);
-        assert_eq!(token_refreshes.load(Ordering::SeqCst), 1);
-        break;
-    }
+    assert_eq!(response.committed_length, 0);
+    assert_eq!(response.current_block_stamp, 0);
+    assert_eq!(response.persisted_through, 0);
+    assert_stream_v2_unimplemented_header(response.header.expect("data header"), "CommitWrite");
 }
 
 /// Route moved: client must follow NEED_REFRESH/MOVED hint and retry.
@@ -542,16 +429,13 @@ async fn test_block_stamp_mismatch_refresh_and_retry() {
     init_logging();
 
     let base_header = RequestHeader::new(types::ids::ClientId::new(12)).with_group_id(3);
-    let refreshes = Arc::new(AtomicUsize::new(0));
     let attempts = Arc::new(AtomicUsize::new(0));
 
     let outcome: RetryOutcome<(ResponseHeader, ())> = retry_metadata_once(
         base_header.clone(),
         {
-            let refreshes = refreshes.clone();
             let attempts = attempts.clone();
             move |hdr: RequestHeader| {
-                let refreshes = refreshes.clone();
                 let attempts = attempts.clone();
                 async move {
                     let attempt = attempts.fetch_add(1, Ordering::SeqCst);

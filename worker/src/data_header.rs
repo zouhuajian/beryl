@@ -30,10 +30,6 @@ pub struct DataResponseHeader {
     /// Canonical error detail (single source of truth for all error semantics).
     /// If None or error_class = OK, the operation succeeded.
     pub error: Option<CanonicalError>,
-    /// Worker epoch hint for client refresh.
-    pub worker_epoch: Option<u64>,
-    /// Optional endpoint hint to allow client to reconnect.
-    pub endpoint_hint: Option<proto::common::WorkerEndpointInfoProto>,
 }
 
 impl DataRequestHeader {
@@ -55,12 +51,7 @@ impl DataRequestHeader {
 impl DataResponseHeader {
     /// Create a successful response header.
     pub fn ok(client: ClientInfo) -> Self {
-        Self {
-            client,
-            error: None,
-            worker_epoch: None,
-            endpoint_hint: None,
-        }
+        Self { client, error: None }
     }
 
     /// Create a NEED_REFRESH response header with reason and message.
@@ -73,8 +64,6 @@ impl DataResponseHeader {
         Self {
             client,
             error: Some(CanonicalError::need_refresh(rpc_code, reason, message)),
-            worker_epoch: None,
-            endpoint_hint: None,
         }
     }
 
@@ -88,8 +77,6 @@ impl DataResponseHeader {
         Self {
             client,
             error: Some(CanonicalError::retryable(rpc_code, retry_after_ms, message)),
-            worker_epoch: None,
-            endpoint_hint: None,
         }
     }
 
@@ -105,8 +92,6 @@ impl DataResponseHeader {
                 message,
                 refresh_hint: None,
             }),
-            worker_epoch: None,
-            endpoint_hint: None,
         }
     }
 }
@@ -154,15 +139,7 @@ impl DataResponseHeader {
 
         let error = proto.error.as_ref().map(proto::convert::error_detail_to_canonical);
 
-        let worker_epoch = proto.worker_epoch;
-        let endpoint_hint = proto.endpoint_hint;
-
-        Ok(DataResponseHeader {
-            client,
-            error,
-            worker_epoch,
-            endpoint_hint,
-        })
+        Ok(DataResponseHeader { client, error })
     }
 
     /// Convert to proto.
@@ -172,8 +149,6 @@ impl DataResponseHeader {
         DataResponseHeaderProto {
             client: Some((&self.client).into()),
             error: error_detail,
-            worker_epoch: self.worker_epoch,
-            endpoint_hint: self.endpoint_hint.clone(),
         }
     }
 }

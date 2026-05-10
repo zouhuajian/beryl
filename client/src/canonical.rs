@@ -38,6 +38,17 @@ impl From<proto::common::WorkerEndpointInfoProto> for EndpointHint {
     }
 }
 
+impl From<common::error::canonical::WorkerEndpointHint> for EndpointHint {
+    fn from(value: common::error::canonical::WorkerEndpointHint) -> Self {
+        Self {
+            worker_id: value.worker_id,
+            endpoint: value.endpoint,
+            net_transport_kind: value.net_transport_kind,
+            worker_epoch: value.worker_epoch,
+        }
+    }
+}
+
 /// Structured refresh hints preserved from response headers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RefreshHint {
@@ -185,12 +196,16 @@ pub fn validate_data_header_or_action(
     };
 
     let canonical = error_detail_to_canonical(err_detail);
+    let canonical_hint = canonical.refresh_hint.as_ref();
     let hint = RefreshHint {
         group_id: None,
         route_epoch: None,
         mount_epoch: None,
-        worker_epoch: header.worker_epoch,
-        endpoint_hint: header.endpoint_hint.clone().map(EndpointHint::from),
+        worker_epoch: canonical_hint.and_then(|hint| hint.worker_epoch),
+        endpoint_hint: canonical_hint
+            .and_then(|hint| hint.worker_endpoints.first())
+            .cloned()
+            .map(EndpointHint::from),
     };
 
     validate_canonical_with_hint(canonical, hint)
