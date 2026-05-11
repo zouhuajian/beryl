@@ -4,6 +4,7 @@
 //! Unit tests for the worker data-plane skeleton.
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -644,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn block_manager_and_store_are_placeholders_without_real_io_or_replication() {
+    fn block_manager_stays_placeholder_and_store_stays_local_only() {
         let block_manager = include_str!("runtime/block.rs");
         let block_store = include_str!("store/block.rs");
 
@@ -662,17 +663,26 @@ mod tests {
         }
 
         for forbidden in [
-            "tokio::fs",
-            "AsyncRead",
-            "AsyncWrite",
-            "std::fs",
-            "manifest",
-            "volume_manager",
+            "proto::",
+            "prost",
+            "tonic",
+            "WorkerCore::",
+            "WorkerDataService",
+            "StreamManager",
+            "TransportFrame",
+            "ReadChunk",
+            "WriteChunk",
+            "ReadRange",
+            "read_chunk",
+            "write_chunk",
+            "ufs",
+            "replication",
+            "quorum",
             ".chunk\"",
         ] {
             assert!(
                 !block_store.contains(forbidden),
-                "block_store.rs must not implement real local IO through {forbidden}"
+                "block_store.rs must stay local-format only and avoid {forbidden}"
             );
         }
     }

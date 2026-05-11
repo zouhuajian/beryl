@@ -25,6 +25,8 @@ tracing = { workspace = true }
 
 # Utilities
 bytes = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
 
 # RPC
 tonic = { workspace = true }

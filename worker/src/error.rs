@@ -47,6 +47,10 @@ pub enum WorkerError {
     #[error("Not found: {0}")]
     NotFound(String),
 
+    /// Persisted local data or metadata is malformed.
+    #[error("Corrupt: {0}")]
+    Corrupt(String),
+
     /// Permission denied.
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
@@ -106,6 +110,7 @@ impl WorkerError {
             WorkerError::Cancelled(_) => (false, None, None, None),
             WorkerError::InvalidArgument(_) => (false, None, None, None),
             WorkerError::NotFound(_) => (false, None, None, None),
+            WorkerError::Corrupt(_) => (false, None, None, None),
             WorkerError::PermissionDenied(_) => (false, None, None, None),
             WorkerError::Unimplemented(_) => (false, None, None, None),
             WorkerError::Internal(_) => (false, None, None, None),
@@ -158,6 +163,7 @@ impl WorkerError {
             WorkerError::Cancelled(_) => tonic::Code::Cancelled,
             WorkerError::InvalidArgument(_) => tonic::Code::InvalidArgument,
             WorkerError::NotFound(_) => tonic::Code::NotFound,
+            WorkerError::Corrupt(_) => tonic::Code::DataLoss,
             WorkerError::PermissionDenied(_) => tonic::Code::PermissionDenied,
             WorkerError::Unimplemented(_) => tonic::Code::Unimplemented,
             WorkerError::Internal(_) => tonic::Code::Internal,
@@ -250,6 +256,14 @@ impl From<WorkerError> for CanonicalError {
                 reason: None,
                 retry_after_ms: None,
                 message: format!("not found: {}", msg),
+                refresh_hint: None,
+            },
+            WorkerError::Corrupt(msg) => CanonicalError {
+                class: ErrorClass::Fatal,
+                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
+                reason: None,
+                retry_after_ms: None,
+                message: format!("corrupt: {}", msg),
                 refresh_hint: None,
             },
             WorkerError::PermissionDenied(msg) => CanonicalError {
