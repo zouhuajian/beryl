@@ -15,128 +15,97 @@ use types::ids::{BlockId, ShardGroupId};
 
 use crate::error::WorkerError;
 
-mod meta_header {
-    pub const MAGIC: [u8; 8] = *b"VBLKMETA";
-    pub const LEN: usize = 40;
-    pub const HEADER_VERSION: u32 = 1;
-    pub const PAYLOAD_VERSION: u32 = 1;
-    pub const CODEC_BINCODE: u32 = 1;
-    pub const FLAGS_NONE: u32 = 0;
-}
-
-mod block_format {
-    pub const FIXED_OFFSET: u32 = 1;
-}
-
-mod checksum {
-    pub const CRC32C_POLY_REVERSED: u32 = 0x82f6_3b78;
-}
-
 type StoreResult<T> = Result<T, WorkerError>;
 
+// Metadata file header constants.
+
+const BLOCK_META_MAGIC: [u8; 8] = *b"VBLKMETA";
+const BLOCK_META_HEADER_LEN: usize = 24;
+const BLOCK_META_VERSION: u32 = 1;
+const MAX_META_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
+
+// Supported local block file format identifiers.
+
+const BLOCK_FORMAT_FIXED_OFFSET: u32 = 1;
+
 /// Fixed little-endian header for a block metadata file.
-/// The header identifies the payload codec and protects the payload with CRC32C.
+/// The header identifies the format and bounds the serialized payload.
+/// Metadata bytes are not checksummed; correctness relies on atomic
+/// replacement, strict decoding, and semantic validation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockMetaFileHeader {
     /// Fixed file magic used to identify Vecton block metadata.
     pub magic: [u8; 8],
-    /// Version of this fixed header layout.
-    pub header_version: u32,
-    /// Version of the serialized metadata payload schema.
-    pub payload_version: u32,
-    /// Codec used to encode the payload.
-    pub payload_codec: u32,
-    /// Reserved feature flags. Unknown non-zero flags are rejected.
-    pub flags: u32,
+    /// Version of this fixed header and serialized payload layout.
+    pub version: u32,
+    /// Fixed header length in bytes.
+    pub header_len: u32,
     /// Serialized payload length in bytes.
     pub payload_len: u64,
-    /// CRC32C of the serialized payload.
-    pub payload_crc32c: u32,
-    /// CRC32C of this header with this field set to zero.
-    pub header_crc32c: u32,
 }
 
 impl BlockMetaFileHeader {
     pub const fn encoded_len() -> usize {
-        meta_header::LEN
+        BLOCK_META_HEADER_LEN
     }
 
-    fn for_payload(payload_len: usize, payload_crc32c: u32) -> StoreResult<Self> {
+    fn for_payload(payload_len: usize) -> StoreResult<Self> {
         let payload_len =
             u64::try_from(payload_len).map_err(|_| invalid_argument("meta payload length does not fit in u64"))?;
-        let mut header = Self {
-            magic: meta_header::MAGIC,
-            header_version: meta_header::HEADER_VERSION,
-            payload_version: meta_header::PAYLOAD_VERSION,
-            payload_codec: meta_header::CODEC_BINCODE,
-            flags: meta_header::FLAGS_NONE,
+        let header = Self {
+            magic: BLOCK_META_MAGIC,
+            version: BLOCK_META_VERSION,
+            header_len: BLOCK_META_HEADER_LEN as u32,
             payload_len,
-            payload_crc32c,
-            header_crc32c: 0,
         };
-        header.header_crc32c = crc32c(&header.bytes_for_crc());
+        header.validate()?;
         Ok(header)
     }
 
     fn decode(encoded: &[u8]) -> StoreResult<Self> {
-        if encoded.len() != meta_header::LEN {
+        if encoded.len() != BLOCK_META_HEADER_LEN {
             return Err(corrupt("invalid meta header length"));
         }
 
         let mut magic = [0u8; 8];
         magic.copy_from_slice(&encoded[0..8]);
 
-        // Fixed little-endian on-disk header. Do not reorder fields without changing header_version.
+        // Fixed little-endian on-disk header. Do not reorder fields without changing
+        // the supported header version.
         Ok(Self {
             magic,
-            header_version: u32::from_le_bytes(encoded[8..12].try_into().expect("fixed header slice")),
-            payload_version: u32::from_le_bytes(encoded[12..16].try_into().expect("fixed header slice")),
-            payload_codec: u32::from_le_bytes(encoded[16..20].try_into().expect("fixed header slice")),
-            flags: u32::from_le_bytes(encoded[20..24].try_into().expect("fixed header slice")),
-            payload_len: u64::from_le_bytes(encoded[24..32].try_into().expect("fixed header slice")),
-            payload_crc32c: u32::from_le_bytes(encoded[32..36].try_into().expect("fixed header slice")),
-            header_crc32c: u32::from_le_bytes(encoded[36..40].try_into().expect("fixed header slice")),
+            version: u32::from_le_bytes(encoded[8..12].try_into().expect("fixed header slice")),
+            header_len: u32::from_le_bytes(encoded[12..16].try_into().expect("fixed header slice")),
+            payload_len: u64::from_le_bytes(encoded[16..24].try_into().expect("fixed header slice")),
         })
     }
 
-    fn encode(self) -> [u8; meta_header::LEN] {
-        // Fixed little-endian on-disk header. Do not reorder fields without changing header_version.
-        let mut encoded = [0u8; meta_header::LEN];
+    fn encode(self) -> [u8; BLOCK_META_HEADER_LEN] {
+        // Fixed little-endian on-disk header. Do not reorder fields without changing
+        // the supported header version.
+        let mut encoded = [0u8; BLOCK_META_HEADER_LEN];
         encoded[0..8].copy_from_slice(&self.magic);
-        encoded[8..12].copy_from_slice(&self.header_version.to_le_bytes());
-        encoded[12..16].copy_from_slice(&self.payload_version.to_le_bytes());
-        encoded[16..20].copy_from_slice(&self.payload_codec.to_le_bytes());
-        encoded[20..24].copy_from_slice(&self.flags.to_le_bytes());
-        encoded[24..32].copy_from_slice(&self.payload_len.to_le_bytes());
-        encoded[32..36].copy_from_slice(&self.payload_crc32c.to_le_bytes());
-        encoded[36..40].copy_from_slice(&self.header_crc32c.to_le_bytes());
+        encoded[8..12].copy_from_slice(&self.version.to_le_bytes());
+        encoded[12..16].copy_from_slice(&self.header_len.to_le_bytes());
+        encoded[16..24].copy_from_slice(&self.payload_len.to_le_bytes());
         encoded
     }
 
-    fn bytes_for_crc(self) -> [u8; meta_header::LEN] {
-        let mut header = self;
-        header.header_crc32c = 0;
-        header.encode()
-    }
-
     fn validate(self) -> StoreResult<()> {
-        if self.magic != meta_header::MAGIC {
+        if self.magic != BLOCK_META_MAGIC {
             return Err(corrupt("invalid block meta magic"));
         }
-        if self.header_version != meta_header::HEADER_VERSION {
-            return Err(corrupt("unsupported block meta header version"));
+        if self.version != BLOCK_META_VERSION {
+            return Err(corrupt("unsupported block meta version"));
         }
-        if self.payload_version != meta_header::PAYLOAD_VERSION {
-            return Err(corrupt("unsupported block meta payload version"));
+        if self.header_len != BLOCK_META_HEADER_LEN as u32 {
+            return Err(corrupt("unsupported block meta header length"));
         }
-        if self.payload_codec != meta_header::CODEC_BINCODE {
-            return Err(corrupt("unsupported block meta payload codec"));
+        if self.payload_len == 0 {
+            return Err(corrupt("block meta payload length must be non-zero"));
         }
-        if self.flags != meta_header::FLAGS_NONE {
-            return Err(corrupt("unsupported block meta flags"));
-        }
-        if crc32c(&self.bytes_for_crc()) != self.header_crc32c {
-            return Err(corrupt("block meta header checksum mismatch"));
+        if self.payload_len > MAX_META_PAYLOAD_LEN as u64 {
+            return Err(corrupt("block meta payload length exceeds limit"));
         }
         Ok(())
     }
@@ -176,7 +145,8 @@ pub struct BlockFormat {
     pub block_size: u64,
     /// Worker-local StorageChunk size used by bitmaps and local IO.
     pub chunk_size: u64,
-    /// Per-chunk checksum algorithm. The current format may use None.
+    /// Checksum algorithm for StorageChunk data in `.blk`.
+    /// This does not protect the `.meta` header or payload.
     pub checksum_kind: ChecksumKind,
 }
 
@@ -365,7 +335,7 @@ impl BlockFileStore {
         let meta = BlockMetaPayload {
             identity: BlockIdentity { block_id, group_id },
             format: BlockFormat {
-                format_id: block_format::FIXED_OFFSET,
+                format_id: BLOCK_FORMAT_FIXED_OFFSET,
                 block_size,
                 chunk_size,
                 checksum_kind: ChecksumKind::None,
@@ -377,6 +347,7 @@ impl BlockFileStore {
             },
             chunks: BlockChunks::new(chunk_count),
         };
+        validate_meta_payload(&meta, group_id, block_id)?;
         write_meta_new(&paths, &meta)?;
         Ok(paths)
     }
@@ -578,7 +549,7 @@ fn write_meta_new(paths: &BlockPaths, meta: &BlockMetaPayload) -> StoreResult<()
 
 fn encode_meta(meta: &BlockMetaPayload) -> StoreResult<Vec<u8>> {
     let payload = encode_to_vec(meta, standard()).map_err(|err| WorkerError::Internal(err.to_string()))?;
-    let header = BlockMetaFileHeader::for_payload(payload.len(), crc32c(&payload))?;
+    let header = BlockMetaFileHeader::for_payload(payload.len())?;
     let mut encoded = Vec::with_capacity(BlockMetaFileHeader::encoded_len() + payload.len());
     encoded.extend_from_slice(&header.encode());
     encoded.extend_from_slice(&payload);
@@ -586,28 +557,23 @@ fn encode_meta(meta: &BlockMetaPayload) -> StoreResult<Vec<u8>> {
 }
 
 fn read_meta_file(path: &Path) -> StoreResult<BlockMetaPayload> {
-    let mut encoded = Vec::new();
-    File::open(path)?.read_to_end(&mut encoded)?;
-    if encoded.len() < BlockMetaFileHeader::encoded_len() {
-        return Err(corrupt("block meta file is shorter than the header"));
-    }
+    let mut file = File::open(path)?;
+    let mut encoded_header = [0u8; BLOCK_META_HEADER_LEN];
+    file.read_exact(&mut encoded_header)
+        .map_err(|err| map_meta_read_error(err, "block meta file is shorter than the header"))?;
 
-    let header = BlockMetaFileHeader::decode(&encoded[..BlockMetaFileHeader::encoded_len()])?;
+    let header = BlockMetaFileHeader::decode(&encoded_header)?;
     header.validate()?;
     let payload_len = usize::try_from(header.payload_len).map_err(|_| corrupt("meta payload length is too large"))?;
-    let expected_len = BlockMetaFileHeader::encoded_len()
-        .checked_add(payload_len)
-        .ok_or_else(|| corrupt("meta file length overflow"))?;
-    if encoded.len() != expected_len {
-        return Err(corrupt("block meta file length does not match header"));
-    }
-
-    let payload = &encoded[BlockMetaFileHeader::encoded_len()..];
-    if crc32c(payload) != header.payload_crc32c {
-        return Err(corrupt("block meta payload checksum mismatch"));
+    let mut payload = vec![0; payload_len];
+    file.read_exact(&mut payload)
+        .map_err(|err| map_meta_read_error(err, "block meta payload is shorter than declared length"))?;
+    let mut trailing = [0u8; 1];
+    if file.read(&mut trailing)? != 0 {
+        return Err(corrupt("block meta file has trailing bytes"));
     }
     let (meta, consumed) =
-        decode_from_slice::<BlockMetaPayload, _>(payload, standard()).map_err(|err| corrupt(err.to_string()))?;
+        decode_from_slice::<BlockMetaPayload, _>(&payload, standard()).map_err(|err| corrupt(err.to_string()))?;
     if consumed != payload.len() {
         return Err(corrupt("block meta payload has trailing bytes"));
     }
@@ -621,7 +587,7 @@ fn validate_meta_payload(meta: &BlockMetaPayload, group_id: ShardGroupId, block_
     if meta.identity.block_id != block_id {
         return Err(corrupt("block meta block id does not match path"));
     }
-    if meta.format.format_id != block_format::FIXED_OFFSET {
+    if meta.format.format_id != BLOCK_FORMAT_FIXED_OFFSET {
         return Err(corrupt("unsupported block format id"));
     }
     if meta.format.checksum_kind != ChecksumKind::None {
@@ -801,18 +767,6 @@ fn sync_parent_dir(parent: &Path) -> StoreResult<()> {
     Ok(())
 }
 
-fn crc32c(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (checksum::CRC32C_POLY_REVERSED & mask);
-        }
-    }
-    !crc
-}
-
 fn map_data_open_error(err: std::io::Error, message: &str) -> WorkerError {
     if err.kind() == std::io::ErrorKind::NotFound {
         corrupt(message)
@@ -822,6 +776,14 @@ fn map_data_open_error(err: std::io::Error, message: &str) -> WorkerError {
 }
 
 fn map_data_read_error(err: std::io::Error, message: &str) -> WorkerError {
+    if err.kind() == std::io::ErrorKind::UnexpectedEof {
+        corrupt(message)
+    } else {
+        WorkerError::from(err)
+    }
+}
+
+fn map_meta_read_error(err: std::io::Error, message: &str) -> WorkerError {
     if err.kind() == std::io::ErrorKind::UnexpectedEof {
         corrupt(message)
     } else {
@@ -873,6 +835,26 @@ mod tests {
     fn persist_meta(store: &BlockFileStore, group_id: ShardGroupId, block_id: BlockId, meta: &BlockMetaPayload) {
         let paths = store.paths(group_id, block_id);
         write_meta_atomic(&paths, meta).expect("persist meta");
+    }
+
+    fn overwrite_header_u32(paths: &BlockPaths, offset: u64, value: u32) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&paths.meta_path)
+            .expect("open meta");
+        file.seek(SeekFrom::Start(offset)).expect("seek header field");
+        file.write_all(&value.to_le_bytes()).expect("write header field");
+        file.sync_all().expect("sync meta");
+    }
+
+    fn overwrite_header_u64(paths: &BlockPaths, offset: u64, value: u64) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&paths.meta_path)
+            .expect("open meta");
+        file.seek(SeekFrom::Start(offset)).expect("seek header field");
+        file.write_all(&value.to_le_bytes()).expect("write header field");
+        file.sync_all().expect("sync meta");
     }
 
     fn extend_data_file(paths: &BlockPaths, len: u64) {
@@ -1105,7 +1087,94 @@ mod tests {
     }
 
     #[test]
-    fn meta_payload_corruption_is_detected() {
+    fn block_meta_header_is_minimal_fixed_header() {
+        assert_eq!(BlockMetaFileHeader::encoded_len(), 24);
+
+        let header = BlockMetaFileHeader::for_payload(17).expect("header");
+        assert_eq!(header.magic, BLOCK_META_MAGIC);
+        assert_eq!(header.version, BLOCK_META_VERSION);
+        assert_eq!(header.header_len, BlockMetaFileHeader::encoded_len() as u32);
+        assert_eq!(header.payload_len, 17);
+    }
+
+    #[test]
+    fn bad_magic_is_rejected() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        let paths = store
+            .create_block(group_id, block_id, 4096, 1024, 4096)
+            .expect("create block");
+        let mut encoded = fs::read(&paths.meta_path).expect("read meta");
+        encoded[0] ^= 0xff;
+        fs::write(&paths.meta_path, encoded).expect("write meta");
+
+        assert_corrupt(store.load_meta(group_id, block_id));
+    }
+
+    #[test]
+    fn unsupported_version_is_rejected() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        let paths = store
+            .create_block(group_id, block_id, 4096, 1024, 4096)
+            .expect("create block");
+        overwrite_header_u32(&paths, 8, BLOCK_META_VERSION + 1);
+
+        assert_corrupt(store.load_meta(group_id, block_id));
+    }
+
+    #[test]
+    fn wrong_header_len_is_rejected() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        let paths = store
+            .create_block(group_id, block_id, 4096, 1024, 4096)
+            .expect("create block");
+        overwrite_header_u32(&paths, 12, BlockMetaFileHeader::encoded_len() as u32 + 4);
+
+        assert_corrupt(store.load_meta(group_id, block_id));
+    }
+
+    #[test]
+    fn zero_payload_len_is_rejected() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        let paths = store
+            .create_block(group_id, block_id, 4096, 1024, 4096)
+            .expect("create block");
+        overwrite_header_u64(&paths, 16, 0);
+
+        assert_corrupt(store.load_meta(group_id, block_id));
+    }
+
+    #[test]
+    fn oversized_payload_len_is_rejected() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        let paths = store
+            .create_block(group_id, block_id, 4096, 1024, 4096)
+            .expect("create block");
+        overwrite_header_u64(&paths, 16, MAX_META_PAYLOAD_LEN as u64 + 1);
+
+        assert_corrupt(store.load_meta(group_id, block_id));
+    }
+
+    #[test]
+    fn truncated_payload_is_rejected() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        let paths = store
+            .create_block(group_id, block_id, 4096, 1024, 4096)
+            .expect("create block");
+        let actual_len = fs::metadata(&paths.meta_path).expect("meta metadata").len();
+        let payload_len = actual_len - BlockMetaFileHeader::encoded_len() as u64 + 1;
+        overwrite_header_u64(&paths, 16, payload_len);
+
+        assert_corrupt(store.load_meta(group_id, block_id));
+    }
+
+    #[test]
+    fn payload_decode_failure_is_rejected() {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
         let paths = store
@@ -1131,25 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn meta_unknown_flags_are_rejected() {
-        let (_temp, store) = store();
-        let (group_id, block_id) = ids();
-        let paths = store
-            .create_block(group_id, block_id, 4096, 1024, 4096)
-            .expect("create block");
-        let mut encoded = fs::read(&paths.meta_path).expect("read meta");
-        let mut header =
-            BlockMetaFileHeader::decode(&encoded[..BlockMetaFileHeader::encoded_len()]).expect("decode header");
-        header.flags = 1;
-        header.header_crc32c = crc32c(&header.bytes_for_crc());
-        encoded[..BlockMetaFileHeader::encoded_len()].copy_from_slice(&header.encode());
-        fs::write(&paths.meta_path, encoded).expect("write meta");
-
-        assert_corrupt(store.load_meta(group_id, block_id));
-    }
-
-    #[test]
-    fn ready_corrupt_bitmap_conflict_is_rejected() {
+    fn payload_semantic_validation_still_rejects_invalid_meta() {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
         store
@@ -1161,11 +1212,6 @@ mod tests {
         persist_meta(&store, group_id, block_id, &meta);
 
         assert_corrupt(store.load_meta(group_id, block_id));
-    }
-
-    #[test]
-    fn crc32c_matches_known_vector() {
-        assert_eq!(crc32c(b"123456789"), 0xe306_9283);
     }
 
     #[test]
