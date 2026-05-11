@@ -15,46 +15,61 @@ use types::ids::{BlockId, ShardGroupId};
 
 use crate::error::WorkerError;
 
-const BLOCK_META_MAGIC: [u8; 8] = *b"VBLKMETA";
-const BLOCK_META_HEADER_LEN: usize = 40;
-const BLOCK_META_HEADER_VERSION: u32 = 1;
-const BLOCK_META_PAYLOAD_VERSION: u32 = 1;
-const BLOCK_META_PAYLOAD_CODEC_BINCODE: u32 = 1;
-const BLOCK_FORMAT_FIXED_OFFSET: u32 = 1;
-const CRC32C_POLY: u32 = 0x82f6_3b78;
+mod meta_header {
+    pub const MAGIC: [u8; 8] = *b"VBLKMETA";
+    pub const LEN: usize = 40;
+    pub const HEADER_VERSION: u32 = 1;
+    pub const PAYLOAD_VERSION: u32 = 1;
+    pub const CODEC_BINCODE: u32 = 1;
+    pub const FLAGS_NONE: u32 = 0;
+}
+
+mod block_format {
+    pub const FIXED_OFFSET: u32 = 1;
+}
+
+mod checksum {
+    pub const CRC32C_POLY_REVERSED: u32 = 0x82f6_3b78;
+}
 
 type StoreResult<T> = Result<T, WorkerError>;
 
-/// On-disk `.meta` container header.
-///
-/// The header is fixed-width and checksums the encoded payload. Its own
-/// checksum is computed with `header_crc32c` set to zero.
+/// Fixed little-endian header for a block metadata file.
+/// The header identifies the payload codec and protects the payload with CRC32C.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockMetaFileHeader {
+    /// Fixed file magic used to identify Vecton block metadata.
     pub magic: [u8; 8],
+    /// Version of this fixed header layout.
     pub header_version: u32,
+    /// Version of the serialized metadata payload schema.
     pub payload_version: u32,
+    /// Codec used to encode the payload.
     pub payload_codec: u32,
+    /// Reserved feature flags. Unknown non-zero flags are rejected.
     pub flags: u32,
+    /// Serialized payload length in bytes.
     pub payload_len: u64,
+    /// CRC32C of the serialized payload.
     pub payload_crc32c: u32,
+    /// CRC32C of this header with this field set to zero.
     pub header_crc32c: u32,
 }
 
 impl BlockMetaFileHeader {
     pub const fn encoded_len() -> usize {
-        BLOCK_META_HEADER_LEN
+        meta_header::LEN
     }
 
     fn for_payload(payload_len: usize, payload_crc32c: u32) -> StoreResult<Self> {
         let payload_len =
             u64::try_from(payload_len).map_err(|_| invalid_argument("meta payload length does not fit in u64"))?;
         let mut header = Self {
-            magic: BLOCK_META_MAGIC,
-            header_version: BLOCK_META_HEADER_VERSION,
-            payload_version: BLOCK_META_PAYLOAD_VERSION,
-            payload_codec: BLOCK_META_PAYLOAD_CODEC_BINCODE,
-            flags: 0,
+            magic: meta_header::MAGIC,
+            header_version: meta_header::HEADER_VERSION,
+            payload_version: meta_header::PAYLOAD_VERSION,
+            payload_codec: meta_header::CODEC_BINCODE,
+            flags: meta_header::FLAGS_NONE,
             payload_len,
             payload_crc32c,
             header_crc32c: 0,
@@ -64,13 +79,14 @@ impl BlockMetaFileHeader {
     }
 
     fn decode(encoded: &[u8]) -> StoreResult<Self> {
-        if encoded.len() != BLOCK_META_HEADER_LEN {
+        if encoded.len() != meta_header::LEN {
             return Err(corrupt("invalid meta header length"));
         }
 
         let mut magic = [0u8; 8];
         magic.copy_from_slice(&encoded[0..8]);
 
+        // Fixed little-endian on-disk header. Do not reorder fields without changing header_version.
         Ok(Self {
             magic,
             header_version: u32::from_le_bytes(encoded[8..12].try_into().expect("fixed header slice")),
@@ -83,8 +99,9 @@ impl BlockMetaFileHeader {
         })
     }
 
-    fn encode(self) -> [u8; BLOCK_META_HEADER_LEN] {
-        let mut encoded = [0u8; BLOCK_META_HEADER_LEN];
+    fn encode(self) -> [u8; meta_header::LEN] {
+        // Fixed little-endian on-disk header. Do not reorder fields without changing header_version.
+        let mut encoded = [0u8; meta_header::LEN];
         encoded[0..8].copy_from_slice(&self.magic);
         encoded[8..12].copy_from_slice(&self.header_version.to_le_bytes());
         encoded[12..16].copy_from_slice(&self.payload_version.to_le_bytes());
@@ -96,24 +113,27 @@ impl BlockMetaFileHeader {
         encoded
     }
 
-    fn bytes_for_crc(self) -> [u8; BLOCK_META_HEADER_LEN] {
+    fn bytes_for_crc(self) -> [u8; meta_header::LEN] {
         let mut header = self;
         header.header_crc32c = 0;
         header.encode()
     }
 
     fn validate(self) -> StoreResult<()> {
-        if self.magic != BLOCK_META_MAGIC {
+        if self.magic != meta_header::MAGIC {
             return Err(corrupt("invalid block meta magic"));
         }
-        if self.header_version != BLOCK_META_HEADER_VERSION {
+        if self.header_version != meta_header::HEADER_VERSION {
             return Err(corrupt("unsupported block meta header version"));
         }
-        if self.payload_version != BLOCK_META_PAYLOAD_VERSION {
+        if self.payload_version != meta_header::PAYLOAD_VERSION {
             return Err(corrupt("unsupported block meta payload version"));
         }
-        if self.payload_codec != BLOCK_META_PAYLOAD_CODEC_BINCODE {
+        if self.payload_codec != meta_header::CODEC_BINCODE {
             return Err(corrupt("unsupported block meta payload codec"));
+        }
+        if self.flags != meta_header::FLAGS_NONE {
+            return Err(corrupt("unsupported block meta flags"));
         }
         if crc32c(&self.bytes_for_crc()) != self.header_crc32c {
             return Err(corrupt("block meta header checksum mismatch"));
@@ -122,40 +142,42 @@ impl BlockMetaFileHeader {
     }
 }
 
-/// Self-describing block metadata payload.
+/// Self-describing metadata for one local block.
+/// This payload is the source of truth for local read visibility.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockMetaPayload {
+    /// Stable block identity.
     pub identity: BlockIdentity,
+    /// Format parameters for interpreting `.blk` and `.meta`.
     pub format: BlockFormat,
+    /// Source-independent local block length.
     pub source: BlockSource,
+    /// Published local visibility state.
     pub visibility: BlockVisibility,
+    /// Per-StorageChunk readiness state.
     pub chunks: BlockChunks,
 }
 
+/// Stable identity of the local block and owning group.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockIdentity {
+    /// Stable block identifier.
     pub block_id: BlockId,
+    /// Owning shard group.
     pub group_id: ShardGroupId,
 }
 
+/// On-disk format parameters used to interpret this block.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockFormat {
+    /// Identifier of the block file format used by this block.
     pub format_id: u32,
-    pub data_layout_kind: DataLayoutKind,
-    pub allocation_policy: AllocationPolicy,
+    /// Maximum logical size of this block.
     pub block_size: u64,
+    /// Worker-local StorageChunk size used by bitmaps and local IO.
     pub chunk_size: u64,
+    /// Per-chunk checksum algorithm. The current format may use None.
     pub checksum_kind: ChecksumKind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DataLayoutKind {
-    FixedOffsetBlockFile,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AllocationPolicy {
-    SparseAllowed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,32 +185,32 @@ pub enum ChecksumKind {
     None,
 }
 
+/// Source-independent effective length of this block.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockSource {
+    /// Valid logical length of this block, capped by block_size.
     pub effective_block_len: u64,
 }
 
+/// Local visibility state persisted in metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockVisibility {
-    pub block_state: BlockState,
-    /// Block-local continuous ready prefix.
-    /// This is derived from ready chunks and capped by effective_block_len.
+    /// Block-local continuous Ready prefix.
+    /// This is not the sum of all Ready chunks.
     pub committed_length: u64,
     /// Logical block stamp persisted with metadata.
     /// Local writes do not advance it until visibility is published.
     pub block_stamp: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BlockState {
-    Created,
-    Published,
-}
-
+/// Per-StorageChunk visibility bitmaps.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockChunks {
+    /// Number of StorageChunks described by the bitmaps.
     pub chunk_count: u32,
+    /// Chunks that are published and can be read locally.
     pub ready_bitmap: Vec<u8>,
+    /// Chunks known to be locally unusable.
     pub corrupt_bitmap: Vec<u8>,
 }
 
@@ -328,10 +350,12 @@ impl BlockFileStore {
         let paths = self.paths(group_id, block_id);
         let parent = paths.parent_dir()?;
         fs::create_dir_all(parent)?;
+        if paths.data_path.exists() || paths.meta_path.exists() {
+            return Err(invalid_argument(format!("block already exists: block_id={block_id}")));
+        }
 
         let data = OpenOptions::new()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .read(true)
             .write(true)
             .open(&paths.data_path)?;
@@ -341,22 +365,19 @@ impl BlockFileStore {
         let meta = BlockMetaPayload {
             identity: BlockIdentity { block_id, group_id },
             format: BlockFormat {
-                format_id: BLOCK_FORMAT_FIXED_OFFSET,
-                data_layout_kind: DataLayoutKind::FixedOffsetBlockFile,
-                allocation_policy: AllocationPolicy::SparseAllowed,
+                format_id: block_format::FIXED_OFFSET,
                 block_size,
                 chunk_size,
                 checksum_kind: ChecksumKind::None,
             },
             source: BlockSource { effective_block_len },
             visibility: BlockVisibility {
-                block_state: BlockState::Created,
                 committed_length: 0,
                 block_stamp: 0,
             },
             chunks: BlockChunks::new(chunk_count),
         };
-        write_meta_atomic(&paths, &meta)?;
+        write_meta_new(&paths, &meta)?;
         Ok(paths)
     }
 
@@ -380,6 +401,7 @@ impl BlockFileStore {
         Ok(())
     }
 
+    /// Publishes selected chunks as Ready by atomically rewriting metadata.
     pub fn publish_ready(
         &self,
         group_id: ShardGroupId,
@@ -389,16 +411,12 @@ impl BlockFileStore {
         block_stamp: u64,
     ) -> StoreResult<()> {
         let paths = self.paths(group_id, block_id);
-        let mut meta = self.load_meta(group_id, block_id)?;
-        validate_publish_ready_transition(&meta, block_id, chunk_indices, committed_length)?;
-        for chunk_index in chunk_indices {
-            meta.chunks.set_ready(*chunk_index)?;
-        }
-        meta.visibility.block_state = BlockState::Published;
-        meta.visibility.committed_length = committed_length;
-        meta.visibility.block_stamp = block_stamp;
-        validate_meta_payload(&meta, group_id, block_id)?;
-        write_meta_atomic(&paths, &meta)
+        let meta = self.load_meta(group_id, block_id)?;
+        let projected =
+            project_publish_ready_transition(&meta, block_id, chunk_indices, committed_length, block_stamp)?;
+        validate_meta_payload(&projected, group_id, block_id)?;
+        validate_ready_data_file(&paths, &projected)?;
+        write_meta_atomic(&paths, &projected)
     }
 
     /// Reads only ranges fully covered by ready StorageChunks.
@@ -463,8 +481,7 @@ impl BlockPaths {
 /// Placeholder for worker-local block storage.
 ///
 /// The concrete file-backed store owns persisted block metadata, byte IO, and
-/// readiness bitmaps. This compatibility shell intentionally remains detached
-/// from the upper data path until that contract is wired explicitly.
+/// readiness bitmaps. It remains detached from the upper data path until wired explicitly.
 #[derive(Clone, Debug)]
 pub struct BlockStore {
     /// Worker-local StorageChunk size.
@@ -539,6 +556,26 @@ fn write_meta_atomic(paths: &BlockPaths, meta: &BlockMetaPayload) -> StoreResult
     Ok(())
 }
 
+fn write_meta_new(paths: &BlockPaths, meta: &BlockMetaPayload) -> StoreResult<()> {
+    let parent = paths.parent_dir()?;
+    fs::create_dir_all(parent)?;
+    let encoded = encode_meta(meta)?;
+    {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&paths.temp_meta_path)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+    }
+    let link_result = fs::hard_link(&paths.temp_meta_path, &paths.meta_path);
+    let cleanup_result = fs::remove_file(&paths.temp_meta_path);
+    link_result?;
+    cleanup_result?;
+    sync_parent_dir(parent)?;
+    Ok(())
+}
+
 fn encode_meta(meta: &BlockMetaPayload) -> StoreResult<Vec<u8>> {
     let payload = encode_to_vec(meta, standard()).map_err(|err| WorkerError::Internal(err.to_string()))?;
     let header = BlockMetaFileHeader::for_payload(payload.len(), crc32c(&payload))?;
@@ -584,14 +621,8 @@ fn validate_meta_payload(meta: &BlockMetaPayload, group_id: ShardGroupId, block_
     if meta.identity.block_id != block_id {
         return Err(corrupt("block meta block id does not match path"));
     }
-    if meta.format.format_id != BLOCK_FORMAT_FIXED_OFFSET {
+    if meta.format.format_id != block_format::FIXED_OFFSET {
         return Err(corrupt("unsupported block format id"));
-    }
-    if meta.format.data_layout_kind != DataLayoutKind::FixedOffsetBlockFile {
-        return Err(corrupt("unsupported block data layout"));
-    }
-    if meta.format.allocation_policy != AllocationPolicy::SparseAllowed {
-        return Err(corrupt("unsupported block allocation policy"));
     }
     if meta.format.checksum_kind != ChecksumKind::None {
         return Err(corrupt("unsupported checksum kind"));
@@ -656,12 +687,13 @@ fn validate_ready_range(meta: &BlockMetaPayload, offset: u64, len: u64) -> Store
     Ok(())
 }
 
-fn validate_publish_ready_transition(
+fn project_publish_ready_transition(
     meta: &BlockMetaPayload,
     block_id: BlockId,
     chunk_indices: &[u32],
     committed_length: u64,
-) -> StoreResult<()> {
+    block_stamp: u64,
+) -> StoreResult<BlockMetaPayload> {
     if committed_length > meta.source.effective_block_len {
         return Err(invalid_argument(format!(
             "publish_ready committed_length={committed_length} exceeds effective_block_len={} for block_id={block_id}",
@@ -688,8 +720,10 @@ fn validate_publish_ready_transition(
             "publish_ready committed_length={committed_length} does not match ready prefix {ready_prefix} for block_id={block_id}"
         )));
     }
+    projected.visibility.committed_length = committed_length;
+    projected.visibility.block_stamp = block_stamp;
 
-    Ok(())
+    Ok(projected)
 }
 
 fn validate_ready_data_file(paths: &BlockPaths, meta: &BlockMetaPayload) -> StoreResult<()> {
@@ -773,7 +807,7 @@ fn crc32c(bytes: &[u8]) -> u32 {
         crc ^= u32::from(*byte);
         for _ in 0..8 {
             let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (CRC32C_POLY & mask);
+            crc = (crc >> 1) ^ (checksum::CRC32C_POLY_REVERSED & mask);
         }
     }
     !crc
@@ -841,6 +875,15 @@ mod tests {
         write_meta_atomic(&paths, meta).expect("persist meta");
     }
 
+    fn extend_data_file(paths: &BlockPaths, len: u64) {
+        OpenOptions::new()
+            .write(true)
+            .open(&paths.data_path)
+            .expect("open data")
+            .set_len(len)
+            .expect("extend data");
+    }
+
     #[test]
     fn create_block_creates_blk_and_meta() {
         let (_temp, store) = store();
@@ -860,6 +903,27 @@ mod tests {
         assert_eq!(meta.format.chunk_size, MB);
         assert_eq!(meta.source.effective_block_len, 4 * MB);
         assert_eq!(meta.chunks.chunk_count, 4);
+    }
+
+    #[test]
+    fn create_block_existing_fails() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        let paths = store
+            .create_block(group_id, block_id, 4096, 1024, 4096)
+            .expect("create block");
+        fs::write(&paths.data_path, b"existing data").expect("write existing data");
+        let meta_before = fs::read(&paths.meta_path).expect("read meta before");
+
+        store
+            .create_block(group_id, block_id, 4096, 1024, 4096)
+            .expect_err("existing block should be rejected");
+
+        assert_eq!(
+            fs::read(&paths.data_path).expect("read existing data"),
+            b"existing data"
+        );
+        assert_eq!(fs::read(&paths.meta_path).expect("read meta after"), meta_before);
     }
 
     #[test]
@@ -888,7 +952,7 @@ mod tests {
         store
             .create_block(group_id, block_id, 4096, 1024, 4096)
             .expect("create block");
-        let data = Bytes::from_static(b"chunk-data");
+        let data = Bytes::from(vec![7; 1024]);
 
         store.write_at(group_id, block_id, 0, data.clone()).expect("write");
         store
@@ -896,6 +960,31 @@ mod tests {
             .expect("publish");
 
         assert_eq!(store.read_at(group_id, block_id, 0, data.len() as u64).unwrap(), data);
+    }
+
+    #[test]
+    fn publish_ready_rejects_short_blk() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        let paths = store
+            .create_block(group_id, block_id, 4096, 1024, 1536)
+            .expect("create block");
+        store
+            .write_at(group_id, block_id, 0, Bytes::from(vec![7; 1024]))
+            .expect("write first chunk");
+        let meta_before = fs::read(&paths.meta_path).expect("read meta before publish");
+
+        assert_corrupt(store.publish_ready(group_id, block_id, &[0, 1], 1536, 1));
+
+        assert_eq!(
+            fs::read(&paths.meta_path).expect("read meta after publish"),
+            meta_before
+        );
+        let reloaded = store.load_meta(group_id, block_id).expect("reload meta");
+        assert!(!reloaded.chunks.is_ready(0).expect("ready bit"));
+        assert!(!reloaded.chunks.is_ready(1).expect("ready bit"));
+        assert_eq!(reloaded.visibility.committed_length, 0);
+        assert_eq!(reloaded.visibility.block_stamp, 0);
     }
 
     #[test]
@@ -939,7 +1028,7 @@ mod tests {
             .expect("create block");
 
         store
-            .write_at(group_id, block_id, 0, Bytes::from_static(b"ready"))
+            .write_at(group_id, block_id, 0, Bytes::from(vec![5; 1024]))
             .expect("write");
         store
             .publish_ready(group_id, block_id, &[0], 1024, 1)
@@ -973,9 +1062,10 @@ mod tests {
     fn committed_length_stops_at_first_missing_chunk() {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
-        store
+        let paths = store
             .create_block(group_id, block_id, 3 * MB, MB, 3 * MB)
             .expect("create block");
+        extend_data_file(&paths, 3 * MB);
         store
             .publish_ready(group_id, block_id, &[0, 2], MB, 1)
             .expect("publish");
@@ -1001,9 +1091,10 @@ mod tests {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
         let effective_len = 2 * MB + MB / 2;
-        store
+        let paths = store
             .create_block(group_id, block_id, 32 * MB, MB, effective_len)
             .expect("create block");
+        extend_data_file(&paths, effective_len);
         store
             .publish_ready(group_id, block_id, &[0, 1, 2], effective_len, 1)
             .expect("publish");
@@ -1040,6 +1131,44 @@ mod tests {
     }
 
     #[test]
+    fn meta_unknown_flags_are_rejected() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        let paths = store
+            .create_block(group_id, block_id, 4096, 1024, 4096)
+            .expect("create block");
+        let mut encoded = fs::read(&paths.meta_path).expect("read meta");
+        let mut header =
+            BlockMetaFileHeader::decode(&encoded[..BlockMetaFileHeader::encoded_len()]).expect("decode header");
+        header.flags = 1;
+        header.header_crc32c = crc32c(&header.bytes_for_crc());
+        encoded[..BlockMetaFileHeader::encoded_len()].copy_from_slice(&header.encode());
+        fs::write(&paths.meta_path, encoded).expect("write meta");
+
+        assert_corrupt(store.load_meta(group_id, block_id));
+    }
+
+    #[test]
+    fn ready_corrupt_bitmap_conflict_is_rejected() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        store
+            .create_block(group_id, block_id, 4096, 1024, 4096)
+            .expect("create block");
+        let mut meta = store.load_meta(group_id, block_id).expect("load meta");
+        set_bit(&mut meta.chunks.ready_bitmap, 0);
+        set_bit(&mut meta.chunks.corrupt_bitmap, 0);
+        persist_meta(&store, group_id, block_id, &meta);
+
+        assert_corrupt(store.load_meta(group_id, block_id));
+    }
+
+    #[test]
+    fn crc32c_matches_known_vector() {
+        assert_eq!(crc32c(b"123456789"), 0xe306_9283);
+    }
+
+    #[test]
     fn meta_temp_file_is_ignored_on_recovery() {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
@@ -1062,7 +1191,7 @@ mod tests {
             .create_block(group_id, block_id, 4096, 1024, 4096)
             .expect("create block");
         store
-            .write_at(group_id, block_id, 0, Bytes::from_static(b"ready"))
+            .write_at(group_id, block_id, 0, Bytes::from(vec![9; 1024]))
             .expect("write");
         store.publish_ready(group_id, block_id, &[0], 1024, 1).expect("publish");
         fs::remove_file(paths.data_path).expect("remove data");
@@ -1078,7 +1207,7 @@ mod tests {
             .create_block(group_id, block_id, 4096, 1024, 4096)
             .expect("create block");
         store
-            .write_at(group_id, block_id, 0, Bytes::from_static(b"ready"))
+            .write_at(group_id, block_id, 0, Bytes::from(vec![9; 1024]))
             .expect("write");
         store.publish_ready(group_id, block_id, &[0], 1024, 1).expect("publish");
         OpenOptions::new()
@@ -1101,7 +1230,7 @@ mod tests {
 
         assert!(store.read_at(group_id, block_id, 0, 8).is_err());
         store
-            .write_at(group_id, block_id, 0, Bytes::from(vec![0; 8]))
+            .write_at(group_id, block_id, 0, Bytes::from(vec![0; 1024]))
             .expect("write zeroes");
         assert!(store.read_at(group_id, block_id, 0, 8).is_err());
         store.publish_ready(group_id, block_id, &[0], 1024, 1).expect("publish");
