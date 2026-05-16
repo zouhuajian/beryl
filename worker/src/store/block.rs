@@ -7,12 +7,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use bincode::config::standard;
-use bincode::serde::{decode_from_slice, encode_to_vec};
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
 use types::ids::{BlockId, ShardGroupId};
 
+use super::meta_codec::{
+    decode_meta_payload, decode_staging_meta_payload, encode_meta_payload, encode_staging_meta_payload,
+};
 use crate::error::WorkerError;
 
 pub type StoreResult<T> = Result<T, WorkerError>;
@@ -33,7 +33,7 @@ const BLOCK_FORMAT_FULL_EFFECTIVE: u32 = 1;
 /// Metadata bytes are not checksummed; correctness relies on atomic
 /// replacement, strict decoding, and semantic validation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BlockMetaFileHeader {
+pub struct BlockMetaHeader {
     /// Fixed file magic used to identify Vecton block metadata.
     pub magic: [u8; 8],
     /// Version of this fixed header and serialized payload layout.
@@ -44,7 +44,7 @@ pub struct BlockMetaFileHeader {
     pub payload_len: u64,
 }
 
-impl BlockMetaFileHeader {
+impl BlockMetaHeader {
     pub const fn encoded_len() -> usize {
         BLOCK_META_HEADER_LEN
     }
@@ -108,8 +108,8 @@ impl BlockMetaFileHeader {
 }
 
 /// Self-describing metadata for one local block.
-/// The metadata state is the publication point for local reads.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Final metadata state is the publication point for local reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMetaPayload {
     /// Stable block identity.
     pub identity: BlockIdentity,
@@ -117,12 +117,12 @@ pub struct BlockMetaPayload {
     pub format: BlockFormat,
     /// Source-independent local block length.
     pub source: BlockSource,
-    /// Published local visibility state.
+    /// Local visibility state.
     pub visibility: BlockVisibility,
 }
 
 /// Stable identity of the local block and owning group.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockIdentity {
     /// Stable block identifier.
     pub block_id: BlockId,
@@ -131,7 +131,7 @@ pub struct BlockIdentity {
 }
 
 /// On-disk format parameters used to interpret this block.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockFormat {
     /// Identifier of the block file format used by this block.
     pub format_id: u32,
@@ -145,30 +145,31 @@ pub struct BlockFormat {
     pub checksum_kind: ChecksumKind,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChecksumKind {
     None,
 }
 
 /// Source-independent effective length of this block.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockSource {
     /// Valid logical length of this block.
     /// Ready `.blk` files must have exactly this length.
     pub effective_block_len: u64,
 }
 
-/// Local visibility state persisted in metadata.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Local visibility state for final metadata and staging runtime paths.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockVisibility {
-    /// Local block visibility state.
+    /// Final metadata may only persist Ready or Corrupt.
     pub block_state: BlockState,
     /// Logical block stamp persisted when visibility is published.
     pub block_stamp: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockState {
+    /// Runtime/staging only; final metadata protobuf never encodes this state.
     Loading,
     Ready,
     Corrupt,
@@ -438,7 +439,7 @@ impl FullBlockFileStore {
 
     fn load_staging_meta(&self, group_id: ShardGroupId, block_id: BlockId) -> StoreResult<BlockMetaPayload> {
         let paths = self.paths(group_id, block_id);
-        let meta = read_meta_file(&paths.staging_meta_path)?;
+        let meta = read_staging_meta_file(&paths.staging_meta_path)?;
         validate_staging_meta_payload(&meta, group_id, block_id)?;
         Ok(meta)
     }
@@ -631,7 +632,7 @@ fn write_staging_meta_new(paths: &BlockPaths, meta: &BlockMetaPayload) -> StoreR
     validate_staging_meta_payload(meta, meta.identity.group_id, meta.identity.block_id)?;
     let parent = paths.staging_parent_dir()?;
     fs::create_dir_all(parent)?;
-    let encoded = encode_meta(meta)?;
+    let encoded = encode_staging_meta(meta)?;
     {
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -645,21 +646,40 @@ fn write_staging_meta_new(paths: &BlockPaths, meta: &BlockMetaPayload) -> StoreR
 }
 
 fn encode_meta(meta: &BlockMetaPayload) -> StoreResult<Vec<u8>> {
-    let payload = encode_to_vec(meta, standard()).map_err(|err| WorkerError::Internal(err.to_string()))?;
-    let header = BlockMetaFileHeader::for_payload(payload.len())?;
-    let mut encoded = Vec::with_capacity(BlockMetaFileHeader::encoded_len() + payload.len());
+    let payload = encode_meta_payload(meta)?;
+    let header = BlockMetaHeader::for_payload(payload.len())?;
+    let mut encoded = Vec::with_capacity(BlockMetaHeader::encoded_len() + payload.len());
+    encoded.extend_from_slice(&header.encode());
+    encoded.extend_from_slice(&payload);
+    Ok(encoded)
+}
+
+fn encode_staging_meta(meta: &BlockMetaPayload) -> StoreResult<Vec<u8>> {
+    let payload = encode_staging_meta_payload(meta)?;
+    let header = BlockMetaHeader::for_payload(payload.len())?;
+    let mut encoded = Vec::with_capacity(BlockMetaHeader::encoded_len() + payload.len());
     encoded.extend_from_slice(&header.encode());
     encoded.extend_from_slice(&payload);
     Ok(encoded)
 }
 
 fn read_meta_file(path: &Path) -> StoreResult<BlockMetaPayload> {
+    let payload = read_meta_payload(path)?;
+    decode_meta_payload(&payload)
+}
+
+fn read_staging_meta_file(path: &Path) -> StoreResult<BlockMetaPayload> {
+    let payload = read_meta_payload(path)?;
+    decode_staging_meta_payload(&payload)
+}
+
+fn read_meta_payload(path: &Path) -> StoreResult<Vec<u8>> {
     let mut file = File::open(path)?;
     let mut encoded_header = [0u8; BLOCK_META_HEADER_LEN];
     file.read_exact(&mut encoded_header)
         .map_err(|err| map_meta_read_error(err, "block meta file is shorter than the header"))?;
 
-    let header = BlockMetaFileHeader::decode(&encoded_header)?;
+    let header = BlockMetaHeader::decode(&encoded_header)?;
     header.validate()?;
     let payload_len = usize::try_from(header.payload_len).map_err(|_| corrupt("meta payload length is too large"))?;
     let mut payload = vec![0; payload_len];
@@ -669,12 +689,7 @@ fn read_meta_file(path: &Path) -> StoreResult<BlockMetaPayload> {
     if file.read(&mut trailing)? != 0 {
         return Err(corrupt("block meta file has trailing bytes"));
     }
-    let (meta, consumed) =
-        decode_from_slice::<BlockMetaPayload, _>(&payload, standard()).map_err(|err| corrupt(err.to_string()))?;
-    if consumed != payload.len() {
-        return Err(corrupt("block meta payload has trailing bytes"));
-    }
-    Ok(meta)
+    Ok(payload)
 }
 
 fn validate_final_meta_payload(meta: &BlockMetaPayload, group_id: ShardGroupId, block_id: BlockId) -> StoreResult<()> {
@@ -737,6 +752,9 @@ fn validate_block_shape(
     }
     if chunk_size == 0 {
         return Err(error("chunk size must be non-zero".to_string()));
+    }
+    if chunk_size > u64::from(u32::MAX) {
+        return Err(error("chunk size does not fit block metadata format".to_string()));
     }
     if !block_size.is_multiple_of(chunk_size) {
         return Err(error("block size must be a multiple of chunk size".to_string()));
@@ -969,11 +987,21 @@ fn maybe_fail_at(fault: StoreFault) -> StoreResult<()> {
 #[cfg(test)]
 mod tests {
     use std::fs::{self, OpenOptions};
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::io::{Seek, SeekFrom, Write};
 
     use bytes::Bytes;
     use tempfile::TempDir;
     use types::ids::{BlockId, BlockIndex, DataHandleId, ShardGroupId};
+
+    use crate::store::meta_codec::{
+        decode_meta_payload, encode_meta_payload,
+        test_support::{
+            payload_has_generated_protobuf_shape, protobuf_payload_missing_block_id, protobuf_payload_missing_format,
+            protobuf_payload_missing_group_id, protobuf_payload_missing_identity, protobuf_payload_missing_source,
+            protobuf_payload_missing_visibility, protobuf_payload_with_block_state,
+            protobuf_payload_with_checksum_kind,
+        },
+    };
 
     use super::*;
 
@@ -1055,11 +1083,15 @@ mod tests {
     }
 
     fn persist_raw_meta_payload(paths: &BlockPaths, meta: &BlockMetaPayload) {
-        let payload = encode_to_vec(meta, standard()).expect("encode payload");
-        let header = BlockMetaFileHeader::for_payload(payload.len()).expect("header");
-        let mut encoded = Vec::with_capacity(BlockMetaFileHeader::encoded_len() + payload.len());
+        let payload = encode_meta_payload(meta).expect("encode payload");
+        persist_raw_payload(paths, &payload);
+    }
+
+    fn persist_raw_payload(paths: &BlockPaths, payload: &[u8]) {
+        let header = BlockMetaHeader::for_payload(payload.len()).expect("header");
+        let mut encoded = Vec::with_capacity(BlockMetaHeader::encoded_len() + payload.len());
         encoded.extend_from_slice(&header.encode());
-        encoded.extend_from_slice(&payload);
+        encoded.extend_from_slice(payload);
         fs::write(&paths.meta_path, encoded).expect("write raw meta");
     }
 
@@ -1090,6 +1122,46 @@ mod tests {
             .expect("open data")
             .set_len(len)
             .expect("set data len");
+    }
+
+    fn ready_meta(group_id: ShardGroupId, block_id: BlockId) -> BlockMetaPayload {
+        BlockMetaPayload {
+            identity: BlockIdentity { block_id, group_id },
+            format: BlockFormat {
+                format_id: BLOCK_FORMAT_FULL_EFFECTIVE,
+                block_size: 4096,
+                chunk_size: 1024,
+                checksum_kind: ChecksumKind::None,
+            },
+            source: BlockSource {
+                effective_block_len: 3072,
+            },
+            visibility: BlockVisibility {
+                block_state: BlockState::Ready,
+                block_stamp: 99,
+            },
+        }
+    }
+
+    #[test]
+    fn meta_payload_round_trip_uses_protobuf() {
+        let (group_id, block_id) = ids();
+        let meta = ready_meta(group_id, block_id);
+
+        let encoded = encode_meta_payload(&meta).expect("encode payload");
+        assert!(payload_has_generated_protobuf_shape(&encoded));
+        let decoded = decode_meta_payload(&encoded).expect("decode payload");
+
+        assert_eq!(decoded, meta);
+    }
+
+    #[test]
+    fn meta_payload_encoding_rejects_loading_state() {
+        let (group_id, block_id) = ids();
+        let mut meta = ready_meta(group_id, block_id);
+        meta.visibility.block_state = BlockState::Loading;
+
+        assert_invalid_argument(encode_meta_payload(&meta));
     }
 
     #[test]
@@ -1380,17 +1452,17 @@ mod tests {
 
     #[test]
     fn block_meta_header_is_minimal_fixed_header() {
-        assert_eq!(BlockMetaFileHeader::encoded_len(), 24);
+        assert_eq!(BlockMetaHeader::encoded_len(), 24);
 
-        let header = BlockMetaFileHeader::for_payload(17).expect("header");
+        let header = BlockMetaHeader::for_payload(17).expect("header");
         assert_eq!(header.magic, BLOCK_META_MAGIC);
         assert_eq!(header.version, BLOCK_META_VERSION);
-        assert_eq!(header.header_len, BlockMetaFileHeader::encoded_len() as u32);
+        assert_eq!(header.header_len, BlockMetaHeader::encoded_len() as u32);
         assert_eq!(header.payload_len, 17);
     }
 
     #[test]
-    fn meta_bad_magic_rejected() {
+    fn load_meta_rejects_bad_magic() {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
         publish_default_block(&store, group_id, block_id);
@@ -1403,7 +1475,7 @@ mod tests {
     }
 
     #[test]
-    fn meta_unsupported_version_rejected() {
+    fn load_meta_rejects_unsupported_version() {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
         publish_default_block(&store, group_id, block_id);
@@ -1414,18 +1486,18 @@ mod tests {
     }
 
     #[test]
-    fn meta_wrong_header_len_rejected() {
+    fn load_meta_rejects_wrong_header_len() {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
         publish_default_block(&store, group_id, block_id);
         let paths = store.paths(group_id, block_id);
-        overwrite_header_u32(&paths, 12, BlockMetaFileHeader::encoded_len() as u32 + 4);
+        overwrite_header_u32(&paths, 12, BlockMetaHeader::encoded_len() as u32 + 4);
 
         assert_corrupt(store.load_meta(group_id, block_id));
     }
 
     #[test]
-    fn meta_zero_payload_len_rejected() {
+    fn load_meta_rejects_zero_payload_len() {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
         publish_default_block(&store, group_id, block_id);
@@ -1436,7 +1508,7 @@ mod tests {
     }
 
     #[test]
-    fn meta_oversized_payload_len_rejected() {
+    fn load_meta_rejects_oversized_payload_len() {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
         publish_default_block(&store, group_id, block_id);
@@ -1447,20 +1519,118 @@ mod tests {
     }
 
     #[test]
-    fn meta_truncated_payload_rejected() {
+    fn load_meta_rejects_truncated_payload() {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
         publish_default_block(&store, group_id, block_id);
         let paths = store.paths(group_id, block_id);
         let actual_len = fs::metadata(&paths.meta_path).expect("meta metadata").len();
-        let payload_len = actual_len - BlockMetaFileHeader::encoded_len() as u64 + 1;
+        let payload_len = actual_len - BlockMetaHeader::encoded_len() as u64 + 1;
         overwrite_header_u64(&paths, 16, payload_len);
 
         assert_corrupt(store.load_meta(group_id, block_id));
     }
 
     #[test]
-    fn payload_semantic_validation_rejects_invalid_lengths() {
+    fn load_meta_rejects_missing_identity() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        publish_default_block(&store, group_id, block_id);
+        let paths = store.paths(group_id, block_id);
+        let valid = store.load_meta(group_id, block_id).expect("load meta");
+
+        let payload = protobuf_payload_missing_identity(&valid);
+        persist_raw_payload(&paths, &payload);
+
+        assert_corrupt(store.load_meta(group_id, block_id));
+    }
+
+    #[test]
+    fn load_meta_rejects_missing_block_id() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        publish_default_block(&store, group_id, block_id);
+        let paths = store.paths(group_id, block_id);
+        let valid = store.load_meta(group_id, block_id).expect("load meta");
+
+        let payload = protobuf_payload_missing_block_id(&valid);
+        persist_raw_payload(&paths, &payload);
+
+        assert_corrupt(store.load_meta(group_id, block_id));
+    }
+
+    #[test]
+    fn load_meta_rejects_missing_group_id() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        publish_default_block(&store, group_id, block_id);
+        let paths = store.paths(group_id, block_id);
+        let valid = store.load_meta(group_id, block_id).expect("load meta");
+
+        let payload = protobuf_payload_missing_group_id(&valid);
+        persist_raw_payload(&paths, &payload);
+
+        assert_corrupt(store.load_meta(group_id, block_id));
+    }
+
+    #[test]
+    fn load_meta_rejects_unspecified_block_state() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        publish_default_block(&store, group_id, block_id);
+        let paths = store.paths(group_id, block_id);
+        let valid = store.load_meta(group_id, block_id).expect("load meta");
+
+        let payload = protobuf_payload_with_block_state(&valid, 0);
+        persist_raw_payload(&paths, &payload);
+
+        assert_corrupt(store.load_meta(group_id, block_id));
+    }
+
+    #[test]
+    fn load_meta_rejects_unsupported_block_state() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        publish_default_block(&store, group_id, block_id);
+        let paths = store.paths(group_id, block_id);
+        let valid = store.load_meta(group_id, block_id).expect("load meta");
+
+        let payload = protobuf_payload_with_block_state(&valid, 99);
+        persist_raw_payload(&paths, &payload);
+
+        assert_corrupt(store.load_meta(group_id, block_id));
+    }
+
+    #[test]
+    fn load_meta_rejects_unspecified_checksum_kind() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        publish_default_block(&store, group_id, block_id);
+        let paths = store.paths(group_id, block_id);
+        let valid = store.load_meta(group_id, block_id).expect("load meta");
+
+        let payload = protobuf_payload_with_checksum_kind(&valid, 0);
+        persist_raw_payload(&paths, &payload);
+
+        assert_corrupt(store.load_meta(group_id, block_id));
+    }
+
+    #[test]
+    fn load_meta_rejects_unsupported_checksum_kind() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        publish_default_block(&store, group_id, block_id);
+        let paths = store.paths(group_id, block_id);
+        let valid = store.load_meta(group_id, block_id).expect("load meta");
+
+        let payload = protobuf_payload_with_checksum_kind(&valid, 99);
+        persist_raw_payload(&paths, &payload);
+
+        assert_corrupt(store.load_meta(group_id, block_id));
+    }
+
+    #[test]
+    fn load_meta_rejects_effective_len_larger_than_block_size() {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
         publish_default_block(&store, group_id, block_id);
@@ -1471,14 +1641,81 @@ mod tests {
         invalid.source.effective_block_len = invalid.format.block_size + 1;
         persist_raw_meta_payload(&paths, &invalid);
         assert_corrupt(store.load_meta(group_id, block_id));
+    }
+
+    #[test]
+    fn load_meta_rejects_block_size_not_multiple_of_chunk_size() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        publish_default_block(&store, group_id, block_id);
+        let paths = store.paths(group_id, block_id);
+        let valid = store.load_meta(group_id, block_id).expect("load meta");
 
         let mut invalid = valid.clone();
-        invalid.format.chunk_size = 0;
+        invalid.format.block_size = 4097;
+        persist_raw_meta_payload(&paths, &invalid);
+        assert_corrupt(store.load_meta(group_id, block_id));
+    }
+
+    #[test]
+    fn meta_payload_semantic_validation_rejects_invalid_core_fields() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        publish_default_block(&store, group_id, block_id);
+        let paths = store.paths(group_id, block_id);
+        let valid = store.load_meta(group_id, block_id).expect("load meta");
+
+        let cases = [
+            ("unsupported format_id", {
+                let mut invalid = valid.clone();
+                invalid.format.format_id = BLOCK_FORMAT_FULL_EFFECTIVE + 1;
+                encode_meta_payload(&invalid).expect("encode unsupported format")
+            }),
+            ("zero block_size", {
+                let mut invalid = valid.clone();
+                invalid.format.block_size = 0;
+                encode_meta_payload(&invalid).expect("encode zero block size")
+            }),
+            ("zero chunk_size", {
+                let mut invalid = valid.clone();
+                invalid.format.chunk_size = 0;
+                encode_meta_payload(&invalid).expect("encode zero chunk size")
+            }),
+            ("zero effective_block_len", {
+                let mut invalid = valid.clone();
+                invalid.source.effective_block_len = 0;
+                encode_meta_payload(&invalid).expect("encode zero effective length")
+            }),
+            ("missing format", protobuf_payload_missing_format(&valid)),
+            ("missing source", protobuf_payload_missing_source(&valid)),
+            ("missing visibility", protobuf_payload_missing_visibility(&valid)),
+        ];
+
+        for (case, payload) in cases {
+            persist_raw_payload(&paths, &payload);
+            let result = store.load_meta(group_id, block_id);
+            assert!(
+                matches!(result, Err(WorkerError::Corrupt(_))),
+                "case {case} should reject final metadata as corrupt, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_meta_rejects_path_identity_mismatch() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        publish_default_block(&store, group_id, block_id);
+        let paths = store.paths(group_id, block_id);
+        let valid = store.load_meta(group_id, block_id).expect("load meta");
+
+        let mut invalid = valid.clone();
+        invalid.identity.group_id = ShardGroupId::new(group_id.as_raw() + 1);
         persist_raw_meta_payload(&paths, &invalid);
         assert_corrupt(store.load_meta(group_id, block_id));
 
         let mut invalid = valid;
-        invalid.format.block_size = 4097;
+        invalid.identity.block_id = BlockId::new(block_id.data_handle_id, BlockIndex::new(block_id.index.as_raw() + 1));
         persist_raw_meta_payload(&paths, &invalid);
         assert_corrupt(store.load_meta(group_id, block_id));
     }
@@ -1562,28 +1799,6 @@ mod tests {
     }
 
     #[test]
-    fn recover_rejects_final_loading_meta() {
-        let (_temp, store) = store();
-        let (group_id, block_id) = ids();
-        create_default_block(&store, group_id, block_id);
-        let paths = store.paths(group_id, block_id);
-        let mut loading = store
-            .create_loading_block(request(
-                group_id,
-                BlockId::new(DataHandleId::new(0x9999), BlockIndex::new(1)),
-                4096,
-                1024,
-                4096,
-            ))
-            .expect("create separate loading block");
-        loading.identity.block_id = block_id;
-        persist_raw_meta_payload(&paths, &loading);
-
-        assert_corrupt(store.load_meta(group_id, block_id));
-        assert_corrupt(store.recover_block(group_id, block_id));
-    }
-
-    #[test]
     fn delete_block_ignores_missing_files() {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
@@ -1623,26 +1838,13 @@ mod tests {
     }
 
     #[test]
-    fn payload_decode_failure_is_rejected() {
+    fn load_meta_rejects_protobuf_decode_failure() {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
         publish_default_block(&store, group_id, block_id);
         let paths = store.paths(group_id, block_id);
 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&paths.meta_path)
-            .expect("open meta");
-        file.seek(SeekFrom::Start(BlockMetaFileHeader::encoded_len() as u64))
-            .expect("seek payload");
-        let mut byte = [0u8; 1];
-        file.read_exact(&mut byte).expect("read payload byte");
-        byte[0] ^= 0xff;
-        file.seek(SeekFrom::Start(BlockMetaFileHeader::encoded_len() as u64))
-            .expect("seek payload");
-        file.write_all(&byte).expect("write payload byte");
-        file.sync_all().expect("sync meta");
+        persist_raw_payload(&paths, &[0xff, 0xff]);
 
         assert_corrupt(store.load_meta(group_id, block_id));
     }

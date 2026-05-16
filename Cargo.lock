@@ -4474,12 +4474,11 @@ name = "worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bincode",
  "bytes",
  "common",
  "futures",
+ "prost",
  "proto",
- "serde",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",

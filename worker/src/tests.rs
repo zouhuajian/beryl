@@ -648,6 +648,7 @@ mod tests {
     fn block_manager_stays_placeholder_and_store_stays_local_only() {
         let block_manager = include_str!("runtime/block.rs");
         let block_store = include_str!("store/block.rs");
+        let meta_codec = include_str!("store/meta_codec.rs");
 
         for forbidden in [
             "ReplicationClient",
@@ -685,6 +686,28 @@ mod tests {
                 "block_store.rs must stay local-format only and avoid {forbidden}"
             );
         }
+
+        assert!(!meta_codec.contains("tonic"), "meta_codec.rs must not depend on tonic");
+        for forbidden in [
+            "WorkerCore::",
+            "WorkerDataService",
+            "StreamManager",
+            "TransportFrame",
+            "ReadChunk",
+            "WriteChunk",
+            "ReadRange",
+            "read_chunk",
+            "write_chunk",
+            "ufs",
+            "replication",
+            "quorum",
+            ".chunk\"",
+        ] {
+            assert!(
+                !meta_codec.contains(forbidden),
+                "meta_codec.rs must stay metadata-payload-only and avoid {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -720,6 +743,7 @@ mod tests {
             include_str!("data/convert.rs"),
             include_str!("runtime/block.rs"),
             include_str!("store/block.rs"),
+            include_str!("store/meta_codec.rs"),
             include_str!("lib.rs"),
         ];
 

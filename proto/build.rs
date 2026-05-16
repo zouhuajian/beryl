@@ -14,6 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=metadata/peer.proto");
     println!("cargo:rerun-if-changed=worker/data.proto");
     println!("cargo:rerun-if-changed=worker/data_header.proto");
+    println!("cargo:rerun-if-changed=worker/block_meta.proto");
 
     tonic_prost_build::configure()
         // Configure bytes fields to use Bytes type for zero-copy
@@ -34,6 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "metadata/peer.proto",
                 "worker/data.proto",
                 "worker/data_header.proto",
+                "worker/block_meta.proto",
             ],
             &["."], // Include root is now "." (proto crate root)
         )?;

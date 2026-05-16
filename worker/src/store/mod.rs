@@ -4,3 +4,4 @@
 //! Worker-local storage interfaces.
 
 pub mod block;
+mod meta_codec;
