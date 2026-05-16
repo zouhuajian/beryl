@@ -12,7 +12,7 @@ use client::error::ClientError;
 use common::{init_logging, MockMetadataServer, MockWorkerServer};
 use proto::common::{
     error_detail_proto, BlockIdProto, ByteRangeProto, ClientInfoProto, ErrorClassProto, FencingTokenProto,
-    FsErrnoProto, StreamIdProto,
+    FsErrnoProto, ShardGroupIdProto, StreamIdProto,
 };
 use proto::metadata::MsyncRequestProto;
 use proto::worker::worker_data_service_server::WorkerDataService;
@@ -52,6 +52,10 @@ fn block_id(data_handle_id: u64, block_index: u32) -> BlockIdProto {
     }
 }
 
+fn group_id(value: u64) -> ShardGroupIdProto {
+    ShardGroupIdProto { value }
+}
+
 fn assert_stream_unimplemented_header(header: DataResponseHeaderProto, operation: &str) {
     let error = header.error.expect("placeholder response should carry error detail");
     assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
@@ -70,6 +74,7 @@ async fn test_direct_worker_open_read_stream_is_explicitly_unimplemented() {
     let mock_worker = MockWorkerServer::new(1);
     let request = Request::new(OpenReadStreamRequestProto {
         header: Some(data_request_header("open-read-stream")),
+        group_id: Some(group_id(1)),
         block_id: Some(block_id(100, 0)),
         byte_range: Some(ByteRangeProto { offset: 0, len: 9 }),
         block_stamp: 1,

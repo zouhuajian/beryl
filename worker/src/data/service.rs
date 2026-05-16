@@ -6,9 +6,8 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use proto::common::{
-    error_detail_proto, ClientInfoProto, ErrorClassProto, ErrorDetailProto, FsErrnoProto, RefreshReasonProto,
-};
+use futures::stream;
+use proto::common::{ClientInfoProto, ErrorDetailProto};
 use proto::worker::worker_data_service_server::WorkerDataService;
 use proto::worker::{
     AbortWriteRequestProto, AbortWriteResponseProto, CommitWriteRequestProto, CommitWriteResponseProto,
@@ -19,7 +18,7 @@ use proto::worker::{
 use tonic::{Request, Response, Status};
 
 use crate::data::convert::{
-    proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_open_request,
+    proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_open_request, proto_to_stream_id,
     proto_to_write_open_request, stream_id_to_proto,
 };
 use crate::data::core::WorkerCore;
@@ -59,28 +58,8 @@ impl WorkerDataServiceImpl {
     }
 
     fn error_detail(error: &WorkerError) -> ErrorDetailProto {
-        let fs_errno = match error {
-            WorkerError::InvalidArgument(_) => FsErrnoProto::FsErrnoEinval,
-            WorkerError::NotFound(_) => FsErrnoProto::FsErrnoEnoent,
-            WorkerError::PermissionDenied(_) => FsErrnoProto::FsErrnoEacces,
-            WorkerError::ResourceExhausted(_) => FsErrnoProto::FsErrnoEagain,
-            WorkerError::Unimplemented(_) => FsErrnoProto::FsErrnoEnotimpl,
-            _ => FsErrnoProto::FsErrnoEnotsup,
-        };
-        let error_class = if error.is_retryable() {
-            ErrorClassProto::ErrorClassRetryable
-        } else {
-            ErrorClassProto::ErrorClassFatal
-        };
-
-        ErrorDetailProto {
-            error_class: error_class as i32,
-            code: Some(error_detail_proto::Code::FsErrno(fs_errno as i32)),
-            refresh_reason: RefreshReasonProto::RefreshReasonUnknown as i32,
-            retry_after_ms: error.metadata().retry_after_ms,
-            message: error.to_string(),
-            refresh_hint: None,
-        }
+        let canonical: common::error::canonical::CanonicalError = error.clone().into();
+        proto::convert::canonical_to_error_detail(&canonical)
     }
 
     fn unimplemented_status(operation: &'static str) -> Status {
@@ -139,9 +118,26 @@ impl WorkerDataService for WorkerDataServiceImpl {
 
     async fn read_stream(
         &self,
-        _request: Request<ReadStreamRequestProto>,
+        request: Request<ReadStreamRequestProto>,
     ) -> Result<Response<Self::ReadStreamStream>, Status> {
-        Err(Self::unimplemented_status("ReadStream"))
+        let request = request.into_inner();
+        let stream_id = proto_to_stream_id(request.stream_id, "stream_id").map_err(|error| error.to_status())?;
+        let frames = self
+            .core
+            .read_stream(stream_id, request.max_bytes)
+            .await
+            .map_err(|error| error.to_status())?;
+        let responses = frames.into_iter().map(|frame| {
+            Ok(ReadStreamResponseProto {
+                offset_in_block: frame.offset_in_block,
+                data: frame.data,
+                checksum32: frame.checksum32,
+                eos: frame.eos,
+            })
+        });
+        Ok(Response::new(
+            Box::pin(stream::iter(responses)) as Self::ReadStreamStream
+        ))
     }
 
     async fn open_write_stream(

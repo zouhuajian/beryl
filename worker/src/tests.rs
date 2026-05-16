@@ -10,17 +10,19 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
+    use futures::StreamExt;
     use proto::common::{
         error_detail_proto, BlockIdProto, ByteRangeProto, ClientInfoProto, ErrorClassProto, FencingTokenProto,
-        FsErrnoProto, StreamIdProto,
+        FsErrnoProto, RefreshReasonProto, ShardGroupIdProto, StreamIdProto,
     };
     use proto::worker::worker_data_service_server::WorkerDataService;
     use proto::worker::{
         AbortWriteRequestProto, CommitWriteRequestProto, DataRequestHeaderProto, DataResponseHeaderProto,
         OpenReadStreamRequestProto, OpenWriteStreamRequestProto, ReadStreamRequestProto, WriteStreamRequestProto,
     };
+    use tempfile::TempDir;
     use types::chunk::ByteRange;
-    use types::ids::{BlockId, BlockIndex, ChunkIndex, ClientId, DataHandleId, StreamId};
+    use types::ids::{BlockId, BlockIndex, ChunkIndex, ClientId, DataHandleId, ShardGroupId, StreamId};
     use types::lease::FencingToken;
 
     use crate::data::convert::{
@@ -34,9 +36,20 @@ mod tests {
     use crate::data::service::WorkerDataServiceImpl;
     use crate::error::WorkerError;
     use crate::runtime::stream::{StreamManager, StreamState};
+    use crate::store::block::{
+        ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, PublishReadyRequest,
+    };
+
+    const BLOCK_SIZE: u64 = 4096;
+    const CHUNK_SIZE: u32 = 1024;
+    const BLOCK_STAMP: u64 = 55;
 
     fn block_id() -> BlockId {
         BlockId::new(DataHandleId::new(7), BlockIndex::new(3))
+    }
+
+    fn group_id() -> ShardGroupId {
+        ShardGroupId::new(9)
     }
 
     fn stream_id() -> StreamId {
@@ -52,6 +65,10 @@ mod tests {
             data_handle_id: 7,
             block_index: 3,
         }
+    }
+
+    fn test_group_id_proto() -> ShardGroupIdProto {
+        ShardGroupIdProto { value: 9 }
     }
 
     fn test_stream_id_proto() -> StreamIdProto {
@@ -97,12 +114,28 @@ mod tests {
         assert!(error.message.contains("not implemented"));
     }
 
-    fn read_open_request() -> ReadOpenRequest {
-        ReadOpenRequest {
-            block_id: block_id(),
-            byte_range: ByteRange { offset: 128, len: 4096 },
-            block_stamp: 0,
-            frame_size: 8192,
+    fn assert_need_refresh<T: std::fmt::Debug>(
+        result: WorkerCoreResult<T>,
+        expected_reason: common::error::canonical::RefreshReason,
+    ) {
+        let error = result.expect_err("operation should need refresh");
+        match error {
+            WorkerError::NeedRefresh { reason, .. } => assert_eq!(reason, expected_reason),
+            other => panic!("expected NeedRefresh, got {other:?}"),
+        }
+    }
+
+    fn assert_invalid_argument<T: std::fmt::Debug>(result: WorkerCoreResult<T>) {
+        match result.expect_err("operation should fail") {
+            WorkerError::InvalidArgument(_) => {}
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    fn assert_not_found<T: std::fmt::Debug>(result: WorkerCoreResult<T>) {
+        match result.expect_err("operation should fail") {
+            WorkerError::NotFound(_) => {}
+            other => panic!("expected NotFound, got {other:?}"),
         }
     }
 
@@ -138,14 +171,85 @@ mod tests {
     fn stream_context() -> StreamContext {
         StreamContext {
             stream_id: stream_id(),
+            group_id: group_id(),
             block_id: block_id(),
             mode: StreamMode::Read,
+            start_offset: 0,
+            end_offset: 4096,
             frame_size: 8192,
             window_bytes: 65_536,
             block_stamp: 17,
             committed_length: 4096,
-            byte_range: Some(ByteRange { offset: 0, len: 4096 }),
+            effective_block_len: 4096,
             fencing_token: None,
+        }
+    }
+
+    fn payload() -> Bytes {
+        Bytes::from((0..BLOCK_SIZE).map(|idx| (idx % 251) as u8).collect::<Vec<_>>())
+    }
+
+    fn core_with_store(
+        default_frame_size: u32,
+        max_frame_size: u32,
+        window_bytes: u32,
+    ) -> (TempDir, Arc<FullBlockFileStore>, WorkerCore) {
+        let temp = TempDir::new().expect("tempdir");
+        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
+            temp.path().to_path_buf(),
+        )));
+        let core = WorkerCore::with_local_store(
+            CHUNK_SIZE,
+            default_frame_size,
+            max_frame_size,
+            window_bytes,
+            Duration::from_secs(60),
+            store.clone(),
+        );
+        (temp, store, core)
+    }
+
+    fn publish_ready_block(store: &FullBlockFileStore, data: Bytes, block_stamp: u64) {
+        store
+            .create_staging_block(CreateStagingBlockRequest {
+                group_id: group_id(),
+                block_id: block_id(),
+                block_size: BLOCK_SIZE,
+                chunk_size: CHUNK_SIZE,
+                checksum_kind: ChecksumKind::None,
+            })
+            .expect("create staging block");
+        store
+            .write_at(group_id(), block_id(), 0, data.clone())
+            .expect("write staging block");
+        store
+            .publish_ready(PublishReadyRequest {
+                group_id: group_id(),
+                block_id: block_id(),
+                effective_block_len: data.len() as u64,
+                block_stamp,
+            })
+            .expect("publish ready block");
+    }
+
+    fn read_open_request_for(offset: u64, len: u32, block_stamp: u64, frame_size: u32) -> ReadOpenRequest {
+        ReadOpenRequest {
+            group_id: group_id(),
+            block_id: block_id(),
+            byte_range: ByteRange { offset, len },
+            block_stamp,
+            frame_size,
+        }
+    }
+
+    fn open_read_proto(offset: u64, len: u32, block_stamp: u64, frame_size: u32) -> OpenReadStreamRequestProto {
+        OpenReadStreamRequestProto {
+            header: Some(test_header()),
+            group_id: Some(test_group_id_proto()),
+            block_id: Some(test_block_id_proto()),
+            byte_range: Some(ByteRangeProto { offset, len }),
+            block_stamp,
+            frame_size,
         }
     }
 
@@ -216,6 +320,7 @@ mod tests {
     fn converts_open_read_stream_request_to_domain() {
         let request = OpenReadStreamRequestProto {
             header: Some(test_header()),
+            group_id: Some(test_group_id_proto()),
             block_id: Some(test_block_id_proto()),
             byte_range: Some(ByteRangeProto { offset: 128, len: 4096 }),
             block_stamp: 0,
@@ -224,6 +329,7 @@ mod tests {
 
         let domain = proto_to_read_open_request(request).unwrap();
 
+        assert_eq!(domain.group_id, group_id());
         assert_eq!(domain.block_id, block_id());
         assert_eq!(domain.byte_range, ByteRange { offset: 128, len: 4096 });
         assert_eq!(domain.block_stamp, 0);
@@ -309,6 +415,7 @@ mod tests {
     fn conversion_reports_missing_required_fields_without_panic() {
         let read_err = proto_to_read_open_request(OpenReadStreamRequestProto {
             header: Some(test_header()),
+            group_id: Some(test_group_id_proto()),
             block_id: None,
             byte_range: Some(ByteRangeProto { offset: 0, len: 1 }),
             block_stamp: 0,
@@ -316,6 +423,17 @@ mod tests {
         })
         .unwrap_err();
         assert!(read_err.to_string().contains("missing block_id"));
+
+        let read_err = proto_to_read_open_request(OpenReadStreamRequestProto {
+            header: Some(test_header()),
+            group_id: None,
+            block_id: Some(test_block_id_proto()),
+            byte_range: Some(ByteRangeProto { offset: 0, len: 1 }),
+            block_stamp: 0,
+            frame_size: 1024,
+        })
+        .unwrap_err();
+        assert!(read_err.to_string().contains("missing group_id"));
 
         let write_open_err = proto_to_write_open_request(OpenWriteStreamRequestProto {
             header: Some(test_header()),
@@ -354,14 +472,13 @@ mod tests {
     async fn worker_core_open_commit_abort_placeholders_are_explicit() {
         let core = WorkerCore::new(1024);
 
-        assert_unimplemented(core.open_read(read_open_request()).await, "OpenReadStream");
         assert_unimplemented(core.open_write(write_open_request()).await, "OpenWriteStream");
         assert_unimplemented(core.commit_write(commit_write_request()).await, "CommitWrite");
         assert_unimplemented(core.abort_write(abort_write_request()).await, "AbortWrite");
     }
 
     #[tokio::test]
-    async fn worker_core_stream_placeholders_do_not_ack_data() {
+    async fn worker_core_write_stream_placeholders_do_not_ack_data() {
         let core = WorkerCore::new(1024);
         let frame = WriteFrame {
             stream_id: stream_id(),
@@ -371,28 +488,146 @@ mod tests {
             checksum32: 0,
         };
 
-        assert_unimplemented(core.read_frame(stream_id(), 1024).await, "ReadStream");
-        assert_unimplemented(core.read_stream(stream_id(), 1024).await, "ReadStream");
         assert_unimplemented(core.write_frame(frame.clone()).await, "WriteStream");
         assert_unimplemented(core.write_stream(frame).await, "WriteStream");
     }
 
     #[tokio::test]
+    async fn open_read_ready_block_succeeds() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+
+        let result = core
+            .open_read(read_open_request_for(128, 1024, BLOCK_STAMP, 0))
+            .await
+            .expect("open read");
+
+        assert_eq!(result.frame_size, 512);
+        assert_eq!(result.window_bytes, 4096);
+        assert_eq!(result.block_stamp, BLOCK_STAMP);
+        assert_eq!(result.committed_length, BLOCK_SIZE);
+        assert_eq!(result.chunk_size, CHUNK_SIZE);
+
+        let state = core
+            .stream_manager()
+            .get(result.stream_id)
+            .await
+            .expect("read stream registered");
+        assert_eq!(state.context.group_id, group_id());
+        assert_eq!(state.context.block_id, block_id());
+        assert_eq!(state.context.mode, StreamMode::Read);
+        assert_eq!(state.context.start_offset, 128);
+        assert_eq!(state.context.end_offset, 1152);
+        assert_eq!(state.cursor, 128);
+        assert_eq!(state.context.effective_block_len, BLOCK_SIZE);
+    }
+
+    #[tokio::test]
+    async fn open_read_rejects_block_stamp_mismatch() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+
+        assert_need_refresh(
+            core.open_read(read_open_request_for(0, 1024, BLOCK_STAMP + 1, 512))
+                .await,
+            common::error::canonical::RefreshReason::BlockStampMismatch,
+        );
+        assert_eq!(core.stream_manager().active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn open_read_rejects_missing_block() {
+        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+
+        assert_need_refresh(
+            core.open_read(read_open_request_for(0, 1024, 0, 512)).await,
+            common::error::canonical::RefreshReason::Moved,
+        );
+        assert_eq!(core.stream_manager().active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn open_read_rejects_out_of_bounds_range() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+
+        assert_invalid_argument(core.open_read(read_open_request_for(4090, 16, BLOCK_STAMP, 512)).await);
+        assert_eq!(core.stream_manager().active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn read_stream_reads_single_frame() {
+        let (_temp, store, core) = core_with_store(1024, 2048, 4096);
+        let data = payload();
+        publish_ready_block(&store, data.clone(), BLOCK_STAMP);
+        let open = core
+            .open_read(read_open_request_for(10, 5, BLOCK_STAMP, 1024))
+            .await
+            .expect("open read");
+
+        let frames = core.read_stream(open.stream_id, 0).await.expect("read stream");
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].offset_in_block, 10);
+        assert_eq!(frames[0].data, data.slice(10..15));
+        assert!(frames[0].eos);
+        assert_eq!(core.stream_manager().active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn read_stream_advances_cursor_across_calls() {
+        let (_temp, store, core) = core_with_store(4, 16, 4096);
+        let data = payload();
+        publish_ready_block(&store, data.clone(), BLOCK_STAMP);
+        let open = core
+            .open_read(read_open_request_for(0, 8, BLOCK_STAMP, 4))
+            .await
+            .expect("open read");
+
+        let first = core.read_stream(open.stream_id, 4).await.expect("first read");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].data, data.slice(0..4));
+        assert!(!first[0].eos);
+        assert_eq!(
+            core.stream_manager().get(open.stream_id).await.expect("stream").cursor,
+            4
+        );
+
+        let second = core.read_stream(open.stream_id, 4).await.expect("second read");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].data, data.slice(4..8));
+        assert!(second[0].eos);
+        assert!(core.stream_manager().get(open.stream_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_stream_respects_max_bytes() {
+        let (_temp, store, core) = core_with_store(8, 16, 4096);
+        let data = payload();
+        publish_ready_block(&store, data.clone(), BLOCK_STAMP);
+        let open = core
+            .open_read(read_open_request_for(0, 8, BLOCK_STAMP, 8))
+            .await
+            .expect("open read");
+
+        let frames = core.read_stream(open.stream_id, 3).await.expect("read stream");
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data.len(), 3);
+        assert_eq!(frames[0].data, data.slice(0..3));
+        assert!(!frames[0].eos);
+    }
+
+    #[tokio::test]
+    async fn read_stream_rejects_missing_stream() {
+        let (_temp, _store, core) = core_with_store(8, 16, 4096);
+
+        assert_not_found(core.read_stream(stream_id(), 1024).await);
+    }
+
+    #[tokio::test]
     async fn service_open_and_commit_placeholders_return_data_header_errors() {
         let service = WorkerDataServiceImpl::new(Arc::new(WorkerCore::new(1024)));
-
-        let open_read = service
-            .open_read_stream(tonic::Request::new(OpenReadStreamRequestProto {
-                header: Some(test_header()),
-                block_id: Some(test_block_id_proto()),
-                byte_range: Some(ByteRangeProto { offset: 0, len: 1024 }),
-                block_stamp: 0,
-                frame_size: 1024,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_unimplemented_header(open_read.header);
 
         let open_write = service
             .open_write_stream(tonic::Request::new(OpenWriteStreamRequestProto {
@@ -437,7 +672,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_stream_placeholders_return_unimplemented_status() {
+    async fn service_write_stream_placeholder_returns_unimplemented_status() {
+        let write_status = WorkerDataServiceImpl::write_stream_placeholder_status();
+        assert_eq!(write_status.code(), tonic::Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn open_read_stream_returns_success_response_for_ready_block() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+        let service = WorkerDataServiceImpl::new(Arc::new(core));
+
+        let response = service
+            .open_read_stream(tonic::Request::new(open_read_proto(0, 1024, BLOCK_STAMP, 0)))
+            .await
+            .expect("open read response")
+            .into_inner();
+
+        assert!(response.header.expect("header").error.is_none());
+        assert!(response.stream_id.is_some());
+        assert_eq!(response.frame_size, 512);
+        assert_eq!(response.window_bytes, 4096);
+        assert_eq!(response.block_stamp, BLOCK_STAMP);
+        assert_eq!(response.committed_length, BLOCK_SIZE);
+        assert_eq!(response.chunk_size, CHUNK_SIZE);
+    }
+
+    #[tokio::test]
+    async fn open_read_stream_returns_need_refresh_on_stale_stamp() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+        let service = WorkerDataServiceImpl::new(Arc::new(core));
+
+        let response = service
+            .open_read_stream(tonic::Request::new(open_read_proto(0, 1024, BLOCK_STAMP + 1, 512)))
+            .await
+            .expect("open read response")
+            .into_inner();
+        let error = response
+            .header
+            .expect("header")
+            .error
+            .expect("stale stamp should return structured error");
+
+        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+        assert_eq!(
+            error.refresh_reason,
+            RefreshReasonProto::RefreshReasonBlockStampMismatch as i32
+        );
+        assert!(response.stream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_stream_returns_data_frames() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let data = payload();
+        publish_ready_block(&store, data.clone(), BLOCK_STAMP);
+        let service = WorkerDataServiceImpl::new(Arc::new(core));
+
+        let open = service
+            .open_read_stream(tonic::Request::new(open_read_proto(4, 6, BLOCK_STAMP, 512)))
+            .await
+            .expect("open read response")
+            .into_inner();
+        let stream_id = open.stream_id.expect("stream id");
+        let response_stream = service
+            .read_stream(tonic::Request::new(ReadStreamRequestProto {
+                stream_id: Some(stream_id),
+                max_bytes: 0,
+            }))
+            .await
+            .expect("read stream response")
+            .into_inner();
+        let frames = response_stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream frames");
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].offset_in_block, 4);
+        assert_eq!(frames[0].data, data.slice(4..10));
+        assert!(frames[0].eos);
+    }
+
+    #[tokio::test]
+    async fn service_read_stream_rejects_missing_stream() {
         let service = WorkerDataServiceImpl::new(Arc::new(WorkerCore::new(1024)));
 
         let read_status = match service
@@ -450,10 +771,7 @@ mod tests {
             Ok(_) => panic!("ReadStream unexpectedly succeeded"),
             Err(status) => status,
         };
-        assert_eq!(read_status.code(), tonic::Code::Unimplemented);
-
-        let write_status = WorkerDataServiceImpl::write_stream_placeholder_status();
-        assert_eq!(write_status.code(), tonic::Code::Unimplemented);
+        assert_eq!(read_status.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]
@@ -645,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn block_manager_stays_placeholder_and_store_stays_local_only() {
+    fn block_manager_stays_validation_only_and_store_stays_local_only() {
         let block_manager = include_str!("runtime/block.rs");
         let block_store = include_str!("store/block.rs");
         let meta_codec = include_str!("store/meta_codec.rs");

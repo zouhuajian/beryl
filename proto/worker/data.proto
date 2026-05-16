@@ -40,6 +40,10 @@ message OpenReadStreamRequestProto {
   // The worker may clamp or adjust it and returns the accepted value.
   // This is not the worker-local StorageChunk size.
   uint32 frame_size = 5;
+
+  // Owning group for the local block-store lookup.
+  // This is target block identity context, not a file layout field.
+  common.ShardGroupIdProto group_id = 6;
 }
 
 message OpenReadStreamResponseProto {

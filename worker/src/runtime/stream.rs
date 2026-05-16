@@ -29,7 +29,7 @@ pub struct StreamState {
 impl StreamState {
     pub fn new(context: StreamContext) -> Self {
         Self {
-            cursor: context.byte_range.map_or(0, |range| range.offset),
+            cursor: context.start_offset,
             last_acked_seq: 0,
             persisted_through: context.committed_length,
             last_activity: Instant::now(),

@@ -10,6 +10,7 @@ use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as Canonica
 use common::header::RpcErrorCode;
 use thiserror::Error;
 use tonic::Status;
+use types::fs::FsErrorCode;
 use types::ids::ShardGroupId;
 
 /// Worker error types.
@@ -50,6 +51,14 @@ pub enum WorkerError {
     /// Persisted local data or metadata is malformed.
     #[error("Corrupt: {0}")]
     Corrupt(String),
+
+    /// Caller must refresh routing or block placement/state before retrying.
+    #[error("Need refresh ({reason:?}): {message}")]
+    NeedRefresh {
+        code: RpcErrorCode,
+        reason: RefreshReason,
+        message: String,
+    },
 
     /// Permission denied.
     #[error("Permission denied: {0}")]
@@ -111,6 +120,7 @@ impl WorkerError {
             WorkerError::InvalidArgument(_) => (false, None, None, None),
             WorkerError::NotFound(_) => (false, None, None, None),
             WorkerError::Corrupt(_) => (false, None, None, None),
+            WorkerError::NeedRefresh { .. } => (false, None, None, None),
             WorkerError::PermissionDenied(_) => (false, None, None, None),
             WorkerError::Unimplemented(_) => (false, None, None, None),
             WorkerError::Internal(_) => (false, None, None, None),
@@ -164,6 +174,7 @@ impl WorkerError {
             WorkerError::InvalidArgument(_) => tonic::Code::InvalidArgument,
             WorkerError::NotFound(_) => tonic::Code::NotFound,
             WorkerError::Corrupt(_) => tonic::Code::DataLoss,
+            WorkerError::NeedRefresh { .. } => tonic::Code::FailedPrecondition,
             WorkerError::PermissionDenied(_) => tonic::Code::PermissionDenied,
             WorkerError::Unimplemented(_) => tonic::Code::Unimplemented,
             WorkerError::Internal(_) => tonic::Code::Internal,
@@ -242,22 +253,10 @@ impl From<WorkerError> for CanonicalError {
                 message: format!("operation cancelled: {}", msg),
                 refresh_hint: None,
             },
-            WorkerError::InvalidArgument(msg) => CanonicalError {
-                class: ErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                reason: None,
-                retry_after_ms: None,
-                message: format!("invalid argument: {}", msg),
-                refresh_hint: None,
-            },
-            WorkerError::NotFound(msg) => CanonicalError {
-                class: ErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                reason: None,
-                retry_after_ms: None,
-                message: format!("not found: {}", msg),
-                refresh_hint: None,
-            },
+            WorkerError::InvalidArgument(msg) => {
+                CanonicalError::fatal_fs(FsErrorCode::EInval, format!("invalid argument: {}", msg))
+            }
+            WorkerError::NotFound(msg) => CanonicalError::fatal_fs(FsErrorCode::ENoEnt, format!("not found: {}", msg)),
             WorkerError::Corrupt(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
                 code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
@@ -266,22 +265,13 @@ impl From<WorkerError> for CanonicalError {
                 message: format!("corrupt: {}", msg),
                 refresh_hint: None,
             },
-            WorkerError::PermissionDenied(msg) => CanonicalError {
-                class: ErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::PermissionDenied)),
-                reason: None,
-                retry_after_ms: None,
-                message: format!("permission denied: {}", msg),
-                refresh_hint: None,
-            },
-            WorkerError::Unimplemented(msg) => CanonicalError {
-                class: ErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                reason: None,
-                retry_after_ms: None,
-                message: format!("unimplemented: {}", msg),
-                refresh_hint: None,
-            },
+            WorkerError::NeedRefresh { code, reason, message } => CanonicalError::need_refresh(code, reason, message),
+            WorkerError::PermissionDenied(msg) => {
+                CanonicalError::fatal_fs(FsErrorCode::EAcces, format!("permission denied: {}", msg))
+            }
+            WorkerError::Unimplemented(msg) => {
+                CanonicalError::fatal_fs(FsErrorCode::ENotImpl, format!("unimplemented: {}", msg))
+            }
             WorkerError::Internal(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
                 code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),

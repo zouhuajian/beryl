@@ -3,13 +3,13 @@
 
 //! Explicit conversion between worker wire messages and core domain types.
 
-use proto::common::{BlockIdProto, ByteRangeProto, FencingTokenProto, StreamIdProto};
+use proto::common::{BlockIdProto, ByteRangeProto, FencingTokenProto, ShardGroupIdProto, StreamIdProto};
 use proto::worker::{
     AbortWriteRequestProto, CommitWriteRequestProto, OpenReadStreamRequestProto, OpenWriteStreamRequestProto,
     WriteStreamRequestProto,
 };
 use types::chunk::ByteRange;
-use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, StreamId};
+use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, ShardGroupId, StreamId};
 use types::lease::FencingToken;
 
 use crate::data::core::{
@@ -31,6 +31,11 @@ pub fn proto_to_stream_id(proto: Option<StreamIdProto>, field_name: &str) -> Wor
     Ok(StreamId::new(value))
 }
 
+pub fn proto_to_group_id(proto: Option<ShardGroupIdProto>, field_name: &str) -> WorkerCoreResult<ShardGroupId> {
+    let proto = proto.ok_or_else(|| WorkerError::InvalidArgument(format!("missing {field_name}")))?;
+    Ok(ShardGroupId::new(proto.value))
+}
+
 pub fn stream_id_to_proto(stream_id: StreamId) -> StreamIdProto {
     let value = stream_id.as_raw();
     StreamIdProto {
@@ -47,12 +52,14 @@ pub fn proto_to_byte_range(proto: &ByteRangeProto) -> ByteRange {
 }
 
 pub fn proto_to_read_open_request(proto: OpenReadStreamRequestProto) -> WorkerCoreResult<ReadOpenRequest> {
+    let group_id = proto_to_group_id(proto.group_id, "group_id")?;
     let block_id = proto_to_block_id(proto.block_id, "block_id")?;
     let byte_range = proto
         .byte_range
         .ok_or_else(|| WorkerError::InvalidArgument("missing byte_range".to_string()))?;
 
     Ok(ReadOpenRequest {
+        group_id,
         block_id,
         byte_range: proto_to_byte_range(&byte_range),
         block_stamp: proto.block_stamp,

@@ -3,16 +3,30 @@
 
 //! Block runtime metadata and validation boundary.
 
+use common::error::canonical::RefreshReason;
+use common::header::RpcErrorCode;
+use types::ids::{BlockId, ShardGroupId};
+
 use crate::data::core::{
-    AbortWriteRequest, AbortWriteResult, CommitWriteRequest, CommitWriteResult, ReadOpenRequest, ReadOpenResult,
-    WorkerCoreResult, WriteOpenRequest, WriteOpenResult,
+    AbortWriteRequest, AbortWriteResult, CommitWriteRequest, CommitWriteResult, ReadOpenRequest, WorkerCoreResult,
+    WriteOpenRequest, WriteOpenResult,
 };
 use crate::error::WorkerError;
+use crate::store::block::{BlockState, LocalBlockStore};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadBlockSnapshot {
+    pub group_id: ShardGroupId,
+    pub block_id: BlockId,
+    pub effective_block_len: u64,
+    pub block_stamp: u64,
+    pub chunk_size: u32,
+}
 
 /// Block-level facade for open and commit decisions.
 ///
-/// The manager will own block existence checks, stamp validation, committed
-/// prefix validation, and fencing decisions. It intentionally does no file IO.
+/// The manager owns block metadata checks, stamp validation, range validation,
+/// and fencing decisions. It does not perform block data reads or writes.
 #[derive(Clone, Debug)]
 pub struct BlockManager {
     /// Transport frame payload size used when a caller does not request one.
@@ -50,8 +64,65 @@ impl BlockManager {
         self.window_bytes
     }
 
-    pub async fn open_read(&self, _req: ReadOpenRequest) -> WorkerCoreResult<ReadOpenResult> {
-        Err(Self::not_implemented("OpenReadStream"))
+    pub fn validate_read(
+        &self,
+        store: &(dyn LocalBlockStore + Send + Sync),
+        req: &ReadOpenRequest,
+    ) -> WorkerCoreResult<ReadBlockSnapshot> {
+        let meta = match store.load_meta(req.group_id, req.block_id) {
+            Ok(meta) => meta,
+            Err(WorkerError::NotFound(message)) => {
+                return Err(Self::need_refresh(
+                    RpcErrorCode::ShardMoved,
+                    RefreshReason::Moved,
+                    format!("local block is not available for read: {message}"),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+
+        if meta.visibility.block_state != BlockState::Ready {
+            return Err(Self::need_refresh(
+                RpcErrorCode::ShardMoved,
+                RefreshReason::Moved,
+                format!(
+                    "local block is not Ready: group_id={}, block_id={}, state={:?}",
+                    req.group_id, req.block_id, meta.visibility.block_state
+                ),
+            ));
+        }
+        if req.block_stamp != 0 && req.block_stamp != meta.visibility.block_stamp {
+            return Err(Self::need_refresh(
+                RpcErrorCode::BlockStampMismatch,
+                RefreshReason::BlockStampMismatch,
+                format!(
+                    "block stamp mismatch: group_id={}, block_id={}, requested={}, local={}",
+                    req.group_id, req.block_id, req.block_stamp, meta.visibility.block_stamp
+                ),
+            ));
+        }
+
+        let range_end = req
+            .byte_range
+            .offset
+            .checked_add(u64::from(req.byte_range.len))
+            .ok_or_else(|| WorkerError::InvalidArgument("byte range offset overflow".to_string()))?;
+        if req.byte_range.offset > meta.source.effective_block_len || range_end > meta.source.effective_block_len {
+            return Err(WorkerError::InvalidArgument(format!(
+                "byte range exceeds effective block length: group_id={}, block_id={}, offset={}, len={}, effective_block_len={}",
+                req.group_id, req.block_id, req.byte_range.offset, req.byte_range.len, meta.source.effective_block_len
+            )));
+        }
+
+        let chunk_size = u32::try_from(meta.format.chunk_size)
+            .map_err(|_| WorkerError::Corrupt("block chunk size does not fit u32".to_string()))?;
+        Ok(ReadBlockSnapshot {
+            group_id: req.group_id,
+            block_id: req.block_id,
+            effective_block_len: meta.source.effective_block_len,
+            block_stamp: meta.visibility.block_stamp,
+            chunk_size,
+        })
     }
 
     pub async fn open_write(&self, _req: WriteOpenRequest) -> WorkerCoreResult<WriteOpenResult> {
@@ -68,6 +139,10 @@ impl BlockManager {
 
     fn not_implemented(operation: &'static str) -> WorkerError {
         WorkerError::Unimplemented(format!("{operation} worker core is not implemented"))
+    }
+
+    fn need_refresh(code: RpcErrorCode, reason: RefreshReason, message: String) -> WorkerError {
+        WorkerError::NeedRefresh { code, reason, message }
     }
 }
 
