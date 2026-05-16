@@ -153,8 +153,9 @@ pub enum ChecksumKind {
 /// Source-independent effective length of this block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockSource {
-    /// Valid logical length of this block.
+    /// Valid logical length of this block in final metadata.
     /// Ready `.blk` files must have exactly this length.
+    /// Staging metadata records the block-size write bound until publish.
     pub effective_block_len: u64,
 }
 
@@ -163,7 +164,8 @@ pub struct BlockSource {
 pub struct BlockVisibility {
     /// Final metadata may only persist Ready or Corrupt.
     pub block_state: BlockState,
-    /// Logical block stamp persisted when visibility is published.
+    /// Metadata-assigned logical block stamp.
+    /// The local store persists this value at publish time and never generates it.
     pub block_stamp: u64,
 }
 
@@ -187,12 +189,24 @@ impl FullBlockFileStoreConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreateLoadingBlockRequest {
+pub struct CreateStagingBlockRequest {
     pub group_id: ShardGroupId,
     pub block_id: BlockId,
+    /// Maximum logical size for this block's local format.
     pub block_size: u64,
-    pub chunk_size: u64,
+    pub chunk_size: u32,
+    pub checksum_kind: ChecksumKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishReadyRequest {
+    pub group_id: ShardGroupId,
+    pub block_id: BlockId,
+    /// Complete effective block length to publish.
     pub effective_block_len: u64,
+    /// Metadata-assigned logical block stamp.
+    /// The local store persists this value at publish time and never generates it.
+    pub block_stamp: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -222,8 +236,10 @@ impl FullBlockFileStore {
         Self { config }
     }
 
-    pub fn create_loading_block(&self, req: CreateLoadingBlockRequest) -> StoreResult<BlockMetaPayload> {
-        validate_create_block_shape(req.block_size, req.chunk_size, req.effective_block_len)?;
+    /// Creates an unpublished staging block.
+    /// This does not create final `.meta` and does not make the block readable.
+    pub fn create_staging_block(&self, req: CreateStagingBlockRequest) -> StoreResult<BlockMetaPayload> {
+        validate_create_block_shape(req.block_size, req.chunk_size)?;
 
         let paths = self.paths(req.group_id, req.block_id);
         let parent = paths.parent_dir()?;
@@ -266,11 +282,11 @@ impl FullBlockFileStore {
             format: BlockFormat {
                 format_id: BLOCK_FORMAT_FULL_EFFECTIVE,
                 block_size: req.block_size,
-                chunk_size: req.chunk_size,
-                checksum_kind: ChecksumKind::None,
+                chunk_size: u64::from(req.chunk_size),
+                checksum_kind: req.checksum_kind,
             },
             source: BlockSource {
-                effective_block_len: req.effective_block_len,
+                effective_block_len: req.block_size,
             },
             visibility: BlockVisibility {
                 block_state: BlockState::Loading,
@@ -291,7 +307,7 @@ impl FullBlockFileStore {
 
     /// Writes bytes to an unpublished staging block.
     /// Overwrites are allowed before publication so a write stream can retry frames.
-    /// Ready blocks are immutable in this store.
+    /// Ready blocks are immutable in this store, and writes do not change block stamps.
     pub fn write_at(&self, group_id: ShardGroupId, block_id: BlockId, offset: u64, data: Bytes) -> StoreResult<()> {
         let paths = self.paths(group_id, block_id);
         if paths.meta_path.exists() {
@@ -322,13 +338,11 @@ impl FullBlockFileStore {
     }
 
     /// Publishes a complete staging block as Ready.
+    /// Persists the metadata-assigned block stamp supplied by the request.
     /// This does not support appending to or replacing an existing Ready block.
-    pub fn publish_ready(
-        &self,
-        group_id: ShardGroupId,
-        block_id: BlockId,
-        block_stamp: u64,
-    ) -> StoreResult<BlockMetaPayload> {
+    pub fn publish_ready(&self, req: PublishReadyRequest) -> StoreResult<BlockMetaPayload> {
+        let group_id = req.group_id;
+        let block_id = req.block_id;
         let paths = self.paths(group_id, block_id);
         if paths.meta_path.exists() {
             let final_meta = self.load_meta(group_id, block_id)?;
@@ -340,12 +354,13 @@ impl FullBlockFileStore {
 
         let meta = self.load_staging_meta(group_id, block_id)?;
         ensure_publishable(&meta)?;
-        sync_and_validate_staging_data_file(&paths, &meta)?;
 
         let mut ready = meta;
+        ready.source.effective_block_len = req.effective_block_len;
         ready.visibility.block_state = BlockState::Ready;
-        ready.visibility.block_stamp = block_stamp;
+        ready.visibility.block_stamp = req.block_stamp;
         validate_final_meta_payload(&ready, group_id, block_id)?;
+        sync_and_validate_staging_data_file(&paths, &ready)?;
 
         let parent = paths.parent_dir()?;
         fs::create_dir_all(parent)?;
@@ -479,16 +494,11 @@ impl BlockPaths {
 /// Ready blocks are immutable in this store. Tail append and rebuild require
 /// explicit store operations and are not part of this minimal implementation.
 pub trait LocalBlockStore {
-    fn create_loading_block(&self, req: CreateLoadingBlockRequest) -> StoreResult<BlockMetaPayload>;
+    fn create_staging_block(&self, req: CreateStagingBlockRequest) -> StoreResult<BlockMetaPayload>;
 
     fn write_at(&self, group_id: ShardGroupId, block_id: BlockId, offset: u64, data: Bytes) -> StoreResult<()>;
 
-    fn publish_ready(
-        &self,
-        group_id: ShardGroupId,
-        block_id: BlockId,
-        block_stamp: u64,
-    ) -> StoreResult<BlockMetaPayload>;
+    fn publish_ready(&self, req: PublishReadyRequest) -> StoreResult<BlockMetaPayload>;
 
     fn read_at(&self, group_id: ShardGroupId, block_id: BlockId, offset: u64, len: u64) -> StoreResult<Bytes>;
 
@@ -500,21 +510,16 @@ pub trait LocalBlockStore {
 }
 
 impl LocalBlockStore for FullBlockFileStore {
-    fn create_loading_block(&self, req: CreateLoadingBlockRequest) -> StoreResult<BlockMetaPayload> {
-        FullBlockFileStore::create_loading_block(self, req)
+    fn create_staging_block(&self, req: CreateStagingBlockRequest) -> StoreResult<BlockMetaPayload> {
+        FullBlockFileStore::create_staging_block(self, req)
     }
 
     fn write_at(&self, group_id: ShardGroupId, block_id: BlockId, offset: u64, data: Bytes) -> StoreResult<()> {
         FullBlockFileStore::write_at(self, group_id, block_id, offset, data)
     }
 
-    fn publish_ready(
-        &self,
-        group_id: ShardGroupId,
-        block_id: BlockId,
-        block_stamp: u64,
-    ) -> StoreResult<BlockMetaPayload> {
-        FullBlockFileStore::publish_ready(self, group_id, block_id, block_stamp)
+    fn publish_ready(&self, req: PublishReadyRequest) -> StoreResult<BlockMetaPayload> {
+        FullBlockFileStore::publish_ready(self, req)
     }
 
     fn read_at(&self, group_id: ShardGroupId, block_id: BlockId, offset: u64, len: u64) -> StoreResult<Bytes> {
@@ -733,8 +738,8 @@ fn validate_meta_payload_shape(meta: &BlockMetaPayload, group_id: ShardGroupId, 
     Ok(())
 }
 
-fn validate_create_block_shape(block_size: u64, chunk_size: u64, effective_block_len: u64) -> StoreResult<()> {
-    validate_block_shape(block_size, chunk_size, effective_block_len, invalid_argument)
+fn validate_create_block_shape(block_size: u64, chunk_size: u32) -> StoreResult<()> {
+    validate_block_shape(block_size, u64::from(chunk_size), block_size, invalid_argument)
 }
 
 fn validate_meta_block_shape(block_size: u64, chunk_size: u64, effective_block_len: u64) -> StoreResult<()> {
@@ -787,7 +792,7 @@ fn ensure_publishable(meta: &BlockMetaPayload) -> StoreResult<()> {
 fn ensure_readable(meta: &BlockMetaPayload) -> StoreResult<()> {
     match meta.visibility.block_state {
         BlockState::Ready => Ok(()),
-        BlockState::Loading => Err(invalid_argument("loading block is not readable")),
+        BlockState::Loading => Err(invalid_argument("staging block is not readable")),
         BlockState::Corrupt => Err(corrupt("corrupt block is not readable")),
     }
 }
@@ -1024,22 +1029,35 @@ mod tests {
         group_id: ShardGroupId,
         block_id: BlockId,
         block_size: u64,
-        chunk_size: u64,
-        effective_block_len: u64,
-    ) -> CreateLoadingBlockRequest {
-        CreateLoadingBlockRequest {
+        chunk_size: u32,
+    ) -> CreateStagingBlockRequest {
+        CreateStagingBlockRequest {
             group_id,
             block_id,
             block_size,
             chunk_size,
+            checksum_kind: ChecksumKind::None,
+        }
+    }
+
+    fn publish_request(
+        group_id: ShardGroupId,
+        block_id: BlockId,
+        effective_block_len: u64,
+        block_stamp: u64,
+    ) -> PublishReadyRequest {
+        PublishReadyRequest {
+            group_id,
+            block_id,
             effective_block_len,
+            block_stamp,
         }
     }
 
     fn create_default_block(store: &FullBlockFileStore, group_id: ShardGroupId, block_id: BlockId) {
         store
-            .create_loading_block(request(group_id, block_id, 4096, 1024, 4096))
-            .expect("create loading block");
+            .create_staging_block(request(group_id, block_id, 4096, 1024))
+            .expect("create staging block");
     }
 
     fn publish_default_block(
@@ -1052,7 +1070,7 @@ mod tests {
             .write_at(group_id, block_id, 0, Bytes::from(vec![1; 4096]))
             .expect("write default block");
         store
-            .publish_ready(group_id, block_id, 1)
+            .publish_ready(publish_request(group_id, block_id, 4096, 1))
             .expect("publish default block")
     }
 
@@ -1193,7 +1211,7 @@ mod tests {
         let _fault = fail_once_at(StoreFault::StagingMetaCleanup);
 
         let meta = store
-            .publish_ready(group_id, block_id, 17)
+            .publish_ready(publish_request(group_id, block_id, 4096, 17))
             .expect("post-commit cleanup failure must not fail publish");
 
         assert_eq!(meta.visibility.block_state, BlockState::Ready);
@@ -1202,13 +1220,13 @@ mod tests {
     }
 
     #[test]
-    fn create_loading_block_does_not_create_final_meta() {
+    fn create_staging_block_does_not_create_final_meta() {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
 
         let meta = store
-            .create_loading_block(request(group_id, block_id, 8 * MB, MB, 4 * MB))
-            .expect("create loading block");
+            .create_staging_block(request(group_id, block_id, 8 * MB, MB as u32))
+            .expect("create staging block");
         let paths = store.paths(group_id, block_id);
 
         assert!(!paths.data_path.exists());
@@ -1218,14 +1236,14 @@ mod tests {
         assert_not_found(store.read_at(group_id, block_id, 0, 1));
         assert_eq!(meta.visibility.block_state, BlockState::Loading);
         assert_eq!(meta.visibility.block_stamp, 0);
-        assert_eq!(meta.source.effective_block_len, 4 * MB);
+        assert_eq!(meta.source.effective_block_len, 8 * MB);
         assert_eq!(meta.format.block_size, 8 * MB);
         assert_eq!(meta.format.chunk_size, MB);
         assert_eq!(meta.format.checksum_kind, ChecksumKind::None);
     }
 
     #[test]
-    fn create_loading_block_existing_fails() {
+    fn create_staging_block_existing_fails() {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
         create_default_block(&store, group_id, block_id);
@@ -1234,7 +1252,7 @@ mod tests {
         let meta_before = fs::read(&paths.staging_meta_path).expect("read meta before");
 
         store
-            .create_loading_block(request(group_id, block_id, 4096, 1024, 4096))
+            .create_staging_block(request(group_id, block_id, 4096, 1024))
             .expect_err("existing block should be rejected");
 
         assert_eq!(
@@ -1275,7 +1293,9 @@ mod tests {
         store
             .write_at(group_id, block_id, 5, Bytes::from(vec![0; 4091]))
             .expect("fill remaining bytes");
-        store.publish_ready(group_id, block_id, 11).expect("publish");
+        store
+            .publish_ready(publish_request(group_id, block_id, 4096, 11))
+            .expect("publish");
 
         assert_eq!(
             store.read_at(group_id, block_id, 0, second.len() as u64).unwrap(),
@@ -1291,13 +1311,44 @@ mod tests {
         let data = Bytes::from(vec![7; 4096]);
 
         store.write_at(group_id, block_id, 0, data.clone()).expect("write");
-        let meta = store.publish_ready(group_id, block_id, 11).expect("publish");
+        let meta = store
+            .publish_ready(publish_request(group_id, block_id, 4096, 11))
+            .expect("publish");
         let paths = store.paths(group_id, block_id);
 
         assert_eq!(meta.visibility.block_state, BlockState::Ready);
         assert_eq!(meta.visibility.block_stamp, 11);
         assert_eq!(fs::metadata(&paths.data_path).expect("data metadata").len(), 4096);
         assert_eq!(store.read_at(group_id, block_id, 0, data.len() as u64).unwrap(), data);
+    }
+
+    #[test]
+    fn publish_ready_persists_metadata_assigned_block_stamp() {
+        let (_temp, store) = store();
+        let (group_id, block_id) = ids();
+        store
+            .create_staging_block(CreateStagingBlockRequest {
+                group_id,
+                block_id,
+                block_size: 4096,
+                chunk_size: 1024,
+                checksum_kind: ChecksumKind::None,
+            })
+            .expect("create staging block");
+        store
+            .write_at(group_id, block_id, 0, Bytes::from(vec![7; 3072]))
+            .expect("write complete effective block");
+        store
+            .publish_ready(PublishReadyRequest {
+                group_id,
+                block_id,
+                effective_block_len: 3072,
+                block_stamp: 0xfeed_cafe,
+            })
+            .expect("publish ready");
+
+        let loaded = store.load_meta(group_id, block_id).expect("load meta");
+        assert_eq!(loaded.visibility.block_stamp, 0xfeed_cafe);
     }
 
     #[test]
@@ -1308,7 +1359,9 @@ mod tests {
         store
             .write_at(group_id, block_id, 0, Bytes::from(vec![7; 4096]))
             .expect("write");
-        store.publish_ready(group_id, block_id, 1).expect("publish");
+        store
+            .publish_ready(publish_request(group_id, block_id, 4096, 1))
+            .expect("publish");
 
         assert_invalid_argument(store.write_at(group_id, block_id, 0, Bytes::from_static(b"x")));
     }
@@ -1321,9 +1374,11 @@ mod tests {
         store
             .write_at(group_id, block_id, 0, Bytes::from(vec![7; 4096]))
             .expect("write");
-        let meta = store.publish_ready(group_id, block_id, 1).expect("publish");
+        let meta = store
+            .publish_ready(publish_request(group_id, block_id, 4096, 1))
+            .expect("publish");
 
-        assert_invalid_argument(store.publish_ready(group_id, block_id, 2));
+        assert_invalid_argument(store.publish_ready(publish_request(group_id, block_id, 4096, 2)));
         let reloaded = store.load_meta(group_id, block_id).expect("load meta");
         assert_eq!(reloaded.visibility.block_stamp, meta.visibility.block_stamp);
     }
@@ -1333,14 +1388,14 @@ mod tests {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
         store
-            .create_loading_block(request(group_id, block_id, 4096, 1024, 1536))
-            .expect("create loading block");
+            .create_staging_block(request(group_id, block_id, 4096, 1024))
+            .expect("create staging block");
         let paths = store.paths(group_id, block_id);
         store
             .write_at(group_id, block_id, 0, Bytes::from(vec![7; 1024]))
             .expect("write first bytes");
 
-        assert_corrupt(store.publish_ready(group_id, block_id, 1));
+        assert_corrupt(store.publish_ready(publish_request(group_id, block_id, 1536, 1)));
 
         assert!(!paths.meta_path.exists());
     }
@@ -1350,20 +1405,22 @@ mod tests {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
         store
-            .create_loading_block(request(group_id, block_id, 4096, 1024, 1536))
-            .expect("create loading block");
+            .create_staging_block(request(group_id, block_id, 4096, 1024))
+            .expect("create staging block");
         let paths = store.paths(group_id, block_id);
         store
             .write_at(group_id, block_id, 0, Bytes::from(vec![7; 1024]))
             .expect("write first bytes");
 
-        assert_corrupt(store.publish_ready(group_id, block_id, 1));
+        assert_corrupt(store.publish_ready(publish_request(group_id, block_id, 1536, 1)));
         assert!(!paths.meta_path.exists());
 
         store
             .write_at(group_id, block_id, 1024, Bytes::from(vec![8; 512]))
             .expect("finish staging bytes");
-        let meta = store.publish_ready(group_id, block_id, 2).expect("publish");
+        let meta = store
+            .publish_ready(publish_request(group_id, block_id, 1536, 2))
+            .expect("publish");
 
         assert!(paths.meta_path.exists());
         assert_eq!(meta.visibility.block_state, BlockState::Ready);
@@ -1375,13 +1432,15 @@ mod tests {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
         store
-            .create_loading_block(request(group_id, block_id, 4096, 1024, 3072))
-            .expect("create loading block");
+            .create_staging_block(request(group_id, block_id, 4096, 1024))
+            .expect("create staging block");
         let paths = store.paths(group_id, block_id);
         store
             .write_at(group_id, block_id, 0, Bytes::from(vec![9; 3072]))
             .expect("write");
-        store.publish_ready(group_id, block_id, 1).expect("publish");
+        store
+            .publish_ready(publish_request(group_id, block_id, 3072, 1))
+            .expect("publish");
 
         set_data_len(&paths, 2048);
         assert_corrupt(store.recover_block(group_id, block_id));
@@ -1399,12 +1458,14 @@ mod tests {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
         store
-            .create_loading_block(request(group_id, block_id, 32 * MB, MB, 4 * MB))
-            .expect("create loading block");
+            .create_staging_block(request(group_id, block_id, 32 * MB, MB as u32))
+            .expect("create staging block");
         let data = Bytes::from(vec![3; (4 * MB) as usize]);
 
         store.write_at(group_id, block_id, 0, data).expect("write");
-        store.publish_ready(group_id, block_id, 1).expect("publish");
+        store
+            .publish_ready(publish_request(group_id, block_id, 4 * MB, 1))
+            .expect("publish");
 
         let paths = store.paths(group_id, block_id);
         assert_eq!(fs::metadata(paths.data_path).expect("data metadata").len(), 4 * MB);
@@ -1440,12 +1501,14 @@ mod tests {
         let (_temp, store) = store();
         let (group_id, block_id) = ids();
         store
-            .create_loading_block(request(group_id, block_id, 4096, 1024, 1536))
-            .expect("create loading block");
+            .create_staging_block(request(group_id, block_id, 4096, 1024))
+            .expect("create staging block");
         store
             .write_at(group_id, block_id, 0, Bytes::from(vec![5; 1536]))
             .expect("write");
-        store.publish_ready(group_id, block_id, 1).expect("publish");
+        store
+            .publish_ready(publish_request(group_id, block_id, 1536, 1))
+            .expect("publish");
 
         assert_invalid_argument(store.read_at(group_id, block_id, 1024, 513));
     }
@@ -1728,7 +1791,9 @@ mod tests {
         store
             .write_at(group_id, block_id, 0, Bytes::from(vec![1; 4096]))
             .expect("write");
-        store.publish_ready(group_id, block_id, 1).expect("publish");
+        store
+            .publish_ready(publish_request(group_id, block_id, 4096, 1))
+            .expect("publish");
         let paths = store.paths(group_id, block_id);
         {
             let mut file = OpenOptions::new()
@@ -1754,7 +1819,9 @@ mod tests {
         store
             .write_at(group_id, block_id, 0, Bytes::from(vec![6; 4096]))
             .expect("write");
-        store.publish_ready(group_id, block_id, 1).expect("publish");
+        store
+            .publish_ready(publish_request(group_id, block_id, 4096, 1))
+            .expect("publish");
         let paths = store.paths(group_id, block_id);
         fs::write(&paths.temp_meta_path, b"ignore this").expect("write temp meta");
 
@@ -1791,7 +1858,9 @@ mod tests {
         store
             .write_at(group_id, block_id, 0, Bytes::from(vec![9; 4096]))
             .expect("write");
-        store.publish_ready(group_id, block_id, 1).expect("publish");
+        store
+            .publish_ready(publish_request(group_id, block_id, 4096, 1))
+            .expect("publish");
         let paths = store.paths(group_id, block_id);
         fs::remove_file(paths.data_path).expect("remove data");
 
