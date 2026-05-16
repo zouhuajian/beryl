@@ -24,26 +24,26 @@ message OpenReadStreamRequestProto {
   // High-frequency ReadStream frames must not carry this header.
   worker.DataRequestHeaderProto header = 1;
 
+  // Owning group for the local block-store lookup.
+  // This is target block identity context, not a file layout field.
+  common.ShardGroupIdProto group_id = 2;
+
   // Target block. Worker data-plane APIs are block-local and must not parse
   // file-level offsets or layouts.
-  common.BlockIdProto block_id = 2;
+  common.BlockIdProto block_id = 3;
 
   // Block-local byte range to read. The offset is relative to block_id,
   // not relative to the file/data handle.
-  common.ByteRangeProto byte_range = 3;
+  common.ByteRangeProto byte_range = 4;
 
   // Client-observed logical block stamp for direct-read validation.
   // 0 means "skip stamp validation".
-  uint64 block_stamp = 4;
+  uint64 block_stamp = 5;
 
   // Client-preferred transport frame payload size in bytes.
   // The worker may clamp or adjust it and returns the accepted value.
   // This is not the worker-local StorageChunk size.
-  uint32 frame_size = 5;
-
-  // Owning group for the local block-store lookup.
-  // This is target block identity context, not a file layout field.
-  common.ShardGroupIdProto group_id = 6;
+  uint32 frame_size = 6;
 }
 
 message OpenReadStreamResponseProto {

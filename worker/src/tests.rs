@@ -242,6 +242,14 @@ mod tests {
         }
     }
 
+    fn write_stream_context() -> StreamContext {
+        StreamContext {
+            mode: StreamMode::Write,
+            fencing_token: Some(token()),
+            ..stream_context()
+        }
+    }
+
     fn open_read_proto(offset: u64, len: u32, block_stamp: u64, frame_size: u32) -> OpenReadStreamRequestProto {
         OpenReadStreamRequestProto {
             header: Some(test_header()),
@@ -523,6 +531,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_core_uses_configured_storage_root() {
+        let custom_root = TempDir::new().expect("custom root");
+        let other_root = TempDir::new().expect("other root");
+        let store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(custom_root.path().to_path_buf()));
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+
+        let core = WorkerCore::with_options(
+            CHUNK_SIZE,
+            512,
+            2048,
+            4096,
+            Duration::from_secs(60),
+            custom_root.path().to_path_buf(),
+        );
+
+        let result = core
+            .open_read(read_open_request_for(0, 8, BLOCK_STAMP, 512))
+            .await
+            .expect("open read from configured root");
+        assert!(core.stream_manager().get(result.stream_id).await.is_some());
+
+        let paths = store.paths(group_id(), block_id());
+        assert!(paths.data_path.starts_with(custom_root.path()));
+        assert!(paths.meta_path.starts_with(custom_root.path()));
+        assert!(
+            paths.data_path.exists(),
+            "ready block data must exist under custom root"
+        );
+        assert!(
+            paths.meta_path.exists(),
+            "ready block metadata must exist under custom root"
+        );
+
+        let other_store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(other_root.path().to_path_buf()));
+        let other_paths = other_store.paths(group_id(), block_id());
+        assert!(
+            !other_paths.data_path.exists(),
+            "ready block data must not be created under other root"
+        );
+        assert!(
+            !other_paths.meta_path.exists(),
+            "ready block metadata must not be created under other root"
+        );
+    }
+
+    #[tokio::test]
     async fn open_read_rejects_block_stamp_mismatch() {
         let (_temp, store, core) = core_with_store(512, 2048, 4096);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
@@ -623,6 +677,23 @@ mod tests {
         let (_temp, _store, core) = core_with_store(8, 16, 4096);
 
         assert_not_found(core.read_stream(stream_id(), 1024).await);
+    }
+
+    #[tokio::test]
+    async fn read_stream_rejects_write_stream() {
+        let (_temp, _store, core) = core_with_store(8, 16, 4096);
+        let state = StreamState::new(write_stream_context());
+        core.stream_manager().register(state).await;
+
+        match core
+            .read_stream(stream_id(), 1024)
+            .await
+            .expect_err("write stream must not be readable")
+        {
+            WorkerError::InvalidArgument(message) => assert!(message.contains("not a read stream")),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        assert_eq!(core.stream_manager().get(stream_id()).await.expect("stream").cursor, 0);
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@ use types::chunk::ByteRange;
 use types::ids::{BlockId, ChunkIndex, ShardGroupId, StreamId};
 use types::lease::FencingToken;
 
+use crate::config::WorkerConfig;
 use crate::error::WorkerError;
 use crate::runtime::block::BlockManager;
 use crate::runtime::stream::{StreamManager, StreamState};
@@ -251,6 +252,7 @@ impl WorkerCore {
             BlockManager::MAX_FRAME_SIZE,
             BlockManager::DEFAULT_WINDOW_BYTES,
             Duration::from_secs(60),
+            WorkerConfig::default().storage_root,
         )
     }
 
@@ -260,10 +262,9 @@ impl WorkerCore {
         max_frame_size: u32,
         window_bytes: u32,
         stream_idle_timeout: Duration,
+        storage_root: PathBuf,
     ) -> Self {
-        let block_store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(PathBuf::from(
-            "./data",
-        ))));
+        let block_store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(storage_root)));
         Self::with_local_store(
             chunk_size,
             default_frame_size,

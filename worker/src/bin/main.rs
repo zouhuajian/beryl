@@ -49,6 +49,7 @@ async fn main() -> Result<()> {
         config.max_frame_size,
         config.window_bytes,
         Duration::from_millis(config.stream_idle_timeout_ms),
+        config.storage_root.clone(),
     ));
     let service = WorkerDataServiceImpl::new(core);
     let bind_addr = config.rpc_bind.parse().context("Invalid worker RPC bind address")?;
