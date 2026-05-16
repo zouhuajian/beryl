@@ -20,8 +20,9 @@ pub struct StreamState {
     pub cursor: u64,
     /// Last acknowledged frame sequence for write streams.
     pub last_acked_seq: u64,
-    /// Highest block-local byte offset known to be persisted by the worker.
-    pub persisted_through: u64,
+    /// Contiguous byte prefix written into the staging block.
+    /// This is not readable until final metadata is published.
+    pub written_through: u64,
     /// Runtime activity timestamp used only for idle cleanup.
     pub last_activity: Instant,
 }
@@ -31,7 +32,7 @@ impl StreamState {
         Self {
             cursor: context.start_offset,
             last_acked_seq: 0,
-            persisted_through: context.committed_length,
+            written_through: context.committed_length,
             last_activity: Instant::now(),
             context,
         }
@@ -100,10 +101,23 @@ impl StreamManager {
         }
     }
 
-    pub async fn mark_persisted(&self, stream_id: StreamId, persisted_through: u64) -> bool {
+    pub async fn mark_written(&self, stream_id: StreamId, written_through: u64) -> bool {
         let mut streams = self.streams.write().await;
         if let Some(state) = streams.get_mut(&stream_id) {
-            state.persisted_through = state.persisted_through.max(persisted_through);
+            state.written_through = state.written_through.max(written_through);
+            state.last_activity = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub async fn advance_write_progress(&self, stream_id: StreamId, seq: u64, written_through: u64) -> bool {
+        let mut streams = self.streams.write().await;
+        if let Some(state) = streams.get_mut(&stream_id) {
+            state.cursor = written_through;
+            state.last_acked_seq = seq;
+            state.written_through = written_through;
             state.last_activity = Instant::now();
             true
         } else {

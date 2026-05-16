@@ -5,8 +5,8 @@
 
 use proto::common::{BlockIdProto, ByteRangeProto, FencingTokenProto, ShardGroupIdProto, StreamIdProto};
 use proto::worker::{
-    AbortWriteRequestProto, CommitWriteRequestProto, OpenReadStreamRequestProto, OpenWriteStreamRequestProto,
-    WriteStreamRequestProto,
+    AbortWriteRequestProto, ChecksumKindProto, CommitWriteRequestProto, OpenReadStreamRequestProto,
+    OpenWriteStreamRequestProto, WriteStreamRequestProto,
 };
 use types::chunk::ByteRange;
 use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, ShardGroupId, StreamId};
@@ -16,6 +16,7 @@ use crate::data::core::{
     AbortWriteRequest, CommitWriteRequest, ReadOpenRequest, WorkerCoreResult, WriteFrame, WriteOpenRequest,
 };
 use crate::error::WorkerError;
+use crate::store::block::ChecksumKind;
 
 pub fn proto_to_block_id(proto: Option<BlockIdProto>, field_name: &str) -> WorkerCoreResult<BlockId> {
     let proto = proto.ok_or_else(|| WorkerError::InvalidArgument(format!("missing {field_name}")))?;
@@ -68,14 +69,20 @@ pub fn proto_to_read_open_request(proto: OpenReadStreamRequestProto) -> WorkerCo
 }
 
 pub fn proto_to_write_open_request(proto: OpenWriteStreamRequestProto) -> WorkerCoreResult<WriteOpenRequest> {
+    let group_id = proto_to_group_id(proto.group_id, "group_id")?;
     let block_id = proto_to_block_id(proto.block_id, "block_id")?;
     let token = proto_to_required_fencing_token(proto.token, "token")?;
+    let checksum_kind = proto_to_checksum_kind(proto.checksum_kind)?;
 
     Ok(WriteOpenRequest {
+        group_id,
         block_id,
         token,
         block_stamp: proto.block_stamp,
         frame_size: proto.frame_size,
+        block_size: proto.block_size,
+        chunk_size: proto.chunk_size,
+        checksum_kind,
     })
 }
 
@@ -93,29 +100,33 @@ pub fn proto_to_write_frame(proto: WriteStreamRequestProto) -> WorkerCoreResult<
 
 pub fn proto_to_commit_write_request(proto: CommitWriteRequestProto) -> WorkerCoreResult<CommitWriteRequest> {
     let stream_id = proto_to_stream_id(proto.stream_id, "stream_id")?;
+    let group_id = proto_to_group_id(proto.group_id, "group_id")?;
     let block_id = proto_to_block_id(proto.block_id, "block_id")?;
     let token = proto_to_required_fencing_token(proto.token, "token")?;
 
     Ok(CommitWriteRequest {
         stream_id,
+        group_id,
         block_id,
         token,
         commit_seq: proto.commit_seq,
-        committed_length: proto.committed_length,
+        effective_block_len: proto.effective_block_len,
+        block_stamp: proto.block_stamp,
         require_sync: proto.require_sync,
     })
 }
 
 pub fn proto_to_abort_write_request(proto: AbortWriteRequestProto) -> WorkerCoreResult<AbortWriteRequest> {
     let stream_id = proto_to_stream_id(proto.stream_id, "stream_id")?;
+    let group_id = proto_to_group_id(proto.group_id, "group_id")?;
     let block_id = proto_to_block_id(proto.block_id, "block_id")?;
     let token = proto_to_required_fencing_token(proto.token, "token")?;
 
     Ok(AbortWriteRequest {
         stream_id,
+        group_id,
         block_id,
         token,
-        reason: proto.reason,
     })
 }
 
@@ -140,4 +151,15 @@ fn proto_to_required_fencing_token(
 ) -> WorkerCoreResult<FencingToken> {
     let proto = proto.ok_or_else(|| WorkerError::InvalidArgument(format!("missing {field_name}")))?;
     proto_to_fencing_token(&proto)
+}
+
+fn proto_to_checksum_kind(checksum_kind: i32) -> WorkerCoreResult<ChecksumKind> {
+    match ChecksumKindProto::try_from(checksum_kind)
+        .map_err(|_| WorkerError::InvalidArgument("unsupported checksum_kind".to_string()))?
+    {
+        ChecksumKindProto::ChecksumKindNone => Ok(ChecksumKind::None),
+        ChecksumKindProto::ChecksumKindUnspecified => Err(WorkerError::InvalidArgument(
+            "checksum_kind must be specified".to_string(),
+        )),
+    }
 }

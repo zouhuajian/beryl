@@ -60,6 +60,10 @@ pub enum WorkerError {
         message: String,
     },
 
+    /// Fencing token is missing, malformed, or does not match the active writer.
+    #[error("Fencing: {0}")]
+    Fencing(String),
+
     /// Permission denied.
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
@@ -121,6 +125,7 @@ impl WorkerError {
             WorkerError::NotFound(_) => (false, None, None, None),
             WorkerError::Corrupt(_) => (false, None, None, None),
             WorkerError::NeedRefresh { .. } => (false, None, None, None),
+            WorkerError::Fencing(_) => (false, None, None, None),
             WorkerError::PermissionDenied(_) => (false, None, None, None),
             WorkerError::Unimplemented(_) => (false, None, None, None),
             WorkerError::Internal(_) => (false, None, None, None),
@@ -175,6 +180,7 @@ impl WorkerError {
             WorkerError::NotFound(_) => tonic::Code::NotFound,
             WorkerError::Corrupt(_) => tonic::Code::DataLoss,
             WorkerError::NeedRefresh { .. } => tonic::Code::FailedPrecondition,
+            WorkerError::Fencing(_) => tonic::Code::FailedPrecondition,
             WorkerError::PermissionDenied(_) => tonic::Code::PermissionDenied,
             WorkerError::Unimplemented(_) => tonic::Code::Unimplemented,
             WorkerError::Internal(_) => tonic::Code::Internal,
@@ -266,6 +272,14 @@ impl From<WorkerError> for CanonicalError {
                 refresh_hint: None,
             },
             WorkerError::NeedRefresh { code, reason, message } => CanonicalError::need_refresh(code, reason, message),
+            WorkerError::Fencing(msg) => CanonicalError {
+                class: ErrorClass::Fatal,
+                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing)),
+                reason: None,
+                retry_after_ms: None,
+                message: format!("fencing: {}", msg),
+                refresh_hint: None,
+            },
             WorkerError::PermissionDenied(msg) => {
                 CanonicalError::fatal_fs(FsErrorCode::EAcces, format!("permission denied: {}", msg))
             }

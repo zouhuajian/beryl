@@ -6,6 +6,7 @@ syntax = "proto3";
 package worker;
 
 import "common/common.proto";
+import "worker/block_meta.proto";
 import "worker/data_header.proto";
 
 // ============================================================================
@@ -36,8 +37,8 @@ message OpenReadStreamRequestProto {
   // not relative to the file/data handle.
   common.ByteRangeProto byte_range = 4;
 
-  // Client-observed logical block stamp for direct-read validation.
-  // 0 means "skip stamp validation".
+  // Metadata-assigned logical block stamp to publish on commit.
+  // Must be non-zero for write streams.
   uint64 block_stamp = 5;
 
   // Client-preferred transport frame payload size in bytes.
@@ -91,20 +92,32 @@ message OpenWriteStreamRequestProto {
   // High-frequency WriteStream frames must not carry this header.
   worker.DataRequestHeaderProto header = 1;
 
+  // Owning group for the local block-store staging lookup.
+  common.ShardGroupIdProto group_id = 2;
+
   // Target block. Writes are block-local.
-  common.BlockIdProto block_id = 2;
+  common.BlockIdProto block_id = 3;
+
+  // Metadata-assigned maximum logical size for this block.
+  uint64 block_size = 4;
+
+  // Metadata-assigned logical block stamp to publish on commit.
+  // Must be non-zero for write streams.
+  uint64 block_stamp = 5;
+
+  // Metadata-assigned StorageChunk size for this block.
+  uint32 chunk_size = 6;
+
+  // StorageChunk checksum algorithm for this local block.
+  worker.ChecksumKindProto checksum_kind = 7;
 
   // Required fencing token issued by metadata.
   // Worker must reject stale writers before accepting data frames.
-  common.FencingTokenProto token = 3;
-
-  // Client-observed logical block stamp for write-open validation.
-  // 0 means "skip stamp validation".
-  uint64 block_stamp = 4;
+  common.FencingTokenProto token = 8;
 
   // Client-preferred transport frame payload size in bytes.
   // This is not the worker-local StorageChunk size.
-  uint32 frame_size = 5;
+  uint32 frame_size = 9;
 }
 
 message OpenWriteStreamResponseProto {
@@ -122,7 +135,8 @@ message OpenWriteStreamResponseProto {
   // outstanding for this stream.
   uint32 window_bytes = 4;
 
-  // Worker's current logical block stamp.
+  // Metadata-assigned logical block stamp to publish on commit.
+  // Must be non-zero for write streams.
   uint64 block_stamp = 5;
 
   // Block-local readable committed prefix length in bytes.
@@ -144,36 +158,43 @@ message WriteStreamRequestProto {
 message WriteStreamResponseProto {
   bool accepted = 1;
   uint64 last_acked_seq = 2;
-  uint64 persisted_through = 3;
+  uint64 written_through = 3;
 }
 
 message CommitWriteRequestProto {
   worker.DataRequestHeaderProto header = 1;
-  common.StreamIdProto stream_id = 2;
+  common.ShardGroupIdProto group_id = 2;
   common.BlockIdProto block_id = 3;
-  common.FencingTokenProto token = 4;
-  uint64 commit_seq = 5;
-  uint64 committed_length = 6;
-  bool require_sync = 7;
+  common.StreamIdProto stream_id = 4;
+
+  // Publishes the complete effective block length for FullBlockFileStore.
+  uint64 effective_block_len = 5;
+
+  // Metadata-assigned logical block stamp to persist at publish time.
+  uint64 block_stamp = 6;
+
+  common.FencingTokenProto token = 7;
+  uint64 commit_seq = 8;
+  bool require_sync = 9;
 }
 
 message CommitWriteResponseProto {
   worker.DataResponseHeaderProto header = 1;
-  uint64 committed_length = 2;
+  uint64 effective_block_len = 2;
 
   // Worker's current logical block stamp after commit.
   uint64 block_stamp = 3;
 
-  // Highest byte offset persisted by the worker.
-  uint64 persisted_through = 4;
+  // Contiguous byte prefix written into the staging block.
+  uint64 written_through = 4;
 }
 
 message AbortWriteRequestProto {
   worker.DataRequestHeaderProto header = 1;
-  common.StreamIdProto stream_id = 2;
+  common.ShardGroupIdProto group_id = 2;
   common.BlockIdProto block_id = 3;
-  common.FencingTokenProto token = 4;
-  string reason = 5;
+  common.StreamIdProto stream_id = 4;
+  common.FencingTokenProto token = 5;
 }
 
 message AbortWriteResponseProto {

@@ -6,7 +6,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use futures::stream;
+use futures::{stream, Stream, StreamExt};
 use proto::common::{ClientInfoProto, ErrorDetailProto};
 use proto::worker::worker_data_service_server::WorkerDataService;
 use proto::worker::{
@@ -19,7 +19,7 @@ use tonic::{Request, Response, Status};
 
 use crate::data::convert::{
     proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_open_request, proto_to_stream_id,
-    proto_to_write_open_request, stream_id_to_proto,
+    proto_to_write_frame, proto_to_write_open_request, stream_id_to_proto,
 };
 use crate::data::core::WorkerCore;
 use crate::error::WorkerError;
@@ -62,12 +62,32 @@ impl WorkerDataServiceImpl {
         proto::convert::canonical_to_error_detail(&canonical)
     }
 
-    fn unimplemented_status(operation: &'static str) -> Status {
-        Status::unimplemented(format!("{operation} worker core is not implemented"))
-    }
-
-    pub(crate) fn write_stream_placeholder_status() -> Status {
-        Self::unimplemented_status("WriteStream")
+    pub(crate) async fn handle_write_frames<S>(&self, mut frames: S) -> Result<WriteStreamResponseProto, Status>
+    where
+        S: Stream<Item = Result<WriteStreamRequestProto, Status>> + Unpin,
+    {
+        let mut response = WriteStreamResponseProto {
+            accepted: true,
+            last_acked_seq: 0,
+            written_through: 0,
+        };
+        while let Some(frame) = frames.next().await {
+            let domain = proto_to_write_frame(frame?).map_err(|error| error.to_status())?;
+            let result = self
+                .core
+                .write_stream(domain)
+                .await
+                .map_err(|error| error.to_status())?;
+            response = WriteStreamResponseProto {
+                accepted: result.accepted,
+                last_acked_seq: result.last_acked_seq,
+                written_through: result.written_through,
+            };
+            if !response.accepted {
+                break;
+            }
+        }
+        Ok(response)
     }
 }
 
@@ -183,9 +203,10 @@ impl WorkerDataService for WorkerDataServiceImpl {
 
     async fn write_stream(
         &self,
-        _request: Request<tonic::Streaming<WriteStreamRequestProto>>,
+        request: Request<tonic::Streaming<WriteStreamRequestProto>>,
     ) -> Result<Response<WriteStreamResponseProto>, Status> {
-        Err(Self::write_stream_placeholder_status())
+        let response = self.handle_write_frames(request.into_inner()).await?;
+        Ok(Response::new(response))
     }
 
     async fn commit_write(
@@ -198,22 +219,22 @@ impl WorkerDataService for WorkerDataServiceImpl {
             Ok(domain) => match self.core.commit_write(domain).await {
                 Ok(result) => CommitWriteResponseProto {
                     header: Some(Self::ok_response_header(header)),
-                    committed_length: result.committed_length,
+                    effective_block_len: result.effective_block_len,
                     block_stamp: result.block_stamp,
-                    persisted_through: result.persisted_through,
+                    written_through: result.written_through,
                 },
                 Err(error) => CommitWriteResponseProto {
                     header: Some(Self::error_response_header(header, error)),
-                    committed_length: 0,
+                    effective_block_len: 0,
                     block_stamp: 0,
-                    persisted_through: 0,
+                    written_through: 0,
                 },
             },
             Err(error) => CommitWriteResponseProto {
                 header: Some(Self::error_response_header(header, error)),
-                committed_length: 0,
+                effective_block_len: 0,
                 block_stamp: 0,
-                persisted_through: 0,
+                written_through: 0,
             },
         };
 

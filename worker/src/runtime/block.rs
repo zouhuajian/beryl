@@ -7,10 +7,7 @@ use common::error::canonical::RefreshReason;
 use common::header::RpcErrorCode;
 use types::ids::{BlockId, ShardGroupId};
 
-use crate::data::core::{
-    AbortWriteRequest, AbortWriteResult, CommitWriteRequest, CommitWriteResult, ReadOpenRequest, WorkerCoreResult,
-    WriteOpenRequest, WriteOpenResult,
-};
+use crate::data::core::{ReadOpenRequest, WorkerCoreResult};
 use crate::error::WorkerError;
 use crate::store::block::{BlockState, LocalBlockStore};
 
@@ -123,22 +120,6 @@ impl BlockManager {
             block_stamp: meta.visibility.block_stamp,
             chunk_size,
         })
-    }
-
-    pub async fn open_write(&self, _req: WriteOpenRequest) -> WorkerCoreResult<WriteOpenResult> {
-        Err(Self::not_implemented("OpenWriteStream"))
-    }
-
-    pub async fn commit_write(&self, _req: CommitWriteRequest) -> WorkerCoreResult<CommitWriteResult> {
-        Err(Self::not_implemented("CommitWrite"))
-    }
-
-    pub async fn abort_write(&self, _req: AbortWriteRequest) -> WorkerCoreResult<AbortWriteResult> {
-        Err(Self::not_implemented("AbortWrite"))
-    }
-
-    fn not_implemented(operation: &'static str) -> WorkerError {
-        WorkerError::Unimplemented(format!("{operation} worker core is not implemented"))
     }
 
     fn need_refresh(code: RpcErrorCode, reason: RefreshReason, message: String) -> WorkerError {

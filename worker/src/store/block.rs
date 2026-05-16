@@ -429,6 +429,20 @@ impl FullBlockFileStore {
         Ok(())
     }
 
+    /// Removes unpublished staging files for an aborted write.
+    /// Final Ready or Corrupt metadata and data are not touched.
+    pub fn abort_staging_block(&self, group_id: ShardGroupId, block_id: BlockId) -> StoreResult<()> {
+        let paths = self.paths(group_id, block_id);
+        remove_file_if_exists(&paths.staging_data_path)?;
+        remove_file_if_exists(&paths.staging_meta_path)?;
+        if let Some(parent) = paths.staging_data_path.parent() {
+            if parent.exists() {
+                sync_parent_dir(parent)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn paths(&self, group_id: ShardGroupId, block_id: BlockId) -> BlockPaths {
         let (hash_a, hash_b) = block_hash_prefix(block_id);
         let stem = format!(
@@ -507,6 +521,8 @@ pub trait LocalBlockStore {
     fn recover_block(&self, group_id: ShardGroupId, block_id: BlockId) -> StoreResult<RecoveredBlock>;
 
     fn delete_block(&self, group_id: ShardGroupId, block_id: BlockId) -> StoreResult<()>;
+
+    fn abort_staging_block(&self, group_id: ShardGroupId, block_id: BlockId) -> StoreResult<()>;
 }
 
 impl LocalBlockStore for FullBlockFileStore {
@@ -536,6 +552,10 @@ impl LocalBlockStore for FullBlockFileStore {
 
     fn delete_block(&self, group_id: ShardGroupId, block_id: BlockId) -> StoreResult<()> {
         FullBlockFileStore::delete_block(self, group_id, block_id)
+    }
+
+    fn abort_staging_block(&self, group_id: ShardGroupId, block_id: BlockId) -> StoreResult<()> {
+        FullBlockFileStore::abort_staging_block(self, group_id, block_id)
     }
 }
 

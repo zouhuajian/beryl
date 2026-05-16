@@ -12,13 +12,14 @@ mod tests {
     use bytes::Bytes;
     use futures::StreamExt;
     use proto::common::{
-        error_detail_proto, BlockIdProto, ByteRangeProto, ClientInfoProto, ErrorClassProto, FencingTokenProto,
-        FsErrnoProto, RefreshReasonProto, ShardGroupIdProto, StreamIdProto,
+        BlockIdProto, ByteRangeProto, ClientInfoProto, ErrorClassProto, FencingTokenProto, RefreshReasonProto,
+        ShardGroupIdProto, StreamIdProto,
     };
     use proto::worker::worker_data_service_server::WorkerDataService;
+    use proto::worker::ChecksumKindProto;
     use proto::worker::{
-        AbortWriteRequestProto, CommitWriteRequestProto, DataRequestHeaderProto, DataResponseHeaderProto,
-        OpenReadStreamRequestProto, OpenWriteStreamRequestProto, ReadStreamRequestProto, WriteStreamRequestProto,
+        AbortWriteRequestProto, CommitWriteRequestProto, DataRequestHeaderProto, OpenReadStreamRequestProto,
+        OpenWriteStreamRequestProto, ReadStreamRequestProto, WriteStreamRequestProto,
     };
     use tempfile::TempDir;
     use types::chunk::ByteRange;
@@ -94,26 +95,6 @@ mod tests {
         }
     }
 
-    fn assert_unimplemented<T: std::fmt::Debug>(result: WorkerCoreResult<T>, operation: &str) {
-        let error = result.expect_err("operation should be a placeholder");
-        match error {
-            WorkerError::Unimplemented(message) => {
-                assert!(message.contains(operation), "unexpected placeholder message: {message}")
-            }
-            other => panic!("expected Unimplemented, got {other:?}"),
-        }
-    }
-
-    fn assert_unimplemented_header(header: Option<DataResponseHeaderProto>) {
-        let error = header.expect("missing header").error.expect("missing error");
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
-        assert_eq!(
-            error.code,
-            Some(error_detail_proto::Code::FsErrno(FsErrnoProto::FsErrnoEnotimpl as i32))
-        );
-        assert!(error.message.contains("not implemented"));
-    }
-
     fn assert_need_refresh<T: std::fmt::Debug>(
         result: WorkerCoreResult<T>,
         expected_reason: common::error::canonical::RefreshReason,
@@ -141,20 +122,26 @@ mod tests {
 
     fn write_open_request() -> WriteOpenRequest {
         WriteOpenRequest {
+            group_id: group_id(),
             block_id: block_id(),
             token: token(),
-            block_stamp: 17,
+            block_stamp: BLOCK_STAMP,
             frame_size: 8192,
+            block_size: BLOCK_SIZE,
+            chunk_size: CHUNK_SIZE,
+            checksum_kind: ChecksumKind::None,
         }
     }
 
     fn commit_write_request() -> CommitWriteRequest {
         CommitWriteRequest {
             stream_id: stream_id(),
+            group_id: group_id(),
             block_id: block_id(),
             token: token(),
             commit_seq: 8,
-            committed_length: 4096,
+            effective_block_len: 4096,
+            block_stamp: BLOCK_STAMP,
             require_sync: true,
         }
     }
@@ -162,9 +149,9 @@ mod tests {
     fn abort_write_request() -> AbortWriteRequest {
         AbortWriteRequest {
             stream_id: stream_id(),
+            group_id: group_id(),
             block_id: block_id(),
             token: token(),
-            reason: "client cancelled".to_string(),
         }
     }
 
@@ -181,6 +168,7 @@ mod tests {
             block_stamp: 17,
             committed_length: 4096,
             effective_block_len: 4096,
+            chunk_size: CHUNK_SIZE,
             fencing_token: None,
         }
     }
@@ -258,6 +246,34 @@ mod tests {
             byte_range: Some(ByteRangeProto { offset, len }),
             block_stamp,
             frame_size,
+        }
+    }
+
+    fn open_write_proto(frame_size: u32) -> OpenWriteStreamRequestProto {
+        OpenWriteStreamRequestProto {
+            header: Some(test_header()),
+            group_id: Some(test_group_id_proto()),
+            block_id: Some(test_block_id_proto()),
+            block_size: BLOCK_SIZE,
+            block_stamp: BLOCK_STAMP,
+            chunk_size: CHUNK_SIZE,
+            checksum_kind: ChecksumKindProto::ChecksumKindNone as i32,
+            token: Some(test_token_proto()),
+            frame_size,
+        }
+    }
+
+    fn commit_write_proto(stream_id: StreamId, commit_seq: u64, effective_block_len: u64) -> CommitWriteRequestProto {
+        CommitWriteRequestProto {
+            header: Some(test_header()),
+            group_id: Some(test_group_id_proto()),
+            block_id: Some(test_block_id_proto()),
+            stream_id: Some(crate::data::convert::stream_id_to_proto(stream_id)),
+            effective_block_len,
+            block_stamp: BLOCK_STAMP,
+            token: Some(test_token_proto()),
+            commit_seq,
+            require_sync: true,
         }
     }
 
@@ -346,21 +362,19 @@ mod tests {
 
     #[test]
     fn converts_open_write_stream_request_to_domain() {
-        let request = OpenWriteStreamRequestProto {
-            header: Some(test_header()),
-            block_id: Some(test_block_id_proto()),
-            token: Some(test_token_proto()),
-            block_stamp: 17,
-            frame_size: 8192,
-        };
+        let request = open_write_proto(8192);
 
         let domain = proto_to_write_open_request(request).unwrap();
 
+        assert_eq!(domain.group_id, group_id());
         assert_eq!(domain.block_id, block_id());
         assert_eq!(domain.token.owner, ClientId::new(9));
         assert_eq!(domain.token.epoch, 11);
-        assert_eq!(domain.block_stamp, 17);
+        assert_eq!(domain.block_stamp, BLOCK_STAMP);
         assert_eq!(domain.frame_size, 8192);
+        assert_eq!(domain.block_size, BLOCK_SIZE);
+        assert_eq!(domain.chunk_size, CHUNK_SIZE);
+        assert_eq!(domain.checksum_kind, ChecksumKind::None);
     }
 
     #[test]
@@ -388,35 +402,39 @@ mod tests {
     fn converts_commit_and_abort_write_requests_to_domain() {
         let commit = proto_to_commit_write_request(CommitWriteRequestProto {
             header: Some(test_header()),
-            stream_id: Some(test_stream_id_proto()),
+            group_id: Some(test_group_id_proto()),
             block_id: Some(test_block_id_proto()),
+            stream_id: Some(test_stream_id_proto()),
+            effective_block_len: 4096,
+            block_stamp: BLOCK_STAMP,
             token: Some(test_token_proto()),
             commit_seq: 8,
-            committed_length: 4096,
             require_sync: true,
         })
         .unwrap();
 
         assert_eq!(commit.stream_id, stream_id());
+        assert_eq!(commit.group_id, group_id());
         assert_eq!(commit.block_id, block_id());
         assert_eq!(commit.token.epoch, 11);
         assert_eq!(commit.commit_seq, 8);
-        assert_eq!(commit.committed_length, 4096);
+        assert_eq!(commit.effective_block_len, 4096);
+        assert_eq!(commit.block_stamp, BLOCK_STAMP);
         assert!(commit.require_sync);
 
         let abort = proto_to_abort_write_request(AbortWriteRequestProto {
             header: Some(test_header()),
-            stream_id: Some(test_stream_id_proto()),
+            group_id: Some(test_group_id_proto()),
             block_id: Some(test_block_id_proto()),
+            stream_id: Some(test_stream_id_proto()),
             token: Some(test_token_proto()),
-            reason: "client cancelled".to_string(),
         })
         .unwrap();
 
         assert_eq!(abort.stream_id, stream_id());
+        assert_eq!(abort.group_id, group_id());
         assert_eq!(abort.block_id, block_id());
         assert_eq!(abort.token.owner, ClientId::new(9));
-        assert_eq!(abort.reason, "client cancelled");
     }
 
     #[test]
@@ -444,11 +462,8 @@ mod tests {
         assert!(read_err.to_string().contains("missing group_id"));
 
         let write_open_err = proto_to_write_open_request(OpenWriteStreamRequestProto {
-            header: Some(test_header()),
-            block_id: Some(test_block_id_proto()),
             token: None,
-            block_stamp: 0,
-            frame_size: 1024,
+            ..open_write_proto(1024)
         })
         .unwrap_err();
         assert!(write_open_err.to_string().contains("missing token"));
@@ -465,11 +480,13 @@ mod tests {
 
         let commit_err = proto_to_commit_write_request(CommitWriteRequestProto {
             header: Some(test_header()),
-            stream_id: None,
+            group_id: Some(test_group_id_proto()),
             block_id: Some(test_block_id_proto()),
+            stream_id: None,
+            effective_block_len: 1,
+            block_stamp: BLOCK_STAMP,
             token: Some(test_token_proto()),
             commit_seq: 1,
-            committed_length: 1,
             require_sync: false,
         })
         .unwrap_err();
@@ -477,27 +494,351 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_core_open_commit_abort_placeholders_are_explicit() {
-        let core = WorkerCore::new(1024);
+    async fn open_write_creates_staging_stream() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
 
-        assert_unimplemented(core.open_write(write_open_request()).await, "OpenWriteStream");
-        assert_unimplemented(core.commit_write(commit_write_request()).await, "CommitWrite");
-        assert_unimplemented(core.abort_write(abort_write_request()).await, "AbortWrite");
+        let result = core.open_write(write_open_request()).await.expect("open write");
+
+        assert_eq!(result.frame_size, 2048);
+        assert_eq!(result.window_bytes, 4096);
+        assert_eq!(result.block_stamp, BLOCK_STAMP);
+        assert_eq!(result.committed_length, 0);
+        assert_eq!(result.chunk_size, CHUNK_SIZE);
+
+        let paths = store.paths(group_id(), block_id());
+        assert!(paths.staging_data_path.exists());
+        assert!(paths.staging_meta_path.exists());
+        assert!(!paths.meta_path.exists());
+        assert_not_found(store.read_at(group_id(), block_id(), 0, 1));
+
+        let state = core
+            .stream_manager()
+            .get(result.stream_id)
+            .await
+            .expect("write stream registered");
+        assert_eq!(state.context.group_id, group_id());
+        assert_eq!(state.context.block_id, block_id());
+        assert_eq!(state.context.mode, StreamMode::Write);
+        assert_eq!(state.context.end_offset, BLOCK_SIZE);
+        assert_eq!(state.context.chunk_size, CHUNK_SIZE);
+        assert_eq!(state.cursor, 0);
+        assert_eq!(state.last_acked_seq, 0);
+        assert_eq!(state.written_through, 0);
     }
 
     #[tokio::test]
-    async fn worker_core_write_stream_placeholders_do_not_ack_data() {
-        let core = WorkerCore::new(1024);
-        let frame = WriteFrame {
-            stream_id: stream_id(),
+    async fn open_write_rejects_invalid_fencing_token() {
+        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let mut req = write_open_request();
+        req.token = FencingToken::new(block_id(), ClientId::new(9), 0);
+
+        match core.open_write(req).await.expect_err("zero epoch must be rejected") {
+            WorkerError::Fencing(message) => assert!(message.contains("epoch")),
+            other => panic!("expected Fencing, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn open_write_rejects_existing_ready_block() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+
+        assert_need_refresh(
+            core.open_write(write_open_request()).await,
+            common::error::canonical::RefreshReason::Moved,
+        );
+        assert_eq!(core.stream_manager().active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn write_stream_writes_staging_data_and_advances_state() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        let data = Bytes::from_static(b"abcd");
+
+        let result = core
+            .write_stream(WriteFrame {
+                stream_id: open.stream_id,
+                seq: 1,
+                offset_in_block: 0,
+                data: data.clone(),
+                checksum32: 0,
+            })
+            .await
+            .expect("write frame");
+
+        assert!(result.accepted);
+        assert_eq!(result.last_acked_seq, 1);
+        assert_eq!(result.written_through, data.len() as u64);
+        let state = core.stream_manager().get(open.stream_id).await.expect("stream state");
+        assert_eq!(state.cursor, data.len() as u64);
+        assert_eq!(state.last_acked_seq, 1);
+        assert_eq!(state.written_through, data.len() as u64);
+        assert!(!store.paths(group_id(), block_id()).meta_path.exists());
+    }
+
+    #[tokio::test]
+    async fn write_stream_rejects_seq_gap() {
+        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+
+        let result = core
+            .write_stream(WriteFrame {
+                stream_id: open.stream_id,
+                seq: 2,
+                offset_in_block: 0,
+                data: Bytes::from_static(b"abcd"),
+                checksum32: 0,
+            })
+            .await
+            .expect("seq gap response");
+
+        assert!(!result.accepted);
+        assert_eq!(result.last_acked_seq, 0);
+        assert_eq!(result.written_through, 0);
+        assert_eq!(
+            core.stream_manager().get(open.stream_id).await.expect("stream").cursor,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn write_stream_rejects_offset_gap() {
+        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+
+        let result = core
+            .write_stream(WriteFrame {
+                stream_id: open.stream_id,
+                seq: 1,
+                offset_in_block: 1,
+                data: Bytes::from_static(b"abcd"),
+                checksum32: 0,
+            })
+            .await
+            .expect("offset gap response");
+
+        assert!(!result.accepted);
+        assert_eq!(result.last_acked_seq, 0);
+        assert_eq!(result.written_through, 0);
+        assert_eq!(
+            core.stream_manager().get(open.stream_id).await.expect("stream").cursor,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn write_stream_rejects_read_stream() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+        let open = core
+            .open_read(read_open_request_for(0, 4, BLOCK_STAMP, 512))
+            .await
+            .expect("open read");
+
+        match core
+            .write_stream(WriteFrame {
+                stream_id: open.stream_id,
+                seq: 1,
+                offset_in_block: 0,
+                data: Bytes::from_static(b"abcd"),
+                checksum32: 0,
+            })
+            .await
+            .expect_err("read stream must reject writes")
+        {
+            WorkerError::InvalidArgument(message) => assert!(message.contains("not a write stream")),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_write_publishes_ready_block() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        let data = payload();
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
             seq: 1,
             offset_in_block: 0,
-            data: Bytes::from_static(b"payload"),
+            data: data.slice(0..2048),
             checksum32: 0,
-        };
+        })
+        .await
+        .expect("first frame");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 2,
+            offset_in_block: 2048,
+            data: data.slice(2048..4096),
+            checksum32: 0,
+        })
+        .await
+        .expect("second frame");
 
-        assert_unimplemented(core.write_frame(frame.clone()).await, "WriteStream");
-        assert_unimplemented(core.write_stream(frame).await, "WriteStream");
+        let result = core
+            .commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                commit_seq: 2,
+                effective_block_len: BLOCK_SIZE,
+                ..commit_write_request()
+            })
+            .await
+            .expect("commit write");
+
+        assert_eq!(result.effective_block_len, BLOCK_SIZE);
+        assert_eq!(result.block_stamp, BLOCK_STAMP);
+        assert_eq!(result.written_through, BLOCK_SIZE);
+        let meta = store.load_meta(group_id(), block_id()).expect("ready meta");
+        assert_eq!(meta.visibility.block_state, crate::store::block::BlockState::Ready);
+        assert_eq!(meta.visibility.block_stamp, BLOCK_STAMP);
+        assert_eq!(store.read_at(group_id(), block_id(), 0, BLOCK_SIZE).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn commit_write_rejects_incomplete_block() {
+        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: Bytes::from_static(b"abcd"),
+            checksum32: 0,
+        })
+        .await
+        .expect("write frame");
+
+        assert_invalid_argument(
+            core.commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                commit_seq: 1,
+                effective_block_len: BLOCK_SIZE,
+                ..commit_write_request()
+            })
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_write_rejects_token_mismatch() {
+        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        let data = payload();
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data,
+            checksum32: 0,
+        })
+        .await
+        .expect("write frame");
+
+        match core
+            .commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                token: FencingToken::new(block_id(), ClientId::new(99), 11),
+                commit_seq: 1,
+                effective_block_len: BLOCK_SIZE,
+                ..commit_write_request()
+            })
+            .await
+            .expect_err("token mismatch must be rejected")
+        {
+            WorkerError::Fencing(message) => assert!(message.contains("token")),
+            other => panic!("expected Fencing, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_write_removes_stream_after_success() {
+        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: payload(),
+            checksum32: 0,
+        })
+        .await
+        .expect("write frame");
+
+        core.commit_write(CommitWriteRequest {
+            stream_id: open.stream_id,
+            commit_seq: 1,
+            effective_block_len: BLOCK_SIZE,
+            ..commit_write_request()
+        })
+        .await
+        .expect("commit write");
+
+        assert!(core.stream_manager().get(open.stream_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn abort_write_removes_stream_and_staging_block() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: Bytes::from_static(b"abcd"),
+            checksum32: 0,
+        })
+        .await
+        .expect("write frame");
+
+        let result = core
+            .abort_write(AbortWriteRequest {
+                stream_id: open.stream_id,
+                ..abort_write_request()
+            })
+            .await
+            .expect("abort write");
+
+        assert!(result.aborted);
+        assert!(core.stream_manager().get(open.stream_id).await.is_none());
+        let paths = store.paths(group_id(), block_id());
+        assert!(!paths.staging_data_path.exists());
+        assert!(!paths.staging_meta_path.exists());
+    }
+
+    #[tokio::test]
+    async fn abort_write_keeps_no_readable_block() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+
+        core.abort_write(AbortWriteRequest {
+            stream_id: open.stream_id,
+            ..abort_write_request()
+        })
+        .await
+        .expect("abort write");
+
+        assert_not_found(store.read_at(group_id(), block_id(), 0, 1));
+        assert!(!store.paths(group_id(), block_id()).meta_path.exists());
+    }
+
+    #[tokio::test]
+    async fn recover_after_uncommitted_write_is_not_readable() {
+        let (temp, _store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: Bytes::from_static(b"abcd"),
+            checksum32: 0,
+        })
+        .await
+        .expect("write frame");
+
+        let recovered_store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(temp.path().to_path_buf()));
+        assert_not_found(recovered_store.recover_block(group_id(), block_id()));
+        assert_not_found(recovered_store.read_at(group_id(), block_id(), 0, 1));
     }
 
     #[tokio::test]
@@ -697,55 +1038,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_open_and_commit_placeholders_return_data_header_errors() {
-        let service = WorkerDataServiceImpl::new(Arc::new(WorkerCore::new(1024)));
+    async fn open_write_stream_returns_success_response() {
+        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let service = WorkerDataServiceImpl::new(Arc::new(core));
 
-        let open_write = service
-            .open_write_stream(tonic::Request::new(OpenWriteStreamRequestProto {
-                header: Some(test_header()),
-                block_id: Some(test_block_id_proto()),
-                token: Some(test_token_proto()),
-                block_stamp: 0,
-                frame_size: 1024,
-            }))
+        let response = service
+            .open_write_stream(tonic::Request::new(open_write_proto(0)))
             .await
-            .unwrap()
+            .expect("open write response")
             .into_inner();
-        assert_unimplemented_header(open_write.header);
 
-        let commit = service
-            .commit_write(tonic::Request::new(CommitWriteRequestProto {
-                header: Some(test_header()),
-                stream_id: Some(test_stream_id_proto()),
-                block_id: Some(test_block_id_proto()),
-                token: Some(test_token_proto()),
-                commit_seq: 1,
-                committed_length: 1024,
-                require_sync: false,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_unimplemented_header(commit.header);
-
-        let abort = service
-            .abort_write(tonic::Request::new(AbortWriteRequestProto {
-                header: Some(test_header()),
-                stream_id: Some(test_stream_id_proto()),
-                block_id: Some(test_block_id_proto()),
-                token: Some(test_token_proto()),
-                reason: "client cancelled".to_string(),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_unimplemented_header(abort.header);
+        assert!(response.header.expect("header").error.is_none());
+        assert!(response.stream_id.is_some());
+        assert_eq!(response.frame_size, 512);
+        assert_eq!(response.window_bytes, 4096);
+        assert_eq!(response.block_stamp, BLOCK_STAMP);
+        assert_eq!(response.committed_length, 0);
+        assert_eq!(response.chunk_size, CHUNK_SIZE);
     }
 
     #[tokio::test]
-    async fn service_write_stream_placeholder_returns_unimplemented_status() {
-        let write_status = WorkerDataServiceImpl::write_stream_placeholder_status();
-        assert_eq!(write_status.code(), tonic::Code::Unimplemented);
+    async fn write_stream_returns_written_through() {
+        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let core = Arc::new(core);
+        let service = WorkerDataServiceImpl::new(core.clone());
+        let open = core.open_write(write_open_request()).await.expect("open write");
+
+        let response = service
+            .handle_write_frames(futures::stream::iter(vec![Ok(WriteStreamRequestProto {
+                stream_id: Some(crate::data::convert::stream_id_to_proto(open.stream_id)),
+                seq: 1,
+                offset_in_block: 0,
+                data: Bytes::from_static(b"abcd"),
+                checksum32: 0,
+            })]))
+            .await
+            .expect("write stream response");
+
+        assert!(response.accepted);
+        assert_eq!(response.last_acked_seq, 1);
+        assert_eq!(response.written_through, 4);
+    }
+
+    #[tokio::test]
+    async fn commit_write_returns_success_after_full_write() {
+        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let core = Arc::new(core);
+        let service = WorkerDataServiceImpl::new(core.clone());
+        let open = service
+            .open_write_stream(tonic::Request::new(open_write_proto(2048)))
+            .await
+            .expect("open write")
+            .into_inner();
+        let stream_id = crate::data::convert::proto_to_stream_id(open.stream_id, "stream_id").expect("stream id");
+        let data = payload();
+        core.write_stream(WriteFrame {
+            stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: data.slice(0..2048),
+            checksum32: 0,
+        })
+        .await
+        .expect("first frame");
+        core.write_stream(WriteFrame {
+            stream_id,
+            seq: 2,
+            offset_in_block: 2048,
+            data: data.slice(2048..4096),
+            checksum32: 0,
+        })
+        .await
+        .expect("second frame");
+
+        let response = service
+            .commit_write(tonic::Request::new(commit_write_proto(stream_id, 2, BLOCK_SIZE)))
+            .await
+            .expect("commit write response")
+            .into_inner();
+
+        assert!(response.header.expect("header").error.is_none());
+        assert_eq!(response.effective_block_len, BLOCK_SIZE);
+        assert_eq!(response.block_stamp, BLOCK_STAMP);
+        assert_eq!(response.written_through, BLOCK_SIZE);
     }
 
     #[tokio::test]
@@ -1154,6 +1529,84 @@ mod tests {
     }
 
     #[test]
+    fn worker_write_proto_fields_are_normalized() {
+        let proto = include_str!("../../proto/worker/data.proto");
+
+        assert_eq!(
+            proto_message_fields(proto, "OpenWriteStreamRequestProto"),
+            vec![
+                ("worker.DataRequestHeaderProto", "header", 1),
+                ("common.ShardGroupIdProto", "group_id", 2),
+                ("common.BlockIdProto", "block_id", 3),
+                ("uint64", "block_size", 4),
+                ("uint64", "block_stamp", 5),
+                ("uint32", "chunk_size", 6),
+                ("worker.ChecksumKindProto", "checksum_kind", 7),
+                ("common.FencingTokenProto", "token", 8),
+                ("uint32", "frame_size", 9),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(proto, "CommitWriteRequestProto"),
+            vec![
+                ("worker.DataRequestHeaderProto", "header", 1),
+                ("common.ShardGroupIdProto", "group_id", 2),
+                ("common.BlockIdProto", "block_id", 3),
+                ("common.StreamIdProto", "stream_id", 4),
+                ("uint64", "effective_block_len", 5),
+                ("uint64", "block_stamp", 6),
+                ("common.FencingTokenProto", "token", 7),
+                ("uint64", "commit_seq", 8),
+                ("bool", "require_sync", 9),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(proto, "CommitWriteResponseProto"),
+            vec![
+                ("worker.DataResponseHeaderProto", "header", 1),
+                ("uint64", "effective_block_len", 2),
+                ("uint64", "block_stamp", 3),
+                ("uint64", "written_through", 4),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(proto, "AbortWriteRequestProto"),
+            vec![
+                ("worker.DataRequestHeaderProto", "header", 1),
+                ("common.ShardGroupIdProto", "group_id", 2),
+                ("common.BlockIdProto", "block_id", 3),
+                ("common.StreamIdProto", "stream_id", 4),
+                ("common.FencingTokenProto", "token", 5),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(proto, "WriteStreamResponseProto"),
+            vec![
+                ("bool", "accepted", 1),
+                ("uint64", "last_acked_seq", 2),
+                ("uint64", "written_through", 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn active_write_path_uses_written_through_name() {
+        let forbidden = concat!("persisted", "_through");
+        let sources = [
+            include_str!("../../proto/worker/data.proto"),
+            include_str!("data/core.rs"),
+            include_str!("data/service.rs"),
+            include_str!("runtime/stream.rs"),
+            include_str!("data/convert.rs"),
+        ];
+
+        assert!(
+            sources.iter().all(|source| !source.contains(forbidden)),
+            "{forbidden} must not remain in active write-path code"
+        );
+    }
+
+    #[test]
     fn active_worker_sources_do_not_use_staged_version_labels() {
         let sources = [
             include_str!("data/core.rs"),
@@ -1171,5 +1624,34 @@ mod tests {
                 "{forbidden} must stay out of active worker source text"
             );
         }
+    }
+
+    fn proto_message_fields<'a>(source: &'a str, message: &str) -> Vec<(&'a str, &'a str, u32)> {
+        let start = format!("message {message} {{");
+        let mut in_message = false;
+        let mut fields = Vec::new();
+        for raw_line in source.lines() {
+            let line = raw_line.trim();
+            if line == start {
+                in_message = true;
+                continue;
+            }
+            if in_message && line == "}" {
+                break;
+            }
+            if !in_message || line.starts_with("//") || line.is_empty() || !line.ends_with(';') {
+                continue;
+            }
+
+            let field = line.trim_end_matches(';');
+            let (left, tag) = field.split_once(" = ").expect("proto field must have tag");
+            let mut left_parts = left.split_whitespace();
+            let ty = left_parts.next().expect("proto field type");
+            let name = left_parts.next().expect("proto field name");
+            assert!(left_parts.next().is_none(), "unexpected proto field modifier: {line}");
+            fields.push((ty, name, tag.parse().expect("numeric proto tag")));
+        }
+        assert!(in_message, "missing proto message {message}");
+        fields
     }
 }

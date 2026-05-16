@@ -121,9 +121,9 @@ impl WorkerDataService for MockWorkerServer {
         let request = request.into_inner();
         Ok(Response::new(CommitWriteResponseProto {
             header: Some(self.placeholder_header(request.header, "CommitWrite")),
-            committed_length: 0,
+            effective_block_len: 0,
             block_stamp: 0,
-            persisted_through: 0,
+            written_through: 0,
         }))
     }
 

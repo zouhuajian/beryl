@@ -17,8 +17,8 @@ use proto::common::{
 use proto::metadata::MsyncRequestProto;
 use proto::worker::worker_data_service_server::WorkerDataService;
 use proto::worker::{
-    CommitWriteRequestProto, DataRequestHeaderProto, DataResponseHeaderProto, OpenReadStreamRequestProto,
-    OpenWriteStreamRequestProto,
+    ChecksumKindProto, CommitWriteRequestProto, DataRequestHeaderProto, DataResponseHeaderProto,
+    OpenReadStreamRequestProto, OpenWriteStreamRequestProto,
 };
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -258,13 +258,17 @@ async fn test_direct_worker_open_write_stream_is_explicitly_unimplemented() {
     let mock_worker = MockWorkerServer::new(1);
     let request = Request::new(OpenWriteStreamRequestProto {
         header: Some(data_request_header("open-write-stream")),
+        group_id: Some(ShardGroupIdProto { value: 1 }),
         block_id: Some(block_id(10, 0)),
+        block_size: 4096,
+        block_stamp: 1,
+        chunk_size: 1024,
+        checksum_kind: ChecksumKindProto::ChecksumKindNone as i32,
         token: Some(FencingTokenProto {
             block_id: Some(block_id(10, 0)),
             owner: 1,
             epoch: 1,
         }),
-        block_stamp: 1,
         frame_size: 4096,
     });
 
@@ -287,15 +291,17 @@ async fn test_direct_worker_commit_write_is_explicitly_unimplemented() {
     let mock_worker = MockWorkerServer::new(1);
     let request = Request::new(CommitWriteRequestProto {
         header: Some(data_request_header("commit-write")),
-        stream_id: Some(StreamIdProto { high: 0, low: 7 }),
+        group_id: Some(ShardGroupIdProto { value: 1 }),
         block_id: Some(block_id(20, 0)),
+        stream_id: Some(StreamIdProto { high: 0, low: 7 }),
+        effective_block_len: 4,
+        block_stamp: 5,
         token: Some(FencingTokenProto {
             block_id: Some(block_id(20, 0)),
             owner: 1,
             epoch: 5,
         }),
         commit_seq: 1,
-        committed_length: 4,
         require_sync: true,
     });
 
@@ -304,9 +310,9 @@ async fn test_direct_worker_commit_write_is_explicitly_unimplemented() {
         .expect("commit placeholder should use structured response")
         .into_inner();
 
-    assert_eq!(response.committed_length, 0);
+    assert_eq!(response.effective_block_len, 0);
     assert_eq!(response.block_stamp, 0);
-    assert_eq!(response.persisted_through, 0);
+    assert_eq!(response.written_through, 0);
     assert_stream_unimplemented_header(response.header.expect("data header"), "CommitWrite");
 }
 
