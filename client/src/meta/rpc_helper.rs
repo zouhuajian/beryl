@@ -293,7 +293,8 @@ mod tests {
     use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
-    use tonic::{transport::Server, Request, Response, Status};
+    use tonic::transport as tonic_net;
+    use tonic::{Request, Response, Status};
     use types::ids::ShardGroupId;
     use types::ClientId;
 
@@ -442,7 +443,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            Server::builder()
+            tonic_net::Server::builder()
                 .add_service(FileSystemServiceProtoServer::new(MockFileSystemService))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
@@ -504,7 +505,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            Server::builder()
+            tonic_net::Server::builder()
                 .add_service(FileSystemServiceProtoServer::new(service))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await

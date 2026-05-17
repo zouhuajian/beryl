@@ -25,7 +25,7 @@ Do not put the following into `client/`:
 
 - authoritative inode/dentry/mount logic
 - worker-local block storage interpretation
-- transport implementation details that belong in `transport/`
+- worker-local net server or peer-client implementation details
 - protobuf schema ownership
 - metadata raft/state-machine logic
 - server-side business rules copied into client-side guessed behavior
@@ -126,11 +126,12 @@ A client that “tries another worker” without revalidating session safety is 
 
 ## 9. Protocol and endpoint selection rules
 
-The client must construct the correct transport/data-path behavior from authoritative endpoint information.
+The client must construct the correct worker data-path behavior from authoritative endpoint information.
 
 Rules:
 
-- do not choose arbitrary transport kinds when the server advertises the actual supported protocol
+- do not choose arbitrary worker network protocols when the server advertises the actual supported protocol
+- client direct-worker code may use proto-generated stubs or client-local helpers until the client data-plane refactor
 - a cached direct-read path must remain subordinate to authoritative route/worker information
 - if the direct path becomes stale or mismatched, refresh from metadata before replaying
 - do not hardcode fallback behavior that bypasses validation

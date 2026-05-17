@@ -24,7 +24,7 @@ Do not put the following into `common/`:
 - filesystem authority logic
 - inode / dentry / mount business rules
 - worker execution logic
-- transport protocol behavior
+- worker-local network protocol behavior
 - replication / repair orchestration
 - routing policy
 - client refresh-replay logic
@@ -32,7 +32,9 @@ Do not put the following into `common/`:
 - domain models that belong in `types/`
 - crate-specific helpers used by only one module
 
-If code is specific to metadata, worker, client, transport, or ufs, keep it there.
+If code is service-specific, keep it in metadata, worker, client, or ufs as appropriate.
+Worker-local networking belongs under `worker::net`.
+Client-side worker access belongs under `client`.
 
 ## 3. Canonical error rules
 
@@ -61,7 +63,7 @@ When changing shared error types, review all of these together:
 Rules:
 
 - prefer zero or minimal dependencies
-- do not depend on `metadata`, `worker`, `client`, `transport`, `ufs`, or generated `proto` crates unless the repo intentionally defines that edge
+- do not depend on service implementation crates such as `metadata`, `worker`, `client`, `ufs`, or generated `proto` crates unless the repo intentionally defines that edge
 - avoid pulling in heavy crates for narrow convenience
 - if a shared utility requires domain knowledge, it probably does not belong here
 

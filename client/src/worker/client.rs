@@ -3,16 +3,42 @@
 
 //! Worker RPC client.
 
-use crate::error::{ClientError, ClientResult};
-use common::header::RequestHeader;
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::warn;
-use transport::net::{NetTransportConfig, NetTransportKind};
-use transport::NetTransport;
-use transport::{GrpcConnection, GrpcTransport, TransportError, TransportResult};
+
+use crate::error::{ClientError, ClientResult};
+use tonic::transport as tonic_net;
 use types::ids::WorkerId;
+
+/// Minimal client-local worker net protocol selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ClientWorkerNetProtocol {
+    #[default]
+    Grpc,
+    Quic,
+    Rdma,
+}
+
+/// Minimal client-local worker net config kept only for connection setup.
+#[derive(Clone, Debug)]
+pub struct ClientWorkerNetConfig {
+    /// Connection establishment timeout for direct worker gRPC channels.
+    pub connect_timeout: Duration,
+    /// Per-request timeout applied to the tonic endpoint.
+    pub request_timeout: Duration,
+    /// Reserved client-side concurrency budget for future direct worker calls.
+    pub max_inflight_requests: usize,
+}
+
+impl Default for ClientWorkerNetConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(30),
+            max_inflight_requests: 100,
+        }
+    }
+}
 
 /// Worker endpoint information from metadata.
 #[derive(Clone, Debug)]
@@ -21,20 +47,20 @@ pub struct WorkerEndpointInfo {
     pub worker_id: WorkerId,
     /// Network endpoint (host:port).
     pub endpoint: String,
-    /// Network transport kind (0=unspecified/grpc, 1=grpc, 2=quic, 3=rdma).
-    pub net_transport_kind: i32,
+    /// Worker network protocol (0=unspecified/grpc, 1=grpc, 2=quic, 3=rdma).
+    pub worker_net_protocol: i32,
     /// Worker epoch/boot_id.
     pub worker_epoch: u64,
 }
 
 impl WorkerEndpointInfo {
-    /// Convert proto NetTransportKind to transport::net::NetTransportKind.
-    pub fn net_transport_kind_to_transport_kind(kind: i32) -> NetTransportKind {
+    /// Convert proto worker net kind to the client-local protocol enum.
+    pub(crate) fn worker_net_protocol_to_protocol(kind: i32) -> ClientWorkerNetProtocol {
         match kind {
-            1 => NetTransportKind::Grpc,
-            2 => NetTransportKind::Quic,
-            3 => NetTransportKind::Rdma,
-            _ => NetTransportKind::Grpc, // Default to grpc
+            1 => ClientWorkerNetProtocol::Grpc,
+            2 => ClientWorkerNetProtocol::Quic,
+            3 => ClientWorkerNetProtocol::Rdma,
+            _ => ClientWorkerNetProtocol::Grpc,
         }
     }
 
@@ -43,372 +69,187 @@ impl WorkerEndpointInfo {
         Self {
             worker_id: WorkerId::new(proto.worker_id),
             endpoint: proto.endpoint,
-            net_transport_kind: proto.net_transport_kind,
+            worker_net_protocol: proto.worker_net_protocol,
             worker_epoch: proto.worker_epoch,
         }
     }
 }
 
-/// Client transport enum (wraps different transport implementations).
-enum ClientTransport {
-    Grpc(Arc<GrpcTransport>),
-}
-
-/// Client connection enum (wraps different connection types).
 #[derive(Clone)]
 enum ClientConnection {
-    Grpc(Arc<GrpcConnection>),
+    Grpc(Arc<tonic_net::Channel>),
     #[cfg(test)]
-    Mock(NetTransportKind),
+    Mock(ClientWorkerNetProtocol),
 }
 
-/// Worker service client using transport abstraction.
+/// Worker service client with only minimal connection handling.
 pub struct WorkerClient {
-    /// Transport for network communication (dynamic based on worker kind).
-    transport: ClientTransport,
-    /// Connection to worker (cached).
+    protocol: ClientWorkerNetProtocol,
     connection: Option<ClientConnection>,
-    /// Worker endpoint information.
     endpoint_info: WorkerEndpointInfo,
-    /// Default transport config (for timeout/backpressure settings).
-    default_config: NetTransportConfig,
+    default_config: ClientWorkerNetConfig,
 }
 
 impl WorkerClient {
     /// Create a new worker client from worker endpoint info.
     ///
-    /// The transport kind is determined from endpoint_info.net_transport_kind,
-    /// not from client configuration. This ensures client uses the protocol
-    /// that the worker actually supports.
+    /// The protocol is determined from endpoint_info.worker_net_protocol, not
+    /// from client configuration, so the client honors metadata authority.
     pub async fn new(
         mut endpoint_info: WorkerEndpointInfo,
-        default_config: Option<NetTransportConfig>,
+        default_config: Option<ClientWorkerNetConfig>,
     ) -> ClientResult<Self> {
         endpoint_info.endpoint = normalize_worker_endpoint(&endpoint_info.endpoint);
-        // Use default config or create a reasonable default
-        let default_config = default_config.unwrap_or_else(|| {
-            NetTransportConfig::default()
-                .with_connect_timeout(Duration::from_secs(5))
-                .with_request_timeout(Duration::from_secs(30))
-                .with_max_inflight_requests(100)
-        });
-
-        // Build transport based on worker's declared kind
-        let transport_kind = WorkerEndpointInfo::net_transport_kind_to_transport_kind(endpoint_info.net_transport_kind);
-
-        let net_config = NetTransportConfig::new(transport_kind)
-            .with_connect_timeout(default_config.connect_timeout)
-            .with_request_timeout(default_config.request_timeout)
-            .with_max_inflight_requests(default_config.max_inflight_requests);
-
-        // Build transport based on kind
-        let transport = match transport_kind {
-            NetTransportKind::Grpc => ClientTransport::Grpc(Arc::new(GrpcTransport::new(net_config))),
-            other => {
-                return Err(ClientError::Unimplemented(format!(
-                    "Worker {} at {} requested unsupported transport {:?}",
-                    endpoint_info.worker_id.as_u64(),
-                    endpoint_info.endpoint,
-                    other
-                )));
+        let default_config = default_config.unwrap_or_default();
+        let protocol = WorkerEndpointInfo::worker_net_protocol_to_protocol(endpoint_info.worker_net_protocol);
+        let connection = match protocol {
+            ClientWorkerNetProtocol::Grpc => Some(ClientConnection::Grpc(Arc::new(
+                connect_grpc(&endpoint_info, &default_config).await?,
+            ))),
+            ClientWorkerNetProtocol::Quic | ClientWorkerNetProtocol::Rdma => {
+                return Err(unsupported_protocol_error(&endpoint_info, protocol));
             }
         };
 
-        // Connect to worker
-        let connection = Self::connect_transport(&transport, &endpoint_info.endpoint, &endpoint_info)
-            .await
-            .map_err(|e| ClientError::Worker(format!("Failed to connect via transport: {}", e)))?;
-
         Ok(Self {
-            transport,
-            connection: Some(connection),
+            protocol,
+            connection,
             endpoint_info,
             default_config,
         })
     }
 
-    /// Connect using the appropriate transport.
-    async fn connect_transport(
-        transport: &ClientTransport,
-        endpoint: &str,
-        info: &WorkerEndpointInfo,
-    ) -> ClientResult<ClientConnection> {
-        match transport {
-            ClientTransport::Grpc(t) => {
-                let conn = t
-                    .connect(endpoint)
-                    .await
-                    .map_err(|err| Self::map_connection_error(info, endpoint, err))?;
-                Ok(ClientConnection::Grpc(Arc::new(conn)))
-            }
-        }
-    }
-
-    /// Get or create connection to worker.
-    async fn get_connection(&self) -> ClientResult<ClientConnection> {
-        if let Some(conn) = &self.connection {
-            Ok(conn.clone())
-        } else {
-            // Reconnect if connection is lost
-            let connection =
-                Self::connect_transport(&self.transport, &self.endpoint_info.endpoint, &self.endpoint_info)
-                    .await
-                    .map_err(|e| ClientError::Worker(format!("Failed to reconnect: {}", e)))?;
-            Ok(connection)
-        }
-    }
-
-    /// Update endpoint info (for metadata refresh scenarios).
+    /// Update endpoint info after a metadata refresh.
     pub async fn update_endpoint_info(&mut self, mut new_info: WorkerEndpointInfo) -> ClientResult<()> {
         new_info.endpoint = normalize_worker_endpoint(&new_info.endpoint);
-        // If transport kind changed, rebuild transport
-        if new_info.net_transport_kind != self.endpoint_info.net_transport_kind {
-            let transport_kind = WorkerEndpointInfo::net_transport_kind_to_transport_kind(new_info.net_transport_kind);
-            let net_config = NetTransportConfig::new(transport_kind)
-                .with_connect_timeout(self.default_config.connect_timeout)
-                .with_request_timeout(self.default_config.request_timeout)
-                .with_max_inflight_requests(self.default_config.max_inflight_requests);
-
-            self.transport = match transport_kind {
-                NetTransportKind::Grpc => ClientTransport::Grpc(Arc::new(GrpcTransport::new(net_config))),
-                other => {
-                    return Err(ClientError::Unimplemented(format!(
-                        "Worker {} at {} requested unsupported transport {:?}",
-                        new_info.worker_id.as_u64(),
-                        new_info.endpoint,
-                        other
-                    )));
-                }
-            };
-            // Clear old connection
-            self.connection = None;
+        let new_protocol = WorkerEndpointInfo::worker_net_protocol_to_protocol(new_info.worker_net_protocol);
+        match new_protocol {
+            ClientWorkerNetProtocol::Grpc => {}
+            ClientWorkerNetProtocol::Quic | ClientWorkerNetProtocol::Rdma => {
+                return Err(unsupported_protocol_error(&new_info, new_protocol));
+            }
         }
 
-        // If endpoint changed, reconnect
-        if new_info.endpoint != self.endpoint_info.endpoint {
-            self.connection = None;
+        if new_protocol != self.protocol || new_info.endpoint != self.endpoint_info.endpoint {
+            self.connection = Some(ClientConnection::Grpc(Arc::new(
+                connect_grpc(&new_info, &self.default_config).await?,
+            )));
+            self.protocol = new_protocol;
         }
 
         self.endpoint_info = new_info;
         Ok(())
     }
 
-    /// Handle endpoint refresh: update endpoint info and log/metrics.
-    async fn handle_endpoint_refresh(
-        &mut self,
-        new_info: WorkerEndpointInfo,
-        ctx: &RequestHeader,
-        reason: &str,
-    ) -> ClientResult<()> {
-        let old_kind = self.endpoint_info.net_transport_kind;
-        let old_endpoint = self.endpoint_info.endpoint.clone();
-        let old_epoch = self.endpoint_info.worker_epoch;
-
-        let new_kind = new_info.net_transport_kind;
-        let new_endpoint = new_info.endpoint.clone();
-        let new_epoch = new_info.worker_epoch;
-
-        // Log warning with full context
-        warn!(
-            worker_id = self.endpoint_info.worker_id.as_u64(),
-            old_kind = old_kind,
-            old_endpoint = %old_endpoint,
-            old_epoch = old_epoch,
-            new_kind = new_kind,
-            new_endpoint = %new_endpoint,
-            new_epoch = new_epoch,
-            request_id = ctx.client.call_id.to_string(),
-            reason = reason,
-            "endpoint stale / protocol mismatch refresh"
-        );
-
-        // Record counter metric for endpoint refresh
-        metrics::counter!(
-            "client_worker_endpoint_refresh_total",
-            "worker_id" => self.endpoint_info.worker_id.as_u64().to_string(),
-            "old_kind" => old_kind.to_string(),
-            "new_kind" => new_kind.to_string(),
-            "reason" => reason.to_string()
-        )
-        .increment(1);
-
-        // Update endpoint info
-        self.update_endpoint_info(new_info).await?;
-
-        Ok(())
-    }
-
-    #[allow(unreachable_patterns)]
-    async fn call_with_transport<R, Fut, Call>(
-        &self,
-        rpc_name: &str,
-        ctx: &RequestHeader,
-        connection: &ClientConnection,
-        call: Call,
-    ) -> ClientResult<R>
-    where
-        Call: FnOnce(Arc<GrpcTransport>, Arc<GrpcConnection>) -> Fut,
-        Fut: Future<Output = TransportResult<R>>,
-    {
-        match (&self.transport, connection) {
-            (ClientTransport::Grpc(transport), ClientConnection::Grpc(conn)) => {
-                call(Arc::clone(transport), Arc::clone(conn))
-                    .await
-                    .map_err(|err| self.map_transport_error(err, rpc_name, ctx))
-            }
-            _ => Err(self.mismatch_error(rpc_name, ctx, connection.kind())),
-        }
-    }
-
-    fn map_transport_error(&self, err: TransportError, rpc_name: &str, ctx: &RequestHeader) -> ClientError {
-        let err_desc = err.to_string();
-        let call_id = ctx.client.call_id.to_string();
-        let base_msg = format!(
-            "rpc {} (call_id {}) to worker {} (endpoint {}) failed: {}",
-            rpc_name,
-            call_id,
-            self.endpoint_info.worker_id.as_u64(),
-            self.endpoint_info.endpoint,
-            err_desc,
-        );
-
-        match err {
-            TransportError::NotImplemented(_) | TransportError::NotSupported(_) => {
-                ClientError::Unimplemented(format!("protocol mismatch: {}", base_msg))
-            }
-            _ => ClientError::Worker(base_msg),
-        }
-    }
-
-    fn mismatch_error(&self, rpc_name: &str, ctx: &RequestHeader, connection_kind: NetTransportKind) -> ClientError {
-        let call_id = ctx.client.call_id.to_string();
-        ClientError::Worker(format!(
-            "transport/connection mismatch for worker {} (endpoint {}) call {} (call_id {}): transport {:?} vs connection {:?}",
-            self.endpoint_info.worker_id.as_u64(),
-            self.endpoint_info.endpoint,
-            rpc_name,
-            call_id,
-            self.transport.kind(),
-            connection_kind,
-        ))
-    }
-
-    fn missing_field_error(&self, field: &str, rpc_name: &str, ctx: &RequestHeader) -> ClientError {
-        let call_id = ctx.client.call_id.to_string();
-        ClientError::Worker(format!(
-            "rpc {} (call_id {}) for worker {} (endpoint {}) missing field {}",
-            rpc_name,
-            call_id,
-            self.endpoint_info.worker_id.as_u64(),
-            self.endpoint_info.endpoint,
-            field,
-        ))
-    }
-
-    fn should_refresh_on_error(error: &ClientError) -> bool {
-        match error {
-            ClientError::Unimplemented(_) => true,
-            ClientError::Worker(msg) => msg.contains("protocol mismatch") || msg.contains("transport mismatch"),
-            _ => false,
-        }
-    }
-
-    fn map_connection_error(info: &WorkerEndpointInfo, endpoint: &str, err: TransportError) -> ClientError {
-        let err_desc = err.to_string();
-        let base_msg = format!(
-            "failed to connect to worker {} (endpoint {}): {}",
-            info.worker_id.as_u64(),
-            endpoint,
-            err_desc,
-        );
-        match err {
-            TransportError::NotImplemented(_) | TransportError::NotSupported(_) => {
-                ClientError::Unimplemented(format!("protocol mismatch: {}", base_msg))
-            }
-            _ => ClientError::Worker(base_msg),
-        }
-    }
-
     /// Get worker endpoint info.
     pub fn endpoint_info(&self) -> &WorkerEndpointInfo {
         &self.endpoint_info
     }
+
+    /// Returns true when a connection has been established.
+    pub fn is_connected(&self) -> bool {
+        self.connection.as_ref().map(ClientConnection::protocol).is_some()
+    }
+
+    #[cfg(test)]
+    fn ensure_connection_protocol(&self, rpc_name: &str) -> ClientResult<()> {
+        let connection = self
+            .connection
+            .as_ref()
+            .ok_or_else(|| ClientError::Worker(format!("worker {} has no active connection", self.worker_id_raw())))?;
+        let connection_protocol = connection.protocol();
+        if connection_protocol == self.protocol {
+            Ok(())
+        } else {
+            Err(ClientError::Worker(format!(
+                "protocol/connection mismatch for worker {} (endpoint {}) call {}: protocol {:?} vs connection {:?}",
+                self.worker_id_raw(),
+                self.endpoint_info.endpoint,
+                rpc_name,
+                self.protocol,
+                connection_protocol,
+            )))
+        }
+    }
+
+    #[cfg(test)]
+    fn worker_id_raw(&self) -> u64 {
+        self.endpoint_info.worker_id.0
+    }
+}
+
+impl ClientConnection {
+    fn protocol(&self) -> ClientWorkerNetProtocol {
+        match self {
+            ClientConnection::Grpc(channel) => {
+                let _ = Arc::strong_count(channel);
+                ClientWorkerNetProtocol::Grpc
+            }
+            #[cfg(test)]
+            ClientConnection::Mock(protocol) => *protocol,
+        }
+    }
+
+    #[cfg(test)]
+    fn mock(protocol: ClientWorkerNetProtocol) -> Self {
+        ClientConnection::Mock(protocol)
+    }
+}
+
+async fn connect_grpc(info: &WorkerEndpointInfo, config: &ClientWorkerNetConfig) -> ClientResult<tonic_net::Channel> {
+    let endpoint = tonic_net::Endpoint::from_shared(info.endpoint.clone())
+        .map_err(|err| ClientError::Worker(format!("invalid worker endpoint {}: {}", info.endpoint, err)))?
+        .connect_timeout(config.connect_timeout)
+        .timeout(config.request_timeout);
+
+    endpoint.connect().await.map_err(|err| {
+        ClientError::Worker(format!(
+            "failed to connect to worker {} (endpoint {}): {}",
+            info.worker_id.0, info.endpoint, err
+        ))
+    })
+}
+
+fn unsupported_protocol_error(info: &WorkerEndpointInfo, protocol: ClientWorkerNetProtocol) -> ClientError {
+    ClientError::Unimplemented(format!(
+        "Worker {} at {} requested unsupported worker net protocol {:?}",
+        info.worker_id.0, info.endpoint, protocol
+    ))
 }
 
 fn normalize_worker_endpoint(endpoint: &str) -> String {
     if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
         endpoint.to_string()
     } else {
-        format!("http://{}", endpoint)
-    }
-}
-
-impl ClientTransport {
-    fn kind(&self) -> NetTransportKind {
-        match self {
-            ClientTransport::Grpc(_) => NetTransportKind::Grpc,
-        }
-    }
-}
-
-impl ClientConnection {
-    fn kind(&self) -> NetTransportKind {
-        match self {
-            ClientConnection::Grpc(_) => NetTransportKind::Grpc,
-            #[cfg(test)]
-            ClientConnection::Mock(kind) => *kind,
-        }
-    }
-
-    #[cfg(test)]
-    fn mock(kind: NetTransportKind) -> Self {
-        ClientConnection::Mock(kind)
-    }
-}
-
-trait WorkerIdExt {
-    fn as_u64(&self) -> u64;
-}
-
-impl WorkerIdExt for WorkerId {
-    fn as_u64(&self) -> u64 {
-        self.0
+        format!("http://{endpoint}")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use transport::net::NetTransportConfig;
-    use transport::net::NetTransportKind;
-    use types::ids::ClientId;
 
-    fn build_test_client() -> WorkerClient {
+    fn build_test_client(connection_protocol: ClientWorkerNetProtocol) -> WorkerClient {
         WorkerClient {
-            transport: ClientTransport::Grpc(Arc::new(GrpcTransport::with_default_config())),
-            connection: None,
+            protocol: ClientWorkerNetProtocol::Grpc,
+            connection: Some(ClientConnection::mock(connection_protocol)),
             endpoint_info: WorkerEndpointInfo {
                 worker_id: WorkerId::new(1),
                 endpoint: "127.0.0.1:1234".to_string(),
-                net_transport_kind: 1,
+                worker_net_protocol: 1,
                 worker_epoch: 0,
             },
-            default_config: NetTransportConfig::default(),
+            default_config: ClientWorkerNetConfig::default(),
         }
     }
 
-    #[tokio::test]
-    async fn call_with_transport_detects_mismatch() {
-        let client = build_test_client();
-        let ctx = RequestHeader::new(ClientId::new(1));
-        let connection = ClientConnection::mock(NetTransportKind::Quic);
+    #[test]
+    fn connection_protocol_mismatch_is_reported() {
+        let client = build_test_client(ClientWorkerNetProtocol::Quic);
 
-        let err = client
-            .call_with_transport("open_read_stream", &ctx, &connection, |_, _| async { Ok(()) })
-            .await
-            .unwrap_err();
+        let err = client.ensure_connection_protocol("open_read_stream").unwrap_err();
 
-        assert!(matches!(err, ClientError::Worker(msg) if msg.contains("transport/connection mismatch")));
+        assert!(matches!(err, ClientError::Worker(msg) if msg.contains("protocol/connection mismatch")));
     }
 
     #[tokio::test]
@@ -416,12 +257,14 @@ mod tests {
         let endpoint_info = WorkerEndpointInfo {
             worker_id: WorkerId::new(2),
             endpoint: "127.0.0.1:4321".to_string(),
-            net_transport_kind: 2,
+            worker_net_protocol: 2,
             worker_epoch: 1,
         };
 
         let result = WorkerClient::new(endpoint_info, None).await;
 
-        assert!(matches!(result, Err(ClientError::Unimplemented(msg)) if msg.contains("unsupported transport")));
+        assert!(
+            matches!(result, Err(ClientError::Unimplemented(msg)) if msg.contains("unsupported worker net protocol"))
+        );
     }
 }

@@ -3,6 +3,11 @@ name = "worker"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+io_uring = []
+spdk = []
+
 [[bin]]
 name = "worker"
 path = "src/bin/main.rs"
@@ -15,6 +20,7 @@ common = { path = "../common" }
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
 futures = { workspace = true }
+async-trait = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }

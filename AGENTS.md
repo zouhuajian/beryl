@@ -63,8 +63,7 @@ These rules apply everywhere in the repo:
 - `types/`: authoritative domain model types and typed identifiers
 - `proto/`: protobuf wire contracts only
 - `metadata/`: metadata authority, mount/inode/dentry, raft state machine
-- `transport/`: transport abstraction and adapters
-- `worker/`: data-plane execution and block/chunk/stream handling
+- `worker/`: data-plane execution, worker-local net server/peer-client code, and block/chunk/stream handling
 - `client/`: routing cache, refresh-replay, SDK behavior
 - `ufs/`: external backend integration and LocalUFS-facing logic
 - `integration_tests/`: end-to-end contract validation

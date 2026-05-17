@@ -111,7 +111,7 @@ mod tests {
         WorkerEndpointInfo {
             worker_id: WorkerId::new(worker_id),
             endpoint: format!("127.0.0.1:{}", 9000 + worker_id),
-            net_transport_kind: kind,
+            worker_net_protocol: kind,
             worker_epoch: epoch,
         }
     }
@@ -126,7 +126,7 @@ mod tests {
         assert!(retrieved.is_some());
         let retrieved = retrieved.unwrap();
         assert_eq!(retrieved.worker_id, endpoint_info.worker_id);
-        assert_eq!(retrieved.net_transport_kind, endpoint_info.net_transport_kind);
+        assert_eq!(retrieved.worker_net_protocol, endpoint_info.worker_net_protocol);
         assert_eq!(retrieved.worker_epoch, endpoint_info.worker_epoch);
     }
 

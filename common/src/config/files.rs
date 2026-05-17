@@ -130,12 +130,12 @@ mod tests {
         let path = dir.join("test_config_flat.yaml");
         let mut file = File::create(&path).unwrap();
         writeln!(file, "metadata.rpc.port: 8080").unwrap();
-        writeln!(file, "worker.transport.max_inflight_requests: 100").unwrap();
+        writeln!(file, "worker.rpc.max_inflight: 100").unwrap();
         drop(file);
 
         let config = load_from_yaml_file(&path).unwrap();
         assert_eq!(config.get_i64("metadata.rpc.port"), Some(8080));
-        assert_eq!(config.get_i64("worker.transport.max_inflight_requests"), Some(100));
+        assert_eq!(config.get_i64("worker.rpc.max_inflight"), Some(100));
         let _ = std::fs::remove_file(&path);
     }
 

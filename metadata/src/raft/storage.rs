@@ -1120,7 +1120,7 @@ impl RocksDBStorage {
         &self,
         identity: &str,
         address: String,
-        net_transport_kind: i32,
+        worker_net_protocol: i32,
         worker_epoch: u64,
         fault_domain: Option<String>,
     ) -> MetadataResult<WorkerInfo> {
@@ -1131,7 +1131,7 @@ impl RocksDBStorage {
         Ok(WorkerInfo {
             worker_id,
             address,
-            net_transport_kind,
+            worker_net_protocol,
             worker_epoch,
             capacity_total: 0,
             capacity_used: 0,

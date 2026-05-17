@@ -3,7 +3,6 @@ members = [
     "common",
     "types",
     "proto",
-    "transport",
     "metadata",
     "ufs",
     "worker",

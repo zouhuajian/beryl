@@ -647,7 +647,7 @@ fn refresh_hint_proto_to_hint(hint: Option<&proto_common::RefreshHintProto>) -> 
             .map(|endpoint| WorkerEndpointHint {
                 worker_id: endpoint.worker_id,
                 endpoint: endpoint.endpoint.clone(),
-                net_transport_kind: endpoint.net_transport_kind,
+                worker_net_protocol: endpoint.worker_net_protocol,
                 worker_epoch: endpoint.worker_epoch,
             })
             .collect(),
@@ -669,7 +669,7 @@ fn refresh_hint_to_proto(hint: Option<&CanonicalRefreshHint>) -> Option<proto_co
             .map(|endpoint| proto_common::WorkerEndpointInfoProto {
                 worker_id: endpoint.worker_id,
                 endpoint: endpoint.endpoint.clone(),
-                net_transport_kind: endpoint.net_transport_kind,
+                worker_net_protocol: endpoint.worker_net_protocol,
                 worker_epoch: endpoint.worker_epoch,
             })
             .collect(),

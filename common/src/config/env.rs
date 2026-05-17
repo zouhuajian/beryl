@@ -11,7 +11,7 @@ use std::env;
 ///
 /// Converts environment variable names to dotted keys:
 /// - `METADATA_RPC_PORT` -> `metadata.rpc.port`
-/// - `TRANSPORT_MAX_INFLIGHT` -> `transport.max_inflight`
+/// - `WORKER_STORAGE_ROOT` -> `worker.storage.root`
 pub fn load_from_env() -> FlatConfig {
     let mut config = FlatConfig::new();
 
@@ -46,7 +46,7 @@ pub fn load_from_env() -> FlatConfig {
 ///
 /// Examples:
 /// - `METADATA_RPC_PORT` -> `metadata.rpc.port`
-/// - `TRANSPORT_MAX_INFLIGHT_REQUESTS` -> `transport.max_inflight.requests`
+/// - `WORKER_STORAGE_ROOT` -> `worker.storage.root`
 fn env_key_to_dotted(env_key: &str) -> String {
     env_key.to_lowercase().split('_').collect::<Vec<_>>().join(".")
 }
@@ -55,7 +55,7 @@ fn env_key_to_dotted(env_key: &str) -> String {
 ///
 /// Examples:
 /// - `metadata.rpc.port` -> `METADATA_RPC_PORT`
-/// - `transport.max_inflight.requests` -> `TRANSPORT_MAX_INFLIGHT_REQUESTS`
+/// - `worker.storage.root` -> `WORKER_STORAGE_ROOT`
 pub fn dotted_to_env_key(dotted: &str) -> String {
     dotted
         .split('.')
@@ -71,12 +71,12 @@ mod tests {
     #[test]
     fn test_env_key_to_dotted() {
         assert_eq!(env_key_to_dotted("METADATA_RPC_PORT"), "metadata.rpc.port");
-        assert_eq!(env_key_to_dotted("TRANSPORT_MAX_INFLIGHT"), "transport.max.inflight");
+        assert_eq!(env_key_to_dotted("WORKER_STORAGE_ROOT"), "worker.storage.root");
     }
 
     #[test]
     fn test_dotted_to_env_key() {
         assert_eq!(dotted_to_env_key("metadata.rpc.port"), "METADATA_RPC_PORT");
-        assert_eq!(dotted_to_env_key("transport.max.inflight"), "TRANSPORT_MAX_INFLIGHT");
+        assert_eq!(dotted_to_env_key("worker.storage.root"), "WORKER_STORAGE_ROOT");
     }
 }

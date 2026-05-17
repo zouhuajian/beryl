@@ -49,7 +49,7 @@ pub struct PresentedFencingToken {
 pub struct WorkerHint {
     pub worker_id: WorkerId,
     pub endpoint: String,
-    pub net_transport_kind: i32,
+    pub worker_net_protocol: i32,
     pub worker_epoch: u64,
 }
 

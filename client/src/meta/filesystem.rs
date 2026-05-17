@@ -38,7 +38,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tonic::transport::Channel;
+use tonic::transport as tonic_net;
 use types::fs::FsErrorCode;
 use types::CallId;
 
@@ -293,7 +293,7 @@ pub trait FileSystemRpc: Send + Sync {
 /// Real tonic-based FileSystemService RPC client.
 pub struct TonicFileSystemRpc {
     endpoint: RwLock<String>,
-    client: tokio::sync::Mutex<FileSystemServiceProtoClient<Channel>>,
+    client: tokio::sync::Mutex<FileSystemServiceProtoClient<tonic_net::Channel>>,
 }
 
 impl TonicFileSystemRpc {
@@ -462,8 +462,8 @@ impl FileSystemRpc for TonicFileSystemRpc {
     }
 }
 
-async fn connect_channel(endpoint: &str) -> ClientResult<Channel> {
-    Channel::from_shared(endpoint.to_string())
+async fn connect_channel(endpoint: &str) -> ClientResult<tonic_net::Channel> {
+    tonic_net::Channel::from_shared(endpoint.to_string())
         .map_err(|e| ClientError::Metadata(format!("invalid metadata endpoint {}: {}", endpoint, e)))?
         .connect()
         .await
@@ -845,7 +845,7 @@ impl ActionMachine {
                         }
                     }
                 }
-                RpcEnvelope::TransportError(status) => {
+                RpcEnvelope::TransportStatus(status) => {
                     if is_transient_transport_status(&status) && transport_attempts < self.policy.max_transport_retries
                     {
                         transport_attempts += 1;
@@ -943,7 +943,7 @@ impl ActionMachine {
             .map(|endpoint| crate::canonical::EndpointHint {
                 worker_id: endpoint.worker_id,
                 endpoint: endpoint.endpoint.clone(),
-                net_transport_kind: endpoint.net_transport_kind,
+                worker_net_protocol: endpoint.worker_net_protocol,
                 worker_epoch: endpoint.worker_epoch,
             });
 
@@ -970,7 +970,7 @@ impl ActionMachine {
             .map(|endpoint| crate::canonical::EndpointHint {
                 worker_id: endpoint.worker_id,
                 endpoint: endpoint.endpoint.clone(),
-                net_transport_kind: endpoint.net_transport_kind,
+                worker_net_protocol: endpoint.worker_net_protocol,
                 worker_epoch: endpoint.worker_epoch,
             });
 
@@ -1168,7 +1168,7 @@ impl ActionMachine {
             RpcEnvelope::CanonicalError(canonical) => {
                 return Err(self.refresh_canonical_error_for_msync(response.header.as_ref(), canonical));
             }
-            RpcEnvelope::TransportError(status) => return Err(ClientError::from(status)),
+            RpcEnvelope::TransportStatus(status) => return Err(ClientError::from(status)),
         }
 
         let response_state = response
@@ -1301,7 +1301,7 @@ impl ActionMachine {
                     .map(|endpoint| WorkerEndpointInfoProto {
                         worker_id: endpoint.worker_id,
                         endpoint: endpoint.endpoint.clone(),
-                        net_transport_kind: endpoint.net_transport_kind,
+                        worker_net_protocol: endpoint.worker_net_protocol,
                         worker_epoch: endpoint.worker_epoch,
                     })
                     .collect::<Vec<_>>();
@@ -1383,7 +1383,7 @@ impl ActionMachine {
             RpcEnvelope::CanonicalError(canonical) => {
                 Err(self.refresh_canonical_error(&request, response.header(), canonical))
             }
-            RpcEnvelope::TransportError(status) => Err(ClientError::from(status)),
+            RpcEnvelope::TransportStatus(status) => Err(ClientError::from(status)),
         }
     }
 

@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! WorkerDataService gRPC adapter.
+//! gRPC WorkerDataService adapter and server entry point.
 
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use anyhow::Context;
 use futures::{stream, Stream, StreamExt};
 use proto::common::{ClientInfoProto, ErrorDetailProto};
-use proto::worker::worker_data_service_server::WorkerDataService;
+use proto::worker::worker_data_service_server::{WorkerDataService, WorkerDataServiceServer};
 use proto::worker::{
     AbortWriteRequestProto, AbortWriteResponseProto, CommitWriteRequestProto, CommitWriteResponseProto,
     DataRequestHeaderProto, DataResponseHeaderProto, OpenReadStreamRequestProto, OpenReadStreamResponseProto,
     OpenWriteStreamRequestProto, OpenWriteStreamResponseProto, ReadStreamRequestProto, ReadStreamResponseProto,
     WriteStreamRequestProto, WriteStreamResponseProto,
 };
+use tonic::transport as tonic_net;
 use tonic::{Request, Response, Status};
 
 use crate::data::convert::{
@@ -266,4 +269,18 @@ impl WorkerDataService for WorkerDataServiceImpl {
 
         Ok(Response::new(response))
     }
+}
+
+pub async fn serve_grpc_worker_data(
+    bind: SocketAddr,
+    max_inflight: usize,
+    core: Arc<WorkerCore>,
+) -> anyhow::Result<()> {
+    let service = WorkerDataServiceImpl::new(core);
+    tonic_net::Server::builder()
+        .concurrency_limit_per_connection(max_inflight)
+        .add_service(WorkerDataServiceServer::new(service))
+        .serve(bind)
+        .await
+        .context("worker gRPC data server failed")
 }

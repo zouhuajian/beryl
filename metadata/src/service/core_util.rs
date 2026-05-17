@@ -191,7 +191,7 @@ fn map_worker_endpoint_hint_to_proto(endpoint: &WorkerEndpointHint) -> proto::co
     proto::common::WorkerEndpointInfoProto {
         worker_id: endpoint.worker_id,
         endpoint: endpoint.endpoint.clone(),
-        net_transport_kind: endpoint.net_transport_kind,
+        worker_net_protocol: endpoint.worker_net_protocol,
         worker_epoch: endpoint.worker_epoch,
     }
 }
@@ -488,7 +488,7 @@ pub fn worker_hint_to_proto(hint: &WorkerHint) -> proto::common::WorkerEndpointI
     proto::common::WorkerEndpointInfoProto {
         worker_id: hint.worker_id.as_raw(),
         endpoint: hint.endpoint.clone(),
-        net_transport_kind: hint.net_transport_kind,
+        worker_net_protocol: hint.worker_net_protocol,
         worker_epoch: hint.worker_epoch,
     }
 }

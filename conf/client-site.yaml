@@ -166,13 +166,11 @@ client.worker.direct_read.cache.ttl_secs: 60
 client.worker.direct_read.version_check: true
 
 # ============================================================================
-# Client Transport Configuration
+# Client Direct Worker Network Notes
 # ============================================================================
-# NOTE: client.transport.xxx configuration has been removed.
-# Client transport kind is now determined from metadata worker information.
-# The client will automatically use the transport protocol (grpc/quic/rdma)
-# that each worker declares in its registration/heartbeat.
+# Client direct-worker protocol is determined from metadata worker information.
+# Only gRPC is currently wired; QUIC/RDMA values return explicit Unimplemented
+# until their client data-plane support is designed.
 #
 # If you need to configure timeout/backpressure settings, they can be
 # configured via client.rpc.* (TODO: implement if needed).
-

@@ -55,8 +55,7 @@ pub fn extract_trace_context(carrier: &dyn CarrierGet) -> ExtractedContext {
 
 /// gRPC metadata adapter for context propagation.
 ///
-/// Note: This module requires tonic to be available. For use in transport crate,
-/// import these types directly.
+/// Note: This module requires tonic to be available in the crate using it.
 pub mod grpc {
     use super::{CarrierGet, CarrierSet};
 

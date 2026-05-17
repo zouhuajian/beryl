@@ -8,18 +8,18 @@ use common::header::RequestHeader;
 use proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
 use proto::metadata::{MsyncRequestProto, MsyncResponseProto};
 use std::sync::Arc;
-use tonic::transport::Channel;
+use tonic::transport as tonic_net;
 
 /// Metadata service client.
 pub struct MetadataClient {
     /// gRPC client for FileSystemService.
-    filesystem_client: Arc<FileSystemServiceProtoClient<Channel>>,
+    filesystem_client: Arc<FileSystemServiceProtoClient<tonic_net::Channel>>,
 }
 
 impl MetadataClient {
     /// Create a new metadata client.
     pub async fn new(endpoint: &str) -> ClientResult<Self> {
-        let channel = Channel::from_shared(endpoint.to_string())
+        let channel = tonic_net::Channel::from_shared(endpoint.to_string())
             .map_err(|e| ClientError::Metadata(format!("Invalid endpoint: {}", e)))?
             .connect()
             .await

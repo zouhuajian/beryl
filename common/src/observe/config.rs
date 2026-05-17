@@ -25,7 +25,7 @@ pub struct LoggingConfig {
     pub level: String,
     /// Format: "json" or "pretty".
     pub format: String,
-    /// Target filters (e.g., "vecton=debug,transport=info").
+    /// Target filters (e.g., "vecton=debug,worker=info").
     pub targets: Option<String>,
     /// Output to stdout (default true).
     pub stdout: bool,

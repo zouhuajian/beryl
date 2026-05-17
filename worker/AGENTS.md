@@ -29,7 +29,7 @@ Do not put the following into `worker/`:
 - client-side refresh/replay policy
 - metadata-side placement decisions
 - metadata-side Raft/state-machine logic
-- generic transport abstraction ownership
+- global network abstraction ownership
 - generic shared helpers that belong in `common/` or `types/`
 - hidden cache shortcuts that bypass block validation
 - UFS path inference from `data_handle_id` or `block_id`

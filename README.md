@@ -1,17 +1,18 @@
 # Vecton
 
-Vecton is an inode-centric distributed storage/cache system targeting HCFS (HDFS-like) semantics. It separates the data plane into **Block / Chunk / Stream** layers and uses structured error semantics to provide predictable retry and self-healing behavior.
+Vecton is an inode-centric distributed storage/cache system targeting HCFS (HDFS-like) semantics. It separates the data plane into **Block / StorageChunk / TransportFrame / Stream** layers and uses structured error semantics to provide predictable retry and self-healing behavior.
 
 > Status: active development. APIs and on-disk formats may change.
 
 ## Key Concepts
 
 - **Inode-centric metadata**: inode/dentry/attrs are authoritative; paths are for traversal only.
-- **Block / Chunk / Stream**
-  - **Block**: the only management unit (placement, replication, repair, migration, reporting).
-  - **Chunk**: the physical storage/IO unit (checksums, refill, relocation granularity).
-  - **Stream**: the transport unit (framing, backpressure, zero-copy).
-- **Client direct I/O**: clients read/write to workers directly after routing via metadata, with cache + refresh on mismatch.
+- **Block / StorageChunk / TransportFrame / Stream**
+  - **Block**: the management, placement, replication, and lifecycle unit.
+  - **StorageChunk**: the worker-local I/O, checksum, bitmap, and cache-fill unit.
+  - **TransportFrame**: the network transfer batch/slice.
+  - **Stream**: the continuous read/write session with flow control.
+- **Client direct I/O**: metadata-routed client-to-worker data access is the target path, but client direct read/write wiring is intentionally deferred after transport removal and may return `Unimplemented` until the client data-plane refactor.
 - **Canonical errors**: `OK / NEED_REFRESH / RETRYABLE / FATAL` to standardize retries and recovery.
 
 ## Architecture
@@ -22,7 +23,7 @@ Vecton is an inode-centric distributed storage/cache system targeting HCFS (HDFS
 |  (HCFS API, cache) | <----> | routing / raft / mounts|
 +---------+----------+        +-----------+------------+
           |                               |
-          | direct I/O                    | control-plane
+          | direct I/O (deferred)         | control-plane
           v                               v
 +--------------------+        +------------------------+
 |     Worker Plane   | <----> | maintenance / repair   |
@@ -33,7 +34,7 @@ Vecton is an inode-centric distributed storage/cache system targeting HCFS (HDFS
 
 * **Client**: HCFS-style API, route cache, canonical retry (refresh loop).
 * **Metadata**: path resolution, mount-based routing, Raft state machine, maintenance/repair scheduling.
-* **Worker**: Block/Chunk/Stream services, local persistence, replication/relocation.
+* **Worker**: Block/StorageChunk/TransportFrame/Stream services, local persistence, replication/relocation.
 
 ## Build
 
@@ -49,11 +50,11 @@ cargo test  --workspace
 * `common`: utilities, canonical error model, metrics/tracing
 * `types`: domain types (IDs, epochs, tokens)
 * `proto`: RPC/Proto definitions and generated code
-* `transport`: network transport abstraction
-* `meta`: metadata plane (Raft, mounts, FS API, maintenance/repair)
-* `worker`: data plane (storage, replication/relocation)
+* `metadata`: metadata plane (Raft, mounts, FS API, maintenance/repair)
+* `worker`: data plane (storage, worker-local net server/peer-client code, replication/relocation)
 * `client`: client library
-* `cli`: CLI tooling (optional)
+* `ufs`: external backend integration
+* `integration_tests`: end-to-end contract validation
 
 ## License
 Apache-2.0. See `LICENSE`.

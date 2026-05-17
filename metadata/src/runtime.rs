@@ -32,7 +32,7 @@ use proto::metadata::metadata_worker_service_proto_server::MetadataWorkerService
 use std::sync::{Arc, Mutex};
 use tokio::signal;
 use tokio::task::JoinHandle;
-use tonic::transport::Server;
+use tonic::transport as tonic_net;
 use tonic_health::pb::health_server::HealthServer;
 use tonic_health::server::{HealthReporter, HealthService};
 use tracing::info;
@@ -520,7 +520,7 @@ pub fn compose_services(
 pub async fn serve(config: &MetadataConfig, services: RpcServices, _handles: RuntimeHandles) -> Result<(), DynError> {
     let addr = config.rpc_addr;
     info!(addr = %addr, "Listening on (path/filesystem + worker services)");
-    Server::builder()
+    tonic_net::Server::builder()
         .add_service(FileSystemServiceProtoServer::new(services.filesystem))
         .add_service(MetadataWorkerServiceProtoServer::new(services.worker))
         .add_service(services.health)
@@ -571,7 +571,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::Mutex as AsyncMutex;
     use tokio_stream::wrappers::TcpListenerStream;
-    use tonic::transport::Server;
+    use tonic::transport as test_tonic_net;
     use types::{ClientId, GroupStateWatermark, RaftLogId};
 
     async fn test_authority(dir: &TempDir) -> MetadataAuthority {
@@ -757,7 +757,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            Server::builder()
+            test_tonic_net::Server::builder()
                 .add_service(FileSystemServiceProtoServer::new(services.filesystem))
                 .add_service(MetadataWorkerServiceProtoServer::new(services.worker))
                 .add_service(services.health)

@@ -346,78 +346,6 @@ worker.replication.fencing.mode: "special"
 worker.replication.fencing.special_token: null
 
 # ============================================================================
-# Worker Transport Configuration
-# ============================================================================
-# All transport parameters for worker are now under worker.transport.xxx
-# Global transport.xxx is kept for backward compatibility and client/metadata use
-
-# Worker transport: kind
-# Type: string (enum: "grpc", "quic", "rdma", "io_uring", "local")
-# Default: "grpc"
-# Description: Transport kind for worker-to-worker communication
-worker.transport.kind: "grpc"
-
-# Worker transport: connection timeout (milliseconds)
-# Type: integer
-# Default: 5000
-# Description: Timeout for establishing connections
-worker.transport.connect_timeout_ms: 5000
-
-# Worker transport: request timeout (milliseconds)
-# Type: integer
-# Default: 30000
-# Description: Default timeout for RPC requests
-worker.transport.request_timeout_ms: 30000
-
-# Worker transport: max inflight requests
-# Type: integer
-# Default: 100
-# Description: Maximum concurrent inflight requests (client-side backpressure)
-worker.transport.max_inflight_requests: 100
-
-# Worker transport: max inflight streams
-# Type: integer
-# Default: 10
-# Description: Maximum concurrent inflight streams (for streaming RPCs)
-worker.transport.max_inflight_streams: 10
-
-# Worker transport: server max inflight
-# Type: integer
-# Default: 100
-# Description: Maximum concurrent inflight requests on server side
-worker.transport.server.max_inflight: 100
-
-# Worker transport: keepalive interval (milliseconds)
-# Type: integer
-# Default: 30000
-# Description: Keep-alive interval for connections
-worker.transport.keepalive_interval_ms: 30000
-
-# Worker transport: keepalive timeout (milliseconds)
-# Type: integer
-# Default: 5000
-# Description: Keep-alive timeout for connections
-worker.transport.keepalive_timeout_ms: 5000
-
-# Worker transport: zero-copy required
-# Type: boolean
-# Default: true
-# Description: Require zero-copy support for transport
-worker.transport.zero_copy.required: true
-
-# Worker transport: combo allow fallback
-# Type: boolean
-# Default: false
-# Description: Allow fallback to another transport if combo is invalid
-worker.transport.combo.allow_fallback: false
-
-# Worker transport: fallback transport (optional)
-# Type: string (optional)
-# Default: null
-# Description: Fallback transport kind (if allow_fallback is true)
-worker.transport.combo.fallback_transport: null
-
-# ============================================================================
 # UFS (Underlying File System) Configuration
 # ============================================================================
 # UFS instances are configured separately (typically via JSON file or metadata).
@@ -450,7 +378,7 @@ observe.logging.format: "json"
 # Observe logging: targets (optional)
 # Type: string (optional)
 # Default: null
-# Description: Target filters (e.g., "metadata=debug,transport=info")
+# Description: Target filters (e.g., "metadata=debug,worker=info")
 observe.logging.targets: null
 
 # Observe logging: stdout

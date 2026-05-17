@@ -176,7 +176,7 @@ impl AppRaftStateMachine {
             Command::RegisterWorker {
                 identity,
                 address,
-                net_transport_kind,
+                worker_net_protocol,
                 worker_epoch,
                 fault_domain,
                 ..
@@ -184,7 +184,7 @@ impl AppRaftStateMachine {
                 let result = self.apply_register_worker(
                     identity,
                     address,
-                    net_transport_kind,
+                    worker_net_protocol,
                     worker_epoch,
                     fault_domain,
                     &dedup_key,
@@ -737,7 +737,7 @@ impl AppRaftStateMachine {
         &self,
         identity: String,
         address: String,
-        net_transport_kind: i32,
+        worker_net_protocol: i32,
         worker_epoch: u64,
         fault_domain: Option<String>,
         dedup_key: &DedupKey,
@@ -746,7 +746,7 @@ impl AppRaftStateMachine {
         let worker_info = self.storage.prepare_worker_registration(
             &identity,
             address,
-            net_transport_kind,
+            worker_net_protocol,
             worker_epoch,
             fault_domain,
         )?;
@@ -2730,7 +2730,7 @@ mod tests {
             dedup: dedup_for_test(76),
             identity: "worker-identity-a".to_string(),
             address: "127.0.0.1:17076".to_string(),
-            net_transport_kind: 1,
+            worker_net_protocol: 1,
             worker_epoch: 3,
             fault_domain: Some("rack-a".to_string()),
         };
@@ -2754,7 +2754,7 @@ mod tests {
             dedup: dedup_for_test(760),
             identity: "worker-identity-reuse".to_string(),
             address: "127.0.0.1:17060".to_string(),
-            net_transport_kind: 1,
+            worker_net_protocol: 1,
             worker_epoch: 3,
             fault_domain: None,
         };
@@ -2762,7 +2762,7 @@ mod tests {
             dedup: dedup_for_test(761),
             identity: "worker-identity-reuse".to_string(),
             address: "127.0.0.1:17061".to_string(),
-            net_transport_kind: 2,
+            worker_net_protocol: 2,
             worker_epoch: 4,
             fault_domain: Some("rack-b".to_string()),
         };
@@ -2775,7 +2775,7 @@ mod tests {
         assert_eq!(expect_worker_upserted(sm.apply(second).unwrap()), WorkerId::new(1));
         let stored = storage.get_worker(WorkerId::new(1)).unwrap().unwrap();
         assert_eq!(stored.address, "127.0.0.1:17061");
-        assert_eq!(stored.net_transport_kind, 2);
+        assert_eq!(stored.worker_net_protocol, 2);
         assert_eq!(stored.worker_epoch, 4);
 
         drop(sm);
@@ -2786,7 +2786,7 @@ mod tests {
             dedup: dedup_for_test(762),
             identity: "worker-identity-new".to_string(),
             address: "127.0.0.1:17062".to_string(),
-            net_transport_kind: 1,
+            worker_net_protocol: 1,
             worker_epoch: 1,
             fault_domain: None,
         };

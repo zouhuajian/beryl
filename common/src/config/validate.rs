@@ -6,8 +6,8 @@
 use crate::config::flat::FlatConfig;
 use crate::config::keys::{
     client, client_cache, client_consistency, client_read_mode, client_retry, client_worker_direct_read,
-    client_write_mode, metadata_raft, metadata_rpc, observe_metrics, worker_eviction, worker_replication, worker_rpc,
-    worker_storage, worker_transport, worker_ufs,
+    client_write_mode, metadata_raft, metadata_rpc, observe_metrics, worker_eviction, worker_replication,
+    worker_service_rpc, worker_storage, worker_ufs,
 };
 use crate::error::{CommonError, CommonErrorCode};
 
@@ -33,14 +33,25 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
         ));
     }
 
-    // Validate worker.rpc.bind format (basic check)
-    if let Some(bind) = config.get_str(worker_rpc::BIND)
+    // Validate worker.rpc.bind as a concrete socket address.
+    if let Some(bind) = config.get_str(worker_service_rpc::BIND)
         && bind.parse::<std::net::SocketAddr>().is_err()
-        && !bind.contains(':')
     {
         return Err(CommonError::new(
             CommonErrorCode::InvalidArgument,
-            format!("{} must be a valid socket address, got {}", worker_rpc::BIND, bind),
+            format!(
+                "{} must be a valid socket address, got {}",
+                worker_service_rpc::BIND,
+                bind
+            ),
+        ));
+    }
+    if let Some(max_inflight) = config.get_usize(worker_service_rpc::MAX_INFLIGHT)
+        && max_inflight == 0
+    {
+        return Err(CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            format!("{} must be > 0", worker_service_rpc::MAX_INFLIGHT),
         ));
     }
 
@@ -74,52 +85,6 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
         }
     }
 
-    // Validate worker.transport.kind and worker.storage.kind combo
-    let transport_kind = config
-        .get_str(worker_transport::KIND)
-        .unwrap_or_else(|| "grpc".to_string());
-    let storage_kind = config.get_str(worker_storage::KIND).unwrap_or_else(|| "fs".to_string());
-
-    // io_uring transport requires io_uring storage (or fs with io_uring support)
-    if transport_kind == "io_uring" && storage_kind != "io_uring" && storage_kind != "fs" {
-        return Err(CommonError::new(
-            CommonErrorCode::InvalidArgument,
-            format!(
-                "{}=io_uring requires {}=io_uring or fs, got {}",
-                worker_transport::KIND,
-                worker_storage::KIND,
-                storage_kind
-            ),
-        ));
-    }
-
-    // Validate worker.transport parameters
-    for key in &[
-        worker_transport::MAX_INFLIGHT_REQUESTS,
-        worker_transport::MAX_INFLIGHT_STREAMS,
-        worker_transport::SERVER_MAX_INFLIGHT,
-        worker_transport::CONNECT_TIMEOUT_MS,
-        worker_transport::REQUEST_TIMEOUT_MS,
-        worker_transport::KEEPALIVE_INTERVAL_MS,
-        worker_transport::KEEPALIVE_TIMEOUT_MS,
-    ] {
-        if let Some(val) = config.get_usize(key) {
-            if val == 0 {
-                return Err(CommonError::new(
-                    CommonErrorCode::InvalidArgument,
-                    format!("{} must be > 0", key),
-                ));
-            }
-        } else if let Some(ms) = config.get_i64(key)
-            && ms <= 0
-        {
-            return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
-                format!("{} must be > 0", key),
-            ));
-        }
-    }
-
     // Validate other timeouts
     for key in &[worker_ufs::TIMEOUT_MS, worker_replication::CHUNK_TIMEOUT_MS] {
         if let Some(ms) = config.get_i64(key)
@@ -128,22 +93,6 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
             return Err(CommonError::new(
                 CommonErrorCode::InvalidArgument,
                 format!("{} must be > 0", key),
-            ));
-        }
-    }
-
-    // Validate worker.transport.kind enum
-    if let Some(kind) = config.get_str(worker_transport::KIND) {
-        let valid_kinds = ["grpc", "quic", "rdma", "io_uring", "local"];
-        if !valid_kinds.contains(&kind.as_str()) {
-            return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
-                format!(
-                    "{} must be one of {:?}, got {}",
-                    worker_transport::KIND,
-                    valid_kinds,
-                    kind
-                ),
             ));
         }
     }

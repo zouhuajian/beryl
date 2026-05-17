@@ -225,7 +225,7 @@ read-plan 校验：
 worker location 边界：
 
 - `FileBlockLocation` 是 external read plan，不暴露 internal extents schema。
-- 当 `WorkerManager` 有 live block locations 时，会填充 worker id、endpoint、transport kind、worker_epoch。
+- 当 `WorkerManager` 有 live block locations 时，会填充 worker id、endpoint、worker net protocol、worker_epoch。
 - worker locations 来自 heartbeat/block report soft state，不是 Raft authority，不是 placement truth，也不是完整 load-aware/fault-domain/nearest-worker scheduler。
 
 freshness 当前事实：

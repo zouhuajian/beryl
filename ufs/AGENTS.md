@@ -26,7 +26,7 @@ Do not put the following into `ufs/`:
 - client refresh-replay policy
 - worker-side block/chunk/stream authority definitions
 - protobuf schema ownership
-- transport abstraction ownership
+- network abstraction ownership
 - ad hoc policy that changes visible filesystem semantics without a documented contract
 - backend-specific shortcuts that bypass route / epoch / fencing validation
 

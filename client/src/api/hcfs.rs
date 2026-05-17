@@ -9,23 +9,18 @@ use crate::consistency::ConsistencyLevel;
 use crate::error::{ClientError, ClientResult};
 use crate::meta::{replay_policy_for_method, ActionMachine, RpcOp, TonicFileSystemRpc};
 use crate::routing::{GroupRoleCache, RouteTable, WorkerSelector};
-use crate::worker::client::WorkerEndpointInfo;
-use crate::worker::WorkerClient;
 use bytes::Bytes;
 use common::header::RequestHeader;
 use parking_lot::Mutex;
-use proto::common::{BlockIdProto, ByteRangeProto, FileLayoutProto};
+use proto::common::FileLayoutProto;
 use proto::fs::FileAttrsProto;
-use proto::metadata::get_block_locations_request_proto;
 use proto::metadata::{
-    AbortFileWriteRequestProto, AddBlockRequestProto, CommitFileRequestProto, CommittedBlockProto,
-    CreateDispositionProto, CreateFileRequestProto, DeleteRequestProto, FileBlockLocationProto,
-    GetBlockLocationsRequestProto, OpenFileRequestProto, WriteHandleProto, WriteTargetProto,
+    CommitFileRequestProto, CommittedBlockProto, CreateDispositionProto, CreateFileRequestProto, DeleteRequestProto,
+    OpenFileRequestProto, WriteHandleProto,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use types::fs::InodeId;
-use types::ids::{BlockId, BlockIndex, DataHandleId};
+use types::ids::DataHandleId;
 
 const DEFAULT_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 const DEFAULT_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
@@ -68,14 +63,7 @@ pub struct Handle {
 enum HandleState {
     Read,
     Write(WriteState),
-    Aborted,
     Closed,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum WriteStart {
-    Ready(WriteHandleProto),
-    AbortUnsupported(WriteHandleProto),
 }
 
 #[derive(Clone, Debug)]
@@ -102,8 +90,6 @@ pub struct Client {
     _worker_selector: Arc<WorkerSelector>,
     /// FileSystemService action machine.
     fs_machine: Arc<ActionMachine>,
-    /// Per-client write id source for worker idempotency.
-    next_write_id: AtomicU64,
 }
 
 impl Client {
@@ -141,7 +127,6 @@ impl Client {
             _group_role_cache: group_role_cache,
             _worker_selector: worker_selector,
             fs_machine,
-            next_write_id: AtomicU64::new(1),
         })
     }
 
@@ -250,44 +235,6 @@ impl Client {
         ))
     }
 
-    fn prepare_write(&self, handle: &Handle, offset: u64) -> ClientResult<WriteStart> {
-        let mut state = handle.state.lock();
-        match &mut *state {
-            HandleState::Write(write) => {
-                if !write.committed_blocks.is_empty() || offset != write.base_size {
-                    let write_handle = write.write_handle;
-                    *state = HandleState::Aborted;
-                    return Ok(WriteStart::AbortUnsupported(write_handle));
-                }
-                Ok(WriteStart::Ready(write.write_handle))
-            }
-            HandleState::Aborted => Err(ClientError::Metadata(
-                "write handle has already been aborted".to_string(),
-            )),
-            HandleState::Closed => Err(ClientError::Metadata("write handle is closed".to_string())),
-            HandleState::Read => Err(ClientError::Metadata("handle is not open for writing".to_string())),
-        }
-    }
-
-    async fn add_block(&self, write_handle: WriteHandleProto, len: u64) -> ClientResult<WriteTargetProto> {
-        let request = AddBlockRequestProto {
-            header: Some(self.request_header_proto()),
-            write_handle: Some(write_handle),
-            desired_len: Some(len),
-        };
-        let response = self.call_filesystem(RpcOp::add_block(request)).await?;
-        response
-            .target
-            .ok_or_else(|| ClientError::Metadata("AddBlockResponseProto missing target".to_string()))
-    }
-
-    async fn write_target_to_worker(&self, target: &WriteTargetProto, data: Bytes) -> ClientResult<()> {
-        let _ = (target, data);
-        Err(ClientError::Unimplemented(
-            "HCFS worker write must be rewired to WorkerDataService stream v2".to_string(),
-        ))
-    }
-
     /// Close a file handle.
     pub async fn close(&self, handle: Handle) -> ClientResult<()> {
         let commit = {
@@ -298,7 +245,6 @@ impl Client {
                     return Ok(());
                 }
                 HandleState::Closed => return Ok(()),
-                HandleState::Aborted => return Err(ClientError::Metadata("write handle has been aborted".to_string())),
                 HandleState::Write(write) => {
                     let final_size = write
                         .committed_blocks
@@ -366,19 +312,6 @@ impl Client {
         self.config.inner.as_flat().get_i64("client.id").unwrap_or(0) as u64
     }
 
-    async fn abort_file_write(&self, write_handle: WriteHandleProto) -> ClientResult<()> {
-        let request = AbortFileWriteRequestProto {
-            header: Some(self.request_header_proto()),
-            write_handle: Some(write_handle),
-        };
-        self.call_filesystem(RpcOp::abort_file_write(request)).await?;
-        Ok(())
-    }
-
-    fn mark_aborted(&self, handle: &Handle) {
-        *handle.state.lock() = HandleState::Aborted;
-    }
-
     /// Delete a file, symlink, or empty directory.
     pub async fn delete(&self, path: &str, recursive: bool) -> ClientResult<()> {
         let request = DeleteRequestProto {
@@ -388,13 +321,6 @@ impl Client {
         };
         self.call_filesystem(RpcOp::delete(request)).await.map(|_| ())
     }
-}
-
-#[derive(Clone, Debug)]
-struct ReadPlan {
-    block_id: BlockId,
-    offset_in_block: u32,
-    worker: WorkerEndpointInfo,
 }
 
 fn default_file_attrs() -> FileAttrsProto {
@@ -433,60 +359,6 @@ fn data_handle_id_from_proto(
         .ok_or_else(|| ClientError::Metadata(format!("{} missing", field)))
 }
 
-fn block_id_from_proto(value: Option<BlockIdProto>, field: &str) -> ClientResult<BlockId> {
-    let block = value.ok_or_else(|| ClientError::Metadata(format!("{} missing", field)))?;
-    Ok(BlockId::new(
-        DataHandleId::new(block.data_handle_id),
-        BlockIndex::new(block.block_index),
-    ))
-}
-
-fn block_id_to_proto(block_id: BlockId) -> BlockIdProto {
-    BlockIdProto {
-        data_handle_id: block_id.data_handle_id.as_raw(),
-        block_index: block_id.index.as_raw(),
-    }
-}
-
-fn select_single_read_plan(locations: &[FileBlockLocationProto], offset: u64, len: u32) -> ClientResult<ReadPlan> {
-    let end = offset + len as u64;
-    let mut overlapping = locations
-        .iter()
-        .filter(|location| location.file_offset < end && location.file_offset + location.len > offset);
-    let location = overlapping
-        .next()
-        .ok_or_else(|| ClientError::Metadata("read has no block location".to_string()))?;
-    if overlapping.next().is_some() || offset < location.file_offset || end > location.file_offset + location.len {
-        return Err(ClientError::NotSupported(
-            "HCFS MVP multi-block read is not supported".to_string(),
-        ));
-    }
-    let offset_in_block = u32::try_from(offset - location.file_offset)
-        .map_err(|_| ClientError::NotSupported("HCFS MVP read offset does not fit worker chunk request".to_string()))?;
-    let worker = location
-        .workers
-        .first()
-        .cloned()
-        .ok_or_else(|| ClientError::Metadata("read block location has no worker endpoints".to_string()))?;
-    Ok(ReadPlan {
-        block_id: block_id_from_proto(location.block_id, "FileBlockLocationProto.block_id")?,
-        offset_in_block,
-        worker: WorkerEndpointInfo::from_proto(worker),
-    })
-}
-
-fn committed_block_from_target(target: &WriteTargetProto) -> ClientResult<CommittedBlockProto> {
-    let block_id = target
-        .block_id
-        .ok_or_else(|| ClientError::Metadata("WriteTargetProto.block_id missing".to_string()))?;
-    Ok(CommittedBlockProto {
-        block_id: Some(block_id),
-        file_offset: target.file_offset,
-        len: target.len,
-        checksum: None,
-    })
-}
-
 /// File status information.
 #[derive(Clone, Debug)]
 pub struct FileStatus {
@@ -511,6 +383,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport as tonic_net;
     use tonic::{Request, Response, Status};
     use types::ClientId;
 
@@ -726,7 +599,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind metadata");
         let metadata_addr = listener.local_addr().expect("metadata addr");
         tokio::spawn(async move {
-            tonic::transport::Server::builder()
+            tonic_net::Server::builder()
                 .add_service(FileSystemServiceProtoServer::new(service))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await

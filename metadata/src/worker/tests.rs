@@ -7,30 +7,30 @@ use super::manager::{HealthStatus, WorkerManager};
 use types::ids::WorkerId;
 
 #[test]
-fn test_worker_registration_with_transport_kind_and_epoch() {
+fn test_worker_registration_with_worker_net_protocol_and_epoch() {
     let manager = WorkerManager::new(60);
     let worker_id = WorkerId::new(1);
     let address = "127.0.0.1:9090".to_string();
-    let net_transport_kind = 1; // GRPC
+    let worker_net_protocol = 1; // GRPC
     let worker_epoch = 100;
 
     // Register worker
     manager
-        .register_worker(worker_id, address.clone(), net_transport_kind, worker_epoch, None)
+        .register_worker(worker_id, address.clone(), worker_net_protocol, worker_epoch, None)
         .unwrap();
 
     // Get descriptor and verify fields
     let descriptor = manager.get_descriptor(worker_id).unwrap();
     assert_eq!(descriptor.worker_id, worker_id);
     assert_eq!(descriptor.address, address);
-    assert_eq!(descriptor.net_transport_kind, net_transport_kind);
+    assert_eq!(descriptor.worker_net_protocol, worker_net_protocol);
     assert_eq!(descriptor.worker_epoch, worker_epoch);
 
     // get_worker requires both descriptor and runtime, so send a heartbeat first
     manager
         .update_runtime(
             worker_id,
-            net_transport_kind,
+            worker_net_protocol,
             worker_epoch,
             0,
             0,
@@ -45,21 +45,21 @@ fn test_worker_registration_with_transport_kind_and_epoch() {
     let worker = manager.get_worker(worker_id).unwrap();
     assert_eq!(worker.worker_id, worker_id);
     assert_eq!(worker.address, address);
-    assert_eq!(worker.net_transport_kind, net_transport_kind);
+    assert_eq!(worker.worker_net_protocol, worker_net_protocol);
     assert_eq!(worker.worker_epoch, worker_epoch);
 }
 
 #[test]
-fn test_worker_heartbeat_updates_transport_kind_and_epoch() {
+fn test_worker_heartbeat_updates_worker_net_protocol_and_epoch() {
     let manager = WorkerManager::new(60);
     let worker_id = WorkerId::new(1);
     let address = "127.0.0.1:9090".to_string();
-    let net_transport_kind = 1; // GRPC
+    let worker_net_protocol = 1; // GRPC
     let worker_epoch = 100;
 
     // Register worker
     manager
-        .register_worker(worker_id, address.clone(), net_transport_kind, worker_epoch, None)
+        .register_worker(worker_id, address.clone(), worker_net_protocol, worker_epoch, None)
         .unwrap();
 
     // Update runtime (note: descriptor fields don't change via update_runtime)
@@ -67,8 +67,8 @@ fn test_worker_heartbeat_updates_transport_kind_and_epoch() {
     manager
         .update_runtime(
             worker_id,
-            net_transport_kind, // Same as before (descriptor doesn't change)
-            worker_epoch,       // Same as before (descriptor doesn't change)
+            worker_net_protocol, // Same as before (descriptor doesn't change)
+            worker_epoch,        // Same as before (descriptor doesn't change)
             1000,
             500,
             500,
@@ -84,7 +84,7 @@ fn test_worker_heartbeat_updates_transport_kind_and_epoch() {
     assert_eq!(worker.capacity_used, 500);
     assert_eq!(worker.capacity_available, 500);
     // Descriptor fields remain unchanged (require re-register via Raft)
-    assert_eq!(worker.net_transport_kind, net_transport_kind);
+    assert_eq!(worker.worker_net_protocol, worker_net_protocol);
     assert_eq!(worker.worker_epoch, worker_epoch);
 }
 

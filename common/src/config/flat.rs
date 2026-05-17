@@ -308,7 +308,10 @@ mod tests {
             Value::Number(serde_yaml::Number::from(8080)),
         );
         config.insert("metadata.rpc.host".to_string(), Value::String("localhost".to_string()));
-        config.insert("worker.transport.kind".to_string(), Value::String("grpc".to_string()));
+        config.insert(
+            "worker.rpc.bind".to_string(),
+            Value::String("127.0.0.1:9090".to_string()),
+        );
 
         let sub = config.sub("metadata.rpc");
         assert_eq!(sub.get_i64("port"), Some(8080));

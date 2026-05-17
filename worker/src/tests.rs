@@ -34,8 +34,8 @@ mod tests {
         AbortWriteRequest, CommitWriteRequest, RangeMapper, ReadOpenRequest, StreamContext, StreamMode, WorkerCore,
         WorkerCoreResult, WriteFrame, WriteOpenRequest,
     };
-    use crate::data::service::WorkerDataServiceImpl;
     use crate::error::WorkerError;
+    use crate::net::server::grpc::WorkerDataServiceImpl;
     use crate::runtime::stream::{StreamManager, StreamState};
     use crate::store::block::{
         ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, PublishReadyRequest,
@@ -1284,6 +1284,7 @@ mod tests {
             "pub mod config",
             "pub mod data",
             "pub mod error",
+            "pub mod net",
             "pub mod runtime",
             "pub mod store",
         ] {
@@ -1297,9 +1298,10 @@ mod tests {
 
         for required in [
             "data/mod.rs",
-            "data/service.rs",
             "data/convert.rs",
             "data/core.rs",
+            "net/mod.rs",
+            "net/server/grpc.rs",
             "runtime/mod.rs",
             "runtime/stream.rs",
             "runtime/block.rs",
@@ -1388,8 +1390,8 @@ mod tests {
     }
 
     #[test]
-    fn service_stays_adapter_only() {
-        let service = include_str!("data/service.rs");
+    fn grpc_server_stays_adapter_only() {
+        let service = include_str!("net/server/grpc.rs");
 
         for forbidden in [
             "ufs",
@@ -1403,7 +1405,7 @@ mod tests {
         ] {
             assert!(
                 !service.contains(forbidden),
-                "service.rs must not depend on {forbidden}"
+                "net/server/grpc.rs must not depend on {forbidden}"
             );
         }
     }
@@ -1503,7 +1505,7 @@ mod tests {
         let sources = [
             include_str!("../../proto/worker/data.proto"),
             include_str!("data/core.rs"),
-            include_str!("data/service.rs"),
+            include_str!("net/server/grpc.rs"),
             include_str!("data/convert.rs"),
             include_str!("runtime/block.rs"),
             include_str!("store/block.rs"),
@@ -1595,7 +1597,7 @@ mod tests {
         let sources = [
             include_str!("../../proto/worker/data.proto"),
             include_str!("data/core.rs"),
-            include_str!("data/service.rs"),
+            include_str!("net/server/grpc.rs"),
             include_str!("runtime/stream.rs"),
             include_str!("data/convert.rs"),
         ];
@@ -1610,7 +1612,7 @@ mod tests {
     fn active_worker_sources_do_not_use_staged_version_labels() {
         let sources = [
             include_str!("data/core.rs"),
-            include_str!("data/service.rs"),
+            include_str!("net/server/grpc.rs"),
             include_str!("data/convert.rs"),
             include_str!("runtime/stream.rs"),
             include_str!("runtime/block.rs"),

@@ -176,8 +176,7 @@ impl ClientConfig {
             vec!["127.0.0.1:18080".to_string()]
         };
 
-        // Transport configuration removed: client.transport.xxx is no longer used.
-        // Transport kind is determined from metadata worker information.
+        // Worker net protocol is determined from metadata worker information.
         // If client needs timeout/backpressure settings, they can be configured
         // via client.rpc.* (TODO: implement if needed).
 

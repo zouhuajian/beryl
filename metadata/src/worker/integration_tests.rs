@@ -20,7 +20,7 @@ async fn test_worker_registration_and_heartbeat() {
         .register_worker(
             worker_id,
             "127.0.0.1:8080".to_string(),
-            1,   // net_transport_kind: GRPC
+            1,   // worker_net_protocol: GRPC
             100, // worker_epoch
             None,
         )
@@ -30,7 +30,7 @@ async fn test_worker_registration_and_heartbeat() {
     manager
         .update_runtime(
             worker_id,
-            1,   // net_transport_kind: GRPC
+            1,   // worker_net_protocol: GRPC
             100, // worker_epoch
             1000,
             500,
@@ -59,7 +59,7 @@ async fn test_block_report_updates_locations() {
         .register_worker(
             worker_id,
             "127.0.0.1:8080".to_string(),
-            1,   // net_transport_kind: GRPC
+            1,   // worker_net_protocol: GRPC
             100, // worker_epoch
             None,
         )
@@ -139,7 +139,7 @@ async fn test_dead_worker_cleanup() {
         .register_worker(
             worker_id,
             "127.0.0.1:8080".to_string(),
-            1,   // net_transport_kind: GRPC
+            1,   // worker_net_protocol: GRPC
             100, // worker_epoch
             None,
         )

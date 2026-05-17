@@ -74,7 +74,7 @@ fn worker_refresh_hint_from_session(
             worker_endpoints.push(WorkerEndpointHint {
                 worker_id: endpoint.worker_id,
                 endpoint: endpoint.endpoint.clone(),
-                net_transport_kind: endpoint.net_transport_kind,
+                worker_net_protocol: endpoint.worker_net_protocol,
                 worker_epoch: endpoint.worker_epoch,
             });
         }
@@ -507,13 +507,13 @@ impl<'a> WriteSessionCoordinator<'a> {
                     worker_endpoints.push(WorkerHint {
                         worker_id,
                         endpoint: endpoint.clone(),
-                        net_transport_kind: worker_info.net_transport_kind,
+                        worker_net_protocol: worker_info.worker_net_protocol,
                         worker_epoch: worker_info.worker_epoch,
                     });
                     worker_endpoints_proto.push(proto::common::WorkerEndpointInfoProto {
                         worker_id: worker_id.as_raw(),
                         endpoint,
-                        net_transport_kind: worker_info.net_transport_kind,
+                        worker_net_protocol: worker_info.worker_net_protocol,
                         worker_epoch: worker_info.worker_epoch,
                     });
                 }
@@ -823,7 +823,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             .map(|endpoint| WorkerHint {
                 worker_id: WorkerId::new(endpoint.worker_id),
                 endpoint: endpoint.endpoint,
-                net_transport_kind: endpoint.net_transport_kind,
+                worker_net_protocol: endpoint.worker_net_protocol,
                 worker_epoch: endpoint.worker_epoch,
             })
             .collect();

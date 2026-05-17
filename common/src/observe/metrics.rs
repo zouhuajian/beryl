@@ -3,24 +3,6 @@
 
 //! Metrics constants and helpers.
 
-/// Transport metrics name constants.
-pub mod transport {
-    /// Total RPC requests.
-    pub const RPC_REQUESTS_TOTAL: &str = "transport_rpc_requests_total";
-    /// RPC latency in milliseconds.
-    pub const RPC_LATENCY_MS: &str = "transport_rpc_latency_ms";
-    /// Inflight RPC requests.
-    pub const RPC_INFLIGHT: &str = "transport_rpc_inflight";
-    /// Timeout count.
-    pub const TIMEOUT_TOTAL: &str = "transport_timeout_total";
-    /// Backpressure wait time in milliseconds.
-    pub const BACKPRESSURE_WAIT_MS: &str = "transport_backpressure_wait_ms";
-    /// Active connections.
-    pub const CONN_ACTIVE: &str = "transport_conn_active";
-    /// Total established connections.
-    pub const CONN_ESTABLISHED_TOTAL: &str = "transport_conn_established_total";
-}
-
 /// UFS metrics name constants.
 pub mod ufs {
     /// Total UFS operations.

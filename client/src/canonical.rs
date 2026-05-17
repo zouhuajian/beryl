@@ -21,8 +21,8 @@ pub struct EndpointHint {
     pub worker_id: u64,
     /// Endpoint address.
     pub endpoint: String,
-    /// Transport kind as proto enum raw value.
-    pub net_transport_kind: i32,
+    /// Worker network protocol as proto enum raw value.
+    pub worker_net_protocol: i32,
     /// Worker epoch for the hinted endpoint.
     pub worker_epoch: u64,
 }
@@ -32,7 +32,7 @@ impl From<proto::common::WorkerEndpointInfoProto> for EndpointHint {
         Self {
             worker_id: value.worker_id,
             endpoint: value.endpoint,
-            net_transport_kind: value.net_transport_kind,
+            worker_net_protocol: value.worker_net_protocol,
             worker_epoch: value.worker_epoch,
         }
     }
@@ -43,7 +43,7 @@ impl From<common::error::canonical::WorkerEndpointHint> for EndpointHint {
         Self {
             worker_id: value.worker_id,
             endpoint: value.endpoint,
-            net_transport_kind: value.net_transport_kind,
+            worker_net_protocol: value.worker_net_protocol,
             worker_epoch: value.worker_epoch,
         }
     }
@@ -108,7 +108,7 @@ pub enum RpcEnvelope {
     /// gRPC OK and no canonical error in response header.
     Ok,
     /// gRPC non-OK transport/auth/framework error.
-    TransportError(tonic::Status),
+    TransportStatus(tonic::Status),
     /// gRPC OK with canonical business/protocol error.
     CanonicalError(CanonicalError),
 }
@@ -176,7 +176,7 @@ pub fn validate_header_or_action(header: &ResponseHeader) -> Result<(), ClientAc
             .map(|endpoint| EndpointHint {
                 worker_id: endpoint.worker_id,
                 endpoint: endpoint.endpoint.clone(),
-                net_transport_kind: endpoint.net_transport_kind,
+                worker_net_protocol: endpoint.worker_net_protocol,
                 worker_epoch: endpoint.worker_epoch,
             }),
     };
@@ -221,7 +221,7 @@ pub fn parse_rpc_envelope(
     response_header: Option<&proto::common::ResponseHeaderProto>,
 ) -> RpcEnvelope {
     match grpc_status {
-        Err(status) => RpcEnvelope::TransportError(status),
+        Err(status) => RpcEnvelope::TransportStatus(status),
         Ok(()) => {
             let Some(header) = response_header else {
                 return RpcEnvelope::CanonicalError(CanonicalError {
@@ -554,7 +554,7 @@ mod tests {
     #[test]
     fn parse_rpc_envelope_reports_transport_error() {
         match parse_rpc_envelope(Err(tonic::Status::unavailable("down")), None) {
-            RpcEnvelope::TransportError(status) => assert_eq!(status.code(), tonic::Code::Unavailable),
+            RpcEnvelope::TransportStatus(status) => assert_eq!(status.code(), tonic::Code::Unavailable),
             _ => panic!("expected transport envelope"),
         }
     }

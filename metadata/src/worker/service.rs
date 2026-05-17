@@ -171,7 +171,7 @@ impl MetadataWorkerServiceImpl {
 async fn persist_worker_descriptor_then_register<F>(
     worker_manager: &WorkerManager,
     address: String,
-    net_transport_kind: i32,
+    worker_net_protocol: i32,
     worker_epoch: u64,
     fault_domain: Option<String>,
     persist_descriptor: F,
@@ -193,7 +193,7 @@ where
     };
 
     worker_manager
-        .register_worker(worker_id, address, net_transport_kind, worker_epoch, fault_domain)
+        .register_worker(worker_id, address, worker_net_protocol, worker_epoch, fault_domain)
         .map_err(|e| Status::internal(format!("Failed to register worker: {}", e)))?;
 
     Ok(worker_id)
@@ -211,7 +211,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         let _caller_ctx = extract_and_inject_context(&req.header);
 
         // Extract all needed fields before any moves
-        let net_transport_kind = req.net_transport_kind() as i32; // Convert enum to i32
+        let worker_net_protocol = req.worker_net_protocol() as i32; // Convert enum to i32
         let worker_epoch = req.worker_epoch;
         if req.suggested_worker_id != 0 {
             return Err(Status::invalid_argument(
@@ -246,7 +246,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             dedup: crate::raft::DedupKey::new(_caller_ctx.client.client_id, _caller_ctx.client.call_id),
             identity,
             address: address.clone(),
-            net_transport_kind,
+            worker_net_protocol,
             worker_epoch,
             fault_domain: None, // TODO: Extract fault_domain from labels
         };
@@ -254,7 +254,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         let worker_id = persist_worker_descriptor_then_register(
             self.worker_manager.as_ref(),
             address.clone(),
-            net_transport_kind,
+            worker_net_protocol,
             worker_epoch,
             None, // TODO: Extract fault_domain from labels
             self.raft_node.propose(command),
@@ -300,8 +300,8 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 
         let health_proto = req.health();
 
-        // Extract net_transport_kind and worker_epoch from request
-        let net_transport_kind = req.net_transport_kind() as i32; // Convert enum to i32
+        // Extract worker_net_protocol and worker_epoch from request
+        let worker_net_protocol = req.worker_net_protocol() as i32; // Convert enum to i32
         let worker_epoch = req.worker_epoch;
 
         // Fanout heartbeat: update runtime in memory (all nodes, no Raft)
@@ -312,7 +312,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             .worker_manager
             .update_runtime(
                 worker_id,
-                net_transport_kind,
+                worker_net_protocol,
                 worker_epoch,
                 capacity.total_bytes,
                 capacity.used_bytes,
@@ -801,7 +801,7 @@ mod tests {
         let descriptor = manager.get_descriptor(worker_id).unwrap();
         assert_eq!(descriptor.worker_id, worker_id);
         assert_eq!(descriptor.address, "127.0.0.1:9090");
-        assert_eq!(descriptor.net_transport_kind, 1);
+        assert_eq!(descriptor.worker_net_protocol, 1);
         assert_eq!(descriptor.worker_epoch, 100);
     }
 

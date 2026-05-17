@@ -24,8 +24,8 @@ message RegisterWorkerRequestProto {
   map<string, string> labels = 5;
   /// Optional: suggested worker_id (for re-registration).
   uint64 suggested_worker_id = 6;
-  /// Network transport kind (grpc/quic/rdma).
-  common.NetTransportKindProto net_transport_kind = 7;
+  /// Worker network protocol (grpc/quic/rdma).
+  common.WorkerNetProtocolProto worker_net_protocol = 7;
   /// Worker epoch/boot_id (monotonically increasing or UUID-based).
   uint64 worker_epoch = 8;
 }
@@ -57,8 +57,8 @@ message HeartbeatRequestProto {
   LoadInfoProto load = 4;
   /// Health status.
   HealthStatusProto health = 5;
-  /// Network transport kind (grpc/quic/rdma).
-  common.NetTransportKindProto net_transport_kind = 6;
+  /// Worker network protocol (grpc/quic/rdma).
+  common.WorkerNetProtocolProto worker_net_protocol = 6;
   /// Worker epoch/boot_id (must match registration).
   uint64 worker_epoch = 7;
   /// Task acknowledgments (completed tasks).

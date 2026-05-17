@@ -18,7 +18,7 @@ pub use keys::{
     client, client_cache, client_consistency, client_read_mode, client_retry, client_worker_direct_read,
     client_write_mode, metadata_authority, metadata_raft, metadata_rpc, metadata_storage, observe_logging,
     observe_metrics, observe_tracing, worker_concurrency, worker_eviction, worker_metadata, worker_orphan,
-    worker_replication, worker_rpc, worker_storage, worker_transport, worker_ufs, worker_volume_health,
+    worker_replication, worker_service_rpc, worker_storage, worker_ufs, worker_volume_health,
 };
 
 use crate::error::CommonError;
@@ -79,8 +79,8 @@ impl Default for CoreConfig {
         // ============================================================================
         // Worker RPC Configuration
         // ============================================================================
-        config.set(worker_rpc::BIND, "0.0.0.0:9090");
-        config.set(worker_rpc::MAX_INFLIGHT, 100i64);
+        config.set(worker_service_rpc::BIND, "0.0.0.0:9090");
+        config.set(worker_service_rpc::MAX_INFLIGHT, 100i64);
 
         // ============================================================================
         // Worker Storage Configuration
@@ -141,20 +141,6 @@ impl Default for CoreConfig {
         config.set(worker_replication::MAX_CONCURRENT_CHUNKS_PER_BLOCK, 4i64);
         config.set(worker_replication::CHUNK_TIMEOUT_MS, 30000i64);
         config.set(worker_replication::FENCING_MODE, "special");
-
-        // ============================================================================
-        // Worker Transport Configuration
-        // ============================================================================
-        config.set(worker_transport::KIND, "grpc");
-        config.set(worker_transport::CONNECT_TIMEOUT_MS, 5000i64);
-        config.set(worker_transport::REQUEST_TIMEOUT_MS, 30000i64);
-        config.set(worker_transport::MAX_INFLIGHT_REQUESTS, 100i64);
-        config.set(worker_transport::MAX_INFLIGHT_STREAMS, 10i64);
-        config.set(worker_transport::SERVER_MAX_INFLIGHT, 100i64);
-        config.set(worker_transport::KEEPALIVE_INTERVAL_MS, 30000i64);
-        config.set(worker_transport::KEEPALIVE_TIMEOUT_MS, 5000i64);
-        config.set(worker_transport::ZERO_COPY_REQUIRED, true);
-        config.set(worker_transport::COMBO_ALLOW_FALLBACK, false);
 
         // ============================================================================
         // Observability Logging Configuration
@@ -290,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_core_config_default() {
-        use crate::config::keys::{metadata_rpc, worker_transport};
+        use crate::config::keys::{metadata_rpc, worker_service_rpc};
         let config = CoreConfig::default();
         assert_eq!(config.inner.get_i64(metadata_rpc::PORT), Some(18080));
         assert_eq!(config.inner.get_str(metadata_rpc::ADDR), Some("0.0.0.0".to_string()));
@@ -298,7 +284,11 @@ mod tests {
             config.inner.get_str("metadata.storage.dir"),
             Some("data/metadata".to_string())
         );
-        assert_eq!(config.inner.get_str(worker_transport::KIND), Some("grpc".to_string()));
+        assert_eq!(
+            config.inner.get_str(worker_service_rpc::BIND),
+            Some("0.0.0.0:9090".to_string())
+        );
+        assert_eq!(config.inner.get_i64(worker_service_rpc::MAX_INFLIGHT), Some(100));
     }
 
     #[test]
@@ -314,25 +304,24 @@ mod tests {
 
     #[test]
     fn test_load_core_site_yaml() {
-        use crate::config::keys::{metadata_rpc, worker_rpc, worker_transport};
+        use crate::config::keys::{metadata_rpc, worker_service_rpc};
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("core-site.yaml");
 
         let yaml_content = r#"
                 metadata.rpc.port: 18081
                 worker.rpc.bind: "127.0.0.1:9091"
-                worker.transport.kind: "grpc"
                 "#;
         fs::write(&config_path, yaml_content).unwrap();
 
         let config = CoreConfig::load(&config_path).unwrap();
         assert_eq!(config.inner.get_i64(metadata_rpc::PORT), Some(18081));
         assert_eq!(
-            config.inner.get_str(worker_rpc::BIND),
+            config.inner.get_str(worker_service_rpc::BIND),
             Some("127.0.0.1:9091".to_string())
         );
         // Default value should still be present
-        assert_eq!(config.inner.get_str(worker_transport::KIND), Some("grpc".to_string()));
+        assert_eq!(config.inner.get_i64(worker_service_rpc::MAX_INFLIGHT), Some(100));
     }
 
     #[test]
@@ -367,6 +356,33 @@ client.default_timeout_ms: 60000
     }
 
     #[test]
+    fn test_validate_core_valid_worker_service_bind() {
+        use crate::config::keys::worker_service_rpc;
+
+        for bind in ["127.0.0.1:9000", "0.0.0.0:9000"] {
+            let mut config = CoreConfig::default();
+            config.inner.set(worker_service_rpc::BIND, bind);
+
+            validate_core(&config.inner).unwrap_or_else(|err| panic!("{bind} should be valid: {err:?}"));
+        }
+    }
+
+    #[test]
+    fn test_validate_core_invalid_worker_service_bind() {
+        use crate::config::keys::worker_service_rpc;
+
+        for bind in ["abc", "abc:xyz", "127.0.0.1:notaport"] {
+            let mut config = CoreConfig::default();
+            config.inner.set(worker_service_rpc::BIND, bind);
+
+            let result = validate_core(&config.inner);
+
+            assert!(result.is_err(), "{bind} should be invalid");
+            assert!(result.unwrap_err().message.contains(worker_service_rpc::BIND));
+        }
+    }
+
+    #[test]
     fn test_validate_core_invalid_block_chunk_size() {
         use crate::config::keys::worker_storage;
         let mut config = CoreConfig::default();
@@ -390,14 +406,14 @@ client.default_timeout_ms: 60000
     }
 
     #[test]
-    fn test_validate_core_invalid_transport_kind() {
-        use crate::config::keys::worker_transport;
+    fn test_validate_core_invalid_worker_service_rpc_max_inflight() {
+        use crate::config::keys::worker_service_rpc;
         let mut config = CoreConfig::default();
-        config.inner.set(worker_transport::KIND, "invalid");
+        config.inner.set(worker_service_rpc::MAX_INFLIGHT, 0i64);
 
         let result = validate_core(&config.inner);
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains(worker_transport::KIND));
+        assert!(result.unwrap_err().message.contains(worker_service_rpc::MAX_INFLIGHT));
     }
 
     #[test]

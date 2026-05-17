@@ -18,8 +18,8 @@ use types::ids::{BlockId, WorkerId};
 pub struct WorkerDescriptor {
     pub worker_id: WorkerId,
     pub address: String,
-    /// Network transport kind (0=unspecified/grpc, 1=grpc, 2=quic, 3=rdma).
-    pub net_transport_kind: i32,
+    /// Worker network protocol (0=unspecified/grpc, 1=grpc, 2=quic, 3=rdma).
+    pub worker_net_protocol: i32,
     /// Worker epoch/boot_id (monotonically increasing or UUID-based).
     pub worker_epoch: u64,
     pub fault_domain: Option<String>,
@@ -43,8 +43,8 @@ pub struct WorkerRuntime {
 pub struct WorkerInfo {
     pub worker_id: WorkerId,
     pub address: String,
-    /// Network transport kind (0=unspecified/grpc, 1=grpc, 2=quic, 3=rdma).
-    pub net_transport_kind: i32,
+    /// Worker network protocol (0=unspecified/grpc, 1=grpc, 2=quic, 3=rdma).
+    pub worker_net_protocol: i32,
     /// Worker epoch/boot_id (monotonically increasing or UUID-based).
     pub worker_epoch: u64,
     pub capacity_total: u64,
@@ -353,14 +353,14 @@ impl WorkerManager {
         &self,
         worker_id: WorkerId,
         address: String,
-        net_transport_kind: i32,
+        worker_net_protocol: i32,
         worker_epoch: u64,
         fault_domain: Option<String>,
     ) -> MetadataResult<()> {
         let descriptor = WorkerDescriptor {
             worker_id,
             address,
-            net_transport_kind,
+            worker_net_protocol,
             worker_epoch,
             fault_domain,
         };
@@ -374,7 +374,7 @@ impl WorkerManager {
     pub fn update_runtime(
         &self,
         worker_id: WorkerId,
-        net_transport_kind: i32,
+        worker_net_protocol: i32,
         worker_epoch: u64,
         capacity_total: u64,
         capacity_used: u64,
@@ -398,7 +398,7 @@ impl WorkerManager {
 
         // Check if descriptor fields changed
         let descriptor_changed = if let Some(desc) = descriptors.get(&worker_id) {
-            desc.net_transport_kind != net_transport_kind || desc.worker_epoch != worker_epoch
+            desc.worker_net_protocol != worker_net_protocol || desc.worker_epoch != worker_epoch
         } else {
             false
         };
@@ -429,7 +429,7 @@ impl WorkerManager {
         Some(WorkerInfo {
             worker_id: descriptor.worker_id,
             address: descriptor.address.clone(),
-            net_transport_kind: descriptor.net_transport_kind,
+            worker_net_protocol: descriptor.worker_net_protocol,
             worker_epoch: descriptor.worker_epoch,
             capacity_total: runtime_data.capacity_total,
             capacity_used: runtime_data.capacity_used,

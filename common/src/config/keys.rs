@@ -35,10 +35,10 @@ pub mod metadata_authority {
 }
 
 /// Worker RPC configuration keys.
-pub mod worker_rpc {
-    /// RPC server bind address (format: "host:port").
+pub mod worker_service_rpc {
+    /// RPC server bind socket address.
     pub const BIND: &str = "worker.rpc.bind";
-    /// Maximum concurrent inflight RPC requests.
+    /// Maximum concurrent inflight RPC requests per gRPC connection.
     pub const MAX_INFLIGHT: &str = "worker.rpc.max_inflight";
 }
 
@@ -138,39 +138,13 @@ pub mod worker_replication {
     pub const FENCING_SPECIAL_TOKEN: &str = "worker.replication.fencing.special_token";
 }
 
-/// Worker transport configuration keys.
-pub mod worker_transport {
-    /// Transport kind: "grpc", "quic", "rdma", "io_uring", or "local".
-    pub const KIND: &str = "worker.transport.kind";
-    /// Connection timeout in milliseconds.
-    pub const CONNECT_TIMEOUT_MS: &str = "worker.transport.connect_timeout_ms";
-    /// Request timeout in milliseconds.
-    pub const REQUEST_TIMEOUT_MS: &str = "worker.transport.request_timeout_ms";
-    /// Maximum concurrent inflight requests (client-side backpressure).
-    pub const MAX_INFLIGHT_REQUESTS: &str = "worker.transport.max_inflight_requests";
-    /// Maximum concurrent inflight streams (for streaming RPCs).
-    pub const MAX_INFLIGHT_STREAMS: &str = "worker.transport.max_inflight_streams";
-    /// Server-side max inflight (for ingress backpressure).
-    pub const SERVER_MAX_INFLIGHT: &str = "worker.transport.server.max_inflight";
-    /// Keep-alive interval in milliseconds.
-    pub const KEEPALIVE_INTERVAL_MS: &str = "worker.transport.keepalive_interval_ms";
-    /// Keep-alive timeout in milliseconds.
-    pub const KEEPALIVE_TIMEOUT_MS: &str = "worker.transport.keepalive_timeout_ms";
-    /// Require zero-copy support for transport.
-    pub const ZERO_COPY_REQUIRED: &str = "worker.transport.zero_copy.required";
-    /// Allow fallback to another transport if combo is invalid.
-    pub const COMBO_ALLOW_FALLBACK: &str = "worker.transport.combo.allow_fallback";
-    /// Fallback transport kind (if allow_fallback is true, optional).
-    pub const COMBO_FALLBACK_TRANSPORT: &str = "worker.transport.combo.fallback_transport";
-}
-
 /// Observability logging configuration keys.
 pub mod observe_logging {
     /// Log level: "trace", "debug", "info", "warn", or "error".
     pub const LEVEL: &str = "observe.logging.level";
     /// Log format: "json" or "pretty".
     pub const FORMAT: &str = "observe.logging.format";
-    /// Target filters (e.g., "metadata=debug,transport=info", optional).
+    /// Target filters (e.g., "metadata=debug,worker=info", optional).
     pub const TARGETS: &str = "observe.logging.targets";
     /// Output logs to stdout.
     pub const STDOUT: &str = "observe.logging.stdout";

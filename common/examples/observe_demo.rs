@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Simulate some work
         sleep(Duration::from_millis(100)).await;
 
-        // Record some metrics (these would normally come from transport/ufs)
+        // Record some metrics (these would normally come from RPC and UFS adapters)
         metrics::counter!("demo_operations_total", "status" => "ok").increment(1);
         metrics::histogram!("demo_operation_latency_ms").record(100.0);
 

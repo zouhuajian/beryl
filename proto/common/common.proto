@@ -94,7 +94,7 @@ message BlockPlacementProto {
 message WorkerEndpointInfoProto {
   uint64 worker_id = 1;
   string endpoint = 2;  // host:port
-  NetTransportKindProto net_transport_kind = 3;
+  WorkerNetProtocolProto worker_net_protocol = 3;
   uint64 worker_epoch = 4;
 }
 
@@ -178,15 +178,15 @@ message NodeInfoProto {
 }
 
 // ============================================================================
-// Network Transport Kind
+// Worker Net Protocol
 // ============================================================================
 
-/// Network transport kind for worker communication.
-enum NetTransportKindProto {
-  NET_TRANSPORT_KIND_UNSPECIFIED = 0;
-  NET_TRANSPORT_KIND_GRPC = 1;
-  NET_TRANSPORT_KIND_QUIC = 2;
-  NET_TRANSPORT_KIND_RDMA = 3;
+/// Worker network protocol for worker communication.
+enum WorkerNetProtocolProto {
+  WORKER_NET_PROTOCOL_UNSPECIFIED = 0;
+  WORKER_NET_PROTOCOL_GRPC = 1;
+  WORKER_NET_PROTOCOL_QUIC = 2;
+  WORKER_NET_PROTOCOL_RDMA = 3;
 }
 
 // ============================================================================

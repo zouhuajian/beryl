@@ -9,12 +9,15 @@ use common::config::CoreConfig;
 use common::error::{CommonError, CommonErrorCode};
 use tracing::info;
 
+use crate::net::config::WorkerNetConfig;
+use crate::net::protocol::WorkerNetProtocol;
+
 /// Worker configuration.
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
     /// RPC server bind address.
     pub rpc_bind: String,
-    /// Maximum concurrent RPC requests.
+    /// Maximum concurrent RPC requests per gRPC connection.
     pub rpc_max_inflight: usize,
     /// Transport frame payload size negotiated at stream open.
     /// This controls network batching and does not define StorageChunk size.
@@ -31,6 +34,8 @@ pub struct WorkerConfig {
     pub stream_idle_timeout_ms: u64,
     /// Placeholder root for worker-local block storage.
     pub storage_root: PathBuf,
+    /// Worker-owned service-specific network configuration.
+    pub net: WorkerNetConfig,
 }
 
 impl Default for WorkerConfig {
@@ -44,6 +49,7 @@ impl Default for WorkerConfig {
             chunk_size: 1024 * 1024,
             stream_idle_timeout_ms: 60_000,
             storage_root: PathBuf::from("./data"),
+            net: WorkerNetConfig::grpc_from_legacy_rpc("0.0.0.0:9090".to_string(), 100, 4 * 1024 * 1024),
         }
     }
 }
@@ -60,51 +66,57 @@ impl WorkerConfig {
         let worker_sub = core_config.as_flat().sub("worker");
         let defaults = Self::default();
 
+        let rpc_bind = worker_sub
+            .get_str("rpc.bind")
+            .unwrap_or_else(|| defaults.rpc_bind.clone());
+        let rpc_max_inflight = worker_sub
+            .get_usize("rpc.max_inflight")
+            .unwrap_or(defaults.rpc_max_inflight);
+        let default_frame_size = Self::bytes_u32(
+            worker_sub.get_bytes("default_frame_size"),
+            defaults.default_frame_size,
+            "worker.default_frame_size",
+        )?;
+        let max_frame_size = Self::bytes_u32(
+            worker_sub.get_bytes("max_frame_size"),
+            defaults.max_frame_size,
+            "worker.max_frame_size",
+        )?;
+        let window_bytes = Self::bytes_u32(
+            worker_sub
+                .get_bytes("window_bytes")
+                .or_else(|| worker_sub.get_bytes("stream.window_bytes")),
+            defaults.window_bytes,
+            "worker.window_bytes",
+        )?;
+        let chunk_size = Self::bytes_u32(
+            worker_sub
+                .get_bytes("chunk_size")
+                .or_else(|| worker_sub.get_bytes("storage.chunk_size")),
+            defaults.chunk_size,
+            "worker.chunk_size",
+        )?;
+        let stream_idle_timeout_ms = worker_sub
+            .get_usize("stream.idle_timeout_ms")
+            .map(|value| value as u64)
+            .unwrap_or(defaults.stream_idle_timeout_ms);
+        let storage_root = worker_sub
+            .get_str("storage.root")
+            .or_else(|| worker_sub.get_str("storage.dir"))
+            .or_else(|| Self::first_storage_dir(worker_sub.get_str("storage.dirs")))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| defaults.storage_root.clone());
+
         let config = Self {
-            rpc_bind: worker_sub
-                .get_str("rpc.bind")
-                .unwrap_or_else(|| defaults.rpc_bind.clone()),
-            rpc_max_inflight: worker_sub
-                .get_usize("rpc.max_inflight")
-                .unwrap_or(defaults.rpc_max_inflight),
-            default_frame_size: Self::bytes_u32(
-                worker_sub
-                    .get_bytes("default_frame_size")
-                    .or_else(|| worker_sub.get_bytes("transport.default_frame_size")),
-                defaults.default_frame_size,
-                "worker.default_frame_size",
-            )?,
-            max_frame_size: Self::bytes_u32(
-                worker_sub
-                    .get_bytes("max_frame_size")
-                    .or_else(|| worker_sub.get_bytes("transport.max_frame_size")),
-                defaults.max_frame_size,
-                "worker.max_frame_size",
-            )?,
-            window_bytes: Self::bytes_u32(
-                worker_sub
-                    .get_bytes("window_bytes")
-                    .or_else(|| worker_sub.get_bytes("stream.window_bytes")),
-                defaults.window_bytes,
-                "worker.window_bytes",
-            )?,
-            chunk_size: Self::bytes_u32(
-                worker_sub
-                    .get_bytes("chunk_size")
-                    .or_else(|| worker_sub.get_bytes("storage.chunk_size")),
-                defaults.chunk_size,
-                "worker.chunk_size",
-            )?,
-            stream_idle_timeout_ms: worker_sub
-                .get_usize("stream.idle_timeout_ms")
-                .map(|value| value as u64)
-                .unwrap_or(defaults.stream_idle_timeout_ms),
-            storage_root: worker_sub
-                .get_str("storage.root")
-                .or_else(|| worker_sub.get_str("storage.dir"))
-                .or_else(|| Self::first_storage_dir(worker_sub.get_str("storage.dirs")))
-                .map(PathBuf::from)
-                .unwrap_or_else(|| defaults.storage_root.clone()),
+            rpc_bind: rpc_bind.clone(),
+            rpc_max_inflight,
+            default_frame_size,
+            max_frame_size,
+            window_bytes,
+            chunk_size,
+            stream_idle_timeout_ms,
+            storage_root,
+            net: WorkerNetConfig::grpc_from_legacy_rpc(rpc_bind, rpc_max_inflight, max_frame_size),
         };
 
         config.validate()?;
@@ -117,6 +129,7 @@ impl WorkerConfig {
             window_bytes = config.window_bytes,
             chunk_size = config.chunk_size,
             storage_root = ?config.storage_root,
+            net_listeners = config.net.listeners.len(),
             "Worker configuration loaded"
         );
 
@@ -191,6 +204,34 @@ impl WorkerConfig {
             ));
         }
 
+        if self.net.listeners.is_empty() {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                "worker.net.listeners must not be empty",
+            ));
+        }
+
+        for listener in &self.net.listeners {
+            if listener.protocol == WorkerNetProtocol::Grpc && listener.bind.parse::<std::net::SocketAddr>().is_err() {
+                return Err(CommonError::new(
+                    CommonErrorCode::InvalidArgument,
+                    format!("invalid worker gRPC listener bind address: {}", listener.bind),
+                ));
+            }
+            if listener.max_inflight == 0 {
+                return Err(CommonError::new(
+                    CommonErrorCode::InvalidArgument,
+                    "worker.net.listeners.max_inflight must be greater than zero",
+                ));
+            }
+            if listener.max_frame_size == 0 {
+                return Err(CommonError::new(
+                    CommonErrorCode::InvalidArgument,
+                    "worker.net.listeners.max_frame_size must be greater than zero",
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -219,6 +260,9 @@ impl WorkerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::config::PeerProtocolSelectionPolicy;
+    use crate::net::endpoint::WorkerEndpointRole;
+    use crate::net::protocol::WorkerNetProtocol;
     use std::fs;
     use tempfile::TempDir;
 
@@ -238,6 +282,16 @@ mod tests {
         assert_eq!(config.chunk_size, 1024 * 1024);
         assert_eq!(config.stream_idle_timeout_ms, 60_000);
         assert_eq!(config.storage_root, PathBuf::from("./data"));
+        assert_eq!(config.net.listeners.len(), 1);
+        assert_eq!(config.net.listeners[0].protocol, WorkerNetProtocol::Grpc);
+        assert_eq!(config.net.listeners[0].bind, "127.0.0.1:9090");
+        assert_eq!(config.net.listeners[0].role, vec![WorkerEndpointRole::ClientData]);
+        assert_eq!(config.net.listeners[0].max_inflight, 100);
+        assert_eq!(config.net.peer.enabled_protocols, vec![WorkerNetProtocol::Grpc]);
+        assert_eq!(
+            config.net.peer.selection_policy,
+            PeerProtocolSelectionPolicy::PreferGrpc
+        );
     }
 
     #[test]
@@ -273,6 +327,40 @@ worker:
         assert_eq!(config.chunk_size, 32_768);
         assert_eq!(config.stream_idle_timeout_ms, 500);
         assert_eq!(config.storage_root, PathBuf::from("/tmp/vecton-worker"));
+        assert_eq!(config.net.listeners[0].bind, "127.0.0.1:9091");
+        assert_eq!(config.net.listeners[0].max_inflight, 8);
+    }
+
+    #[test]
+    fn ignores_removed_worker_transport_frame_size_keys() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("core-site.yaml");
+        fs::write(
+            &config_path,
+            r#"
+worker:
+  transport:
+    default_frame_size: 8388608
+    max_frame_size: 16777216
+"#,
+        )
+        .unwrap();
+
+        let config = WorkerConfig::load(&config_path).unwrap();
+        let defaults = WorkerConfig::default();
+
+        assert_eq!(config.default_frame_size, defaults.default_frame_size);
+        assert_eq!(config.max_frame_size, defaults.max_frame_size);
+    }
+
+    #[test]
+    fn rejects_empty_worker_net_listeners() {
+        let mut config = WorkerConfig::default();
+        config.net.listeners.clear();
+
+        let error = config.validate().unwrap_err();
+
+        assert!(error.message.contains("net.listeners"));
     }
 
     #[test]

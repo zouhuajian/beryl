@@ -374,7 +374,7 @@ impl FsCore {
                             workers.push(WorkerHint {
                                 worker_id,
                                 endpoint: descriptor.address,
-                                net_transport_kind: descriptor.net_transport_kind,
+                                worker_net_protocol: descriptor.worker_net_protocol,
                                 worker_epoch: descriptor.worker_epoch,
                             });
                         }

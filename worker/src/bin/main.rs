@@ -8,10 +8,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use common::observe::{init_observability, ObservabilityConfig, ServiceInfo};
-use proto::worker::worker_data_service_server::WorkerDataServiceServer;
-use tonic::transport::Server;
 use tracing::{error, info};
-use worker::{config::WorkerConfig, WorkerCore, WorkerDataServiceImpl};
+use worker::{config::WorkerConfig, net, WorkerCore};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -40,8 +38,19 @@ async fn main() -> Result<()> {
         window_bytes = config.window_bytes,
         chunk_size = config.chunk_size,
         storage_root = ?config.storage_root,
+        net_listeners = config.net.listeners.len(),
         "Starting worker data service skeleton"
     );
+    for listener in &config.net.listeners {
+        info!(
+            protocol = %listener.protocol,
+            bind = %listener.bind,
+            max_inflight = listener.max_inflight,
+            max_frame_size = listener.max_frame_size,
+            roles = ?listener.role,
+            "Configured worker net listener"
+        );
+    }
 
     let core = Arc::new(WorkerCore::with_options(
         config.chunk_size,
@@ -51,12 +60,8 @@ async fn main() -> Result<()> {
         Duration::from_millis(config.stream_idle_timeout_ms),
         config.storage_root.clone(),
     ));
-    let service = WorkerDataServiceImpl::new(core);
-    let bind_addr = config.rpc_bind.parse().context("Invalid worker RPC bind address")?;
 
-    if let Err(error) = Server::builder()
-        .add_service(WorkerDataServiceServer::new(service))
-        .serve(bind_addr)
+    if let Err(error) = net::server::serve_worker_data(&config.net, core)
         .await
         .context("Worker data service server failed")
     {

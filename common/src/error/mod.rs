@@ -11,7 +11,7 @@ pub mod canonical {
     //! Canonical, protocol-independent error model for vecton.
     //!
     //! This sits *above* module-local error types (MetadataError, WorkerError,
-    //! ClientError, TransportError, FsErrorCode, RpcErrorCode) and *below* the
+    //! ClientError, FsErrorCode, RpcErrorCode) and *below* the
     //! concrete protobuf headers. The goal is:
     //!
     //! - Provide a single semantic classification:
@@ -27,7 +27,7 @@ pub mod canonical {
     //! NOTE:
     //! - This module MUST NOT depend on generated protobuf types.
     //! - All conversions between module errors and `CanonicalError` should live
-    //!   in the respective crates (metadata/worker/client/transport).
+    //!   in the respective owner crates (metadata/worker/client).
 
     use crate::header::RpcErrorCode;
     use serde::{Deserialize, Serialize};
@@ -85,7 +85,7 @@ pub mod canonical {
     pub struct WorkerEndpointHint {
         pub worker_id: u64,
         pub endpoint: String,
-        pub net_transport_kind: i32,
+        pub worker_net_protocol: i32,
         pub worker_epoch: u64,
     }
 
@@ -296,7 +296,7 @@ impl fmt::Display for CommonErrorCode {
 pub struct ErrorMeta {
     /// Call ID associated with this error.
     pub call_id: Option<types::CallId>,
-    /// Operation name (e.g., "ufs.read", "transport.rpc").
+    /// Operation name (e.g., "ufs.read", "worker.rpc").
     pub op: Option<String>,
     /// Peer endpoint or identifier.
     pub peer: Option<String>,

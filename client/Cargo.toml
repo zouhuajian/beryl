@@ -8,7 +8,6 @@ edition = "2021"
 common = { path = "../common" }
 types = { path = "../types" }
 proto = { path = "../proto" }
-transport = { path = "../transport" }
 
 # RPC
 tonic = { workspace = true, features = ["transport"] }

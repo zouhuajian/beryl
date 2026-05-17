@@ -98,7 +98,7 @@ pub enum Command {
         dedup: DedupKey,
         identity: String,
         address: String,
-        net_transport_kind: i32,
+        worker_net_protocol: i32,
         worker_epoch: u64,
         fault_domain: Option<String>,
     },
@@ -297,7 +297,7 @@ enum FingerprintView {
     RegisterWorker {
         identity: String,
         address: String,
-        net_transport_kind: i32,
+        worker_net_protocol: i32,
         worker_epoch: u64,
         fault_domain: Option<String>,
     },
@@ -431,14 +431,14 @@ impl From<&Command> for FingerprintView {
             Command::RegisterWorker {
                 identity,
                 address,
-                net_transport_kind,
+                worker_net_protocol,
                 worker_epoch,
                 fault_domain,
                 ..
             } => FingerprintView::RegisterWorker {
                 identity: identity.clone(),
                 address: address.clone(),
-                net_transport_kind: *net_transport_kind,
+                worker_net_protocol: *worker_net_protocol,
                 worker_epoch: *worker_epoch,
                 fault_domain: fault_domain.clone(),
             },
