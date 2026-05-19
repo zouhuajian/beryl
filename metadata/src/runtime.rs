@@ -558,20 +558,13 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use crate::config::{BootstrapConfig, MetadataAuthorityConfig, MetadataAuthzConfig, RaftConfig, WorkerConfig};
-    use client::cache::{RouteCache, StateIdCache};
-    use client::canonical::RetryOutcome;
-    use client::meta::{MetadataClient, MetadataRpcHelper};
-    use client::routing::{GroupRoleCache, RouteTable};
-    use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode, RefreshReason};
+    use common::error::canonical::{ErrorClass, ErrorCode, RefreshReason};
     use common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
     use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
     use proto::metadata::{MsyncRequestProto, MsyncResponseProto};
     use std::sync::OnceLock;
     use tempfile::TempDir;
-    use tokio::net::TcpListener;
     use tokio::sync::Mutex as AsyncMutex;
-    use tokio_stream::wrappers::TcpListenerStream;
-    use tonic::transport as test_tonic_net;
     use types::{ClientId, GroupStateWatermark, RaftLogId};
 
     async fn test_authority(dir: &TempDir) -> MetadataAuthority {
@@ -735,77 +728,6 @@ mod tests {
         assert!(!handles._maintenance._delete_executor_handle.is_finished());
         assert!(Arc::strong_count(&handles._readiness.gate) >= 1);
         let _readiness_watcher_finished = handles._readiness._watcher.is_finished();
-    }
-
-    #[tokio::test]
-    async fn stale_state_client_refresh_uses_production_runtime_msync() {
-        let dir = TempDir::new().unwrap();
-        let config = test_config();
-        let authority = test_authority(&dir).await;
-        let expected_state_id = wait_for_leader_state(&authority).await;
-        let readiness = build_readiness(&config, &authority).await;
-        let maintenance_repair = build_maintenance_repair_state(&config);
-        let (worker_runtime, mut worker_service) = build_worker_runtime(&authority, &maintenance_repair);
-        let filesystem = build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
-            .await
-            .unwrap();
-        let maintenance = build_maintenance(&authority, &worker_runtime, maintenance_repair).await;
-        let worker_background = build_worker_background(&worker_runtime, &mut worker_service, &maintenance);
-        let (services, _handles) =
-            compose_services(filesystem, worker_service, readiness, worker_background, maintenance);
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            test_tonic_net::Server::builder()
-                .add_service(FileSystemServiceProtoServer::new(services.filesystem))
-                .add_service(MetadataWorkerServiceProtoServer::new(services.worker))
-                .add_service(services.health)
-                .serve_with_incoming(TcpListenerStream::new(listener))
-                .await
-                .unwrap();
-        });
-
-        let endpoint = format!("http://{}", addr);
-        let metadata_client = Arc::new(MetadataClient::new(&endpoint).await.unwrap());
-        let state_cache = Arc::new(StateIdCache::new(60));
-        let route_table = Arc::new(RouteTable::new(RouteCache::new(64, 60)));
-        let group_role = Arc::new(GroupRoleCache::new(60));
-        let helper = MetadataRpcHelper::new(Arc::clone(&state_cache), route_table, group_role, metadata_client);
-
-        let group_id = ShardGroupId::new(1);
-        let base_header = RequestHeader::new(ClientId::new(7)).with_group_id(group_id.as_raw());
-        let expected_watermark = GroupStateWatermark::new(group_id, expected_state_id);
-        let mut first = true;
-        let outcome: RetryOutcome<(ResponseHeader, ())> = helper
-            .call_with_refresh(&base_header, Some(group_id), true, |hdr| {
-                let is_first = first;
-                first = false;
-                async move {
-                    if is_first {
-                        let canonical = CanonicalError::need_refresh(
-                            RpcErrorCode::StaleState,
-                            RefreshReason::StaleState,
-                            "stale state",
-                        );
-                        let mut header = ResponseHeader::from_canonical(hdr.client.clone(), canonical)
-                            .with_group_id(group_id.as_raw());
-                        header.state = vec![expected_watermark];
-                        Ok((header, ()))
-                    } else {
-                        Ok((
-                            ResponseHeader::ok(hdr.client.clone()).with_group_id(group_id.as_raw()),
-                            (),
-                        ))
-                    }
-                }
-            })
-            .await
-            .expect("stale-state refresh should call production msync and retry");
-
-        assert_eq!(outcome.refreshes, 1);
-        assert_eq!(state_cache.get(&group_id).map(|w| w.state_id), Some(expected_state_id));
-        server.abort();
     }
 
     #[tokio::test]

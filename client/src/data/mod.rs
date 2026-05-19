@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Vecton Contributors
+
+//! Internal worker data-plane boundary.
+//!
+//! This module stays private to the crate, so stream handles and block-local
+//! worker operations do not appear in the public API.
+
+mod worker;
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use proto::metadata::WriteTargetProto;
+use proto::worker::WriteStreamResponseProto;
+
+use crate::error::ClientResult;
+use crate::planner::read_planner::PlannedReadSegment;
+use crate::runtime::AttemptContext;
+
+/// Internal worker data client boundary.
+/// Stream identifiers and endpoint details stay inside the implementation.
+#[async_trait]
+pub(crate) trait WorkerDataClient: Send + Sync {
+    async fn read_segment(
+        &self,
+        ctx: AttemptContext,
+        group_id: u64,
+        segment: &PlannedReadSegment,
+    ) -> ClientResult<Bytes>;
+
+    async fn open_write(&self, ctx: AttemptContext, target: WorkerWriteTarget) -> ClientResult<WorkerWriteBlock>;
+
+    async fn write_stream(&self, block: &WorkerWriteBlock, data: Bytes) -> ClientResult<WriteStreamResponseProto>;
+
+    async fn commit_write(
+        &self,
+        ctx: AttemptContext,
+        block: &WorkerWriteBlock,
+        effective_len: u64,
+        commit_seq: u64,
+        require_sync: bool,
+    ) -> ClientResult<WorkerCommitResult>;
+
+    async fn abort_write(&self, ctx: AttemptContext, block: &WorkerWriteBlock) -> ClientResult<()>;
+}
+
+/// Internal worker write target derived from metadata AddBlock.
+#[derive(Clone, Debug)]
+pub(crate) struct WorkerWriteTarget {
+    /// Metadata owner group for the target block.
+    pub(crate) group_id: u64,
+    /// Metadata AddBlock target.
+    pub(crate) target: WriteTargetProto,
+}
+
+/// Internal worker write stream state.
+#[derive(Clone, Debug)]
+pub(crate) struct WorkerWriteBlock {
+    /// Metadata owner group for the block.
+    pub(crate) group_id: u64,
+    /// Stable worker identity selected by metadata.
+    pub(crate) worker_id: u64,
+    /// Target worker endpoint selected by the worker client.
+    pub(crate) endpoint: String,
+    /// Worker network protocol selected by metadata.
+    pub(crate) worker_net_protocol: i32,
+    /// Worker epoch selected by metadata.
+    pub(crate) worker_epoch: u64,
+    /// Metadata AddBlock target.
+    pub(crate) target: WriteTargetProto,
+    /// Worker stream identifier.
+    pub(crate) stream_id: proto::common::StreamIdProto,
+    /// Worker-accepted frame size.
+    pub(crate) frame_size: u32,
+    /// Next frame sequence number.
+    pub(crate) next_seq: u64,
+}
+
+/// Worker CommitWrite result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WorkerCommitResult {
+    /// Effective block length published by the worker.
+    pub(crate) effective_block_len: u64,
+    /// Metadata-assigned block stamp persisted by the worker.
+    pub(crate) block_stamp: u64,
+    /// Contiguous byte prefix written into the staging block.
+    pub(crate) written_through: u64,
+}
+
+pub(crate) use worker::DataPlaneBoundary;

@@ -72,7 +72,8 @@ pub struct ReadOpenRequest {
     /// Block-local byte range. The offset is relative to block_id, not to the file.
     pub byte_range: ByteRange,
     /// Logical block stamp used for direct read validation.
-    /// 0 means stamp validation is skipped.
+    /// Normal client reads must use a non-zero metadata-authoritative stamp.
+    /// 0 is reserved for explicitly allowed internal/debug callers.
     pub block_stamp: u64,
     /// Requested transport frame payload size, not the worker-local StorageChunk size.
     pub frame_size: u32,

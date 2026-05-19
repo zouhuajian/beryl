@@ -135,6 +135,12 @@ impl WriteSessionManager {
         let mut sessions = self.sessions.write();
         let session = sessions.get_mut(&file_handle)?;
         let mut target = session.write_targets.get(session.next_target_index).cloned()?;
+        let next_file_offset = session
+            .issued_targets
+            .last()
+            .and_then(|issued| issued.file_offset.checked_add(issued.len))
+            .unwrap_or(session.base_size);
+        target.file_offset = next_file_offset;
         if let Some(len) = desired_len {
             target.len = len.min(target.len).max(1);
         }

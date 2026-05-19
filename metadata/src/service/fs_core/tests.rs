@@ -146,7 +146,7 @@ async fn get_file_layout_returns_worker_locations_from_worker_manager() {
             block_offset: 0,
             len: 512,
             file_version: None,
-            block_stamp: None,
+            block_stamp: Some(41),
         }],
         file_version: Some(1),
         lease_epoch: None,
@@ -178,7 +178,104 @@ async fn get_file_layout_returns_worker_locations_from_worker_manager() {
         vec![WorkerId::new(1), WorkerId::new(2)]
     );
     assert_eq!(location.worker_epoch, Some(22));
+    assert_eq!(location.block_stamp, 41);
     assert_eq!(location.workers[0].endpoint, "127.0.0.1:9101");
+}
+
+#[tokio::test]
+async fn get_file_layout_rejects_returned_extent_without_block_stamp() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(49);
+    let inode_id = InodeId::new(490);
+    let data_handle_id = DataHandleId::new(9490);
+    let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(8));
+    fs_core.set_storage(Arc::clone(&storage));
+
+    let mut attrs = FileAttrs::new();
+    attrs.size = 512;
+    let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+    inode.data = types::fs::InodeData::File {
+        extents: vec![types::fs::Extent {
+            file_offset: 0,
+            block_id,
+            block_offset: 0,
+            len: 512,
+            file_version: Some(1),
+            block_stamp: None,
+        }],
+        file_version: Some(1),
+        lease_epoch: None,
+    };
+    storage.put_inode(&inode).unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let failure = fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx: request_context(),
+            inode_id,
+            range: None,
+            requested_data_handle_id: None,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect_err("missing block_stamp must reject returned layout");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
+    );
+    assert!(failure.error.message.contains("block_stamp"));
+}
+
+#[tokio::test]
+async fn get_file_layout_rejects_returned_extent_with_zero_block_stamp() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(50);
+    let inode_id = InodeId::new(500);
+    let data_handle_id = DataHandleId::new(9500);
+    let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(8));
+    fs_core.set_storage(Arc::clone(&storage));
+
+    let mut attrs = FileAttrs::new();
+    attrs.size = 512;
+    let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+    inode.data = types::fs::InodeData::File {
+        extents: vec![types::fs::Extent {
+            file_offset: 0,
+            block_id,
+            block_offset: 0,
+            len: 512,
+            file_version: Some(1),
+            block_stamp: Some(0),
+        }],
+        file_version: Some(1),
+        lease_epoch: Some(1),
+    };
+    storage.put_inode(&inode).unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let failure = fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx: request_context(),
+            inode_id,
+            range: None,
+            requested_data_handle_id: None,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect_err("zero block_stamp must reject returned layout");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
+    );
+    assert!(failure.error.message.contains("zero block_stamp"));
 }
 
 #[tokio::test]
@@ -417,7 +514,7 @@ async fn get_locations_handles_empty_range() {
             block_offset: 0,
             len: 512,
             file_version: Some(4),
-            block_stamp: None,
+            block_stamp: Some(4),
         }],
         file_version: Some(4),
         lease_epoch: Some(4),
@@ -463,7 +560,7 @@ async fn get_locations_filters_range() {
                 block_offset: 0,
                 len: 100,
                 file_version: Some(5),
-                block_stamp: None,
+                block_stamp: Some(u64::from(idx) + 50),
             })
             .collect(),
         file_version: Some(5),
@@ -494,6 +591,15 @@ async fn get_locations_filters_range() {
             .map(|location| location.block_id.index.as_raw())
             .collect::<Vec<_>>(),
         vec![0, 1]
+    );
+    assert_eq!(
+        success
+            .payload
+            .locations
+            .iter()
+            .map(|location| location.block_stamp)
+            .collect::<Vec<_>>(),
+        vec![50, 51]
     );
     assert_eq!(success.payload.file_version, Some(5));
 }
@@ -543,6 +649,8 @@ fn install_write_session(fs_core: &FsCore, inode_id: InodeId, mount_id: MountId)
                     owner: writer.as_raw(),
                     epoch: lease_epoch,
                 }),
+                block_stamp: 1,
+                chunk_size: 64,
             }],
             writer_identity: crate::write_session::WriterIdentity {
                 client_id: writer,
@@ -707,7 +815,7 @@ fn seed_committed_file_version(env: &WriteFlowEnv, file_version: u64, lease_epoc
                 block_offset: 0,
                 len: 64,
                 file_version: Some(file_version),
-                block_stamp: None,
+                block_stamp: Some(file_version),
             }];
             *stored_file_version = Some(file_version);
             *stored_lease_epoch = Some(lease_epoch);

@@ -453,11 +453,32 @@ impl<'a> WriteSessionCoordinator<'a> {
         };
 
         let desired_len = req.desired_len.unwrap_or(4 * 1024 * 1024);
-        let block_size = storage
-            .get_layout(inode_id)
+        let layout = storage.get_layout(inode_id);
+        let block_size = layout
+            .as_ref()
             .map(|layout| layout.block_size as u64)
             .unwrap_or(4 * 1024 * 1024)
             .max(1);
+        let chunk_size = layout
+            .as_ref()
+            .map(|layout| layout.chunk_size)
+            .unwrap_or(4 * 1024 * 1024)
+            .max(1);
+        let current_file_version = match &inode.data {
+            types::fs::InodeData::File { file_version, .. } => *file_version,
+            _ => None,
+        };
+        let block_stamp = match current_file_version.unwrap_or(0).checked_add(1) {
+            Some(block_stamp) => block_stamp,
+            None => {
+                return self.core.failure_from_error(
+                    &req.ctx,
+                    MetadataError::InvalidArgument(format!("file_version overflow for inode {}", inode_id)),
+                    group_id,
+                    mount_epoch,
+                );
+            }
+        };
         let num_blocks = desired_len.div_ceil(block_size).clamp(1, 10);
         let start_index = match &inode.data {
             types::fs::InodeData::File { extents, .. } => extents
@@ -586,6 +607,8 @@ impl<'a> WriteSessionCoordinator<'a> {
                 len: planned.len,
                 worker_endpoints: planned.worker_endpoints,
                 fencing_token: target_token,
+                block_stamp,
+                chunk_size,
             });
             write_targets_proto.push(proto::metadata::WriteTargetProto {
                 block_id: Some(proto::common::BlockIdProto {
@@ -603,6 +626,8 @@ impl<'a> WriteSessionCoordinator<'a> {
                     owner: caller_ctx.client.client_id.as_raw(),
                     epoch: lease_epoch,
                 }),
+                block_stamp,
+                chunk_size,
             });
         }
 
@@ -837,6 +862,8 @@ impl<'a> WriteSessionCoordinator<'a> {
                     len: target.len,
                     worker_endpoints,
                     fencing_token,
+                    block_stamp: target.block_stamp,
+                    chunk_size: target.chunk_size,
                 },
             },
             group_id,

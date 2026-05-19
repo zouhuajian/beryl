@@ -8,11 +8,10 @@
 //! converting response headers to a structured `ClientAction` that preserves
 //! canonical error details and refresh hints.
 
-use crate::error::{ClientError, ClientResult};
+use crate::error::ClientError;
 use common::error::canonical::{CanonicalError, ErrorClass, RefreshReason};
-use common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
+use common::header::{ResponseHeader, RpcErrorCode};
 use proto::convert::error_detail_to_canonical;
-use std::time::Duration;
 
 /// Endpoint hint preserved on refresh actions.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,16 +51,24 @@ impl From<common::error::canonical::WorkerEndpointHint> for EndpointHint {
 /// Structured refresh hints preserved from response headers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RefreshHint {
+    /// Metadata leader endpoint from canonical refresh hint.
+    pub leader_endpoint: Option<String>,
     /// Group ID hint from metadata header.
     pub group_id: Option<u64>,
+    /// Mount prefix associated with the mount epoch, when the server provides it.
+    pub mount_prefix: Option<String>,
     /// Route epoch hint (if present in future headers).
     pub route_epoch: Option<u64>,
     /// Mount epoch hint from metadata header.
     pub mount_epoch: Option<u64>,
     /// Worker epoch hint from data header.
     pub worker_epoch: Option<u64>,
-    /// Endpoint hint from data header.
+    /// Primary endpoint hint for callers that expect a single target.
     pub endpoint_hint: Option<EndpointHint>,
+    /// All worker endpoint hints from the canonical refresh hint.
+    pub worker_endpoints: Vec<EndpointHint>,
+    /// Whether the server requires worker placement re-resolution.
+    pub worker_resolve_required: bool,
 }
 
 /// Client action determined from canonical/header validation.
@@ -74,7 +81,7 @@ pub enum ClientAction {
         /// Refresh reason from canonical error.
         reason: RefreshReason,
         /// Structured refresh hints from response header.
-        hint: RefreshHint,
+        hint: Box<RefreshHint>,
         /// Original canonical error.
         canonical: Box<CanonicalError>,
     },
@@ -97,59 +104,6 @@ pub enum ClientAction {
     },
 }
 
-/// Unified RPC envelope parse outcome.
-///
-/// This models the contract:
-/// - non-OK gRPC status => transport/framework failure
-/// - gRPC OK + header.error => canonical business/protocol error
-/// - gRPC OK + no header.error => success
-#[derive(Clone, Debug)]
-pub enum RpcEnvelope {
-    /// gRPC OK and no canonical error in response header.
-    Ok,
-    /// gRPC non-OK transport/auth/framework error.
-    TransportStatus(tonic::Status),
-    /// gRPC OK with canonical business/protocol error.
-    CanonicalError(CanonicalError),
-}
-
-/// Refresh dispatch context passed to the refresh action machine.
-#[derive(Clone, Debug)]
-pub struct RefreshDispatchContext {
-    /// Refresh reason from canonical error.
-    pub reason: RefreshReason,
-    /// Parsed refresh hints for this response.
-    pub hint: RefreshHint,
-    /// Original canonical error.
-    pub canonical: CanonicalError,
-    /// Full response header that triggered refresh.
-    pub response_header: ResponseHeader,
-}
-
-/// Bounded retry policy for the client action machine.
-#[derive(Clone, Debug)]
-pub struct RetryPolicy {
-    /// Max refresh actions per operation.
-    pub max_refresh_attempts: u32,
-    /// Max retryable-class retries per operation.
-    pub max_retryable_attempts: u32,
-    /// Max transport retries for transient gRPC failures.
-    pub max_transport_retries: u32,
-    /// Base backoff for transport retries.
-    pub transport_retry_base_ms: u64,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_refresh_attempts: 2,
-            max_retryable_attempts: 1,
-            max_transport_retries: 2,
-            transport_retry_base_ms: 50,
-        }
-    }
-}
-
 /// Validate metadata response header and return structured action on error.
 ///
 /// This is the single entrypoint for header validation before response body use.
@@ -165,21 +119,7 @@ pub fn validate_header_or_action(header: &ResponseHeader) -> Result<(), ClientAc
         return Ok(());
     };
 
-    let canonical_hint = canonical.refresh_hint.as_ref();
-    let hint = RefreshHint {
-        group_id: canonical_hint.and_then(|hint| hint.group_id).or(header.group_id),
-        route_epoch: canonical_hint.and_then(|hint| hint.route_epoch).or(header.route_epoch),
-        mount_epoch: canonical_hint.and_then(|hint| hint.mount_epoch).or(header.mount_epoch),
-        worker_epoch: canonical_hint.and_then(|hint| hint.worker_epoch),
-        endpoint_hint: canonical_hint
-            .and_then(|hint| hint.worker_endpoints.first())
-            .map(|endpoint| EndpointHint {
-                worker_id: endpoint.worker_id,
-                endpoint: endpoint.endpoint.clone(),
-                worker_net_protocol: endpoint.worker_net_protocol,
-                worker_epoch: endpoint.worker_epoch,
-            }),
-    };
+    let hint = refresh_hint_from_canonical_and_header(canonical.refresh_hint.as_ref(), header);
     validate_canonical_with_hint(canonical, hint)
 }
 
@@ -196,63 +136,9 @@ pub fn validate_data_header_or_action(
     };
 
     let canonical = error_detail_to_canonical(err_detail);
-    let canonical_hint = canonical.refresh_hint.as_ref();
-    let hint = RefreshHint {
-        group_id: None,
-        route_epoch: None,
-        mount_epoch: None,
-        worker_epoch: canonical_hint.and_then(|hint| hint.worker_epoch),
-        endpoint_hint: canonical_hint
-            .and_then(|hint| hint.worker_endpoints.first())
-            .cloned()
-            .map(EndpointHint::from),
-    };
+    let hint = refresh_hint_from_canonical(canonical.refresh_hint.as_ref());
 
     validate_canonical_with_hint(canonical, hint)
-}
-
-/// Parse gRPC status + response header into a unified envelope outcome.
-///
-/// `grpc_status` should be:
-/// - `Ok(())` when the RPC transport returned gRPC OK and a response body.
-/// - `Err(status)` when tonic returned a non-OK gRPC status.
-pub fn parse_rpc_envelope(
-    grpc_status: Result<(), tonic::Status>,
-    response_header: Option<&proto::common::ResponseHeaderProto>,
-) -> RpcEnvelope {
-    match grpc_status {
-        Err(status) => RpcEnvelope::TransportStatus(status),
-        Ok(()) => {
-            let Some(header) = response_header else {
-                return RpcEnvelope::CanonicalError(CanonicalError {
-                    class: ErrorClass::Fatal,
-                    code: Some(common::error::canonical::ErrorCode::RpcCode(
-                        RpcErrorCode::InvalidHeader,
-                    )),
-                    reason: None,
-                    retry_after_ms: None,
-                    message: "missing response header".to_string(),
-                    refresh_hint: None,
-                });
-            };
-            match header.error.as_ref() {
-                None => RpcEnvelope::Ok,
-                Some(err_detail) => {
-                    let canonical = error_detail_to_canonical(err_detail);
-                    if matches!(canonical.class, ErrorClass::Ok) {
-                        RpcEnvelope::Ok
-                    } else {
-                        RpcEnvelope::CanonicalError(canonical)
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Validate canonical error directly.
-pub fn handle_canonical_error(err: &CanonicalError) -> Result<(), ClientAction> {
-    validate_canonical_with_hint(err.clone(), RefreshHint::default())
 }
 
 fn validate_canonical_with_hint(canonical: CanonicalError, hint: RefreshHint) -> Result<(), ClientAction> {
@@ -266,7 +152,7 @@ fn validate_canonical_with_hint(canonical: CanonicalError, hint: RefreshHint) ->
             );
             Err(ClientAction::Refresh {
                 reason,
-                hint,
+                hint: Box::new(hint),
                 canonical: Box::new(canonical),
             })
         }
@@ -280,180 +166,57 @@ fn validate_canonical_with_hint(canonical: CanonicalError, hint: RefreshHint) ->
     }
 }
 
-/// Outcome of a refresh-aware call.
-#[derive(Clone, Debug)]
-pub struct RetryOutcome<T> {
-    /// Successful result returned by the final attempt.
-    pub result: T,
-    /// Count of refresh-triggered retries performed.
-    pub refreshes: u32,
-    /// Count of retry-after responses handled.
-    pub retries: u32,
-    /// Count of transport retries performed.
-    pub transport_retries: u32,
-    /// Last canonical error observed before success (if any).
-    pub last_canonical_error: Option<CanonicalError>,
-}
-
-impl<T> RetryOutcome<T> {
-    /// Create a new outcome with zero refresh/retry counters.
-    pub fn new(result: T) -> Self {
-        Self {
-            result,
-            refreshes: 0,
-            retries: 0,
-            transport_retries: 0,
-            last_canonical_error: None,
-        }
-    }
-
-    /// Map the inner result while preserving counters and error context.
-    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> RetryOutcome<U> {
-        RetryOutcome {
-            result: f(self.result),
-            refreshes: self.refreshes,
-            retries: self.retries,
-            transport_retries: self.transport_retries,
-            last_canonical_error: self.last_canonical_error,
-        }
+pub(crate) fn invalid_header_action(message: impl Into<String>) -> ClientAction {
+    ClientAction::Fail {
+        canonical: Box::new(invalid_header_canonical(message)),
     }
 }
 
-/// Retry with bounded refresh/retry/transport handling.
-///
-/// The refresh callback is the authoritative dispatch point that translates
-/// refresh reasons into real refresh actions and produces a refreshed request
-/// context for the next retry.
-pub async fn retry_metadata_once<T, CallFut, RefreshFut>(
-    header: RequestHeader,
-    mut call: impl FnMut(RequestHeader) -> CallFut,
-    mut dispatch_refresh: impl FnMut(RefreshDispatchContext, RequestHeader) -> RefreshFut,
-) -> ClientResult<RetryOutcome<(ResponseHeader, T)>>
-where
-    CallFut: std::future::Future<Output = ClientResult<(ResponseHeader, T)>>,
-    RefreshFut: std::future::Future<Output = ClientResult<RequestHeader>>,
-{
-    retry_metadata_with_policy(header, &mut call, &mut dispatch_refresh, RetryPolicy::default()).await
-}
-
-/// Same as [`retry_metadata_once`] with explicit retry policy.
-pub async fn retry_metadata_with_policy<T, CallFut, RefreshFut>(
-    header: RequestHeader,
-    call: &mut impl FnMut(RequestHeader) -> CallFut,
-    dispatch_refresh: &mut impl FnMut(RefreshDispatchContext, RequestHeader) -> RefreshFut,
-    policy: RetryPolicy,
-) -> ClientResult<RetryOutcome<(ResponseHeader, T)>>
-where
-    CallFut: std::future::Future<Output = ClientResult<(ResponseHeader, T)>>,
-    RefreshFut: std::future::Future<Output = ClientResult<RequestHeader>>,
-{
-    let mut current_header = header;
-    let mut refreshes = 0;
-    let mut retries = 0;
-    let mut transport_retries = 0;
-    let mut last_canonical_error = None;
-
-    loop {
-        let rpc_result = call(current_header.clone()).await;
-        let (resp_header, payload) = match rpc_result {
-            Ok(ok) => ok,
-            Err(err) => match err {
-                ClientError::Action(action) => match *action {
-                    ClientAction::TransportFail { status } => {
-                        if transport_retries < policy.max_transport_retries && is_transient_transport_status(&status) {
-                            let backoff_ms =
-                                transport_backoff_ms(policy.transport_retry_base_ms, transport_retries + 1);
-                            transport_retries += 1;
-                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                            current_header = current_header.child_with_same_call_id();
-                            continue;
-                        }
-                        return Err(ClientError::from(ClientAction::TransportFail { status }));
-                    }
-                    other => return Err(ClientError::from(other)),
-                },
-                other => return Err(other),
-            },
-        };
-
-        match validate_header_or_action(&resp_header) {
-            Ok(()) => {
-                return Ok(RetryOutcome {
-                    result: (resp_header, payload),
-                    refreshes,
-                    retries,
-                    transport_retries,
-                    last_canonical_error,
-                });
-            }
-            Err(ClientAction::Refresh {
-                reason,
-                hint,
-                canonical,
-            }) => {
-                if refreshes >= policy.max_refresh_attempts {
-                    return Err(ClientError::from(ClientAction::Refresh {
-                        reason,
-                        hint,
-                        canonical,
-                    }));
-                }
-                refreshes += 1;
-                let canonical_value = canonical.as_ref().clone();
-                last_canonical_error = Some(canonical_value.clone());
-                current_header = dispatch_refresh(
-                    RefreshDispatchContext {
-                        reason,
-                        hint,
-                        canonical: canonical_value,
-                        response_header: resp_header,
-                    },
-                    current_header,
-                )
-                .await?;
-            }
-            Err(ClientAction::Retry { after_ms, canonical }) => {
-                if retries >= policy.max_retryable_attempts {
-                    return Err(ClientError::from(ClientAction::Retry { after_ms, canonical }));
-                }
-                retries += 1;
-                last_canonical_error = Some(canonical.as_ref().clone());
-                if let Some(delay) = after_ms {
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                }
-                current_header = current_header.child_with_same_call_id();
-            }
-            Err(ClientAction::Fail { canonical }) => {
-                return Err(ClientError::from(ClientAction::Fail { canonical }));
-            }
-            Err(ClientAction::TransportFail { status }) => {
-                if transport_retries < policy.max_transport_retries && is_transient_transport_status(&status) {
-                    let backoff_ms = transport_backoff_ms(policy.transport_retry_base_ms, transport_retries + 1);
-                    transport_retries += 1;
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    current_header = current_header.child_with_same_call_id();
-                    continue;
-                }
-                return Err(ClientError::from(ClientAction::TransportFail { status }));
-            }
-            Err(ClientAction::Ok) => {
-                debug_assert!(false, "ClientAction::Ok should never be returned as error");
-                return Err(ClientError::Metadata("invalid client action state".to_string()));
-            }
-        }
+fn invalid_header_canonical(message: impl Into<String>) -> CanonicalError {
+    CanonicalError {
+        class: ErrorClass::Fatal,
+        code: Some(common::error::canonical::ErrorCode::RpcCode(
+            RpcErrorCode::InvalidHeader,
+        )),
+        reason: None,
+        retry_after_ms: None,
+        message: message.into(),
+        refresh_hint: None,
     }
 }
 
-fn is_transient_transport_status(status: &tonic::Status) -> bool {
-    matches!(
-        status.code(),
-        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::ResourceExhausted
-    )
+fn refresh_hint_from_canonical_and_header(
+    canonical_hint: Option<&common::error::canonical::RefreshHint>,
+    header: &ResponseHeader,
+) -> RefreshHint {
+    let mut hint = refresh_hint_from_canonical(canonical_hint);
+    hint.group_id = hint.group_id.or(header.group_id);
+    hint.route_epoch = hint.route_epoch.or(header.route_epoch);
+    hint.mount_epoch = hint.mount_epoch.or(header.mount_epoch);
+    hint
 }
 
-fn transport_backoff_ms(base_ms: u64, attempt: u32) -> u64 {
-    let shift = attempt.saturating_sub(1).min(4);
-    base_ms.saturating_mul(1u64 << shift)
+fn refresh_hint_from_canonical(canonical_hint: Option<&common::error::canonical::RefreshHint>) -> RefreshHint {
+    let Some(canonical_hint) = canonical_hint else {
+        return RefreshHint::default();
+    };
+    let worker_endpoints = canonical_hint
+        .worker_endpoints
+        .iter()
+        .cloned()
+        .map(EndpointHint::from)
+        .collect::<Vec<_>>();
+    RefreshHint {
+        leader_endpoint: canonical_hint.leader_endpoint.clone(),
+        group_id: canonical_hint.group_id,
+        mount_prefix: canonical_hint.mount_prefix.clone(),
+        route_epoch: canonical_hint.route_epoch,
+        mount_epoch: canonical_hint.mount_epoch,
+        worker_epoch: canonical_hint.worker_epoch,
+        endpoint_hint: worker_endpoints.first().cloned(),
+        worker_endpoints,
+        worker_resolve_required: canonical_hint.worker_resolve_required,
+    }
 }
 
 impl ClientAction {
@@ -470,17 +233,58 @@ impl ClientAction {
 
 impl From<ClientAction> for ClientError {
     fn from(action: ClientAction) -> Self {
-        ClientError::Action(Box::new(action))
+        ClientError::Action(crate::error::ClientActionError::new(action))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::error::canonical::ErrorCode as CanonicalErrorCode;
+    use common::error::canonical::{
+        ErrorCode as CanonicalErrorCode, RefreshHint as CanonicalRefreshHint, WorkerEndpointHint,
+    };
     use common::header::RpcErrorCode;
     use common::header::{ClientInfo, ResponseHeader};
     use proto::convert::canonical_to_error_detail;
+
+    #[derive(Clone, Debug)]
+    enum RpcEnvelope {
+        Ok,
+        TransportStatus(tonic::Status),
+        CanonicalError(CanonicalError),
+    }
+
+    fn parse_rpc_envelope(
+        grpc_status: Result<(), tonic::Status>,
+        response_header: Option<&proto::common::ResponseHeaderProto>,
+    ) -> RpcEnvelope {
+        match grpc_status {
+            Err(status) => RpcEnvelope::TransportStatus(status),
+            Ok(()) => {
+                let Some(header) = response_header else {
+                    return RpcEnvelope::CanonicalError(invalid_header_canonical("missing response header"));
+                };
+                if header.group_id == 0 {
+                    return RpcEnvelope::CanonicalError(invalid_header_canonical(
+                        "invalid response header: group_id must be non-zero",
+                    ));
+                }
+                let header = match ResponseHeader::try_from(header.clone()) {
+                    Ok(header) => header,
+                    Err(err) => {
+                        return RpcEnvelope::CanonicalError(invalid_header_canonical(format!(
+                            "invalid response header: {err}"
+                        )));
+                    }
+                };
+                match header.canonical_error {
+                    None => RpcEnvelope::Ok,
+                    Some(canonical) if matches!(canonical.class, ErrorClass::Ok) => RpcEnvelope::Ok,
+                    Some(canonical) => RpcEnvelope::CanonicalError(canonical),
+                }
+            }
+        }
+    }
 
     #[test]
     fn validate_ok_header_returns_ok() {
@@ -507,6 +311,60 @@ mod tests {
                 assert_eq!(hint.mount_epoch, Some(12));
                 assert_eq!(returned.reason, canonical.reason);
                 assert_eq!(returned.code, canonical.code);
+            }
+            _ => panic!("expected Refresh action"),
+        }
+    }
+
+    #[test]
+    fn validate_need_refresh_preserves_full_refresh_hint_fields() {
+        let canonical = CanonicalError::need_refresh_with_hint(
+            RpcErrorCode::ShardMoved,
+            RefreshReason::Moved,
+            CanonicalRefreshHint {
+                leader_endpoint: Some("http://127.0.0.1:18081".to_string()),
+                group_id: Some(17),
+                mount_epoch: Some(31),
+                mount_prefix: Some("/mnt".to_string()),
+                route_epoch: Some(23),
+                worker_epoch: Some(47),
+                worker_endpoints: vec![
+                    WorkerEndpointHint {
+                        worker_id: 5,
+                        endpoint: "127.0.0.1:9005".to_string(),
+                        worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+                        worker_epoch: 47,
+                    },
+                    WorkerEndpointHint {
+                        worker_id: 6,
+                        endpoint: "127.0.0.1:9006".to_string(),
+                        worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+                        worker_epoch: 48,
+                    },
+                ],
+                worker_resolve_required: true,
+            },
+            "route moved",
+        );
+        let mut header = ResponseHeader::error(ClientInfo::new(types::ClientId::new(1)), canonical);
+        header.group_id = Some(99);
+        header.mount_epoch = Some(111);
+        header.route_epoch = Some(222);
+
+        let result = validate_header_or_action(&header);
+
+        match result {
+            Err(ClientAction::Refresh { hint, .. }) => {
+                assert_eq!(hint.leader_endpoint.as_deref(), Some("http://127.0.0.1:18081"));
+                assert_eq!(hint.group_id, Some(17));
+                assert_eq!(hint.mount_epoch, Some(31));
+                assert_eq!(hint.mount_prefix.as_deref(), Some("/mnt"));
+                assert_eq!(hint.route_epoch, Some(23));
+                assert_eq!(hint.worker_epoch, Some(47));
+                assert!(hint.worker_resolve_required);
+                assert_eq!(hint.worker_endpoints.len(), 2);
+                assert_eq!(hint.worker_endpoints[0].endpoint, "127.0.0.1:9005");
+                assert_eq!(hint.worker_endpoints[1].endpoint, "127.0.0.1:9006");
             }
             _ => panic!("expected Refresh action"),
         }
@@ -570,7 +428,7 @@ mod tests {
             }),
             error: Some(canonical_to_error_detail(&canonical)),
             state: Vec::new(),
-            group_id: 0,
+            group_id: 7,
             mount_epoch: None,
             route_epoch: None,
         };
@@ -597,44 +455,49 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn retry_loop_retries_transient_transport_without_refresh_dispatch() {
-        let mut calls = 0usize;
-        let mut refresh_dispatch_calls = 0usize;
-        let header = RequestHeader::new(types::ClientId::new(1));
+    #[test]
+    fn parse_rpc_envelope_malformed_ok_header_is_fatal_canonical() {
+        let malformed = proto::common::ResponseHeaderProto::default();
 
-        let mut call = |hdr: RequestHeader| {
-            let _ = hdr;
-            calls += 1;
-            async move {
-                if calls == 1 {
-                    Err(ClientError::from(tonic::Status::unavailable("temporary outage")))
-                } else {
-                    Ok((ResponseHeader::ok(ClientInfo::new(types::ClientId::new(1))), ()))
-                }
+        match parse_rpc_envelope(Ok(()), Some(&malformed)) {
+            RpcEnvelope::CanonicalError(err) => {
+                assert_eq!(err.class, ErrorClass::Fatal);
+                assert!(matches!(
+                    err.code,
+                    Some(CanonicalErrorCode::RpcCode(RpcErrorCode::InvalidHeader))
+                ));
+                assert!(err.message.contains("invalid response header"));
             }
+            _ => panic!("expected fatal canonical envelope"),
+        }
+    }
+
+    #[test]
+    fn parse_rpc_envelope_zero_group_id_ok_header_is_fatal_canonical() {
+        const INVALID_GROUP_ID: u64 = 0;
+        let header = proto::common::ResponseHeaderProto {
+            client: Some(proto::common::ClientInfoProto {
+                call_id: types::CallId::new().to_string(),
+                client_id: 7,
+                client_name: "test".to_string(),
+            }),
+            error: None,
+            state: Vec::new(),
+            group_id: INVALID_GROUP_ID,
+            mount_epoch: None,
+            route_epoch: None,
         };
 
-        let mut dispatch_refresh = |ctx: RefreshDispatchContext, req: RequestHeader| {
-            let _ = (ctx, req);
-            refresh_dispatch_calls += 1;
-            async move { Ok(RequestHeader::new(types::ClientId::new(1))) }
-        };
-
-        let policy = RetryPolicy {
-            max_refresh_attempts: 1,
-            max_retryable_attempts: 1,
-            max_transport_retries: 1,
-            transport_retry_base_ms: 0,
-        };
-
-        let outcome = retry_metadata_with_policy(header, &mut call, &mut dispatch_refresh, policy)
-            .await
-            .expect("retry succeeds");
-        assert_eq!(calls, 2);
-        assert_eq!(refresh_dispatch_calls, 0);
-        assert_eq!(outcome.transport_retries, 1);
-        assert_eq!(outcome.refreshes, 0);
-        assert_eq!(outcome.retries, 0);
+        match parse_rpc_envelope(Ok(()), Some(&header)) {
+            RpcEnvelope::CanonicalError(err) => {
+                assert_eq!(err.class, ErrorClass::Fatal);
+                assert!(matches!(
+                    err.code,
+                    Some(CanonicalErrorCode::RpcCode(RpcErrorCode::InvalidHeader))
+                ));
+                assert!(err.message.contains("group_id"));
+            }
+            _ => panic!("expected fatal canonical envelope"),
+        }
     }
 }

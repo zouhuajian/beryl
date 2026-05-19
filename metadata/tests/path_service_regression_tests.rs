@@ -423,7 +423,7 @@ fn put_extent_file(
             block_offset: 0,
             len,
             file_version: Some(1),
-            block_stamp: None,
+            block_stamp: Some(1),
         }];
         *file_version = Some(1);
         *lease_epoch = Some(1);
@@ -838,7 +838,7 @@ async fn get_locations_rejects_stale_handle() {
             block_offset: 0,
             len: 128,
             file_version: Some(4),
-            block_stamp: None,
+            block_stamp: Some(4),
         }],
         file_version: Some(4),
         lease_epoch: Some(4),
@@ -899,7 +899,7 @@ async fn get_locations_accepts_current_handle() {
             block_offset: 0,
             len: 128,
             file_version: Some(4),
-            block_stamp: None,
+            block_stamp: Some(4),
         }],
         file_version: Some(4),
         lease_epoch: Some(4),
@@ -938,6 +938,7 @@ async fn get_locations_accepts_current_handle() {
     );
     assert_eq!(response.file_version, Some(4));
     assert_eq!(response.locations.len(), 1);
+    assert_eq!(response.locations[0].block_stamp, Some(4));
     assert_eq!(
         response.locations[0]
             .block_id
@@ -966,7 +967,7 @@ async fn get_locations_by_path_uses_current_handle() {
             block_offset: 0,
             len: 128,
             file_version: Some(8),
-            block_stamp: None,
+            block_stamp: Some(8),
         }],
         file_version: Some(8),
         lease_epoch: Some(8),
@@ -1124,12 +1125,31 @@ async fn commit_file_public_replay_returns_persisted_result_and_rejects_fingerpr
     assert_success_header(first.header);
     assert_eq!(first.committed_size, 128);
     let first_file_version = first.file_version.expect("first file version");
+    assert_ne!(first_file_version, 0);
     assert!(env.write_session_manager.get_session(write_handle.handle_id).is_none());
     let typed_block_id = BlockId::new(
         DataHandleId::new(block_id.data_handle_id),
         BlockIndex::new(block_id.block_index),
     );
     assert_eq!(env.storage.get_block_ref_count(typed_block_id).unwrap(), Some(1));
+
+    let locations = FileSystemServiceProto::get_block_locations(
+        &env.service,
+        Request::new(GetBlockLocationsRequestProto {
+            header: header(33),
+            target: Some(get_block_locations_request_proto::Target::DataHandleId(
+                DataHandleIdProto { value: data_handle_id },
+            )),
+            range: Some(proto::common::ByteRangeProto { offset: 0, len: 128 }),
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+    assert_success_header(locations.header);
+    assert_eq!(locations.file_version, Some(first_file_version));
+    assert_eq!(locations.locations.len(), 1);
+    assert_eq!(locations.locations[0].block_stamp, Some(first_file_version));
 
     let second = FileSystemServiceProto::commit_file(
         &env.service,
@@ -1163,6 +1183,7 @@ async fn commit_file_public_replay_returns_persisted_result_and_rejects_fingerpr
             assert_eq!(extents.len(), 1);
             assert_eq!(extents[0].block_id, typed_block_id);
             assert_eq!(extents[0].len, 128);
+            assert_eq!(extents[0].block_stamp, Some(first_file_version));
         }
         other => panic!("expected file inode data, got {:?}", other),
     }

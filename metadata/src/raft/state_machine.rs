@@ -1913,6 +1913,9 @@ impl AppRaftStateMachine {
             // Update inode: publish extents and update size/mtime/ctime/file_version/lease_epoch.
             for extent in &mut ordered_extents {
                 extent.file_version = Some(file_version);
+                // The Raft apply boundary assigns the metadata-authoritative
+                // stamp that direct readers must present to workers.
+                extent.block_stamp = Some(file_version);
             }
             match &mut inode.data {
                 types::fs::InodeData::File {

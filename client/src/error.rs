@@ -10,6 +10,35 @@ use common::{CommonError, CommonErrorCode};
 use proto::common::RpcErrorCodeProto as ProtoErrorCode;
 use thiserror::Error;
 
+/// Opaque structured action error derived from RPC header validation.
+pub struct ClientActionError {
+    action: Box<ClientAction>,
+}
+
+impl ClientActionError {
+    pub(crate) fn new(action: ClientAction) -> Self {
+        Self {
+            action: Box::new(action),
+        }
+    }
+
+    pub(crate) fn into_action(self) -> ClientAction {
+        *self.action
+    }
+}
+
+impl AsRef<ClientAction> for ClientActionError {
+    fn as_ref(&self) -> &ClientAction {
+        self.action.as_ref()
+    }
+}
+
+impl std::fmt::Debug for ClientActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClientActionError")
+    }
+}
+
 /// Client-specific error type.
 #[derive(Error, Debug)]
 pub enum ClientError {
@@ -21,9 +50,32 @@ pub enum ClientError {
     #[error("Metadata error: {0}")]
     Metadata(String),
 
+    /// Client configuration error.
+    #[error("Config error: {0}")]
+    Config(String),
+
+    /// Invalid client argument or server-advertised protocol value.
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+
+    /// Stale public file handle.
+    #[error("Stale handle: {reason}")]
+    StaleHandle {
+        /// Reason the handle is stale.
+        reason: String,
+    },
+
+    /// Invalid metadata layout returned for a read.
+    #[error("Invalid layout: {0}")]
+    InvalidLayout(String),
+
     /// Worker service error.
     #[error("Worker error: {0}")]
     Worker(String),
+
+    /// Operation result may have committed, but the client cannot prove it.
+    #[error("Unknown outcome: {0}")]
+    UnknownOutcome(String),
 
     /// Cache error.
     #[error("Cache error: {0}")]
@@ -67,30 +119,47 @@ pub enum ClientError {
     #[error("Unimplemented: {0}")]
     Unimplemented(String),
 
+    /// Unsupported operation or protocol for the current implementation.
+    #[error("Unsupported: {0}")]
+    Unsupported(String),
+
     /// Unsupported operation for the current MVP contract.
     #[error("Not supported: {0}")]
     NotSupported(String),
 
     /// Structured action error derived from canonical/header validation.
-    #[error("Client action: {0:?}")]
-    Action(Box<ClientAction>),
+    #[error("Client action error")]
+    Action(ClientActionError),
 }
 
 /// Result type alias for client operations.
 pub type ClientResult<T> = Result<T, ClientError>;
+
+pub(crate) fn side_effect_response_body_mismatch(operation: &str, detail: impl std::fmt::Display) -> ClientError {
+    ClientError::UnknownOutcome(format!("{operation} response body mismatch after OK header: {detail}"))
+}
 
 impl ClientError {
     /// Check if this error is retryable.
     pub fn is_retryable(&self) -> bool {
         match self {
             ClientError::Common(e) => e.is_retryable(),
-            ClientError::Metadata(_) => true,
-            ClientError::Worker(_) => true,
-            ClientError::Routing(_) => true,
+            ClientError::Metadata(_) => false,
+            ClientError::Worker(_) => false,
+            ClientError::UnknownOutcome(_) => false,
+            ClientError::Routing(_) => false,
             ClientError::NotLeader(_) => true,
             ClientError::RouteEpochMismatch { .. } => true,
             ClientError::StaleMeta(_) => true,
             ClientError::Action(action) => match action.as_ref() {
+                ClientAction::Refresh {
+                    reason:
+                        common::error::canonical::RefreshReason::Fencing
+                        | common::error::canonical::RefreshReason::EpochMismatch
+                        | common::error::canonical::RefreshReason::SessionInvalid
+                        | common::error::canonical::RefreshReason::SessionExpired,
+                    ..
+                } => false,
                 ClientAction::Retry { .. } | ClientAction::Refresh { .. } => true,
                 ClientAction::TransportFail { status } => {
                     matches!(
@@ -104,7 +173,12 @@ impl ClientError {
             ClientError::Cache(_) => false,
             ClientError::Moved(_) => false,
             ClientError::Unimplemented(_) => false,
+            ClientError::Unsupported(_) => false,
             ClientError::NotSupported(_) => false,
+            ClientError::Config(_) => false,
+            ClientError::InvalidArgument(_) => false,
+            ClientError::StaleHandle { .. } => false,
+            ClientError::InvalidLayout(_) => false,
         }
     }
 
@@ -129,14 +203,6 @@ impl ClientError {
             _ => None,
         }
     }
-
-    /// Extract action if this error is action-based.
-    pub fn action(&self) -> Option<&ClientAction> {
-        match self {
-            ClientError::Action(action) => Some(action.as_ref()),
-            _ => None,
-        }
-    }
 }
 
 /// Convert proto ErrorCode to ClientError.
@@ -153,15 +219,15 @@ impl From<ProtoErrorCode> for ClientError {
             14 => ClientError::VersionMismatch { expected: 0, actual: 0 },
             15 => ClientError::Moved("Resource moved".to_string()),
             16 => ClientError::Unimplemented("Feature not implemented".to_string()),
-            17 => ClientError::Action(Box::new(ClientAction::Refresh {
+            17 => ClientError::from(ClientAction::Refresh {
                 reason: RefreshReason::StaleState,
-                hint: Default::default(),
+                hint: Box::default(),
                 canonical: Box::new(CanonicalError::need_refresh(
                     RpcErrorCode::StaleState,
                     RefreshReason::StaleState,
                     "Need refresh",
                 )),
-            })),
+            }),
             1 => ClientError::Common(CommonError::new(CommonErrorCode::Timeout, "Timeout")),
             2 => ClientError::Common(CommonError::new(CommonErrorCode::Unavailable, "Unavailable")),
             3 => ClientError::Common(CommonError::new(CommonErrorCode::Throttled, "Throttled")),
@@ -181,9 +247,9 @@ impl From<ProtoErrorCode> for ClientError {
 /// Convert tonic::Status to ClientError.
 impl From<tonic::Status> for ClientError {
     fn from(status: tonic::Status) -> Self {
-        ClientError::Action(Box::new(ClientAction::TransportFail {
+        ClientError::from(ClientAction::TransportFail {
             status: Box::new(status),
-        }))
+        })
     }
 }
 
@@ -213,7 +279,7 @@ impl From<ClientError> for CanonicalError {
                 message: format!("version mismatch: expected {}, got {}", expected, actual),
                 refresh_hint: None,
             },
-            ClientError::Action(action) => match *action {
+            ClientError::Action(action) => match action.into_action() {
                 ClientAction::Ok => CanonicalError::ok("ok"),
                 ClientAction::Refresh { canonical, .. }
                 | ClientAction::Retry { canonical, .. }
@@ -245,16 +311,29 @@ impl From<ClientError> for CanonicalError {
             ClientError::Metadata(msg) | ClientError::Worker(msg) | ClientError::Routing(msg) => {
                 CanonicalError::retryable(RpcErrorCode::Application, Some(1000), msg)
             }
-            ClientError::Cache(msg) | ClientError::Unimplemented(msg) | ClientError::NotSupported(msg) => {
-                CanonicalError {
-                    class: ErrorClass::Fatal,
-                    code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                    reason: None,
-                    retry_after_ms: None,
-                    message: msg,
-                    refresh_hint: None,
-                }
-            }
+            ClientError::Cache(msg)
+            | ClientError::Config(msg)
+            | ClientError::InvalidArgument(msg)
+            | ClientError::InvalidLayout(msg)
+            | ClientError::UnknownOutcome(msg)
+            | ClientError::Unimplemented(msg)
+            | ClientError::Unsupported(msg)
+            | ClientError::NotSupported(msg) => CanonicalError {
+                class: ErrorClass::Fatal,
+                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
+                reason: None,
+                retry_after_ms: None,
+                message: msg,
+                refresh_hint: None,
+            },
+            ClientError::StaleHandle { reason } => CanonicalError {
+                class: ErrorClass::Fatal,
+                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
+                reason: None,
+                retry_after_ms: None,
+                message: reason,
+                refresh_hint: None,
+            },
         }
     }
 }

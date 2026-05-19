@@ -181,7 +181,8 @@ pub struct Extent {
     /// File version for the committed file state that owns this extent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_version: Option<u64>,
-    /// Block stamp (optional, for direct read validation).
+    /// Metadata-assigned block stamp for direct read validation.
+    /// Readable committed extents must carry a non-zero value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_stamp: Option<u64>,
 }

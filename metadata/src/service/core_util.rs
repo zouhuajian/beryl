@@ -503,6 +503,8 @@ pub fn write_target_to_proto(target: &WriteTarget) -> proto::metadata::WriteTarg
         len: target.len,
         worker_endpoints: target.worker_endpoints.iter().map(worker_hint_to_proto).collect(),
         fencing_token: Some(fencing_to_proto(target.fencing_token)),
+        block_stamp: target.block_stamp,
+        chunk_size: target.chunk_size,
     }
 }
 
@@ -516,6 +518,7 @@ pub fn location_to_proto(location: &FileBlockLocation) -> proto::metadata::FileB
         len: location.len,
         workers: location.workers.iter().map(worker_hint_to_proto).collect(),
         worker_epoch: location.worker_epoch,
+        block_stamp: Some(location.block_stamp),
     }
 }
 

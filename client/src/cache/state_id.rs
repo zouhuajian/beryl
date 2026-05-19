@@ -38,6 +38,7 @@ impl CachedWatermark {
 }
 
 /// State ID cache per group.
+#[derive(Clone, Debug)]
 pub struct StateIdCache {
     /// Watermark map: group_id -> CachedWatermark.
     cache: Arc<RwLock<DashMap<ShardGroupId, CachedWatermark>>>,
@@ -67,12 +68,6 @@ impl StateIdCache {
         })
     }
 
-    /// Update the cached watermark for a group.
-    pub fn put(&self, watermark: GroupStateWatermark) {
-        let cache = self.cache.write();
-        cache.insert(watermark.group_id, CachedWatermark::new(watermark));
-    }
-
     /// Update the cached watermark for a group if the new watermark is ahead.
     /// This ensures we only advance the watermark, never go backwards.
     pub fn update_if_ahead(&self, new_watermark: GroupStateWatermark) {
@@ -90,41 +85,6 @@ impl StateIdCache {
             cache.insert(new_watermark.group_id, CachedWatermark::new(new_watermark));
         }
     }
-
-    /// Merge a response state vector without rolling back any group.
-    pub fn merge_if_ahead<I>(&self, watermarks: I)
-    where
-        I: IntoIterator<Item = GroupStateWatermark>,
-    {
-        for watermark in watermarks {
-            self.update_if_ahead(watermark);
-        }
-    }
-
-    /// Compare a watermark with the cached one for the same group.
-    /// Returns:
-    /// - Some(true) if cached watermark >= provided watermark (safe to read)
-    /// - Some(false) if cached watermark < provided watermark (stale, need sync)
-    /// - None if no cached watermark for this group or different groups
-    pub fn compare(&self, watermark: &GroupStateWatermark) -> Option<bool> {
-        self.get(&watermark.group_id).and_then(|cached| {
-            cached
-                .cmp_same_group(watermark)
-                .map(|ord| ord != std::cmp::Ordering::Less)
-        })
-    }
-
-    /// Invalidate the cached watermark for a group.
-    pub fn invalidate(&self, group_id: &ShardGroupId) {
-        let cache = self.cache.write();
-        cache.remove(group_id);
-    }
-
-    /// Clear all cached watermarks.
-    pub fn clear(&self) {
-        let cache = self.cache.write();
-        cache.clear();
-    }
 }
 
 #[cfg(test)]
@@ -138,12 +98,10 @@ mod tests {
         let group_a = ShardGroupId::new(10);
         let group_b = ShardGroupId::new(20);
 
-        cache.merge_if_ahead(vec![
-            GroupStateWatermark::new(group_a, RaftLogId::new(1, 1, 10)),
-            GroupStateWatermark::new(group_b, RaftLogId::new(1, 1, 5)),
-        ]);
-        cache.merge_if_ahead(vec![GroupStateWatermark::new(group_a, RaftLogId::new(1, 1, 8))]);
-        cache.merge_if_ahead(vec![GroupStateWatermark::new(group_b, RaftLogId::new(1, 1, 6))]);
+        cache.update_if_ahead(GroupStateWatermark::new(group_a, RaftLogId::new(1, 1, 10)));
+        cache.update_if_ahead(GroupStateWatermark::new(group_b, RaftLogId::new(1, 1, 5)));
+        cache.update_if_ahead(GroupStateWatermark::new(group_a, RaftLogId::new(1, 1, 8)));
+        cache.update_if_ahead(GroupStateWatermark::new(group_b, RaftLogId::new(1, 1, 6)));
 
         assert_eq!(cache.get(&group_a).unwrap().state_id, RaftLogId::new(1, 1, 10));
         assert_eq!(cache.get(&group_b).unwrap().state_id, RaftLogId::new(1, 1, 6));

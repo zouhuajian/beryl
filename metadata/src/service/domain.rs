@@ -60,6 +60,8 @@ pub struct WriteTarget {
     pub len: u64,
     pub worker_endpoints: Vec<WorkerHint>,
     pub fencing_token: FencingToken,
+    pub block_stamp: u64,
+    pub chunk_size: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +88,7 @@ pub struct FileBlockLocation {
     pub block_id: BlockId,
     pub file_offset: u64,
     pub len: u64,
+    pub block_stamp: u64,
     pub workers: Vec<WorkerHint>,
     pub worker_epoch: Option<u64>,
 }

@@ -1,0 +1,405 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Vecton Contributors
+
+//! Stable logical operation and per-attempt request context.
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+use proto::common::{ClientInfoProto, RequestHeaderProto};
+use proto::worker::DataRequestHeaderProto;
+use types::{CallId, ClientId};
+
+use crate::error::{ClientError, ClientResult};
+use crate::runtime::policy::{OperationKind, ReplaySafety};
+
+/// Stable operation fingerprint used to guard replay of mutations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OperationFingerprint(u64);
+
+/// Stable identity fields that define one logical public operation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct OperationIdentity {
+    original_target_path: Option<String>,
+    secondary_target_path: Option<String>,
+    detail: Option<String>,
+    session_identity: Option<String>,
+}
+
+impl OperationIdentity {
+    /// Identity for a path-targeted operation.
+    pub fn path(path: impl Into<String>) -> Self {
+        Self {
+            original_target_path: Some(path.into()),
+            secondary_target_path: None,
+            detail: None,
+            session_identity: None,
+        }
+    }
+
+    /// Identity for a two-path operation such as rename.
+    pub fn path_pair(src: impl Into<String>, dst: impl Into<String>) -> Self {
+        Self {
+            original_target_path: Some(src.into()),
+            secondary_target_path: Some(dst.into()),
+            detail: None,
+            session_identity: None,
+        }
+    }
+
+    /// Identity for a session-scoped operation.
+    pub(crate) fn session(path: impl Into<String>, session_identity: impl Into<String>) -> Self {
+        Self {
+            original_target_path: Some(path.into()),
+            secondary_target_path: None,
+            detail: None,
+            session_identity: Some(session_identity.into()),
+        }
+    }
+
+    /// Attach an operation-specific stable detail.
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// Compute the replay fingerprint for this identity.
+    pub fn fingerprint(&self, kind: OperationKind, operation_name: &str) -> OperationFingerprint {
+        let mut hasher = DefaultHasher::new();
+        kind.hash(&mut hasher);
+        operation_name.hash(&mut hasher);
+        self.hash(&mut hasher);
+        OperationFingerprint(hasher.finish())
+    }
+
+    /// Original path used by this operation, if any.
+    pub fn original_target_path(&self) -> Option<&str> {
+        self.original_target_path.as_deref()
+    }
+
+    /// Return true when this operation has stable session identity.
+    fn has_session_identity(&self) -> bool {
+        self.session_identity.is_some()
+    }
+}
+
+/// Stable context for one logical public operation.
+#[derive(Clone, Debug)]
+pub struct OperationContext {
+    client_id: ClientId,
+    call_id: CallId,
+    kind: OperationKind,
+    operation_name: String,
+    replay_safety: ReplaySafety,
+    operation_fingerprint: OperationFingerprint,
+    identity: OperationIdentity,
+}
+
+impl OperationContext {
+    /// Create a new logical operation with a fresh call id.
+    pub fn new(
+        client_id: ClientId,
+        kind: OperationKind,
+        operation_name: impl Into<String>,
+        identity: OperationIdentity,
+    ) -> ClientResult<Self> {
+        Self::with_call_id(client_id, CallId::new(), kind, operation_name, identity)
+    }
+
+    /// Create a logical operation with an explicit call id.
+    pub fn with_call_id(
+        client_id: ClientId,
+        call_id: CallId,
+        kind: OperationKind,
+        operation_name: impl Into<String>,
+        identity: OperationIdentity,
+    ) -> ClientResult<Self> {
+        validate_client_id(client_id)?;
+        let operation_name = operation_name.into();
+        let replay_safety = crate::runtime::policy::ReplayPolicyTable::safety_for(kind);
+        let operation_fingerprint = identity.fingerprint(kind, &operation_name);
+        Ok(Self {
+            client_id,
+            call_id,
+            kind,
+            operation_name,
+            replay_safety,
+            operation_fingerprint,
+            identity,
+        })
+    }
+
+    /// Create a logical operation with an explicit call id and expected fingerprint.
+    pub(crate) fn with_call_id_and_fingerprint(
+        client_id: ClientId,
+        call_id: CallId,
+        kind: OperationKind,
+        operation_name: impl Into<String>,
+        identity: OperationIdentity,
+        expected_fingerprint: OperationFingerprint,
+    ) -> ClientResult<Self> {
+        let operation = Self::with_call_id(client_id, call_id, kind, operation_name, identity)?;
+        if operation.operation_fingerprint != expected_fingerprint {
+            return Err(ClientError::InvalidArgument(
+                "operation fingerprint changed for stable call_id".to_string(),
+            ));
+        }
+        Ok(operation)
+    }
+
+    /// Logical operation kind.
+    pub fn kind(&self) -> OperationKind {
+        self.kind
+    }
+
+    /// Human readable operation name.
+    pub fn operation_name(&self) -> &str {
+        &self.operation_name
+    }
+
+    /// Replay safety required for this operation.
+    pub fn replay_safety(&self) -> ReplaySafety {
+        self.replay_safety
+    }
+
+    /// Stable operation fingerprint.
+    pub fn operation_fingerprint(&self) -> OperationFingerprint {
+        self.operation_fingerprint
+    }
+
+    /// Original target path, if present.
+    pub fn original_target_path(&self) -> Option<&str> {
+        self.identity.original_target_path()
+    }
+
+    /// Return true when replay is tied to a stable session identity.
+    pub(crate) fn has_session_identity(&self) -> bool {
+        self.identity.has_session_identity()
+    }
+}
+
+/// Per-attempt context shared by metadata and worker adapters.
+#[derive(Clone, Debug)]
+pub struct AttemptContext {
+    operation: OperationContext,
+    call_id_text: String,
+    group_id: Option<u64>,
+    metadata_endpoint: Option<String>,
+    attempt_number: u32,
+    mount_epoch: Option<u64>,
+    route_epoch: Option<u64>,
+    state: Vec<proto::common::GroupStateWatermarkProto>,
+    deadline_ms: i64,
+}
+
+impl AttemptContext {
+    /// Create a metadata context and require an explicit non-zero group id.
+    pub fn for_metadata(operation: &OperationContext, group_id: u64, attempt_number: u32) -> ClientResult<Self> {
+        if group_id == 0 {
+            return Err(ClientError::InvalidArgument(
+                "metadata AttemptContext requires non-zero group_id".to_string(),
+            ));
+        }
+        validate_client_id(operation.client_id)?;
+        Ok(Self {
+            call_id_text: operation.call_id.to_string(),
+            operation: operation.clone(),
+            group_id: Some(group_id),
+            metadata_endpoint: None,
+            attempt_number,
+            mount_epoch: None,
+            route_epoch: None,
+            state: Vec::new(),
+            deadline_ms: 0,
+        })
+    }
+
+    /// Create a data-plane context. Data RPCs carry block ownership in their operation payload.
+    pub fn for_data(operation: &OperationContext, attempt_number: u32) -> Self {
+        Self {
+            call_id_text: operation.call_id.to_string(),
+            operation: operation.clone(),
+            group_id: None,
+            metadata_endpoint: None,
+            attempt_number,
+            mount_epoch: None,
+            route_epoch: None,
+            state: Vec::new(),
+            deadline_ms: 0,
+        }
+    }
+
+    /// Attach selected metadata endpoint for this attempt.
+    pub fn with_metadata_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.metadata_endpoint = Some(endpoint.into());
+        self
+    }
+
+    /// Attach known mount epoch.
+    pub fn with_mount_epoch(mut self, mount_epoch: u64) -> Self {
+        self.mount_epoch = Some(mount_epoch);
+        self
+    }
+
+    /// Attach known route epoch.
+    pub fn with_route_epoch(mut self, route_epoch: u64) -> Self {
+        self.route_epoch = Some(route_epoch);
+        self
+    }
+
+    /// Attach group-scoped state watermarks.
+    pub fn with_state(mut self, state: Vec<proto::common::GroupStateWatermarkProto>) -> Self {
+        self.state = state;
+        self
+    }
+
+    /// Return the stable logical call id.
+    pub fn call_id(&self) -> &str {
+        &self.call_id_text
+    }
+
+    /// Return the stable logical operation fingerprint.
+    pub(crate) fn operation_fingerprint(&self) -> OperationFingerprint {
+        self.operation.operation_fingerprint()
+    }
+
+    /// Return the selected metadata endpoint for this attempt.
+    pub fn metadata_endpoint(&self) -> Option<&str> {
+        self.metadata_endpoint.as_deref()
+    }
+
+    /// Build common client info for request headers.
+    pub fn client_info(&self) -> ClientInfoProto {
+        ClientInfoProto {
+            call_id: self.call_id_text.clone(),
+            client_id: self.operation.client_id.as_raw(),
+            client_name: String::new(),
+        }
+    }
+
+    /// Build a metadata request header for this attempt.
+    pub fn metadata_header(&self) -> ClientResult<RequestHeaderProto> {
+        let group_id = self
+            .group_id
+            .ok_or_else(|| ClientError::InvalidArgument("metadata AttemptContext missing group_id".to_string()))?;
+        if group_id == 0 {
+            return Err(ClientError::InvalidArgument(
+                "metadata AttemptContext requires non-zero group_id".to_string(),
+            ));
+        }
+        if self.operation.client_id.as_raw() == 0 {
+            return Err(ClientError::InvalidArgument(
+                "metadata AttemptContext requires non-zero client_id".to_string(),
+            ));
+        }
+        Ok(RequestHeaderProto {
+            client: Some(self.client_info()),
+            group_id,
+            mount_epoch: self.mount_epoch,
+            deadline_ms: self.deadline_ms,
+            traceparent: self.call_id_text.clone(),
+            caller_context: None,
+            state: self.state.clone(),
+            retry_count: self.attempt_number as i32,
+            route_epoch: self.route_epoch,
+            principal: String::new(),
+            real_user: String::new(),
+            doas: String::new(),
+            authn_type: 0,
+        })
+    }
+
+    /// Build a worker data-plane request header for this attempt.
+    pub fn data_header(&self) -> DataRequestHeaderProto {
+        DataRequestHeaderProto {
+            client: Some(self.client_info()),
+            traceparent: self.call_id_text.clone(),
+        }
+    }
+}
+
+fn validate_client_id(client_id: ClientId) -> ClientResult<()> {
+    if client_id.as_raw() == 0 {
+        Err(ClientError::InvalidArgument(
+            "AttemptContext requires non-zero client_id".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use types::{CallId, ClientId};
+
+    fn metadata_operation() -> OperationContext {
+        OperationContext::new(
+            ClientId::new(7),
+            OperationKind::MetadataRead,
+            "OpenFile",
+            OperationIdentity::path("/alpha"),
+        )
+        .expect("operation context")
+    }
+
+    #[test]
+    fn operation_context_uses_stable_call_id() {
+        let call_id = CallId::new();
+        let operation = OperationContext::with_call_id(
+            ClientId::new(7),
+            call_id,
+            OperationKind::MetadataRead,
+            "OpenFile",
+            OperationIdentity::path("/alpha"),
+        )
+        .expect("operation context");
+
+        assert_eq!(operation.call_id, call_id);
+        assert_eq!(
+            operation.operation_fingerprint,
+            OperationIdentity::path("/alpha").fingerprint(OperationKind::MetadataRead, "OpenFile")
+        );
+    }
+
+    #[test]
+    fn attempt_context_rejects_zero_client_id() {
+        let invalid_operation = OperationContext {
+            client_id: ClientId::new(0),
+            call_id: CallId::new(),
+            kind: OperationKind::MetadataRead,
+            operation_name: "OpenFile".to_string(),
+            replay_safety: ReplaySafety::Idempotent,
+            operation_fingerprint: OperationIdentity::path("/alpha")
+                .fingerprint(OperationKind::MetadataRead, "OpenFile"),
+            identity: OperationIdentity::path("/alpha"),
+        };
+
+        let err = AttemptContext::for_metadata(&invalid_operation, 9, 0)
+            .expect_err("metadata attempt must reject zero client_id");
+
+        assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("client_id")));
+    }
+
+    #[test]
+    fn attempt_context_rejects_zero_group_id() {
+        let operation = metadata_operation();
+
+        let err =
+            AttemptContext::for_metadata(&operation, 0, 0).expect_err("metadata attempt must reject zero group_id");
+
+        assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("group_id")));
+    }
+
+    #[test]
+    fn replay_attempt_preserves_call_id() {
+        let operation = metadata_operation();
+        let first = AttemptContext::for_metadata(&operation, 9, 0).expect("first attempt");
+        let replay = AttemptContext::for_metadata(&operation, 11, 1).expect("replay attempt");
+
+        assert_eq!(first.call_id(), replay.call_id());
+        assert_eq!(first.metadata_header().expect("first header").group_id, 9);
+        assert_eq!(replay.metadata_header().expect("replay header").group_id, 11);
+    }
+}

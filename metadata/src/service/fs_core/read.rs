@@ -361,35 +361,63 @@ impl FsCore {
         };
 
         let worker_manager = self.worker_manager.as_ref();
-        let locations: Vec<FileBlockLocation> = filtered_extents
-            .iter()
-            .map(|extent| {
-                let mut workers = Vec::new();
-                if let Some(worker_manager) = worker_manager {
-                    let mut worker_ids = worker_manager.get_block_locations(extent.block_id);
-                    worker_ids.sort_by_key(|worker_id| worker_id.as_raw());
-                    workers.reserve(worker_ids.len());
-                    for worker_id in worker_ids {
-                        if let Some(descriptor) = worker_manager.get_descriptor(worker_id) {
-                            workers.push(WorkerHint {
-                                worker_id,
-                                endpoint: descriptor.address,
-                                worker_net_protocol: descriptor.worker_net_protocol,
-                                worker_epoch: descriptor.worker_epoch,
-                            });
-                        }
+        let mut locations = Vec::with_capacity(filtered_extents.len());
+        for extent in &filtered_extents {
+            let block_stamp = match extent.block_stamp {
+                Some(stamp) => {
+                    if stamp == 0 {
+                        return self.failure_from_error_with_route_epoch(
+                            &req.ctx,
+                            MetadataError::InvalidArgument(format!(
+                                "extent {} at file_offset {} has zero block_stamp",
+                                extent.block_id, extent.file_offset
+                            )),
+                            group_id,
+                            mount_epoch,
+                            route_epoch,
+                        );
+                    }
+                    stamp
+                }
+                None => {
+                    return self.failure_from_error_with_route_epoch(
+                        &req.ctx,
+                        MetadataError::InvalidArgument(format!(
+                            "extent {} at file_offset {} missing block_stamp",
+                            extent.block_id, extent.file_offset
+                        )),
+                        group_id,
+                        mount_epoch,
+                        route_epoch,
+                    );
+                }
+            };
+            let mut workers = Vec::new();
+            if let Some(worker_manager) = worker_manager {
+                let mut worker_ids = worker_manager.get_block_locations(extent.block_id);
+                worker_ids.sort_by_key(|worker_id| worker_id.as_raw());
+                workers.reserve(worker_ids.len());
+                for worker_id in worker_ids {
+                    if let Some(descriptor) = worker_manager.get_descriptor(worker_id) {
+                        workers.push(WorkerHint {
+                            worker_id,
+                            endpoint: descriptor.address,
+                            worker_net_protocol: descriptor.worker_net_protocol,
+                            worker_epoch: descriptor.worker_epoch,
+                        });
                     }
                 }
-                let worker_epoch = workers.iter().map(|worker| worker.worker_epoch).max();
-                FileBlockLocation {
-                    block_id: extent.block_id,
-                    file_offset: extent.file_offset,
-                    len: extent.len,
-                    workers,
-                    worker_epoch,
-                }
-            })
-            .collect();
+            }
+            let worker_epoch = workers.iter().map(|worker| worker.worker_epoch).max();
+            locations.push(FileBlockLocation {
+                block_id: extent.block_id,
+                file_offset: extent.file_offset,
+                len: extent.len,
+                block_stamp,
+                workers,
+                worker_epoch,
+            });
+        }
 
         self.success_with_route_epoch(
             &req.ctx,

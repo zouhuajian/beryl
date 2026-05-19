@@ -1,44 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Vecton Client Library
+//! Vecton filesystem client.
 //!
-//! High-level client API for interacting with Vecton metadata and worker services.
-//!
-//! # Features
-//!
-//! - HCFS-style API: `open`, `read`, `write`, `delete`, `rename`, `list`, `stat`
-//! - Multi-Raft group routing
-//! - Consistency levels: `strong`, `normal` (bounded-stale), `weak`
-//! - Follower reads with msync/refresh compensation
-//! - Direct worker reads with version-based cache invalidation
-//! - ReadMode/WriteMode with forward compatibility
+//! The public facade is centered on [`FsClient`], [`FileHandle`],
+//! [`OpenOptions`], and [`CreateMode`]. Metadata-facing operations are executed
+//! through the internal operation executor and metadata gateway, with hardened
+//! refresh, replay header, and invalid response-header handling. Public reads
+//! return one complete buffer through internal data-plane adapters; public
+//! writes use internal write-state tracking and data-plane adapters.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-pub mod api;
-pub mod cache;
-pub mod canonical;
-pub mod config;
-pub mod consistency;
-pub mod context;
-pub mod error;
-pub mod meta;
-pub mod metrics;
-pub mod modes;
-pub mod routing;
-pub mod worker;
+mod api;
+mod cache;
+mod canonical;
+mod config;
+mod consistency;
+mod error;
+mod metrics;
+mod modes;
+mod planner;
+mod runtime;
+mod session;
+
+mod context;
+mod data;
+pub(crate) mod metadata;
 
 // Re-export commonly used types
+pub use api::{CreateMode, FileHandle, FsClient, OpenOptions};
 pub use config::ClientConfig;
-pub use error::{ClientError, ClientResult};
-// RequestHeader is available from common::header::RequestHeader
-pub use api::hcfs::{Client, Handle, OpenFlags};
-pub use canonical::{validate_header_or_action, ClientAction};
-pub use consistency::ConsistencyLevel;
-pub use meta::{
-    replay_policy_for_method, ActionMachine, ActionMachinePolicy, FileSystemRpc, FileSystemRpcMethod, ReplayPolicy,
-    RpcOp, TonicFileSystemRpc,
+pub use config::{
+    BackoffConfig, CacheConfig, ChannelPoolConfig, ReadModeFallback, RefreshConfig, RetryConfig, WriteModeFallback,
 };
+pub use consistency::ConsistencyLevel;
+pub use error::{ClientActionError, ClientError, ClientResult};
 pub use modes::{ReadMode, WriteMode};
