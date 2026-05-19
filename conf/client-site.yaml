@@ -111,29 +111,29 @@ client.cache.route.ttl_secs: 60
 # Client Retry Configuration
 # ============================================================================
 
-# Client retry: max retries
+# Client retry: maximum retry attempts
 # Type: integer
 # Default: 3
-# Description: Maximum number of retries for failed operations
-client.retry.max_retries: 3
+# Description: Maximum retry attempts per logical operation
+client.retry.max_retry_attempts: 3
 
-# Client retry: initial backoff (milliseconds)
+# Client backoff: initial delay (milliseconds)
 # Type: integer
 # Default: 100
 # Description: Initial backoff delay in milliseconds
-client.retry.initial_backoff_ms: 100
+client.backoff.initial_ms: 100
 
-# Client retry: max backoff (milliseconds)
+# Client backoff: maximum delay (milliseconds)
 # Type: integer
 # Default: 5000
 # Description: Maximum backoff delay in milliseconds
-client.retry.max_backoff_ms: 5000
+client.backoff.max_ms: 5000
 
-# Client retry: backoff multiplier
+# Client backoff: multiplier
 # Type: float or string
 # Default: "2.0"
-# Description: Multiplier for exponential backoff (must be > 0)
-client.retry.backoff_multiplier: "2.0"
+# Description: Multiplier for exponential backoff (must be >= 1.0)
+client.backoff.multiplier: "2.0"
 
 # ============================================================================
 # Client Worker Direct Read Configuration

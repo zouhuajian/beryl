@@ -236,6 +236,73 @@ fn client_sources_do_not_use_process_evolution_wording() {
     assert!(matches.is_empty(), "banned wording found: {matches:?}");
 }
 
+#[test]
+fn client_source_tree_has_no_orphan_rust_files() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src = manifest_dir.join("src");
+    let expected = [
+        "api/fs_client.rs",
+        "api/handle.rs",
+        "api/mod.rs",
+        "api/options.rs",
+        "cache/layout.rs",
+        "cache/mod.rs",
+        "cache/state_id.rs",
+        "cache/worker_endpoint.rs",
+        "canonical.rs",
+        "config.rs",
+        "consistency.rs",
+        "context.rs",
+        "data/mod.rs",
+        "data/worker.rs",
+        "error.rs",
+        "lib.rs",
+        "metadata/gateway.rs",
+        "metadata/header.rs",
+        "metadata/mod.rs",
+        "metadata/ops.rs",
+        "metadata/snapshot.rs",
+        "metrics.rs",
+        "modes.rs",
+        "planner/mod.rs",
+        "planner/read_planner.rs",
+        "planner/write_planner.rs",
+        "runtime/backoff.rs",
+        "runtime/classify.rs",
+        "runtime/context.rs",
+        "runtime/decision.rs",
+        "runtime/executor.rs",
+        "runtime/mod.rs",
+        "runtime/policy.rs",
+        "runtime/refresh.rs",
+        "session/mod.rs",
+        "session/write_session.rs",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<std::collections::BTreeSet<_>>();
+
+    let mut files = Vec::new();
+    collect_rs_files(&src, &mut files);
+    let actual = files
+        .into_iter()
+        .map(|path| {
+            path.strip_prefix(&src)
+                .expect("source file under client/src")
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let unexpected = actual.difference(&expected).collect::<Vec<_>>();
+    let missing = expected.difference(&actual).collect::<Vec<_>>();
+
+    assert!(
+        unexpected.is_empty() && missing.is_empty(),
+        "client/src Rust file set drifted; unexpected={unexpected:?}, missing={missing:?}"
+    );
+}
+
 fn has_path_dependency(manifest: &str, crate_name: &str) -> bool {
     let prefix = format!("{crate_name} =");
     manifest

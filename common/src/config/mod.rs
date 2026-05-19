@@ -15,10 +15,10 @@ pub use flat::FlatConfig;
 pub use validate::{validate_client, validate_core};
 
 pub use keys::{
-    client, client_cache, client_consistency, client_read_mode, client_retry, client_worker_direct_read,
-    client_write_mode, metadata_authority, metadata_raft, metadata_rpc, metadata_storage, observe_logging,
-    observe_metrics, observe_tracing, worker_concurrency, worker_eviction, worker_metadata, worker_orphan,
-    worker_replication, worker_service_rpc, worker_storage, worker_ufs, worker_volume_health,
+    client, client_backoff, client_cache, client_consistency, client_read_mode, client_retry,
+    client_worker_direct_read, client_write_mode, metadata_authority, metadata_raft, metadata_rpc, metadata_storage,
+    observe_logging, observe_metrics, observe_tracing, worker_concurrency, worker_eviction, worker_metadata,
+    worker_orphan, worker_replication, worker_service_rpc, worker_storage, worker_ufs, worker_volume_health,
 };
 
 use crate::error::CommonError;
@@ -242,10 +242,10 @@ impl Default for ClientConfig {
         // ============================================================================
         // Client Retry Configuration
         // ============================================================================
-        config.set(client_retry::MAX_RETRIES, 3i64);
-        config.set(client_retry::INITIAL_BACKOFF_MS, 100i64);
-        config.set(client_retry::MAX_BACKOFF_MS, 5000i64);
-        config.set(client_retry::BACKOFF_MULTIPLIER, "2.0");
+        config.set(client_retry::MAX_RETRY_ATTEMPTS, 3i64);
+        config.set(client_backoff::INITIAL_MS, 100i64);
+        config.set(client_backoff::MAX_MS, 5000i64);
+        config.set(client_backoff::MULTIPLIER, "2.0");
 
         // ============================================================================
         // Client Worker Direct Read Configuration
@@ -300,6 +300,31 @@ mod tests {
             config.inner.get_str(client::METADATA_ENDPOINTS),
             Some("127.0.0.1:18080".to_string())
         );
+    }
+
+    #[test]
+    fn test_client_config_default_uses_current_retry_and_backoff_keys() {
+        let config = ClientConfig::default();
+
+        assert_eq!(config.inner.get_i64("client.retry.max_retry_attempts"), Some(3));
+        assert_eq!(config.inner.get_i64("client.backoff.initial_ms"), Some(100));
+        assert_eq!(config.inner.get_i64("client.backoff.max_ms"), Some(5000));
+        assert_eq!(
+            config.inner.get_str("client.backoff.multiplier"),
+            Some("2.0".to_string())
+        );
+
+        for old_key in [
+            "client.retry.max_retries",
+            "client.retry.initial_backoff_ms",
+            "client.retry.max_backoff_ms",
+            "client.retry.backoff_multiplier",
+        ] {
+            assert!(
+                config.inner.get_str(old_key).is_none(),
+                "{old_key} must not remain in common client defaults"
+            );
+        }
     }
 
     #[test]

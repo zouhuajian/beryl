@@ -5,9 +5,9 @@
 
 use crate::config::flat::FlatConfig;
 use crate::config::keys::{
-    client, client_cache, client_consistency, client_read_mode, client_retry, client_worker_direct_read,
-    client_write_mode, metadata_raft, metadata_rpc, observe_metrics, worker_eviction, worker_replication,
-    worker_service_rpc, worker_storage, worker_ufs,
+    client, client_backoff, client_cache, client_consistency, client_read_mode, client_retry,
+    client_worker_direct_read, client_write_mode, metadata_raft, metadata_rpc, observe_metrics, worker_eviction,
+    worker_replication, worker_service_rpc, worker_storage, worker_ufs,
 };
 use crate::error::{CommonError, CommonErrorCode};
 
@@ -279,22 +279,51 @@ pub fn validate_client(config: &FlatConfig) -> Result<(), CommonError> {
     }
 
     // Validate retry configuration
-    if let Some(max_retries) = config.get_i64(client_retry::MAX_RETRIES)
-        && max_retries < 0
+    for key in &[
+        client_retry::MAX_RETRY_ATTEMPTS,
+        client_retry::METADATA_BUDGET,
+        client_retry::WORKER_BUDGET,
+        client_retry::SESSION_BARRIER_BUDGET,
+        client_backoff::INITIAL_MS,
+        client_backoff::MAX_MS,
+    ] {
+        if let Some(value) = config.get_i64(key)
+            && value < 0
+        {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!("{key} must be >= 0, got {value}"),
+            ));
+        }
+    }
+
+    if let Some(initial) = config.get_i64(client_backoff::INITIAL_MS)
+        && let Some(max) = config.get_i64(client_backoff::MAX_MS)
+        && max < initial
     {
         return Err(CommonError::new(
             CommonErrorCode::InvalidArgument,
-            format!("{} must be >= 0, got {}", client_retry::MAX_RETRIES, max_retries),
+            format!("{} must be >= {}", client_backoff::MAX_MS, client_backoff::INITIAL_MS),
         ));
     }
-    if let Some(multiplier_str) = config.get_str(client_retry::BACKOFF_MULTIPLIER)
-        && let Ok(multiplier) = multiplier_str.parse::<f64>()
-        && multiplier <= 0.0
-    {
-        return Err(CommonError::new(
-            CommonErrorCode::InvalidArgument,
-            format!("{} must be > 0, got {}", client_retry::BACKOFF_MULTIPLIER, multiplier),
-        ));
+
+    if let Some(multiplier_str) = config.get_str(client_backoff::MULTIPLIER) {
+        let multiplier = multiplier_str.parse::<f64>().map_err(|_| {
+            CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!("{} must be a number", client_backoff::MULTIPLIER),
+            )
+        })?;
+        if !multiplier.is_finite() || multiplier < 1.0 {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!(
+                    "{} must be finite and >= 1.0, got {}",
+                    client_backoff::MULTIPLIER,
+                    multiplier
+                ),
+            ));
+        }
     }
 
     Ok(())

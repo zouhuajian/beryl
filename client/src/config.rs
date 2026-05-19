@@ -112,7 +112,7 @@ pub struct ChannelPoolConfig {
 /// Retry configuration.
 #[derive(Clone, Debug)]
 pub struct RetryConfig {
-    /// Compatibility cap for maximum retries.
+    /// Maximum configured retry cap.
     pub max_retries: usize,
     /// Maximum retry attempts per logical operation.
     pub max_retry_attempts: usize,
@@ -435,12 +435,7 @@ fn parse_metadata_group_ids(flat: &FlatConfig) -> Result<Vec<u64>, CommonError> 
 
 fn retry_config_from_flat(flat: &FlatConfig) -> Result<RetryConfig, CommonError> {
     let defaults = RetryConfig::default();
-    let max_retry_attempts = get_usize_with_legacy(
-        flat,
-        "client.retry.max_retry_attempts",
-        "client.retry.max_retries",
-        defaults.max_retry_attempts,
-    )?;
+    let max_retry_attempts = get_usize_or_strict(flat, "client.retry.max_retry_attempts", defaults.max_retry_attempts)?;
     let metadata_retry_budget = get_usize_or(flat, "client.retry.metadata_budget", max_retry_attempts)?;
     let worker_retry_budget = get_usize_or(flat, "client.retry.worker_budget", max_retry_attempts)?;
     let session_barrier_retry_budget = get_usize_or(
@@ -472,24 +467,9 @@ fn refresh_config_from_flat(flat: &FlatConfig) -> Result<RefreshConfig, CommonEr
 fn backoff_config_from_flat(flat: &FlatConfig) -> Result<BackoffConfig, CommonError> {
     let defaults = BackoffConfig::default();
     let backoff = BackoffConfig {
-        initial_backoff_ms: get_u64_with_legacy(
-            flat,
-            "client.backoff.initial_ms",
-            "client.retry.initial_backoff_ms",
-            defaults.initial_backoff_ms,
-        )?,
-        max_backoff_ms: get_u64_with_legacy(
-            flat,
-            "client.backoff.max_ms",
-            "client.retry.max_backoff_ms",
-            defaults.max_backoff_ms,
-        )?,
-        backoff_multiplier: get_f64_with_legacy(
-            flat,
-            "client.backoff.multiplier",
-            "client.retry.backoff_multiplier",
-            defaults.backoff_multiplier,
-        )?,
+        initial_backoff_ms: get_u64_or_strict(flat, "client.backoff.initial_ms", defaults.initial_backoff_ms)?,
+        max_backoff_ms: get_u64_or_strict(flat, "client.backoff.max_ms", defaults.max_backoff_ms)?,
+        backoff_multiplier: get_f64_or(flat, "client.backoff.multiplier", defaults.backoff_multiplier)?,
     };
     if backoff.max_backoff_ms < backoff.initial_backoff_ms {
         return Err(invalid_config(
@@ -506,42 +486,6 @@ fn backoff_config_from_flat(flat: &FlatConfig) -> Result<BackoffConfig, CommonEr
     Ok(backoff)
 }
 
-fn get_usize_with_legacy(
-    flat: &FlatConfig,
-    key: &'static str,
-    legacy_key: &'static str,
-    default: usize,
-) -> Result<usize, CommonError> {
-    if flat.get_str(key).is_some() {
-        return get_usize_or(flat, key, default);
-    }
-    get_usize_or(flat, legacy_key, default)
-}
-
-fn get_u64_with_legacy(
-    flat: &FlatConfig,
-    key: &'static str,
-    legacy_key: &'static str,
-    default: u64,
-) -> Result<u64, CommonError> {
-    if flat.get_str(key).is_some() {
-        return get_u64_or(flat, key, default);
-    }
-    get_u64_or(flat, legacy_key, default)
-}
-
-fn get_f64_with_legacy(
-    flat: &FlatConfig,
-    key: &'static str,
-    legacy_key: &'static str,
-    default: f64,
-) -> Result<f64, CommonError> {
-    if flat.get_str(key).is_some() {
-        return get_f64_or(flat, key, default);
-    }
-    get_f64_or(flat, legacy_key, default)
-}
-
 fn get_usize_or(flat: &FlatConfig, key: &'static str, default: usize) -> Result<usize, CommonError> {
     match flat.get_i64(key) {
         Some(value) if value >= 0 => Ok(value as usize),
@@ -553,14 +497,6 @@ fn get_usize_or(flat: &FlatConfig, key: &'static str, default: usize) -> Result<
 fn get_usize_or_strict(flat: &FlatConfig, key: &'static str, default: usize) -> Result<usize, CommonError> {
     match get_i64_or_strict(flat, key)? {
         Some(value) if value >= 0 => Ok(value as usize),
-        Some(_) => Err(invalid_config(key, "must be non-negative")),
-        None => Ok(default),
-    }
-}
-
-fn get_u64_or(flat: &FlatConfig, key: &'static str, default: u64) -> Result<u64, CommonError> {
-    match flat.get_i64(key) {
-        Some(value) if value >= 0 => Ok(value as u64),
         Some(_) => Err(invalid_config(key, "must be non-negative")),
         None => Ok(default),
     }
@@ -757,6 +693,59 @@ mod tests {
     }
 
     #[test]
+    fn current_retry_refresh_and_backoff_keys_are_loaded_from_flat_config() {
+        let mut flat = FlatConfig::new();
+        flat.set("client.retry.max_retry_attempts", 5i64);
+        flat.set("client.retry.metadata_budget", 4i64);
+        flat.set("client.retry.worker_budget", 3i64);
+        flat.set("client.retry.session_barrier_budget", 2i64);
+        flat.set("client.refresh.max_attempts", 6i64);
+        flat.set("client.operation.timeout_ms", 7000i64);
+        flat.set("client.backoff.initial_ms", 25i64);
+        flat.set("client.backoff.max_ms", 400i64);
+        flat.set("client.backoff.multiplier", "1.5");
+
+        let config = ClientConfig::from_flat(flat).expect("current retry and backoff config");
+
+        assert_eq!(config.retry.max_retries, 5);
+        assert_eq!(config.retry.max_retry_attempts(), 5);
+        assert_eq!(config.retry.metadata_retry_budget(), 4);
+        assert_eq!(config.retry.worker_retry_budget(), 3);
+        assert_eq!(config.retry.session_barrier_retry_budget(), 2);
+        assert_eq!(config.retry.operation_timeout_ms, Some(7000));
+        assert_eq!(config.refresh.max_refresh_attempts, 6);
+        assert_eq!(config.backoff.initial_backoff_ms, 25);
+        assert_eq!(config.backoff.max_backoff_ms, 400);
+        assert_eq!(config.backoff.backoff_multiplier, 1.5);
+    }
+
+    #[test]
+    fn obsolete_retry_and_backoff_aliases_do_not_affect_current_config() {
+        let mut flat = FlatConfig::new();
+        flat.set("client.retry.max_retries", 9i64);
+        flat.set("client.retry.initial_backoff_ms", 25i64);
+        flat.set("client.retry.max_backoff_ms", 400i64);
+        flat.set("client.retry.backoff_multiplier", "1.5");
+
+        let config = ClientConfig::from_flat(flat).expect("obsolete aliases are ignored");
+
+        assert_eq!(config.retry.max_retries, RetryConfig::default().max_retries);
+        assert_eq!(
+            config.retry.max_retry_attempts(),
+            RetryConfig::default().max_retry_attempts
+        );
+        assert_eq!(
+            config.backoff.initial_backoff_ms,
+            BackoffConfig::default().initial_backoff_ms
+        );
+        assert_eq!(config.backoff.max_backoff_ms, BackoffConfig::default().max_backoff_ms);
+        assert_eq!(
+            config.backoff.backoff_multiplier,
+            BackoffConfig::default().backoff_multiplier
+        );
+    }
+
+    #[test]
     fn invalid_retry_and_backoff_config_is_rejected() {
         for (key, value) in [
             ("client.retry.max_retry_attempts", -1i64),
@@ -793,18 +782,5 @@ mod tests {
         flat.set("client.backoff.multiplier", "not-a-number");
         let err = ClientConfig::from_flat(flat).expect_err("non-numeric backoff multiplier must be rejected");
         assert!(err.to_string().contains("client.backoff.multiplier"));
-    }
-
-    #[test]
-    fn legacy_max_retries_key_still_populates_explicit_retry_budget() {
-        let mut flat = FlatConfig::new();
-        flat.set("client.retry.max_retries", 2i64);
-
-        let config = ClientConfig::from_flat(flat).expect("legacy retry config");
-
-        assert_eq!(config.retry.max_retries, 2);
-        assert_eq!(config.retry.max_retry_attempts(), 2);
-        assert_eq!(config.retry.metadata_retry_budget(), 2);
-        assert_eq!(config.retry.worker_retry_budget(), 2);
     }
 }

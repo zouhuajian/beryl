@@ -236,14 +236,24 @@ pub mod client_cache {
 
 /// Client retry configuration keys.
 pub mod client_retry {
-    /// Maximum number of retries for failed operations.
-    pub const MAX_RETRIES: &str = "client.retry.max_retries";
+    /// Maximum retry attempts per logical operation.
+    pub const MAX_RETRY_ATTEMPTS: &str = "client.retry.max_retry_attempts";
+    /// Metadata retry budget per logical operation.
+    pub const METADATA_BUDGET: &str = "client.retry.metadata_budget";
+    /// Worker retry budget per logical operation.
+    pub const WORKER_BUDGET: &str = "client.retry.worker_budget";
+    /// Session barrier retry budget per logical operation.
+    pub const SESSION_BARRIER_BUDGET: &str = "client.retry.session_barrier_budget";
+}
+
+/// Client backoff configuration keys.
+pub mod client_backoff {
     /// Initial backoff delay in milliseconds.
-    pub const INITIAL_BACKOFF_MS: &str = "client.retry.initial_backoff_ms";
+    pub const INITIAL_MS: &str = "client.backoff.initial_ms";
     /// Maximum backoff delay in milliseconds.
-    pub const MAX_BACKOFF_MS: &str = "client.retry.max_backoff_ms";
-    /// Multiplier for exponential backoff (must be > 0).
-    pub const BACKOFF_MULTIPLIER: &str = "client.retry.backoff_multiplier";
+    pub const MAX_MS: &str = "client.backoff.max_ms";
+    /// Multiplier for exponential backoff.
+    pub const MULTIPLIER: &str = "client.backoff.multiplier";
 }
 
 /// Client worker direct read configuration keys.
