@@ -166,20 +166,14 @@ impl RequestHeaderCodec {
                 k if k.eq_ignore_ascii_case(HEADER_TRACEPARENT) => {
                     traceparent = Some(value);
                 }
-                k if k.eq_ignore_ascii_case(HEADER_PRINCIPAL) => {
-                    if !value.is_empty() {
-                        principal = Some(value);
-                    }
+                k if k.eq_ignore_ascii_case(HEADER_PRINCIPAL) && !value.is_empty() => {
+                    principal = Some(value);
                 }
-                k if k.eq_ignore_ascii_case(HEADER_REAL_USER) => {
-                    if !value.is_empty() {
-                        real_user = Some(value);
-                    }
+                k if k.eq_ignore_ascii_case(HEADER_REAL_USER) && !value.is_empty() => {
+                    real_user = Some(value);
                 }
-                k if k.eq_ignore_ascii_case(HEADER_DOAS) => {
-                    if !value.is_empty() {
-                        doas = Some(value);
-                    }
+                k if k.eq_ignore_ascii_case(HEADER_DOAS) && !value.is_empty() => {
+                    doas = Some(value);
                 }
                 k if k.eq_ignore_ascii_case(HEADER_AUTHN_TYPE) => {
                     authn_type = match value.to_ascii_lowercase().as_str() {

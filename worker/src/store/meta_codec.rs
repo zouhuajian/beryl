@@ -4,12 +4,11 @@
 //! Protobuf payload codec for worker-local block metadata.
 
 use prost::Message;
-use proto::common::{BlockIdProto as CommonBlockIdProto, ShardGroupIdProto};
 use proto::worker::{
     BlockFormatProto, BlockIdentityProto, BlockMetaPayloadProto, BlockSourceProto, BlockStateProto,
     BlockVisibilityProto, ChecksumKindProto,
 };
-use types::ids::{BlockId, BlockIndex, DataHandleId, ShardGroupId};
+use types::ids::{BlockId, ShardGroupId};
 
 use super::block::{
     BlockFormat, BlockIdentity, BlockMetaPayload, BlockSource, BlockState, BlockVisibility, ChecksumKind, StoreResult,
@@ -61,13 +60,8 @@ fn meta_to_proto_without_visibility(meta: &BlockMetaPayload) -> StoreResult<Bloc
 
     Ok(BlockMetaPayloadProto {
         identity: Some(BlockIdentityProto {
-            block_id: Some(CommonBlockIdProto {
-                data_handle_id: meta.identity.block_id.data_handle_id.as_raw(),
-                block_index: meta.identity.block_id.index.as_raw(),
-            }),
-            group_id: Some(ShardGroupIdProto {
-                value: meta.identity.group_id.as_raw(),
-            }),
+            block_id: Some(meta.identity.block_id.into()),
+            group_id: Some(meta.identity.group_id.into()),
         }),
         format: Some(BlockFormatProto {
             format_id: meta.format.format_id,
@@ -149,11 +143,10 @@ fn meta_fields_from_proto(
 
     Ok(MetaFields {
         identity: BlockIdentity {
-            block_id: BlockId::new(
-                DataHandleId::new(block_id.data_handle_id),
-                BlockIndex::new(block_id.block_index),
-            ),
-            group_id: ShardGroupId::new(group_id.value),
+            block_id: BlockId::try_from(block_id)
+                .unwrap_or_else(|()| unreachable!("BlockIdProto conversion is infallible")),
+            group_id: ShardGroupId::try_from(group_id)
+                .unwrap_or_else(|()| unreachable!("ShardGroupIdProto conversion is infallible")),
         },
         format: BlockFormat {
             format_id: format.format_id,

@@ -427,20 +427,14 @@ fn validate_worker_endpoint(candidate: &WorkerEndpointInfoProto) -> ClientResult
             "worker endpoint candidate worker_epoch must be non-zero".to_string(),
         ));
     }
-    match candidate.worker_net_protocol {
-        value if value == WorkerNetProtocolProto::WorkerNetProtocolUnspecified as i32 => Err(
-            ClientError::InvalidArgument("unspecified worker_net_protocol must not default to gRPC".to_string()),
-        ),
-        value if value == WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32 => Ok(()),
-        value
-            if value == WorkerNetProtocolProto::WorkerNetProtocolQuic as i32
-                || value == WorkerNetProtocolProto::WorkerNetProtocolRdma as i32 =>
-        {
+    match proto::convert::parse_known_worker_net_protocol(candidate.worker_net_protocol)
+        .map_err(ClientError::InvalidArgument)?
+    {
+        WorkerNetProtocolProto::WorkerNetProtocolGrpc => Ok(()),
+        WorkerNetProtocolProto::WorkerNetProtocolQuic | WorkerNetProtocolProto::WorkerNetProtocolRdma => {
             Err(ClientError::Unsupported("unsupported worker net protocol".to_string()))
         }
-        other => Err(ClientError::InvalidArgument(format!(
-            "unknown worker_net_protocol value {other}"
-        ))),
+        WorkerNetProtocolProto::WorkerNetProtocolUnspecified => unreachable!("parser rejects unspecified"),
     }
 }
 

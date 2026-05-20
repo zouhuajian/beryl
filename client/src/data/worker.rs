@@ -13,6 +13,8 @@ use futures::stream;
 use parking_lot::RwLock;
 use proto::worker::worker_data_service_client::WorkerDataServiceClient;
 use tonic::transport as tonic_net;
+use types::chunk::ByteRange;
+use types::ids::ShardGroupId;
 
 use super::{WorkerCommitResult, WorkerDataClient, WorkerWriteBlock, WorkerWriteTarget};
 use crate::cache::{CacheInvalidationReason, WorkerEndpointCache};
@@ -587,16 +589,13 @@ enum ClientWorkerNetProtocol {
 }
 
 fn worker_net_protocol_from_i32(kind: i32) -> ClientResult<ClientWorkerNetProtocol> {
-    match kind {
-        0 => Err(ClientError::InvalidArgument(
-            "unspecified worker_net_protocol must not default to gRPC".to_string(),
-        )),
-        1 => Ok(ClientWorkerNetProtocol::Grpc),
-        2 => Ok(ClientWorkerNetProtocol::Quic),
-        3 => Ok(ClientWorkerNetProtocol::Rdma),
-        other => Err(ClientError::InvalidArgument(format!(
-            "unknown worker_net_protocol value {other}"
-        ))),
+    match proto::convert::parse_known_worker_net_protocol(kind).map_err(ClientError::InvalidArgument)? {
+        proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc => Ok(ClientWorkerNetProtocol::Grpc),
+        proto::common::WorkerNetProtocolProto::WorkerNetProtocolQuic => Ok(ClientWorkerNetProtocol::Quic),
+        proto::common::WorkerNetProtocolProto::WorkerNetProtocolRdma => Ok(ClientWorkerNetProtocol::Rdma),
+        proto::common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified => {
+            unreachable!("parser rejects unspecified")
+        }
     }
 }
 
@@ -626,15 +625,15 @@ fn build_open_read_stream_request(
     }
     Ok(proto::worker::OpenReadStreamRequestProto {
         header: Some(ctx.data_header()),
-        group_id: Some(proto::common::ShardGroupIdProto { value: group_id }),
-        block_id: Some(proto::common::BlockIdProto {
-            data_handle_id: segment.block_id.data_handle_id.as_raw(),
-            block_index: segment.block_id.index.as_raw(),
-        }),
-        byte_range: Some(proto::common::ByteRangeProto {
-            offset: segment.block_offset,
-            len: segment.len,
-        }),
+        group_id: Some(ShardGroupId::new(group_id).into()),
+        block_id: Some(segment.block_id.into()),
+        byte_range: Some(
+            ByteRange {
+                offset: segment.block_offset,
+                len: segment.len,
+            }
+            .into(),
+        ),
         block_stamp: segment.block_stamp,
         frame_size: default_frame_size(segment.len),
     })
@@ -687,7 +686,7 @@ fn build_open_write_stream_request(
     validate_worker_write_target(target)?;
     Ok(proto::worker::OpenWriteStreamRequestProto {
         header: Some(ctx.data_header()),
-        group_id: Some(proto::common::ShardGroupIdProto { value: target.group_id }),
+        group_id: Some(ShardGroupId::new(target.group_id).into()),
         block_id: target.target.block_id,
         block_size: target.target.len,
         block_stamp: target.target.block_stamp,
@@ -734,7 +733,7 @@ fn build_commit_write_request(
     validate_block_for_worker_control(block)?;
     Ok(proto::worker::CommitWriteRequestProto {
         header: Some(ctx.data_header()),
-        group_id: Some(proto::common::ShardGroupIdProto { value: block.group_id }),
+        group_id: Some(ShardGroupId::new(block.group_id).into()),
         block_id: block.target.block_id,
         stream_id: Some(block.stream_id),
         effective_block_len: effective_len,
@@ -752,7 +751,7 @@ fn build_abort_write_request(
     validate_block_for_worker_control(block)?;
     Ok(proto::worker::AbortWriteRequestProto {
         header: Some(ctx.data_header()),
-        group_id: Some(proto::common::ShardGroupIdProto { value: block.group_id }),
+        group_id: Some(ShardGroupId::new(block.group_id).into()),
         block_id: block.target.block_id,
         stream_id: Some(block.stream_id),
         token: block.target.fencing_token,

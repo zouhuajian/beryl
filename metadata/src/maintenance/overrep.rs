@@ -511,7 +511,7 @@ impl OverReplicaCleanupService {
 
         // Sort domains by count (descending) - prefer deleting from domains with more replicas
         let mut domain_order: Vec<(String, usize)> = domain_counts.into_iter().collect();
-        domain_order.sort_by(|a, b| b.1.cmp(&a.1));
+        domain_order.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
         // Select from domains with >1 replica first
         for (domain, _count) in &domain_order {

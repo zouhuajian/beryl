@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
-use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+use types::ids::{BlockId, WorkerId};
 
 /// Worker service background task handles.
 pub struct WorkerBackgroundHandle {
@@ -161,10 +161,7 @@ impl MetadataWorkerServiceImpl {
 
     /// Convert proto BlockId to types BlockId.
     fn proto_to_block_id(proto: &proto::common::BlockIdProto) -> MetadataResult<BlockId> {
-        Ok(BlockId::new(
-            DataHandleId::new(proto.data_handle_id),
-            BlockIndex::new(proto.block_index),
-        ))
+        Ok(BlockId::try_from(*proto).unwrap_or_else(|()| unreachable!("BlockIdProto conversion is infallible")))
     }
 }
 
@@ -764,10 +761,7 @@ mod tests {
     }
 
     fn block_proto(block_id: BlockId) -> proto::common::BlockIdProto {
-        proto::common::BlockIdProto {
-            data_handle_id: block_id.data_handle_id.as_raw(),
-            block_index: block_id.index.as_raw(),
-        }
+        block_id.into()
     }
 
     #[tokio::test]
@@ -829,7 +823,7 @@ mod tests {
         let raft_node = leader_raft(&dir).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
         let worker_id = WorkerId::new(7);
-        let block_id = BlockId::new(DataHandleId::new(70), BlockIndex::new(0));
+        let block_id = BlockId::from_u64_u32(70, 0);
         worker_manager
             .register_worker(worker_id, "127.0.0.1:9090".to_string(), 1, 100, None)
             .unwrap();
@@ -880,7 +874,7 @@ mod tests {
         let raft_node = nonleader_raft(&dir).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
         let worker_id = WorkerId::new(8);
-        let block_id = BlockId::new(DataHandleId::new(80), BlockIndex::new(0));
+        let block_id = BlockId::from_u64_u32(80, 0);
         worker_manager
             .register_worker(worker_id, "127.0.0.1:9091".to_string(), 1, 100, None)
             .unwrap();

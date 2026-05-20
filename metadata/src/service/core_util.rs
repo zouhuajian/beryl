@@ -8,12 +8,12 @@ use super::domain::{
 };
 use crate::error::{to_canonical_fs, MetadataError};
 use common::error::canonical::{
-    CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshHint, RefreshReason, WorkerEndpointHint,
+    CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshHint, RefreshReason,
 };
 use common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
 use tracing::Span;
 use types::fs::FsErrorCode;
-use types::ids::{BlockId, BlockIndex, DataHandleId, LeaseId};
+use types::ids::{BlockId, LeaseId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
 use types::GroupStateWatermark;
@@ -71,129 +71,13 @@ fn error_detail_from_canonical(err: &CanonicalError) -> Option<proto::common::Er
         return None;
     }
 
-    let error_class = match err.class {
-        ErrorClass::Ok => proto::common::ErrorClassProto::ErrorClassOk,
-        ErrorClass::NeedRefresh => proto::common::ErrorClassProto::ErrorClassNeedRefresh,
-        ErrorClass::Retryable => proto::common::ErrorClassProto::ErrorClassRetryable,
-        ErrorClass::Fatal => proto::common::ErrorClassProto::ErrorClassFatal,
-    };
-    let code = match &err.code {
-        Some(CanonicalErrorCode::FsErrno(errno)) => {
-            let fs_errno = match errno {
-                types::fs::FsErrorCode::Ok => proto::common::FsErrnoProto::FsErrnoOk,
-                types::fs::FsErrorCode::ENoEnt => proto::common::FsErrnoProto::FsErrnoEnoent,
-                types::fs::FsErrorCode::EExist => proto::common::FsErrnoProto::FsErrnoEexist,
-                types::fs::FsErrorCode::ENotEmpty => proto::common::FsErrnoProto::FsErrnoEnotempty,
-                types::fs::FsErrorCode::ENotDir => proto::common::FsErrnoProto::FsErrnoEnotdir,
-                types::fs::FsErrorCode::EIsDir => proto::common::FsErrnoProto::FsErrnoEisdir,
-                types::fs::FsErrorCode::EXDev => proto::common::FsErrnoProto::FsErrnoExdev,
-                types::fs::FsErrorCode::EPerm => proto::common::FsErrnoProto::FsErrnoEperm,
-                types::fs::FsErrorCode::EAcces => proto::common::FsErrnoProto::FsErrnoEacces,
-                types::fs::FsErrorCode::EInval => proto::common::FsErrnoProto::FsErrnoEinval,
-                types::fs::FsErrorCode::ENotsup => proto::common::FsErrnoProto::FsErrnoEnotsup,
-                types::fs::FsErrorCode::ENotImpl => proto::common::FsErrnoProto::FsErrnoEnotimpl,
-                types::fs::FsErrorCode::EAgain => proto::common::FsErrnoProto::FsErrnoEagain,
-                types::fs::FsErrorCode::EBusy => proto::common::FsErrnoProto::FsErrnoEbusy,
-            };
-            Some(proto::common::error_detail_proto::Code::FsErrno(fs_errno as i32))
-        }
-        Some(CanonicalErrorCode::RpcCode(rpc_code)) => {
-            let rpc_code_proto = match rpc_code {
-                RpcErrorCode::Unspecified => proto::common::RpcErrorCodeProto::RpcErrCodeUnspecified,
-                RpcErrorCode::NoSuchMethod => proto::common::RpcErrorCodeProto::RpcErrCodeNoSuchMethod,
-                RpcErrorCode::InvalidHeader => proto::common::RpcErrorCodeProto::RpcErrCodeInvalidHeader,
-                RpcErrorCode::VersionMismatch => proto::common::RpcErrorCodeProto::RpcErrCodeVersionMismatch,
-                RpcErrorCode::DeserializeRequest => proto::common::RpcErrorCodeProto::RpcErrCodeDeserializeRequest,
-                RpcErrorCode::SerializeResponse => proto::common::RpcErrorCodeProto::RpcErrCodeSerializeResponse,
-                RpcErrorCode::Unauthenticated => proto::common::RpcErrorCodeProto::RpcErrCodeUnauthenticated,
-                RpcErrorCode::PermissionDenied => proto::common::RpcErrorCodeProto::RpcErrCodePermissionDenied,
-                RpcErrorCode::NotLeader => proto::common::RpcErrorCodeProto::RpcErrCodeNotLeader,
-                RpcErrorCode::StaleState => proto::common::RpcErrorCodeProto::RpcErrCodeStaleState,
-                RpcErrorCode::MountEpochMismatch => proto::common::RpcErrorCodeProto::RpcErrCodeMountEpochMismatch,
-                RpcErrorCode::RouteEpochMismatch => proto::common::RpcErrorCodeProto::RpcErrCodeRouteEpochMismatch,
-                RpcErrorCode::WorkerEpochMismatch => proto::common::RpcErrorCodeProto::RpcErrCodeWorkerEpochMismatch,
-                RpcErrorCode::BlockStampMismatch => proto::common::RpcErrorCodeProto::RpcErrCodeBlockStampMismatch,
-                RpcErrorCode::EpochMismatch => proto::common::RpcErrorCodeProto::RpcErrCodeEpochMismatch,
-                RpcErrorCode::Fencing => proto::common::RpcErrorCodeProto::RpcErrCodeFencing,
-                RpcErrorCode::ShardMoved => proto::common::RpcErrorCodeProto::RpcErrCodeShardMoved,
-                RpcErrorCode::NodeUnavailable => proto::common::RpcErrorCodeProto::RpcErrCodeNodeUnavailable,
-                RpcErrorCode::Application => proto::common::RpcErrorCodeProto::RpcErrCodeApplication,
-            };
-            Some(proto::common::error_detail_proto::Code::RpcCode(rpc_code_proto as i32))
-        }
-        None => None,
-    };
-    let refresh_reason = err
-        .reason
-        .map(|r| match r {
-            common::error::canonical::RefreshReason::Unknown => proto::common::RefreshReasonProto::RefreshReasonUnknown,
-            common::error::canonical::RefreshReason::NotLeader => {
-                proto::common::RefreshReasonProto::RefreshReasonNotLeader
-            }
-            // MOVED is de-scoped for FileSystemService; do not emit it on the wire.
-            common::error::canonical::RefreshReason::Moved => proto::common::RefreshReasonProto::RefreshReasonUnknown,
-            common::error::canonical::RefreshReason::StaleState => {
-                proto::common::RefreshReasonProto::RefreshReasonStaleState
-            }
-            common::error::canonical::RefreshReason::MountEpochMismatch => {
-                proto::common::RefreshReasonProto::RefreshReasonMountEpochMismatch
-            }
-            common::error::canonical::RefreshReason::RouteEpochMismatch => {
-                proto::common::RefreshReasonProto::RefreshReasonRouteEpochMismatch
-            }
-            common::error::canonical::RefreshReason::WorkerEpochMismatch => {
-                proto::common::RefreshReasonProto::RefreshReasonWorkerEpochMismatch
-            }
-            common::error::canonical::RefreshReason::BlockStampMismatch => {
-                proto::common::RefreshReasonProto::RefreshReasonBlockStampMismatch
-            }
-            common::error::canonical::RefreshReason::Fencing => proto::common::RefreshReasonProto::RefreshReasonFencing,
-            common::error::canonical::RefreshReason::EpochMismatch => {
-                proto::common::RefreshReasonProto::RefreshReasonEpochMismatch
-            }
-            common::error::canonical::RefreshReason::SessionInvalid => {
-                proto::common::RefreshReasonProto::RefreshReasonSessionInvalid
-            }
-            common::error::canonical::RefreshReason::SessionExpired => {
-                proto::common::RefreshReasonProto::RefreshReasonSessionExpired
-            }
-        })
-        .unwrap_or(proto::common::RefreshReasonProto::RefreshReasonUnknown);
-
-    Some(proto::common::ErrorDetailProto {
-        error_class: error_class as i32,
-        code,
-        refresh_reason: refresh_reason as i32,
-        retry_after_ms: err.retry_after_ms,
-        message: err.message.clone(),
-        refresh_hint: map_refresh_hint_to_proto(err.refresh_hint.as_ref()),
-    })
-}
-
-fn map_refresh_hint_to_proto(hint: Option<&RefreshHint>) -> Option<proto::common::RefreshHintProto> {
-    hint.map(|hint| proto::common::RefreshHintProto {
-        leader_endpoint: hint.leader_endpoint.clone(),
-        group_id: hint.group_id,
-        mount_epoch: hint.mount_epoch,
-        mount_prefix: hint.mount_prefix.clone(),
-        route_epoch: hint.route_epoch,
-        worker_epoch: hint.worker_epoch,
-        worker_endpoints: hint
-            .worker_endpoints
-            .iter()
-            .map(map_worker_endpoint_hint_to_proto)
-            .collect(),
-        worker_resolve_required: hint.worker_resolve_required,
-    })
-}
-
-fn map_worker_endpoint_hint_to_proto(endpoint: &WorkerEndpointHint) -> proto::common::WorkerEndpointInfoProto {
-    proto::common::WorkerEndpointInfoProto {
-        worker_id: endpoint.worker_id,
-        endpoint: endpoint.endpoint.clone(),
-        worker_net_protocol: endpoint.worker_net_protocol,
-        worker_epoch: endpoint.worker_epoch,
+    let mut wire_error = err.clone();
+    // FileSystemService deliberately does not expose generic Moved; structural
+    // encoding stays in proto::convert after this service-local policy choice.
+    if wire_error.reason == Some(RefreshReason::Moved) {
+        wire_error.reason = Some(RefreshReason::Unknown);
     }
+    Some(proto::convert::canonical_to_error_detail(&wire_error))
 }
 
 fn build_base_response_header(
@@ -448,40 +332,24 @@ pub fn permission_denied_canonical_error(op: Option<&str>, detail: Option<&str>)
 
 pub fn lease_id_from_proto(lease_id: Option<proto::common::LeaseIdProto>) -> Option<LeaseId> {
     lease_id.map(|lease_id_proto| {
-        let lease_id_raw = (lease_id_proto.high as u128) << 64 | lease_id_proto.low as u128;
-        LeaseId::new(lease_id_raw)
+        LeaseId::try_from(lease_id_proto).unwrap_or_else(|()| unreachable!("LeaseIdProto conversion is infallible"))
     })
 }
 
 pub fn lease_id_to_proto(lease_id: LeaseId) -> proto::common::LeaseIdProto {
-    proto::common::LeaseIdProto {
-        high: (lease_id.as_raw() >> 64) as u64,
-        low: lease_id.as_raw() as u64,
-    }
+    lease_id.into()
 }
 
 pub fn presented_fencing_from_proto(token: Option<proto::common::FencingTokenProto>) -> Option<PresentedFencingToken> {
     token.map(|token_proto| PresentedFencingToken {
-        block_id: token_proto.block_id.map(|block| {
-            BlockId::new(
-                DataHandleId::new(block.data_handle_id),
-                BlockIndex::new(block.block_index),
-            )
-        }),
+        block_id: token_proto.block_id.and_then(|block| BlockId::try_from(block).ok()),
         owner: token_proto.owner,
         epoch: token_proto.epoch,
     })
 }
 
 pub fn fencing_to_proto(token: FencingToken) -> proto::common::FencingTokenProto {
-    proto::common::FencingTokenProto {
-        block_id: Some(proto::common::BlockIdProto {
-            data_handle_id: token.block_id.data_handle_id.as_raw(),
-            block_index: token.block_id.index.as_raw(),
-        }),
-        owner: token.owner.as_raw(),
-        epoch: token.epoch,
-    }
+    token.into()
 }
 
 pub fn worker_hint_to_proto(hint: &WorkerHint) -> proto::common::WorkerEndpointInfoProto {
@@ -495,14 +363,11 @@ pub fn worker_hint_to_proto(hint: &WorkerHint) -> proto::common::WorkerEndpointI
 
 pub fn write_target_to_proto(target: &WriteTarget) -> proto::metadata::WriteTargetProto {
     proto::metadata::WriteTargetProto {
-        block_id: Some(proto::common::BlockIdProto {
-            data_handle_id: target.block_id.data_handle_id.as_raw(),
-            block_index: target.block_id.index.as_raw(),
-        }),
+        block_id: Some(target.block_id.into()),
         file_offset: target.file_offset,
         len: target.len,
         worker_endpoints: target.worker_endpoints.iter().map(worker_hint_to_proto).collect(),
-        fencing_token: Some(fencing_to_proto(target.fencing_token)),
+        fencing_token: Some(target.fencing_token.into()),
         block_stamp: target.block_stamp,
         chunk_size: target.chunk_size,
     }
@@ -510,10 +375,7 @@ pub fn write_target_to_proto(target: &WriteTarget) -> proto::metadata::WriteTarg
 
 pub fn location_to_proto(location: &FileBlockLocation) -> proto::metadata::FileBlockLocationProto {
     proto::metadata::FileBlockLocationProto {
-        block_id: Some(proto::common::BlockIdProto {
-            data_handle_id: location.block_id.data_handle_id.as_raw(),
-            block_index: location.block_id.index.as_raw(),
-        }),
+        block_id: Some(location.block_id.into()),
         file_offset: location.file_offset,
         len: location.len,
         workers: location.workers.iter().map(worker_hint_to_proto).collect(),

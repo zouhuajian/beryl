@@ -33,7 +33,7 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::instrument;
 use types::fs::InodeId;
-use types::ids::{BlockId, BlockIndex, DataHandleId};
+use types::ids::{BlockId, DataHandleId};
 
 trait HeaderResponse {
     fn with_header(self, header: proto::common::ResponseHeaderProto) -> Self;
@@ -258,18 +258,14 @@ impl MetadataFileSystemServiceImpl {
             .ok_or_else(|| MetadataError::InvalidArgument("Missing block_id in committed block".to_string()))?;
         Ok(CommittedBlock {
             file_offset: block.file_offset,
-            block_id: BlockId::new(
-                DataHandleId::new(block_id.data_handle_id),
-                BlockIndex::new(block_id.block_index),
-            ),
+            block_id: BlockId::try_from(block_id)
+                .unwrap_or_else(|()| unreachable!("BlockIdProto conversion is infallible")),
             len: block.len,
         })
     }
 
     fn data_handle_proto(data_handle_id: DataHandleId) -> proto::common::DataHandleIdProto {
-        proto::common::DataHandleIdProto {
-            value: data_handle_id.as_raw(),
-        }
+        data_handle_id.into()
     }
 
     fn inode_proto(inode_id: InodeId) -> proto::fs::InodeIdProto {
@@ -905,7 +901,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 }
             }
             Some(get_block_locations_request_proto::Target::DataHandleId(data_handle)) => {
-                let data_handle_id = DataHandleId::new(data_handle.value);
+                let data_handle_id = DataHandleId::try_from(data_handle)
+                    .unwrap_or_else(|()| unreachable!("DataHandleIdProto conversion is infallible"));
                 requested_data_handle_id = Some(data_handle_id);
                 let inode_id = match self.fs_core.inode_for_data_handle(&req_ctx, data_handle_id).await {
                     Ok(success) => success.payload,

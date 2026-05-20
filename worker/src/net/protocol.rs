@@ -6,6 +6,7 @@
 use std::fmt;
 
 use proto::common::WorkerNetProtocolProto;
+use proto::convert::parse_known_worker_net_protocol;
 
 /// Worker data-plane network protocol.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -30,7 +31,7 @@ impl From<WorkerNetProtocolProto> for WorkerNetProtocol {
 
 impl From<i32> for WorkerNetProtocol {
     fn from(value: i32) -> Self {
-        WorkerNetProtocolProto::try_from(value)
+        parse_known_worker_net_protocol(value)
             .map(Self::from)
             .unwrap_or(Self::Grpc)
     }

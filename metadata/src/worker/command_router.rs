@@ -226,52 +226,31 @@ impl RepairCommandSource {
                 src_workers: _,
                 target_worker,
                 ..
-            } => {
-                let proto_block_id = proto::common::BlockIdProto {
-                    data_handle_id: block_id.data_handle_id.as_raw(),
-                    block_index: block_id.index.as_raw(),
-                };
-
-                Some(worker_command_proto::Command::Replicate(ReplicateCommandProto {
-                    block_id: Some(proto_block_id),
-                    target_worker_ids: vec![target_worker.as_raw()],
-                }))
-            }
+            } => Some(worker_command_proto::Command::Replicate(ReplicateCommandProto {
+                block_id: Some(block_id.into()),
+                target_worker_ids: vec![target_worker.as_raw()],
+            })),
             RepairTask::EvictReplica {
                 block_id,
                 reason,
                 target_worker: _,
-            } => {
-                let proto_block_id = proto::common::BlockIdProto {
-                    data_handle_id: block_id.data_handle_id.as_raw(),
-                    block_index: block_id.index.as_raw(),
-                };
-
-                Some(worker_command_proto::Command::Evict(EvictCommandProto {
-                    block_ids: vec![proto_block_id],
-                    reason,
-                    intent_id: 0,
-                    op_kind: proto::metadata::DeleteOpKindProto::DeleteOpKindReplicaEvict as i32,
-                    not_before_ms: 0,
-                    expected_epoch: 0,
-                }))
-            }
+            } => Some(worker_command_proto::Command::Evict(EvictCommandProto {
+                block_ids: vec![block_id.into()],
+                reason,
+                intent_id: 0,
+                op_kind: proto::metadata::DeleteOpKindProto::DeleteOpKindReplicaEvict as i32,
+                not_before_ms: 0,
+                expected_epoch: 0,
+            })),
             RepairTask::MoveCopy {
                 block_id,
                 from_worker,
                 to_worker,
-            } => {
-                let proto_block_id = proto::common::BlockIdProto {
-                    data_handle_id: block_id.data_handle_id.as_raw(),
-                    block_index: block_id.index.as_raw(),
-                };
-
-                Some(worker_command_proto::Command::MoveCopy(MoveCopyCommandProto {
-                    block_id: Some(proto_block_id),
-                    from_worker_id: from_worker.as_raw(),
-                    to_worker_id: to_worker.as_raw(),
-                }))
-            }
+            } => Some(worker_command_proto::Command::MoveCopy(MoveCopyCommandProto {
+                block_id: Some(block_id.into()),
+                from_worker_id: from_worker.as_raw(),
+                to_worker_id: to_worker.as_raw(),
+            })),
         };
 
         command.map(|command| WorkerCommandProto {

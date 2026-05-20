@@ -5,13 +5,14 @@
 
 use common::header::RequestHeader;
 use proto::common::{BlockIdProto, ByteRangeProto, FencingTokenProto, ShardGroupIdProto, StreamIdProto};
+use proto::convert as proto_convert;
 use proto::worker::{
     AbortWriteRequestProto, ChecksumKindProto, CommitWriteRequestProto, DataRequestHeaderProto,
     OpenReadStreamRequestProto, OpenWriteStreamRequestProto, ReadStreamResponseProto, WriteStreamRequestProto,
     WriteStreamResponseProto,
 };
 use types::chunk::ByteRange;
-use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, ShardGroupId, StreamId};
+use types::ids::{BlockId, ShardGroupId, StreamId};
 use types::lease::FencingToken;
 
 use crate::data::core::{
@@ -22,72 +23,43 @@ use crate::error::WorkerError;
 use crate::store::block::ChecksumKind;
 
 pub fn proto_to_block_id(proto: Option<BlockIdProto>, field_name: &str) -> WorkerCoreResult<BlockId> {
-    let proto = proto.ok_or_else(|| WorkerError::InvalidArgument(format!("missing {field_name}")))?;
-    Ok(BlockId::new(
-        DataHandleId::new(proto.data_handle_id),
-        BlockIndex::new(proto.block_index),
-    ))
+    proto_convert::required_block_id(proto, field_name).map_err(WorkerError::InvalidArgument)
 }
 
 pub fn proto_to_stream_id(proto: Option<StreamIdProto>, field_name: &str) -> WorkerCoreResult<StreamId> {
-    let proto = proto.ok_or_else(|| WorkerError::InvalidArgument(format!("missing {field_name}")))?;
-    let value = ((proto.high as u128) << 64) | proto.low as u128;
-    Ok(StreamId::new(value))
+    proto_convert::required_stream_id(proto, field_name).map_err(WorkerError::InvalidArgument)
 }
 
 pub fn proto_to_group_id(proto: Option<ShardGroupIdProto>, field_name: &str) -> WorkerCoreResult<ShardGroupId> {
-    let proto = proto.ok_or_else(|| WorkerError::InvalidArgument(format!("missing {field_name}")))?;
-    Ok(ShardGroupId::new(proto.value))
+    proto_convert::required_group_id(proto, field_name).map_err(WorkerError::InvalidArgument)
 }
 
 pub fn stream_id_to_proto(stream_id: StreamId) -> StreamIdProto {
-    let value = stream_id.as_raw();
-    StreamIdProto {
-        high: (value >> 64) as u64,
-        low: value as u64,
-    }
+    stream_id.into()
 }
 
 pub fn proto_to_byte_range(proto: &ByteRangeProto) -> ByteRange {
-    ByteRange {
-        offset: proto.offset,
-        len: proto.len,
-    }
+    proto.into()
 }
 
 pub fn group_id_to_proto(group_id: ShardGroupId) -> ShardGroupIdProto {
-    ShardGroupIdProto {
-        value: group_id.as_raw(),
-    }
+    group_id.into()
 }
 
 pub fn block_id_to_proto(block_id: BlockId) -> BlockIdProto {
-    BlockIdProto {
-        data_handle_id: block_id.data_handle_id.as_raw(),
-        block_index: block_id.index.as_raw(),
-    }
+    block_id.into()
 }
 
 pub fn byte_range_to_proto(byte_range: ByteRange) -> ByteRangeProto {
-    ByteRangeProto {
-        offset: byte_range.offset,
-        len: byte_range.len,
-    }
+    byte_range.into()
 }
 
 pub fn fencing_token_to_proto(token: FencingToken) -> FencingTokenProto {
-    FencingTokenProto {
-        block_id: Some(block_id_to_proto(token.block_id)),
-        owner: token.owner.as_raw(),
-        epoch: token.epoch,
-    }
+    token.into()
 }
 
 pub fn request_header_to_data_proto(ctx: &RequestHeader) -> DataRequestHeaderProto {
-    DataRequestHeaderProto {
-        client: Some((&ctx.client).into()),
-        traceparent: ctx.traceparent.clone().unwrap_or_default(),
-    }
+    ctx.into()
 }
 
 pub fn read_open_request_to_proto(req: ReadOpenRequest, ctx: &RequestHeader) -> OpenReadStreamRequestProto {
@@ -245,26 +217,14 @@ pub fn proto_to_abort_write_request(proto: AbortWriteRequestProto) -> WorkerCore
 }
 
 pub fn proto_to_fencing_token(proto: &FencingTokenProto) -> WorkerCoreResult<FencingToken> {
-    let block_id = proto
-        .block_id
-        .as_ref()
-        .ok_or_else(|| WorkerError::InvalidArgument("missing block_id in token".to_string()))?;
-    Ok(FencingToken::new(
-        BlockId::new(
-            DataHandleId::new(block_id.data_handle_id),
-            BlockIndex::new(block_id.block_index),
-        ),
-        ClientId::new(proto.owner),
-        proto.epoch,
-    ))
+    FencingToken::try_from(*proto).map_err(WorkerError::InvalidArgument)
 }
 
 fn proto_to_required_fencing_token(
     proto: Option<FencingTokenProto>,
     field_name: &str,
 ) -> WorkerCoreResult<FencingToken> {
-    let proto = proto.ok_or_else(|| WorkerError::InvalidArgument(format!("missing {field_name}")))?;
-    proto_to_fencing_token(&proto)
+    proto_convert::required_fencing_token(proto, field_name).map_err(WorkerError::InvalidArgument)
 }
 
 fn proto_to_checksum_kind(checksum_kind: i32) -> WorkerCoreResult<ChecksumKind> {

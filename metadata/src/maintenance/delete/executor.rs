@@ -662,10 +662,8 @@ impl DeleteExecutor {
 
             let block_ids_proto: Vec<proto::common::BlockIdProto> = block_ids
                 .iter()
-                .map(|bid| proto::common::BlockIdProto {
-                    data_handle_id: bid.data_handle_id.as_raw(),
-                    block_index: bid.index.as_raw(),
-                })
+                .copied()
+                .map(proto::common::BlockIdProto::from)
                 .collect();
 
             let task_id = {

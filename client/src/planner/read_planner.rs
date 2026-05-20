@@ -5,7 +5,7 @@
 
 use crate::error::{ClientError, ClientResult};
 use proto::metadata::{FileBlockLocationProto, GetBlockLocationsResponseProto};
-use types::{BlockId, BlockIndex, DataHandleId, InodeId};
+use types::{BlockId, DataHandleId, InodeId};
 
 /// Splits public read ranges into block-local worker reads.
 #[derive(Clone, Debug, Default)]
@@ -222,12 +222,10 @@ impl ReadPlanner {
 fn block_id_from_location(location: &FileBlockLocationProto) -> ClientResult<BlockId> {
     let block_id = location
         .block_id
-        .as_ref()
         .ok_or_else(|| ClientError::InvalidLayout("block location missing block_id".to_string()))?;
-    Ok(BlockId::new(
-        DataHandleId::new(block_id.data_handle_id),
-        BlockIndex::new(block_id.block_index),
-    ))
+    block_id
+        .try_into()
+        .map_err(|_| ClientError::InvalidLayout("block location invalid block_id".to_string()))
 }
 
 fn response_group_id(response: &GetBlockLocationsResponseProto) -> ClientResult<u64> {
@@ -254,8 +252,9 @@ fn data_handle_id_from_proto(
     field: &str,
 ) -> ClientResult<DataHandleId> {
     value
-        .map(|id| DataHandleId::new(id.value))
-        .ok_or_else(|| ClientError::InvalidLayout(format!("{field} missing")))
+        .ok_or_else(|| ClientError::InvalidLayout(format!("{field} missing")))?
+        .try_into()
+        .map_err(|_| ClientError::InvalidLayout(format!("{field} invalid")))
 }
 
 fn file_version_from_proto(value: Option<u64>, field: &str) -> ClientResult<u64> {

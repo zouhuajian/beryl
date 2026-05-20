@@ -1097,8 +1097,9 @@ fn data_handle_id_from_proto(
     field: &str,
 ) -> ClientResult<DataHandleId> {
     value
-        .map(|id| DataHandleId::new(id.value))
-        .ok_or_else(|| ClientError::Metadata(format!("{field} missing")))
+        .ok_or_else(|| ClientError::Metadata(format!("{field} missing")))?
+        .try_into()
+        .map_err(|_| ClientError::Metadata(format!("{field} invalid")))
 }
 
 fn file_version_from_proto(value: Option<u64>, field: &str) -> ClientResult<u64> {

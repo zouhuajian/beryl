@@ -17,7 +17,7 @@ use proto::metadata::WriteTargetProto;
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use types::fs::{Extent, FsErrorCode};
-use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+use types::ids::{BlockId, BlockIndex, WorkerId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
 
@@ -813,10 +813,9 @@ impl<'a> WriteSessionCoordinator<'a> {
             }
         };
         let block_id = match target.block_id {
-            Some(block_id) => BlockId::new(
-                types::ids::DataHandleId::new(block_id.data_handle_id),
-                BlockIndex::new(block_id.block_index),
-            ),
+            Some(block_id) => {
+                BlockId::try_from(block_id).unwrap_or_else(|()| unreachable!("BlockIdProto conversion is infallible"))
+            }
             None => {
                 return self.core.failure_from_error(
                     &req.ctx,
@@ -832,10 +831,8 @@ impl<'a> WriteSessionCoordinator<'a> {
                 block_id: token
                     .block_id
                     .map(|block| {
-                        BlockId::new(
-                            types::ids::DataHandleId::new(block.data_handle_id),
-                            BlockIndex::new(block.block_index),
-                        )
+                        BlockId::try_from(block)
+                            .unwrap_or_else(|()| unreachable!("BlockIdProto conversion is infallible"))
                     })
                     .unwrap_or(block_id),
                 owner: types::ids::ClientId::new(token.owner),
@@ -891,12 +888,8 @@ impl<'a> WriteSessionCoordinator<'a> {
     fn target_block_id(target: &WriteTargetProto) -> MetadataResult<BlockId> {
         let block_id = target
             .block_id
-            .as_ref()
             .ok_or_else(|| MetadataError::InvalidArgument("issued write target missing block_id".to_string()))?;
-        Ok(BlockId::new(
-            DataHandleId::new(block_id.data_handle_id),
-            BlockIndex::new(block_id.block_index),
-        ))
+        Ok(BlockId::try_from(block_id).unwrap_or_else(|()| unreachable!("BlockIdProto conversion is infallible")))
     }
 
     fn block_end(block: &CommittedBlock) -> Option<u64> {

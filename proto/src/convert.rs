@@ -16,9 +16,11 @@ use ::common::{
     header::{AuthnType, CallerContext, ClientInfo, RequestHeader, ResponseHeader, RpcErrorCode, RpcStatus},
 };
 use std::str::FromStr;
+use types::chunk::ByteRange;
 use types::ids::{
     BlockId, BlockIndex, ChunkId, ChunkIndex, DataHandleId, LeaseId, MountId, ShardGroupId, ShardId, StreamId, WorkerId,
 };
+use types::lease::FencingToken;
 use types::{CallId, ClientId, GroupStateWatermark, RaftLogId};
 
 // ============================================================================
@@ -157,6 +159,17 @@ impl TryFrom<proto_common::ShardGroupIdProto> for ShardGroupId {
     }
 }
 
+/// Parse a required shard group id field without choosing caller error policy.
+pub fn required_group_id(
+    proto: Option<proto_common::ShardGroupIdProto>,
+    field_name: &str,
+) -> Result<ShardGroupId, String> {
+    proto
+        .ok_or_else(|| format!("missing {field_name}"))?
+        .try_into()
+        .map_err(|_| format!("invalid {field_name}"))
+}
+
 impl From<MountId> for proto_common::MountIdProto {
     fn from(id: MountId) -> Self {
         proto_common::MountIdProto { value: id.as_raw() }
@@ -169,6 +182,86 @@ impl TryFrom<proto_common::MountIdProto> for MountId {
     fn try_from(id: proto_common::MountIdProto) -> Result<Self, Self::Error> {
         Ok(MountId::new(id.value))
     }
+}
+
+/// Parse a required block id field without choosing caller error policy.
+pub fn required_block_id(proto: Option<proto_common::BlockIdProto>, field_name: &str) -> Result<BlockId, String> {
+    proto
+        .ok_or_else(|| format!("missing {field_name}"))?
+        .try_into()
+        .map_err(|_| format!("invalid {field_name}"))
+}
+
+/// Parse a required stream id field without choosing caller error policy.
+pub fn required_stream_id(proto: Option<proto_common::StreamIdProto>, field_name: &str) -> Result<StreamId, String> {
+    proto
+        .ok_or_else(|| format!("missing {field_name}"))?
+        .try_into()
+        .map_err(|_| format!("invalid {field_name}"))
+}
+
+impl From<ByteRange> for proto_common::ByteRangeProto {
+    fn from(range: ByteRange) -> Self {
+        proto_common::ByteRangeProto {
+            offset: range.offset,
+            len: range.len,
+        }
+    }
+}
+
+impl From<&proto_common::ByteRangeProto> for ByteRange {
+    fn from(range: &proto_common::ByteRangeProto) -> Self {
+        ByteRange {
+            offset: range.offset,
+            len: range.len,
+        }
+    }
+}
+
+impl From<proto_common::ByteRangeProto> for ByteRange {
+    fn from(range: proto_common::ByteRangeProto) -> Self {
+        ByteRange::from(&range)
+    }
+}
+
+impl From<FencingToken> for proto_common::FencingTokenProto {
+    fn from(token: FencingToken) -> Self {
+        proto_common::FencingTokenProto {
+            block_id: Some(token.block_id.into()),
+            owner: token.owner.as_raw(),
+            epoch: token.epoch,
+        }
+    }
+}
+
+impl TryFrom<proto_common::FencingTokenProto> for FencingToken {
+    type Error = String;
+
+    fn try_from(token: proto_common::FencingTokenProto) -> Result<Self, Self::Error> {
+        let block_id = required_block_id(token.block_id, "block_id in token")?;
+        Ok(FencingToken::new(block_id, ClientId::new(token.owner), token.epoch))
+    }
+}
+
+/// Parse a required fencing token field without choosing caller error policy.
+pub fn required_fencing_token(
+    proto: Option<proto_common::FencingTokenProto>,
+    field_name: &str,
+) -> Result<FencingToken, String> {
+    proto.ok_or_else(|| format!("missing {field_name}"))?.try_into()
+}
+
+/// Parse a known, explicitly specified worker network protocol value.
+///
+/// Caller-owned policy still decides whether a known protocol is supported or
+/// whether unspecified/unknown values should default, reject, or trigger refresh.
+pub fn parse_known_worker_net_protocol(value: i32) -> Result<proto_common::WorkerNetProtocolProto, String> {
+    let protocol = proto_common::WorkerNetProtocolProto::try_from(value)
+        .map_err(|_| format!("unknown worker_net_protocol value {value}"))?;
+    if protocol == proto_common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified {
+        return Err("unspecified worker_net_protocol must not default to gRPC".to_string());
+    }
+    Ok(protocol)
 }
 
 // ============================================================================
@@ -488,11 +581,17 @@ impl From<proto_common::CallerContextProto> for CallerContext {
 }
 
 // ============================================================================
-// DataRequestHeaderProto / DataResponseHeaderProto Conversions
+// DataRequestHeaderProto Conversions
 // ============================================================================
-//
-// NOTE: These conversions are implemented in worker crate's convert module
-// to avoid circular dependencies (proto should not depend on worker).
+
+impl From<&RequestHeader> for crate::worker::DataRequestHeaderProto {
+    fn from(header: &RequestHeader) -> Self {
+        crate::worker::DataRequestHeaderProto {
+            client: Some((&header.client).into()),
+            traceparent: header.traceparent.clone().unwrap_or_default(),
+        }
+    }
+}
 
 // ============================================================================
 // Canonical error helpers (shared between control/data-plane conversions)
@@ -867,5 +966,61 @@ mod tests {
         let proto_response: proto_common::ResponseHeaderProto = (&response).into();
         let decoded_response = ResponseHeader::try_from(proto_response).expect("response header decode");
         assert_eq!(decoded_response.state, state);
+    }
+
+    #[test]
+    fn required_fencing_token_requires_token_and_block_id() {
+        let missing_token = required_fencing_token(None, "token").expect_err("missing token must fail");
+        assert!(missing_token.contains("missing token"));
+
+        let missing_block = proto_common::FencingTokenProto {
+            block_id: None,
+            owner: 7,
+            epoch: 11,
+        };
+        let missing_block =
+            required_fencing_token(Some(missing_block), "token").expect_err("missing token block_id must fail");
+        assert!(missing_block.contains("missing block_id in token"));
+    }
+
+    #[test]
+    fn fencing_token_and_byte_range_conversion_round_trip() {
+        let block_id = BlockId::from_u64_u32(42, 3);
+        let token = types::lease::FencingToken::new(block_id, ClientId::new(9), 17);
+        let proto_token: proto_common::FencingTokenProto = token.into();
+        let decoded = types::lease::FencingToken::try_from(proto_token).expect("fencing token decode");
+        assert_eq!(decoded, token);
+
+        let range = types::chunk::ByteRange { offset: 128, len: 4096 };
+        let proto_range: proto_common::ByteRangeProto = range.into();
+        let decoded = types::chunk::ByteRange::from(proto_range);
+        assert_eq!(decoded, range);
+    }
+
+    #[test]
+    fn worker_net_protocol_parser_rejects_unspecified_and_unknown_but_accepts_known_values() {
+        let unspecified =
+            parse_known_worker_net_protocol(proto_common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified as i32)
+                .expect_err("unspecified must fail");
+        assert!(unspecified.contains("unspecified worker_net_protocol"));
+
+        let unknown = parse_known_worker_net_protocol(99).expect_err("unknown must fail");
+        assert!(unknown.contains("unknown worker_net_protocol value 99"));
+
+        assert_eq!(
+            parse_known_worker_net_protocol(proto_common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32)
+                .expect("grpc must parse"),
+            proto_common::WorkerNetProtocolProto::WorkerNetProtocolGrpc
+        );
+        assert_eq!(
+            parse_known_worker_net_protocol(proto_common::WorkerNetProtocolProto::WorkerNetProtocolQuic as i32)
+                .expect("quic must parse"),
+            proto_common::WorkerNetProtocolProto::WorkerNetProtocolQuic
+        );
+        assert_eq!(
+            parse_known_worker_net_protocol(proto_common::WorkerNetProtocolProto::WorkerNetProtocolRdma as i32)
+                .expect("rdma must parse"),
+            proto_common::WorkerNetProtocolProto::WorkerNetProtocolRdma
+        );
     }
 }
