@@ -4,11 +4,12 @@
 //! Vecton filesystem client.
 //!
 //! The public facade is centered on [`FsClient`], [`FileHandle`],
-//! [`OpenOptions`], and [`CreateMode`]. Metadata-facing operations are executed
-//! through the internal operation executor and metadata gateway, with hardened
-//! refresh, replay header, and invalid response-header handling. Public reads
-//! return one complete buffer through internal data-plane adapters; public
-//! writes use internal write-state tracking and data-plane adapters.
+//! [`OpenOptions`], [`CreateMode`], and small namespace snapshot types.
+//! Metadata-facing operations are executed through the internal operation
+//! executor and metadata gateway, with hardened refresh, replay header, and
+//! invalid response-header handling. Public reads return one complete buffer
+//! through internal data-plane adapters; public writes use internal write-state
+//! tracking and data-plane adapters.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -31,6 +32,7 @@ pub(crate) mod metadata;
 
 // Re-export commonly used types
 pub use api::{CreateMode, FileHandle, FsClient, OpenOptions};
+pub use api::{DirectoryEntry, DirectoryListing, FileAttrs, FileKind, FileStatus};
 pub use config::ClientConfig;
 pub use config::{
     BackoffConfig, CacheConfig, ChannelPoolConfig, ReadModeFallback, RefreshConfig, RetryConfig, WriteModeFallback,

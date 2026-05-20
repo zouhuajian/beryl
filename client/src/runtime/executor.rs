@@ -6,6 +6,7 @@
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::canonical::ClientAction;
 use crate::config::{BackoffConfig, RefreshConfig, RetryConfig};
@@ -237,19 +238,12 @@ impl OperationExecutor {
         .await
     }
 
-    /// Execute AbortFileWrite.
+    /// Execute AbortFileWrite with a frozen cleanup operation identity.
     pub(crate) async fn abort_file_write(
         &self,
-        path: &str,
-        session_identity: String,
+        operation: OperationContext,
         req: AbortFileWriteOp,
     ) -> ClientResult<AbortFileWriteResult> {
-        let operation = OperationContext::new(
-            self.client_id,
-            OperationKind::CleanupBestEffort,
-            "AbortFileWrite",
-            OperationIdentity::session(path, session_identity),
-        )?;
         self.execute_metadata(operation, req, |gateway, ctx, req| async move {
             gateway.abort_file_write(ctx, req).await
         })
@@ -323,7 +317,8 @@ impl OperationExecutor {
 
         loop {
             let endpoint = self.refresh_manager.endpoint_for_group(target_group)?;
-            let mut ctx = AttemptContext::for_metadata(&operation, target_group, attempt)?;
+            let mut ctx = AttemptContext::for_metadata(&operation, target_group, attempt)?
+                .with_operation_timeout_ms(self.retry.operation_timeout_ms);
             ctx = ctx.with_metadata_endpoint(endpoint);
             ctx = self.refresh_manager.enrich_attempt_context(&operation, ctx);
             if let Some(watermark) = self.refresh_manager.state_watermark_proto(target_group) {
@@ -331,7 +326,10 @@ impl OperationExecutor {
             }
             let observed_fingerprint = ctx.operation_fingerprint();
 
-            match call(Arc::clone(&self.gateway), ctx, request.clone()).await {
+            match self
+                .metadata_rpc_with_timeout(&operation, call(Arc::clone(&self.gateway), ctx, request.clone()))
+                .await
+            {
                 Ok(result) => return Ok(result),
                 Err(err) => {
                     let class = self.classifier.classify_error(&err);
@@ -462,10 +460,34 @@ impl OperationExecutor {
         attempt_number: u32,
     ) -> ClientResult<()> {
         let endpoint = self.refresh_manager.endpoint_for_group(target_group)?;
-        let ctx =
-            AttemptContext::for_metadata(operation, target_group, attempt_number)?.with_metadata_endpoint(endpoint);
-        let watermark = self.gateway.msync(ctx, MsyncOp { header: None }).await?;
+        let ctx = AttemptContext::for_metadata(operation, target_group, attempt_number)?
+            .with_operation_timeout_ms(self.retry.operation_timeout_ms)
+            .with_metadata_endpoint(endpoint);
+        let watermark = self
+            .metadata_rpc_with_timeout(operation, self.gateway.msync(ctx, MsyncOp { header: None }))
+            .await?;
         self.refresh_manager.record_state_watermark(watermark)
+    }
+
+    async fn metadata_rpc_with_timeout<T, Fut>(&self, operation: &OperationContext, future: Fut) -> ClientResult<T>
+    where
+        Fut: Future<Output = ClientResult<T>>,
+    {
+        let Some(timeout) = operation_timeout_duration(self.retry.operation_timeout_ms) else {
+            return future.await;
+        };
+        match tokio::time::timeout(timeout, future).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.record_metric(
+                    ClientMetric::RpcTimeout,
+                    operation_labels(operation)
+                        .with_error_class(ErrorClass::RetryableTransport.label())
+                        .with_outcome("timeout"),
+                );
+                Err(timeout_error("metadata", operation.operation_name(), timeout))
+            }
+        }
     }
 
     fn retry_budget_for_operation(&self, kind: OperationKind) -> usize {
@@ -558,6 +580,17 @@ impl OperationExecutor {
     fn record_metric(&self, metric: ClientMetric, labels: ClientMetricLabels) {
         self.metrics.record(ClientMetricEvent::new(metric, labels));
     }
+}
+
+fn operation_timeout_duration(timeout_ms: Option<u64>) -> Option<Duration> {
+    timeout_ms.map(Duration::from_millis)
+}
+
+fn timeout_error(target_plane: &str, operation: &str, timeout: Duration) -> ClientError {
+    ClientError::from(tonic::Status::deadline_exceeded(format!(
+        "{target_plane} {operation} timed out after {}ms",
+        timeout.as_millis()
+    )))
 }
 
 impl fmt::Debug for OperationExecutor {
@@ -1384,6 +1417,75 @@ mod tests {
         assert_eq!(gateway.calls().len(), 1);
     }
 
+    #[tokio::test]
+    async fn pending_metadata_rpc_times_out_with_configured_operation_timeout() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let gateway = Arc::new(ScriptedGateway::new(vec![GatewayOutcome::Pending]));
+        let mut retry = retry_config(0);
+        retry.operation_timeout_ms = Some(10);
+        let metrics_hook: Arc<dyn ClientMetrics> = metrics.clone();
+        let executor = test_executor_with_hooks(
+            gateway.clone(),
+            retry,
+            RefreshConfig::default(),
+            metrics_hook,
+            Arc::new(RecordingSleeper::default()),
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            executor.get_status(
+                "/alpha",
+                GetStatusRequestProto {
+                    header: None,
+                    path: "/alpha".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("executor must return before outer test timeout");
+        let err = result.expect_err("pending metadata call must fail with timeout");
+
+        assert_eq!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
+        assert_metric(&metrics.events(), ClientMetric::RpcTimeout);
+        let calls = gateway.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].deadline_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_timeout_consumes_retry_budget_and_reuses_call_id() {
+        let gateway = Arc::new(ScriptedGateway::new(vec![GatewayOutcome::Pending, GatewayOutcome::Ok]));
+        let mut retry = retry_config(1);
+        retry.operation_timeout_ms = Some(10);
+        let executor = test_executor_with_hooks(
+            gateway.clone(),
+            retry,
+            RefreshConfig::default(),
+            Arc::new(RecordingMetrics::default()),
+            Arc::new(RecordingSleeper::default()),
+        );
+
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            executor.get_status(
+                "/alpha",
+                GetStatusRequestProto {
+                    header: None,
+                    path: "/alpha".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("executor must return before outer test timeout")
+        .expect("retry after timeout should succeed");
+
+        let calls = gateway.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].call_id, calls[1].call_id);
+        assert!(calls.iter().all(|call| call.deadline_ms > 0));
+    }
+
     #[derive(Clone, Debug)]
     enum GatewayOutcome {
         Ok,
@@ -1395,6 +1497,7 @@ mod tests {
         TransportUnavailable,
         MissingHeader,
         ZeroGroupIdOkHeader,
+        Pending,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1403,6 +1506,7 @@ mod tests {
         group_id: u64,
         endpoint: Option<String>,
         call_id: String,
+        deadline_ms: i64,
         mount_epoch: Option<u64>,
         route_epoch: Option<u64>,
         state: Vec<GroupStateWatermarkProto>,
@@ -1440,21 +1544,20 @@ mod tests {
                 group_id: header.group_id,
                 endpoint: ctx.metadata_endpoint().map(ToOwned::to_owned),
                 call_id: header.client.expect("client").call_id,
+                deadline_ms: header.deadline_ms,
                 mount_epoch: header.mount_epoch,
                 route_epoch: header.route_epoch,
                 state: header.state,
             });
         }
 
-        fn next_result(&self, method: &'static str, ctx: &AttemptContext) -> ClientResult<()> {
+        async fn next_result(&self, method: &'static str, ctx: &AttemptContext) -> ClientResult<()> {
             self.record(method, ctx);
-            match self
-                .outcomes
-                .lock()
-                .expect("outcomes")
-                .pop_front()
-                .unwrap_or(GatewayOutcome::Ok)
-            {
+            let outcome = {
+                let mut outcomes = self.outcomes.lock().expect("outcomes");
+                outcomes.pop_front().unwrap_or(GatewayOutcome::Ok)
+            };
+            match outcome {
                 GatewayOutcome::Ok => Ok(()),
                 GatewayOutcome::Refresh { code, reason, hint } => Err(refresh_error(code, reason, hint)),
                 GatewayOutcome::TransportUnavailable => Err(ClientError::from(tonic::Status::unavailable(
@@ -1464,6 +1567,10 @@ mod tests {
                     Err(invalid_header_error("metadata OK response missing ResponseHeader"))
                 }
                 GatewayOutcome::ZeroGroupIdOkHeader => zero_group_id_ok_header_error(),
+                GatewayOutcome::Pending => {
+                    std::future::pending::<()>().await;
+                    Ok(())
+                }
             }
         }
     }
@@ -1471,22 +1578,22 @@ mod tests {
     #[async_trait]
     impl MetadataGateway for ScriptedGateway {
         async fn get_status(&self, ctx: AttemptContext, _req: GetStatusOp) -> ClientResult<StatusSnapshot> {
-            self.next_result("get_status", &ctx)?;
+            self.next_result("get_status", &ctx).await?;
             Ok(GetStatusResponseProto::default())
         }
 
         async fn list_status(&self, ctx: AttemptContext, _req: ListStatusOp) -> ClientResult<ListSnapshot> {
-            self.next_result("list_status", &ctx)?;
+            self.next_result("list_status", &ctx).await?;
             Ok(ListSnapshot::default())
         }
 
         async fn delete(&self, ctx: AttemptContext, _req: DeleteOp) -> ClientResult<DeleteResult> {
-            self.next_result("delete", &ctx)?;
+            self.next_result("delete", &ctx).await?;
             Ok(DeleteResponseProto::default())
         }
 
         async fn rename(&self, ctx: AttemptContext, _req: RenameOp) -> ClientResult<RenameResult> {
-            self.next_result("rename", &ctx)?;
+            self.next_result("rename", &ctx).await?;
             Ok(RenameResult::default())
         }
 
@@ -1495,27 +1602,27 @@ mod tests {
             ctx: AttemptContext,
             _req: OpenFileOp,
         ) -> ClientResult<crate::metadata::FileSnapshot> {
-            self.next_result("open_file", &ctx)?;
+            self.next_result("open_file", &ctx).await?;
             Ok(crate::metadata::FileSnapshot::default())
         }
 
         async fn read_layout(&self, ctx: AttemptContext, _req: GetBlockLocationsOp) -> ClientResult<LayoutSnapshot> {
-            self.next_result("read_layout", &ctx)?;
+            self.next_result("read_layout", &ctx).await?;
             Ok(GetBlockLocationsResponseProto::default())
         }
 
         async fn create_file(&self, ctx: AttemptContext, _req: CreateFileOp) -> ClientResult<WriteSessionSeed> {
-            self.next_result("create_file", &ctx)?;
+            self.next_result("create_file", &ctx).await?;
             Ok(WriteSessionSeed::Create(CreateFileResponseProto::default()))
         }
 
         async fn append_file(&self, ctx: AttemptContext, _req: AppendFileOp) -> ClientResult<WriteSessionSeed> {
-            self.next_result("append_file", &ctx)?;
+            self.next_result("append_file", &ctx).await?;
             Ok(WriteSessionSeed::Append(AppendFileResponseProto::default()))
         }
 
         async fn add_block(&self, ctx: AttemptContext, _req: AddBlockOp) -> ClientResult<AddBlockResult> {
-            self.next_result("add_block", &ctx)?;
+            self.next_result("add_block", &ctx).await?;
             Ok(AddBlockResult {
                 group_id: ctx.metadata_header()?.group_id,
                 target: AddBlockResponseProto::default()
@@ -1525,7 +1632,7 @@ mod tests {
         }
 
         async fn commit_file(&self, ctx: AttemptContext, _req: CommitFileOp) -> ClientResult<CommitFileResult> {
-            self.next_result("commit_file", &ctx)?;
+            self.next_result("commit_file", &ctx).await?;
             Ok(CommitFileResponseProto::default())
         }
 
@@ -1534,12 +1641,12 @@ mod tests {
             ctx: AttemptContext,
             _req: AbortFileWriteOp,
         ) -> ClientResult<AbortFileWriteResult> {
-            self.next_result("abort_file_write", &ctx)?;
+            self.next_result("abort_file_write", &ctx).await?;
             Ok(AbortFileWriteResponseProto::default())
         }
 
         async fn renew_lease(&self, ctx: AttemptContext, _req: RenewLeaseOp) -> ClientResult<RenewLeaseResult> {
-            self.next_result("renew_lease", &ctx)?;
+            self.next_result("renew_lease", &ctx).await?;
             Ok(RenewLeaseResponseProto::default())
         }
 

@@ -88,12 +88,22 @@ pub struct CacheConfig {
     pub layout_cache_ttl: Duration,
     /// Maximum number of read-layout cache entries.
     pub layout_cache_max_entries: usize,
+    /// Enable singleflight coalescing for concurrent read-layout misses.
+    pub layout_singleflight_enabled: bool,
     /// Enable metadata-authoritative worker endpoint cache reuse.
     pub worker_endpoint_cache_enabled: bool,
     /// TTL for worker endpoint cache entries.
     pub worker_endpoint_cache_ttl: Duration,
     /// Maximum number of worker endpoint cache entries.
     pub worker_endpoint_cache_max_entries: usize,
+    /// Enable singleflight coalescing for concurrent worker endpoint misses.
+    pub worker_endpoint_singleflight_enabled: bool,
+    /// Enable temporary endpoint health penalties after repeated failures.
+    pub endpoint_health_enabled: bool,
+    /// Consecutive failure threshold before an endpoint is temporarily unhealthy.
+    pub endpoint_health_failure_threshold: usize,
+    /// Temporary endpoint health penalty TTL.
+    pub endpoint_health_ttl: Duration,
 }
 
 /// Channel/client pool configuration.
@@ -103,10 +113,14 @@ pub struct ChannelPoolConfig {
     pub metadata_channel_pool_enabled: bool,
     /// Maximum cached metadata channels per group.
     pub metadata_channel_pool_max_per_group: usize,
+    /// Enable singleflight coalescing for metadata channel creation.
+    pub metadata_channel_singleflight_enabled: bool,
     /// Enable worker channel/client reuse.
     pub worker_channel_pool_enabled: bool,
     /// Maximum cached worker channels per worker identity.
     pub worker_channel_pool_max_per_worker: usize,
+    /// Enable singleflight coalescing for worker channel creation.
+    pub worker_channel_singleflight_enabled: bool,
 }
 
 /// Retry configuration.
@@ -202,8 +216,10 @@ impl Default for ChannelPoolConfig {
         Self {
             metadata_channel_pool_enabled: true,
             metadata_channel_pool_max_per_group: 1,
+            metadata_channel_singleflight_enabled: true,
             worker_channel_pool_enabled: true,
             worker_channel_pool_max_per_worker: 1,
+            worker_channel_singleflight_enabled: true,
         }
     }
 }
@@ -331,11 +347,22 @@ fn cache_config_from_flat(flat: &FlatConfig) -> Result<CacheConfig, CommonError>
     let layout_cache_enabled = get_bool_or(flat, "client.cache.layout.enabled", false)?;
     let layout_cache_ttl = Duration::from_secs(get_u64_or_strict(flat, "client.cache.layout.ttl_secs", 0)?);
     let layout_cache_max_entries = get_usize_or_strict(flat, "client.cache.layout.max_entries", 1024)?;
+    let layout_singleflight_enabled = get_bool_or(flat, "client.cache.layout.singleflight.enabled", true)?;
     let worker_endpoint_cache_enabled = get_bool_or(flat, "client.cache.worker_endpoint.enabled", false)?;
     let worker_endpoint_cache_ttl =
         Duration::from_secs(get_u64_or_strict(flat, "client.cache.worker_endpoint.ttl_secs", 0)?);
     let worker_endpoint_cache_max_entries =
         get_usize_or_strict(flat, "client.cache.worker_endpoint.max_entries", 1024)?;
+    let worker_endpoint_singleflight_enabled =
+        get_bool_or(flat, "client.cache.worker_endpoint.singleflight.enabled", true)?;
+    let endpoint_health_enabled = get_bool_or(flat, "client.cache.worker_endpoint.health.enabled", true)?;
+    let endpoint_health_failure_threshold =
+        get_usize_or_strict(flat, "client.cache.worker_endpoint.health.failure_threshold", 2)?;
+    let endpoint_health_ttl = Duration::from_secs(get_u64_or_strict(
+        flat,
+        "client.cache.worker_endpoint.health.ttl_secs",
+        5,
+    )?);
 
     if layout_cache_enabled && layout_cache_max_entries == 0 {
         return Err(invalid_config(
@@ -349,6 +376,12 @@ fn cache_config_from_flat(flat: &FlatConfig) -> Result<CacheConfig, CommonError>
             "must be greater than zero when worker endpoint cache is enabled",
         ));
     }
+    if endpoint_health_enabled && endpoint_health_failure_threshold == 0 {
+        return Err(invalid_config(
+            "client.cache.worker_endpoint.health.failure_threshold",
+            "must be greater than zero when endpoint health is enabled",
+        ));
+    }
 
     Ok(CacheConfig {
         max_file_meta_entries: get_usize_or_strict(flat, "client.cache.file_meta.max_entries", 10000)?,
@@ -359,9 +392,14 @@ fn cache_config_from_flat(flat: &FlatConfig) -> Result<CacheConfig, CommonError>
         layout_cache_enabled,
         layout_cache_ttl,
         layout_cache_max_entries,
+        layout_singleflight_enabled,
         worker_endpoint_cache_enabled,
         worker_endpoint_cache_ttl,
         worker_endpoint_cache_max_entries,
+        worker_endpoint_singleflight_enabled,
+        endpoint_health_enabled,
+        endpoint_health_failure_threshold,
+        endpoint_health_ttl,
     })
 }
 
@@ -377,6 +415,11 @@ fn channel_pool_config_from_flat(flat: &FlatConfig) -> Result<ChannelPoolConfig,
             "client.channel_pool.metadata.max_per_group",
             ChannelPoolConfig::default().metadata_channel_pool_max_per_group,
         )?,
+        metadata_channel_singleflight_enabled: get_bool_or(
+            flat,
+            "client.channel_pool.metadata.singleflight.enabled",
+            ChannelPoolConfig::default().metadata_channel_singleflight_enabled,
+        )?,
         worker_channel_pool_enabled: get_bool_or(
             flat,
             "client.channel_pool.worker.enabled",
@@ -386,6 +429,11 @@ fn channel_pool_config_from_flat(flat: &FlatConfig) -> Result<ChannelPoolConfig,
             flat,
             "client.channel_pool.worker.max_per_worker",
             ChannelPoolConfig::default().worker_channel_pool_max_per_worker,
+        )?,
+        worker_channel_singleflight_enabled: get_bool_or(
+            flat,
+            "client.channel_pool.worker.singleflight.enabled",
+            ChannelPoolConfig::default().worker_channel_singleflight_enabled,
         )?,
     };
     if config.metadata_channel_pool_max_per_group == 0 {
@@ -587,10 +635,17 @@ mod tests {
         assert!(!config.cache.worker_endpoint_cache_enabled);
         assert_eq!(config.cache.worker_endpoint_cache_max_entries, 1024);
         assert!(config.cache.worker_endpoint_cache_ttl.is_zero());
+        assert!(config.cache.layout_singleflight_enabled);
+        assert!(config.cache.worker_endpoint_singleflight_enabled);
+        assert!(config.cache.endpoint_health_enabled);
+        assert_eq!(config.cache.endpoint_health_failure_threshold, 2);
+        assert_eq!(config.cache.endpoint_health_ttl, std::time::Duration::from_secs(5));
         assert!(config.channel_pool.metadata_channel_pool_enabled);
         assert_eq!(config.channel_pool.metadata_channel_pool_max_per_group, 1);
+        assert!(config.channel_pool.metadata_channel_singleflight_enabled);
         assert!(config.channel_pool.worker_channel_pool_enabled);
         assert_eq!(config.channel_pool.worker_channel_pool_max_per_worker, 1);
+        assert!(config.channel_pool.worker_channel_singleflight_enabled);
     }
 
     #[test]
@@ -602,10 +657,17 @@ mod tests {
         flat.set("client.cache.worker_endpoint.enabled", true);
         flat.set("client.cache.worker_endpoint.ttl_secs", 45i64);
         flat.set("client.cache.worker_endpoint.max_entries", 9i64);
+        flat.set("client.cache.layout.singleflight.enabled", false);
+        flat.set("client.cache.worker_endpoint.singleflight.enabled", false);
+        flat.set("client.cache.worker_endpoint.health.enabled", false);
+        flat.set("client.cache.worker_endpoint.health.failure_threshold", 4i64);
+        flat.set("client.cache.worker_endpoint.health.ttl_secs", 12i64);
         flat.set("client.channel_pool.metadata.enabled", false);
         flat.set("client.channel_pool.metadata.max_per_group", 2i64);
+        flat.set("client.channel_pool.metadata.singleflight.enabled", false);
         flat.set("client.channel_pool.worker.enabled", false);
         flat.set("client.channel_pool.worker.max_per_worker", 3i64);
+        flat.set("client.channel_pool.worker.singleflight.enabled", false);
 
         let config = ClientConfig::from_flat(flat).expect("cache and pool config");
 
@@ -618,10 +680,17 @@ mod tests {
             std::time::Duration::from_secs(45)
         );
         assert_eq!(config.cache.worker_endpoint_cache_max_entries, 9);
+        assert!(!config.cache.layout_singleflight_enabled);
+        assert!(!config.cache.worker_endpoint_singleflight_enabled);
+        assert!(!config.cache.endpoint_health_enabled);
+        assert_eq!(config.cache.endpoint_health_failure_threshold, 4);
+        assert_eq!(config.cache.endpoint_health_ttl, std::time::Duration::from_secs(12));
         assert!(!config.channel_pool.metadata_channel_pool_enabled);
         assert_eq!(config.channel_pool.metadata_channel_pool_max_per_group, 2);
+        assert!(!config.channel_pool.metadata_channel_singleflight_enabled);
         assert!(!config.channel_pool.worker_channel_pool_enabled);
         assert_eq!(config.channel_pool.worker_channel_pool_max_per_worker, 3);
+        assert!(!config.channel_pool.worker_channel_singleflight_enabled);
     }
 
     #[test]

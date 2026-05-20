@@ -245,6 +245,7 @@ fn client_source_tree_has_no_orphan_rust_files() {
         "api/handle.rs",
         "api/mod.rs",
         "api/options.rs",
+        "api/status.rs",
         "cache/layout.rs",
         "cache/mod.rs",
         "cache/state_id.rs",
@@ -275,6 +276,7 @@ fn client_source_tree_has_no_orphan_rust_files() {
         "runtime/mod.rs",
         "runtime/policy.rs",
         "runtime/refresh.rs",
+        "runtime/singleflight.rs",
         "session/mod.rs",
         "session/write_session.rs",
     ]

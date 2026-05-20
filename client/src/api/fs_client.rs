@@ -4,17 +4,19 @@
 //! Public filesystem-facing facade.
 
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use proto::metadata::{
-    AbortFileWriteRequestProto, AddBlockRequestProto, AppendFileRequestProto, CommittedBlockProto,
-    CreateDispositionProto, CreateFileRequestProto, DeleteRequestProto, GetStatusRequestProto, GetStatusResponseProto,
-    ListStatusRequestProto, ListStatusResponseProto, OpenFileRequestProto, RenameRequestProto, RenewLeaseRequestProto,
+    AddBlockRequestProto, AppendFileRequestProto, CommittedBlockProto, CreateDispositionProto, CreateFileRequestProto,
+    DeleteRequestProto, GetBlockLocationsResponseProto, GetStatusRequestProto, ListStatusRequestProto,
+    OpenFileRequestProto, RenameRequestProto, RenewLeaseRequestProto,
 };
 use types::{DataHandleId, InodeId};
 
-use crate::api::{CreateMode, FileHandle, OpenOptions};
+use crate::api::{CreateMode, DirectoryListing, FileHandle, FileStatus, OpenOptions};
 use crate::cache::{LayoutCache, LayoutCacheKey};
 use crate::canonical::{ClientAction, RefreshHint};
 use crate::config::ClientConfig;
@@ -23,6 +25,7 @@ use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult
 use crate::metadata::{MetadataGateway, TonicMetadataGateway, WriteSessionSeed};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics, NoopClientMetrics};
 use crate::planner::read_planner::ReadPlanner;
+use crate::runtime::singleflight::{Singleflight, SingleflightMode};
 use crate::runtime::{
     AttemptContext, BackoffPolicy, BackoffSleeper, ErrorClass, ErrorClassifier, OperationContext, OperationExecutor,
     OperationIdentity, OperationKind, OperationRuntime, RefreshManager, RefreshReason, RetryDecision,
@@ -42,6 +45,7 @@ pub struct FsClient {
     executor: OperationExecutor,
     data_boundary: DataPlaneBoundary,
     layout_cache: LayoutCache,
+    layout_singleflight: Singleflight<LayoutCacheKey, GetBlockLocationsResponseProto>,
     backoff: BackoffPolicy,
     sleeper: Arc<dyn BackoffSleeper>,
     metrics: Arc<dyn ClientMetrics>,
@@ -119,6 +123,7 @@ impl FsClient {
             executor,
             data_boundary,
             layout_cache,
+            layout_singleflight: Singleflight::default(),
             backoff,
             sleeper,
             metrics,
@@ -210,9 +215,10 @@ impl FsClient {
     }
 
     /// Return file or directory status through the metadata runtime.
-    pub async fn stat(&self, path: &str) -> ClientResult<GetStatusResponseProto> {
+    pub async fn stat(&self, path: &str) -> ClientResult<FileStatus> {
         validate_path(path)?;
-        self.executor
+        let response = self
+            .executor
             .get_status(
                 path,
                 GetStatusRequestProto {
@@ -220,13 +226,15 @@ impl FsClient {
                     path: path.to_string(),
                 },
             )
-            .await
+            .await?;
+        FileStatus::from_proto(path, response)
     }
 
     /// List a directory through the metadata runtime.
-    pub async fn list(&self, path: &str) -> ClientResult<ListStatusResponseProto> {
+    pub async fn list(&self, path: &str) -> ClientResult<DirectoryListing> {
         validate_path(path)?;
-        self.executor
+        let response = self
+            .executor
             .list_status(
                 path,
                 ListStatusRequestProto {
@@ -237,7 +245,8 @@ impl FsClient {
                     limit: 0,
                 },
             )
-            .await
+            .await?;
+        Ok(DirectoryListing::from_proto(path, response))
     }
 
     /// Delete a file, symlink, or directory through the metadata runtime.
@@ -277,21 +286,22 @@ impl FsClient {
 
     /// Read a full range into one buffer using all-or-error semantics.
     pub async fn read(&self, handle: &FileHandle, offset: u64, len: u32) -> ClientResult<Bytes> {
-        let Some(span) = ReadPlanner::plan_requested_range(offset, len, handle.file_size)? else {
+        let Some(span) = ReadPlanner::plan_requested_range(offset, len, handle.size_hint())? else {
             return Ok(Bytes::new());
         };
-        if handle.file_version.is_none() {
+        let Some(file_version) = handle.file_version() else {
             return Err(ClientError::StaleHandle {
                 reason: "read handle missing file_version".to_string(),
             });
-        }
-        let file_version = handle.file_version.expect("checked above");
-        let layout_key = LayoutCacheKey::new(handle.inode_id, handle.data_handle_id, file_version, span);
+        };
+        let inode_id = handle.inode_id();
+        let data_handle_id = handle.data_handle_id();
+        let layout_key = LayoutCacheKey::new(inode_id, data_handle_id, file_version, span);
         let operation = OperationContext::new(
             self.executor.client_id(),
             OperationKind::WorkerReadData,
             "Read",
-            OperationIdentity::path(handle.path.clone()),
+            OperationIdentity::path(handle.path().to_string()),
         )?;
         let mut retry_used = 0usize;
         let mut refresh_used = 0usize;
@@ -299,26 +309,20 @@ impl FsClient {
         let refresh_budget = self.config.refresh.max_refresh_attempts;
         let mut attempt = 0u32;
         loop {
-            let layout = match self.layout_cache.get(&layout_key) {
-                Some(layout) => layout,
-                None => {
-                    let layout = self
-                        .executor
-                        .read_layout_for_data_handle(&handle.path, handle.data_handle_id, span.file_offset, span.len)
-                        .await?;
-                    self.layout_cache.insert_validated(layout_key, layout.clone())?;
-                    layout
-                }
-            };
-            let (group_id, segments) = ReadPlanner::resolve_response(
-                handle.inode_id,
-                handle.data_handle_id,
-                handle.file_version,
-                span,
-                &layout,
-            )?;
-            let ctx = AttemptContext::for_data(&operation, attempt);
-            match self.data_boundary.read_all(ctx, group_id, &segments).await {
+            let layout = self
+                .load_layout(handle.path(), data_handle_id, span, layout_key)
+                .await?;
+            let (group_id, segments) =
+                ReadPlanner::resolve_response(inode_id, data_handle_id, Some(file_version), span, &layout)?;
+            let ctx = self.data_attempt_context(&operation, attempt);
+            match self
+                .worker_rpc_with_timeout(
+                    "Read",
+                    OperationKind::WorkerReadData,
+                    self.data_boundary.read_all(ctx, group_id, &segments),
+                )
+                .await
+            {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => {
                     let class = ErrorClassifier.classify_error(&err);
@@ -458,15 +462,18 @@ impl FsClient {
                     &worker_path,
                     &worker_session_identity,
                 )?;
-                let ctx = AttemptContext::for_data(&operation, 0);
+                let ctx = self.data_attempt_context(&operation, 0);
                 let commit_result = match self
-                    .data_boundary
-                    .commit_write(
-                        ctx,
-                        pending.worker_block(),
-                        pending.written_len(),
-                        pending.commit_seq(),
-                        false,
+                    .worker_rpc_with_timeout(
+                        "CommitWrite",
+                        OperationKind::WorkerWriteData,
+                        self.data_boundary.commit_write(
+                            ctx,
+                            pending.worker_block(),
+                            pending.written_len(),
+                            pending.commit_seq(),
+                            false,
+                        ),
                     )
                     .await
                 {
@@ -493,8 +500,15 @@ impl FsClient {
             committed_blocks.push(committed_block_from_pending(pending)?);
         }
 
+        let retrying_unknown_commit = session.is_commit_unknown();
         let (operation, request) =
             session.prepare_commit_file(self.executor.client_id(), committed_blocks, final_size)?;
+        if retrying_unknown_commit {
+            self.record_metric(
+                ClientMetric::CommitUnknownRetry,
+                metric_labels("CommitFile", OperationKind::MetadataSessionBarrier).with_outcome("retry"),
+            );
+        }
         match self.executor.commit_file(operation, request).await {
             Ok(response) => {
                 session.mark_closed(response.file_version);
@@ -512,9 +526,7 @@ impl FsClient {
                 )))
             }
             Err(err) => {
-                if is_session_or_fencing_error(&err) {
-                    session.mark_session_invalid();
-                }
+                mark_session_after_session_error(&mut session, &err);
                 let class = ErrorClassifier.classify_error(&err);
                 self.record_error_metric("CommitFile", OperationKind::MetadataSessionBarrier, &class);
                 Err(err)
@@ -540,10 +552,14 @@ impl FsClient {
             .write_session()
             .ok_or_else(|| ClientError::InvalidArgument("handle is not a write handle".to_string()))?;
         let mut session = session_ref.lock().await;
-        session.ensure_open()?;
+        session.ensure_open_for_renew()?;
         let path = session.path().to_string();
         let session_identity = session.session_identity();
         let write_handle = session.write_handle();
+        self.record_metric(
+            ClientMetric::LeaseRenewAttempt,
+            metric_labels("RenewLease", OperationKind::MetadataSessionBarrier).with_outcome("attempt"),
+        );
         match self
             .executor
             .renew_lease(
@@ -558,14 +574,22 @@ impl FsClient {
         {
             Ok(response) => {
                 session.update_expires_at_ms(response.expires_at_ms);
+                self.record_metric(
+                    ClientMetric::LeaseRenewSuccess,
+                    metric_labels("RenewLease", OperationKind::MetadataSessionBarrier).with_outcome("success"),
+                );
                 Ok(())
             }
             Err(err) => {
-                if is_session_or_fencing_error(&err) {
-                    session.mark_session_invalid();
-                }
+                mark_session_after_session_error(&mut session, &err);
                 let class = ErrorClassifier.classify_error(&err);
                 self.record_error_metric("RenewLease", OperationKind::MetadataSessionBarrier, &class);
+                self.record_metric(
+                    ClientMetric::LeaseRenewFailure,
+                    metric_labels("RenewLease", OperationKind::MetadataSessionBarrier)
+                        .with_error_class(class.label())
+                        .with_outcome("failure"),
+                );
                 Err(err)
             }
         }
@@ -577,41 +601,30 @@ impl FsClient {
             .write_session()
             .ok_or_else(|| ClientError::InvalidArgument("handle is not a write handle".to_string()))?;
         let mut session = session_ref.lock().await;
-        session.ensure_abort_allowed()?;
-        if session
-            .pending_blocks_mut()
-            .iter()
-            .any(|block| block.worker_committed())
-        {
-            return Err(ClientError::UnknownOutcome(
-                "cannot safely abort after a worker block commit succeeded".to_string(),
-            ));
-        }
-        let path = session.path().to_string();
-        let session_identity = session.session_identity();
-        let write_handle = session.write_handle();
+        session.ensure_open_for_abort()?;
+        let plan = session.prepare_abort_cleanup(self.executor.client_id())?;
         let mut abort_error = None;
         self.record_metric(
             ClientMetric::AbortAttempt,
             metric_labels("AbortFileWrite", OperationKind::CleanupBestEffort).with_outcome("attempt"),
         );
-        for pending in session.pending_blocks_mut() {
-            let operation = worker_write_operation(self.executor.client_id(), "AbortWrite", &path, &session_identity)?;
-            let ctx = AttemptContext::for_data(&operation, 0);
-            if let Err(err) = self.data_boundary.abort_write(ctx, pending.worker_block()).await {
+        for cleanup in plan.worker_cleanups() {
+            let operation = cleanup.operation();
+            let ctx = self.data_attempt_context(&operation, 0);
+            if let Err(err) = self
+                .worker_rpc_with_timeout(
+                    "AbortWrite",
+                    OperationKind::CleanupBestEffort,
+                    self.data_boundary.abort_write(ctx, cleanup.worker_block()),
+                )
+                .await
+            {
                 abort_error.get_or_insert(err);
             }
         }
         if let Err(err) = self
             .executor
-            .abort_file_write(
-                &path,
-                session_identity,
-                AbortFileWriteRequestProto {
-                    header: None,
-                    write_handle: Some(write_handle),
-                },
-            )
+            .abort_file_write(plan.metadata_operation(), plan.metadata_request())
             .await
         {
             abort_error.get_or_insert(self.normalize_unknown_outcome(
@@ -685,10 +698,14 @@ impl FsClient {
             session.path(),
             &session.session_identity(),
         )?;
-        let ctx = AttemptContext::for_data(&operation, 0);
+        let ctx = self.data_attempt_context(&operation, 0);
         let worker_block = match self
-            .data_boundary
-            .open_write(ctx, add_block.group_id, add_block.target.clone())
+            .worker_rpc_with_timeout(
+                "OpenWriteStream",
+                OperationKind::WorkerWriteData,
+                self.data_boundary
+                    .open_write(ctx, add_block.group_id, add_block.target.clone()),
+            )
             .await
         {
             Ok(worker_block) => worker_block,
@@ -697,7 +714,14 @@ impl FsClient {
                 return Err(self.normalize_unknown_outcome("OpenWriteStream", OperationKind::WorkerWriteData, err));
             }
         };
-        let response = match self.data_boundary.write_all(&worker_block, data).await {
+        let response = match self
+            .worker_rpc_with_timeout(
+                "WriteStream",
+                OperationKind::WorkerWriteData,
+                self.data_boundary.write_all(&worker_block, data),
+            )
+            .await
+        {
             Ok(response) => response,
             Err(err) => {
                 mark_session_after_write_error(session, &err);
@@ -727,6 +751,62 @@ impl FsClient {
         Ok(())
     }
 
+    async fn load_layout(
+        &self,
+        path: &str,
+        data_handle_id: DataHandleId,
+        span: crate::planner::read_planner::PlannedReadRange,
+        layout_key: LayoutCacheKey,
+    ) -> ClientResult<GetBlockLocationsResponseProto> {
+        if let Some(layout) = self.layout_cache.get(&layout_key) {
+            return Ok(layout);
+        }
+        if !self.config.cache.layout_singleflight_enabled {
+            let layout = self
+                .executor
+                .read_layout_for_data_handle(path, data_handle_id, span.file_offset, span.len)
+                .await?;
+            self.layout_cache.insert_validated(layout_key, layout.clone())?;
+            return Ok(layout);
+        }
+
+        let executor = self.executor.clone();
+        let layout_cache = self.layout_cache.clone();
+        let layout_cache_for_flight = layout_cache.clone();
+        let path = path.to_string();
+        let (mode, result) = self
+            .layout_singleflight
+            .run(layout_key, move || async move {
+                tokio::task::yield_now().await;
+                if let Some(layout) = layout_cache_for_flight.get(&layout_key) {
+                    return Ok(layout);
+                }
+                let layout = executor
+                    .read_layout_for_data_handle(&path, data_handle_id, span.file_offset, span.len)
+                    .await?;
+                layout_cache.insert_validated(layout_key, layout.clone())?;
+                Ok(layout)
+            })
+            .await;
+        if mode == SingleflightMode::Joined {
+            self.record_metric(
+                ClientMetric::LayoutSingleflightJoin,
+                cache_metric_labels("layout", "metadata", "read", "join"),
+            );
+            self.record_metric(
+                ClientMetric::LayoutDuplicateRequestAvoided,
+                cache_metric_labels("layout", "metadata", "read", "avoided"),
+            );
+        }
+        if result.is_err() {
+            self.record_metric(
+                ClientMetric::LayoutSingleflightFailure,
+                cache_metric_labels("layout", "metadata", "read", "failure"),
+            );
+        }
+        result
+    }
+
     async fn unsupported_write_barrier(
         &self,
         handle: &FileHandle,
@@ -736,8 +816,8 @@ impl FsClient {
         let session_ref = handle
             .write_session()
             .ok_or_else(|| ClientError::InvalidArgument("handle is not a write handle".to_string()))?;
-        let session = session_ref.lock().await;
-        session.ensure_open()?;
+        let mut session = session_ref.lock().await;
+        session.ensure_open_for_barrier()?;
         self.record_metric(
             ClientMetric::UnsupportedOperation,
             metric_labels(operation, OperationKind::MetadataSessionBarrier)
@@ -747,6 +827,40 @@ impl FsClient {
         Err(ClientError::Unsupported(format!(
             "unsupported operation: {operation} ({reason})"
         )))
+    }
+
+    fn data_attempt_context(&self, operation: &OperationContext, attempt: u32) -> AttemptContext {
+        AttemptContext::for_data(operation, attempt).with_operation_timeout_ms(self.config.retry.operation_timeout_ms)
+    }
+
+    async fn worker_rpc_with_timeout<T, Fut>(
+        &self,
+        operation: &'static str,
+        kind: OperationKind,
+        future: Fut,
+    ) -> ClientResult<T>
+    where
+        Fut: Future<Output = ClientResult<T>>,
+    {
+        let Some(timeout) = self.operation_timeout_duration() else {
+            return future.await;
+        };
+        match tokio::time::timeout(timeout, future).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.record_metric(
+                    ClientMetric::RpcTimeout,
+                    metric_labels(operation, kind)
+                        .with_error_class(ErrorClass::RetryableTransport.label())
+                        .with_outcome("timeout"),
+                );
+                Err(timeout_error(kind.target_plane(), operation, timeout))
+            }
+        }
+    }
+
+    fn operation_timeout_duration(&self) -> Option<Duration> {
+        self.config.retry.operation_timeout_ms.map(Duration::from_millis)
     }
 
     async fn sleep_before_retry(&self, retry_index: usize, operation: &'static str, kind: OperationKind) {
@@ -1004,6 +1118,26 @@ fn metric_labels(operation: &'static str, kind: OperationKind) -> ClientMetricLa
     ClientMetricLabels::default().with_operation(kind.label(), operation, kind.target_plane())
 }
 
+fn cache_metric_labels(
+    cache: &'static str,
+    plane: &'static str,
+    operation: &'static str,
+    outcome: &'static str,
+) -> ClientMetricLabels {
+    ClientMetricLabels::default()
+        .with_cache(cache)
+        .with_target_plane(plane)
+        .with_operation_name(operation)
+        .with_outcome(outcome)
+}
+
+fn timeout_error(target_plane: &str, operation: &str, timeout: Duration) -> ClientError {
+    ClientError::from(tonic::Status::deadline_exceeded(format!(
+        "{target_plane} {operation} timed out after {}ms",
+        timeout.as_millis()
+    )))
+}
+
 fn refresh_hint_from_error(err: &ClientError) -> RefreshHint {
     match err {
         ClientError::Action(action) => match action.as_ref() {
@@ -1035,7 +1169,15 @@ fn mark_session_after_write_error(session: &mut WriteSession, err: &ClientError)
     if is_conservative_unknown_outcome_error(err) {
         session.mark_unknown_outcome();
     } else if is_session_or_fencing_error(err) || is_write_refresh_error(err) {
-        session.mark_session_invalid();
+        mark_session_after_session_error(session, err);
+    }
+}
+
+fn mark_session_after_session_error(session: &mut WriteSession, err: &ClientError) {
+    match ErrorClassifier.classify_error(err) {
+        ErrorClass::SessionExpired => session.mark_session_expired(),
+        ErrorClass::Fencing | ErrorClass::SessionInvalid | ErrorClass::NeedRefresh(_) => session.mark_session_invalid(),
+        _ => {}
     }
 }
 
@@ -1104,6 +1246,7 @@ mod tests {
         ListStatusResponseProto, OpenFileResponseProto, RenameResponseProto, RenewLeaseResponseProto, WriteHandleProto,
         WriteTargetProto,
     };
+    use tokio::sync::Notify;
     use types::{DataHandleId, InodeId};
 
     use crate::canonical::{ClientAction, RefreshHint};
@@ -1162,8 +1305,8 @@ mod tests {
             .await
             .expect("open replay succeeds");
 
-        assert_eq!(handle.inode_id, InodeId::new(101));
-        assert_eq!(handle.data_handle_id, DataHandleId::new(202));
+        assert_eq!(handle.inode_id(), InodeId::new(101));
+        assert_eq!(handle.data_handle_id(), DataHandleId::new(202));
         let calls = gateway.calls();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].method, "open_file");
@@ -1186,10 +1329,40 @@ mod tests {
             .await
             .expect("append open");
 
-        assert_eq!(created.path, "/created");
-        assert_eq!(appended.path, "/append");
+        assert_eq!(created.path(), "/created");
+        assert_eq!(appended.path(), "/append");
         let methods: Vec<_> = gateway.calls().into_iter().map(|call| call.method).collect();
         assert_eq!(methods, vec!["create_file", "append_file"]);
+    }
+
+    #[tokio::test]
+    async fn file_handle_debug_redacts_write_session_identity_names() {
+        let gateway = Arc::new(MockGateway::default());
+        let client = FsClient::with_metadata_gateway(test_config(9), gateway).expect("client");
+        let handle = client
+            .open("/created", OpenOptions::create_new())
+            .await
+            .expect("write handle");
+        let debug = format!("{handle:?}");
+
+        assert!(debug.contains("is_write"));
+        for needle in [
+            concat!("inode", "_id"),
+            concat!("data", "_handle_id"),
+            concat!("file", "_version"),
+            concat!("write", "_handle"),
+            "fencing",
+            concat!("route", "_epoch"),
+            concat!("worker", "_epoch"),
+            concat!("block", "_stamp"),
+            concat!("call", "_id"),
+            concat!("stream", "_id"),
+        ] {
+            assert!(
+                !debug.contains(needle),
+                "FileHandle Debug output must redact {needle}: {debug}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1197,11 +1370,19 @@ mod tests {
         let gateway = Arc::new(MockGateway::default());
         let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
 
-        let _ = client.stat("/alpha").await.expect("stat");
-        let _ = client.list("/alpha").await.expect("list");
+        let status = client.stat("/alpha").await.expect("stat");
+        let listing = client.list("/alpha").await.expect("list");
         client.delete("/alpha", false).await.expect("delete");
         client.rename("/alpha", "/beta").await.expect("rename");
 
+        assert_eq!(status.path(), "/alpha");
+        assert_eq!(status.attrs.size, 10);
+        assert_eq!(listing.path(), "/alpha");
+        assert!(listing.eof);
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].name, "child");
+        assert_eq!(listing.entries[0].kind, Some(crate::api::FileKind::File));
+        assert_eq!(listing.entries[0].attrs.as_ref().expect("entry attrs").size, 4);
         let methods: Vec<_> = gateway.calls().into_iter().map(|call| call.method).collect();
         assert_eq!(methods, vec!["get_status", "list_status", "delete", "rename"]);
     }
@@ -1521,6 +1702,10 @@ mod tests {
             .expect("write handle");
 
         client.renew_lease(&handle).await.expect("renew write lease");
+        let session_ref = handle.write_session().expect("write session");
+        let session = session_ref.lock().await;
+        assert_eq!(session.expires_at_ms(), Some(u64::MAX / 2));
+        drop(session);
         client
             .write(&handle, 0, Bytes::from_static(b"ok"))
             .await
@@ -1598,7 +1783,7 @@ mod tests {
             .expect("overwrite sequential write");
         client.close(&handle).await.expect("overwrite close");
 
-        assert_eq!(handle.file_size, 0);
+        assert_eq!(handle.size_hint(), 0);
         assert_eq!(worker.written_bytes(), Bytes::from_static(b"fresh"));
         assert_eq!(worker.committed_lens(), vec![5]);
 
@@ -1870,6 +2055,120 @@ mod tests {
         let err = client.abort(&handle).await.expect_err("finished abort is terminal");
         assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("aborted")));
         assert_eq!(method_count(&gateway.calls(), "abort_file_write"), 2);
+    }
+
+    #[tokio::test]
+    async fn abort_unknown_retry_reuses_worker_abort_identity_and_snapshot() {
+        let gateway = Arc::new(MockGateway::default());
+        let worker = Arc::new(MockDataClient::with_abort_outcomes(vec![
+            WorkerAbortOutcome::Unknown,
+            WorkerAbortOutcome::Ok,
+        ]));
+        let client = FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone()))
+            .expect("client");
+        let handle = client
+            .open("/created", OpenOptions::create_new())
+            .await
+            .expect("write handle");
+
+        client
+            .write(&handle, 0, Bytes::from_static(b"hello"))
+            .await
+            .expect("sequential write");
+        let err = client.abort(&handle).await.expect_err("worker abort outcome unknown");
+        assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("AbortWrite")));
+
+        client.abort(&handle).await.expect("abort retry succeeds");
+
+        let worker_aborts = worker.abort_records();
+        assert_eq!(worker_aborts.len(), 2);
+        assert_eq!(worker_aborts[0].call_id, worker_aborts[1].call_id);
+        assert_eq!(
+            worker_aborts[0].operation_fingerprint,
+            worker_aborts[1].operation_fingerprint
+        );
+        assert_eq!(
+            worker_block_signature(&worker_aborts[0].block),
+            worker_block_signature(&worker_aborts[1].block)
+        );
+
+        let metadata_aborts = gateway.abort_file_records();
+        assert_eq!(metadata_aborts.len(), 2);
+        assert_eq!(metadata_aborts[0].call_id, metadata_aborts[1].call_id);
+        assert_eq!(
+            metadata_aborts[0].operation_fingerprint,
+            metadata_aborts[1].operation_fingerprint
+        );
+        assert_eq!(metadata_aborts[0].write_handle, metadata_aborts[1].write_handle);
+    }
+
+    #[tokio::test]
+    async fn abort_unknown_retry_reuses_metadata_abort_identity_and_payload() {
+        let gateway = Arc::new(MockGateway::with_abort_outcomes(vec![
+            AbortOutcome::TransportUnknown,
+            AbortOutcome::Ok,
+        ]));
+        let worker = Arc::new(MockDataClient::default());
+        let client =
+            FsClient::with_data_boundary(test_config_with_retries(9, 0), gateway.clone(), data_boundary(worker))
+                .expect("client");
+        let handle = client
+            .open("/created", OpenOptions::create_new())
+            .await
+            .expect("write handle");
+
+        let err = client.abort(&handle).await.expect_err("metadata abort outcome unknown");
+        assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("AbortFileWrite")));
+        client.abort(&handle).await.expect("abort retry succeeds");
+
+        let metadata_aborts = gateway.abort_file_records();
+        assert_eq!(metadata_aborts.len(), 2);
+        assert_eq!(metadata_aborts[0].call_id, metadata_aborts[1].call_id);
+        assert_eq!(
+            metadata_aborts[0].operation_fingerprint,
+            metadata_aborts[1].operation_fingerprint
+        );
+        assert_eq!(metadata_aborts[0].write_handle, metadata_aborts[1].write_handle);
+    }
+
+    #[tokio::test]
+    async fn abort_cleanup_timeout_marks_abort_unknown_and_preserves_frozen_identity() {
+        let gateway = Arc::new(MockGateway::with_abort_outcomes(vec![
+            AbortOutcome::Pending,
+            AbortOutcome::Ok,
+        ]));
+        let worker = Arc::new(MockDataClient::default());
+        let client = FsClient::with_data_boundary(
+            test_config_with_timeout(9, 0, 10),
+            gateway.clone(),
+            data_boundary(worker),
+        )
+        .expect("client");
+        let handle = client
+            .open("/created", OpenOptions::create_new())
+            .await
+            .expect("write handle");
+
+        let err = client.abort(&handle).await.expect_err("metadata abort timeout unknown");
+        assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("AbortFileWrite")));
+        let err = client
+            .write(&handle, 0, Bytes::from_static(b"x"))
+            .await
+            .expect_err("AbortUnknown blocks writes");
+        assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("abort outcome")));
+        let err = client.close(&handle).await.expect_err("AbortUnknown blocks close");
+        assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("abort outcome")));
+
+        client.abort(&handle).await.expect("abort retry succeeds");
+
+        let metadata_aborts = gateway.abort_file_records();
+        assert_eq!(metadata_aborts.len(), 2);
+        assert_eq!(metadata_aborts[0].call_id, metadata_aborts[1].call_id);
+        assert_eq!(
+            metadata_aborts[0].operation_fingerprint,
+            metadata_aborts[1].operation_fingerprint
+        );
+        assert_eq!(metadata_aborts[0].write_handle, metadata_aborts[1].write_handle);
     }
 
     #[tokio::test]
@@ -2154,6 +2453,39 @@ mod tests {
             .expect_err("write session must stay conservative");
         assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("unknown outcome")));
         assert_eq!(method_count(&gateway.calls(), "add_block"), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_worker_open_write_times_out_without_advancing_cursor_or_committing_block() {
+        let gateway = Arc::new(MockGateway::default());
+        let worker = Arc::new(MockDataClient::with_open_outcomes(vec![WorkerOpenOutcome::Pending]));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let client = client_with_metrics(
+            test_config_with_timeout(9, 0, 10),
+            gateway,
+            data_boundary(worker.clone()),
+            metrics.clone(),
+        );
+        let handle = client
+            .open("/created", OpenOptions::create_new())
+            .await
+            .expect("write handle");
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            client.write(&handle, 0, Bytes::from_static(b"hello")),
+        )
+        .await
+        .expect("write must return before outer test timeout");
+        let err = result.expect_err("pending OpenWriteStream must time out");
+
+        assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("OpenWriteStream")));
+        assert_eq!(worker.written_bytes(), Bytes::new());
+        let session_ref = handle.write_session().expect("write session");
+        let mut session = session_ref.lock().await;
+        assert_eq!(session.cursor(), 0);
+        assert!(session.pending_blocks_mut().is_empty());
+        assert_metric(&metrics.events(), ClientMetric::RpcTimeout);
     }
 
     #[tokio::test]
@@ -2557,7 +2889,7 @@ mod tests {
             .await
             .expect("CreateFile retry returns persisted result");
 
-        assert_eq!(handle.path, "/created");
+        assert_eq!(handle.path(), "/created");
         let calls: Vec<_> = gateway
             .calls()
             .into_iter()
@@ -3027,6 +3359,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_layout_cache_miss_same_key_coalesces_to_one_metadata_call() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let gateway = Arc::new(MockGateway::with_layout_gate(
+            layout_response(9, 101, 202, Some(3), 16, vec![location_with_stamp(202, 0, 0, 16, 77)]),
+            Arc::clone(&started),
+            Arc::clone(&release),
+        ));
+        let worker = Arc::new(MockDataClient::from_file(b"abcdefghijklmnop"));
+        let client = FsClient::with_data_boundary(
+            test_config_with_layout_cache(9, Duration::from_secs(60), 16),
+            gateway.clone(),
+            data_boundary(worker),
+        )
+        .expect("client");
+        let handle = read_handle(16);
+
+        let mut reads = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let client = client.clone();
+            let handle = handle.clone();
+            reads.push(tokio::spawn(async move { client.read(&handle, 0, 4).await }));
+        }
+        started.notified().await;
+        release.notify_waiters();
+
+        for read in reads {
+            let bytes = read.await.expect("read task").expect("coalesced read");
+            assert_eq!(bytes, Bytes::from_static(b"abcd"));
+        }
+        assert_eq!(method_count(&gateway.calls(), "read_layout"), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_layout_cache_miss_different_keys_do_not_share_result() {
+        let gateway = Arc::new(MockGateway::with_layouts(vec![
+            layout_response(9, 101, 202, Some(3), 16, vec![location_with_stamp(202, 0, 0, 16, 77)]),
+            layout_response(9, 101, 202, Some(3), 16, vec![location_with_stamp(202, 0, 0, 16, 88)]),
+        ]));
+        let worker = Arc::new(MockDataClient::from_file(b"abcdefghijklmnop"));
+        let client = FsClient::with_data_boundary(
+            test_config_with_layout_cache(9, Duration::from_secs(60), 16),
+            gateway.clone(),
+            data_boundary(worker),
+        )
+        .expect("client");
+        let handle = read_handle(16);
+
+        let first = {
+            let client = client.clone();
+            let handle = handle.clone();
+            tokio::spawn(async move { client.read(&handle, 0, 4).await })
+        };
+        let second = {
+            let client = client.clone();
+            let handle = handle.clone();
+            tokio::spawn(async move { client.read(&handle, 4, 4).await })
+        };
+
+        first.await.expect("first task").expect("first read");
+        second.await.expect("second task").expect("second read");
+        assert_eq!(method_count(&gateway.calls(), "read_layout"), 2);
+    }
+
+    #[tokio::test]
+    async fn layout_singleflight_failure_wakes_all_waiters_without_cache_poisoning() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let gateway = Arc::new(MockGateway::with_layout_failure_gate(
+            Arc::clone(&started),
+            Arc::clone(&release),
+        ));
+        let worker = Arc::new(MockDataClient::from_file(b"abcdefghijklmnop"));
+        let client = FsClient::with_data_boundary(
+            test_config_with_layout_cache(9, Duration::from_secs(60), 16),
+            gateway.clone(),
+            data_boundary(worker),
+        )
+        .expect("client");
+        let handle = read_handle(16);
+
+        let mut reads = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let client = client.clone();
+            let handle = handle.clone();
+            reads.push(tokio::spawn(async move { client.read(&handle, 0, 4).await }));
+        }
+        started.notified().await;
+        release.notify_waiters();
+
+        for read in reads {
+            let err = read.await.expect("read task").expect_err("layout failure");
+            assert!(matches!(err, ClientError::Metadata(msg) if msg.contains("injected layout failure")));
+        }
+        assert_eq!(method_count(&gateway.calls(), "read_layout"), 1);
+        assert_eq!(client.layout_cache.len(), 0);
+    }
+
+    #[tokio::test]
     async fn layout_cache_metrics_use_safe_low_cardinality_labels() {
         let metrics = Arc::new(RecordingMetrics::default());
         let gateway = Arc::new(MockGateway::with_layout(layout_response(
@@ -3117,6 +3548,36 @@ mod tests {
 
         assert!(matches!(err, ClientError::Worker(msg) if msg.contains("injected read failure")));
         assert_eq!(worker.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn pending_worker_read_times_out_without_returning_partial_bytes() {
+        let gateway = Arc::new(MockGateway::with_layout(layout_response(
+            9,
+            101,
+            202,
+            Some(3),
+            16,
+            vec![location(202, 0, 0, 16)],
+        )));
+        let worker = Arc::new(MockDataClient::with_read_outcomes(vec![WorkerReadOutcome::Pending]));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let client = client_with_metrics(
+            test_config_with_timeout(9, 0, 10),
+            gateway,
+            data_boundary(worker.clone()),
+            metrics.clone(),
+        );
+        let handle = read_handle(16);
+
+        let result = tokio::time::timeout(Duration::from_millis(200), client.read(&handle, 0, 5))
+            .await
+            .expect("read must return before outer test timeout");
+        let err = result.expect_err("pending worker read must time out");
+
+        assert_eq!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
+        assert_eq!(worker.calls(), 1);
+        assert_metric(&metrics.events(), ClientMetric::RpcTimeout);
     }
 
     #[tokio::test]
@@ -3313,6 +3774,35 @@ mod tests {
         );
     }
 
+    fn worker_block_signature(
+        block: &WorkerWriteBlock,
+    ) -> (u64, u64, String, i32, u64, u64, u64, u64, u32, u64, u64, u64) {
+        (
+            block.group_id,
+            block.worker_id,
+            block.endpoint.clone(),
+            block.worker_net_protocol,
+            block.worker_epoch,
+            block.target.file_offset,
+            block.target.len,
+            block.target.block_stamp,
+            block
+                .target
+                .block_id
+                .as_ref()
+                .map(|block_id| block_id.block_index)
+                .unwrap_or_default(),
+            block
+                .target
+                .block_id
+                .as_ref()
+                .map(|block_id| block_id.data_handle_id)
+                .unwrap_or_default(),
+            block.stream_id.high,
+            block.stream_id.low,
+        )
+    }
+
     fn test_config(group_id: u64) -> ClientConfig {
         let mut config = ClientConfig {
             metadata_endpoints: vec!["http://127.0.0.1:18080".to_string()],
@@ -3330,6 +3820,12 @@ mod tests {
         config.retry.metadata_retry_budget = max_retries;
         config.retry.worker_retry_budget = max_retries;
         config.refresh.max_refresh_attempts = max_retries;
+        config
+    }
+
+    fn test_config_with_timeout(group_id: u64, max_retries: usize, timeout_ms: u64) -> ClientConfig {
+        let mut config = test_config_with_retries(group_id, max_retries);
+        config.retry.operation_timeout_ms = Some(timeout_ms);
         config
     }
 
@@ -3356,11 +3852,28 @@ mod tests {
         create_disposition: Option<i32>,
     }
 
+    #[derive(Clone, Debug)]
+    struct RecordedMetadataAbort {
+        call_id: String,
+        operation_fingerprint: crate::runtime::context::OperationFingerprint,
+        write_handle: Option<WriteHandleProto>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordedWorkerAbort {
+        call_id: String,
+        operation_fingerprint: crate::runtime::context::OperationFingerprint,
+        block: WorkerWriteBlock,
+    }
+
     #[derive(Debug, Default)]
     struct MockGateway {
         calls: Mutex<Vec<RecordedCall>>,
+        abort_file_records: Mutex<Vec<RecordedMetadataAbort>>,
         owner_redirect_group: Option<u64>,
         layouts: Mutex<VecDeque<GetBlockLocationsResponseProto>>,
+        layout_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+        layout_failure_gate: Option<(Arc<Notify>, Arc<Notify>)>,
         next_offsets: Mutex<HashMap<u64, u64>>,
         next_block_indexes: Mutex<HashMap<u64, u32>>,
         create_outcomes: Mutex<VecDeque<CreateOutcome>>,
@@ -3384,6 +3897,10 @@ mod tests {
             self.calls.lock().expect("calls").clone()
         }
 
+        fn abort_file_records(&self) -> Vec<RecordedMetadataAbort> {
+            self.abort_file_records.lock().expect("abort file records").clone()
+        }
+
         fn with_events(events: EventLog) -> Self {
             Self {
                 events: Some(events),
@@ -3403,6 +3920,27 @@ mod tests {
         fn with_layouts(layouts: Vec<GetBlockLocationsResponseProto>) -> Self {
             Self {
                 layouts: Mutex::new(layouts.into()),
+                ..Self::default()
+            }
+        }
+
+        fn with_layout_gate(
+            layout: GetBlockLocationsResponseProto,
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+        ) -> Self {
+            let mut layouts = VecDeque::new();
+            layouts.push_back(layout);
+            Self {
+                layouts: Mutex::new(layouts),
+                layout_gate: Some((started, release)),
+                ..Self::default()
+            }
+        }
+
+        fn with_layout_failure_gate(started: Arc<Notify>, release: Arc<Notify>) -> Self {
+            Self {
+                layout_failure_gate: Some((started, release)),
                 ..Self::default()
             }
         }
@@ -3608,12 +4146,25 @@ mod tests {
     impl MetadataGateway for MockGateway {
         async fn get_status(&self, ctx: AttemptContext, _req: GetStatusOp) -> ClientResult<GetStatusResponseProto> {
             self.record("get_status", &ctx);
-            Ok(GetStatusResponseProto::default())
+            Ok(GetStatusResponseProto {
+                inode_id: Some(proto::fs::InodeIdProto { value: 101 }),
+                attrs: Some(file_attrs_proto(10)),
+                ..GetStatusResponseProto::default()
+            })
         }
 
         async fn list_status(&self, ctx: AttemptContext, _req: ListStatusOp) -> ClientResult<ListStatusResponseProto> {
             self.record("list_status", &ctx);
-            Ok(ListStatusResponseProto::default())
+            Ok(ListStatusResponseProto {
+                entries: vec![proto::fs::DirEntryProto {
+                    name: "child".to_string(),
+                    inode_id: Some(proto::fs::InodeIdProto { value: 102 }),
+                    kind: proto::fs::InodeKindProto::InodeKindFile as i32,
+                    attrs: Some(file_attrs_proto(4)),
+                }],
+                eof: true,
+                ..ListStatusResponseProto::default()
+            })
         }
 
         async fn delete(&self, ctx: AttemptContext, _req: DeleteOp) -> ClientResult<DeleteResponseProto> {
@@ -3645,6 +4196,15 @@ mod tests {
         ) -> ClientResult<GetBlockLocationsResponseProto> {
             self.record_read_layout(&ctx, &req);
             self.maybe_owner_redirect(&ctx)?;
+            if let Some((started, release)) = &self.layout_failure_gate {
+                started.notify_waiters();
+                release.notified().await;
+                return Err(ClientError::Metadata("injected layout failure".to_string()));
+            }
+            if let Some((started, release)) = &self.layout_gate {
+                started.notify_waiters();
+                release.notified().await;
+            }
             let mut layouts = self.layouts.lock().expect("layouts");
             Ok(if layouts.len() > 1 {
                 layouts.pop_front().expect("layout queue reported a non-empty length")
@@ -3770,15 +4330,24 @@ mod tests {
         async fn abort_file_write(
             &self,
             ctx: AttemptContext,
-            _req: AbortFileWriteOp,
+            req: AbortFileWriteOp,
         ) -> ClientResult<AbortFileWriteResult> {
             self.record_event("abort_file_write");
             self.record("abort_file_write", &ctx);
+            self.abort_file_records
+                .lock()
+                .expect("abort file records")
+                .push(RecordedMetadataAbort {
+                    call_id: ctx.call_id().to_string(),
+                    operation_fingerprint: ctx.operation_fingerprint(),
+                    write_handle: req.write_handle,
+                });
             match self.next_abort_outcome() {
                 AbortOutcome::Ok => Ok(AbortFileWriteResponseProto::default()),
                 AbortOutcome::TransportUnknown => Err(ClientError::from(tonic::Status::unavailable(
                     "injected AbortFileWrite transport uncertainty",
                 ))),
+                AbortOutcome::Pending => std::future::pending::<ClientResult<AbortFileWriteResult>>().await,
             }
         }
 
@@ -3786,7 +4355,7 @@ mod tests {
             self.record("renew_lease", &ctx);
             match self.next_renew_outcome() {
                 RenewOutcome::Ok => Ok(RenewLeaseResponseProto {
-                    expires_at_ms: 12345,
+                    expires_at_ms: u64::MAX / 2,
                     ..RenewLeaseResponseProto::default()
                 }),
                 RenewOutcome::TransportFailure => Err(ClientError::from(tonic::Status::unavailable(
@@ -3840,6 +4409,7 @@ mod tests {
     enum AbortOutcome {
         Ok,
         TransportUnknown,
+        Pending,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3852,6 +4422,7 @@ mod tests {
     #[derive(Debug)]
     struct MockDataClient {
         file: Bytes,
+        read_outcomes: Mutex<VecDeque<WorkerReadOutcome>>,
         fail_after_first: bool,
         refresh_once: Option<RefreshReason>,
         calls: Mutex<usize>,
@@ -3864,6 +4435,7 @@ mod tests {
         write_outcomes: Mutex<VecDeque<WorkerWriteOutcome>>,
         commit_write_outcomes: Mutex<VecDeque<WorkerCommitOutcome>>,
         abort_outcomes: Mutex<VecDeque<WorkerAbortOutcome>>,
+        abort_records: Mutex<Vec<RecordedWorkerAbort>>,
         events: Option<EventLog>,
     }
 
@@ -3871,6 +4443,7 @@ mod tests {
         fn from_file(file: &'static [u8]) -> Self {
             Self {
                 file: Bytes::from_static(file),
+                read_outcomes: Mutex::new(VecDeque::new()),
                 fail_after_first: false,
                 refresh_once: None,
                 calls: Mutex::new(0),
@@ -3883,6 +4456,7 @@ mod tests {
                 write_outcomes: Mutex::new(VecDeque::new()),
                 commit_write_outcomes: Mutex::new(VecDeque::new()),
                 abort_outcomes: Mutex::new(VecDeque::new()),
+                abort_records: Mutex::new(Vec::new()),
                 events: None,
             }
         }
@@ -3905,6 +4479,13 @@ mod tests {
             Self {
                 refresh_once: Some(reason),
                 ..Self::from_file(file)
+            }
+        }
+
+        fn with_read_outcomes(outcomes: Vec<WorkerReadOutcome>) -> Self {
+            Self {
+                read_outcomes: Mutex::new(outcomes.into()),
+                ..Self::default()
             }
         }
 
@@ -3942,6 +4523,14 @@ mod tests {
                 .expect("open outcomes")
                 .pop_front()
                 .unwrap_or(WorkerOpenOutcome::Ok)
+        }
+
+        fn next_read_outcome(&self) -> WorkerReadOutcome {
+            self.read_outcomes
+                .lock()
+                .expect("read outcomes")
+                .pop_front()
+                .unwrap_or(WorkerReadOutcome::Ok)
         }
 
         fn next_write_outcome(&self) -> WorkerWriteOutcome {
@@ -3992,6 +4581,10 @@ mod tests {
             self.commit_sync_flags.lock().expect("commit sync flags").clone()
         }
 
+        fn abort_records(&self) -> Vec<RecordedWorkerAbort> {
+            self.abort_records.lock().expect("abort records").clone()
+        }
+
         fn record_event(&self, event: &'static str) {
             if let Some(events) = &self.events {
                 events.lock().expect("events").push(event);
@@ -4013,16 +4606,23 @@ mod tests {
             _group_id: u64,
             segment: &PlannedReadSegment,
         ) -> ClientResult<Bytes> {
-            let mut calls = self.calls.lock().expect("calls");
-            *calls += 1;
+            let call_number = {
+                let mut calls = self.calls.lock().expect("calls");
+                *calls += 1;
+                *calls
+            };
             self.stamps.lock().expect("stamps").push(segment.block_stamp);
-            if self.fail_after_first && *calls > 1 {
+            if self.fail_after_first && call_number > 1 {
                 return Err(ClientError::Worker("injected read failure".to_string()));
             }
-            if *calls == 1 {
+            if call_number == 1 {
                 if let Some(reason) = self.refresh_once {
                     return Err(refresh_action_error(reason));
                 }
+            }
+            match self.next_read_outcome() {
+                WorkerReadOutcome::Ok => {}
+                WorkerReadOutcome::Pending => std::future::pending::<()>().await,
             }
             let start = segment.file_offset as usize;
             let end = start + segment.len as usize;
@@ -4031,8 +4631,11 @@ mod tests {
 
         async fn open_write(&self, _ctx: AttemptContext, target: WorkerWriteTarget) -> ClientResult<WorkerWriteBlock> {
             self.record_event("open_write");
-            let mut calls = self.calls.lock().expect("calls");
-            *calls += 1;
+            let call_number = {
+                let mut calls = self.calls.lock().expect("calls");
+                *calls += 1;
+                *calls
+            };
             match self.next_open_outcome() {
                 WorkerOpenOutcome::Ok => {}
                 WorkerOpenOutcome::Unknown => {
@@ -4042,6 +4645,7 @@ mod tests {
                 }
                 WorkerOpenOutcome::InvalidHeader => return Err(invalid_header_error("OpenWriteStream")),
                 WorkerOpenOutcome::FatalFencing => return Err(fatal_fencing_error()),
+                WorkerOpenOutcome::Pending => std::future::pending::<()>().await,
             }
             Ok(WorkerWriteBlock {
                 group_id: target.group_id,
@@ -4052,7 +4656,7 @@ mod tests {
                 target: target.target,
                 stream_id: proto::common::StreamIdProto {
                     high: 1,
-                    low: *calls as u64,
+                    low: call_number as u64,
                 },
                 frame_size: 1024,
                 next_seq: 1,
@@ -4134,8 +4738,16 @@ mod tests {
             })
         }
 
-        async fn abort_write(&self, _ctx: AttemptContext, _block: &WorkerWriteBlock) -> ClientResult<()> {
+        async fn abort_write(&self, ctx: AttemptContext, block: &WorkerWriteBlock) -> ClientResult<()> {
             self.record_event("abort_write");
+            self.abort_records
+                .lock()
+                .expect("abort records")
+                .push(RecordedWorkerAbort {
+                    call_id: ctx.call_id().to_string(),
+                    operation_fingerprint: ctx.operation_fingerprint(),
+                    block: block.clone(),
+                });
             match self.next_abort_outcome() {
                 WorkerAbortOutcome::Ok => Ok(()),
                 WorkerAbortOutcome::Unknown => {
@@ -4146,11 +4758,18 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum WorkerReadOutcome {
+        Ok,
+        Pending,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum WorkerOpenOutcome {
         Ok,
         Unknown,
         InvalidHeader,
         FatalFencing,
+        Pending,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4216,6 +4835,19 @@ mod tests {
             file_size,
             locations,
             file_version,
+        }
+    }
+
+    fn file_attrs_proto(size: u64) -> proto::fs::FileAttrsProto {
+        proto::fs::FileAttrsProto {
+            mode: 0o100644,
+            uid: 1000,
+            gid: 1000,
+            size,
+            atime_ms: 11,
+            mtime_ms: 12,
+            ctime_ms: 13,
+            nlink: 1,
         }
     }
 

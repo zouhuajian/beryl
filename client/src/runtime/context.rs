@@ -5,6 +5,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use proto::common::{ClientInfoProto, RequestHeaderProto};
 use proto::worker::DataRequestHeaderProto;
@@ -253,9 +254,45 @@ impl AttemptContext {
         self
     }
 
+    /// Attach an absolute per-attempt deadline derived from the operation timeout.
+    pub fn with_operation_timeout_ms(mut self, timeout_ms: Option<u64>) -> Self {
+        if let Some(timeout_ms) = timeout_ms {
+            self.deadline_ms = unix_now_ms().saturating_add(timeout_ms.min(i64::MAX as u64) as i64);
+        }
+        self
+    }
+
     /// Return the stable logical call id.
     pub fn call_id(&self) -> &str {
         &self.call_id_text
+    }
+
+    /// Return the stable client identity for this attempt.
+    pub fn client_id(&self) -> ClientId {
+        self.operation.client_id
+    }
+
+    /// Return the metadata group id carried by this attempt, when present.
+    pub(crate) fn group_id(&self) -> Option<u64> {
+        self.group_id
+    }
+
+    /// Return the absolute deadline in Unix epoch milliseconds, or zero when unset.
+    pub fn deadline_ms(&self) -> i64 {
+        self.deadline_ms
+    }
+
+    /// Return the remaining local timeout until this attempt's absolute deadline.
+    pub(crate) fn timeout_remaining(&self) -> Option<Duration> {
+        if self.deadline_ms <= 0 {
+            return None;
+        }
+        let now = unix_now_ms();
+        if self.deadline_ms <= now {
+            Some(Duration::ZERO)
+        } else {
+            Some(Duration::from_millis((self.deadline_ms - now) as u64))
+        }
     }
 
     /// Return the stable logical operation fingerprint.
@@ -296,7 +333,7 @@ impl AttemptContext {
             client: Some(self.client_info()),
             group_id,
             mount_epoch: self.mount_epoch,
-            deadline_ms: self.deadline_ms,
+            deadline_ms: self.deadline_ms(),
             traceparent: self.call_id_text.clone(),
             caller_context: None,
             state: self.state.clone(),
@@ -326,6 +363,14 @@ fn validate_client_id(client_id: ClientId) -> ClientResult<()> {
     } else {
         Ok(())
     }
+}
+
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 #[cfg(test)]
@@ -401,5 +446,33 @@ mod tests {
         assert_eq!(first.call_id(), replay.call_id());
         assert_eq!(first.metadata_header().expect("first header").group_id, 9);
         assert_eq!(replay.metadata_header().expect("replay header").group_id, 11);
+    }
+
+    #[test]
+    fn operation_timeout_sets_attempt_deadline_without_changing_call_id() {
+        let operation = metadata_operation();
+        let base = AttemptContext::for_metadata(&operation, 9, 0).expect("attempt");
+        let call_id = base.call_id().to_string();
+
+        let timed = base.with_operation_timeout_ms(Some(50));
+        let deadline_ms = timed.deadline_ms();
+
+        assert!(deadline_ms > 0);
+        assert_eq!(timed.call_id(), call_id);
+        assert_eq!(
+            timed.metadata_header().expect("metadata header").deadline_ms,
+            deadline_ms
+        );
+    }
+
+    #[test]
+    fn absent_operation_timeout_keeps_no_deadline_behavior() {
+        let operation = metadata_operation();
+        let ctx = AttemptContext::for_metadata(&operation, 9, 0)
+            .expect("attempt")
+            .with_operation_timeout_ms(None);
+
+        assert_eq!(ctx.deadline_ms(), 0);
+        assert_eq!(ctx.metadata_header().expect("metadata header").deadline_ms, 0);
     }
 }

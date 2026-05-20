@@ -4,14 +4,19 @@
 //! Client-side sequential write session state.
 
 use std::fmt::Write as _;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use proto::metadata::{CommitFileRequestProto, CommittedBlockProto, WriteHandleProto, WriteTargetProto};
+use proto::metadata::{
+    AbortFileWriteRequestProto, CommitFileRequestProto, CommittedBlockProto, WriteHandleProto, WriteTargetProto,
+};
 use types::{CallId, ClientId, DataHandleId, InodeId};
 
 use crate::data::WorkerWriteBlock;
 use crate::error::{ClientError, ClientResult};
 use crate::runtime::context::{OperationContext, OperationFingerprint, OperationIdentity};
 use crate::runtime::policy::OperationKind;
+
+const LEASE_EXPIRY_SAFETY_WINDOW_MS: u64 = 1_000;
 
 /// Open sequential write session tracked by an internal file handle field.
 #[derive(Clone, Debug)]
@@ -27,6 +32,7 @@ pub(crate) struct WriteSession {
     pending_blocks: Vec<PendingBlock>,
     state: WriteSessionState,
     commit: Option<CommitFileState>,
+    abort: Option<AbortCleanupState>,
 }
 
 impl WriteSession {
@@ -51,6 +57,7 @@ impl WriteSession {
             pending_blocks: Vec::new(),
             state: WriteSessionState::Open,
             commit: None,
+            abort: None,
         })
     }
 
@@ -84,8 +91,8 @@ impl WriteSession {
     }
 
     /// Validate that a non-empty write may start at the supplied offset.
-    pub(crate) fn validate_write_offset(&self, offset: u64) -> ClientResult<()> {
-        self.ensure_open()?;
+    pub(crate) fn validate_write_offset(&mut self, offset: u64) -> ClientResult<()> {
+        self.ensure_open_for_write()?;
         if offset != self.cursor {
             return Err(ClientError::InvalidArgument(format!(
                 "sequential write cursor mismatch: expected {}, got {}",
@@ -96,8 +103,8 @@ impl WriteSession {
     }
 
     /// Validate a metadata write target before opening the worker stream.
-    pub(crate) fn validate_target(&self, target: &WriteTargetProto, expected_len: u64) -> ClientResult<()> {
-        self.ensure_open()?;
+    pub(crate) fn validate_target(&mut self, target: &WriteTargetProto, expected_len: u64) -> ClientResult<()> {
+        self.ensure_open_for_write()?;
         if target.file_offset != self.cursor {
             return Err(ClientError::InvalidLayout(format!(
                 "write target file_offset mismatch: expected {}, got {}",
@@ -244,6 +251,11 @@ impl WriteSession {
                     reason: "write session is invalid".to_string(),
                 });
             }
+            WriteSessionState::SessionExpired => {
+                return Err(ClientError::StaleHandle {
+                    reason: "write session lease expired".to_string(),
+                });
+            }
             WriteSessionState::AbortUnknown => {
                 return Err(ClientError::StaleHandle {
                     reason: "write handle abort outcome is unknown".to_string(),
@@ -278,6 +290,108 @@ impl WriteSession {
         ))
     }
 
+    /// Freeze and return the abort cleanup plan for this write session.
+    pub(crate) fn prepare_abort_cleanup(&mut self, client_id: ClientId) -> ClientResult<AbortCleanupPlan> {
+        match self.state {
+            WriteSessionState::Open => {
+                if self.pending_blocks.iter().any(PendingBlock::worker_committed) {
+                    self.state = WriteSessionState::AbortUnknown;
+                    return Err(ClientError::UnknownOutcome(
+                        "cannot safely abort after a worker block commit succeeded".to_string(),
+                    ));
+                }
+                let session_identity = self.session_identity();
+                let worker_cleanups = self
+                    .pending_blocks
+                    .iter()
+                    .map(|pending| {
+                        let worker_block = pending.worker_block().clone();
+                        let detail = abort_worker_fingerprint_detail(&worker_block);
+                        let identity = OperationIdentity::session(self.path.clone(), session_identity.clone())
+                            .with_detail(detail.clone());
+                        let abort_fingerprint = identity.fingerprint(OperationKind::WorkerWriteData, "AbortWrite");
+                        AbortWorkerCleanupState {
+                            abort_call_id: CallId::new(),
+                            abort_fingerprint,
+                            worker_block,
+                            detail,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let detail = abort_file_fingerprint_detail(
+                    &self.write_handle,
+                    self.inode_id,
+                    self.data_handle_id,
+                    &worker_cleanups,
+                );
+                let metadata_identity =
+                    OperationIdentity::session(self.path.clone(), session_identity.clone()).with_detail(detail.clone());
+                let metadata_fingerprint =
+                    metadata_identity.fingerprint(OperationKind::CleanupBestEffort, "AbortFileWrite");
+                self.abort = Some(AbortCleanupState {
+                    metadata_call_id: CallId::new(),
+                    metadata_fingerprint,
+                    metadata_write_handle: self.write_handle,
+                    session_identity,
+                    detail,
+                    worker_cleanups,
+                });
+                self.state = WriteSessionState::AbortUnknown;
+            }
+            WriteSessionState::AbortUnknown => {
+                let abort = self.abort.as_ref().ok_or_else(|| {
+                    ClientError::InvalidArgument("AbortUnknown state missing frozen cleanup plan".to_string())
+                })?;
+                if abort.metadata_write_handle != self.write_handle || abort.session_identity != self.session_identity()
+                {
+                    return Err(ClientError::InvalidArgument(
+                        "Abort cleanup replay identity changed after cleanup started".to_string(),
+                    ));
+                }
+            }
+            _ => return Err(self.state_error_value()),
+        }
+
+        let abort = self
+            .abort
+            .as_ref()
+            .ok_or_else(|| ClientError::InvalidArgument("abort cleanup state missing frozen plan".to_string()))?;
+        let metadata_operation = OperationContext::with_call_id_and_fingerprint(
+            client_id,
+            abort.metadata_call_id,
+            OperationKind::CleanupBestEffort,
+            "AbortFileWrite",
+            OperationIdentity::session(self.path.clone(), abort.session_identity.clone())
+                .with_detail(abort.detail.clone()),
+            abort.metadata_fingerprint,
+        )?;
+        let metadata_request = AbortFileWriteRequestProto {
+            header: None,
+            write_handle: Some(abort.metadata_write_handle),
+        };
+        let mut worker_cleanups = Vec::with_capacity(abort.worker_cleanups.len());
+        for cleanup in &abort.worker_cleanups {
+            let operation = OperationContext::with_call_id_and_fingerprint(
+                client_id,
+                cleanup.abort_call_id,
+                OperationKind::WorkerWriteData,
+                "AbortWrite",
+                OperationIdentity::session(self.path.clone(), abort.session_identity.clone())
+                    .with_detail(cleanup.detail.clone()),
+                cleanup.abort_fingerprint,
+            )?;
+            worker_cleanups.push(AbortWorkerCleanupPlan {
+                operation,
+                worker_block: cleanup.worker_block.clone(),
+            });
+        }
+        Ok(AbortCleanupPlan {
+            metadata_operation,
+            metadata_request,
+            worker_cleanups,
+        })
+    }
+
     /// Mark CommitFile outcome as unknown and keep the session retryable.
     pub(crate) fn mark_commit_unknown(&mut self) {
         if matches!(self.state, WriteSessionState::CommitStarted) {
@@ -293,6 +407,7 @@ impl WriteSession {
 
     /// Mark the session aborted after best-effort cleanup.
     pub(crate) fn mark_aborted(&mut self) {
+        self.abort = None;
         self.state = WriteSessionState::Aborted;
     }
 
@@ -306,6 +421,11 @@ impl WriteSession {
         self.state = WriteSessionState::SessionInvalid;
     }
 
+    /// Mark the session expired after local or metadata lease expiration.
+    pub(crate) fn mark_session_expired(&mut self) {
+        self.state = WriteSessionState::SessionExpired;
+    }
+
     /// Mark abort cleanup as uncertain while keeping retry metadata.
     pub(crate) fn mark_abort_unknown(&mut self) {
         self.state = WriteSessionState::AbortUnknown;
@@ -316,72 +436,176 @@ impl WriteSession {
         self.expires_at_ms = Some(expires_at_ms);
     }
 
+    /// Return the latest known lease expiration.
+    #[cfg(test)]
+    pub(crate) fn expires_at_ms(&self) -> Option<u64> {
+        self.expires_at_ms
+    }
+
+    /// Return whether CommitFile outcome is unresolved and retryable.
+    pub(crate) fn is_commit_unknown(&self) -> bool {
+        matches!(self.state, WriteSessionState::CommitUnknown)
+    }
+
     /// Reject close attempts on handles that already reached a terminal state.
-    pub(crate) fn ensure_close_allowed(&self) -> ClientResult<()> {
+    pub(crate) fn ensure_close_allowed(&mut self) -> ClientResult<()> {
+        self.ensure_open_for_close()
+    }
+
+    /// Reject writes unless the session is open and the lease is locally valid.
+    pub(crate) fn ensure_open_for_write(&mut self) -> ClientResult<()> {
+        self.ensure_open_for_write_at_ms(unix_now_ms())
+    }
+
+    /// Reject close unless the session can start or continue a safe close.
+    pub(crate) fn ensure_open_for_close(&mut self) -> ClientResult<()> {
+        self.ensure_open_for_close_at_ms(unix_now_ms())
+    }
+
+    /// Reject abort unless cleanup is safe to attempt.
+    pub(crate) fn ensure_open_for_abort(&mut self) -> ClientResult<()> {
+        self.ensure_open_for_abort_at_ms(unix_now_ms())
+    }
+
+    /// Reject lease renew unless the handle still represents an open session.
+    pub(crate) fn ensure_open_for_renew(&mut self) -> ClientResult<()> {
+        self.ensure_open_for_renew_at_ms(unix_now_ms())
+    }
+
+    /// Reject side-effect-free barriers after validating session state.
+    pub(crate) fn ensure_open_for_barrier(&mut self) -> ClientResult<()> {
+        self.ensure_open_for_barrier_at_ms(unix_now_ms())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ensure_open_for_write_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
+        self.ensure_state_allows_write()?;
+        self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS)
+    }
+
+    #[cfg(not(test))]
+    fn ensure_open_for_write_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
+        self.ensure_state_allows_write()?;
+        self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ensure_open_for_close_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
         match self.state {
-            WriteSessionState::Open | WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown => Ok(()),
-            WriteSessionState::Closed => Err(ClientError::StaleHandle {
-                reason: "write handle is closed".to_string(),
-            }),
-            WriteSessionState::Aborted => Err(ClientError::StaleHandle {
-                reason: "write handle is aborted".to_string(),
-            }),
-            WriteSessionState::UnknownOutcome => Err(ClientError::StaleHandle {
-                reason: "write handle has an unknown outcome".to_string(),
-            }),
-            WriteSessionState::SessionInvalid => Err(ClientError::StaleHandle {
-                reason: "write session is invalid".to_string(),
-            }),
-            WriteSessionState::AbortUnknown => Err(ClientError::StaleHandle {
-                reason: "write handle abort outcome is unknown".to_string(),
-            }),
+            WriteSessionState::Open => self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS),
+            WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown => Ok(()),
+            _ => self.state_error(),
         }
     }
 
-    /// Reject operations on closed or aborted handles.
-    pub(crate) fn ensure_open(&self) -> ClientResult<()> {
+    #[cfg(not(test))]
+    fn ensure_open_for_close_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
+        match self.state {
+            WriteSessionState::Open => self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS),
+            WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown => Ok(()),
+            _ => self.state_error(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ensure_open_for_abort_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
+        match self.state {
+            WriteSessionState::Open => self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS),
+            WriteSessionState::AbortUnknown => Ok(()),
+            _ => self.state_error(),
+        }
+    }
+
+    #[cfg(not(test))]
+    fn ensure_open_for_abort_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
+        match self.state {
+            WriteSessionState::Open => self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS),
+            WriteSessionState::AbortUnknown => Ok(()),
+            _ => self.state_error(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ensure_open_for_renew_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
+        self.ensure_state_allows_write()?;
+        self.ensure_lease_valid_at_ms(now_ms, 0)
+    }
+
+    #[cfg(not(test))]
+    fn ensure_open_for_renew_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
+        self.ensure_state_allows_write()?;
+        self.ensure_lease_valid_at_ms(now_ms, 0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ensure_open_for_barrier_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
+        self.ensure_state_allows_write()?;
+        self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS)
+    }
+
+    #[cfg(not(test))]
+    fn ensure_open_for_barrier_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
+        self.ensure_state_allows_write()?;
+        self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS)
+    }
+
+    fn ensure_state_allows_write(&self) -> ClientResult<()> {
         match self.state {
             WriteSessionState::Open => Ok(()),
-            WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown => Err(ClientError::StaleHandle {
-                reason: "write handle has an in-progress CommitFile".to_string(),
-            }),
-            WriteSessionState::Closed => Err(ClientError::StaleHandle {
-                reason: "write handle is closed".to_string(),
-            }),
-            WriteSessionState::Aborted => Err(ClientError::StaleHandle {
-                reason: "write handle is aborted".to_string(),
-            }),
-            WriteSessionState::UnknownOutcome => Err(ClientError::StaleHandle {
-                reason: "write handle has an unknown outcome".to_string(),
-            }),
-            WriteSessionState::SessionInvalid => Err(ClientError::StaleHandle {
-                reason: "write session is invalid".to_string(),
-            }),
-            WriteSessionState::AbortUnknown => Err(ClientError::StaleHandle {
-                reason: "write handle abort outcome is unknown".to_string(),
-            }),
+            _ => self.state_error(),
         }
     }
 
-    /// Reject aborts that cannot safely run for the current session state.
-    pub(crate) fn ensure_abort_allowed(&self) -> ClientResult<()> {
+    fn ensure_lease_valid_at_ms(&mut self, now_ms: u64, safety_window_ms: u64) -> ClientResult<()> {
+        let Some(expires_at_ms) = self.expires_at_ms else {
+            return Ok(());
+        };
+        if expires_at_ms <= now_ms {
+            self.mark_session_expired();
+            return Err(ClientError::StaleHandle {
+                reason: "write session lease expired".to_string(),
+            });
+        }
+        if expires_at_ms.saturating_sub(now_ms) <= safety_window_ms {
+            self.mark_session_expired();
+            return Err(ClientError::StaleHandle {
+                reason: "write session lease is near expiry".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn state_error(&self) -> ClientResult<()> {
+        if matches!(self.state, WriteSessionState::Open) {
+            return Ok(());
+        }
+        Err(self.state_error_value())
+    }
+
+    fn state_error_value(&self) -> ClientError {
         match self.state {
-            WriteSessionState::Open | WriteSessionState::AbortUnknown => Ok(()),
-            WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown => Err(ClientError::StaleHandle {
+            WriteSessionState::Open => ClientError::InvalidArgument("write session is open".to_string()),
+            WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown => ClientError::StaleHandle {
                 reason: "write handle has an in-progress CommitFile".to_string(),
-            }),
-            WriteSessionState::Closed => Err(ClientError::StaleHandle {
+            },
+            WriteSessionState::Closed => ClientError::StaleHandle {
                 reason: "write handle is closed".to_string(),
-            }),
-            WriteSessionState::Aborted => Err(ClientError::StaleHandle {
+            },
+            WriteSessionState::Aborted => ClientError::StaleHandle {
                 reason: "write handle is aborted".to_string(),
-            }),
-            WriteSessionState::UnknownOutcome => Err(ClientError::StaleHandle {
+            },
+            WriteSessionState::UnknownOutcome => ClientError::StaleHandle {
                 reason: "write handle has an unknown outcome".to_string(),
-            }),
-            WriteSessionState::SessionInvalid => Err(ClientError::StaleHandle {
+            },
+            WriteSessionState::SessionInvalid => ClientError::StaleHandle {
                 reason: "write session is invalid".to_string(),
-            }),
+            },
+            WriteSessionState::SessionExpired => ClientError::StaleHandle {
+                reason: "write session lease expired".to_string(),
+            },
+            WriteSessionState::AbortUnknown => ClientError::StaleHandle {
+                reason: "write handle abort outcome is unknown".to_string(),
+            },
         }
     }
 }
@@ -437,7 +661,15 @@ enum WriteSessionState {
     Aborted,
     UnknownOutcome,
     SessionInvalid,
+    SessionExpired,
     AbortUnknown,
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug)]
@@ -449,6 +681,80 @@ struct CommitFileState {
     commit_committed_blocks_snapshot: Vec<CommittedBlockProto>,
     session_identity: String,
     detail: String,
+}
+
+#[derive(Clone)]
+struct AbortCleanupState {
+    metadata_call_id: CallId,
+    metadata_fingerprint: OperationFingerprint,
+    metadata_write_handle: WriteHandleProto,
+    session_identity: String,
+    detail: String,
+    worker_cleanups: Vec<AbortWorkerCleanupState>,
+}
+
+impl std::fmt::Debug for AbortCleanupState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AbortCleanupState").finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
+struct AbortWorkerCleanupState {
+    abort_call_id: CallId,
+    abort_fingerprint: OperationFingerprint,
+    worker_block: WorkerWriteBlock,
+    detail: String,
+}
+
+impl std::fmt::Debug for AbortWorkerCleanupState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AbortWorkerCleanupState").finish_non_exhaustive()
+    }
+}
+
+/// Frozen side-effecting abort cleanup plan.
+#[derive(Clone)]
+pub(crate) struct AbortCleanupPlan {
+    metadata_operation: OperationContext,
+    metadata_request: AbortFileWriteRequestProto,
+    worker_cleanups: Vec<AbortWorkerCleanupPlan>,
+}
+
+impl AbortCleanupPlan {
+    /// Metadata AbortFileWrite operation with stable call identity.
+    pub(crate) fn metadata_operation(&self) -> OperationContext {
+        self.metadata_operation.clone()
+    }
+
+    /// Metadata AbortFileWrite request frozen before cleanup starts.
+    pub(crate) fn metadata_request(&self) -> AbortFileWriteRequestProto {
+        self.metadata_request.clone()
+    }
+
+    /// Per-worker cleanup operations frozen before cleanup starts.
+    pub(crate) fn worker_cleanups(&self) -> &[AbortWorkerCleanupPlan] {
+        &self.worker_cleanups
+    }
+}
+
+/// Frozen worker AbortWrite cleanup operation.
+#[derive(Clone)]
+pub(crate) struct AbortWorkerCleanupPlan {
+    operation: OperationContext,
+    worker_block: WorkerWriteBlock,
+}
+
+impl AbortWorkerCleanupPlan {
+    /// Worker AbortWrite operation with stable call identity.
+    pub(crate) fn operation(&self) -> OperationContext {
+        self.operation.clone()
+    }
+
+    /// Worker write block snapshot to abort.
+    pub(crate) fn worker_block(&self) -> &WorkerWriteBlock {
+        &self.worker_block
+    }
 }
 
 fn validate_write_handle(handle: &WriteHandleProto) -> ClientResult<()> {
@@ -511,6 +817,63 @@ fn commit_fingerprint_detail(
     detail
 }
 
+fn abort_file_fingerprint_detail(
+    write_handle: &WriteHandleProto,
+    inode_id: InodeId,
+    data_handle_id: DataHandleId,
+    worker_cleanups: &[AbortWorkerCleanupState],
+) -> String {
+    let mut detail = String::new();
+    let _ = write!(
+        &mut detail,
+        "inode={} write_handle={} data_handle={} lease={} lease_epoch={} open_epoch={} fencing={}",
+        inode_id.as_raw(),
+        write_handle.handle_id,
+        data_handle_id.as_raw(),
+        lease_identity(write_handle),
+        write_handle.lease_epoch,
+        write_handle.open_epoch,
+        fencing_identity(write_handle)
+    );
+    detail.push_str(" worker_cleanups=[");
+    for cleanup in worker_cleanups {
+        append_worker_block_identity(&mut detail, &cleanup.worker_block);
+        detail.push(';');
+    }
+    detail.push(']');
+    detail
+}
+
+fn abort_worker_fingerprint_detail(worker_block: &WorkerWriteBlock) -> String {
+    let mut detail = String::new();
+    append_worker_block_identity(&mut detail, worker_block);
+    detail
+}
+
+fn append_worker_block_identity(detail: &mut String, worker_block: &WorkerWriteBlock) {
+    let block_id = worker_block
+        .target
+        .block_id
+        .as_ref()
+        .map(|block| format!("{}:{}", block.data_handle_id, block.block_index))
+        .unwrap_or_else(|| "missing".to_string());
+    let _ = write!(
+        detail,
+        "group={} worker={} protocol={} worker_epoch={} block={} stamp={} offset={} len={} stream={}:{} next_seq={}",
+        worker_block.group_id,
+        worker_block.worker_id,
+        worker_block.worker_net_protocol,
+        worker_block.worker_epoch,
+        block_id,
+        worker_block.target.block_stamp,
+        worker_block.target.file_offset,
+        worker_block.target.len,
+        worker_block.stream_id.high,
+        worker_block.stream_id.low,
+        worker_block.next_seq
+    );
+}
+
 fn lease_identity(write_handle: &WriteHandleProto) -> String {
     write_handle
         .lease_id
@@ -538,10 +901,11 @@ fn fencing_identity(write_handle: &WriteHandleProto) -> String {
 mod tests {
     use super::*;
 
-    use proto::common::{BlockIdProto, FencingTokenProto, LeaseIdProto};
-    use proto::metadata::CommittedBlockProto;
+    use proto::common::{BlockIdProto, FencingTokenProto, LeaseIdProto, StreamIdProto, WorkerNetProtocolProto};
+    use proto::metadata::{CommittedBlockProto, WriteTargetProto};
     use types::ClientId;
 
+    use crate::data::WorkerWriteBlock;
     use crate::runtime::AttemptContext;
 
     #[test]
@@ -681,6 +1045,235 @@ mod tests {
         assert_eq!(retry_request.committed_blocks, vec![committed_block(302, 0, 0, 5)]);
     }
 
+    #[test]
+    fn prepare_abort_cleanup_reuses_call_id_fingerprint_and_frozen_payload() {
+        let mut session = WriteSession::new(
+            "/alpha".to_string(),
+            InodeId::new(301),
+            DataHandleId::new(302),
+            write_handle_proto(1, 302),
+            0,
+        )
+        .expect("session");
+        session
+            .push_pending_block(write_target(302, 0, 0, 5), worker_block(302, 0, 0, 5, 9), 5, 1)
+            .expect("pending block");
+
+        let first = session
+            .prepare_abort_cleanup(ClientId::new(7))
+            .expect("first abort plan");
+        let first_metadata =
+            AttemptContext::for_metadata(&first.metadata_operation(), 9, 0).expect("first metadata context");
+        let first_worker = first.worker_cleanups()[0].operation();
+        let first_worker_ctx = AttemptContext::for_data(&first_worker, 0);
+        let first_worker_snapshot = worker_block_signature(first.worker_cleanups()[0].worker_block());
+        session.pending_blocks.clear();
+
+        let second = session
+            .prepare_abort_cleanup(ClientId::new(7))
+            .expect("retry abort plan");
+        let second_metadata =
+            AttemptContext::for_metadata(&second.metadata_operation(), 9, 0).expect("second metadata context");
+        let second_worker = second.worker_cleanups()[0].operation();
+        let second_worker_ctx = AttemptContext::for_data(&second_worker, 0);
+
+        assert_eq!(first_metadata.call_id(), second_metadata.call_id());
+        assert_eq!(
+            first.metadata_operation().operation_fingerprint(),
+            second.metadata_operation().operation_fingerprint()
+        );
+        assert_eq!(
+            first.metadata_request().write_handle,
+            second.metadata_request().write_handle
+        );
+        assert_eq!(second.worker_cleanups().len(), 1);
+        assert_eq!(first_worker_ctx.call_id(), second_worker_ctx.call_id());
+        assert_eq!(
+            first_worker.operation_fingerprint(),
+            second_worker.operation_fingerprint()
+        );
+        assert_eq!(
+            first_worker_snapshot,
+            worker_block_signature(second.worker_cleanups()[0].worker_block())
+        );
+    }
+
+    #[test]
+    fn prepare_abort_cleanup_rejects_session_identity_drift_after_unknown_without_replacing_call_id() {
+        let mut session = WriteSession::new(
+            "/alpha".to_string(),
+            InodeId::new(301),
+            DataHandleId::new(302),
+            write_handle_proto(1, 302),
+            0,
+        )
+        .expect("session");
+
+        let first = session
+            .prepare_abort_cleanup(ClientId::new(7))
+            .expect("first abort plan");
+        let first_ctx =
+            AttemptContext::for_metadata(&first.metadata_operation(), 9, 0).expect("first metadata context");
+
+        session.write_handle.lease_epoch = 2;
+        let err = match session.prepare_abort_cleanup(ClientId::new(7)) {
+            Ok(_) => panic!("identity drift must reject abort replay"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("identity changed")));
+
+        session.write_handle.lease_epoch = 1;
+        let retry = session
+            .prepare_abort_cleanup(ClientId::new(7))
+            .expect("retry abort plan");
+        let retry_ctx =
+            AttemptContext::for_metadata(&retry.metadata_operation(), 9, 0).expect("retry metadata context");
+        assert_eq!(first_ctx.call_id(), retry_ctx.call_id());
+        assert_eq!(
+            first.metadata_operation().operation_fingerprint(),
+            retry.metadata_operation().operation_fingerprint()
+        );
+    }
+
+    #[test]
+    fn prepare_abort_cleanup_after_worker_committed_block_is_conservative() {
+        let mut session = WriteSession::new(
+            "/alpha".to_string(),
+            InodeId::new(301),
+            DataHandleId::new(302),
+            write_handle_proto(1, 302),
+            0,
+        )
+        .expect("session");
+        session
+            .push_pending_block(write_target(302, 0, 0, 5), worker_block(302, 0, 0, 5, 9), 5, 1)
+            .expect("pending block");
+        session.pending_blocks[0].mark_worker_committed();
+
+        let err = match session.prepare_abort_cleanup(ClientId::new(7)) {
+            Ok(_) => panic!("committed worker block cannot be safely aborted"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("worker block commit")));
+        assert!(matches!(
+            session.ensure_open_for_write_at_ms(0),
+            Err(ClientError::StaleHandle { reason }) if reason.contains("abort outcome")
+        ));
+        assert!(matches!(
+            session.ensure_open_for_close_at_ms(0),
+            Err(ClientError::StaleHandle { reason }) if reason.contains("abort outcome")
+        ));
+    }
+
+    #[test]
+    fn lease_expiry_guard_marks_session_expired_and_blocks_side_effects() {
+        let mut session = WriteSession::new(
+            "/alpha".to_string(),
+            InodeId::new(301),
+            DataHandleId::new(302),
+            write_handle_proto(1, 302),
+            0,
+        )
+        .expect("session");
+
+        session.update_expires_at_ms(1_000);
+        let err = session
+            .ensure_open_for_write_at_ms(1_001)
+            .expect_err("expired lease must block write");
+        assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("expired")));
+
+        for rejected in [
+            session.ensure_open_for_write_at_ms(1_001),
+            session.ensure_open_for_close_at_ms(1_001),
+            session.ensure_open_for_renew_at_ms(1_001),
+            session.ensure_open_for_abort_at_ms(1_001),
+            session.ensure_open_for_barrier_at_ms(1_001),
+        ] {
+            assert!(matches!(rejected, Err(ClientError::StaleHandle { reason }) if reason.contains("expired")));
+        }
+    }
+
+    #[test]
+    fn state_transition_table_covers_all_write_session_states() {
+        #[derive(Clone, Copy)]
+        enum Operation {
+            Write,
+            Close,
+            Abort,
+            RenewLease,
+            Barrier,
+        }
+
+        let cases = [
+            (WriteSessionState::Open, Operation::Write, true),
+            (WriteSessionState::Open, Operation::Close, true),
+            (WriteSessionState::Open, Operation::Abort, true),
+            (WriteSessionState::Open, Operation::RenewLease, true),
+            (WriteSessionState::Open, Operation::Barrier, true),
+            (WriteSessionState::CommitStarted, Operation::Write, false),
+            (WriteSessionState::CommitStarted, Operation::Close, true),
+            (WriteSessionState::CommitStarted, Operation::Abort, false),
+            (WriteSessionState::CommitStarted, Operation::RenewLease, false),
+            (WriteSessionState::CommitStarted, Operation::Barrier, false),
+            (WriteSessionState::CommitUnknown, Operation::Write, false),
+            (WriteSessionState::CommitUnknown, Operation::Close, true),
+            (WriteSessionState::CommitUnknown, Operation::Abort, false),
+            (WriteSessionState::CommitUnknown, Operation::RenewLease, false),
+            (WriteSessionState::CommitUnknown, Operation::Barrier, false),
+            (WriteSessionState::Closed, Operation::Write, false),
+            (WriteSessionState::Closed, Operation::Close, false),
+            (WriteSessionState::Closed, Operation::Abort, false),
+            (WriteSessionState::Closed, Operation::RenewLease, false),
+            (WriteSessionState::Closed, Operation::Barrier, false),
+            (WriteSessionState::Aborted, Operation::Write, false),
+            (WriteSessionState::Aborted, Operation::Close, false),
+            (WriteSessionState::Aborted, Operation::Abort, false),
+            (WriteSessionState::Aborted, Operation::RenewLease, false),
+            (WriteSessionState::Aborted, Operation::Barrier, false),
+            (WriteSessionState::UnknownOutcome, Operation::Write, false),
+            (WriteSessionState::UnknownOutcome, Operation::Close, false),
+            (WriteSessionState::UnknownOutcome, Operation::Abort, false),
+            (WriteSessionState::UnknownOutcome, Operation::RenewLease, false),
+            (WriteSessionState::UnknownOutcome, Operation::Barrier, false),
+            (WriteSessionState::SessionInvalid, Operation::Write, false),
+            (WriteSessionState::SessionInvalid, Operation::Close, false),
+            (WriteSessionState::SessionInvalid, Operation::Abort, false),
+            (WriteSessionState::SessionInvalid, Operation::RenewLease, false),
+            (WriteSessionState::SessionInvalid, Operation::Barrier, false),
+            (WriteSessionState::SessionExpired, Operation::Write, false),
+            (WriteSessionState::SessionExpired, Operation::Close, false),
+            (WriteSessionState::SessionExpired, Operation::Abort, false),
+            (WriteSessionState::SessionExpired, Operation::RenewLease, false),
+            (WriteSessionState::SessionExpired, Operation::Barrier, false),
+            (WriteSessionState::AbortUnknown, Operation::Write, false),
+            (WriteSessionState::AbortUnknown, Operation::Close, false),
+            (WriteSessionState::AbortUnknown, Operation::Abort, true),
+            (WriteSessionState::AbortUnknown, Operation::RenewLease, false),
+            (WriteSessionState::AbortUnknown, Operation::Barrier, false),
+        ];
+
+        for (state, operation, allowed) in cases {
+            let mut session = WriteSession::new(
+                "/alpha".to_string(),
+                InodeId::new(301),
+                DataHandleId::new(302),
+                write_handle_proto(1, 302),
+                0,
+            )
+            .expect("session");
+            session.state = state;
+
+            let result = match operation {
+                Operation::Write => session.ensure_open_for_write_at_ms(0),
+                Operation::Close => session.ensure_open_for_close_at_ms(0),
+                Operation::Abort => session.ensure_open_for_abort_at_ms(0),
+                Operation::RenewLease => session.ensure_open_for_renew_at_ms(0),
+                Operation::Barrier => session.ensure_open_for_barrier_at_ms(0),
+            };
+            assert_eq!(result.is_ok(), allowed, "unexpected transition for {state:?}");
+        }
+    }
+
     fn commit_fingerprint(
         write_handle: &WriteHandleProto,
         final_size: u64,
@@ -728,5 +1321,68 @@ mod tests {
             len,
             checksum: None,
         }
+    }
+
+    fn write_target(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -> WriteTargetProto {
+        WriteTargetProto {
+            block_id: Some(BlockIdProto {
+                data_handle_id,
+                block_index,
+            }),
+            file_offset,
+            len,
+            block_stamp: 77,
+            chunk_size: 1024,
+            ..WriteTargetProto::default()
+        }
+    }
+
+    fn worker_block(
+        data_handle_id: u64,
+        block_index: u32,
+        file_offset: u64,
+        len: u64,
+        stream_low: u64,
+    ) -> WorkerWriteBlock {
+        WorkerWriteBlock {
+            group_id: 9,
+            worker_id: 11,
+            endpoint: "127.0.0.1:19101".to_string(),
+            worker_net_protocol: WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+            worker_epoch: 13,
+            target: write_target(data_handle_id, block_index, file_offset, len),
+            stream_id: StreamIdProto {
+                high: 1,
+                low: stream_low,
+            },
+            frame_size: 1024,
+            next_seq: 1,
+        }
+    }
+
+    fn worker_block_signature(block: &WorkerWriteBlock) -> (u64, u64, i32, u64, u64, u64, u64, u32, u64, u64, u64) {
+        (
+            block.group_id,
+            block.worker_id,
+            block.worker_net_protocol,
+            block.worker_epoch,
+            block.target.file_offset,
+            block.target.len,
+            block.target.block_stamp,
+            block
+                .target
+                .block_id
+                .as_ref()
+                .map(|block_id| block_id.block_index)
+                .unwrap_or_default(),
+            block
+                .target
+                .block_id
+                .as_ref()
+                .map(|block_id| block_id.data_handle_id)
+                .unwrap_or_default(),
+            block.stream_id.high,
+            block.stream_id.low,
+        )
     }
 }

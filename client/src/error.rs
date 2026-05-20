@@ -11,6 +11,7 @@ use proto::common::RpcErrorCodeProto as ProtoErrorCode;
 use thiserror::Error;
 
 /// Opaque structured action error derived from RPC header validation.
+#[derive(Clone)]
 pub struct ClientActionError {
     action: Box<ClientAction>,
 }
@@ -40,7 +41,7 @@ impl std::fmt::Debug for ClientActionError {
 }
 
 /// Client-specific error type.
-#[derive(Error, Debug)]
+#[derive(Clone, Error, Debug)]
 pub enum ClientError {
     /// Common error (wrapped).
     #[error("Common error: {0}")]

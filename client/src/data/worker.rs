@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -20,7 +21,8 @@ use crate::config::ClientConfig;
 use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics, NoopClientMetrics};
 use crate::planner::read_planner::PlannedReadSegment;
-use crate::runtime::AttemptContext;
+use crate::runtime::singleflight::{Singleflight, SingleflightMode};
+use crate::runtime::{AttemptContext, ErrorClass, ErrorClassifier, RefreshReason};
 
 #[derive(Debug)]
 struct TonicWorkerDataClient {
@@ -28,6 +30,8 @@ struct TonicWorkerDataClient {
     endpoint_cache: WorkerEndpointCache,
     channel_pool_enabled: bool,
     max_channels_per_worker: usize,
+    channel_singleflight_enabled: bool,
+    channel_singleflight: Singleflight<WorkerChannelKey, tonic_net::Channel>,
     metrics: Arc<dyn ClientMetrics>,
 }
 
@@ -37,12 +41,14 @@ impl TonicWorkerDataClient {
     }
 
     fn from_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> Self {
-        Self::with_parts(
+        let mut client = Self::with_parts(
             WorkerEndpointCache::from_config(&config.cache, Arc::clone(&metrics)),
             config.channel_pool.worker_channel_pool_enabled,
             config.channel_pool.worker_channel_pool_max_per_worker,
             metrics,
-        )
+        );
+        client.channel_singleflight_enabled = config.channel_pool.worker_channel_singleflight_enabled;
+        client
     }
 
     fn with_parts(
@@ -56,6 +62,8 @@ impl TonicWorkerDataClient {
             endpoint_cache,
             channel_pool_enabled,
             max_channels_per_worker: max_channels_per_worker.max(1),
+            channel_singleflight_enabled: true,
+            channel_singleflight: Singleflight::default(),
             metrics,
         }
     }
@@ -64,12 +72,12 @@ impl TonicWorkerDataClient {
         self.endpoint_cache.clone()
     }
 
-    fn client(
+    async fn client(
         &self,
         candidate: &proto::common::WorkerEndpointInfoProto,
         operation: &'static str,
     ) -> ClientResult<WorkerDataServiceClient<tonic_net::Channel>> {
-        let candidate = self.endpoint_cache.get_or_insert_authoritative(candidate)?;
+        let candidate = self.endpoint_cache.get_or_resolve_authoritative(candidate).await?;
         let endpoint = normalize_endpoint(&candidate.endpoint)?;
         let key = WorkerChannelKey {
             worker_id: candidate.worker_id,
@@ -96,20 +104,95 @@ impl TonicWorkerDataClient {
             }
             None => {
                 self.record_pool_metric(ClientMetric::WorkerChannelPoolMiss, operation, "miss");
-                let channel = lazy_channel(&key.endpoint).inspect_err(|_err| {
-                    self.record_pool_metric(ClientMetric::ChannelPoolConnectError, operation, "error");
-                })?;
-                let mut channels = self.channels.write();
-                evict_worker_channel_if_needed(&mut channels, &key, self.max_channels_per_worker);
-                channels.insert(key, channel.clone());
-                channel
+                self.create_worker_channel(key, operation).await?
             }
         };
         Ok(WorkerDataServiceClient::new(channel))
     }
 
+    async fn create_worker_channel(
+        &self,
+        key: WorkerChannelKey,
+        operation: &'static str,
+    ) -> ClientResult<tonic_net::Channel> {
+        if let Some(channel) = self.channels.read().get(&key).cloned() {
+            self.record_pool_metric(ClientMetric::WorkerChannelPoolHit, operation, "hit");
+            return Ok(channel);
+        }
+        if !self.channel_singleflight_enabled {
+            let channel = lazy_channel(&key.endpoint).inspect_err(|_err| {
+                self.record_pool_metric(ClientMetric::ChannelPoolConnectError, operation, "error");
+            })?;
+            self.insert_worker_channel(key, channel.clone());
+            return Ok(channel);
+        }
+
+        let endpoint = key.endpoint.clone();
+        let (mode, result) = self
+            .channel_singleflight
+            .run(key.clone(), move || async move {
+                tokio::task::yield_now().await;
+                lazy_channel(&endpoint)
+            })
+            .await;
+        if mode == SingleflightMode::Joined {
+            self.record_pool_metric(ClientMetric::WorkerChannelSingleflightJoin, operation, "join");
+            self.record_pool_metric(
+                ClientMetric::WorkerChannelDuplicateCreationAvoided,
+                operation,
+                "avoided",
+            );
+        }
+        match result {
+            Ok(channel) => {
+                self.insert_worker_channel(key, channel.clone());
+                Ok(channel)
+            }
+            Err(err) => {
+                self.record_pool_metric(ClientMetric::ChannelPoolConnectError, operation, "error");
+                self.record_pool_metric(ClientMetric::WorkerChannelSingleflightFailure, operation, "failure");
+                Err(err)
+            }
+        }
+    }
+
+    fn insert_worker_channel(&self, key: WorkerChannelKey, channel: tonic_net::Channel) {
+        let mut channels = self.channels.write();
+        if channels.contains_key(&key) {
+            return;
+        }
+        evict_worker_channel_if_needed(&mut channels, &key, self.max_channels_per_worker);
+        channels.insert(key, channel);
+    }
+
     fn invalidate_endpoint(&self, candidate: &proto::common::WorkerEndpointInfoProto, reason: CacheInvalidationReason) {
         self.endpoint_cache.invalidate_candidate(candidate, reason);
+    }
+
+    fn record_endpoint_failure(
+        &self,
+        candidate: &proto::common::WorkerEndpointInfoProto,
+        reason: CacheInvalidationReason,
+    ) {
+        self.endpoint_cache.record_candidate_failure(candidate, reason);
+    }
+
+    fn invalidate_channel(&self, candidate: &proto::common::WorkerEndpointInfoProto, reason: CacheInvalidationReason) {
+        if let Ok(endpoint) = normalize_endpoint(&candidate.endpoint) {
+            let key = WorkerChannelKey {
+                worker_id: candidate.worker_id,
+                endpoint,
+                protocol: candidate.worker_net_protocol,
+                worker_epoch: candidate.worker_epoch,
+            };
+            if self.channels.write().remove(&key).is_some() {
+                self.record_pool_metric(
+                    ClientMetric::CachePreciseInvalidation,
+                    "channel_invalidate",
+                    reason.label(),
+                );
+            }
+        }
     }
 
     fn record_pool_metric(&self, metric: ClientMetric, operation: &'static str, outcome: &'static str) {
@@ -184,18 +267,31 @@ impl WorkerDataClient for TonicWorkerDataClient {
             }
             let protocol = worker_net_protocol_from_i32(candidate.worker_net_protocol)?;
             ensure_supported_worker_protocol(protocol)?;
-            let mut client = self.client(candidate, "read")?;
+            let mut client = match self.client(candidate, "read").await {
+                Ok(client) => client,
+                Err(err) if is_endpoint_health_error(&err) => {
+                    last_transport_error = Some(err);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             let request = build_open_read_stream_request(&ctx, group_id, segment)?;
-            let open_response = match client.open_read_stream(tonic::Request::new(request)).await {
+            let open_response = match client.open_read_stream(tonic_request(&ctx, request)).await {
                 Ok(response) => response.into_inner(),
                 Err(status) if is_retryable_worker_status(&status) => {
-                    self.invalidate_endpoint(candidate, CacheInvalidationReason::Unavailable);
+                    self.record_endpoint_failure(candidate, CacheInvalidationReason::Unavailable);
                     last_transport_error = Some(ClientError::from(status));
                     continue;
                 }
                 Err(status) => return Err(ClientError::from(status)),
             };
-            parse_worker_control_header(&ctx, open_response.header.as_ref())?;
+            if let Err(err) = parse_worker_control_header(&ctx, open_response.header.as_ref()) {
+                if is_worker_epoch_mismatch(&err) {
+                    self.invalidate_endpoint(candidate, CacheInvalidationReason::WorkerEpoch);
+                    self.invalidate_channel(candidate, CacheInvalidationReason::WorkerEpoch);
+                }
+                return Err(err);
+            }
             let stream_id = open_response
                 .stream_id
                 .ok_or_else(|| invalid_worker_header("worker OK response missing stream_id"))?;
@@ -231,12 +327,19 @@ impl WorkerDataClient for TonicWorkerDataClient {
             }
             let protocol = worker_net_protocol_from_i32(candidate.worker_net_protocol)?;
             ensure_supported_worker_protocol(protocol)?;
-            let mut client = self.client(candidate, "write")?;
+            let mut client = match self.client(candidate, "write").await {
+                Ok(client) => client,
+                Err(err) if is_endpoint_health_error(&err) => {
+                    last_transport_error = Some(err);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             let request = build_open_write_stream_request(&ctx, &target)?;
-            let response = match client.open_write_stream(tonic::Request::new(request)).await {
+            let response = match client.open_write_stream(tonic_request(&ctx, request)).await {
                 Ok(response) => response.into_inner(),
                 Err(status) if is_retryable_worker_status(&status) => {
-                    self.invalidate_endpoint(candidate, CacheInvalidationReason::Unavailable);
+                    self.record_endpoint_failure(candidate, CacheInvalidationReason::Unavailable);
                     last_transport_error = Some(ClientError::UnknownOutcome(format!(
                         "worker OpenWriteStream outcome is unknown after transport status {}: {}",
                         status.code(),
@@ -246,7 +349,12 @@ impl WorkerDataClient for TonicWorkerDataClient {
                 }
                 Err(status) => return Err(ClientError::from(status)),
             };
-            return worker_write_block_from_open_response(&ctx, &target, candidate, response);
+            return worker_write_block_from_open_response(&ctx, &target, candidate, response).inspect_err(|err| {
+                if is_worker_epoch_mismatch(err) {
+                    self.invalidate_endpoint(candidate, CacheInvalidationReason::WorkerEpoch);
+                    self.invalidate_channel(candidate, CacheInvalidationReason::WorkerEpoch);
+                }
+            });
         }
         Err(last_transport_error
             .unwrap_or_else(|| ClientError::Worker("worker write has no reachable worker candidates".to_string())))
@@ -264,7 +372,8 @@ impl WorkerDataClient for TonicWorkerDataClient {
                 written_through: 0,
             });
         }
-        let mut client = self.client(&worker_endpoint_from_block(block), "write")?;
+        let endpoint = worker_endpoint_from_block(block);
+        let mut client = self.client(&endpoint, "write").await?;
         let expected_written_through = data.len() as u64;
         let frames = build_write_stream_frames(block, data)?;
         let expected_last_seq = frames
@@ -298,10 +407,11 @@ impl WorkerDataClient for TonicWorkerDataClient {
         commit_seq: u64,
         require_sync: bool,
     ) -> ClientResult<WorkerCommitResult> {
-        let mut client = self.client(&worker_endpoint_from_block(block), "write")?;
+        let endpoint = worker_endpoint_from_block(block);
+        let mut client = self.client(&endpoint, "write").await?;
         let request = build_commit_write_request(&ctx, block, effective_len, commit_seq, require_sync)?;
         let response = client
-            .commit_write(tonic::Request::new(request))
+            .commit_write(tonic_request(&ctx, request))
             .await
             .map_err(|status| {
                 ClientError::UnknownOutcome(format!(
@@ -311,14 +421,20 @@ impl WorkerDataClient for TonicWorkerDataClient {
                 ))
             })?
             .into_inner();
-        worker_commit_result_from_response(&ctx, block, effective_len, response)
+        worker_commit_result_from_response(&ctx, block, effective_len, response).inspect_err(|err| {
+            if is_worker_epoch_mismatch(err) {
+                self.invalidate_endpoint(&endpoint, CacheInvalidationReason::WorkerEpoch);
+                self.invalidate_channel(&endpoint, CacheInvalidationReason::WorkerEpoch);
+            }
+        })
     }
 
     async fn abort_write(&self, ctx: AttemptContext, block: &WorkerWriteBlock) -> ClientResult<()> {
-        let mut client = self.client(&worker_endpoint_from_block(block), "write")?;
+        let endpoint = worker_endpoint_from_block(block);
+        let mut client = self.client(&endpoint, "write").await?;
         let request = build_abort_write_request(&ctx, block)?;
         let response = client
-            .abort_write(tonic::Request::new(request))
+            .abort_write(tonic_request(&ctx, request))
             .await
             .map_err(|status| {
                 ClientError::UnknownOutcome(format!(
@@ -882,6 +998,11 @@ fn parse_worker_control_header(
             "worker OK response invalid DataResponseHeader: client_id must be non-zero",
         ));
     }
+    if client.client_id != ctx.client_id().as_raw() {
+        return Err(invalid_worker_header(
+            "worker OK response invalid DataResponseHeader: client_id mismatch",
+        ));
+    }
     if client.call_id.is_empty() {
         return Err(invalid_worker_header(
             "worker OK response invalid DataResponseHeader: call_id must not be empty",
@@ -906,6 +1027,17 @@ fn is_retryable_worker_status(status: &tonic::Status) -> bool {
     )
 }
 
+fn is_worker_epoch_mismatch(err: &ClientError) -> bool {
+    matches!(
+        ErrorClassifier.classify_error(err),
+        ErrorClass::NeedRefresh(RefreshReason::WorkerEpochMismatch)
+    )
+}
+
+fn is_endpoint_health_error(err: &ClientError) -> bool {
+    matches!(err, ClientError::Worker(message) if message.contains("temporarily unavailable"))
+}
+
 fn default_frame_size(len: u32) -> u32 {
     len.clamp(1, 1024 * 1024)
 }
@@ -927,6 +1059,14 @@ fn lazy_channel(endpoint: &str) -> ClientResult<tonic_net::Channel> {
     tonic_net::Endpoint::from_shared(endpoint.to_string())
         .map_err(|err| ClientError::Worker(format!("invalid worker endpoint {endpoint}: {err}")))
         .map(|endpoint| endpoint.connect_lazy())
+}
+
+fn tonic_request<T>(ctx: &AttemptContext, message: T) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    if let Some(timeout) = ctx.timeout_remaining() {
+        request.set_timeout(timeout.max(Duration::from_millis(1)));
+    }
+    request
 }
 
 #[cfg(test)]
@@ -1003,13 +1143,96 @@ mod tests {
         );
         let candidate = worker_endpoint();
 
-        let _first = client.client(&candidate, "read").expect("first client");
-        let _second = client.client(&candidate, "read").expect("second client");
+        let _first = client.client(&candidate, "read").await.expect("first client");
+        let _second = client.client(&candidate, "read").await.expect("second client");
 
         let events = metrics.events();
         assert_metric(&events, ClientMetric::WorkerChannelPoolMiss);
         assert_metric(&events, ClientMetric::WorkerChannelPoolHit);
         assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
+    }
+
+    #[tokio::test]
+    async fn concurrent_worker_channel_requests_same_key_create_one_channel() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let client = Arc::new(TonicWorkerDataClient::with_parts(
+            WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone()),
+            true,
+            8,
+            metrics.clone(),
+        ));
+        let candidate = worker_endpoint();
+
+        let mut tasks = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let client = Arc::clone(&client);
+            let candidate = candidate.clone();
+            tasks.push(tokio::spawn(async move { client.client(&candidate, "read").await }));
+        }
+
+        for task in tasks {
+            let _client = task.await.expect("task").expect("worker client");
+        }
+        assert_eq!(client.channels.read().len(), 1);
+        let events = metrics.events();
+        assert_metric(&events, ClientMetric::WorkerChannelSingleflightJoin);
+        assert_metric(&events, ClientMetric::WorkerChannelDuplicateCreationAvoided);
+        assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
+    }
+
+    #[tokio::test]
+    async fn worker_channel_different_epoch_does_not_share_channel() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let client = Arc::new(TonicWorkerDataClient::with_parts(
+            WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone()),
+            true,
+            8,
+            metrics,
+        ));
+        let mut first = worker_endpoint();
+        first.worker_epoch = 7;
+        let mut second = worker_endpoint();
+        second.worker_epoch = 8;
+
+        let first_task = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.client(&first, "read").await })
+        };
+        let second_task = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.client(&second, "read").await })
+        };
+
+        first_task.await.expect("first").expect("first client");
+        second_task.await.expect("second").expect("second client");
+        assert_eq!(client.channels.read().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_worker_channel_creation_wakes_waiters_without_insert() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let client = Arc::new(TonicWorkerDataClient::with_parts(
+            WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone()),
+            true,
+            8,
+            metrics.clone(),
+        ));
+        let mut candidate = worker_endpoint();
+        candidate.endpoint = "http://[invalid".to_string();
+
+        let mut tasks = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let client = Arc::clone(&client);
+            let candidate = candidate.clone();
+            tasks.push(tokio::spawn(async move { client.client(&candidate, "read").await }));
+        }
+
+        for task in tasks {
+            let err = task.await.expect("task").expect_err("invalid endpoint");
+            assert!(matches!(err, ClientError::Worker(msg) if msg.contains("invalid worker endpoint")));
+        }
+        assert!(client.channels.read().is_empty());
+        assert_metric(&metrics.events(), ClientMetric::WorkerChannelSingleflightFailure);
     }
 
     #[tokio::test]
@@ -1023,8 +1246,8 @@ mod tests {
         );
         let candidate = worker_endpoint();
 
-        let _first = client.client(&candidate, "read").expect("first client");
-        let _second = client.client(&candidate, "read").expect("second client");
+        let _first = client.client(&candidate, "read").await.expect("first client");
+        let _second = client.client(&candidate, "read").await.expect("second client");
 
         let events = metrics.events();
         assert_eq!(
@@ -1039,8 +1262,8 @@ mod tests {
             .all(|event| event.metric != ClientMetric::WorkerChannelPoolHit));
     }
 
-    #[test]
-    fn invalid_worker_protocol_does_not_create_channel() {
+    #[tokio::test]
+    async fn invalid_worker_protocol_does_not_create_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
         let client = TonicWorkerDataClient::with_parts(
             WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics),
@@ -1053,6 +1276,7 @@ mod tests {
 
         let err = client
             .client(&candidate, "read")
+            .await
             .expect_err("invalid protocol rejected");
 
         assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("unspecified")));
@@ -1071,7 +1295,10 @@ mod tests {
         let mut candidate = worker_endpoint();
         candidate.endpoint = "http://[invalid".to_string();
 
-        let err = client.client(&candidate, "read").expect_err("invalid endpoint fails");
+        let err = client
+            .client(&candidate, "read")
+            .await
+            .expect_err("invalid endpoint fails");
 
         assert!(matches!(err, ClientError::Worker(msg) if msg.contains("invalid worker endpoint")));
         assert_metric(&metrics.events(), ClientMetric::ChannelPoolConnectError);
@@ -1282,6 +1509,36 @@ mod tests {
         let err = validate_abort_write_response(&ctx, response).expect_err("missing AbortWrite header must fail");
 
         assert_invalid_worker_header(&err);
+    }
+
+    #[test]
+    fn worker_control_header_with_wrong_client_id_is_invalid_header() {
+        let ctx = write_attempt_context();
+        let mut header = ok_data_header(&ctx);
+        header.client.as_mut().expect("client").client_id = ctx.client_id().as_raw() + 1;
+
+        let err = parse_worker_control_header(&ctx, Some(&header)).expect_err("wrong client_id must fail");
+
+        assert_invalid_worker_header(&err);
+        match action(&err) {
+            ClientAction::Fail { canonical } => assert!(canonical.message.contains("client_id")),
+            other => panic!("expected invalid header failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worker_control_header_with_wrong_call_id_is_invalid_header() {
+        let ctx = write_attempt_context();
+        let mut header = ok_data_header(&ctx);
+        header.client.as_mut().expect("client").call_id = types::CallId::new().to_string();
+
+        let err = parse_worker_control_header(&ctx, Some(&header)).expect_err("wrong call_id must fail");
+
+        assert_invalid_worker_header(&err);
+        match action(&err) {
+            ClientAction::Fail { canonical } => assert!(canonical.message.contains("call_id")),
+            other => panic!("expected invalid header failure, got {other:?}"),
+        }
     }
 
     #[test]

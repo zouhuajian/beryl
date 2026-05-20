@@ -28,6 +28,14 @@ pub(crate) enum ClientMetric {
     SessionExpired,
     /// Session invalid observed.
     SessionInvalid,
+    /// Lease renewal attempt started.
+    LeaseRenewAttempt,
+    /// Lease renewal succeeded.
+    LeaseRenewSuccess,
+    /// Lease renewal failed.
+    LeaseRenewFailure,
+    /// CommitFile unknown-outcome retry attempted.
+    CommitUnknownRetry,
     /// Invalid response header observed.
     InvalidHeader,
     /// Worker response body mismatch observed.
@@ -62,6 +70,12 @@ pub(crate) enum ClientMetric {
     LayoutCacheInvalidate,
     /// Layout cache entry evicted.
     LayoutCacheEvict,
+    /// Layout singleflight waiter joined an in-flight miss.
+    LayoutSingleflightJoin,
+    /// Layout singleflight avoided a duplicate metadata request.
+    LayoutDuplicateRequestAvoided,
+    /// Layout singleflight leader failed.
+    LayoutSingleflightFailure,
     /// Worker endpoint cache lookup attempted.
     WorkerEndpointCacheLookup,
     /// Worker endpoint cache hit.
@@ -74,16 +88,44 @@ pub(crate) enum ClientMetric {
     WorkerEndpointCacheInvalidate,
     /// Worker endpoint cache entry evicted.
     WorkerEndpointCacheEvict,
+    /// Worker endpoint singleflight waiter joined an in-flight miss.
+    WorkerEndpointSingleflightJoin,
+    /// Worker endpoint singleflight avoided a duplicate resolution.
+    WorkerEndpointDuplicateResolutionAvoided,
+    /// Worker endpoint singleflight leader failed.
+    WorkerEndpointSingleflightFailure,
+    /// Worker endpoint health recorded a failure threshold event.
+    WorkerEndpointHealthFailure,
+    /// Worker endpoint health recovered after TTL.
+    WorkerEndpointHealthRecovery,
     /// Metadata channel pool hit.
     MetadataChannelPoolHit,
     /// Metadata channel pool miss.
     MetadataChannelPoolMiss,
+    /// Metadata channel singleflight waiter joined an in-flight creation.
+    MetadataChannelSingleflightJoin,
+    /// Metadata channel singleflight avoided duplicate creation.
+    MetadataChannelDuplicateCreationAvoided,
+    /// Metadata channel singleflight creation failed.
+    MetadataChannelSingleflightFailure,
     /// Worker channel pool hit.
     WorkerChannelPoolHit,
     /// Worker channel pool miss.
     WorkerChannelPoolMiss,
+    /// Worker channel singleflight waiter joined an in-flight creation.
+    WorkerChannelSingleflightJoin,
+    /// Worker channel singleflight avoided duplicate creation.
+    WorkerChannelDuplicateCreationAvoided,
+    /// Worker channel singleflight creation failed.
+    WorkerChannelSingleflightFailure,
     /// Channel pool connection setup failed.
     ChannelPoolConnectError,
+    /// Precise cache invalidation was used.
+    CachePreciseInvalidation,
+    /// Broad invalidation fallback was used.
+    CacheBroadInvalidationFallback,
+    /// Client-side RPC timeout fired.
+    RpcTimeout,
 }
 
 /// Low-cardinality labels for client metric events.

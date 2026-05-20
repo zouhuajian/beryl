@@ -8,6 +8,7 @@ use common::header::ResponseHeader;
 use proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::transport as tonic_net;
 
 use crate::canonical::{invalid_header_action, validate_header_or_action};
@@ -23,6 +24,7 @@ use crate::metadata::snapshot::{
     RenameResult, RenewLeaseResult, StateWatermark, StatusSnapshot, WriteSessionSeed,
 };
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
+use crate::runtime::singleflight::{Singleflight, SingleflightMode};
 use crate::runtime::AttemptContext;
 
 /// Client-owned metadata control-plane adapter.
@@ -75,6 +77,8 @@ pub(crate) struct TonicMetadataGateway {
     channels: Arc<parking_lot::RwLock<HashMap<MetadataChannelKey, tonic_net::Channel>>>,
     channel_pool_enabled: bool,
     max_channels_per_group: usize,
+    channel_singleflight_enabled: bool,
+    channel_singleflight: Singleflight<MetadataChannelKey, tonic_net::Channel>,
     metrics: Arc<dyn ClientMetrics>,
 }
 
@@ -85,18 +89,30 @@ impl TonicMetadataGateway {
         config: &ClientConfig,
         metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
-        Self::new_lazy_with_pool(
+        Self::new_lazy_with_pool_options(
             endpoint,
             config.channel_pool.metadata_channel_pool_enabled,
             config.channel_pool.metadata_channel_pool_max_per_group,
+            config.channel_pool.metadata_channel_singleflight_enabled,
             metrics,
         )
     }
 
+    #[cfg(test)]
     fn new_lazy_with_pool(
         endpoint: impl Into<String>,
         channel_pool_enabled: bool,
         max_channels_per_group: usize,
+        metrics: Arc<dyn ClientMetrics>,
+    ) -> ClientResult<Self> {
+        Self::new_lazy_with_pool_options(endpoint, channel_pool_enabled, max_channels_per_group, true, metrics)
+    }
+
+    fn new_lazy_with_pool_options(
+        endpoint: impl Into<String>,
+        channel_pool_enabled: bool,
+        max_channels_per_group: usize,
+        channel_singleflight_enabled: bool,
         metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
         let endpoint = normalize_endpoint(&endpoint.into());
@@ -114,11 +130,13 @@ impl TonicMetadataGateway {
             channels: Arc::new(parking_lot::RwLock::new(channels)),
             channel_pool_enabled,
             max_channels_per_group: max_channels_per_group.max(1),
+            channel_singleflight_enabled,
+            channel_singleflight: Singleflight::default(),
             metrics,
         })
     }
 
-    fn client(
+    async fn client(
         &self,
         ctx: &AttemptContext,
         operation: &'static str,
@@ -148,16 +166,65 @@ impl TonicMetadataGateway {
             }
             None => {
                 self.record_pool_metric(ClientMetric::MetadataChannelPoolMiss, operation, "miss");
-                let channel = lazy_channel(&key.endpoint).inspect_err(|_err| {
-                    self.record_pool_metric(ClientMetric::ChannelPoolConnectError, operation, "error");
-                })?;
-                let mut channels = self.channels.write();
-                evict_metadata_channel_if_needed(&mut channels, &key, self.max_channels_per_group);
-                channels.insert(key, channel.clone());
-                channel
+                self.create_metadata_channel(key, operation).await?
             }
         };
         Ok(FileSystemServiceProtoClient::new(channel))
+    }
+
+    async fn create_metadata_channel(
+        &self,
+        key: MetadataChannelKey,
+        operation: &'static str,
+    ) -> ClientResult<tonic_net::Channel> {
+        if let Some(channel) = self.channels.read().get(&key).cloned() {
+            self.record_pool_metric(ClientMetric::MetadataChannelPoolHit, operation, "hit");
+            return Ok(channel);
+        }
+        if !self.channel_singleflight_enabled {
+            let channel = lazy_channel(&key.endpoint).inspect_err(|_err| {
+                self.record_pool_metric(ClientMetric::ChannelPoolConnectError, operation, "error");
+            })?;
+            self.insert_metadata_channel(key, channel.clone());
+            return Ok(channel);
+        }
+
+        let endpoint = key.endpoint.clone();
+        let (mode, result) = self
+            .channel_singleflight
+            .run(key.clone(), move || async move {
+                tokio::task::yield_now().await;
+                lazy_channel(&endpoint)
+            })
+            .await;
+        if mode == SingleflightMode::Joined {
+            self.record_pool_metric(ClientMetric::MetadataChannelSingleflightJoin, operation, "join");
+            self.record_pool_metric(
+                ClientMetric::MetadataChannelDuplicateCreationAvoided,
+                operation,
+                "avoided",
+            );
+        }
+        match result {
+            Ok(channel) => {
+                self.insert_metadata_channel(key, channel.clone());
+                Ok(channel)
+            }
+            Err(err) => {
+                self.record_pool_metric(ClientMetric::ChannelPoolConnectError, operation, "error");
+                self.record_pool_metric(ClientMetric::MetadataChannelSingleflightFailure, operation, "failure");
+                Err(err)
+            }
+        }
+    }
+
+    fn insert_metadata_channel(&self, key: MetadataChannelKey, channel: tonic_net::Channel) {
+        let mut channels = self.channels.write();
+        if channels.contains_key(&key) {
+            return;
+        }
+        evict_metadata_channel_if_needed(&mut channels, &key, self.max_channels_per_group);
+        channels.insert(key, channel);
     }
 
     fn record_pool_metric(&self, metric: ClientMetric, operation: &'static str, outcome: &'static str) {
@@ -208,108 +275,117 @@ impl MetadataGateway for TonicMetadataGateway {
     async fn get_status(&self, ctx: AttemptContext, mut req: GetStatusOp) -> ClientResult<StatusSnapshot> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
-            .client(&ctx, "read")?
-            .get_status(tonic::Request::new(req))
+            .client(&ctx, "read")
+            .await?
+            .get_status(tonic_request(&ctx, req))
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(response.header.as_ref())?;
+        parse_metadata_response_header(&ctx, response.header.as_ref())?;
         Ok(response)
     }
 
     async fn list_status(&self, ctx: AttemptContext, mut req: ListStatusOp) -> ClientResult<ListSnapshot> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
-            .client(&ctx, "read")?
-            .list_status(tonic::Request::new(req))
+            .client(&ctx, "read")
+            .await?
+            .list_status(tonic_request(&ctx, req))
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(response.header.as_ref())?;
+        parse_metadata_response_header(&ctx, response.header.as_ref())?;
         Ok(response)
     }
 
     async fn delete(&self, ctx: AttemptContext, mut req: DeleteOp) -> ClientResult<DeleteResult> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
-            .client(&ctx, "write")?
-            .delete(tonic::Request::new(req))
+            .client(&ctx, "write")
+            .await?
+            .delete(tonic_request(&ctx, req))
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(response.header.as_ref())?;
+        parse_metadata_response_header(&ctx, response.header.as_ref())?;
         Ok(response)
     }
 
     async fn rename(&self, ctx: AttemptContext, mut req: RenameOp) -> ClientResult<RenameResult> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
-            .client(&ctx, "write")?
-            .rename(tonic::Request::new(req))
+            .client(&ctx, "write")
+            .await?
+            .rename(tonic_request(&ctx, req))
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(response.header.as_ref())?;
+        parse_metadata_response_header(&ctx, response.header.as_ref())?;
         Ok(response)
     }
 
     async fn open_file(&self, ctx: AttemptContext, mut req: OpenFileOp) -> ClientResult<FileSnapshot> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
-            .client(&ctx, "read")?
-            .open_file(tonic::Request::new(req))
+            .client(&ctx, "read")
+            .await?
+            .open_file(tonic_request(&ctx, req))
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(response.header.as_ref())?;
+        parse_metadata_response_header(&ctx, response.header.as_ref())?;
         Ok(response)
     }
 
     async fn read_layout(&self, ctx: AttemptContext, mut req: GetBlockLocationsOp) -> ClientResult<LayoutSnapshot> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
-            .client(&ctx, "read")?
-            .get_block_locations(tonic::Request::new(req))
+            .client(&ctx, "read")
+            .await?
+            .get_block_locations(tonic_request(&ctx, req))
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(response.header.as_ref())?;
+        parse_metadata_response_header(&ctx, response.header.as_ref())?;
         Ok(response)
     }
 
     async fn create_file(&self, ctx: AttemptContext, mut req: CreateFileOp) -> ClientResult<WriteSessionSeed> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
-            .client(&ctx, "write")?
-            .create_file(tonic::Request::new(req))
+            .client(&ctx, "write")
+            .await?
+            .create_file(tonic_request(&ctx, req))
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(response.header.as_ref())?;
+        parse_metadata_response_header(&ctx, response.header.as_ref())?;
         Ok(WriteSessionSeed::Create(response))
     }
 
     async fn append_file(&self, ctx: AttemptContext, mut req: AppendFileOp) -> ClientResult<WriteSessionSeed> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
-            .client(&ctx, "write")?
-            .append_file(tonic::Request::new(req))
+            .client(&ctx, "write")
+            .await?
+            .append_file(tonic_request(&ctx, req))
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(response.header.as_ref())?;
+        parse_metadata_response_header(&ctx, response.header.as_ref())?;
         Ok(WriteSessionSeed::Append(response))
     }
 
     async fn add_block(&self, ctx: AttemptContext, mut req: AddBlockOp) -> ClientResult<AddBlockResult> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
-            .client(&ctx, "write")?
-            .add_block(tonic::Request::new(req))
+            .client(&ctx, "write")
+            .await?
+            .add_block(tonic_request(&ctx, req))
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        let group_id = parse_metadata_response_header(response.header.as_ref())?;
+        let group_id = parse_metadata_response_header(&ctx, response.header.as_ref())?;
         let target = response
             .target
             .ok_or_else(|| side_effect_response_body_mismatch("AddBlock", "missing target"))?;
@@ -319,12 +395,13 @@ impl MetadataGateway for TonicMetadataGateway {
     async fn commit_file(&self, ctx: AttemptContext, mut req: CommitFileOp) -> ClientResult<CommitFileResult> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
-            .client(&ctx, "write")?
-            .commit_file(tonic::Request::new(req))
+            .client(&ctx, "write")
+            .await?
+            .commit_file(tonic_request(&ctx, req))
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(response.header.as_ref())?;
+        parse_metadata_response_header(&ctx, response.header.as_ref())?;
         Ok(response)
     }
 
@@ -335,43 +412,49 @@ impl MetadataGateway for TonicMetadataGateway {
     ) -> ClientResult<AbortFileWriteResult> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
-            .client(&ctx, "write")?
-            .abort_file_write(tonic::Request::new(req))
+            .client(&ctx, "write")
+            .await?
+            .abort_file_write(tonic_request(&ctx, req))
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(response.header.as_ref())?;
+        parse_metadata_response_header(&ctx, response.header.as_ref())?;
         Ok(response)
     }
 
     async fn renew_lease(&self, ctx: AttemptContext, mut req: RenewLeaseOp) -> ClientResult<RenewLeaseResult> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
-            .client(&ctx, "write")?
-            .renew_lease(tonic::Request::new(req))
+            .client(&ctx, "write")
+            .await?
+            .renew_lease(tonic_request(&ctx, req))
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(response.header.as_ref())?;
+        parse_metadata_response_header(&ctx, response.header.as_ref())?;
         Ok(response)
     }
 
     async fn msync(&self, ctx: AttemptContext, mut req: MsyncOp) -> ClientResult<StateWatermark> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
-            .client(&ctx, "refresh")?
-            .msync(tonic::Request::new(req))
+            .client(&ctx, "refresh")
+            .await?
+            .msync(tonic_request(&ctx, req))
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(response.header.as_ref())?;
+        parse_metadata_response_header(&ctx, response.header.as_ref())?;
         response
             .state
             .ok_or_else(|| ClientError::Metadata("MsyncResponseProto missing state".to_string()))
     }
 }
 
-fn parse_metadata_response_header(header: Option<&proto::common::ResponseHeaderProto>) -> ClientResult<u64> {
+fn parse_metadata_response_header(
+    ctx: &AttemptContext,
+    header: Option<&proto::common::ResponseHeaderProto>,
+) -> ClientResult<u64> {
     let Some(header) = header else {
         return Err(ClientError::from(invalid_header_action(
             "metadata OK response missing ResponseHeader",
@@ -382,6 +465,7 @@ fn parse_metadata_response_header(header: Option<&proto::common::ResponseHeaderP
             "metadata OK response invalid ResponseHeader: group_id must be non-zero",
         )));
     }
+    validate_metadata_response_identity(ctx, header)?;
     let header = ResponseHeader::try_from(header.clone()).map_err(|err| {
         ClientError::from(invalid_header_action(format!(
             "metadata OK response invalid ResponseHeader: {err}"
@@ -393,6 +477,50 @@ fn parse_metadata_response_header(header: Option<&proto::common::ResponseHeaderP
             "metadata OK response invalid ResponseHeader: group_id missing",
         ))
     })
+}
+
+fn validate_metadata_response_identity(
+    ctx: &AttemptContext,
+    header: &proto::common::ResponseHeaderProto,
+) -> ClientResult<()> {
+    if header.group_id != 0 {
+        if let Some(request_group_id) = ctx.group_id() {
+            if header.group_id != request_group_id {
+                return Err(ClientError::from(invalid_header_action(format!(
+                    "metadata OK response invalid ResponseHeader: group_id mismatch: expected {}, got {}",
+                    request_group_id, header.group_id
+                ))));
+            }
+        }
+    }
+    let client = header.client.as_ref().ok_or_else(|| {
+        ClientError::from(invalid_header_action(
+            "metadata OK response invalid ResponseHeader: missing client identity",
+        ))
+    })?;
+    if client.client_id == 0 {
+        return Err(ClientError::from(invalid_header_action(
+            "metadata OK response invalid ResponseHeader: client_id must be non-zero",
+        )));
+    }
+    if client.client_id != ctx.client_id().as_raw() {
+        return Err(ClientError::from(invalid_header_action(format!(
+            "metadata OK response invalid ResponseHeader: client_id mismatch: expected {}, got {}",
+            ctx.client_id().as_raw(),
+            client.client_id
+        ))));
+    }
+    if client.call_id.is_empty() {
+        return Err(ClientError::from(invalid_header_action(
+            "metadata OK response invalid ResponseHeader: call_id must not be empty",
+        )));
+    }
+    if client.call_id != ctx.call_id() {
+        return Err(ClientError::from(invalid_header_action(
+            "metadata OK response invalid ResponseHeader: call_id mismatch",
+        )));
+    }
+    Ok(())
 }
 
 fn normalize_endpoint(endpoint: &str) -> String {
@@ -407,6 +535,14 @@ fn lazy_channel(endpoint: &str) -> ClientResult<tonic_net::Channel> {
     tonic_net::Endpoint::from_shared(endpoint.to_string())
         .map_err(|err| ClientError::Metadata(format!("invalid metadata endpoint {endpoint}: {err}")))
         .map(|endpoint| endpoint.connect_lazy())
+}
+
+fn tonic_request<T>(ctx: &AttemptContext, message: T) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    if let Some(timeout) = ctx.timeout_remaining() {
+        request.set_timeout(timeout.max(Duration::from_millis(1)));
+    }
+    request
 }
 
 #[cfg(test)]
@@ -445,13 +581,61 @@ mod tests {
             TonicMetadataGateway::new_lazy_with_pool("127.0.0.1:18080", true, 1, metrics.clone()).expect("gateway");
         let ctx = metadata_attempt(9, None);
 
-        let _first = gateway.client(&ctx, "read").expect("first client");
-        let _second = gateway.client(&ctx, "read").expect("second client");
+        let _first = gateway.client(&ctx, "read").await.expect("first client");
+        let _second = gateway.client(&ctx, "read").await.expect("second client");
 
         let events = metrics.events();
         assert_metric(&events, ClientMetric::MetadataChannelPoolMiss);
         assert_metric(&events, ClientMetric::MetadataChannelPoolHit);
         assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
+    }
+
+    #[tokio::test]
+    async fn concurrent_metadata_channel_requests_same_key_create_one_channel() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let gateway = Arc::new(
+            TonicMetadataGateway::new_lazy_with_pool("127.0.0.1:18080", true, 8, metrics.clone()).expect("gateway"),
+        );
+        let ctx = metadata_attempt(9, None);
+
+        let mut tasks = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let gateway = Arc::clone(&gateway);
+            let ctx = ctx.clone();
+            tasks.push(tokio::spawn(async move { gateway.client(&ctx, "read").await }));
+        }
+
+        for task in tasks {
+            let _client = task.await.expect("task").expect("metadata client");
+        }
+        let events = metrics.events();
+        assert_eq!(gateway.channels.read().len(), 2);
+        assert_metric(&events, ClientMetric::MetadataChannelSingleflightJoin);
+        assert_metric(&events, ClientMetric::MetadataChannelDuplicateCreationAvoided);
+        assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
+    }
+
+    #[tokio::test]
+    async fn failed_metadata_channel_creation_wakes_waiters_without_insert() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let gateway = Arc::new(
+            TonicMetadataGateway::new_lazy_with_pool("127.0.0.1:18080", true, 8, metrics.clone()).expect("gateway"),
+        );
+        let ctx = metadata_attempt(9, Some("http://[invalid"));
+
+        let mut tasks = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let gateway = Arc::clone(&gateway);
+            let ctx = ctx.clone();
+            tasks.push(tokio::spawn(async move { gateway.client(&ctx, "read").await }));
+        }
+
+        for task in tasks {
+            let err = task.await.expect("task").expect_err("invalid endpoint");
+            assert!(matches!(err, ClientError::Metadata(msg) if msg.contains("invalid metadata endpoint")));
+        }
+        assert_eq!(gateway.channels.read().len(), 1);
+        assert_metric(&metrics.events(), ClientMetric::MetadataChannelSingleflightFailure);
     }
 
     #[tokio::test]
@@ -461,8 +645,8 @@ mod tests {
             TonicMetadataGateway::new_lazy_with_pool("127.0.0.1:18080", false, 1, metrics.clone()).expect("gateway");
         let ctx = metadata_attempt(9, None);
 
-        let _first = gateway.client(&ctx, "read").expect("first client");
-        let _second = gateway.client(&ctx, "read").expect("second client");
+        let _first = gateway.client(&ctx, "read").await.expect("first client");
+        let _second = gateway.client(&ctx, "read").await.expect("second client");
 
         let events = metrics.events();
         assert_eq!(
@@ -484,7 +668,7 @@ mod tests {
             TonicMetadataGateway::new_lazy_with_pool("127.0.0.1:18080", true, 1, metrics.clone()).expect("gateway");
         let ctx = metadata_attempt(9, Some("http://[invalid"));
 
-        let err = gateway.client(&ctx, "read").expect_err("invalid endpoint fails");
+        let err = gateway.client(&ctx, "read").await.expect_err("invalid endpoint fails");
 
         assert!(matches!(err, ClientError::Metadata(msg) if msg.contains("invalid metadata endpoint")));
         assert_metric(&metrics.events(), ClientMetric::ChannelPoolConnectError);
@@ -492,6 +676,7 @@ mod tests {
 
     #[test]
     fn metadata_response_header_preserves_need_refresh_hints() {
+        let ctx = metadata_attempt(17, None);
         let canonical = CanonicalError::need_refresh_with_hint(
             RpcErrorCode::ShardMoved,
             RefreshReason::RouteEpochMismatch,
@@ -508,11 +693,7 @@ mod tests {
             "route moved",
         );
         let header = proto::common::ResponseHeaderProto {
-            client: Some(proto::common::ClientInfoProto {
-                call_id: types::CallId::new().to_string(),
-                client_id: 7,
-                client_name: String::new(),
-            }),
+            client: Some(ctx.client_info()),
             error: Some(canonical_to_error_detail(&canonical)),
             state: Vec::new(),
             group_id: 17,
@@ -520,7 +701,7 @@ mod tests {
             route_epoch: Some(23),
         };
 
-        let err = parse_metadata_response_header(Some(&header)).expect_err("need refresh must be surfaced");
+        let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("need refresh must be surfaced");
         match action(&err) {
             ClientAction::Refresh { reason, hint, .. } => {
                 assert_eq!(*reason, RefreshReason::RouteEpochMismatch);
@@ -538,7 +719,8 @@ mod tests {
 
     #[test]
     fn missing_metadata_response_header_is_invalid_header_action() {
-        let err = parse_metadata_response_header(None).expect_err("missing response header must fail");
+        let ctx = metadata_attempt(9, None);
+        let err = parse_metadata_response_header(&ctx, None).expect_err("missing response header must fail");
 
         assert_ne!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
         match action(&err) {
@@ -558,9 +740,11 @@ mod tests {
 
     #[test]
     fn malformed_metadata_response_header_is_invalid_header_action() {
+        let ctx = metadata_attempt(9, None);
         let malformed = proto::common::ResponseHeaderProto::default();
 
-        let err = parse_metadata_response_header(Some(&malformed)).expect_err("malformed response header must fail");
+        let err =
+            parse_metadata_response_header(&ctx, Some(&malformed)).expect_err("malformed response header must fail");
 
         assert_ne!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
         match action(&err) {
@@ -581,6 +765,7 @@ mod tests {
     #[test]
     fn metadata_response_header_with_zero_group_id_is_invalid_header_action() {
         const INVALID_GROUP_ID: u64 = 0;
+        let ctx = metadata_attempt(9, None);
         let header = proto::common::ResponseHeaderProto {
             client: Some(proto::common::ClientInfoProto {
                 call_id: types::CallId::new().to_string(),
@@ -594,7 +779,7 @@ mod tests {
             route_epoch: None,
         };
 
-        let err = parse_metadata_response_header(Some(&header)).expect_err("zero group_id must fail");
+        let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("zero group_id must fail");
 
         assert_ne!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
         match action(&err) {
@@ -612,10 +797,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn metadata_response_header_with_wrong_call_id_is_invalid_header_action() {
+        let ctx = metadata_attempt(9, None);
+        let mut header = ok_metadata_header(&ctx);
+        header.client.as_mut().expect("client").call_id = types::CallId::new().to_string();
+
+        let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("wrong call_id must fail");
+
+        assert_invalid_metadata_header(&err, "call_id");
+    }
+
+    #[test]
+    fn metadata_response_header_with_wrong_client_id_is_invalid_header_action() {
+        let ctx = metadata_attempt(9, None);
+        let mut header = ok_metadata_header(&ctx);
+        header.client.as_mut().expect("client").client_id = ctx.client_id().as_raw() + 1;
+
+        let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("wrong client_id must fail");
+
+        assert_invalid_metadata_header(&err, "client_id");
+    }
+
+    #[test]
+    fn metadata_response_header_with_wrong_group_id_is_invalid_header_action() {
+        let ctx = metadata_attempt(9, None);
+        let mut header = ok_metadata_header(&ctx);
+        header.group_id = 11;
+
+        let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("wrong group_id must fail");
+
+        assert_invalid_metadata_header(&err, "group_id");
+    }
+
+    #[test]
+    fn metadata_response_header_with_missing_client_identity_is_invalid_header_action() {
+        let ctx = metadata_attempt(9, None);
+        let mut header = ok_metadata_header(&ctx);
+        header.client = None;
+
+        let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("missing client must fail");
+
+        assert_invalid_metadata_header(&err, "client identity");
+    }
+
+    #[test]
+    fn metadata_response_header_with_empty_call_id_is_invalid_header_action() {
+        let ctx = metadata_attempt(9, None);
+        let mut header = ok_metadata_header(&ctx);
+        header.client.as_mut().expect("client").call_id.clear();
+
+        let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("empty call_id must fail");
+
+        assert_invalid_metadata_header(&err, "call_id");
+    }
+
     fn action(err: &ClientError) -> &ClientAction {
         match err {
             ClientError::Action(action) => action.as_ref(),
             other => panic!("expected action error, got {other:?}"),
+        }
+    }
+
+    fn assert_invalid_metadata_header(err: &ClientError, message_fragment: &str) {
+        assert_eq!(ErrorClassifier.classify_error(err), ErrorClass::InvalidHeader);
+        match action(err) {
+            ClientAction::Fail { canonical } => {
+                assert!(matches!(
+                    canonical.code,
+                    Some(common::error::canonical::ErrorCode::RpcCode(
+                        HeaderRpcErrorCode::InvalidHeader
+                    ))
+                ));
+                assert!(
+                    canonical.message.contains(message_fragment),
+                    "expected {message_fragment:?} in {:?}",
+                    canonical.message
+                );
+            }
+            other => panic!("expected invalid header Fail action, got {other:?}"),
         }
     }
 
@@ -639,6 +899,18 @@ mod tests {
             ctx.with_metadata_endpoint(endpoint.to_string())
         } else {
             ctx
+        }
+    }
+
+    fn ok_metadata_header(ctx: &AttemptContext) -> proto::common::ResponseHeaderProto {
+        let request = ctx.metadata_header().expect("metadata request header");
+        proto::common::ResponseHeaderProto {
+            client: request.client,
+            error: None,
+            state: Vec::new(),
+            group_id: request.group_id,
+            mount_epoch: request.mount_epoch,
+            route_epoch: request.route_epoch,
         }
     }
 }
