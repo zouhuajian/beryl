@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 use parking_lot::RwLock;
-use proto::metadata::GetBlockLocationsResponseProto;
 use types::{DataHandleId, InodeId};
 
 use crate::cache::{cache_labels, CacheInvalidationReason};
 use crate::config::CacheConfig;
 use crate::error::{ClientError, ClientResult};
+use crate::metadata::LayoutSnapshot;
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetrics};
 use crate::planner::read_planner::{PlannedReadRange, ReadPlanner};
 
@@ -83,7 +83,7 @@ impl LayoutCacheKey {
 
 #[derive(Clone, Debug)]
 struct CachedLayout {
-    response: GetBlockLocationsResponseProto,
+    response: LayoutSnapshot,
     inserted_at: Instant,
 }
 
@@ -138,7 +138,7 @@ impl LayoutCache {
     }
 
     /// Return a validated cached layout, or None on miss/expiry/disabled state.
-    pub(crate) fn get(&self, key: &LayoutCacheKey) -> Option<GetBlockLocationsResponseProto> {
+    pub(crate) fn get(&self, key: &LayoutCacheKey) -> Option<LayoutSnapshot> {
         self.record(ClientMetric::LayoutCacheLookup, "lookup", None);
         if !self.reuse_enabled() {
             self.record(ClientMetric::LayoutCacheMiss, "miss", None);
@@ -169,11 +169,7 @@ impl LayoutCache {
     }
 
     /// Insert a layout after validating identity, coverage, and block stamps.
-    pub(crate) fn insert_validated(
-        &self,
-        key: LayoutCacheKey,
-        response: GetBlockLocationsResponseProto,
-    ) -> ClientResult<()> {
+    pub(crate) fn insert_validated(&self, key: LayoutCacheKey, response: LayoutSnapshot) -> ClientResult<()> {
         if let Err(err) = validate_layout_for_key(key, &response) {
             match &err {
                 ClientError::StaleHandle { .. } => self.invalidate_all(CacheInvalidationReason::DataHandle),
@@ -241,7 +237,7 @@ impl std::fmt::Debug for LayoutCache {
     }
 }
 
-fn validate_layout_for_key(key: LayoutCacheKey, response: &GetBlockLocationsResponseProto) -> ClientResult<()> {
+fn validate_layout_for_key(key: LayoutCacheKey, response: &LayoutSnapshot) -> ClientResult<()> {
     ReadPlanner::resolve_response(
         key.inode_id(),
         key.data_handle_id(),
@@ -257,9 +253,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    use proto::common::{BlockIdProto, WorkerEndpointInfoProto, WorkerNetProtocolProto};
-
     use crate::metrics::NoopClientMetrics;
+    use types::{BlockId, BlockIndex, FileBlockLocation, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
 
     #[derive(Debug)]
     struct ManualClock {
@@ -351,21 +346,15 @@ mod tests {
     }
 
     #[test]
-    fn zero_or_missing_block_stamp_is_rejected_before_insert() {
+    fn zero_block_stamp_is_rejected_before_insert() {
         let cache = LayoutCache::new(true, Duration::from_secs(60), 8, Arc::new(NoopClientMetrics));
         let key = key(0, 4);
-        let mut missing = location(0, 4, 77);
-        missing.block_stamp = None;
 
         let zero = cache
             .insert_validated(key, layout(vec![location(0, 4, 0)]))
             .expect_err("zero stamp rejected");
-        let missing = cache
-            .insert_validated(key, layout(vec![missing]))
-            .expect_err("missing stamp rejected");
 
         assert!(matches!(zero, ClientError::InvalidLayout(msg) if msg.contains("block_stamp")));
-        assert!(matches!(missing, ClientError::InvalidLayout(msg) if msg.contains("block_stamp")));
         assert_eq!(cache.len(), 0);
     }
 
@@ -403,41 +392,30 @@ mod tests {
         )
     }
 
-    fn layout(locations: Vec<proto::metadata::FileBlockLocationProto>) -> GetBlockLocationsResponseProto {
-        GetBlockLocationsResponseProto {
-            header: Some(proto::common::ResponseHeaderProto {
-                client: Some(proto::common::ClientInfoProto {
-                    call_id: types::CallId::new().to_string(),
-                    client_id: 7,
-                    client_name: String::new(),
-                }),
-                group_id: 9,
-                ..proto::common::ResponseHeaderProto::default()
-            }),
-            inode_id: Some(proto::fs::InodeIdProto { value: 101 }),
-            data_handle_id: Some(proto::common::DataHandleIdProto { value: 202 }),
+    fn layout(locations: Vec<FileBlockLocation>) -> LayoutSnapshot {
+        LayoutSnapshot {
+            group_id: 9,
+            inode_id: InodeId::new(101),
+            data_handle_id: DataHandleId::new(202),
             file_size: 16,
-            locations,
             file_version: Some(3),
+            locations,
         }
     }
 
-    fn location(file_offset: u64, len: u64, block_stamp: u64) -> proto::metadata::FileBlockLocationProto {
-        proto::metadata::FileBlockLocationProto {
-            block_id: Some(BlockIdProto {
-                data_handle_id: 202,
-                block_index: (file_offset / 4) as u32,
-            }),
+    fn location(file_offset: u64, len: u64, block_stamp: u64) -> FileBlockLocation {
+        FileBlockLocation {
+            block_id: BlockId::new(DataHandleId::new(202), BlockIndex::new((file_offset / 4) as u32)),
             file_offset,
             len,
-            workers: vec![WorkerEndpointInfoProto {
-                worker_id: 1,
+            workers: vec![WorkerEndpointInfo {
+                worker_id: WorkerId::new(1),
                 endpoint: "127.0.0.1:19101".to_string(),
-                worker_net_protocol: WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+                worker_net_protocol: WorkerNetProtocol::Grpc,
                 worker_epoch: 7,
             }],
             worker_epoch: Some(7),
-            block_stamp: Some(block_stamp),
+            block_stamp,
         }
     }
 }

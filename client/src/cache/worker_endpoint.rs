@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 use parking_lot::RwLock;
-use proto::common::{WorkerEndpointInfoProto, WorkerNetProtocolProto};
+use types::{WorkerEndpointInfo, WorkerNetProtocol};
 
 use crate::cache::layout::{CacheClock, SystemCacheClock};
 use crate::cache::{cache_labels, CacheInvalidationReason};
@@ -26,16 +26,16 @@ const OPERATION: &str = "read";
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct WorkerEndpointCacheKey {
     worker_id: u64,
-    protocol: i32,
+    protocol: WorkerNetProtocol,
     endpoint: String,
     worker_epoch: u64,
 }
 
 impl WorkerEndpointCacheKey {
-    fn from_candidate(candidate: &WorkerEndpointInfoProto) -> ClientResult<Self> {
+    fn from_candidate(candidate: &WorkerEndpointInfo) -> ClientResult<Self> {
         validate_worker_endpoint(candidate)?;
         Ok(Self {
-            worker_id: candidate.worker_id,
+            worker_id: candidate.worker_id.as_raw(),
             protocol: candidate.worker_net_protocol,
             endpoint: candidate.endpoint.clone(),
             worker_epoch: candidate.worker_epoch,
@@ -45,7 +45,7 @@ impl WorkerEndpointCacheKey {
 
 #[derive(Clone, Debug)]
 struct CachedWorkerEndpoint {
-    endpoint: WorkerEndpointInfoProto,
+    endpoint: WorkerEndpointInfo,
     inserted_at: Instant,
 }
 
@@ -66,7 +66,7 @@ pub(crate) struct WorkerEndpointCache {
     health_ttl: Duration,
     cache: Arc<RwLock<LruCache<WorkerEndpointCacheKey, CachedWorkerEndpoint>>>,
     health: Arc<RwLock<std::collections::HashMap<WorkerEndpointCacheKey, EndpointHealth>>>,
-    singleflight: Singleflight<WorkerEndpointCacheKey, WorkerEndpointInfoProto>,
+    singleflight: Singleflight<WorkerEndpointCacheKey, WorkerEndpointInfo>,
     clock: Arc<dyn CacheClock>,
     metrics: Arc<dyn ClientMetrics>,
 }
@@ -143,8 +143,8 @@ impl WorkerEndpointCache {
     /// Resolve and cache a metadata-authoritative endpoint candidate with miss coalescing.
     pub(crate) async fn get_or_resolve_authoritative(
         &self,
-        candidate: &WorkerEndpointInfoProto,
-    ) -> ClientResult<WorkerEndpointInfoProto> {
+        candidate: &WorkerEndpointInfo,
+    ) -> ClientResult<WorkerEndpointInfo> {
         self.get_or_resolve_authoritative_with(candidate, |candidate| async move {
             tokio::task::yield_now().await;
             Ok(candidate)
@@ -155,12 +155,12 @@ impl WorkerEndpointCache {
     /// Resolve and cache a candidate through an injected resolver.
     pub(crate) async fn get_or_resolve_authoritative_with<F, Fut>(
         &self,
-        candidate: &WorkerEndpointInfoProto,
+        candidate: &WorkerEndpointInfo,
         resolver: F,
-    ) -> ClientResult<WorkerEndpointInfoProto>
+    ) -> ClientResult<WorkerEndpointInfo>
     where
-        F: FnOnce(WorkerEndpointInfoProto) -> Fut + Send + 'static,
-        Fut: Future<Output = ClientResult<WorkerEndpointInfoProto>> + Send + 'static,
+        F: FnOnce(WorkerEndpointInfo) -> Fut + Send + 'static,
+        Fut: Future<Output = ClientResult<WorkerEndpointInfo>> + Send + 'static,
     {
         let key = match WorkerEndpointCacheKey::from_candidate(candidate) {
             Ok(key) => key,
@@ -223,8 +223,8 @@ impl WorkerEndpointCache {
     #[cfg(test)]
     pub(crate) fn get_or_insert_authoritative(
         &self,
-        candidate: &WorkerEndpointInfoProto,
-    ) -> ClientResult<WorkerEndpointInfoProto> {
+        candidate: &WorkerEndpointInfo,
+    ) -> ClientResult<WorkerEndpointInfo> {
         let key = match WorkerEndpointCacheKey::from_candidate(candidate) {
             Ok(key) => key,
             Err(err) => {
@@ -241,7 +241,7 @@ impl WorkerEndpointCache {
     }
 
     /// Invalidate one candidate endpoint if its key is valid.
-    pub(crate) fn invalidate_candidate(&self, candidate: &WorkerEndpointInfoProto, reason: CacheInvalidationReason) {
+    pub(crate) fn invalidate_candidate(&self, candidate: &WorkerEndpointInfo, reason: CacheInvalidationReason) {
         let Ok(key) = WorkerEndpointCacheKey::from_candidate(candidate) else {
             self.invalidate_all(reason);
             return;
@@ -257,11 +257,7 @@ impl WorkerEndpointCache {
     }
 
     /// Record a retryable failure for one endpoint candidate.
-    pub(crate) fn record_candidate_failure(
-        &self,
-        candidate: &WorkerEndpointInfoProto,
-        reason: CacheInvalidationReason,
-    ) {
+    pub(crate) fn record_candidate_failure(&self, candidate: &WorkerEndpointInfo, reason: CacheInvalidationReason) {
         let Ok(key) = WorkerEndpointCacheKey::from_candidate(candidate) else {
             self.invalidate_all(reason);
             return;
@@ -284,7 +280,7 @@ impl WorkerEndpointCache {
 
     /// Return whether the candidate is currently healthy enough to try.
     #[cfg(test)]
-    pub(crate) fn is_candidate_healthy(&self, candidate: &WorkerEndpointInfoProto) -> bool {
+    pub(crate) fn is_candidate_healthy(&self, candidate: &WorkerEndpointInfo) -> bool {
         let Ok(key) = WorkerEndpointCacheKey::from_candidate(candidate) else {
             return false;
         };
@@ -320,7 +316,7 @@ impl WorkerEndpointCache {
         self.enabled && !self.ttl.is_zero()
     }
 
-    fn get_cached_after_lookup(&self, key: &WorkerEndpointCacheKey) -> Option<WorkerEndpointInfoProto> {
+    fn get_cached_after_lookup(&self, key: &WorkerEndpointCacheKey) -> Option<WorkerEndpointInfo> {
         if !self.reuse_enabled() {
             self.record(ClientMetric::WorkerEndpointCacheMiss, "miss", None);
             return None;
@@ -350,7 +346,7 @@ impl WorkerEndpointCache {
         None
     }
 
-    fn insert_resolved(&self, key: WorkerEndpointCacheKey, endpoint: WorkerEndpointInfoProto) {
+    fn insert_resolved(&self, key: WorkerEndpointCacheKey, endpoint: WorkerEndpointInfo) {
         if !self.reuse_enabled() {
             return;
         }
@@ -411,8 +407,8 @@ impl std::fmt::Debug for WorkerEndpointCache {
     }
 }
 
-fn validate_worker_endpoint(candidate: &WorkerEndpointInfoProto) -> ClientResult<()> {
-    if candidate.worker_id == 0 {
+fn validate_worker_endpoint(candidate: &WorkerEndpointInfo) -> ClientResult<()> {
+    if candidate.worker_id.as_raw() == 0 {
         return Err(ClientError::InvalidLayout(
             "worker endpoint candidate worker_id must be non-zero".to_string(),
         ));
@@ -427,14 +423,11 @@ fn validate_worker_endpoint(candidate: &WorkerEndpointInfoProto) -> ClientResult
             "worker endpoint candidate worker_epoch must be non-zero".to_string(),
         ));
     }
-    match proto::convert::parse_known_worker_net_protocol(candidate.worker_net_protocol)
-        .map_err(ClientError::InvalidArgument)?
-    {
-        WorkerNetProtocolProto::WorkerNetProtocolGrpc => Ok(()),
-        WorkerNetProtocolProto::WorkerNetProtocolQuic | WorkerNetProtocolProto::WorkerNetProtocolRdma => {
+    match candidate.worker_net_protocol {
+        WorkerNetProtocol::Grpc => Ok(()),
+        WorkerNetProtocol::Quic | WorkerNetProtocol::Rdma => {
             Err(ClientError::Unsupported("unsupported worker net protocol".to_string()))
         }
-        WorkerNetProtocolProto::WorkerNetProtocolUnspecified => unreachable!("parser rejects unspecified"),
     }
 }
 
@@ -515,22 +508,16 @@ mod tests {
     }
 
     #[test]
-    fn invalid_or_unspecified_protocol_is_rejected_without_insert() {
+    fn unsupported_protocol_is_rejected_without_insert() {
         let cache = WorkerEndpointCache::new(true, Duration::from_secs(60), 8, Arc::new(NoopClientMetrics));
-        let mut unspecified = endpoint(1, 7);
-        unspecified.worker_net_protocol = WorkerNetProtocolProto::WorkerNetProtocolUnspecified as i32;
-        let mut unknown = endpoint(1, 7);
-        unknown.worker_net_protocol = 99;
+        let mut unsupported = endpoint(1, 7);
+        unsupported.worker_net_protocol = WorkerNetProtocol::Quic;
 
-        let unspecified_err = cache
-            .get_or_insert_authoritative(&unspecified)
-            .expect_err("unspecified protocol rejected");
-        let unknown_err = cache
-            .get_or_insert_authoritative(&unknown)
-            .expect_err("unknown protocol rejected");
+        let err = cache
+            .get_or_insert_authoritative(&unsupported)
+            .expect_err("unsupported protocol rejected");
 
-        assert!(matches!(unspecified_err, ClientError::InvalidArgument(msg) if msg.contains("unspecified")));
-        assert!(matches!(unknown_err, ClientError::InvalidArgument(msg) if msg.contains("unknown")));
+        assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("unsupported")));
         assert_eq!(cache.len(), 0);
     }
 
@@ -706,11 +693,11 @@ mod tests {
         );
     }
 
-    fn endpoint(worker_id: u64, worker_epoch: u64) -> WorkerEndpointInfoProto {
-        WorkerEndpointInfoProto {
-            worker_id,
+    fn endpoint(worker_id: u64, worker_epoch: u64) -> WorkerEndpointInfo {
+        WorkerEndpointInfo {
+            worker_id: types::WorkerId::new(worker_id),
             endpoint: "127.0.0.1:19101".to_string(),
-            worker_net_protocol: WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+            worker_net_protocol: WorkerNetProtocol::Grpc,
             worker_epoch,
         }
     }

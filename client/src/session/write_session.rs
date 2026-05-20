@@ -6,10 +6,8 @@
 use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use proto::metadata::{
-    AbortFileWriteRequestProto, CommitFileRequestProto, CommittedBlockProto, WriteHandleProto, WriteTargetProto,
-};
-use types::{CallId, ClientId, DataHandleId, InodeId};
+use proto::metadata::{AbortFileWriteRequestProto, CommitFileRequestProto, WriteHandleProto};
+use types::{CallId, ClientId, CommittedBlock, DataHandleId, InodeId, WriteTarget};
 
 use crate::data::WorkerWriteBlock;
 use crate::error::{ClientError, ClientResult};
@@ -103,7 +101,7 @@ impl WriteSession {
     }
 
     /// Validate a metadata write target before opening the worker stream.
-    pub(crate) fn validate_target(&mut self, target: &WriteTargetProto, expected_len: u64) -> ClientResult<()> {
+    pub(crate) fn validate_target(&mut self, target: &WriteTarget, expected_len: u64) -> ClientResult<()> {
         self.ensure_open_for_write()?;
         if target.file_offset != self.cursor {
             return Err(ClientError::InvalidLayout(format!(
@@ -117,15 +115,12 @@ impl WriteSession {
                 expected_len, target.len
             )));
         }
-        let block = target
-            .block_id
-            .as_ref()
-            .ok_or_else(|| ClientError::InvalidLayout("write target missing block_id".to_string()))?;
-        if block.data_handle_id != self.data_handle_id.as_raw() {
+        let block = target.block_id;
+        if block.data_handle_id != self.data_handle_id {
             return Err(ClientError::StaleHandle {
                 reason: format!(
                     "write target data_handle_id {} does not match session data_handle_id {}",
-                    block.data_handle_id,
+                    block.data_handle_id.as_raw(),
                     self.data_handle_id.as_raw()
                 ),
             });
@@ -146,7 +141,7 @@ impl WriteSession {
     /// Record a worker-accepted block and advance the cursor.
     pub(crate) fn push_pending_block(
         &mut self,
-        target: WriteTargetProto,
+        target: WriteTarget,
         worker_block: WorkerWriteBlock,
         written_len: u64,
         commit_seq: u64,
@@ -180,7 +175,7 @@ impl WriteSession {
     pub(crate) fn prepare_commit_file(
         &mut self,
         client_id: ClientId,
-        committed_blocks: Vec<CommittedBlockProto>,
+        committed_blocks: Vec<CommittedBlock>,
         final_size: u64,
     ) -> ClientResult<(OperationContext, CommitFileRequestProto)> {
         match self.state {
@@ -284,7 +279,7 @@ impl WriteSession {
                 data_handle_id: Some(proto::common::DataHandleIdProto {
                     value: self.data_handle_id.as_raw(),
                 }),
-                committed_blocks: commit.commit_committed_blocks_snapshot.clone(),
+                committed_blocks: commit.commit_committed_blocks_snapshot.iter().map(Into::into).collect(),
                 final_size: commit.commit_final_size,
             },
         ))
@@ -613,7 +608,7 @@ impl WriteSession {
 /// Pending worker block in a write session.
 #[derive(Clone, Debug)]
 pub(crate) struct PendingBlock {
-    target: WriteTargetProto,
+    target: WriteTarget,
     worker_block: WorkerWriteBlock,
     written_len: u64,
     commit_seq: u64,
@@ -622,7 +617,7 @@ pub(crate) struct PendingBlock {
 
 impl PendingBlock {
     /// Metadata write target for this block.
-    pub(crate) fn target(&self) -> &WriteTargetProto {
+    pub(crate) fn target(&self) -> &WriteTarget {
         &self.target
     }
 
@@ -678,7 +673,7 @@ struct CommitFileState {
     commit_fingerprint: OperationFingerprint,
     commit_write_handle: WriteHandleProto,
     commit_final_size: u64,
-    commit_committed_blocks_snapshot: Vec<CommittedBlockProto>,
+    commit_committed_blocks_snapshot: Vec<CommittedBlock>,
     session_identity: String,
     detail: String,
 }
@@ -787,7 +782,7 @@ fn commit_fingerprint_detail(
     inode_id: InodeId,
     data_handle_id: DataHandleId,
     final_size: u64,
-    committed_blocks: &[CommittedBlockProto],
+    committed_blocks: &[CommittedBlock],
 ) -> String {
     let mut detail = String::new();
     let _ = write!(
@@ -807,8 +802,8 @@ fn commit_fingerprint_detail(
         let _ = write!(
             &mut detail,
             "{}:{}@{}+{};",
-            block.block_id.as_ref().map(|id| id.data_handle_id).unwrap_or_default(),
-            block.block_id.as_ref().map(|id| id.block_index).unwrap_or_default(),
+            block.block_id.data_handle_id.as_raw(),
+            block.block_id.index.as_raw(),
             block.file_offset,
             block.len
         );
@@ -851,19 +846,14 @@ fn abort_worker_fingerprint_detail(worker_block: &WorkerWriteBlock) -> String {
 }
 
 fn append_worker_block_identity(detail: &mut String, worker_block: &WorkerWriteBlock) {
-    let block_id = worker_block
-        .target
-        .block_id
-        .as_ref()
-        .map(|block| format!("{}:{}", block.data_handle_id, block.block_index))
-        .unwrap_or_else(|| "missing".to_string());
+    let block_id = worker_block.target.block_id;
     let _ = write!(
         detail,
         "group={} worker={} protocol={} worker_epoch={} block={} stamp={} offset={} len={} stream={}:{} next_seq={}",
         worker_block.group_id,
-        worker_block.worker_id,
-        worker_block.worker_net_protocol,
-        worker_block.worker_epoch,
+        worker_block.worker.worker_id,
+        proto::common::WorkerNetProtocolProto::from(worker_block.worker.worker_net_protocol) as i32,
+        worker_block.worker.worker_epoch,
         block_id,
         worker_block.target.block_stamp,
         worker_block.target.file_offset,
@@ -901,9 +891,12 @@ fn fencing_identity(write_handle: &WriteHandleProto) -> String {
 mod tests {
     use super::*;
 
-    use proto::common::{BlockIdProto, FencingTokenProto, LeaseIdProto, StreamIdProto, WorkerNetProtocolProto};
-    use proto::metadata::{CommittedBlockProto, WriteTargetProto};
-    use types::ClientId;
+    use proto::common::{BlockIdProto, FencingTokenProto, LeaseIdProto, StreamIdProto};
+    use types::lease::FencingToken;
+    use types::{
+        BlockId, BlockIndex, ClientId, CommittedBlock, DataHandleId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol,
+        WriteTarget,
+    };
 
     use crate::data::WorkerWriteBlock;
     use crate::runtime::AttemptContext;
@@ -1042,7 +1035,12 @@ mod tests {
             retry_operation.operation_fingerprint()
         );
         assert_eq!(retry_request.final_size, 5);
-        assert_eq!(retry_request.committed_blocks, vec![committed_block(302, 0, 0, 5)]);
+        assert_eq!(
+            retry_request.committed_blocks,
+            vec![proto::metadata::CommittedBlockProto::from(committed_block(
+                302, 0, 0, 5
+            ))]
+        );
     }
 
     #[test]
@@ -1277,7 +1275,7 @@ mod tests {
     fn commit_fingerprint(
         write_handle: &WriteHandleProto,
         final_size: u64,
-        committed_blocks: &[CommittedBlockProto],
+        committed_blocks: &[CommittedBlock],
     ) -> OperationFingerprint {
         let detail = commit_fingerprint_detail(
             write_handle,
@@ -1311,29 +1309,37 @@ mod tests {
         }
     }
 
-    fn committed_block(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -> CommittedBlockProto {
-        CommittedBlockProto {
-            block_id: Some(BlockIdProto {
-                data_handle_id,
-                block_index,
-            }),
+    fn committed_block(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -> CommittedBlock {
+        CommittedBlock {
+            block_id: BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(block_index)),
             file_offset,
             len,
             checksum: None,
         }
     }
 
-    fn write_target(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -> WriteTargetProto {
-        WriteTargetProto {
-            block_id: Some(BlockIdProto {
-                data_handle_id,
-                block_index,
-            }),
+    fn write_target(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -> WriteTarget {
+        WriteTarget {
+            block_id: BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(block_index)),
             file_offset,
             len,
+            worker_endpoints: vec![worker_endpoint()],
+            fencing_token: FencingToken {
+                block_id: BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(block_index)),
+                owner: ClientId::new(7),
+                epoch: 1,
+            },
             block_stamp: 77,
             chunk_size: 1024,
-            ..WriteTargetProto::default()
+        }
+    }
+
+    fn worker_endpoint() -> WorkerEndpointInfo {
+        WorkerEndpointInfo {
+            worker_id: WorkerId::new(11),
+            endpoint: "127.0.0.1:19101".to_string(),
+            worker_net_protocol: WorkerNetProtocol::Grpc,
+            worker_epoch: 13,
         }
     }
 
@@ -1346,10 +1352,7 @@ mod tests {
     ) -> WorkerWriteBlock {
         WorkerWriteBlock {
             group_id: 9,
-            worker_id: 11,
-            endpoint: "127.0.0.1:19101".to_string(),
-            worker_net_protocol: WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-            worker_epoch: 13,
+            worker: worker_endpoint(),
             target: write_target(data_handle_id, block_index, file_offset, len),
             stream_id: StreamIdProto {
                 high: 1,
@@ -1363,24 +1366,14 @@ mod tests {
     fn worker_block_signature(block: &WorkerWriteBlock) -> (u64, u64, i32, u64, u64, u64, u64, u32, u64, u64, u64) {
         (
             block.group_id,
-            block.worker_id,
-            block.worker_net_protocol,
-            block.worker_epoch,
+            block.worker.worker_id.as_raw(),
+            proto::common::WorkerNetProtocolProto::from(block.worker.worker_net_protocol) as i32,
+            block.worker.worker_epoch,
             block.target.file_offset,
             block.target.len,
             block.target.block_stamp,
-            block
-                .target
-                .block_id
-                .as_ref()
-                .map(|block_id| block_id.block_index)
-                .unwrap_or_default(),
-            block
-                .target
-                .block_id
-                .as_ref()
-                .map(|block_id| block_id.data_handle_id)
-                .unwrap_or_default(),
+            block.target.block_id.index.as_raw(),
+            block.target.block_id.data_handle_id.as_raw(),
             block.stream_id.high,
             block.stream_id.low,
         )

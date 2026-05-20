@@ -11,9 +11,9 @@
 //! Domain freshness, session, lease, and fencing semantics remain in FsCore.
 
 use super::domain::{
-    AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CommittedBlock, CreateInput,
-    DeleteEmptyDirInput, DeleteTreeInput, FileRange, Freshness, GetAttrInput, GetFileLayoutInput, MkdirInput,
-    OpenWriteInput, ReadDirInput, RenameInput, RenewLeaseInput, UnlinkInput,
+    AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CreateInput, DeleteEmptyDirInput,
+    DeleteTreeInput, FileRange, Freshness, GetAttrInput, GetFileLayoutInput, MkdirInput, OpenWriteInput, ReadDirInput,
+    RenameInput, RenewLeaseInput, UnlinkInput,
 };
 use super::guard::{GuardChain, GuardFailure, LeadershipChecker};
 use super::MsyncHandler;
@@ -33,7 +33,8 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::instrument;
 use types::fs::InodeId;
-use types::ids::{BlockId, DataHandleId};
+use types::ids::DataHandleId;
+use types::CommittedBlock;
 
 trait HeaderResponse {
     fn with_header(self, header: proto::common::ResponseHeaderProto) -> Self;
@@ -253,15 +254,7 @@ impl MetadataFileSystemServiceImpl {
     }
 
     fn committed_block_from_proto(block: CommittedBlockProto) -> Result<CommittedBlock, MetadataError> {
-        let block_id = block
-            .block_id
-            .ok_or_else(|| MetadataError::InvalidArgument("Missing block_id in committed block".to_string()))?;
-        Ok(CommittedBlock {
-            file_offset: block.file_offset,
-            block_id: BlockId::try_from(block_id)
-                .unwrap_or_else(|()| unreachable!("BlockIdProto conversion is infallible")),
-            len: block.len,
-        })
+        CommittedBlock::try_from(block).map_err(MetadataError::InvalidArgument)
     }
 
     fn data_handle_proto(data_handle_id: DataHandleId) -> proto::common::DataHandleIdProto {

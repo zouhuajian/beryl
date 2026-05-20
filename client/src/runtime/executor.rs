@@ -643,14 +643,18 @@ mod tests {
     use common::header::RpcErrorCode;
     use proto::common::{GroupStateWatermarkProto, RaftLogIdProto, ShardGroupIdProto};
     use proto::metadata::{
-        AbortFileWriteResponseProto, AddBlockResponseProto, AppendFileResponseProto, CommitFileResponseProto,
-        CreateFileResponseProto, DeleteRequestProto, DeleteResponseProto, GetBlockLocationsResponseProto,
-        GetStatusRequestProto, GetStatusResponseProto, RenewLeaseResponseProto,
+        AbortFileWriteResponseProto, AppendFileResponseProto, CommitFileResponseProto, CreateFileResponseProto,
+        DeleteRequestProto, DeleteResponseProto, GetStatusRequestProto, GetStatusResponseProto,
+        RenewLeaseResponseProto,
     };
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::time::Duration;
-    use types::{CallId, ClientId};
+    use types::lease::FencingToken;
+    use types::{
+        BlockId, BlockIndex, CallId, ClientId, DataHandleId, InodeId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol,
+        WriteTarget,
+    };
 
     #[derive(Debug, Default)]
     struct RecordingSleeper {
@@ -1575,6 +1579,39 @@ mod tests {
         }
     }
 
+    fn layout_snapshot(group_id: u64) -> LayoutSnapshot {
+        LayoutSnapshot {
+            group_id,
+            inode_id: InodeId::new(101),
+            data_handle_id: DataHandleId::new(202),
+            file_size: 0,
+            file_version: Some(1),
+            locations: Vec::new(),
+        }
+    }
+
+    fn worker_endpoint() -> WorkerEndpointInfo {
+        WorkerEndpointInfo {
+            worker_id: WorkerId::new(1),
+            endpoint: "127.0.0.1:19101".to_string(),
+            worker_net_protocol: WorkerNetProtocol::Grpc,
+            worker_epoch: 7,
+        }
+    }
+
+    fn write_target() -> WriteTarget {
+        let block_id = BlockId::new(DataHandleId::new(202), BlockIndex::new(0));
+        WriteTarget {
+            block_id,
+            file_offset: 0,
+            len: 1,
+            worker_endpoints: vec![worker_endpoint()],
+            fencing_token: FencingToken::new(block_id, ClientId::new(7), 1),
+            block_stamp: 1,
+            chunk_size: 4096,
+        }
+    }
+
     #[async_trait]
     impl MetadataGateway for ScriptedGateway {
         async fn get_status(&self, ctx: AttemptContext, _req: GetStatusOp) -> ClientResult<StatusSnapshot> {
@@ -1608,7 +1645,7 @@ mod tests {
 
         async fn read_layout(&self, ctx: AttemptContext, _req: GetBlockLocationsOp) -> ClientResult<LayoutSnapshot> {
             self.next_result("read_layout", &ctx).await?;
-            Ok(GetBlockLocationsResponseProto::default())
+            Ok(layout_snapshot(ctx.metadata_header()?.group_id))
         }
 
         async fn create_file(&self, ctx: AttemptContext, _req: CreateFileOp) -> ClientResult<WriteSessionSeed> {
@@ -1625,9 +1662,7 @@ mod tests {
             self.next_result("add_block", &ctx).await?;
             Ok(AddBlockResult {
                 group_id: ctx.metadata_header()?.group_id,
-                target: AddBlockResponseProto::default()
-                    .target
-                    .unwrap_or_else(proto::metadata::WriteTargetProto::default),
+                target: write_target(),
             })
         }
 

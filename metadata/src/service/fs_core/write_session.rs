@@ -8,18 +8,19 @@ use crate::raft::{
 };
 use crate::service::domain::{
     AbortWriteInput, AbortWriteOutput, AddBlockInput, AddBlockOutput, CloseWriteInput, CloseWriteIntent,
-    CloseWriteOutput, CommittedBlock, CoreResult, OpenWriteInput, OpenWriteOutput, RenewLeaseInput, RenewLeaseOutput,
-    RequestContext, SessionKey, WorkerHint, WriteTarget,
+    CloseWriteOutput, CoreResult, OpenWriteInput, OpenWriteOutput, RenewLeaseInput, RenewLeaseOutput, RequestContext,
+    SessionKey,
 };
+use crate::service::worker_endpoint_from_parts;
 use common::error::canonical::{RefreshHint, RefreshReason, WorkerEndpointHint};
 use common::header::RpcErrorCode;
-use proto::metadata::WriteTargetProto;
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use types::fs::{Extent, FsErrorCode};
-use types::ids::{BlockId, BlockIndex, WorkerId};
+use types::ids::{BlockId, BlockIndex};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
+use types::{CommittedBlock, WorkerEndpointInfo, WriteTarget};
 
 impl FsCore {
     pub(crate) fn write_session_for_handle(&self, file_handle: u64) -> Option<crate::write_session::WriteSession> {
@@ -72,9 +73,9 @@ fn worker_refresh_hint_from_session(
     for target in &session.write_targets {
         for endpoint in &target.worker_endpoints {
             worker_endpoints.push(WorkerEndpointHint {
-                worker_id: endpoint.worker_id,
+                worker_id: endpoint.worker_id.as_raw(),
                 endpoint: endpoint.endpoint.clone(),
-                worker_net_protocol: endpoint.worker_net_protocol,
+                worker_net_protocol: proto::common::WorkerNetProtocolProto::from(endpoint.worker_net_protocol) as i32,
                 worker_epoch: endpoint.worker_epoch,
             });
         }
@@ -92,8 +93,7 @@ struct PlannedWriteTarget {
     block_id: BlockId,
     file_offset: u64,
     len: u64,
-    worker_endpoints: Vec<WorkerHint>,
-    worker_endpoints_proto: Vec<proto::common::WorkerEndpointInfoProto>,
+    worker_endpoints: Vec<WorkerEndpointInfo>,
 }
 
 struct WriteSessionCoordinator<'a> {
@@ -521,22 +521,20 @@ impl<'a> WriteSessionCoordinator<'a> {
             };
 
             let mut worker_endpoints = Vec::with_capacity(3);
-            let mut worker_endpoints_proto = Vec::with_capacity(3);
             for worker_id in placement.all_workers() {
                 if let Some(worker_info) = worker_manager.get_worker(worker_id) {
-                    let endpoint = worker_info.address.clone();
-                    worker_endpoints.push(WorkerHint {
+                    let endpoint = match worker_endpoint_from_parts(
                         worker_id,
-                        endpoint: endpoint.clone(),
-                        worker_net_protocol: worker_info.worker_net_protocol,
-                        worker_epoch: worker_info.worker_epoch,
-                    });
-                    worker_endpoints_proto.push(proto::common::WorkerEndpointInfoProto {
-                        worker_id: worker_id.as_raw(),
-                        endpoint,
-                        worker_net_protocol: worker_info.worker_net_protocol,
-                        worker_epoch: worker_info.worker_epoch,
-                    });
+                        worker_info.address.clone(),
+                        worker_info.worker_net_protocol,
+                        worker_info.worker_epoch,
+                    ) {
+                        Ok(endpoint) => endpoint,
+                        Err(err) => {
+                            return self.core.failure_from_error(&req.ctx, err, group_id, mount_epoch);
+                        }
+                    };
+                    worker_endpoints.push(endpoint);
                 }
             }
 
@@ -554,7 +552,6 @@ impl<'a> WriteSessionCoordinator<'a> {
                 file_offset,
                 len,
                 worker_endpoints,
-                worker_endpoints_proto,
             });
         }
 
@@ -593,7 +590,6 @@ impl<'a> WriteSessionCoordinator<'a> {
 
         let open_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         let mut write_targets = Vec::with_capacity(planned_targets.len());
-        let mut write_targets_proto = Vec::with_capacity(planned_targets.len());
         for planned in planned_targets {
             let block_id = planned.block_id;
             let target_token = FencingToken {
@@ -607,25 +603,6 @@ impl<'a> WriteSessionCoordinator<'a> {
                 len: planned.len,
                 worker_endpoints: planned.worker_endpoints,
                 fencing_token: target_token,
-                block_stamp,
-                chunk_size,
-            });
-            write_targets_proto.push(proto::metadata::WriteTargetProto {
-                block_id: Some(proto::common::BlockIdProto {
-                    data_handle_id: block_id.data_handle_id.as_raw(),
-                    block_index: block_id.index.as_raw(),
-                }),
-                file_offset: planned.file_offset,
-                len: planned.len,
-                worker_endpoints: planned.worker_endpoints_proto,
-                fencing_token: Some(proto::common::FencingTokenProto {
-                    block_id: Some(proto::common::BlockIdProto {
-                        data_handle_id: block_id.data_handle_id.as_raw(),
-                        block_index: block_id.index.as_raw(),
-                    }),
-                    owner: caller_ctx.client.client_id.as_raw(),
-                    epoch: lease_epoch,
-                }),
                 block_stamp,
                 chunk_size,
             });
@@ -649,7 +626,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 open_epoch,
                 base_size,
                 mode,
-                write_targets: write_targets_proto,
+                write_targets: write_targets.clone(),
                 writer_identity: crate::write_session::WriterIdentity {
                     client_id: caller_ctx.client.client_id,
                     call_id: caller_ctx.client.call_id,
@@ -812,61 +789,8 @@ impl<'a> WriteSessionCoordinator<'a> {
                 );
             }
         };
-        let block_id = match target.block_id {
-            Some(block_id) => {
-                BlockId::try_from(block_id).unwrap_or_else(|()| unreachable!("BlockIdProto conversion is infallible"))
-            }
-            None => {
-                return self.core.failure_from_error(
-                    &req.ctx,
-                    MetadataError::Internal("preallocated write target missing block_id".to_string()),
-                    group_id,
-                    mount_epoch,
-                );
-            }
-        };
-        let fencing_token = target
-            .fencing_token
-            .map(|token| FencingToken {
-                block_id: token
-                    .block_id
-                    .map(|block| {
-                        BlockId::try_from(block)
-                            .unwrap_or_else(|()| unreachable!("BlockIdProto conversion is infallible"))
-                    })
-                    .unwrap_or(block_id),
-                owner: types::ids::ClientId::new(token.owner),
-                epoch: token.epoch,
-            })
-            .unwrap_or(session.fencing_token);
-        let worker_endpoints = target
-            .worker_endpoints
-            .into_iter()
-            .map(|endpoint| WorkerHint {
-                worker_id: WorkerId::new(endpoint.worker_id),
-                endpoint: endpoint.endpoint,
-                worker_net_protocol: endpoint.worker_net_protocol,
-                worker_epoch: endpoint.worker_epoch,
-            })
-            .collect();
-
-        self.core.success_with_route_epoch(
-            &req.ctx,
-            AddBlockOutput {
-                target: WriteTarget {
-                    block_id,
-                    file_offset: target.file_offset,
-                    len: target.len,
-                    worker_endpoints,
-                    fencing_token,
-                    block_stamp: target.block_stamp,
-                    chunk_size: target.chunk_size,
-                },
-            },
-            group_id,
-            mount_epoch,
-            route_epoch,
-        )
+        self.core
+            .success_with_route_epoch(&req.ctx, AddBlockOutput { target }, group_id, mount_epoch, route_epoch)
     }
 
     fn invalid_commit_failure(
@@ -885,13 +809,6 @@ impl<'a> WriteSessionCoordinator<'a> {
         }
     }
 
-    fn target_block_id(target: &WriteTargetProto) -> MetadataResult<BlockId> {
-        let block_id = target
-            .block_id
-            .ok_or_else(|| MetadataError::InvalidArgument("issued write target missing block_id".to_string()))?;
-        Ok(BlockId::try_from(block_id).unwrap_or_else(|()| unreachable!("BlockIdProto conversion is infallible")))
-    }
-
     fn block_end(block: &CommittedBlock) -> Option<u64> {
         block.file_offset.checked_add(block.len)
     }
@@ -902,8 +819,7 @@ impl<'a> WriteSessionCoordinator<'a> {
     ) -> MetadataResult<Vec<Extent>> {
         let mut issued = HashMap::with_capacity(session.issued_targets.len());
         for target in &session.issued_targets {
-            let block_id = Self::target_block_id(target)?;
-            issued.insert(block_id, (target.file_offset, target.len));
+            issued.insert(target.block_id, (target.file_offset, target.len));
         }
 
         let mut seen = HashSet::with_capacity(intent.committed_blocks.len());
@@ -1069,7 +985,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         if let Some(worker_manager) = self.core.worker_manager.as_ref() {
             for target in &session.write_targets {
                 for endpoint in &target.worker_endpoints {
-                    let worker_id = WorkerId::new(endpoint.worker_id);
+                    let worker_id = endpoint.worker_id;
                     let current_epoch = worker_manager.get_descriptor(worker_id).map(|d| d.worker_epoch);
                     if current_epoch != Some(endpoint.worker_epoch) {
                         let hint = worker_refresh_hint_from_session(&session, current_epoch, true);

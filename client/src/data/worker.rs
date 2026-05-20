@@ -15,6 +15,7 @@ use proto::worker::worker_data_service_client::WorkerDataServiceClient;
 use tonic::transport as tonic_net;
 use types::chunk::ByteRange;
 use types::ids::ShardGroupId;
+use types::{WorkerEndpointInfo, WorkerNetProtocol, WriteTarget};
 
 use super::{WorkerCommitResult, WorkerDataClient, WorkerWriteBlock, WorkerWriteTarget};
 use crate::cache::{CacheInvalidationReason, WorkerEndpointCache};
@@ -76,13 +77,13 @@ impl TonicWorkerDataClient {
 
     async fn client(
         &self,
-        candidate: &proto::common::WorkerEndpointInfoProto,
+        candidate: &WorkerEndpointInfo,
         operation: &'static str,
     ) -> ClientResult<WorkerDataServiceClient<tonic_net::Channel>> {
         let candidate = self.endpoint_cache.get_or_resolve_authoritative(candidate).await?;
         let endpoint = normalize_endpoint(&candidate.endpoint)?;
         let key = WorkerChannelKey {
-            worker_id: candidate.worker_id,
+            worker_id: candidate.worker_id.as_raw(),
             endpoint,
             protocol: candidate.worker_net_protocol,
             worker_epoch: candidate.worker_epoch,
@@ -167,22 +168,18 @@ impl TonicWorkerDataClient {
         channels.insert(key, channel);
     }
 
-    fn invalidate_endpoint(&self, candidate: &proto::common::WorkerEndpointInfoProto, reason: CacheInvalidationReason) {
+    fn invalidate_endpoint(&self, candidate: &WorkerEndpointInfo, reason: CacheInvalidationReason) {
         self.endpoint_cache.invalidate_candidate(candidate, reason);
     }
 
-    fn record_endpoint_failure(
-        &self,
-        candidate: &proto::common::WorkerEndpointInfoProto,
-        reason: CacheInvalidationReason,
-    ) {
+    fn record_endpoint_failure(&self, candidate: &WorkerEndpointInfo, reason: CacheInvalidationReason) {
         self.endpoint_cache.record_candidate_failure(candidate, reason);
     }
 
-    fn invalidate_channel(&self, candidate: &proto::common::WorkerEndpointInfoProto, reason: CacheInvalidationReason) {
+    fn invalidate_channel(&self, candidate: &WorkerEndpointInfo, reason: CacheInvalidationReason) {
         if let Ok(endpoint) = normalize_endpoint(&candidate.endpoint) {
             let key = WorkerChannelKey {
-                worker_id: candidate.worker_id,
+                worker_id: candidate.worker_id.as_raw(),
                 endpoint,
                 protocol: candidate.worker_net_protocol,
                 worker_epoch: candidate.worker_epoch,
@@ -213,7 +210,7 @@ impl TonicWorkerDataClient {
 struct WorkerChannelKey {
     worker_id: u64,
     endpoint: String,
-    protocol: i32,
+    protocol: WorkerNetProtocol,
     worker_epoch: u64,
 }
 
@@ -267,8 +264,7 @@ impl WorkerDataClient for TonicWorkerDataClient {
                     "worker candidate epoch must be non-zero".to_string(),
                 ));
             }
-            let protocol = worker_net_protocol_from_i32(candidate.worker_net_protocol)?;
-            ensure_supported_worker_protocol(protocol)?;
+            ensure_supported_worker_protocol(candidate.worker_net_protocol)?;
             let mut client = match self.client(candidate, "read").await {
                 Ok(client) => client,
                 Err(err) if is_endpoint_health_error(&err) => {
@@ -327,8 +323,7 @@ impl WorkerDataClient for TonicWorkerDataClient {
                     "worker write candidate epoch must be non-zero".to_string(),
                 ));
             }
-            let protocol = worker_net_protocol_from_i32(candidate.worker_net_protocol)?;
-            ensure_supported_worker_protocol(protocol)?;
+            ensure_supported_worker_protocol(candidate.worker_net_protocol)?;
             let mut client = match self.client(candidate, "write").await {
                 Ok(client) => client,
                 Err(err) if is_endpoint_health_error(&err) => {
@@ -455,7 +450,7 @@ impl WorkerDataClient for TonicWorkerDataClient {
 pub(crate) struct DataPlaneBoundary {
     client: Arc<dyn WorkerDataClient>,
     worker_endpoint_cache: Option<WorkerEndpointCache>,
-    grpc_protocol: ClientWorkerNetProtocol,
+    grpc_protocol: WorkerNetProtocol,
 }
 
 impl DataPlaneBoundary {
@@ -479,9 +474,7 @@ impl DataPlaneBoundary {
 
     /// Create a data-plane boundary around an already selected worker client implementation.
     pub(crate) fn with_client(client: Arc<dyn WorkerDataClient>) -> Self {
-        let grpc_protocol =
-            worker_net_protocol_from_i32(proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32)
-                .expect("WORKER_NET_PROTOCOL_GRPC must be accepted");
+        let grpc_protocol = WorkerNetProtocol::Grpc;
         ensure_supported_worker_protocol(grpc_protocol).expect("gRPC must be supported");
         Self {
             client,
@@ -535,7 +528,7 @@ impl DataPlaneBoundary {
         &self,
         ctx: AttemptContext,
         group_id: u64,
-        target: proto::metadata::WriteTargetProto,
+        target: WriteTarget,
     ) -> ClientResult<WorkerWriteBlock> {
         let worker_target = WorkerWriteTarget { group_id, target };
         self.client.open_write(ctx, worker_target).await
@@ -581,28 +574,10 @@ impl Default for DataPlaneBoundary {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ClientWorkerNetProtocol {
-    Grpc,
-    Quic,
-    Rdma,
-}
-
-fn worker_net_protocol_from_i32(kind: i32) -> ClientResult<ClientWorkerNetProtocol> {
-    match proto::convert::parse_known_worker_net_protocol(kind).map_err(ClientError::InvalidArgument)? {
-        proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc => Ok(ClientWorkerNetProtocol::Grpc),
-        proto::common::WorkerNetProtocolProto::WorkerNetProtocolQuic => Ok(ClientWorkerNetProtocol::Quic),
-        proto::common::WorkerNetProtocolProto::WorkerNetProtocolRdma => Ok(ClientWorkerNetProtocol::Rdma),
-        proto::common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified => {
-            unreachable!("parser rejects unspecified")
-        }
-    }
-}
-
-fn ensure_supported_worker_protocol(protocol: ClientWorkerNetProtocol) -> ClientResult<()> {
+fn ensure_supported_worker_protocol(protocol: WorkerNetProtocol) -> ClientResult<()> {
     match protocol {
-        ClientWorkerNetProtocol::Grpc => Ok(()),
-        ClientWorkerNetProtocol::Quic | ClientWorkerNetProtocol::Rdma => Err(ClientError::Unsupported(format!(
+        WorkerNetProtocol::Grpc => Ok(()),
+        WorkerNetProtocol::Quic | WorkerNetProtocol::Rdma => Err(ClientError::Unsupported(format!(
             "unsupported worker net protocol {protocol:?}"
         ))),
     }
@@ -645,12 +620,8 @@ fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> 
             "worker write requires non-zero group_id".to_string(),
         ));
     }
-    let block = target
-        .target
-        .block_id
-        .as_ref()
-        .ok_or_else(|| ClientError::InvalidLayout("write target missing block_id".to_string()))?;
-    if block.data_handle_id == 0 {
+    let block = target.target.block_id;
+    if block.data_handle_id.as_raw() == 0 {
         return Err(ClientError::InvalidLayout(
             "write target block_id data_handle_id must be non-zero".to_string(),
         ));
@@ -687,12 +658,12 @@ fn build_open_write_stream_request(
     Ok(proto::worker::OpenWriteStreamRequestProto {
         header: Some(ctx.data_header()),
         group_id: Some(ShardGroupId::new(target.group_id).into()),
-        block_id: target.target.block_id,
+        block_id: Some(target.target.block_id.into()),
         block_size: target.target.len,
         block_stamp: target.target.block_stamp,
         chunk_size: target.target.chunk_size,
         checksum_kind: proto::worker::ChecksumKindProto::ChecksumKindNone as i32,
-        token: target.target.fencing_token,
+        token: Some(target.target.fencing_token.into()),
         frame_size: default_frame_size(target.target.len.min(u64::from(u32::MAX)) as u32),
     })
 }
@@ -734,11 +705,11 @@ fn build_commit_write_request(
     Ok(proto::worker::CommitWriteRequestProto {
         header: Some(ctx.data_header()),
         group_id: Some(ShardGroupId::new(block.group_id).into()),
-        block_id: block.target.block_id,
+        block_id: Some(block.target.block_id.into()),
         stream_id: Some(block.stream_id),
         effective_block_len: effective_len,
         block_stamp: block.target.block_stamp,
-        token: block.target.fencing_token,
+        token: Some(block.target.fencing_token.into()),
         commit_seq,
         require_sync,
     })
@@ -752,16 +723,16 @@ fn build_abort_write_request(
     Ok(proto::worker::AbortWriteRequestProto {
         header: Some(ctx.data_header()),
         group_id: Some(ShardGroupId::new(block.group_id).into()),
-        block_id: block.target.block_id,
+        block_id: Some(block.target.block_id.into()),
         stream_id: Some(block.stream_id),
-        token: block.target.fencing_token,
+        token: Some(block.target.fencing_token.into()),
     })
 }
 
 fn worker_write_block_from_open_response(
     ctx: &AttemptContext,
     target: &WorkerWriteTarget,
-    candidate: &proto::common::WorkerEndpointInfoProto,
+    candidate: &WorkerEndpointInfo,
     response: proto::worker::OpenWriteStreamResponseProto,
 ) -> ClientResult<WorkerWriteBlock> {
     parse_worker_control_header(ctx, response.header.as_ref())?;
@@ -791,10 +762,7 @@ fn worker_write_block_from_open_response(
     }
     Ok(WorkerWriteBlock {
         group_id: target.group_id,
-        worker_id: candidate.worker_id,
-        endpoint: candidate.endpoint.clone(),
-        worker_net_protocol: candidate.worker_net_protocol,
-        worker_epoch: candidate.worker_epoch,
+        worker: candidate.clone(),
         target: target.target.clone(),
         stream_id,
         frame_size: response.frame_size.max(1),
@@ -802,13 +770,8 @@ fn worker_write_block_from_open_response(
     })
 }
 
-fn worker_endpoint_from_block(block: &WorkerWriteBlock) -> proto::common::WorkerEndpointInfoProto {
-    proto::common::WorkerEndpointInfoProto {
-        worker_id: block.worker_id,
-        endpoint: block.endpoint.clone(),
-        worker_net_protocol: block.worker_net_protocol,
-        worker_epoch: block.worker_epoch,
-    }
+fn worker_endpoint_from_block(block: &WorkerWriteBlock) -> WorkerEndpointInfo {
+    block.worker.clone()
 }
 
 fn validate_write_stream_response(
@@ -899,25 +862,15 @@ fn validate_block_for_worker_control(block: &WorkerWriteBlock) -> ClientResult<(
     validate_fencing_token(&block.target)
 }
 
-fn validate_fencing_token(target: &proto::metadata::WriteTargetProto) -> ClientResult<()> {
-    let block = target
-        .block_id
-        .as_ref()
-        .ok_or_else(|| ClientError::InvalidLayout("write target missing block_id".to_string()))?;
-    let token = target
-        .fencing_token
-        .as_ref()
-        .ok_or_else(|| ClientError::InvalidLayout("write target missing fencing_token".to_string()))?;
-    let token_block = token
-        .block_id
-        .as_ref()
-        .ok_or_else(|| ClientError::InvalidLayout("write target fencing_token missing block_id".to_string()))?;
-    if token.owner == 0 || token.epoch == 0 {
+fn validate_fencing_token(target: &WriteTarget) -> ClientResult<()> {
+    let block = target.block_id;
+    let token = target.fencing_token;
+    if token.owner.as_raw() == 0 || token.epoch == 0 {
         return Err(ClientError::InvalidLayout(
             "write target fencing_token owner and epoch must be non-zero".to_string(),
         ));
     }
-    if token_block.data_handle_id != block.data_handle_id || token_block.block_index != block.block_index {
+    if token.block_id != block {
         return Err(ClientError::InvalidLayout(
             "write target fencing_token block_id must match target block_id".to_string(),
         ));
@@ -1081,7 +1034,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
-    use types::{BlockId, BlockIndex, ClientId, DataHandleId};
+    use types::lease::FencingToken;
+    use types::{
+        BlockId, BlockIndex, ClientId, DataHandleId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol, WriteTarget,
+    };
 
     use crate::canonical::ClientAction;
     use crate::metrics::NoopClientMetrics;
@@ -1106,29 +1062,8 @@ mod tests {
     }
 
     #[test]
-    fn worker_endpoint_info_from_proto_accepts_grpc() {
-        let protocol =
-            worker_net_protocol_from_i32(proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32)
-                .expect("grpc endpoint");
-
-        assert_eq!(protocol, ClientWorkerNetProtocol::Grpc);
-        assert!(ensure_supported_worker_protocol(protocol).is_ok());
-    }
-
-    #[test]
-    fn worker_endpoint_info_rejects_unspecified_protocol() {
-        let err =
-            worker_net_protocol_from_i32(proto::common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified as i32)
-                .expect_err("unspecified protocol must not fall back to gRPC");
-
-        assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("unspecified worker_net_protocol")));
-    }
-
-    #[test]
-    fn worker_endpoint_info_rejects_unknown_protocol() {
-        let err = worker_net_protocol_from_i32(99).expect_err("unknown protocol must fail");
-
-        assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("unknown worker_net_protocol")));
+    fn worker_data_boundary_accepts_grpc_protocol() {
+        assert!(ensure_supported_worker_protocol(WorkerNetProtocol::Grpc).is_ok());
     }
 
     #[tokio::test]
@@ -1262,7 +1197,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_worker_protocol_does_not_create_channel() {
+    async fn unsupported_worker_protocol_does_not_create_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
         let client = TonicWorkerDataClient::with_parts(
             WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics),
@@ -1271,14 +1206,14 @@ mod tests {
             Arc::new(NoopClientMetrics),
         );
         let mut candidate = worker_endpoint();
-        candidate.worker_net_protocol = proto::common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified as i32;
+        candidate.worker_net_protocol = WorkerNetProtocol::Quic;
 
         let err = client
             .client(&candidate, "read")
             .await
-            .expect_err("invalid protocol rejected");
+            .expect_err("unsupported protocol rejected");
 
-        assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("unspecified")));
+        assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("unsupported worker net protocol")));
         assert!(client.channels.read().is_empty());
     }
 
@@ -1305,11 +1240,7 @@ mod tests {
 
     #[test]
     fn worker_data_boundary_returns_unsupported_for_quic_and_rdma() {
-        for raw in [
-            proto::common::WorkerNetProtocolProto::WorkerNetProtocolQuic as i32,
-            proto::common::WorkerNetProtocolProto::WorkerNetProtocolRdma as i32,
-        ] {
-            let protocol = worker_net_protocol_from_i32(raw).expect("known unsupported protocol parses");
+        for protocol in [WorkerNetProtocol::Quic, WorkerNetProtocol::Rdma] {
             let err = ensure_supported_worker_protocol(protocol).expect_err("known non-GRPC protocol is unsupported");
 
             assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("unsupported worker net protocol")));
@@ -1955,10 +1886,7 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(WorkerWriteBlock {
                 group_id: target.group_id,
-                worker_id: 1,
-                endpoint: "127.0.0.1:19101".to_string(),
-                worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-                worker_epoch: 7,
+                worker: worker_endpoint(),
                 target: target.target,
                 stream_id: proto::common::StreamIdProto { high: 1, low: 1 },
                 frame_size: 1024,
@@ -2033,38 +1961,27 @@ mod tests {
     fn worker_write_target() -> WorkerWriteTarget {
         WorkerWriteTarget {
             group_id: 9,
-            target: proto::metadata::WriteTargetProto {
-                block_id: Some(proto::common::BlockIdProto {
-                    data_handle_id: 202,
-                    block_index: 0,
-                }),
+            target: WriteTarget {
+                block_id: BlockId::new(DataHandleId::new(202), BlockIndex::new(0)),
                 file_offset: 0,
                 len: 5,
-                worker_endpoints: vec![proto::common::WorkerEndpointInfoProto {
-                    worker_id: 1,
-                    endpoint: "127.0.0.1:19101".to_string(),
-                    worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-                    worker_epoch: 7,
-                }],
-                fencing_token: Some(proto::common::FencingTokenProto {
-                    block_id: Some(proto::common::BlockIdProto {
-                        data_handle_id: 202,
-                        block_index: 0,
-                    }),
-                    owner: 7,
+                worker_endpoints: vec![worker_endpoint()],
+                fencing_token: FencingToken {
+                    block_id: BlockId::new(DataHandleId::new(202), BlockIndex::new(0)),
+                    owner: ClientId::new(7),
                     epoch: 1,
-                }),
+                },
                 block_stamp: 77,
                 chunk_size: 4096,
             },
         }
     }
 
-    fn worker_endpoint() -> proto::common::WorkerEndpointInfoProto {
-        proto::common::WorkerEndpointInfoProto {
-            worker_id: 1,
+    fn worker_endpoint() -> WorkerEndpointInfo {
+        WorkerEndpointInfo {
+            worker_id: WorkerId::new(1),
             endpoint: "127.0.0.1:19101".to_string(),
-            worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+            worker_net_protocol: WorkerNetProtocol::Grpc,
             worker_epoch: 7,
         }
     }
@@ -2072,10 +1989,7 @@ mod tests {
     fn worker_write_block(frame_size: u32) -> WorkerWriteBlock {
         WorkerWriteBlock {
             group_id: 9,
-            worker_id: 1,
-            endpoint: "127.0.0.1:19101".to_string(),
-            worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-            worker_epoch: 7,
+            worker: worker_endpoint(),
             target: worker_write_target().target,
             stream_id: proto::common::StreamIdProto { high: 1, low: 1 },
             frame_size,
@@ -2090,12 +2004,7 @@ mod tests {
             end_file_offset: 4,
             block_id: BlockId::new(DataHandleId::new(202), BlockIndex::new(0)),
             block_offset: 0,
-            workers: vec![proto::common::WorkerEndpointInfoProto {
-                worker_id: 1,
-                endpoint: "127.0.0.1:19101".to_string(),
-                worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-                worker_epoch: 7,
-            }],
+            workers: vec![worker_endpoint()],
             worker_epoch: Some(7),
             block_stamp,
         }

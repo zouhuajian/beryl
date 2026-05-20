@@ -20,8 +20,10 @@ pub mod group_watermark;
 pub mod ids;
 pub mod layout;
 pub mod lease;
+pub mod location;
 pub mod raft_log_id;
 pub mod stream;
+pub mod worker;
 
 pub use acl::{
     AclCodecError, AclEntry, AclPerm, AclSubject, POSIX_ACL_ACCESS_XATTR, POSIX_ACL_DEFAULT_XATTR, PosixAcl,
@@ -33,4 +35,6 @@ pub use ids::{
     BlockId, BlockIndex, CallId, ChunkId, ChunkIndex, ClientId, DataHandleId, LeaseId, MountId, RequestId,
     ShardGroupId, ShardId, StreamId, WorkerId,
 };
+pub use location::{CommittedBlock, FileBlockLocation, WriteTarget};
 pub use raft_log_id::RaftLogId;
+pub use worker::{WorkerEndpointInfo, WorkerNetProtocol};

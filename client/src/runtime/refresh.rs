@@ -317,18 +317,19 @@ mod tests {
     use super::*;
     use crate::cache::{LayoutCache, LayoutCacheKey, WorkerEndpointCache};
     use crate::canonical::RefreshHint;
+    use crate::metadata::LayoutSnapshot;
     use crate::metrics::NoopClientMetrics;
     use crate::planner::read_planner::PlannedReadRange;
     use crate::runtime::classify::RefreshReason;
     use crate::runtime::policy::OperationKind;
     use crate::runtime::{OperationContext, OperationIdentity};
-    use proto::common::{
-        BlockIdProto, GroupStateWatermarkProto, RaftLogIdProto, ShardGroupIdProto, WorkerEndpointInfoProto,
-        WorkerNetProtocolProto,
-    };
+    use proto::common::{GroupStateWatermarkProto, RaftLogIdProto, ShardGroupIdProto};
     use std::sync::Arc;
     use std::time::Duration;
-    use types::{ClientId, DataHandleId, InodeId};
+    use types::{
+        BlockId, BlockIndex, ClientId, DataHandleId, FileBlockLocation, InodeId, WorkerEndpointInfo, WorkerId,
+        WorkerNetProtocol,
+    };
 
     fn manager() -> RefreshManager {
         RefreshManager::new(vec![ConfiguredMetadataGroup {
@@ -569,29 +570,18 @@ mod tests {
         cache
             .insert_validated(
                 key,
-                proto::metadata::GetBlockLocationsResponseProto {
-                    header: Some(proto::common::ResponseHeaderProto {
-                        client: Some(proto::common::ClientInfoProto {
-                            call_id: types::CallId::new().to_string(),
-                            client_id: 7,
-                            client_name: String::new(),
-                        }),
-                        group_id: 9,
-                        ..proto::common::ResponseHeaderProto::default()
-                    }),
-                    inode_id: Some(proto::fs::InodeIdProto { value: 101 }),
-                    data_handle_id: Some(proto::common::DataHandleIdProto { value: 202 }),
+                LayoutSnapshot {
+                    group_id: 9,
+                    inode_id: InodeId::new(101),
+                    data_handle_id: DataHandleId::new(202),
                     file_size: 4,
-                    locations: vec![proto::metadata::FileBlockLocationProto {
-                        block_id: Some(BlockIdProto {
-                            data_handle_id: 202,
-                            block_index: 0,
-                        }),
+                    locations: vec![FileBlockLocation {
+                        block_id: BlockId::new(DataHandleId::new(202), BlockIndex::new(0)),
                         file_offset: 0,
                         len: 4,
                         workers: vec![worker_endpoint()],
                         worker_epoch: Some(7),
-                        block_stamp: Some(11),
+                        block_stamp: 11,
                     }],
                     file_version: Some(3),
                 },
@@ -608,11 +598,11 @@ mod tests {
         cache
     }
 
-    fn worker_endpoint() -> WorkerEndpointInfoProto {
-        WorkerEndpointInfoProto {
-            worker_id: 1,
+    fn worker_endpoint() -> WorkerEndpointInfo {
+        WorkerEndpointInfo {
+            worker_id: WorkerId::new(1),
             endpoint: "127.0.0.1:19101".to_string(),
-            worker_net_protocol: WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+            worker_net_protocol: WorkerNetProtocol::Grpc,
             worker_epoch: 7,
         }
     }

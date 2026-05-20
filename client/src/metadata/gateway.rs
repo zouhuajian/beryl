@@ -346,8 +346,8 @@ impl MetadataGateway for TonicMetadataGateway {
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        Ok(response)
+        let group_id = parse_metadata_response_header(&ctx, response.header.as_ref())?;
+        LayoutSnapshot::from_proto(group_id, response)
     }
 
     async fn create_file(&self, ctx: AttemptContext, mut req: CreateFileOp) -> ClientResult<WriteSessionSeed> {
@@ -389,6 +389,9 @@ impl MetadataGateway for TonicMetadataGateway {
         let target = response
             .target
             .ok_or_else(|| side_effect_response_body_mismatch("AddBlock", "missing target"))?;
+        let target = target
+            .try_into()
+            .map_err(|err| side_effect_response_body_mismatch("AddBlock", err))?;
         Ok(AddBlockResult { group_id, target })
     }
 

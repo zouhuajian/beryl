@@ -6,9 +6,9 @@ use crate::config::RaftConfig;
 use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
 use crate::raft::{AppRaftNode, AppRaftStateMachine, Command, DedupKey, RocksDBStorage};
 use crate::service::domain::{
-    AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CommittedBlock, CoreResult, Freshness,
-    GetAttrInput, GetFileLayoutInput, OpenWriteInput, PresentedFencingToken, ReadDirInput, RenameInput,
-    RenewLeaseInput, RequestContext, SessionKey, UnlinkInput, WriteTarget,
+    AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CoreResult, Freshness, GetAttrInput,
+    GetFileLayoutInput, OpenWriteInput, PresentedFencingToken, ReadDirInput, RenameInput, RenewLeaseInput,
+    RequestContext, SessionKey, UnlinkInput,
 };
 use crate::state::{MemoryStateStore, RouteEpoch};
 use crate::worker::{HealthStatus, WorkerManager};
@@ -22,6 +22,7 @@ use types::fs::{FileAttrs, Inode};
 use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, LeaseId, MountId, ShardGroupId, WorkerId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
+use types::{CommittedBlock, WriteTarget};
 
 use super::freshness::{FreshnessValidator, StaleStateStatus};
 
@@ -633,22 +634,16 @@ fn install_write_session(fs_core: &FsCore, inode_id: InodeId, mount_id: MountId)
             open_epoch: 1234,
             base_size: 0,
             mode: crate::inode_lease::WriteMode::Write,
-            write_targets: vec![proto::metadata::WriteTargetProto {
-                block_id: Some(proto::common::BlockIdProto {
-                    data_handle_id: data_handle_id.as_raw(),
-                    block_index: 0,
-                }),
+            write_targets: vec![WriteTarget {
+                block_id: BlockId::new(data_handle_id, BlockIndex::new(0)),
                 file_offset: 0,
                 len: 64,
                 worker_endpoints: Vec::new(),
-                fencing_token: Some(proto::common::FencingTokenProto {
-                    block_id: Some(proto::common::BlockIdProto {
-                        data_handle_id: data_handle_id.as_raw(),
-                        block_index: 0,
-                    }),
-                    owner: writer.as_raw(),
+                fencing_token: FencingToken {
+                    block_id: BlockId::new(data_handle_id, BlockIndex::new(0)),
+                    owner: writer,
                     epoch: lease_epoch,
-                }),
+                },
                 block_stamp: 1,
                 chunk_size: 64,
             }],
@@ -704,6 +699,7 @@ fn committed_block(block_id: BlockId, file_offset: u64, len: u64) -> CommittedBl
         block_id,
         file_offset,
         len,
+        checksum: None,
     }
 }
 

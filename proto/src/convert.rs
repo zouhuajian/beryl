@@ -7,6 +7,7 @@
 //! and domain types defined in the types crate.
 
 use crate::common as proto_common;
+use crate::metadata as proto_metadata;
 use ::common::{
     Deadline,
     error::canonical::{
@@ -21,7 +22,10 @@ use types::ids::{
     BlockId, BlockIndex, ChunkId, ChunkIndex, DataHandleId, LeaseId, MountId, ShardGroupId, ShardId, StreamId, WorkerId,
 };
 use types::lease::FencingToken;
-use types::{CallId, ClientId, GroupStateWatermark, RaftLogId};
+use types::{
+    CallId, ClientId, CommittedBlock, FileBlockLocation, GroupStateWatermark, RaftLogId, WorkerEndpointInfo,
+    WorkerNetProtocol, WriteTarget,
+};
 
 // ============================================================================
 // ID Conversions
@@ -262,6 +266,261 @@ pub fn parse_known_worker_net_protocol(value: i32) -> Result<proto_common::Worke
         return Err("unspecified worker_net_protocol must not default to gRPC".to_string());
     }
     Ok(protocol)
+}
+
+impl From<WorkerNetProtocol> for proto_common::WorkerNetProtocolProto {
+    fn from(protocol: WorkerNetProtocol) -> Self {
+        match protocol {
+            WorkerNetProtocol::Grpc => proto_common::WorkerNetProtocolProto::WorkerNetProtocolGrpc,
+            WorkerNetProtocol::Quic => proto_common::WorkerNetProtocolProto::WorkerNetProtocolQuic,
+            WorkerNetProtocol::Rdma => proto_common::WorkerNetProtocolProto::WorkerNetProtocolRdma,
+        }
+    }
+}
+
+impl TryFrom<proto_common::WorkerNetProtocolProto> for WorkerNetProtocol {
+    type Error = String;
+
+    fn try_from(protocol: proto_common::WorkerNetProtocolProto) -> Result<Self, Self::Error> {
+        match protocol {
+            proto_common::WorkerNetProtocolProto::WorkerNetProtocolGrpc => Ok(Self::Grpc),
+            proto_common::WorkerNetProtocolProto::WorkerNetProtocolQuic => Ok(Self::Quic),
+            proto_common::WorkerNetProtocolProto::WorkerNetProtocolRdma => Ok(Self::Rdma),
+            proto_common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified => {
+                Err("unspecified worker_net_protocol must not default to gRPC".to_string())
+            }
+        }
+    }
+}
+
+impl TryFrom<proto_common::WorkerEndpointInfoProto> for WorkerEndpointInfo {
+    type Error = String;
+
+    fn try_from(endpoint: proto_common::WorkerEndpointInfoProto) -> Result<Self, Self::Error> {
+        worker_endpoint_info_from_parts(
+            WorkerId::new(endpoint.worker_id),
+            endpoint.endpoint,
+            endpoint.worker_net_protocol,
+            endpoint.worker_epoch,
+        )
+    }
+}
+
+/// Build a shared worker endpoint value from raw wire-shaped fields.
+///
+/// This performs structural parsing only; protocol support and cache policy
+/// remain caller-owned decisions.
+pub fn worker_endpoint_info_from_parts(
+    worker_id: WorkerId,
+    endpoint: String,
+    worker_net_protocol: i32,
+    worker_epoch: u64,
+) -> Result<WorkerEndpointInfo, String> {
+    if worker_id.as_raw() == 0 {
+        return Err("WorkerEndpointInfoProto.worker_id must be non-zero".to_string());
+    }
+    if endpoint.is_empty() {
+        return Err("WorkerEndpointInfoProto.endpoint must not be empty".to_string());
+    }
+    if worker_epoch == 0 {
+        return Err("WorkerEndpointInfoProto.worker_epoch must be non-zero".to_string());
+    }
+    let protocol = parse_known_worker_net_protocol(worker_net_protocol)?;
+    Ok(WorkerEndpointInfo {
+        worker_id,
+        endpoint,
+        worker_net_protocol: protocol.try_into()?,
+        worker_epoch,
+    })
+}
+
+impl From<&WorkerEndpointInfo> for proto_common::WorkerEndpointInfoProto {
+    fn from(endpoint: &WorkerEndpointInfo) -> Self {
+        Self {
+            worker_id: endpoint.worker_id.as_raw(),
+            endpoint: endpoint.endpoint.clone(),
+            worker_net_protocol: proto_common::WorkerNetProtocolProto::from(endpoint.worker_net_protocol) as i32,
+            worker_epoch: endpoint.worker_epoch,
+        }
+    }
+}
+
+impl From<WorkerEndpointInfo> for proto_common::WorkerEndpointInfoProto {
+    fn from(endpoint: WorkerEndpointInfo) -> Self {
+        Self {
+            worker_id: endpoint.worker_id.as_raw(),
+            endpoint: endpoint.endpoint,
+            worker_net_protocol: proto_common::WorkerNetProtocolProto::from(endpoint.worker_net_protocol) as i32,
+            worker_epoch: endpoint.worker_epoch,
+        }
+    }
+}
+
+impl TryFrom<proto_metadata::WriteTargetProto> for WriteTarget {
+    type Error = String;
+
+    fn try_from(target: proto_metadata::WriteTargetProto) -> Result<Self, Self::Error> {
+        if target.len == 0 {
+            return Err("WriteTargetProto.len must be non-zero".to_string());
+        }
+        if target.worker_endpoints.is_empty() {
+            return Err("WriteTargetProto.worker_endpoints must not be empty".to_string());
+        }
+        if target.block_stamp == 0 {
+            return Err("WriteTargetProto.block_stamp must be non-zero".to_string());
+        }
+        if target.chunk_size == 0 {
+            return Err("WriteTargetProto.chunk_size must be non-zero".to_string());
+        }
+        let block_id = required_block_id(target.block_id, "WriteTargetProto.block_id")?;
+        let fencing_token = required_fencing_token(target.fencing_token, "WriteTargetProto.fencing_token")?;
+        if fencing_token.block_id != block_id {
+            return Err("WriteTargetProto.fencing_token block_id must match block_id".to_string());
+        }
+        if fencing_token.owner.as_raw() == 0 || fencing_token.epoch == 0 {
+            return Err("WriteTargetProto.fencing_token owner and epoch must be non-zero".to_string());
+        }
+        let worker_endpoints = target
+            .worker_endpoints
+            .into_iter()
+            .map(WorkerEndpointInfo::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            block_id,
+            file_offset: target.file_offset,
+            len: target.len,
+            worker_endpoints,
+            fencing_token,
+            block_stamp: target.block_stamp,
+            chunk_size: target.chunk_size,
+        })
+    }
+}
+
+impl From<&WriteTarget> for proto_metadata::WriteTargetProto {
+    fn from(target: &WriteTarget) -> Self {
+        Self {
+            block_id: Some(target.block_id.into()),
+            file_offset: target.file_offset,
+            len: target.len,
+            worker_endpoints: target.worker_endpoints.iter().map(Into::into).collect(),
+            fencing_token: Some(target.fencing_token.into()),
+            block_stamp: target.block_stamp,
+            chunk_size: target.chunk_size,
+        }
+    }
+}
+
+impl From<WriteTarget> for proto_metadata::WriteTargetProto {
+    fn from(target: WriteTarget) -> Self {
+        Self {
+            block_id: Some(target.block_id.into()),
+            file_offset: target.file_offset,
+            len: target.len,
+            worker_endpoints: target.worker_endpoints.into_iter().map(Into::into).collect(),
+            fencing_token: Some(target.fencing_token.into()),
+            block_stamp: target.block_stamp,
+            chunk_size: target.chunk_size,
+        }
+    }
+}
+
+impl TryFrom<proto_metadata::CommittedBlockProto> for CommittedBlock {
+    type Error = String;
+
+    fn try_from(block: proto_metadata::CommittedBlockProto) -> Result<Self, Self::Error> {
+        let block_id = required_block_id(block.block_id, "CommittedBlockProto.block_id")?;
+        Ok(Self {
+            block_id,
+            file_offset: block.file_offset,
+            len: block.len,
+            checksum: block.checksum,
+        })
+    }
+}
+
+impl From<&CommittedBlock> for proto_metadata::CommittedBlockProto {
+    fn from(block: &CommittedBlock) -> Self {
+        Self {
+            block_id: Some(block.block_id.into()),
+            file_offset: block.file_offset,
+            len: block.len,
+            checksum: block.checksum.clone(),
+        }
+    }
+}
+
+impl From<CommittedBlock> for proto_metadata::CommittedBlockProto {
+    fn from(block: CommittedBlock) -> Self {
+        Self {
+            block_id: Some(block.block_id.into()),
+            file_offset: block.file_offset,
+            len: block.len,
+            checksum: block.checksum,
+        }
+    }
+}
+
+impl TryFrom<proto_metadata::FileBlockLocationProto> for FileBlockLocation {
+    type Error = String;
+
+    fn try_from(location: proto_metadata::FileBlockLocationProto) -> Result<Self, Self::Error> {
+        if location.len == 0 {
+            return Err("FileBlockLocationProto.len must be non-zero".to_string());
+        }
+        if location.workers.is_empty() {
+            return Err("FileBlockLocationProto.workers must not be empty".to_string());
+        }
+        let block_stamp = location
+            .block_stamp
+            .ok_or_else(|| "FileBlockLocationProto.block_stamp missing".to_string())?;
+        if block_stamp == 0 {
+            return Err("FileBlockLocationProto.block_stamp must be non-zero".to_string());
+        }
+        if location.worker_epoch == Some(0) {
+            return Err("FileBlockLocationProto.worker_epoch must be non-zero when present".to_string());
+        }
+        let block_id = required_block_id(location.block_id, "FileBlockLocationProto.block_id")?;
+        let workers = location
+            .workers
+            .into_iter()
+            .map(WorkerEndpointInfo::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            block_id,
+            file_offset: location.file_offset,
+            len: location.len,
+            workers,
+            worker_epoch: location.worker_epoch,
+            block_stamp,
+        })
+    }
+}
+
+impl From<&FileBlockLocation> for proto_metadata::FileBlockLocationProto {
+    fn from(location: &FileBlockLocation) -> Self {
+        Self {
+            block_id: Some(location.block_id.into()),
+            file_offset: location.file_offset,
+            len: location.len,
+            workers: location.workers.iter().map(Into::into).collect(),
+            worker_epoch: location.worker_epoch,
+            block_stamp: Some(location.block_stamp),
+        }
+    }
+}
+
+impl From<FileBlockLocation> for proto_metadata::FileBlockLocationProto {
+    fn from(location: FileBlockLocation) -> Self {
+        Self {
+            block_id: Some(location.block_id.into()),
+            file_offset: location.file_offset,
+            len: location.len,
+            workers: location.workers.into_iter().map(Into::into).collect(),
+            worker_epoch: location.worker_epoch,
+            block_stamp: Some(location.block_stamp),
+        }
+    }
 }
 
 // ============================================================================
@@ -1022,5 +1281,114 @@ mod tests {
                 .expect("rdma must parse"),
             proto_common::WorkerNetProtocolProto::WorkerNetProtocolRdma
         );
+    }
+
+    #[test]
+    fn worker_endpoint_info_conversion_rejects_unspecified_protocol() {
+        let endpoint = proto_common::WorkerEndpointInfoProto {
+            worker_id: 7,
+            endpoint: "127.0.0.1:19101".to_string(),
+            worker_net_protocol: proto_common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified as i32,
+            worker_epoch: 11,
+        };
+
+        let err = types::WorkerEndpointInfo::try_from(endpoint).expect_err("unspecified protocol must fail");
+
+        assert!(err.contains("unspecified worker_net_protocol"));
+    }
+
+    #[test]
+    fn shared_location_conversion_rejects_malformed_required_fields() {
+        let endpoint = || proto_common::WorkerEndpointInfoProto {
+            worker_id: 7,
+            endpoint: "127.0.0.1:19101".to_string(),
+            worker_net_protocol: proto_common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+            worker_epoch: 11,
+        };
+        let block_id = BlockId::from_u64_u32(42, 3);
+        let token = FencingToken::new(block_id, ClientId::new(9), 17);
+
+        let mut target = proto_metadata::WriteTargetProto {
+            block_id: Some(block_id.into()),
+            file_offset: 128,
+            len: 4096,
+            worker_endpoints: Vec::new(),
+            fencing_token: Some(token.into()),
+            block_stamp: 55,
+            chunk_size: 1024,
+        };
+        let err = types::WriteTarget::try_from(target.clone()).expect_err("empty target workers must fail");
+        assert!(err.contains("worker_endpoints"));
+        target.worker_endpoints.push(endpoint());
+        target.block_stamp = 0;
+        let err = types::WriteTarget::try_from(target).expect_err("zero target block_stamp must fail");
+        assert!(err.contains("block_stamp"));
+
+        let mut location = proto_metadata::FileBlockLocationProto {
+            block_id: Some(block_id.into()),
+            file_offset: 128,
+            len: 4096,
+            workers: Vec::new(),
+            worker_epoch: Some(11),
+            block_stamp: Some(55),
+        };
+        let err = types::FileBlockLocation::try_from(location.clone()).expect_err("empty location workers must fail");
+        assert!(err.contains("workers"));
+        location.workers.push(endpoint());
+        location.block_stamp = None;
+        let err = types::FileBlockLocation::try_from(location.clone()).expect_err("missing block_stamp must fail");
+        assert!(err.contains("block_stamp missing"));
+        location.block_stamp = Some(0);
+        let err = types::FileBlockLocation::try_from(location).expect_err("zero block_stamp must fail");
+        assert!(err.contains("block_stamp"));
+    }
+
+    #[test]
+    fn shared_location_payloads_round_trip_through_proto() {
+        let endpoint = types::WorkerEndpointInfo {
+            worker_id: WorkerId::new(7),
+            endpoint: "127.0.0.1:19101".to_string(),
+            worker_net_protocol: types::WorkerNetProtocol::Grpc,
+            worker_epoch: 11,
+        };
+        let block_id = BlockId::from_u64_u32(42, 3);
+        let token = FencingToken::new(block_id, ClientId::new(9), 17);
+
+        let target = types::WriteTarget {
+            block_id,
+            file_offset: 128,
+            len: 4096,
+            worker_endpoints: vec![endpoint.clone()],
+            fencing_token: token,
+            block_stamp: 55,
+            chunk_size: 1024,
+        };
+        let decoded_target = types::WriteTarget::try_from(proto_metadata::WriteTargetProto::from(target.clone()))
+            .expect("write target decodes");
+        assert_eq!(decoded_target, target);
+
+        let committed = types::CommittedBlock {
+            block_id,
+            file_offset: 128,
+            len: 4096,
+            checksum: Some(vec![1, 2, 3]),
+        };
+        let decoded_committed =
+            types::CommittedBlock::try_from(proto_metadata::CommittedBlockProto::from(committed.clone()))
+                .expect("committed block decodes");
+        assert_eq!(decoded_committed, committed);
+
+        let location = types::FileBlockLocation {
+            block_id,
+            file_offset: 128,
+            len: 4096,
+            workers: vec![endpoint],
+            worker_epoch: Some(11),
+            block_stamp: 55,
+        };
+        let decoded_location =
+            types::FileBlockLocation::try_from(proto_metadata::FileBlockLocationProto::from(location.clone()))
+                .expect("file block location decodes");
+        assert_eq!(decoded_location, location);
     }
 }

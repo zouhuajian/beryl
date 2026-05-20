@@ -3,15 +3,16 @@
 
 use super::{FsCore, StaleStateStatus};
 use crate::error::MetadataError;
-use crate::service::core_util::need_refresh_core_failure;
+use crate::service::core_util::{need_refresh_core_failure, worker_endpoint_from_parts};
 use crate::service::domain::{
-    CoreFailure, CoreResult, FileBlockLocation, Freshness, GetAttrInput, GetAttrOutput, GetFileLayoutInput,
-    GetFileLayoutOutput, InodeMountGuardInputs, ReadDirEntry, ReadDirInput, ReadDirOutput, RequestContext, WorkerHint,
+    CoreFailure, CoreResult, Freshness, GetAttrInput, GetAttrOutput, GetFileLayoutInput, GetFileLayoutOutput,
+    InodeMountGuardInputs, ReadDirEntry, ReadDirInput, ReadDirOutput, RequestContext,
 };
 use common::error::canonical::RefreshReason;
 use common::header::RpcErrorCode;
 use types::fs::{Extent, InodeId};
 use types::ids::DataHandleId;
+use types::FileBlockLocation;
 
 impl FsCore {
     async fn validate_read_freshness_for_mount(
@@ -399,12 +400,24 @@ impl FsCore {
                 workers.reserve(worker_ids.len());
                 for worker_id in worker_ids {
                     if let Some(descriptor) = worker_manager.get_descriptor(worker_id) {
-                        workers.push(WorkerHint {
+                        let endpoint = match worker_endpoint_from_parts(
                             worker_id,
-                            endpoint: descriptor.address,
-                            worker_net_protocol: descriptor.worker_net_protocol,
-                            worker_epoch: descriptor.worker_epoch,
-                        });
+                            descriptor.address,
+                            descriptor.worker_net_protocol,
+                            descriptor.worker_epoch,
+                        ) {
+                            Ok(endpoint) => endpoint,
+                            Err(err) => {
+                                return self.failure_from_error_with_route_epoch(
+                                    &req.ctx,
+                                    err,
+                                    group_id,
+                                    mount_epoch,
+                                    route_epoch,
+                                );
+                            }
+                        };
+                        workers.push(endpoint);
                     }
                 }
             }

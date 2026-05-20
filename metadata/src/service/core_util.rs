@@ -3,9 +3,7 @@
 
 //! Core wire/context utilities shared by service adapters and FsCore.
 
-use super::domain::{
-    CoreFailure, CoreSuccess, FileBlockLocation, PresentedFencingToken, RequestContext, WorkerHint, WriteTarget,
-};
+use super::domain::{CoreFailure, CoreSuccess, PresentedFencingToken, RequestContext};
 use crate::error::{to_canonical_fs, MetadataError};
 use common::error::canonical::{
     CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshHint, RefreshReason,
@@ -13,10 +11,10 @@ use common::error::canonical::{
 use common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
 use tracing::Span;
 use types::fs::FsErrorCode;
-use types::ids::{BlockId, LeaseId};
+use types::ids::{BlockId, LeaseId, WorkerId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
-use types::GroupStateWatermark;
+use types::{FileBlockLocation, GroupStateWatermark, WorkerEndpointInfo, WriteTarget};
 
 pub fn request_context_from_proto(req_header: &Option<proto::common::RequestHeaderProto>) -> RequestContext {
     let caller = if let Some(proto_header) = req_header {
@@ -352,36 +350,22 @@ pub fn fencing_to_proto(token: FencingToken) -> proto::common::FencingTokenProto
     token.into()
 }
 
-pub fn worker_hint_to_proto(hint: &WorkerHint) -> proto::common::WorkerEndpointInfoProto {
-    proto::common::WorkerEndpointInfoProto {
-        worker_id: hint.worker_id.as_raw(),
-        endpoint: hint.endpoint.clone(),
-        worker_net_protocol: hint.worker_net_protocol,
-        worker_epoch: hint.worker_epoch,
-    }
+pub fn worker_endpoint_from_parts(
+    worker_id: WorkerId,
+    endpoint: String,
+    worker_net_protocol: i32,
+    worker_epoch: u64,
+) -> Result<WorkerEndpointInfo, MetadataError> {
+    proto::convert::worker_endpoint_info_from_parts(worker_id, endpoint, worker_net_protocol, worker_epoch)
+        .map_err(MetadataError::InvalidArgument)
 }
 
 pub fn write_target_to_proto(target: &WriteTarget) -> proto::metadata::WriteTargetProto {
-    proto::metadata::WriteTargetProto {
-        block_id: Some(target.block_id.into()),
-        file_offset: target.file_offset,
-        len: target.len,
-        worker_endpoints: target.worker_endpoints.iter().map(worker_hint_to_proto).collect(),
-        fencing_token: Some(target.fencing_token.into()),
-        block_stamp: target.block_stamp,
-        chunk_size: target.chunk_size,
-    }
+    target.into()
 }
 
 pub fn location_to_proto(location: &FileBlockLocation) -> proto::metadata::FileBlockLocationProto {
-    proto::metadata::FileBlockLocationProto {
-        block_id: Some(location.block_id.into()),
-        file_offset: location.file_offset,
-        len: location.len,
-        workers: location.workers.iter().map(worker_hint_to_proto).collect(),
-        worker_epoch: location.worker_epoch,
-        block_stamp: Some(location.block_stamp),
-    }
+    location.into()
 }
 
 #[cfg(test)]

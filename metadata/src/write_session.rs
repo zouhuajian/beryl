@@ -8,7 +8,6 @@
 
 use crate::inode_lease::WriteMode;
 use parking_lot::RwLock;
-use proto::metadata::WriteTargetProto;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,6 +15,7 @@ use types::fs::Extent;
 use types::fs::InodeId;
 use types::ids::{ClientId, DataHandleId, LeaseId, MountId};
 use types::lease::FencingToken;
+use types::WriteTarget;
 
 /// Write session (runtime-only, not persisted to Raft).
 #[derive(Clone, Debug)]
@@ -43,9 +43,9 @@ pub struct WriteSession {
     /// Pending size (accumulated before close).
     pub pending_size: u64,
     /// Write targets (worker endpoints) for barrier.
-    pub write_targets: Vec<WriteTargetProto>,
+    pub write_targets: Vec<WriteTarget>,
     /// Targets already issued to the client through AddBlock.
-    pub issued_targets: Vec<WriteTargetProto>,
+    pub issued_targets: Vec<WriteTarget>,
     /// Next write target to hand out through AddBlock.
     pub next_target_index: usize,
     /// Writer identity (client_id / call_id).
@@ -74,7 +74,7 @@ pub struct CreateSessionInput {
     pub open_epoch: u64,
     pub base_size: u64,
     pub mode: WriteMode,
-    pub write_targets: Vec<WriteTargetProto>,
+    pub write_targets: Vec<WriteTarget>,
     pub writer_identity: WriterIdentity,
 }
 
@@ -131,7 +131,7 @@ impl WriteSessionManager {
     }
 
     /// Allocate the next precomputed write target for a session.
-    pub fn allocate_target(&self, file_handle: u64, desired_len: Option<u64>) -> Option<WriteTargetProto> {
+    pub fn allocate_target(&self, file_handle: u64, desired_len: Option<u64>) -> Option<WriteTarget> {
         let mut sessions = self.sessions.write();
         let session = sessions.get_mut(&file_handle)?;
         let mut target = session.write_targets.get(session.next_target_index).cloned()?;

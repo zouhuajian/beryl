@@ -6,10 +6,10 @@
 use common::error::canonical::CanonicalError;
 use common::header::{AuthnType, RequestHeader};
 use types::fs::{Extent, FileAttrs, InodeId, InodeKind};
-use types::ids::{BlockId, DataHandleId, LeaseId, MountId, WorkerId};
+use types::ids::{BlockId, DataHandleId, LeaseId, MountId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
-use types::GroupStateWatermark;
+use types::{CommittedBlock, FileBlockLocation, GroupStateWatermark, WriteTarget};
 
 #[derive(Clone, Debug)]
 pub struct RequestContext {
@@ -46,32 +46,6 @@ pub struct PresentedFencingToken {
 }
 
 #[derive(Clone, Debug)]
-pub struct WorkerHint {
-    pub worker_id: WorkerId,
-    pub endpoint: String,
-    pub worker_net_protocol: i32,
-    pub worker_epoch: u64,
-}
-
-#[derive(Clone, Debug)]
-pub struct WriteTarget {
-    pub block_id: BlockId,
-    pub file_offset: u64,
-    pub len: u64,
-    pub worker_endpoints: Vec<WorkerHint>,
-    pub fencing_token: FencingToken,
-    pub block_stamp: u64,
-    pub chunk_size: u32,
-}
-
-#[derive(Clone, Debug)]
-pub struct CommittedBlock {
-    pub block_id: BlockId,
-    pub file_offset: u64,
-    pub len: u64,
-}
-
-#[derive(Clone, Debug)]
 pub struct CloseWriteIntent {
     pub committed_blocks: Vec<CommittedBlock>,
     pub final_size: u64,
@@ -81,16 +55,6 @@ pub struct CloseWriteIntent {
 pub struct FileRange {
     pub offset: u64,
     pub len: u64,
-}
-
-#[derive(Clone, Debug)]
-pub struct FileBlockLocation {
-    pub block_id: BlockId,
-    pub file_offset: u64,
-    pub len: u64,
-    pub block_stamp: u64,
-    pub workers: Vec<WorkerHint>,
-    pub worker_epoch: Option<u64>,
 }
 
 #[derive(Clone, Debug)]

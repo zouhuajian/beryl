@@ -10,8 +10,8 @@ mod worker;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use proto::metadata::WriteTargetProto;
 use proto::worker::WriteStreamResponseProto;
+use types::{WorkerEndpointInfo, WriteTarget};
 
 use crate::error::ClientResult;
 use crate::planner::read_planner::PlannedReadSegment;
@@ -50,7 +50,7 @@ pub(crate) struct WorkerWriteTarget {
     /// Metadata owner group for the target block.
     pub(crate) group_id: u64,
     /// Metadata AddBlock target.
-    pub(crate) target: WriteTargetProto,
+    pub(crate) target: WriteTarget,
 }
 
 /// Internal worker write stream state.
@@ -59,15 +59,9 @@ pub(crate) struct WorkerWriteBlock {
     /// Metadata owner group for the block.
     pub(crate) group_id: u64,
     /// Stable worker identity selected by metadata.
-    pub(crate) worker_id: u64,
-    /// Target worker endpoint selected by the worker client.
-    pub(crate) endpoint: String,
-    /// Worker network protocol selected by metadata.
-    pub(crate) worker_net_protocol: i32,
-    /// Worker epoch selected by metadata.
-    pub(crate) worker_epoch: u64,
+    pub(crate) worker: WorkerEndpointInfo,
     /// Metadata AddBlock target.
-    pub(crate) target: WriteTargetProto,
+    pub(crate) target: WriteTarget,
     /// Worker stream identifier.
     pub(crate) stream_id: proto::common::StreamIdProto,
     /// Worker-accepted frame size.

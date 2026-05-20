@@ -10,9 +10,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use proto::metadata::{
-    AddBlockRequestProto, AppendFileRequestProto, CommittedBlockProto, CreateDispositionProto, CreateFileRequestProto,
-    DeleteRequestProto, GetBlockLocationsResponseProto, GetStatusRequestProto, ListStatusRequestProto,
-    OpenFileRequestProto, RenameRequestProto, RenewLeaseRequestProto,
+    AddBlockRequestProto, AppendFileRequestProto, CreateDispositionProto, CreateFileRequestProto, DeleteRequestProto,
+    GetStatusRequestProto, ListStatusRequestProto, OpenFileRequestProto, RenameRequestProto, RenewLeaseRequestProto,
 };
 use types::{DataHandleId, InodeId};
 
@@ -22,7 +21,7 @@ use crate::canonical::{ClientAction, RefreshHint};
 use crate::config::ClientConfig;
 use crate::data::DataPlaneBoundary;
 use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult};
-use crate::metadata::{MetadataGateway, TonicMetadataGateway, WriteSessionSeed};
+use crate::metadata::{LayoutSnapshot, MetadataGateway, TonicMetadataGateway, WriteSessionSeed};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics, NoopClientMetrics};
 use crate::planner::read_planner::ReadPlanner;
 use crate::runtime::singleflight::{Singleflight, SingleflightMode};
@@ -45,7 +44,7 @@ pub struct FsClient {
     executor: OperationExecutor,
     data_boundary: DataPlaneBoundary,
     layout_cache: LayoutCache,
-    layout_singleflight: Singleflight<LayoutCacheKey, GetBlockLocationsResponseProto>,
+    layout_singleflight: Singleflight<LayoutCacheKey, LayoutSnapshot>,
     backoff: BackoffPolicy,
     sleeper: Arc<dyn BackoffSleeper>,
     metrics: Arc<dyn ClientMetrics>,
@@ -757,7 +756,7 @@ impl FsClient {
         data_handle_id: DataHandleId,
         span: crate::planner::read_planner::PlannedReadRange,
         layout_key: LayoutCacheKey,
-    ) -> ClientResult<GetBlockLocationsResponseProto> {
+    ) -> ClientResult<LayoutSnapshot> {
         if let Some(layout) = self.layout_cache.get(&layout_key) {
             return Ok(layout);
         }
@@ -1043,9 +1042,9 @@ fn worker_write_operation(
 
 fn committed_block_from_pending(
     pending: &crate::session::write_session::PendingBlock,
-) -> ClientResult<CommittedBlockProto> {
+) -> ClientResult<types::CommittedBlock> {
     let target = pending.target();
-    Ok(CommittedBlockProto {
+    Ok(types::CommittedBlock {
         block_id: target.block_id,
         file_offset: target.file_offset,
         len: pending.written_len(),
@@ -1240,22 +1239,25 @@ mod tests {
     use async_trait::async_trait;
     use common::error::canonical::{CanonicalError, RefreshHint as CanonicalRefreshHint, RefreshReason};
     use common::header::RpcErrorCode;
-    use proto::common::{BlockIdProto, FencingTokenProto, WorkerEndpointInfoProto, WorkerNetProtocolProto};
+    use proto::common::{BlockIdProto, FencingTokenProto};
     use proto::metadata::{
         AbortFileWriteResponseProto, AppendFileResponseProto, CommitFileResponseProto, CreateFileResponseProto,
-        DeleteResponseProto, FileBlockLocationProto, GetBlockLocationsResponseProto, GetStatusResponseProto,
-        ListStatusResponseProto, OpenFileResponseProto, RenameResponseProto, RenewLeaseResponseProto, WriteHandleProto,
-        WriteTargetProto,
+        DeleteResponseProto, GetStatusResponseProto, ListStatusResponseProto, OpenFileResponseProto,
+        RenameResponseProto, RenewLeaseResponseProto, WriteHandleProto,
     };
     use tokio::sync::Notify;
-    use types::{DataHandleId, InodeId};
+    use types::lease::FencingToken;
+    use types::{
+        BlockId, BlockIndex, ClientId, DataHandleId, FileBlockLocation, InodeId, WorkerEndpointInfo, WorkerId,
+        WorkerNetProtocol, WriteTarget,
+    };
 
     use crate::canonical::{ClientAction, RefreshHint};
     use crate::data::{WorkerCommitResult, WorkerDataClient, WorkerWriteBlock, WorkerWriteTarget};
     use crate::metadata::{
         AbortFileWriteOp, AbortFileWriteResult, AddBlockOp, AddBlockResult, AppendFileOp, CommitFileOp,
-        CommitFileResult, CreateFileOp, DeleteOp, GetBlockLocationsOp, GetStatusOp, ListStatusOp, MsyncOp, OpenFileOp,
-        RenameOp, RenewLeaseOp, RenewLeaseResult,
+        CommitFileResult, CreateFileOp, DeleteOp, GetBlockLocationsOp, GetStatusOp, LayoutSnapshot, ListStatusOp,
+        MsyncOp, OpenFileOp, RenameOp, RenewLeaseOp, RenewLeaseResult,
     };
     use crate::planner::read_planner::PlannedReadSegment;
 
@@ -3780,25 +3782,15 @@ mod tests {
     ) -> (u64, u64, String, i32, u64, u64, u64, u64, u32, u64, u64, u64) {
         (
             block.group_id,
-            block.worker_id,
-            block.endpoint.clone(),
-            block.worker_net_protocol,
-            block.worker_epoch,
+            block.worker.worker_id.as_raw(),
+            block.worker.endpoint.clone(),
+            proto::common::WorkerNetProtocolProto::from(block.worker.worker_net_protocol) as i32,
+            block.worker.worker_epoch,
             block.target.file_offset,
             block.target.len,
             block.target.block_stamp,
-            block
-                .target
-                .block_id
-                .as_ref()
-                .map(|block_id| block_id.block_index)
-                .unwrap_or_default(),
-            block
-                .target
-                .block_id
-                .as_ref()
-                .map(|block_id| block_id.data_handle_id)
-                .unwrap_or_default(),
+            block.target.block_id.index.as_raw(),
+            block.target.block_id.data_handle_id.as_raw(),
             block.stream_id.high,
             block.stream_id.low,
         )
@@ -3872,7 +3864,7 @@ mod tests {
         calls: Mutex<Vec<RecordedCall>>,
         abort_file_records: Mutex<Vec<RecordedMetadataAbort>>,
         owner_redirect_group: Option<u64>,
-        layouts: Mutex<VecDeque<GetBlockLocationsResponseProto>>,
+        layouts: Mutex<VecDeque<LayoutSnapshot>>,
         layout_gate: Option<(Arc<Notify>, Arc<Notify>)>,
         layout_failure_gate: Option<(Arc<Notify>, Arc<Notify>)>,
         next_offsets: Mutex<HashMap<u64, u64>>,
@@ -3909,7 +3901,7 @@ mod tests {
             }
         }
 
-        fn with_layout(layout: GetBlockLocationsResponseProto) -> Self {
+        fn with_layout(layout: LayoutSnapshot) -> Self {
             let mut layouts = VecDeque::new();
             layouts.push_back(layout);
             Self {
@@ -3918,18 +3910,14 @@ mod tests {
             }
         }
 
-        fn with_layouts(layouts: Vec<GetBlockLocationsResponseProto>) -> Self {
+        fn with_layouts(layouts: Vec<LayoutSnapshot>) -> Self {
             Self {
                 layouts: Mutex::new(layouts.into()),
                 ..Self::default()
             }
         }
 
-        fn with_layout_gate(
-            layout: GetBlockLocationsResponseProto,
-            started: Arc<Notify>,
-            release: Arc<Notify>,
-        ) -> Self {
+        fn with_layout_gate(layout: LayoutSnapshot, started: Arc<Notify>, release: Arc<Notify>) -> Self {
             let mut layouts = VecDeque::new();
             layouts.push_back(layout);
             Self {
@@ -4190,11 +4178,7 @@ mod tests {
             })
         }
 
-        async fn read_layout(
-            &self,
-            ctx: AttemptContext,
-            req: GetBlockLocationsOp,
-        ) -> ClientResult<GetBlockLocationsResponseProto> {
+        async fn read_layout(&self, ctx: AttemptContext, req: GetBlockLocationsOp) -> ClientResult<LayoutSnapshot> {
             self.record_read_layout(&ctx, &req);
             self.maybe_owner_redirect(&ctx)?;
             if let Some((started, release)) = &self.layout_failure_gate {
@@ -4306,7 +4290,7 @@ mod tests {
             let header = ctx.metadata_header().expect("metadata header");
             Ok(AddBlockResult {
                 group_id: header.group_id,
-                target: write_target_proto(target_data_handle_id, block_index, offset, len),
+                target: write_target(target_data_handle_id, block_index, offset, len),
             })
         }
 
@@ -4650,10 +4634,7 @@ mod tests {
             }
             Ok(WorkerWriteBlock {
                 group_id: target.group_id,
-                worker_id: 1,
-                endpoint: "127.0.0.1:19101".to_string(),
-                worker_net_protocol: WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-                worker_epoch: 7,
+                worker: worker_endpoint(),
                 target: target.target,
                 stream_id: proto::common::StreamIdProto {
                     high: 1,
@@ -4819,23 +4800,15 @@ mod tests {
         data_handle_id: u64,
         file_version: Option<u64>,
         file_size: u64,
-        locations: Vec<FileBlockLocationProto>,
-    ) -> GetBlockLocationsResponseProto {
-        GetBlockLocationsResponseProto {
-            header: Some(proto::common::ResponseHeaderProto {
-                client: Some(proto::common::ClientInfoProto {
-                    call_id: types::CallId::new().to_string(),
-                    client_id: 7,
-                    client_name: String::new(),
-                }),
-                group_id,
-                ..proto::common::ResponseHeaderProto::default()
-            }),
-            inode_id: Some(proto::fs::InodeIdProto { value: inode_id }),
-            data_handle_id: Some(proto::common::DataHandleIdProto { value: data_handle_id }),
+        locations: Vec<FileBlockLocation>,
+    ) -> LayoutSnapshot {
+        LayoutSnapshot {
+            group_id,
+            inode_id: InodeId::new(inode_id),
+            data_handle_id: DataHandleId::new(data_handle_id),
             file_size,
-            locations,
             file_version,
+            locations,
         }
     }
 
@@ -4872,34 +4845,29 @@ mod tests {
         }
     }
 
-    fn write_target_proto(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -> WriteTargetProto {
-        WriteTargetProto {
-            block_id: Some(BlockIdProto {
-                data_handle_id,
-                block_index,
-            }),
+    fn write_target(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -> WriteTarget {
+        let block_id = BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(block_index));
+        WriteTarget {
+            block_id,
             file_offset,
             len,
-            worker_endpoints: vec![WorkerEndpointInfoProto {
-                worker_id: 1,
-                endpoint: "127.0.0.1:19101".to_string(),
-                worker_net_protocol: WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-                worker_epoch: 7,
-            }],
-            fencing_token: Some(FencingTokenProto {
-                block_id: Some(BlockIdProto {
-                    data_handle_id,
-                    block_index,
-                }),
-                owner: 7,
-                epoch: 1,
-            }),
+            worker_endpoints: vec![worker_endpoint()],
+            fencing_token: FencingToken::new(block_id, ClientId::new(7), 1),
             block_stamp: 1,
             chunk_size: DEFAULT_CHUNK_SIZE,
         }
     }
 
-    fn location(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -> FileBlockLocationProto {
+    fn worker_endpoint() -> WorkerEndpointInfo {
+        WorkerEndpointInfo {
+            worker_id: WorkerId::new(1),
+            endpoint: "127.0.0.1:19101".to_string(),
+            worker_net_protocol: WorkerNetProtocol::Grpc,
+            worker_epoch: 7,
+        }
+    }
+
+    fn location(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -> FileBlockLocation {
         location_with_stamp(
             data_handle_id,
             block_index,
@@ -4915,22 +4883,14 @@ mod tests {
         file_offset: u64,
         len: u64,
         stamp: u64,
-    ) -> FileBlockLocationProto {
-        FileBlockLocationProto {
-            block_id: Some(BlockIdProto {
-                data_handle_id,
-                block_index,
-            }),
+    ) -> FileBlockLocation {
+        FileBlockLocation {
+            block_id: BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(block_index)),
             file_offset,
             len,
-            workers: vec![WorkerEndpointInfoProto {
-                worker_id: 1,
-                endpoint: "127.0.0.1:19101".to_string(),
-                worker_net_protocol: WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-                worker_epoch: 7,
-            }],
+            workers: vec![worker_endpoint()],
             worker_epoch: Some(7),
-            block_stamp: Some(stamp),
+            block_stamp: stamp,
         }
     }
 

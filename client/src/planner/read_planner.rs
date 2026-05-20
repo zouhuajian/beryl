@@ -4,8 +4,8 @@
 //! Read planner.
 
 use crate::error::{ClientError, ClientResult};
-use proto::metadata::{FileBlockLocationProto, GetBlockLocationsResponseProto};
-use types::{BlockId, DataHandleId, InodeId};
+use crate::metadata::LayoutSnapshot;
+use types::{BlockId, DataHandleId, FileBlockLocation, InodeId, WorkerEndpointInfo};
 
 /// Splits public read ranges into block-local worker reads.
 #[derive(Clone, Debug, Default)]
@@ -31,7 +31,7 @@ pub(crate) struct PlannedReadSegment {
     pub(crate) block_id: BlockId,
     pub(crate) block_offset: u64,
     pub(crate) block_stamp: u64,
-    pub(crate) workers: Vec<proto::common::WorkerEndpointInfoProto>,
+    pub(crate) workers: Vec<WorkerEndpointInfo>,
     pub(crate) worker_epoch: Option<u64>,
 }
 
@@ -65,7 +65,7 @@ impl ReadPlanner {
     pub(crate) fn resolve_locations(
         expected_data_handle_id: DataHandleId,
         span: PlannedReadRange,
-        locations: &[FileBlockLocationProto],
+        locations: &[FileBlockLocation],
     ) -> ClientResult<Vec<PlannedReadSegment>> {
         let mut normalized = Vec::with_capacity(locations.len());
         for location in locations {
@@ -78,7 +78,7 @@ impl ReadPlanner {
                 .file_offset
                 .checked_add(location.len)
                 .ok_or_else(|| ClientError::InvalidLayout("block location range overflow".to_string()))?;
-            let block_id = block_id_from_location(location)?;
+            let block_id = location.block_id;
             if block_id.data_handle_id != expected_data_handle_id {
                 return Err(ClientError::InvalidLayout(format!(
                     "block location data_handle_id {} does not match handle {}",
@@ -91,23 +91,13 @@ impl ReadPlanner {
                     "block location has no worker candidates".to_string(),
                 ));
             }
-            let block_stamp = match location.block_stamp {
-                Some(stamp) => {
-                    if stamp == 0 {
-                        return Err(ClientError::InvalidLayout(format!(
-                            "block location {} has zero block_stamp",
-                            block_id
-                        )));
-                    }
-                    stamp
-                }
-                None => {
-                    return Err(ClientError::InvalidLayout(format!(
-                        "block location {} missing block_stamp",
-                        block_id
-                    )));
-                }
-            };
+            let block_stamp = location.block_stamp;
+            if block_stamp == 0 {
+                return Err(ClientError::InvalidLayout(format!(
+                    "block location {} has zero block_stamp",
+                    block_id
+                )));
+            }
             if end <= span.file_offset || location.file_offset >= span.end_file_offset() {
                 continue;
             }
@@ -180,10 +170,15 @@ impl ReadPlanner {
         expected_data_handle_id: DataHandleId,
         expected_file_version: Option<u64>,
         span: PlannedReadRange,
-        response: &GetBlockLocationsResponseProto,
+        response: &LayoutSnapshot,
     ) -> ClientResult<(u64, Vec<PlannedReadSegment>)> {
-        let group_id = response_group_id(response)?;
-        let inode_id = inode_id_from_proto(response.inode_id, "GetBlockLocationsResponseProto.inode_id")?;
+        if response.group_id == 0 {
+            return Err(ClientError::InvalidLayout(
+                "GetBlockLocations response header has group_id 0".to_string(),
+            ));
+        }
+        let group_id = response.group_id;
+        let inode_id = response.inode_id;
         if inode_id != expected_inode_id {
             return Err(ClientError::StaleHandle {
                 reason: format!(
@@ -192,8 +187,7 @@ impl ReadPlanner {
                 ),
             });
         }
-        let data_handle_id =
-            data_handle_id_from_proto(response.data_handle_id, "GetBlockLocationsResponseProto.data_handle_id")?;
+        let data_handle_id = response.data_handle_id;
         if data_handle_id != expected_data_handle_id {
             return Err(ClientError::StaleHandle {
                 reason: format!(
@@ -204,7 +198,7 @@ impl ReadPlanner {
             });
         }
         let actual_version =
-            file_version_from_proto(response.file_version, "GetBlockLocationsResponseProto.file_version")?;
+            file_version_from_snapshot(response.file_version, "GetBlockLocationsResponseProto.file_version")?;
         let expected_version = expected_file_version.ok_or_else(|| ClientError::StaleHandle {
             reason: "read handle missing file_version".to_string(),
         })?;
@@ -219,54 +213,14 @@ impl ReadPlanner {
     }
 }
 
-fn block_id_from_location(location: &FileBlockLocationProto) -> ClientResult<BlockId> {
-    let block_id = location
-        .block_id
-        .ok_or_else(|| ClientError::InvalidLayout("block location missing block_id".to_string()))?;
-    block_id
-        .try_into()
-        .map_err(|_| ClientError::InvalidLayout("block location invalid block_id".to_string()))
-}
-
-fn response_group_id(response: &GetBlockLocationsResponseProto) -> ClientResult<u64> {
-    let header = response
-        .header
-        .as_ref()
-        .ok_or_else(|| ClientError::InvalidLayout("GetBlockLocations response missing header".to_string()))?;
-    if header.group_id == 0 {
-        return Err(ClientError::InvalidLayout(
-            "GetBlockLocations response header has group_id 0".to_string(),
-        ));
-    }
-    Ok(header.group_id)
-}
-
-fn inode_id_from_proto(value: Option<proto::fs::InodeIdProto>, field: &str) -> ClientResult<InodeId> {
-    value
-        .map(|id| InodeId::new(id.value))
-        .ok_or_else(|| ClientError::InvalidLayout(format!("{field} missing")))
-}
-
-fn data_handle_id_from_proto(
-    value: Option<proto::common::DataHandleIdProto>,
-    field: &str,
-) -> ClientResult<DataHandleId> {
-    value
-        .ok_or_else(|| ClientError::InvalidLayout(format!("{field} missing")))?
-        .try_into()
-        .map_err(|_| ClientError::InvalidLayout(format!("{field} invalid")))
-}
-
-fn file_version_from_proto(value: Option<u64>, field: &str) -> ClientResult<u64> {
+fn file_version_from_snapshot(value: Option<u64>, field: &str) -> ClientResult<u64> {
     value.ok_or_else(|| ClientError::InvalidLayout(format!("{field} missing")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto::common::{BlockIdProto, WorkerEndpointInfoProto, WorkerNetProtocolProto};
-    use proto::metadata::FileBlockLocationProto;
-    use types::DataHandleId;
+    use types::{BlockId, BlockIndex, DataHandleId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
 
     #[test]
     fn requested_range_is_truncated_at_eof() {
@@ -370,42 +324,25 @@ mod tests {
         assert!(format!("{err}").contains("block_stamp"));
     }
 
-    #[test]
-    fn planner_rejects_missing_block_stamp() {
-        let span = ReadPlanner::plan_requested_range(0, 4, 20)
-            .expect("range planning succeeds")
-            .expect("non-empty span");
-        let mut missing = location(10, 0, 0, 4, 101);
-        missing.block_stamp = None;
-
-        let err = ReadPlanner::resolve_locations(DataHandleId::new(10), span, &[missing])
-            .expect_err("missing block stamp must fail");
-
-        assert!(format!("{err}").contains("block_stamp"));
-    }
-
     fn location(
         data_handle_id: u64,
         block_index: u32,
         file_offset: u64,
         len: u64,
         block_stamp: u64,
-    ) -> FileBlockLocationProto {
-        FileBlockLocationProto {
-            block_id: Some(BlockIdProto {
-                data_handle_id,
-                block_index,
-            }),
+    ) -> FileBlockLocation {
+        FileBlockLocation {
+            block_id: BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(block_index)),
             file_offset,
             len,
-            workers: vec![WorkerEndpointInfoProto {
-                worker_id: 1,
+            workers: vec![WorkerEndpointInfo {
+                worker_id: WorkerId::new(1),
                 endpoint: "127.0.0.1:19101".to_string(),
-                worker_net_protocol: WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+                worker_net_protocol: WorkerNetProtocol::Grpc,
                 worker_epoch: 7,
             }],
             worker_epoch: Some(7),
-            block_stamp: Some(block_stamp),
+            block_stamp,
         }
     }
 }
