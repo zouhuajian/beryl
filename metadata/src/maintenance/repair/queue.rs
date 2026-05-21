@@ -5,7 +5,7 @@
 
 use super::metrics::RepairMetrics;
 use super::types::{
-    ErrorClass, RepairDedupKey, RepairTask, RepairTaskId, RepairTaskRecord, RepairTaskState, TaskAckStatus,
+    RepairDedupKey, RepairTask, RepairTaskId, RepairTaskRecord, RepairTaskState, TaskAckStatus, TaskFailureClass,
 };
 use crate::error::{MetadataError, MetadataResult};
 use crate::inflight_registry::{InflightKind, InflightRegistry};
@@ -387,7 +387,7 @@ impl RepairQueue {
         worker_id: WorkerId,
         status: TaskAckStatus,
         message: Option<String>,
-        error_class: Option<ErrorClass>,
+        error_class: Option<TaskFailureClass>,
     ) -> MetadataResult<Option<RepairTask>> {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 
@@ -485,10 +485,10 @@ impl RepairQueue {
                 record.attempt += 1;
 
                 // Determine error class (default to Retryable if not provided)
-                let error_class = error_class.unwrap_or(ErrorClass::Retryable);
+                let error_class = error_class.unwrap_or(TaskFailureClass::Retryable);
 
                 match error_class {
-                    ErrorClass::Fatal => {
+                    TaskFailureClass::Fatal => {
                         // Permanent error, mark as Failed and remove
                         let dedup_key = record.dedup_key.clone();
 
@@ -507,7 +507,7 @@ impl RepairQueue {
                             "Task failed permanently (fatal error)"
                         );
                     }
-                    ErrorClass::Retryable | ErrorClass::NeedRefresh => {
+                    TaskFailureClass::Retryable | TaskFailureClass::NeedRefresh => {
                         // Retry with adaptive backoff
                         if record.attempt >= self.max_attempts {
                             // Exceeded max attempts
@@ -555,7 +555,7 @@ impl RepairQueue {
                             );
                         }
                     }
-                    ErrorClass::Ok => {
+                    TaskFailureClass::Ok => {
                         // Should not happen for Failed status, but handle gracefully
                         // Remove from dedup
                         state.dedup.remove(&record.dedup_key);
@@ -588,15 +588,20 @@ impl RepairQueue {
     }
 
     /// Calculate adaptive backoff based on error class and attempt count.
-    fn calculate_adaptive_backoff(&self, attempt: u32, error_class: ErrorClass, _error_message: Option<&str>) -> u64 {
+    fn calculate_adaptive_backoff(
+        &self,
+        attempt: u32,
+        error_class: TaskFailureClass,
+        _error_message: Option<&str>,
+    ) -> u64 {
         match error_class {
-            ErrorClass::NeedRefresh => {
+            TaskFailureClass::NeedRefresh => {
                 // Shorter backoff for refresh-needed errors
                 let base = self.initial_backoff_ms / 2; // 500ms
                 let backoff = base * (1u64 << attempt.min(5)); // Cap at 2^5
                 backoff.min(self.max_backoff_ms / 2) // Cap at 30s
             }
-            ErrorClass::Retryable => {
+            TaskFailureClass::Retryable => {
                 // Standard exponential backoff
                 self.calculate_backoff(attempt)
             }

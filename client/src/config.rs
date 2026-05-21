@@ -246,43 +246,22 @@ impl ClientConfig {
     /// Create from FlatConfig.
     pub fn from_flat(flat: FlatConfig) -> Result<Self, CommonError> {
         // Default consistency level
-        let default_consistency = flat
-            .get_str("client.consistency.default")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(ConsistencyLevel::Normal);
+        let default_consistency =
+            parse_value_or_default(&flat, "client.consistency.default", ConsistencyLevel::Normal)?;
 
         // Default read mode
-        let default_read_mode = flat
-            .get_str("client.read_mode.default")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(ReadMode::Cached);
+        let default_read_mode = parse_value_or_default(&flat, "client.read_mode.default", ReadMode::Cached)?;
 
         // Default write mode
-        let default_write_mode = flat
-            .get_str("client.write_mode.default")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(WriteMode::Back);
+        let default_write_mode = parse_value_or_default(&flat, "client.write_mode.default", WriteMode::Back)?;
 
         // Read mode fallback
-        let read_mode_fallback = flat
-            .get_str("client.read_mode.fallback")
-            .and_then(|s| match s.as_str() {
-                "direct" => Some(ReadModeFallback::Direct),
-                "disable" => Some(ReadModeFallback::Disable),
-                _ => None,
-            })
-            .unwrap_or(ReadModeFallback::Direct);
+        let read_mode_fallback =
+            parse_read_mode_fallback_or_default(&flat, "client.read_mode.fallback", ReadModeFallback::Direct)?;
 
         // Write mode fallback
-        let write_mode_fallback = flat
-            .get_str("client.write_mode.fallback")
-            .and_then(|s| match s.as_str() {
-                "through" => Some(WriteModeFallback::Through),
-                "direct" => Some(WriteModeFallback::Direct),
-                "disable" => Some(WriteModeFallback::Disable),
-                _ => None,
-            })
-            .unwrap_or(WriteModeFallback::Through);
+        let write_mode_fallback =
+            parse_write_mode_fallback_or_default(&flat, "client.write_mode.fallback", WriteModeFallback::Through)?;
 
         let cache = cache_config_from_flat(&flat)?;
 
@@ -332,7 +311,18 @@ impl ClientConfig {
 
     /// Return the configured non-zero client id for request headers.
     pub fn client_id(&self) -> crate::error::ClientResult<types::ClientId> {
-        let id = self.inner.as_flat().get_i64("client.id").unwrap_or(0) as u64;
+        let flat = self.inner.as_flat();
+        let raw_id = if let Some(id) = flat.get_i64("client.id") {
+            id
+        } else if flat.contains_key("client.id") {
+            return Err(crate::error::ClientError::InvalidArgument(
+                "client.id must be an integer".to_string(),
+            ));
+        } else {
+            0
+        };
+        let id = u64::try_from(raw_id)
+            .map_err(|_| crate::error::ClientError::InvalidArgument("client.id must be non-negative".to_string()))?;
         if id == 0 {
             Err(crate::error::ClientError::InvalidArgument(
                 "client metadata operations require non-zero client.id".to_string(),
@@ -466,8 +456,8 @@ fn parse_metadata_group_ids(flat: &FlatConfig) -> Result<Vec<u64>, CommonError> 
                 )
             })?;
         parsed
-    } else if let Some(group_id) = flat.get_i64("client.metadata.group_id") {
-        vec![group_id as u64]
+    } else if let Some(group_id) = get_optional_u64(flat, "client.metadata.group_id")? {
+        vec![group_id]
     } else {
         vec![1]
     };
@@ -534,6 +524,60 @@ fn backoff_config_from_flat(flat: &FlatConfig) -> Result<BackoffConfig, CommonEr
     Ok(backoff)
 }
 
+fn parse_value_or_default<T>(flat: &FlatConfig, key: &'static str, default: T) -> Result<T, CommonError>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let Some(value) = get_str_if_present(flat, key)? else {
+        return Ok(default);
+    };
+    value
+        .parse()
+        .map_err(|err| invalid_config(key, format!("is invalid: {err}")))
+}
+
+fn parse_read_mode_fallback_or_default(
+    flat: &FlatConfig,
+    key: &'static str,
+    default: ReadModeFallback,
+) -> Result<ReadModeFallback, CommonError> {
+    let Some(value) = get_str_if_present(flat, key)? else {
+        return Ok(default);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "direct" => Ok(ReadModeFallback::Direct),
+        "disable" => Ok(ReadModeFallback::Disable),
+        _ => Err(invalid_config(key, "must be one of direct|disable")),
+    }
+}
+
+fn parse_write_mode_fallback_or_default(
+    flat: &FlatConfig,
+    key: &'static str,
+    default: WriteModeFallback,
+) -> Result<WriteModeFallback, CommonError> {
+    let Some(value) = get_str_if_present(flat, key)? else {
+        return Ok(default);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "through" => Ok(WriteModeFallback::Through),
+        "direct" => Ok(WriteModeFallback::Direct),
+        "disable" => Ok(WriteModeFallback::Disable),
+        _ => Err(invalid_config(key, "must be one of through|direct|disable")),
+    }
+}
+
+fn get_str_if_present(flat: &FlatConfig, key: &'static str) -> Result<Option<String>, CommonError> {
+    if let Some(value) = flat.get_str(key) {
+        return Ok(Some(value));
+    }
+    if flat.contains_key(key) {
+        return Err(invalid_config(key, "must be a string"));
+    }
+    Ok(None)
+}
+
 fn get_usize_or(flat: &FlatConfig, key: &'static str, default: usize) -> Result<usize, CommonError> {
     match flat.get_i64(key) {
         Some(value) if value >= 0 => Ok(value as usize),
@@ -577,7 +621,7 @@ fn get_i64_or_strict(flat: &FlatConfig, key: &'static str) -> Result<Option<i64>
 }
 
 fn get_optional_u64(flat: &FlatConfig, key: &'static str) -> Result<Option<u64>, CommonError> {
-    match flat.get_i64(key) {
+    match get_i64_or_strict(flat, key)? {
         Some(value) if value >= 0 => Ok(Some(value as u64)),
         Some(_) => Err(invalid_config(key, "must be non-negative")),
         None => Ok(None),
@@ -603,8 +647,11 @@ fn get_f64_or(flat: &FlatConfig, key: &'static str, default: f64) -> Result<f64,
     }
 }
 
-fn invalid_config(key: &'static str, detail: &'static str) -> CommonError {
-    CommonError::new(common::CommonErrorCode::InvalidArgument, format!("{key} {detail}"))
+fn invalid_config(key: &'static str, detail: impl Into<String>) -> CommonError {
+    CommonError::new(
+        common::CommonErrorCode::InvalidArgument,
+        format!("{key} {}", detail.into()),
+    )
 }
 
 #[cfg(test)]
@@ -615,6 +662,11 @@ mod tests {
     fn default_config_has_conservative_bounded_retry_refresh_and_backoff() {
         let config = ClientConfig::default();
 
+        assert_eq!(config.default_consistency, ConsistencyLevel::Normal);
+        assert_eq!(config.default_read_mode, ReadMode::Cached);
+        assert_eq!(config.default_write_mode, WriteMode::Back);
+        assert_eq!(config.read_mode_fallback, ReadModeFallback::Direct);
+        assert_eq!(config.write_mode_fallback, WriteModeFallback::Through);
         assert_eq!(config.retry.max_retry_attempts(), 3);
         assert_eq!(config.retry.metadata_retry_budget(), 3);
         assert_eq!(config.retry.worker_retry_budget(), 3);
@@ -646,6 +698,62 @@ mod tests {
         assert!(config.channel_pool.worker_channel_pool_enabled);
         assert_eq!(config.channel_pool.worker_channel_pool_max_per_worker, 1);
         assert!(config.channel_pool.worker_channel_singleflight_enabled);
+    }
+
+    #[test]
+    fn invalid_mode_strings_are_rejected() {
+        for key in [
+            "client.consistency.default",
+            "client.read_mode.default",
+            "client.write_mode.default",
+            "client.read_mode.fallback",
+            "client.write_mode.fallback",
+        ] {
+            let mut flat = FlatConfig::new();
+            flat.set(key, "invalid-mode");
+
+            let err = ClientConfig::from_flat(flat).expect_err("invalid mode string must fail");
+
+            assert!(
+                err.to_string().contains(key),
+                "error for {key} should mention the offending key: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_mode_wrong_type_values_are_rejected() {
+        for key in [
+            "client.consistency.default",
+            "client.read_mode.default",
+            "client.write_mode.default",
+            "client.read_mode.fallback",
+            "client.write_mode.fallback",
+        ] {
+            let mut flat = FlatConfig::new();
+            flat.set(key, true);
+
+            let err = ClientConfig::from_flat(flat).expect_err("present wrong-type mode value must fail");
+
+            assert!(
+                err.to_string().contains(key),
+                "error for {key} should mention the offending key: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_client_identity_values_are_rejected() {
+        let mut flat = FlatConfig::new();
+        flat.set("client.metadata.group_id", -1i64);
+        let err = ClientConfig::from_flat(flat).expect_err("negative metadata group id must fail");
+        assert!(err.to_string().contains("client.metadata.group_id"));
+
+        let mut flat = FlatConfig::new();
+        flat.set("client.id", -1i64);
+        let config = ClientConfig::from_flat(flat).expect("client.id is checked when request identity is needed");
+        let err = config.client_id().expect_err("negative client id must fail");
+        assert!(err.to_string().contains("client.id"));
     }
 
     #[test]

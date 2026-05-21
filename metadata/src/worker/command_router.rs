@@ -4,11 +4,13 @@
 //! Worker command routing boundary between worker RPC and command sources.
 
 use crate::maintenance::delete::DeleteExecutor;
-use crate::maintenance::repair::{ErrorClass, RepairQueue, RepairTask, RepairTaskId, RepairTaskRecord, TaskAckStatus};
+use crate::maintenance::repair::{
+    RepairQueue, RepairTask, RepairTaskId, RepairTaskRecord, TaskAckStatus, TaskFailureClass,
+};
 use parking_lot::Mutex;
 use proto::metadata::{
-    worker_command_proto, DeleteBlockStatusProto, ErrorClassProto, EvictCommandProto, MoveCopyCommandProto,
-    ReplicateCommandProto, TaskAckProto, TaskAckStatusProto, WorkerCommandProto,
+    worker_command_proto, DeleteBlockStatusProto, EvictCommandProto, MoveCopyCommandProto, ReplicateCommandProto,
+    TaskAckProto, TaskAckStatusProto, WorkerCommandProto,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -297,13 +299,7 @@ impl WorkerCommandSource for RepairCommandSource {
             Some(ack.error_message.clone())
         };
 
-        let error_class = match ack.error_class() {
-            ErrorClassProto::ErrorClassOk => Some(ErrorClass::Ok),
-            ErrorClassProto::ErrorClassRetryable => Some(ErrorClass::Retryable),
-            ErrorClassProto::ErrorClassFatal => Some(ErrorClass::Fatal),
-            ErrorClassProto::ErrorClassNeedRefresh => Some(ErrorClass::NeedRefresh),
-            _ => None,
-        };
+        let error_class = TaskFailureClass::from_proto(ack.error_class());
 
         match self.repair_queue.ack(task_id, worker_id, status, message, error_class) {
             Ok(Some(followup_task)) => {

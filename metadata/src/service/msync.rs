@@ -46,7 +46,7 @@ impl MsyncHandler {
         if header_group_id != self.shard_group_id {
             let canonical = CanonicalError::need_refresh(
                 RpcErrorCode::ShardMoved,
-                RefreshReason::Moved,
+                RefreshReason::OwnerGroupMismatch,
                 format!(
                     "requested group {} is not served by this metadata runtime",
                     header_group_id.as_raw()

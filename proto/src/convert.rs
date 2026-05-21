@@ -961,6 +961,7 @@ fn refresh_reason_proto_to_enum(reason: proto_common::RefreshReasonProto) -> Ref
     match reason {
         proto_common::RefreshReasonProto::RefreshReasonUnknown => RefreshReason::Unknown,
         proto_common::RefreshReasonProto::RefreshReasonNotLeader => RefreshReason::NotLeader,
+        proto_common::RefreshReasonProto::RefreshReasonOwnerGroupMismatch => RefreshReason::OwnerGroupMismatch,
         proto_common::RefreshReasonProto::RefreshReasonMoved => RefreshReason::Moved,
         proto_common::RefreshReasonProto::RefreshReasonStaleState => RefreshReason::StaleState,
         proto_common::RefreshReasonProto::RefreshReasonMountEpochMismatch => RefreshReason::MountEpochMismatch,
@@ -978,6 +979,7 @@ fn refresh_reason_to_proto(reason: &Option<RefreshReason>) -> i32 {
     match reason.unwrap_or(RefreshReason::Unknown) {
         RefreshReason::Unknown => proto_common::RefreshReasonProto::RefreshReasonUnknown as i32,
         RefreshReason::NotLeader => proto_common::RefreshReasonProto::RefreshReasonNotLeader as i32,
+        RefreshReason::OwnerGroupMismatch => proto_common::RefreshReasonProto::RefreshReasonOwnerGroupMismatch as i32,
         RefreshReason::Moved => proto_common::RefreshReasonProto::RefreshReasonMoved as i32,
         RefreshReason::StaleState => proto_common::RefreshReasonProto::RefreshReasonStaleState as i32,
         RefreshReason::MountEpochMismatch => proto_common::RefreshReasonProto::RefreshReasonMountEpochMismatch as i32,

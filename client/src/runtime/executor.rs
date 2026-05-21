@@ -791,7 +791,7 @@ mod tests {
         let gateway = Arc::new(ScriptedGateway::new(vec![
             refresh_outcome(
                 RpcErrorCode::ShardMoved,
-                CanonicalRefreshReason::Moved,
+                CanonicalRefreshReason::OwnerGroupMismatch,
                 CanonicalRefreshHint {
                     group_id: Some(11),
                     ..CanonicalRefreshHint::default()
@@ -824,7 +824,7 @@ mod tests {
         let gateway = Arc::new(ScriptedGateway::new(vec![
             refresh_outcome(
                 RpcErrorCode::ShardMoved,
-                CanonicalRefreshReason::Moved,
+                CanonicalRefreshReason::OwnerGroupMismatch,
                 CanonicalRefreshHint {
                     group_id: Some(11),
                     leader_endpoint: Some("http://127.0.0.1:18082".to_string()),
@@ -859,7 +859,7 @@ mod tests {
         let gateway = Arc::new(ScriptedGateway::new(vec![
             refresh_outcome(
                 RpcErrorCode::ShardMoved,
-                CanonicalRefreshReason::Moved,
+                CanonicalRefreshReason::OwnerGroupMismatch,
                 CanonicalRefreshHint {
                     group_id: Some(11),
                     ..CanonicalRefreshHint::default()

@@ -187,8 +187,8 @@ message DeleteBlockResultProto {
   common.BlockIdProto block_id = 1;
   /// Delete status.
   DeleteBlockStatusProto status = 2;
-  /// Error class (for retry strategy).
-  ErrorClassProto error_class = 3;
+  /// Task-local failure class for retry/backoff decisions.
+  TaskFailureClassProto error_class = 3;
   /// Retry after milliseconds (if retryable).
   uint32 retry_after_ms = 4;
   /// Optional error message.
@@ -243,8 +243,8 @@ message TaskAckProto {
   TaskAckStatusProto status = 2;
   /// Optional error message (for failures).
   string error_message = 3;
-  /// Error class/category for adaptive backoff.
-  ErrorClassProto error_class = 4;
+  /// Task-local failure class for adaptive backoff.
+  TaskFailureClassProto error_class = 4;
   /// Optional error code (for detailed classification).
   string error_code = 5;
   /// For MoveCopy: whether verification passed.
@@ -263,13 +263,13 @@ enum TaskAckStatusProto {
   TASK_ACK_STATUS_RETRYABLE_FAILED = 3;
 }
 
-/// Error class for adaptive backoff and retry strategy.
-enum ErrorClassProto {
-  ERROR_CLASS_UNSPECIFIED = 0;
-  ERROR_CLASS_OK = 1;
-  ERROR_CLASS_RETRYABLE = 2;  // Transient error, should retry with backoff
-  ERROR_CLASS_FATAL = 3;       // Permanent error, should not retry
-  ERROR_CLASS_NEED_REFRESH = 4; // Need to refresh state (e.g., worker info)
+/// Task-local failure class for adaptive backoff and retry strategy.
+enum TaskFailureClassProto {
+  TASK_FAILURE_CLASS_UNSPECIFIED = 0;
+  TASK_FAILURE_CLASS_OK = 1;
+  TASK_FAILURE_CLASS_RETRYABLE = 2;  // Transient error, should retry with backoff
+  TASK_FAILURE_CLASS_FATAL = 3;       // Permanent error, should not retry
+  TASK_FAILURE_CLASS_NEED_REFRESH = 4; // Need to refresh task source state before retry
 }
 
 // ============================================================================

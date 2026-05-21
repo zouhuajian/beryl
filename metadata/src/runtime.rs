@@ -835,7 +835,7 @@ mod tests {
         assert!(response.state.is_none());
         assert_eq!(canonical.class, ErrorClass::NeedRefresh);
         assert_eq!(canonical.code, Some(ErrorCode::RpcCode(RpcErrorCode::ShardMoved)));
-        assert_eq!(canonical.reason, Some(RefreshReason::Moved));
+        assert_eq!(canonical.reason, Some(RefreshReason::OwnerGroupMismatch));
     }
 
     #[tokio::test]

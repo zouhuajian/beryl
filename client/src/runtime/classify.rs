@@ -109,7 +109,7 @@ impl ErrorClassifier {
             ClientError::NotLeader(_) => ErrorClass::NeedRefresh(RefreshReason::NotLeader),
             ClientError::RouteEpochMismatch { .. } => ErrorClass::NeedRefresh(RefreshReason::RouteEpochMismatch),
             ClientError::StaleMeta(_) => ErrorClass::NeedRefresh(RefreshReason::StaleState),
-            ClientError::Moved(_) => ErrorClass::NeedRefresh(RefreshReason::OwnerGroupMismatch),
+            ClientError::Moved(_) => ErrorClass::NeedRefresh(RefreshReason::Unknown),
             ClientError::Common(_)
             | ClientError::Cache(_)
             | ClientError::Config(_)
@@ -144,22 +144,20 @@ impl ErrorClassifier {
     }
 }
 
-fn classify_refresh_reason(reason: CanonicalRefreshReason, group_hint: Option<u64>) -> ErrorClass {
+fn classify_refresh_reason(reason: CanonicalRefreshReason, _group_hint: Option<u64>) -> ErrorClass {
     match reason {
         CanonicalRefreshReason::Fencing | CanonicalRefreshReason::EpochMismatch => ErrorClass::Fencing,
         CanonicalRefreshReason::SessionInvalid => ErrorClass::SessionInvalid,
         CanonicalRefreshReason::SessionExpired => ErrorClass::SessionExpired,
-        other => ErrorClass::NeedRefresh(refresh_reason_from_canonical(other, group_hint)),
+        other => ErrorClass::NeedRefresh(refresh_reason_from_canonical(other)),
     }
 }
 
-fn refresh_reason_from_canonical(reason: CanonicalRefreshReason, group_hint: Option<u64>) -> RefreshReason {
+fn refresh_reason_from_canonical(reason: CanonicalRefreshReason) -> RefreshReason {
     match reason {
         CanonicalRefreshReason::NotLeader => RefreshReason::NotLeader,
-        // Current proto has no distinct owner-group mismatch reason. A MOVED
-        // response with group_id is the typed owner redirect signal.
-        CanonicalRefreshReason::Moved if group_hint.is_some() => RefreshReason::OwnerGroupMismatch,
-        CanonicalRefreshReason::Moved => RefreshReason::RouteEpochMismatch,
+        CanonicalRefreshReason::OwnerGroupMismatch => RefreshReason::OwnerGroupMismatch,
+        CanonicalRefreshReason::Moved => RefreshReason::Unknown,
         CanonicalRefreshReason::StaleState => RefreshReason::StaleState,
         CanonicalRefreshReason::MountEpochMismatch => RefreshReason::MountEpochMismatch,
         CanonicalRefreshReason::RouteEpochMismatch => RefreshReason::RouteEpochMismatch,
@@ -189,7 +187,32 @@ mod tests {
     use common::header::RpcErrorCode;
 
     #[test]
-    fn moved_with_group_hint_classifies_as_owner_group_mismatch() {
+    fn owner_group_mismatch_reason_classifies_as_owner_group_mismatch() {
+        let canonical = CanonicalError::need_refresh_with_hint(
+            RpcErrorCode::ShardMoved,
+            common::error::canonical::RefreshReason::OwnerGroupMismatch,
+            CanonicalRefreshHint {
+                group_id: Some(11),
+                ..CanonicalRefreshHint::default()
+            },
+            "owner moved",
+        );
+        let err = ClientError::from(ClientAction::Refresh {
+            reason: common::error::canonical::RefreshReason::OwnerGroupMismatch,
+            hint: Box::new(RefreshHint {
+                group_id: Some(11),
+                ..RefreshHint::default()
+            }),
+            canonical: Box::new(canonical),
+        });
+
+        let classified = ErrorClassifier.classify_error(&err);
+
+        assert_eq!(classified, ErrorClass::NeedRefresh(RefreshReason::OwnerGroupMismatch));
+    }
+
+    #[test]
+    fn generic_moved_no_longer_infers_owner_group_from_hint() {
         let canonical = CanonicalError::need_refresh_with_hint(
             RpcErrorCode::ShardMoved,
             common::error::canonical::RefreshReason::Moved,
@@ -197,7 +220,7 @@ mod tests {
                 group_id: Some(11),
                 ..CanonicalRefreshHint::default()
             },
-            "owner moved",
+            "resource moved",
         );
         let err = ClientError::from(ClientAction::Refresh {
             reason: common::error::canonical::RefreshReason::Moved,
@@ -210,7 +233,7 @@ mod tests {
 
         let classified = ErrorClassifier.classify_error(&err);
 
-        assert_eq!(classified, ErrorClass::NeedRefresh(RefreshReason::OwnerGroupMismatch));
+        assert_eq!(classified, ErrorClass::NeedRefresh(RefreshReason::Unknown));
     }
 
     #[test]

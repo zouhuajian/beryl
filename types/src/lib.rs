@@ -22,7 +22,6 @@ pub mod layout;
 pub mod lease;
 pub mod location;
 pub mod raft_log_id;
-pub mod stream;
 pub mod worker;
 
 pub use acl::{

@@ -9,7 +9,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=common/errors.proto");
     println!("cargo:rerun-if-changed=admin/admin.proto");
     println!("cargo:rerun-if-changed=metadata/filesystem.proto");
-    println!("cargo:rerun-if-changed=metadata/data_control.proto");
     println!("cargo:rerun-if-changed=metadata/worker.proto");
     println!("cargo:rerun-if-changed=metadata/peer.proto");
     println!("cargo:rerun-if-changed=worker/data.proto");
@@ -30,7 +29,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "common/errors.proto",
                 "admin/admin.proto",
                 "metadata/filesystem.proto",
-                "metadata/data_control.proto",
                 "metadata/worker.proto",
                 "metadata/peer.proto",
                 "worker/data.proto",

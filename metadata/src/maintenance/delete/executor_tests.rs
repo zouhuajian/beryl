@@ -14,8 +14,8 @@ mod tests {
     use crate::state::{BlockMetaState, DeleteIntent, DeleteIntentReason, DeleteIntentStatus};
     use crate::worker::{HealthStatus, WorkerManager};
     use proto::metadata::{
-        worker_command_proto, DeleteBlockResultProto, DeleteBlockStatusProto, DeleteBlocksCommandProto,
-        ErrorClassProto, TaskAckProto, TaskAckStatusProto, WorkerCommandProto,
+        worker_command_proto, DeleteBlockResultProto, DeleteBlockStatusProto, DeleteBlocksCommandProto, TaskAckProto,
+        TaskAckStatusProto, TaskFailureClassProto, WorkerCommandProto,
     };
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -154,7 +154,7 @@ mod tests {
             task_id,
             status: TaskAckStatusProto::TaskAckStatusSuccess as i32,
             error_message: String::new(),
-            error_class: ErrorClassProto::ErrorClassOk as i32,
+            error_class: TaskFailureClassProto::TaskFailureClassOk as i32,
             error_code: String::new(),
             verify_ok: true,
             block_results: vec![DeleteBlockResultProto {
@@ -163,7 +163,7 @@ mod tests {
                     block_index: block_id.index.as_raw(),
                 }),
                 status: DeleteBlockStatusProto::DeleteBlockStatusDeleted as i32,
-                error_class: ErrorClassProto::ErrorClassOk as i32,
+                error_class: TaskFailureClassProto::TaskFailureClassOk as i32,
                 retry_after_ms: 0,
                 message: String::new(),
             }],
@@ -176,7 +176,7 @@ mod tests {
             task_id,
             status: TaskAckStatusProto::TaskAckStatusRetryableFailed as i32,
             error_message: "temporary worker failure".to_string(),
-            error_class: ErrorClassProto::ErrorClassRetryable as i32,
+            error_class: TaskFailureClassProto::TaskFailureClassRetryable as i32,
             error_code: String::new(),
             verify_ok: false,
             block_results: Vec::new(),
@@ -189,7 +189,7 @@ mod tests {
             task_id,
             status: TaskAckStatusProto::TaskAckStatusFailed as i32,
             error_message: message.to_string(),
-            error_class: ErrorClassProto::ErrorClassFatal as i32,
+            error_class: TaskFailureClassProto::TaskFailureClassFatal as i32,
             error_code: String::new(),
             verify_ok: false,
             block_results: vec![DeleteBlockResultProto {
@@ -198,7 +198,7 @@ mod tests {
                     block_index: block_id.index.as_raw(),
                 }),
                 status: DeleteBlockStatusProto::DeleteBlockStatusFailedFatal as i32,
-                error_class: ErrorClassProto::ErrorClassFatal as i32,
+                error_class: TaskFailureClassProto::TaskFailureClassFatal as i32,
                 retry_after_ms: 0,
                 message: message.to_string(),
             }],

@@ -27,7 +27,7 @@ pub use policy::RepairPolicy;
 pub use queue::RepairQueue;
 pub(crate) use signal::{BlockReportDelta, RepairSignalHandler, RepairSignalHandlerDeps, RepairSignalSink};
 pub use types::{
-    ErrorClass, RepairDedupKey, RepairTask, RepairTaskId, RepairTaskRecord, RepairTaskState, TaskAckStatus,
+    RepairDedupKey, RepairTask, RepairTaskId, RepairTaskRecord, RepairTaskState, TaskAckStatus, TaskFailureClass,
 };
 
 #[cfg(test)]
@@ -655,7 +655,7 @@ mod tests {
             worker1,
             TaskAckStatus::RetryableFailed,
             Some("Temporary error".to_string()),
-            Some(ErrorClass::Retryable),
+            Some(TaskFailureClass::Retryable),
         );
 
         // Task should be back to pending with backoff

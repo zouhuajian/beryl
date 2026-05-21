@@ -4113,7 +4113,7 @@ mod tests {
             }
             let canonical = CanonicalError::need_refresh_with_hint(
                 RpcErrorCode::ShardMoved,
-                RefreshReason::Moved,
+                RefreshReason::OwnerGroupMismatch,
                 CanonicalRefreshHint {
                     group_id: Some(owner_group),
                     ..CanonicalRefreshHint::default()
@@ -4121,7 +4121,7 @@ mod tests {
                 "owner group moved",
             );
             Err(ClientError::from(ClientAction::Refresh {
-                reason: RefreshReason::Moved,
+                reason: RefreshReason::OwnerGroupMismatch,
                 hint: Box::new(RefreshHint {
                     group_id: Some(owner_group),
                     ..RefreshHint::default()

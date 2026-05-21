@@ -84,6 +84,7 @@ mod tests {
         // Test all refresh reasons are properly set
         let reasons = vec![
             RefreshReason::NotLeader,
+            RefreshReason::OwnerGroupMismatch,
             RefreshReason::Moved,
             RefreshReason::StaleState,
             RefreshReason::MountEpochMismatch,

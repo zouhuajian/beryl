@@ -138,9 +138,21 @@ pub enum TaskAckStatus {
 
 /// Error class for adaptive backoff.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ErrorClass {
+pub enum TaskFailureClass {
     Ok,
     Retryable,   // Transient error, should retry with backoff
     Fatal,       // Permanent error, should not retry
     NeedRefresh, // Need to refresh state
+}
+
+impl TaskFailureClass {
+    pub(crate) fn from_proto(error_class: proto::metadata::TaskFailureClassProto) -> Option<Self> {
+        match error_class {
+            proto::metadata::TaskFailureClassProto::TaskFailureClassOk => Some(Self::Ok),
+            proto::metadata::TaskFailureClassProto::TaskFailureClassRetryable => Some(Self::Retryable),
+            proto::metadata::TaskFailureClassProto::TaskFailureClassFatal => Some(Self::Fatal),
+            proto::metadata::TaskFailureClassProto::TaskFailureClassNeedRefresh => Some(Self::NeedRefresh),
+            proto::metadata::TaskFailureClassProto::TaskFailureClassUnspecified => None,
+        }
+    }
 }

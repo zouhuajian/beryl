@@ -320,7 +320,7 @@ mod tests {
     fn validate_need_refresh_preserves_full_refresh_hint_fields() {
         let canonical = CanonicalError::need_refresh_with_hint(
             RpcErrorCode::ShardMoved,
-            RefreshReason::Moved,
+            RefreshReason::OwnerGroupMismatch,
             CanonicalRefreshHint {
                 leader_endpoint: Some("http://127.0.0.1:18081".to_string()),
                 group_id: Some(17),

@@ -13,7 +13,7 @@
 use crate::destructive_gate::{DestructiveCheckContext, DestructiveGate};
 use crate::error::MetadataResult;
 use crate::inflight_registry::{InflightKind, InflightRegistry};
-use crate::maintenance::repair::{ErrorClass, TaskAckStatus};
+use crate::maintenance::repair::{TaskAckStatus, TaskFailureClass};
 use crate::metrics::MetadataMetrics;
 use crate::mount::MountTable;
 use crate::raft::{AppRaftNode, Command, DedupKey, RocksDBStorage};
@@ -767,13 +767,7 @@ impl DeleteExecutor {
             proto::metadata::TaskAckStatusProto::TaskAckStatusRetryableFailed => TaskAckStatus::RetryableFailed,
             _ => TaskAckStatus::Failed,
         };
-        let error_class = match ack.error_class() {
-            proto::metadata::ErrorClassProto::ErrorClassOk => Some(ErrorClass::Ok),
-            proto::metadata::ErrorClassProto::ErrorClassRetryable => Some(ErrorClass::Retryable),
-            proto::metadata::ErrorClassProto::ErrorClassFatal => Some(ErrorClass::Fatal),
-            proto::metadata::ErrorClassProto::ErrorClassNeedRefresh => Some(ErrorClass::NeedRefresh),
-            _ => None,
-        };
+        let error_class = TaskFailureClass::from_proto(ack.error_class());
 
         // Handle per-block results if available (DeleteBlocksCommand)
         if !ack.block_results.is_empty() {
@@ -811,7 +805,7 @@ impl DeleteExecutor {
                 // Legacy path - handle failure
                 // Failure: check if retryable
                 let is_retryable = matches!(status, TaskAckStatus::RetryableFailed)
-                    || matches!(error_class, Some(ErrorClass::Retryable));
+                    || matches!(error_class, Some(TaskFailureClass::Retryable));
 
                 if !is_retryable {
                     // Non-retryable failure

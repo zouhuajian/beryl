@@ -58,7 +58,9 @@ pub mod canonical {
         Unknown,
         /// Not leader for the requested group.
         NotLeader,
-        /// Shard or resource moved (route/table change).
+        /// Path or mount owner group mismatch.
+        OwnerGroupMismatch,
+        /// Resource relocated, but the producer cannot classify the refresh more specifically.
         Moved,
         /// Follower state is behind requested state watermark.
         StaleState,

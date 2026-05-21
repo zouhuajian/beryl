@@ -376,7 +376,7 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 - client action machine 已有 header error 解析和 refresh/replay 分支。
 - `resolve_path_to_group()` 仍返回 `None`；path->group route cache 未闭环。
 - mount refresh 没有专用 API，当前 fallback 到 route/status refresh。
-- MOVED / ShardMoved 仍 de-scope。
+- generic `Moved` 仍 de-scope；owner-group mismatch 已有专用 refresh reason。
 
 ## 14. 当前已完成整理
 
