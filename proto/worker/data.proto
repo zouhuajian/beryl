@@ -10,7 +10,7 @@ import "worker/block_meta.proto";
 import "worker/data_header.proto";
 
 // ============================================================================
-// Worker Data Service: block-local stream API
+// Worker Data Service: block-local stream and sync API
 // ============================================================================
 //
 // Block is the management, routing, reporting, replication, migration,
@@ -190,6 +190,26 @@ message CommitWriteResponseProto {
   uint64 written_through = 4;
 }
 
+message SyncCommittedBlockRequestProto {
+  worker.DataRequestHeaderProto header = 1;
+  common.ShardGroupIdProto group_id = 2;
+  common.BlockIdProto block_id = 3;
+
+  // Metadata-authoritative logical block stamp for the committed generation.
+  uint64 block_stamp = 4;
+
+  // Complete committed block length expected by the metadata-visible prefix.
+  uint64 expected_block_len = 5;
+}
+
+message SyncCommittedBlockResponseProto {
+  worker.DataResponseHeaderProto header = 1;
+  uint64 effective_block_len = 2;
+
+  // Worker's current logical block stamp after durable sync validation.
+  uint64 block_stamp = 3;
+}
+
 message AbortWriteRequestProto {
   worker.DataRequestHeaderProto header = 1;
   common.ShardGroupIdProto group_id = 2;
@@ -218,6 +238,9 @@ service WorkerDataService {
 
   rpc CommitWrite(CommitWriteRequestProto)
       returns (CommitWriteResponseProto);
+
+  rpc SyncCommittedBlock(SyncCommittedBlockRequestProto)
+      returns (SyncCommittedBlockResponseProto);
 
   rpc AbortWrite(AbortWriteRequestProto)
       returns (AbortWriteResponseProto);

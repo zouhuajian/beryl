@@ -299,6 +299,37 @@ pub struct RenewLeaseOutput {
     pub expires_at_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncWriteMode {
+    Visibility,
+    Durability,
+}
+
+#[derive(Clone, Debug)]
+pub struct SyncWriteInput {
+    pub ctx: RequestContext,
+    pub file_handle: u64,
+    pub lease_id: Option<LeaseId>,
+    pub lease_epoch: u64,
+    pub open_epoch: u64,
+    pub fencing_token: Option<PresentedFencingToken>,
+    pub data_handle_id: DataHandleId,
+    pub committed_blocks: Vec<CommittedBlock>,
+    pub target_size: u64,
+    pub flags: u32,
+    pub mode: SyncWriteMode,
+    pub freshness: Freshness,
+}
+
+/// Metadata result for a SyncWrite barrier that published or confirmed a visible prefix.
+#[derive(Clone, Debug, Default)]
+pub struct SyncWriteOutput {
+    /// Visible prefix acknowledged by metadata for this barrier.
+    pub synced_size: u64,
+    /// File version visible to new read plans after the barrier.
+    pub file_version: Option<u64>,
+}
+
 #[derive(Clone, Debug)]
 pub struct CloseWriteInput {
     pub ctx: RequestContext,

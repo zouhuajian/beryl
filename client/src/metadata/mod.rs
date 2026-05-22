@@ -17,9 +17,9 @@ mod header;
 pub(crate) use gateway::{MetadataGateway, TonicMetadataGateway};
 pub(crate) use ops::{
     AbortFileWriteOp, AddBlockOp, AppendFileOp, CommitFileOp, CreateFileOp, DeleteOp, GetBlockLocationsOp, GetStatusOp,
-    ListStatusOp, MsyncOp, OpenFileOp, RenameOp, RenewLeaseOp,
+    ListStatusOp, MsyncOp, OpenFileOp, RenameOp, RenewLeaseOp, SyncWriteOp,
 };
 pub(crate) use snapshot::{
     AbortFileWriteResult, AddBlockResult, CommitFileResult, DeleteResult, FileSnapshot, LayoutSnapshot, ListSnapshot,
-    RenameResult, RenewLeaseResult, StatusSnapshot, WriteSessionSeed,
+    RenameResult, RenewLeaseResult, StatusSnapshot, SyncWriteResult, WriteSessionSeed,
 };

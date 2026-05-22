@@ -9,7 +9,7 @@ use crate::raft::{
 use crate::service::domain::{
     AbortWriteInput, AbortWriteOutput, AddBlockInput, AddBlockOutput, CloseWriteInput, CloseWriteIntent,
     CloseWriteOutput, CoreResult, OpenWriteInput, OpenWriteOutput, RenewLeaseInput, RenewLeaseOutput, RequestContext,
-    SessionKey,
+    SessionKey, SyncWriteInput, SyncWriteMode, SyncWriteOutput,
 };
 use crate::service::worker_endpoint_from_parts;
 use common::error::canonical::{RefreshHint, RefreshReason, WorkerEndpointHint};
@@ -33,6 +33,11 @@ impl FsCore {
 
     pub(crate) async fn execute_renew_inode_lease(&self, req: RenewLeaseInput) -> CoreResult<RenewLeaseOutput> {
         WriteSessionCoordinator::new(self).execute_renew_inode_lease(req).await
+    }
+
+    /// Validate an open write session and publish a SyncWrite prefix without closing the handle.
+    pub(crate) async fn execute_sync_write(&self, req: SyncWriteInput) -> CoreResult<SyncWriteOutput> {
+        WriteSessionCoordinator::new(self).execute_sync_write(req).await
     }
 
     pub(crate) async fn execute_open_write(&self, req: OpenWriteInput) -> CoreResult<OpenWriteOutput> {
@@ -371,6 +376,236 @@ impl<'a> WriteSessionCoordinator<'a> {
             RenewLeaseOutput { expires_at_ms },
             group_id,
             mount_epoch,
+            route_epoch,
+        )
+    }
+
+    async fn execute_sync_write(&self, req: SyncWriteInput) -> CoreResult<SyncWriteOutput> {
+        let file_handle = req.file_handle;
+
+        let session = match self.core.write_session_manager.get_session(file_handle) {
+            Some(session) => session,
+            None => {
+                return self.core.session_terminal_failure(
+                    &req.ctx,
+                    RefreshReason::SessionInvalid,
+                    RpcErrorCode::Fencing,
+                    format!(
+                        "write handle not found for handle={}; SyncWrite cannot be replayed automatically",
+                        file_handle,
+                    ),
+                    None,
+                    None,
+                );
+            }
+        };
+
+        let (group_id, mount_epoch) =
+            match self
+                .core
+                .validate_mount_epoch_for_mount(&req.ctx, req.freshness, session.mount_id)
+            {
+                Ok(hints) => hints,
+                Err(err) => return Err(err),
+            };
+
+        let route_epoch = match self
+            .core
+            .validate_route_epoch(&req.ctx, req.freshness, group_id, mount_epoch, "SyncWrite")
+            .await
+        {
+            Ok(route_epoch) => route_epoch,
+            Err(err) => return Err(err),
+        };
+
+        if req.data_handle_id != session.data_handle_id {
+            return self.core.failure_from_error_with_route_epoch(
+                &req.ctx,
+                MetadataError::InvalidArgument(format!(
+                    "SyncWrite data_handle_id {} does not match write handle data_handle_id {}",
+                    req.data_handle_id, session.data_handle_id
+                )),
+                group_id,
+                mount_epoch,
+                route_epoch,
+            );
+        }
+        for block in &req.committed_blocks {
+            if block.block_id.data_handle_id != session.data_handle_id {
+                return self.core.failure_from_error_with_route_epoch(
+                    &req.ctx,
+                    MetadataError::InvalidArgument(format!(
+                        "SyncWrite committed block data_handle_id {} does not match write handle data_handle_id {}",
+                        block.block_id.data_handle_id, session.data_handle_id
+                    )),
+                    group_id,
+                    mount_epoch,
+                    route_epoch,
+                );
+            }
+        }
+
+        let lease_id_typed = match req.lease_id {
+            Some(lease_id) => lease_id,
+            None => {
+                return self.core.failure_from_error_with_route_epoch(
+                    &req.ctx,
+                    MetadataError::InvalidArgument("Missing lease_id".to_string()),
+                    group_id,
+                    mount_epoch,
+                    route_epoch,
+                );
+            }
+        };
+        if lease_id_typed != session.lease_id || req.lease_epoch != session.lease_epoch {
+            return self.core.session_terminal_failure(
+                &req.ctx,
+                RefreshReason::SessionInvalid,
+                RpcErrorCode::Fencing,
+                format!(
+                    "lease/write handle mismatch: expected lease_id={:?} lease_epoch={}, got lease_id={:?} lease_epoch={}; SyncWrite cannot be replayed automatically",
+                    session.lease_id,
+                    session.lease_epoch,
+                    lease_id_typed,
+                    req.lease_epoch,
+                ),
+                group_id,
+                mount_epoch,
+            );
+        }
+        if req.open_epoch != session.open_epoch {
+            return self.core.session_terminal_failure(
+                &req.ctx,
+                RefreshReason::SessionInvalid,
+                RpcErrorCode::EpochMismatch,
+                format!(
+                    "open_epoch mismatch: expected {}, got {}; SyncWrite cannot be replayed automatically",
+                    session.open_epoch, req.open_epoch,
+                ),
+                group_id,
+                mount_epoch,
+            );
+        }
+        let req_token = match req.fencing_token.as_ref() {
+            Some(token) => token,
+            None => {
+                return self.core.session_terminal_failure(
+                    &req.ctx,
+                    RefreshReason::SessionInvalid,
+                    RpcErrorCode::Fencing,
+                    format!(
+                        "missing fencing_token for handle={}; SyncWrite cannot be replayed automatically",
+                        file_handle,
+                    ),
+                    group_id,
+                    mount_epoch,
+                );
+            }
+        };
+        if !FsCore::fencing_token_matches_session(&session, req_token) {
+            return self.core.session_terminal_failure(
+                &req.ctx,
+                RefreshReason::SessionInvalid,
+                RpcErrorCode::Fencing,
+                format!(
+                    "fencing_token mismatch for handle={}; SyncWrite cannot be replayed automatically",
+                    file_handle,
+                ),
+                group_id,
+                mount_epoch,
+            );
+        }
+        if self
+            .core
+            .inode_lease_manager
+            .validate_lease(session.inode_id, lease_id_typed, req.lease_epoch)
+            .is_err()
+        {
+            return self.core.session_terminal_failure(
+                &req.ctx,
+                RefreshReason::SessionExpired,
+                RpcErrorCode::Fencing,
+                format!(
+                    "lease validation rejected for handle={}; SyncWrite cannot be replayed automatically",
+                    file_handle,
+                ),
+                group_id,
+                mount_epoch,
+            );
+        }
+
+        // Durability is a client/worker precondition: metadata publishes the
+        // same visible prefix after the client has completed worker durable sync.
+        match req.mode {
+            SyncWriteMode::Visibility | SyncWriteMode::Durability => {}
+        }
+
+        let intent = CloseWriteIntent {
+            committed_blocks: req.committed_blocks.clone(),
+            final_size: req.target_size,
+        };
+        let extents = match Self::validate_committed_blocks(&intent, &session) {
+            Ok(extents) => extents,
+            Err(err) => {
+                return Err(self.invalid_sync_write_failure(&req, err.to_string(), group_id, mount_epoch));
+            }
+        };
+
+        let ctx = match self.core.route_ctx_for_write_with_error_hints(
+            &req.ctx,
+            CoreWriteOp::SetAttr,
+            &[session.inode_id],
+            req.freshness,
+            group_id,
+            mount_epoch,
+        ) {
+            Ok(ctx) => ctx,
+            Err(failure) => return Err(failure),
+        };
+
+        let dedup = match self.core.dedup_key(&req.ctx.caller) {
+            Ok(k) => k,
+            Err(err) => return self.core.failure_from_error(&req.ctx, err, group_id, mount_epoch),
+        };
+        let command = Command::SyncWrite {
+            dedup,
+            inode_id: session.inode_id,
+            extents,
+            target_size: req.target_size,
+            lease_id: session.lease_id,
+            open_epoch: session.open_epoch,
+            lease_epoch: req.lease_epoch,
+            commit_mode: Self::commit_mode_for_session(&session),
+        };
+        let file_version = match self.core.propose_fs_write_command(CoreWriteOp::SetAttr, command).await {
+            Ok(FsCommandResult::Ok(ok)) => ok.file_version,
+            Ok(FsCommandResult::Err(err)) => {
+                return self.core.fatal_fs_failure(
+                    &req.ctx,
+                    err.errno,
+                    err.message,
+                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.mount_epoch),
+                );
+            }
+            Err(err) => {
+                return self.core.failure_from_error(
+                    &req.ctx,
+                    err,
+                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.mount_epoch),
+                );
+            }
+        };
+
+        self.core.success_with_route_epoch(
+            &req.ctx,
+            SyncWriteOutput {
+                synced_size: req.target_size,
+                file_version,
+            },
+            Some(ctx.namespace_owner_group_id.as_raw()),
+            Some(ctx.mount_epoch),
             route_epoch,
         )
     }
@@ -796,6 +1031,22 @@ impl<'a> WriteSessionCoordinator<'a> {
     fn invalid_commit_failure(
         &self,
         req: &CloseWriteInput,
+        message: impl Into<String>,
+        group_id: Option<u64>,
+        mount_epoch: Option<u64>,
+    ) -> crate::service::domain::CoreFailure {
+        match self
+            .core
+            .fatal_fs_failure::<()>(&req.ctx, FsErrorCode::EInval, message, group_id, mount_epoch)
+        {
+            Err(failure) => failure,
+            Ok(_) => unreachable!("fatal_fs_failure always returns Err"),
+        }
+    }
+
+    fn invalid_sync_write_failure(
+        &self,
+        req: &SyncWriteInput,
         message: impl Into<String>,
         group_id: Option<u64>,
         mount_epoch: Option<u64>,

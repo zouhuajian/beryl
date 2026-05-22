@@ -8,7 +8,7 @@ use crate::raft::{AppRaftNode, AppRaftStateMachine, Command, DedupKey, RocksDBSt
 use crate::service::domain::{
     AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CoreResult, Freshness, GetAttrInput,
     GetFileLayoutInput, OpenWriteInput, PresentedFencingToken, ReadDirInput, RenameInput, RenewLeaseInput,
-    RequestContext, SessionKey, UnlinkInput,
+    RequestContext, SessionKey, SyncWriteInput, SyncWriteMode, UnlinkInput,
 };
 use crate::state::{MemoryStateStore, RouteEpoch};
 use crate::worker::{HealthStatus, WorkerManager};
@@ -747,6 +747,31 @@ async fn commit_for_key(
                 committed_blocks,
                 final_size,
             },
+            freshness: Freshness::default(),
+        })
+        .await
+}
+
+async fn sync_for_key(
+    fs_core: &FsCore,
+    key: &SessionKey,
+    committed_blocks: Vec<CommittedBlock>,
+    target_size: u64,
+    mode: SyncWriteMode,
+) -> CoreResult<crate::service::domain::SyncWriteOutput> {
+    fs_core
+        .execute_sync_write(SyncWriteInput {
+            ctx: request_context(),
+            file_handle: key.file_handle,
+            lease_id: Some(key.lease_id),
+            lease_epoch: key.lease_epoch,
+            open_epoch: key.open_epoch,
+            fencing_token: Some(presented_key_token(key)),
+            data_handle_id: key.fencing_token.block_id.data_handle_id,
+            committed_blocks,
+            target_size,
+            flags: 0,
+            mode,
             freshness: Freshness::default(),
         })
         .await
@@ -1786,6 +1811,166 @@ async fn commit_rejects_offset_mismatch() {
         Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
     );
     assert!(env.fs_core.write_session_for_handle(key.file_handle).is_some());
+}
+
+#[tokio::test]
+async fn sync_write_visibility_publishes_prefix_and_keeps_session_open() {
+    let env = write_flow_env(0).await;
+    let open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(8192),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("open write should succeed");
+    let key = open.payload.session_key;
+    let first = add_block_for_key(&env.fs_core, &key, 64).await;
+    let second = add_block_for_key(&env.fs_core, &key, 64).await;
+
+    let synced = sync_for_key(
+        &env.fs_core,
+        &key,
+        vec![committed_block(first.block_id, first.file_offset, first.len)],
+        64,
+        SyncWriteMode::Visibility,
+    )
+    .await
+    .expect("visibility sync should succeed");
+
+    assert_eq!(synced.payload.synced_size, 64);
+    assert_eq!(env.storage.get_inode(env.inode_id).unwrap().unwrap().attrs.size, 64);
+    assert!(synced.payload.file_version.is_some());
+    assert!(env.fs_core.write_session_for_handle(key.file_handle).is_some());
+
+    let layout = env
+        .fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            range: None,
+            requested_data_handle_id: Some(env.data_handle_id),
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("synced prefix should be readable");
+    assert_eq!(layout.payload.file_size, 64);
+    assert_eq!(layout.payload.extents.len(), 1);
+    assert_eq!(layout.payload.extents[0].block_id, first.block_id);
+
+    commit_for_key(
+        &env.fs_core,
+        &key,
+        vec![
+            committed_block(first.block_id, first.file_offset, first.len),
+            committed_block(second.block_id, second.file_offset, second.len),
+        ],
+        128,
+    )
+    .await
+    .expect("CommitFile should still close after SyncWrite");
+    assert!(env.fs_core.write_session_for_handle(key.file_handle).is_none());
+    assert_eq!(env.storage.get_inode(env.inode_id).unwrap().unwrap().attrs.size, 128);
+}
+
+#[tokio::test]
+async fn sync_write_durability_uses_same_metadata_publish_path() {
+    let env = write_flow_env(0).await;
+    let open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(64),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("open write should succeed");
+    let key = open.payload.session_key;
+    let target = add_block_for_key(&env.fs_core, &key, 64).await;
+
+    let synced = sync_for_key(
+        &env.fs_core,
+        &key,
+        vec![committed_block(target.block_id, target.file_offset, target.len)],
+        64,
+        SyncWriteMode::Durability,
+    )
+    .await
+    .expect("durability sync should publish through metadata");
+
+    assert_eq!(synced.payload.synced_size, 64);
+    assert_eq!(env.storage.get_inode(env.inode_id).unwrap().unwrap().attrs.size, 64);
+    assert!(env.fs_core.write_session_for_handle(key.file_handle).is_some());
+}
+
+#[tokio::test]
+async fn sync_write_rejects_target_beyond_committed_block_coverage() {
+    let env = write_flow_env(0).await;
+    let open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(64),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("open write should succeed");
+    let key = open.payload.session_key;
+    let target = add_block_for_key(&env.fs_core, &key, 64).await;
+
+    let failure = sync_for_key(
+        &env.fs_core,
+        &key,
+        vec![committed_block(target.block_id, target.file_offset, target.len)],
+        128,
+        SyncWriteMode::Visibility,
+    )
+    .await
+    .expect_err("target beyond committed coverage must be rejected");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
+    );
+    assert!(env.fs_core.write_session_for_handle(key.file_handle).is_some());
+    assert_eq!(env.storage.get_inode(env.inode_id).unwrap().unwrap().attrs.size, 0);
+}
+
+#[tokio::test]
+async fn repeated_identical_sync_write_is_idempotent_without_file_version_advance() {
+    let env = write_flow_env(0).await;
+    let open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(64),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("open write should succeed");
+    let key = open.payload.session_key;
+    let target = add_block_for_key(&env.fs_core, &key, 64).await;
+    let blocks = vec![committed_block(target.block_id, target.file_offset, target.len)];
+
+    let first = sync_for_key(&env.fs_core, &key, blocks.clone(), 64, SyncWriteMode::Visibility)
+        .await
+        .expect("first SyncWrite should publish");
+    let first_version = stored_file_version(&env.storage, env.inode_id).expect("file version");
+    let second = sync_for_key(&env.fs_core, &key, blocks, 64, SyncWriteMode::Visibility)
+        .await
+        .expect("repeated SyncWrite should be a no-op");
+
+    assert_eq!(second.payload.file_version, first.payload.file_version);
+    assert_eq!(stored_file_version(&env.storage, env.inode_id), Some(first_version));
 }
 
 #[tokio::test]

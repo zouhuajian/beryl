@@ -12,9 +12,13 @@ import "common/errors.proto";
 // Data-Plane Request/Response Headers
 // ============================================================================
 
-/// Request header for low-frequency data-plane control operations.
-/// OpenReadStream, OpenWriteStream, CommitWrite, and AbortWrite may use it.
-/// High-frequency ReadStream and WriteStream frames must not carry this header.
+// DataRequestHeaderProto is carried by low-frequency worker data-plane control
+// operations such as OpenRead, OpenWrite, CommitWrite, AbortWrite, and
+// SyncCommittedBlock.
+//
+// Hot-path stream frames intentionally do not carry this header. Stream
+// identity, sequence, offset, and flow-control fields are carried by the stream
+// frame messages themselves.
 message DataRequestHeaderProto {
   /// Client information (call_id, client_id, client_name).
   common.ClientInfoProto client = 1;

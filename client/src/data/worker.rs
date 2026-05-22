@@ -17,7 +17,7 @@ use types::chunk::ByteRange;
 use types::ids::ShardGroupId;
 use types::{WorkerEndpointInfo, WorkerNetProtocol, WriteTarget};
 
-use super::{WorkerCommitResult, WorkerDataClient, WorkerWriteBlock, WorkerWriteTarget};
+use super::{WorkerBlockSyncResult, WorkerCommitResult, WorkerDataClient, WorkerWriteBlock, WorkerWriteTarget};
 use crate::cache::{CacheInvalidationReason, WorkerEndpointCache};
 use crate::canonical::{invalid_header_action, validate_data_header_or_action};
 use crate::config::ClientConfig;
@@ -426,6 +426,34 @@ impl WorkerDataClient for TonicWorkerDataClient {
         })
     }
 
+    async fn sync_committed_block(
+        &self,
+        ctx: AttemptContext,
+        block: &WorkerWriteBlock,
+        expected_len: u64,
+    ) -> ClientResult<WorkerBlockSyncResult> {
+        let endpoint = worker_endpoint_from_block(block);
+        let mut client = self.client(&endpoint, "write").await?;
+        let request = build_sync_committed_block_request(&ctx, block, expected_len)?;
+        let response = client
+            .sync_committed_block(tonic_request(&ctx, request))
+            .await
+            .map_err(|status| {
+                ClientError::UnknownOutcome(format!(
+                    "worker SyncCommittedBlock outcome is unknown after transport status {}: {}",
+                    status.code(),
+                    status.message()
+                ))
+            })?
+            .into_inner();
+        worker_block_sync_result_from_response(&ctx, block, expected_len, response).inspect_err(|err| {
+            if is_worker_epoch_mismatch(err) {
+                self.invalidate_endpoint(&endpoint, CacheInvalidationReason::WorkerEpoch);
+                self.invalidate_channel(&endpoint, CacheInvalidationReason::WorkerEpoch);
+            }
+        })
+    }
+
     async fn abort_write(&self, ctx: AttemptContext, block: &WorkerWriteBlock) -> ClientResult<()> {
         let endpoint = worker_endpoint_from_block(block);
         let mut client = self.client(&endpoint, "write").await?;
@@ -553,6 +581,15 @@ impl DataPlaneBoundary {
         self.client
             .commit_write(ctx, block, effective_len, commit_seq, require_sync)
             .await
+    }
+
+    pub(crate) async fn sync_committed_block(
+        &self,
+        ctx: AttemptContext,
+        block: &WorkerWriteBlock,
+        expected_len: u64,
+    ) -> ClientResult<WorkerBlockSyncResult> {
+        self.client.sync_committed_block(ctx, block, expected_len).await
     }
 
     pub(crate) async fn abort_write(&self, ctx: AttemptContext, block: &WorkerWriteBlock) -> ClientResult<()> {
@@ -715,6 +752,21 @@ fn build_commit_write_request(
     })
 }
 
+fn build_sync_committed_block_request(
+    ctx: &AttemptContext,
+    block: &WorkerWriteBlock,
+    expected_len: u64,
+) -> ClientResult<proto::worker::SyncCommittedBlockRequestProto> {
+    validate_block_for_worker_sync(block)?;
+    Ok(proto::worker::SyncCommittedBlockRequestProto {
+        header: Some(ctx.data_header()),
+        group_id: Some(ShardGroupId::new(block.group_id).into()),
+        block_id: Some(block.target.block_id.into()),
+        block_stamp: block.target.block_stamp,
+        expected_block_len: expected_len,
+    })
+}
+
 fn build_abort_write_request(
     ctx: &AttemptContext,
     block: &WorkerWriteBlock,
@@ -835,6 +887,37 @@ fn worker_commit_result_from_response(
     })
 }
 
+fn worker_block_sync_result_from_response(
+    ctx: &AttemptContext,
+    block: &WorkerWriteBlock,
+    expected_len: u64,
+    response: proto::worker::SyncCommittedBlockResponseProto,
+) -> ClientResult<WorkerBlockSyncResult> {
+    parse_worker_control_header(ctx, response.header.as_ref())?;
+    if response.effective_block_len != expected_len {
+        return Err(side_effect_response_body_mismatch(
+            "SyncCommittedBlock",
+            format!(
+                "effective_block_len expected {}, got {}",
+                expected_len, response.effective_block_len
+            ),
+        ));
+    }
+    if response.block_stamp != block.target.block_stamp {
+        return Err(side_effect_response_body_mismatch(
+            "SyncCommittedBlock",
+            format!(
+                "block_stamp expected {}, got {}",
+                block.target.block_stamp, response.block_stamp
+            ),
+        ));
+    }
+    Ok(WorkerBlockSyncResult {
+        effective_block_len: response.effective_block_len,
+        block_stamp: response.block_stamp,
+    })
+}
+
 fn validate_abort_write_response(
     ctx: &AttemptContext,
     response: proto::worker::AbortWriteResponseProto,
@@ -873,6 +956,20 @@ fn validate_fencing_token(target: &WriteTarget) -> ClientResult<()> {
     if token.block_id != block {
         return Err(ClientError::InvalidLayout(
             "write target fencing_token block_id must match target block_id".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_block_for_worker_sync(block: &WorkerWriteBlock) -> ClientResult<()> {
+    if block.group_id == 0 {
+        return Err(ClientError::InvalidArgument(
+            "worker block sync requires non-zero group_id".to_string(),
+        ));
+    }
+    if block.target.block_stamp == 0 {
+        return Err(ClientError::InvalidArgument(
+            "worker block sync requires non-zero block_stamp".to_string(),
         ));
     }
     Ok(())
@@ -1920,6 +2017,19 @@ mod tests {
                 effective_block_len: effective_len,
                 block_stamp: block.target.block_stamp,
                 written_through: effective_len,
+            })
+        }
+
+        async fn sync_committed_block(
+            &self,
+            _ctx: AttemptContext,
+            block: &WorkerWriteBlock,
+            expected_len: u64,
+        ) -> ClientResult<WorkerBlockSyncResult> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(WorkerBlockSyncResult {
+                effective_block_len: expected_len,
+                block_stamp: block.target.block_stamp,
             })
         }
 

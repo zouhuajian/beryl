@@ -9,7 +9,8 @@ use types::ids::StreamId;
 
 use crate::data::core::{
     AbortWriteRequest, AbortWriteResult, CommitWriteRequest, CommitWriteResult, ReadFrame, ReadOpenRequest,
-    ReadOpenResult, WorkerCoreResult, WriteFrame, WriteFrameResult, WriteOpenRequest, WriteOpenResult,
+    ReadOpenResult, SyncCommittedBlockRequest, SyncCommittedBlockResult, WorkerCoreResult, WriteFrame,
+    WriteFrameResult, WriteOpenRequest, WriteOpenResult,
 };
 use crate::error::WorkerError;
 use crate::net::config::WorkerPeerNetConfig;
@@ -164,6 +165,23 @@ impl WorkerPeerClient for WorkerPeerClientRouter {
         match endpoint.protocol {
             WorkerNetProtocol::Grpc => self.grpc("commit_write")?.commit_write(endpoint, req, ctx).await,
             other => Err(self.protocol_unimplemented(other, "commit_write")),
+        }
+    }
+
+    async fn sync_committed_block(
+        &self,
+        endpoint: &WorkerNetEndpoint,
+        req: SyncCommittedBlockRequest,
+        ctx: RequestHeader,
+    ) -> WorkerCoreResult<SyncCommittedBlockResult> {
+        self.ensure_enabled(endpoint.protocol, "sync_committed_block")?;
+        match endpoint.protocol {
+            WorkerNetProtocol::Grpc => {
+                self.grpc("sync_committed_block")?
+                    .sync_committed_block(endpoint, req, ctx)
+                    .await
+            }
+            other => Err(self.protocol_unimplemented(other, "sync_committed_block")),
         }
     }
 

@@ -39,5 +39,8 @@ pub type AbortFileWriteOp = proto::metadata::AbortFileWriteRequestProto;
 /// RenewLease request operation.
 pub type RenewLeaseOp = proto::metadata::RenewLeaseRequestProto;
 
+/// SyncWrite request operation.
+pub type SyncWriteOp = proto::metadata::SyncWriteRequestProto;
+
 /// Msync request operation.
 pub type MsyncOp = proto::metadata::MsyncRequestProto;

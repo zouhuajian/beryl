@@ -13,7 +13,7 @@ use proto::worker::{
     AbortWriteRequestProto, AbortWriteResponseProto, CommitWriteRequestProto, CommitWriteResponseProto,
     DataRequestHeaderProto, DataResponseHeaderProto, OpenReadStreamRequestProto, OpenReadStreamResponseProto,
     OpenWriteStreamRequestProto, OpenWriteStreamResponseProto, ReadStreamRequestProto, ReadStreamResponseProto,
-    WriteStreamRequestProto, WriteStreamResponseProto,
+    SyncCommittedBlockRequestProto, SyncCommittedBlockResponseProto, WriteStreamRequestProto, WriteStreamResponseProto,
 };
 use tonic::{Request, Response, Status};
 
@@ -124,6 +124,18 @@ impl WorkerDataService for MockWorkerServer {
             effective_block_len: 0,
             block_stamp: 0,
             written_through: 0,
+        }))
+    }
+
+    async fn sync_committed_block(
+        &self,
+        request: Request<SyncCommittedBlockRequestProto>,
+    ) -> Result<Response<SyncCommittedBlockResponseProto>, Status> {
+        let request = request.into_inner();
+        Ok(Response::new(SyncCommittedBlockResponseProto {
+            header: Some(self.placeholder_header(request.header, "SyncCommittedBlock")),
+            effective_block_len: 0,
+            block_stamp: 0,
         }))
     }
 

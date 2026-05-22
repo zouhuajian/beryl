@@ -71,7 +71,7 @@ flowchart TB
 | --- | --- |
 | 已实现 | 薄 `main.rs`、runtime composition、root readiness、FileSystemService 新 16 RPC、inode/dentry/attrs authority、mount_epoch/route_epoch/state watermark freshness、durable single `file_version`、write lifecycle 主链路、worker register 持久化、block report soft locations、delete intent Raft apply/status 更新。 |
 | 部分实现 | maintenance/repair/delete framework、worker command heartbeat pull、full block report lease、GC/orphan/overrep intent creation、repair queue ack/retry、client refresh/replay 配合。 |
-| 未实现 | recursive directory delete、Hflush/Hsync barrier、ACL/Ranger、完整 UFS-backed namespace、生产级 repair/move/evict/rebalance 策略、多 group msync、follower read 全路径、专用 mount refresh API、path->group route cache。 |
+| 未实现 | recursive directory delete、ACL/Ranger、完整 UFS-backed namespace、生产级 repair/move/evict/rebalance 策略、多 group msync、follower read 全路径、专用 mount refresh API、path->group route cache。 |
 | 历史残留 | `MemoryStateStore` route-epoch 测试 helper。 |
 | 可保留但暂缓 | maintenance/repair 的 RepairPlanner/RepairQueue/OrphanQueue、maintenance/delete 的 DeleteExecutor、MaintenanceService、authz extension point、共享 `metrics.rs` 导出聚合。 |
 
@@ -167,7 +167,7 @@ root mount bootstrap：
 | namespace mutation | `CreateDirectory`, `Delete`, `Rename` | 已实现主链路；`Delete(recursive=true)` 对目录未实现；rename overwrite cleanup 已实现。 |
 | read plan | `OpenFile`, `GetBlockLocations` | 已实现 read-plan API；返回 external `FileBlockLocation`，worker locations 是 soft route hints。 |
 | write lifecycle | `CreateFile`, `AppendFile`, `AddBlock`, `CommitFile`, `AbortFileWrite`, `RenewLease` | 已实现主链路；`WriteSession` 是内部 runtime concept，不是 public RPC 命名。 |
-| reserved barrier | `Hflush`, `Hsync` | public RPC 保留，但当前返回 structured `NotSupported`，不是 visibility/durability barrier。 |
+| write barrier | `SyncWrite` | 已实现 visibility/durability barrier；成功时发布 `target_size` 前缀并保持 write session 打开。 |
 | freshness sync | `Msync` | 已实现 production single-group local authoritative state 返回；multi-group msync 未实现。 |
 
 public surface 当前没有旧 FUSE/POSIX 残留 RPC：
@@ -200,7 +200,8 @@ commit/version 当前事实：
 
 限制：
 
-- `Hflush` / `Hsync` 当前只是 reserved public RPC，返回 structured `NotSupported`。
+- `SyncWrite(VISIBILITY)` 发布已提交 worker blocks 覆盖的 `target_size` 前缀，推进 visible file size/read-plan `file_version`，并保持 write session/lease 打开。
+- `SyncWrite(DURABILITY)` 使用同一 metadata publish path；其 durability 边界来自 client 在 metadata publication 前确保相关 worker blocks 已 durable：未提交 block 使用 `CommitWrite(require_sync=true)`，已 visibility-committed block 使用 worker block-level `SyncCommittedBlock`。当前不额外声明 UFS durability、replication quorum 或独立持久 durability marker。
 - Truncate grow 未实现；Truncate shrink 在 state machine 层存在并推进 file_version，但当前没有 public FileSystem RPC。
 - `WriteSession` 是 runtime-only 内部对象，不是持久 metadata identity；持久 identity 是 inode/data_handle/file_version，session identity 是 write handle/fencing/open_epoch。
 
@@ -428,7 +429,7 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 高优先级 correctness / capability gaps：
 
 - Recursive directory delete 未实现；`Delete(recursive=true)` 对目录返回 `NotSupported`，不遍历、不局部删除、不创建 delete intent。
-- `Hflush` / `Hsync` 不是 barrier，只是 structured `NotSupported`。
+- `SyncWrite` 已实现 visibility/durability publish；当前 durability 不包含 UFS sync、replication quorum 或独立 durability marker。
 - UFS-backed namespace 未实现、未接入 FileSystemService 主路径，且 metadata runtime 不再保留 UFS metadata proxy。
 - ACL/Ranger 配置存在但 fail fast，不是 MVP/stub。
 - repair/delete/rebalance 不能描述为完整生产级自治系统。

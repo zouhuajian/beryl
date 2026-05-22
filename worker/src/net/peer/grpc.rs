@@ -9,7 +9,8 @@ use types::ids::StreamId;
 
 use crate::data::core::{
     AbortWriteRequest, AbortWriteResult, CommitWriteRequest, CommitWriteResult, ReadFrame, ReadOpenRequest,
-    ReadOpenResult, WorkerCoreResult, WriteFrame, WriteFrameResult, WriteOpenRequest, WriteOpenResult,
+    ReadOpenResult, SyncCommittedBlockRequest, SyncCommittedBlockResult, WorkerCoreResult, WriteFrame,
+    WriteFrameResult, WriteOpenRequest, WriteOpenResult,
 };
 use crate::error::WorkerError;
 use crate::net::endpoint::WorkerNetEndpoint;
@@ -73,6 +74,15 @@ impl WorkerPeerClient for GrpcWorkerPeerClient {
         Err(peer_grpc_unimplemented("commit_write"))
     }
 
+    async fn sync_committed_block(
+        &self,
+        _endpoint: &WorkerNetEndpoint,
+        _req: SyncCommittedBlockRequest,
+        _ctx: RequestHeader,
+    ) -> WorkerCoreResult<SyncCommittedBlockResult> {
+        Err(peer_grpc_unimplemented("sync_committed_block"))
+    }
+
     async fn abort_write(
         &self,
         _endpoint: &WorkerNetEndpoint,
@@ -98,7 +108,9 @@ mod tests {
     use types::lease::FencingToken;
 
     use super::*;
-    use crate::data::core::{AbortWriteRequest, CommitWriteRequest, WriteFrame, WriteOpenRequest};
+    use crate::data::core::{
+        AbortWriteRequest, CommitWriteRequest, SyncCommittedBlockRequest, WriteFrame, WriteOpenRequest,
+    };
     use crate::net::capability::WorkerNetCapabilities;
     use crate::net::endpoint::WorkerEndpointRole;
     use crate::net::protocol::WorkerNetProtocol;
@@ -182,6 +194,21 @@ mod tests {
                         effective_block_len: 4,
                         block_stamp: 1,
                         require_sync: false,
+                    },
+                    header.clone(),
+                )
+                .await
+                .unwrap_err(),
+        );
+        assert_peer_grpc_unimplemented(
+            client
+                .sync_committed_block(
+                    &endpoint,
+                    SyncCommittedBlockRequest {
+                        group_id: ShardGroupId::new(3),
+                        block_id,
+                        block_stamp: 1,
+                        expected_block_len: 4,
                     },
                     header.clone(),
                 )

@@ -194,6 +194,17 @@ pub enum Command {
         lease_epoch: u64,
         commit_mode: FileCommitMode,
     },
+    /// Publish a committed prefix while keeping the write session open.
+    SyncWrite {
+        dedup: DedupKey,
+        inode_id: InodeId,
+        extents: Vec<types::fs::Extent>,
+        target_size: u64,
+        lease_id: types::ids::LeaseId,
+        open_epoch: u64,
+        lease_epoch: u64,
+        commit_mode: FileCommitMode,
+    },
     /// Truncate file (shrink).
     Truncate {
         dedup: DedupKey,
@@ -228,6 +239,7 @@ impl Command {
             | Command::Rename { dedup, .. }
             | Command::SetAttr { dedup, .. }
             | Command::CloseWrite { dedup, .. }
+            | Command::SyncWrite { dedup, .. }
             | Command::Truncate { dedup, .. } => dedup,
         }
     }
@@ -352,6 +364,15 @@ enum FingerprintView {
         inode_id: InodeId,
         extents: Vec<types::fs::Extent>,
         final_size: u64,
+        lease_id: types::ids::LeaseId,
+        open_epoch: u64,
+        lease_epoch: u64,
+        commit_mode: FileCommitMode,
+    },
+    SyncWrite {
+        inode_id: InodeId,
+        extents: Vec<types::fs::Extent>,
+        target_size: u64,
         lease_id: types::ids::LeaseId,
         open_epoch: u64,
         lease_epoch: u64,
@@ -534,6 +555,24 @@ impl From<&Command> for FingerprintView {
                 inode_id: *inode_id,
                 extents: extents.clone(),
                 final_size: *final_size,
+                lease_id: *lease_id,
+                open_epoch: *open_epoch,
+                lease_epoch: *lease_epoch,
+                commit_mode: *commit_mode,
+            },
+            Command::SyncWrite {
+                inode_id,
+                extents,
+                target_size,
+                lease_id,
+                open_epoch,
+                lease_epoch,
+                commit_mode,
+                ..
+            } => FingerprintView::SyncWrite {
+                inode_id: *inode_id,
+                extents: extents.clone(),
+                target_size: *target_size,
                 lease_id: *lease_id,
                 open_epoch: *open_epoch,
                 lease_epoch: *lease_epoch,

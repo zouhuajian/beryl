@@ -9,7 +9,8 @@ use types::ids::StreamId;
 
 use crate::data::core::{
     AbortWriteRequest, AbortWriteResult, CommitWriteRequest, CommitWriteResult, ReadFrame, ReadOpenRequest,
-    ReadOpenResult, WorkerCoreResult, WriteFrame, WriteFrameResult, WriteOpenRequest, WriteOpenResult,
+    ReadOpenResult, SyncCommittedBlockRequest, SyncCommittedBlockResult, WorkerCoreResult, WriteFrame,
+    WriteFrameResult, WriteOpenRequest, WriteOpenResult,
 };
 use crate::net::endpoint::WorkerNetEndpoint;
 
@@ -50,6 +51,13 @@ pub trait WorkerPeerClient: Send + Sync {
         req: CommitWriteRequest,
         ctx: RequestHeader,
     ) -> WorkerCoreResult<CommitWriteResult>;
+
+    async fn sync_committed_block(
+        &self,
+        endpoint: &WorkerNetEndpoint,
+        req: SyncCommittedBlockRequest,
+        ctx: RequestHeader,
+    ) -> WorkerCoreResult<SyncCommittedBlockResult>;
 
     async fn abort_write(
         &self,

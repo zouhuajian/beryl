@@ -8,16 +8,16 @@ use proto::common::{BlockIdProto, ByteRangeProto, FencingTokenProto, ShardGroupI
 use proto::convert as proto_convert;
 use proto::worker::{
     AbortWriteRequestProto, ChecksumKindProto, CommitWriteRequestProto, DataRequestHeaderProto,
-    OpenReadStreamRequestProto, OpenWriteStreamRequestProto, ReadStreamResponseProto, WriteStreamRequestProto,
-    WriteStreamResponseProto,
+    OpenReadStreamRequestProto, OpenWriteStreamRequestProto, ReadStreamResponseProto, SyncCommittedBlockRequestProto,
+    WriteStreamRequestProto, WriteStreamResponseProto,
 };
 use types::chunk::ByteRange;
 use types::ids::{BlockId, ShardGroupId, StreamId};
 use types::lease::FencingToken;
 
 use crate::data::core::{
-    AbortWriteRequest, CommitWriteRequest, ReadFrame, ReadOpenRequest, WorkerCoreResult, WriteFrame, WriteFrameResult,
-    WriteOpenRequest,
+    AbortWriteRequest, CommitWriteRequest, ReadFrame, ReadOpenRequest, SyncCommittedBlockRequest, WorkerCoreResult,
+    WriteFrame, WriteFrameResult, WriteOpenRequest,
 };
 use crate::error::WorkerError;
 use crate::store::block::ChecksumKind;
@@ -111,6 +111,19 @@ pub fn commit_write_request_to_proto(req: CommitWriteRequest, ctx: &RequestHeade
     }
 }
 
+pub fn sync_committed_block_request_to_proto(
+    req: SyncCommittedBlockRequest,
+    ctx: &RequestHeader,
+) -> SyncCommittedBlockRequestProto {
+    SyncCommittedBlockRequestProto {
+        header: Some(request_header_to_data_proto(ctx)),
+        group_id: Some(group_id_to_proto(req.group_id)),
+        block_id: Some(block_id_to_proto(req.block_id)),
+        block_stamp: req.block_stamp,
+        expected_block_len: req.expected_block_len,
+    }
+}
+
 pub fn abort_write_request_to_proto(req: AbortWriteRequest, ctx: &RequestHeader) -> AbortWriteRequestProto {
     AbortWriteRequestProto {
         header: Some(request_header_to_data_proto(ctx)),
@@ -199,6 +212,20 @@ pub fn proto_to_commit_write_request(proto: CommitWriteRequestProto) -> WorkerCo
         effective_block_len: proto.effective_block_len,
         block_stamp: proto.block_stamp,
         require_sync: proto.require_sync,
+    })
+}
+
+pub fn proto_to_sync_committed_block_request(
+    proto: SyncCommittedBlockRequestProto,
+) -> WorkerCoreResult<SyncCommittedBlockRequest> {
+    let group_id = proto_to_group_id(proto.group_id, "group_id")?;
+    let block_id = proto_to_block_id(proto.block_id, "block_id")?;
+
+    Ok(SyncCommittedBlockRequest {
+        group_id,
+        block_id,
+        block_stamp: proto.block_stamp,
+        expected_block_len: proto.expected_block_len,
     })
 }
 

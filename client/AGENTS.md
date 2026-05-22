@@ -86,7 +86,7 @@ Rules:
 - `data_handle_id` is stable data-plane/data-version identity
 - `file_handle` is a session-scoped open-write handle
 - do not collapse routing keys, cache keys, and write-session identity into one field
-- keep session/open state explicit when required for fsync/hflush/hsync/close semantics
+- keep session/open state explicit when required for SyncWrite visibility/durability/close semantics
 
 Any change touching identity must audit:
 

@@ -210,6 +210,12 @@ pub struct PublishReadyRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncReadyBlockRequest {
+    pub group_id: ShardGroupId,
+    pub block_id: BlockId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockPaths {
     pub data_path: PathBuf,
     pub meta_path: PathBuf,
@@ -396,6 +402,27 @@ impl FullBlockFileStore {
         Ok(Bytes::from(buf))
     }
 
+    /// Durably syncs an already Ready block's data and sidecar metadata.
+    pub fn sync_ready_block(&self, req: SyncReadyBlockRequest) -> StoreResult<BlockMetaPayload> {
+        let paths = self.paths(req.group_id, req.block_id);
+        let meta = self.load_meta(req.group_id, req.block_id)?;
+        ensure_readable(&meta)?;
+        validate_ready_data_file(&paths, &meta)?;
+
+        let data = OpenOptions::new()
+            .read(true)
+            .open(&paths.data_path)
+            .map_err(|err| map_data_open_error(err, "ready block data file is missing"))?;
+        data.sync_all()?;
+
+        let meta_file = OpenOptions::new()
+            .read(true)
+            .open(&paths.meta_path)
+            .map_err(|err| map_meta_open_error(err, "ready block meta file is missing"))?;
+        meta_file.sync_all()?;
+        Ok(meta)
+    }
+
     pub fn recover_block(&self, group_id: ShardGroupId, block_id: BlockId) -> StoreResult<RecoveredBlock> {
         let paths = self.paths(group_id, block_id);
         let meta = self.load_meta(group_id, block_id)?;
@@ -518,6 +545,8 @@ pub trait LocalBlockStore {
 
     fn load_meta(&self, group_id: ShardGroupId, block_id: BlockId) -> StoreResult<BlockMetaPayload>;
 
+    fn sync_ready_block(&self, req: SyncReadyBlockRequest) -> StoreResult<BlockMetaPayload>;
+
     fn recover_block(&self, group_id: ShardGroupId, block_id: BlockId) -> StoreResult<RecoveredBlock>;
 
     fn delete_block(&self, group_id: ShardGroupId, block_id: BlockId) -> StoreResult<()>;
@@ -544,6 +573,10 @@ impl LocalBlockStore for FullBlockFileStore {
 
     fn load_meta(&self, group_id: ShardGroupId, block_id: BlockId) -> StoreResult<BlockMetaPayload> {
         FullBlockFileStore::load_meta(self, group_id, block_id)
+    }
+
+    fn sync_ready_block(&self, req: SyncReadyBlockRequest) -> StoreResult<BlockMetaPayload> {
+        FullBlockFileStore::sync_ready_block(self, req)
     }
 
     fn recover_block(&self, group_id: ShardGroupId, block_id: BlockId) -> StoreResult<RecoveredBlock> {
@@ -930,6 +963,14 @@ fn map_data_open_error(err: std::io::Error, message: &str) -> WorkerError {
 fn map_staging_data_open_error(err: std::io::Error, message: &str) -> WorkerError {
     if err.kind() == std::io::ErrorKind::NotFound {
         not_found(message)
+    } else {
+        WorkerError::from(err)
+    }
+}
+
+fn map_meta_open_error(err: std::io::Error, message: &str) -> WorkerError {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        corrupt(message)
     } else {
         WorkerError::from(err)
     }

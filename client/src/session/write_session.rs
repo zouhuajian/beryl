@@ -160,7 +160,7 @@ impl WriteSession {
             worker_block,
             written_len,
             commit_seq,
-            worker_committed: false,
+            worker_commit_level: WorkerCommitLevel::Uncommitted,
         });
         self.cursor = final_offset;
         Ok(())
@@ -289,7 +289,7 @@ impl WriteSession {
     pub(crate) fn prepare_abort_cleanup(&mut self, client_id: ClientId) -> ClientResult<AbortCleanupPlan> {
         match self.state {
             WriteSessionState::Open => {
-                if self.pending_blocks.iter().any(PendingBlock::worker_committed) {
+                if self.pending_blocks.iter().any(PendingBlock::has_worker_commit) {
                     self.state = WriteSessionState::AbortUnknown;
                     return Err(ClientError::UnknownOutcome(
                         "cannot safely abort after a worker block commit succeeded".to_string(),
@@ -612,7 +612,7 @@ pub(crate) struct PendingBlock {
     worker_block: WorkerWriteBlock,
     written_len: u64,
     commit_seq: u64,
-    worker_committed: bool,
+    worker_commit_level: WorkerCommitLevel,
 }
 
 impl PendingBlock {
@@ -636,14 +636,55 @@ impl PendingBlock {
         self.commit_seq
     }
 
-    /// Whether CommitWrite already succeeded for this block.
-    pub(crate) fn worker_committed(&self) -> bool {
-        self.worker_committed
+    /// Whether any CommitWrite already succeeded for this block.
+    pub(crate) fn has_worker_commit(&self) -> bool {
+        self.worker_commit_level != WorkerCommitLevel::Uncommitted
     }
 
-    /// Mark worker commit as successful.
-    pub(crate) fn mark_worker_committed(&mut self) {
-        self.worker_committed = true;
+    /// Current worker-observed commit level for this block.
+    pub(crate) fn worker_commit_level(&self) -> WorkerCommitLevel {
+        self.worker_commit_level
+    }
+
+    /// Mark worker commit as successful at the visibility or durability level.
+    pub(crate) fn mark_worker_committed(&mut self, require_sync: bool) {
+        self.worker_commit_level = WorkerCommitLevel::from_require_sync(require_sync);
+    }
+}
+
+/// Client-observed worker commit strength for a pending write block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerCommitLevel {
+    Uncommitted,
+    Visible,
+    Durable,
+}
+
+impl WorkerCommitLevel {
+    /// Required level for the existing non-sync close path.
+    pub(crate) const CLOSE_REQUIRED: Self = Self::Visible;
+
+    /// Return the required worker commit level for a CommitWrite request.
+    pub(crate) fn from_require_sync(require_sync: bool) -> Self {
+        if require_sync {
+            Self::Durable
+        } else {
+            Self::Visible
+        }
+    }
+
+    pub(crate) fn satisfies(self, required: Self) -> bool {
+        matches!(
+            (self, required),
+            (Self::Durable, Self::Durable | Self::Visible)
+                | (Self::Visible, Self::Visible)
+                | (Self::Uncommitted, Self::Uncommitted)
+        )
+    }
+
+    /// Whether CommitWrite must request worker-side sync for this level.
+    pub(crate) fn requires_sync(self) -> bool {
+        matches!(self, Self::Durable)
     }
 }
 
@@ -1146,7 +1187,7 @@ mod tests {
         session
             .push_pending_block(write_target(302, 0, 0, 5), worker_block(302, 0, 0, 5, 9), 5, 1)
             .expect("pending block");
-        session.pending_blocks[0].mark_worker_committed();
+        session.pending_blocks[0].mark_worker_committed(false);
 
         let err = match session.prepare_abort_cleanup(ClientId::new(7)) {
             Ok(_) => panic!("committed worker block cannot be safely aborted"),

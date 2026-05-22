@@ -46,8 +46,7 @@ fn path_service_keeps_complete_filesystem_service_view() {
         "async fn commit_file",
         "async fn abort_file_write",
         "async fn renew_lease",
-        "async fn hflush",
-        "async fn hsync",
+        "async fn sync_write",
         "async fn msync",
     ] {
         assert!(
@@ -121,8 +120,7 @@ fn session_rpc_handlers_do_not_call_permission_checker() {
         "async fn commit_file",
         "async fn abort_file_write",
         "async fn renew_lease",
-        "async fn hflush",
-        "async fn hsync",
+        "async fn sync_write",
     ] {
         let start = source
             .find(handler)

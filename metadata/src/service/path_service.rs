@@ -13,7 +13,7 @@
 use super::domain::{
     AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CreateInput, DeleteEmptyDirInput,
     DeleteTreeInput, FileRange, Freshness, GetAttrInput, GetFileLayoutInput, MkdirInput, OpenWriteInput, ReadDirInput,
-    RenameInput, RenewLeaseInput, UnlinkInput,
+    RenameInput, RenewLeaseInput, SyncWriteInput, SyncWriteMode, UnlinkInput,
 };
 use super::guard::{GuardChain, GuardFailure, LeadershipChecker};
 use super::MsyncHandler;
@@ -67,8 +67,7 @@ impl_header_response!(
     CommitFileResponseProto,
     AbortFileWriteResponseProto,
     RenewLeaseResponseProto,
-    HflushResponseProto,
-    HsyncResponseProto,
+    SyncWriteResponseProto,
     MsyncResponseProto,
 );
 
@@ -1582,49 +1581,110 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     }
 
     #[instrument(skip(self), fields(call_id, client_id))]
-    async fn hflush(&self, request: Request<HflushRequestProto>) -> Result<Response<HflushResponseProto>, Status> {
+    async fn sync_write(
+        &self,
+        request: Request<SyncWriteRequestProto>,
+    ) -> Result<Response<SyncWriteResponseProto>, Status> {
         let req = request.into_inner();
         let req_ctx = request_context_from_proto(&req.header);
-        guard_or_error!(
-            self,
-            req,
-            HflushResponseProto,
-            self.guard_chain.check_meta_write(&req_ctx)
-        );
-        error_response!(
-            HflushResponseProto,
-            self.header_from_path_error(
-                &req.header,
-                MetadataError::NotSupported(
-                    "Hflush is reserved but not supported until metadata visibility barrier semantics are defined"
-                        .to_string(),
-                ),
-                None,
-            )
-        )
-    }
-
-    #[instrument(skip(self), fields(call_id, client_id))]
-    async fn hsync(&self, request: Request<HsyncRequestProto>) -> Result<Response<HsyncResponseProto>, Status> {
-        let req = request.into_inner();
-        let req_ctx = request_context_from_proto(&req.header);
-        guard_or_error!(
-            self,
-            req,
-            HsyncResponseProto,
-            self.guard_chain.check_meta_write(&req_ctx)
-        );
-        error_response!(
-            HsyncResponseProto,
-            self.header_from_path_error(
-                &req.header,
-                MetadataError::NotSupported(
-                    "Hsync is reserved but not supported until metadata durability barrier semantics are defined"
-                        .to_string(),
-                ),
-                None,
-            )
-        )
+        let handle = match Self::write_handle_or_error(&req.header, req.write_handle) {
+            Ok(handle) => handle,
+            Err(header) => return response_with_header!(SyncWriteResponseProto::default(), *header),
+        };
+        if let Some(session) = self.fs_core.write_session_for_handle(handle.handle_id) {
+            guard_or_error!(
+                self,
+                req,
+                SyncWriteResponseProto,
+                self.guard_chain.check_data_write(&req_ctx, session.mount_id)
+            );
+        } else {
+            guard_or_error!(
+                self,
+                req,
+                SyncWriteResponseProto,
+                self.guard_chain.check_meta_write(&req_ctx)
+            );
+        }
+        let data_handle_id = match req.data_handle_id.as_ref() {
+            Some(data_handle_id) => DataHandleId::new(data_handle_id.value),
+            None => {
+                return error_response!(
+                    SyncWriteResponseProto,
+                    self.header_from_path_error(
+                        &req.header,
+                        MetadataError::InvalidArgument("missing data_handle_id".to_string()),
+                        None,
+                    )
+                )
+            }
+        };
+        let mode = match WriteSyncModeProto::try_from(req.mode) {
+            Ok(WriteSyncModeProto::WriteSyncModeVisibility) => SyncWriteMode::Visibility,
+            Ok(WriteSyncModeProto::WriteSyncModeDurability) => SyncWriteMode::Durability,
+            Ok(WriteSyncModeProto::WriteSyncModeUnspecified) | Err(_) => {
+                return error_response!(
+                    SyncWriteResponseProto,
+                    self.header_from_path_error(
+                        &req.header,
+                        MetadataError::InvalidArgument("SyncWrite mode must be visibility or durability".to_string()),
+                        None,
+                    )
+                )
+            }
+        };
+        let mut committed_blocks = Vec::with_capacity(req.committed_blocks.len());
+        for block in req.committed_blocks {
+            if block.block_id.as_ref().map(|id| id.data_handle_id) != Some(data_handle_id.as_raw()) {
+                return error_response!(
+                    SyncWriteResponseProto,
+                    self.header_from_path_error(
+                        &req.header,
+                        MetadataError::InvalidArgument(
+                            "committed block data_handle_id does not match request".to_string()
+                        ),
+                        None,
+                    )
+                );
+            }
+            match Self::committed_block_from_proto(block) {
+                Ok(committed_block) => committed_blocks.push(committed_block),
+                Err(err) => {
+                    return error_response!(
+                        SyncWriteResponseProto,
+                        self.header_from_path_error(&req.header, err, None)
+                    )
+                }
+            }
+        }
+        match self
+            .fs_core
+            .execute_sync_write(SyncWriteInput {
+                ctx: req_ctx.clone(),
+                file_handle: handle.handle_id,
+                lease_id: lease_id_from_proto(handle.lease_id),
+                lease_epoch: handle.lease_epoch,
+                open_epoch: handle.open_epoch,
+                fencing_token: presented_fencing_from_proto(handle.fencing_token),
+                data_handle_id,
+                committed_blocks,
+                target_size: req.target_size,
+                flags: req.flags,
+                mode,
+                freshness: Self::freshness_from_header(&req.header),
+            })
+            .await
+        {
+            Ok(success) => response_with_header!(
+                SyncWriteResponseProto {
+                    synced_size: success.payload.synced_size,
+                    file_version: success.payload.file_version,
+                    ..Default::default()
+                },
+                ok_header_from_core_success(&req_ctx, &success)
+            ),
+            Err(failure) => error_response!(SyncWriteResponseProto, header_from_core_failure(&req_ctx, &failure)),
+        }
     }
 }
 

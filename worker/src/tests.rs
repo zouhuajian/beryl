@@ -19,7 +19,7 @@ mod tests {
     use proto::worker::ChecksumKindProto;
     use proto::worker::{
         AbortWriteRequestProto, CommitWriteRequestProto, DataRequestHeaderProto, OpenReadStreamRequestProto,
-        OpenWriteStreamRequestProto, ReadStreamRequestProto, WriteStreamRequestProto,
+        OpenWriteStreamRequestProto, ReadStreamRequestProto, SyncCommittedBlockRequestProto, WriteStreamRequestProto,
     };
     use tempfile::TempDir;
     use types::chunk::ByteRange;
@@ -27,12 +27,12 @@ mod tests {
     use types::lease::FencingToken;
 
     use crate::data::convert::{
-        proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_open_request, proto_to_write_frame,
-        proto_to_write_open_request,
+        proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_open_request,
+        proto_to_sync_committed_block_request, proto_to_write_frame, proto_to_write_open_request,
     };
     use crate::data::core::{
-        AbortWriteRequest, CommitWriteRequest, RangeMapper, ReadOpenRequest, StreamContext, StreamMode, WorkerCore,
-        WorkerCoreResult, WriteFrame, WriteOpenRequest,
+        AbortWriteRequest, CommitWriteRequest, RangeMapper, ReadOpenRequest, StreamContext, StreamMode,
+        SyncCommittedBlockRequest, WorkerCore, WorkerCoreResult, WriteFrame, WriteOpenRequest,
     };
     use crate::error::WorkerError;
     use crate::net::server::grpc::WorkerDataServiceImpl;
@@ -155,6 +155,15 @@ mod tests {
         }
     }
 
+    fn sync_committed_block_request(block_stamp: u64, expected_block_len: u64) -> SyncCommittedBlockRequest {
+        SyncCommittedBlockRequest {
+            group_id: group_id(),
+            block_id: block_id(),
+            block_stamp,
+            expected_block_len,
+        }
+    }
+
     fn stream_context() -> StreamContext {
         StreamContext {
             stream_id: stream_id(),
@@ -274,6 +283,16 @@ mod tests {
             token: Some(test_token_proto()),
             commit_seq,
             require_sync: true,
+        }
+    }
+
+    fn sync_committed_block_proto(block_stamp: u64, expected_block_len: u64) -> SyncCommittedBlockRequestProto {
+        SyncCommittedBlockRequestProto {
+            header: Some(test_header()),
+            group_id: Some(test_group_id_proto()),
+            block_id: Some(test_block_id_proto()),
+            block_stamp,
+            expected_block_len,
         }
     }
 
@@ -435,6 +454,16 @@ mod tests {
         assert_eq!(abort.group_id, group_id());
         assert_eq!(abort.block_id, block_id());
         assert_eq!(abort.token.owner, ClientId::new(9));
+    }
+
+    #[test]
+    fn converts_sync_committed_block_request_to_domain() {
+        let sync = proto_to_sync_committed_block_request(sync_committed_block_proto(BLOCK_STAMP, BLOCK_SIZE)).unwrap();
+
+        assert_eq!(sync.group_id, group_id());
+        assert_eq!(sync.block_id, block_id());
+        assert_eq!(sync.block_stamp, BLOCK_STAMP);
+        assert_eq!(sync.expected_block_len, BLOCK_SIZE);
     }
 
     #[test]
@@ -775,6 +804,107 @@ mod tests {
         .expect("commit write");
 
         assert!(core.stream_manager().get(open.stream_id).await.is_none());
+        assert_not_found(
+            core.commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                commit_seq: 1,
+                effective_block_len: BLOCK_SIZE,
+                ..commit_write_request()
+            })
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_committed_block_succeeds_after_terminal_commit_without_stream() {
+        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: payload(),
+            checksum32: 0,
+        })
+        .await
+        .expect("write frame");
+        core.commit_write(CommitWriteRequest {
+            stream_id: open.stream_id,
+            commit_seq: 1,
+            effective_block_len: BLOCK_SIZE,
+            require_sync: false,
+            ..commit_write_request()
+        })
+        .await
+        .expect("visibility commit");
+        assert!(core.stream_manager().get(open.stream_id).await.is_none());
+
+        let result = core
+            .sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE))
+            .await
+            .expect("sync committed block");
+
+        assert_eq!(result.effective_block_len, BLOCK_SIZE);
+        assert_eq!(result.block_stamp, BLOCK_STAMP);
+    }
+
+    #[tokio::test]
+    async fn sync_committed_block_rejects_missing_wrong_generation_and_uncommitted_block() {
+        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        assert_not_found(
+            core.sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE))
+                .await,
+        );
+
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: payload(),
+            checksum32: 0,
+        })
+        .await
+        .expect("write frame");
+        assert_not_found(
+            core.sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE))
+                .await,
+        );
+
+        core.commit_write(CommitWriteRequest {
+            stream_id: open.stream_id,
+            commit_seq: 1,
+            effective_block_len: BLOCK_SIZE,
+            ..commit_write_request()
+        })
+        .await
+        .expect("commit write");
+        assert_need_refresh(
+            core.sync_committed_block(sync_committed_block_request(BLOCK_STAMP + 1, BLOCK_SIZE))
+                .await,
+            common::error::canonical::RefreshReason::BlockStampMismatch,
+        );
+        assert_invalid_argument(
+            core.sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE - 1))
+                .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_sync_committed_block_is_idempotent() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        publish_ready_block(store.as_ref(), payload(), BLOCK_STAMP);
+
+        let first = core
+            .sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE))
+            .await
+            .expect("first sync");
+        let second = core
+            .sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE))
+            .await
+            .expect("second sync");
+
+        assert_eq!(first, second);
     }
 
     #[tokio::test]
@@ -1121,6 +1251,23 @@ mod tests {
         assert_eq!(response.effective_block_len, BLOCK_SIZE);
         assert_eq!(response.block_stamp, BLOCK_STAMP);
         assert_eq!(response.written_through, BLOCK_SIZE);
+    }
+
+    #[tokio::test]
+    async fn sync_committed_block_returns_success_for_ready_block() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+        let service = WorkerDataServiceImpl::new(Arc::new(core));
+
+        let response = service
+            .sync_committed_block(tonic::Request::new(sync_committed_block_proto(BLOCK_STAMP, BLOCK_SIZE)))
+            .await
+            .expect("sync committed block response")
+            .into_inner();
+
+        assert!(response.header.expect("header").error.is_none());
+        assert_eq!(response.effective_block_len, BLOCK_SIZE);
+        assert_eq!(response.block_stamp, BLOCK_STAMP);
     }
 
     #[tokio::test]
@@ -1569,6 +1716,24 @@ mod tests {
                 ("uint64", "effective_block_len", 2),
                 ("uint64", "block_stamp", 3),
                 ("uint64", "written_through", 4),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(proto, "SyncCommittedBlockRequestProto"),
+            vec![
+                ("worker.DataRequestHeaderProto", "header", 1),
+                ("common.ShardGroupIdProto", "group_id", 2),
+                ("common.BlockIdProto", "block_id", 3),
+                ("uint64", "block_stamp", 4),
+                ("uint64", "expected_block_len", 5),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(proto, "SyncCommittedBlockResponseProto"),
+            vec![
+                ("worker.DataResponseHeaderProto", "header", 1),
+                ("uint64", "effective_block_len", 2),
+                ("uint64", "block_stamp", 3),
             ]
         );
         assert_eq!(

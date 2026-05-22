@@ -25,8 +25,8 @@ use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::{
     get_block_locations_request_proto, AddBlockRequestProto, AppendFileRequestProto, CommitFileRequestProto,
     CommittedBlockProto, CreateDirectoryRequestProto, CreateDispositionProto, CreateFileRequestProto,
-    DeleteRequestProto, GetBlockLocationsRequestProto, GetStatusRequestProto, HflushRequestProto, HsyncRequestProto,
-    WriteHandleProto,
+    DeleteRequestProto, GetBlockLocationsRequestProto, GetStatusRequestProto, SyncWriteRequestProto, WriteHandleProto,
+    WriteSyncModeProto,
 };
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
@@ -363,6 +363,61 @@ fn worker_manager_for_write_targets() -> Arc<WorkerManager> {
             .expect("update worker runtime");
     }
     manager
+}
+
+async fn open_write_session_with_committed_block(
+    env: &PathTestEnv,
+    path: &str,
+    client_id: u64,
+) -> (WriteHandleProto, u64, CommittedBlockProto) {
+    let create = FileSystemServiceProto::create_file(
+        &env.service,
+        Request::new(CreateFileRequestProto {
+            header: header(client_id),
+            path: path.to_string(),
+            attrs: Some(proto::fs::FileAttrsProto {
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+                ..Default::default()
+            }),
+            layout: Some(proto::common::FileLayoutProto {
+                block_size: 4096,
+                chunk_size: 4096,
+                replication: 1,
+            }),
+            disposition: CreateDispositionProto::CreateNew as i32,
+            desired_len: Some(128),
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+    assert_success_header(create.header);
+
+    let write_handle = create.write_handle.expect("write handle");
+    let data_handle_id = create.data_handle_id.expect("data handle").value;
+    let target = FileSystemServiceProto::add_block(
+        &env.service,
+        Request::new(AddBlockRequestProto {
+            header: header(client_id + 1),
+            write_handle: Some(write_handle),
+            desired_len: Some(128),
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner()
+    .target
+    .expect("write target");
+    let committed = CommittedBlockProto {
+        block_id: target.block_id,
+        file_offset: target.file_offset,
+        len: target.len,
+        checksum: None,
+    };
+
+    (write_handle, data_handle_id, committed)
 }
 
 fn put_dir(env: &PathTestEnv, parent_inode_id: InodeId, name: &str, inode_id: InodeId) {
@@ -735,89 +790,116 @@ async fn root_mount_data_io_gate_is_enforced() {
 }
 
 #[tokio::test]
-async fn hflush_is_not_supported() {
-    let env = build_env(
+async fn sync_write_rejects_structural_validation_errors() {
+    let env = build_env_with_raft_and_workers(
         "/mnt/test",
         DataIoPolicy::Allow,
-        None,
-        Some(Arc::new(AlwaysLeader)),
+        Some(worker_manager_for_write_targets()),
         |_| Arc::new(NonePermissionChecker),
-    );
-    let file_inode_id = InodeId::new(9001);
-    let data_handle_id = DataHandleId::new(9001);
-    let mut attrs = FileAttrs::new();
-    attrs.size = 123;
-    env.storage
-        .put_inode(&Inode::new_file(file_inode_id, attrs, env.mount_id, data_handle_id))
-        .expect("put test file inode");
-    env.storage
-        .put_layout(file_inode_id, FileLayout::new(4096, 4096, 1))
-        .expect("put test layout");
-    let before_inode = env.storage.get_inode(file_inode_id).unwrap();
-    let before_layout = env.storage.get_layout(file_inode_id).unwrap();
+    )
+    .await;
+    let (write_handle, data_handle_id, committed) =
+        open_write_session_with_committed_block(&env, "/mnt/test/sync-validation", 40).await;
 
-    let response = FileSystemServiceProto::hflush(
+    let unspecified = FileSystemServiceProto::sync_write(
         &env.service,
-        Request::new(HflushRequestProto {
-            header: header(12),
-            write_handle: Some(WriteHandleProto {
-                handle_id: 99,
-                ..Default::default()
-            }),
-            ..Default::default()
+        Request::new(SyncWriteRequestProto {
+            header: header(42),
+            write_handle: Some(write_handle),
+            data_handle_id: Some(DataHandleIdProto { value: data_handle_id }),
+            committed_blocks: vec![committed.clone()],
+            target_size: 128,
+            mode: WriteSyncModeProto::WriteSyncModeUnspecified as i32,
+            flags: 0,
         }),
     )
     .await
     .expect("transport status must remain OK")
     .into_inner();
-    let err = header_error(response.header);
-    assert_fs_errno(&err, FsErrnoProto::FsErrnoEnotsup);
-    assert!(err.message.contains("Hflush is reserved"));
-    assert_eq!(env.storage.get_inode(file_inode_id).unwrap(), before_inode);
-    assert_eq!(env.storage.get_layout(file_inode_id).unwrap(), before_layout);
+    let err = header_error(unspecified.header);
+    assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
+    assert!(err.message.contains("SyncWrite mode"));
+
+    let missing_data_handle = FileSystemServiceProto::sync_write(
+        &env.service,
+        Request::new(SyncWriteRequestProto {
+            header: header(43),
+            write_handle: Some(write_handle),
+            data_handle_id: None,
+            committed_blocks: vec![committed.clone()],
+            target_size: 128,
+            mode: WriteSyncModeProto::WriteSyncModeVisibility as i32,
+            flags: 0,
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+    let err = header_error(missing_data_handle.header);
+    assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
+    assert!(err.message.contains("missing data_handle_id"));
+
+    let mut mismatched = committed;
+    mismatched.block_id.as_mut().expect("block id").data_handle_id += 1;
+    let mismatch = FileSystemServiceProto::sync_write(
+        &env.service,
+        Request::new(SyncWriteRequestProto {
+            header: header(44),
+            write_handle: Some(write_handle),
+            data_handle_id: Some(DataHandleIdProto { value: data_handle_id }),
+            committed_blocks: vec![mismatched],
+            target_size: 128,
+            mode: WriteSyncModeProto::WriteSyncModeVisibility as i32,
+            flags: 0,
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+    let err = header_error(mismatch.header);
+    assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
+    assert!(err.message.contains("committed block data_handle_id"));
 }
 
 #[tokio::test]
-async fn hsync_is_not_supported() {
-    let env = build_env(
+async fn sync_write_valid_request_publishes_prefix_and_keeps_session_open() {
+    let env = build_env_with_raft_and_workers(
         "/mnt/test",
         DataIoPolicy::Allow,
-        None,
-        Some(Arc::new(AlwaysLeader)),
+        Some(worker_manager_for_write_targets()),
         |_| Arc::new(NonePermissionChecker),
-    );
-    let file_inode_id = InodeId::new(9002);
-    let data_handle_id = DataHandleId::new(9002);
-    let mut attrs = FileAttrs::new();
-    attrs.size = 456;
-    env.storage
-        .put_inode(&Inode::new_file(file_inode_id, attrs, env.mount_id, data_handle_id))
-        .expect("put test file inode");
-    env.storage
-        .put_layout(file_inode_id, FileLayout::new(4096, 4096, 1))
-        .expect("put test layout");
-    let before_inode = env.storage.get_inode(file_inode_id).unwrap();
-    let before_layout = env.storage.get_layout(file_inode_id).unwrap();
-
-    let response = FileSystemServiceProto::hsync(
-        &env.service,
-        Request::new(HsyncRequestProto {
-            header: header(19),
-            write_handle: Some(WriteHandleProto {
-                handle_id: 99,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
     )
-    .await
-    .expect("transport status must remain OK")
-    .into_inner();
-    let err = header_error(response.header);
-    assert_fs_errno(&err, FsErrnoProto::FsErrnoEnotsup);
-    assert!(err.message.contains("Hsync is reserved"));
-    assert_eq!(env.storage.get_inode(file_inode_id).unwrap(), before_inode);
-    assert_eq!(env.storage.get_layout(file_inode_id).unwrap(), before_layout);
+    .await;
+    let (write_handle, data_handle_id, committed) =
+        open_write_session_with_committed_block(&env, "/mnt/test/sync-publish", 50).await;
+
+    for (idx, mode) in [
+        WriteSyncModeProto::WriteSyncModeVisibility,
+        WriteSyncModeProto::WriteSyncModeDurability,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = FileSystemServiceProto::sync_write(
+            &env.service,
+            Request::new(SyncWriteRequestProto {
+                header: header(52 + idx as u64),
+                write_handle: Some(write_handle),
+                data_handle_id: Some(DataHandleIdProto { value: data_handle_id }),
+                committed_blocks: vec![committed.clone()],
+                target_size: 128,
+                mode: mode as i32,
+                flags: 0,
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        assert_success_header(response.header);
+        assert_eq!(response.synced_size, 128);
+        assert!(response.file_version.is_some());
+        assert!(env.write_session_manager.get_session(write_handle.handle_id).is_some());
+    }
 }
 
 #[tokio::test]

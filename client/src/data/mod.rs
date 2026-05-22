@@ -41,6 +41,13 @@ pub(crate) trait WorkerDataClient: Send + Sync {
         require_sync: bool,
     ) -> ClientResult<WorkerCommitResult>;
 
+    async fn sync_committed_block(
+        &self,
+        ctx: AttemptContext,
+        block: &WorkerWriteBlock,
+        expected_len: u64,
+    ) -> ClientResult<WorkerBlockSyncResult>;
+
     async fn abort_write(&self, ctx: AttemptContext, block: &WorkerWriteBlock) -> ClientResult<()>;
 }
 
@@ -79,6 +86,15 @@ pub(crate) struct WorkerCommitResult {
     pub(crate) block_stamp: u64,
     /// Contiguous byte prefix written into the staging block.
     pub(crate) written_through: u64,
+}
+
+/// Worker block-level durable sync result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WorkerBlockSyncResult {
+    /// Effective block length validated by the worker.
+    pub(crate) effective_block_len: u64,
+    /// Metadata-assigned block stamp persisted by the worker.
+    pub(crate) block_stamp: u64,
 }
 
 pub(crate) use worker::DataPlaneBoundary;

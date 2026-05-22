@@ -15,14 +15,14 @@ use proto::worker::{
     AbortWriteRequestProto, AbortWriteResponseProto, CommitWriteRequestProto, CommitWriteResponseProto,
     DataRequestHeaderProto, DataResponseHeaderProto, OpenReadStreamRequestProto, OpenReadStreamResponseProto,
     OpenWriteStreamRequestProto, OpenWriteStreamResponseProto, ReadStreamRequestProto, ReadStreamResponseProto,
-    WriteStreamRequestProto, WriteStreamResponseProto,
+    SyncCommittedBlockRequestProto, SyncCommittedBlockResponseProto, WriteStreamRequestProto, WriteStreamResponseProto,
 };
 use tonic::transport as tonic_net;
 use tonic::{Request, Response, Status};
 
 use crate::data::convert::{
     proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_open_request, proto_to_stream_id,
-    proto_to_write_frame, proto_to_write_open_request, stream_id_to_proto,
+    proto_to_sync_committed_block_request, proto_to_write_frame, proto_to_write_open_request, stream_id_to_proto,
 };
 use crate::data::core::WorkerCore;
 use crate::error::WorkerError;
@@ -238,6 +238,35 @@ impl WorkerDataService for WorkerDataServiceImpl {
                 effective_block_len: 0,
                 block_stamp: 0,
                 written_through: 0,
+            },
+        };
+
+        Ok(Response::new(response))
+    }
+
+    async fn sync_committed_block(
+        &self,
+        request: Request<SyncCommittedBlockRequestProto>,
+    ) -> Result<Response<SyncCommittedBlockResponseProto>, Status> {
+        let request = request.into_inner();
+        let header = request.header.clone();
+        let response = match proto_to_sync_committed_block_request(request) {
+            Ok(domain) => match self.core.sync_committed_block(domain).await {
+                Ok(result) => SyncCommittedBlockResponseProto {
+                    header: Some(Self::ok_response_header(header)),
+                    effective_block_len: result.effective_block_len,
+                    block_stamp: result.block_stamp,
+                },
+                Err(error) => SyncCommittedBlockResponseProto {
+                    header: Some(Self::error_response_header(header, error)),
+                    effective_block_len: 0,
+                    block_stamp: 0,
+                },
+            },
+            Err(error) => SyncCommittedBlockResponseProto {
+                header: Some(Self::error_response_header(header, error)),
+                effective_block_len: 0,
+                block_stamp: 0,
             },
         };
 

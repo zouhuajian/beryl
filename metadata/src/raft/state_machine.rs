@@ -22,7 +22,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::warn;
 use types::block::{BlockPlacement, BlockState};
-use types::fs::{FileAttrs, FsErrorCode, Inode, InodeData, InodeId, InodeKind};
+use types::fs::{Extent, FileAttrs, FsErrorCode, Inode, InodeData, InodeId, InodeKind};
 use types::ids::{BlockId, ClientId, DataHandleId, LeaseId, MountId, ShardGroupId, ShardId};
 use types::layout::FileLayout;
 use types::lease::{FencingToken, Lease};
@@ -69,6 +69,7 @@ struct DeleteTreePlan {
 
 type PreparedUnlink = (InodeId, Option<DataHandleId>, Inode, Vec<BlockId>, FsOkResult);
 type PreparedCloseWrite = (Inode, FileLayout, Vec<BlockId>, Vec<BlockId>, u64, FsOkResult);
+type PreparedSyncWrite = (Inode, FileLayout, Vec<BlockId>, Vec<BlockId>, u64, FsOkResult, bool);
 
 impl AppRaftStateMachine {
     pub fn new(storage: Arc<RocksDBStorage>, mount_table: Arc<MountTable>) -> Self {
@@ -294,6 +295,29 @@ impl AppRaftStateMachine {
                     inode_id,
                     extents,
                     final_size,
+                    lease_id,
+                    open_epoch,
+                    lease_epoch,
+                    commit_mode,
+                    &dedup_key,
+                    fingerprint,
+                )?;
+                Ok(AppDataResponse::Fs(result))
+            }
+            Command::SyncWrite {
+                inode_id,
+                extents,
+                target_size,
+                lease_id,
+                open_epoch,
+                lease_epoch,
+                commit_mode,
+                ..
+            } => {
+                let result = self.apply_sync_write(
+                    inode_id,
+                    extents,
+                    target_size,
                     lease_id,
                     open_epoch,
                     lease_epoch,
@@ -855,6 +879,98 @@ impl AppRaftStateMachine {
         let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
         self.storage.put_apply_result_atomic(dedup_key, applied_result)?;
         Ok(result)
+    }
+
+    fn extent_end(extent: &Extent) -> MetadataResult<u64> {
+        extent.file_offset.checked_add(extent.len).ok_or_else(|| {
+            MetadataError::InvalidArgument(format!(
+                "Extent end overflows: file_offset={}, len={}",
+                extent.file_offset, extent.len
+            ))
+        })
+    }
+
+    fn extent_matches_visible(existing: &[Extent], candidate: &Extent) -> bool {
+        existing.iter().any(|visible| {
+            visible.block_id == candidate.block_id
+                && visible.file_offset == candidate.file_offset
+                && visible.block_offset == candidate.block_offset
+                && visible.len == candidate.len
+        })
+    }
+
+    /// Validate that a no-op SyncWrite request matches the already visible layout prefix.
+    fn validate_noop_sync_prefix(existing: &[Extent], requested: &[Extent], target_size: u64) -> MetadataResult<()> {
+        if requested.is_empty() {
+            return Ok(());
+        }
+        Self::validate_contiguous_extents(requested, requested[0].file_offset, target_size, "SyncWrite no-op")?;
+        for extent in requested {
+            if !Self::extent_matches_visible(existing, extent) {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "SyncWrite no-op block {} does not match visible layout",
+                    extent.block_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_contiguous_extents(
+        extents: &[Extent],
+        start_offset: u64,
+        target_size: u64,
+        label: &str,
+    ) -> MetadataResult<()> {
+        let mut expected_offset = start_offset;
+        for extent in extents {
+            if extent.file_offset != expected_offset {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "{} extent file_offset mismatch: expected {}, got {}",
+                    label, expected_offset, extent.file_offset
+                )));
+            }
+            expected_offset = Self::extent_end(extent)?;
+        }
+        if expected_offset != target_size {
+            return Err(MetadataError::InvalidArgument(format!(
+                "{} target_size mismatch: expected {}, got {}",
+                label, expected_offset, target_size
+            )));
+        }
+        Ok(())
+    }
+
+    /// Return the suffix that still needs publication for append-style commits.
+    fn append_extents_not_already_visible(
+        existing: &[Extent],
+        requested: &[Extent],
+        current_size: u64,
+        target_size: u64,
+        label: &str,
+    ) -> MetadataResult<Vec<Extent>> {
+        let mut expected_offset = current_size;
+        let mut publish = Vec::new();
+        for extent in requested {
+            if Self::extent_end(extent)? <= current_size && Self::extent_matches_visible(existing, extent) {
+                continue;
+            }
+            if extent.file_offset != expected_offset {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "{} extent file_offset mismatch: expected {}, got {}",
+                    label, expected_offset, extent.file_offset
+                )));
+            }
+            expected_offset = Self::extent_end(extent)?;
+            publish.push(extent.clone());
+        }
+        if expected_offset != target_size {
+            return Err(MetadataError::InvalidArgument(format!(
+                "{} target_size mismatch: expected {}, got {}",
+                label, expected_offset, target_size
+            )));
+        }
+        Ok(publish)
     }
 
     /// Apply Mkdir command.
@@ -1864,6 +1980,7 @@ impl AppRaftStateMachine {
                 max_committed_end = max_committed_end.max(extent_end);
             }
 
+            let mut extents_to_publish = ordered_extents.clone();
             match commit_mode {
                 FileCommitMode::Replace => {
                     if ordered_extents.is_empty() && final_size != 0 {
@@ -1880,38 +1997,18 @@ impl AppRaftStateMachine {
                     }
                 }
                 FileCommitMode::Append => {
-                    let mut expected_offset = old_size;
-                    for extent in &ordered_extents {
-                        if existing_block_ids.contains(&extent.block_id) {
-                            return Err(MetadataError::InvalidArgument(format!(
-                                "Append committed block {} already exists in authoritative layout",
-                                extent.block_id
-                            )));
-                        }
-                        if extent.file_offset != expected_offset {
-                            return Err(MetadataError::InvalidArgument(format!(
-                                "Append extent file_offset mismatch: expected {}, got {}",
-                                expected_offset, extent.file_offset
-                            )));
-                        }
-                        expected_offset = extent.file_offset.checked_add(extent.len).ok_or_else(|| {
-                            MetadataError::InvalidArgument(format!(
-                                "Extent end overflows: file_offset={}, len={}",
-                                extent.file_offset, extent.len
-                            ))
-                        })?;
-                    }
-                    if final_size != expected_offset {
-                        return Err(MetadataError::InvalidArgument(format!(
-                            "Append final_size mismatch: expected {}, got {}",
-                            expected_offset, final_size
-                        )));
-                    }
+                    extents_to_publish = Self::append_extents_not_already_visible(
+                        &existing_extents_snapshot,
+                        &ordered_extents,
+                        old_size,
+                        final_size,
+                        "Append",
+                    )?;
                 }
             }
 
             // Update inode: publish extents and update size/mtime/ctime/file_version/lease_epoch.
-            for extent in &mut ordered_extents {
+            for extent in &mut extents_to_publish {
                 extent.file_version = Some(file_version);
                 // The Raft apply boundary assigns the metadata-authoritative
                 // stamp that direct readers must present to workers.
@@ -1926,10 +2023,10 @@ impl AppRaftStateMachine {
                 } => {
                     match commit_mode {
                         FileCommitMode::Replace => {
-                            *existing_extents = ordered_extents.clone();
+                            *existing_extents = extents_to_publish.clone();
                         }
                         FileCommitMode::Append => {
-                            existing_extents.extend(ordered_extents.clone());
+                            existing_extents.extend(extents_to_publish.clone());
                         }
                     }
                     for extent in existing_extents.iter_mut() {
@@ -1996,6 +2093,234 @@ impl AppRaftStateMachine {
             dedup_key,
             applied_result,
         )?;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Apply a SyncWrite command by publishing a prefix while leaving the write session open.
+    fn apply_sync_write(
+        &self,
+        inode_id: InodeId,
+        extents: Vec<Extent>,
+        target_size: u64,
+        lease_id: types::ids::LeaseId,
+        open_epoch: u64,
+        lease_epoch: u64,
+        commit_mode: FileCommitMode,
+        dedup_key: &DedupKey,
+        fingerprint: CommandFingerprint,
+    ) -> MetadataResult<FsCommandResult> {
+        let prepared: MetadataResult<PreparedSyncWrite> = (|| {
+            let mut inode = self
+                .storage
+                .get_inode(inode_id)?
+                .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {}", inode_id)))?;
+
+            if !inode.kind.is_file() {
+                return Err(MetadataError::InvalidArgument(format!(
+                    "Inode is not a file: {}",
+                    inode_id
+                )));
+            }
+
+            let expected_data_handle_id = inode.current_data_handle_id;
+            if expected_data_handle_id.as_raw() == 0 {
+                return Err(MetadataError::Internal(format!(
+                    "File inode {} is missing current_data_handle_id",
+                    inode_id
+                )));
+            }
+
+            // FsCore validates the live runtime session before proposing. The
+            // Raft command carries lease identity so dedup replay still rejects
+            // calls that reuse a call_id for a different write barrier.
+            let _ = (lease_id, open_epoch);
+
+            let layout = self.storage.get_layout(inode_id)?;
+            let now_ms = Self::apply_timestamp_ms();
+            let current_size = inode.attrs.size;
+            let (existing_extents_snapshot, current_file_version) = match &inode.data {
+                InodeData::File {
+                    extents, file_version, ..
+                } => (extents.clone(), *file_version),
+                _ => {
+                    return Err(MetadataError::InvalidArgument(format!(
+                        "Inode data is not File: {}",
+                        inode_id
+                    )));
+                }
+            };
+
+            let mut existing_block_ids = std::collections::HashSet::new();
+            for extent in &existing_extents_snapshot {
+                existing_block_ids.insert(extent.block_id);
+            }
+
+            let mut committed_block_ids = std::collections::HashSet::with_capacity(extents.len());
+            let mut ordered_extents = extents;
+            ordered_extents.sort_by_key(|extent| (extent.file_offset, extent.block_id.index.as_raw()));
+            let mut previous_end = None;
+            for extent in &ordered_extents {
+                if extent.len == 0 {
+                    return Err(MetadataError::InvalidArgument(
+                        "Committed extent len must be greater than 0".to_string(),
+                    ));
+                }
+                if extent.block_id.data_handle_id != expected_data_handle_id {
+                    return Err(MetadataError::InvalidArgument(format!(
+                        "Extent block data_handle_id {} does not match inode {} current_data_handle_id {}",
+                        extent.block_id.data_handle_id, inode_id, expected_data_handle_id
+                    )));
+                }
+                if !committed_block_ids.insert(extent.block_id) {
+                    return Err(MetadataError::InvalidArgument(format!(
+                        "Committed block {} was submitted more than once",
+                        extent.block_id
+                    )));
+                }
+                let extent_end = extent.file_offset.checked_add(extent.len).ok_or_else(|| {
+                    MetadataError::InvalidArgument(format!(
+                        "Extent end overflows: file_offset={}, len={}",
+                        extent.file_offset, extent.len
+                    ))
+                })?;
+                if previous_end.map(|prev| extent.file_offset < prev).unwrap_or(false) {
+                    return Err(MetadataError::InvalidArgument(
+                        "Committed extents must not overlap".to_string(),
+                    ));
+                }
+                if extent_end > target_size {
+                    return Err(MetadataError::InvalidArgument(format!(
+                        "Extent extends beyond target_size: extent_end={}, target_size={}",
+                        extent_end, target_size
+                    )));
+                }
+                previous_end = Some(extent_end);
+            }
+
+            if target_size <= current_size {
+                Self::validate_noop_sync_prefix(&existing_extents_snapshot, &ordered_extents, target_size)?;
+                return Ok((
+                    inode,
+                    layout,
+                    Vec::new(),
+                    Vec::new(),
+                    now_ms,
+                    FsOkResult {
+                        inode_id: Some(inode_id),
+                        data_handle_id: Some(expected_data_handle_id),
+                        file_version: current_file_version,
+                    },
+                    false,
+                ));
+            }
+
+            let extents_to_publish = match commit_mode {
+                FileCommitMode::Replace => {
+                    Self::validate_contiguous_extents(&ordered_extents, 0, target_size, "SyncWrite replace")?;
+                    ordered_extents.clone()
+                }
+                FileCommitMode::Append => Self::append_extents_not_already_visible(
+                    &existing_extents_snapshot,
+                    &ordered_extents,
+                    current_size,
+                    target_size,
+                    "SyncWrite append",
+                )?,
+            };
+
+            let file_version = Self::next_file_version(inode_id, current_file_version)?;
+            let mut stamped_extents = extents_to_publish;
+            for extent in &mut stamped_extents {
+                extent.file_version = Some(file_version);
+                extent.block_stamp = Some(file_version);
+            }
+
+            match &mut inode.data {
+                InodeData::File {
+                    extents: existing_extents,
+                    file_version: stored_file_version,
+                    lease_epoch: stored_lease_epoch,
+                    ..
+                } => {
+                    match commit_mode {
+                        FileCommitMode::Replace => {
+                            *existing_extents = stamped_extents.clone();
+                        }
+                        FileCommitMode::Append => {
+                            existing_extents.extend(stamped_extents.clone());
+                        }
+                    }
+                    for extent in existing_extents.iter_mut() {
+                        extent.file_version = Some(file_version);
+                    }
+                    *stored_file_version = Some(file_version);
+                    *stored_lease_epoch = Some(lease_epoch);
+                }
+                _ => {
+                    return Err(MetadataError::InvalidArgument(format!(
+                        "Inode data is not File: {}",
+                        inode_id
+                    )));
+                }
+            }
+            inode.attrs.size = target_size;
+            inode.attrs.update_mtime_ctime(now_ms);
+
+            let published_block_ids = stamped_extents
+                .iter()
+                .map(|extent| extent.block_id)
+                .collect::<std::collections::HashSet<_>>();
+            let block_ref_increments = published_block_ids
+                .difference(&existing_block_ids)
+                .copied()
+                .collect::<Vec<_>>();
+            let block_ref_decrements = if commit_mode == FileCommitMode::Replace {
+                existing_extents_snapshot
+                    .iter()
+                    .map(|extent| extent.block_id)
+                    .collect::<std::collections::HashSet<_>>()
+                    .difference(&committed_block_ids)
+                    .copied()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+
+            Ok((
+                inode,
+                layout,
+                block_ref_increments,
+                block_ref_decrements,
+                now_ms,
+                FsOkResult {
+                    inode_id: Some(inode_id),
+                    data_handle_id: Some(expected_data_handle_id),
+                    file_version: Some(file_version),
+                },
+                true,
+            ))
+        })();
+
+        let (inode, layout, block_ref_increments, block_ref_decrements, now_ms, ok, mutates_metadata) = match prepared {
+            Ok(prepared) => prepared,
+            Err(err) => return self.persist_fs_apply_result(Self::fs_command_result(Err(err)), dedup_key, fingerprint),
+        };
+        let result = FsCommandResult::Ok(ok);
+        let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Fs(result.clone()));
+        if !mutates_metadata {
+            self.storage.put_apply_result_atomic(dedup_key, applied_result)?;
+        } else {
+            self.storage.close_write_with_apply_result_atomic(
+                &inode,
+                layout,
+                &block_ref_increments,
+                &block_ref_decrements,
+                now_ms,
+                dedup_key,
+                applied_result,
+            )?;
+        }
         Ok(result)
     }
 

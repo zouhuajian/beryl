@@ -17,11 +17,11 @@ use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult
 use crate::metadata::header::ensure_metadata_header;
 use crate::metadata::ops::{
     AbortFileWriteOp, AddBlockOp, AppendFileOp, CommitFileOp, CreateFileOp, DeleteOp, GetBlockLocationsOp, GetStatusOp,
-    ListStatusOp, MsyncOp, OpenFileOp, RenameOp, RenewLeaseOp,
+    ListStatusOp, MsyncOp, OpenFileOp, RenameOp, RenewLeaseOp, SyncWriteOp,
 };
 use crate::metadata::snapshot::{
     AbortFileWriteResult, AddBlockResult, CommitFileResult, DeleteResult, FileSnapshot, LayoutSnapshot, ListSnapshot,
-    RenameResult, RenewLeaseResult, StateWatermark, StatusSnapshot, WriteSessionSeed,
+    RenameResult, RenewLeaseResult, StateWatermark, StatusSnapshot, SyncWriteResult, WriteSessionSeed,
 };
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
 use crate::runtime::singleflight::{Singleflight, SingleflightMode};
@@ -65,6 +65,9 @@ pub(crate) trait MetadataGateway: Send + Sync {
 
     /// Renew an active write session lease.
     async fn renew_lease(&self, ctx: AttemptContext, req: RenewLeaseOp) -> ClientResult<RenewLeaseResult>;
+
+    /// Apply a write-session visibility or durability barrier.
+    async fn sync_write(&self, ctx: AttemptContext, req: SyncWriteOp) -> ClientResult<SyncWriteResult>;
 
     /// Synchronize metadata state freshness.
     async fn msync(&self, ctx: AttemptContext, req: MsyncOp) -> ClientResult<StateWatermark>;
@@ -431,6 +434,19 @@ impl MetadataGateway for TonicMetadataGateway {
             .client(&ctx, "write")
             .await?
             .renew_lease(tonic_request(&ctx, req))
+            .await
+            .map_err(ClientError::from)?
+            .into_inner();
+        parse_metadata_response_header(&ctx, response.header.as_ref())?;
+        Ok(response)
+    }
+
+    async fn sync_write(&self, ctx: AttemptContext, mut req: SyncWriteOp) -> ClientResult<SyncWriteResult> {
+        ensure_metadata_header(&mut req.header, &ctx)?;
+        let response = self
+            .client(&ctx, "write")
+            .await?
+            .sync_write(tonic_request(&ctx, req))
             .await
             .map_err(ClientError::from)?
             .into_inner();

@@ -42,7 +42,7 @@ pub struct WriteSession {
     pub pending_extents: Vec<Extent>,
     /// Pending size (accumulated before close).
     pub pending_size: u64,
-    /// Write targets (worker endpoints) for barrier.
+    /// Precomputed write targets for AddBlock.
     pub write_targets: Vec<WriteTarget>,
     /// Targets already issued to the client through AddBlock.
     pub issued_targets: Vec<WriteTarget>,
@@ -52,8 +52,6 @@ pub struct WriteSession {
     pub writer_identity: WriterIdentity,
     /// Created timestamp (for TTL cleanup).
     pub created_at_ms: u64,
-    /// Last observed written length (for Hflush/Hsync target size).
-    pub last_written: u64,
 }
 
 /// Writer identity (client + call for tracking).
@@ -123,7 +121,6 @@ impl WriteSessionManager {
             next_target_index: 0,
             writer_identity: input.writer_identity,
             created_at_ms: now_ms,
-            last_written: input.base_size,
         };
 
         self.sessions.write().insert(file_handle, session);
@@ -147,17 +144,6 @@ impl WriteSessionManager {
         session.next_target_index += 1;
         session.issued_targets.push(target.clone());
         Some(target)
-    }
-
-    /// Update the last_written watermark for a session.
-    pub fn set_last_written(&self, file_handle: u64, written: u64) -> bool {
-        let mut sessions = self.sessions.write();
-        if let Some(session) = sessions.get_mut(&file_handle) {
-            session.last_written = written.max(session.last_written);
-            true
-        } else {
-            false
-        }
     }
 
     /// Get a write session by file handle.

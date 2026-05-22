@@ -15,7 +15,7 @@ use crate::metadata::{
     AbortFileWriteOp, AbortFileWriteResult, AddBlockOp, AddBlockResult, AppendFileOp, CommitFileOp, CommitFileResult,
     CreateFileOp, DeleteOp, DeleteResult, GetBlockLocationsOp, GetStatusOp, LayoutSnapshot, ListStatusOp,
     MetadataGateway, MsyncOp, OpenFileOp, RenameOp, RenameResult, RenewLeaseOp, RenewLeaseResult, StatusSnapshot,
-    WriteSessionSeed,
+    SyncWriteOp, SyncWriteResult, WriteSessionSeed,
 };
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
 use crate::runtime::classify::{ErrorClass, ErrorClassifier, RefreshReason};
@@ -265,6 +265,26 @@ impl OperationExecutor {
         )?;
         self.execute_metadata(operation, req, |gateway, ctx, req| async move {
             gateway.renew_lease(ctx, req).await
+        })
+        .await
+    }
+
+    /// Execute SyncWrite.
+    pub(crate) async fn sync_write(
+        &self,
+        path: &str,
+        session_identity: String,
+        req: SyncWriteOp,
+    ) -> ClientResult<SyncWriteResult> {
+        let detail = format!("mode={} target_size={}", req.mode, req.target_size);
+        let operation = OperationContext::new(
+            self.client_id,
+            OperationKind::MetadataSessionBarrier,
+            "SyncWrite",
+            OperationIdentity::session(path, session_identity).with_detail(detail),
+        )?;
+        self.execute_metadata(operation, req, |gateway, ctx, req| async move {
+            gateway.sync_write(ctx, req).await
         })
         .await
     }
@@ -1683,6 +1703,11 @@ mod tests {
         async fn renew_lease(&self, ctx: AttemptContext, _req: RenewLeaseOp) -> ClientResult<RenewLeaseResult> {
             self.next_result("renew_lease", &ctx).await?;
             Ok(RenewLeaseResponseProto::default())
+        }
+
+        async fn sync_write(&self, ctx: AttemptContext, _req: SyncWriteOp) -> ClientResult<SyncWriteResult> {
+            self.next_result("sync_write", &ctx).await?;
+            Ok(SyncWriteResult::default())
         }
 
         async fn msync(

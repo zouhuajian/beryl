@@ -21,7 +21,7 @@ use crate::runtime::block::BlockManager;
 use crate::runtime::stream::{StreamManager, StreamState};
 use crate::store::block::{
     BlockState, ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
-    PublishReadyRequest,
+    PublishReadyRequest, SyncReadyBlockRequest,
 };
 
 pub type WorkerCoreResult<T> = Result<T, WorkerError>;
@@ -187,6 +187,24 @@ pub struct CommitWriteResult {
     /// Contiguous byte prefix written into the staging block.
     /// This is not readable until final metadata is published.
     pub written_through: u64,
+}
+
+/// Durable sync request for an already committed block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncCommittedBlockRequest {
+    pub group_id: ShardGroupId,
+    pub block_id: BlockId,
+    /// Metadata-authoritative block stamp for the committed generation.
+    pub block_stamp: u64,
+    /// Complete committed block length expected by the metadata-visible prefix.
+    pub expected_block_len: u64,
+}
+
+/// Durable sync result for an already committed block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncCommittedBlockResult {
+    pub effective_block_len: u64,
+    pub block_stamp: u64,
 }
 
 /// Abort request for a write stream.
@@ -435,6 +453,24 @@ impl WorkerCore {
             effective_block_len: meta.source.effective_block_len,
             block_stamp: meta.visibility.block_stamp,
             written_through: meta.source.effective_block_len,
+        })
+    }
+
+    pub async fn sync_committed_block(
+        &self,
+        req: SyncCommittedBlockRequest,
+    ) -> WorkerCoreResult<SyncCommittedBlockResult> {
+        validate_sync_committed_block_request(&req)?;
+        let meta = self.block_store.load_meta(req.group_id, req.block_id)?;
+        validate_sync_committed_block_meta(&req, &meta)?;
+        let synced = self.block_store.sync_ready_block(SyncReadyBlockRequest {
+            group_id: req.group_id,
+            block_id: req.block_id,
+        })?;
+        validate_sync_committed_block_meta(&req, &synced)?;
+        Ok(SyncCommittedBlockResult {
+            effective_block_len: synced.source.effective_block_len,
+            block_stamp: synced.visibility.block_stamp,
         })
     }
 
@@ -709,6 +745,53 @@ fn validate_commit_request(state: &StreamState, req: &CommitWriteRequest) -> Wor
                 state.context.block_stamp, req.block_stamp
             ),
         });
+    }
+    Ok(())
+}
+
+fn validate_sync_committed_block_request(req: &SyncCommittedBlockRequest) -> WorkerCoreResult<()> {
+    if req.block_stamp == 0 {
+        return Err(WorkerError::InvalidArgument(
+            "sync committed block requires non-zero block_stamp".to_string(),
+        ));
+    }
+    if req.expected_block_len == 0 {
+        return Err(WorkerError::InvalidArgument(
+            "sync committed block requires non-zero expected_block_len".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sync_committed_block_meta(
+    req: &SyncCommittedBlockRequest,
+    meta: &crate::store::block::BlockMetaPayload,
+) -> WorkerCoreResult<()> {
+    if meta.visibility.block_state != BlockState::Ready {
+        return Err(WorkerError::NeedRefresh {
+            code: RpcErrorCode::ShardMoved,
+            reason: RefreshReason::Moved,
+            message: format!(
+                "local block is not Ready for durable sync: group_id={}, block_id={}, state={:?}",
+                req.group_id, req.block_id, meta.visibility.block_state
+            ),
+        });
+    }
+    if meta.visibility.block_stamp != req.block_stamp {
+        return Err(WorkerError::NeedRefresh {
+            code: RpcErrorCode::BlockStampMismatch,
+            reason: RefreshReason::BlockStampMismatch,
+            message: format!(
+                "block stamp mismatch during durable sync: group_id={}, block_id={}, requested={}, local={}",
+                req.group_id, req.block_id, req.block_stamp, meta.visibility.block_stamp
+            ),
+        });
+    }
+    if meta.source.effective_block_len != req.expected_block_len {
+        return Err(WorkerError::InvalidArgument(format!(
+            "effective block length mismatch during durable sync: group_id={}, block_id={}, expected={}, local={}",
+            req.group_id, req.block_id, req.expected_block_len, meta.source.effective_block_len
+        )));
     }
     Ok(())
 }

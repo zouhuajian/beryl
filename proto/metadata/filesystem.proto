@@ -268,26 +268,30 @@ message RenewLeaseResponseProto {
   uint64 expires_at_ms = 2;
 }
 
-message HflushRequestProto {
+// SyncWrite is a write-session barrier that keeps the write handle open.
+enum WriteSyncModeProto {
+  WRITE_SYNC_MODE_UNSPECIFIED = 0;
+  // VISIBILITY publishes committed data up to target_size to new readers.
+  WRITE_SYNC_MODE_VISIBILITY = 1;
+  // DURABILITY means VISIBILITY after the client has requested worker durable
+  // sync for the published prefix.
+  WRITE_SYNC_MODE_DURABILITY = 2;
+}
+
+message SyncWriteRequestProto {
   common.RequestHeaderProto header = 1;
   WriteHandleProto write_handle = 2;
-  optional uint64 target_size = 3;
-  uint32 flags = 4;
+  common.DataHandleIdProto data_handle_id = 3;
+  repeated CommittedBlockProto committed_blocks = 4;
+  uint64 target_size = 5;
+  WriteSyncModeProto mode = 6;
+  uint32 flags = 7;
 }
 
-message HflushResponseProto {
+message SyncWriteResponseProto {
   common.ResponseHeaderProto header = 1;
-}
-
-message HsyncRequestProto {
-  common.RequestHeaderProto header = 1;
-  WriteHandleProto write_handle = 2;
-  optional uint64 target_size = 3;
-  uint32 flags = 4;
-}
-
-message HsyncResponseProto {
-  common.ResponseHeaderProto header = 1;
+  uint64 synced_size = 2;
+  optional uint64 file_version = 3;
 }
 
 // ============================================================================
@@ -323,9 +327,9 @@ service FileSystemServiceProto {
   rpc AbortFileWrite(AbortFileWriteRequestProto) returns (AbortFileWriteResponseProto);
   rpc RenewLease(RenewLeaseRequestProto) returns (RenewLeaseResponseProto);
 
-  // write visibility / durability barriers
-  rpc Hflush(HflushRequestProto) returns (HflushResponseProto);
-  rpc Hsync(HsyncRequestProto) returns (HsyncResponseProto);
+  // SyncWrite keeps the write handle/session open.
+  // CommitFile remains the final close operation.
+  rpc SyncWrite(SyncWriteRequestProto) returns (SyncWriteResponseProto);
 
   // freshness
   rpc Msync(MsyncRequestProto) returns (MsyncResponseProto);

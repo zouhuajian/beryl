@@ -101,5 +101,8 @@ pub type AbortFileWriteResult = proto::metadata::AbortFileWriteResponseProto;
 /// RenewLease result returned by metadata.
 pub type RenewLeaseResult = proto::metadata::RenewLeaseResponseProto;
 
+/// SyncWrite result returned by metadata.
+pub type SyncWriteResult = proto::metadata::SyncWriteResponseProto;
+
 /// Metadata state watermark returned by Msync.
 pub type StateWatermark = proto::common::GroupStateWatermarkProto;

@@ -12,6 +12,7 @@ use bytes::Bytes;
 use proto::metadata::{
     AddBlockRequestProto, AppendFileRequestProto, CreateDispositionProto, CreateFileRequestProto, DeleteRequestProto,
     GetStatusRequestProto, ListStatusRequestProto, OpenFileRequestProto, RenameRequestProto, RenewLeaseRequestProto,
+    SyncWriteRequestProto, WriteSyncModeProto,
 };
 use types::{DataHandleId, InodeId};
 
@@ -19,7 +20,7 @@ use crate::api::{CreateMode, DirectoryListing, FileHandle, FileStatus, OpenOptio
 use crate::cache::{LayoutCache, LayoutCacheKey};
 use crate::canonical::{ClientAction, RefreshHint};
 use crate::config::ClientConfig;
-use crate::data::DataPlaneBoundary;
+use crate::data::{DataPlaneBoundary, WorkerBlockSyncResult};
 use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult};
 use crate::metadata::{LayoutSnapshot, MetadataGateway, TonicMetadataGateway, WriteSessionSeed};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics, NoopClientMetrics};
@@ -30,7 +31,7 @@ use crate::runtime::{
     OperationIdentity, OperationKind, OperationRuntime, RefreshManager, RefreshReason, RetryDecision,
     RetryDecisionInput, TokioBackoffSleeper,
 };
-use crate::session::write_session::WriteSession;
+use crate::session::write_session::{WorkerCommitLevel, WriteSession};
 
 const DEFAULT_BLOCK_SIZE: u32 = 64 * 1024 * 1024;
 const DEFAULT_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
@@ -447,57 +448,10 @@ impl FsClient {
         let mut session = session_ref.lock().await;
         session.ensure_close_allowed()?;
         let path = session.path().to_string();
-        let session_identity = session.session_identity();
         let final_size = session.cursor();
-        let worker_path = path.clone();
-        let worker_session_identity = session_identity.clone();
-
-        let mut committed_blocks = Vec::with_capacity(session.pending_blocks_mut().len());
-        for pending in session.pending_blocks_mut() {
-            if !pending.worker_committed() {
-                let operation = worker_write_operation(
-                    self.executor.client_id(),
-                    "CommitWrite",
-                    &worker_path,
-                    &worker_session_identity,
-                )?;
-                let ctx = self.data_attempt_context(&operation, 0);
-                let commit_result = match self
-                    .worker_rpc_with_timeout(
-                        "CommitWrite",
-                        OperationKind::WorkerWriteData,
-                        self.data_boundary.commit_write(
-                            ctx,
-                            pending.worker_block(),
-                            pending.written_len(),
-                            pending.commit_seq(),
-                            false,
-                        ),
-                    )
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(err) => {
-                        mark_session_after_write_error(&mut session, &err);
-                        return Err(self.normalize_unknown_outcome("CommitWrite", OperationKind::WorkerWriteData, err));
-                    }
-                };
-                if let Err(err) = validate_worker_commit_result(pending, commit_result) {
-                    session.mark_unknown_outcome();
-                    self.record_metric(
-                        ClientMetric::WorkerResponseBodyMismatch,
-                        metric_labels("CommitWrite", OperationKind::WorkerWriteData).with_outcome("unknown"),
-                    );
-                    self.record_metric(
-                        ClientMetric::UnknownOutcome,
-                        metric_labels("CommitWrite", OperationKind::WorkerWriteData).with_outcome("unknown"),
-                    );
-                    return Err(err);
-                }
-                pending.mark_worker_committed();
-            }
-            committed_blocks.push(committed_block_from_pending(pending)?);
-        }
+        let committed_blocks = self
+            .ensure_pending_worker_blocks_at_level(&mut session, WorkerCommitLevel::CLOSE_REQUIRED)
+            .await?;
 
         let retrying_unknown_commit = session.is_commit_unknown();
         let (operation, request) =
@@ -513,7 +467,7 @@ impl FsClient {
                 session.mark_closed(response.file_version);
                 Ok(())
             }
-            Err(err) if is_unknown_commit_file_outcome(&err) => {
+            Err(err) if is_unknown_session_barrier_outcome(&err) => {
                 session.mark_commit_unknown();
                 self.record_metric(
                     ClientMetric::UnknownOutcome,
@@ -533,15 +487,15 @@ impl FsClient {
         }
     }
 
-    /// Return Unsupported after validating the write handle.
-    pub async fn hflush(&self, handle: &FileHandle) -> ClientResult<()> {
-        self.unsupported_write_barrier(handle, "hflush", "visibility barrier not available")
+    /// Publish a visible prefix while keeping the write handle open.
+    pub async fn sync_write_visibility(&self, handle: &FileHandle) -> ClientResult<()> {
+        self.sync_write_barrier(handle, WriteSyncModeProto::WriteSyncModeVisibility)
             .await
     }
 
-    /// Return Unsupported after validating the write handle.
-    pub async fn hsync(&self, handle: &FileHandle) -> ClientResult<()> {
-        self.unsupported_write_barrier(handle, "hsync", "durability barrier not available")
+    /// Publish a durable prefix while keeping the write handle open.
+    pub async fn sync_write_durability(&self, handle: &FileHandle) -> ClientResult<()> {
+        self.sync_write_barrier(handle, WriteSyncModeProto::WriteSyncModeDurability)
             .await
     }
 
@@ -806,26 +760,165 @@ impl FsClient {
         result
     }
 
-    async fn unsupported_write_barrier(
-        &self,
-        handle: &FileHandle,
-        operation: &'static str,
-        reason: &'static str,
-    ) -> ClientResult<()> {
+    /// Ensure pending worker blocks reach the requested level, then publish the SyncWrite barrier in metadata.
+    async fn sync_write_barrier(&self, handle: &FileHandle, mode: WriteSyncModeProto) -> ClientResult<()> {
         let session_ref = handle
             .write_session()
             .ok_or_else(|| ClientError::InvalidArgument("handle is not a write handle".to_string()))?;
         let mut session = session_ref.lock().await;
         session.ensure_open_for_barrier()?;
-        self.record_metric(
-            ClientMetric::UnsupportedOperation,
-            metric_labels(operation, OperationKind::MetadataSessionBarrier)
-                .with_error_class(ErrorClass::Unsupported.label())
-                .with_outcome("error"),
-        );
-        Err(ClientError::Unsupported(format!(
-            "unsupported operation: {operation} ({reason})"
-        )))
+        let path = session.path().to_string();
+        let session_identity = session.session_identity();
+        let target_size = session.cursor();
+        let required_level = sync_write_required_commit_level(mode)?;
+        let committed_blocks = self
+            .ensure_pending_worker_blocks_at_level(&mut session, required_level)
+            .await?;
+        let request = SyncWriteRequestProto {
+            header: None,
+            write_handle: Some(session.write_handle()),
+            data_handle_id: Some(proto::common::DataHandleIdProto {
+                value: handle.data_handle_id().as_raw(),
+            }),
+            committed_blocks: committed_blocks.iter().map(Into::into).collect(),
+            target_size,
+            mode: mode as i32,
+            flags: 0,
+        };
+        match self.executor.sync_write(&path, session_identity, request).await {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                let class = ErrorClassifier.classify_error(&err);
+                if is_unknown_session_barrier_outcome(&err) {
+                    session.mark_unknown_outcome();
+                    self.record_metric(
+                        ClientMetric::UnknownOutcome,
+                        metric_labels("SyncWrite", OperationKind::MetadataSessionBarrier).with_outcome("unknown"),
+                    );
+                    return Err(ClientError::UnknownOutcome(format!(
+                        "SyncWrite outcome is unknown for path {}: {}",
+                        path, err
+                    )));
+                }
+                mark_session_after_session_error(&mut session, &err);
+                self.record_error_metric("SyncWrite", OperationKind::MetadataSessionBarrier, &class);
+                Err(err)
+            }
+        }
+    }
+
+    /// Move worker blocks to the required level and return the metadata block list for the open session.
+    async fn ensure_pending_worker_blocks_at_level(
+        &self,
+        session: &mut WriteSession,
+        required_level: WorkerCommitLevel,
+    ) -> ClientResult<Vec<types::CommittedBlock>> {
+        let worker_path = session.path().to_string();
+        let worker_session_identity = session.session_identity();
+        let mut committed_blocks = Vec::with_capacity(session.pending_blocks_mut().len());
+        for pending in session.pending_blocks_mut() {
+            if pending.worker_commit_level().satisfies(required_level) {
+                committed_blocks.push(committed_block_from_pending(pending)?);
+                continue;
+            }
+
+            match (pending.worker_commit_level(), required_level) {
+                (WorkerCommitLevel::Uncommitted, WorkerCommitLevel::Visible | WorkerCommitLevel::Durable) => {
+                    let require_sync = required_level.requires_sync();
+                    let operation = worker_write_operation(
+                        self.executor.client_id(),
+                        "CommitWrite",
+                        &worker_path,
+                        &worker_session_identity,
+                    )?;
+                    let ctx = self.data_attempt_context(&operation, 0);
+                    let commit_result = match self
+                        .worker_rpc_with_timeout(
+                            "CommitWrite",
+                            OperationKind::WorkerWriteData,
+                            self.data_boundary.commit_write(
+                                ctx,
+                                pending.worker_block(),
+                                pending.written_len(),
+                                pending.commit_seq(),
+                                require_sync,
+                            ),
+                        )
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            mark_session_after_write_error(session, &err);
+                            return Err(self.normalize_unknown_outcome(
+                                "CommitWrite",
+                                OperationKind::WorkerWriteData,
+                                err,
+                            ));
+                        }
+                    };
+                    if let Err(err) = validate_worker_commit_result(pending, commit_result) {
+                        session.mark_unknown_outcome();
+                        self.record_metric(
+                            ClientMetric::WorkerResponseBodyMismatch,
+                            metric_labels("CommitWrite", OperationKind::WorkerWriteData).with_outcome("unknown"),
+                        );
+                        self.record_metric(
+                            ClientMetric::UnknownOutcome,
+                            metric_labels("CommitWrite", OperationKind::WorkerWriteData).with_outcome("unknown"),
+                        );
+                        return Err(err);
+                    }
+                    pending.mark_worker_committed(require_sync);
+                }
+                (WorkerCommitLevel::Visible, WorkerCommitLevel::Durable) => {
+                    let operation = worker_write_operation(
+                        self.executor.client_id(),
+                        "SyncCommittedBlock",
+                        &worker_path,
+                        &worker_session_identity,
+                    )?;
+                    let ctx = self.data_attempt_context(&operation, 0);
+                    let sync_result = match self
+                        .worker_rpc_with_timeout(
+                            "SyncCommittedBlock",
+                            OperationKind::WorkerWriteData,
+                            self.data_boundary
+                                .sync_committed_block(ctx, pending.worker_block(), pending.written_len()),
+                        )
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            mark_session_after_block_sync_error(session, &err);
+                            return Err(self.normalize_unknown_outcome(
+                                "SyncCommittedBlock",
+                                OperationKind::WorkerWriteData,
+                                err,
+                            ));
+                        }
+                    };
+                    if let Err(err) = validate_worker_block_sync_result(pending, sync_result) {
+                        session.mark_unknown_outcome();
+                        self.record_metric(
+                            ClientMetric::WorkerResponseBodyMismatch,
+                            metric_labels("SyncCommittedBlock", OperationKind::WorkerWriteData).with_outcome("unknown"),
+                        );
+                        self.record_metric(
+                            ClientMetric::UnknownOutcome,
+                            metric_labels("SyncCommittedBlock", OperationKind::WorkerWriteData).with_outcome("unknown"),
+                        );
+                        return Err(err);
+                    }
+                    pending.mark_worker_committed(true);
+                }
+                (WorkerCommitLevel::Visible, WorkerCommitLevel::Visible)
+                | (WorkerCommitLevel::Durable, WorkerCommitLevel::Visible | WorkerCommitLevel::Durable)
+                | (WorkerCommitLevel::Uncommitted, WorkerCommitLevel::Uncommitted)
+                | (WorkerCommitLevel::Visible | WorkerCommitLevel::Durable, WorkerCommitLevel::Uncommitted) => {}
+            }
+            committed_blocks.push(committed_block_from_pending(pending)?);
+        }
+        Ok(committed_blocks)
     }
 
     fn data_attempt_context(&self, operation: &OperationContext, attempt: u32) -> AttemptContext {
@@ -1026,6 +1119,16 @@ fn default_write_preallocation_len() -> u64 {
     u64::from(DEFAULT_BLOCK_SIZE) * MAX_PREALLOCATED_WRITE_BLOCKS
 }
 
+fn sync_write_required_commit_level(mode: WriteSyncModeProto) -> ClientResult<WorkerCommitLevel> {
+    match mode {
+        WriteSyncModeProto::WriteSyncModeDurability => Ok(WorkerCommitLevel::Durable),
+        WriteSyncModeProto::WriteSyncModeVisibility => Ok(WorkerCommitLevel::Visible),
+        WriteSyncModeProto::WriteSyncModeUnspecified => Err(ClientError::InvalidArgument(
+            "SyncWrite mode must be visibility or durability".to_string(),
+        )),
+    }
+}
+
 fn worker_write_operation(
     client_id: types::ClientId,
     operation_name: &str,
@@ -1079,6 +1182,30 @@ fn validate_worker_commit_result(
     if result.block_stamp != expected_stamp {
         return Err(side_effect_response_body_mismatch(
             "CommitWrite",
+            format!("block_stamp expected {}, got {}", expected_stamp, result.block_stamp),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_worker_block_sync_result(
+    pending: &crate::session::write_session::PendingBlock,
+    result: WorkerBlockSyncResult,
+) -> ClientResult<()> {
+    let expected_len = pending.written_len();
+    if result.effective_block_len != expected_len {
+        return Err(side_effect_response_body_mismatch(
+            "SyncCommittedBlock",
+            format!(
+                "effective_block_len expected {}, got {}",
+                expected_len, result.effective_block_len
+            ),
+        ));
+    }
+    let expected_stamp = pending.target().block_stamp;
+    if result.block_stamp != expected_stamp {
+        return Err(side_effect_response_body_mismatch(
+            "SyncCommittedBlock",
             format!("block_stamp expected {}, got {}", expected_stamp, result.block_stamp),
         ));
     }
@@ -1148,7 +1275,7 @@ fn refresh_hint_from_error(err: &ClientError) -> RefreshHint {
     }
 }
 
-fn is_unknown_commit_file_outcome(err: &ClientError) -> bool {
+fn is_unknown_session_barrier_outcome(err: &ClientError) -> bool {
     matches!(err, ClientError::UnknownOutcome(_))
         || matches!(ErrorClassifier.classify_error(err), ErrorClass::RetryableTransport)
 }
@@ -1170,6 +1297,14 @@ fn mark_session_after_write_error(session: &mut WriteSession, err: &ClientError)
         session.mark_unknown_outcome();
     } else if is_session_or_fencing_error(err) || is_write_refresh_error(err) {
         mark_session_after_session_error(session, err);
+    }
+}
+
+fn mark_session_after_block_sync_error(session: &mut WriteSession, err: &ClientError) {
+    if is_session_or_fencing_error(err) || is_write_refresh_error(err) {
+        mark_session_after_session_error(session, err);
+    } else {
+        session.mark_unknown_outcome();
     }
 }
 
@@ -1243,7 +1378,7 @@ mod tests {
     use proto::metadata::{
         AbortFileWriteResponseProto, AppendFileResponseProto, CommitFileResponseProto, CreateFileResponseProto,
         DeleteResponseProto, GetStatusResponseProto, ListStatusResponseProto, OpenFileResponseProto,
-        RenameResponseProto, RenewLeaseResponseProto, WriteHandleProto,
+        RenameResponseProto, RenewLeaseResponseProto, SyncWriteResponseProto, WriteHandleProto, WriteSyncModeProto,
     };
     use tokio::sync::Notify;
     use types::lease::FencingToken;
@@ -1546,74 +1681,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_hflush_and_hsync_are_unsupported_without_side_effects() {
-        let events = event_log();
-        let gateway = Arc::new(MockGateway::with_events(events.clone()));
-        let worker = Arc::new(MockDataClient::with_events(events.clone()));
-        let client = FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone()))
-            .expect("client");
-        let handle = client
-            .open("/created", OpenOptions::create_new())
-            .await
-            .expect("write handle");
-
-        client
-            .write(&handle, 0, Bytes::from_static(b"hello"))
-            .await
-            .expect("sequential write");
-
-        let events_before = events.lock().expect("events").clone();
-        let calls_before = gateway.calls();
-        let worker_calls_before = worker.calls();
-        let written_before = worker.written_bytes();
-
-        let err = client.hflush(&handle).await.expect_err("hflush must be unsupported");
-        assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("hflush")));
-        let err = client.hsync(&handle).await.expect_err("hsync must be unsupported");
-        assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("hsync")));
-
-        assert_eq!(events.lock().expect("events").clone(), events_before);
-        assert_eq!(gateway.calls(), calls_before);
-        assert_eq!(worker.calls(), worker_calls_before);
-        assert_eq!(worker.written_bytes(), written_before);
-        assert!(worker.committed_lens().is_empty());
-        assert!(worker.commit_sync_flags().is_empty());
-        assert_eq!(method_count(&gateway.calls(), "hflush"), 0);
-        assert_eq!(method_count(&gateway.calls(), "hsync"), 0);
-        assert_eq!(method_count(&gateway.calls(), "commit_file"), 0);
-    }
-
-    #[tokio::test]
-    async fn public_hflush_hsync_emit_unsupported_metrics_with_safe_labels() {
-        let metrics = Arc::new(RecordingMetrics::default());
+    async fn public_sync_write_visibility_commits_barrier_and_keeps_handle_open() {
         let gateway = Arc::new(MockGateway::default());
         let worker = Arc::new(MockDataClient::default());
-        let client = client_with_metrics(
-            test_config(9),
-            gateway.clone(),
-            data_boundary(worker),
-            Arc::clone(&metrics),
-        );
-        let handle = client
-            .open("/created", OpenOptions::create_new())
-            .await
-            .expect("write handle");
-
-        let _ = client.hflush(&handle).await.expect_err("hflush unsupported");
-        let _ = client.hsync(&handle).await.expect_err("hsync unsupported");
-
-        let events = metrics.events();
-        assert_eq!(metric_count(&events, ClientMetric::UnsupportedOperation), 2);
-        assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
-        assert_eq!(method_count(&gateway.calls(), "hflush"), 0);
-        assert_eq!(method_count(&gateway.calls(), "hsync"), 0);
-    }
-
-    #[tokio::test]
-    async fn public_write_and_close_continue_after_unsupported_hflush_hsync() {
-        let events = event_log();
-        let gateway = Arc::new(MockGateway::with_events(events.clone()));
-        let worker = Arc::new(MockDataClient::with_events(events.clone()));
         let client = FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone()))
             .expect("client");
         let handle = client
@@ -1624,73 +1694,359 @@ mod tests {
         client
             .write(&handle, 0, Bytes::from_static(b"hello"))
             .await
-            .expect("sequential write");
-        let events_before = events.lock().expect("events").clone();
-        let err = client.hflush(&handle).await.expect_err("hflush must be unsupported");
-        assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("hflush")));
-        let err = client.hsync(&handle).await.expect_err("hsync must be unsupported");
-        assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("hsync")));
+            .expect("write before visibility sync");
+        client
+            .sync_write_visibility(&handle)
+            .await
+            .expect("visibility sync should publish");
 
-        assert_eq!(events.lock().expect("events").clone(), events_before);
+        let sync_calls = gateway
+            .calls()
+            .into_iter()
+            .filter(|call| call.method == "sync_write")
+            .collect::<Vec<_>>();
+        assert_eq!(sync_calls.len(), 1);
+        assert_eq!(
+            sync_calls[0].sync_mode,
+            Some(WriteSyncModeProto::WriteSyncModeVisibility as i32)
+        );
+        assert_eq!(sync_calls[0].target_data_handle_id, Some(302));
+        assert_eq!(sync_calls[0].target_size, Some(5));
+        assert_eq!(sync_calls[0].committed_block_lens, vec![5]);
+        assert_eq!(worker.committed_lens(), vec![5]);
+        assert_eq!(worker.commit_sync_flags(), vec![false]);
+        assert!(worker.block_sync_lens().is_empty());
+
         client
             .write(&handle, 5, Bytes::from_static(b"!"))
             .await
-            .expect("write continues at cursor");
-        client.close(&handle).await.expect("close after unsupported barriers");
-
-        assert_eq!(worker.committed_lens(), vec![5, 1]);
+            .expect("write handle must remain open after visibility sync");
+        client
+            .close(&handle)
+            .await
+            .expect("close after visibility sync should succeed");
         assert_eq!(worker.commit_sync_flags(), vec![false, false]);
-        assert_eq!(method_count(&gateway.calls(), "hsync"), 0);
-        assert_eq!(method_count(&gateway.calls(), "hflush"), 0);
-        let commit = gateway
-            .calls()
-            .into_iter()
-            .find(|call| call.method == "commit_file")
-            .expect("commit_file call");
-        assert_eq!(commit.final_size, Some(6));
-        assert_eq!(commit.committed_block_offsets, vec![0, 5]);
-        assert_eq!(commit.committed_block_lens, vec![5, 1]);
-        assert_event_order(&events, "commit_write", "commit_file");
+        assert_eq!(method_count(&gateway.calls(), "commit_file"), 1);
     }
 
     #[tokio::test]
-    async fn public_hflush_hsync_validate_handles_before_unsupported() {
+    async fn public_sync_write_durability_commits_barrier_and_keeps_handle_open() {
         let gateway = Arc::new(MockGateway::default());
         let worker = Arc::new(MockDataClient::default());
-        let client =
-            FsClient::with_data_boundary(test_config(9), gateway, data_boundary(worker.clone())).expect("client");
-        let invalid = FileHandle::read("/invalid".to_string(), InodeId::new(0), DataHandleId::new(0), 0, 0);
+        let client = FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone()))
+            .expect("client");
+        let handle = client
+            .open("/created", OpenOptions::create_new())
+            .await
+            .expect("write handle");
+
+        client
+            .write(&handle, 0, Bytes::from_static(b"hello"))
+            .await
+            .expect("write before durability sync");
+        client
+            .sync_write_durability(&handle)
+            .await
+            .expect("durability sync should publish");
+
+        let sync_call = gateway
+            .calls()
+            .into_iter()
+            .find(|call| call.method == "sync_write")
+            .expect("sync_write call");
+        assert_eq!(
+            sync_call.sync_mode,
+            Some(WriteSyncModeProto::WriteSyncModeDurability as i32)
+        );
+        assert_eq!(sync_call.target_size, Some(5));
+        assert_eq!(sync_call.committed_block_lens, vec![5]);
+        assert_eq!(worker.committed_lens(), vec![5]);
+        assert_eq!(worker.commit_sync_flags(), vec![true]);
+        assert!(worker.block_sync_lens().is_empty());
+
+        client
+            .write(&handle, 5, Bytes::from_static(b"!"))
+            .await
+            .expect("write handle must remain open after durability sync");
+        client
+            .close(&handle)
+            .await
+            .expect("close after durability sync should succeed");
+        assert_eq!(worker.commit_sync_flags(), vec![true, false]);
+    }
+
+    #[tokio::test]
+    async fn sync_write_durability_after_visibility_upgrades_worker_commit_before_metadata() {
+        let gateway = Arc::new(MockGateway::default());
+        let worker = Arc::new(MockDataClient::default());
+        let client = FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone()))
+            .expect("client");
+        let handle = client
+            .open("/created", OpenOptions::create_new())
+            .await
+            .expect("write handle");
+
+        client
+            .write(&handle, 0, Bytes::from_static(b"hello"))
+            .await
+            .expect("write before visibility sync");
+        client
+            .sync_write_visibility(&handle)
+            .await
+            .expect("visibility sync should publish");
+        client
+            .sync_write_durability(&handle)
+            .await
+            .expect("durability sync should upgrade committed block");
+
+        let sync_modes = gateway
+            .calls()
+            .into_iter()
+            .filter(|call| call.method == "sync_write")
+            .map(|call| call.sync_mode)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sync_modes,
+            vec![
+                Some(WriteSyncModeProto::WriteSyncModeVisibility as i32),
+                Some(WriteSyncModeProto::WriteSyncModeDurability as i32),
+            ]
+        );
+        assert_eq!(worker.committed_lens(), vec![5]);
+        assert_eq!(worker.commit_sync_flags(), vec![false]);
+        assert_eq!(worker.block_sync_lens(), vec![5]);
+    }
+
+    #[tokio::test]
+    async fn repeated_sync_write_durability_does_not_recommit_worker_block() {
+        let gateway = Arc::new(MockGateway::default());
+        let worker = Arc::new(MockDataClient::default());
+        let client = FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone()))
+            .expect("client");
+        let handle = client
+            .open("/created", OpenOptions::create_new())
+            .await
+            .expect("write handle");
+
+        client
+            .write(&handle, 0, Bytes::from_static(b"hello"))
+            .await
+            .expect("write before durability sync");
+        client
+            .sync_write_durability(&handle)
+            .await
+            .expect("first durability sync should publish");
+        client
+            .sync_write_durability(&handle)
+            .await
+            .expect("second durability sync should not recommit worker block");
+
+        assert_eq!(method_count(&gateway.calls(), "sync_write"), 2);
+        assert_eq!(worker.committed_lens(), vec![5]);
+        assert_eq!(worker.commit_sync_flags(), vec![true]);
+        assert!(worker.block_sync_lens().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_write_durability_worker_commit_unknown_does_not_call_metadata_sync_write() {
+        let gateway = Arc::new(MockGateway::default());
+        let worker = Arc::new(MockDataClient::with_commit_write_outcomes(vec![
+            WorkerCommitOutcome::Unknown,
+        ]));
+        let client = FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone()))
+            .expect("client");
+        let handle = client
+            .open("/created", OpenOptions::create_new())
+            .await
+            .expect("write handle");
+
+        client
+            .write(&handle, 0, Bytes::from_static(b"hello"))
+            .await
+            .expect("write before durability sync");
+        let err = client
+            .sync_write_durability(&handle)
+            .await
+            .expect_err("unknown CommitWrite must block SyncWrite");
+
+        assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("CommitWrite")));
+        assert_eq!(method_count(&gateway.calls(), "sync_write"), 0);
+        assert!(worker.commit_sync_flags().is_empty());
+        let write_err = client
+            .write(&handle, 5, Bytes::from_static(b"!"))
+            .await
+            .expect_err("session must be blocked after unknown CommitWrite");
+        assert!(matches!(write_err, ClientError::StaleHandle { reason } if reason.contains("unknown outcome")));
+    }
+
+    #[tokio::test]
+    async fn sync_write_durability_block_sync_unknown_does_not_call_metadata_durability() {
+        let gateway = Arc::new(MockGateway::default());
+        let worker = Arc::new(MockDataClient::with_block_sync_outcomes(vec![
+            WorkerBlockSyncOutcome::Unknown,
+        ]));
+        let client = FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone()))
+            .expect("client");
+        let handle = client
+            .open("/created", OpenOptions::create_new())
+            .await
+            .expect("write handle");
+
+        client
+            .write(&handle, 0, Bytes::from_static(b"hello"))
+            .await
+            .expect("write before visibility sync");
+        client
+            .sync_write_visibility(&handle)
+            .await
+            .expect("visibility sync should publish");
+        let err = client
+            .sync_write_durability(&handle)
+            .await
+            .expect_err("unknown block sync must block metadata durability SyncWrite");
+
+        assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("SyncCommittedBlock")));
+        let sync_modes = gateway
+            .calls()
+            .into_iter()
+            .filter(|call| call.method == "sync_write")
+            .map(|call| call.sync_mode)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sync_modes,
+            vec![Some(WriteSyncModeProto::WriteSyncModeVisibility as i32)]
+        );
+        assert_eq!(worker.committed_lens(), vec![5]);
+        assert_eq!(worker.commit_sync_flags(), vec![false]);
+        assert!(worker.block_sync_lens().is_empty());
+        let write_err = client
+            .write(&handle, 5, Bytes::from_static(b"!"))
+            .await
+            .expect_err("session must be blocked after unknown block sync");
+        assert!(matches!(write_err, ClientError::StaleHandle { reason } if reason.contains("unknown outcome")));
+    }
+
+    #[tokio::test]
+    async fn sync_write_durability_block_sync_failure_does_not_call_metadata_durability() {
+        let gateway = Arc::new(MockGateway::default());
+        let worker = Arc::new(MockDataClient::with_block_sync_outcomes(vec![
+            WorkerBlockSyncOutcome::Failure,
+        ]));
+        let client = FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone()))
+            .expect("client");
+        let handle = client
+            .open("/created", OpenOptions::create_new())
+            .await
+            .expect("write handle");
+
+        client
+            .write(&handle, 0, Bytes::from_static(b"hello"))
+            .await
+            .expect("write before visibility sync");
+        client
+            .sync_write_visibility(&handle)
+            .await
+            .expect("visibility sync should publish");
+        let err = client
+            .sync_write_durability(&handle)
+            .await
+            .expect_err("block sync failure must block metadata durability SyncWrite");
+
+        assert!(matches!(err, ClientError::Worker(msg) if msg.contains("SyncCommittedBlock")));
+        let sync_modes = gateway
+            .calls()
+            .into_iter()
+            .filter(|call| call.method == "sync_write")
+            .map(|call| call.sync_mode)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sync_modes,
+            vec![Some(WriteSyncModeProto::WriteSyncModeVisibility as i32)]
+        );
+        assert_eq!(worker.committed_lens(), vec![5]);
+        assert_eq!(worker.commit_sync_flags(), vec![false]);
+        assert!(worker.block_sync_lens().is_empty());
+        let write_err = client
+            .write(&handle, 5, Bytes::from_static(b"!"))
+            .await
+            .expect_err("session must be blocked after block sync failure");
+        assert!(matches!(write_err, ClientError::StaleHandle { reason } if reason.contains("unknown outcome")));
+    }
+
+    #[tokio::test]
+    async fn sync_write_unknown_outcome_blocks_later_writes() {
+        let gateway = Arc::new(MockGateway::with_sync_outcomes(vec![
+            SyncOutcome::TransportUnknown,
+            SyncOutcome::TransportUnknown,
+            SyncOutcome::TransportUnknown,
+            SyncOutcome::TransportUnknown,
+        ]));
+        let worker = Arc::new(MockDataClient::default());
+        let client = FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone()))
+            .expect("client");
+        let handle = client
+            .open("/created", OpenOptions::create_new())
+            .await
+            .expect("write handle");
+
+        client
+            .write(&handle, 0, Bytes::from_static(b"hello"))
+            .await
+            .expect("write before visibility sync");
+        let err = client
+            .sync_write_visibility(&handle)
+            .await
+            .expect_err("unknown metadata SyncWrite outcome must fail");
+
+        assert!(
+            matches!(&err, ClientError::UnknownOutcome(msg) if msg.contains("SyncWrite")),
+            "{err:?}"
+        );
+        assert_eq!(worker.commit_sync_flags(), vec![false]);
+        assert_eq!(method_count(&gateway.calls(), "sync_write"), 1);
+        let write_err = client
+            .write(&handle, 5, Bytes::from_static(b"!"))
+            .await
+            .expect_err("session must be blocked after unknown SyncWrite");
+        assert!(matches!(write_err, ClientError::StaleHandle { reason } if reason.contains("unknown outcome")));
+    }
+
+    #[tokio::test]
+    async fn public_sync_write_barriers_validate_handles_before_execution() {
+        let gateway = Arc::new(MockGateway::default());
+        let worker = Arc::new(MockDataClient::default());
+        let client = FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone()))
+            .expect("client");
         let read = read_handle(10);
         let write = client
             .open("/created", OpenOptions::create_new())
             .await
             .expect("write handle");
-        let aborted = client
-            .open("/created", OpenOptions::create_new())
+
+        let err = client
+            .sync_write_visibility(&read)
             .await
-            .expect("write handle");
-
-        let err = client.hflush(&invalid).await.expect_err("invalid hflush must fail");
+            .expect_err("read visibility sync must fail");
         assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("write handle")));
-        let err = client.hsync(&invalid).await.expect_err("invalid hsync must fail");
-        assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("write handle")));
-
-        let err = client.hflush(&read).await.expect_err("read hflush must fail");
-        assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("write handle")));
-        let err = client.hsync(&read).await.expect_err("read hsync must fail");
+        let err = client
+            .sync_write_durability(&read)
+            .await
+            .expect_err("read durability sync must fail");
         assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("write handle")));
 
         client.close(&write).await.expect("close empty handle");
-        let err = client.hflush(&write).await.expect_err("closed hflush must fail");
+        let err = client
+            .sync_write_visibility(&write)
+            .await
+            .expect_err("closed visibility sync must fail");
         assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("closed")));
-        let err = client.hsync(&write).await.expect_err("closed hsync must fail");
+        let err = client
+            .sync_write_durability(&write)
+            .await
+            .expect_err("closed durability sync must fail");
         assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("closed")));
 
-        client.abort(&aborted).await.expect("abort empty handle");
-        let err = client.hflush(&aborted).await.expect_err("aborted hflush must fail");
-        assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("aborted")));
-        let err = client.hsync(&aborted).await.expect_err("aborted hsync must fail");
-        assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("aborted")));
+        assert_eq!(method_count(&gateway.calls(), "sync_write"), 0);
     }
 
     #[tokio::test]
@@ -3750,10 +4106,6 @@ mod tests {
         calls.iter().filter(|call| call.method == method).count()
     }
 
-    fn metric_count(events: &[ClientMetricEvent], metric: ClientMetric) -> usize {
-        events.iter().filter(|event| event.metric == metric).count()
-    }
-
     fn assert_metric(events: &[ClientMetricEvent], metric: ClientMetric) {
         assert!(
             events.iter().any(|event| event.metric == metric),
@@ -3842,6 +4194,7 @@ mod tests {
         final_size: Option<u64>,
         committed_block_offsets: Vec<u64>,
         committed_block_lens: Vec<u64>,
+        sync_mode: Option<i32>,
         create_disposition: Option<i32>,
     }
 
@@ -3873,6 +4226,7 @@ mod tests {
         append_outcomes: Mutex<VecDeque<AppendOutcome>>,
         add_block_outcomes: Mutex<VecDeque<AddBlockOutcome>>,
         commit_outcomes: Mutex<VecDeque<CommitOutcome>>,
+        sync_outcomes: Mutex<VecDeque<SyncOutcome>>,
         abort_outcomes: Mutex<VecDeque<AbortOutcome>>,
         renew_outcomes: Mutex<VecDeque<RenewOutcome>>,
         events: Option<EventLog>,
@@ -3946,6 +4300,7 @@ mod tests {
                 final_size: None,
                 committed_block_offsets: Vec::new(),
                 committed_block_lens: Vec::new(),
+                sync_mode: None,
                 operation_fingerprint: Some(ctx.operation_fingerprint()),
                 create_disposition: None,
             });
@@ -3968,6 +4323,7 @@ mod tests {
                 final_size: None,
                 committed_block_offsets: Vec::new(),
                 committed_block_lens: Vec::new(),
+                sync_mode: None,
                 operation_fingerprint: Some(ctx.operation_fingerprint()),
                 create_disposition: None,
             });
@@ -3985,6 +4341,7 @@ mod tests {
                 final_size: None,
                 committed_block_offsets: Vec::new(),
                 committed_block_lens: Vec::new(),
+                sync_mode: None,
                 operation_fingerprint: Some(ctx.operation_fingerprint()),
                 create_disposition: Some(req.disposition),
             });
@@ -4003,6 +4360,25 @@ mod tests {
                 final_size: Some(req.final_size),
                 committed_block_offsets: req.committed_blocks.iter().map(|block| block.file_offset).collect(),
                 committed_block_lens: req.committed_blocks.iter().map(|block| block.len).collect(),
+                sync_mode: None,
+                operation_fingerprint: Some(ctx.operation_fingerprint()),
+                create_disposition: None,
+            });
+        }
+
+        fn record_sync_write(&self, ctx: &AttemptContext, req: &crate::metadata::SyncWriteOp) {
+            let header = ctx.metadata_header().expect("metadata header");
+            self.calls.lock().expect("calls").push(RecordedCall {
+                method: "sync_write",
+                group_id: header.group_id,
+                call_id: header.client.as_ref().expect("client").call_id.clone(),
+                target_data_handle_id: req.data_handle_id.as_ref().map(|id| id.value),
+                range: None,
+                target_size: Some(req.target_size),
+                final_size: None,
+                committed_block_offsets: req.committed_blocks.iter().map(|block| block.file_offset).collect(),
+                committed_block_lens: req.committed_blocks.iter().map(|block| block.len).collect(),
+                sync_mode: Some(req.mode),
                 operation_fingerprint: Some(ctx.operation_fingerprint()),
                 create_disposition: None,
             });
@@ -4025,6 +4401,13 @@ mod tests {
         fn with_commit_outcomes(outcomes: Vec<CommitOutcome>) -> Self {
             Self {
                 commit_outcomes: Mutex::new(outcomes.into()),
+                ..Self::default()
+            }
+        }
+
+        fn with_sync_outcomes(outcomes: Vec<SyncOutcome>) -> Self {
+            Self {
+                sync_outcomes: Mutex::new(outcomes.into()),
                 ..Self::default()
             }
         }
@@ -4080,6 +4463,14 @@ mod tests {
                 .expect("commit outcomes")
                 .pop_front()
                 .unwrap_or(CommitOutcome::Ok)
+        }
+
+        fn next_sync_outcome(&self) -> SyncOutcome {
+            self.sync_outcomes
+                .lock()
+                .expect("sync outcomes")
+                .pop_front()
+                .unwrap_or(SyncOutcome::Ok)
         }
 
         fn next_abort_outcome(&self) -> AbortOutcome {
@@ -4350,6 +4741,24 @@ mod tests {
             }
         }
 
+        async fn sync_write(
+            &self,
+            ctx: AttemptContext,
+            req: crate::metadata::SyncWriteOp,
+        ) -> ClientResult<SyncWriteResponseProto> {
+            self.record_sync_write(&ctx, &req);
+            match self.next_sync_outcome() {
+                SyncOutcome::Ok => Ok(SyncWriteResponseProto {
+                    synced_size: req.target_size,
+                    file_version: Some(1),
+                    ..SyncWriteResponseProto::default()
+                }),
+                SyncOutcome::TransportUnknown => Err(ClientError::from(tonic::Status::unavailable(
+                    "injected SyncWrite transport uncertainty",
+                ))),
+            }
+        }
+
         async fn msync(
             &self,
             ctx: AttemptContext,
@@ -4379,6 +4788,12 @@ mod tests {
         TransportUnknown,
         FingerprintMismatch,
         SessionExpired,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SyncOutcome {
+        Ok,
+        TransportUnknown,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4415,10 +4830,13 @@ mod tests {
         written: Mutex<Vec<u8>>,
         committed: Mutex<Vec<u64>>,
         committed_seqs: Mutex<Vec<u64>>,
+        committed_streams: Mutex<std::collections::HashSet<(u64, u64)>>,
         commit_sync_flags: Mutex<Vec<bool>>,
+        block_syncs: Mutex<Vec<u64>>,
         open_outcomes: Mutex<VecDeque<WorkerOpenOutcome>>,
         write_outcomes: Mutex<VecDeque<WorkerWriteOutcome>>,
         commit_write_outcomes: Mutex<VecDeque<WorkerCommitOutcome>>,
+        block_sync_outcomes: Mutex<VecDeque<WorkerBlockSyncOutcome>>,
         abort_outcomes: Mutex<VecDeque<WorkerAbortOutcome>>,
         abort_records: Mutex<Vec<RecordedWorkerAbort>>,
         events: Option<EventLog>,
@@ -4436,10 +4854,13 @@ mod tests {
                 written: Mutex::new(Vec::new()),
                 committed: Mutex::new(Vec::new()),
                 committed_seqs: Mutex::new(Vec::new()),
+                committed_streams: Mutex::new(std::collections::HashSet::new()),
                 commit_sync_flags: Mutex::new(Vec::new()),
+                block_syncs: Mutex::new(Vec::new()),
                 open_outcomes: Mutex::new(VecDeque::new()),
                 write_outcomes: Mutex::new(VecDeque::new()),
                 commit_write_outcomes: Mutex::new(VecDeque::new()),
+                block_sync_outcomes: Mutex::new(VecDeque::new()),
                 abort_outcomes: Mutex::new(VecDeque::new()),
                 abort_records: Mutex::new(Vec::new()),
                 events: None,
@@ -4495,6 +4916,13 @@ mod tests {
             }
         }
 
+        fn with_block_sync_outcomes(outcomes: Vec<WorkerBlockSyncOutcome>) -> Self {
+            Self {
+                block_sync_outcomes: Mutex::new(outcomes.into()),
+                ..Self::default()
+            }
+        }
+
         fn with_abort_outcomes(outcomes: Vec<WorkerAbortOutcome>) -> Self {
             Self {
                 abort_outcomes: Mutex::new(outcomes.into()),
@@ -4534,6 +4962,14 @@ mod tests {
                 .unwrap_or(WorkerCommitOutcome::Ok)
         }
 
+        fn next_block_sync_outcome(&self) -> WorkerBlockSyncOutcome {
+            self.block_sync_outcomes
+                .lock()
+                .expect("block sync outcomes")
+                .pop_front()
+                .unwrap_or(WorkerBlockSyncOutcome::Ok)
+        }
+
         fn next_abort_outcome(&self) -> WorkerAbortOutcome {
             self.abort_outcomes
                 .lock()
@@ -4564,6 +5000,10 @@ mod tests {
 
         fn commit_sync_flags(&self) -> Vec<bool> {
             self.commit_sync_flags.lock().expect("commit sync flags").clone()
+        }
+
+        fn block_sync_lens(&self) -> Vec<u64> {
+            self.block_syncs.lock().expect("block syncs").clone()
         }
 
         fn abort_records(&self) -> Vec<RecordedWorkerAbort> {
@@ -4697,6 +5137,18 @@ mod tests {
                 | WorkerCommitOutcome::WrittenThroughMismatch
                 | WorkerCommitOutcome::BlockStampMismatch => {}
             }
+            let stream_key = (block.stream_id.high, block.stream_id.low);
+            if !self
+                .committed_streams
+                .lock()
+                .expect("committed streams")
+                .insert(stream_key)
+            {
+                return Err(ClientError::Worker(format!(
+                    "CommitWrite stream already committed and removed: high={} low={}",
+                    block.stream_id.high, block.stream_id.low
+                )));
+            }
             self.committed.lock().expect("committed").push(effective_len);
             self.committed_seqs.lock().expect("committed seqs").push(commit_seq);
             self.commit_sync_flags
@@ -4717,6 +5169,32 @@ mod tests {
                     WorkerCommitOutcome::WrittenThroughMismatch => effective_len.saturating_sub(1),
                     _ => effective_len,
                 },
+            })
+        }
+
+        async fn sync_committed_block(
+            &self,
+            _ctx: AttemptContext,
+            block: &WorkerWriteBlock,
+            expected_len: u64,
+        ) -> ClientResult<WorkerBlockSyncResult> {
+            self.record_event("sync_committed_block");
+            let outcome = self.next_block_sync_outcome();
+            match outcome {
+                WorkerBlockSyncOutcome::Ok => {}
+                WorkerBlockSyncOutcome::Unknown => {
+                    return Err(ClientError::UnknownOutcome(
+                        "SyncCommittedBlock outcome is unknown".to_string(),
+                    ));
+                }
+                WorkerBlockSyncOutcome::Failure => {
+                    return Err(ClientError::Worker("SyncCommittedBlock failed".to_string()));
+                }
+            }
+            self.block_syncs.lock().expect("block syncs").push(expected_len);
+            Ok(WorkerBlockSyncResult {
+                effective_block_len: expected_len,
+                block_stamp: block.target.block_stamp,
             })
         }
 
@@ -4772,6 +5250,13 @@ mod tests {
         LengthMismatch,
         WrittenThroughMismatch,
         BlockStampMismatch,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum WorkerBlockSyncOutcome {
+        Ok,
+        Unknown,
+        Failure,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
