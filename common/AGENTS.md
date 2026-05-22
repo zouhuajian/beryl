@@ -1,137 +1,62 @@
-# common/AGENTS.md
+# `common` Agent Instructions
 
-This file applies to `common/`.
+This file applies to `common/`. Follow the root `AGENTS.md` first, then these local rules.
 
-## 1. Directory purpose
+## Crate role
 
-`common/` contains only repository-wide shared primitives that are stable across modules.
+`common` is generic shared infrastructure. It is not a fallback bucket for code that lacks a clearer owner.
 
-Typical allowed contents:
+## Allowed changes
 
-- canonical error model and shared error helpers
-- config primitives and common config utilities
-- observability primitives: logging / tracing / metrics context
-- shared request / correlation identifiers
-- generic utility code with broad multi-module reuse
-- versioned low-level shared structs that do not belong to a domain crate
+- Canonical recoverable error types and shared error helpers.
+- Request/response header domain types that are independent of one service implementation.
+- Generic config loading, flattening, and environment-key mapping.
+- Generic utilities, retry/time/path helpers, and observability primitives.
+- Module-independent validation helpers.
+- Shared low-level primitives that are stable across multiple modules.
 
-`common/` is **not** a fallback bucket for code that lacks a home.
+## Forbidden changes
 
-## 2. What must NOT live here
+- Metadata authority DTOs, inode/dentry/mount policy, or filesystem authority rules.
+- Worker store state, worker runtime state, replication/repair orchestration, or worker-local network behavior.
+- Client retry, replay, refresh, route-cache, endpoint-health, or SDK error policy.
+- UFS backend-specific policy or adapter behavior.
+- Generated proto types, schema-local codecs, or gRPC adapters.
+- Module-specific typed config structs, defaults, validation, or every module key/default as a dumping ground.
+- Domain models that belong in `types`.
 
-Do not put the following into `common/`:
+## Dependency rules
 
-- filesystem authority logic
-- inode / dentry / mount business rules
-- worker execution logic
-- worker-local network protocol behavior
-- replication / repair orchestration
-- routing policy
-- client refresh-replay logic
-- protobuf-generated code
-- domain models that belong in `types/`
-- crate-specific helpers used by only one module
+- `common` may depend on `types` for stable IDs and shared primitives.
+- `common` must not depend on `proto`, `metadata`, `worker`, `client`, or `ufs`.
+- Avoid heavy dependencies for narrow convenience.
+- If a helper needs module policy to be correct, keep it out of `common`.
 
-If code is service-specific, keep it in metadata, worker, client, or ufs as appropriate.
-Worker-local networking belongs under `worker::net`.
-Client-side worker access belongs under `client`.
+## Conversion and validation rules
 
-## 3. Canonical error rules
+- Shared error/header domain types may live here; structural proto conversion belongs in `proto`.
+- Generic validation is allowed only when it does not choose metadata, worker, client, UFS, retry, refresh, route, repair, or cache policy.
+- Config helpers may parse and flatten config data, but typed module config validation belongs to the owning module.
+- Do not silently rewrite invalid config combinations.
 
-`common/` owns the shared error vocabulary.
+## Testing guidance
 
-Rules:
+- Add unit tests for error classification, config helpers, and generic validation.
+- Prefer structured assertions over string-only assertions when structured fields exist.
+- Add negative tests proving invalid combinations are rejected.
+- Do not add integration-style tests here when the behavior belongs to a product crate.
 
-- there must be one canonical recoverable error model shared across the repo
-- do not introduce parallel wire/business error enums in other crates unless explicitly approved
-- recoverable business/protocol/consistency failures must be representable in structured form
-- error types must carry machine-usable fields, not only strings
-- string messages are secondary; class/code/reason/retry hints are primary
+## Documentation guidance
 
-When changing shared error types, review all of these together:
+- Document shared primitives whose misuse would cause semantic bugs.
+- Keep comments focused on invariants, ownership, and structured semantics.
+- Update root or crate docs when shared infrastructure ownership changes.
 
-- proto header mapping
-- server-side construction
-- client-side interpretation
-- retry / refresh behavior
-- tests for semantic matching
+## Review checklist
 
-## 4. Dependency discipline
-
-`common/` must remain low in the dependency graph.
-
-Rules:
-
-- prefer zero or minimal dependencies
-- do not depend on service implementation crates such as `metadata`, `worker`, `client`, `ufs`, or generated `proto` crates unless the repo intentionally defines that edge
-- avoid pulling in heavy crates for narrow convenience
-- if a shared utility requires domain knowledge, it probably does not belong here
-
-If a new dependency in `common/` increases coupling across the workspace, assume it is wrong until proven necessary.
-
-## 5. Type design rules
-
-Types in `common/` must be generic and semantic.
-
-Rules:
-
-- use precise names; avoid `Utils`, `Helper`, `ContextData`, `ExtraInfo`, `Meta`
-- avoid raw `String` / `u64` where a typed wrapper is warranted and broadly reusable
-- keep generic shared structs small and explicit
-- prefer enums over magic numbers and string discriminators
-- persistent or cross-process shared structs must be version-conscious
-
-Do not create duplicate identity wrappers here if the authoritative domain identity belongs in `types/`.
-
-## 6. Observability rules
-
-`common/` should converge shared observability primitives, not business logging policy.
-
-Rules:
-
-- shared field names should be stable across modules
-- prefer structured logging fields over interpolated strings
-- request_id / trace_id / call_id / group_id / inode_id / block_id style identifiers should be easy to propagate
-- do not hardcode module-specific policy into common observability helpers
-
-Metrics/logging names should be reusable by multiple modules, not secretly tailored to one crate.
-
-## 7. Config rules
-
-Shared config code should define reusable primitives, validation helpers, and defaults policy.
-
-Rules:
-
-- config defaults may help create new runtime state, but must not reinterpret persisted state
-- validate invalid combinations explicitly
-- do not silently rewrite invalid config
-- avoid module-specific config structs here unless they are intentionally shared across multiple crates
-
-## 8. Coding rules for this directory
-
-- keep files small and semantically tight
-- delete dead shared abstractions instead of keeping compatibility layers
-- prefer `pub(crate)` over `pub` unless the item is intentionally shared across crate boundaries
-- avoid “temporary” bridge adapters
-- add doc comments for shared primitives whose misuse would cause semantic bugs
-
-## 9. Tests required for changes here
-
-A change in `common/` usually requires:
-
-- unit tests for error/classification mapping
-- serialization/deserialization tests for stable structs when applicable
-- validation tests for config helpers
-- negative tests proving invalid combinations are rejected
-- no test should assert only on string text when structured fields are available
-
-## 10. Pre-merge checklist
-
-Before submitting a change in `common/`, verify:
-
-- is this truly cross-module and stable?
-- should this actually live in `types/` instead?
-- did I accidentally introduce domain/business logic here?
-- did I create a second error vocabulary?
-- did I add an unnecessary dependency edge?
-- did I preserve structured semantics over stringly-typed behavior?
+- Is this truly generic, stable, and cross-module?
+- Should it live in `types` instead?
+- Did it introduce product runtime policy or a product-crate dependency?
+- Did it create a second error vocabulary?
+- Did config handling stay generic while typed module config stayed local?
+- Did stale internal code get deleted instead of wrapped when no compatibility requirement exists?

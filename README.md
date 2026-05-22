@@ -30,7 +30,7 @@ Vecton is an inode-centric distributed storage/cache system targeting HCFS (HDFS
 | block/chunk/stream |        | scheduling (metadata)  |
 | local store + xfer |        +------------------------+
 +--------------------+
-````
+```
 
 * **Client**: HCFS-style API, route cache, canonical retry (refresh loop).
 * **Metadata**: path resolution, mount-based routing, Raft state machine, maintenance/repair scheduling.
@@ -45,16 +45,24 @@ cargo build --workspace
 cargo test  --workspace
 ```
 
-## Repository Layout (typical)
+## Workspace crates
 
-* `common`: utilities, canonical error model, metrics/tracing
-* `types`: domain types (IDs, epochs, tokens)
-* `proto`: RPC/Proto definitions and generated code
-* `metadata`: metadata plane (Raft, mounts, FS API, maintenance/repair)
-* `worker`: data plane (storage, worker-local net server/peer-client code, replication/relocation)
-* `client`: client library
-* `ufs`: external backend integration
-* `integration_tests`: end-to-end contract validation
+| Crate | Role | Owns | Must not own |
+| --- | --- | --- | --- |
+| `common` | Shared infrastructure | Generic errors, request/response header domain types, config loading/flattening/env-key mapping, observability primitives, and module-independent utilities. | Metadata authority DTOs, worker store/runtime state, client retry/cache policy, UFS backend policy, generated proto types, or module-specific typed config. |
+| `types` | Pure Rust domain model | Stable cross-module value objects, typed IDs, worker endpoints, file block locations, write targets, committed blocks, fencing/block/epoch/watermark helpers, and pure shared value validation. | Generated proto types, proto wire values, runtime policy, metadata internals, worker store state, client cache/replay policy, UFS internals, test fixtures, or placeholder abstractions. |
+| `proto` | Wire schema and conversion | `.proto` files, generated Rust modules, gRPC service contracts, wire enum numeric values, structural proto/domain conversion, and schema-local codecs. | Business policy, retry/replay/cache decisions, metadata routing, worker runtime behavior, UFS behavior, or product-crate dependencies. |
+| `metadata` | Product runtime: metadata authority | Inode/dentry/attrs authority, mount state, leases, write sessions, `FsCore`, Raft state machine, worker membership, maintenance routing, and metadata typed config. | Worker store execution, client cache/replay policy, UFS backend behavior, or duplicated structural proto/domain conversion already owned by `proto`. |
+| `worker` | Product runtime: data plane | Local block store, chunk IO, checksum/repair execution, stream runtime, data service adapters, worker net server/client, and worker typed config. | Metadata authority policy, client cache/replay policy, generated schema ownership, or pushing store/runtime state into shared crates. |
+| `client` | Product runtime: SDK and orchestration | SDK behavior, metadata gateway, layout cache, worker endpoint cache, retry/replay classification, planner behavior, data-plane adapter orchestration, and client typed config. | Metadata authority policy, worker store/runtime behavior, generic schema ownership, or long-lived raw proto state when a domain model exists. |
+| `ufs` | External backend adapter | Backend integration, backend-specific config, OpenDAL setup, UFS path behavior, and backend capability decisions. | Metadata, worker, or client runtime policy; production helpers for unrelated crates; or dependencies on product runtime crates. |
+| `integration_tests` | Test-only contracts | End-to-end fixtures, mock servers, cross-crate contract assertions, and raw proto checks for wire behavior. | Production helpers, canonical conversion code, or runtime abstractions used by product crates. |
+
+### Dependency direction
+
+Shared crates sit below product crates. `types` must stay independent of workspace crates. `common` may use `types`, but not `proto` or product crates. `proto` may use `types` and `common`, but not `metadata`, `worker`, `client`, or `ufs`. Production crates must not depend on each other in production code: `metadata`, `worker`, and `client` stay separated, and `ufs` does not depend on them. `integration_tests` may depend on production crates, but remains test-only.
+
+Do not use `types` as a dumping ground for anything that merely appears in more than one place. Raw proto messages should stay near service or adapter boundaries and be converted before reaching long-lived business state. Runtime policy belongs to the owning module. `common` owns generic config loading mechanics; typed module config, defaults, and validation belong to the module that consumes them. Internal stale schemas and types should be deleted when they have no active use instead of wrapped in duplicate legacy APIs.
 
 ## License
 Apache-2.0. See `LICENSE`.

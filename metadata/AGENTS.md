@@ -1,200 +1,66 @@
-# metadata/AGENTS.md
+# `metadata` Agent Instructions
 
-This file applies to `metadata/`.
+This file applies to `metadata/`. Follow the root `AGENTS.md` first, then these local rules.
 
-## 1. Directory purpose
+## Crate role
 
-`metadata/` is the authoritative filesystem metadata plane.
+`metadata` owns the authoritative filesystem metadata plane. It is the source of truth for inode/dentry/attrs semantics, mount ownership, leases, write sessions, worker membership, and Raft-backed metadata state.
 
-This directory owns:
+## Allowed changes
 
-- inode / dentry / attrs authority
-- mount table and mount routing semantics
-- metadata raft state machine
-- namespace ownership and group routing
-- commit-boundary metadata durability
-- metadata-facing path traversal as an adapter over dentries/inodes
-- authoritative validation for metadata-level epochs / versions / ownership
-- metadata APIs and server-side behavior behind filesystem-facing contracts
+- Filesystem metadata authority: inode, dentry, attrs, and path traversal as an adapter.
+- Mount state, mount routing, namespace ownership, and route freshness.
+- Lease and write-session authority.
+- `FsCore` and server-side filesystem behavior.
+- Raft state machine, snapshots, replay, and metadata persistence.
+- Worker membership and metadata maintenance routing.
+- Metadata typed config, defaults, and validation.
+- Authority-side DTOs that are not stable shared contracts.
 
-This directory is the source of truth for filesystem metadata semantics.
+## Forbidden changes
 
-## 2. What must NOT live here
+- Worker store execution, chunk IO, stream runtime, checksum/repair execution, or worker-local path layout.
+- Client retry, replay, cache, endpoint-health, or SDK policy.
+- UFS backend behavior or backend capability policy.
+- Protobuf schema ownership.
+- Structural proto/domain conversion duplicated when `proto` already owns it.
+- Stable cross-module domain definitions that belong in `types`.
+- Path-as-authority indexes or caches that can outvote inode/dentry state.
 
-Do not put the following into `metadata/`:
+## Dependency rules
 
-- data-plane block/chunk read/write execution
-- worker-local storage layout logic
-- transport framing / codec details
-- generic shared utilities that belong in `common/`
-- protobuf schema ownership
-- client-side refresh-replay policy
-- opaque cache-only shortcuts that bypass metadata authority
-- path-as-authority indexing or duplicated path truth outside inode/dentry model
+- `metadata` may depend on shared crates where appropriate.
+- `metadata` must not depend on `worker` or `client` in production code.
+- Test-only dependencies must stay explicit and narrow.
+- Stable cross-module returned DTOs should use `types` domain models and `proto` conversion instead of metadata-local shadow models.
 
-Metadata may coordinate with other modules, but it must not absorb their responsibilities.
+## Conversion and validation rules
 
-## 3. Authority rules
+- Authority policy stays local: owner group, route freshness, lease renewal, block allocation, metadata publication, delete/repair/GC scheduling, and write-session planning.
+- Structural proto/domain conversion should be called from `proto` helpers when shared.
+- Metadata validates namespace, inode/dentry/attrs, mount ownership, route epoch, mount epoch, state watermark, leases, and write-session semantics.
+- Recoverable authority failures must be machine-usable through structured response errors.
+- Follower successful responses must not advance client state cache.
+- `applied_seq` must not be reintroduced as runtime, storage, snapshot, header, or client state.
 
-### 3.1 Inode / dentry / attrs are authoritative
+## Testing guidance
 
-Rules:
+- Add or update tests for inode/dentry/path traversal, mount routing, child-over-parent mounts, same-mount rename atomicity, stale route/mount/state behavior, not-leader refresh, lease/write-session behavior, persistence, and replay where relevant.
+- Assert structured error class/reason fields when structured errors exist.
+- Prefer focused metadata tests for authority policy; use integration tests for cross-crate behavior.
 
-- inode, dentry, and attrs are the authoritative filesystem model
-- path is resolved by traversal, not by a persisted authoritative path index
-- do not reintroduce file-path-based authority for convenience
-- do not store or cache alternate truth that can drift from inode/dentry state
+## Documentation guidance
 
-A path API is allowed only as an adapter over authoritative metadata structures.
+- Update docs when filesystem-visible behavior, schema usage, config ownership, authority boundaries, or state freshness semantics change.
+- Comments should explain authority invariants and recovery semantics, not restate syntax.
+- Keep speculative multi-group msync or future routing designs out of local docs unless explicitly requested.
 
-### 3.2 FileSystemService is the external entrypoint
+## Review checklist
 
-Rules:
-
-- external filesystem-facing behavior must align with the filesystem entrypoint contract
-- do not introduce side-channel external APIs that bypass the entrypoint contract
-- internal services may exist, but they must not become competing external authority paths
-- FileSystemService is client-facing and should expose HCFS-style filesystem operations.
-- Public path deletion is represented by `Delete`.
-- Do not expose public file-delete or empty-directory-delete handlers from `path_service`; public path deletion is represented by `Delete`.
-- `path_service` may dispatch `Delete` to internal `FsCore::execute_unlink` or `FsCore::execute_delete_empty_dir`, but it must remain a path-first adapter over inode/dentry authority.
-
-### 3.3 Rename and namespace rules
-
-Rules:
-
-- same-mount rename must preserve atomicity
-- mount ownership must be explicit and stable
-- cross-mount semantics must not be hidden behind same-mount assumptions
-- do not add shortcuts that undermine namespace consistency
-
-## 4. Mount routing rules
-
-Mount handling is a high-risk area. Preserve explicit semantics.
-
-Rules:
-
-- mount routing follows namespace/mount ownership semantics, not generic hashing
-- longest-prefix match must be unambiguous
-- child mount prefixes override parent prefixes
-- mount changes must carry monotonic per-entry versioning: Rust `MountEntry.mount_version` and proto `MountEntryProto.mount_version` are exposed externally as `mount_epoch`
-- `MountTable::version()` is a table-level version counter, not a per-entry mount version getter
-- ownership, redirect, and refresh semantics must remain machine-usable
-- leader/group mismatch must return structured refreshable errors, not opaque failures
-
-Do not “temporarily” route metadata writes by hash when the contract requires mount ownership routing.
-
-## 5. Raft and persistence rules
-
-Metadata uses consensus for authoritative state, but only at the right boundary.
-
-Rules:
-
-- raft is for authoritative metadata state
-- write raft at commit boundaries, not per data chunk or per transport frame
-- high-frequency runtime chatter must not become raft write traffic
-- snapshots/log replay must preserve authoritative metadata interpretation
-- persisted metadata state must remain semantically explicit and version-conscious
-
-Do not push transient worker/runtime/load signals through raft without an explicit documented reason.
-
-## 6. Identity rules inside metadata
-
-Metadata must preserve strict identity separation.
-
-Rules:
-
-- `inode_id` is the authoritative filesystem identity
-- `data_handle_id` is related data-plane identity and must not replace filesystem authority
-- `file_handle` is session-scoped and must not be treated as durable metadata identity
-- do not collapse inode identity and data identity into a single field or cache key
-- when metadata returns data-facing routing info, keep the semantic boundary explicit
-
-Any change touching identity must audit:
-
-- metadata storage schema
-- path traversal logic
-- mount/inode ownership checks
-- RPC request/response types
-- client cache/update behavior
-- worker validation paths
-
-## 7. Error and refresh rules
-
-Metadata is a major producer of structured recoverable errors.
-
-Rules:
-
-- business / protocol / consistency failures must be returned as gRPC OK + structured response header error
-- not-leader, stale route, mount epoch mismatch, stale state, and similar recoverable conditions must be machine-usable
-- do not hide recoverability in strings
-- response fields should enable client refresh-replay rather than forcing blind retries
-
-Metadata must prefer actionable refresh semantics over generic failure responses.
-
-## 8. Metadata state freshness invariants
-
-Rules:
-
-- metadata state freshness is represented only by repeated `GroupStateWatermark`
-- `GroupStateWatermark` is `{ group_id, state_id: RaftLogId }`
-- `state_id` means state-machine applied `RaftLogId`
-- `state_id` must not mean committed index, append index, `applied_seq`, `route_epoch`, `mount_epoch`, `worker_epoch`, `call_id`, or `request_id`
-- `RequestHeader.state` is the client-required applied watermark
-- `ResponseHeader.state` is a server-authorized client state-cache update
-- follower successful responses must return empty `ResponseHeader.state`
-- empty `ResponseHeader.state` means "do not update client state cache"; it is not stale-state
-- stale-state must be expressed through the canonical stale-state error
-- `applied_seq` must not be reintroduced as runtime, storage, snapshot, header, or client state
-- do not add legacy `applied_seq` snapshot decode fallback
-- do not bump snapshot version just to preserve removed `applied_seq` compatibility unless a real external compatibility requirement exists
-- `route_epoch`, `mount_epoch`, and `worker_epoch` are separate config freshness domains
-
-## 9. Path traversal and caching rules
-
-Rules:
-
-- path traversal is an adapter over dentry/inode authority
-- caches are accelerators, not alternate sources of truth
-- cache invalidation/versioning must be grounded in authoritative metadata versions/epochs
-- do not add hidden fallback paths that succeed while bypassing version checks
-
-A metadata cache that can outvote authority is a bug.
-
-## 10. Coding rules for this directory
-
-- keep authority logic explicit and local
-- prefer semantically named types over generic structs/maps
-- keep mount routing, inode/dentry state, and raft application logic readable and testable
-- delete legacy path-authority or hash-routing remnants instead of layering around them
-- avoid helper abstractions that blur authority boundaries
-- comments should explain invariants and recovery semantics, not restate syntax
-
-## 11. Tests required for changes here
-
-A meaningful metadata change should usually include the relevant subset of:
-
-- inode/dentry/path traversal tests
-- longest-prefix mount resolution tests
-- child-overrides-parent mount tests
-- same-mount rename atomicity tests
-- mount epoch / config version mismatch tests
-- not-leader structured refresh tests
-- state watermark / stale-state related tests where applicable
-- persistence / restart / replay tests
-- negative tests proving stale or wrong ownership requests are rejected
-
-Tests should assert semantic class/reason fields when structured errors exist.
-
-## 12. Pre-merge checklist
-
-Before submitting a metadata change, verify:
-
-- did I preserve inode/dentry/attrs authority?
-- did I reintroduce path-as-source-of-truth in any form?
-- did I accidentally route by hash where ownership routing is required?
-- did I mix inode identity, data identity, and session identity?
-- did I push high-frequency state into raft?
-- did I preserve structured refreshable error behavior?
-- did I keep same-mount rename semantics intact?
-- did docs/tests move with the contract?
+- Did inode/dentry/attrs remain authoritative and path remain an adapter?
+- Did authority policy stay in `metadata`?
+- Did the change avoid dependencies on `worker` and `client` production code?
+- Did it reuse `types` and `proto` conversion for stable shared DTOs?
+- Did it preserve structured refreshable error behavior?
+- Did it keep `route_epoch`, `mount_epoch`, `worker_epoch`, and `GroupStateWatermark` separate?
+- Did tests/docs move with changed authority behavior?

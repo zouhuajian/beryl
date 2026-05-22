@@ -1,138 +1,65 @@
-# types/AGENTS.md
+# `types` Agent Instructions
 
-This file applies to `types/`.
+This file applies to `types/`. Follow the root `AGENTS.md` first, then these local rules.
 
-## 1. Directory purpose
+## Crate role
 
-`types/` contains authoritative domain model types shared across the Vecton workspace.
+`types` is a pure Rust domain-model crate. It owns stable value objects shared by multiple production modules. It must stay independent of generated proto types and product-runtime crates.
 
-This directory should define:
+## Allowed changes
 
-- strongly typed identifiers
-- domain enums and value objects
-- Block / Chunk / Stream-related domain models
-- metadata-facing shared domain structs
-- state/version/epoch wrappers when they are part of domain semantics
-- request/response-adjacent domain objects that are not protobuf-generated code
+- Strongly typed IDs and value objects.
+- Stable cross-module Rust domain models.
+- Worker endpoint domain values.
+- File block location, write target, and committed block domain values.
+- Fencing token, block stamp, worker epoch, and state watermark helpers.
+- Pure validation for shared values.
+- Small semantic helpers that make illegal states harder to represent.
 
-`types/` is the semantic model layer for the workspace.
+## Forbidden changes
 
-## 2. What must NOT live here
+- Generated proto types or imports from `proto`.
+- Proto wire enum values or service-contract details.
+- Metadata authority internals, state-machine code, or persistence engine policy.
+- Worker store/runtime state, stream runtime state, path layout, publishability, recovery, or local execution helpers.
+- Client retry, replay, cache, endpoint-health, or SDK policy.
+- UFS adapter internals or backend behavior.
+- Integration-test fixtures or test-only abstractions.
+- Placeholder abstractions without active runtime use.
+- Generic utilities that belong in `common`.
 
-Do not put the following into `types/`:
+## Dependency rules
 
-- protobuf-generated structs as the authoritative model
-- service implementation logic
-- persistence engine details
-- transport codec logic
-- client retry algorithms
-- metadata state machine code
-- worker-local execution helpers
-- generic utilities that belong in `common/`
+- `types` must not depend on any workspace crate: not `common`, `proto`, `metadata`, `worker`, `client`, `ufs`, or `integration_tests`.
+- Keep external dependencies light and justified.
+- Do not import generated proto code as the authoritative shape of any domain concept.
 
-If a type is only meaningful inside one crate’s implementation, keep it in that crate.
+## Conversion and validation rules
 
-## 3. Identity is strict here
+- Domain construction and pure value validation may live here.
+- Proto/domain conversion belongs in `proto`, not `types`.
+- Avoid lossy `From`/`Into` implementations unless the loss is obvious and safe.
+- Use `TryFrom` or explicit constructors when validation can fail.
+- Keep identity separation explicit: inode identity, data identity, session handle, block identity, worker epoch, route epoch, and mount epoch are distinct concepts.
+- Do not flatten Block, Chunk, and Stream into a generic range abstraction unless the abstraction is semantically proven and actively used.
 
-This directory is the main place where identity separation must remain explicit.
+## Testing guidance
 
-Rules:
+- Test identity separation, invalid construction, equality/ordering semantics, and epoch/watermark comparison.
+- Test serialization only when a type owns stable serialized semantics.
+- Tests should prove domain semantics, not just derived trait behavior.
 
-- `inode_id` is filesystem authority identity
-- `data_handle_id` is stable data-plane/data-version identity
-- `file_handle` is session-scoped open-write identity
-- `block_id` must remain aligned with data-plane identity plus block index semantics
-- do not create umbrella IDs that blur these roles
+## Documentation guidance
 
-Never collapse multiple identities into one integer wrapper “for convenience”.
+- Document persisted or cross-node interpretation semantics.
+- Document defaults only when a default is semantically valid.
+- Update README or boundary docs when a shared domain value moves into or out of `types`.
 
-## 4. Block / Chunk / Stream modeling rules
+## Review checklist
 
-The distinction is mandatory.
-
-Rules:
-
-- Block is the sole management / reporting / replication / relocation unit
-- Chunk is the physical IO / repair / checksum granularity
-- Stream is the continuous read/write abstraction with negotiated runtime context
-- block size, storage chunk size, and transport frame size are different concepts
-- model them as different concepts even when they are numerically equal in some deployments
-
-Do not create APIs or structs that flatten Block/Chunk/Stream into a single generic range abstraction unless that abstraction is proven semantically correct.
-
-## 5. Domain modeling rules
-
-- use newtypes / wrappers for semantic safety where confusion is plausible
-- use enums for variant-bearing concepts
-- keep expected vs actual version/epoch/state distinctions explicit
-- prefer typed structs over `HashMap<String, String>`
-- avoid ambiguous names like `id`, `version`, `epoch`, `state`, `meta`
-- use units in names when needed: `_bytes`, `_ms`, `_index`
-
-A `types/` API should make illegal states harder to represent.
-
-## 6. Persistence and self-description awareness
-
-Types that participate in persisted or cross-node state must preserve interpretation semantics.
-
-Rules:
-
-- persisted layout-relevant fields must be explicit
-- do not assume runtime defaults are enough to interpret existing data
-- tail block / tail chunk semantics must stay representable where relevant
-- if a type encodes layout/version/checksum meaning, document that clearly
-
-## 7. Conversion rules
-
-Conversions between domain types and proto/storage/runtime representations must be deliberate.
-
-Rules:
-
-- avoid lossy `From`/`Into` implementations unless the loss is obvious and safe
-- if conversion can fail semantically, use `TryFrom`
-- do not hide identity collapse or version dropping inside convenience conversions
-- keep conversion boundaries visible in code review
-
-## 8. Dependency discipline
-
-`types/` should stay highly reusable.
-
-Rules:
-
-- keep dependencies light
-- avoid depending on high-level implementation crates
-- do not import generated proto code as the authoritative shape of the domain
-- do not let `types/` become coupled to a single runtime path
-
-## 9. Coding rules for this directory
-
-- prioritize semantic precision over brevity
-- derive common traits intentionally, not automatically everywhere
-- use `Copy` only for truly small immutable value types where the semantic cost is low
-- implement `Display` only when there is a stable human-meaningful representation
-- implement `Default` only when a default value is semantically valid
-
-Avoid placeholder or catch-all variants like `Unknown` unless the protocol/domain truly requires them.
-
-## 10. Tests required for changes here
-
-Changes in `types/` should usually include:
-
-- identity separation tests
-- serialization / conversion tests where applicable
-- equality / ordering tests when semantics depend on them
-- version/epoch comparison tests where relevant
-- negative tests for invalid construction or failed conversion
-
-Tests should validate semantics, not just derive behavior.
-
-## 11. Pre-merge checklist
-
-Before submitting a change in `types/`, verify:
-
-- did I preserve inode/data/session identity separation?
-- did I keep Block / Chunk / Stream distinct?
-- did I accidentally model runtime defaults as persisted truth?
-- did I add a type that actually belongs in `common/`?
-- did I add crate-local implementation detail that should stay outside `types/`?
-- are conversions explicit and semantically safe?
+- Is this a stable Rust domain concept used by more than one production module?
+- Does this accidentally encode runtime policy?
+- Did `types` remain free of generated proto imports and workspace dependencies?
+- Did the change preserve Block/Chunk/Stream separation and identity separation?
+- Is every default, conversion, and validation rule semantically valid?
+- Is this active runtime surface rather than a future placeholder?
