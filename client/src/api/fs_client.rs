@@ -1519,7 +1519,7 @@ mod tests {
         assert!(listing.eof);
         assert_eq!(listing.entries.len(), 1);
         assert_eq!(listing.entries[0].name, "child");
-        assert_eq!(listing.entries[0].kind, Some(crate::api::FileKind::File));
+        assert_eq!(listing.entries[0].kind, Some(crate::api::InodeKind::File));
         assert_eq!(listing.entries[0].attrs.as_ref().expect("entry attrs").size, 4);
         let methods: Vec<_> = gateway.calls().into_iter().map(|call| call.method).collect();
         assert_eq!(methods, vec!["get_status", "list_status", "delete", "rename"]);

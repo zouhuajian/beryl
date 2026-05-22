@@ -7,6 +7,7 @@
 //! and domain types defined in the types crate.
 
 use crate::common as proto_common;
+use crate::fs as proto_fs;
 use crate::metadata as proto_metadata;
 use ::common::{
     Deadline,
@@ -23,8 +24,8 @@ use types::ids::{
 };
 use types::lease::FencingToken;
 use types::{
-    CallId, ClientId, CommittedBlock, FileBlockLocation, GroupStateWatermark, RaftLogId, WorkerEndpointInfo,
-    WorkerNetProtocol, WriteTarget,
+    CallId, ClientId, CommittedBlock, FileAttrs, FileBlockLocation, GroupStateWatermark, InodeKind, RaftLogId,
+    WorkerEndpointInfo, WorkerNetProtocol, WriteTarget,
 };
 
 // ============================================================================
@@ -225,6 +226,71 @@ impl From<&proto_common::ByteRangeProto> for ByteRange {
 impl From<proto_common::ByteRangeProto> for ByteRange {
     fn from(range: proto_common::ByteRangeProto) -> Self {
         ByteRange::from(&range)
+    }
+}
+
+// ============================================================================
+// FS Domain Conversions
+// ============================================================================
+
+impl From<proto_fs::FileAttrsProto> for FileAttrs {
+    fn from(attrs: proto_fs::FileAttrsProto) -> Self {
+        Self {
+            mode: attrs.mode,
+            uid: attrs.uid,
+            gid: attrs.gid,
+            size: attrs.size,
+            atime_ms: attrs.atime_ms,
+            mtime_ms: attrs.mtime_ms,
+            ctime_ms: attrs.ctime_ms,
+            nlink: attrs.nlink,
+        }
+    }
+}
+
+impl From<&FileAttrs> for proto_fs::FileAttrsProto {
+    fn from(attrs: &FileAttrs) -> Self {
+        Self {
+            mode: attrs.mode,
+            uid: attrs.uid,
+            gid: attrs.gid,
+            size: attrs.size,
+            atime_ms: attrs.atime_ms,
+            mtime_ms: attrs.mtime_ms,
+            ctime_ms: attrs.ctime_ms,
+            nlink: attrs.nlink,
+        }
+    }
+}
+
+impl From<FileAttrs> for proto_fs::FileAttrsProto {
+    fn from(attrs: FileAttrs) -> Self {
+        Self::from(&attrs)
+    }
+}
+
+impl TryFrom<proto_fs::InodeKindProto> for InodeKind {
+    type Error = String;
+
+    fn try_from(kind: proto_fs::InodeKindProto) -> Result<Self, Self::Error> {
+        match kind {
+            proto_fs::InodeKindProto::InodeKindFile => Ok(Self::File),
+            proto_fs::InodeKindProto::InodeKindDir => Ok(Self::Dir),
+            proto_fs::InodeKindProto::InodeKindSymlink => Ok(Self::Symlink),
+            proto_fs::InodeKindProto::InodeKindUnspecified => {
+                Err("unspecified inode kind is not a domain value".to_string())
+            }
+        }
+    }
+}
+
+impl From<InodeKind> for proto_fs::InodeKindProto {
+    fn from(kind: InodeKind) -> Self {
+        match kind {
+            InodeKind::File => Self::InodeKindFile,
+            InodeKind::Dir => Self::InodeKindDir,
+            InodeKind::Symlink => Self::InodeKindSymlink,
+        }
     }
 }
 
@@ -1134,6 +1200,85 @@ mod tests {
         let proto_id: proto_common::BlockIdProto = block_id.into();
         let back: BlockId = proto_id.try_into().unwrap();
         assert_eq!(block_id, back);
+    }
+
+    #[test]
+    fn file_attrs_proto_converts_to_domain_file_attrs() {
+        let proto_attrs = crate::fs::FileAttrsProto {
+            mode: 0o100755,
+            uid: 501,
+            gid: 20,
+            size: 4096,
+            atime_ms: 11,
+            mtime_ms: 12,
+            ctime_ms: 13,
+            nlink: 2,
+        };
+
+        let attrs: types::FileAttrs = proto_attrs.into();
+
+        assert_eq!(
+            attrs,
+            types::FileAttrs {
+                mode: 0o100755,
+                uid: 501,
+                gid: 20,
+                size: 4096,
+                atime_ms: 11,
+                mtime_ms: 12,
+                ctime_ms: 13,
+                nlink: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn domain_file_attrs_converts_to_proto() {
+        let attrs = types::FileAttrs {
+            mode: 0o040755,
+            uid: 502,
+            gid: 21,
+            size: 8192,
+            atime_ms: 21,
+            mtime_ms: 22,
+            ctime_ms: 23,
+            nlink: 3,
+        };
+
+        let proto_attrs: crate::fs::FileAttrsProto = (&attrs).into();
+        let owned_proto_attrs: crate::fs::FileAttrsProto = attrs.into();
+
+        let expected = crate::fs::FileAttrsProto {
+            mode: 0o040755,
+            uid: 502,
+            gid: 21,
+            size: 8192,
+            atime_ms: 21,
+            mtime_ms: 22,
+            ctime_ms: 23,
+            nlink: 3,
+        };
+        assert_eq!(proto_attrs, expected);
+        assert_eq!(owned_proto_attrs, expected);
+    }
+
+    #[test]
+    fn inode_kind_proto_converts_to_domain_inode_kind() {
+        let cases = [
+            (crate::fs::InodeKindProto::InodeKindFile, types::InodeKind::File),
+            (crate::fs::InodeKindProto::InodeKindDir, types::InodeKind::Dir),
+            (crate::fs::InodeKindProto::InodeKindSymlink, types::InodeKind::Symlink),
+        ];
+
+        for (proto_kind, domain_kind) in cases {
+            let decoded: types::InodeKind = proto_kind.try_into().expect("known inode kind");
+            let encoded: crate::fs::InodeKindProto = domain_kind.into();
+            assert_eq!(decoded, domain_kind);
+            assert_eq!(encoded, proto_kind);
+        }
+
+        let err = types::InodeKind::try_from(crate::fs::InodeKindProto::InodeKindUnspecified);
+        assert!(err.is_err(), "unspecified inode kind is not a domain value");
     }
 
     #[test]

@@ -32,7 +32,7 @@ pub(crate) mod metadata;
 
 // Re-export commonly used types
 pub use api::{CreateMode, FileHandle, FsClient, OpenOptions};
-pub use api::{DirectoryEntry, DirectoryListing, FileAttrs, FileKind, FileStatus};
+pub use api::{DirectoryEntry, DirectoryListing, FileAttrs, FileStatus, InodeKind};
 pub use config::ClientConfig;
 pub use config::{
     BackoffConfig, CacheConfig, ChannelPoolConfig, ReadModeFallback, RefreshConfig, RetryConfig, WriteModeFallback,

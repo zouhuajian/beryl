@@ -3,66 +3,12 @@
 
 //! Public namespace status snapshots.
 
-use proto::fs::InodeKindProto;
+use types::{FileAttrs, InodeKind};
 
 use crate::error::{ClientError, ClientResult};
 
-/// User-visible file attributes returned by namespace APIs.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FileAttrs {
-    /// File mode bits.
-    pub mode: u32,
-    /// Owner user id.
-    pub uid: u32,
-    /// Owner group id.
-    pub gid: u32,
-    /// File length in bytes.
-    pub size: u64,
-    /// Last access time in milliseconds since Unix epoch.
-    pub atime_ms: u64,
-    /// Last modification time in milliseconds since Unix epoch.
-    pub mtime_ms: u64,
-    /// Last metadata change time in milliseconds since Unix epoch.
-    pub ctime_ms: u64,
-    /// Number of hard links.
-    pub nlink: u32,
-}
-
-impl FileAttrs {
-    pub(crate) fn from_proto(attrs: proto::fs::FileAttrsProto) -> Self {
-        Self {
-            mode: attrs.mode,
-            uid: attrs.uid,
-            gid: attrs.gid,
-            size: attrs.size,
-            atime_ms: attrs.atime_ms,
-            mtime_ms: attrs.mtime_ms,
-            ctime_ms: attrs.ctime_ms,
-            nlink: attrs.nlink,
-        }
-    }
-}
-
-/// User-visible inode kind for directory entries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FileKind {
-    /// Regular file.
-    File,
-    /// Directory.
-    Directory,
-    /// Symbolic link.
-    Symlink,
-}
-
-impl FileKind {
-    fn from_proto(kind: i32) -> Option<Self> {
-        match InodeKindProto::try_from(kind).ok()? {
-            InodeKindProto::InodeKindFile => Some(Self::File),
-            InodeKindProto::InodeKindDir => Some(Self::Directory),
-            InodeKindProto::InodeKindSymlink => Some(Self::Symlink),
-            InodeKindProto::InodeKindUnspecified => None,
-        }
-    }
+fn inode_kind_from_proto(kind: i32) -> Option<InodeKind> {
+    proto::fs::InodeKindProto::try_from(kind).ok()?.try_into().ok()
 }
 
 /// Public file or directory status returned by [`crate::FsClient::stat`].
@@ -85,7 +31,7 @@ impl FileStatus {
             .ok_or_else(|| ClientError::Metadata("GetStatusResponseProto.attrs missing".to_string()))?;
         Ok(Self {
             path: path.to_string(),
-            attrs: FileAttrs::from_proto(attrs),
+            attrs: attrs.into(),
         })
     }
 }
@@ -96,7 +42,7 @@ pub struct DirectoryEntry {
     /// Entry name relative to the listed directory.
     pub name: String,
     /// Entry kind when supplied by metadata.
-    pub kind: Option<FileKind>,
+    pub kind: Option<InodeKind>,
     /// Entry attributes when supplied by metadata.
     pub attrs: Option<FileAttrs>,
 }
@@ -105,8 +51,8 @@ impl DirectoryEntry {
     fn from_proto(entry: proto::fs::DirEntryProto) -> Self {
         Self {
             name: entry.name,
-            kind: FileKind::from_proto(entry.kind),
-            attrs: entry.attrs.map(FileAttrs::from_proto),
+            kind: inode_kind_from_proto(entry.kind),
+            attrs: entry.attrs.map(Into::into),
         }
     }
 }
@@ -140,6 +86,47 @@ impl DirectoryListing {
             entries: response.entries.into_iter().map(DirectoryEntry::from_proto).collect(),
             next_cursor,
             eof: response.eof,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use types::InodeKind;
+
+    fn dir_entry(name: &str, kind: i32) -> proto::fs::DirEntryProto {
+        proto::fs::DirEntryProto {
+            name: name.to_string(),
+            inode_id: None,
+            kind,
+            attrs: None,
+        }
+    }
+
+    #[test]
+    fn directory_entry_unspecified_and_unknown_kind_map_to_none() {
+        let unspecified = DirectoryEntry::from_proto(dir_entry(
+            "unspecified",
+            proto::fs::InodeKindProto::InodeKindUnspecified as i32,
+        ));
+        let unknown = DirectoryEntry::from_proto(dir_entry("unknown", 99));
+
+        assert_eq!(unspecified.kind, None);
+        assert_eq!(unknown.kind, None);
+    }
+
+    #[test]
+    fn directory_entry_known_kinds_map_to_domain_inode_kind() {
+        let cases = [
+            (proto::fs::InodeKindProto::InodeKindFile, Some(InodeKind::File)),
+            (proto::fs::InodeKindProto::InodeKindDir, Some(InodeKind::Dir)),
+            (proto::fs::InodeKindProto::InodeKindSymlink, Some(InodeKind::Symlink)),
+        ];
+
+        for (proto_kind, expected_kind) in cases {
+            let entry = DirectoryEntry::from_proto(dir_entry("entry", proto_kind as i32));
+            assert_eq!(entry.kind, expected_kind);
         }
     }
 }

@@ -11,4 +11,5 @@ pub mod status;
 pub use fs_client::FsClient;
 pub use handle::FileHandle;
 pub use options::{CreateMode, OpenOptions};
-pub use status::{DirectoryEntry, DirectoryListing, FileAttrs, FileKind, FileStatus};
+pub use status::{DirectoryEntry, DirectoryListing, FileStatus};
+pub use types::{FileAttrs, InodeKind};
