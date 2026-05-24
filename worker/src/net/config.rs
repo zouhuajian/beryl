@@ -40,7 +40,7 @@ pub enum PeerProtocolSelectionPolicy {
 }
 
 impl WorkerNetConfig {
-    pub fn grpc_from_legacy_rpc(bind: String, max_inflight: usize, max_frame_size: u32) -> Self {
+    pub fn grpc_from_rpc(bind: String, max_inflight: usize, max_frame_size: u32) -> Self {
         Self {
             listeners: vec![WorkerListenerConfig::grpc(bind, max_inflight, max_frame_size)],
             peer: WorkerPeerNetConfig::default(),
@@ -50,7 +50,7 @@ impl WorkerNetConfig {
 
 impl Default for WorkerNetConfig {
     fn default() -> Self {
-        Self::grpc_from_legacy_rpc("0.0.0.0:9090".to_string(), 100, BlockManager::MAX_FRAME_SIZE)
+        Self::grpc_from_rpc("0.0.0.0:9090".to_string(), 100, BlockManager::MAX_FRAME_SIZE)
     }
 }
 

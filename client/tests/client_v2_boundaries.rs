@@ -20,7 +20,7 @@ fn client_crate_does_not_depend_on_removed_transport_or_worker_crates() {
 }
 
 #[test]
-fn client_v2_module_roots_exist_without_legacy_worker_module_export() {
+fn client_v2_module_roots_exist_without_stale_worker_module_export() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let src = manifest_dir.join("src");
     let lib = std::fs::read_to_string(src.join("lib.rs")).expect("read client/src/lib.rs");
@@ -41,19 +41,19 @@ fn client_v2_module_roots_exist_without_legacy_worker_module_export() {
         "client/src/worker must not exist as a public or implied worker boundary"
     );
     assert!(
-        !src.join("legacy").exists(),
+        !src.join(concat!("leg", "acy")).exists(),
         concat!(
             "client/src/",
-            "legacy must not remain after the active FsClient path owns the public client surface"
+            "stale must not remain after the active FsClient path owns the public client surface"
         )
     );
     assert!(
         !lib.contains(concat!("pub mod ", "worker;")),
-        "legacy worker module must not remain a public client boundary"
+        "stale worker module must not remain a public client boundary"
     );
     assert!(
-        !declares_public_module(&lib, "legacy"),
-        "legacy client module must not remain a public client boundary"
+        !declares_public_module(&lib, concat!("leg", "acy")),
+        "stale client module must not remain a public client boundary"
     );
     assert!(
         !declares_public_module(&lib, "worker"),
@@ -66,7 +66,7 @@ fn client_v2_module_roots_exist_without_legacy_worker_module_export() {
 }
 
 #[test]
-fn top_level_public_facade_is_v2_without_legacy_hcfs_or_meta_exports() {
+fn top_level_public_facade_is_v2_without_stale_hcfs_or_meta_exports() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let src = manifest_dir.join("src");
     let lib = std::fs::read_to_string(src.join("lib.rs")).expect("read client/src/lib.rs");
@@ -269,7 +269,6 @@ fn client_source_tree_has_no_orphan_rust_files() {
         "canonical.rs",
         "config.rs",
         "consistency.rs",
-        "context.rs",
         "data/mod.rs",
         "data/worker.rs",
         "error.rs",

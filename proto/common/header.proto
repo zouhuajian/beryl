@@ -51,7 +51,7 @@ message RequestHeaderProto {
   /// Mount epoch for FS write operations.
   /// Client should provide the mount_epoch it knows for the mount being accessed.
   /// Server validates this against current mount.mount_epoch and returns NEED_REFRESH if mismatch.
-  /// Optional: if not provided, server skips mount_epoch validation (for backward compatibility).
+  /// Optional: if not provided, server skips mount_epoch validation for calls without a known mount epoch.
   optional uint64 mount_epoch = 3;
 
   /// Absolute deadline (Unix epoch milliseconds).

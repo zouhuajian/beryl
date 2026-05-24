@@ -355,7 +355,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     .await
                 {
                     // Lease allocated
-                    // Update metrics (keep slot_metrics for backward compatibility)
+                    // Update full-report lease metrics.
                     if let Some(ref slot_metrics) = self.slot_metrics {
                         slot_metrics
                             .full_report_granted_total

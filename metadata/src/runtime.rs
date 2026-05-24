@@ -328,9 +328,7 @@ pub async fn build_authority(config: &MetadataConfig) -> Result<MetadataAuthorit
 }
 
 fn effective_storage_dir(config: &MetadataConfig) -> std::path::PathBuf {
-    std::env::var_os("VECTON_METADATA_DB_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| config.storage_dir.clone())
+    config.storage_dir.clone()
 }
 
 /// Builds maintenance-owned repair state before worker RPC and maintenance tasks are wired.
@@ -562,9 +560,7 @@ mod tests {
     use common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
     use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
     use proto::metadata::{MsyncRequestProto, MsyncResponseProto};
-    use std::sync::OnceLock;
     use tempfile::TempDir;
-    use tokio::sync::Mutex as AsyncMutex;
     use types::{ClientId, GroupStateWatermark, RaftLogId};
 
     async fn test_authority(dir: &TempDir) -> MetadataAuthority {
@@ -873,9 +869,7 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_server_build_composes_required_runtime() {
-        let _guard = metadata_db_env_lock().lock().await;
         let dir = TempDir::new().unwrap();
-        std::env::remove_var("VECTON_METADATA_DB_PATH");
         let mut config = test_config();
         config.storage_dir = dir.path().to_path_buf();
 
@@ -895,25 +889,18 @@ mod tests {
         assert_eq!(server.handles._maintenance._maintenance_handle.task_count(), 8);
         assert!(!server.handles._maintenance._delete_executor_handle.is_finished());
         assert!(Arc::strong_count(&server.handles._readiness.gate) >= 1);
-
-        std::env::remove_var("VECTON_METADATA_DB_PATH");
     }
 
     #[tokio::test]
-    async fn vecton_metadata_db_path_overrides_config_storage_dir_for_legacy_runtime() {
-        let _guard = metadata_db_env_lock().lock().await;
+    async fn build_authority_uses_configured_storage_dir() {
         let configured = TempDir::new().unwrap();
-        let legacy_env = TempDir::new().unwrap();
-        std::env::set_var("VECTON_METADATA_DB_PATH", legacy_env.path());
         let mut config = test_config();
         config.storage_dir = configured.path().to_path_buf();
 
         let authority = build_authority(&config).await.unwrap();
 
-        assert!(legacy_env.path().join("CURRENT").exists());
-        assert!(!configured.path().join("CURRENT").exists());
+        assert!(configured.path().join("CURRENT").exists());
         drop(authority);
-        std::env::remove_var("VECTON_METADATA_DB_PATH");
     }
 
     #[test]
@@ -937,10 +924,5 @@ mod tests {
                 "main.rs must not perform runtime wiring with {forbidden}"
             );
         }
-    }
-
-    fn metadata_db_env_lock() -> &'static AsyncMutex<()> {
-        static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| AsyncMutex::new(()))
     }
 }

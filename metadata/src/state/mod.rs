@@ -115,7 +115,7 @@ pub struct DeleteIntent {
     /// Used for route consistency checking.
     #[serde(default)]
     pub mount_epoch: Option<types::group_watermark::MountEpoch>,
-    /// Guard state ID (legacy, for backward compatibility).
+    /// Single-group guard state ID used when no group-scoped watermark is stored.
     /// If guard_watermark is provided, this is ignored.
     pub guard_state_id: types::RaftLogId,
     /// Target workers (optional, can be empty for now).

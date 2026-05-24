@@ -625,7 +625,7 @@ impl GcService {
         match storage.get_all_block_ref_counts() {
             Ok(ref_counts) => {
                 let mut new_ref_counts = HashMap::new();
-                // Convert from global block_id refcount to data_handle_id:block_id format for backward compatibility
+                // Convert from global block_id refcount to data_handle_id:block_id format.
                 for (block_id, count) in ref_counts {
                     let data_handle_id = block_id.data_handle_id;
                     let file_refs = new_ref_counts.entry(data_handle_id).or_insert_with(HashMap::new);

@@ -7,23 +7,11 @@ use common::{ClientConfig as CommonClientConfig, CommonError, FlatConfig};
 use std::path::Path;
 use std::time::Duration;
 
-// Timeout/backpressure settings can be configured via client.rpc.* if needed (TODO).
-
 /// Client-specific configuration.
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
     /// Underlying common client config.
     pub inner: CommonClientConfig,
-    /// Default consistency level.
-    pub default_consistency: ConsistencyLevel,
-    /// Default read mode.
-    pub default_read_mode: ReadMode,
-    /// Default write mode.
-    pub default_write_mode: WriteMode,
-    /// Read mode fallback strategy.
-    pub read_mode_fallback: ReadModeFallback,
-    /// Write mode fallback strategy.
-    pub write_mode_fallback: WriteModeFallback,
     /// Cache configuration.
     pub cache: CacheConfig,
     /// Retry configuration.
@@ -40,48 +28,9 @@ pub struct ClientConfig {
     pub metadata_group_ids: Vec<u64>,
 }
 
-/// Consistency level (re-exported from consistency module).
-pub use crate::consistency::ConsistencyLevel;
-
-/// Read mode (re-exported from modes module).
-pub use crate::modes::ReadMode;
-
-/// Write mode (re-exported from modes module).
-pub use crate::modes::WriteMode;
-
-/// Read mode fallback strategy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReadModeFallback {
-    /// Fallback to direct read (skip cache).
-    Direct,
-    /// Disable read mode (use default path).
-    Disable,
-}
-
-/// Write mode fallback strategy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteModeFallback {
-    /// Fallback to write-through.
-    Through,
-    /// Fallback to direct-to-UFS.
-    Direct,
-    /// Disable write mode (use default path).
-    Disable,
-}
-
 /// Cache configuration.
 #[derive(Clone, Debug)]
 pub struct CacheConfig {
-    /// Maximum number of file metadata entries.
-    pub max_file_meta_entries: usize,
-    /// Maximum memory for file metadata cache (bytes).
-    pub max_file_meta_bytes: Option<usize>,
-    /// TTL for file metadata cache (seconds).
-    pub file_meta_ttl_secs: u64,
-    /// Maximum number of route table entries.
-    pub max_route_entries: usize,
-    /// TTL for route table cache (seconds).
-    pub route_ttl_secs: u64,
     /// Enable validated read-layout cache reuse.
     pub layout_cache_enabled: bool,
     /// TTL for read-layout cache entries.
@@ -245,24 +194,6 @@ impl ClientConfig {
 
     /// Create from FlatConfig.
     pub fn from_flat(flat: FlatConfig) -> Result<Self, CommonError> {
-        // Default consistency level
-        let default_consistency =
-            parse_value_or_default(&flat, "client.consistency.default", ConsistencyLevel::Normal)?;
-
-        // Default read mode
-        let default_read_mode = parse_value_or_default(&flat, "client.read_mode.default", ReadMode::Cached)?;
-
-        // Default write mode
-        let default_write_mode = parse_value_or_default(&flat, "client.write_mode.default", WriteMode::Back)?;
-
-        // Read mode fallback
-        let read_mode_fallback =
-            parse_read_mode_fallback_or_default(&flat, "client.read_mode.fallback", ReadModeFallback::Direct)?;
-
-        // Write mode fallback
-        let write_mode_fallback =
-            parse_write_mode_fallback_or_default(&flat, "client.write_mode.fallback", WriteModeFallback::Through)?;
-
         let cache = cache_config_from_flat(&flat)?;
 
         let retry = retry_config_from_flat(&flat)?;
@@ -283,17 +214,8 @@ impl ClientConfig {
 
         let metadata_group_ids = parse_metadata_group_ids(&flat)?;
 
-        // Worker net protocol is determined from metadata worker information.
-        // If client needs timeout/backpressure settings, they can be configured
-        // via client.rpc.* (TODO: implement if needed).
-
         Ok(Self {
             inner: CommonClientConfig::from_flat(flat),
-            default_consistency,
-            default_read_mode,
-            default_write_mode,
-            read_mode_fallback,
-            write_mode_fallback,
             cache,
             retry,
             refresh,
@@ -374,11 +296,6 @@ fn cache_config_from_flat(flat: &FlatConfig) -> Result<CacheConfig, CommonError>
     }
 
     Ok(CacheConfig {
-        max_file_meta_entries: get_usize_or_strict(flat, "client.cache.file_meta.max_entries", 10000)?,
-        max_file_meta_bytes: get_optional_usize(flat, "client.cache.file_meta.max_bytes")?,
-        file_meta_ttl_secs: get_u64_or_strict(flat, "client.cache.file_meta.ttl_secs", 300)?,
-        max_route_entries: get_usize_or_strict(flat, "client.cache.route.max_entries", 1000)?,
-        route_ttl_secs: get_u64_or_strict(flat, "client.cache.route.ttl_secs", 60)?,
         layout_cache_enabled,
         layout_cache_ttl,
         layout_cache_max_entries,
@@ -456,8 +373,6 @@ fn parse_metadata_group_ids(flat: &FlatConfig) -> Result<Vec<u64>, CommonError> 
                 )
             })?;
         parsed
-    } else if let Some(group_id) = get_optional_u64(flat, "client.metadata.group_id")? {
-        vec![group_id]
     } else {
         vec![1]
     };
@@ -474,9 +389,9 @@ fn parse_metadata_group_ids(flat: &FlatConfig) -> Result<Vec<u64>, CommonError> 
 fn retry_config_from_flat(flat: &FlatConfig) -> Result<RetryConfig, CommonError> {
     let defaults = RetryConfig::default();
     let max_retry_attempts = get_usize_or_strict(flat, "client.retry.max_retry_attempts", defaults.max_retry_attempts)?;
-    let metadata_retry_budget = get_usize_or(flat, "client.retry.metadata_budget", max_retry_attempts)?;
-    let worker_retry_budget = get_usize_or(flat, "client.retry.worker_budget", max_retry_attempts)?;
-    let session_barrier_retry_budget = get_usize_or(
+    let metadata_retry_budget = get_usize_or_strict(flat, "client.retry.metadata_budget", max_retry_attempts)?;
+    let worker_retry_budget = get_usize_or_strict(flat, "client.retry.worker_budget", max_retry_attempts)?;
+    let session_barrier_retry_budget = get_usize_or_strict(
         flat,
         "client.retry.session_barrier_budget",
         defaults.session_barrier_retry_budget.min(max_retry_attempts),
@@ -494,7 +409,7 @@ fn retry_config_from_flat(flat: &FlatConfig) -> Result<RetryConfig, CommonError>
 
 fn refresh_config_from_flat(flat: &FlatConfig) -> Result<RefreshConfig, CommonError> {
     Ok(RefreshConfig {
-        max_refresh_attempts: get_usize_or(
+        max_refresh_attempts: get_usize_or_strict(
             flat,
             "client.refresh.max_attempts",
             RefreshConfig::default().max_refresh_attempts,
@@ -524,68 +439,6 @@ fn backoff_config_from_flat(flat: &FlatConfig) -> Result<BackoffConfig, CommonEr
     Ok(backoff)
 }
 
-fn parse_value_or_default<T>(flat: &FlatConfig, key: &'static str, default: T) -> Result<T, CommonError>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    let Some(value) = get_str_if_present(flat, key)? else {
-        return Ok(default);
-    };
-    value
-        .parse()
-        .map_err(|err| invalid_config(key, format!("is invalid: {err}")))
-}
-
-fn parse_read_mode_fallback_or_default(
-    flat: &FlatConfig,
-    key: &'static str,
-    default: ReadModeFallback,
-) -> Result<ReadModeFallback, CommonError> {
-    let Some(value) = get_str_if_present(flat, key)? else {
-        return Ok(default);
-    };
-    match value.to_ascii_lowercase().as_str() {
-        "direct" => Ok(ReadModeFallback::Direct),
-        "disable" => Ok(ReadModeFallback::Disable),
-        _ => Err(invalid_config(key, "must be one of direct|disable")),
-    }
-}
-
-fn parse_write_mode_fallback_or_default(
-    flat: &FlatConfig,
-    key: &'static str,
-    default: WriteModeFallback,
-) -> Result<WriteModeFallback, CommonError> {
-    let Some(value) = get_str_if_present(flat, key)? else {
-        return Ok(default);
-    };
-    match value.to_ascii_lowercase().as_str() {
-        "through" => Ok(WriteModeFallback::Through),
-        "direct" => Ok(WriteModeFallback::Direct),
-        "disable" => Ok(WriteModeFallback::Disable),
-        _ => Err(invalid_config(key, "must be one of through|direct|disable")),
-    }
-}
-
-fn get_str_if_present(flat: &FlatConfig, key: &'static str) -> Result<Option<String>, CommonError> {
-    if let Some(value) = flat.get_str(key) {
-        return Ok(Some(value));
-    }
-    if flat.contains_key(key) {
-        return Err(invalid_config(key, "must be a string"));
-    }
-    Ok(None)
-}
-
-fn get_usize_or(flat: &FlatConfig, key: &'static str, default: usize) -> Result<usize, CommonError> {
-    match flat.get_i64(key) {
-        Some(value) if value >= 0 => Ok(value as usize),
-        Some(_) => Err(invalid_config(key, "must be non-negative")),
-        None => Ok(default),
-    }
-}
-
 fn get_usize_or_strict(flat: &FlatConfig, key: &'static str, default: usize) -> Result<usize, CommonError> {
     match get_i64_or_strict(flat, key)? {
         Some(value) if value >= 0 => Ok(value as usize),
@@ -599,14 +452,6 @@ fn get_u64_or_strict(flat: &FlatConfig, key: &'static str, default: u64) -> Resu
         Some(value) if value >= 0 => Ok(value as u64),
         Some(_) => Err(invalid_config(key, "must be non-negative")),
         None => Ok(default),
-    }
-}
-
-fn get_optional_usize(flat: &FlatConfig, key: &'static str) -> Result<Option<usize>, CommonError> {
-    match get_i64_or_strict(flat, key)? {
-        Some(value) if value >= 0 => Ok(Some(value as usize)),
-        Some(_) => Err(invalid_config(key, "must be non-negative")),
-        None => Ok(None),
     }
 }
 
@@ -662,11 +507,6 @@ mod tests {
     fn default_config_has_conservative_bounded_retry_refresh_and_backoff() {
         let config = ClientConfig::default();
 
-        assert_eq!(config.default_consistency, ConsistencyLevel::Normal);
-        assert_eq!(config.default_read_mode, ReadMode::Cached);
-        assert_eq!(config.default_write_mode, WriteMode::Back);
-        assert_eq!(config.read_mode_fallback, ReadModeFallback::Direct);
-        assert_eq!(config.write_mode_fallback, WriteModeFallback::Through);
         assert_eq!(config.retry.max_retry_attempts(), 3);
         assert_eq!(config.retry.metadata_retry_budget(), 3);
         assert_eq!(config.retry.worker_retry_budget(), 3);
@@ -701,53 +541,11 @@ mod tests {
     }
 
     #[test]
-    fn invalid_mode_strings_are_rejected() {
-        for key in [
-            "client.consistency.default",
-            "client.read_mode.default",
-            "client.write_mode.default",
-            "client.read_mode.fallback",
-            "client.write_mode.fallback",
-        ] {
-            let mut flat = FlatConfig::new();
-            flat.set(key, "invalid-mode");
-
-            let err = ClientConfig::from_flat(flat).expect_err("invalid mode string must fail");
-
-            assert!(
-                err.to_string().contains(key),
-                "error for {key} should mention the offending key: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn invalid_mode_wrong_type_values_are_rejected() {
-        for key in [
-            "client.consistency.default",
-            "client.read_mode.default",
-            "client.write_mode.default",
-            "client.read_mode.fallback",
-            "client.write_mode.fallback",
-        ] {
-            let mut flat = FlatConfig::new();
-            flat.set(key, true);
-
-            let err = ClientConfig::from_flat(flat).expect_err("present wrong-type mode value must fail");
-
-            assert!(
-                err.to_string().contains(key),
-                "error for {key} should mention the offending key: {err}"
-            );
-        }
-    }
-
-    #[test]
     fn negative_client_identity_values_are_rejected() {
         let mut flat = FlatConfig::new();
-        flat.set("client.metadata.group_id", -1i64);
+        flat.set("client.metadata.group_ids", "-1");
         let err = ClientConfig::from_flat(flat).expect_err("negative metadata group id must fail");
-        assert!(err.to_string().contains("client.metadata.group_id"));
+        assert!(err.to_string().contains("client.metadata.group_ids"));
 
         let mut flat = FlatConfig::new();
         flat.set("client.id", -1i64);
@@ -897,29 +695,13 @@ mod tests {
     }
 
     #[test]
-    fn obsolete_retry_and_backoff_aliases_do_not_affect_current_config() {
+    fn metadata_group_ids_parse_comma_separated_values() {
         let mut flat = FlatConfig::new();
-        flat.set("client.retry.max_retries", 9i64);
-        flat.set("client.retry.initial_backoff_ms", 25i64);
-        flat.set("client.retry.max_backoff_ms", 400i64);
-        flat.set("client.retry.backoff_multiplier", "1.5");
+        flat.set("client.metadata.group_ids", "1,2,3");
 
-        let config = ClientConfig::from_flat(flat).expect("obsolete aliases are ignored");
+        let config = ClientConfig::from_flat(flat).expect("metadata group ids config");
 
-        assert_eq!(config.retry.max_retries, RetryConfig::default().max_retries);
-        assert_eq!(
-            config.retry.max_retry_attempts(),
-            RetryConfig::default().max_retry_attempts
-        );
-        assert_eq!(
-            config.backoff.initial_backoff_ms,
-            BackoffConfig::default().initial_backoff_ms
-        );
-        assert_eq!(config.backoff.max_backoff_ms, BackoffConfig::default().max_backoff_ms);
-        assert_eq!(
-            config.backoff.backoff_multiplier,
-            BackoffConfig::default().backoff_multiplier
-        );
+        assert_eq!(config.metadata_group_ids, vec![1, 2, 3]);
     }
 
     #[test]
@@ -959,5 +741,10 @@ mod tests {
         flat.set("client.backoff.multiplier", "not-a-number");
         let err = ClientConfig::from_flat(flat).expect_err("non-numeric backoff multiplier must be rejected");
         assert!(err.to_string().contains("client.backoff.multiplier"));
+
+        let mut flat = FlatConfig::new();
+        flat.set("client.retry.metadata_budget", "three");
+        let err = ClientConfig::from_flat(flat).expect_err("wrong-type retry budget must be rejected");
+        assert!(err.to_string().contains("client.retry.metadata_budget"));
     }
 }

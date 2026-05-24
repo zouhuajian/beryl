@@ -18,8 +18,7 @@
 //! - `MetadataFileSystemServiceImpl`: implements the external
 //!   `FileSystemService` path-based metadata/control-plane API.
 //! - `MetadataWorkerServiceImpl`: handles worker registration, heartbeat, block
-//!   reports, task acknowledgements, and retained worker RPC compatibility
-//!   surfaces.
+//!   reports, task acknowledgements, and current worker RPC surfaces.
 //!
 //! Metadata does not perform data-plane IO. Clients read and write data
 //! directly through workers; this crate only maintains or returns metadata and
@@ -46,7 +45,7 @@
 //!
 //! `GroupStateWatermark` carries state-machine applied `RaftLogId` freshness.
 //! `route_epoch`, `mount_epoch`, and `worker_epoch` remain separate freshness
-//! domains. Current no-op, legacy unsupported, and partially wired boundaries
+//! domains. Current no-op, stale unsupported, and partially wired boundaries
 //! are tracked in `metadata/README_ZH.md`.
 
 pub mod bootstrap;

@@ -322,20 +322,6 @@ message BlockReportRequestProto {
   uint64 full_report_lease_token = 7;
 }
 
-/// Legacy BlockReportEntry (kept for backward compatibility during migration).
-/// DEPRECATED: Use BlockReportEntryFullProto or BlockReportEntryDeltaProto instead.
-message BlockReportEntryProto {
-  common.BlockIdProto block_id = 1;
-  /// Chunk presence bitmap.
-  common.ChunkBitmapProto chunk_bitmap = 2;
-  /// Committed length for this block.
-  uint64 committed_length = 3;
-  /// Optional: checksum/digest (e.g., SHA-256 as bytes).
-  bytes checksum = 4;
-  /// Optional: storage location hint.
-  string storage_hint = 5;
-}
-
 message BlockReportResponseProto {
   common.ResponseHeaderProto header = 1;
   /// Acknowledged sequence number for this report (for INCREMENTAL dedup).

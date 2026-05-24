@@ -7,8 +7,6 @@
 **/.cargo/
 /target/
 /**/target/
-docs/
-docs_backup/*
 
 
 # Rustfmt / clippy / coverage artifacts

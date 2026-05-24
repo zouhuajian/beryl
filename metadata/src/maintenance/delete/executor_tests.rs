@@ -254,7 +254,7 @@ mod tests {
             reason: DeleteIntentReason::Gc,
             created_at_ms: now_ms,
             not_before_ms: now_ms - 1000, // Already ready
-            // Intent without cross-group metadata uses legacy guard_state_id only.
+            // Intent without cross-group metadata uses single-group guard_state_id only.
             shard_group_id: None,
             guard_watermark: None,
             mount_epoch: None,
@@ -351,7 +351,7 @@ mod tests {
                 reason: DeleteIntentReason::Gc,
                 created_at_ms: now_ms,
                 not_before_ms: now_ms - 1000,
-                // Intent without cross-group metadata uses legacy guard_state_id only.
+                // Intent without cross-group metadata uses single-group guard_state_id only.
                 shard_group_id: None,
                 guard_watermark: None,
                 mount_epoch: None,

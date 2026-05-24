@@ -32,7 +32,7 @@ pub struct WorkerConfig {
     pub chunk_size: u32,
     /// Idle timeout for runtime stream state.
     pub stream_idle_timeout_ms: u64,
-    /// Placeholder root for worker-local block storage.
+    /// Root for worker-local block storage.
     pub storage_root: PathBuf,
     /// Worker-owned service-specific network configuration.
     pub net: WorkerNetConfig,
@@ -49,7 +49,7 @@ impl Default for WorkerConfig {
             chunk_size: 1024 * 1024,
             stream_idle_timeout_ms: 60_000,
             storage_root: PathBuf::from("./data"),
-            net: WorkerNetConfig::grpc_from_legacy_rpc("0.0.0.0:9090".to_string(), 100, 4 * 1024 * 1024),
+            net: WorkerNetConfig::grpc_from_rpc("0.0.0.0:9090".to_string(), 100, 4 * 1024 * 1024),
         }
     }
 }
@@ -66,46 +66,43 @@ impl WorkerConfig {
         let worker_sub = core_config.as_flat().sub("worker");
         let defaults = Self::default();
 
-        let rpc_bind = worker_sub
-            .get_str("rpc.bind")
-            .unwrap_or_else(|| defaults.rpc_bind.clone());
-        let rpc_max_inflight = worker_sub
-            .get_usize("rpc.max_inflight")
-            .unwrap_or(defaults.rpc_max_inflight);
+        let rpc_bind = Self::str_or(&worker_sub, "rpc.bind", &defaults.rpc_bind, "worker.rpc.bind")?;
+        let rpc_max_inflight = Self::usize_or(
+            &worker_sub,
+            "rpc.max_inflight",
+            defaults.rpc_max_inflight,
+            "worker.rpc.max_inflight",
+        )?;
         let default_frame_size = Self::bytes_u32(
-            worker_sub.get_bytes("default_frame_size"),
+            &worker_sub,
+            "default_frame_size",
             defaults.default_frame_size,
             "worker.default_frame_size",
         )?;
         let max_frame_size = Self::bytes_u32(
-            worker_sub.get_bytes("max_frame_size"),
+            &worker_sub,
+            "max_frame_size",
             defaults.max_frame_size,
             "worker.max_frame_size",
         )?;
         let window_bytes = Self::bytes_u32(
-            worker_sub
-                .get_bytes("window_bytes")
-                .or_else(|| worker_sub.get_bytes("stream.window_bytes")),
+            &worker_sub,
+            "window_bytes",
             defaults.window_bytes,
             "worker.window_bytes",
         )?;
-        let chunk_size = Self::bytes_u32(
-            worker_sub
-                .get_bytes("chunk_size")
-                .or_else(|| worker_sub.get_bytes("storage.chunk_size")),
-            defaults.chunk_size,
-            "worker.chunk_size",
-        )?;
-        let stream_idle_timeout_ms = worker_sub
-            .get_usize("stream.idle_timeout_ms")
-            .map(|value| value as u64)
-            .unwrap_or(defaults.stream_idle_timeout_ms);
+        let chunk_size = Self::bytes_u32(&worker_sub, "chunk_size", defaults.chunk_size, "worker.chunk_size")?;
+        let stream_idle_timeout_ms = Self::usize_or(
+            &worker_sub,
+            "stream.idle_timeout_ms",
+            defaults.stream_idle_timeout_ms as usize,
+            "worker.stream.idle_timeout_ms",
+        )? as u64;
         let storage_root = worker_sub
             .get_str("storage.root")
-            .or_else(|| worker_sub.get_str("storage.dir"))
-            .or_else(|| Self::first_storage_dir(worker_sub.get_str("storage.dirs")))
             .map(PathBuf::from)
-            .unwrap_or_else(|| defaults.storage_root.clone());
+            .or_else(|| (!worker_sub.contains_key("storage.root")).then(|| defaults.storage_root.clone()))
+            .ok_or_else(|| invalid_config("worker.storage.root", "must be a string"))?;
 
         let config = Self {
             rpc_bind: rpc_bind.clone(),
@@ -116,7 +113,7 @@ impl WorkerConfig {
             chunk_size,
             stream_idle_timeout_ms,
             storage_root,
-            net: WorkerNetConfig::grpc_from_legacy_rpc(rpc_bind, rpc_max_inflight, max_frame_size),
+            net: WorkerNetConfig::grpc_from_rpc(rpc_bind, rpc_max_inflight, max_frame_size),
         };
 
         config.validate()?;
@@ -235,26 +232,57 @@ impl WorkerConfig {
         Ok(())
     }
 
-    fn bytes_u32(value: Option<usize>, fallback: u32, field_name: &str) -> Result<u32, CommonError> {
-        match value {
+    fn str_or(
+        flat: &common::config::FlatConfig,
+        key: &str,
+        fallback: &str,
+        field_name: &'static str,
+    ) -> Result<String, CommonError> {
+        if let Some(value) = flat.get_str(key) {
+            return Ok(value);
+        }
+        if flat.contains_key(key) {
+            return Err(invalid_config(field_name, "must be a string"));
+        }
+        Ok(fallback.to_string())
+    }
+
+    fn usize_or(
+        flat: &common::config::FlatConfig,
+        key: &str,
+        fallback: usize,
+        field_name: &'static str,
+    ) -> Result<usize, CommonError> {
+        if let Some(value) = flat.get_usize(key) {
+            return Ok(value);
+        }
+        if flat.contains_key(key) {
+            return Err(invalid_config(field_name, "must be a non-negative integer"));
+        }
+        Ok(fallback)
+    }
+
+    fn bytes_u32(
+        flat: &common::config::FlatConfig,
+        key: &str,
+        fallback: u32,
+        field_name: &'static str,
+    ) -> Result<u32, CommonError> {
+        match flat.get_bytes(key) {
             Some(value) => u32::try_from(value).map_err(|_| {
                 CommonError::new(
                     CommonErrorCode::InvalidArgument,
                     format!("{field_name} exceeds u32 byte size"),
                 )
             }),
+            None if flat.contains_key(key) => Err(invalid_config(field_name, "must be a byte size")),
             None => Ok(fallback),
         }
     }
+}
 
-    fn first_storage_dir(value: Option<String>) -> Option<String> {
-        value.and_then(|dirs| {
-            dirs.split(',')
-                .map(str::trim)
-                .find(|entry| !entry.is_empty())
-                .map(str::to_string)
-        })
-    }
+fn invalid_config(key: &'static str, detail: &'static str) -> CommonError {
+    CommonError::new(CommonErrorCode::InvalidArgument, format!("{key} {detail}"))
 }
 
 #[cfg(test)]
@@ -390,13 +418,33 @@ worker:
     }
 
     #[test]
-    fn storage_dirs_fallback_uses_first_entry_as_root_placeholder() {
+    fn rejects_wrong_type_current_worker_knobs() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("core-site.yaml");
-        fs::write(&config_path, "worker:\n  storage:\n    dirs: \"/data/a,/data/b\"\n").unwrap();
+        fs::write(&config_path, "worker:\n  rpc:\n    max_inflight: false\n").unwrap();
+
+        let error = WorkerConfig::load(&config_path).unwrap_err();
+
+        assert!(error.message.contains("worker.rpc.max_inflight"));
+    }
+
+    #[test]
+    fn removed_storage_aliases_do_not_change_storage_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("core-site.yaml");
+        fs::write(
+            &config_path,
+            r#"
+worker:
+  storage:
+    dir: "/data/a"
+    dirs: "/data/b,/data/c"
+"#,
+        )
+        .unwrap();
 
         let config = WorkerConfig::load(&config_path).unwrap();
 
-        assert_eq!(config.storage_root, PathBuf::from("/data/a"));
+        assert_eq!(config.storage_root, WorkerConfig::default().storage_root);
     }
 }

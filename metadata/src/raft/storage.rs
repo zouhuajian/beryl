@@ -183,7 +183,7 @@ impl RocksDBStorage {
         let db = DB::open_cf_descriptors(&opts, &path_buf, cfs)
             .map_err(|e| MetadataError::Internal(format!("Failed to open RocksDB: {}", e)))?;
 
-        // Clear legacy dedup entries when format version changes.
+        // Clear obsolete dedup entries when format version changes.
         reset_dedup_if_stale(&db)?;
 
         let snapshot_dir = path_buf.join("snapshots");
@@ -3244,11 +3244,11 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_cf_detection() {
+    fn test_obsolete_cf_detection() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test_db");
 
-        // Create a RocksDB with legacy "files" CF
+        // Create a RocksDB with obsolete "files" CF.
         {
             let mut opts = Options::default();
             opts.create_if_missing(true);
@@ -3265,15 +3265,15 @@ mod tests {
             db.put_cf(files_cf, b"test_key", b"test_value").unwrap();
         }
 
-        // Try to open with new code - should fail with legacy CF error
+        // Try to open with new code; obsolete CF layouts must fail fast.
         let result = RocksDBStorage::open(&db_path);
-        assert!(result.is_err(), "Opening DB with legacy 'files' CF should fail");
+        assert!(result.is_err(), "Opening DB with obsolete 'files' CF should fail");
         match result {
             Err(e) => {
                 let error_msg = format!("{}", e);
                 assert!(
-                    error_msg.contains("legacy column family") || error_msg.contains("files"),
-                    "Error message should mention legacy column family 'files', got: {}",
+                    error_msg.contains("obsolete column family") || error_msg.contains("files"),
+                    "Error message should mention obsolete column family 'files', got: {}",
                     error_msg
                 );
             }

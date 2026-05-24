@@ -54,7 +54,7 @@ pub mod canonical {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
     pub enum RefreshReason {
-        /// Unknown / legacy refresh hint.
+        /// Unknown or unclassified refresh hint.
         Unknown,
         /// Not leader for the requested group.
         NotLeader,

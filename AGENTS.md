@@ -31,7 +31,7 @@ The `docs/` directory is informative by default; `AGENTS.md` files are normative
 - Follower successful responses must not advance the client state cache.
 - Production metadata msync is single-group; multi-group msync is future work.
 - `applied_seq` must not be reintroduced as runtime, storage, snapshot, header, or client state.
-- Do not add legacy `applied_seq` snapshot decode fallback.
+- Do not add removed `applied_seq` snapshot decode fallback.
 - Do not bump snapshot version just to preserve removed `applied_seq` compatibility unless a real external compatibility requirement exists.
 - `route_epoch`, `mount_epoch`, and `worker_epoch` are separate freshness domains.
 - Breaking changes are allowed when requested or necessary; do not keep compatibility bridges for internal-only stale code unless explicitly required.
@@ -305,6 +305,10 @@ Before adding a new struct, enum, function, trait, proto message, config key, or
 - Letting a documentation-only task change Rust, proto, config, generated, or build files.
 
 ## Validation expectations
+
+The development toolchain baseline is Rust 1.95.0. Keep the root
+`rust-toolchain.toml`, workspace `rust-version`, local verify entrypoint, and CI
+workflow aligned to that exact baseline.
 
 Run the relevant subset before handoff. For code changes, the default full validation set is:
 

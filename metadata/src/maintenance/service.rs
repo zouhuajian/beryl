@@ -123,7 +123,7 @@ impl MaintenanceService {
         let mut block_ref_counts = HashMap::new();
         match storage.get_all_block_ref_counts() {
             Ok(ref_counts) => {
-                // Preserve the legacy in-memory view from the global block refcount
+                // Preserve the in-memory view from the global block refcount.
                 // store. Authoritative file-layout mutations update refcounts in
                 // Raft apply batches; this cache must not be treated as authority.
                 for (block_id, count) in ref_counts {

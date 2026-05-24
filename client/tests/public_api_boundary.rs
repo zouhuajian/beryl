@@ -83,9 +83,9 @@ pub async fn probe_writer_mutability(writer: FileWriter) {
 }
 
 #[test]
-fn public_api_does_not_export_legacy_file_handle_or_create_mode() {
+fn public_api_does_not_export_stale_file_handle_or_create_mode() {
     assert_external_snippet_fails(
-        "legacy_handle_exports_removed",
+        "stale_handle_exports_removed",
         r#"
 use client::{CreateMode, FileHandle};
 

@@ -257,10 +257,10 @@ Raft apply 当前统一做 dedup：
 | STRUCTURED_ERROR_REPLAY | deterministic FS business errors for create/mkdir/unlink/delete-empty-dir/rename/close-write/truncate are persisted as `AppliedResult` when they happen inside apply preparation. |
 已清理：
 
-- `SetXattr` / `RemoveXattr` internal legacy command、fingerprint、state-machine apply helper 和 replay 测试残留已删除；metadata 当前不支持 public xattr API。
+- `SetXattr` / `RemoveXattr` internal stale command、fingerprint、state-machine apply helper 和 replay 测试残留已删除；metadata 当前不支持 public xattr API。
 - inode domain / proto 中不再保留历史 `xattrs` 字段。
-- `UpdateCommittedLength` legacy command path 已删除。Committed length mutation 语义不再作为独立 command 存在；当前 committed file state 通过 `CommitFile` / `CloseWrite` apply 和 durable `file_version` 维护。
-- `CommandSender` push-mode no-op legacy hook 已删除。当前 worker command 只通过 heartbeat pull 返回。
+- `UpdateCommittedLength` stale command path 已删除。Committed length mutation 语义不再作为独立 command 存在；当前 committed file state 通过 `CommitFile` / `CloseWrite` apply 和 durable `file_version` 维护。
+- `CommandSender` push-mode no-op hook 已删除。当前 worker command 只通过 heartbeat pull 返回。
 - `StateStore` 已收窄为 route freshness 读取接口；旧 block/lease mutation trait 方法已删除。
 - `MaintenanceService::increment_ref_count()` / `decrement_ref_count()` direct RocksDB helper 已删除；当前 file-layout refcount mutation 仍走 Raft apply batch。
 
@@ -302,7 +302,7 @@ block report：
 
 - proto RPC 和服务实现已删除。
 - 当前 block presence 主来源是 `block_report`。
-- 旧调用方必须迁移到 full / incremental block report；不再保留 deprecated/NotSupported 兼容入口。
+- 旧调用方必须迁移到 full / incremental block report；不再保留 NotSupported 旁路入口。
 
 ## 11. Maintenance / Repair / Delete 当前状态
 
@@ -411,12 +411,12 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 - 当前 checkout 未包含 `docs/architecture` 目录；README 不把该目录写成当前可读实现文档。
 - 旧 `report_presence` proto RPC 和服务实现已删除；当前 block presence authoritative input 是 `block_report`。
 - `metadata/src/worker/command_sender.rs` 已删除；当前没有 push queue 或 push transport hook。
-- `Command::UpdateCommittedLength` legacy command path 已删除；scan 未发现当前 public caller。
+- `Command::UpdateCommittedLength` stale command path 已删除；scan 未发现当前 public caller。
 - `MemoryStateStore` 已收窄为 route-epoch tests/helper，production runtime 使用 `RaftStateStore`。
 - `StateStore` 已从旧 block/lease mutation abstraction 收窄为 route freshness read trait。
 - `state::DeleteIntent` 注释已修正：当前 `DeleteExecutor` status transition 使用 `Command::UpdateDeleteIntentStatus`，不能把 direct RocksDB status write 写成当前主链路。
 - UFS metadata proxy future hook 已删除；README 只保留 external mount metadata 表达事实。
-- `maintenance/mod.rs` re-export 注释已去掉 backward-compatibility wording；P5 已继续收窄 public surface。
+- `maintenance/mod.rs` re-export 注释已去掉过时 wording；P5 已继续收窄 public surface。
 - `MaintenanceService::increment_ref_count()` / `decrement_ref_count()` direct RocksDB helper 已删除。
 - P4.6 边界校准已修正 ARCHITECTURE/README 的 command router、P1-P4.6 状态和 repair/delete/repair-signal 路径漂移；runtime 中 repair state 归为 maintenance-owned state。
 - P4.7 已补强 repair signal 语义：`removed_blocks` 会触发基于当前 locations 的 repair planning，且默认 replication factor 集中到 `RepairPolicy`。
@@ -439,14 +439,11 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 历史残留：
 
 - `MemoryStateStore` 仍作为 route-epoch test helper 暴露在 `metadata::state`，不是生产 authority。
-- 旧 `report_presence` proto surface 已删除；旧调用方需要迁移到 `block_report`。
 - `metrics.rs` 仍是共享 Prometheus 导出聚合入口；已删除无 updater 零值项，但尚未按 fs/worker/maintenance/authz 完全拆分。
 
 验证状态：
 
-- P1-P5 cleanup 使用 `cargo fmt --all --check`、`cargo test -p metadata --all-targets`、`cargo clippy -p metadata --all-targets -- -D warnings`、`git diff --check` 和 `cargo test --workspace --all-targets` 验证。
-- `cargo fmt --all --check` 仍输出 stable rustfmt 对 unstable import 配置的 warning，但命令退出码为 0。
-- `cargo test --workspace --all-targets` 仍输出 worker / integration_tests 既有 warning，但命令退出码为 0。
+- 当前基线使用 Rust 1.95.0，并通过仓库根目录 `Makefile` 的 `verify` 目标执行 `fmt-check`、`metadata`、`check`、`clippy`、`test`。
 
 ## 17. 多余 / 不必要设计候选
 
@@ -455,7 +452,6 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 | 文件/模块 | 当前引用情况 | 为什么可疑 | 建议 | 风险 |
 | --- | --- | --- | --- | --- |
 | `metadata/src/state/memory.rs` / `MemoryStateStore` | regression/FsCore tests 使用；保留在 `metadata::state` 下 | 生产 runtime 使用 `RaftStateStore`，但 integration tests 仍需构造 route-epoch store | 已收窄为 route-epoch helper；后续如有测试辅助 crate 可继续取消 public state exposure | 直接删除会破坏现有 tests |
-| `WorkerManager::try_start_full_sync`、`max_concurrent_full_syncs`、`concurrent_full_syncs` | deprecated path；tests 仍覆盖 | full report 已转为 lease manager；旧 counter 语义残留 | 删除候选，先改 tests | 直接删会破坏 tests 和可能的兼容调用 |
 | `metadata/src/metrics.rs` shared export surface | 仍由多个 subsystem 共同更新 | 聚合层可能继续混合 fs/maintenance/worker/authz 命名 | 后续做纯 metrics-module split | 本轮强拆会造成大面积 import churn |
 | `docs/architecture/*` | 本轮扫描未发现 `docs/architecture` 目录 | 用户指定的背景目录当前不存在 | 无需处理；后续若新增再审 | 无 |
 
@@ -485,12 +481,12 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 
 优先瘦身方向：
 
-- 先收窄或删除没有主链路 caller 的 legacy command/API。
+- 先收窄或删除没有主链路 caller 的 stale command/API。
 - 把 no-op / placeholder 明确降级，不写成能力。
-- 对 direct RocksDB compatibility write 保持审计压力，不把它混入 authoritative Raft apply closure。
+- 对 direct RocksDB write 保持审计压力，不把它混入 authoritative Raft apply closure。
 - 对 maintenance/repair/rebalance 只保留当前能证明的闭环，避免扩展策略复杂度。
 - 对 external mount 和 ACL/Ranger 保持 fail-fast/未接入描述，避免隐式 allow-all 或半成品代理。
-- 后续 metrics 拆分应保持现有 Prometheus 文本格式，不引入新 framework，不把无实现的 ACL/Ranger/legacy lease runtime 指标重新加入。
+- 后续 metrics 拆分应保持现有 Prometheus 文本格式，不引入新 framework，不把无实现的 ACL/Ranger/old lease runtime 指标重新加入。
 
 ## 19. 快速阅读路径
 

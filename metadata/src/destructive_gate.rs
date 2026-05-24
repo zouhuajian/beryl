@@ -46,7 +46,7 @@ pub struct DestructiveCheckContext {
     /// Guard watermark (group_id + state_id).
     /// If provided, the target shard group must have applied at least up to this state_id.
     pub guard_watermark: Option<GroupStateWatermark>,
-    /// Guard state ID (legacy, for backward compatibility).
+    /// Single-group guard state ID used when no group-scoped watermark is provided.
     /// If guard_watermark is provided, this is ignored.
     pub guard_state_id: Option<RaftLogId>,
     /// Not before timestamp (from DeleteIntent).

@@ -26,7 +26,6 @@ mod planner;
 mod runtime;
 mod session;
 
-mod context;
 mod data;
 pub(crate) mod metadata;
 
@@ -35,9 +34,7 @@ pub use api::{AppendOptions, CreateDisposition, CreateOptions, FileReader, FileW
 pub use api::{DirectoryEntry, DirectoryListing, FileAttrs, FileStatus, InodeKind};
 pub use api::{ListOptions, OpenOptions};
 pub use config::ClientConfig;
-pub use config::{
-    BackoffConfig, CacheConfig, ChannelPoolConfig, ReadModeFallback, RefreshConfig, RetryConfig, WriteModeFallback,
-};
+pub use config::{BackoffConfig, CacheConfig, ChannelPoolConfig, RefreshConfig, RetryConfig};
 pub use consistency::ConsistencyLevel;
 pub use error::{ClientActionError, ClientError, ClientResult};
 pub use modes::{ReadMode, WriteMode};

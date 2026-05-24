@@ -138,7 +138,7 @@ fn session_rpc_handlers_do_not_call_permission_checker() {
 }
 
 #[test]
-fn auth_permission_contract_lives_in_single_file_without_legacy_public_surface() {
+fn auth_permission_contract_lives_in_single_file_without_stale_public_surface() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let service_dir = manifest_dir.join("src/service");
     let auth_file = service_dir.join("auth.rs");
@@ -155,7 +155,7 @@ fn auth_permission_contract_lives_in_single_file_without_legacy_public_surface()
     );
     assert!(
         !service_dir.join("authz.rs").exists(),
-        "legacy authz.rs must not remain in use"
+        "stale authz.rs must not remain in use"
     );
 
     let service_mod = std::fs::read_to_string(service_dir.join("mod.rs")).expect("read service/mod.rs");
@@ -176,7 +176,7 @@ fn auth_permission_contract_lives_in_single_file_without_legacy_public_surface()
     ] {
         assert!(
             !service_mod.contains(forbidden),
-            "service/mod.rs must not expose legacy authz surface `{forbidden}`"
+            "service/mod.rs must not expose stale authz surface `{forbidden}`"
         );
     }
 
@@ -208,7 +208,7 @@ fn auth_permission_contract_lives_in_single_file_without_legacy_public_surface()
     ] {
         assert!(
             !auth_mod.contains(forbidden),
-            "auth.rs must not expose ACL/Ranger legacy implementation detail `{forbidden}`"
+            "auth.rs must not expose ACL/Ranger stale implementation detail `{forbidden}`"
         );
     }
 }

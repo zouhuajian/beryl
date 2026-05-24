@@ -37,8 +37,7 @@ pub struct WorkerRuntime {
     pub health: HealthStatus,
 }
 
-/// Legacy WorkerInfo for backward compatibility (used in RocksDB storage).
-/// This is only used when reading from RocksDB during migration.
+/// Worker information persisted by RocksDB storage.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerInfo {
     pub worker_id: WorkerId,
@@ -117,10 +116,6 @@ pub struct WorkerManager {
     metadata_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Heartbeat timeout in seconds.
     heartbeat_timeout_sec: u64,
-    /// Maximum concurrent full syncs (for storm control) - deprecated, use lease_manager.
-    max_concurrent_full_syncs: usize,
-    /// Current number of workers in full sync (for storm control) - deprecated, use lease_manager.
-    concurrent_full_syncs: Arc<std::sync::atomic::AtomicUsize>,
     /// Full report lease manager (leader-only, memory-only).
     lease_manager: Arc<super::full_report_lease::FullReportLeaseManager>,
 }
@@ -149,8 +144,6 @@ impl WorkerManager {
             worker_sync_state: Arc::new(RwLock::new(HashMap::new())),
             metadata_epoch: Arc::new(std::sync::atomic::AtomicU64::new(initial_epoch)),
             heartbeat_timeout_sec,
-            max_concurrent_full_syncs: DEFAULT_MAX_CONCURRENT_LEASES, // Keep for backward compatibility
-            concurrent_full_syncs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             lease_manager,
         }
     }
@@ -216,35 +209,6 @@ impl WorkerManager {
             .unwrap_or(true) // If no state exists, needs full sync
     }
 
-    /// Try to start full sync (returns true if allowed, false if rate-limited).
-    /// DEPRECATED: Use lease_manager.try_allocate() instead.
-    /// This method is kept for backward compatibility but delegates to lease_manager.
-    pub fn try_start_full_sync(&self, worker_id: WorkerId) -> bool {
-        // Check if already in full sync
-        let sync_state = self.worker_sync_state.read();
-        if let Some(state) = sync_state.get(&worker_id) {
-            if state.full_received {
-                // Already synced, no need to start
-                return true;
-            }
-        }
-        drop(sync_state);
-
-        // Use lease manager (but don't allocate lease here, that's done in heartbeat)
-        // This method is only used for legacy code paths
-        // Note: This is a synchronous check, but lease_manager is async
-        // For legacy compatibility, we just check the counter
-        let current = self.concurrent_full_syncs.load(std::sync::atomic::Ordering::Relaxed);
-        if current >= self.max_concurrent_full_syncs {
-            return false; // Rate limited
-        }
-
-        // For legacy compatibility, still update counter
-        self.concurrent_full_syncs
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        true
-    }
-
     /// Get lease manager.
     pub(crate) fn lease_manager(&self) -> Arc<super::full_report_lease::FullReportLeaseManager> {
         Arc::clone(&self.lease_manager)
@@ -272,10 +236,6 @@ impl WorkerManager {
                 last_full_ts: now_ms,
                 last_seq: 0,
             });
-
-        // Decrement concurrent counter
-        self.concurrent_full_syncs
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Apply full block report (replaces all blocks for this worker).
@@ -418,7 +378,7 @@ impl WorkerManager {
         Ok(descriptor_changed)
     }
 
-    /// Get worker info (combined descriptor + runtime, for backward compatibility).
+    /// Get worker info by combining persisted descriptor and current runtime state.
     pub fn get_worker(&self, worker_id: WorkerId) -> Option<WorkerInfo> {
         let descriptors = self.descriptors.read();
         let runtime = self.runtime.read();

@@ -24,7 +24,6 @@ const METADATA_REPAIR_INFLIGHT_TIMEOUT_MS: &str = "metadata.repair.inflight_time
 const METADATA_REPAIR_INITIAL_BACKOFF_MS: &str = "metadata.repair.initial_backoff_ms";
 const METADATA_REPAIR_MAX_BACKOFF_MS: &str = "metadata.repair.max_backoff_ms";
 const METADATA_REPAIR_WORKER_INFLIGHT_LIMIT: &str = "metadata.repair.worker_inflight_limit";
-const METADATA_WORKER_MAX_COMMANDS_PER_HEARTBEAT: &str = "metadata.worker.max_commands_per_heartbeat";
 const METADATA_BOOTSTRAP_ROOT_READY_INITIAL_BACKOFF_MS: &str = "metadata.bootstrap.root_ready_initial_backoff_ms";
 const METADATA_BOOTSTRAP_ROOT_READY_MAX_BACKOFF_MS: &str = "metadata.bootstrap.root_ready_max_backoff_ms";
 const METADATA_BOOTSTRAP_ROOT_READY_WARN_AFTER_MS: &str = "metadata.bootstrap.root_ready_warn_after_ms";
@@ -94,10 +93,8 @@ impl Default for MetadataAuthzConfig {
 }
 
 /// Worker and repair configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct WorkerConfig {
-    /// Max commands per heartbeat (default: 8).
-    pub max_commands_per_heartbeat: usize,
     /// Repair queue configuration.
     pub repair: RepairConfig,
 }
@@ -138,10 +135,16 @@ impl Default for RaftConfig {
 }
 
 /// Metadata authority group served by this runtime.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MetadataAuthorityConfig {
     /// Authority group ID for the root namespace owner served by this metadata runtime.
     pub group_id: u64,
+}
+
+impl Default for MetadataAuthorityConfig {
+    fn default() -> Self {
+        Self { group_id: 1 }
+    }
 }
 
 impl Default for RepairConfig {
@@ -153,15 +156,6 @@ impl Default for RepairConfig {
             initial_backoff_ms: 1_000,    // 1 second
             max_backoff_ms: 60_000,       // 1 minute
             worker_inflight_limit: 4,
-        }
-    }
-}
-
-impl Default for WorkerConfig {
-    fn default() -> Self {
-        Self {
-            max_commands_per_heartbeat: 8,
-            repair: RepairConfig::default(),
         }
     }
 }
@@ -178,7 +172,7 @@ impl MetadataConfig {
         let flat = core_config.as_flat();
 
         // Read RPC address
-        let addr = flat.get_str(METADATA_RPC_ADDR).unwrap_or_else(|| "0.0.0.0".to_string());
+        let addr = get_str_or(flat, METADATA_RPC_ADDR, "0.0.0.0")?;
         let port = match get_i64_if_present(flat, METADATA_RPC_PORT)?.unwrap_or(18080) {
             port @ 1..=65535 => port as u16,
             port => {
@@ -195,14 +189,9 @@ impl MetadataConfig {
             )
         })?;
 
-        let storage_dir = PathBuf::from(
-            flat.get_str(METADATA_STORAGE_DIR)
-                .unwrap_or_else(|| "data/metadata".to_string()),
-        );
+        let storage_dir = PathBuf::from(get_str_or(flat, METADATA_STORAGE_DIR, "data/metadata")?);
 
-        let filesystem_mode_raw = flat
-            .get_str(METADATA_AUTHZ_FILESYSTEM_MODE)
-            .unwrap_or_else(|| "NONE".to_string());
+        let filesystem_mode_raw = get_str_or(flat, METADATA_AUTHZ_FILESYSTEM_MODE, "NONE")?;
         let filesystem_mode = FileSystemAuthzMode::parse(&filesystem_mode_raw).ok_or_else(|| {
             CommonError::new(
                 CommonErrorCode::InvalidArgument,
@@ -218,16 +207,11 @@ impl MetadataConfig {
         };
 
         // Read Raft config
-        let peers = if let Some(peers_str) = flat.get_str(METADATA_RAFT_PEERS) {
-            // Parse comma-separated list of peers
-            peers_str
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        } else {
-            vec![]
-        };
+        let peers = get_str_or(flat, METADATA_RAFT_PEERS, "")?
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
 
         let raft = RaftConfig {
             node_id: get_positive_u64_or(flat, METADATA_RAFT_NODE_ID, 1)?,
@@ -235,7 +219,11 @@ impl MetadataConfig {
         };
 
         let authority = MetadataAuthorityConfig {
-            group_id: get_u64_or(flat, METADATA_AUTHORITY_GROUP_ID, 0)?,
+            group_id: get_u64_or(
+                flat,
+                METADATA_AUTHORITY_GROUP_ID,
+                MetadataAuthorityConfig::default().group_id,
+            )?,
         };
 
         // Read Worker/Repair config
@@ -248,10 +236,7 @@ impl MetadataConfig {
             worker_inflight_limit: get_positive_usize_or(flat, METADATA_REPAIR_WORKER_INFLIGHT_LIMIT, 4)?,
         };
 
-        let worker = WorkerConfig {
-            max_commands_per_heartbeat: get_positive_usize_or(flat, METADATA_WORKER_MAX_COMMANDS_PER_HEARTBEAT, 8)?,
-            repair,
-        };
+        let worker = WorkerConfig { repair };
 
         let root_readiness = RootReadinessConfig {
             initial_backoff_ms: get_positive_u64_or(flat, METADATA_BOOTSTRAP_ROOT_READY_INITIAL_BACKOFF_MS, 200)?,
@@ -281,6 +266,20 @@ fn get_i64_if_present(flat: &common::config::FlatConfig, key: &'static str) -> R
         return Err(invalid_config(key, "must be an integer"));
     }
     Ok(None)
+}
+
+fn get_str_or(
+    flat: &common::config::FlatConfig,
+    key: &'static str,
+    default: &'static str,
+) -> Result<String, CommonError> {
+    if let Some(value) = flat.get_str(key) {
+        return Ok(value);
+    }
+    if flat.contains_key(key) {
+        return Err(invalid_config(key, "must be a string"));
+    }
+    Ok(default.to_string())
 }
 
 fn get_u64_or(flat: &common::config::FlatConfig, key: &'static str, default: u64) -> Result<u64, CommonError> {
@@ -402,12 +401,33 @@ mod tests {
     }
 
     #[test]
-    fn legacy_shard_group_id_key_is_not_a_compatibility_bridge() {
+    fn string_keys_reject_present_wrong_type_values() {
+        for key in [
+            METADATA_RPC_ADDR,
+            METADATA_STORAGE_DIR,
+            METADATA_AUTHZ_FILESYSTEM_MODE,
+            METADATA_RAFT_PEERS,
+        ] {
+            let mut flat = CoreConfig::default().as_flat().clone();
+            flat.set(key, true);
+
+            let err = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap_err();
+
+            assert!(
+                err.message.contains(key),
+                "error for {key} should mention the offending key: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn removed_shard_group_id_key_is_ignored() {
         let mut flat = CoreConfig::default().as_flat().clone();
         flat.set("metadata.shard.group_id", 9i64);
 
         let config = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap();
-        assert_eq!(config.authority.group_id, 0);
+        assert_eq!(config.authority.group_id, 1);
     }
 
     #[test]
@@ -424,8 +444,7 @@ mod tests {
         let config = MetadataConfig::from_core_config(CoreConfig::default()).unwrap();
 
         assert_eq!(config.raft.node_id, 1);
-        assert_eq!(config.authority.group_id, 0);
-        assert_eq!(config.worker.max_commands_per_heartbeat, 8);
+        assert_eq!(config.authority.group_id, 1);
         assert_eq!(config.worker.repair.max_queue_size, 10000);
         assert_eq!(config.worker.repair.max_attempts, 3);
         assert_eq!(config.worker.repair.inflight_timeout_ms, 300_000);
@@ -448,7 +467,6 @@ mod tests {
             METADATA_REPAIR_INITIAL_BACKOFF_MS,
             METADATA_REPAIR_MAX_BACKOFF_MS,
             METADATA_REPAIR_WORKER_INFLIGHT_LIMIT,
-            METADATA_WORKER_MAX_COMMANDS_PER_HEARTBEAT,
             METADATA_BOOTSTRAP_ROOT_READY_INITIAL_BACKOFF_MS,
             METADATA_BOOTSTRAP_ROOT_READY_MAX_BACKOFF_MS,
             METADATA_BOOTSTRAP_ROOT_READY_WARN_AFTER_MS,
@@ -476,7 +494,6 @@ mod tests {
             METADATA_REPAIR_INITIAL_BACKOFF_MS,
             METADATA_REPAIR_MAX_BACKOFF_MS,
             METADATA_REPAIR_WORKER_INFLIGHT_LIMIT,
-            METADATA_WORKER_MAX_COMMANDS_PER_HEARTBEAT,
             METADATA_BOOTSTRAP_ROOT_READY_INITIAL_BACKOFF_MS,
             METADATA_BOOTSTRAP_ROOT_READY_MAX_BACKOFF_MS,
             METADATA_BOOTSTRAP_ROOT_READY_WARN_AFTER_MS,
