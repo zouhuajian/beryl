@@ -32,6 +32,7 @@ tracing = { workspace = true }
 # Utilities
 bytes = { workspace = true }
 prost = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 
 # RPC
 tonic = { workspace = true }

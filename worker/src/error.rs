@@ -40,6 +40,10 @@ pub enum WorkerError {
     #[error("Operation cancelled: {0}")]
     Cancelled(String),
 
+    /// Service is temporarily unavailable.
+    #[error("Unavailable: {0}")]
+    Unavailable(String),
+
     /// Invalid argument.
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
@@ -99,7 +103,10 @@ impl WorkerError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            WorkerError::LeaderChanged(_) | WorkerError::Timeout(_) | WorkerError::ResourceExhausted(_)
+            WorkerError::LeaderChanged(_)
+                | WorkerError::Timeout(_)
+                | WorkerError::ResourceExhausted(_)
+                | WorkerError::Unavailable(_)
         )
     }
 
@@ -118,6 +125,7 @@ impl WorkerError {
                 };
                 (true, Some(5000), limit_type, None)
             }
+            WorkerError::Unavailable(_) => (true, Some(500), None, None),
             WorkerError::ChunkConflict(_) => (false, None, None, None),
             WorkerError::DiskError(_) => (false, None, None, None),
             WorkerError::Cancelled(_) => (false, None, None, None),
@@ -176,6 +184,7 @@ impl WorkerError {
             WorkerError::DiskError(_) => tonic::Code::Internal,
             WorkerError::Timeout(_) => tonic::Code::DeadlineExceeded,
             WorkerError::Cancelled(_) => tonic::Code::Cancelled,
+            WorkerError::Unavailable(_) => tonic::Code::Unavailable,
             WorkerError::InvalidArgument(_) => tonic::Code::InvalidArgument,
             WorkerError::NotFound(_) => tonic::Code::NotFound,
             WorkerError::Corrupt(_) => tonic::Code::DataLoss,
@@ -234,6 +243,9 @@ impl From<WorkerError> for CanonicalError {
             }
             WorkerError::ResourceExhausted(msg) => {
                 CanonicalError::retryable(RpcErrorCode::Application, metadata.retry_after_ms, msg)
+            }
+            WorkerError::Unavailable(msg) => {
+                CanonicalError::retryable(RpcErrorCode::NodeUnavailable, metadata.retry_after_ms, msg)
             }
             WorkerError::ChunkConflict(msg) => CanonicalError {
                 class: ErrorClass::Fatal,
@@ -306,6 +318,7 @@ mod tests {
     fn test_retryable_errors() {
         assert!(WorkerError::LeaderChanged("test".to_string()).is_retryable());
         assert!(WorkerError::Timeout("test".to_string()).is_retryable());
+        assert!(WorkerError::Unavailable("test".to_string()).is_retryable());
         assert!(!WorkerError::ChunkConflict("test".to_string()).is_retryable());
         assert!(!WorkerError::DiskError("test".to_string()).is_retryable());
     }

@@ -212,8 +212,8 @@ impl fmt::Display for ChunkId {
 id_new_uint!(
     /// Worker identity.
     ///
-    /// Keep it simple: a numeric ID or hash.
-    /// Later you may extend with incarnation/epoch to prevent stale membership confusion.
+    /// Stable logical worker identity. This must not be confused with
+    /// `WorkerRunId`, which identifies a single worker process start.
     WorkerId(u64)
 );
 impl fmt::Display for WorkerId {

@@ -20,22 +20,30 @@ use proto::worker::{
 use tonic::transport as tonic_net;
 use tonic::{Request, Response, Status};
 
+use crate::control::RegistrationSet;
 use crate::data::convert::{
     proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_open_request, proto_to_stream_id,
     proto_to_sync_committed_block_request, proto_to_write_frame, proto_to_write_open_request, stream_id_to_proto,
 };
 use crate::data::core::WorkerCore;
 use crate::error::WorkerError;
+use common::error::canonical::RefreshReason;
+use common::header::RpcErrorCode;
+use types::ids::ShardGroupId;
 
 /// Worker data service implementation.
 #[derive(Clone)]
 pub struct WorkerDataServiceImpl {
     core: Arc<WorkerCore>,
+    registration_state: Arc<RegistrationSet>,
 }
 
 impl WorkerDataServiceImpl {
-    pub fn new(core: Arc<WorkerCore>) -> Self {
-        Self { core }
+    pub fn new(core: Arc<WorkerCore>, registration_state: Arc<RegistrationSet>) -> Self {
+        Self {
+            core,
+            registration_state,
+        }
     }
 
     fn error_response_header(header: Option<DataRequestHeaderProto>, error: WorkerError) -> DataResponseHeaderProto {
@@ -63,6 +71,33 @@ impl WorkerDataServiceImpl {
     fn error_detail(error: &WorkerError) -> ErrorDetailProto {
         let canonical: common::error::canonical::CanonicalError = error.clone().into();
         proto::convert::canonical_to_error_detail(&canonical)
+    }
+
+    fn ensure_group_ready(&self, group_id: Option<proto::common::ShardGroupIdProto>) -> Result<(), WorkerError> {
+        let group_id = group_id
+            .map(|group_id| ShardGroupId::new(group_id.value))
+            .ok_or_else(|| WorkerError::InvalidArgument("missing group_id".to_string()))?;
+        if self.registration_state.is_ready(group_id) {
+            return Ok(());
+        }
+
+        Err(WorkerError::NeedRefresh {
+            code: RpcErrorCode::NodeUnavailable,
+            reason: RefreshReason::StaleState,
+            message: format!("worker is not registered for metadata group {}", group_id.as_raw()),
+        })
+    }
+
+    fn ensure_any_ready(&self) -> Result<(), WorkerError> {
+        if self.registration_state.is_any_ready() {
+            return Ok(());
+        }
+
+        Err(WorkerError::NeedRefresh {
+            code: RpcErrorCode::NodeUnavailable,
+            reason: RefreshReason::StaleState,
+            message: "worker is not registered with any metadata group".to_string(),
+        })
     }
 
     pub(crate) async fn handle_write_frames<S>(&self, mut frames: S) -> Result<WriteStreamResponseProto, Status>
@@ -104,6 +139,17 @@ impl WorkerDataService for WorkerDataServiceImpl {
     ) -> Result<Response<OpenReadStreamResponseProto>, Status> {
         let request = request.into_inner();
         let header = request.header.clone();
+        if let Err(error) = self.ensure_group_ready(request.group_id) {
+            return Ok(Response::new(OpenReadStreamResponseProto {
+                header: Some(Self::error_response_header(header, error)),
+                stream_id: None,
+                frame_size: 0,
+                window_bytes: 0,
+                block_stamp: 0,
+                committed_length: 0,
+                chunk_size: self.core.chunk_size(),
+            }));
+        }
         let response = match proto_to_read_open_request(request) {
             Ok(domain) => match self.core.open_read(domain).await {
                 Ok(result) => OpenReadStreamResponseProto {
@@ -143,6 +189,7 @@ impl WorkerDataService for WorkerDataServiceImpl {
         &self,
         request: Request<ReadStreamRequestProto>,
     ) -> Result<Response<Self::ReadStreamStream>, Status> {
+        self.ensure_any_ready().map_err(|error| error.to_status())?;
         let request = request.into_inner();
         let stream_id = proto_to_stream_id(request.stream_id, "stream_id").map_err(|error| error.to_status())?;
         let frames = self
@@ -169,6 +216,17 @@ impl WorkerDataService for WorkerDataServiceImpl {
     ) -> Result<Response<OpenWriteStreamResponseProto>, Status> {
         let request = request.into_inner();
         let header = request.header.clone();
+        if let Err(error) = self.ensure_group_ready(request.group_id) {
+            return Ok(Response::new(OpenWriteStreamResponseProto {
+                header: Some(Self::error_response_header(header, error)),
+                stream_id: None,
+                frame_size: 0,
+                window_bytes: 0,
+                block_stamp: 0,
+                committed_length: 0,
+                chunk_size: self.core.chunk_size(),
+            }));
+        }
         let response = match proto_to_write_open_request(request) {
             Ok(domain) => match self.core.open_write(domain).await {
                 Ok(result) => OpenWriteStreamResponseProto {
@@ -208,6 +266,7 @@ impl WorkerDataService for WorkerDataServiceImpl {
         &self,
         request: Request<tonic::Streaming<WriteStreamRequestProto>>,
     ) -> Result<Response<WriteStreamResponseProto>, Status> {
+        self.ensure_any_ready().map_err(|error| error.to_status())?;
         let response = self.handle_write_frames(request.into_inner()).await?;
         Ok(Response::new(response))
     }
@@ -218,6 +277,14 @@ impl WorkerDataService for WorkerDataServiceImpl {
     ) -> Result<Response<CommitWriteResponseProto>, Status> {
         let request = request.into_inner();
         let header = request.header.clone();
+        if let Err(error) = self.ensure_group_ready(request.group_id) {
+            return Ok(Response::new(CommitWriteResponseProto {
+                header: Some(Self::error_response_header(header, error)),
+                effective_block_len: 0,
+                block_stamp: 0,
+                written_through: 0,
+            }));
+        }
         let response = match proto_to_commit_write_request(request) {
             Ok(domain) => match self.core.commit_write(domain).await {
                 Ok(result) => CommitWriteResponseProto {
@@ -250,6 +317,13 @@ impl WorkerDataService for WorkerDataServiceImpl {
     ) -> Result<Response<SyncCommittedBlockResponseProto>, Status> {
         let request = request.into_inner();
         let header = request.header.clone();
+        if let Err(error) = self.ensure_group_ready(request.group_id) {
+            return Ok(Response::new(SyncCommittedBlockResponseProto {
+                header: Some(Self::error_response_header(header, error)),
+                effective_block_len: 0,
+                block_stamp: 0,
+            }));
+        }
         let response = match proto_to_sync_committed_block_request(request) {
             Ok(domain) => match self.core.sync_committed_block(domain).await {
                 Ok(result) => SyncCommittedBlockResponseProto {
@@ -279,6 +353,12 @@ impl WorkerDataService for WorkerDataServiceImpl {
     ) -> Result<Response<AbortWriteResponseProto>, Status> {
         let request = request.into_inner();
         let header = request.header.clone();
+        if let Err(error) = self.ensure_group_ready(request.group_id) {
+            return Ok(Response::new(AbortWriteResponseProto {
+                header: Some(Self::error_response_header(header, error)),
+                aborted: false,
+            }));
+        }
         let response = match proto_to_abort_write_request(request) {
             Ok(domain) => match self.core.abort_write(domain).await {
                 Ok(result) => AbortWriteResponseProto {
@@ -300,12 +380,21 @@ impl WorkerDataService for WorkerDataServiceImpl {
     }
 }
 
-pub async fn serve_grpc_worker_data(
+pub async fn serve_grpc_worker_data_with_registration(
     bind: SocketAddr,
     max_inflight: usize,
     core: Arc<WorkerCore>,
+    registration_state: Arc<RegistrationSet>,
 ) -> anyhow::Result<()> {
-    let service = WorkerDataServiceImpl::new(core);
+    let service = WorkerDataServiceImpl::new(core, registration_state);
+    serve_grpc_worker_data_with_service(bind, max_inflight, service).await
+}
+
+async fn serve_grpc_worker_data_with_service(
+    bind: SocketAddr,
+    max_inflight: usize,
+    service: WorkerDataServiceImpl,
+) -> anyhow::Result<()> {
     tonic_net::Server::builder()
         .concurrency_limit_per_connection(max_inflight)
         .add_service(WorkerDataServiceServer::new(service))

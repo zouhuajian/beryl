@@ -17,7 +17,7 @@ use common::header::RpcErrorCode;
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use types::fs::{Extent, FsErrorCode};
-use types::ids::{BlockId, BlockIndex};
+use types::ids::{BlockId, BlockIndex, ShardGroupId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
 use types::{CommittedBlock, WorkerEndpointInfo, WriteTarget};
@@ -736,6 +736,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 );
             }
         };
+        let placement_group_id = group_id.map(ShardGroupId::new).unwrap_or_else(|| ShardGroupId::new(1));
 
         let mut planned_targets = Vec::with_capacity(num_blocks as usize);
         for i in 0..num_blocks {
@@ -743,7 +744,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             let block_id = BlockId::new(data_handle_id, block_index);
             let file_offset = base_size + i * block_size;
             let len = desired_len.saturating_sub(i * block_size).min(block_size).max(1);
-            let placement = match worker_manager.select_workers_for_placement(3, None) {
+            let placement = match worker_manager.select_workers_for_placement_in_group(placement_group_id, 3, None) {
                 Ok(placement) => placement,
                 Err(e) => {
                     return self.core.failure_from_error(
@@ -757,7 +758,7 @@ impl<'a> WriteSessionCoordinator<'a> {
 
             let mut worker_endpoints = Vec::with_capacity(3);
             for worker_id in placement.all_workers() {
-                if let Some(worker_info) = worker_manager.get_worker(worker_id) {
+                if let Some(worker_info) = worker_manager.get_worker(placement_group_id, worker_id) {
                     let endpoint = match worker_endpoint_from_parts(
                         worker_id,
                         worker_info.address.clone(),
@@ -1572,12 +1573,13 @@ impl<'a> WriteSessionCoordinator<'a> {
                     .err();
             }
         };
+        let placement_group_id = group_id.map(ShardGroupId::new).unwrap_or_else(|| ShardGroupId::new(1));
 
         let desired_len = desired_len.unwrap_or(4 * 1024 * 1024);
         let block_size = (layout.block_size as u64).max(1);
         let num_blocks = desired_len.div_ceil(block_size).clamp(1, 10);
         for _ in 0..num_blocks {
-            let placement = match worker_manager.select_workers_for_placement(3, None) {
+            let placement = match worker_manager.select_workers_for_placement_in_group(placement_group_id, 3, None) {
                 Ok(placement) => placement,
                 Err(err) => {
                     return self
@@ -1588,7 +1590,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             };
             let has_live_endpoint = placement
                 .all_workers()
-                .any(|worker_id| worker_manager.get_worker(worker_id).is_some());
+                .any(|worker_id| worker_manager.get_worker(placement_group_id, worker_id).is_some());
             if !has_live_endpoint {
                 return self
                     .core

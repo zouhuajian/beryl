@@ -6,14 +6,25 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
+    use common::error::canonical::CanonicalError;
+    use common::header::RpcErrorCode;
     use futures::StreamExt;
     use proto::common::{
-        BlockIdProto, ByteRangeProto, ClientInfoProto, ErrorClassProto, FencingTokenProto, RefreshReasonProto,
-        ShardGroupIdProto, StreamIdProto,
+        BlockIdProto, ByteRangeProto, ClientInfoProto, EndpointProto, ErrorClassProto, FencingTokenProto,
+        RefreshReasonProto, ResponseHeaderProto, ShardGroupIdProto, StreamIdProto,
+    };
+    use proto::convert::canonical_to_error_detail;
+    use proto::metadata::metadata_worker_service_proto_server::{
+        MetadataWorkerServiceProto, MetadataWorkerServiceProtoServer,
+    };
+    use proto::metadata::{
+        BlockReportRequestProto, BlockReportResponseProto, HeartbeatRequestProto, HeartbeatResponseProto,
+        RegisterWorkerRequestProto, RegisterWorkerResponseProto,
     };
     use proto::worker::worker_data_service_server::WorkerDataService;
     use proto::worker::ChecksumKindProto;
@@ -22,10 +33,16 @@ mod tests {
         OpenWriteStreamRequestProto, ReadStreamRequestProto, SyncCommittedBlockRequestProto, WriteStreamRequestProto,
     };
     use tempfile::TempDir;
+    use tonic::transport::Server;
+    use tonic::{Request, Response, Status};
     use types::chunk::ByteRange;
-    use types::ids::{BlockId, BlockIndex, ChunkIndex, ClientId, DataHandleId, ShardGroupId, StreamId};
+    use types::fs::FsErrorCode;
+    use types::ids::{BlockId, BlockIndex, ChunkIndex, ClientId, DataHandleId, ShardGroupId, StreamId, WorkerId};
     use types::lease::FencingToken;
+    use types::WorkerRunId;
 
+    use crate::config::{WorkerConfig, WorkerRegistrationConfig};
+    use crate::control::{resolve_worker_id, MetadataRegistrar, Registration, RegistrationDescriptor, RegistrationSet};
     use crate::data::convert::{
         proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_open_request,
         proto_to_sync_committed_block_request, proto_to_write_frame, proto_to_write_open_request,
@@ -35,6 +52,8 @@ mod tests {
         SyncCommittedBlockRequest, WorkerCore, WorkerCoreResult, WriteFrame, WriteOpenRequest,
     };
     use crate::error::WorkerError;
+    use crate::net::config::WorkerNetConfig;
+    use crate::net::protocol::WorkerNetProtocol;
     use crate::net::server::grpc::WorkerDataServiceImpl;
     use crate::runtime::stream::{StreamManager, StreamState};
     use crate::store::block::{
@@ -118,6 +137,442 @@ mod tests {
             WorkerError::NotFound(_) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    #[derive(Clone)]
+    enum MockRegisterReply {
+        Ok { worker_id: u64, worker_run_id: WorkerRunId },
+        MalformedOkHeader { worker_id: u64, worker_run_id: WorkerRunId },
+        HeaderError(CanonicalError),
+        Status(Status),
+    }
+
+    #[derive(Default)]
+    struct MockMetadataState {
+        replies: Mutex<VecDeque<MockRegisterReply>>,
+        requests: Mutex<Vec<RegisterWorkerRequestProto>>,
+    }
+
+    #[derive(Clone)]
+    struct MockMetadataWorkerService {
+        state: Arc<MockMetadataState>,
+    }
+
+    #[tonic::async_trait]
+    impl MetadataWorkerServiceProto for MockMetadataWorkerService {
+        async fn register_worker(
+            &self,
+            request: Request<RegisterWorkerRequestProto>,
+        ) -> Result<Response<RegisterWorkerResponseProto>, Status> {
+            let request = request.into_inner();
+            self.state.requests.lock().unwrap().push(request.clone());
+            let reply = self
+                .state
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("mock register reply");
+
+            match reply {
+                MockRegisterReply::Ok {
+                    worker_id,
+                    worker_run_id,
+                } => Ok(Response::new(RegisterWorkerResponseProto {
+                    header: Some(response_header_from_request(&request, None)),
+                    group_id: request.group_id,
+                    worker_id,
+                    accepted_worker_run_id: worker_run_id.to_string(),
+                })),
+                MockRegisterReply::MalformedOkHeader {
+                    worker_id,
+                    worker_run_id,
+                } => Ok(Response::new(RegisterWorkerResponseProto {
+                    header: Some(response_header_from_request(
+                        &request,
+                        Some(CanonicalError::ok("malformed ok")),
+                    )),
+                    group_id: request.group_id,
+                    worker_id,
+                    accepted_worker_run_id: worker_run_id.to_string(),
+                })),
+                MockRegisterReply::HeaderError(error) => Ok(Response::new(RegisterWorkerResponseProto {
+                    header: Some(response_header_from_request(&request, Some(error))),
+                    group_id: request.group_id,
+                    worker_id: 0,
+                    accepted_worker_run_id: String::new(),
+                })),
+                MockRegisterReply::Status(status) => Err(status),
+            }
+        }
+
+        async fn heartbeat(
+            &self,
+            _request: Request<HeartbeatRequestProto>,
+        ) -> Result<Response<HeartbeatResponseProto>, Status> {
+            Ok(Response::new(HeartbeatResponseProto::default()))
+        }
+
+        async fn block_report(
+            &self,
+            _request: Request<BlockReportRequestProto>,
+        ) -> Result<Response<BlockReportResponseProto>, Status> {
+            Ok(Response::new(BlockReportResponseProto::default()))
+        }
+    }
+
+    fn response_header_from_request(
+        request: &RegisterWorkerRequestProto,
+        error: Option<CanonicalError>,
+    ) -> ResponseHeaderProto {
+        ResponseHeaderProto {
+            client: request.header.as_ref().and_then(|header| header.client.clone()),
+            error: error.as_ref().map(canonical_to_error_detail),
+            state: Vec::new(),
+            group_id: request.header.as_ref().map(|header| header.group_id).unwrap_or(0),
+            mount_epoch: None,
+            route_epoch: None,
+        }
+    }
+
+    async fn start_mock_metadata(
+        replies: Vec<MockRegisterReply>,
+    ) -> (String, Arc<MockMetadataState>, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock metadata");
+        let addr = listener.local_addr().expect("mock metadata local addr");
+        let state = Arc::new(MockMetadataState {
+            replies: Mutex::new(VecDeque::from(replies)),
+            requests: Mutex::new(Vec::new()),
+        });
+        let service = MockMetadataWorkerService {
+            state: Arc::clone(&state),
+        };
+        let incoming = futures::stream::try_unfold(listener, |listener| async move {
+            let (stream, _) = listener.accept().await?;
+            Ok::<_, std::io::Error>(Some((stream, listener)))
+        });
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(MetadataWorkerServiceProtoServer::new(service))
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("mock metadata server");
+        });
+
+        (format!("http://{addr}"), state, shutdown_tx)
+    }
+
+    fn test_registration_config(endpoint: String) -> WorkerRegistrationConfig {
+        WorkerRegistrationConfig {
+            group_id: group_id(),
+            endpoint,
+            register_timeout_ms: 1_000,
+            register_retry_initial_backoff_ms: 1,
+            register_retry_max_backoff_ms: 1,
+        }
+    }
+
+    fn test_worker_run_id() -> WorkerRunId {
+        "550e8400-e29b-41d4-a716-446655440000".parse().unwrap()
+    }
+
+    fn other_worker_run_id() -> WorkerRunId {
+        "550e8400-e29b-41d4-a716-446655440001".parse().unwrap()
+    }
+
+    fn test_registration_descriptor(worker_run_id: WorkerRunId) -> RegistrationDescriptor {
+        RegistrationDescriptor {
+            group_id: group_id(),
+            worker_id: WorkerId::new(42),
+            worker_run_id,
+            endpoint_host: "127.0.0.1".to_string(),
+            endpoint_port: 9090,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+            worker_net_protocol: WorkerNetProtocol::Grpc,
+            version: "worker-test".to_string(),
+            capabilities: 0,
+            labels: BTreeMap::new(),
+        }
+    }
+
+    fn mark_registered(state: &RegistrationSet) {
+        state.record_registered(Registration {
+            group_id: group_id(),
+            worker_id: WorkerId::new(46),
+            worker_run_id: test_worker_run_id(),
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        });
+    }
+
+    fn registered_data_service(core: Arc<WorkerCore>) -> WorkerDataServiceImpl {
+        let state = Arc::new(RegistrationSet::new());
+        mark_registered(&state);
+        WorkerDataServiceImpl::new(core, state)
+    }
+
+    #[test]
+    fn worker_id_local_identity_generation_and_load_are_stable() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = WorkerConfig {
+            worker_id: None,
+            identity_path: temp.path().join("worker.identity"),
+            ..WorkerConfig::default()
+        };
+
+        let first = resolve_worker_id(&config).expect("generated worker id");
+        let second = resolve_worker_id(&config).expect("loaded worker id");
+
+        assert_ne!(first.as_raw(), 0);
+        assert_eq!(second, first);
+        let stored = std::fs::read_to_string(&config.identity_path).expect("identity file");
+        assert!(stored.trim().parse::<uuid::Uuid>().is_ok());
+    }
+
+    #[tokio::test]
+    async fn registrar_sends_register_request_and_stores_worker_run_id() {
+        let worker_run_id = test_worker_run_id();
+        let (endpoint, mock, shutdown) = start_mock_metadata(vec![MockRegisterReply::Ok {
+            worker_id: 42,
+            worker_run_id,
+        }])
+        .await;
+        let state = Arc::new(RegistrationSet::new());
+        let registrar = MetadataRegistrar::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+        )
+        .expect("registrar");
+
+        let registration = registrar.register_once().await.expect("register once");
+
+        assert_eq!(registration.worker_id, WorkerId::new(42));
+        assert_eq!(registration.worker_run_id, worker_run_id);
+        assert!(state.is_registered(group_id()));
+        assert!(state.is_ready(group_id()));
+        assert_eq!(
+            state.registration(group_id()).expect("state registration"),
+            registration
+        );
+
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.group_id, group_id().as_raw());
+        assert_eq!(request.worker_id, 42);
+        assert_eq!(request.worker_run_id, worker_run_id.to_string());
+        assert_eq!(
+            request.advertised_endpoint,
+            Some(EndpointProto {
+                host: "127.0.0.1".to_string(),
+                port: 9090,
+                protocol: "grpc".to_string(),
+            })
+        );
+        assert_eq!(
+            request.worker_net_protocol,
+            proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32
+        );
+        assert_eq!(request.version, "worker-test");
+        shutdown.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn registrar_rejects_malformed_ok_header_error_and_does_not_set_ready() {
+        let worker_run_id = test_worker_run_id();
+        let (endpoint, mock, shutdown) = start_mock_metadata(vec![MockRegisterReply::MalformedOkHeader {
+            worker_id: 44,
+            worker_run_id,
+        }])
+        .await;
+        let state = Arc::new(RegistrationSet::new());
+        let registrar = MetadataRegistrar::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+        )
+        .expect("registrar");
+
+        let error = registrar
+            .register_once()
+            .await
+            .expect_err("malformed OK header error must fail registration");
+
+        assert!(error.to_string().contains("malformed"));
+        assert!(!state.is_registered(group_id()));
+        assert!(!state.is_ready(group_id()));
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        shutdown.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn registrar_rejects_worker_run_id_mismatch() {
+        let worker_run_id = test_worker_run_id();
+        let (endpoint, _mock, shutdown) = start_mock_metadata(vec![MockRegisterReply::Ok {
+            worker_id: 42,
+            worker_run_id: other_worker_run_id(),
+        }])
+        .await;
+        let state = Arc::new(RegistrationSet::new());
+        let registrar = MetadataRegistrar::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+        )
+        .expect("registrar");
+
+        let error = registrar
+            .register_once()
+            .await
+            .expect_err("mismatched worker_run_id must fail registration");
+
+        assert!(error.to_string().contains("worker_run_id"));
+        assert!(!state.is_ready(group_id()));
+        shutdown.send(()).ok();
+    }
+
+    #[test]
+    fn descriptor_from_config_uses_advertised_endpoint_not_bind() {
+        let mut config = WorkerConfig::default();
+        config.worker_id = Some(WorkerId::new(42));
+        config.rpc_bind = "0.0.0.0:9090".to_string();
+        config.rpc_advertised_endpoint = "http://127.0.0.1:19090".to_string();
+        config.net =
+            WorkerNetConfig::grpc_from_rpc(config.rpc_bind.clone(), config.rpc_max_inflight, config.max_frame_size);
+
+        let descriptor = MetadataRegistrar::descriptor_from_config(&config).expect("descriptor");
+
+        assert_eq!(descriptor.endpoint_host, "127.0.0.1");
+        assert_eq!(descriptor.endpoint_port, 19090);
+    }
+
+    #[tokio::test]
+    async fn retryable_register_failure_is_retried() {
+        let retryable = CanonicalError::retryable(
+            RpcErrorCode::NodeUnavailable,
+            Some(1),
+            "metadata temporarily unavailable",
+        );
+        let worker_run_id = test_worker_run_id();
+        let (endpoint, mock, shutdown) = start_mock_metadata(vec![
+            MockRegisterReply::HeaderError(retryable),
+            MockRegisterReply::Ok {
+                worker_id: 42,
+                worker_run_id,
+            },
+        ])
+        .await;
+        let state = Arc::new(RegistrationSet::new());
+        let registrar = MetadataRegistrar::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+        )
+        .expect("registrar");
+
+        let registration = registrar
+            .register_with_retry(std::future::pending::<()>())
+            .await
+            .expect("register with retry");
+
+        assert_eq!(registration.worker_id, WorkerId::new(42));
+        assert_eq!(registration.worker_run_id, worker_run_id);
+        assert!(state.is_ready(group_id()));
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].worker_run_id, worker_run_id.to_string());
+        assert_eq!(requests[1].worker_run_id, worker_run_id.to_string());
+        shutdown.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn transport_register_unavailable_is_retried() {
+        let worker_run_id = test_worker_run_id();
+        let (endpoint, mock, shutdown) = start_mock_metadata(vec![
+            MockRegisterReply::Status(Status::unavailable("metadata temporarily unavailable")),
+            MockRegisterReply::Ok {
+                worker_id: 42,
+                worker_run_id,
+            },
+        ])
+        .await;
+        let state = Arc::new(RegistrationSet::new());
+        let registrar = MetadataRegistrar::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+        )
+        .expect("registrar");
+
+        let registration = registrar
+            .register_with_retry(std::future::pending::<()>())
+            .await
+            .expect("register with transport retry");
+
+        assert_eq!(registration.worker_id, WorkerId::new(42));
+        assert_eq!(registration.worker_run_id, worker_run_id);
+        assert!(state.is_ready(group_id()));
+        assert_eq!(mock.requests.lock().unwrap().len(), 2);
+        shutdown.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn fatal_register_failure_stops_startup() {
+        let fatal = CanonicalError::fatal_fs(FsErrorCode::EInval, "bad worker descriptor");
+        let (endpoint, mock, shutdown) = start_mock_metadata(vec![MockRegisterReply::HeaderError(fatal)]).await;
+        let state = Arc::new(RegistrationSet::new());
+        let registrar = MetadataRegistrar::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(test_worker_run_id()),
+            Arc::clone(&state),
+        )
+        .expect("registrar");
+
+        let error = registrar
+            .register_with_retry(std::future::pending::<()>())
+            .await
+            .expect_err("fatal registration error");
+
+        assert!(error.to_string().contains("fatal metadata registration error"));
+        assert!(!state.is_ready(group_id()));
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        shutdown.send(()).ok();
+    }
+
+    #[test]
+    fn worker_readiness_is_false_before_registration_and_true_after() {
+        let state = RegistrationSet::new();
+
+        assert!(!state.is_registered(group_id()));
+        assert!(!state.is_ready(group_id()));
+        assert!(!state.is_any_ready());
+        assert!(state.registration(group_id()).is_none());
+
+        state.record_registered(Registration {
+            group_id: group_id(),
+            worker_id: WorkerId::new(44),
+            worker_run_id: test_worker_run_id(),
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        });
+
+        assert!(state.is_registered(group_id()));
+        assert!(state.is_ready(group_id()));
+        assert!(state.is_any_ready());
+        assert_eq!(
+            state.registration(group_id()),
+            Some(Registration {
+                group_id: group_id(),
+                worker_id: WorkerId::new(44),
+                worker_run_id: test_worker_run_id(),
+                advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+            })
+        );
     }
 
     fn write_open_request() -> WriteOpenRequest {
@@ -1179,7 +1634,7 @@ mod tests {
     #[tokio::test]
     async fn open_write_stream_returns_success_response() {
         let (_temp, _store, core) = core_with_store(512, 2048, 4096);
-        let service = WorkerDataServiceImpl::new(Arc::new(core));
+        let service = registered_data_service(Arc::new(core));
 
         let response = service
             .open_write_stream(tonic::Request::new(open_write_proto(0)))
@@ -1197,10 +1652,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guarded_data_service_rejects_open_before_registration() {
+        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let state = Arc::new(RegistrationSet::new());
+        let service = WorkerDataServiceImpl::new(Arc::new(core), Arc::clone(&state));
+
+        let response = service
+            .open_write_stream(tonic::Request::new(open_write_proto(0)))
+            .await
+            .expect("open write response")
+            .into_inner();
+        let error = response.header.expect("header").error.expect("header error");
+
+        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+        assert!(error.message.contains("not registered"));
+        assert!(response.stream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn guarded_data_service_allows_open_after_registration() {
+        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let state = Arc::new(RegistrationSet::new());
+        mark_registered(&state);
+        let service = WorkerDataServiceImpl::new(Arc::new(core), Arc::clone(&state));
+
+        let response = service
+            .open_write_stream(tonic::Request::new(open_write_proto(0)))
+            .await
+            .expect("open write response")
+            .into_inner();
+
+        assert!(response.header.expect("header").error.is_none());
+        assert!(response.stream_id.is_some());
+    }
+
+    #[tokio::test]
     async fn write_stream_returns_written_through() {
         let (_temp, _store, core) = core_with_store(512, 2048, 4096);
         let core = Arc::new(core);
-        let service = WorkerDataServiceImpl::new(core.clone());
+        let state = Arc::new(RegistrationSet::new());
+        mark_registered(&state);
+        let service = WorkerDataServiceImpl::new(core.clone(), state);
         let open = core.open_write(write_open_request()).await.expect("open write");
 
         let response = service
@@ -1223,7 +1715,7 @@ mod tests {
     async fn commit_write_returns_success_after_full_write() {
         let (_temp, _store, core) = core_with_store(512, 2048, 4096);
         let core = Arc::new(core);
-        let service = WorkerDataServiceImpl::new(core.clone());
+        let service = registered_data_service(Arc::clone(&core));
         let open = service
             .open_write_stream(tonic::Request::new(open_write_proto(2048)))
             .await
@@ -1266,7 +1758,7 @@ mod tests {
     async fn sync_committed_block_returns_success_for_ready_block() {
         let (_temp, store, core) = core_with_store(512, 2048, 4096);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
-        let service = WorkerDataServiceImpl::new(Arc::new(core));
+        let service = registered_data_service(Arc::new(core));
 
         let response = service
             .sync_committed_block(tonic::Request::new(sync_committed_block_proto(BLOCK_STAMP, BLOCK_SIZE)))
@@ -1283,7 +1775,7 @@ mod tests {
     async fn open_read_stream_returns_success_response_for_ready_block() {
         let (_temp, store, core) = core_with_store(512, 2048, 4096);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
-        let service = WorkerDataServiceImpl::new(Arc::new(core));
+        let service = registered_data_service(Arc::new(core));
 
         let response = service
             .open_read_stream(tonic::Request::new(open_read_proto(0, 1024, BLOCK_STAMP, 0)))
@@ -1304,7 +1796,7 @@ mod tests {
     async fn open_read_stream_returns_need_refresh_on_stale_stamp() {
         let (_temp, store, core) = core_with_store(512, 2048, 4096);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
-        let service = WorkerDataServiceImpl::new(Arc::new(core));
+        let service = registered_data_service(Arc::new(core));
 
         let response = service
             .open_read_stream(tonic::Request::new(open_read_proto(0, 1024, BLOCK_STAMP + 1, 512)))
@@ -1329,7 +1821,7 @@ mod tests {
     async fn open_read_stream_returns_header_error_on_zero_stamp() {
         let (_temp, store, core) = core_with_store(512, 2048, 4096);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
-        let service = WorkerDataServiceImpl::new(Arc::new(core));
+        let service = registered_data_service(Arc::new(core));
 
         let response = service
             .open_read_stream(tonic::Request::new(open_read_proto(0, 1024, 0, 512)))
@@ -1352,7 +1844,7 @@ mod tests {
         let (_temp, store, core) = core_with_store(512, 2048, 4096);
         let data = payload();
         publish_ready_block(&store, data.clone(), BLOCK_STAMP);
-        let service = WorkerDataServiceImpl::new(Arc::new(core));
+        let service = registered_data_service(Arc::new(core));
 
         let open = service
             .open_read_stream(tonic::Request::new(open_read_proto(4, 6, BLOCK_STAMP, 512)))
@@ -1383,7 +1875,7 @@ mod tests {
 
     #[tokio::test]
     async fn service_read_stream_rejects_missing_stream() {
-        let service = WorkerDataServiceImpl::new(Arc::new(WorkerCore::new(1024)));
+        let service = registered_data_service(Arc::new(WorkerCore::new(1024)));
 
         let read_status = match service
             .read_stream(tonic::Request::new(ReadStreamRequestProto {
@@ -1554,6 +2046,34 @@ mod tests {
             assert!(
                 !main.contains(forbidden),
                 "worker main must not initialize inactive path: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn grpc_server_has_no_unregistered_production_constructor() {
+        let grpc = include_str!("net/server/grpc.rs");
+        let server_mod = include_str!("net/server/mod.rs");
+
+        for forbidden in [
+            concat!("registration_state: ", "Option"),
+            concat!("registration_", "state: ", "No", "ne"),
+            concat!("pub async fn serve_grpc_", "worker_data("),
+        ] {
+            assert!(
+                !grpc.contains(forbidden),
+                "gRPC server must not retain unregistered production path: {forbidden}"
+            );
+        }
+
+        for forbidden in [
+            concat!("pub async fn serve_", "worker_data("),
+            concat!("registration_state: ", "Option"),
+            concat!("None", " =>"),
+        ] {
+            assert!(
+                !server_mod.contains(forbidden),
+                "worker server must not retain unregistered production path: {forbidden}"
             );
         }
     }

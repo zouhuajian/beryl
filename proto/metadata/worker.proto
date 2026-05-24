@@ -14,28 +14,32 @@ import "common/header.proto";
 
 message RegisterWorkerRequestProto {
   common.RequestHeaderProto header = 1;
-  /// Worker address/endpoint.
-  common.EndpointProto endpoint = 2;
+  /// Metadata group this registration targets.
+  uint64 group_id = 2;
+  /// Stable logical worker identity supplied by the worker.
+  uint64 worker_id = 3;
+  /// UUID generated once for this worker process start; not an epoch.
+  string worker_run_id = 4;
+  /// Routable worker data endpoint advertised to metadata and clients.
+  common.EndpointProto advertised_endpoint = 5;
   /// Optional: worker capabilities/features.
-  uint64 capabilities = 3;
+  uint64 capabilities = 6;
   /// Optional: version string.
-  string version = 4;
+  string version = 7;
   /// Optional: labels/tags for placement.
-  map<string, string> labels = 5;
-  /// Optional: suggested worker_id (for re-registration).
-  uint64 suggested_worker_id = 6;
+  map<string, string> labels = 8;
   /// Worker network protocol (grpc/quic/rdma).
-  common.WorkerNetProtocolProto worker_net_protocol = 7;
-  /// Worker epoch/boot_id (monotonically increasing or UUID-based).
-  uint64 worker_epoch = 8;
+  common.WorkerNetProtocolProto worker_net_protocol = 9;
 }
 
 message RegisterWorkerResponseProto {
   common.ResponseHeaderProto header = 1;
-  /// Assigned or confirmed worker_id.
-  uint64 worker_id = 2;
-  /// Optional: initial configuration.
-  WorkerConfigProto config = 3;
+  /// Metadata group that accepted this registration.
+  uint64 group_id = 2;
+  /// Confirmed stable worker identity.
+  uint64 worker_id = 3;
+  /// Accepted process-run identity for this group.
+  string accepted_worker_run_id = 4;
 }
 
 message WorkerConfigProto {
@@ -59,7 +63,8 @@ message HeartbeatRequestProto {
   HealthStatusProto health = 5;
   /// Worker network protocol (grpc/quic/rdma).
   common.WorkerNetProtocolProto worker_net_protocol = 6;
-  /// Worker epoch/boot_id (must match registration).
+  /// TODO(PR-6): align heartbeat identity with WorkerId + WorkerRunId.
+  /// This field is not part of the startup registration contract.
   uint64 worker_epoch = 7;
   /// Task acknowledgments (completed tasks).
   repeated TaskAckProto acks = 8;

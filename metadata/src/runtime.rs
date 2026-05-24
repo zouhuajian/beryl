@@ -169,6 +169,7 @@ impl WorkerRuntime {
             Arc::clone(&self.manager),
             repair_signal_handler,
             Arc::clone(&authority.mount_table),
+            authority.shard_group_id,
         );
         service.set_slot_metrics(Arc::clone(&authority.metadata_metrics));
 
@@ -342,6 +343,10 @@ pub(crate) fn build_worker_runtime(
     repair: &MaintenanceRepairState,
 ) -> (WorkerRuntime, MetadataWorkerServiceImpl) {
     let worker = WorkerRuntime::new();
+    authority
+        .raft_node
+        .set_worker_manager(Arc::clone(&worker.manager))
+        .expect("worker registration replay into live WorkerManager should succeed");
     let service = worker.service(authority, repair);
     (worker, service)
 }

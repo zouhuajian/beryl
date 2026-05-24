@@ -346,10 +346,18 @@ fn worker_manager_for_write_targets() -> Arc<WorkerManager> {
     for raw in 1..=3 {
         let worker_id = WorkerId::new(raw);
         manager
-            .register_worker(worker_id, format!("127.0.0.1:{}", 9000 + raw), 1, 10 + raw, None)
+            .register_worker(
+                ShardGroupId::new(1),
+                worker_id,
+                format!("127.0.0.1:{}", 9000 + raw),
+                1,
+                10 + raw,
+                None,
+            )
             .expect("register worker");
         manager
             .update_runtime(
+                ShardGroupId::new(1),
                 worker_id,
                 1,
                 10 + raw,

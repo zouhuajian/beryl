@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context};
 
+use crate::control::RegistrationSet;
 use crate::data::core::WorkerCore;
 use crate::net::config::WorkerNetConfig;
 use crate::net::protocol::WorkerNetProtocol;
@@ -15,8 +16,20 @@ pub mod grpc;
 pub mod quic;
 pub mod rdma;
 
-/// Serve worker data-plane RPCs using the configured worker-owned net layer.
-pub async fn serve_worker_data(config: &WorkerNetConfig, core: Arc<WorkerCore>) -> anyhow::Result<()> {
+/// Serve worker data-plane RPCs after metadata registration, with an active readiness guard.
+pub async fn serve_worker_data_with_registration(
+    config: &WorkerNetConfig,
+    core: Arc<WorkerCore>,
+    registration_state: Arc<RegistrationSet>,
+) -> anyhow::Result<()> {
+    serve_worker_data_inner(config, core, registration_state).await
+}
+
+async fn serve_worker_data_inner(
+    config: &WorkerNetConfig,
+    core: Arc<WorkerCore>,
+    registration_state: Arc<RegistrationSet>,
+) -> anyhow::Result<()> {
     if config.listeners.is_empty() {
         bail!("worker net listeners must not be empty");
     }
@@ -31,9 +44,9 @@ pub async fn serve_worker_data(config: &WorkerNetConfig, core: Arc<WorkerCore>) 
                 .bind
                 .parse()
                 .with_context(|| format!("invalid worker gRPC listener bind address: {}", listener.bind))?;
-            grpc::serve_grpc_worker_data(bind, listener.max_inflight, core).await
+            grpc::serve_grpc_worker_data_with_registration(bind, listener.max_inflight, core, registration_state).await
         }
-        WorkerNetProtocol::Quic => quic::serve_quic_worker_data(&listener.bind, core).await,
-        WorkerNetProtocol::Rdma => rdma::serve_rdma_worker_data(&listener.bind, core).await,
+        WorkerNetProtocol::Quic => bail!("QUIC worker data service requires a registration readiness guard"),
+        WorkerNetProtocol::Rdma => bail!("RDMA worker data service requires a registration readiness guard"),
     }
 }

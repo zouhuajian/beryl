@@ -22,7 +22,7 @@ mod tests {
     use tempfile::TempDir;
     use types::block::{BlockPlacement, BlockState};
     use types::fs::InodeId;
-    use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, WorkerId};
+    use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, ShardGroupId, WorkerId};
     use types::CallId;
     use types::RaftLogId;
 
@@ -93,9 +93,27 @@ mod tests {
         worker_id: WorkerId,
         blocks: Vec<BlockId>,
     ) -> MetadataResult<()> {
-        worker_manager.register_worker(worker_id, "127.0.0.1:8080".to_string(), 1, 100, None)?;
-        worker_manager.update_runtime(worker_id, 1, 100, 1000, 500, 500, 0, 0, HealthStatus::Healthy)?;
-        worker_manager.apply_full_report(worker_id, blocks)?;
+        worker_manager.register_worker(
+            ShardGroupId::new(1),
+            worker_id,
+            "127.0.0.1:8080".to_string(),
+            1,
+            100,
+            None,
+        )?;
+        worker_manager.update_runtime(
+            ShardGroupId::new(1),
+            worker_id,
+            1,
+            100,
+            1000,
+            500,
+            500,
+            0,
+            0,
+            HealthStatus::Healthy,
+        )?;
+        worker_manager.apply_full_report(ShardGroupId::new(1), worker_id, blocks)?;
         Ok(())
     }
 
@@ -423,10 +441,28 @@ mod tests {
         worker_manager.increment_metadata_epoch();
         let worker_id = WorkerId::new(1);
         worker_manager
-            .register_worker(worker_id, "127.0.0.1:8080".to_string(), 1, 100, None)
+            .register_worker(
+                ShardGroupId::new(1),
+                worker_id,
+                "127.0.0.1:8080".to_string(),
+                1,
+                100,
+                None,
+            )
             .unwrap();
         worker_manager
-            .update_runtime(worker_id, 1, 100, 1000, 500, 500, 0, 0, HealthStatus::Healthy)
+            .update_runtime(
+                ShardGroupId::new(1),
+                worker_id,
+                1,
+                100,
+                1000,
+                500,
+                500,
+                0,
+                0,
+                HealthStatus::Healthy,
+            )
             .unwrap();
 
         let block_id = BlockId::new(DataHandleId::new(7), BlockIndex::new(0));
@@ -441,7 +477,9 @@ mod tests {
             },
             committed_length: 4096,
         })?;
-        worker_manager.apply_full_report(worker_id, vec![block_id]).unwrap();
+        worker_manager
+            .apply_full_report(ShardGroupId::new(1), worker_id, vec![block_id])
+            .unwrap();
         assert_eq!(worker_manager.get_block_locations(block_id), vec![worker_id]);
 
         storage.put_delete_intent(&DeleteIntent {
@@ -546,7 +584,8 @@ mod tests {
             .find(|command| delete_command(command).0 == 102)
             .expect("second intent command");
 
-        env.worker_manager.apply_full_report(worker_id, vec![first_block])?;
+        env.worker_manager
+            .apply_full_report(ShardGroupId::new(1), worker_id, vec![first_block])?;
         env.executor
             .process_task_acks(
                 worker_id,
@@ -567,7 +606,8 @@ mod tests {
             vec![(102, DeleteIntentStatus::Completed)]
         );
 
-        env.worker_manager.apply_full_report(worker_id, Vec::new())?;
+        env.worker_manager
+            .apply_full_report(ShardGroupId::new(1), worker_id, Vec::new())?;
         env.executor
             .process_task_acks(
                 worker_id,

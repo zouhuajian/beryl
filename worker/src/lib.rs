@@ -4,6 +4,7 @@
 //! Vecton worker data-plane skeleton.
 
 pub mod config;
+pub mod control;
 pub mod data;
 pub mod error;
 pub mod net;

@@ -37,7 +37,9 @@ metadata.repair.max_backoff_ms: 60000
 metadata.repair.worker_inflight_limit: 4
 
 # Worker data service.
+worker.identity.path: "./data/worker.identity"
 worker.rpc.bind: "0.0.0.0:9090"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
 worker.rpc.max_inflight: 100
 worker.default_frame_size: "1MB"
 worker.max_frame_size: "4MB"
@@ -45,3 +47,10 @@ worker.window_bytes: "8MB"
 worker.chunk_size: "1MB"
 worker.stream.idle_timeout_ms: 60000
 worker.storage.root: "./data"
+
+# Worker metadata startup registration.
+worker.metadata.group_id: 1
+worker.metadata.endpoint: "http://127.0.0.1:18080"
+worker.metadata.register_timeout_ms: 5000
+worker.metadata.register_retry_initial_backoff_ms: 200
+worker.metadata.register_retry_max_backoff_ms: 5000

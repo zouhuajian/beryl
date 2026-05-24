@@ -31,19 +31,21 @@ Currently supported:
 
 - Rust workspace build, metadata generation, lint, and unit/contract test gates.
 - Single-group metadata runtime with inode/dentry/attrs authority, root mount bootstrap, Raft-backed state, write sessions, leases, and route/state freshness.
-- Worker gRPC data service for local block/chunk/stream read and write execution.
+- Worker startup registration with MetadataWorkerService using stable `WorkerId` plus per-process `WorkerRunId`, followed by a gRPC data service for local block/chunk/stream read and write execution.
+- MetadataWorkerService structured application-error response contract for worker registration.
 - Client facade with metadata gateway, retry/refresh classification, read planning, worker endpoint validation, and sequential write handles.
 - Default `conf/core-site.yaml` and `conf/client-site.yaml` containing only keys consumed by current runtime code.
 
 Intentionally not yet implemented in this baseline:
 
-- Production worker registration, heartbeat, and block-report loop from worker binary to metadata.
+- Production worker heartbeat and block-report loops from worker binary to metadata.
 - WorkerDataService public `block_stamp=0` hardening.
-- MetadataWorkerService structured application-error response contract.
 - Raft network implementation for production multi-node metadata.
 - QUIC, RDMA, io_uring, or SPDK production data paths.
 - Expanded maintenance repair/delete features.
 - Real metadata + worker + client end-to-end system tests.
+
+Worker startup registration is group-scoped. The worker resolves a stable `WorkerId` from `worker.id` or the persisted `worker.identity.path`, generates a UUID `WorkerRunId` once per process start, registers the advertised gRPC endpoint with the configured metadata group leader, and serves data-plane requests for a group only after that group accepts the registration. Metadata persists only the stable worker descriptor; `WorkerRunId` is live registration state and is not restored from metadata restart or snapshot reload. `WorkerRunId` is not an epoch and is not comparable. Heartbeat, block report, command acknowledgment, and data-plane-wide removal of older `worker_epoch` fields remain deferred.
 
 ## Workspace Crates
 

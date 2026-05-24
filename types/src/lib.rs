@@ -36,4 +36,4 @@ pub use ids::{
 };
 pub use location::{CommittedBlock, FileBlockLocation, WriteTarget};
 pub use raft_log_id::RaftLogId;
-pub use worker::{WorkerEndpointInfo, WorkerNetProtocol};
+pub use worker::{WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId};

@@ -9,7 +9,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use common::observe::{init_observability, ObservabilityConfig, ServiceInfo};
 use tracing::{error, info};
-use worker::{config::WorkerConfig, net, WorkerCore};
+use worker::{
+    config::WorkerConfig,
+    control::{MetadataRegistrar, RegistrationSet},
+    net, WorkerCore,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,6 +36,7 @@ async fn main() -> Result<()> {
 
     info!(
         rpc_bind = %config.rpc_bind,
+        rpc_advertised_endpoint = %config.rpc_advertised_endpoint,
         rpc_max_inflight = config.rpc_max_inflight,
         default_frame_size = config.default_frame_size,
         max_frame_size = config.max_frame_size,
@@ -52,6 +57,12 @@ async fn main() -> Result<()> {
         );
     }
 
+    let registration_state = Arc::new(RegistrationSet::new());
+    let descriptor =
+        MetadataRegistrar::descriptor_from_config(&config).context("Failed to build worker registration descriptor")?;
+    let registrar = MetadataRegistrar::new(config.metadata.clone(), descriptor, Arc::clone(&registration_state))
+        .context("Failed to create worker metadata registrar")?;
+
     let core = Arc::new(WorkerCore::with_options(
         config.chunk_size,
         config.default_frame_size,
@@ -61,7 +72,14 @@ async fn main() -> Result<()> {
         config.storage_root.clone(),
     ));
 
-    if let Err(error) = net::server::serve_worker_data(&config.net, core)
+    registrar
+        .register_with_retry(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+        .context("Worker metadata registration failed")?;
+
+    if let Err(error) = net::server::serve_worker_data_with_registration(&config.net, core, registration_state)
         .await
         .context("Worker data service server failed")
     {

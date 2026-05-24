@@ -464,7 +464,7 @@ impl OverReplicaCleanupService {
             .iter()
             .map(|&worker_id| {
                 // Get worker info (combined descriptor + runtime)
-                let worker_info = self.worker_manager.get_worker(worker_id);
+                let worker_info = self.worker_manager.get_worker_any_group(worker_id);
 
                 let load_score = worker_info.as_ref().map(|w| {
                     // Calculate load score: capacity_used_ratio + active_ops_penalty

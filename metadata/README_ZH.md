@@ -277,10 +277,22 @@ snapshot / state store：
 
 register：
 
-- endpoint + labels 生成 stable identity。
-- `Command::RegisterWorker` 通过 Raft apply 持久化 identity mapping、worker descriptor、`next_worker_id` allocator 和 `AppliedResult`。
-- propose 成功后才调用 `WorkerManager::register_worker()` 更新 runtime descriptor。
-- `suggested_worker_id` 不再 authoritative。
+- Worker 在请求中提交稳定 `WorkerId`、本次进程启动生成的 UUID `WorkerRunId`、目标 `group_id` 与 advertised gRPC endpoint。
+- `WorkerRunId` 不是 epoch，不比较大小，也不替代 block_stamp。
+- `Command::RegisterWorker` 通过当前 metadata group 的 Raft apply 持久化稳定 worker descriptor（`WorkerId`、advertised endpoint、protocol 等）和 `AppliedResult`；`WorkerRunId` 只写入 group-scoped live `WorkerManager` registration state。
+- metadata restart / snapshot reload 只恢复稳定 descriptor，不恢复旧 `WorkerRunId` readiness；worker 必须重新 register 后才重新成为该 group 的 accepted process run。
+- leader 才接受 register；follower 返回结构化 NotLeader / NEED_REFRESH，之后只通过 Raft apply/replay 学到 registration state。
+- 同一 live `WorkerId + WorkerRunId` 重放是幂等成功；同一 live `WorkerId` 携带不同 `WorkerRunId` 会被拒绝。metadata reload 后 live registration 为空，新的 `WorkerRunId` 可重新注册。
+- `MetadataWorkerServiceImpl` 只负责校验 served `group_id`、解析请求和提交 Raft proposal；不在 proposal 成功后做 leader-only live registration mutation。
+
+后续 client/data-plane identity 目标模型：
+
+- metadata location 最终应携带 `group_id`、`worker_id`、`worker_run_id`、advertised endpoint、`block_id`、`block_stamp`，以及适用的现有 `file_version` / `route_epoch` freshness 字段。
+- client 直连 worker request 最终应携带 `group_id`、`worker_id`、`worker_run_id`、`block_id`、`block_stamp` 和 range。
+- worker 校验 request `worker_id` 匹配本地 `WorkerId`、`group_id` 已注册、request `worker_run_id` 匹配该 group 已接受的 `WorkerRunId`、`block_stamp` 匹配本地 `BlockMeta`。
+- `WorkerId` 判断是哪一个 worker；`WorkerRunId` 判断是哪一次 worker 进程运行；`block_stamp` 判断是哪一代 block。
+- `WorkerRunId` 不替代 `block_stamp`；`block_stamp` 也不替代 `WorkerRunId`。
+- PR-5 只完成 startup registration 契约和 metadata live registration apply/replay 收口；完整 direct data-plane identity 迁移仍是后续工作。
 
 heartbeat：
 

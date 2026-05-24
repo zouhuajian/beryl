@@ -39,7 +39,7 @@ mod tests {
     use crate::MountTable;
     use ::types::block::{BlockPlacement, BlockState};
     use ::types::fs::InodeId;
-    use ::types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+    use ::types::ids::{BlockId, BlockIndex, DataHandleId, ShardGroupId, WorkerId};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -83,6 +83,7 @@ mod tests {
     fn live_worker(manager: &WorkerManager, worker_id: WorkerId) {
         manager
             .register_worker(
+                ShardGroupId::new(1),
                 worker_id,
                 format!("127.0.0.1:{}", 9000 + worker_id.as_raw()),
                 1,
@@ -91,7 +92,18 @@ mod tests {
             )
             .unwrap();
         manager
-            .update_runtime(worker_id, 1, 100, 1_000, 500, 500, 0, 0, HealthStatus::Healthy)
+            .update_runtime(
+                ShardGroupId::new(1),
+                worker_id,
+                1,
+                100,
+                1_000,
+                500,
+                500,
+                0,
+                0,
+                HealthStatus::Healthy,
+            )
             .unwrap();
     }
 
@@ -158,7 +170,9 @@ mod tests {
         live_worker(&worker_manager, worker1);
         live_worker(&worker_manager, worker2);
         live_worker(&worker_manager, worker3);
-        worker_manager.apply_full_report(worker1, vec![block_id]).unwrap();
+        worker_manager
+            .apply_full_report(ShardGroupId::new(1), worker1, vec![block_id])
+            .unwrap();
         put_block(&storage, block_id, worker1);
 
         let handler = signal_handler(
@@ -194,7 +208,9 @@ mod tests {
         let block_id = make_block_id(8, 0);
         let worker_id = make_worker_id(1);
         live_worker(&worker_manager, worker_id);
-        worker_manager.apply_full_report(worker_id, vec![block_id]).unwrap();
+        worker_manager
+            .apply_full_report(ShardGroupId::new(1), worker_id, vec![block_id])
+            .unwrap();
 
         let handler = signal_handler(
             Arc::clone(&raft_node),

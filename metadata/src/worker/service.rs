@@ -15,13 +15,14 @@ use ::common::error::canonical::{CanonicalError, ErrorClass, RefreshReason};
 use ::common::header::{ResponseHeader, RpcErrorCode, RpcStatus};
 use proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProto;
 use proto::metadata::*;
-use std::future::Future;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
-use types::ids::{BlockId, WorkerId};
+use types::ids::{BlockId, ShardGroupId, WorkerId};
+use types::WorkerRunId;
 
 /// Worker service background task handles.
 pub struct WorkerBackgroundHandle {
@@ -66,6 +67,7 @@ pub struct MetadataWorkerServiceImpl {
     slot_metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
     /// Mount table used to compute mount_epoch for lease gating (TODO-2).
     mount_table: Arc<crate::mount::MountTable>,
+    served_group_id: ShardGroupId,
 }
 
 impl MetadataWorkerServiceImpl {
@@ -74,6 +76,7 @@ impl MetadataWorkerServiceImpl {
         worker_manager: Arc<WorkerManager>,
         repair_signal_handler: Arc<dyn RepairSignalSink>,
         mount_table: Arc<crate::mount::MountTable>,
+        served_group_id: ShardGroupId,
     ) -> Self {
         let metrics = Arc::new(WorkerMetrics::new());
 
@@ -85,6 +88,7 @@ impl MetadataWorkerServiceImpl {
             metrics,
             slot_metrics: None, // Will be set via set_slot_metrics
             mount_table,
+            served_group_id,
         }
     }
 
@@ -225,6 +229,7 @@ impl MetadataWorkerServiceImpl {
             let worker_manager = Arc::clone(&self.worker_manager);
             let slot_metrics = Arc::clone(slot_metrics);
             let raft_node = Arc::clone(&self.raft_node);
+            let served_group_id = self.served_group_id;
             Some(tokio::spawn(async move {
                 use tokio::time::{interval, Duration};
                 let mut interval = interval(Duration::from_secs(10)); // Update every 10 seconds
@@ -252,7 +257,7 @@ impl MetadataWorkerServiceImpl {
                         let live_workers = worker_manager.list_live_workers();
                         let mut waiting: usize = 0;
                         for worker_id in &live_workers {
-                            if worker_manager.needs_full_sync(*worker_id) {
+                            if worker_manager.needs_full_sync(served_group_id, *worker_id) {
                                 // Approximate: if needs_full_sync, count as waiting
                                 // This is approximate because we don't track which workers have leases
                                 waiting += 1;
@@ -281,35 +286,38 @@ impl MetadataWorkerServiceImpl {
     }
 }
 
-async fn persist_worker_descriptor_then_register<F>(
-    worker_manager: &WorkerManager,
-    address: String,
-    worker_net_protocol: i32,
-    worker_epoch: u64,
-    fault_domain: Option<String>,
-    persist_descriptor: F,
-) -> MetadataResult<WorkerId>
-where
-    F: Future<Output = MetadataResult<AppDataResponse>>,
-{
-    let worker_id = match persist_descriptor.await? {
-        AppDataResponse::Worker(WorkerCommandResult::Upserted(worker_id)) => worker_id,
-        other => {
-            return Err(MetadataError::Internal(format!(
-                "RegisterWorker returned unexpected Raft response: {:?}",
-                other
-            )))
-        }
-    };
-
-    worker_manager
-        .register_worker(worker_id, address, worker_net_protocol, worker_epoch, fault_domain)
-        .map_err(|e| MetadataError::Internal(format!("Failed to register worker: {}", e)))?;
-
-    Ok(worker_id)
+fn validate_advertised_endpoint(endpoint: proto::common::EndpointProto) -> Result<String, String> {
+    if endpoint.protocol != "grpc" {
+        return Err("advertised_endpoint protocol must be grpc".to_string());
+    }
+    if endpoint.host.trim().is_empty() {
+        return Err("advertised_endpoint host must not be empty".to_string());
+    }
+    if endpoint.port == 0 || endpoint.port > u32::from(u16::MAX) {
+        return Err("advertised_endpoint port must be between 1 and 65535".to_string());
+    }
+    if endpoint
+        .host
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.is_unspecified())
+    {
+        return Err("advertised_endpoint must not use a wildcard host".to_string());
+    }
+    Ok(format!("{}:{}", endpoint.host, endpoint.port))
 }
 
-#[tonic::async_trait]
+async fn persist_worker_descriptor(
+    persist_descriptor: impl std::future::Future<Output = MetadataResult<AppDataResponse>>,
+) -> MetadataResult<WorkerId> {
+    match persist_descriptor.await? {
+        AppDataResponse::Worker(WorkerCommandResult::Upserted(worker_id)) => Ok(worker_id),
+        other => Err(MetadataError::Internal(format!(
+            "RegisterWorker returned unexpected Raft response: {:?}",
+            other
+        ))),
+    }
+}
+
 #[tonic::async_trait]
 impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
     #[instrument(skip(self), fields(call_id, client_id))]
@@ -320,75 +328,114 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         let req = request.into_inner();
         let _caller_ctx = extract_and_inject_context(&req.header);
 
-        // Extract all needed fields before any moves
-        let worker_net_protocol = req.worker_net_protocol() as i32; // Convert enum to i32
-        let worker_epoch = req.worker_epoch;
-        if req.suggested_worker_id != 0 {
-            return self.invalid_request_response::<RegisterWorkerResponseProto>(
+        if !self.raft_node.is_leader() {
+            return self.metadata_error_response::<RegisterWorkerResponseProto>(
                 &req.header,
-                "suggested_worker_id is no longer authoritative; worker id is allocated by Raft",
+                MetadataError::LeaderChanged("worker registration must be sent to the metadata group leader".into()),
             );
         }
-        let labels = req.labels;
-        let endpoint = match req.endpoint {
-            Some(endpoint) => endpoint,
-            None => {
-                return self.invalid_request_response::<RegisterWorkerResponseProto>(&req.header, "Missing endpoint");
+
+        let header_group_id = Self::group_id_from_request_header(&req.header);
+        let group_id = if req.group_id != 0 {
+            req.group_id
+        } else {
+            header_group_id.unwrap_or(0)
+        };
+        if group_id == 0 {
+            return self
+                .invalid_request_response::<RegisterWorkerResponseProto>(&req.header, "group_id must be non-zero");
+        }
+        if let Some(header_group_id) = header_group_id {
+            if header_group_id != group_id {
+                return self.invalid_request_response::<RegisterWorkerResponseProto>(
+                    &req.header,
+                    "request header group_id must match register group_id",
+                );
+            }
+        }
+        if ShardGroupId::new(group_id) != self.served_group_id {
+            return self.invalid_request_response::<RegisterWorkerResponseProto>(
+                &req.header,
+                format!(
+                    "register group_id {} does not match served metadata group {}",
+                    group_id,
+                    self.served_group_id.as_raw()
+                ),
+            );
+        }
+        let worker_id = WorkerId::new(req.worker_id);
+        if worker_id.as_raw() == 0 {
+            return self
+                .invalid_request_response::<RegisterWorkerResponseProto>(&req.header, "worker_id must be non-zero");
+        }
+        let worker_run_id = match req.worker_run_id.parse::<WorkerRunId>() {
+            Ok(worker_run_id) => worker_run_id,
+            Err(error) => {
+                return self.invalid_request_response::<RegisterWorkerResponseProto>(
+                    &req.header,
+                    format!("worker_run_id must be a UUID: {error}"),
+                )
             }
         };
-
-        let address = format!("{}:{}", endpoint.host, endpoint.port);
-
-        // Generate worker identity from address + labels for mapping (stable hash)
-        let identity = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(address.as_bytes());
-            // Sort labels by key for stable hash
-            let mut sorted_labels: Vec<_> = labels.iter().collect();
-            sorted_labels.sort_by_key(|(k, _)| *k);
-            for (k, v) in sorted_labels {
-                hasher.update(k.as_bytes());
-                hasher.update(b":");
-                hasher.update(v.as_bytes());
-                hasher.update(b";");
+        let worker_net_protocol = req.worker_net_protocol() as i32;
+        if req.worker_net_protocol() != proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc {
+            return self.invalid_request_response::<RegisterWorkerResponseProto>(
+                &req.header,
+                "worker_net_protocol must be gRPC for startup registration",
+            );
+        }
+        let _labels = req.labels;
+        let endpoint = match req.advertised_endpoint {
+            Some(endpoint) => endpoint,
+            None => {
+                return self.invalid_request_response::<RegisterWorkerResponseProto>(
+                    &req.header,
+                    "Missing advertised_endpoint",
+                );
             }
-            format!("{:x}", hasher.finalize())
+        };
+        let address = match validate_advertised_endpoint(endpoint) {
+            Ok(address) => address,
+            Err(message) => return self.invalid_request_response::<RegisterWorkerResponseProto>(&req.header, message),
         };
 
         let command = Command::RegisterWorker {
             dedup: crate::raft::DedupKey::new(_caller_ctx.client.client_id, _caller_ctx.client.call_id),
-            identity,
+            group_id: ShardGroupId::new(group_id),
+            worker_id,
+            worker_run_id,
             address: address.clone(),
             worker_net_protocol,
-            worker_epoch,
             fault_domain: None, // TODO: Extract fault_domain from labels
         };
 
-        let worker_id = match persist_worker_descriptor_then_register(
-            self.worker_manager.as_ref(),
-            address.clone(),
-            worker_net_protocol,
-            worker_epoch,
-            None, // TODO: Extract fault_domain from labels
-            self.raft_node.propose(command),
-        )
-        .await
-        {
+        let accepted_worker_id = match persist_worker_descriptor(self.raft_node.propose(command)).await {
             Ok(worker_id) => worker_id,
             Err(error) => return self.metadata_error_response::<RegisterWorkerResponseProto>(&req.header, error),
         };
+        if accepted_worker_id != worker_id {
+            return self.metadata_error_response::<RegisterWorkerResponseProto>(
+                &req.header,
+                MetadataError::Internal(format!(
+                    "RegisterWorker returned worker_id {}, expected {}",
+                    accepted_worker_id.as_raw(),
+                    worker_id.as_raw()
+                )),
+            );
+        }
 
-        info!(worker_id = worker_id.as_raw(), "Worker registered");
+        info!(
+            group_id,
+            worker_id = accepted_worker_id.as_raw(),
+            worker_run_id = %worker_run_id,
+            "Worker registered"
+        );
 
         Ok(Response::new(RegisterWorkerResponseProto {
             header: Some(self.ok_response_header_from_request(&req.header)),
-            worker_id: worker_id.as_raw(),
-            config: Some(WorkerConfigProto {
-                heartbeat_interval_sec: 30,
-                block_report_interval_sec: 60,
-                params: std::collections::HashMap::new(),
-            }),
+            group_id,
+            worker_id: accepted_worker_id.as_raw(),
+            accepted_worker_run_id: worker_run_id.to_string(),
         }))
     }
 
@@ -414,7 +461,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 
         let health_proto = req.health();
 
-        // Extract worker_net_protocol and worker_epoch from request
+        // Heartbeat still carries the existing data-plane worker_epoch; startup registration does not.
         let worker_net_protocol = req.worker_net_protocol() as i32; // Convert enum to i32
         let worker_epoch = req.worker_epoch;
 
@@ -423,6 +470,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         let health_status = HealthStatus::from(health_proto as i32);
 
         let descriptor_changed = match self.worker_manager.update_runtime(
+            self.served_group_id,
             worker_id,
             worker_net_protocol,
             worker_epoch,
@@ -453,7 +501,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 
         // All nodes: check if worker needs full sync (metadata restart detection)
         let mut commands = Vec::new();
-        let needs_full_sync = self.worker_manager.needs_full_sync(worker_id);
+        let needs_full_sync = self.worker_manager.needs_full_sync(self.served_group_id, worker_id);
 
         // Leader-only: lease allocation for full reports
         let (can_full_report, full_report_lease_token, backoff_ms) = if is_leader {
@@ -462,8 +510,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 let metadata_epoch = self.worker_manager.get_metadata_epoch();
                 let lease_manager = self.worker_manager.lease_manager();
 
-                // TODO: Get shard_group_id from router when available
-                let shard_group_id = None; // Will be resolved from block_id/router in future
+                let shard_group_id = Some(self.served_group_id);
 
                 // TODO-2: Get mount_epoch from mount_table
                 let mount_epoch = Some(types::group_watermark::MountEpoch::new(self.mount_table.version()));
@@ -579,7 +626,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 // Leader-only: verify lease token for full reports when needs_full_sync
                 let is_leader = self.raft_node.is_leader();
                 if is_leader {
-                    let needs_full_sync = self.worker_manager.needs_full_sync(worker_id);
+                    let needs_full_sync = self.worker_manager.needs_full_sync(self.served_group_id, worker_id);
                     if needs_full_sync {
                         // Worker needs full sync, must have valid lease token
                         if lease_token == 0 {
@@ -631,7 +678,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 // Apply full report (lease already released in verify_and_release above)
                 match self
                     .worker_manager
-                    .apply_full_report(worker_id, reported_blocks.clone())
+                    .apply_full_report(self.served_group_id, worker_id, reported_blocks.clone())
                 {
                     Ok(result) => {
                         // Update metrics after successful full report
@@ -696,10 +743,12 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 }
 
                 // Apply delta report
-                match self
-                    .worker_manager
-                    .apply_delta_report(worker_id, added_blocks.clone(), removed_blocks.clone())
-                {
+                match self.worker_manager.apply_delta_report(
+                    self.served_group_id,
+                    worker_id,
+                    added_blocks.clone(),
+                    removed_blocks.clone(),
+                ) {
                     Ok(result) => result,
                     Err(_e) => {
                         // Full sync required: return RequestFullBlockReport command
@@ -865,57 +914,40 @@ mod tests {
         block_id.into()
     }
 
-    #[tokio::test]
-    async fn register_worker_does_not_store_descriptor_when_propose_fails() {
-        let manager = WorkerManager::new(60);
-        let worker_id = WorkerId::new(7);
+    fn test_worker_run_id() -> WorkerRunId {
+        "550e8400-e29b-41d4-a716-446655440000".parse().unwrap()
+    }
 
-        let result =
-            persist_worker_descriptor_then_register(&manager, "127.0.0.1:9090".to_string(), 1, 100, None, async {
-                Err(MetadataError::Internal("propose failed".to_string()))
-            })
-            .await;
-
-        assert!(result.is_err());
-        assert!(manager.get_descriptor(worker_id).is_none());
+    fn second_worker_run_id() -> WorkerRunId {
+        "550e8400-e29b-41d4-a716-446655440001".parse().unwrap()
     }
 
     #[tokio::test]
-    async fn register_worker_stores_descriptor_after_propose_succeeds() {
-        let manager = WorkerManager::new(60);
+    async fn register_worker_persist_helper_propagates_propose_failure() {
+        let result =
+            persist_worker_descriptor(async { Err(MetadataError::Internal("propose failed".to_string())) }).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("propose failed"));
+    }
+
+    #[tokio::test]
+    async fn register_worker_persist_helper_returns_accepted_worker_id() {
         let worker_id = WorkerId::new(7);
 
         let returned_worker_id =
-            persist_worker_descriptor_then_register(&manager, "127.0.0.1:9090".to_string(), 1, 100, None, async {
-                Ok(AppDataResponse::Worker(WorkerCommandResult::Upserted(worker_id)))
-            })
-            .await
-            .unwrap();
+            persist_worker_descriptor(async { Ok(AppDataResponse::Worker(WorkerCommandResult::Upserted(worker_id))) })
+                .await
+                .unwrap();
         assert_eq!(returned_worker_id, worker_id);
-
-        let descriptor = manager.get_descriptor(worker_id).unwrap();
-        assert_eq!(descriptor.worker_id, worker_id);
-        assert_eq!(descriptor.address, "127.0.0.1:9090");
-        assert_eq!(descriptor.worker_net_protocol, 1);
-        assert_eq!(descriptor.worker_epoch, 100);
     }
 
     #[tokio::test]
-    async fn repeated_register_remains_idempotent_after_successful_propose() {
-        let manager = WorkerManager::new(60);
-        let worker_id = WorkerId::new(7);
+    async fn register_worker_persist_helper_rejects_unexpected_response() {
+        let result = persist_worker_descriptor(async { Ok(AppDataResponse::None) }).await;
 
-        for _ in 0..2 {
-            persist_worker_descriptor_then_register(&manager, "127.0.0.1:9090".to_string(), 1, 100, None, async {
-                Ok(AppDataResponse::Worker(WorkerCommandResult::Upserted(worker_id)))
-            })
-            .await
-            .unwrap();
-        }
-
-        let descriptor = manager.get_descriptor(worker_id).unwrap();
-        assert_eq!(descriptor.worker_id, worker_id);
-        assert_eq!(descriptor.address, "127.0.0.1:9090");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unexpected Raft response"));
     }
 
     #[tokio::test]
@@ -926,18 +958,37 @@ mod tests {
         let worker_id = WorkerId::new(7);
         let block_id = BlockId::from_u64_u32(70, 0);
         worker_manager
-            .register_worker(worker_id, "127.0.0.1:9090".to_string(), 1, 100, None)
+            .register_worker(
+                ShardGroupId::new(1),
+                worker_id,
+                "127.0.0.1:9090".to_string(),
+                1,
+                100,
+                None,
+            )
             .unwrap();
         worker_manager
-            .update_runtime(worker_id, 1, 100, 1_000, 500, 500, 0, 0, HealthStatus::Healthy)
+            .update_runtime(
+                ShardGroupId::new(1),
+                worker_id,
+                1,
+                100,
+                1_000,
+                500,
+                500,
+                0,
+                0,
+                HealthStatus::Healthy,
+            )
             .unwrap();
-        worker_manager.mark_full_sync_complete(worker_id);
+        worker_manager.mark_full_sync_complete(ShardGroupId::new(1), worker_id);
         let signal_sink = Arc::new(RecordingRepairSignalSink::default());
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             Arc::clone(&worker_manager),
             Arc::clone(&signal_sink) as Arc<dyn RepairSignalSink>,
             Arc::new(MountTable::new()),
+            ShardGroupId::new(1),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
@@ -978,12 +1029,30 @@ mod tests {
         let worker_id = WorkerId::new(8);
         let block_id = BlockId::from_u64_u32(80, 0);
         worker_manager
-            .register_worker(worker_id, "127.0.0.1:9091".to_string(), 1, 100, None)
+            .register_worker(
+                ShardGroupId::new(1),
+                worker_id,
+                "127.0.0.1:9091".to_string(),
+                1,
+                100,
+                None,
+            )
             .unwrap();
         worker_manager
-            .update_runtime(worker_id, 1, 100, 1_000, 500, 500, 0, 0, HealthStatus::Healthy)
+            .update_runtime(
+                ShardGroupId::new(1),
+                worker_id,
+                1,
+                100,
+                1_000,
+                500,
+                500,
+                0,
+                0,
+                HealthStatus::Healthy,
+            )
             .unwrap();
-        worker_manager.mark_full_sync_complete(worker_id);
+        worker_manager.mark_full_sync_complete(ShardGroupId::new(1), worker_id);
         worker_manager.update_locations(worker_id, vec![block_id]).unwrap();
         let signal_sink = Arc::new(RecordingRepairSignalSink::default());
         let service = MetadataWorkerServiceImpl::new(
@@ -991,6 +1060,7 @@ mod tests {
             Arc::clone(&worker_manager),
             Arc::clone(&signal_sink) as Arc<dyn RepairSignalSink>,
             Arc::new(MountTable::new()),
+            ShardGroupId::new(1),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
@@ -1025,26 +1095,28 @@ mod tests {
     #[tokio::test]
     async fn register_worker_invalid_request_returns_header_error() {
         let dir = TempDir::new().unwrap();
-        let raft_node = nonleader_raft(&dir).await;
+        let raft_node = leader_raft(&dir).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             worker_manager,
             Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
+            ShardGroupId::new(1),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
             &service,
             Request::new(RegisterWorkerRequestProto {
                 header: None,
-                endpoint: None,
+                group_id: 1,
+                worker_id: 9,
+                worker_run_id: test_worker_run_id().to_string(),
+                advertised_endpoint: None,
                 capabilities: 0,
                 version: String::new(),
                 labels: Default::default(),
-                suggested_worker_id: 0,
                 worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-                worker_epoch: 1,
             }),
         )
         .await
@@ -1053,7 +1125,249 @@ mod tests {
 
         let error = response.header.expect("header").error.expect("header error");
         assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
-        assert!(error.message.contains("Missing endpoint"));
+        assert!(error.message.contains("Missing advertised_endpoint"));
+    }
+
+    #[tokio::test]
+    async fn follower_register_worker_returns_not_leader_header_error() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(RecordingRepairSignalSink::default()),
+            Arc::new(MountTable::new()),
+            ShardGroupId::new(1),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
+            &service,
+            Request::new(RegisterWorkerRequestProto {
+                header: None,
+                group_id: 1,
+                worker_id: 123,
+                worker_run_id: test_worker_run_id().to_string(),
+                advertised_endpoint: Some(proto::common::EndpointProto {
+                    host: "127.0.0.1".to_string(),
+                    port: 9090,
+                    protocol: "grpc".to_string(),
+                }),
+                capabilities: 0,
+                version: "0.1.0".to_string(),
+                labels: Default::default(),
+                worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+            }),
+        )
+        .await
+        .expect("follower business redirect returns gRPC OK")
+        .into_inner();
+
+        let error = response.header.expect("header").error.expect("header error");
+        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+        assert_eq!(error.refresh_reason, RefreshReasonProto::RefreshReasonNotLeader as i32);
+    }
+
+    #[tokio::test]
+    async fn register_worker_response_confirms_worker_id_and_run_id() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = leader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        raft_node.set_worker_manager(Arc::clone(&worker_manager)).unwrap();
+        let worker_run_id = test_worker_run_id();
+        let service = MetadataWorkerServiceImpl::new(
+            Arc::clone(&raft_node),
+            Arc::clone(&worker_manager),
+            Arc::new(RecordingRepairSignalSink::default()),
+            Arc::new(MountTable::new()),
+            ShardGroupId::new(1),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
+            &service,
+            Request::new(RegisterWorkerRequestProto {
+                header: None,
+                group_id: 1,
+                worker_id: 123,
+                worker_run_id: worker_run_id.to_string(),
+                advertised_endpoint: Some(proto::common::EndpointProto {
+                    host: "127.0.0.1".to_string(),
+                    port: 9090,
+                    protocol: "grpc".to_string(),
+                }),
+                capabilities: 0,
+                version: "0.1.0".to_string(),
+                labels: Default::default(),
+                worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+            }),
+        )
+        .await
+        .expect("register worker response")
+        .into_inner();
+
+        assert!(response.header.expect("header").error.is_none());
+        assert_eq!(response.group_id, 1);
+        assert_eq!(response.worker_id, 123);
+        assert_eq!(response.accepted_worker_run_id, worker_run_id.to_string());
+        let descriptor = worker_manager
+            .get_descriptor_in_group(ShardGroupId::new(1), WorkerId::new(123))
+            .unwrap();
+        assert_eq!(descriptor.address, "127.0.0.1:9090");
+        assert_eq!(
+            worker_manager
+                .get_registration_in_group(ShardGroupId::new(1), WorkerId::new(123))
+                .expect("live registration")
+                .worker_run_id,
+            worker_run_id
+        );
+    }
+
+    #[tokio::test]
+    async fn register_worker_service_does_not_mutate_live_manager_without_apply_observer() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = leader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_run_id = test_worker_run_id();
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            Arc::clone(&worker_manager),
+            Arc::new(RecordingRepairSignalSink::default()),
+            Arc::new(MountTable::new()),
+            ShardGroupId::new(1),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
+            &service,
+            Request::new(RegisterWorkerRequestProto {
+                header: None,
+                group_id: 1,
+                worker_id: 124,
+                worker_run_id: worker_run_id.to_string(),
+                advertised_endpoint: Some(proto::common::EndpointProto {
+                    host: "127.0.0.1".to_string(),
+                    port: 9091,
+                    protocol: "grpc".to_string(),
+                }),
+                capabilities: 0,
+                version: "0.1.0".to_string(),
+                labels: Default::default(),
+                worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+            }),
+        )
+        .await
+        .expect("register worker response")
+        .into_inner();
+
+        assert!(response.header.expect("header").error.is_none());
+        assert!(worker_manager
+            .get_descriptor_in_group(ShardGroupId::new(1), WorkerId::new(124))
+            .is_none());
+        assert!(worker_manager
+            .get_registration_in_group(ShardGroupId::new(1), WorkerId::new(124))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn register_worker_rejects_different_live_worker_run_id() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = leader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        raft_node.set_worker_manager(Arc::clone(&worker_manager)).unwrap();
+        let service = MetadataWorkerServiceImpl::new(
+            Arc::clone(&raft_node),
+            Arc::clone(&worker_manager),
+            Arc::new(RecordingRepairSignalSink::default()),
+            Arc::new(MountTable::new()),
+            ShardGroupId::new(1),
+        );
+        let request = |worker_run_id: WorkerRunId| RegisterWorkerRequestProto {
+            header: None,
+            group_id: 1,
+            worker_id: 123,
+            worker_run_id: worker_run_id.to_string(),
+            advertised_endpoint: Some(proto::common::EndpointProto {
+                host: "127.0.0.1".to_string(),
+                port: 9090,
+                protocol: "grpc".to_string(),
+            }),
+            capabilities: 0,
+            version: "0.1.0".to_string(),
+            labels: Default::default(),
+            worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+        };
+
+        let first = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
+            &service,
+            Request::new(request(test_worker_run_id())),
+        )
+        .await
+        .expect("first register")
+        .into_inner();
+        assert!(first.header.expect("header").error.is_none());
+
+        let second = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
+            &service,
+            Request::new(request(second_worker_run_id())),
+        )
+        .await
+        .expect("conflicting register returns header error")
+        .into_inner();
+        let error = second.header.expect("header").error.expect("header error");
+        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
+        assert!(error.message.contains("already registered"));
+        assert_eq!(
+            worker_manager
+                .get_registration_in_group(ShardGroupId::new(1), WorkerId::new(123))
+                .expect("registration")
+                .worker_run_id,
+            test_worker_run_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn register_worker_rejects_non_served_group_without_mutating_worker_manager() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = leader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            Arc::clone(&worker_manager),
+            Arc::new(RecordingRepairSignalSink::default()),
+            Arc::new(MountTable::new()),
+            ShardGroupId::new(1),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
+            &service,
+            Request::new(RegisterWorkerRequestProto {
+                header: Some(proto::common::RequestHeaderProto {
+                    group_id: 2,
+                    ..Default::default()
+                }),
+                group_id: 2,
+                worker_id: 123,
+                worker_run_id: test_worker_run_id().to_string(),
+                advertised_endpoint: Some(proto::common::EndpointProto {
+                    host: "127.0.0.1".to_string(),
+                    port: 9090,
+                    protocol: "grpc".to_string(),
+                }),
+                capabilities: 0,
+                version: "0.1.0".to_string(),
+                labels: Default::default(),
+                worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+            }),
+        )
+        .await
+        .expect("wrong-group register returns gRPC OK")
+        .into_inner();
+
+        let error = response.header.expect("header").error.expect("header error");
+        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
+        assert!(error.message.contains("served metadata group"));
+        assert!(worker_manager
+            .get_descriptor_in_group(ShardGroupId::new(2), WorkerId::new(123))
+            .is_none());
     }
 
     #[tokio::test]
@@ -1066,6 +1380,7 @@ mod tests {
             worker_manager,
             Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
+            ShardGroupId::new(1),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
@@ -1106,13 +1421,21 @@ mod tests {
         let worker_manager = Arc::new(WorkerManager::new(60));
         let worker_id = WorkerId::new(9);
         worker_manager
-            .register_worker(worker_id, "127.0.0.1:9099".to_string(), 1, 100, None)
+            .register_worker(
+                ShardGroupId::new(1),
+                worker_id,
+                "127.0.0.1:9099".to_string(),
+                1,
+                100,
+                None,
+            )
             .unwrap();
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             worker_manager,
             Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
+            ShardGroupId::new(1),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
@@ -1160,6 +1483,7 @@ mod tests {
             worker_manager,
             Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
+            ShardGroupId::new(1),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(

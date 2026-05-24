@@ -194,6 +194,11 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
                 source: StorageIOError::<u64>::write_snapshot(Some(meta.signature()), AnyError::new(&e)),
             })?;
         }
+        self.state_machine
+            .reload_worker_manager_from_storage()
+            .map_err(|e| StorageError::IO {
+                source: StorageIOError::<u64>::write_snapshot(Some(meta.signature()), AnyError::new(&e)),
+            })?;
 
         // Persist snapshot metadata
         {

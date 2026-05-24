@@ -15,6 +15,7 @@ use crate::raft::state_machine_store::StateMachineStorage;
 use crate::raft::storage::RocksDBStorage;
 use crate::raft::types::{AppDataResponse, AppMetadataRaftState, MetadataNode, MetadataRaftTypeConfig};
 use crate::raft_conv;
+use crate::worker::WorkerManager;
 use openraft::{Config, Raft, RaftMetrics, RaftTypeConfig, ServerState, SnapshotPolicy};
 use parking_lot::RwLock;
 use serde_json;
@@ -151,6 +152,11 @@ impl AppRaftNode {
 
         // Extract response from ClientWriteResponse
         Ok(result.data)
+    }
+
+    /// Attach worker live-state observer used by the Raft apply/replay path.
+    pub fn set_worker_manager(&self, worker_manager: Arc<WorkerManager>) -> MetadataResult<()> {
+        self.state_machine.set_worker_manager(worker_manager)
     }
 
     /// Check if this node is the leader.

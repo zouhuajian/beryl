@@ -147,7 +147,7 @@ impl RepairPlanner {
         let mut worker_loads: Vec<(WorkerId, f64)> = live_workers
             .iter()
             .filter_map(|&id| {
-                worker_manager.get_worker(id).map(|w| {
+                worker_manager.get_worker_any_group(id).map(|w| {
                     // Calculate load as: (capacity_used / capacity_total) * 100
                     let capacity_ratio = if w.capacity_total > 0 {
                         w.capacity_used as f64 / w.capacity_total as f64

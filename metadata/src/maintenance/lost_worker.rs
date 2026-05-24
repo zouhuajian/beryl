@@ -109,7 +109,7 @@ mod tests {
     use crate::MountTable;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+    use types::ids::{BlockId, BlockIndex, DataHandleId, ShardGroupId, WorkerId};
 
     async fn test_raft(dir: &TempDir, leader: bool) -> Arc<AppRaftNode> {
         let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
@@ -139,6 +139,7 @@ mod tests {
     fn live_worker(manager: &WorkerManager, worker_id: WorkerId) {
         manager
             .register_worker(
+                ShardGroupId::new(1),
                 worker_id,
                 format!("127.0.0.1:{}", 9000 + worker_id.as_raw()),
                 1,
@@ -147,13 +148,25 @@ mod tests {
             )
             .unwrap();
         manager
-            .update_runtime(worker_id, 1, 100, 1_000, 500, 500, 0, 0, HealthStatus::Healthy)
+            .update_runtime(
+                ShardGroupId::new(1),
+                worker_id,
+                1,
+                100,
+                1_000,
+                500,
+                500,
+                0,
+                0,
+                HealthStatus::Healthy,
+            )
             .unwrap();
     }
 
     fn registered_dead_worker(manager: &WorkerManager, worker_id: WorkerId) {
         manager
             .register_worker(
+                ShardGroupId::new(1),
                 worker_id,
                 format!("127.0.0.1:{}", 9000 + worker_id.as_raw()),
                 1,

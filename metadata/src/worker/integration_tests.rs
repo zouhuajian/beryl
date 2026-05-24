@@ -8,7 +8,7 @@ use crate::worker::manager::HealthStatus;
 use crate::worker::WorkerManager;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+use types::ids::{BlockId, BlockIndex, DataHandleId, ShardGroupId, WorkerId};
 
 #[tokio::test]
 async fn test_worker_registration_and_heartbeat() {
@@ -18,6 +18,7 @@ async fn test_worker_registration_and_heartbeat() {
     // Register worker
     manager
         .register_worker(
+            ShardGroupId::new(1),
             worker_id,
             "127.0.0.1:8080".to_string(),
             1,   // worker_net_protocol: GRPC
@@ -29,6 +30,7 @@ async fn test_worker_registration_and_heartbeat() {
     // Send heartbeat (update runtime)
     manager
         .update_runtime(
+            ShardGroupId::new(1),
             worker_id,
             1,   // worker_net_protocol: GRPC
             100, // worker_epoch
@@ -42,7 +44,7 @@ async fn test_worker_registration_and_heartbeat() {
         .unwrap();
 
     // Verify worker is live
-    assert!(manager.is_worker_live(worker_id));
+    assert!(manager.is_worker_live(ShardGroupId::new(1), worker_id));
 
     let live_workers = manager.list_live_workers();
     assert!(live_workers.contains(&worker_id));
@@ -57,6 +59,7 @@ async fn test_block_report_updates_locations() {
 
     manager
         .register_worker(
+            ShardGroupId::new(1),
             worker_id,
             "127.0.0.1:8080".to_string(),
             1,   // worker_net_protocol: GRPC
@@ -67,7 +70,18 @@ async fn test_block_report_updates_locations() {
 
     // Send heartbeat to make worker live
     manager
-        .update_runtime(worker_id, 1, 100, 1000, 500, 500, 0, 0, HealthStatus::Healthy)
+        .update_runtime(
+            ShardGroupId::new(1),
+            worker_id,
+            1,
+            100,
+            1000,
+            500,
+            500,
+            0,
+            0,
+            HealthStatus::Healthy,
+        )
         .unwrap();
 
     // First block report
@@ -98,12 +112,30 @@ async fn test_block_report_batching_correctness() {
     let worker_id = WorkerId::new(1);
 
     manager
-        .register_worker(worker_id, "127.0.0.1:8080".to_string(), 1, 100, None)
+        .register_worker(
+            ShardGroupId::new(1),
+            worker_id,
+            "127.0.0.1:8080".to_string(),
+            1,
+            100,
+            None,
+        )
         .unwrap();
 
     // Send heartbeat to make worker live
     manager
-        .update_runtime(worker_id, 1, 100, 1000, 500, 500, 0, 0, HealthStatus::Healthy)
+        .update_runtime(
+            ShardGroupId::new(1),
+            worker_id,
+            1,
+            100,
+            1000,
+            500,
+            500,
+            0,
+            0,
+            HealthStatus::Healthy,
+        )
         .unwrap();
 
     // Create 2001 blocks
@@ -137,6 +169,7 @@ async fn test_dead_worker_cleanup() {
 
     manager
         .register_worker(
+            ShardGroupId::new(1),
             worker_id,
             "127.0.0.1:8080".to_string(),
             1,   // worker_net_protocol: GRPC
@@ -147,22 +180,33 @@ async fn test_dead_worker_cleanup() {
 
     // Send heartbeat to make worker live
     manager
-        .update_runtime(worker_id, 1, 100, 1000, 500, 500, 0, 0, HealthStatus::Healthy)
+        .update_runtime(
+            ShardGroupId::new(1),
+            worker_id,
+            1,
+            100,
+            1000,
+            500,
+            500,
+            0,
+            0,
+            HealthStatus::Healthy,
+        )
         .unwrap();
 
     manager.update_locations(worker_id, vec![block_id]).unwrap();
 
     // Verify worker is live
-    assert!(manager.is_worker_live(worker_id));
+    assert!(manager.is_worker_live(ShardGroupId::new(1), worker_id));
     assert_eq!(manager.get_block_locations(block_id).len(), 1);
 
     // Force timeout by manipulating last_seen_ms to the past
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
     let expired_ms = now_ms.saturating_sub((manager.heartbeat_timeout_sec() + 1) * 1000);
-    manager.set_last_seen_ms_for_test(worker_id, expired_ms);
+    manager.set_last_seen_ms_for_test(ShardGroupId::new(1), worker_id, expired_ms);
 
     // Verify worker is dead
-    assert!(!manager.is_worker_live(worker_id));
+    assert!(!manager.is_worker_live(ShardGroupId::new(1), worker_id));
 
     // Verify locations are cleaned up (only live workers returned)
     assert_eq!(manager.get_block_locations(block_id).len(), 0);
@@ -249,24 +293,78 @@ async fn test_worker_placement_selection() {
     let worker3 = WorkerId::new(3);
 
     manager
-        .register_worker(worker1, "127.0.0.1:8080".to_string(), 1, 100, None)
+        .register_worker(
+            ShardGroupId::new(1),
+            worker1,
+            "127.0.0.1:8080".to_string(),
+            1,
+            100,
+            None,
+        )
         .unwrap();
     manager
-        .register_worker(worker2, "127.0.0.1:8081".to_string(), 1, 100, None)
+        .register_worker(
+            ShardGroupId::new(1),
+            worker2,
+            "127.0.0.1:8081".to_string(),
+            1,
+            100,
+            None,
+        )
         .unwrap();
     manager
-        .register_worker(worker3, "127.0.0.1:8082".to_string(), 1, 100, None)
+        .register_worker(
+            ShardGroupId::new(1),
+            worker3,
+            "127.0.0.1:8082".to_string(),
+            1,
+            100,
+            None,
+        )
         .unwrap();
 
     // Send heartbeats to make workers live and update capacity (update runtime)
     manager
-        .update_runtime(worker1, 1, 100, 1000, 200, 800, 0, 0, HealthStatus::Healthy)
+        .update_runtime(
+            ShardGroupId::new(1),
+            worker1,
+            1,
+            100,
+            1000,
+            200,
+            800,
+            0,
+            0,
+            HealthStatus::Healthy,
+        )
         .unwrap();
     manager
-        .update_runtime(worker2, 1, 100, 1000, 300, 700, 0, 0, HealthStatus::Healthy)
+        .update_runtime(
+            ShardGroupId::new(1),
+            worker2,
+            1,
+            100,
+            1000,
+            300,
+            700,
+            0,
+            0,
+            HealthStatus::Healthy,
+        )
         .unwrap();
     manager
-        .update_runtime(worker3, 1, 100, 1000, 100, 900, 0, 0, HealthStatus::Healthy)
+        .update_runtime(
+            ShardGroupId::new(1),
+            worker3,
+            1,
+            100,
+            1000,
+            100,
+            900,
+            0,
+            0,
+            HealthStatus::Healthy,
+        )
         .unwrap();
 
     // Request placement with replication_factor=3
@@ -352,30 +450,102 @@ async fn test_replication_check_triggers_repair() {
 
     // Register workers
     manager
-        .register_worker(worker1, "127.0.0.1:8080".to_string(), 1, 100, None)
+        .register_worker(
+            ShardGroupId::new(1),
+            worker1,
+            "127.0.0.1:8080".to_string(),
+            1,
+            100,
+            None,
+        )
         .unwrap();
     manager
-        .register_worker(worker2, "127.0.0.1:8081".to_string(), 1, 100, None)
+        .register_worker(
+            ShardGroupId::new(1),
+            worker2,
+            "127.0.0.1:8081".to_string(),
+            1,
+            100,
+            None,
+        )
         .unwrap();
     manager
-        .register_worker(worker3, "127.0.0.1:8082".to_string(), 1, 100, None)
+        .register_worker(
+            ShardGroupId::new(1),
+            worker3,
+            "127.0.0.1:8082".to_string(),
+            1,
+            100,
+            None,
+        )
         .unwrap();
     manager
-        .register_worker(worker4, "127.0.0.1:8083".to_string(), 1, 100, None)
+        .register_worker(
+            ShardGroupId::new(1),
+            worker4,
+            "127.0.0.1:8083".to_string(),
+            1,
+            100,
+            None,
+        )
         .unwrap();
 
     // Send heartbeats to make all workers live
     manager
-        .update_runtime(worker1, 1, 100, 1000, 500, 500, 0, 0, HealthStatus::Healthy)
+        .update_runtime(
+            ShardGroupId::new(1),
+            worker1,
+            1,
+            100,
+            1000,
+            500,
+            500,
+            0,
+            0,
+            HealthStatus::Healthy,
+        )
         .unwrap();
     manager
-        .update_runtime(worker2, 1, 100, 1000, 500, 500, 0, 0, HealthStatus::Healthy)
+        .update_runtime(
+            ShardGroupId::new(1),
+            worker2,
+            1,
+            100,
+            1000,
+            500,
+            500,
+            0,
+            0,
+            HealthStatus::Healthy,
+        )
         .unwrap();
     manager
-        .update_runtime(worker3, 1, 100, 1000, 500, 500, 0, 0, HealthStatus::Healthy)
+        .update_runtime(
+            ShardGroupId::new(1),
+            worker3,
+            1,
+            100,
+            1000,
+            500,
+            500,
+            0,
+            0,
+            HealthStatus::Healthy,
+        )
         .unwrap();
     manager
-        .update_runtime(worker4, 1, 100, 1000, 500, 500, 0, 0, HealthStatus::Healthy)
+        .update_runtime(
+            ShardGroupId::new(1),
+            worker4,
+            1,
+            100,
+            1000,
+            500,
+            500,
+            0,
+            0,
+            HealthStatus::Healthy,
+        )
         .unwrap();
 
     // Update locations: block has only 1 replica (worker1)

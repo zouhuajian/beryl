@@ -89,15 +89,23 @@ fn fs_core_with_mount(mount_id: MountId, mount_epoch: u64, group_id: ShardGroupI
     FsCore::new_default(Arc::new(MemoryStateStore::new()), mount_table)
 }
 
-fn worker_manager_for_write_targets() -> Arc<WorkerManager> {
+fn worker_manager_for_write_targets(group_id: ShardGroupId) -> Arc<WorkerManager> {
     let manager = Arc::new(WorkerManager::new(60));
     for raw in 1..=3 {
         let worker_id = types::ids::WorkerId::new(raw);
         manager
-            .register_worker(worker_id, format!("127.0.0.1:{}", 9000 + raw), 1, 10 + raw, None)
+            .register_worker(
+                group_id,
+                worker_id,
+                format!("127.0.0.1:{}", 9000 + raw),
+                1,
+                10 + raw,
+                None,
+            )
             .unwrap();
         manager
             .update_runtime(
+                group_id,
                 worker_id,
                 1,
                 10 + raw,
@@ -127,10 +135,21 @@ async fn get_file_layout_returns_worker_locations_from_worker_manager() {
     for (raw, port) in [(2, 9102), (1, 9101)] {
         let worker_id = WorkerId::new(raw);
         worker_manager
-            .register_worker(worker_id, format!("127.0.0.1:{port}"), 1, 20 + raw, None)
+            .register_worker(group_id, worker_id, format!("127.0.0.1:{port}"), 1, 20 + raw, None)
             .unwrap();
         worker_manager
-            .update_runtime(worker_id, 1, 20 + raw, 1024, 0, 1024, 0, 0, HealthStatus::Healthy)
+            .update_runtime(
+                group_id,
+                worker_id,
+                1,
+                20 + raw,
+                1024,
+                0,
+                1024,
+                0,
+                0,
+                HealthStatus::Healthy,
+            )
             .unwrap();
         worker_manager.update_locations(worker_id, vec![block_id]).unwrap();
     }
@@ -783,6 +802,7 @@ struct WriteFlowEnv {
     fs_core: FsCore,
     inode_id: InodeId,
     data_handle_id: DataHandleId,
+    group_id: ShardGroupId,
 }
 
 async fn write_flow_env(base_size: u64) -> WriteFlowEnv {
@@ -797,7 +817,7 @@ async fn write_flow_env(base_size: u64) -> WriteFlowEnv {
     let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
     fs_core.set_storage(Arc::clone(&storage));
     fs_core.set_raft_node(raft_node);
-    fs_core.set_worker_manager(worker_manager_for_write_targets());
+    fs_core.set_worker_manager(worker_manager_for_write_targets(group_id));
 
     let mut attrs = FileAttrs::new();
     attrs.size = base_size;
@@ -813,6 +833,7 @@ async fn write_flow_env(base_size: u64) -> WriteFlowEnv {
         fs_core,
         inode_id,
         data_handle_id,
+        group_id,
     }
 }
 
@@ -1250,7 +1271,7 @@ async fn open_write_targets_use_inode_current_data_handle() {
 
     let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
     fs_core.set_storage(storage);
-    fs_core.set_worker_manager(worker_manager_for_write_targets());
+    fs_core.set_worker_manager(worker_manager_for_write_targets(group_id));
 
     let success = fs_core
         .execute_open_write(OpenWriteInput {
@@ -1295,7 +1316,7 @@ async fn open_write_rejects_file_missing_current_data_handle() {
 
     let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(10));
     fs_core.set_storage(storage);
-    fs_core.set_worker_manager(worker_manager_for_write_targets());
+    fs_core.set_worker_manager(worker_manager_for_write_targets(ShardGroupId::new(10)));
 
     let failure = fs_core
         .execute_open_write(OpenWriteInput {
@@ -1548,7 +1569,18 @@ async fn worker_report_does_not_change_file_version() {
         .update_locations(WorkerId::new(1), vec![target.block_id])
         .expect("worker report should update soft locations");
     worker_manager
-        .update_runtime(WorkerId::new(1), 1, 99, 1024, 1, 2048, 2, 3, HealthStatus::Healthy)
+        .update_runtime(
+            env.group_id,
+            WorkerId::new(1),
+            1,
+            99,
+            1024,
+            1,
+            2048,
+            2,
+            3,
+            HealthStatus::Healthy,
+        )
         .expect("worker runtime should update soft state");
 
     let locations = env

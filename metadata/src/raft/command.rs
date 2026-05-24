@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use types::block::{BlockPlacement, BlockState};
 use types::fs::{FileAttrs, InodeId};
-use types::ids::{BlockId, ClientId, MountId, ShardGroupId, ShardId};
+use types::ids::{BlockId, ClientId, MountId, ShardGroupId, ShardId, WorkerId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
-use types::CallId;
+use types::{CallId, WorkerRunId};
 
 /// File layout publication semantics for a committed write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,10 +96,11 @@ pub enum Command {
     /// Register worker identity and descriptor through the Raft apply boundary.
     RegisterWorker {
         dedup: DedupKey,
-        identity: String,
+        group_id: ShardGroupId,
+        worker_id: WorkerId,
+        worker_run_id: WorkerRunId,
         address: String,
         worker_net_protocol: i32,
-        worker_epoch: u64,
         fault_domain: Option<String>,
     },
 
@@ -307,10 +308,11 @@ enum FingerprintView {
         initial_members: Vec<u64>,
     },
     RegisterWorker {
-        identity: String,
+        group_id: ShardGroupId,
+        worker_id: WorkerId,
+        worker_run_id: WorkerRunId,
         address: String,
         worker_net_protocol: i32,
-        worker_epoch: u64,
         fault_domain: Option<String>,
     },
     CreateDeleteIntents {
@@ -450,17 +452,19 @@ impl From<&Command> for FingerprintView {
                 initial_members: initial_members.clone(),
             },
             Command::RegisterWorker {
-                identity,
+                group_id,
+                worker_id,
+                worker_run_id,
                 address,
                 worker_net_protocol,
-                worker_epoch,
                 fault_domain,
                 ..
             } => FingerprintView::RegisterWorker {
-                identity: identity.clone(),
+                group_id: *group_id,
+                worker_id: *worker_id,
+                worker_run_id: *worker_run_id,
                 address: address.clone(),
                 worker_net_protocol: *worker_net_protocol,
-                worker_epoch: *worker_epoch,
                 fault_domain: fault_domain.clone(),
             },
             Command::CreateDeleteIntents { intents, .. } => FingerprintView::CreateDeleteIntents {

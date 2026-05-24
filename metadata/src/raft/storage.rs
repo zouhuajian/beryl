@@ -68,7 +68,10 @@ const DEDUP_TTL_MS: u64 = 10 * 60 * 1000; // 10 minutes; TODO: make configurable
 const DEDUP_MAX_ENTRIES: usize = if cfg!(debug_assertions) { 128 } else { 10_000 };
 const NEXT_INODE_ID_KEY: &[u8] = b"next_inode_id";
 const NEXT_DELETE_INTENT_ID_KEY: &[u8] = b"next_delete_intent_id";
-const NEXT_WORKER_ID_KEY: &[u8] = b"next_worker_id";
+
+fn worker_key(group_id: ShardGroupId, worker_id: WorkerId) -> String {
+    format!("{}/{}", group_id.as_raw(), worker_id.as_raw())
+}
 
 // FS column families
 const CF_INODES: &str = "inodes"; // inode/{inode_id_be} -> Inode
@@ -978,64 +981,6 @@ impl RocksDBStorage {
         Ok(inode_id)
     }
 
-    /// Get worker ID by identity (address + labels hash).
-    pub fn get_worker_id_by_identity(&self, identity: &str) -> MetadataResult<Option<WorkerId>> {
-        let cf_meta = self
-            .db
-            .cf_handle(CF_META)
-            .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
-        let key = format!("worker_identity:{}", identity);
-
-        match self.db.get_cf(cf_meta, key.as_bytes()) {
-            Ok(Some(value)) => {
-                let worker_id_raw: u64 = decode_from_slice(&value, standard())
-                    .map_err(|e| MetadataError::Internal(format!("Failed to deserialize worker_id: {}", e)))?
-                    .0;
-                Ok(Some(WorkerId::new(worker_id_raw)))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
-        }
-    }
-
-    fn stored_next_worker_id(&self) -> MetadataResult<u64> {
-        let cf_meta = self.cf(CF_META)?;
-        match self.db.get_cf(cf_meta, NEXT_WORKER_ID_KEY) {
-            Ok(Some(value)) => {
-                let id: u64 = decode_from_slice(&value, standard())
-                    .map_err(|e| MetadataError::Internal(format!("Failed to deserialize next_worker_id: {}", e)))?
-                    .0;
-                Ok(id)
-            }
-            Ok(None) => Ok(1),
-            Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
-        }
-    }
-
-    fn batch_put_worker_identity(
-        batch: &mut WriteBatch,
-        cf_meta: &ColumnFamily,
-        identity: &str,
-        worker_id: WorkerId,
-    ) -> MetadataResult<()> {
-        let key = format!("worker_identity:{}", identity);
-        let value = encode_to_vec(worker_id.as_raw(), standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to serialize worker_id: {}", e)))?;
-        batch.put_cf(cf_meta, key.as_bytes(), value);
-        Ok(())
-    }
-
-    fn batch_put_next_worker_id(
-        batch: &mut WriteBatch,
-        cf_meta: &ColumnFamily,
-        next_worker_id: u64,
-    ) -> MetadataResult<()> {
-        let value = encode_to_vec(next_worker_id, standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to serialize next_worker_id: {}", e)))?;
-        batch.put_cf(cf_meta, NEXT_WORKER_ID_KEY, value);
-        Ok(())
-    }
-
     /// Put mount version.
     pub fn put_mount_version(&self, version: u64) -> MetadataResult<()> {
         let cf = self
@@ -1074,11 +1019,20 @@ impl RocksDBStorage {
 
     /// Get worker info.
     pub fn get_worker(&self, worker_id: WorkerId) -> MetadataResult<Option<WorkerInfo>> {
+        self.get_worker_in_group(ShardGroupId::new(1), worker_id)
+    }
+
+    /// Get worker info accepted by a metadata group.
+    pub fn get_worker_in_group(
+        &self,
+        group_id: ShardGroupId,
+        worker_id: WorkerId,
+    ) -> MetadataResult<Option<WorkerInfo>> {
         let cf = self
             .db
             .cf_handle(CF_WORKERS)
             .ok_or_else(|| MetadataError::Internal("Workers CF not found".to_string()))?;
-        let key = format!("{}", worker_id.as_raw());
+        let key = worker_key(group_id, worker_id);
 
         match self.db.get_cf(cf, key.as_bytes()) {
             Ok(Some(value)) => {
@@ -1098,7 +1052,7 @@ impl RocksDBStorage {
             .db
             .cf_handle(CF_WORKERS)
             .ok_or_else(|| MetadataError::Internal("Workers CF not found".to_string()))?;
-        let key = format!("{}", info.worker_id.as_raw());
+        let key = worker_key(info.group_id, info.worker_id);
         let value = encode_to_vec(info, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize WorkerInfo: {}", e)))?;
 
@@ -1109,7 +1063,7 @@ impl RocksDBStorage {
     }
 
     fn batch_put_worker(batch: &mut WriteBatch, cf: &ColumnFamily, info: &WorkerInfo) -> MetadataResult<()> {
-        let key = format!("{}", info.worker_id.as_raw());
+        let key = worker_key(info.group_id, info.worker_id);
         let value = encode_to_vec(info, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize WorkerInfo: {}", e)))?;
         batch.put_cf(cf, key.as_bytes(), value);
@@ -1118,21 +1072,23 @@ impl RocksDBStorage {
 
     pub fn prepare_worker_registration(
         &self,
-        identity: &str,
+        group_id: ShardGroupId,
+        worker_id: WorkerId,
         address: String,
         worker_net_protocol: i32,
-        worker_epoch: u64,
         fault_domain: Option<String>,
     ) -> MetadataResult<WorkerInfo> {
-        let worker_id = match self.get_worker_id_by_identity(identity)? {
-            Some(worker_id) => worker_id,
-            None => WorkerId::new(self.stored_next_worker_id()?),
-        };
+        if worker_id.as_raw() == 0 {
+            return Err(MetadataError::InvalidArgument(
+                "worker_id must be non-zero for registration".to_string(),
+            ));
+        }
         Ok(WorkerInfo {
+            group_id,
             worker_id,
             address,
             worker_net_protocol,
-            worker_epoch,
+            worker_epoch: 0,
             capacity_total: 0,
             capacity_used: 0,
             capacity_available: 0,
@@ -1146,44 +1102,18 @@ impl RocksDBStorage {
 
     pub fn register_worker_with_apply_result_atomic(
         &self,
-        identity: &str,
         info: &WorkerInfo,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
     ) -> MetadataResult<()> {
-        let cf_meta = self.cf(CF_META)?;
         let cf_workers = self.cf(CF_WORKERS)?;
-        let existing_id = self.get_worker_id_by_identity(identity)?;
-        if let Some(existing_id) = existing_id {
-            if existing_id != info.worker_id {
-                return Err(MetadataError::InvalidArgument(format!(
-                    "worker identity {} maps to {}, not {}",
-                    identity,
-                    existing_id.as_raw(),
-                    info.worker_id.as_raw()
-                )));
-            }
-        } else {
-            let current = self.stored_next_worker_id()?;
-            if info.worker_id.as_raw() != current {
-                return Err(MetadataError::InvalidArgument(format!(
-                    "worker id allocator expected {}, got {}",
-                    current,
-                    info.worker_id.as_raw()
-                )));
-            }
+        if info.worker_id.as_raw() == 0 {
+            return Err(MetadataError::InvalidArgument(
+                "worker_id must be non-zero for registration".to_string(),
+            ));
         }
 
         let mut batch = WriteBatch::default();
-        if existing_id.is_none() {
-            let next_id = info
-                .worker_id
-                .as_raw()
-                .checked_add(1)
-                .ok_or_else(|| MetadataError::Internal("worker id allocator overflow".to_string()))?;
-            Self::batch_put_worker_identity(&mut batch, cf_meta, identity, info.worker_id)?;
-            Self::batch_put_next_worker_id(&mut batch, cf_meta, next_id)?;
-        }
         Self::batch_put_worker(&mut batch, cf_workers, info)?;
         self.commit_apply_batch(batch, dedup_key, applied_result)
     }

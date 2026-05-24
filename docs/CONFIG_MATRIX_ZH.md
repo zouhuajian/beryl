@@ -22,7 +22,10 @@
 | `metadata.repair.initial_backoff_ms` | `metadata` | `RepairQueue::with_config_and_metrics` | `1000` | active | 必须大于 0 | Repair retry 初始退避。 |
 | `metadata.repair.max_backoff_ms` | `metadata` | `RepairQueue::with_config_and_metrics` | `60000` | active | 必须大于 0 | Repair retry 最大退避。 |
 | `metadata.repair.worker_inflight_limit` | `metadata` | `RepairQueue::with_config_and_metrics` | `4` | active | 必须大于 0 | 单 worker in-flight repair 限制。 |
-| `worker.rpc.bind` | `worker` | `WorkerConfig::from_core_config` / `serve_worker_data` | `0.0.0.0:9090` | active | gRPC listener 必须是合法 `SocketAddr` | Worker data service bind 地址。 |
+| `worker.id` | `worker` | `WorkerConfig::from_core_config` / `resolve_worker_id` | 无默认值 | active optional | 如果存在，必须是非 0 整数；非法时启动失败，不静默生成新 identity | 显式稳定 `WorkerId`，跨 worker 进程重启保持不变。 |
+| `worker.identity.path` | `worker` | `resolve_worker_id` | `./data/worker.identity` | active | `worker.id` 缺省时使用；文件缺失时生成 UUID、写入并 fsync，后续启动复用同一文件 | 本地持久 WorkerId 来源；文件内容为 UUID，运行时折叠为当前 `WorkerId(u64)`。 |
+| `worker.rpc.bind` | `worker` | `WorkerConfig::from_core_config` / `serve_worker_data_with_registration` | `0.0.0.0:9090` | active | gRPC listener 必须是合法 `SocketAddr` | Worker data service 本地监听地址，不作为 metadata 注册 endpoint。 |
+| `worker.rpc.advertised_endpoint` | `worker` | `WorkerConfig::from_core_config` / `MetadataRegistrar` | `http://127.0.0.1:9090` | active | 必须显式存在，必须是合法 endpoint URI，包含可用 host 和 port，host 不能是 `0.0.0.0` 或 `::` | 注册到 metadata 并返回给 client 的 worker data endpoint。 |
 | `worker.rpc.max_inflight` | `worker` | `WorkerConfig::from_core_config` / net listener config | `100` | active | 必须大于 0 | 每连接并发上限。 |
 | `worker.default_frame_size` | `worker` | `WorkerCore::with_options` | `1MB` | active | 必须大于 0 且不超过 `max_frame_size` | Transport frame 默认载荷大小。 |
 | `worker.max_frame_size` | `worker` | `WorkerCore::with_options` | `4MB` | active | 必须大于 0 | Transport frame 最大载荷大小。 |
@@ -30,6 +33,11 @@
 | `worker.chunk_size` | `worker` | `WorkerCore::with_options` | `1MB` | active | 必须大于 0 | Worker-local StorageChunk 大小。 |
 | `worker.stream.idle_timeout_ms` | `worker` | `WorkerCore::with_options` | `60000` | active | 必须大于 0 | Runtime stream idle timeout。 |
 | `worker.storage.root` | `worker` | `WorkerCore::with_options` / local block store | `./data` | active | 路径字符串不能为空 | 当前只支持单 worker-local storage root。 |
+| `worker.metadata.group_id` | `worker` | `MetadataRegistrar` / worker startup | `1` | active | 必须大于 0 | Worker 启动注册目标 metadata group；当前默认配置只声明一个 group。 |
+| `worker.metadata.endpoint` | `worker` | `MetadataRegistrar` / worker startup | `http://127.0.0.1:18080` | active | 必须显式存在，且必须是合法 tonic endpoint URI，包含 `http://` 或 `https://` scheme | Worker 启动注册使用的 MetadataWorkerService leader endpoint。 |
+| `worker.metadata.register_timeout_ms` | `worker` | `MetadataRegistrar` | `5000` | active | 必须大于 0 | 单次 register 连接/RPC timeout。 |
+| `worker.metadata.register_retry_initial_backoff_ms` | `worker` | `MetadataRegistrar` | `200` | active | 必须大于 0 | register retry 初始退避。 |
+| `worker.metadata.register_retry_max_backoff_ms` | `worker` | `MetadataRegistrar` | `5000` | active | 必须大于 0，且不小于 initial backoff | register retry 最大退避。 |
 | `client.id` | `client` | `ClientConfig::client_id` / `FsClient::new` | `1` | active | metadata 操作要求非 0，且不能为负数 | Client request identity。 |
 | `client.metadata.endpoints` | `client` | `RefreshManager::from_config` | `127.0.0.1:18080` | active | 必须至少有一个非空 endpoint | 逗号分隔 metadata endpoint。 |
 | `client.metadata.group_ids` | `client` | `RefreshManager::from_config` | `1` | active | 必须至少有一个非 0 group id | 与 endpoints 按顺序配对，缺少 endpoint 时复用第一个 endpoint。 |
@@ -64,7 +72,7 @@
 
 以下能力可以在设计文档中讨论，但当前不出现在默认配置文件中：
 
-- worker 主动 register / heartbeat / block report 生产循环相关配置。
+- worker heartbeat / block report / command ack 生产循环相关配置；本轮只激活启动 register 配置。
 - worker replication、relocation、delete command 执行策略配置。
 - QUIC、RDMA、io_uring、SPDK 数据路径配置。
 - UFS per-instance 部署配置。
@@ -94,8 +102,8 @@
 | `worker.orphan.*` | removed | 当前 worker runtime 不消费这些键。 |
 | `worker.volume_health.*` | removed | 当前 worker runtime 不消费这些键。 |
 | `worker.ufs.*`, `ufs.*` | removed | 当前默认配置不声明未接线的 UFS 部署项。 |
-| `worker.metadata.*` | removed | worker 二进制尚未实现 metadata lifecycle loop。 |
 | `worker.replication.*` | removed | worker replication 执行策略尚未作为 active 配置接入。 |
+| `worker.metadata.heartbeat.*`, `worker.metadata.block_report.*`, `worker.metadata.command_ack.*` | removed | 当前 worker 只消费 startup register 配置，heartbeat / block report / command ack 留到后续 PR。 |
 | `client.default_timeout_ms` | removed | 当前 client 使用 `client.operation.timeout_ms`。 |
 | `client.metadata.group_id` | removed | 当前 client 只消费 `client.metadata.group_ids`。 |
 | `client.consistency.*` | removed | 当前 client runtime 不消费 consistency 配置。 |
