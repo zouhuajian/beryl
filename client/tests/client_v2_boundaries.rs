@@ -72,7 +72,16 @@ fn top_level_public_facade_is_v2_without_legacy_hcfs_or_meta_exports() {
     let lib = std::fs::read_to_string(src.join("lib.rs")).expect("read client/src/lib.rs");
     let api = std::fs::read_to_string(src.join("api").join("mod.rs")).expect("read client/src/api/mod.rs");
 
-    for name in ["FsClient", "FileHandle", "OpenOptions", "CreateMode"] {
+    for name in [
+        "FsClient",
+        "FileReader",
+        "FileWriter",
+        "OpenOptions",
+        "CreateOptions",
+        "AppendOptions",
+        "ListOptions",
+        "CreateDisposition",
+    ] {
         assert!(
             exports_public_name(&lib, name) || exports_public_name(&api, name),
             "{name} must remain part of the v2 public facade"
@@ -80,6 +89,8 @@ fn top_level_public_facade_is_v2_without_legacy_hcfs_or_meta_exports() {
     }
 
     for name in [
+        "FileHandle",
+        "CreateMode",
         "Client",
         "Handle",
         concat!("Open", "Flags"),
@@ -117,9 +128,13 @@ fn crate_root_exposes_only_stable_facade_modules_and_types() {
 
     for name in [
         "FsClient",
-        "FileHandle",
+        "FileReader",
+        "FileWriter",
         "OpenOptions",
-        "CreateMode",
+        "CreateOptions",
+        "AppendOptions",
+        "ListOptions",
+        "CreateDisposition",
         "ClientConfig",
         "ClientError",
     ] {
@@ -246,6 +261,7 @@ fn client_source_tree_has_no_orphan_rust_files() {
         "api/mod.rs",
         "api/options.rs",
         "api/status.rs",
+        "api/tests.rs",
         "cache/layout.rs",
         "cache/mod.rs",
         "cache/state_id.rs",

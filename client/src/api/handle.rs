@@ -1,46 +1,153 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Public file handle type.
+//! Public reader and writer handles.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tokio::sync::Mutex;
 use types::fs::InodeId;
 use types::ids::DataHandleId;
 
+use super::fs_client::FsClient;
+use crate::error::ClientResult;
 use crate::session::write_session::WriteSession;
 
-/// Public filesystem file handle.
+/// A reader for an immutable file snapshot opened through [`FsClient::open`].
 #[derive(Clone)]
-pub struct FileHandle {
+pub struct FileReader {
+    client: FsClient,
+    inner: ReadHandle,
+}
+
+impl FileReader {
+    pub(crate) fn new(client: FsClient, inner: ReadHandle) -> Self {
+        Self { client, inner }
+    }
+
+    /// Returns the namespace path used to open this file snapshot.
+    pub fn path(&self) -> &str {
+        self.inner.path()
+    }
+
+    /// Returns the file size observed when this reader was opened.
+    pub fn size_hint(&self) -> u64 {
+        self.inner.size_hint()
+    }
+
+    /// Reads a range from the file snapshot opened by [`FsClient::open`].
+    pub async fn read_at(&self, offset: u64, len: u32) -> ClientResult<Bytes> {
+        self.client.read_handle(&self.inner, offset, len).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inode_id(&self) -> InodeId {
+        self.inner.inode_id()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn data_handle_id(&self) -> DataHandleId {
+        self.inner.data_handle_id()
+    }
+}
+
+impl fmt::Debug for FileReader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileReader")
+            .field("path", &self.path())
+            .field("size_hint", &self.size_hint())
+            .finish()
+    }
+}
+
+/// A writer for a sequential write session created through [`FsClient::create`] or [`FsClient::append`].
+pub struct FileWriter {
+    client: FsClient,
+    inner: WriteHandle,
+}
+
+impl FileWriter {
+    pub(crate) fn new(client: FsClient, inner: WriteHandle) -> Self {
+        Self { client, inner }
+    }
+
+    /// Returns the namespace path associated with this write session.
+    pub fn path(&self) -> &str {
+        self.inner.path()
+    }
+
+    /// Returns the next sequential write offset for this writer.
+    pub fn cursor(&self) -> u64 {
+        self.inner.write_cursor()
+    }
+
+    /// Writes all supplied bytes at the current sequential cursor.
+    pub async fn write_all(&mut self, data: Bytes) -> ClientResult<()> {
+        self.client.write_handle_all(&self.inner, data).await.map(|_| ())
+    }
+
+    /// Publishes the written prefix for visibility while keeping the writer open.
+    pub async fn sync_write_visibility(&mut self) -> ClientResult<()> {
+        self.client.sync_write_visibility_handle(&self.inner).await
+    }
+
+    /// Publishes the written prefix for durability while keeping the writer open.
+    pub async fn sync_write_durability(&mut self) -> ClientResult<()> {
+        self.client.sync_write_durability_handle(&self.inner).await
+    }
+
+    /// Renews the writer lease while keeping the write session open.
+    pub async fn renew_lease(&mut self) -> ClientResult<()> {
+        self.client.renew_lease_handle(&self.inner).await
+    }
+
+    /// Closes the writer and commits the final file metadata.
+    pub async fn close(&mut self) -> ClientResult<()> {
+        self.client.close_handle(&self.inner).await
+    }
+
+    /// Aborts this writer's open write session and reports cleanup failures.
+    pub async fn abort(&mut self) -> ClientResult<()> {
+        self.client.abort_handle(&self.inner).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_session(&self) -> Option<Arc<Mutex<WriteSession>>> {
+        Some(self.inner.write_session())
+    }
+}
+
+impl fmt::Debug for FileWriter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileWriter")
+            .field("path", &self.path())
+            .field("cursor", &self.cursor())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ReadHandle {
     path: String,
     inode_id: InodeId,
     data_handle_id: DataHandleId,
-    file_version: Option<u64>,
+    file_version: u64,
     file_size: u64,
-    write_session: Option<Arc<Mutex<WriteSession>>>,
 }
 
-impl FileHandle {
-    /// Return the namespace path used to open this handle.
-    pub fn path(&self) -> &str {
+impl ReadHandle {
+    pub(crate) fn path(&self) -> &str {
         &self.path
     }
 
-    /// Return the file size observed when the handle was opened.
-    pub fn size_hint(&self) -> u64 {
+    pub(crate) fn size_hint(&self) -> u64 {
         self.file_size
     }
 
-    /// Return whether this handle owns an open write session.
-    pub fn is_write(&self) -> bool {
-        self.write_session.is_some()
-    }
-
-    /// Create an internal read handle.
-    pub(crate) fn read(
+    pub(crate) fn new(
         path: String,
         inode_id: InodeId,
         data_handle_id: DataHandleId,
@@ -51,14 +158,43 @@ impl FileHandle {
             path,
             inode_id,
             data_handle_id,
-            file_version: Some(file_version),
+            file_version,
             file_size,
-            write_session: None,
         }
     }
 
-    /// Create an internal write handle.
-    pub(crate) fn write(
+    pub(crate) fn inode_id(&self) -> InodeId {
+        self.inode_id
+    }
+
+    pub(crate) fn data_handle_id(&self) -> DataHandleId {
+        self.data_handle_id
+    }
+
+    pub(crate) fn file_version(&self) -> u64 {
+        self.file_version
+    }
+}
+
+impl fmt::Debug for ReadHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadHandle")
+            .field("path", &self.path())
+            .field("size_hint", &self.size_hint())
+            .finish()
+    }
+}
+
+pub(crate) struct WriteHandle {
+    path: String,
+    _inode_id: InodeId,
+    data_handle_id: DataHandleId,
+    write_session: Arc<Mutex<WriteSession>>,
+    write_cursor: Arc<AtomicU64>,
+}
+
+impl WriteHandle {
+    pub(crate) fn new(
         path: String,
         inode_id: InodeId,
         data_handle_id: DataHandleId,
@@ -67,41 +203,39 @@ impl FileHandle {
     ) -> Self {
         Self {
             path,
-            inode_id,
+            _inode_id: inode_id,
             data_handle_id,
-            file_version: None,
-            file_size: base_size,
-            write_session: Some(Arc::new(Mutex::new(session))),
+            write_session: Arc::new(Mutex::new(session)),
+            write_cursor: Arc::new(AtomicU64::new(base_size)),
         }
     }
 
-    /// Return the internal write session, when this is a write handle.
-    pub(crate) fn write_session(&self) -> Option<Arc<Mutex<WriteSession>>> {
-        self.write_session.clone()
+    pub(crate) fn path(&self) -> &str {
+        &self.path
     }
 
-    /// Return the sealed inode identity for internal read planning.
-    pub(crate) fn inode_id(&self) -> InodeId {
-        self.inode_id
-    }
-
-    /// Return the sealed data identity for internal read planning.
     pub(crate) fn data_handle_id(&self) -> DataHandleId {
         self.data_handle_id
     }
 
-    /// Return the sealed file version for internal read planning.
-    pub(crate) fn file_version(&self) -> Option<u64> {
-        self.file_version
+    pub(crate) fn write_session(&self) -> Arc<Mutex<WriteSession>> {
+        Arc::clone(&self.write_session)
+    }
+
+    pub(crate) fn write_cursor(&self) -> u64 {
+        self.write_cursor.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn store_write_cursor(&self, cursor: u64) {
+        self.write_cursor.store(cursor, Ordering::SeqCst);
     }
 }
 
-impl fmt::Debug for FileHandle {
+impl fmt::Debug for WriteHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FileHandle")
+        f.debug_struct("WriteHandle")
             .field("path", &self.path())
-            .field("size_hint", &self.size_hint())
-            .field("is_write", &self.is_write())
+            .field("cursor", &self.write_cursor())
             .finish()
     }
 }
@@ -109,12 +243,25 @@ impl fmt::Debug for FileHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ClientConfig;
 
-    #[test]
-    fn file_handle_debug_redacts_internal_identity_names() {
-        let read = FileHandle::read("/alpha".to_string(), InodeId::new(101), DataHandleId::new(202), 3, 10);
+    #[tokio::test]
+    async fn file_reader_debug_redacts_identity_names() {
+        let mut config = ClientConfig {
+            metadata_endpoints: vec!["http://127.0.0.1:18080".to_string()],
+            ..ClientConfig::default()
+        };
+        config.inner.inner.set("client.id", 7i64);
+        let client = FsClient::try_new(config).expect("client");
+        let read = FileReader::new(
+            client,
+            ReadHandle::new("/alpha".to_string(), InodeId::new(101), DataHandleId::new(202), 3, 10),
+        );
+        let debug = format!("{read:?}");
 
-        assert_debug_redacts_internal_identity_names(&format!("{read:?}"));
+        assert!(debug.contains("FileReader"));
+        assert!(debug.contains("size_hint"));
+        assert_debug_redacts_internal_identity_names(&debug);
     }
 
     fn assert_debug_redacts_internal_identity_names(debug: &str) {
@@ -132,7 +279,7 @@ mod tests {
         ] {
             assert!(
                 !debug.contains(needle),
-                "FileHandle Debug output must redact {needle}: {debug}"
+                "reader or writer Debug output must redact {needle}: {debug}"
             );
         }
     }

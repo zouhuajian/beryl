@@ -88,18 +88,6 @@ impl WriteSession {
         )
     }
 
-    /// Validate that a non-empty write may start at the supplied offset.
-    pub(crate) fn validate_write_offset(&mut self, offset: u64) -> ClientResult<()> {
-        self.ensure_open_for_write()?;
-        if offset != self.cursor {
-            return Err(ClientError::InvalidArgument(format!(
-                "sequential write cursor mismatch: expected {}, got {}",
-                self.cursor, offset
-            )));
-        }
-        Ok(())
-    }
-
     /// Validate a metadata write target before opening the worker stream.
     pub(crate) fn validate_target(&mut self, target: &WriteTarget, expected_len: u64) -> ClientResult<()> {
         self.ensure_open_for_write()?;

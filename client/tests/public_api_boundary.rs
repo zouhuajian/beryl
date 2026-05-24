@@ -10,27 +10,15 @@ fn public_api_does_not_expose_internal_identity_or_headers() {
     assert_external_snippet_fails(
         "public_boundary",
         r#"
-use client::FileHandle;
-use client::FsClient;
+use client::{AppendOptions, CreateOptions, FileReader, FileWriter, FsClient, ListOptions, OpenOptions};
 
-pub fn probe(mut handle: FileHandle) {
-    let value = handle.path.clone();
-    handle.path = value;
+pub fn probe_reader(reader: FileReader) {
+    let _ = reader.inner;
+    reader.close();
+}
 
-    let value = handle.inode_id;
-    handle.inode_id = value;
-
-    let value = handle.data_handle_id;
-    handle.data_handle_id = value;
-
-    let value = handle.file_version;
-    handle.file_version = value;
-
-    let value = handle.file_size;
-    handle.file_size = value;
-
-    let value = handle.write_session.clone();
-    handle.write_session = value;
+pub fn probe_writer(writer: FileWriter) {
+    let _ = writer.inner;
 }
 
 pub async fn probe_stat(client: FsClient) {
@@ -39,19 +27,71 @@ pub async fn probe_stat(client: FsClient) {
 }
 
 pub async fn probe_list(client: FsClient) {
-    let result = client.list("/alpha").await.unwrap();
+    let result = client.list("/alpha", ListOptions::default()).await.unwrap();
     let _ = result.header;
+}
+
+pub async fn probe_removed_client_handle_methods(client: FsClient, reader: FileReader, writer: FileWriter) {
+    let _ = client.read(&reader, 0, 1).await.unwrap();
+    client.write(&writer, 0, Vec::new().into()).await.unwrap();
+    client.close(&writer).await.unwrap();
+    client.sync_write_visibility(&writer).await.unwrap();
+    client.sync_write_durability(&writer).await.unwrap();
+    client.renew_lease(&writer).await.unwrap();
+    client.abort(&writer).await.unwrap();
+}
+
+pub async fn probe_split_entrypoints(client: FsClient) {
+    let _ = client.open("/alpha", OpenOptions::default()).await.unwrap();
+    let _ = client.create("/alpha", CreateOptions::create()).await.unwrap();
+    let _ = client.append("/alpha", AppendOptions::default()).await.unwrap();
 }
 "#,
         &[
-            "field `path`",
-            "field `inode_id`",
-            "field `data_handle_id`",
-            "field `file_version`",
-            "field `file_size`",
-            "field `write_session`",
+            "field `inner`",
+            "no method named `close` found for struct `FileReader`",
+            "no method named `read` found for struct `FsClient`",
+            "no method named `write` found for struct `FsClient`",
+            "no method named `close` found for struct `FsClient`",
+            "no method named `sync_write_visibility` found for struct `FsClient`",
+            "no method named `sync_write_durability` found for struct `FsClient`",
+            "no method named `renew_lease` found for struct `FsClient`",
+            "no method named `abort` found for struct `FsClient`",
             "no field `header`",
         ],
+    );
+}
+
+#[test]
+fn public_writer_operations_require_mutable_writer_binding() {
+    assert_external_snippet_fails(
+        "writer_operations_require_mutable_binding",
+        r#"
+use client::FileWriter;
+
+pub async fn probe_writer_mutability(writer: FileWriter) {
+    writer.write_all(Vec::new().into()).await.unwrap();
+    writer.sync_write_visibility().await.unwrap();
+    writer.sync_write_durability().await.unwrap();
+    writer.renew_lease().await.unwrap();
+    writer.close().await.unwrap();
+    writer.abort().await.unwrap();
+}
+"#,
+        &["cannot borrow `writer` as mutable"],
+    );
+}
+
+#[test]
+fn public_api_does_not_export_legacy_file_handle_or_create_mode() {
+    assert_external_snippet_fails(
+        "legacy_handle_exports_removed",
+        r#"
+use client::{CreateMode, FileHandle};
+
+pub fn probe(_handle: FileHandle, _mode: CreateMode) {}
+"#,
+        &["unresolved imports `client::CreateMode`, `client::FileHandle`"],
     );
 }
 

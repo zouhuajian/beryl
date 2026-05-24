@@ -3,13 +3,16 @@
 
 //! High-level API modules.
 
-pub mod fs_client;
-pub mod handle;
-pub mod options;
-pub mod status;
+mod fs_client;
+mod handle;
+mod options;
+mod status;
 
 pub use fs_client::FsClient;
-pub use handle::FileHandle;
-pub use options::{CreateMode, OpenOptions};
+pub use handle::{FileReader, FileWriter};
+pub use options::{AppendOptions, CreateDisposition, CreateOptions, ListOptions, OpenOptions};
 pub use status::{DirectoryEntry, DirectoryListing, FileStatus};
 pub use types::{FileAttrs, InodeKind};
+
+#[cfg(test)]
+mod tests;
