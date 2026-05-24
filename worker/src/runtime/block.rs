@@ -66,6 +66,12 @@ impl BlockManager {
         store: &(dyn LocalBlockStore + Send + Sync),
         req: &ReadOpenRequest,
     ) -> WorkerCoreResult<ReadBlockSnapshot> {
+        if req.block_stamp == 0 {
+            return Err(WorkerError::InvalidArgument(
+                "block_stamp must be metadata-assigned and non-zero".to_string(),
+            ));
+        }
+
         let meta = match store.load_meta(req.group_id, req.block_id) {
             Ok(meta) => meta,
             Err(WorkerError::NotFound(message)) => {
@@ -88,7 +94,7 @@ impl BlockManager {
                 ),
             ));
         }
-        if req.block_stamp != 0 && req.block_stamp != meta.visibility.block_stamp {
+        if req.block_stamp != meta.visibility.block_stamp {
             return Err(Self::need_refresh(
                 RpcErrorCode::BlockStampMismatch,
                 RefreshReason::BlockStampMismatch,

@@ -6,12 +6,13 @@
 use super::command_router::WorkerCommandRouter;
 use super::manager::WorkerManager;
 use super::metrics::WorkerMetrics;
-use crate::error::MetadataResult;
+use crate::error::{to_canonical_rpc, MetadataError, MetadataResult};
 use crate::maintenance::repair::{BlockReportDelta, RepairSignalSink};
 use crate::raft::Command;
 use crate::raft::{AppDataResponse, AppRaftNode, WorkerCommandResult};
 use crate::service::extract_and_inject_context;
-use ::common::header::ResponseHeader;
+use ::common::error::canonical::{CanonicalError, ErrorClass, RefreshReason};
+use ::common::header::{ResponseHeader, RpcErrorCode, RpcStatus};
 use proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProto;
 use proto::metadata::*;
 use std::future::Future;
@@ -32,6 +33,28 @@ impl WorkerBackgroundHandle {
         usize::from(self._lease_metrics_task.is_some())
     }
 }
+
+trait WorkerServiceResponse {
+    fn set_header(&mut self, header: proto::common::ResponseHeaderProto);
+}
+
+macro_rules! impl_worker_service_response {
+    ($($resp_ty:ty),+ $(,)?) => {
+        $(
+            impl WorkerServiceResponse for $resp_ty {
+                fn set_header(&mut self, header: proto::common::ResponseHeaderProto) {
+                    self.header = Some(header);
+                }
+            }
+        )+
+    };
+}
+
+impl_worker_service_response!(
+    RegisterWorkerResponseProto,
+    HeartbeatResponseProto,
+    BlockReportResponseProto,
+);
 
 /// MetadataWorkerService implementation.
 pub struct MetadataWorkerServiceImpl {
@@ -99,6 +122,99 @@ impl MetadataWorkerServiceImpl {
             }
         }
         header
+    }
+
+    fn group_id_from_request_header(req_header: &Option<proto::common::RequestHeaderProto>) -> Option<u64> {
+        req_header.as_ref().and_then(|header| {
+            if header.group_id != 0 {
+                Some(header.group_id)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn ok_response_header_from_request(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+    ) -> proto::common::ResponseHeaderProto {
+        (&self.create_response_header_from_request(req_header, Self::group_id_from_request_header(req_header))).into()
+    }
+
+    fn error_response_header_from_request(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        error: CanonicalError,
+    ) -> proto::common::ResponseHeaderProto {
+        debug_assert!(
+            error.class != ErrorClass::Ok,
+            "metadata worker error response must carry a non-OK canonical error"
+        );
+        let mut header =
+            self.create_response_header_from_request(req_header, Self::group_id_from_request_header(req_header));
+        header.status = match error.class {
+            ErrorClass::Ok => RpcStatus::Ok,
+            ErrorClass::NeedRefresh | ErrorClass::Retryable => RpcStatus::Error,
+            ErrorClass::Fatal => RpcStatus::Fatal,
+        };
+        header.canonical_error = Some(error);
+        (&header).into()
+    }
+
+    fn response_with_error<T>(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        error: CanonicalError,
+    ) -> Result<Response<T>, Status>
+    where
+        T: Default + WorkerServiceResponse,
+    {
+        let mut response = T::default();
+        response.set_header(self.error_response_header_from_request(req_header, error));
+        Ok(Response::new(response))
+    }
+
+    fn invalid_request_response<T>(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        message: impl Into<String>,
+    ) -> Result<Response<T>, Status>
+    where
+        T: Default + WorkerServiceResponse,
+    {
+        self.response_with_error(
+            req_header,
+            to_canonical_rpc(MetadataError::InvalidArgument(message.into())),
+        )
+    }
+
+    fn metadata_error_response<T>(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        error: MetadataError,
+    ) -> Result<Response<T>, Status>
+    where
+        T: Default + WorkerServiceResponse,
+    {
+        self.response_with_error(req_header, to_canonical_rpc(error))
+    }
+
+    fn worker_epoch_mismatch_response<T>(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        message: impl Into<String>,
+    ) -> Result<Response<T>, Status>
+    where
+        T: Default + WorkerServiceResponse,
+    {
+        self.response_with_error(
+            req_header,
+            CanonicalError::need_refresh(
+                RpcErrorCode::WorkerEpochMismatch,
+                RefreshReason::WorkerEpochMismatch,
+                message,
+            ),
+        )
     }
 
     /// Start worker-local background tasks.
@@ -172,17 +288,14 @@ async fn persist_worker_descriptor_then_register<F>(
     worker_epoch: u64,
     fault_domain: Option<String>,
     persist_descriptor: F,
-) -> Result<WorkerId, Status>
+) -> MetadataResult<WorkerId>
 where
     F: Future<Output = MetadataResult<AppDataResponse>>,
 {
-    let worker_id = match persist_descriptor
-        .await
-        .map_err(|e| Status::internal(format!("Failed to propose command: {}", e)))?
-    {
+    let worker_id = match persist_descriptor.await? {
         AppDataResponse::Worker(WorkerCommandResult::Upserted(worker_id)) => worker_id,
         other => {
-            return Err(Status::internal(format!(
+            return Err(MetadataError::Internal(format!(
                 "RegisterWorker returned unexpected Raft response: {:?}",
                 other
             )))
@@ -191,7 +304,7 @@ where
 
     worker_manager
         .register_worker(worker_id, address, worker_net_protocol, worker_epoch, fault_domain)
-        .map_err(|e| Status::internal(format!("Failed to register worker: {}", e)))?;
+        .map_err(|e| MetadataError::Internal(format!("Failed to register worker: {}", e)))?;
 
     Ok(worker_id)
 }
@@ -211,14 +324,18 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         let worker_net_protocol = req.worker_net_protocol() as i32; // Convert enum to i32
         let worker_epoch = req.worker_epoch;
         if req.suggested_worker_id != 0 {
-            return Err(Status::invalid_argument(
+            return self.invalid_request_response::<RegisterWorkerResponseProto>(
+                &req.header,
                 "suggested_worker_id is no longer authoritative; worker id is allocated by Raft",
-            ));
+            );
         }
         let labels = req.labels;
-        let endpoint = req
-            .endpoint
-            .ok_or_else(|| Status::invalid_argument("Missing endpoint"))?;
+        let endpoint = match req.endpoint {
+            Some(endpoint) => endpoint,
+            None => {
+                return self.invalid_request_response::<RegisterWorkerResponseProto>(&req.header, "Missing endpoint");
+            }
+        };
 
         let address = format!("{}:{}", endpoint.host, endpoint.port);
 
@@ -248,7 +365,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             fault_domain: None, // TODO: Extract fault_domain from labels
         };
 
-        let worker_id = persist_worker_descriptor_then_register(
+        let worker_id = match persist_worker_descriptor_then_register(
             self.worker_manager.as_ref(),
             address.clone(),
             worker_net_protocol,
@@ -256,20 +373,16 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             None, // TODO: Extract fault_domain from labels
             self.raft_node.propose(command),
         )
-        .await?;
+        .await
+        {
+            Ok(worker_id) => worker_id,
+            Err(error) => return self.metadata_error_response::<RegisterWorkerResponseProto>(&req.header, error),
+        };
 
         info!(worker_id = worker_id.as_raw(), "Worker registered");
 
         Ok(Response::new(RegisterWorkerResponseProto {
-            header: Some(
-                (&self.create_response_header_from_request(
-                    &req.header,
-                    req.header
-                        .as_ref()
-                        .and_then(|h| if h.group_id != 0 { Some(h.group_id) } else { None }),
-                ))
-                    .into(),
-            ),
+            header: Some(self.ok_response_header_from_request(&req.header)),
             worker_id: worker_id.as_raw(),
             config: Some(WorkerConfigProto {
                 heartbeat_interval_sec: 30,
@@ -289,11 +402,15 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 
         let worker_id = WorkerId::new(req.worker_id);
 
-        let capacity = req
-            .capacity
-            .ok_or_else(|| Status::invalid_argument("Missing capacity"))?;
+        let capacity = match req.capacity {
+            Some(capacity) => capacity,
+            None => return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, "Missing capacity"),
+        };
 
-        let load = req.load.ok_or_else(|| Status::invalid_argument("Missing load"))?;
+        let load = match req.load {
+            Some(load) => load,
+            None => return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, "Missing load"),
+        };
 
         let health_proto = req.health();
 
@@ -305,28 +422,29 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         use super::manager::HealthStatus;
         let health_status = HealthStatus::from(health_proto as i32);
 
-        let descriptor_changed = self
-            .worker_manager
-            .update_runtime(
-                worker_id,
-                worker_net_protocol,
-                worker_epoch,
-                capacity.total_bytes,
-                capacity.used_bytes,
-                capacity.available_bytes,
-                load.active_reads,
-                load.active_writes,
-                health_status,
-            )
-            .map_err(|e| Status::internal(format!("Failed to update worker runtime: {}", e)))?;
+        let descriptor_changed = match self.worker_manager.update_runtime(
+            worker_id,
+            worker_net_protocol,
+            worker_epoch,
+            capacity.total_bytes,
+            capacity.used_bytes,
+            capacity.available_bytes,
+            load.active_reads,
+            load.active_writes,
+            health_status,
+        ) {
+            Ok(changed) => changed,
+            Err(error) => return self.metadata_error_response::<HeartbeatResponseProto>(&req.header, error),
+        };
 
         // If descriptor changed, require worker to re-register (leader-only check)
         let is_leader = self.raft_node.is_leader();
         if descriptor_changed && is_leader {
             // Leader detects descriptor change, return error to trigger re-register
-            return Err(Status::failed_precondition(
+            return self.worker_epoch_mismatch_response::<HeartbeatResponseProto>(
+                &req.header,
                 "Worker descriptor changed, please re-register",
-            ));
+            );
         }
 
         // Update metrics (all nodes)
@@ -427,15 +545,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         }
 
         Ok(Response::new(HeartbeatResponseProto {
-            header: Some(
-                (&self.create_response_header_from_request(
-                    &req.header,
-                    req.header
-                        .as_ref()
-                        .and_then(|h| if h.group_id != 0 { Some(h.group_id) } else { None }),
-                ))
-                    .into(),
-            ),
+            header: Some(self.ok_response_header_from_request(&req.header)),
             commands,
             full_report_lease_token,
             can_full_report,
@@ -473,9 +583,10 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     if needs_full_sync {
                         // Worker needs full sync, must have valid lease token
                         if lease_token == 0 {
-                            return Err(Status::invalid_argument(
+                            return self.invalid_request_response::<BlockReportResponseProto>(
+                                &req.header,
                                 "Full report requires lease token when needs_full_sync is true",
-                            ));
+                            );
                         }
 
                         // Verify and release lease
@@ -488,9 +599,10 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                             .verify_and_release(lease_token, worker_id, metadata_epoch, mount_epoch)
                             .await
                         {
-                            return Err(Status::invalid_argument(
+                            return self.invalid_request_response::<BlockReportResponseProto>(
+                                &req.header,
                                 "Invalid or expired lease token for full report",
-                            ));
+                            );
                         }
                     }
                 }
@@ -498,12 +610,21 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 // FULL report: convert full_entries to BlockIds
                 let mut reported_blocks = Vec::new();
                 for entry in &req.full_entries {
-                    let block_id = entry
-                        .block_id
-                        .as_ref()
-                        .ok_or_else(|| Status::invalid_argument("Missing block_id in full entry"))?;
-                    let block_id =
-                        Self::proto_to_block_id(block_id).map_err(|e| Status::invalid_argument(e.to_string()))?;
+                    let block_id = match entry.block_id.as_ref() {
+                        Some(block_id) => block_id,
+                        None => {
+                            return self.invalid_request_response::<BlockReportResponseProto>(
+                                &req.header,
+                                "Missing block_id in full entry",
+                            );
+                        }
+                    };
+                    let block_id = match Self::proto_to_block_id(block_id) {
+                        Ok(block_id) => block_id,
+                        Err(error) => {
+                            return self.metadata_error_response::<BlockReportResponseProto>(&req.header, error);
+                        }
+                    };
                     reported_blocks.push(block_id);
                 }
 
@@ -526,21 +647,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                             (base_ms + jitter_ms) as u32
                         };
                         return Ok(Response::new(BlockReportResponseProto {
-                            header: Some(
-                                (&self.create_response_header_from_request(
-                                    &req.header,
-                                    req.header.as_ref().and_then(
-                                        |h| {
-                                            if h.group_id != 0 {
-                                                Some(h.group_id)
-                                            } else {
-                                                None
-                                            }
-                                        },
-                                    ),
-                                ))
-                                    .into(),
-                            ),
+                            header: Some(self.ok_response_header_from_request(&req.header)),
                             report_seq: req.last_report_seq,
                             commands: vec![],
                             retry_after_ms,
@@ -556,12 +663,21 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 let mut removed_blocks = Vec::new();
 
                 for entry in &req.delta_entries {
-                    let block_id = entry
-                        .block_id
-                        .as_ref()
-                        .ok_or_else(|| Status::invalid_argument("Missing block_id in delta entry"))?;
-                    let block_id =
-                        Self::proto_to_block_id(block_id).map_err(|e| Status::invalid_argument(e.to_string()))?;
+                    let block_id = match entry.block_id.as_ref() {
+                        Some(block_id) => block_id,
+                        None => {
+                            return self.invalid_request_response::<BlockReportResponseProto>(
+                                &req.header,
+                                "Missing block_id in delta entry",
+                            );
+                        }
+                    };
+                    let block_id = match Self::proto_to_block_id(block_id) {
+                        Ok(block_id) => block_id,
+                        Err(error) => {
+                            return self.metadata_error_response::<BlockReportResponseProto>(&req.header, error);
+                        }
+                    };
 
                     match entry.op() {
                         proto::metadata::BlockReportDeltaOpProto::BlockReportDeltaOpAdd => {
@@ -571,7 +687,10 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                             removed_blocks.push(block_id);
                         }
                         _ => {
-                            return Err(Status::invalid_argument("Invalid delta operation"));
+                            return self.invalid_request_response::<BlockReportResponseProto>(
+                                &req.header,
+                                "Invalid delta operation",
+                            );
                         }
                     }
                 }
@@ -586,21 +705,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                         // Full sync required: return RequestFullBlockReport command
                         let metadata_epoch = self.worker_manager.get_metadata_epoch();
                         return Ok(Response::new(BlockReportResponseProto {
-                            header: Some(
-                                (&self.create_response_header_from_request(
-                                    &req.header,
-                                    req.header.as_ref().and_then(
-                                        |h| {
-                                            if h.group_id != 0 {
-                                                Some(h.group_id)
-                                            } else {
-                                                None
-                                            }
-                                        },
-                                    ),
-                                ))
-                                    .into(),
-                            ),
+                            header: Some(self.ok_response_header_from_request(&req.header)),
                             report_seq: req.last_report_seq,
                             commands: vec![WorkerCommandProto {
                                 task_id: 0,
@@ -617,7 +722,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 }
             }
             _ => {
-                return Err(Status::invalid_argument("Invalid report_type"));
+                return self.invalid_request_response::<BlockReportResponseProto>(&req.header, "Invalid report_type");
             }
         };
 
@@ -626,7 +731,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 
         // Hand block-report repair signals to maintenance. The handler owns the leader gate.
         let is_leader = self.raft_node.is_leader();
-        let outcome = self
+        let outcome = match self
             .repair_signal_handler
             .handle_block_report_delta(BlockReportDelta {
                 worker_id,
@@ -634,7 +739,10 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 removed_blocks: removed_blocks.clone(),
             })
             .await
-            .map_err(|e| Status::internal(format!("Failed to handle repair signal: {}", e)))?;
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return self.metadata_error_response::<BlockReportResponseProto>(&req.header, error),
+        };
         if let Some(queue_lengths) = outcome.queue_lengths {
             self.metrics.update_orphan_queue_len(queue_lengths.orphan_queue_len);
             self.metrics.update_repair_queue_len(queue_lengths.repair_queue_len);
@@ -681,15 +789,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         };
 
         Ok(Response::new(BlockReportResponseProto {
-            header: Some(
-                (&self.create_response_header_from_request(
-                    &req.header,
-                    req.header
-                        .as_ref()
-                        .and_then(|h| if h.group_id != 0 { Some(h.group_id) } else { None }),
-                ))
-                    .into(),
-            ),
+            header: Some(self.ok_response_header_from_request(&req.header)),
             report_seq,
             commands,
             retry_after_ms: 0,
@@ -707,6 +807,7 @@ mod tests {
     use crate::worker::HealthStatus;
     use crate::MountTable;
     use parking_lot::Mutex;
+    use proto::common::{ErrorClassProto, RefreshReasonProto};
     use tempfile::TempDir;
 
     #[derive(Default)]
@@ -859,6 +960,7 @@ mod tests {
         .unwrap()
         .into_inner();
 
+        assert!(response.header.expect("header").error.is_none());
         assert_eq!(response.report_seq, 42);
         assert_eq!(worker_manager.get_block_locations(block_id), vec![worker_id]);
         let deltas = signal_sink.deltas.lock();
@@ -911,11 +1013,177 @@ mod tests {
         .unwrap()
         .into_inner();
 
+        assert!(response.header.expect("header").error.is_none());
         assert_eq!(response.report_seq, 53);
         let deltas = signal_sink.deltas.lock();
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].worker_id, worker_id);
         assert!(deltas[0].added_blocks.is_empty());
         assert_eq!(deltas[0].removed_blocks, vec![block_id]);
+    }
+
+    #[tokio::test]
+    async fn register_worker_invalid_request_returns_header_error() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(RecordingRepairSignalSink::default()),
+            Arc::new(MountTable::new()),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
+            &service,
+            Request::new(RegisterWorkerRequestProto {
+                header: None,
+                endpoint: None,
+                capabilities: 0,
+                version: String::new(),
+                labels: Default::default(),
+                suggested_worker_id: 0,
+                worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+                worker_epoch: 1,
+            }),
+        )
+        .await
+        .expect("business validation must return gRPC OK")
+        .into_inner();
+
+        let error = response.header.expect("header").error.expect("header error");
+        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
+        assert!(error.message.contains("Missing endpoint"));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_unknown_worker_returns_header_error() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(RecordingRepairSignalSink::default()),
+            Arc::new(MountTable::new()),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+            &service,
+            Request::new(HeartbeatRequestProto {
+                header: None,
+                worker_id: 99,
+                capacity: Some(CapacityInfoProto {
+                    total_bytes: 1_000,
+                    used_bytes: 100,
+                    available_bytes: 900,
+                }),
+                load: Some(LoadInfoProto {
+                    active_reads: 0,
+                    active_writes: 0,
+                    cpu_usage_percent: 0,
+                    memory_used_bytes: 0,
+                }),
+                health: HealthStatusProto::HealthStatusHealthy as i32,
+                worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+                worker_epoch: 1,
+                acks: Vec::new(),
+            }),
+        )
+        .await
+        .expect("business validation must return gRPC OK")
+        .into_inner();
+
+        let error = response.header.expect("header").error.expect("header error");
+        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
+        assert!(error.message.contains("Worker descriptor not found"));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_worker_epoch_mismatch_returns_need_refresh_header_error() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = leader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_id = WorkerId::new(9);
+        worker_manager
+            .register_worker(worker_id, "127.0.0.1:9099".to_string(), 1, 100, None)
+            .unwrap();
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(RecordingRepairSignalSink::default()),
+            Arc::new(MountTable::new()),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+            &service,
+            Request::new(HeartbeatRequestProto {
+                header: None,
+                worker_id: worker_id.as_raw(),
+                capacity: Some(CapacityInfoProto {
+                    total_bytes: 1_000,
+                    used_bytes: 100,
+                    available_bytes: 900,
+                }),
+                load: Some(LoadInfoProto {
+                    active_reads: 0,
+                    active_writes: 0,
+                    cpu_usage_percent: 0,
+                    memory_used_bytes: 0,
+                }),
+                health: HealthStatusProto::HealthStatusHealthy as i32,
+                worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+                worker_epoch: 101,
+                acks: Vec::new(),
+            }),
+        )
+        .await
+        .expect("business validation must return gRPC OK")
+        .into_inner();
+
+        let error = response.header.expect("header").error.expect("header error");
+        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+        assert_eq!(
+            error.refresh_reason,
+            RefreshReasonProto::RefreshReasonWorkerEpochMismatch as i32
+        );
+        assert!(error.message.contains("re-register"));
+    }
+
+    #[tokio::test]
+    async fn block_report_invalid_entry_returns_header_error() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(RecordingRepairSignalSink::default()),
+            Arc::new(MountTable::new()),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+            &service,
+            Request::new(BlockReportRequestProto {
+                header: None,
+                worker_id: 99,
+                report_type: BlockReportTypeProto::BlockReportTypeIncremental as i32,
+                full_entries: Vec::new(),
+                delta_entries: vec![BlockReportEntryDeltaProto {
+                    block_id: None,
+                    op: BlockReportDeltaOpProto::BlockReportDeltaOpAdd as i32,
+                    chunk_bitmap: None,
+                }],
+                last_report_seq: 0,
+                full_report_lease_token: 0,
+            }),
+        )
+        .await
+        .expect("business validation must return gRPC OK")
+        .into_inner();
+
+        let error = response.header.expect("header").error.expect("header error");
+        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
+        assert!(error.message.contains("Missing block_id"));
     }
 }
