@@ -181,6 +181,7 @@ mod tests {
         );
         let outcome = handler
             .handle_block_report_delta(BlockReportDelta {
+                group_id: ShardGroupId::new(1),
                 worker_id: worker1,
                 added_blocks: vec![block_id],
                 removed_blocks: Vec::new(),
@@ -218,6 +219,7 @@ mod tests {
         );
         let outcome = handler
             .handle_block_report_delta(BlockReportDelta {
+                group_id: ShardGroupId::new(1),
                 worker_id,
                 added_blocks: vec![block_id],
                 removed_blocks: Vec::new(),
@@ -249,8 +251,12 @@ mod tests {
         live_worker(&worker_manager, source_a);
         live_worker(&worker_manager, source_b);
         live_worker(&worker_manager, target);
-        worker_manager.update_locations(source_a, vec![block_id]).unwrap();
-        worker_manager.update_locations(source_b, vec![block_id]).unwrap();
+        worker_manager
+            .update_locations(ShardGroupId::new(1), source_a, vec![block_id])
+            .unwrap();
+        worker_manager
+            .update_locations(ShardGroupId::new(1), source_b, vec![block_id])
+            .unwrap();
         put_block(&storage, block_id, source_a);
 
         let handler = signal_handler(
@@ -261,6 +267,7 @@ mod tests {
         );
         let outcome = handler
             .handle_block_report_delta(BlockReportDelta {
+                group_id: ShardGroupId::new(1),
                 worker_id: removed_worker,
                 added_blocks: Vec::new(),
                 removed_blocks: vec![block_id],
@@ -295,6 +302,7 @@ mod tests {
         );
         let outcome = handler
             .handle_block_report_delta(BlockReportDelta {
+                group_id: ShardGroupId::new(1),
                 worker_id,
                 added_blocks: Vec::new(),
                 removed_blocks: vec![block_id],
@@ -327,9 +335,15 @@ mod tests {
         live_worker(&worker_manager, worker_a);
         live_worker(&worker_manager, worker_b);
         live_worker(&worker_manager, worker_c);
-        worker_manager.update_locations(worker_a, vec![block_id]).unwrap();
-        worker_manager.update_locations(worker_b, vec![block_id]).unwrap();
-        worker_manager.update_locations(worker_c, vec![block_id]).unwrap();
+        worker_manager
+            .update_locations(ShardGroupId::new(1), worker_a, vec![block_id])
+            .unwrap();
+        worker_manager
+            .update_locations(ShardGroupId::new(1), worker_b, vec![block_id])
+            .unwrap();
+        worker_manager
+            .update_locations(ShardGroupId::new(1), worker_c, vec![block_id])
+            .unwrap();
         put_block(&storage, block_id, worker_a);
 
         let handler = signal_handler(
@@ -340,6 +354,7 @@ mod tests {
         );
         let outcome = handler
             .handle_block_report_delta(BlockReportDelta {
+                group_id: ShardGroupId::new(1),
                 worker_id: removed_worker,
                 added_blocks: Vec::new(),
                 removed_blocks: vec![block_id],
@@ -373,6 +388,7 @@ mod tests {
         );
         let outcome = handler
             .handle_block_report_delta(BlockReportDelta {
+                group_id: ShardGroupId::new(1),
                 worker_id,
                 added_blocks: vec![block_id],
                 removed_blocks: vec![block_id],
@@ -401,7 +417,9 @@ mod tests {
         live_worker(&worker_manager, worker_a);
         live_worker(&worker_manager, worker_b);
         live_worker(&worker_manager, worker_c);
-        worker_manager.update_locations(worker_a, vec![block_id]).unwrap();
+        worker_manager
+            .update_locations(ShardGroupId::new(1), worker_a, vec![block_id])
+            .unwrap();
         put_block(&storage, block_id, worker_a);
 
         let handler = signal_handler_with_policy(
@@ -415,6 +433,7 @@ mod tests {
         );
         let outcome = handler
             .handle_block_report_delta(BlockReportDelta {
+                group_id: ShardGroupId::new(1),
                 worker_id: worker_a,
                 added_blocks: vec![block_id],
                 removed_blocks: Vec::new(),
@@ -448,7 +467,9 @@ mod tests {
         live_worker(&worker_manager, source);
         live_worker(&worker_manager, target_a);
         live_worker(&worker_manager, target_b);
-        worker_manager.update_locations(source, vec![block_a, block_b]).unwrap();
+        worker_manager
+            .update_locations(ShardGroupId::new(1), source, vec![block_a, block_b])
+            .unwrap();
         put_block(&storage, block_a, source);
         put_block(&storage, block_b, source);
 
@@ -460,6 +481,7 @@ mod tests {
         );
         let outcome = handler
             .handle_block_report_delta(BlockReportDelta {
+                group_id: ShardGroupId::new(1),
                 worker_id: source,
                 added_blocks: vec![block_a, block_b],
                 removed_blocks: Vec::new(),
@@ -607,41 +629,6 @@ mod tests {
         assert_eq!(queue.len_total(), 0);
         assert_eq!(queue.len_pending(), 0);
         assert_eq!(queue.len_inflight(), 0);
-    }
-
-    #[test]
-    fn test_move_copy_success_returns_replica_eviction_followup() {
-        let queue = RepairQueue::new(1000);
-        let block_id = make_block_id(1, 0);
-        let from_worker = make_worker_id(1);
-        let to_worker = make_worker_id(2);
-
-        let task = RepairTask::MoveCopy {
-            block_id,
-            from_worker,
-            to_worker,
-        };
-
-        let _task_id = queue.enqueue(task).unwrap();
-        let records = queue.poll_for_worker(to_worker, 10);
-        assert_eq!(records.len(), 1);
-
-        let followup = queue
-            .ack(records[0].id, to_worker, TaskAckStatus::Success, None, None)
-            .unwrap();
-
-        match followup {
-            Some(RepairTask::EvictReplica {
-                target_worker,
-                block_id: followup_block_id,
-                reason,
-            }) => {
-                assert_eq!(target_worker, from_worker);
-                assert_eq!(followup_block_id, block_id);
-                assert!(reason.contains("MoveCopy completed"));
-            }
-            other => panic!("expected EvictReplica follow-up, got {other:?}"),
-        }
     }
 
     #[test]

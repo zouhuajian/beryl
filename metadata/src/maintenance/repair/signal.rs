@@ -10,11 +10,12 @@ use crate::worker::WorkerManager;
 use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::{debug, warn};
-use types::ids::{BlockId, WorkerId};
+use types::ids::{BlockId, ShardGroupId, WorkerId};
 
 /// Soft-state block-report delta handed off from worker RPC ingress.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockReportDelta {
+    pub group_id: ShardGroupId,
     pub worker_id: WorkerId,
     pub added_blocks: Vec<BlockId>,
     pub removed_blocks: Vec<BlockId>,
@@ -88,9 +89,9 @@ impl RepairSignalHandler {
         Ok(self.raft_node.read(false, |sm| sm.get_block(block_id)).await?.is_some())
     }
 
-    fn plan_and_enqueue(&self, block_id: BlockId, outcome: &mut RepairSignalOutcome) {
-        let current_locations = self.worker_manager.get_block_locations(block_id);
-        let live_workers = self.worker_manager.list_live_workers();
+    fn plan_and_enqueue(&self, group_id: ShardGroupId, block_id: BlockId, outcome: &mut RepairSignalOutcome) {
+        let current_locations = self.worker_manager.get_block_locations(group_id, block_id);
+        let live_workers = self.worker_manager.list_live_workers_in_group(group_id);
         let replication_factor = self.repair_policy.default_replication_factor;
         let actions =
             self.repair_planner
@@ -144,7 +145,7 @@ impl RepairSignalSink for RepairSignalHandler {
                 continue;
             }
 
-            self.plan_and_enqueue(block_id, &mut outcome);
+            self.plan_and_enqueue(delta.group_id, block_id, &mut outcome);
         }
 
         for block_id in delta.removed_blocks {
@@ -158,7 +159,7 @@ impl RepairSignalSink for RepairSignalHandler {
                 continue;
             }
 
-            self.plan_and_enqueue(block_id, &mut outcome);
+            self.plan_and_enqueue(delta.group_id, block_id, &mut outcome);
         }
 
         outcome.queue_lengths = Some(self.queue_lengths());

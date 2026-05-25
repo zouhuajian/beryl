@@ -182,6 +182,25 @@ impl FsCore {
         ))
     }
 
+    fn require_worker_lookup_group(
+        &self,
+        ctx: &RequestContext,
+        group_id: Option<u64>,
+        mount_epoch: Option<u64>,
+        route_epoch: Option<u64>,
+        intent: &str,
+    ) -> Result<ShardGroupId, CoreFailure> {
+        group_id.map(ShardGroupId::new).ok_or_else(|| {
+            core_failure_from_metadata_error(
+                ctx,
+                MetadataError::Internal(format!("{intent} worker lookup requires authoritative metadata group")),
+                group_id,
+                mount_epoch,
+                route_epoch,
+            )
+        })
+    }
+
     // Refresh failures must keep caller and server hint fields explicit.
     #[allow(clippy::too_many_arguments)]
     fn need_refresh_failure_with_hint<T>(

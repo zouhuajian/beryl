@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 use types::block::BlockState;
-use types::ids::{BlockId, WorkerId};
+use types::ids::{BlockId, ShardGroupId, WorkerId};
 
 use super::delete::DeleteIntentBuilder;
 use super::repair::RepairPolicy;
@@ -155,8 +155,26 @@ impl OverReplicaCleanupService {
         // Collect updates first (without holding lock across await)
         let mut updates: Vec<(BlockId, Option<(u32, u32)>)> = Vec::new();
         for block_id in all_blocks {
-            // Get current locations
-            let current_locations = self.worker_manager.get_block_locations(block_id);
+            let group_id = match crate::maintenance::owner_group_for_block(&self.storage, &self.mount_table, block_id) {
+                Ok(group_id) => group_id,
+                Err(error) => {
+                    debug!(
+                        block_id = %block_id,
+                        error = %error,
+                        "Skipping overrep scan: block owner group is not authoritative"
+                    );
+                    continue;
+                }
+            };
+            let current_locations = self.worker_manager.get_block_locations(group_id, block_id);
+            if current_locations.is_empty() {
+                debug!(
+                    block_id = %block_id,
+                    group_id = group_id.as_raw(),
+                    "Skipping overrep scan: block has no live locations in owner group"
+                );
+                continue;
+            }
             let current_replicas = current_locations.len() as u32;
 
             // Get desired replicas from file layout or the current repair policy placeholder.
@@ -302,8 +320,28 @@ impl OverReplicaCleanupService {
                 continue;
             }
 
-            // Get current locations
-            let current_locations = self.worker_manager.get_block_locations(block_id);
+            let group_id = match crate::maintenance::owner_group_for_block(&self.storage, &self.mount_table, block_id) {
+                Ok(group_id) => group_id,
+                Err(error) => {
+                    self.inflight_registry.release(block_id);
+                    debug!(
+                        block_id = %block_id,
+                        error = %error,
+                        "Skipping overrep cleanup: block owner group is not authoritative"
+                    );
+                    continue;
+                }
+            };
+            let current_locations = self.worker_manager.get_block_locations(group_id, block_id);
+            if current_locations.is_empty() {
+                self.inflight_registry.release(block_id);
+                debug!(
+                    block_id = %block_id,
+                    group_id = group_id.as_raw(),
+                    "Skipping overrep cleanup: block has no live locations in owner group"
+                );
+                continue;
+            }
             if current_locations.len() as u32 <= candidate.desired_replicas {
                 // No longer over-replicated
                 self.inflight_registry.release(block_id);
@@ -314,6 +352,7 @@ impl OverReplicaCleanupService {
 
             // Select target workers to evict
             let target_workers = self.select_target_workers(
+                group_id,
                 &current_locations,
                 candidate.current_replicas,
                 candidate.desired_replicas,
@@ -450,6 +489,7 @@ impl OverReplicaCleanupService {
     /// 4. Stable random (hash-based sorting for determinism)
     fn select_target_workers(
         &self,
+        group_id: ShardGroupId,
         current_locations: &[WorkerId],
         current_replicas: u32,
         desired_replicas: u32,
@@ -464,7 +504,7 @@ impl OverReplicaCleanupService {
             .iter()
             .map(|&worker_id| {
                 // Get worker info (combined descriptor + runtime)
-                let worker_info = self.worker_manager.get_worker_any_group(worker_id);
+                let worker_info = self.worker_manager.get_worker(group_id, worker_id);
 
                 let load_score = worker_info.as_ref().map(|w| {
                     // Calculate load score: capacity_used_ratio + active_ops_penalty

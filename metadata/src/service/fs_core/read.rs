@@ -395,11 +395,13 @@ impl FsCore {
             };
             let mut workers = Vec::new();
             if let Some(worker_manager) = worker_manager {
-                let mut worker_ids = worker_manager.get_block_locations(extent.block_id);
+                let worker_lookup_group_id =
+                    self.require_worker_lookup_group(&req.ctx, group_id, mount_epoch, route_epoch, "GetFileLayout")?;
+                let mut worker_ids = worker_manager.get_block_locations(worker_lookup_group_id, extent.block_id);
                 worker_ids.sort_by_key(|worker_id| worker_id.as_raw());
                 workers.reserve(worker_ids.len());
                 for worker_id in worker_ids {
-                    if let Some(descriptor) = worker_manager.get_descriptor(worker_id) {
+                    if let Some(descriptor) = worker_manager.get_descriptor(worker_lookup_group_id, worker_id) {
                         let endpoint = match worker_endpoint_from_parts(
                             worker_id,
                             descriptor.address,

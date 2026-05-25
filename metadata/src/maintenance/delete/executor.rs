@@ -8,12 +8,10 @@
 //! - Safety gate checks (not_before_ms, blockreport_converged, guard_state_id)
 //! - Rate limiting (per-worker concurrency, per-block single-flight)
 //! - Batch command generation (group by worker)
-//! - Ack processing and completion tracking
 
 use crate::destructive_gate::{DestructiveCheckContext, DestructiveGate};
 use crate::error::MetadataResult;
 use crate::inflight_registry::{InflightKind, InflightRegistry};
-use crate::maintenance::repair::{TaskAckStatus, TaskFailureClass};
 use crate::metrics::MetadataMetrics;
 use crate::mount::MountTable;
 use crate::raft::{AppRaftNode, Command, DedupKey, RocksDBStorage};
@@ -36,28 +34,19 @@ pub struct DeleteExecutorHandle {
     _task: JoinHandle<()>,
 }
 
-impl DeleteExecutorHandle {
-    #[cfg(test)]
-    pub fn is_finished(&self) -> bool {
-        self._task.is_finished()
-    }
-}
-
 /// Delete intent execution status.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum IntentExecutionStatus {
     /// Pending: not yet started.
     Pending,
-    /// InFlight: command sent, waiting for ack.
+    /// InFlight: command sent to a worker.
     InFlight {
         worker_id: WorkerId,
         task_id: u64,
         sent_at_ms: u64,
     },
-    /// Completed: all required acks received.
+    /// Completed: authoritative status persisted.
     Completed { completed_at_ms: u64 },
-    /// Failed: non-retryable failure.
-    Failed { failed_at_ms: u64, reason: String },
 }
 
 /// Per-intent execution state. Terminal authoritative status is persisted through Raft.
@@ -66,8 +55,6 @@ struct IntentExecutionState {
     intent: DeleteIntent,
     status: IntentExecutionStatus,
     registry_held: bool,
-    /// Track which workers have successfully acked.
-    acked_workers: HashSet<WorkerId>,
     /// Track which workers we've sent commands to.
     sent_to_workers: HashSet<WorkerId>,
 }
@@ -318,7 +305,6 @@ impl DeleteExecutor {
                         intent: intent.clone(),
                         status: IntentExecutionStatus::Pending,
                         registry_held: true,
-                        acked_workers: HashSet::new(),
                         sent_to_workers: HashSet::new(),
                     },
                 );
@@ -392,16 +378,22 @@ impl DeleteExecutor {
                 continue;
             }
 
-            // Get block locations
-            let locations = self.worker_manager.get_block_locations(intent.block_id);
-
             // Determine target workers
             let target_workers = if !intent.target_workers.is_empty() {
                 // Use explicit target_workers (e.g., for Orphan)
                 intent.target_workers.clone()
+            } else if let Some(group_id) = intent.shard_group_id {
+                self.worker_manager.get_block_locations(group_id, intent.block_id)
             } else {
-                // Use all known locations (for GC)
-                locations
+                // Delete execution requires an authoritative shard_group_id for
+                // implicit target resolution. Do not infer a group from
+                // block-report soft state.
+                debug!(
+                    intent_id,
+                    block_id = %intent.block_id,
+                    "Skipping delete intent without authoritative shard_group_id"
+                );
+                continue;
             };
 
             if target_workers.is_empty() {
@@ -588,14 +580,6 @@ impl DeleteExecutor {
         }
     }
 
-    fn reset_intent_for_retry(&self, route: DeleteTaskRoute) {
-        self.release_inflight_route(route);
-        let mut state = self.execution_state.write();
-        if let Some(exec_state) = state.get_mut(&route.intent_id) {
-            exec_state.status = IntentExecutionStatus::Pending;
-        }
-    }
-
     /// Get pending commands for a worker (called from Heartbeat handler).
     pub fn get_pending_commands(&self, worker_id: WorkerId, max: usize) -> Vec<WorkerCommandProto> {
         let mut commands = Vec::new();
@@ -713,153 +697,6 @@ impl DeleteExecutor {
         commands
     }
 
-    /// Process task acknowledgments (called from Heartbeat handler).
-    pub async fn process_task_acks(&self, worker_id: WorkerId, acks: &[TaskAckProto]) {
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-
-        for ack in acks {
-            let route = {
-                let task_routes = self.task_routes.read();
-                task_routes.get(&ack.task_id).copied()
-            };
-
-            let Some(route) = route else {
-                // Task ID not found - might be from repair queue, ignore
-                debug!(
-                    worker_id = worker_id.as_raw(),
-                    task_id = ack.task_id,
-                    "TaskAck for unknown task_id (might be from repair queue)"
-                );
-                continue;
-            };
-
-            if route.worker_id != worker_id {
-                warn!(
-                    worker_id = worker_id.as_raw(),
-                    expected_worker_id = route.worker_id.as_raw(),
-                    task_id = ack.task_id,
-                    "Ignoring DeleteIntent ack from unexpected worker"
-                );
-                continue;
-            }
-
-            if ack.intent_id != 0 && ack.intent_id != route.intent_id {
-                warn!(
-                    worker_id = worker_id.as_raw(),
-                    task_id = ack.task_id,
-                    ack_intent_id = ack.intent_id,
-                    route_intent_id = route.intent_id,
-                    "Ignoring DeleteIntent ack with mismatched intent_id"
-                );
-                continue;
-            }
-
-            self.handle_ack(route, worker_id, ack, now_ms).await;
-        }
-    }
-
-    /// Handle a single ack.
-    async fn handle_ack(&self, route: DeleteTaskRoute, worker_id: WorkerId, ack: &TaskAckProto, now_ms: u64) {
-        let intent_id = route.intent_id;
-        let status = match ack.status() {
-            proto::metadata::TaskAckStatusProto::TaskAckStatusSuccess => TaskAckStatus::Success,
-            proto::metadata::TaskAckStatusProto::TaskAckStatusFailed => TaskAckStatus::Failed,
-            proto::metadata::TaskAckStatusProto::TaskAckStatusRetryableFailed => TaskAckStatus::RetryableFailed,
-            _ => TaskAckStatus::Failed,
-        };
-        let error_class = TaskFailureClass::from_proto(ack.error_class());
-
-        // Handle per-block results if available (DeleteBlocksCommand)
-        if !ack.block_results.is_empty() {
-            self.handle_per_block_ack(route, worker_id, ack, now_ms).await;
-            return;
-        }
-
-        // Legacy: Handle single-block ack (EvictCommand)
-        match status {
-            TaskAckStatus::Success => {
-                // Success: mark worker as acked
-                let mut completed = false;
-                {
-                    let mut state = self.execution_state.write();
-                    if let Some(exec_state) = state.get_mut(&intent_id) {
-                        exec_state.acked_workers.insert(worker_id);
-
-                        // Check completion condition (ack only, no reconcile yet)
-                        completed = self.check_ack_completion(exec_state);
-                    }
-                }
-
-                if completed {
-                    // Check reconcile condition (blockreport convergence)
-                    let reconcile_completed = self.check_reconcile_completion(intent_id, now_ms);
-                    if reconcile_completed {
-                        self.mark_intent_completed(intent_id, now_ms, true).await;
-                    } else {
-                        // Ack completed but reconcile pending - mark as ack-only completed
-                        debug!(intent_id, "DeleteIntent ack completed, waiting for reconcile");
-                    }
-                }
-            }
-            TaskAckStatus::Failed | TaskAckStatus::RetryableFailed => {
-                // Legacy path - handle failure
-                // Failure: check if retryable
-                let is_retryable = matches!(status, TaskAckStatus::RetryableFailed)
-                    || matches!(error_class, Some(TaskFailureClass::Retryable));
-
-                if !is_retryable {
-                    // Non-retryable failure
-                    let error_msg = ack.error_message.clone();
-
-                    // Persist failed status through Raft before changing runtime state.
-                    if let Err(e) = self
-                        .propose_delete_intent_status(
-                            intent_id,
-                            DeleteIntentStatus::Failed,
-                            Some(now_ms),
-                            Some(error_msg.clone()),
-                        )
-                        .await
-                    {
-                        warn!(
-                            intent_id,
-                            error = %e,
-                            "Failed to persist DeleteIntent failed status"
-                        );
-                        return;
-                    }
-
-                    {
-                        let mut state = self.execution_state.write();
-                        if let Some(exec_state) = state.get_mut(&intent_id) {
-                            exec_state.status = IntentExecutionStatus::Failed {
-                                failed_at_ms: now_ms,
-                                reason: error_msg.clone(),
-                            };
-                        }
-                    }
-
-                    self.release_inflight_routes_for_intent(intent_id);
-
-                    self.metrics
-                        .delete_executor_requests_failed_total
-                        .fetch_add(1, Ordering::Relaxed);
-
-                    warn!(
-                        intent_id,
-                        worker_id = worker_id.as_raw(),
-                        error = %error_msg,
-                        "DeleteIntent failed (non-retryable) and persisted"
-                    );
-                } else {
-                    // Retryable: will retry in next cycle
-                    self.metrics.delete_intents_retry_total.fetch_add(1, Ordering::Relaxed);
-                    self.reset_intent_for_retry(route);
-                }
-            }
-        }
-    }
-
     /// Cleanup old completed/failed intents.
     fn cleanup_old_intents(&self, now_ms: u64) {
         const CLEANUP_TTL_MS: u64 = 60 * 60 * 1000; // 1 hour
@@ -870,221 +707,7 @@ impl DeleteExecutor {
             IntentExecutionStatus::Completed { completed_at_ms } => {
                 now_ms.saturating_sub(*completed_at_ms) < CLEANUP_TTL_MS
             }
-            IntentExecutionStatus::Failed { failed_at_ms, .. } => now_ms.saturating_sub(*failed_at_ms) < CLEANUP_TTL_MS,
         });
-    }
-
-    /// Get current in-flight count (for metrics).
-    #[cfg(test)]
-    pub fn get_inflight_count(&self) -> usize {
-        let state = self.execution_state.read();
-        state
-            .values()
-            .filter(|s| matches!(s.status, IntentExecutionStatus::InFlight { .. }))
-            .count()
-    }
-
-    #[cfg(test)]
-    pub(super) fn worker_inflight_count_for_test(&self, worker_id: WorkerId) -> usize {
-        self.worker_inflight
-            .read()
-            .get(&worker_id)
-            .map(|in_flight| in_flight.count)
-            .unwrap_or(0)
-    }
-
-    #[cfg(test)]
-    pub(super) fn block_inflight_contains_for_test(&self, block_id: BlockId) -> bool {
-        self.block_inflight.read().contains_key(&block_id)
-    }
-
-    /// Handle per-block ack results (DeleteBlocksCommand).
-    async fn handle_per_block_ack(&self, route: DeleteTaskRoute, worker_id: WorkerId, ack: &TaskAckProto, now_ms: u64) {
-        let intent_id = route.intent_id;
-        let block_id_opt = {
-            let state = self.execution_state.read();
-            state.get(&intent_id).map(|exec_state| exec_state.intent.block_id)
-        };
-
-        let Some(block_id) = block_id_opt else {
-            warn!(intent_id, "DeleteIntent not found for per-block ack");
-            return;
-        };
-
-        // Process each per-block result
-        for block_result in &ack.block_results {
-            let Some(proto_block_id) = &block_result.block_id else {
-                continue;
-            };
-            let result_block_id = BlockId::new(
-                types::ids::DataHandleId::new(proto_block_id.data_handle_id),
-                types::ids::BlockIndex::new(proto_block_id.block_index),
-            );
-
-            // Verify block_id matches
-            if result_block_id != block_id {
-                warn!(
-                    intent_id,
-                    expected_block = %block_id,
-                    actual_block = %result_block_id,
-                    "Block ID mismatch in per-block ack"
-                );
-                continue;
-            }
-
-            // Process based on status
-            match block_result.status() {
-                proto::metadata::DeleteBlockStatusProto::DeleteBlockStatusDeleted
-                | proto::metadata::DeleteBlockStatusProto::DeleteBlockStatusTombstoned
-                | proto::metadata::DeleteBlockStatusProto::DeleteBlockStatusNotFound => {
-                    // Success: mark worker as acked
-                    let mut ack_completed = false;
-                    {
-                        let mut state = self.execution_state.write();
-                        if let Some(exec_state) = state.get_mut(&intent_id) {
-                            exec_state.acked_workers.insert(worker_id);
-                            ack_completed = self.check_ack_completion(exec_state);
-                        }
-                    }
-
-                    if ack_completed {
-                        // Check reconcile condition (blockreport convergence)
-                        let reconcile_completed = self.check_reconcile_completion(intent_id, now_ms);
-                        if reconcile_completed {
-                            self.mark_intent_completed(intent_id, now_ms, true).await;
-                        } else {
-                            debug!(intent_id, "DeleteIntent ack completed, waiting for reconcile");
-                        }
-                    }
-                }
-                proto::metadata::DeleteBlockStatusProto::DeleteBlockStatusInProgress => {
-                    // In progress - metadata should retry/poll
-                    debug!(
-                        intent_id,
-                        block_id = %block_id,
-                        worker_id = worker_id.as_raw(),
-                        "Delete operation in progress, will retry"
-                    );
-                    self.metrics.delete_intents_retry_total.fetch_add(1, Ordering::Relaxed);
-                    self.reset_intent_for_retry(route);
-                }
-                proto::metadata::DeleteBlockStatusProto::DeleteBlockStatusBusy
-                | proto::metadata::DeleteBlockStatusProto::DeleteBlockStatusConflict => {
-                    // Retryable conflict - backoff and retry
-                    let retry_after_ms = block_result.retry_after_ms;
-                    debug!(
-                        intent_id,
-                        block_id = %block_id,
-                        worker_id = worker_id.as_raw(),
-                        retry_after_ms,
-                        "Delete operation blocked by conflict, will retry"
-                    );
-                    self.metrics.delete_intents_retry_total.fetch_add(1, Ordering::Relaxed);
-                    self.reset_intent_for_retry(route);
-                }
-                proto::metadata::DeleteBlockStatusProto::DeleteBlockStatusFailedFatal => {
-                    // Permanent failure
-                    let error_msg = block_result.message.clone();
-                    warn!(
-                        intent_id,
-                        block_id = %block_id,
-                        worker_id = worker_id.as_raw(),
-                        error = %error_msg,
-                        "Delete operation failed permanently"
-                    );
-                    self.mark_intent_failed(intent_id, now_ms, error_msg).await;
-                }
-                _ => {
-                    warn!(
-                        intent_id,
-                        block_id = %block_id,
-                        status = ?block_result.status(),
-                        "Unknown delete block status"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Check if ack condition is satisfied (all target workers have acked).
-    fn check_ack_completion(&self, exec_state: &IntentExecutionState) -> bool {
-        if !exec_state.intent.target_workers.is_empty() {
-            // Use explicit target_workers (e.g., for Orphan)
-            let target_set: HashSet<WorkerId> = exec_state.intent.target_workers.iter().copied().collect();
-            target_set.iter().all(|w| exec_state.acked_workers.contains(w))
-        } else {
-            // For GC: check if we've acked all known locations
-            let locations = self.worker_manager.get_block_locations(exec_state.intent.block_id);
-            if locations.is_empty() {
-                // No known locations - consider completed
-                true
-            } else {
-                // Check if all locations have acked
-                locations.iter().all(|w| exec_state.acked_workers.contains(w))
-            }
-        }
-    }
-
-    /// Check if reconcile condition is satisfied (block no longer in blockreport).
-    fn check_reconcile_completion(&self, intent_id: u64, _now_ms: u64) -> bool {
-        let exec_state_opt = {
-            let state = self.execution_state.read();
-            state.get(&intent_id).cloned()
-        };
-
-        let Some(exec_state) = exec_state_opt else {
-            return false;
-        };
-
-        let block_id = exec_state.intent.block_id;
-        let intent_reason = exec_state.intent.reason;
-        let target_workers = exec_state.intent.target_workers;
-
-        // For OverRep (ReplicaEvict): check if target_workers are no longer in locations
-        if matches!(intent_reason, crate::state::DeleteIntentReason::OverRep) {
-            let locations = self.worker_manager.get_block_locations(block_id);
-            let target_set: std::collections::HashSet<types::ids::WorkerId> = target_workers.iter().copied().collect();
-            let still_present: Vec<_> = locations.iter().filter(|w| target_set.contains(w)).collect();
-            if still_present.is_empty() {
-                // All target workers removed - reconcile completed
-                debug!(
-                    intent_id,
-                    block_id = %block_id,
-                    "Reconcile completed: target workers no longer in blockreport"
-                );
-                return true;
-            } else {
-                // Some target workers still present - reconcile pending
-                debug!(
-                    intent_id,
-                    block_id = %block_id,
-                    remaining_targets = still_present.len(),
-                    "Reconcile pending: target workers still reported"
-                );
-                return false;
-            }
-        }
-
-        // For other reasons (GC, Orphan, etc.): check if block no longer exists in any worker
-        let locations = self.worker_manager.get_block_locations(block_id);
-        if locations.is_empty() {
-            // Block no longer reported by any worker - reconcile completed
-            debug!(
-                intent_id,
-                block_id = %block_id,
-                "Reconcile completed: block no longer in blockreport"
-            );
-            true
-        } else {
-            // Block still reported - reconcile pending
-            debug!(
-                intent_id,
-                block_id = %block_id,
-                remaining_locations = locations.len(),
-                "Reconcile pending: block still reported by workers"
-            );
-            false
-        }
     }
 
     async fn propose_delete_intent_status(
@@ -1155,53 +778,6 @@ impl DeleteExecutor {
                 block_id = %block_id,
                 reconciled,
                 "DeleteIntent completed and persisted"
-            );
-        }
-    }
-
-    /// Mark intent as failed.
-    async fn mark_intent_failed(&self, intent_id: u64, now_ms: u64, reason: String) {
-        let block_id = {
-            let state = self.execution_state.read();
-            state.get(&intent_id).map(|exec_state| exec_state.intent.block_id)
-        };
-
-        if let Some(block_id) = block_id {
-            if let Err(e) = self
-                .propose_delete_intent_status(
-                    intent_id,
-                    DeleteIntentStatus::Failed,
-                    Some(now_ms),
-                    Some(reason.clone()),
-                )
-                .await
-            {
-                warn!(
-                    intent_id,
-                    error = %e,
-                    "Failed to persist DeleteIntent failed status"
-                );
-                return;
-            }
-
-            {
-                let mut state = self.execution_state.write();
-                if let Some(exec_state) = state.get_mut(&intent_id) {
-                    exec_state.status = IntentExecutionStatus::Failed {
-                        failed_at_ms: now_ms,
-                        reason: reason.clone(),
-                    };
-                }
-            }
-
-            self.release_inflight_routes_for_intent(intent_id);
-            self.release_registry_held(intent_id, block_id);
-
-            error!(
-                intent_id,
-                block_id = %block_id,
-                reason = %reason,
-                "DeleteIntent failed permanently"
             );
         }
     }

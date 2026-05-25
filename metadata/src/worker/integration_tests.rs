@@ -4,7 +4,7 @@
 //! Integration tests for worker management and block reporting.
 
 use crate::maintenance::repair::{OrphanQueue, RepairPlanner, RepairQueue, RepairTask};
-use crate::worker::manager::HealthStatus;
+use crate::worker::manager::{HealthStatus, WorkerRegistrationKey};
 use crate::worker::WorkerManager;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -45,7 +45,7 @@ async fn test_worker_registration_and_heartbeat() {
     assert!(manager.is_worker_live(ShardGroupId::new(1), worker_id));
 
     let live_workers = manager.list_live_workers();
-    assert!(live_workers.contains(&worker_id));
+    assert!(live_workers.contains(&WorkerRegistrationKey::new(ShardGroupId::new(1), worker_id)));
 }
 
 #[tokio::test]
@@ -81,24 +81,28 @@ async fn test_block_report_updates_locations() {
         .unwrap();
 
     // First block report
-    let (added1, removed1) = manager.update_locations(worker_id, vec![block_id1, block_id2]).unwrap();
+    let (added1, removed1) = manager
+        .update_locations(ShardGroupId::new(1), worker_id, vec![block_id1, block_id2])
+        .unwrap();
     assert_eq!(added1.len(), 2);
     assert_eq!(removed1.len(), 0);
 
     // Verify locations (only live workers returned)
-    assert_eq!(manager.get_block_locations(block_id1).len(), 1);
-    assert_eq!(manager.get_block_locations(block_id2).len(), 1);
+    assert_eq!(manager.get_block_locations(ShardGroupId::new(1), block_id1).len(), 1);
+    assert_eq!(manager.get_block_locations(ShardGroupId::new(1), block_id2).len(), 1);
 
     // Second block report (remove block_id2, add block_id3)
     let block_id3 = BlockId::new(DataHandleId::new(1), BlockIndex::new(2));
-    let (added2, removed2) = manager.update_locations(worker_id, vec![block_id1, block_id3]).unwrap();
+    let (added2, removed2) = manager
+        .update_locations(ShardGroupId::new(1), worker_id, vec![block_id1, block_id3])
+        .unwrap();
     assert_eq!(added2.len(), 1); // block_id3
     assert_eq!(removed2.len(), 1); // block_id2
 
     // Verify locations updated
-    assert_eq!(manager.get_block_locations(block_id1).len(), 1);
-    assert_eq!(manager.get_block_locations(block_id2).len(), 0); // Removed
-    assert_eq!(manager.get_block_locations(block_id3).len(), 1);
+    assert_eq!(manager.get_block_locations(ShardGroupId::new(1), block_id1).len(), 1);
+    assert_eq!(manager.get_block_locations(ShardGroupId::new(1), block_id2).len(), 0); // Removed
+    assert_eq!(manager.get_block_locations(ShardGroupId::new(1), block_id3).len(), 1);
 }
 
 #[tokio::test]
@@ -139,19 +143,21 @@ async fn test_block_report_batching_correctness() {
     }
 
     // Update locations ONCE with all blocks (not batched)
-    let (added, removed) = manager.update_locations(worker_id, reported_blocks.clone()).unwrap();
+    let (added, removed) = manager
+        .update_locations(ShardGroupId::new(1), worker_id, reported_blocks.clone())
+        .unwrap();
     assert_eq!(added.len(), 2001);
     assert_eq!(removed.len(), 0);
 
     // Verify all blocks are present (only live workers returned)
     for block_id in &reported_blocks {
-        let locations = manager.get_block_locations(*block_id);
+        let locations = manager.get_block_locations(ShardGroupId::new(1), *block_id);
         assert_eq!(locations.len(), 1, "Block {} should have 1 location", block_id);
         assert!(locations.contains(&worker_id));
     }
 
     // Verify worker_blocks mapping
-    let worker_blocks = manager.get_worker_blocks(worker_id);
+    let worker_blocks = manager.get_worker_blocks(ShardGroupId::new(1), worker_id);
     assert_eq!(worker_blocks.len(), 2001);
 }
 
@@ -186,11 +192,13 @@ async fn test_dead_worker_cleanup() {
         )
         .unwrap();
 
-    manager.update_locations(worker_id, vec![block_id]).unwrap();
+    manager
+        .update_locations(ShardGroupId::new(1), worker_id, vec![block_id])
+        .unwrap();
 
     // Verify worker is live
     assert!(manager.is_worker_live(ShardGroupId::new(1), worker_id));
-    assert_eq!(manager.get_block_locations(block_id).len(), 1);
+    assert_eq!(manager.get_block_locations(ShardGroupId::new(1), block_id).len(), 1);
 
     // Force timeout by manipulating last_seen_ms to the past
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -201,7 +209,7 @@ async fn test_dead_worker_cleanup() {
     assert!(!manager.is_worker_live(ShardGroupId::new(1), worker_id));
 
     // Verify locations are cleaned up (only live workers returned)
-    assert_eq!(manager.get_block_locations(block_id).len(), 0);
+    assert_eq!(manager.get_block_locations(ShardGroupId::new(1), block_id).len(), 0);
 }
 
 #[tokio::test]
@@ -354,7 +362,9 @@ async fn test_worker_placement_selection() {
         .unwrap();
 
     // Request placement with replication_factor=3
-    let placement = manager.select_workers_for_placement(3, None).unwrap();
+    let placement = manager
+        .select_workers_for_placement_in_group(ShardGroupId::new(1), 3, None)
+        .unwrap();
 
     // Verify we got 3 different workers
     let mut workers = vec![placement.primary];
@@ -527,7 +537,9 @@ async fn test_replication_check_triggers_repair() {
         .unwrap();
 
     // Update locations: block has only 1 replica (worker1)
-    manager.update_locations(worker1, vec![block_id]).unwrap();
+    manager
+        .update_locations(ShardGroupId::new(1), worker1, vec![block_id])
+        .unwrap();
 
     // Check replication: current=1, target=3, available=[1,2,3,4]
     // Use explicit worker list to ensure deterministic selection

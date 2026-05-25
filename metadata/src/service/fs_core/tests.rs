@@ -11,7 +11,7 @@ use crate::service::domain::{
     RequestContext, SessionKey, SyncWriteInput, SyncWriteMode, UnlinkInput,
 };
 use crate::state::{MemoryStateStore, RouteEpoch};
-use crate::worker::{HealthStatus, WorkerManager};
+use crate::worker::{HealthStatus, WorkerInfo, WorkerManager};
 use async_trait::async_trait;
 use common::error::canonical::{ErrorCode as CanonicalErrorCode, RefreshReason};
 use common::header::{AuthnType, RequestHeader, RpcErrorCode};
@@ -22,7 +22,8 @@ use types::fs::{FileAttrs, Inode};
 use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, LeaseId, MountId, ShardGroupId, WorkerId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
-use types::{CommittedBlock, WriteTarget};
+use types::worker::WorkerNetProtocol;
+use types::{CommittedBlock, WorkerEndpointInfo, WriteTarget};
 
 use super::freshness::{FreshnessValidator, StaleStateStatus};
 
@@ -119,6 +120,10 @@ fn worker_manager_for_write_targets(group_id: ShardGroupId) -> Arc<WorkerManager
     manager
 }
 
+fn fs_core_without_mount() -> FsCore {
+    FsCore::new_default(Arc::new(MemoryStateStore::new()), Arc::new(MountTable::new()))
+}
+
 #[tokio::test]
 async fn get_file_layout_returns_worker_locations_from_worker_manager() {
     let dir = TempDir::new().unwrap();
@@ -138,7 +143,9 @@ async fn get_file_layout_returns_worker_locations_from_worker_manager() {
         worker_manager
             .record_test_heartbeat(group_id, worker_id, 1024, 0, 1024, 0, 0, HealthStatus::Healthy)
             .unwrap();
-        worker_manager.update_locations(worker_id, vec![block_id]).unwrap();
+        worker_manager
+            .update_locations(group_id, worker_id, vec![block_id])
+            .unwrap();
     }
     fs_core.set_storage(Arc::clone(&storage));
     fs_core.set_worker_manager(worker_manager);
@@ -187,6 +194,157 @@ async fn get_file_layout_returns_worker_locations_from_worker_manager() {
     assert_eq!(location.worker_epoch, Some(22));
     assert_eq!(location.block_stamp, 41);
     assert_eq!(location.workers[0].endpoint, "127.0.0.1:9101");
+}
+
+#[tokio::test]
+async fn get_file_layout_rejects_worker_lookup_without_authoritative_group() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(52);
+    let inode_id = InodeId::new(520);
+    let data_handle_id = DataHandleId::new(9520);
+    let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+    let worker_id = WorkerId::new(1);
+    let mut fs_core = fs_core_without_mount();
+    let worker_manager = Arc::new(WorkerManager::new(60));
+    let fallback_group = ShardGroupId::new(1);
+
+    worker_manager
+        .register_worker(fallback_group, worker_id, "127.0.0.1:9101".to_string(), 1, 11, None)
+        .unwrap();
+    worker_manager
+        .record_test_heartbeat(fallback_group, worker_id, 1024, 0, 1024, 0, 0, HealthStatus::Healthy)
+        .unwrap();
+    worker_manager
+        .update_locations(fallback_group, worker_id, vec![block_id])
+        .unwrap();
+    fs_core.set_storage(Arc::clone(&storage));
+    fs_core.set_worker_manager(worker_manager);
+
+    let mut attrs = FileAttrs::new();
+    attrs.size = 512;
+    let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+    inode.data = types::fs::InodeData::File {
+        extents: vec![types::fs::Extent {
+            file_offset: 0,
+            block_id,
+            block_offset: 0,
+            len: 512,
+            file_version: Some(1),
+            block_stamp: Some(41),
+        }],
+        file_version: Some(1),
+        lease_epoch: None,
+    };
+    storage.put_inode(&inode).unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let failure = fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx: request_context(),
+            inode_id,
+            range: None,
+            requested_data_handle_id: None,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect_err("missing mount owner group must reject worker lookup");
+
+    assert!(
+        failure
+            .error
+            .message
+            .contains("GetFileLayout worker lookup requires authoritative metadata group"),
+        "unexpected error: {}",
+        failure.error.message
+    );
+    assert_eq!(failure.group_id, None);
+}
+
+#[tokio::test]
+async fn get_file_layout_does_not_cross_read_worker_descriptor_from_other_group() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(51);
+    let served_group = ShardGroupId::new(9);
+    let other_group = ShardGroupId::new(10);
+    let inode_id = InodeId::new(510);
+    let data_handle_id = DataHandleId::new(9510);
+    let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+    let worker_id = WorkerId::new(1);
+    let worker_run_id: types::WorkerRunId = "550e8400-e29b-41d4-a716-446655440052".parse().unwrap();
+    let mut fs_core = fs_core_with_mount(mount_id, 9, served_group);
+    let worker_manager = Arc::new(WorkerManager::new(60));
+
+    worker_manager
+        .register_worker_run(
+            other_group,
+            worker_id,
+            "127.0.0.1:9999".to_string(),
+            1,
+            worker_run_id,
+            None,
+        )
+        .unwrap();
+    worker_manager
+        .record_heartbeat(
+            other_group,
+            worker_id,
+            worker_run_id,
+            1,
+            "127.0.0.1:9999",
+            1,
+            1024,
+            0,
+            1024,
+            0,
+            0,
+            HealthStatus::Healthy,
+        )
+        .unwrap();
+    worker_manager
+        .update_locations(other_group, worker_id, vec![block_id])
+        .unwrap();
+    fs_core.set_storage(Arc::clone(&storage));
+    fs_core.set_worker_manager(worker_manager);
+
+    let mut attrs = FileAttrs::new();
+    attrs.size = 512;
+    let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+    inode.data = types::fs::InodeData::File {
+        extents: vec![types::fs::Extent {
+            file_offset: 0,
+            block_id,
+            block_offset: 0,
+            len: 512,
+            file_version: Some(1),
+            block_stamp: Some(41),
+        }],
+        file_version: Some(1),
+        lease_epoch: None,
+    };
+    storage.put_inode(&inode).unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let success = fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx: request_context(),
+            inode_id,
+            range: None,
+            requested_data_handle_id: None,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("layout read succeeds");
+
+    assert_eq!(success.payload.locations.len(), 1);
+    assert!(
+        success.payload.locations[0].workers.is_empty(),
+        "served group must not reuse another group's worker descriptor"
+    );
+    assert_eq!(success.payload.locations[0].worker_epoch, None);
 }
 
 #[tokio::test]
@@ -1286,6 +1444,145 @@ async fn open_write_targets_use_inode_current_data_handle() {
     assert_eq!(session.data_handle_id, data_handle_id);
 }
 
+#[test]
+fn open_write_preflight_rejects_placement_without_authoritative_group() {
+    let mut fs_core = fs_core_without_mount();
+    fs_core.set_worker_manager(worker_manager_for_write_targets(ShardGroupId::new(1)));
+
+    let failure = fs_core
+        .preflight_open_write_runtime(
+            &request_context(),
+            Some(4096),
+            FileLayout::new(4096, 4096, 1),
+            None,
+            None,
+        )
+        .expect("missing authoritative group must reject placement preflight");
+
+    assert!(
+        failure
+            .error
+            .message
+            .contains("OpenWrite preflight worker lookup requires authoritative metadata group"),
+        "unexpected error: {}",
+        failure.error.message
+    );
+}
+
+#[tokio::test]
+async fn commit_worker_epoch_check_rejects_missing_authoritative_group() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(53);
+    let inode_id = InodeId::new(530);
+    let data_handle_id = DataHandleId::new(9530);
+    let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+    let worker_id = WorkerId::new(1);
+    let mut fs_core = fs_core_without_mount();
+    fs_core.set_storage(Arc::clone(&storage));
+    fs_core.set_worker_manager(worker_manager_for_write_targets(ShardGroupId::new(1)));
+
+    storage
+        .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+        .unwrap();
+    let writer = ClientId::new(7);
+    let (lease_id, lease_epoch, _) = fs_core
+        .inode_lease_manager_for_test()
+        .try_acquire(
+            inode_id,
+            writer,
+            Some(types::CallId::new()),
+            crate::inode_lease::WriteMode::Write,
+            None,
+        )
+        .expect("lease acquired");
+    let file_handle =
+        fs_core
+            .write_session_manager_for_test()
+            .create_session(crate::write_session::CreateSessionInput {
+                inode_id,
+                mount_id,
+                data_handle_id,
+                lease_id,
+                lease_epoch,
+                fencing_token: FencingToken {
+                    block_id,
+                    owner: writer,
+                    epoch: lease_epoch,
+                },
+                open_epoch: 777,
+                base_size: 0,
+                mode: crate::inode_lease::WriteMode::Write,
+                write_targets: vec![WriteTarget {
+                    block_id,
+                    file_offset: 0,
+                    len: 64,
+                    worker_endpoints: vec![WorkerEndpointInfo {
+                        worker_id,
+                        endpoint: "127.0.0.1:9001".to_string(),
+                        worker_net_protocol: WorkerNetProtocol::Grpc,
+                        worker_epoch: 11,
+                    }],
+                    fencing_token: FencingToken {
+                        block_id,
+                        owner: writer,
+                        epoch: lease_epoch,
+                    },
+                    block_stamp: 1,
+                    chunk_size: 64,
+                }],
+                writer_identity: crate::write_session::WriterIdentity {
+                    client_id: writer,
+                    call_id: types::CallId::new(),
+                },
+            });
+    let session = fs_core
+        .write_session_for_handle(file_handle)
+        .expect("session should be installed");
+    fs_core
+        .execute_add_block(AddBlockInput {
+            ctx: request_context(),
+            file_handle,
+            lease_id: Some(session.lease_id),
+            lease_epoch: session.lease_epoch,
+            open_epoch: session.open_epoch,
+            fencing_token: Some(presented_session_token(&session)),
+            desired_len: Some(64),
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("preallocated target should be issued");
+    let session = fs_core
+        .write_session_for_handle(file_handle)
+        .expect("session should remain installed");
+
+    let failure = fs_core
+        .execute_close_write(CloseWriteInput {
+            ctx: request_context(),
+            file_handle,
+            lease_id: Some(session.lease_id),
+            lease_epoch: session.lease_epoch,
+            open_epoch: session.open_epoch,
+            fencing_token: Some(presented_session_token(&session)),
+            intent: CloseWriteIntent {
+                committed_blocks: vec![committed_block(block_id, 0, 64)],
+                final_size: 64,
+            },
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect_err("missing authoritative group must reject commit worker lookup");
+
+    assert!(
+        failure
+            .error
+            .message
+            .contains("CommitFile worker lookup requires authoritative metadata group"),
+        "unexpected error: {}",
+        failure.error.message
+    );
+}
+
 #[tokio::test]
 async fn open_write_rejects_file_missing_current_data_handle() {
     let dir = TempDir::new().unwrap();
@@ -1395,6 +1692,61 @@ async fn create_then_add_block() {
     assert_eq!(success.payload.file_version, Some(1));
     assert!(env.fs_core.write_session_for_handle(key.file_handle).is_none());
     assert_eq!(env.storage.get_inode(env.inode_id).unwrap().unwrap().attrs.size, 512);
+}
+
+#[tokio::test]
+async fn commit_worker_epoch_check_uses_session_group() {
+    let env = write_flow_env(0).await;
+    let open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(64),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("open write should succeed");
+    let key = open.payload.session_key;
+    let target = add_block_for_key(&env.fs_core, &key, 64).await;
+    let endpoint = target.worker_endpoints.first().expect("worker endpoint").clone();
+    let worker_manager = env.fs_core.worker_manager.as_ref().expect("worker manager");
+    let other_group = ShardGroupId::new(env.group_id.as_raw() + 1);
+
+    worker_manager
+        .load_registered_workers(vec![WorkerInfo {
+            group_id: other_group,
+            worker_id: endpoint.worker_id,
+            address: "127.0.0.1:9999".to_string(),
+            worker_net_protocol: 1,
+            worker_epoch: endpoint.worker_epoch,
+            capacity_total: 0,
+            capacity_used: 0,
+            capacity_available: 0,
+            active_reads: 0,
+            active_writes: 0,
+            health: HealthStatus::Healthy,
+            last_heartbeat: 0,
+            fault_domain: None,
+        }])
+        .expect("replace manager descriptors with another group");
+
+    let failure = commit_for_key(
+        &env.fs_core,
+        &key,
+        vec![committed_block(target.block_id, target.file_offset, target.len)],
+        64,
+    )
+    .await
+    .expect_err("commit must not validate worker_epoch against another group's descriptor");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::WorkerEpochMismatch))
+    );
+    assert_eq!(failure.error.reason, Some(RefreshReason::WorkerEpochMismatch));
+    assert!(failure.error.message.contains("worker_epoch mismatch"));
 }
 
 #[tokio::test]
@@ -1553,7 +1905,7 @@ async fn worker_report_does_not_change_file_version() {
 
     let worker_manager = env.fs_core.worker_manager.as_ref().expect("worker manager");
     worker_manager
-        .update_locations(WorkerId::new(1), vec![target.block_id])
+        .update_locations(env.group_id, WorkerId::new(1), vec![target.block_id])
         .expect("worker report should update soft locations");
     worker_manager
         .record_test_heartbeat(

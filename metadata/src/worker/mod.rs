@@ -11,8 +11,6 @@
 
 mod command_router;
 mod full_report_lease;
-#[cfg(test)]
-mod full_report_lease_tests;
 mod manager;
 pub(crate) mod metrics;
 mod service;

@@ -65,14 +65,20 @@ impl LostWorkerCleanupService {
 
         let mut outcome = LostWorkerCleanupOutcome::default();
         for dead_worker in dead_workers {
-            info!(worker_id = dead_worker.as_raw(), "Removing dead worker");
-            let affected_blocks = self.worker_manager.remove_dead_worker(dead_worker);
+            info!(
+                group_id = dead_worker.group_id.as_raw(),
+                worker_id = dead_worker.worker_id.as_raw(),
+                "Removing dead worker"
+            );
+            let affected_blocks = self
+                .worker_manager
+                .remove_dead_worker(dead_worker.group_id, dead_worker.worker_id);
             outcome.removed_workers += 1;
             outcome.affected_blocks += affected_blocks.len();
 
-            let live_workers_after = self.worker_manager.list_live_workers();
+            let live_workers_after = self.worker_manager.list_live_workers_in_group(dead_worker.group_id);
             for block_id in affected_blocks {
-                let current_locations = self.worker_manager.get_block_locations(block_id);
+                let current_locations = self.worker_manager.get_block_locations(dead_worker.group_id, block_id);
                 let replication_factor = self.repair_policy.default_replication_factor;
                 let actions = self.repair_planner.plan_replication(
                     block_id,
@@ -222,8 +228,12 @@ mod tests {
         live_worker(&worker_manager, target_a);
         live_worker(&worker_manager, target_b);
         registered_dead_worker(&worker_manager, dead);
-        worker_manager.update_locations(source, vec![block_id]).unwrap();
-        worker_manager.update_locations(dead, vec![block_id]).unwrap();
+        worker_manager
+            .update_locations(ShardGroupId::new(1), source, vec![block_id])
+            .unwrap();
+        worker_manager
+            .update_locations(ShardGroupId::new(1), dead, vec![block_id])
+            .unwrap();
 
         let outcome = service(
             Arc::clone(&raft_node),
@@ -238,8 +248,11 @@ mod tests {
         assert_eq!(outcome.removed_workers, 1);
         assert_eq!(outcome.affected_blocks, 1);
         assert_eq!(outcome.repair_tasks_enqueued, 2);
-        assert!(worker_manager.get_worker_blocks(dead).is_empty());
-        assert_eq!(worker_manager.get_block_locations(block_id), vec![source]);
+        assert!(worker_manager.get_worker_blocks(ShardGroupId::new(1), dead).is_empty());
+        assert_eq!(
+            worker_manager.get_block_locations(ShardGroupId::new(1), block_id),
+            vec![source]
+        );
         assert_eq!(repair_queue.len_pending(), 2);
     }
 
@@ -284,8 +297,12 @@ mod tests {
         live_worker(&worker_manager, target_a);
         live_worker(&worker_manager, target_b);
         registered_dead_worker(&worker_manager, dead);
-        worker_manager.update_locations(source, vec![block_id]).unwrap();
-        worker_manager.update_locations(dead, vec![block_id]).unwrap();
+        worker_manager
+            .update_locations(ShardGroupId::new(1), source, vec![block_id])
+            .unwrap();
+        worker_manager
+            .update_locations(ShardGroupId::new(1), dead, vec![block_id])
+            .unwrap();
 
         let outcome = service_with_policy(
             Arc::clone(&raft_node),
@@ -324,7 +341,9 @@ mod tests {
         let dead = WorkerId::new(1);
         let block_id = BlockId::new(DataHandleId::new(12), BlockIndex::new(0));
         registered_dead_worker(&worker_manager, dead);
-        worker_manager.update_locations(dead, vec![block_id]).unwrap();
+        worker_manager
+            .update_locations(ShardGroupId::new(1), dead, vec![block_id])
+            .unwrap();
 
         let outcome = service(
             Arc::clone(&raft_node),
@@ -338,7 +357,10 @@ mod tests {
 
         assert_eq!(outcome.removed_workers, 0);
         assert_eq!(outcome.skipped_dead_workers, 0);
-        assert_eq!(worker_manager.get_worker_blocks(dead), vec![block_id]);
+        assert_eq!(
+            worker_manager.get_worker_blocks(ShardGroupId::new(1), dead),
+            vec![block_id]
+        );
         assert_eq!(repair_queue.len_pending(), 0);
     }
 }

@@ -68,7 +68,7 @@ struct MetricsUpdate {
 
 /// Repair queue with state machine, deduplication, and retry.
 ///
-/// Manages the lifecycle of repair tasks (Replicate, MoveCopy, EvictReplica) with:
+/// Manages the lifecycle of repair tasks (Replicate, EvictReplica) with:
 /// - State tracking: Pending → InFlight → Done/Failed
 /// - Deduplication: Prevents duplicate tasks based on dedup keys
 /// - Worker-level rate limiting: Limits concurrent tasks per worker
@@ -311,9 +311,8 @@ impl RepairQueue {
 
                     // Check if task matches this worker
                     let matches = match &record.task {
-                        RepairTask::Replicate { target_worker, .. } => *target_worker == worker_id,
-                        RepairTask::MoveCopy { to_worker, .. } => *to_worker == worker_id,
-                        RepairTask::EvictReplica { target_worker, .. } => *target_worker == worker_id,
+                        RepairTask::Replicate { target_worker, .. }
+                        | RepairTask::EvictReplica { target_worker, .. } => *target_worker == worker_id,
                     };
 
                     if matches {
@@ -449,24 +448,11 @@ impl RepairQueue {
         }
 
         // Handle success or failure
-        let mut followup_task: Option<RepairTask> = None;
+        let followup_task: Option<RepairTask> = None;
         let mut metrics_update = MetricsUpdate::default();
 
         match status {
             TaskAckStatus::Success => {
-                // Check if this is a MoveCopy that needs to trigger replica eviction.
-                if let RepairTask::MoveCopy {
-                    block_id, from_worker, ..
-                } = &record.task
-                {
-                    // Create a follow-up replica eviction task for from_worker.
-                    followup_task = Some(RepairTask::EvictReplica {
-                        target_worker: *from_worker,
-                        block_id: *block_id,
-                        reason: format!("MoveCopy completed (task_id={})", task_id.0),
-                    });
-                }
-
                 // Remove from dedup map
                 state.dedup.remove(&record.dedup_key);
 

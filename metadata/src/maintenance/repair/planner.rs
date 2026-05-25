@@ -38,8 +38,7 @@ use types::ids::{BlockId, WorkerId};
 /// # Outputs
 ///
 /// - RepairAction::Replicate (when replication factor not met)
-/// - RepairAction::MoveCopy (when rebalancing needed)
-/// - RepairAction::EvictReplica (for excess replicas and move-copy follow-ups)
+/// - RepairAction::EvictReplica (for excess replicas)
 ///
 /// Orphan/GC physical deletion is represented by DeleteIntent and consumed by
 /// DeleteExecutor, not by RepairPlanner.
@@ -135,100 +134,10 @@ impl RepairPlanner {
         }
     }
 
-    /// Plan rebalancing actions based on worker load (pure planning, no side effects).
-    ///
-    /// Returns a list of RepairAction::MoveCopy actions that should be executed
-    /// to balance worker load.
-    pub fn plan_rebalance(&self, worker_manager: &crate::worker::WorkerManager) -> Vec<RepairAction> {
-        // Get all live workers with their load information
-        let live_workers = worker_manager.list_live_workers();
-
-        // Calculate load metrics for each worker
-        let mut worker_loads: Vec<(WorkerId, f64)> = live_workers
-            .iter()
-            .filter_map(|&id| {
-                worker_manager.get_worker_any_group(id).map(|w| {
-                    // Calculate load as: (capacity_used / capacity_total) * 100
-                    let capacity_ratio = if w.capacity_total > 0 {
-                        w.capacity_used as f64 / w.capacity_total as f64
-                    } else {
-                        0.0
-                    };
-                    // Also factor in active I/O operations
-                    let io_load = (w.active_reads + w.active_writes) as f64 / 1000.0; // Normalize
-                    let total_load = capacity_ratio * 0.7 + io_load * 0.3; // Weighted
-                    (id, total_load)
-                })
-            })
-            .collect();
-
-        if worker_loads.len() < 2 {
-            // Need at least 2 workers for rebalancing
-            return Vec::new();
-        }
-
-        // Sort by load
-        worker_loads.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Find overloaded (top 20%) and underloaded (bottom 20%)
-        let threshold_high = 0.8; // 80% load threshold
-        let threshold_low = 0.3; // 30% load threshold
-
-        let overloaded: Vec<(WorkerId, f64)> = worker_loads
-            .iter()
-            .rev()
-            .take((worker_loads.len() as f64 * 0.2).ceil() as usize)
-            .filter(|(_, load)| *load > threshold_high)
-            .map(|(id, load)| (*id, *load))
-            .collect();
-
-        let underloaded: Vec<(WorkerId, f64)> = worker_loads
-            .iter()
-            .take((worker_loads.len() as f64 * 0.2).ceil() as usize)
-            .filter(|(_, load)| *load < threshold_low)
-            .map(|(id, load)| (*id, *load))
-            .collect();
-
-        if overloaded.is_empty() || underloaded.is_empty() {
-            return Vec::new();
-        }
-
-        // Create move actions: move blocks from overloaded to underloaded workers
-        // Limit to 10 rebalance actions per cycle to avoid overwhelming the system
-        const MAX_REBALANCE_ACTIONS: usize = 10;
-        let mut action_count = 0;
-        let mut actions = Vec::new();
-
-        for (from_worker, _) in &overloaded {
-            if action_count >= MAX_REBALANCE_ACTIONS {
-                break;
-            }
-
-            // Get blocks on this worker
-            let blocks = worker_manager.get_worker_blocks(*from_worker);
-
-            // Select a few blocks to move (prefer smaller blocks or less frequently accessed)
-            // For simplicity, we'll move up to 5 blocks per overloaded worker
-            let blocks_to_move: Vec<BlockId> = blocks.iter().take(5).copied().collect();
-
-            // Select target worker (round-robin from underloaded)
-            for (idx, block_id) in blocks_to_move.iter().enumerate() {
-                if action_count >= MAX_REBALANCE_ACTIONS {
-                    break;
-                }
-
-                let to_worker = underloaded[idx % underloaded.len()].0;
-
-                actions.push(RepairAction::MoveCopy {
-                    block_id: *block_id,
-                    from_worker: *from_worker,
-                    to_worker,
-                });
-
-                action_count += 1;
-            }
-        }
-
-        actions
+    /// Plan rebalancing actions based on worker load.
+    pub fn plan_rebalance(&self, _worker_manager: &crate::worker::WorkerManager) -> Vec<RepairAction> {
+        // Rebalance planning currently emits no copy actions because source
+        // and target routing must carry authoritative group identity.
+        Vec::new()
     }
 }

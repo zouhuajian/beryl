@@ -41,7 +41,7 @@ impl DeleteIntentBuilder {
         guard_state_id: RaftLogId,
         target_workers: Vec<WorkerId>,
     ) -> MetadataResult<DeleteIntent> {
-        // Resolve group_id from block_id (TODO-1)
+        // Resolve the authoritative group before building the intent.
         let group_id = self.resolve_group_id(block_id)?;
 
         // Build guard_watermark

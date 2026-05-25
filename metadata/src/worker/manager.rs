@@ -80,8 +80,8 @@ impl From<i32> for HealthStatus {
     }
 }
 
-/// Block locations: block_id -> [worker_ids...]
-pub type BlockLocations = HashMap<BlockId, Vec<WorkerId>>;
+/// Block locations: block_id -> [(group_id, worker_id)...]
+pub type BlockLocations = HashMap<BlockId, Vec<WorkerRegistrationKey>>;
 
 /// Group-scoped key for worker registration and liveness state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -152,8 +152,8 @@ pub struct WorkerManager {
     runtime: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerRuntime>>>,
     /// Block presence: block_id -> [worker_ids] (soft-state, memory-only).
     locations: Arc<RwLock<BlockLocations>>, // block_id -> [worker_ids]
-    /// Worker blocks: worker_id -> [block_ids] (soft-state, memory-only).
-    worker_blocks: Arc<RwLock<HashMap<WorkerId, Vec<BlockId>>>>, // worker_id -> [block_ids]
+    /// Worker blocks: (group_id, worker_id) -> [block_ids] (soft-state, memory-only).
+    worker_blocks: Arc<RwLock<HashMap<WorkerRegistrationKey, Vec<BlockId>>>>,
     /// Worker sync state: worker_id -> sync state (per-metadata-node, memory-only).
     worker_sync_state: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerSyncState>>>,
     /// Current metadata epoch (incremented on metadata restart).
@@ -303,7 +303,7 @@ impl WorkerManager {
         reported_blocks: Vec<BlockId>,
     ) -> MetadataResult<(Vec<BlockId>, Vec<BlockId>)> {
         // Update locations (full replacement)
-        let result = self.update_locations(worker_id, reported_blocks)?;
+        let result = self.update_locations(group_id, worker_id, reported_blocks)?;
 
         // Mark full sync as complete
         self.mark_full_sync_complete(group_id, worker_id);
@@ -331,8 +331,9 @@ impl WorkerManager {
 
         // Get current blocks
         let worker_blocks = self.worker_blocks.read();
+        let key = WorkerRegistrationKey::new(group_id, worker_id);
         let mut current_blocks: std::collections::HashSet<BlockId> = worker_blocks
-            .get(&worker_id)
+            .get(&key)
             .map(|blocks| blocks.iter().copied().collect())
             .unwrap_or_default();
         drop(worker_blocks);
@@ -347,7 +348,7 @@ impl WorkerManager {
 
         // Update locations with new block set
         let new_blocks: Vec<BlockId> = current_blocks.into_iter().collect();
-        self.update_locations(worker_id, new_blocks)
+        self.update_locations(group_id, worker_id, new_blocks)
     }
 
     /// Upsert worker descriptor (called from Raft apply).
@@ -392,27 +393,15 @@ impl WorkerManager {
     }
 
     /// Get a worker descriptor scoped to one metadata group.
-    pub fn get_descriptor_in_group(&self, group_id: ShardGroupId, worker_id: WorkerId) -> Option<WorkerDescriptor> {
+    pub fn get_descriptor(&self, group_id: ShardGroupId, worker_id: WorkerId) -> Option<WorkerDescriptor> {
         let descriptors = self.descriptors.read();
         descriptors
             .get(&WorkerRegistrationKey::new(group_id, worker_id))
             .cloned()
     }
 
-    /// Get a descriptor by worker id for current single-group data-plane call sites.
-    pub fn get_descriptor(&self, worker_id: WorkerId) -> Option<WorkerDescriptor> {
-        let descriptors = self.descriptors.read();
-        descriptors
-            .iter()
-            .find_map(|(key, descriptor)| (key.worker_id == worker_id).then(|| descriptor.clone()))
-    }
-
     /// Get live startup registration state scoped to one metadata group.
-    pub fn get_registration_in_group(
-        &self,
-        group_id: ShardGroupId,
-        worker_id: WorkerId,
-    ) -> Option<WorkerRegistrationState> {
+    pub fn get_registration(&self, group_id: ShardGroupId, worker_id: WorkerId) -> Option<WorkerRegistrationState> {
         let registrations = self.registrations.read();
         registrations
             .get(&WorkerRegistrationKey::new(group_id, worker_id))
@@ -642,36 +631,8 @@ impl WorkerManager {
         })
     }
 
-    /// Get worker info by worker id for current single-group maintenance paths.
-    pub fn get_worker_any_group(&self, worker_id: WorkerId) -> Option<WorkerInfo> {
-        let descriptors = self.descriptors.read();
-        let runtime = self.runtime.read();
-
-        descriptors.iter().find_map(|(key, descriptor)| {
-            if key.worker_id != worker_id {
-                return None;
-            }
-            let runtime_data = runtime.get(key)?;
-            Some(WorkerInfo {
-                group_id: descriptor.group_id,
-                worker_id: descriptor.worker_id,
-                address: descriptor.address.clone(),
-                worker_net_protocol: descriptor.worker_net_protocol,
-                worker_epoch: descriptor.worker_epoch,
-                capacity_total: runtime_data.capacity_total,
-                capacity_used: runtime_data.capacity_used,
-                capacity_available: runtime_data.capacity_available,
-                active_reads: runtime_data.active_reads,
-                active_writes: runtime_data.active_writes,
-                health: runtime_data.health,
-                last_heartbeat: runtime_data.last_seen_ms / 1000,
-                fault_domain: descriptor.fault_domain.clone(),
-            })
-        })
-    }
-
-    /// List all live workers (based on runtime last_seen_ms).
-    pub fn list_live_workers(&self) -> Vec<WorkerId> {
+    /// List all live workers (based on runtime last_seen_ms), preserving group identity.
+    pub fn list_live_workers(&self) -> Vec<WorkerRegistrationKey> {
         let runtime = self.runtime.read();
         let now = Instant::now();
         let timeout = self.heartbeat_timeout();
@@ -679,7 +640,7 @@ impl WorkerManager {
         runtime
             .iter()
             .filter(|(_, r)| now.duration_since(r.last_seen_at) < timeout)
-            .map(|(key, _)| key.worker_id)
+            .map(|(key, _)| *key)
             .collect()
     }
 
@@ -709,10 +670,10 @@ impl WorkerManager {
             .unwrap_or(false)
     }
 
-    /// List all workers (for background cleanup).
-    pub fn list_all_workers(&self) -> Vec<WorkerId> {
+    /// List all workers (for background cleanup), preserving group identity.
+    pub fn list_all_workers(&self) -> Vec<WorkerRegistrationKey> {
         let descriptors = self.descriptors.read();
-        descriptors.keys().map(|key| key.worker_id).collect()
+        descriptors.keys().copied().collect()
     }
 
     /// Get total number of block locations (for metrics).
@@ -732,21 +693,24 @@ impl WorkerManager {
     /// Returns (added_blocks, removed_blocks) for repair planning.
     pub fn update_locations(
         &self,
+        group_id: ShardGroupId,
         worker_id: WorkerId,
         reported_blocks: Vec<BlockId>,
     ) -> MetadataResult<(Vec<BlockId>, Vec<BlockId>)> {
         use std::collections::HashSet;
 
+        let key = WorkerRegistrationKey::new(group_id, worker_id);
+
         // Get current blocks for this worker (before update)
         let mut worker_blocks = self.worker_blocks.write();
-        let old_blocks = worker_blocks.get(&worker_id).cloned().unwrap_or_default();
+        let old_blocks = worker_blocks.get(&key).cloned().unwrap_or_default();
 
         // Convert to HashSet for O(1) lookup (performance optimization)
         let old_blocks_set: HashSet<BlockId> = old_blocks.iter().copied().collect();
         let reported_blocks_set: HashSet<BlockId> = reported_blocks.iter().copied().collect();
 
         // Full replacement: update worker -> blocks mapping
-        worker_blocks.insert(worker_id, reported_blocks.clone());
+        worker_blocks.insert(key, reported_blocks.clone());
 
         // Update block -> workers mapping
         let mut locations = self.locations.write();
@@ -760,7 +724,7 @@ impl WorkerManager {
 
         for block_id in &removed_blocks {
             if let Some(workers) = locations.get_mut(block_id) {
-                workers.retain(|&w| w != worker_id);
+                workers.retain(|&w| w != key);
                 if workers.is_empty() {
                     locations.remove(block_id);
                 }
@@ -776,42 +740,50 @@ impl WorkerManager {
 
         for block_id in &reported_blocks {
             let workers = locations.entry(*block_id).or_default();
-            if !workers.contains(&worker_id) {
-                workers.push(worker_id);
+            if !workers.contains(&key) {
+                workers.push(key);
             }
         }
 
         Ok((added_blocks, removed_blocks))
     }
 
-    /// Get block locations (only live workers).
-    pub fn get_block_locations(&self, block_id: BlockId) -> Vec<WorkerId> {
+    /// Get block locations for one metadata group (only live workers in that group).
+    pub fn get_block_locations(&self, group_id: ShardGroupId, block_id: BlockId) -> Vec<WorkerId> {
         let locations = self.locations.read();
-        let live_workers = self.list_live_workers();
+        let live_workers = self.list_live_workers_in_group(group_id);
         let live_set: std::collections::HashSet<WorkerId> = live_workers.into_iter().collect();
 
         locations
             .get(&block_id)
-            .map(|workers| workers.iter().filter(|w| live_set.contains(w)).copied().collect())
+            .map(|workers| {
+                workers
+                    .iter()
+                    .filter(|key| key.group_id == group_id && live_set.contains(&key.worker_id))
+                    .map(|key| key.worker_id)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
     /// Remove dead worker and clean up locations.
     /// Note: descriptor is kept (from Raft state), only runtime and presence are cleaned.
-    pub fn remove_dead_worker(&self, worker_id: WorkerId) -> Vec<BlockId> {
+    pub fn remove_dead_worker(&self, group_id: ShardGroupId, worker_id: WorkerId) -> Vec<BlockId> {
+        let key = WorkerRegistrationKey::new(group_id, worker_id);
+
         // Remove runtime (soft-state)
         let mut runtime = self.runtime.write();
-        runtime.retain(|key, _| key.worker_id != worker_id);
+        runtime.remove(&key);
 
         // Remove worker blocks and locations
         let mut worker_blocks = self.worker_blocks.write();
-        let blocks = worker_blocks.remove(&worker_id).unwrap_or_default();
+        let blocks = worker_blocks.remove(&key).unwrap_or_default();
 
         // Remove worker from locations
         let mut locations = self.locations.write();
         for block_id in &blocks {
             if let Some(workers) = locations.get_mut(block_id) {
-                workers.retain(|&w| w != worker_id);
+                workers.retain(|&w| w != key);
                 if workers.is_empty() {
                     locations.remove(block_id);
                 }
@@ -822,69 +794,12 @@ impl WorkerManager {
     }
 
     /// Get all blocks for a worker.
-    pub fn get_worker_blocks(&self, worker_id: WorkerId) -> Vec<BlockId> {
+    pub fn get_worker_blocks(&self, group_id: ShardGroupId, worker_id: WorkerId) -> Vec<BlockId> {
         let worker_blocks = self.worker_blocks.read();
-        worker_blocks.get(&worker_id).cloned().unwrap_or_default()
-    }
-
-    /// Select workers for block placement.
-    ///
-    /// Returns primary and replicas based on:
-    /// - Available capacity
-    /// - Load (active reads/writes)
-    /// - Fault domain distribution (if available)
-    /// - Health status
-    pub fn select_workers_for_placement(
-        &self,
-        replication_factor: u8,
-        preferred_fault_domain: Option<String>,
-    ) -> MetadataResult<BlockPlacement> {
-        // Get live workers
-        let live_workers = self.list_live_workers();
-
-        if live_workers.is_empty() {
-            return Err(MetadataError::ServiceUnavailable(
-                "No live workers available".to_string(),
-            ));
-        }
-
-        // Collect worker info with comprehensive scoring
-        let mut candidates: Vec<(WorkerId, WorkerInfo, PlacementScore)> = live_workers
-            .iter()
-            .filter_map(|&id| {
-                self.get_worker_any_group(id).map(|w| {
-                    let score = self.calculate_placement_score(&w, &preferred_fault_domain);
-                    (id, w, score)
-                })
-            })
-            .collect();
-
-        // Sort by score (descending)
-        candidates.sort_by(|a, b| b.2.cmp(&a.2));
-
-        let needed = replication_factor as usize;
-        let available_count = candidates.len();
-        if available_count < needed {
-            warn!(
-                available = available_count,
-                needed = needed,
-                "Not enough workers for replication factor"
-            );
-        }
-
-        // Select workers with fault domain distribution
-        let selected = self.select_with_fault_domain_distribution(&candidates, needed.min(available_count));
-
-        if selected.is_empty() {
-            return Err(MetadataError::ServiceUnavailable(
-                "No suitable workers found".to_string(),
-            ));
-        }
-
-        let primary = selected[0];
-        let replicas = selected[1..].to_vec();
-
-        Ok(BlockPlacement { primary, replicas })
+        worker_blocks
+            .get(&WorkerRegistrationKey::new(group_id, worker_id))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Select workers for block placement within one metadata group.
@@ -1179,7 +1094,7 @@ impl WorkerManager {
         active_writes: u32,
         health: HealthStatus,
     ) -> MetadataResult<WorkerLiveState> {
-        let descriptor = self.get_descriptor_in_group(group_id, worker_id).ok_or_else(|| {
+        let descriptor = self.get_descriptor(group_id, worker_id).ok_or_else(|| {
             MetadataError::NotFound(format!(
                 "worker descriptor not found for group_id={}, worker_id={}",
                 group_id.as_raw(),

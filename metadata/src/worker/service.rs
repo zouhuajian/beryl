@@ -65,7 +65,7 @@ pub struct MetadataWorkerServiceImpl {
     command_router: Option<Arc<WorkerCommandRouter>>,
     metrics: Arc<WorkerMetrics>,
     slot_metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
-    /// Mount table used to compute mount_epoch for lease gating (TODO-2).
+    /// Mount table used to compute mount_epoch for lease gating.
     mount_table: Arc<crate::mount::MountTable>,
     served_group_id: ShardGroupId,
 }
@@ -309,8 +309,8 @@ impl MetadataWorkerServiceImpl {
                     let waiting_count = {
                         let live_workers = worker_manager.list_live_workers();
                         let mut waiting: usize = 0;
-                        for worker_id in &live_workers {
-                            if worker_manager.needs_full_sync(served_group_id, *worker_id) {
+                        for worker in live_workers.iter().filter(|worker| worker.group_id == served_group_id) {
+                            if worker_manager.needs_full_sync(served_group_id, worker.worker_id) {
                                 // Approximate: if needs_full_sync, count as waiting
                                 // This is approximate because we don't track which workers have leases
                                 waiting += 1;
@@ -616,7 +616,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 
         self.worker_manager.expire_liveness();
 
-        let descriptor = match self.worker_manager.get_descriptor_in_group(group_id, worker_id) {
+        let descriptor = match self.worker_manager.get_descriptor(group_id, worker_id) {
             Some(descriptor) => descriptor,
             None => {
                 return self.need_register_response::<HeartbeatResponseProto>(
@@ -629,7 +629,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 );
             }
         };
-        let registration = match self.worker_manager.get_registration_in_group(group_id, worker_id) {
+        let registration = match self.worker_manager.get_registration(group_id, worker_id) {
             Some(registration) => registration,
             None => {
                 return self.need_register_response::<HeartbeatResponseProto>(
@@ -701,7 +701,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             warn!(
                 worker_id = worker_id.as_raw(),
                 ack_count = req.acks.len(),
-                "Ignoring worker command acks because full command ack is outside PR-6"
+                "Ignoring worker command acks because command ack handling is not enabled"
             );
         }
 
@@ -760,7 +760,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                         // Verify and release lease
                         let metadata_epoch = self.worker_manager.get_metadata_epoch();
                         let lease_manager = self.worker_manager.lease_manager();
-                        // TODO-2: Get mount_epoch from mount_table
                         let mount_epoch = Some(types::group_watermark::MountEpoch::new(self.mount_table.version()));
 
                         if !lease_manager
@@ -904,6 +903,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         let outcome = match self
             .repair_signal_handler
             .handle_block_report_delta(BlockReportDelta {
+                group_id: self.served_group_id,
                 worker_id,
                 added_blocks: added_blocks.clone(),
                 removed_blocks: removed_blocks.clone(),
@@ -1171,7 +1171,10 @@ mod tests {
 
         assert!(response.header.as_ref().expect("header").error.is_none());
         assert_eq!(response.report_seq, 42);
-        assert_eq!(worker_manager.get_block_locations(block_id), vec![worker_id]);
+        assert_eq!(
+            worker_manager.get_block_locations(ShardGroupId::new(1), block_id),
+            vec![worker_id]
+        );
         let deltas = signal_sink.deltas.lock();
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].worker_id, worker_id);
@@ -1209,7 +1212,9 @@ mod tests {
             )
             .unwrap();
         worker_manager.mark_full_sync_complete(ShardGroupId::new(1), worker_id);
-        worker_manager.update_locations(worker_id, vec![block_id]).unwrap();
+        worker_manager
+            .update_locations(ShardGroupId::new(1), worker_id, vec![block_id])
+            .unwrap();
         let signal_sink = Arc::new(RecordingRepairSignalSink::default());
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
@@ -1366,12 +1371,12 @@ mod tests {
         assert_eq!(response.worker_id, 123);
         assert_eq!(response.accepted_worker_run_id, worker_run_id.to_string());
         let descriptor = worker_manager
-            .get_descriptor_in_group(ShardGroupId::new(1), WorkerId::new(123))
+            .get_descriptor(ShardGroupId::new(1), WorkerId::new(123))
             .unwrap();
         assert_eq!(descriptor.address, "127.0.0.1:9090");
         assert_eq!(
             worker_manager
-                .get_registration_in_group(ShardGroupId::new(1), WorkerId::new(123))
+                .get_registration(ShardGroupId::new(1), WorkerId::new(123))
                 .expect("live registration")
                 .worker_run_id,
             worker_run_id
@@ -1416,10 +1421,10 @@ mod tests {
 
         assert!(response.header.as_ref().expect("header").error.is_none());
         assert!(worker_manager
-            .get_descriptor_in_group(ShardGroupId::new(1), WorkerId::new(124))
+            .get_descriptor(ShardGroupId::new(1), WorkerId::new(124))
             .is_none());
         assert!(worker_manager
-            .get_registration_in_group(ShardGroupId::new(1), WorkerId::new(124))
+            .get_registration(ShardGroupId::new(1), WorkerId::new(124))
             .is_none());
     }
 
@@ -1473,7 +1478,7 @@ mod tests {
         assert!(error.message.contains("already registered"));
         assert_eq!(
             worker_manager
-                .get_registration_in_group(ShardGroupId::new(1), WorkerId::new(123))
+                .get_registration(ShardGroupId::new(1), WorkerId::new(123))
                 .expect("registration")
                 .worker_run_id,
             test_worker_run_id()
@@ -1522,7 +1527,7 @@ mod tests {
         assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
         assert!(error.message.contains("served metadata group"));
         assert!(worker_manager
-            .get_descriptor_in_group(ShardGroupId::new(2), WorkerId::new(123))
+            .get_descriptor(ShardGroupId::new(2), WorkerId::new(123))
             .is_none());
     }
 

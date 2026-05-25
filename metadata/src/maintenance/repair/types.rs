@@ -31,13 +31,6 @@ pub enum RepairTask {
         replication_factor: Option<u8>,
         reason: Option<String>,
     },
-    /// Move copy: copy block from source to target worker.
-    /// After successful copy + verify, metadata enqueues replica eviction for from_worker.
-    MoveCopy {
-        block_id: BlockId,
-        from_worker: WorkerId,
-        to_worker: WorkerId,
-    },
     /// Evict one replica from a worker after repair planning.
     EvictReplica {
         target_worker: WorkerId,
@@ -50,9 +43,7 @@ impl RepairTask {
     /// Get primary block_id for this task.
     pub fn block_id(&self) -> BlockId {
         match self {
-            RepairTask::Replicate { block_id, .. }
-            | RepairTask::MoveCopy { block_id, .. }
-            | RepairTask::EvictReplica { block_id, .. } => *block_id,
+            RepairTask::Replicate { block_id, .. } | RepairTask::EvictReplica { block_id, .. } => *block_id,
         }
     }
 
@@ -60,7 +51,6 @@ impl RepairTask {
     pub fn task_type(&self) -> &'static str {
         match self {
             RepairTask::Replicate { .. } => "replicate",
-            RepairTask::MoveCopy { .. } => "move_copy",
             RepairTask::EvictReplica { .. } => "evict_replica",
         }
     }
@@ -69,19 +59,8 @@ impl RepairTask {
 /// Deduplication key for repair tasks.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RepairDedupKey {
-    Replicate {
-        block_id: BlockId,
-        target_worker: WorkerId,
-    },
-    MoveCopy {
-        block_id: BlockId,
-        from_worker: WorkerId,
-        to_worker: WorkerId,
-    },
-    EvictReplica {
-        block_id: BlockId,
-        target_worker: WorkerId,
-    },
+    Replicate { block_id: BlockId, target_worker: WorkerId },
+    EvictReplica { block_id: BlockId, target_worker: WorkerId },
 }
 
 impl RepairDedupKey {
@@ -95,15 +74,6 @@ impl RepairDedupKey {
             } => RepairDedupKey::Replicate {
                 block_id: *block_id,
                 target_worker: *target_worker,
-            },
-            RepairTask::MoveCopy {
-                block_id,
-                from_worker,
-                to_worker,
-            } => RepairDedupKey::MoveCopy {
-                block_id: *block_id,
-                from_worker: *from_worker,
-                to_worker: *to_worker,
             },
             RepairTask::EvictReplica {
                 block_id,
@@ -143,16 +113,4 @@ pub enum TaskFailureClass {
     Retryable,   // Transient error, should retry with backoff
     Fatal,       // Permanent error, should not retry
     NeedRefresh, // Need to refresh state
-}
-
-impl TaskFailureClass {
-    pub(crate) fn from_proto(error_class: proto::metadata::TaskFailureClassProto) -> Option<Self> {
-        match error_class {
-            proto::metadata::TaskFailureClassProto::TaskFailureClassOk => Some(Self::Ok),
-            proto::metadata::TaskFailureClassProto::TaskFailureClassRetryable => Some(Self::Retryable),
-            proto::metadata::TaskFailureClassProto::TaskFailureClassFatal => Some(Self::Fatal),
-            proto::metadata::TaskFailureClassProto::TaskFailureClassNeedRefresh => Some(Self::NeedRefresh),
-            proto::metadata::TaskFailureClassProto::TaskFailureClassUnspecified => None,
-        }
-    }
 }

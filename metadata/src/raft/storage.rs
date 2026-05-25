@@ -1017,11 +1017,6 @@ impl RocksDBStorage {
         Ok(mounts)
     }
 
-    /// Get worker info.
-    pub fn get_worker(&self, worker_id: WorkerId) -> MetadataResult<Option<WorkerInfo>> {
-        self.get_worker_in_group(ShardGroupId::new(1), worker_id)
-    }
-
     /// Get worker info accepted by a metadata group.
     pub fn get_worker_in_group(
         &self,
@@ -2717,24 +2712,6 @@ impl RocksDBStorage {
             count += 1;
         }
         Ok(count)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn applied_results_for_test(&self) -> MetadataResult<Vec<AppliedResult>> {
-        let cf = self
-            .db
-            .cf_handle(CF_DEDUP)
-            .ok_or_else(|| MetadataError::Internal("Dedup CF not found".to_string()))?;
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut results = Vec::new();
-        for item in iter {
-            let (_, value) =
-                item.map_err(|e| MetadataError::Internal(format!("RocksDB iterator error (dedup test): {}", e)))?;
-            let (applied, _) = decode_from_slice::<AppliedResult, _>(&value, standard())
-                .map_err(|e| MetadataError::Internal(format!("Failed to deserialize test applied result: {}", e)))?;
-            results.push(applied);
-        }
-        Ok(results)
     }
 }
 

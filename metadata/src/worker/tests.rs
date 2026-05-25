@@ -3,7 +3,7 @@
 
 //! Tests for worker manager and registration.
 
-use super::manager::{HealthStatus, WorkerInfo, WorkerManager};
+use super::manager::{HealthStatus, WorkerInfo, WorkerManager, WorkerRegistrationKey};
 use types::ids::{ShardGroupId, WorkerId};
 use types::WorkerRunId;
 
@@ -28,7 +28,7 @@ fn test_worker_registration_with_worker_net_protocol_and_epoch() {
         .unwrap();
 
     // Get descriptor and verify fields
-    let descriptor = manager.get_descriptor(worker_id).unwrap();
+    let descriptor = manager.get_descriptor(ShardGroupId::new(1), worker_id).unwrap();
     assert_eq!(descriptor.worker_id, worker_id);
     assert_eq!(descriptor.address, address);
     assert_eq!(descriptor.worker_net_protocol, worker_net_protocol);
@@ -94,16 +94,173 @@ fn worker_run_registration_is_group_scoped() {
         )
         .unwrap();
 
-    let first = manager.get_descriptor_in_group(first_group, worker_id).unwrap();
-    let second = manager.get_descriptor_in_group(second_group, worker_id).unwrap();
-    let first_registration = manager.get_registration_in_group(first_group, worker_id).unwrap();
-    let second_registration = manager.get_registration_in_group(second_group, worker_id).unwrap();
+    let first = manager.get_descriptor(first_group, worker_id).unwrap();
+    let second = manager.get_descriptor(second_group, worker_id).unwrap();
+    let first_registration = manager.get_registration(first_group, worker_id).unwrap();
+    let second_registration = manager.get_registration(second_group, worker_id).unwrap();
     assert_eq!(first.group_id, first_group);
     assert_eq!(first.address, "127.0.0.1:9090");
     assert_eq!(first_registration.worker_run_id, first_run_id);
     assert_eq!(second.group_id, second_group);
     assert_eq!(second.address, "127.0.0.1:9091");
     assert_eq!(second_registration.worker_run_id, second_run_id);
+}
+
+#[test]
+fn worker_descriptor_runtime_and_liveness_are_group_scoped() {
+    let manager = WorkerManager::new(60);
+    let worker_id = WorkerId::new(7);
+    let first_group = ShardGroupId::new(11);
+    let second_group = ShardGroupId::new(12);
+    let first_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440050".parse().unwrap();
+    let second_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440051".parse().unwrap();
+
+    manager
+        .register_worker_run(
+            first_group,
+            worker_id,
+            "127.0.0.1:9107".to_string(),
+            1,
+            first_run_id,
+            Some("rack-a".to_string()),
+        )
+        .unwrap();
+    manager
+        .register_worker_run(
+            second_group,
+            worker_id,
+            "127.0.0.1:9207".to_string(),
+            1,
+            second_run_id,
+            Some("rack-b".to_string()),
+        )
+        .unwrap();
+    manager
+        .record_heartbeat(
+            first_group,
+            worker_id,
+            first_run_id,
+            1,
+            "127.0.0.1:9107",
+            1,
+            1_000,
+            100,
+            900,
+            1,
+            0,
+            HealthStatus::Healthy,
+        )
+        .unwrap();
+    manager
+        .record_heartbeat(
+            second_group,
+            worker_id,
+            second_run_id,
+            1,
+            "127.0.0.1:9207",
+            1,
+            2_000,
+            300,
+            1_700,
+            3,
+            1,
+            HealthStatus::Degraded,
+        )
+        .unwrap();
+
+    let first_descriptor = manager.get_descriptor(first_group, worker_id).unwrap();
+    let second_descriptor = manager.get_descriptor(second_group, worker_id).unwrap();
+    let first_registration = manager.get_registration(first_group, worker_id).unwrap();
+    let second_registration = manager.get_registration(second_group, worker_id).unwrap();
+    let first_runtime = manager.get_worker(first_group, worker_id).unwrap();
+    let second_runtime = manager.get_worker(second_group, worker_id).unwrap();
+
+    assert_eq!(first_descriptor.address, "127.0.0.1:9107");
+    assert_eq!(second_descriptor.address, "127.0.0.1:9207");
+    assert_eq!(first_registration.worker_run_id, first_run_id);
+    assert_eq!(second_registration.worker_run_id, second_run_id);
+    assert_eq!(first_runtime.capacity_total, 1_000);
+    assert_eq!(second_runtime.capacity_total, 2_000);
+    assert!(manager.is_worker_live(first_group, worker_id));
+    assert!(manager.is_worker_live(second_group, worker_id));
+    let mut live_workers = manager.list_live_workers();
+    live_workers.sort_by_key(|key| (key.group_id.as_raw(), key.worker_id.as_raw()));
+    assert_eq!(
+        live_workers,
+        vec![
+            WorkerRegistrationKey::new(first_group, worker_id),
+            WorkerRegistrationKey::new(second_group, worker_id),
+        ]
+    );
+}
+
+#[test]
+fn worker_manager_api_does_not_expose_production_any_group_lookup() {
+    let source = include_str!("manager.rs");
+    assert!(
+        !source.contains(concat!("pub fn get_worker", "_any_group")),
+        "WorkerManager must not expose a production WorkerId-only lookup"
+    );
+}
+
+#[test]
+fn production_worker_lookup_sources_reject_implicit_group_patterns() {
+    let sources = [
+        ("metadata/src/worker/manager.rs", include_str!("manager.rs")),
+        ("metadata/src/raft/storage.rs", include_str!("../raft/storage.rs")),
+        (
+            "metadata/src/service/fs_core/read.rs",
+            include_str!("../service/fs_core/read.rs"),
+        ),
+        (
+            "metadata/src/service/fs_core/write_session.rs",
+            include_str!("../service/fs_core/write_session.rs"),
+        ),
+        (
+            "metadata/src/maintenance/delete/executor.rs",
+            include_str!("../maintenance/delete/executor.rs"),
+        ),
+        (
+            "metadata/src/maintenance/overrep.rs",
+            include_str!("../maintenance/overrep.rs"),
+        ),
+        (
+            "metadata/src/maintenance/repair/planner.rs",
+            include_str!("../maintenance/repair/planner.rs"),
+        ),
+        (
+            "metadata/src/maintenance/repair/actions.rs",
+            include_str!("../maintenance/repair/actions.rs"),
+        ),
+        (
+            "metadata/src/maintenance/repair/types.rs",
+            include_str!("../maintenance/repair/types.rs"),
+        ),
+        (
+            "metadata/src/worker/command_router.rs",
+            include_str!("command_router.rs"),
+        ),
+    ];
+    let forbidden = [
+        concat!("unwrap_or_else(|| ShardGroupId::", "new(1))"),
+        "pub fn get_worker(&self, worker_id: WorkerId)",
+        concat!("get_worker", "_any_group"),
+        concat!("get_block_locations_for", "_single", "_report_group"),
+        concat!("get_report_groups", "_for_block"),
+        concat!("reported_locations_for", "_single_group"),
+        concat!("single", "_report", "_group"),
+        "descriptors.iter().find_map",
+        concat!("Move", "Copy"),
+    ];
+
+    for (path, source) in sources {
+        for pattern in forbidden {
+            assert!(
+                !source.contains(pattern),
+                "{path} contains forbidden implicit worker group pattern: {pattern}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -133,10 +290,7 @@ fn worker_run_registration_conflict_is_live_group_local() {
         .expect_err("different live WorkerRunId must conflict");
     assert!(error.to_string().contains("already registered"));
     assert_eq!(
-        manager
-            .get_registration_in_group(group_id, worker_id)
-            .unwrap()
-            .worker_run_id,
+        manager.get_registration(group_id, worker_id).unwrap().worker_run_id,
         first_run_id
     );
 }
@@ -194,8 +348,8 @@ fn loading_persisted_workers_drops_live_run_registration() {
         }])
         .unwrap();
 
-    assert!(manager.get_registration_in_group(group_id, worker_id).is_none());
-    assert!(manager.get_descriptor_in_group(group_id, worker_id).is_some());
+    assert!(manager.get_registration(group_id, worker_id).is_none());
+    assert!(manager.get_descriptor(group_id, worker_id).is_some());
     assert!(manager.get_worker(group_id, worker_id).is_none());
     assert!(manager.needs_full_sync(group_id, worker_id));
 }
@@ -293,6 +447,6 @@ fn heartbeat_liveness_expiry_removes_live_run_but_keeps_descriptor() {
 
     assert_eq!(expired, vec![(group_id, worker_id)]);
     assert!(!manager.is_worker_live(group_id, worker_id));
-    assert!(manager.get_registration_in_group(group_id, worker_id).is_none());
-    assert!(manager.get_descriptor_in_group(group_id, worker_id).is_some());
+    assert!(manager.get_registration(group_id, worker_id).is_none());
+    assert!(manager.get_descriptor(group_id, worker_id).is_some());
 }

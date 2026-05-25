@@ -25,13 +25,7 @@ pub enum RepairAction {
         replication_factor: Option<u8>,
         reason: Option<String>,
     },
-    /// Move copy: copy block from source to target worker (copy then delete).
-    MoveCopy {
-        block_id: BlockId,
-        from_worker: WorkerId,
-        to_worker: WorkerId,
-    },
-    /// Evict an excess or move follow-up replica from a worker.
+    /// Evict an excess replica from a worker.
     EvictReplica {
         block_id: BlockId,
         target_worker: WorkerId,
@@ -56,15 +50,6 @@ impl RepairAction {
                 replication_factor,
                 reason,
             },
-            RepairAction::MoveCopy {
-                block_id,
-                from_worker,
-                to_worker,
-            } => RepairTask::MoveCopy {
-                block_id,
-                from_worker,
-                to_worker,
-            },
             RepairAction::EvictReplica {
                 block_id,
                 target_worker,
@@ -80,9 +65,7 @@ impl RepairAction {
     /// Get block_id for this action.
     pub fn block_id(&self) -> BlockId {
         match self {
-            RepairAction::Replicate { block_id, .. }
-            | RepairAction::MoveCopy { block_id, .. }
-            | RepairAction::EvictReplica { block_id, .. } => *block_id,
+            RepairAction::Replicate { block_id, .. } | RepairAction::EvictReplica { block_id, .. } => *block_id,
         }
     }
 }

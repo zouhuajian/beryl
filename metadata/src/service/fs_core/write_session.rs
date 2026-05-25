@@ -17,7 +17,7 @@ use common::header::RpcErrorCode;
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use types::fs::{Extent, FsErrorCode};
-use types::ids::{BlockId, BlockIndex, ShardGroupId};
+use types::ids::{BlockId, BlockIndex};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
 use types::{CommittedBlock, WorkerEndpointInfo, WriteTarget};
@@ -736,7 +736,9 @@ impl<'a> WriteSessionCoordinator<'a> {
                 );
             }
         };
-        let placement_group_id = group_id.map(ShardGroupId::new).unwrap_or_else(|| ShardGroupId::new(1));
+        let placement_group_id =
+            self.core
+                .require_worker_lookup_group(&req.ctx, group_id, mount_epoch, route_epoch, "OpenWrite")?;
 
         let mut planned_targets = Vec::with_capacity(num_blocks as usize);
         for i in 0..num_blocks {
@@ -1235,10 +1237,15 @@ impl<'a> WriteSessionCoordinator<'a> {
         };
 
         if let Some(worker_manager) = self.core.worker_manager.as_ref() {
+            let worker_lookup_group_id =
+                self.core
+                    .require_worker_lookup_group(&req.ctx, group_id, mount_epoch, route_epoch, "CommitFile")?;
             for target in &session.write_targets {
                 for endpoint in &target.worker_endpoints {
                     let worker_id = endpoint.worker_id;
-                    let current_epoch = worker_manager.get_descriptor(worker_id).map(|d| d.worker_epoch);
+                    let current_epoch = worker_manager
+                        .get_descriptor(worker_lookup_group_id, worker_id)
+                        .map(|d| d.worker_epoch);
                     if current_epoch != Some(endpoint.worker_epoch) {
                         let hint = worker_refresh_hint_from_session(&session, current_epoch, true);
                         return self.core.need_refresh_failure_with_hint(
@@ -1573,7 +1580,14 @@ impl<'a> WriteSessionCoordinator<'a> {
                     .err();
             }
         };
-        let placement_group_id = group_id.map(ShardGroupId::new).unwrap_or_else(|| ShardGroupId::new(1));
+        let placement_group_id =
+            match self
+                .core
+                .require_worker_lookup_group(req_ctx, group_id, mount_epoch, None, "OpenWrite preflight")
+            {
+                Ok(group_id) => group_id,
+                Err(failure) => return Some(failure),
+            };
 
         let desired_len = desired_len.unwrap_or(4 * 1024 * 1024);
         let block_size = (layout.block_size as u64).max(1);

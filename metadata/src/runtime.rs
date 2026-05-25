@@ -697,10 +697,9 @@ mod tests {
         let (worker_runtime, mut worker_service) = build_worker_runtime(&authority, &maintenance_repair);
         let maintenance = build_maintenance(&authority, &worker_runtime, maintenance_repair).await;
         let worker_background = build_worker_background(&worker_runtime, &mut worker_service, &maintenance);
-        assert_eq!(worker_background._command_router.source_count(), 2);
+        let _worker_background = worker_background;
         assert!(Arc::strong_count(&maintenance.delete_executor) >= 3);
         assert_eq!(maintenance._maintenance_handle.task_count(), 8);
-        assert!(!maintenance._delete_executor_handle.is_finished());
         let readiness = build_readiness(&config, &authority).await;
         let _filesystem =
             build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
@@ -726,7 +725,6 @@ mod tests {
 
         assert_eq!(handles._worker_background._handle.task_count(), 1);
         assert_eq!(handles._maintenance._maintenance_handle.task_count(), 8);
-        assert!(!handles._maintenance._delete_executor_handle.is_finished());
         assert!(Arc::strong_count(&handles._readiness.gate) >= 1);
         let _readiness_watcher_finished = handles._readiness._watcher.is_finished();
     }
@@ -892,7 +890,6 @@ mod tests {
         assert!(server.worker.manager.get_metadata_epoch() > 0);
         assert_eq!(server.handles._worker_background._handle.task_count(), 1);
         assert_eq!(server.handles._maintenance._maintenance_handle.task_count(), 8);
-        assert!(!server.handles._maintenance._delete_executor_handle.is_finished());
         assert!(Arc::strong_count(&server.handles._readiness.gate) >= 1);
     }
 

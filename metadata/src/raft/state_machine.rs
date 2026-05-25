@@ -3112,7 +3112,10 @@ mod tests {
 
         assert_eq!(expect_worker_upserted(sm.apply(cmd.clone()).unwrap()), worker_id);
         assert_eq!(expect_worker_upserted(sm.apply(cmd).unwrap()), worker_id);
-        let stored = storage.get_worker(worker_id).unwrap().unwrap();
+        let stored = storage
+            .get_worker_in_group(ShardGroupId::new(1), worker_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.address, "127.0.0.1:17076");
         assert_eq!(stored.worker_id, worker_id);
         assert_eq!(stored.group_id, ShardGroupId::new(1));
@@ -3158,11 +3161,14 @@ mod tests {
             .apply(second)
             .expect_err("different live worker_run_id must be rejected");
         assert!(error.to_string().contains("already registered"));
-        let stored = storage.get_worker(worker_id).unwrap().unwrap();
+        let stored = storage
+            .get_worker_in_group(ShardGroupId::new(1), worker_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.address, "127.0.0.1:17060");
         assert_eq!(
             worker_manager
-                .get_registration_in_group(ShardGroupId::new(1), worker_id)
+                .get_registration(ShardGroupId::new(1), worker_id)
                 .expect("live registration")
                 .worker_run_id,
             first_run_id
@@ -3205,10 +3211,8 @@ mod tests {
             mount_table,
             Arc::clone(&reloaded_manager),
         );
-        assert!(reloaded_manager
-            .get_registration_in_group(group_id, worker_id)
-            .is_none());
-        assert!(reloaded_manager.get_descriptor_in_group(group_id, worker_id).is_some());
+        assert!(reloaded_manager.get_registration(group_id, worker_id).is_none());
+        assert!(reloaded_manager.get_descriptor(group_id, worker_id).is_some());
 
         assert_eq!(
             expect_worker_upserted(
@@ -3228,7 +3232,7 @@ mod tests {
         );
         assert_eq!(
             reloaded_manager
-                .get_registration_in_group(group_id, worker_id)
+                .get_registration(group_id, worker_id)
                 .expect("new live registration")
                 .worker_run_id,
             second_run_id
@@ -3326,16 +3330,16 @@ mod tests {
         );
 
         let first = worker_manager
-            .get_descriptor_in_group(first_group, worker_id)
+            .get_descriptor(first_group, worker_id)
             .expect("first group descriptor");
         let second = worker_manager
-            .get_descriptor_in_group(second_group, worker_id)
+            .get_descriptor(second_group, worker_id)
             .expect("second group descriptor");
         let first_registration = worker_manager
-            .get_registration_in_group(first_group, worker_id)
+            .get_registration(first_group, worker_id)
             .expect("first group registration");
         let second_registration = worker_manager
-            .get_registration_in_group(second_group, worker_id)
+            .get_registration(second_group, worker_id)
             .expect("second group registration");
         assert_eq!(first.address, "127.0.0.1:17064");
         assert_eq!(first_registration.worker_run_id, first_run_id);
