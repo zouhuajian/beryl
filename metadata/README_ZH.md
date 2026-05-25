@@ -273,7 +273,7 @@ snapshot / state store：
 
 ## 10. Worker metadata 链路
 
-`MetadataWorkerServiceImpl` 当前处理 worker register、heartbeat、block report、task ack。
+`MetadataWorkerServiceImpl` 当前处理 worker register、heartbeat liveness 与 block report；PR-6 heartbeat 不实现 block report、repair/delete execution 或完整 command ack。
 
 register：
 
@@ -296,10 +296,13 @@ register：
 
 heartbeat：
 
-- 所有节点更新 `WorkerManager` runtime soft state，不走 Raft。
-- leader 发现 descriptor drift 时返回 non-OK gRPC `failed_precondition` 要求 re-register。
-- leader 分配 full block report lease，经 `WorkerCommandRouter` 处理 task ack，并从 maintenance/delete `DeleteExecutor` 与 maintenance/repair `RepairQueue` 拉取 worker command。
-- follower 不分配 full report lease，不下发 repair/delete command。
+- Worker 只在 startup register 成功后启动 heartbeat；请求携带 `group_id`、稳定 `WorkerId`、本进程 `WorkerRunId`、per-group/run `heartbeat_seq`、registered advertised endpoint，以及 PR-6 当前 placeholder/default capacity/load/health snapshot；真实资源采样是后续工作。
+- Metadata heartbeat 首先校验 served `group_id`、稳定 descriptor、live registration、`WorkerRunId` 与 advertised endpoint；heartbeat 不创建 registration，不写 RocksDB，不提交 Raft proposal。
+- Heartbeat liveness 是 metadata node 本地 memory-only soft state。metadata reload / snapshot recovery 只恢复稳定 descriptor，不恢复 `WorkerRunId` 或 heartbeat liveness；worker 必须重新 register 后才能恢复 ready。
+- Liveness timeout 使用 metadata 本地 monotonic time；worker wall-clock time 不参与 correctness。
+- Follower 可以接受 heartbeat 并预热本地 volatile liveness，但 follower 必须返回空 commands。Leader 返回 leader role/hint；PR-6 commands 也保持为空。
+- Heartbeat 与 block report 分离：heartbeat 不分配 full block report lease，不携带 block report，不触发 repair/delete cleanup，不执行完整 worker command ack。
+- Worker 本地 data-plane readiness 要求 registration 与本地 heartbeat lease 同时有效；单次 peer heartbeat 失败不会立即 fail closed，lease 过期后才 fail closed。`WORKER_NOT_REGISTERED / NEED_REGISTER` 和 `WORKER_DESCRIPTOR_MISMATCH / NEED_REGISTER` 会清除本地 registration 并触发重新 register；`WORKER_RUN_MISMATCH` 会显式标记该 group not ready。
 
 block report：
 

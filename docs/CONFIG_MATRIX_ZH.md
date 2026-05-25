@@ -35,7 +35,8 @@
 | `worker.storage.root` | `worker` | `WorkerCore::with_options` / local block store | `./data` | active | 路径字符串不能为空 | 当前只支持单 worker-local storage root。 |
 | `worker.metadata.group_id` | `worker` | `MetadataRegistrar` / worker startup | `1` | active | 必须大于 0 | Worker 启动注册目标 metadata group；当前默认配置只声明一个 group。 |
 | `worker.metadata.endpoint` | `worker` | `MetadataRegistrar` / worker startup | `http://127.0.0.1:18080` | active | 必须显式存在，且必须是合法 tonic endpoint URI，包含 `http://` 或 `https://` scheme | Worker 启动注册使用的 MetadataWorkerService leader endpoint。 |
-| `worker.metadata.register_timeout_ms` | `worker` | `MetadataRegistrar` | `5000` | active | 必须大于 0 | 单次 register 连接/RPC timeout。 |
+| `worker.metadata.endpoints` | `worker` | `MetadataHeartbeatLoop` | `http://127.0.0.1:18080` | active | 逗号分隔；至少一个合法 tonic endpoint URI，每项包含 `http://` 或 `https://` scheme | Worker heartbeat fanout 目标 metadata peers；默认单节点与 `worker.metadata.endpoint` 相同，多 peer 时 heartbeat 会发送到所有配置项，包括 follower。 |
+| `worker.metadata.register_timeout_ms` | `worker` | `MetadataRegistrar` / `MetadataHeartbeatLoop` | `5000` | active | 必须大于 0 | 单次 register 与当前 heartbeat RPC 连接/请求 timeout；独立 heartbeat RPC timeout 配置尚未接入。 |
 | `worker.metadata.register_retry_initial_backoff_ms` | `worker` | `MetadataRegistrar` | `200` | active | 必须大于 0 | register retry 初始退避。 |
 | `worker.metadata.register_retry_max_backoff_ms` | `worker` | `MetadataRegistrar` | `5000` | active | 必须大于 0，且不小于 initial backoff | register retry 最大退避。 |
 | `client.id` | `client` | `ClientConfig::client_id` / `FsClient::new` | `1` | active | metadata 操作要求非 0，且不能为负数 | Client request identity。 |
@@ -72,7 +73,8 @@
 
 以下能力可以在设计文档中讨论，但当前不出现在默认配置文件中：
 
-- worker heartbeat / block report / command ack 生产循环相关配置；本轮只激活启动 register 配置。
+- worker block report / command ack 生产循环相关配置；本轮只激活 startup register 与 heartbeat liveness fanout，未激活 block report 或 command ack 配置。
+- heartbeat timing 配置 `worker.heartbeat.interval`、`worker.heartbeat.rpc.timeout`、`worker.heartbeat.max_backoff`、`metadata.worker.heartbeat.timeout`、`metadata.worker.heartbeat.expire_scan_interval` 尚未接入 typed config。PR-6 当前使用保守内部默认：worker heartbeat loop 固定 1s，heartbeat RPC timeout 复用 `worker.metadata.register_timeout_ms`，metadata runtime liveness timeout 当前由 `WorkerManager` 构造参数注入；这些 key 不属于当前支持的 active 配置。
 - worker replication、relocation、delete command 执行策略配置。
 - QUIC、RDMA、io_uring、SPDK 数据路径配置。
 - UFS per-instance 部署配置。
@@ -103,7 +105,7 @@
 | `worker.volume_health.*` | removed | 当前 worker runtime 不消费这些键。 |
 | `worker.ufs.*`, `ufs.*` | removed | 当前默认配置不声明未接线的 UFS 部署项。 |
 | `worker.replication.*` | removed | worker replication 执行策略尚未作为 active 配置接入。 |
-| `worker.metadata.heartbeat.*`, `worker.metadata.block_report.*`, `worker.metadata.command_ack.*` | removed | 当前 worker 只消费 startup register 配置，heartbeat / block report / command ack 留到后续 PR。 |
+| `worker.metadata.heartbeat.*`, `worker.metadata.block_report.*`, `worker.metadata.command_ack.*` | removed | 当前 worker heartbeat 只消费 `worker.metadata.endpoints` 和 register timeout；独立 heartbeat timing 配置尚未接入 typed config。block report / command ack 留到后续 PR。 |
 | `client.default_timeout_ms` | removed | 当前 client 使用 `client.operation.timeout_ms`。 |
 | `client.metadata.group_id` | removed | 当前 client 只消费 `client.metadata.group_ids`。 |
 | `client.consistency.*` | removed | 当前 client runtime 不消费 consistency 配置。 |

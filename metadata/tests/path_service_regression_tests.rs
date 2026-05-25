@@ -34,7 +34,7 @@ use tonic::Request;
 use types::fs::{Extent, FileAttrs, Inode, InodeId};
 use types::ids::{BlockId, BlockIndex, DataHandleId, ShardGroupId, WorkerId};
 use types::layout::FileLayout;
-use types::{ClientId, RaftLogId};
+use types::{ClientId, RaftLogId, WorkerRunId};
 
 const TEST_GROUP_ID: u64 = 1;
 
@@ -345,22 +345,35 @@ fn worker_manager_for_write_targets() -> Arc<WorkerManager> {
     let manager = Arc::new(WorkerManager::new(60));
     for raw in 1..=3 {
         let worker_id = WorkerId::new(raw);
+        let endpoint = format!("127.0.0.1:{}", 9000 + raw);
+        let worker_epoch = 10 + raw;
+        let worker_run_id: WorkerRunId = format!("550e8400-e29b-41d4-a716-{raw:012x}")
+            .parse()
+            .expect("valid test worker run id");
         manager
-            .register_worker(
+            .register_worker(ShardGroupId::new(1), worker_id, endpoint.clone(), 1, worker_epoch, None)
+            .expect("register worker descriptor");
+        manager
+            .register_worker_run(
                 ShardGroupId::new(1),
                 worker_id,
-                format!("127.0.0.1:{}", 9000 + raw),
+                endpoint.clone(),
                 1,
-                10 + raw,
+                worker_run_id,
                 None,
             )
-            .expect("register worker");
+            .expect("register worker run");
         manager
-            .update_runtime(
+            .register_worker(ShardGroupId::new(1), worker_id, endpoint.clone(), 1, worker_epoch, None)
+            .expect("restore worker descriptor");
+        manager
+            .record_heartbeat(
                 ShardGroupId::new(1),
                 worker_id,
+                worker_run_id,
                 1,
-                10 + raw,
+                &endpoint,
+                1,
                 1024 * 1024,
                 0,
                 1024 * 1024,
@@ -368,7 +381,7 @@ fn worker_manager_for_write_targets() -> Arc<WorkerManager> {
                 0,
                 HealthStatus::Healthy,
             )
-            .expect("update worker runtime");
+            .expect("record worker heartbeat");
     }
     manager
 }

@@ -11,7 +11,7 @@ use crate::maintenance::repair::{BlockReportDelta, RepairSignalSink};
 use crate::raft::Command;
 use crate::raft::{AppDataResponse, AppRaftNode, WorkerCommandResult};
 use crate::service::extract_and_inject_context;
-use ::common::error::canonical::{CanonicalError, ErrorClass, RefreshReason};
+use ::common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshReason};
 use ::common::header::{ResponseHeader, RpcErrorCode, RpcStatus};
 use proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProto;
 use proto::metadata::*;
@@ -203,7 +203,42 @@ impl MetadataWorkerServiceImpl {
         self.response_with_error(req_header, to_canonical_rpc(error))
     }
 
-    fn worker_epoch_mismatch_response<T>(
+    fn group_mismatch_response<T>(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        message: impl Into<String>,
+    ) -> Result<Response<T>, Status>
+    where
+        T: Default + WorkerServiceResponse,
+    {
+        self.response_with_error(
+            req_header,
+            CanonicalError {
+                class: ErrorClass::Fatal,
+                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::InvalidArgument)),
+                reason: Some(RefreshReason::GroupMismatch),
+                retry_after_ms: None,
+                message: message.into(),
+                refresh_hint: None,
+            },
+        )
+    }
+
+    fn need_register_response<T>(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        message: impl Into<String>,
+    ) -> Result<Response<T>, Status>
+    where
+        T: Default + WorkerServiceResponse,
+    {
+        self.response_with_error(
+            req_header,
+            CanonicalError::need_refresh(RpcErrorCode::WorkerNotRegistered, RefreshReason::NeedRegister, message),
+        )
+    }
+
+    fn worker_run_mismatch_response<T>(
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
         message: impl Into<String>,
@@ -214,8 +249,26 @@ impl MetadataWorkerServiceImpl {
         self.response_with_error(
             req_header,
             CanonicalError::need_refresh(
-                RpcErrorCode::WorkerEpochMismatch,
-                RefreshReason::WorkerEpochMismatch,
+                RpcErrorCode::WorkerRunMismatch,
+                RefreshReason::WorkerRunMismatch,
+                message,
+            ),
+        )
+    }
+
+    fn worker_descriptor_mismatch_response<T>(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        message: impl Into<String>,
+    ) -> Result<Response<T>, Status>
+    where
+        T: Default + WorkerServiceResponse,
+    {
+        self.response_with_error(
+            req_header,
+            CanonicalError::need_refresh(
+                RpcErrorCode::WorkerDescriptorMismatch,
+                RefreshReason::NeedRegister,
                 message,
             ),
         )
@@ -284,6 +337,33 @@ impl MetadataWorkerServiceImpl {
     fn proto_to_block_id(proto: &proto::common::BlockIdProto) -> MetadataResult<BlockId> {
         Ok(BlockId::try_from(*proto).unwrap_or_else(|()| unreachable!("BlockIdProto conversion is infallible")))
     }
+
+    fn heartbeat_interval_ms(&self) -> u32 {
+        1_000
+    }
+
+    fn liveness_timeout_ms(&self) -> u32 {
+        self.worker_manager
+            .heartbeat_timeout_sec()
+            .saturating_mul(1000)
+            .try_into()
+            .unwrap_or(u32::MAX)
+    }
+
+    fn server_role(&self) -> MetadataServerRoleProto {
+        if self.raft_node.is_leader() {
+            MetadataServerRoleProto::MetadataServerRoleLeader
+        } else {
+            MetadataServerRoleProto::MetadataServerRoleFollower
+        }
+    }
+
+    fn leader_hint(&self) -> Option<proto::common::EndpointProto> {
+        let leader_id = self.raft_node.get_leader_id()?;
+        let membership = self.raft_node.get_membership()?;
+        let (_, node) = membership.nodes().find(|(node_id, _)| **node_id == leader_id)?;
+        parse_metadata_endpoint(&node.address)
+    }
 }
 
 fn validate_advertised_endpoint(endpoint: proto::common::EndpointProto) -> Result<String, String> {
@@ -304,6 +384,20 @@ fn validate_advertised_endpoint(endpoint: proto::common::EndpointProto) -> Resul
         return Err("advertised_endpoint must not use a wildcard host".to_string());
     }
     Ok(format!("{}:{}", endpoint.host, endpoint.port))
+}
+
+fn parse_metadata_endpoint(address: &str) -> Option<proto::common::EndpointProto> {
+    let without_scheme = address
+        .strip_prefix("http://")
+        .or_else(|| address.strip_prefix("https://"))
+        .unwrap_or(address);
+    let (host, port) = without_scheme.rsplit_once(':')?;
+    let port = port.parse::<u32>().ok()?;
+    Some(proto::common::EndpointProto {
+        host: host.trim_matches(['[', ']']).to_string(),
+        port,
+        protocol: "grpc".to_string(),
+    })
 }
 
 async fn persist_worker_descriptor(
@@ -447,7 +541,48 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         let req = request.into_inner();
         let _caller_ctx = extract_and_inject_context(&req.header);
 
+        let header_group_id = Self::group_id_from_request_header(&req.header);
+        let group_id = if req.group_id != 0 {
+            req.group_id
+        } else {
+            header_group_id.unwrap_or(0)
+        };
+        if group_id == 0 {
+            return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, "group_id must be non-zero");
+        }
+        if let Some(header_group_id) = header_group_id {
+            if header_group_id != group_id {
+                return self.group_mismatch_response::<HeartbeatResponseProto>(
+                    &req.header,
+                    "request header group_id must match heartbeat group_id",
+                );
+            }
+        }
+        let group_id = ShardGroupId::new(group_id);
+        if group_id != self.served_group_id {
+            return self.group_mismatch_response::<HeartbeatResponseProto>(
+                &req.header,
+                format!(
+                    "heartbeat group_id {} does not match served metadata group {}",
+                    group_id.as_raw(),
+                    self.served_group_id.as_raw()
+                ),
+            );
+        }
+
         let worker_id = WorkerId::new(req.worker_id);
+        if worker_id.as_raw() == 0 {
+            return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, "worker_id must be non-zero");
+        }
+        let worker_run_id = match req.worker_run_id.parse::<WorkerRunId>() {
+            Ok(worker_run_id) => worker_run_id,
+            Err(error) => {
+                return self.invalid_request_response::<HeartbeatResponseProto>(
+                    &req.header,
+                    format!("worker_run_id must be a UUID: {error}"),
+                )
+            }
+        };
 
         let capacity = match req.capacity {
             Some(capacity) => capacity,
@@ -460,20 +595,84 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         };
 
         let health_proto = req.health();
-
-        // Heartbeat still carries the existing data-plane worker_epoch; startup registration does not.
         let worker_net_protocol = req.worker_net_protocol() as i32; // Convert enum to i32
-        let worker_epoch = req.worker_epoch;
+        if req.worker_net_protocol() != proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc {
+            return self.invalid_request_response::<HeartbeatResponseProto>(
+                &req.header,
+                "worker_net_protocol must be gRPC for heartbeat",
+            );
+        }
+        let endpoint = match req.advertised_endpoint {
+            Some(endpoint) => endpoint,
+            None => {
+                return self
+                    .invalid_request_response::<HeartbeatResponseProto>(&req.header, "Missing advertised_endpoint");
+            }
+        };
+        let advertised_endpoint = match validate_advertised_endpoint(endpoint) {
+            Ok(address) => address,
+            Err(message) => return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, message),
+        };
 
-        // Fanout heartbeat: update runtime in memory (all nodes, no Raft)
+        self.worker_manager.expire_liveness();
+
+        let descriptor = match self.worker_manager.get_descriptor_in_group(group_id, worker_id) {
+            Some(descriptor) => descriptor,
+            None => {
+                return self.need_register_response::<HeartbeatResponseProto>(
+                    &req.header,
+                    format!(
+                        "worker descriptor not found for group_id={}, worker_id={}",
+                        group_id.as_raw(),
+                        worker_id.as_raw()
+                    ),
+                );
+            }
+        };
+        let registration = match self.worker_manager.get_registration_in_group(group_id, worker_id) {
+            Some(registration) => registration,
+            None => {
+                return self.need_register_response::<HeartbeatResponseProto>(
+                    &req.header,
+                    format!(
+                        "live worker registration not found for group_id={}, worker_id={}",
+                        group_id.as_raw(),
+                        worker_id.as_raw()
+                    ),
+                );
+            }
+        };
+        if registration.worker_run_id != worker_run_id {
+            return self.worker_run_mismatch_response::<HeartbeatResponseProto>(
+                &req.header,
+                format!(
+                    "worker_run_id mismatch for group_id={}, worker_id={}",
+                    group_id.as_raw(),
+                    worker_id.as_raw()
+                ),
+            );
+        }
+        if descriptor.address != advertised_endpoint || descriptor.worker_net_protocol != worker_net_protocol {
+            return self.worker_descriptor_mismatch_response::<HeartbeatResponseProto>(
+                &req.header,
+                format!(
+                    "advertised endpoint or protocol does not match registration for group_id={}, worker_id={}",
+                    group_id.as_raw(),
+                    worker_id.as_raw()
+                ),
+            );
+        }
+
         use super::manager::HealthStatus;
         let health_status = HealthStatus::from(health_proto as i32);
 
-        let descriptor_changed = match self.worker_manager.update_runtime(
-            self.served_group_id,
+        let live_state = match self.worker_manager.record_heartbeat(
+            group_id,
             worker_id,
+            worker_run_id,
+            req.heartbeat_seq,
+            &advertised_endpoint,
             worker_net_protocol,
-            worker_epoch,
             capacity.total_bytes,
             capacity.used_bytes,
             capacity.available_bytes,
@@ -481,122 +680,44 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             load.active_writes,
             health_status,
         ) {
-            Ok(changed) => changed,
+            Ok(live_state) => live_state,
+            Err(MetadataError::NotFound(message)) => {
+                return self.need_register_response::<HeartbeatResponseProto>(&req.header, message);
+            }
+            Err(MetadataError::StaleState(message)) => {
+                return self.worker_run_mismatch_response::<HeartbeatResponseProto>(&req.header, message);
+            }
+            Err(MetadataError::InvalidArgument(message)) => {
+                return self.worker_descriptor_mismatch_response::<HeartbeatResponseProto>(&req.header, message);
+            }
             Err(error) => return self.metadata_error_response::<HeartbeatResponseProto>(&req.header, error),
         };
-
-        // If descriptor changed, require worker to re-register (leader-only check)
-        let is_leader = self.raft_node.is_leader();
-        if descriptor_changed && is_leader {
-            // Leader detects descriptor change, return error to trigger re-register
-            return self.worker_epoch_mismatch_response::<HeartbeatResponseProto>(
-                &req.header,
-                "Worker descriptor changed, please re-register",
-            );
-        }
 
         // Update metrics (all nodes)
         let live_count = self.worker_manager.list_live_workers().len();
         self.metrics.update_worker_live(live_count);
 
-        // All nodes: check if worker needs full sync (metadata restart detection)
-        let mut commands = Vec::new();
-        let needs_full_sync = self.worker_manager.needs_full_sync(self.served_group_id, worker_id);
-
-        // Leader-only: lease allocation for full reports
-        let (can_full_report, full_report_lease_token, backoff_ms) = if is_leader {
-            if needs_full_sync {
-                // Try to allocate lease
-                let metadata_epoch = self.worker_manager.get_metadata_epoch();
-                let lease_manager = self.worker_manager.lease_manager();
-
-                let shard_group_id = Some(self.served_group_id);
-
-                // TODO-2: Get mount_epoch from mount_table
-                let mount_epoch = Some(types::group_watermark::MountEpoch::new(self.mount_table.version()));
-
-                if let Some(token) = lease_manager
-                    .try_allocate(worker_id, shard_group_id, metadata_epoch, mount_epoch)
-                    .await
-                {
-                    // Lease allocated
-                    // Update full-report lease metrics.
-                    if let Some(ref slot_metrics) = self.slot_metrics {
-                        slot_metrics
-                            .full_report_granted_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        // Note: lease metrics can be added later
-                    }
-
-                    // Request full block report
-                    commands.push(WorkerCommandProto {
-                        task_id: 0, // No task ID for control commands
-                        command: Some(proto::metadata::worker_command_proto::Command::RequestFullBlockReport(
-                            proto::metadata::RequestFullBlockReportCommandProto {
-                                target_metadata_epoch: metadata_epoch,
-                                reason: "METADATA_RESTART".to_string(),
-                            },
-                        )),
-                    });
-                    (true, token, 0)
-                } else {
-                    // Lease allocation failed (rate-limited)
-                    // Update metrics
-                    if let Some(ref slot_metrics) = self.slot_metrics {
-                        slot_metrics
-                            .full_report_throttled_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-
-                    // Calculate backoff with jitter (5-30 seconds)
-                    use rand::Rng;
-                    let base_ms = 5000; // 5 seconds base
-                    let jitter_ms = rand::thread_rng().gen_range(0..25000); // 0-25 seconds jitter
-                    let backoff_ms = (base_ms + jitter_ms) as u32;
-
-                    commands.push(WorkerCommandProto {
-                        task_id: 0, // No task ID for control commands
-                        command: Some(proto::metadata::worker_command_proto::Command::BlockReportBackoff(
-                            proto::metadata::BlockReportBackoffCommandProto {
-                                retry_after_ms: backoff_ms,
-                            },
-                        )),
-                    });
-                    (false, 0, backoff_ms)
-                }
-            } else {
-                // Worker doesn't need full sync
-                (false, 0, 0)
-            }
-        } else {
-            // Follower: no lease allocation
-            (false, 0, 0)
-        };
-
-        // Leader-only: process task acknowledgments and get pending commands
-        if is_leader {
-            if let Some(ref command_router) = self.command_router {
-                if !req.acks.is_empty() {
-                    command_router.handle_acks(worker_id, &req.acks).await;
-                }
-
-                const MAX_COMMANDS_PER_HEARTBEAT: usize = 12;
-                commands.extend(command_router.poll_commands(worker_id, MAX_COMMANDS_PER_HEARTBEAT));
-            } else if !req.acks.is_empty() {
-                warn!(
-                    worker_id = worker_id.as_raw(),
-                    ack_count = req.acks.len(),
-                    "Ignoring worker command acks because command router is not configured"
-                );
-            }
+        if !req.acks.is_empty() {
+            warn!(
+                worker_id = worker_id.as_raw(),
+                ack_count = req.acks.len(),
+                "Ignoring worker command acks because full command ack is outside PR-6"
+            );
         }
 
         Ok(Response::new(HeartbeatResponseProto {
-            header: Some(self.ok_response_header_from_request(&req.header)),
-            commands,
-            full_report_lease_token,
-            can_full_report,
-            backoff_ms,
+            header: Some((&self.create_response_header_from_request(&req.header, Some(group_id.as_raw()))).into()),
+            commands: Vec::new(),
+            full_report_lease_token: 0,
+            can_full_report: false,
+            backoff_ms: 0,
+            group_id: group_id.as_raw(),
+            worker_id: live_state.worker_id.as_raw(),
+            accepted_worker_run_id: live_state.worker_run_id.to_string(),
+            heartbeat_interval_ms: self.heartbeat_interval_ms(),
+            liveness_timeout_ms: self.liveness_timeout_ms(),
+            server_role: self.server_role() as i32,
+            leader_hint: self.leader_hint(),
         }))
     }
 
@@ -856,7 +977,7 @@ mod tests {
     use crate::worker::HealthStatus;
     use crate::MountTable;
     use parking_lot::Mutex;
-    use proto::common::{ErrorClassProto, RefreshReasonProto};
+    use proto::common::{error_detail_proto, ErrorClassProto, RefreshReasonProto, RpcErrorCodeProto};
     use tempfile::TempDir;
 
     #[derive(Default)]
@@ -922,6 +1043,45 @@ mod tests {
         "550e8400-e29b-41d4-a716-446655440001".parse().unwrap()
     }
 
+    fn heartbeat_request(
+        group_id: u64,
+        worker_id: WorkerId,
+        worker_run_id: WorkerRunId,
+        heartbeat_seq: u64,
+        endpoint_port: u32,
+    ) -> HeartbeatRequestProto {
+        HeartbeatRequestProto {
+            header: Some(proto::common::RequestHeaderProto {
+                group_id,
+                ..Default::default()
+            }),
+            group_id,
+            worker_id: worker_id.as_raw(),
+            worker_run_id: worker_run_id.to_string(),
+            heartbeat_seq,
+            advertised_endpoint: Some(proto::common::EndpointProto {
+                host: "127.0.0.1".to_string(),
+                port: endpoint_port,
+                protocol: "grpc".to_string(),
+            }),
+            capacity: Some(CapacityInfoProto {
+                total_bytes: 1_000,
+                used_bytes: 100,
+                available_bytes: 900,
+            }),
+            load: Some(LoadInfoProto {
+                active_reads: 0,
+                active_writes: 0,
+                cpu_usage_percent: 0,
+                memory_used_bytes: 0,
+            }),
+            health: HealthStatusProto::HealthStatusHealthy as i32,
+            worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+            worker_epoch: 0,
+            acks: Vec::new(),
+        }
+    }
+
     #[tokio::test]
     async fn register_worker_persist_helper_propagates_propose_failure() {
         let result =
@@ -968,11 +1128,9 @@ mod tests {
             )
             .unwrap();
         worker_manager
-            .update_runtime(
+            .record_test_heartbeat(
                 ShardGroupId::new(1),
                 worker_id,
-                1,
-                100,
                 1_000,
                 500,
                 500,
@@ -1011,7 +1169,7 @@ mod tests {
         .unwrap()
         .into_inner();
 
-        assert!(response.header.expect("header").error.is_none());
+        assert!(response.header.as_ref().expect("header").error.is_none());
         assert_eq!(response.report_seq, 42);
         assert_eq!(worker_manager.get_block_locations(block_id), vec![worker_id]);
         let deltas = signal_sink.deltas.lock();
@@ -1039,11 +1197,9 @@ mod tests {
             )
             .unwrap();
         worker_manager
-            .update_runtime(
+            .record_test_heartbeat(
                 ShardGroupId::new(1),
                 worker_id,
-                1,
-                100,
                 1_000,
                 500,
                 500,
@@ -1083,7 +1239,7 @@ mod tests {
         .unwrap()
         .into_inner();
 
-        assert!(response.header.expect("header").error.is_none());
+        assert!(response.header.as_ref().expect("header").error.is_none());
         assert_eq!(response.report_seq, 53);
         let deltas = signal_sink.deltas.lock();
         assert_eq!(deltas.len(), 1);
@@ -1205,7 +1361,7 @@ mod tests {
         .expect("register worker response")
         .into_inner();
 
-        assert!(response.header.expect("header").error.is_none());
+        assert!(response.header.as_ref().expect("header").error.is_none());
         assert_eq!(response.group_id, 1);
         assert_eq!(response.worker_id, 123);
         assert_eq!(response.accepted_worker_run_id, worker_run_id.to_string());
@@ -1258,7 +1414,7 @@ mod tests {
         .expect("register worker response")
         .into_inner();
 
-        assert!(response.header.expect("header").error.is_none());
+        assert!(response.header.as_ref().expect("header").error.is_none());
         assert!(worker_manager
             .get_descriptor_in_group(ShardGroupId::new(1), WorkerId::new(124))
             .is_none());
@@ -1385,48 +1541,38 @@ mod tests {
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
             &service,
-            Request::new(HeartbeatRequestProto {
-                header: None,
-                worker_id: 99,
-                capacity: Some(CapacityInfoProto {
-                    total_bytes: 1_000,
-                    used_bytes: 100,
-                    available_bytes: 900,
-                }),
-                load: Some(LoadInfoProto {
-                    active_reads: 0,
-                    active_writes: 0,
-                    cpu_usage_percent: 0,
-                    memory_used_bytes: 0,
-                }),
-                health: HealthStatusProto::HealthStatusHealthy as i32,
-                worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-                worker_epoch: 1,
-                acks: Vec::new(),
-            }),
+            Request::new(heartbeat_request(1, WorkerId::new(99), test_worker_run_id(), 1, 9090)),
         )
         .await
         .expect("business validation must return gRPC OK")
         .into_inner();
 
         let error = response.header.expect("header").error.expect("header error");
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
-        assert!(error.message.contains("Worker descriptor not found"));
+        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+        assert!(matches!(
+            error.code,
+            Some(error_detail_proto::Code::RpcCode(code))
+                if code == RpcErrorCodeProto::RpcErrCodeWorkerNotRegistered as i32
+        ));
+        assert_eq!(
+            error.refresh_reason,
+            RefreshReasonProto::RefreshReasonNeedRegister as i32
+        );
     }
 
     #[tokio::test]
-    async fn heartbeat_worker_epoch_mismatch_returns_need_refresh_header_error() {
+    async fn heartbeat_missing_live_registration_returns_need_register() {
         let dir = TempDir::new().unwrap();
-        let raft_node = leader_raft(&dir).await;
+        let raft_node = nonleader_raft(&dir).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
-        let worker_id = WorkerId::new(9);
+        let worker_id = WorkerId::new(10);
         worker_manager
             .register_worker(
                 ShardGroupId::new(1),
                 worker_id,
-                "127.0.0.1:9099".to_string(),
+                "127.0.0.1:9090".to_string(),
                 1,
-                100,
+                0,
                 None,
             )
             .unwrap();
@@ -1440,25 +1586,266 @@ mod tests {
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
             &service,
-            Request::new(HeartbeatRequestProto {
-                header: None,
-                worker_id: worker_id.as_raw(),
-                capacity: Some(CapacityInfoProto {
-                    total_bytes: 1_000,
-                    used_bytes: 100,
-                    available_bytes: 900,
-                }),
-                load: Some(LoadInfoProto {
-                    active_reads: 0,
-                    active_writes: 0,
-                    cpu_usage_percent: 0,
-                    memory_used_bytes: 0,
-                }),
-                health: HealthStatusProto::HealthStatusHealthy as i32,
-                worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-                worker_epoch: 101,
-                acks: Vec::new(),
-            }),
+            Request::new(heartbeat_request(1, worker_id, test_worker_run_id(), 1, 9090)),
+        )
+        .await
+        .expect("heartbeat business error uses gRPC OK")
+        .into_inner();
+
+        let error = response.header.expect("header").error.expect("header error");
+        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+        assert!(matches!(
+            error.code,
+            Some(error_detail_proto::Code::RpcCode(code))
+                if code == RpcErrorCodeProto::RpcErrCodeWorkerNotRegistered as i32
+        ));
+        assert_eq!(
+            error.refresh_reason,
+            RefreshReasonProto::RefreshReasonNeedRegister as i32
+        );
+        assert!(response.commands.is_empty());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_stale_worker_run_returns_run_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_id = WorkerId::new(11);
+        worker_manager
+            .register_worker_run(
+                ShardGroupId::new(1),
+                worker_id,
+                "127.0.0.1:9090".to_string(),
+                1,
+                test_worker_run_id(),
+                None,
+            )
+            .unwrap();
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(RecordingRepairSignalSink::default()),
+            Arc::new(MountTable::new()),
+            ShardGroupId::new(1),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+            &service,
+            Request::new(heartbeat_request(1, worker_id, second_worker_run_id(), 1, 9090)),
+        )
+        .await
+        .expect("heartbeat business error uses gRPC OK")
+        .into_inner();
+
+        let error = response.header.expect("header").error.expect("header error");
+        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+        assert!(matches!(
+            error.code,
+            Some(error_detail_proto::Code::RpcCode(code))
+                if code == RpcErrorCodeProto::RpcErrCodeWorkerRunMismatch as i32
+        ));
+        assert_eq!(
+            error.refresh_reason,
+            RefreshReasonProto::RefreshReasonWorkerRunMismatch as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_expired_live_registration_returns_need_register_not_run_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(1));
+        let worker_id = WorkerId::new(110);
+        worker_manager
+            .register_worker_run(
+                ShardGroupId::new(1),
+                worker_id,
+                "127.0.0.1:9090".to_string(),
+                1,
+                test_worker_run_id(),
+                None,
+            )
+            .unwrap();
+        worker_manager.set_last_seen_ms_for_test(ShardGroupId::new(1), worker_id, 0);
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(RecordingRepairSignalSink::default()),
+            Arc::new(MountTable::new()),
+            ShardGroupId::new(1),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+            &service,
+            Request::new(heartbeat_request(1, worker_id, second_worker_run_id(), 1, 9090)),
+        )
+        .await
+        .expect("expired registration heartbeat returns gRPC OK")
+        .into_inner();
+
+        let error = response.header.expect("header").error.expect("header error");
+        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+        assert!(matches!(
+            error.code,
+            Some(error_detail_proto::Code::RpcCode(code))
+                if code == RpcErrorCodeProto::RpcErrCodeWorkerNotRegistered as i32
+        ));
+        assert_eq!(
+            error.refresh_reason,
+            RefreshReasonProto::RefreshReasonNeedRegister as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn follower_heartbeat_accepts_liveness_but_returns_empty_commands() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_id = WorkerId::new(12);
+        worker_manager
+            .register_worker_run(
+                ShardGroupId::new(1),
+                worker_id,
+                "127.0.0.1:9090".to_string(),
+                1,
+                test_worker_run_id(),
+                None,
+            )
+            .unwrap();
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            Arc::clone(&worker_manager),
+            Arc::new(RecordingRepairSignalSink::default()),
+            Arc::new(MountTable::new()),
+            ShardGroupId::new(1),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+            &service,
+            Request::new(heartbeat_request(1, worker_id, test_worker_run_id(), 7, 9090)),
+        )
+        .await
+        .expect("follower heartbeat succeeds")
+        .into_inner();
+
+        assert!(response.header.as_ref().expect("header").error.is_none());
+        assert_eq!(response.group_id, 1);
+        assert_eq!(response.worker_id, worker_id.as_raw());
+        assert_eq!(response.accepted_worker_run_id, test_worker_run_id().to_string());
+        assert_eq!(
+            response.server_role(),
+            MetadataServerRoleProto::MetadataServerRoleFollower
+        );
+        assert!(response.commands.is_empty());
+        assert!(worker_manager.is_worker_live(ShardGroupId::new(1), worker_id));
+    }
+
+    #[tokio::test]
+    async fn leader_heartbeat_accepts_liveness_without_raft_propose() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = leader_raft(&dir).await;
+        let before_state_id = raft_node.get_last_applied_state_id();
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_id = WorkerId::new(13);
+        worker_manager
+            .register_worker_run(
+                ShardGroupId::new(1),
+                worker_id,
+                "127.0.0.1:9090".to_string(),
+                1,
+                test_worker_run_id(),
+                None,
+            )
+            .unwrap();
+        let service = MetadataWorkerServiceImpl::new(
+            Arc::clone(&raft_node),
+            Arc::clone(&worker_manager),
+            Arc::new(RecordingRepairSignalSink::default()),
+            Arc::new(MountTable::new()),
+            ShardGroupId::new(1),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+            &service,
+            Request::new(heartbeat_request(1, worker_id, test_worker_run_id(), 1, 9090)),
+        )
+        .await
+        .expect("leader heartbeat succeeds")
+        .into_inner();
+
+        assert!(response.header.as_ref().expect("header").error.is_none());
+        assert_eq!(
+            response.server_role(),
+            MetadataServerRoleProto::MetadataServerRoleLeader
+        );
+        assert!(response.commands.is_empty());
+        assert_eq!(raft_node.get_last_applied_state_id(), before_state_id);
+        assert!(worker_manager.is_worker_live(ShardGroupId::new(1), worker_id));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_wrong_group_returns_group_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(RecordingRepairSignalSink::default()),
+            Arc::new(MountTable::new()),
+            ShardGroupId::new(1),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+            &service,
+            Request::new(heartbeat_request(2, WorkerId::new(14), test_worker_run_id(), 1, 9090)),
+        )
+        .await
+        .expect("wrong group returns gRPC OK")
+        .into_inner();
+
+        let error = response.header.expect("header").error.expect("header error");
+        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
+        assert!(matches!(
+            error.code,
+            Some(error_detail_proto::Code::RpcCode(code))
+                if code == RpcErrorCodeProto::RpcErrCodeInvalidArgument as i32
+        ));
+        assert_eq!(
+            error.refresh_reason,
+            RefreshReasonProto::RefreshReasonGroupMismatch as i32
+        );
+        assert!(response.commands.is_empty());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_descriptor_mismatch_returns_need_register_header_error() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = leader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_id = WorkerId::new(9);
+        worker_manager
+            .register_worker_run(
+                ShardGroupId::new(1),
+                worker_id,
+                "127.0.0.1:9099".to_string(),
+                1,
+                test_worker_run_id(),
+                None,
+            )
+            .unwrap();
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(RecordingRepairSignalSink::default()),
+            Arc::new(MountTable::new()),
+            ShardGroupId::new(1),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+            &service,
+            Request::new(heartbeat_request(1, worker_id, test_worker_run_id(), 1, 9098)),
         )
         .await
         .expect("business validation must return gRPC OK")
@@ -1466,11 +1853,16 @@ mod tests {
 
         let error = response.header.expect("header").error.expect("header error");
         assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+        assert!(matches!(
+            error.code,
+            Some(error_detail_proto::Code::RpcCode(code))
+                if code == RpcErrorCodeProto::RpcErrCodeWorkerDescriptorMismatch as i32
+        ));
         assert_eq!(
             error.refresh_reason,
-            RefreshReasonProto::RefreshReasonWorkerEpochMismatch as i32
+            RefreshReasonProto::RefreshReasonNeedRegister as i32
         );
-        assert!(error.message.contains("re-register"));
+        assert!(error.message.contains("registration"));
     }
 
     #[tokio::test]

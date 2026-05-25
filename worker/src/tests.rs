@@ -11,7 +11,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
-    use common::error::canonical::CanonicalError;
+    use common::error::canonical::{CanonicalError, RefreshReason};
     use common::header::RpcErrorCode;
     use futures::StreamExt;
     use proto::common::{
@@ -24,7 +24,7 @@ mod tests {
     };
     use proto::metadata::{
         BlockReportRequestProto, BlockReportResponseProto, HeartbeatRequestProto, HeartbeatResponseProto,
-        RegisterWorkerRequestProto, RegisterWorkerResponseProto,
+        MetadataServerRoleProto, RegisterWorkerRequestProto, RegisterWorkerResponseProto, WorkerCommandProto,
     };
     use proto::worker::worker_data_service_server::WorkerDataService;
     use proto::worker::ChecksumKindProto;
@@ -42,7 +42,10 @@ mod tests {
     use types::WorkerRunId;
 
     use crate::config::{WorkerConfig, WorkerRegistrationConfig};
-    use crate::control::{resolve_worker_id, MetadataRegistrar, Registration, RegistrationDescriptor, RegistrationSet};
+    use crate::control::{
+        resolve_worker_id, HeartbeatSnapshot, MetadataHeartbeatLoop, MetadataRegistrar, Registration,
+        RegistrationDescriptor, RegistrationSet,
+    };
     use crate::data::convert::{
         proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_open_request,
         proto_to_sync_committed_block_request, proto_to_write_frame, proto_to_write_open_request,
@@ -147,10 +150,24 @@ mod tests {
         Status(Status),
     }
 
+    #[derive(Clone)]
+    enum MockHeartbeatReply {
+        Ok {
+            worker_id: u64,
+            worker_run_id: WorkerRunId,
+            server_role: MetadataServerRoleProto,
+            commands: Vec<WorkerCommandProto>,
+        },
+        HeaderError(CanonicalError),
+        Status(Status),
+    }
+
     #[derive(Default)]
     struct MockMetadataState {
         replies: Mutex<VecDeque<MockRegisterReply>>,
+        heartbeat_replies: Mutex<VecDeque<MockHeartbeatReply>>,
         requests: Mutex<Vec<RegisterWorkerRequestProto>>,
+        heartbeat_requests: Mutex<Vec<HeartbeatRequestProto>>,
     }
 
     #[derive(Clone)]
@@ -208,9 +225,49 @@ mod tests {
 
         async fn heartbeat(
             &self,
-            _request: Request<HeartbeatRequestProto>,
+            request: Request<HeartbeatRequestProto>,
         ) -> Result<Response<HeartbeatResponseProto>, Status> {
-            Ok(Response::new(HeartbeatResponseProto::default()))
+            let request = request.into_inner();
+            self.state.heartbeat_requests.lock().unwrap().push(request.clone());
+            let reply = self
+                .state
+                .heartbeat_replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(MockHeartbeatReply::Ok {
+                    worker_id: request.worker_id,
+                    worker_run_id: request.worker_run_id.parse().unwrap_or_else(|_| test_worker_run_id()),
+                    server_role: MetadataServerRoleProto::MetadataServerRoleFollower,
+                    commands: Vec::new(),
+                });
+
+            match reply {
+                MockHeartbeatReply::Ok {
+                    worker_id,
+                    worker_run_id,
+                    server_role,
+                    commands,
+                } => Ok(Response::new(HeartbeatResponseProto {
+                    header: Some(response_header_from_heartbeat_request(&request, None)),
+                    commands,
+                    full_report_lease_token: 0,
+                    can_full_report: false,
+                    backoff_ms: 0,
+                    group_id: request.group_id,
+                    worker_id,
+                    accepted_worker_run_id: worker_run_id.to_string(),
+                    heartbeat_interval_ms: 1_000,
+                    liveness_timeout_ms: 5_000,
+                    server_role: server_role as i32,
+                    leader_hint: None,
+                })),
+                MockHeartbeatReply::HeaderError(error) => Ok(Response::new(HeartbeatResponseProto {
+                    header: Some(response_header_from_heartbeat_request(&request, Some(error))),
+                    ..HeartbeatResponseProto::default()
+                })),
+                MockHeartbeatReply::Status(status) => Err(status),
+            }
         }
 
         async fn block_report(
@@ -235,6 +292,20 @@ mod tests {
         }
     }
 
+    fn response_header_from_heartbeat_request(
+        request: &HeartbeatRequestProto,
+        error: Option<CanonicalError>,
+    ) -> ResponseHeaderProto {
+        ResponseHeaderProto {
+            client: request.header.as_ref().and_then(|header| header.client.clone()),
+            error: error.as_ref().map(canonical_to_error_detail),
+            state: Vec::new(),
+            group_id: request.header.as_ref().map(|header| header.group_id).unwrap_or(0),
+            mount_epoch: None,
+            route_epoch: None,
+        }
+    }
+
     async fn start_mock_metadata(
         replies: Vec<MockRegisterReply>,
     ) -> (String, Arc<MockMetadataState>, tokio::sync::oneshot::Sender<()>) {
@@ -244,7 +315,9 @@ mod tests {
         let addr = listener.local_addr().expect("mock metadata local addr");
         let state = Arc::new(MockMetadataState {
             replies: Mutex::new(VecDeque::from(replies)),
+            heartbeat_replies: Mutex::new(VecDeque::new()),
             requests: Mutex::new(Vec::new()),
+            heartbeat_requests: Mutex::new(Vec::new()),
         });
         let service = MockMetadataWorkerService {
             state: Arc::clone(&state),
@@ -268,9 +341,18 @@ mod tests {
         (format!("http://{addr}"), state, shutdown_tx)
     }
 
+    async fn start_mock_metadata_with_heartbeat(
+        replies: Vec<MockHeartbeatReply>,
+    ) -> (String, Arc<MockMetadataState>, tokio::sync::oneshot::Sender<()>) {
+        let (endpoint, state, shutdown) = start_mock_metadata(Vec::new()).await;
+        *state.heartbeat_replies.lock().unwrap() = VecDeque::from(replies);
+        (endpoint, state, shutdown)
+    }
+
     fn test_registration_config(endpoint: String) -> WorkerRegistrationConfig {
         WorkerRegistrationConfig {
             group_id: group_id(),
+            endpoints: vec![endpoint.clone()],
             endpoint,
             register_timeout_ms: 1_000,
             register_retry_initial_backoff_ms: 1,
@@ -308,6 +390,7 @@ mod tests {
             worker_run_id: test_worker_run_id(),
             advertised_endpoint: "http://127.0.0.1:9090".to_string(),
         });
+        state.record_heartbeat_success(group_id(), Duration::from_secs(60));
     }
 
     fn registered_data_service(core: Arc<WorkerCore>) -> WorkerDataServiceImpl {
@@ -355,7 +438,7 @@ mod tests {
         assert_eq!(registration.worker_id, WorkerId::new(42));
         assert_eq!(registration.worker_run_id, worker_run_id);
         assert!(state.is_registered(group_id()));
-        assert!(state.is_ready(group_id()));
+        assert!(!state.is_ready(group_id()));
         assert_eq!(
             state.registration(group_id()).expect("state registration"),
             registration
@@ -483,7 +566,8 @@ mod tests {
 
         assert_eq!(registration.worker_id, WorkerId::new(42));
         assert_eq!(registration.worker_run_id, worker_run_id);
-        assert!(state.is_ready(group_id()));
+        assert!(state.is_registered(group_id()));
+        assert!(!state.is_ready(group_id()));
         let requests = mock.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].worker_run_id, worker_run_id.to_string());
@@ -517,7 +601,8 @@ mod tests {
 
         assert_eq!(registration.worker_id, WorkerId::new(42));
         assert_eq!(registration.worker_run_id, worker_run_id);
-        assert!(state.is_ready(group_id()));
+        assert!(state.is_registered(group_id()));
+        assert!(!state.is_ready(group_id()));
         assert_eq!(mock.requests.lock().unwrap().len(), 2);
         shutdown.send(()).ok();
     }
@@ -545,6 +630,269 @@ mod tests {
         shutdown.send(()).ok();
     }
 
+    #[tokio::test]
+    async fn heartbeat_sends_registered_identity_to_all_configured_peers() {
+        let worker_run_id = test_worker_run_id();
+        let (endpoint_a, mock_a, shutdown_a) = start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::Ok {
+            worker_id: 42,
+            worker_run_id,
+            server_role: MetadataServerRoleProto::MetadataServerRoleLeader,
+            commands: Vec::new(),
+        }])
+        .await;
+        let (endpoint_b, mock_b, shutdown_b) = start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::Ok {
+            worker_id: 42,
+            worker_run_id,
+            server_role: MetadataServerRoleProto::MetadataServerRoleFollower,
+            commands: Vec::new(),
+        }])
+        .await;
+        let state = Arc::new(RegistrationSet::new());
+        state.record_registered(Registration {
+            group_id: group_id(),
+            worker_id: WorkerId::new(42),
+            worker_run_id,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        });
+        let heartbeat = MetadataHeartbeatLoop::new(
+            WorkerRegistrationConfig {
+                endpoints: vec![endpoint_a.clone(), endpoint_b.clone()],
+                ..test_registration_config(endpoint_a)
+            },
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+        )
+        .expect("heartbeat loop");
+
+        let round = heartbeat
+            .send_once(HeartbeatSnapshot {
+                capacity_total_bytes: 10,
+                capacity_used_bytes: 3,
+                capacity_available_bytes: 7,
+                active_reads: 1,
+                active_writes: 2,
+                cpu_usage_percent: 4,
+                memory_used_bytes: 5,
+            })
+            .await
+            .expect("heartbeat round");
+
+        assert_eq!(round.attempted_peers, 2);
+        assert_eq!(round.accepted_peers, 2);
+        assert!(state.is_ready(group_id()));
+        for mock in [&mock_a, &mock_b] {
+            let requests = mock.heartbeat_requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            assert_eq!(request.group_id, group_id().as_raw());
+            assert_eq!(request.worker_id, 42);
+            assert_eq!(request.worker_run_id, worker_run_id.to_string());
+            assert_eq!(request.heartbeat_seq, 1);
+            assert_eq!(request.capacity.as_ref().unwrap().total_bytes, 10);
+            assert_eq!(
+                request.advertised_endpoint,
+                Some(EndpointProto {
+                    host: "127.0.0.1".to_string(),
+                    port: 9090,
+                    protocol: "grpc".to_string(),
+                })
+            );
+        }
+        shutdown_a.send(()).ok();
+        shutdown_b.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_without_registration_sends_no_requests() {
+        let (endpoint, mock, shutdown) = start_mock_metadata_with_heartbeat(Vec::new()).await;
+        let state = Arc::new(RegistrationSet::new());
+        let heartbeat = MetadataHeartbeatLoop::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(test_worker_run_id()),
+            Arc::clone(&state),
+        )
+        .expect("heartbeat loop");
+
+        let round = heartbeat.send_once(HeartbeatSnapshot::default()).await.unwrap();
+
+        assert_eq!(round.attempted_peers, 0);
+        assert!(mock.heartbeat_requests.lock().unwrap().is_empty());
+        shutdown.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn single_heartbeat_peer_failure_does_not_clear_ready_lease() {
+        let worker_run_id = test_worker_run_id();
+        let (endpoint_a, _mock_a, shutdown_a) = start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::Status(
+            Status::unavailable("metadata peer down"),
+        )])
+        .await;
+        let (endpoint_b, _mock_b, shutdown_b) = start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::Ok {
+            worker_id: 42,
+            worker_run_id,
+            server_role: MetadataServerRoleProto::MetadataServerRoleFollower,
+            commands: Vec::new(),
+        }])
+        .await;
+        let state = Arc::new(RegistrationSet::new());
+        state.record_registered(Registration {
+            group_id: group_id(),
+            worker_id: WorkerId::new(42),
+            worker_run_id,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        });
+        state.record_heartbeat_success(group_id(), Duration::from_secs(60));
+        let heartbeat = MetadataHeartbeatLoop::new(
+            WorkerRegistrationConfig {
+                endpoints: vec![endpoint_a.clone(), endpoint_b.clone()],
+                ..test_registration_config(endpoint_a)
+            },
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+        )
+        .expect("heartbeat loop");
+
+        let round = heartbeat.send_once(HeartbeatSnapshot::default()).await.unwrap();
+
+        assert_eq!(round.attempted_peers, 2);
+        assert_eq!(round.accepted_peers, 1);
+        assert!(state.is_ready(group_id()));
+        shutdown_a.send(()).ok();
+        shutdown_b.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn need_register_heartbeat_responses_clear_registration() {
+        for (code, message) in [
+            (RpcErrorCode::WorkerNotRegistered, "register first"),
+            (RpcErrorCode::WorkerDescriptorMismatch, "descriptor changed"),
+        ] {
+            let worker_run_id = test_worker_run_id();
+            let (endpoint, _mock, shutdown) =
+                start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::HeaderError(
+                    CanonicalError::need_refresh(code, RefreshReason::NeedRegister, message),
+                )])
+                .await;
+            let state = Arc::new(RegistrationSet::new());
+            state.record_registered(Registration {
+                group_id: group_id(),
+                worker_id: WorkerId::new(42),
+                worker_run_id,
+                advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+            });
+            let heartbeat = MetadataHeartbeatLoop::new(
+                test_registration_config(endpoint),
+                test_registration_descriptor(worker_run_id),
+                Arc::clone(&state),
+            )
+            .expect("heartbeat loop");
+
+            let round = heartbeat.send_once(HeartbeatSnapshot::default()).await.unwrap();
+
+            assert!(round.needs_register, "{code:?} should request registration");
+            assert!(!state.is_registered(group_id()), "{code:?} should clear registration");
+            assert!(!state.is_ready(group_id()), "{code:?} should clear readiness");
+            shutdown.send(()).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_run_mismatch_heartbeat_response_marks_group_not_ready() {
+        let worker_run_id = test_worker_run_id();
+        let (endpoint, _mock, shutdown) =
+            start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::HeaderError(CanonicalError::need_refresh(
+                RpcErrorCode::WorkerRunMismatch,
+                common::error::canonical::RefreshReason::WorkerRunMismatch,
+                "stale worker run",
+            ))])
+            .await;
+        let state = Arc::new(RegistrationSet::new());
+        state.record_registered(Registration {
+            group_id: group_id(),
+            worker_id: WorkerId::new(42),
+            worker_run_id,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        });
+        state.record_heartbeat_success(group_id(), Duration::from_secs(60));
+        let heartbeat = MetadataHeartbeatLoop::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+        )
+        .expect("heartbeat loop");
+
+        let round = heartbeat.send_once(HeartbeatSnapshot::default()).await.unwrap();
+
+        assert!(round.worker_run_mismatch);
+        assert!(state.is_registered(group_id()));
+        assert!(!state.is_ready(group_id()));
+        shutdown.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn follower_heartbeat_commands_are_ignored_for_readiness() {
+        let worker_run_id = test_worker_run_id();
+        let (endpoint, _mock, shutdown) = start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::Ok {
+            worker_id: 42,
+            worker_run_id,
+            server_role: MetadataServerRoleProto::MetadataServerRoleFollower,
+            commands: vec![WorkerCommandProto {
+                task_id: 1,
+                command: None,
+            }],
+        }])
+        .await;
+        let state = Arc::new(RegistrationSet::new());
+        state.record_registered(Registration {
+            group_id: group_id(),
+            worker_id: WorkerId::new(42),
+            worker_run_id,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        });
+        let heartbeat = MetadataHeartbeatLoop::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+        )
+        .expect("heartbeat loop");
+
+        let round = heartbeat.send_once(HeartbeatSnapshot::default()).await.unwrap();
+
+        assert_eq!(round.accepted_peers, 1);
+        assert!(state.is_ready(group_id()));
+        shutdown.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn malformed_ok_heartbeat_header_is_rejected() {
+        let worker_run_id = test_worker_run_id();
+        let (endpoint, _mock, shutdown) = start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::HeaderError(
+            CanonicalError::ok("malformed ok"),
+        )])
+        .await;
+        let state = Arc::new(RegistrationSet::new());
+        state.record_registered(Registration {
+            group_id: group_id(),
+            worker_id: WorkerId::new(42),
+            worker_run_id,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        });
+        let heartbeat = MetadataHeartbeatLoop::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            state,
+        )
+        .expect("heartbeat loop");
+
+        let error = heartbeat
+            .send_once(HeartbeatSnapshot::default())
+            .await
+            .expect_err("malformed OK header must fail heartbeat");
+
+        assert!(error.to_string().contains("malformed OK"));
+        shutdown.send(()).ok();
+    }
+
     #[test]
     fn worker_readiness_is_false_before_registration_and_true_after() {
         let state = RegistrationSet::new();
@@ -562,6 +910,9 @@ mod tests {
         });
 
         assert!(state.is_registered(group_id()));
+        assert!(!state.is_ready(group_id()));
+        assert!(!state.is_any_ready());
+        state.record_heartbeat_success(group_id(), Duration::from_millis(1_000));
         assert!(state.is_ready(group_id()));
         assert!(state.is_any_ready());
         assert_eq!(
@@ -573,6 +924,9 @@ mod tests {
                 advertised_endpoint: "http://127.0.0.1:9090".to_string(),
             })
         );
+        state.expire_heartbeat_for_test(group_id());
+        assert!(state.is_registered(group_id()));
+        assert!(!state.is_ready(group_id()));
     }
 
     fn write_open_request() -> WriteOpenRequest {
@@ -2023,7 +2377,6 @@ mod tests {
             "MetadataConfig",
             "combo",
             "fallback_transport",
-            "heartbeat",
             "block_report",
         ] {
             assert!(

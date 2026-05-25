@@ -51,6 +51,7 @@ worker.storage.root: "./data"
 # Worker metadata startup registration.
 worker.metadata.group_id: 1
 worker.metadata.endpoint: "http://127.0.0.1:18080"
+worker.metadata.endpoints: "http://127.0.0.1:18080"
 worker.metadata.register_timeout_ms: 5000
 worker.metadata.register_retry_initial_backoff_ms: 200
 worker.metadata.register_retry_max_backoff_ms: 5000

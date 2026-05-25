@@ -148,11 +148,9 @@ mod tests {
             )
             .unwrap();
         manager
-            .update_runtime(
+            .record_test_heartbeat(
                 ShardGroupId::new(1),
                 worker_id,
-                1,
-                100,
                 1_000,
                 500,
                 500,

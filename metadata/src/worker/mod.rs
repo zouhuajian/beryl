@@ -4,7 +4,7 @@
 //! Worker management and BlockReport handling.
 //!
 //! This module implements:
-//! - Worker registration and heartbeat
+//! - Worker registration and volatile heartbeat liveness
 //! - BlockReport processing (full + delta)
 //! - Block locations convergence
 //! - Worker heartbeat command transport
@@ -24,5 +24,5 @@ mod tests;
 mod integration_tests;
 
 pub(crate) use command_router::{DeleteCommandSource, RepairCommandSource, WorkerCommandRouter};
-pub use manager::{HealthStatus, WorkerDescriptor, WorkerInfo, WorkerManager};
+pub use manager::{HealthStatus, WorkerDescriptor, WorkerInfo, WorkerLiveState, WorkerManager};
 pub use service::{MetadataWorkerServiceImpl, WorkerBackgroundHandle};

@@ -53,7 +53,15 @@ message WorkerConfigProto {
 
 message HeartbeatRequestProto {
   common.RequestHeaderProto header = 1;
+  /// Metadata group this heartbeat targets.
+  uint64 group_id = 9;
   uint64 worker_id = 2;
+  /// UUID accepted by RegisterWorker for this worker process run.
+  string worker_run_id = 10;
+  /// Monotonic sequence number scoped to (group_id, worker_run_id).
+  uint64 heartbeat_seq = 11;
+  /// Current advertised data endpoint; must match the registered descriptor.
+  common.EndpointProto advertised_endpoint = 12;
   
   /// Capacity information.
   CapacityInfoProto capacity = 3;
@@ -63,8 +71,9 @@ message HeartbeatRequestProto {
   HealthStatusProto health = 5;
   /// Worker network protocol (grpc/quic/rdma).
   common.WorkerNetProtocolProto worker_net_protocol = 6;
-  /// TODO(PR-6): align heartbeat identity with WorkerId + WorkerRunId.
-  /// This field is not part of the startup registration contract.
+  /// Heartbeat identity is group_id + worker_id + worker_run_id.
+  /// worker_epoch is not part of startup registration or heartbeat identity.
+  /// Block report and command ack protocols are separate follow-ups.
   uint64 worker_epoch = 7;
   /// Task acknowledgments (completed tasks).
   repeated TaskAckProto acks = 8;
@@ -99,7 +108,7 @@ enum HealthStatusProto {
 
 message HeartbeatResponseProto {
   common.ResponseHeaderProto header = 1;
-  /// Commands from metadata to worker (can return multiple).
+  /// Commands from metadata to worker. PR-6 heartbeat liveness returns this empty.
   repeated WorkerCommandProto commands = 2;
   /// Full report lease token (if can_full_report is true).
   /// Worker must include this token in full block report.
@@ -108,6 +117,26 @@ message HeartbeatResponseProto {
   bool can_full_report = 4;
   /// Backoff delay in milliseconds (if can_full_report is false and needs_full_sync).
   uint32 backoff_ms = 5;
+  /// Metadata group that accepted this heartbeat.
+  uint64 group_id = 6;
+  /// Confirmed stable worker identity.
+  uint64 worker_id = 7;
+  /// Accepted live worker process-run identity.
+  string accepted_worker_run_id = 8;
+  /// Metadata-recommended heartbeat interval.
+  uint32 heartbeat_interval_ms = 9;
+  /// Local liveness timeout used by metadata for this worker run.
+  uint32 liveness_timeout_ms = 10;
+  /// Role of the metadata node that accepted this heartbeat.
+  MetadataServerRoleProto server_role = 11;
+  /// Best-effort leader endpoint hint when this node knows one.
+  common.EndpointProto leader_hint = 12;
+}
+
+enum MetadataServerRoleProto {
+  METADATA_SERVER_ROLE_UNKNOWN = 0;
+  METADATA_SERVER_ROLE_LEADER = 1;
+  METADATA_SERVER_ROLE_FOLLOWER = 2;
 }
 
 message WorkerCommandProto {

@@ -162,6 +162,9 @@ fn refresh_reason_from_canonical(reason: CanonicalRefreshReason) -> RefreshReaso
         CanonicalRefreshReason::MountEpochMismatch => RefreshReason::MountEpochMismatch,
         CanonicalRefreshReason::RouteEpochMismatch => RefreshReason::RouteEpochMismatch,
         CanonicalRefreshReason::WorkerEpochMismatch => RefreshReason::WorkerEpochMismatch,
+        CanonicalRefreshReason::GroupMismatch
+        | CanonicalRefreshReason::NeedRegister
+        | CanonicalRefreshReason::WorkerRunMismatch => RefreshReason::Unknown,
         CanonicalRefreshReason::BlockStampMismatch => RefreshReason::BlockStampMismatch,
         CanonicalRefreshReason::Unknown => RefreshReason::Unknown,
         CanonicalRefreshReason::Fencing

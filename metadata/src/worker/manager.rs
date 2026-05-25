@@ -8,7 +8,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use types::block::BlockPlacement;
 use types::ids::{BlockId, ShardGroupId, WorkerId};
@@ -30,6 +30,9 @@ pub struct WorkerDescriptor {
 /// Worker runtime (high-frequency, soft-state, memory-only with TTL).
 #[derive(Clone, Debug)]
 pub struct WorkerRuntime {
+    pub worker_run_id: WorkerRunId,
+    pub heartbeat_seq: u64,
+    pub last_seen_at: Instant,
     pub last_seen_ms: u64, // Unix timestamp in milliseconds
     pub capacity_total: u64,
     pub capacity_used: u64,
@@ -103,6 +106,17 @@ pub struct WorkerRegistrationState {
     pub worker_net_protocol: i32,
     pub fault_domain: Option<String>,
     pub registered_at_ms: u64,
+    pub lease_deadline: Instant,
+}
+
+/// Worker liveness view updated only by group-scoped heartbeat.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerLiveState {
+    pub group_id: ShardGroupId,
+    pub worker_id: WorkerId,
+    pub worker_run_id: WorkerRunId,
+    pub heartbeat_seq: u64,
+    pub last_seen_ms: u64,
 }
 
 /// Worker sync state: tracks whether a worker has completed full sync with this metadata node.
@@ -187,6 +201,10 @@ impl WorkerManager {
     /// Get heartbeat timeout in seconds.
     pub fn heartbeat_timeout_sec(&self) -> u64 {
         self.heartbeat_timeout_sec
+    }
+
+    fn heartbeat_timeout(&self) -> Duration {
+        Duration::from_secs(self.heartbeat_timeout_sec)
     }
 
     /// Increment metadata epoch (call on metadata restart).
@@ -408,6 +426,7 @@ impl WorkerManager {
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
     ) -> MetadataResult<()> {
+        self.expire_liveness();
         let registrations = self.registrations.read();
         let key = WorkerRegistrationKey::new(group_id, worker_id);
         if let Some(existing) = registrations.get(&key) {
@@ -456,6 +475,7 @@ impl WorkerManager {
     ) -> MetadataResult<()> {
         self.validate_worker_run_registration(group_id, worker_id, worker_run_id)?;
         let registered_at_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let lease_deadline = Instant::now() + self.heartbeat_timeout();
         let descriptor_address = address.clone();
         let descriptor_fault_domain = fault_domain.clone();
         let descriptor = WorkerDescriptor {
@@ -479,63 +499,121 @@ impl WorkerManager {
                 worker_net_protocol,
                 fault_domain,
                 registered_at_ms,
+                lease_deadline,
             },
         );
         Ok(())
     }
 
-    /// Update worker runtime (fanout heartbeat, memory-only, no Raft).
-    /// Returns true if descriptor fields changed (requires re-register).
-    // Heartbeat fields mirror the worker report wire payload; grouping would obscure drift checks.
+    /// Record a validated group-scoped heartbeat in volatile live state.
+    ///
+    /// Stale sequence numbers renew the local liveness lease but do not replace
+    /// the last accepted resource snapshot.
     #[allow(clippy::too_many_arguments)]
-    pub fn update_runtime(
+    pub fn record_heartbeat(
         &self,
         group_id: ShardGroupId,
         worker_id: WorkerId,
+        worker_run_id: WorkerRunId,
+        heartbeat_seq: u64,
+        advertised_endpoint: &str,
         worker_net_protocol: i32,
-        worker_epoch: u64,
         capacity_total: u64,
         capacity_used: u64,
         capacity_available: u64,
         active_reads: u32,
         active_writes: u32,
         health: HealthStatus,
-    ) -> MetadataResult<bool> {
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+    ) -> MetadataResult<WorkerLiveState> {
+        self.expire_liveness();
         let key = WorkerRegistrationKey::new(group_id, worker_id);
+        let descriptor = {
+            let descriptors = self.descriptors.read();
+            descriptors.get(&key).cloned().ok_or_else(|| {
+                MetadataError::NotFound(format!(
+                    "worker descriptor not found for group_id={}, worker_id={}",
+                    group_id.as_raw(),
+                    worker_id.as_raw()
+                ))
+            })?
+        };
+        let registration = {
+            let registrations = self.registrations.read();
+            registrations.get(&key).cloned().ok_or_else(|| {
+                MetadataError::NotFound(format!(
+                    "live worker registration not found for group_id={}, worker_id={}",
+                    group_id.as_raw(),
+                    worker_id.as_raw()
+                ))
+            })?
+        };
 
-        let mut runtime = self.runtime.write();
-        let descriptors = self.descriptors.read();
-
-        // Check if descriptor exists
-        if !descriptors.contains_key(&key) {
-            return Err(MetadataError::NotFound(format!(
-                "Worker descriptor not found for group_id={}, worker_id={}",
+        if registration.worker_run_id != worker_run_id {
+            return Err(MetadataError::StaleState(format!(
+                "worker_run_id mismatch for group_id={}, worker_id={}",
+                group_id.as_raw(),
+                worker_id.as_raw()
+            )));
+        }
+        if descriptor.address != advertised_endpoint || descriptor.worker_net_protocol != worker_net_protocol {
+            return Err(MetadataError::InvalidArgument(format!(
+                "worker descriptor mismatch for group_id={}, worker_id={}",
                 group_id.as_raw(),
                 worker_id.as_raw()
             )));
         }
 
-        // Check if descriptor fields changed
-        let descriptor_changed = if let Some(desc) = descriptors.get(&key) {
-            desc.worker_net_protocol != worker_net_protocol || desc.worker_epoch != worker_epoch
-        } else {
-            false
+        let now = Instant::now();
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let mut runtime = self.runtime.write();
+        let live_state = match runtime.get_mut(&key) {
+            Some(existing) if heartbeat_seq <= existing.heartbeat_seq => {
+                existing.last_seen_at = now;
+                existing.last_seen_ms = now_ms;
+                existing.worker_run_id = worker_run_id;
+                WorkerLiveState {
+                    group_id,
+                    worker_id,
+                    worker_run_id,
+                    heartbeat_seq: existing.heartbeat_seq,
+                    last_seen_ms: existing.last_seen_ms,
+                }
+            }
+            existing => {
+                let worker_runtime = WorkerRuntime {
+                    worker_run_id,
+                    heartbeat_seq,
+                    last_seen_at: now,
+                    last_seen_ms: now_ms,
+                    capacity_total,
+                    capacity_used,
+                    capacity_available,
+                    active_reads,
+                    active_writes,
+                    health,
+                };
+                match existing {
+                    Some(slot) => *slot = worker_runtime,
+                    None => {
+                        runtime.insert(key, worker_runtime);
+                    }
+                }
+                WorkerLiveState {
+                    group_id,
+                    worker_id,
+                    worker_run_id,
+                    heartbeat_seq,
+                    last_seen_ms: now_ms,
+                }
+            }
         };
+        drop(runtime);
 
-        // Update runtime (always, even if descriptor changed)
-        let worker_runtime = WorkerRuntime {
-            last_seen_ms: now_ms,
-            capacity_total,
-            capacity_used,
-            capacity_available,
-            active_reads,
-            active_writes,
-            health,
-        };
-        runtime.insert(key, worker_runtime);
+        if let Some(registration) = self.registrations.write().get_mut(&key) {
+            registration.lease_deadline = now + self.heartbeat_timeout();
+        }
 
-        Ok(descriptor_changed)
+        Ok(live_state)
     }
 
     /// Get worker info by combining persisted descriptor and current runtime state.
@@ -595,12 +673,12 @@ impl WorkerManager {
     /// List all live workers (based on runtime last_seen_ms).
     pub fn list_live_workers(&self) -> Vec<WorkerId> {
         let runtime = self.runtime.read();
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        let timeout_ms = self.heartbeat_timeout_sec * 1000;
+        let now = Instant::now();
+        let timeout = self.heartbeat_timeout();
 
         runtime
             .iter()
-            .filter(|(_, r)| now_ms.saturating_sub(r.last_seen_ms) < timeout_ms)
+            .filter(|(_, r)| now.duration_since(r.last_seen_at) < timeout)
             .map(|(key, _)| key.worker_id)
             .collect()
     }
@@ -608,12 +686,12 @@ impl WorkerManager {
     /// List live workers scoped to one metadata group.
     pub fn list_live_workers_in_group(&self, group_id: ShardGroupId) -> Vec<WorkerId> {
         let runtime = self.runtime.read();
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        let timeout_ms = self.heartbeat_timeout_sec * 1000;
+        let now = Instant::now();
+        let timeout = self.heartbeat_timeout();
 
         runtime
             .iter()
-            .filter(|(key, r)| key.group_id == group_id && now_ms.saturating_sub(r.last_seen_ms) < timeout_ms)
+            .filter(|(key, r)| key.group_id == group_id && now.duration_since(r.last_seen_at) < timeout)
             .map(|(key, _)| key.worker_id)
             .collect()
     }
@@ -621,13 +699,13 @@ impl WorkerManager {
     /// Check if worker is live (based on runtime last_seen_ms).
     pub fn is_worker_live(&self, group_id: ShardGroupId, worker_id: WorkerId) -> bool {
         let runtime = self.runtime.read();
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        let timeout_ms = self.heartbeat_timeout_sec * 1000;
+        let now = Instant::now();
+        let timeout = self.heartbeat_timeout();
         let key = WorkerRegistrationKey::new(group_id, worker_id);
 
         runtime
             .get(&key)
-            .map(|r| now_ms.saturating_sub(r.last_seen_ms) < timeout_ms)
+            .map(|r| now.duration_since(r.last_seen_at) < timeout)
             .unwrap_or(false)
     }
 
@@ -962,12 +1040,12 @@ impl WorkerManager {
         let runtime = self.runtime.read();
         let locations = self.locations.read();
 
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        let timeout_ms = self.heartbeat_timeout_sec * 1000;
+        let now = Instant::now();
+        let timeout = self.heartbeat_timeout();
 
         let live_count = runtime
             .values()
-            .filter(|r| now_ms.saturating_sub(r.last_seen_ms) < timeout_ms)
+            .filter(|r| now.duration_since(r.last_seen_at) < timeout)
             .count();
 
         WorkerManagerStats {
@@ -981,10 +1059,44 @@ impl WorkerManager {
     /// Clean up stale runtime entries (TTL-based cleanup).
     pub fn cleanup_stale_runtime(&self) {
         let mut runtime = self.runtime.write();
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        let timeout_ms = self.heartbeat_timeout_sec * 1000 * 2; // 2x timeout for cleanup
+        let now = Instant::now();
+        let timeout = self.heartbeat_timeout() * 2; // 2x timeout for cleanup
 
-        runtime.retain(|_, r| now_ms.saturating_sub(r.last_seen_ms) < timeout_ms);
+        runtime.retain(|_, r| now.duration_since(r.last_seen_at) < timeout);
+    }
+
+    /// Expire heartbeat liveness and live process-run registrations.
+    pub fn expire_liveness(&self) -> Vec<(ShardGroupId, WorkerId)> {
+        let now = Instant::now();
+        let timeout = self.heartbeat_timeout();
+        let mut expired = Vec::new();
+
+        {
+            let mut runtime = self.runtime.write();
+            runtime.retain(|key, runtime| {
+                let is_live = now.duration_since(runtime.last_seen_at) < timeout;
+                if !is_live {
+                    expired.push((key.group_id, key.worker_id));
+                }
+                is_live
+            });
+        }
+
+        {
+            let mut registrations = self.registrations.write();
+            registrations.retain(|key, registration| {
+                let is_live = registration.lease_deadline > now;
+                if !is_live {
+                    let entry = (key.group_id, key.worker_id);
+                    if !expired.contains(&entry) {
+                        expired.push(entry);
+                    }
+                }
+                is_live
+            });
+        }
+
+        expired
     }
 
     /// Get block report convergence snapshot for maintenance safety gate.
@@ -1054,13 +1166,87 @@ impl WorkerManager {
 
 #[cfg(test)]
 impl WorkerManager {
+    /// Test-only helper that creates liveness through the validated heartbeat path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_test_heartbeat(
+        &self,
+        group_id: ShardGroupId,
+        worker_id: WorkerId,
+        capacity_total: u64,
+        capacity_used: u64,
+        capacity_available: u64,
+        active_reads: u32,
+        active_writes: u32,
+        health: HealthStatus,
+    ) -> MetadataResult<WorkerLiveState> {
+        let descriptor = self.get_descriptor_in_group(group_id, worker_id).ok_or_else(|| {
+            MetadataError::NotFound(format!(
+                "worker descriptor not found for group_id={}, worker_id={}",
+                group_id.as_raw(),
+                worker_id.as_raw()
+            ))
+        })?;
+        let worker_run_id = worker_run_id_for_test(group_id, worker_id);
+        self.register_worker_run(
+            group_id,
+            worker_id,
+            descriptor.address.clone(),
+            descriptor.worker_net_protocol,
+            worker_run_id,
+            descriptor.fault_domain.clone(),
+        )?;
+        self.upsert_descriptor(descriptor.clone())?;
+        self.record_heartbeat(
+            group_id,
+            worker_id,
+            worker_run_id,
+            1,
+            &descriptor.address,
+            descriptor.worker_net_protocol,
+            capacity_total,
+            capacity_used,
+            capacity_available,
+            active_reads,
+            active_writes,
+            health,
+        )
+    }
+
     /// Test-only helper to override last_seen_ms for deterministic timeout checks.
     pub(crate) fn set_last_seen_ms_for_test(&self, group_id: ShardGroupId, worker_id: WorkerId, last_seen_ms: u64) {
         let mut runtime = self.runtime.write();
         if let Some(worker) = runtime.get_mut(&WorkerRegistrationKey::new(group_id, worker_id)) {
             worker.last_seen_ms = last_seen_ms;
+            let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+            let age_ms = now_ms.saturating_sub(last_seen_ms);
+            let fallback = self
+                .heartbeat_timeout_sec
+                .saturating_mul(1000)
+                .saturating_mul(2)
+                .saturating_add(1);
+            worker.last_seen_at = Instant::now()
+                .checked_sub(Duration::from_millis(age_ms))
+                .unwrap_or_else(|| Instant::now() - Duration::from_millis(fallback));
+        }
+        if let Some(registration) = self
+            .registrations
+            .write()
+            .get_mut(&WorkerRegistrationKey::new(group_id, worker_id))
+        {
+            registration.lease_deadline = Instant::now() - Duration::from_millis(1);
         }
     }
+}
+
+#[cfg(test)]
+fn worker_run_id_for_test(group_id: ShardGroupId, worker_id: WorkerId) -> WorkerRunId {
+    let suffix = group_id
+        .as_raw()
+        .saturating_mul(1_000_000)
+        .saturating_add(worker_id.as_raw());
+    format!("550e8400-e29b-41d4-a716-{suffix:012x}")
+        .parse()
+        .expect("valid test WorkerRunId")
 }
 
 /// Placement score for worker selection.

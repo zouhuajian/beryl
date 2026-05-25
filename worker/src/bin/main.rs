@@ -11,7 +11,7 @@ use common::observe::{init_observability, ObservabilityConfig, ServiceInfo};
 use tracing::{error, info};
 use worker::{
     config::WorkerConfig,
-    control::{MetadataRegistrar, RegistrationSet},
+    control::{MetadataHeartbeatLoop, MetadataRegistrar, RegistrationSet},
     net, WorkerCore,
 };
 
@@ -60,8 +60,16 @@ async fn main() -> Result<()> {
     let registration_state = Arc::new(RegistrationSet::new());
     let descriptor =
         MetadataRegistrar::descriptor_from_config(&config).context("Failed to build worker registration descriptor")?;
-    let registrar = MetadataRegistrar::new(config.metadata.clone(), descriptor, Arc::clone(&registration_state))
-        .context("Failed to create worker metadata registrar")?;
+    let heartbeat = MetadataHeartbeatLoop::new(
+        config.metadata.clone(),
+        descriptor.clone(),
+        Arc::clone(&registration_state),
+    )
+    .context("Failed to create worker metadata heartbeat loop")?;
+    let registrar = Arc::new(
+        MetadataRegistrar::new(config.metadata.clone(), descriptor, Arc::clone(&registration_state))
+            .context("Failed to create worker metadata registrar")?,
+    );
 
     let core = Arc::new(WorkerCore::with_options(
         config.chunk_size,
@@ -78,6 +86,7 @@ async fn main() -> Result<()> {
         })
         .await
         .context("Worker metadata registration failed")?;
+    let _heartbeat_handle = heartbeat.spawn_with_registrar(Arc::clone(&registrar));
 
     if let Err(error) = net::server::serve_worker_data_with_registration(&config.net, core, registration_state)
         .await

@@ -33,141 +33,6 @@ fn test_worker_registration_with_worker_net_protocol_and_epoch() {
     assert_eq!(descriptor.address, address);
     assert_eq!(descriptor.worker_net_protocol, worker_net_protocol);
     assert_eq!(descriptor.worker_epoch, worker_epoch);
-
-    // get_worker requires both descriptor and runtime, so send a heartbeat first
-    manager
-        .update_runtime(
-            ShardGroupId::new(1),
-            worker_id,
-            worker_net_protocol,
-            worker_epoch,
-            0,
-            0,
-            0,
-            0,
-            0,
-            HealthStatus::Healthy,
-        )
-        .unwrap();
-
-    // Now get_worker should work
-    let worker = manager.get_worker(ShardGroupId::new(1), worker_id).unwrap();
-    assert_eq!(worker.worker_id, worker_id);
-    assert_eq!(worker.address, address);
-    assert_eq!(worker.worker_net_protocol, worker_net_protocol);
-    assert_eq!(worker.worker_epoch, worker_epoch);
-}
-
-#[test]
-fn test_worker_heartbeat_updates_worker_net_protocol_and_epoch() {
-    let manager = WorkerManager::new(60);
-    let worker_id = WorkerId::new(1);
-    let address = "127.0.0.1:9090".to_string();
-    let worker_net_protocol = 1; // GRPC
-    let worker_epoch = 100;
-
-    // Register worker
-    manager
-        .register_worker(
-            ShardGroupId::new(1),
-            worker_id,
-            address.clone(),
-            worker_net_protocol,
-            worker_epoch,
-            None,
-        )
-        .unwrap();
-
-    // Update runtime (note: descriptor fields don't change via update_runtime)
-    // Runtime fields are updated, but descriptor fields require re-register
-    manager
-        .update_runtime(
-            ShardGroupId::new(1),
-            worker_id,
-            worker_net_protocol, // Same as before (descriptor doesn't change)
-            worker_epoch,        // Same as before (descriptor doesn't change)
-            1000,
-            500,
-            500,
-            0,
-            0,
-            HealthStatus::Healthy,
-        )
-        .unwrap();
-
-    // Verify runtime fields are updated
-    let worker = manager.get_worker(ShardGroupId::new(1), worker_id).unwrap();
-    assert_eq!(worker.capacity_total, 1000);
-    assert_eq!(worker.capacity_used, 500);
-    assert_eq!(worker.capacity_available, 500);
-    // Descriptor fields remain unchanged (require re-register via Raft)
-    assert_eq!(worker.worker_net_protocol, worker_net_protocol);
-    assert_eq!(worker.worker_epoch, worker_epoch);
-}
-
-#[test]
-fn test_worker_heartbeat_detects_descriptor_change() {
-    let manager = WorkerManager::new(60);
-    let worker_id = WorkerId::new(1);
-
-    manager
-        .register_worker(
-            ShardGroupId::new(1),
-            worker_id,
-            "127.0.0.1:9090".to_string(),
-            1,
-            100,
-            None,
-        )
-        .unwrap();
-
-    let unchanged = manager
-        .update_runtime(
-            ShardGroupId::new(1),
-            worker_id,
-            1,
-            100,
-            1000,
-            500,
-            500,
-            0,
-            0,
-            HealthStatus::Healthy,
-        )
-        .unwrap();
-    assert!(!unchanged);
-
-    let epoch_changed = manager
-        .update_runtime(
-            ShardGroupId::new(1),
-            worker_id,
-            1,
-            101,
-            1000,
-            500,
-            500,
-            0,
-            0,
-            HealthStatus::Healthy,
-        )
-        .unwrap();
-    assert!(epoch_changed);
-
-    let transport_changed = manager
-        .update_runtime(
-            ShardGroupId::new(1),
-            worker_id,
-            2,
-            100,
-            1000,
-            500,
-            500,
-            0,
-            0,
-            HealthStatus::Healthy,
-        )
-        .unwrap();
-    assert!(transport_changed);
 }
 
 #[test]
@@ -294,7 +159,20 @@ fn loading_persisted_workers_drops_live_run_registration() {
         )
         .unwrap();
     manager
-        .update_runtime(group_id, worker_id, 1, 0, 1000, 10, 990, 0, 0, HealthStatus::Healthy)
+        .record_heartbeat(
+            group_id,
+            worker_id,
+            run_id,
+            1,
+            "127.0.0.1:9090",
+            1,
+            1000,
+            10,
+            990,
+            0,
+            0,
+            HealthStatus::Healthy,
+        )
         .unwrap();
     manager.mark_full_sync_complete(group_id, worker_id);
 
@@ -320,4 +198,101 @@ fn loading_persisted_workers_drops_live_run_registration() {
     assert!(manager.get_descriptor_in_group(group_id, worker_id).is_some());
     assert!(manager.get_worker(group_id, worker_id).is_none());
     assert!(manager.needs_full_sync(group_id, worker_id));
+}
+
+#[test]
+fn worker_heartbeat_updates_live_state_without_moving_stale_seq_backward() {
+    let manager = WorkerManager::new(60);
+    let group_id = ShardGroupId::new(1);
+    let worker_id = WorkerId::new(1);
+    let run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440040".parse().unwrap();
+
+    manager
+        .register_worker_run(
+            group_id,
+            worker_id,
+            "127.0.0.1:9090".to_string(),
+            1,
+            run_id,
+            Some("rack-a".to_string()),
+        )
+        .unwrap();
+
+    let first = manager
+        .record_heartbeat(
+            group_id,
+            worker_id,
+            run_id,
+            10,
+            "127.0.0.1:9090",
+            1,
+            1_000,
+            100,
+            900,
+            2,
+            1,
+            HealthStatus::Healthy,
+        )
+        .unwrap();
+    assert_eq!(first.heartbeat_seq, 10);
+    assert_eq!(manager.get_worker(group_id, worker_id).unwrap().capacity_total, 1_000);
+
+    let stale = manager
+        .record_heartbeat(
+            group_id,
+            worker_id,
+            run_id,
+            9,
+            "127.0.0.1:9090",
+            1,
+            2_000,
+            1_000,
+            1_000,
+            9,
+            9,
+            HealthStatus::Unhealthy,
+        )
+        .unwrap();
+    assert_eq!(stale.heartbeat_seq, 10);
+
+    let worker = manager.get_worker(group_id, worker_id).unwrap();
+    assert_eq!(worker.capacity_total, 1_000);
+    assert_eq!(worker.active_reads, 2);
+    assert_eq!(worker.health, HealthStatus::Healthy);
+}
+
+#[test]
+fn heartbeat_liveness_expiry_removes_live_run_but_keeps_descriptor() {
+    let manager = WorkerManager::new(1);
+    let group_id = ShardGroupId::new(1);
+    let worker_id = WorkerId::new(1);
+    let run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440041".parse().unwrap();
+
+    manager
+        .register_worker_run(group_id, worker_id, "127.0.0.1:9090".to_string(), 1, run_id, None)
+        .unwrap();
+    manager
+        .record_heartbeat(
+            group_id,
+            worker_id,
+            run_id,
+            1,
+            "127.0.0.1:9090",
+            1,
+            1_000,
+            100,
+            900,
+            0,
+            0,
+            HealthStatus::Healthy,
+        )
+        .unwrap();
+
+    manager.set_last_seen_ms_for_test(group_id, worker_id, 0);
+    let expired = manager.expire_liveness();
+
+    assert_eq!(expired, vec![(group_id, worker_id)]);
+    assert!(!manager.is_worker_live(group_id, worker_id));
+    assert!(manager.get_registration_in_group(group_id, worker_id).is_none());
+    assert!(manager.get_descriptor_in_group(group_id, worker_id).is_some());
 }

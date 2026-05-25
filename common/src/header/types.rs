@@ -147,12 +147,15 @@ pub enum RpcErrorCode {
     MountEpochMismatch,
     RouteEpochMismatch,
     WorkerEpochMismatch,
+    WorkerNotRegistered,
+    WorkerRunMismatch,
+    WorkerDescriptorMismatch,
     BlockStampMismatch,
     EpochMismatch,
     Fencing,
     ShardMoved,
     NodeUnavailable,
-    // Application
+    InvalidArgument,
     Application,
 }
 

@@ -104,11 +104,9 @@ fn worker_manager_for_write_targets(group_id: ShardGroupId) -> Arc<WorkerManager
             )
             .unwrap();
         manager
-            .update_runtime(
+            .record_test_heartbeat(
                 group_id,
                 worker_id,
-                1,
-                10 + raw,
                 1024 * 1024,
                 0,
                 1024 * 1024,
@@ -138,18 +136,7 @@ async fn get_file_layout_returns_worker_locations_from_worker_manager() {
             .register_worker(group_id, worker_id, format!("127.0.0.1:{port}"), 1, 20 + raw, None)
             .unwrap();
         worker_manager
-            .update_runtime(
-                group_id,
-                worker_id,
-                1,
-                20 + raw,
-                1024,
-                0,
-                1024,
-                0,
-                0,
-                HealthStatus::Healthy,
-            )
+            .record_test_heartbeat(group_id, worker_id, 1024, 0, 1024, 0, 0, HealthStatus::Healthy)
             .unwrap();
         worker_manager.update_locations(worker_id, vec![block_id]).unwrap();
     }
@@ -1569,11 +1556,9 @@ async fn worker_report_does_not_change_file_version() {
         .update_locations(WorkerId::new(1), vec![target.block_id])
         .expect("worker report should update soft locations");
     worker_manager
-        .update_runtime(
+        .record_test_heartbeat(
             env.group_id,
             WorkerId::new(1),
-            1,
-            99,
             1024,
             1,
             2048,

@@ -70,6 +70,12 @@ pub mod canonical {
         RouteEpochMismatch,
         /// Worker epoch / boot id mismatch.
         WorkerEpochMismatch,
+        /// Request targeted a metadata group this server does not serve.
+        GroupMismatch,
+        /// Worker must run startup registration for the target group.
+        NeedRegister,
+        /// Worker process-run identity no longer matches metadata live state.
+        WorkerRunMismatch,
         /// Block stamp mismatch (data-plane).
         BlockStampMismatch,
         /// Fencing / lease fenced.

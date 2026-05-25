@@ -27,13 +27,11 @@ async fn test_worker_registration_and_heartbeat() {
         )
         .unwrap();
 
-    // Send heartbeat (update runtime)
+    // Send heartbeat through the validated live-registration path.
     manager
-        .update_runtime(
+        .record_test_heartbeat(
             ShardGroupId::new(1),
             worker_id,
-            1,   // worker_net_protocol: GRPC
-            100, // worker_epoch
             1000,
             500,
             500,
@@ -68,13 +66,11 @@ async fn test_block_report_updates_locations() {
         )
         .unwrap();
 
-    // Send heartbeat to make worker live
+    // Send heartbeat to make worker live.
     manager
-        .update_runtime(
+        .record_test_heartbeat(
             ShardGroupId::new(1),
             worker_id,
-            1,
-            100,
             1000,
             500,
             500,
@@ -122,13 +118,11 @@ async fn test_block_report_batching_correctness() {
         )
         .unwrap();
 
-    // Send heartbeat to make worker live
+    // Send heartbeat to make worker live.
     manager
-        .update_runtime(
+        .record_test_heartbeat(
             ShardGroupId::new(1),
             worker_id,
-            1,
-            100,
             1000,
             500,
             500,
@@ -178,13 +172,11 @@ async fn test_dead_worker_cleanup() {
         )
         .unwrap();
 
-    // Send heartbeat to make worker live
+    // Send heartbeat to make worker live.
     manager
-        .update_runtime(
+        .record_test_heartbeat(
             ShardGroupId::new(1),
             worker_id,
-            1,
-            100,
             1000,
             500,
             500,
@@ -323,13 +315,11 @@ async fn test_worker_placement_selection() {
         )
         .unwrap();
 
-    // Send heartbeats to make workers live and update capacity (update runtime)
+    // Send heartbeats to make workers live and update capacity.
     manager
-        .update_runtime(
+        .record_test_heartbeat(
             ShardGroupId::new(1),
             worker1,
-            1,
-            100,
             1000,
             200,
             800,
@@ -339,11 +329,9 @@ async fn test_worker_placement_selection() {
         )
         .unwrap();
     manager
-        .update_runtime(
+        .record_test_heartbeat(
             ShardGroupId::new(1),
             worker2,
-            1,
-            100,
             1000,
             300,
             700,
@@ -353,11 +341,9 @@ async fn test_worker_placement_selection() {
         )
         .unwrap();
     manager
-        .update_runtime(
+        .record_test_heartbeat(
             ShardGroupId::new(1),
             worker3,
-            1,
-            100,
             1000,
             100,
             900,
@@ -490,13 +476,11 @@ async fn test_replication_check_triggers_repair() {
         )
         .unwrap();
 
-    // Send heartbeats to make all workers live
+    // Send heartbeats to make all workers live.
     manager
-        .update_runtime(
+        .record_test_heartbeat(
             ShardGroupId::new(1),
             worker1,
-            1,
-            100,
             1000,
             500,
             500,
@@ -506,11 +490,9 @@ async fn test_replication_check_triggers_repair() {
         )
         .unwrap();
     manager
-        .update_runtime(
+        .record_test_heartbeat(
             ShardGroupId::new(1),
             worker2,
-            1,
-            100,
             1000,
             500,
             500,
@@ -520,11 +502,9 @@ async fn test_replication_check_triggers_repair() {
         )
         .unwrap();
     manager
-        .update_runtime(
+        .record_test_heartbeat(
             ShardGroupId::new(1),
             worker3,
-            1,
-            100,
             1000,
             500,
             500,
@@ -534,11 +514,9 @@ async fn test_replication_check_triggers_repair() {
         )
         .unwrap();
     manager
-        .update_runtime(
+        .record_test_heartbeat(
             ShardGroupId::new(1),
             worker4,
-            1,
-            100,
             1000,
             500,
             500,

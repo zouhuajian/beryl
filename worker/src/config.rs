@@ -22,7 +22,9 @@ pub struct WorkerRegistrationConfig {
     pub group_id: ShardGroupId,
     /// MetadataWorkerService endpoint URI used during worker startup registration.
     pub endpoint: String,
-    /// Per-attempt registration timeout.
+    /// MetadataWorkerService peer endpoint URIs used for heartbeat fanout.
+    pub endpoints: Vec<String>,
+    /// Per-attempt registration timeout; PR-6 heartbeat RPC currently reuses it.
     pub register_timeout_ms: u64,
     /// Initial retry backoff after retryable registration failures.
     pub register_retry_initial_backoff_ms: u64,
@@ -35,6 +37,7 @@ impl Default for WorkerRegistrationConfig {
         Self {
             group_id: ShardGroupId::new(1),
             endpoint: "http://127.0.0.1:18080".to_string(),
+            endpoints: vec!["http://127.0.0.1:18080".to_string()],
             register_timeout_ms: 5_000,
             register_retry_initial_backoff_ms: 200,
             register_retry_max_backoff_ms: 5_000,
@@ -158,6 +161,11 @@ impl WorkerConfig {
         let endpoint = worker_sub
             .get_str("metadata.endpoint")
             .ok_or_else(|| invalid_config("worker.metadata.endpoint", "must be present and be a string"))?;
+        let endpoints = worker_sub
+            .get_str("metadata.endpoints")
+            .map(parse_csv_endpoints)
+            .transpose()?
+            .unwrap_or_else(|| vec![endpoint.clone()]);
         let group_id = ShardGroupId::new(Self::usize_or(
             &worker_sub,
             "metadata.group_id",
@@ -167,6 +175,7 @@ impl WorkerConfig {
         let metadata = WorkerRegistrationConfig {
             group_id,
             endpoint,
+            endpoints,
             register_timeout_ms: Self::usize_or(
                 &worker_sub,
                 "metadata.register_timeout_ms",
@@ -218,6 +227,7 @@ impl WorkerConfig {
             storage_root = ?config.storage_root,
             net_listeners = config.net.listeners.len(),
             metadata_endpoint = %config.metadata.endpoint,
+            metadata_endpoints = ?config.metadata.endpoints,
             metadata_group_id = config.metadata.group_id.as_raw(),
             register_timeout_ms = config.metadata.register_timeout_ms,
             register_retry_initial_backoff_ms = config.metadata.register_retry_initial_backoff_ms,
@@ -449,6 +459,34 @@ impl WorkerRegistrationConfig {
             )
         })?;
 
+        if self.endpoints.is_empty() {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                "worker.metadata.endpoints must not be empty",
+            ));
+        }
+
+        for endpoint in &self.endpoints {
+            if endpoint.is_empty() {
+                return Err(CommonError::new(
+                    CommonErrorCode::InvalidArgument,
+                    "worker.metadata.endpoints entries must not be empty",
+                ));
+            }
+            if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+                return Err(CommonError::new(
+                    CommonErrorCode::InvalidArgument,
+                    "worker.metadata.endpoints entries must include http:// or https:// scheme",
+                ));
+            }
+            Endpoint::from_shared(endpoint.clone()).map_err(|err| {
+                CommonError::new(
+                    CommonErrorCode::InvalidArgument,
+                    format!("worker.metadata.endpoints entry must be a valid tonic endpoint URI: {err}"),
+                )
+            })?;
+        }
+
         if self.register_timeout_ms == 0 {
             return Err(CommonError::new(
                 CommonErrorCode::InvalidArgument,
@@ -486,6 +524,22 @@ impl WorkerRegistrationConfig {
 
 fn invalid_config(key: &'static str, detail: &'static str) -> CommonError {
     CommonError::new(CommonErrorCode::InvalidArgument, format!("{key} {detail}"))
+}
+
+fn parse_csv_endpoints(value: String) -> Result<Vec<String>, CommonError> {
+    let endpoints: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if endpoints.is_empty() {
+        return Err(invalid_config(
+            "worker.metadata.endpoints",
+            "must contain at least one endpoint",
+        ));
+    }
+    Ok(endpoints)
 }
 
 fn parse_advertised_endpoint(value: &str) -> Result<(String, u32), CommonError> {

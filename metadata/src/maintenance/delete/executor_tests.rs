@@ -101,11 +101,9 @@ mod tests {
             100,
             None,
         )?;
-        worker_manager.update_runtime(
+        worker_manager.record_test_heartbeat(
             ShardGroupId::new(1),
             worker_id,
-            1,
-            100,
             1000,
             500,
             500,
@@ -451,11 +449,9 @@ mod tests {
             )
             .unwrap();
         worker_manager
-            .update_runtime(
+            .record_test_heartbeat(
                 ShardGroupId::new(1),
                 worker_id,
-                1,
-                100,
                 1000,
                 500,
                 500,
