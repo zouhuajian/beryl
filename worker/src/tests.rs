@@ -43,8 +43,8 @@ mod tests {
 
     use crate::config::{WorkerConfig, WorkerRegistrationConfig};
     use crate::control::{
-        resolve_worker_id, HeartbeatSnapshot, MetadataHeartbeatLoop, MetadataRegistrar, Registration,
-        RegistrationDescriptor, RegistrationSet,
+        resolve_worker_id, BlockReportOptions, HeartbeatSnapshot, MetadataBlockReportLoop, MetadataHeartbeatLoop,
+        MetadataRegistrar, Registration, RegistrationDescriptor, RegistrationSet,
     };
     use crate::data::convert::{
         proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_open_request,
@@ -162,12 +162,21 @@ mod tests {
         Status(Status),
     }
 
+    #[derive(Clone)]
+    enum MockBlockReportReply {
+        Ok,
+        HeaderError(CanonicalError),
+        Status(Status),
+    }
+
     #[derive(Default)]
     struct MockMetadataState {
         replies: Mutex<VecDeque<MockRegisterReply>>,
         heartbeat_replies: Mutex<VecDeque<MockHeartbeatReply>>,
+        block_report_replies: Mutex<VecDeque<MockBlockReportReply>>,
         requests: Mutex<Vec<RegisterWorkerRequestProto>>,
         heartbeat_requests: Mutex<Vec<HeartbeatRequestProto>>,
+        block_report_requests: Mutex<Vec<BlockReportRequestProto>>,
     }
 
     #[derive(Clone)]
@@ -251,9 +260,6 @@ mod tests {
                 } => Ok(Response::new(HeartbeatResponseProto {
                     header: Some(response_header_from_heartbeat_request(&request, None)),
                     commands,
-                    full_report_lease_token: 0,
-                    can_full_report: false,
-                    backoff_ms: 0,
                     group_id: request.group_id,
                     worker_id,
                     accepted_worker_run_id: worker_run_id.to_string(),
@@ -272,9 +278,33 @@ mod tests {
 
         async fn block_report(
             &self,
-            _request: Request<BlockReportRequestProto>,
+            request: Request<BlockReportRequestProto>,
         ) -> Result<Response<BlockReportResponseProto>, Status> {
-            Ok(Response::new(BlockReportResponseProto::default()))
+            let request = request.into_inner();
+            self.state.block_report_requests.lock().unwrap().push(request.clone());
+            let reply = self
+                .state
+                .block_report_replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(MockBlockReportReply::Ok);
+
+            match reply {
+                MockBlockReportReply::Ok => Ok(Response::new(BlockReportResponseProto {
+                    header: Some(response_header_from_block_report_request(&request, None)),
+                    report_epoch: request.report_epoch,
+                    next_delta_seq: 0,
+                    retry_after_ms: 0,
+                })),
+                MockBlockReportReply::HeaderError(error) => Ok(Response::new(BlockReportResponseProto {
+                    header: Some(response_header_from_block_report_request(&request, Some(error))),
+                    report_epoch: request.report_epoch,
+                    next_delta_seq: 0,
+                    retry_after_ms: 0,
+                })),
+                MockBlockReportReply::Status(status) => Err(status),
+            }
         }
     }
 
@@ -306,6 +336,20 @@ mod tests {
         }
     }
 
+    fn response_header_from_block_report_request(
+        request: &BlockReportRequestProto,
+        error: Option<CanonicalError>,
+    ) -> ResponseHeaderProto {
+        ResponseHeaderProto {
+            client: request.header.as_ref().and_then(|header| header.client.clone()),
+            error: error.as_ref().map(canonical_to_error_detail),
+            state: Vec::new(),
+            group_id: request.header.as_ref().map(|header| header.group_id).unwrap_or(0),
+            mount_epoch: None,
+            route_epoch: None,
+        }
+    }
+
     async fn start_mock_metadata(
         replies: Vec<MockRegisterReply>,
     ) -> (String, Arc<MockMetadataState>, tokio::sync::oneshot::Sender<()>) {
@@ -316,8 +360,10 @@ mod tests {
         let state = Arc::new(MockMetadataState {
             replies: Mutex::new(VecDeque::from(replies)),
             heartbeat_replies: Mutex::new(VecDeque::new()),
+            block_report_replies: Mutex::new(VecDeque::new()),
             requests: Mutex::new(Vec::new()),
             heartbeat_requests: Mutex::new(Vec::new()),
+            block_report_requests: Mutex::new(Vec::new()),
         });
         let service = MockMetadataWorkerService {
             state: Arc::clone(&state),
@@ -346,6 +392,14 @@ mod tests {
     ) -> (String, Arc<MockMetadataState>, tokio::sync::oneshot::Sender<()>) {
         let (endpoint, state, shutdown) = start_mock_metadata(Vec::new()).await;
         *state.heartbeat_replies.lock().unwrap() = VecDeque::from(replies);
+        (endpoint, state, shutdown)
+    }
+
+    async fn start_mock_metadata_with_block_reports(
+        replies: Vec<MockBlockReportReply>,
+    ) -> (String, Arc<MockMetadataState>, tokio::sync::oneshot::Sender<()>) {
+        let (endpoint, state, shutdown) = start_mock_metadata(Vec::new()).await;
+        *state.block_report_replies.lock().unwrap() = VecDeque::from(replies);
         (endpoint, state, shutdown)
     }
 
@@ -797,15 +851,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_run_mismatch_heartbeat_response_marks_group_not_ready() {
+    async fn worker_run_mismatch_heartbeat_response_clears_registration_for_recovery() {
         let worker_run_id = test_worker_run_id();
-        let (endpoint, _mock, shutdown) =
-            start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::HeaderError(CanonicalError::need_refresh(
+        let (endpoint, mock, shutdown) = start_mock_metadata(vec![MockRegisterReply::Ok {
+            worker_id: 42,
+            worker_run_id,
+        }])
+        .await;
+        *mock.heartbeat_replies.lock().unwrap() =
+            VecDeque::from(vec![MockHeartbeatReply::HeaderError(CanonicalError::need_refresh(
                 RpcErrorCode::WorkerRunMismatch,
                 common::error::canonical::RefreshReason::WorkerRunMismatch,
                 "stale worker run",
-            ))])
-            .await;
+            ))]);
         let state = Arc::new(RegistrationSet::new());
         state.record_registered(Registration {
             group_id: group_id(),
@@ -815,17 +873,47 @@ mod tests {
         });
         state.record_heartbeat_success(group_id(), Duration::from_secs(60));
         let heartbeat = MetadataHeartbeatLoop::new(
-            test_registration_config(endpoint),
+            test_registration_config(endpoint.clone()),
             test_registration_descriptor(worker_run_id),
             Arc::clone(&state),
         )
         .expect("heartbeat loop");
+        let registrar = MetadataRegistrar::new(
+            test_registration_config(endpoint.clone()),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+        )
+        .expect("registrar");
+        let temp = TempDir::new().expect("tempdir");
+        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
+            temp.path().to_path_buf(),
+        )));
+        publish_ready_block_for(store.as_ref(), group_id(), block_id(), payload(), 101);
+        let reporter = MetadataBlockReportLoop::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+            Arc::clone(&store),
+        )
+        .expect("block reporter");
 
         let round = heartbeat.send_once(HeartbeatSnapshot::default()).await.unwrap();
 
         assert!(round.worker_run_mismatch);
+        assert!(!state.is_registered(group_id()));
+        assert!(!state.is_ready(group_id()));
+        assert_eq!(reporter.send_full_once().await.unwrap().attempted_peers, 0);
+
+        registrar.register_once().await.expect("re-register after mismatch");
         assert!(state.is_registered(group_id()));
         assert!(!state.is_ready(group_id()));
+
+        let ready = heartbeat.send_once(HeartbeatSnapshot::default()).await.unwrap();
+        assert_eq!(ready.accepted_peers, 1);
+        assert!(state.is_ready(group_id()));
+
+        let report_round = reporter.send_full_once().await.expect("block report after recovery");
+        assert_eq!(report_round.accepted_peers, 1);
         shutdown.send(()).ok();
     }
 
@@ -924,9 +1012,404 @@ mod tests {
                 advertised_endpoint: "http://127.0.0.1:9090".to_string(),
             })
         );
-        state.expire_heartbeat_for_test(group_id());
+        state.mark_not_ready(group_id());
         assert!(state.is_registered(group_id()));
         assert!(!state.is_ready(group_id()));
+    }
+
+    #[test]
+    fn block_report_scans_local_blocks_by_group_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(temp.path().to_path_buf()));
+        let report_group = ShardGroupId::new(12);
+        let other_group = ShardGroupId::new(1);
+        let report_block = BlockId::new(DataHandleId::new(77), BlockIndex::new(0));
+        let other_block = BlockId::new(DataHandleId::new(78), BlockIndex::new(0));
+        publish_ready_block_for(&store, report_group, report_block, payload(), 101);
+        publish_ready_block_for(&store, other_group, other_block, payload(), 102);
+
+        let scanned = store.scan_group_blocks(report_group).expect("scan group blocks");
+
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].identity.group_id, report_group);
+        assert_eq!(scanned[0].identity.block_id, report_block);
+    }
+
+    #[tokio::test]
+    async fn block_report_waits_for_registration_and_heartbeat_readiness() {
+        let worker_run_id = test_worker_run_id();
+        let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(Vec::new()).await;
+        let state = Arc::new(RegistrationSet::new());
+        let temp = TempDir::new().expect("tempdir");
+        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
+            temp.path().to_path_buf(),
+        )));
+        publish_ready_block_for(store.as_ref(), group_id(), block_id(), payload(), 101);
+        let reporter = MetadataBlockReportLoop::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+            Arc::clone(&store),
+        )
+        .expect("block reporter");
+
+        let without_registration = reporter.send_full_once().await.expect("skip unregistered");
+        assert_eq!(without_registration.attempted_peers, 0);
+        state.record_registered(Registration {
+            group_id: group_id(),
+            worker_id: WorkerId::new(42),
+            worker_run_id,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        });
+        let without_heartbeat = reporter.send_full_once().await.expect("skip not ready");
+
+        assert_eq!(without_heartbeat.attempted_peers, 0);
+        assert!(mock.block_report_requests.lock().unwrap().is_empty());
+        shutdown.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn full_block_report_batches_by_configured_limit() {
+        let worker_run_id = test_worker_run_id();
+        let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(Vec::new()).await;
+        let state = Arc::new(RegistrationSet::new());
+        state.record_registered(Registration {
+            group_id: group_id(),
+            worker_id: WorkerId::new(42),
+            worker_run_id,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        });
+        state.record_heartbeat_success(group_id(), Duration::from_secs(60));
+        let temp = TempDir::new().expect("tempdir");
+        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
+            temp.path().to_path_buf(),
+        )));
+        publish_ready_block_for(
+            store.as_ref(),
+            group_id(),
+            BlockId::new(DataHandleId::new(7), BlockIndex::new(0)),
+            payload(),
+            101,
+        );
+        publish_ready_block_for(
+            store.as_ref(),
+            group_id(),
+            BlockId::new(DataHandleId::new(7), BlockIndex::new(1)),
+            payload(),
+            102,
+        );
+        let reporter = MetadataBlockReportLoop::with_options(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+            Arc::clone(&store),
+            BlockReportOptions {
+                full_max_blocks_per_batch: 1,
+                ..BlockReportOptions::default()
+            },
+        )
+        .expect("block reporter");
+
+        let round = reporter.send_full_once().await.expect("full report");
+
+        assert_eq!(round.attempted_peers, 1);
+        assert_eq!(round.accepted_peers, 1);
+        let requests = mock.block_report_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].group_id, group_id().as_raw());
+        assert_eq!(requests[0].worker_id, 42);
+        assert_eq!(requests[0].worker_run_id, worker_run_id.to_string());
+        match requests[0].report.as_ref().expect("first report") {
+            proto::metadata::block_report_request_proto::Report::Full(full) => {
+                assert_eq!(full.batch_seq, 0);
+                assert!(!full.last_batch);
+                assert_eq!(full.blocks.len(), 1);
+            }
+            other => panic!("expected full report, got {other:?}"),
+        }
+        match requests[1].report.as_ref().expect("second report") {
+            proto::metadata::block_report_request_proto::Report::Full(full) => {
+                assert_eq!(full.batch_seq, 1);
+                assert!(full.last_batch);
+                assert_eq!(full.blocks.len(), 1);
+            }
+            other => panic!("expected full report, got {other:?}"),
+        }
+        shutdown.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn full_block_report_stops_peer_batches_after_hard_report_errors() {
+        for (code, reason, message) in [
+            (
+                RpcErrorCode::FullReportRequired,
+                RefreshReason::FullReportRequired,
+                "send full report",
+            ),
+            (
+                RpcErrorCode::WorkerNotRegistered,
+                RefreshReason::NeedRegister,
+                "register first",
+            ),
+            (
+                RpcErrorCode::WorkerRunMismatch,
+                RefreshReason::WorkerRunMismatch,
+                "worker run mismatch",
+            ),
+        ] {
+            let worker_run_id = test_worker_run_id();
+            let error = CanonicalError::need_refresh(code, reason, message);
+            let (endpoint, mock, shutdown) =
+                start_mock_metadata_with_block_reports(vec![MockBlockReportReply::HeaderError(error)]).await;
+            let state = Arc::new(RegistrationSet::new());
+            state.record_registered(Registration {
+                group_id: group_id(),
+                worker_id: WorkerId::new(42),
+                worker_run_id,
+                advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+            });
+            state.record_heartbeat_success(group_id(), Duration::from_secs(60));
+            let temp = TempDir::new().expect("tempdir");
+            let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
+                temp.path().to_path_buf(),
+            )));
+            publish_ready_block_for(
+                store.as_ref(),
+                group_id(),
+                BlockId::new(DataHandleId::new(7), BlockIndex::new(0)),
+                payload(),
+                101,
+            );
+            publish_ready_block_for(
+                store.as_ref(),
+                group_id(),
+                BlockId::new(DataHandleId::new(7), BlockIndex::new(1)),
+                payload(),
+                102,
+            );
+            let reporter = MetadataBlockReportLoop::with_options(
+                test_registration_config(endpoint),
+                test_registration_descriptor(worker_run_id),
+                Arc::clone(&state),
+                Arc::clone(&store),
+                BlockReportOptions {
+                    full_max_blocks_per_batch: 1,
+                    ..BlockReportOptions::default()
+                },
+            )
+            .expect("block reporter");
+
+            let round = reporter.send_full_once().await.expect("full report round");
+
+            match reason {
+                RefreshReason::FullReportRequired => assert!(round.full_report_required),
+                RefreshReason::NeedRegister => assert!(round.needs_register),
+                RefreshReason::WorkerRunMismatch => assert!(round.worker_run_mismatch),
+                other => panic!("unexpected hard report reason: {other:?}"),
+            }
+            assert_eq!(
+                mock.block_report_requests.lock().unwrap().len(),
+                1,
+                "{code:?} should stop later full-report batches for the same peer"
+            );
+            shutdown.send(()).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn full_report_required_from_one_peer_does_not_stop_other_peers() {
+        let worker_run_id = test_worker_run_id();
+        let full_required = CanonicalError::need_refresh(
+            RpcErrorCode::FullReportRequired,
+            RefreshReason::FullReportRequired,
+            "send full report",
+        );
+        let (first_endpoint, first_mock, first_shutdown) =
+            start_mock_metadata_with_block_reports(vec![MockBlockReportReply::HeaderError(full_required)]).await;
+        let (second_endpoint, second_mock, second_shutdown) = start_mock_metadata_with_block_reports(Vec::new()).await;
+        let state = Arc::new(RegistrationSet::new());
+        state.record_registered(Registration {
+            group_id: group_id(),
+            worker_id: WorkerId::new(42),
+            worker_run_id,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        });
+        state.record_heartbeat_success(group_id(), Duration::from_secs(60));
+        let temp = TempDir::new().expect("tempdir");
+        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
+            temp.path().to_path_buf(),
+        )));
+        publish_ready_block_for(
+            store.as_ref(),
+            group_id(),
+            BlockId::new(DataHandleId::new(7), BlockIndex::new(0)),
+            payload(),
+            101,
+        );
+        publish_ready_block_for(
+            store.as_ref(),
+            group_id(),
+            BlockId::new(DataHandleId::new(7), BlockIndex::new(1)),
+            payload(),
+            102,
+        );
+        let mut config = test_registration_config(first_endpoint);
+        config.endpoints.push(second_endpoint);
+        let reporter = MetadataBlockReportLoop::with_options(
+            config,
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+            Arc::clone(&store),
+            BlockReportOptions {
+                full_max_blocks_per_batch: 1,
+                ..BlockReportOptions::default()
+            },
+        )
+        .expect("block reporter");
+
+        let round = reporter.send_full_once().await.expect("full report round");
+
+        assert!(round.full_report_required);
+        assert_eq!(round.accepted_peers, 1);
+        assert_eq!(first_mock.block_report_requests.lock().unwrap().len(), 1);
+        assert_eq!(second_mock.block_report_requests.lock().unwrap().len(), 2);
+        first_shutdown.send(()).ok();
+        second_shutdown.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn block_report_worker_run_mismatch_clears_registration() {
+        let worker_run_id = test_worker_run_id();
+        let mismatch = CanonicalError::need_refresh(
+            RpcErrorCode::WorkerRunMismatch,
+            RefreshReason::WorkerRunMismatch,
+            "worker run mismatch",
+        );
+        let (endpoint, mock, shutdown) =
+            start_mock_metadata_with_block_reports(vec![MockBlockReportReply::HeaderError(mismatch)]).await;
+        let state = Arc::new(RegistrationSet::new());
+        state.record_registered(Registration {
+            group_id: group_id(),
+            worker_id: WorkerId::new(42),
+            worker_run_id,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        });
+        state.record_heartbeat_success(group_id(), Duration::from_secs(60));
+        let temp = TempDir::new().expect("tempdir");
+        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
+            temp.path().to_path_buf(),
+        )));
+        publish_ready_block_for(store.as_ref(), group_id(), block_id(), payload(), 101);
+        let reporter = MetadataBlockReportLoop::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+            Arc::clone(&store),
+        )
+        .expect("block reporter");
+
+        let round = reporter.send_full_once().await.expect("full report round");
+        let after_mismatch = reporter.send_full_once().await.expect("stale registration skipped");
+
+        assert!(round.worker_run_mismatch);
+        assert!(state.registration(group_id()).is_none());
+        assert_eq!(after_mismatch.attempted_peers, 0);
+        assert_eq!(mock.block_report_requests.lock().unwrap().len(), 1);
+        shutdown.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn full_block_report_peer_failure_does_not_skip_other_peers() {
+        let worker_run_id = test_worker_run_id();
+        let (first_endpoint, first_mock, first_shutdown) =
+            start_mock_metadata_with_block_reports(vec![MockBlockReportReply::Status(Status::unavailable(
+                "peer unavailable",
+            ))])
+            .await;
+        let (second_endpoint, second_mock, second_shutdown) = start_mock_metadata_with_block_reports(Vec::new()).await;
+        let state = Arc::new(RegistrationSet::new());
+        state.record_registered(Registration {
+            group_id: group_id(),
+            worker_id: WorkerId::new(42),
+            worker_run_id,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        });
+        state.record_heartbeat_success(group_id(), Duration::from_secs(60));
+        let temp = TempDir::new().expect("tempdir");
+        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
+            temp.path().to_path_buf(),
+        )));
+        publish_ready_block_for(store.as_ref(), group_id(), block_id(), payload(), 101);
+        let mut config = test_registration_config(first_endpoint);
+        config.endpoints.push(second_endpoint);
+        let reporter = MetadataBlockReportLoop::new(
+            config,
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+            Arc::clone(&store),
+        )
+        .expect("block reporter");
+
+        let round = reporter.send_full_once().await.expect("full report round");
+
+        assert!(!round.full_report_required);
+        assert_eq!(round.accepted_peers, 1);
+        assert_eq!(first_mock.block_report_requests.lock().unwrap().len(), 1);
+        assert_eq!(second_mock.block_report_requests.lock().unwrap().len(), 1);
+        first_shutdown.send(()).ok();
+        second_shutdown.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn delta_report_starts_after_full_and_full_required_resets_baseline() {
+        let worker_run_id = test_worker_run_id();
+        let full_required = CanonicalError::need_refresh(
+            RpcErrorCode::FullReportRequired,
+            RefreshReason::FullReportRequired,
+            "send full report",
+        );
+        let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(vec![
+            MockBlockReportReply::Ok,
+            MockBlockReportReply::HeaderError(full_required),
+        ])
+        .await;
+        let state = Arc::new(RegistrationSet::new());
+        state.record_registered(Registration {
+            group_id: group_id(),
+            worker_id: WorkerId::new(42),
+            worker_run_id,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        });
+        state.record_heartbeat_success(group_id(), Duration::from_secs(60));
+        let temp = TempDir::new().expect("tempdir");
+        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
+            temp.path().to_path_buf(),
+        )));
+        let first = BlockId::new(DataHandleId::new(7), BlockIndex::new(0));
+        let second = BlockId::new(DataHandleId::new(7), BlockIndex::new(1));
+        publish_ready_block_for(store.as_ref(), group_id(), first, payload(), 101);
+        let reporter = MetadataBlockReportLoop::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+            Arc::clone(&store),
+        )
+        .expect("block reporter");
+
+        let before_full = reporter.send_delta_once().await.expect("no delta baseline");
+        assert_eq!(before_full.attempted_peers, 0);
+        reporter.send_full_once().await.expect("full report");
+        publish_ready_block_for(store.as_ref(), group_id(), second, payload(), 102);
+        let delta = reporter.send_delta_once().await.expect("delta report");
+
+        assert!(delta.full_report_required);
+        assert!(!reporter.has_delta_baseline(group_id()));
+        let requests = mock.block_report_requests.lock().unwrap();
+        assert!(matches!(
+            requests.last().and_then(|request| request.report.as_ref()),
+            Some(proto::metadata::block_report_request_proto::Report::Delta(_))
+        ));
+        shutdown.send(()).ok();
     }
 
     fn write_open_request() -> WriteOpenRequest {
@@ -1032,6 +1515,35 @@ mod tests {
             .publish_ready(PublishReadyRequest {
                 group_id: group_id(),
                 block_id: block_id(),
+                effective_block_len: data.len() as u64,
+                block_stamp,
+            })
+            .expect("publish ready block");
+    }
+
+    fn publish_ready_block_for(
+        store: &FullBlockFileStore,
+        group_id: ShardGroupId,
+        block_id: BlockId,
+        data: Bytes,
+        block_stamp: u64,
+    ) {
+        store
+            .create_staging_block(CreateStagingBlockRequest {
+                group_id,
+                block_id,
+                block_size: BLOCK_SIZE,
+                chunk_size: CHUNK_SIZE,
+                checksum_kind: ChecksumKind::None,
+            })
+            .expect("create staging block");
+        store
+            .write_at(group_id, block_id, 0, data.clone())
+            .expect("write block");
+        store
+            .publish_ready(PublishReadyRequest {
+                group_id,
+                block_id,
                 effective_block_len: data.len() as u64,
                 block_stamp,
             })

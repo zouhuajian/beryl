@@ -11,7 +11,7 @@ use crate::service::domain::{
     RequestContext, SessionKey, SyncWriteInput, SyncWriteMode, UnlinkInput,
 };
 use crate::state::{MemoryStateStore, RouteEpoch};
-use crate::worker::{HealthStatus, WorkerInfo, WorkerManager};
+use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerInfo, WorkerManager};
 use async_trait::async_trait;
 use common::error::canonical::{ErrorCode as CanonicalErrorCode, RefreshReason};
 use common::header::{AuthnType, RequestHeader, RpcErrorCode};
@@ -23,7 +23,7 @@ use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, LeaseId, MountId, 
 use types::layout::FileLayout;
 use types::lease::FencingToken;
 use types::worker::WorkerNetProtocol;
-use types::{CommittedBlock, WorkerEndpointInfo, WriteTarget};
+use types::{CommittedBlock, WorkerEndpointInfo, WorkerRunId, WriteTarget};
 
 use super::freshness::{FreshnessValidator, StaleStateStatus};
 
@@ -90,6 +90,105 @@ fn fs_core_with_mount(mount_id: MountId, mount_epoch: u64, group_id: ShardGroupI
     FsCore::new_default(Arc::new(MemoryStateStore::new()), mount_table)
 }
 
+fn worker_run_id(group_id: ShardGroupId, worker_id: WorkerId) -> WorkerRunId {
+    let suffix = group_id
+        .as_raw()
+        .saturating_mul(1_000_000)
+        .saturating_add(worker_id.as_raw());
+    format!("550e8400-e29b-41d4-a716-{suffix:012x}")
+        .parse()
+        .expect("valid test WorkerRunId")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_worker_heartbeat(
+    manager: &WorkerManager,
+    group_id: ShardGroupId,
+    worker_id: WorkerId,
+    capacity_total: u64,
+    capacity_used: u64,
+    capacity_available: u64,
+    active_reads: u32,
+    active_writes: u32,
+    health: HealthStatus,
+) {
+    let descriptor = manager
+        .get_descriptor(group_id, worker_id)
+        .expect("worker descriptor should be registered");
+    let run_id = manager
+        .get_registration(group_id, worker_id)
+        .map(|registration| registration.worker_run_id)
+        .unwrap_or_else(|| {
+            let run_id = worker_run_id(group_id, worker_id);
+            manager
+                .register_worker_run(
+                    group_id,
+                    worker_id,
+                    descriptor.address.clone(),
+                    descriptor.worker_net_protocol,
+                    run_id,
+                    descriptor.fault_domain.clone(),
+                )
+                .expect("worker run should register");
+            run_id
+        });
+    manager
+        .record_heartbeat(
+            group_id,
+            worker_id,
+            run_id,
+            1,
+            &descriptor.address,
+            descriptor.worker_net_protocol,
+            capacity_total,
+            capacity_used,
+            capacity_available,
+            active_reads,
+            active_writes,
+            health,
+        )
+        .expect("heartbeat should be accepted");
+    manager
+        .upsert_descriptor(descriptor)
+        .expect("descriptor should be restored");
+}
+
+fn report_block(block_id: BlockId) -> BlockReportBlock {
+    BlockReportBlock {
+        block_id,
+        data_handle_id: block_id.data_handle_id.as_raw(),
+        block_index: block_id.index.as_raw(),
+        block_stamp: u64::from(block_id.index.as_raw()) + 1,
+        effective_len: 4096,
+        committed_length: 4096,
+        block_state: BlockReportBlockState::Ready,
+    }
+}
+
+fn publish_report_locations(
+    manager: &WorkerManager,
+    group_id: ShardGroupId,
+    worker_id: WorkerId,
+    report_epoch: u64,
+    blocks: Vec<BlockId>,
+) {
+    let run_id = manager
+        .get_registration(group_id, worker_id)
+        .expect("worker registration")
+        .worker_run_id;
+    manager
+        .receive_full_block_report(
+            group_id,
+            worker_id,
+            run_id,
+            report_epoch,
+            0,
+            true,
+            blocks.into_iter().map(report_block).collect(),
+        )
+        .expect("full block report should publish locations");
+}
+
 fn worker_manager_for_write_targets(group_id: ShardGroupId) -> Arc<WorkerManager> {
     let manager = Arc::new(WorkerManager::new(60));
     for raw in 1..=3 {
@@ -104,18 +203,17 @@ fn worker_manager_for_write_targets(group_id: ShardGroupId) -> Arc<WorkerManager
                 None,
             )
             .unwrap();
-        manager
-            .record_test_heartbeat(
-                group_id,
-                worker_id,
-                1024 * 1024,
-                0,
-                1024 * 1024,
-                0,
-                0,
-                HealthStatus::Healthy,
-            )
-            .unwrap();
+        record_worker_heartbeat(
+            &manager,
+            group_id,
+            worker_id,
+            1024 * 1024,
+            0,
+            1024 * 1024,
+            0,
+            0,
+            HealthStatus::Healthy,
+        );
     }
     manager
 }
@@ -140,12 +238,18 @@ async fn get_file_layout_returns_worker_locations_from_worker_manager() {
         worker_manager
             .register_worker(group_id, worker_id, format!("127.0.0.1:{port}"), 1, 20 + raw, None)
             .unwrap();
-        worker_manager
-            .record_test_heartbeat(group_id, worker_id, 1024, 0, 1024, 0, 0, HealthStatus::Healthy)
-            .unwrap();
-        worker_manager
-            .update_locations(group_id, worker_id, vec![block_id])
-            .unwrap();
+        record_worker_heartbeat(
+            &worker_manager,
+            group_id,
+            worker_id,
+            1024,
+            0,
+            1024,
+            0,
+            0,
+            HealthStatus::Healthy,
+        );
+        publish_report_locations(&worker_manager, group_id, worker_id, raw, vec![block_id]);
     }
     fs_core.set_storage(Arc::clone(&storage));
     fs_core.set_worker_manager(worker_manager);
@@ -212,12 +316,18 @@ async fn get_file_layout_rejects_worker_lookup_without_authoritative_group() {
     worker_manager
         .register_worker(fallback_group, worker_id, "127.0.0.1:9101".to_string(), 1, 11, None)
         .unwrap();
-    worker_manager
-        .record_test_heartbeat(fallback_group, worker_id, 1024, 0, 1024, 0, 0, HealthStatus::Healthy)
-        .unwrap();
-    worker_manager
-        .update_locations(fallback_group, worker_id, vec![block_id])
-        .unwrap();
+    record_worker_heartbeat(
+        &worker_manager,
+        fallback_group,
+        worker_id,
+        1024,
+        0,
+        1024,
+        0,
+        0,
+        HealthStatus::Healthy,
+    );
+    publish_report_locations(&worker_manager, fallback_group, worker_id, 1, vec![block_id]);
     fs_core.set_storage(Arc::clone(&storage));
     fs_core.set_worker_manager(worker_manager);
 
@@ -303,9 +413,7 @@ async fn get_file_layout_does_not_cross_read_worker_descriptor_from_other_group(
             HealthStatus::Healthy,
         )
         .unwrap();
-    worker_manager
-        .update_locations(other_group, worker_id, vec![block_id])
-        .unwrap();
+    publish_report_locations(&worker_manager, other_group, worker_id, 1, vec![block_id]);
     fs_core.set_storage(Arc::clone(&storage));
     fs_core.set_worker_manager(worker_manager);
 
@@ -1904,21 +2012,18 @@ async fn worker_report_does_not_change_file_version() {
     .expect("commit should succeed");
 
     let worker_manager = env.fs_core.worker_manager.as_ref().expect("worker manager");
-    worker_manager
-        .update_locations(env.group_id, WorkerId::new(1), vec![target.block_id])
-        .expect("worker report should update soft locations");
-    worker_manager
-        .record_test_heartbeat(
-            env.group_id,
-            WorkerId::new(1),
-            1024,
-            1,
-            2048,
-            2,
-            3,
-            HealthStatus::Healthy,
-        )
-        .expect("worker runtime should update soft state");
+    record_worker_heartbeat(
+        worker_manager,
+        env.group_id,
+        WorkerId::new(1),
+        1024,
+        1,
+        2048,
+        2,
+        3,
+        HealthStatus::Healthy,
+    );
+    publish_report_locations(worker_manager, env.group_id, WorkerId::new(1), 1, vec![target.block_id]);
 
     let locations = env
         .fs_core

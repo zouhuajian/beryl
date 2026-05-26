@@ -123,7 +123,7 @@ impl MetadataHeartbeatLoop {
                 }
                 Ok(HeartbeatPeerOutcome::WorkerRunMismatch) => {
                     round.worker_run_mismatch = true;
-                    self.state.mark_not_ready(registration.group_id);
+                    self.state.mark_needs_register(registration.group_id);
                 }
                 Err(error) => {
                     debug!(%error, "Worker heartbeat peer attempt failed");

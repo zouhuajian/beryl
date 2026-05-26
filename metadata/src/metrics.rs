@@ -62,13 +62,6 @@ pub struct MetadataMetrics {
     pub(crate) delete_executor_requests_total: Arc<AtomicU64>,
     pub(crate) delete_executor_requests_failed_total: Arc<AtomicU64>,
 
-    // Worker full-report lease control.
-    pub(crate) full_report_leases_inflight: Arc<AtomicUsize>,
-    pub(crate) full_report_leases_available: Arc<AtomicUsize>,
-    pub(crate) full_report_leases_waiting: Arc<AtomicUsize>,
-    pub(crate) full_report_granted_total: Arc<AtomicU64>,
-    pub(crate) full_report_throttled_total: Arc<AtomicU64>,
-
     // Over-replica cleanup.
     pub(crate) overrep_candidates_total: Arc<AtomicU64>,
     pub(crate) overrep_scanned_total: Arc<AtomicU64>,
@@ -126,11 +119,6 @@ impl MetadataMetrics {
             delete_intents_completed_by_reconcile_total: Arc::new(AtomicU64::new(0)),
             delete_executor_requests_total: Arc::new(AtomicU64::new(0)),
             delete_executor_requests_failed_total: Arc::new(AtomicU64::new(0)),
-            full_report_leases_inflight: Arc::new(AtomicUsize::new(0)),
-            full_report_leases_available: Arc::new(AtomicUsize::new(0)),
-            full_report_leases_waiting: Arc::new(AtomicUsize::new(0)),
-            full_report_granted_total: Arc::new(AtomicU64::new(0)),
-            full_report_throttled_total: Arc::new(AtomicU64::new(0)),
             overrep_candidates_total: Arc::new(AtomicU64::new(0)),
             overrep_scanned_total: Arc::new(AtomicU64::new(0)),
             overrep_intents_created_total: Arc::new(AtomicU64::new(0)),
@@ -327,37 +315,6 @@ impl MetadataMetrics {
             "delete_executor_requests_failed_total",
             "Total number of failed delete executor requests",
             &self.delete_executor_requests_failed_total,
-        );
-
-        push_usize(
-            &mut metrics,
-            "full_report_leases_inflight",
-            "Current number of in-flight full report leases",
-            &self.full_report_leases_inflight,
-        );
-        push_usize(
-            &mut metrics,
-            "full_report_leases_available",
-            "Current number of available full report leases",
-            &self.full_report_leases_available,
-        );
-        push_usize(
-            &mut metrics,
-            "full_report_leases_waiting",
-            "Estimated number of workers waiting for full report leases",
-            &self.full_report_leases_waiting,
-        );
-        push_u64(
-            &mut metrics,
-            "full_report_granted_total",
-            "Total number of full report leases granted",
-            &self.full_report_granted_total,
-        );
-        push_u64(
-            &mut metrics,
-            "full_report_throttled_total",
-            "Total number of full report lease requests throttled",
-            &self.full_report_throttled_total,
         );
 
         push_u64(

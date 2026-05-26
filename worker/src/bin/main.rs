@@ -11,8 +11,10 @@ use common::observe::{init_observability, ObservabilityConfig, ServiceInfo};
 use tracing::{error, info};
 use worker::{
     config::WorkerConfig,
-    control::{MetadataHeartbeatLoop, MetadataRegistrar, RegistrationSet},
-    net, WorkerCore,
+    control::{MetadataBlockReportLoop, MetadataHeartbeatLoop, MetadataRegistrar, RegistrationSet},
+    net,
+    store::block::{FullBlockFileStore, FullBlockFileStoreConfig},
+    WorkerCore,
 };
 
 #[tokio::main]
@@ -60,6 +62,7 @@ async fn main() -> Result<()> {
     let registration_state = Arc::new(RegistrationSet::new());
     let descriptor =
         MetadataRegistrar::descriptor_from_config(&config).context("Failed to build worker registration descriptor")?;
+    let block_report_descriptor = descriptor.clone();
     let heartbeat = MetadataHeartbeatLoop::new(
         config.metadata.clone(),
         descriptor.clone(),
@@ -71,13 +74,16 @@ async fn main() -> Result<()> {
             .context("Failed to create worker metadata registrar")?,
     );
 
-    let core = Arc::new(WorkerCore::with_options(
+    let block_store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
+        config.storage_root.clone(),
+    )));
+    let core = Arc::new(WorkerCore::with_local_store(
         config.chunk_size,
         config.default_frame_size,
         config.max_frame_size,
         config.window_bytes,
         Duration::from_millis(config.stream_idle_timeout_ms),
-        config.storage_root.clone(),
+        block_store.clone(),
     ));
 
     registrar
@@ -87,6 +93,14 @@ async fn main() -> Result<()> {
         .await
         .context("Worker metadata registration failed")?;
     let _heartbeat_handle = heartbeat.spawn_with_registrar(Arc::clone(&registrar));
+    let block_report = MetadataBlockReportLoop::new(
+        config.metadata.clone(),
+        block_report_descriptor,
+        Arc::clone(&registration_state),
+        block_store,
+    )
+    .context("Failed to create worker block report loop")?;
+    let _block_report_handle = block_report.spawn();
 
     if let Err(error) = net::server::serve_worker_data_with_registration(&config.net, core, registration_state)
         .await

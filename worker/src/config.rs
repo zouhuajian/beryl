@@ -24,7 +24,7 @@ pub struct WorkerRegistrationConfig {
     pub endpoint: String,
     /// MetadataWorkerService peer endpoint URIs used for heartbeat fanout.
     pub endpoints: Vec<String>,
-    /// Per-attempt registration timeout; PR-6 heartbeat RPC currently reuses it.
+    /// Per-attempt registration timeout shared by startup registration and heartbeat RPCs.
     pub register_timeout_ms: u64,
     /// Initial retry backoff after retryable registration failures.
     pub register_retry_initial_backoff_ms: u64,

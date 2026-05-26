@@ -150,6 +150,7 @@ pub enum RpcErrorCode {
     WorkerNotRegistered,
     WorkerRunMismatch,
     WorkerDescriptorMismatch,
+    FullReportRequired,
     BlockStampMismatch,
     EpochMismatch,
     Fencing,

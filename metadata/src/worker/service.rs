@@ -3,11 +3,11 @@
 
 //! MetadataWorkerService implementation.
 
-use super::command_router::WorkerCommandRouter;
-use super::manager::WorkerManager;
+use super::manager::{
+    BlockReportBlock, BlockReportBlockState, BlockReportDeltaEntry, BlockReportDeltaOp, WorkerManager,
+};
 use super::metrics::WorkerMetrics;
 use crate::error::{to_canonical_rpc, MetadataError, MetadataResult};
-use crate::maintenance::repair::{BlockReportDelta, RepairSignalSink};
 use crate::raft::Command;
 use crate::raft::{AppDataResponse, AppRaftNode, WorkerCommandResult};
 use crate::service::extract_and_inject_context;
@@ -17,21 +17,17 @@ use proto::metadata::metadata_worker_service_proto_server::MetadataWorkerService
 use proto::metadata::*;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
 use types::ids::{BlockId, ShardGroupId, WorkerId};
 use types::WorkerRunId;
 
 /// Worker service background task handles.
-pub struct WorkerBackgroundHandle {
-    _lease_metrics_task: Option<JoinHandle<()>>,
-}
+pub struct WorkerBackgroundHandle {}
 
 impl WorkerBackgroundHandle {
     pub fn task_count(&self) -> usize {
-        usize::from(self._lease_metrics_task.is_some())
+        0
     }
 }
 
@@ -61,12 +57,10 @@ impl_worker_service_response!(
 pub struct MetadataWorkerServiceImpl {
     raft_node: Arc<AppRaftNode>,
     worker_manager: Arc<WorkerManager>,
-    repair_signal_handler: Arc<dyn RepairSignalSink>,
-    command_router: Option<Arc<WorkerCommandRouter>>,
     metrics: Arc<WorkerMetrics>,
     slot_metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
     /// Mount table used to compute mount_epoch for lease gating.
-    mount_table: Arc<crate::mount::MountTable>,
+    _mount_table: Arc<crate::mount::MountTable>,
     served_group_id: ShardGroupId,
 }
 
@@ -74,7 +68,6 @@ impl MetadataWorkerServiceImpl {
     pub(crate) fn new(
         raft_node: Arc<AppRaftNode>,
         worker_manager: Arc<WorkerManager>,
-        repair_signal_handler: Arc<dyn RepairSignalSink>,
         mount_table: Arc<crate::mount::MountTable>,
         served_group_id: ShardGroupId,
     ) -> Self {
@@ -83,18 +76,11 @@ impl MetadataWorkerServiceImpl {
         Self {
             raft_node,
             worker_manager,
-            repair_signal_handler,
-            command_router: None,
             metrics,
             slot_metrics: None, // Will be set via set_slot_metrics
-            mount_table,
+            _mount_table: mount_table,
             served_group_id,
         }
-    }
-
-    /// Set command router after maintenance-owned command sources are available.
-    pub(crate) fn set_command_router(&mut self, command_router: Arc<WorkerCommandRouter>) {
-        self.command_router = Some(command_router);
     }
 
     /// Set slot metrics (called after metrics are available).
@@ -276,66 +262,7 @@ impl MetadataWorkerServiceImpl {
 
     /// Start worker-local background tasks.
     pub(crate) fn start_background_tasks(&self) -> WorkerBackgroundHandle {
-        // Start lease metrics update task
-        let lease_metrics_task = if let Some(ref slot_metrics) = self.slot_metrics {
-            let lease_manager = self.worker_manager.lease_manager();
-            let worker_manager = Arc::clone(&self.worker_manager);
-            let slot_metrics = Arc::clone(slot_metrics);
-            let raft_node = Arc::clone(&self.raft_node);
-            let served_group_id = self.served_group_id;
-            Some(tokio::spawn(async move {
-                use tokio::time::{interval, Duration};
-                let mut interval = interval(Duration::from_secs(10)); // Update every 10 seconds
-                loop {
-                    interval.tick().await;
-
-                    // Only update on leader
-                    if !raft_node.is_leader() {
-                        continue;
-                    }
-
-                    let active_leases = lease_manager.active_lease_count().await;
-                    const DEFAULT_MAX_CONCURRENT_LEASES: usize = 10;
-                    let available_leases = DEFAULT_MAX_CONCURRENT_LEASES.saturating_sub(active_leases);
-
-                    slot_metrics
-                        .full_report_leases_inflight
-                        .store(active_leases, std::sync::atomic::Ordering::Relaxed);
-                    slot_metrics
-                        .full_report_leases_available
-                        .store(available_leases, std::sync::atomic::Ordering::Relaxed);
-
-                    // Estimate waiting count: count workers that need_full_sync but don't have lease
-                    let waiting_count = {
-                        let live_workers = worker_manager.list_live_workers();
-                        let mut waiting: usize = 0;
-                        for worker in live_workers.iter().filter(|worker| worker.group_id == served_group_id) {
-                            if worker_manager.needs_full_sync(served_group_id, worker.worker_id) {
-                                // Approximate: if needs_full_sync, count as waiting
-                                // This is approximate because we don't track which workers have leases
-                                waiting += 1;
-                            }
-                        }
-                        // Subtract in-flight leases (those workers are not waiting)
-                        waiting.saturating_sub(active_leases)
-                    };
-                    slot_metrics
-                        .full_report_leases_waiting
-                        .store(waiting_count, std::sync::atomic::Ordering::Relaxed);
-                }
-            }))
-        } else {
-            None
-        };
-
-        WorkerBackgroundHandle {
-            _lease_metrics_task: lease_metrics_task,
-        }
-    }
-
-    /// Convert proto BlockId to types BlockId.
-    fn proto_to_block_id(proto: &proto::common::BlockIdProto) -> MetadataResult<BlockId> {
-        Ok(BlockId::try_from(*proto).unwrap_or_else(|()| unreachable!("BlockIdProto conversion is infallible")))
+        WorkerBackgroundHandle {}
     }
 
     fn heartbeat_interval_ms(&self) -> u32 {
@@ -363,6 +290,90 @@ impl MetadataWorkerServiceImpl {
         let membership = self.raft_node.get_membership()?;
         let (_, node) = membership.nodes().find(|(node_id, _)| **node_id == leader_id)?;
         parse_metadata_endpoint(&node.address)
+    }
+
+    fn full_report_required_response<T>(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        message: impl Into<String>,
+    ) -> Result<Response<T>, Status>
+    where
+        T: Default + WorkerServiceResponse,
+    {
+        self.response_with_error(
+            req_header,
+            CanonicalError::need_refresh(
+                RpcErrorCode::FullReportRequired,
+                RefreshReason::FullReportRequired,
+                message,
+            ),
+        )
+    }
+
+    fn proto_to_report_block(block: BlockReportBlockProto) -> MetadataResult<BlockReportBlock> {
+        let block_id_proto = block
+            .block_id
+            .ok_or_else(|| MetadataError::InvalidArgument("block report entry missing block_id".to_string()))?;
+        let block_id = BlockId::try_from(block_id_proto)
+            .unwrap_or_else(|()| unreachable!("BlockIdProto conversion is infallible"));
+        let block_state = match block.block_state() {
+            BlockReportBlockStateProto::BlockReportBlockStateReady => BlockReportBlockState::Ready,
+            BlockReportBlockStateProto::BlockReportBlockStatePartial => BlockReportBlockState::Partial,
+            BlockReportBlockStateProto::BlockReportBlockStateCorrupt => BlockReportBlockState::Corrupt,
+            BlockReportBlockStateProto::BlockReportBlockStateDeleting => BlockReportBlockState::Deleting,
+            BlockReportBlockStateProto::BlockReportBlockStateUnspecified => {
+                return Err(MetadataError::InvalidArgument(
+                    "block report entry block_state must be specified".to_string(),
+                ));
+            }
+        };
+        Ok(BlockReportBlock {
+            block_id,
+            data_handle_id: block.data_handle_id,
+            block_index: block.block_index,
+            block_stamp: block.block_stamp,
+            effective_len: block.effective_len,
+            committed_length: block.committed_length,
+            block_state,
+        })
+    }
+
+    fn proto_to_delta(delta: BlockReportDeltaProto) -> MetadataResult<BlockReportDeltaEntry> {
+        let block = delta
+            .block
+            .ok_or_else(|| MetadataError::InvalidArgument("block report delta missing block".to_string()))?;
+        let op = match delta.op() {
+            BlockReportDeltaOpProto::BlockReportDeltaOpAddUpdate => BlockReportDeltaOp::AddUpdate,
+            BlockReportDeltaOpProto::BlockReportDeltaOpRemove => BlockReportDeltaOp::Remove,
+            BlockReportDeltaOpProto::BlockReportDeltaOpUnspecified => {
+                return Err(MetadataError::InvalidArgument(
+                    "block report delta op must be specified".to_string(),
+                ));
+            }
+        };
+        Ok(BlockReportDeltaEntry {
+            op,
+            block: Self::proto_to_report_block(block)?,
+        })
+    }
+
+    fn map_report_error(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        error: MetadataError,
+    ) -> Result<Response<BlockReportResponseProto>, Status> {
+        match error {
+            MetadataError::NotFound(message) => {
+                self.need_register_response::<BlockReportResponseProto>(req_header, message)
+            }
+            MetadataError::StaleState(message) => {
+                self.worker_run_mismatch_response::<BlockReportResponseProto>(req_header, message)
+            }
+            MetadataError::FullReportRequired(message) => {
+                self.full_report_required_response::<BlockReportResponseProto>(req_header, message)
+            }
+            other => self.metadata_error_response::<BlockReportResponseProto>(req_header, other),
+        }
     }
 }
 
@@ -708,9 +719,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         Ok(Response::new(HeartbeatResponseProto {
             header: Some((&self.create_response_header_from_request(&req.header, Some(group_id.as_raw()))).into()),
             commands: Vec::new(),
-            full_report_lease_token: 0,
-            can_full_report: false,
-            backoff_ms: 0,
             group_id: group_id.as_raw(),
             worker_id: live_state.worker_id.as_raw(),
             accepted_worker_run_id: live_state.worker_run_id.to_string(),
@@ -729,239 +737,123 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         let req = request.into_inner();
         let _caller_ctx = extract_and_inject_context(&req.header);
 
-        let worker_id = WorkerId::new(req.worker_id);
-        let report_type = req.report_type();
-        let lease_token = req.full_report_lease_token;
-
-        info!(
-            worker_id = worker_id.as_raw(),
-            report_type = ?report_type,
-            full_entries_count = req.full_entries.len(),
-            delta_entries_count = req.delta_entries.len(),
-            last_report_seq = req.last_report_seq,
-            "Processing block report"
-        );
-
-        let (added_blocks, removed_blocks) = match report_type {
-            proto::metadata::BlockReportTypeProto::BlockReportTypeFull => {
-                // Leader-only: verify lease token for full reports when needs_full_sync
-                let is_leader = self.raft_node.is_leader();
-                if is_leader {
-                    let needs_full_sync = self.worker_manager.needs_full_sync(self.served_group_id, worker_id);
-                    if needs_full_sync {
-                        // Worker needs full sync, must have valid lease token
-                        if lease_token == 0 {
-                            return self.invalid_request_response::<BlockReportResponseProto>(
-                                &req.header,
-                                "Full report requires lease token when needs_full_sync is true",
-                            );
-                        }
-
-                        // Verify and release lease
-                        let metadata_epoch = self.worker_manager.get_metadata_epoch();
-                        let lease_manager = self.worker_manager.lease_manager();
-                        let mount_epoch = Some(types::group_watermark::MountEpoch::new(self.mount_table.version()));
-
-                        if !lease_manager
-                            .verify_and_release(lease_token, worker_id, metadata_epoch, mount_epoch)
-                            .await
-                        {
-                            return self.invalid_request_response::<BlockReportResponseProto>(
-                                &req.header,
-                                "Invalid or expired lease token for full report",
-                            );
-                        }
-                    }
-                }
-
-                // FULL report: convert full_entries to BlockIds
-                let mut reported_blocks = Vec::new();
-                for entry in &req.full_entries {
-                    let block_id = match entry.block_id.as_ref() {
-                        Some(block_id) => block_id,
-                        None => {
-                            return self.invalid_request_response::<BlockReportResponseProto>(
-                                &req.header,
-                                "Missing block_id in full entry",
-                            );
-                        }
-                    };
-                    let block_id = match Self::proto_to_block_id(block_id) {
-                        Ok(block_id) => block_id,
-                        Err(error) => {
-                            return self.metadata_error_response::<BlockReportResponseProto>(&req.header, error);
-                        }
-                    };
-                    reported_blocks.push(block_id);
-                }
-
-                // Apply full report (lease already released in verify_and_release above)
-                match self
-                    .worker_manager
-                    .apply_full_report(self.served_group_id, worker_id, reported_blocks.clone())
-                {
-                    Ok(result) => {
-                        // Update metrics after successful full report
-                        // Note: Lease metrics can be added later
-                        result
-                    }
-                    Err(_e) => {
-                        // Rate limited: return retry_after_ms
-                        let retry_after_ms = {
-                            use rand::Rng;
-                            let base_ms = 5000;
-                            let jitter_ms = rand::thread_rng().gen_range(0..25000);
-                            (base_ms + jitter_ms) as u32
-                        };
-                        return Ok(Response::new(BlockReportResponseProto {
-                            header: Some(self.ok_response_header_from_request(&req.header)),
-                            report_seq: req.last_report_seq,
-                            commands: vec![],
-                            retry_after_ms,
-                        }));
-                    }
-                }
-            }
-            proto::metadata::BlockReportTypeProto::BlockReportTypeIncremental => {
-                // INCREMENTAL report: convert delta_entries to ADD/REMOVE operations
-                // INCREMENTAL reports don't require slot token (only FULL reports do)
-
-                let mut added_blocks = Vec::new();
-                let mut removed_blocks = Vec::new();
-
-                for entry in &req.delta_entries {
-                    let block_id = match entry.block_id.as_ref() {
-                        Some(block_id) => block_id,
-                        None => {
-                            return self.invalid_request_response::<BlockReportResponseProto>(
-                                &req.header,
-                                "Missing block_id in delta entry",
-                            );
-                        }
-                    };
-                    let block_id = match Self::proto_to_block_id(block_id) {
-                        Ok(block_id) => block_id,
-                        Err(error) => {
-                            return self.metadata_error_response::<BlockReportResponseProto>(&req.header, error);
-                        }
-                    };
-
-                    match entry.op() {
-                        proto::metadata::BlockReportDeltaOpProto::BlockReportDeltaOpAdd => {
-                            added_blocks.push(block_id);
-                        }
-                        proto::metadata::BlockReportDeltaOpProto::BlockReportDeltaOpRemove => {
-                            removed_blocks.push(block_id);
-                        }
-                        _ => {
-                            return self.invalid_request_response::<BlockReportResponseProto>(
-                                &req.header,
-                                "Invalid delta operation",
-                            );
-                        }
-                    }
-                }
-
-                // Apply delta report
-                match self.worker_manager.apply_delta_report(
-                    self.served_group_id,
-                    worker_id,
-                    added_blocks.clone(),
-                    removed_blocks.clone(),
-                ) {
-                    Ok(result) => result,
-                    Err(_e) => {
-                        // Full sync required: return RequestFullBlockReport command
-                        let metadata_epoch = self.worker_manager.get_metadata_epoch();
-                        return Ok(Response::new(BlockReportResponseProto {
-                            header: Some(self.ok_response_header_from_request(&req.header)),
-                            report_seq: req.last_report_seq,
-                            commands: vec![WorkerCommandProto {
-                                task_id: 0,
-                                command: Some(proto::metadata::worker_command_proto::Command::RequestFullBlockReport(
-                                    proto::metadata::RequestFullBlockReportCommandProto {
-                                        target_metadata_epoch: metadata_epoch,
-                                        reason: "FULL_SYNC_REQUIRED".to_string(),
-                                    },
-                                )),
-                            }],
-                            retry_after_ms: 0,
-                        }));
-                    }
-                }
-            }
-            _ => {
-                return self.invalid_request_response::<BlockReportResponseProto>(&req.header, "Invalid report_type");
-            }
+        let header_group_id = Self::group_id_from_request_header(&req.header);
+        let group_id = if req.group_id != 0 {
+            req.group_id
+        } else {
+            header_group_id.unwrap_or(0)
         };
-
-        // Fanout: all nodes update presence (memory-only, no Raft)
-        // No Raft propose for UpdateBlockLocations
-
-        // Hand block-report repair signals to maintenance. The handler owns the leader gate.
-        let is_leader = self.raft_node.is_leader();
-        let outcome = match self
-            .repair_signal_handler
-            .handle_block_report_delta(BlockReportDelta {
-                group_id: self.served_group_id,
-                worker_id,
-                added_blocks: added_blocks.clone(),
-                removed_blocks: removed_blocks.clone(),
-            })
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => return self.metadata_error_response::<BlockReportResponseProto>(&req.header, error),
-        };
-        if let Some(queue_lengths) = outcome.queue_lengths {
-            self.metrics.update_orphan_queue_len(queue_lengths.orphan_queue_len);
-            self.metrics.update_repair_queue_len(queue_lengths.repair_queue_len);
+        if group_id == 0 {
+            return self.invalid_request_response::<BlockReportResponseProto>(&req.header, "group_id must be non-zero");
         }
-        if outcome.enqueue_failures > 0 {
-            warn!(
-                worker_id = worker_id.as_raw(),
-                enqueue_failures = outcome.enqueue_failures,
-                "Repair signal handler could not enqueue some planned tasks"
+        if let Some(header_group_id) = header_group_id {
+            if header_group_id != group_id {
+                return self.group_mismatch_response::<BlockReportResponseProto>(
+                    &req.header,
+                    "request header group_id must match block report group_id",
+                );
+            }
+        }
+        let group_id = ShardGroupId::new(group_id);
+        if group_id != self.served_group_id {
+            return self.group_mismatch_response::<BlockReportResponseProto>(
+                &req.header,
+                format!(
+                    "block report group_id {} does not match served metadata group {}",
+                    group_id.as_raw(),
+                    self.served_group_id.as_raw()
+                ),
             );
         }
 
-        // Generate new report sequence (monotonically increasing)
-        // Note: last_report_seq is now memory-only (no persistence), allows restart duplicates
-        let report_seq = if req.last_report_seq > 0 {
-            req.last_report_seq + 1
-        } else {
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+        let worker_id = WorkerId::new(req.worker_id);
+        if worker_id.as_raw() == 0 {
+            return self
+                .invalid_request_response::<BlockReportResponseProto>(&req.header, "worker_id must be non-zero");
+        }
+        let worker_run_id = match req.worker_run_id.parse::<WorkerRunId>() {
+            Ok(worker_run_id) => worker_run_id,
+            Err(error) => {
+                return self.invalid_request_response::<BlockReportResponseProto>(
+                    &req.header,
+                    format!("worker_run_id must be a UUID: {error}"),
+                )
+            }
+        };
+        let report_epoch = req.report_epoch;
+        let Some(report) = req.report else {
+            return self
+                .invalid_request_response::<BlockReportResponseProto>(&req.header, "block report body is required");
+        };
+
+        let result = match report {
+            block_report_request_proto::Report::Full(full) => {
+                let mut blocks = Vec::with_capacity(full.blocks.len());
+                for block in full.blocks {
+                    match Self::proto_to_report_block(block) {
+                        Ok(block) => blocks.push(block),
+                        Err(error) => {
+                            return self.metadata_error_response::<BlockReportResponseProto>(&req.header, error);
+                        }
+                    }
+                }
+                match self.worker_manager.receive_full_block_report(
+                    group_id,
+                    worker_id,
+                    worker_run_id,
+                    report_epoch,
+                    full.batch_seq,
+                    full.last_batch,
+                    blocks,
+                ) {
+                    Ok(result) => result,
+                    Err(error) => return self.map_report_error(&req.header, error),
+                }
+            }
+            block_report_request_proto::Report::Delta(delta) => {
+                let mut deltas = Vec::with_capacity(delta.deltas.len());
+                for delta in delta.deltas {
+                    match Self::proto_to_delta(delta) {
+                        Ok(delta) => deltas.push(delta),
+                        Err(error) => {
+                            return self.metadata_error_response::<BlockReportResponseProto>(&req.header, error);
+                        }
+                    }
+                }
+                match self.worker_manager.apply_delta_block_report(
+                    group_id,
+                    worker_id,
+                    worker_run_id,
+                    report_epoch,
+                    delta.delta_seq,
+                    deltas,
+                ) {
+                    Ok(result) => result,
+                    Err(error) => return self.map_report_error(&req.header, error),
+                }
+            }
         };
 
         // Update metrics
-        let total_blocks = added_blocks.len() + removed_blocks.len();
+        let total_blocks = result.added_blocks.len() + result.removed_blocks.len();
         self.metrics.record_blockreport_blocks(total_blocks as u64);
         let locations_size = self.worker_manager.get_all_locations_count();
         self.metrics.update_locations_size(locations_size);
 
         info!(
+            group_id = group_id.as_raw(),
             worker_id = worker_id.as_raw(),
-            report_type = ?report_type,
-            added_blocks = added_blocks.len(),
-            removed_blocks = removed_blocks.len(),
-            report_seq = report_seq,
+            report_epoch,
+            next_delta_seq = result.next_delta_seq,
+            added_blocks = result.added_blocks.len(),
+            removed_blocks = result.removed_blocks.len(),
             "Block report processed"
         );
 
-        // Leader-only: get pending commands (follower returns empty)
-        let commands = if is_leader {
-            self.command_router
-                .as_ref()
-                .map(|command_router| command_router.poll_commands(worker_id, 1))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
         Ok(Response::new(BlockReportResponseProto {
-            header: Some(self.ok_response_header_from_request(&req.header)),
-            report_seq,
-            commands,
+            header: Some((&self.create_response_header_from_request(&req.header, Some(group_id.as_raw()))).into()),
+            report_epoch,
+            next_delta_seq: result.next_delta_seq,
             retry_after_ms: 0,
         }))
     }
@@ -971,33 +863,11 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 mod tests {
     use super::*;
     use crate::error::MetadataError;
-    use crate::maintenance::repair::signal::{RepairSignalOutcome, RepairSignalQueueLengths};
-    use crate::maintenance::repair::{BlockReportDelta, RepairSignalSink};
     use crate::raft::{AppRaftStateMachine, RocksDBStorage};
     use crate::worker::HealthStatus;
     use crate::MountTable;
-    use parking_lot::Mutex;
     use proto::common::{error_detail_proto, ErrorClassProto, RefreshReasonProto, RpcErrorCodeProto};
     use tempfile::TempDir;
-
-    #[derive(Default)]
-    struct RecordingRepairSignalSink {
-        deltas: Mutex<Vec<BlockReportDelta>>,
-    }
-
-    #[async_trait::async_trait]
-    impl RepairSignalSink for RecordingRepairSignalSink {
-        async fn handle_block_report_delta(&self, delta: BlockReportDelta) -> MetadataResult<RepairSignalOutcome> {
-            self.deltas.lock().push(delta);
-            Ok(RepairSignalOutcome {
-                queue_lengths: Some(RepairSignalQueueLengths {
-                    orphan_queue_len: 0,
-                    repair_queue_len: 0,
-                }),
-                ..RepairSignalOutcome::default()
-            })
-        }
-    }
 
     async fn leader_raft(dir: &TempDir) -> Arc<AppRaftNode> {
         let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
@@ -1035,12 +905,144 @@ mod tests {
         block_id.into()
     }
 
+    fn report_block_proto(block_id: BlockId) -> BlockReportBlockProto {
+        BlockReportBlockProto {
+            block_id: Some(block_proto(block_id)),
+            data_handle_id: block_id.data_handle_id.as_raw(),
+            block_index: block_id.index.as_raw(),
+            block_stamp: 100 + u64::from(block_id.index.as_raw()),
+            effective_len: 4096,
+            committed_length: 4096,
+            block_state: BlockReportBlockStateProto::BlockReportBlockStateReady as i32,
+        }
+    }
+
+    fn full_report_request(
+        group_id: ShardGroupId,
+        worker_id: WorkerId,
+        worker_run_id: WorkerRunId,
+        report_epoch: u64,
+        batch_seq: u64,
+        last_batch: bool,
+        blocks: Vec<BlockId>,
+    ) -> BlockReportRequestProto {
+        BlockReportRequestProto {
+            header: Some(proto::common::RequestHeaderProto {
+                group_id: group_id.as_raw(),
+                ..Default::default()
+            }),
+            group_id: group_id.as_raw(),
+            worker_id: worker_id.as_raw(),
+            worker_run_id: worker_run_id.to_string(),
+            report_epoch,
+            report: Some(block_report_request_proto::Report::Full(FullBlockReportBatchProto {
+                batch_seq,
+                last_batch,
+                blocks: blocks.into_iter().map(report_block_proto).collect(),
+            })),
+        }
+    }
+
+    fn delta_report_request(
+        group_id: ShardGroupId,
+        worker_id: WorkerId,
+        worker_run_id: WorkerRunId,
+        report_epoch: u64,
+        delta_seq: u64,
+        deltas: Vec<(BlockReportDeltaOpProto, BlockId)>,
+    ) -> BlockReportRequestProto {
+        BlockReportRequestProto {
+            header: Some(proto::common::RequestHeaderProto {
+                group_id: group_id.as_raw(),
+                ..Default::default()
+            }),
+            group_id: group_id.as_raw(),
+            worker_id: worker_id.as_raw(),
+            worker_run_id: worker_run_id.to_string(),
+            report_epoch,
+            report: Some(block_report_request_proto::Report::Delta(DeltaBlockReportProto {
+                delta_seq,
+                deltas: deltas
+                    .into_iter()
+                    .map(|(op, block_id)| BlockReportDeltaProto {
+                        op: op as i32,
+                        block: Some(report_block_proto(block_id)),
+                    })
+                    .collect(),
+            })),
+        }
+    }
+
     fn test_worker_run_id() -> WorkerRunId {
         "550e8400-e29b-41d4-a716-446655440000".parse().unwrap()
     }
 
     fn second_worker_run_id() -> WorkerRunId {
         "550e8400-e29b-41d4-a716-446655440001".parse().unwrap()
+    }
+
+    fn worker_run_id_for(group_id: ShardGroupId, worker_id: WorkerId) -> WorkerRunId {
+        let suffix = group_id
+            .as_raw()
+            .saturating_mul(1_000_000)
+            .saturating_add(worker_id.as_raw());
+        format!("550e8400-e29b-41d4-a716-{suffix:012x}")
+            .parse()
+            .expect("valid test WorkerRunId")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_heartbeat(
+        worker_manager: &WorkerManager,
+        group_id: ShardGroupId,
+        worker_id: WorkerId,
+        capacity_total: u64,
+        capacity_used: u64,
+        capacity_available: u64,
+        active_reads: u32,
+        active_writes: u32,
+        health: HealthStatus,
+    ) -> WorkerRunId {
+        let descriptor = worker_manager
+            .get_descriptor(group_id, worker_id)
+            .expect("worker descriptor should be registered");
+        let worker_run_id = worker_manager
+            .get_registration(group_id, worker_id)
+            .map(|registration| registration.worker_run_id)
+            .unwrap_or_else(|| {
+                let worker_run_id = worker_run_id_for(group_id, worker_id);
+                worker_manager
+                    .register_worker_run(
+                        group_id,
+                        worker_id,
+                        descriptor.address.clone(),
+                        descriptor.worker_net_protocol,
+                        worker_run_id,
+                        descriptor.fault_domain.clone(),
+                    )
+                    .expect("worker run should register");
+                worker_run_id
+            });
+        worker_manager
+            .record_heartbeat(
+                group_id,
+                worker_id,
+                worker_run_id,
+                1,
+                &descriptor.address,
+                descriptor.worker_net_protocol,
+                capacity_total,
+                capacity_used,
+                capacity_available,
+                active_reads,
+                active_writes,
+                health,
+            )
+            .expect("heartbeat should be accepted");
+        worker_manager
+            .upsert_descriptor(descriptor)
+            .expect("descriptor should be restored");
+        worker_run_id
     }
 
     fn heartbeat_request(
@@ -1111,9 +1113,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn block_report_applies_soft_state_and_delegates_repair_signal() {
+    async fn block_report_applies_soft_state_without_maintenance_signal() {
         let dir = TempDir::new().unwrap();
         let raft_node = leader_raft(&dir).await;
+        let before_state_id = raft_node.get_last_applied_state_id();
         let worker_manager = Arc::new(WorkerManager::new(60));
         let worker_id = WorkerId::new(7);
         let block_id = BlockId::from_u64_u32(70, 0);
@@ -1127,63 +1130,52 @@ mod tests {
                 None,
             )
             .unwrap();
-        worker_manager
-            .record_test_heartbeat(
-                ShardGroupId::new(1),
-                worker_id,
-                1_000,
-                500,
-                500,
-                0,
-                0,
-                HealthStatus::Healthy,
-            )
-            .unwrap();
-        worker_manager.mark_full_sync_complete(ShardGroupId::new(1), worker_id);
-        let signal_sink = Arc::new(RecordingRepairSignalSink::default());
+        let worker_run_id = record_heartbeat(
+            &worker_manager,
+            ShardGroupId::new(1),
+            worker_id,
+            1_000,
+            500,
+            500,
+            0,
+            0,
+            HealthStatus::Healthy,
+        );
         let service = MetadataWorkerServiceImpl::new(
-            raft_node,
+            Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
-            Arc::clone(&signal_sink) as Arc<dyn RepairSignalSink>,
             Arc::new(MountTable::new()),
             ShardGroupId::new(1),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
             &service,
-            Request::new(BlockReportRequestProto {
-                header: None,
-                worker_id: worker_id.as_raw(),
-                report_type: BlockReportTypeProto::BlockReportTypeIncremental as i32,
-                full_entries: Vec::new(),
-                delta_entries: vec![BlockReportEntryDeltaProto {
-                    block_id: Some(block_proto(block_id)),
-                    op: BlockReportDeltaOpProto::BlockReportDeltaOpAdd as i32,
-                    chunk_bitmap: None,
-                }],
-                last_report_seq: 41,
-                full_report_lease_token: 0,
-            }),
+            Request::new(full_report_request(
+                ShardGroupId::new(1),
+                worker_id,
+                worker_run_id,
+                1,
+                0,
+                true,
+                vec![block_id],
+            )),
         )
         .await
         .unwrap()
         .into_inner();
 
         assert!(response.header.as_ref().expect("header").error.is_none());
-        assert_eq!(response.report_seq, 42);
+        assert_eq!(response.report_epoch, 1);
+        assert_eq!(response.next_delta_seq, 0);
         assert_eq!(
             worker_manager.get_block_locations(ShardGroupId::new(1), block_id),
             vec![worker_id]
         );
-        let deltas = signal_sink.deltas.lock();
-        assert_eq!(deltas.len(), 1);
-        assert_eq!(deltas[0].worker_id, worker_id);
-        assert_eq!(deltas[0].added_blocks, vec![block_id]);
-        assert!(deltas[0].removed_blocks.is_empty());
+        assert_eq!(raft_node.get_last_applied_state_id(), before_state_id);
     }
 
     #[tokio::test]
-    async fn follower_block_report_delegates_repair_signal_to_handler_noop_gate() {
+    async fn follower_block_report_updates_local_view_without_commands() {
         let dir = TempDir::new().unwrap();
         let raft_node = nonleader_raft(&dir).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
@@ -1199,58 +1191,63 @@ mod tests {
                 None,
             )
             .unwrap();
+        let worker_run_id = record_heartbeat(
+            &worker_manager,
+            ShardGroupId::new(1),
+            worker_id,
+            1_000,
+            500,
+            500,
+            0,
+            0,
+            HealthStatus::Healthy,
+        );
         worker_manager
-            .record_test_heartbeat(
+            .receive_full_block_report(
                 ShardGroupId::new(1),
                 worker_id,
-                1_000,
-                500,
-                500,
+                worker_run_id,
+                3,
                 0,
-                0,
-                HealthStatus::Healthy,
+                true,
+                vec![BlockReportBlock {
+                    block_id,
+                    data_handle_id: block_id.data_handle_id.as_raw(),
+                    block_index: block_id.index.as_raw(),
+                    block_stamp: 100,
+                    effective_len: 4096,
+                    committed_length: 4096,
+                    block_state: BlockReportBlockState::Ready,
+                }],
             )
             .unwrap();
-        worker_manager.mark_full_sync_complete(ShardGroupId::new(1), worker_id);
-        worker_manager
-            .update_locations(ShardGroupId::new(1), worker_id, vec![block_id])
-            .unwrap();
-        let signal_sink = Arc::new(RecordingRepairSignalSink::default());
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             Arc::clone(&worker_manager),
-            Arc::clone(&signal_sink) as Arc<dyn RepairSignalSink>,
             Arc::new(MountTable::new()),
             ShardGroupId::new(1),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
             &service,
-            Request::new(BlockReportRequestProto {
-                header: None,
-                worker_id: worker_id.as_raw(),
-                report_type: BlockReportTypeProto::BlockReportTypeIncremental as i32,
-                full_entries: Vec::new(),
-                delta_entries: vec![BlockReportEntryDeltaProto {
-                    block_id: Some(block_proto(block_id)),
-                    op: BlockReportDeltaOpProto::BlockReportDeltaOpRemove as i32,
-                    chunk_bitmap: None,
-                }],
-                last_report_seq: 52,
-                full_report_lease_token: 0,
-            }),
+            Request::new(delta_report_request(
+                ShardGroupId::new(1),
+                worker_id,
+                worker_run_id,
+                3,
+                0,
+                vec![(BlockReportDeltaOpProto::BlockReportDeltaOpRemove, block_id)],
+            )),
         )
         .await
         .unwrap()
         .into_inner();
 
         assert!(response.header.as_ref().expect("header").error.is_none());
-        assert_eq!(response.report_seq, 53);
-        let deltas = signal_sink.deltas.lock();
-        assert_eq!(deltas.len(), 1);
-        assert_eq!(deltas[0].worker_id, worker_id);
-        assert!(deltas[0].added_blocks.is_empty());
-        assert_eq!(deltas[0].removed_blocks, vec![block_id]);
+        assert_eq!(response.next_delta_seq, 1);
+        assert!(worker_manager
+            .get_block_locations(ShardGroupId::new(1), block_id)
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1261,7 +1258,6 @@ mod tests {
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             worker_manager,
-            Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
             ShardGroupId::new(1),
         );
@@ -1297,7 +1293,6 @@ mod tests {
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             worker_manager,
-            Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
             ShardGroupId::new(1),
         );
@@ -1339,7 +1334,6 @@ mod tests {
         let service = MetadataWorkerServiceImpl::new(
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
-            Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
             ShardGroupId::new(1),
         );
@@ -1392,7 +1386,6 @@ mod tests {
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             Arc::clone(&worker_manager),
-            Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
             ShardGroupId::new(1),
         );
@@ -1437,7 +1430,6 @@ mod tests {
         let service = MetadataWorkerServiceImpl::new(
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
-            Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
             ShardGroupId::new(1),
         );
@@ -1493,7 +1485,6 @@ mod tests {
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             Arc::clone(&worker_manager),
-            Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
             ShardGroupId::new(1),
         );
@@ -1539,7 +1530,6 @@ mod tests {
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             worker_manager,
-            Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
             ShardGroupId::new(1),
         );
@@ -1584,7 +1574,6 @@ mod tests {
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             worker_manager,
-            Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
             ShardGroupId::new(1),
         );
@@ -1630,7 +1619,6 @@ mod tests {
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             worker_manager,
-            Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
             ShardGroupId::new(1),
         );
@@ -1672,11 +1660,10 @@ mod tests {
                 None,
             )
             .unwrap();
-        worker_manager.set_last_seen_ms_for_test(ShardGroupId::new(1), worker_id, 0);
+        tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             worker_manager,
-            Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
             ShardGroupId::new(1),
         );
@@ -1721,7 +1708,6 @@ mod tests {
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             Arc::clone(&worker_manager),
-            Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
             ShardGroupId::new(1),
         );
@@ -1766,7 +1752,6 @@ mod tests {
         let service = MetadataWorkerServiceImpl::new(
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
-            Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
             ShardGroupId::new(1),
         );
@@ -1797,7 +1782,6 @@ mod tests {
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             worker_manager,
-            Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
             ShardGroupId::new(1),
         );
@@ -1843,7 +1827,6 @@ mod tests {
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             worker_manager,
-            Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
             ShardGroupId::new(1),
         );
@@ -1875,10 +1858,34 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let raft_node = nonleader_raft(&dir).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_id = WorkerId::new(99);
+        worker_manager
+            .register_worker(
+                ShardGroupId::new(1),
+                worker_id,
+                "127.0.0.1:9099".to_string(),
+                1,
+                100,
+                None,
+            )
+            .unwrap();
+        let worker_run_id = record_heartbeat(
+            &worker_manager,
+            ShardGroupId::new(1),
+            worker_id,
+            1_000,
+            500,
+            500,
+            0,
+            0,
+            HealthStatus::Healthy,
+        );
+        worker_manager
+            .receive_full_block_report(ShardGroupId::new(1), worker_id, worker_run_id, 1, 0, true, Vec::new())
+            .unwrap();
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             worker_manager,
-            Arc::new(RecordingRepairSignalSink::default()),
             Arc::new(MountTable::new()),
             ShardGroupId::new(1),
         );
@@ -1886,17 +1893,21 @@ mod tests {
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
             &service,
             Request::new(BlockReportRequestProto {
-                header: None,
-                worker_id: 99,
-                report_type: BlockReportTypeProto::BlockReportTypeIncremental as i32,
-                full_entries: Vec::new(),
-                delta_entries: vec![BlockReportEntryDeltaProto {
-                    block_id: None,
-                    op: BlockReportDeltaOpProto::BlockReportDeltaOpAdd as i32,
-                    chunk_bitmap: None,
-                }],
-                last_report_seq: 0,
-                full_report_lease_token: 0,
+                header: Some(proto::common::RequestHeaderProto {
+                    group_id: 1,
+                    ..Default::default()
+                }),
+                group_id: 1,
+                worker_id: worker_id.as_raw(),
+                worker_run_id: worker_run_id.to_string(),
+                report_epoch: 1,
+                report: Some(block_report_request_proto::Report::Delta(DeltaBlockReportProto {
+                    delta_seq: 0,
+                    deltas: vec![BlockReportDeltaProto {
+                        op: BlockReportDeltaOpProto::BlockReportDeltaOpAddUpdate as i32,
+                        block: None,
+                    }],
+                })),
             }),
         )
         .await
@@ -1905,6 +1916,6 @@ mod tests {
 
         let error = response.header.expect("header").error.expect("header error");
         assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
-        assert!(error.message.contains("Missing block_id"));
+        assert!(error.message.contains("missing block"));
     }
 }

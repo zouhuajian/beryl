@@ -108,16 +108,4 @@ impl RegistrationSet {
                     .is_some_and(|deadline| deadline > Instant::now())
             })
     }
-
-    #[cfg(test)]
-    pub(crate) fn expire_heartbeat_for_test(&self, group_id: ShardGroupId) {
-        if let Some(entry) = self
-            .registrations
-            .write()
-            .expect("registration state poisoned")
-            .get_mut(&group_id)
-        {
-            entry.heartbeat_deadline = Some(Instant::now() - Duration::from_millis(1));
-        }
-    }
 }

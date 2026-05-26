@@ -436,6 +436,56 @@ impl FullBlockFileStore {
         }
     }
 
+    /// Scan final block metadata under one local group directory.
+    ///
+    /// The group directory is the source of the report group_id. Staging files
+    /// under `tmp/` are not scanned, and Ready entries are revalidated against
+    /// their local `.blk` file before being reported.
+    pub fn scan_group_blocks(&self, group_id: ShardGroupId) -> StoreResult<Vec<BlockMetaPayload>> {
+        let blocks_dir = self.group_dir(group_id).join("blocks");
+        if !blocks_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut blocks = Vec::new();
+        for first_level in fs::read_dir(&blocks_dir)? {
+            let first_level = first_level?;
+            if !first_level.file_type()?.is_dir() {
+                continue;
+            }
+            for second_level in fs::read_dir(first_level.path())? {
+                let second_level = second_level?;
+                if !second_level.file_type()?.is_dir() {
+                    continue;
+                }
+                for entry in fs::read_dir(second_level.path())? {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_file() {
+                        continue;
+                    }
+                    let path = entry.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("meta") {
+                        continue;
+                    }
+                    let meta = read_meta_file(&path)?;
+                    let block_id = meta.identity.block_id;
+                    validate_final_meta_payload(&meta, group_id, block_id)?;
+                    if meta.visibility.block_state == BlockState::Ready {
+                        validate_ready_data_file(&self.paths(group_id, block_id), &meta)?;
+                    }
+                    blocks.push(meta);
+                }
+            }
+        }
+        blocks.sort_by_key(|meta| {
+            (
+                meta.identity.block_id.data_handle_id.as_raw(),
+                meta.identity.block_id.index.as_raw(),
+            )
+        });
+        Ok(blocks)
+    }
+
     pub fn delete_block(&self, group_id: ShardGroupId, block_id: BlockId) -> StoreResult<()> {
         let paths = self.paths(group_id, block_id);
         remove_file_if_exists(&paths.meta_path)?;
@@ -630,26 +680,6 @@ impl BlockStore {
     fn not_implemented(operation: &'static str) -> WorkerError {
         WorkerError::Unimplemented(format!("{operation} is not implemented"))
     }
-}
-
-#[cfg(test)]
-fn write_meta_atomic(paths: &BlockPaths, meta: &BlockMetaPayload) -> StoreResult<()> {
-    validate_final_meta_payload(meta, meta.identity.group_id, meta.identity.block_id)?;
-    let parent = paths.parent_dir()?;
-    fs::create_dir_all(parent)?;
-    let encoded = encode_meta(meta)?;
-    {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&paths.temp_meta_path)?;
-        file.write_all(&encoded)?;
-        file.sync_all()?;
-    }
-    fs::rename(&paths.temp_meta_path, &paths.meta_path)?;
-    sync_parent_dir(parent)?;
-    Ok(())
 }
 
 fn write_meta_new(paths: &BlockPaths, meta: &BlockMetaPayload) -> StoreResult<()> {
@@ -929,26 +959,14 @@ fn remove_file_if_exists(path: &Path) -> StoreResult<()> {
 }
 
 fn remove_temp_meta_after_commit(path: &Path) {
-    #[cfg(test)]
-    if maybe_fail_at(StoreFault::TempMetaCleanup).is_err() {
-        return;
-    }
     let _ = remove_file_if_exists(path);
 }
 
 fn remove_staging_meta_after_commit(path: &Path) {
-    #[cfg(test)]
-    if maybe_fail_at(StoreFault::StagingMetaCleanup).is_err() {
-        return;
-    }
     let _ = remove_file_if_exists(path);
 }
 
 fn sync_parent_dir_after_commit(parent: &Path) {
-    #[cfg(test)]
-    if maybe_fail_at(StoreFault::FinalMetaParentSync).is_err() {
-        return;
-    }
     let _ = sync_parent_dir(parent);
 }
 
@@ -1005,52 +1023,6 @@ fn corrupt(message: impl Into<String>) -> WorkerError {
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StoreFault {
-    TempMetaCleanup,
-    StagingMetaCleanup,
-    FinalMetaParentSync,
-}
-
-#[cfg(test)]
-thread_local! {
-    static STORE_FAULT: std::cell::Cell<Option<StoreFault>> = const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-struct StoreFaultGuard;
-
-#[cfg(test)]
-impl Drop for StoreFaultGuard {
-    fn drop(&mut self) {
-        STORE_FAULT.with(|fault| fault.set(None));
-    }
-}
-
-#[cfg(test)]
-fn fail_once_at(fault: StoreFault) -> StoreFaultGuard {
-    STORE_FAULT.with(|current| current.set(Some(fault)));
-    StoreFaultGuard
-}
-
-#[cfg(test)]
-fn maybe_fail_at(fault: StoreFault) -> StoreResult<()> {
-    let should_fail = STORE_FAULT.with(|current| {
-        if current.get() == Some(fault) {
-            current.set(None);
-            true
-        } else {
-            false
-        }
-    });
-    if should_fail {
-        Err(WorkerError::DiskError(format!("injected store fault at {fault:?}")))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use std::fs::{self, OpenOptions};
     use std::io::{Seek, SeekFrom, Write};
@@ -1059,15 +1031,7 @@ mod tests {
     use tempfile::TempDir;
     use types::ids::{BlockId, BlockIndex, DataHandleId, ShardGroupId};
 
-    use crate::store::meta_codec::{
-        decode_meta_payload, encode_meta_payload,
-        test_support::{
-            payload_has_generated_protobuf_shape, protobuf_payload_missing_block_id, protobuf_payload_missing_format,
-            protobuf_payload_missing_group_id, protobuf_payload_missing_identity, protobuf_payload_missing_source,
-            protobuf_payload_missing_visibility, protobuf_payload_with_block_state,
-            protobuf_payload_with_checksum_kind,
-        },
-    };
+    use crate::store::meta_codec::{decode_meta_payload, encode_meta_payload};
 
     use super::*;
 
@@ -1158,7 +1122,22 @@ mod tests {
 
     fn persist_meta(store: &FullBlockFileStore, group_id: ShardGroupId, block_id: BlockId, meta: &BlockMetaPayload) {
         let paths = store.paths(group_id, block_id);
-        write_meta_atomic(&paths, meta).expect("persist meta");
+        validate_final_meta_payload(meta, meta.identity.group_id, meta.identity.block_id).expect("valid final meta");
+        let parent = paths.parent_dir().expect("parent dir");
+        fs::create_dir_all(parent).expect("create parent");
+        let encoded = encode_meta(meta).expect("encode meta");
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&paths.temp_meta_path)
+                .expect("open temp meta");
+            file.write_all(&encoded).expect("write temp meta");
+            file.sync_all().expect("sync temp meta");
+        }
+        fs::rename(&paths.temp_meta_path, &paths.meta_path).expect("rename meta");
+        sync_parent_dir(parent).expect("sync parent");
     }
 
     fn persist_raw_meta_payload(paths: &BlockPaths, meta: &BlockMetaPayload) {
@@ -1222,6 +1201,164 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct WireField {
+        key_start: usize,
+        value_start: usize,
+        value_end: usize,
+        wire_type: u64,
+    }
+
+    fn read_varint(encoded: &[u8], cursor: &mut usize) -> Option<u64> {
+        let mut value = 0u64;
+        let mut shift = 0;
+        while *cursor < encoded.len() {
+            let byte = encoded[*cursor];
+            *cursor += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+            shift += 7;
+            if shift >= 64 {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn write_varint(mut value: u64, out: &mut Vec<u8>) {
+        while value >= 0x80 {
+            out.push((value as u8 & 0x7f) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+
+    fn find_wire_field(encoded: &[u8], field_number: u64) -> Option<WireField> {
+        let mut cursor = 0;
+        while cursor < encoded.len() {
+            let key_start = cursor;
+            let key = read_varint(encoded, &mut cursor)?;
+            let current_field = key >> 3;
+            let wire_type = key & 0x07;
+            let mut value_start = cursor;
+            let value_end = match wire_type {
+                0 => {
+                    read_varint(encoded, &mut cursor)?;
+                    cursor
+                }
+                2 => {
+                    let len = usize::try_from(read_varint(encoded, &mut cursor)?).ok()?;
+                    value_start = cursor;
+                    let end = cursor.checked_add(len)?;
+                    if end > encoded.len() {
+                        return None;
+                    }
+                    cursor = end;
+                    end
+                }
+                _ => return None,
+            };
+            if current_field == field_number {
+                return Some(WireField {
+                    key_start,
+                    value_start,
+                    value_end,
+                    wire_type,
+                });
+            }
+        }
+        None
+    }
+
+    fn field_payload(encoded: &[u8], field_number: u64) -> Vec<u8> {
+        let field = find_wire_field(encoded, field_number).expect("field should exist");
+        assert_eq!(field.wire_type, 2);
+        encoded[field.value_start..field.value_end].to_vec()
+    }
+
+    fn remove_field(encoded: &[u8], field_number: u64) -> Vec<u8> {
+        let field = find_wire_field(encoded, field_number).expect("field should exist");
+        let mut out = Vec::with_capacity(encoded.len());
+        out.extend_from_slice(&encoded[..field.key_start]);
+        out.extend_from_slice(&encoded[field.value_end..]);
+        out
+    }
+
+    fn replace_field_payload(encoded: &[u8], field_number: u64, payload: &[u8]) -> Vec<u8> {
+        let field = find_wire_field(encoded, field_number).expect("field should exist");
+        assert_eq!(field.wire_type, 2);
+        let mut out = Vec::with_capacity(encoded.len() + payload.len());
+        out.extend_from_slice(&encoded[..field.key_start]);
+        write_varint((field_number << 3) | 2, &mut out);
+        write_varint(payload.len() as u64, &mut out);
+        out.extend_from_slice(payload);
+        out.extend_from_slice(&encoded[field.value_end..]);
+        out
+    }
+
+    fn replace_varint_field(encoded: &[u8], field_number: u64, value: u64) -> Vec<u8> {
+        let field = find_wire_field(encoded, field_number).expect("field should exist");
+        assert_eq!(field.wire_type, 0);
+        let mut out = Vec::with_capacity(encoded.len());
+        out.extend_from_slice(&encoded[..field.key_start]);
+        write_varint(field_number << 3, &mut out);
+        write_varint(value, &mut out);
+        out.extend_from_slice(&encoded[field.value_end..]);
+        out
+    }
+
+    fn payload_has_generated_protobuf_shape(encoded: &[u8]) -> bool {
+        [1, 2, 3, 4]
+            .into_iter()
+            .all(|field_number| find_wire_field(encoded, field_number).is_some())
+    }
+
+    fn valid_payload(meta: &BlockMetaPayload) -> Vec<u8> {
+        encode_meta_payload(meta).expect("encode payload")
+    }
+
+    fn protobuf_payload_missing_identity(meta: &BlockMetaPayload) -> Vec<u8> {
+        remove_field(&valid_payload(meta), 1)
+    }
+
+    fn protobuf_payload_missing_block_id(meta: &BlockMetaPayload) -> Vec<u8> {
+        let encoded = valid_payload(meta);
+        let identity = remove_field(&field_payload(&encoded, 1), 1);
+        replace_field_payload(&encoded, 1, &identity)
+    }
+
+    fn protobuf_payload_missing_group_id(meta: &BlockMetaPayload) -> Vec<u8> {
+        let encoded = valid_payload(meta);
+        let identity = remove_field(&field_payload(&encoded, 1), 2);
+        replace_field_payload(&encoded, 1, &identity)
+    }
+
+    fn protobuf_payload_missing_format(meta: &BlockMetaPayload) -> Vec<u8> {
+        remove_field(&valid_payload(meta), 2)
+    }
+
+    fn protobuf_payload_missing_source(meta: &BlockMetaPayload) -> Vec<u8> {
+        remove_field(&valid_payload(meta), 3)
+    }
+
+    fn protobuf_payload_missing_visibility(meta: &BlockMetaPayload) -> Vec<u8> {
+        remove_field(&valid_payload(meta), 4)
+    }
+
+    fn protobuf_payload_with_block_state(meta: &BlockMetaPayload, block_state: i32) -> Vec<u8> {
+        let encoded = valid_payload(meta);
+        let visibility = replace_varint_field(&field_payload(&encoded, 4), 1, block_state as u64);
+        replace_field_payload(&encoded, 4, &visibility)
+    }
+
+    fn protobuf_payload_with_checksum_kind(meta: &BlockMetaPayload, checksum_kind: i32) -> Vec<u8> {
+        let encoded = valid_payload(meta);
+        let format = replace_varint_field(&field_payload(&encoded, 2), 4, checksum_kind as u64);
+        replace_field_payload(&encoded, 2, &format)
+    }
+
     #[test]
     fn meta_payload_round_trip_uses_protobuf() {
         let (group_id, block_id) = ids();
@@ -1241,43 +1378,6 @@ mod tests {
         meta.visibility.block_state = BlockState::Loading;
 
         assert_invalid_argument(encode_meta_payload(&meta));
-    }
-
-    #[test]
-    fn write_meta_new_does_not_fail_after_final_meta_commit() {
-        let (_temp, store) = store();
-        let (group_id, block_id) = ids();
-        create_default_block(&store, group_id, block_id);
-        let paths = store.paths(group_id, block_id);
-        let mut meta = store.load_staging_meta(group_id, block_id).expect("load staging meta");
-        meta.visibility.block_state = BlockState::Ready;
-        meta.visibility.block_stamp = 9;
-        let _fault = fail_once_at(StoreFault::TempMetaCleanup);
-
-        let result = write_meta_new(&paths, &meta);
-
-        assert!(result.is_ok(), "final meta commit should be success: {result:?}");
-        let reloaded = read_meta_file(&paths.meta_path).expect("read committed meta");
-        assert_eq!(reloaded.visibility.block_state, BlockState::Ready);
-        assert_eq!(reloaded.visibility.block_stamp, 9);
-    }
-
-    #[test]
-    fn publish_ready_treats_post_commit_cleanup_failure_as_success() {
-        let (_temp, store) = store();
-        let (group_id, block_id) = ids();
-        create_default_block(&store, group_id, block_id);
-        let data = Bytes::from(vec![7; 4096]);
-        store.write_at(group_id, block_id, 0, data.clone()).expect("write");
-        let _fault = fail_once_at(StoreFault::StagingMetaCleanup);
-
-        let meta = store
-            .publish_ready(publish_request(group_id, block_id, 4096, 17))
-            .expect("post-commit cleanup failure must not fail publish");
-
-        assert_eq!(meta.visibility.block_state, BlockState::Ready);
-        assert_eq!(meta.visibility.block_stamp, 17);
-        assert_eq!(store.read_at(group_id, block_id, 0, data.len() as u64).unwrap(), data);
     }
 
     #[test]

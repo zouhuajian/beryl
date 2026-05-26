@@ -76,6 +76,8 @@ pub mod canonical {
         NeedRegister,
         /// Worker process-run identity no longer matches metadata live state.
         WorkerRunMismatch,
+        /// Worker must send a new full block report before deltas continue.
+        FullReportRequired,
         /// Block stamp mismatch (data-plane).
         BlockStampMismatch,
         /// Fencing / lease fenced.

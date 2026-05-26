@@ -18,7 +18,6 @@ use crate::raft::{AppRaftNode, Command, DedupKey, RocksDBStorage};
 use crate::state::{DeleteIntent, DeleteIntentReason, DeleteIntentStatus};
 use crate::worker::WorkerManager;
 use parking_lot::RwLock;
-use proto::metadata::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -578,123 +577,6 @@ impl DeleteExecutor {
         for route in routes {
             self.release_inflight_route(route);
         }
-    }
-
-    /// Get pending commands for a worker (called from Heartbeat handler).
-    pub fn get_pending_commands(&self, worker_id: WorkerId, max: usize) -> Vec<WorkerCommandProto> {
-        let mut commands = Vec::new();
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-
-        // Collect blocks to evict for this worker
-        let mut blocks_to_evict: Vec<(u64, BlockId)> = Vec::new();
-        {
-            let state = self.execution_state.read();
-            for (intent_id, exec_state) in state.iter() {
-                if let IntentExecutionStatus::InFlight {
-                    worker_id: target_worker,
-                    task_id: _,
-                    ..
-                } = &exec_state.status
-                {
-                    if *target_worker == worker_id && exec_state.sent_to_workers.contains(&worker_id) {
-                        blocks_to_evict.push((*intent_id, exec_state.intent.block_id));
-                    }
-                }
-            }
-        }
-
-        // Group by intent_id (for batching)
-        let mut intent_blocks: HashMap<u64, Vec<BlockId>> = HashMap::new();
-        for (intent_id, block_id) in blocks_to_evict.into_iter().take(max) {
-            intent_blocks.entry(intent_id).or_default().push(block_id);
-        }
-
-        // Generate commands
-        for (intent_id, block_ids) in intent_blocks {
-            let intent = {
-                let state = self.execution_state.read();
-                state.get(&intent_id).map(|s| s.intent.clone()).unwrap_or_else(|| {
-                    // Fallback: try to load from storage
-                    match self.storage.get_delete_intent(intent_id) {
-                        Ok(Some(intent)) => intent,
-                        _ => {
-                            // Last resort: create minimal intent (should not happen in normal flow)
-                            warn!(
-                                intent_id,
-                                "DeleteIntent not found in execution_state or storage, creating fallback"
-                            );
-                            // Last resort: create minimal intent
-                            DeleteIntent {
-                                intent_id,
-                                block_id: block_ids[0],
-                                reason: crate::state::DeleteIntentReason::Gc,
-                                created_at_ms: now_ms,
-                                not_before_ms: now_ms,
-                                shard_group_id: None,
-                                guard_watermark: None,
-                                mount_epoch: None,
-                                guard_state_id: types::RaftLogId::default(),
-                                target_workers: Vec::new(),
-                                status: crate::state::DeleteIntentStatus::Pending,
-                                finished_at_ms: None,
-                                last_error_msg: None,
-                            }
-                        }
-                    }
-                })
-            };
-
-            let block_ids_proto: Vec<proto::common::BlockIdProto> = block_ids
-                .iter()
-                .copied()
-                .map(proto::common::BlockIdProto::from)
-                .collect();
-
-            let task_id = {
-                let state = self.execution_state.read();
-                if let Some(exec_state) = state.get(&intent_id) {
-                    if let IntentExecutionStatus::InFlight { task_id, .. } = exec_state.status {
-                        task_id
-                    } else {
-                        self.next_task_id.fetch_add(1, Ordering::Relaxed)
-                    }
-                } else {
-                    self.next_task_id.fetch_add(1, Ordering::Relaxed)
-                }
-            };
-
-            // Determine op_kind based on intent reason
-            let op_kind = match intent.reason {
-                crate::state::DeleteIntentReason::OverRep => {
-                    proto::metadata::DeleteOpKindProto::DeleteOpKindReplicaEvict as i32
-                }
-                _ => proto::metadata::DeleteOpKindProto::DeleteOpKindDelete as i32,
-            };
-
-            // Generate DeleteBlocksCommandProto with per-block status support
-            let delete_blocks_command = DeleteBlocksCommandProto {
-                intent_id,
-                op_kind,
-                blocks: block_ids_proto
-                    .iter()
-                    .map(|proto_bid| proto::metadata::DeleteBlockRequestProto {
-                        block_id: Some(*proto_bid),
-                        expected_state: String::new(), // TODO: Add expected state check
-                    })
-                    .collect(),
-                not_before_ms: intent.not_before_ms,
-                expected_epoch: 0, // TODO: Add epoch check
-            };
-
-            commands.push(WorkerCommandProto {
-                task_id,
-                command: Some(proto::metadata::worker_command_proto::Command::DeleteBlocks(
-                    delete_blocks_command,
-                )),
-            });
-        }
-
-        commands
     }
 
     /// Cleanup old completed/failed intents.

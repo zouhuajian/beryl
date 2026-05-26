@@ -3,8 +3,12 @@
 
 //! Tests for worker manager and registration.
 
-use super::manager::{HealthStatus, WorkerInfo, WorkerManager, WorkerRegistrationKey};
-use types::ids::{ShardGroupId, WorkerId};
+use super::manager::{
+    BlockLocationKey, BlockReportBlock, BlockReportBlockState, BlockReportDeltaEntry, BlockReportDeltaOp, HealthStatus,
+    WorkerInfo, WorkerManager, WorkerRegistrationKey,
+};
+use std::time::Duration;
+use types::ids::{BlockId, BlockIndex, DataHandleId, ShardGroupId, WorkerId};
 use types::WorkerRunId;
 
 #[test]
@@ -35,33 +39,371 @@ fn test_worker_registration_with_worker_net_protocol_and_epoch() {
     assert_eq!(descriptor.worker_epoch, worker_epoch);
 }
 
-#[test]
-fn test_incremental_before_full_rejected() {
-    let manager = WorkerManager::new(60);
-    let worker_id = WorkerId::new(1);
+fn report_run_id() -> WorkerRunId {
+    "550e8400-e29b-41d4-a716-446655440100".parse().unwrap()
+}
 
-    // Register worker
+fn report_block(index: u32) -> BlockReportBlock {
+    let block_id = BlockId::new(DataHandleId::new(9), BlockIndex::new(index));
+    report_block_with_id(block_id)
+}
+
+fn report_block_with_id(block_id: BlockId) -> BlockReportBlock {
+    BlockReportBlock {
+        block_id,
+        data_handle_id: block_id.data_handle_id.as_raw(),
+        block_index: block_id.index.as_raw(),
+        block_stamp: u64::from(block_id.index.as_raw()) + 100,
+        effective_len: 4096,
+        committed_length: 4096,
+        block_state: BlockReportBlockState::Ready,
+    }
+}
+
+fn register_live_report_worker(
+    manager: &WorkerManager,
+    group_id: ShardGroupId,
+    worker_id: WorkerId,
+    run_id: WorkerRunId,
+) {
     manager
-        .register_worker(
-            ShardGroupId::new(1),
+        .register_worker_run(group_id, worker_id, "127.0.0.1:9090".to_string(), 1, run_id, None)
+        .unwrap();
+    manager
+        .record_heartbeat(
+            group_id,
             worker_id,
-            "127.0.0.1:9090".to_string(),
+            run_id,
             1,
+            "127.0.0.1:9090",
+            1,
+            1_000,
             100,
-            None,
+            900,
+            0,
+            0,
+            HealthStatus::Healthy,
+        )
+        .unwrap();
+}
+
+#[test]
+fn full_report_batches_publish_only_after_last_batch() {
+    let manager = WorkerManager::new(60);
+    let group_id = ShardGroupId::new(21);
+    let worker_id = WorkerId::new(5);
+    let run_id = report_run_id();
+    register_live_report_worker(&manager, group_id, worker_id, run_id);
+
+    manager
+        .receive_full_block_report(group_id, worker_id, run_id, 1, 0, false, vec![report_block(0)])
+        .unwrap();
+
+    assert!(manager
+        .get_block_locations(group_id, report_block(0).block_id)
+        .is_empty());
+    assert!(manager.get_worker_blocks(group_id, worker_id).is_empty());
+
+    manager
+        .receive_full_block_report(group_id, worker_id, run_id, 1, 1, true, vec![report_block(1)])
+        .unwrap();
+
+    assert_eq!(manager.get_worker_blocks(group_id, worker_id).len(), 2);
+    assert_eq!(
+        manager.get_block_locations(group_id, report_block(0).block_id),
+        vec![worker_id]
+    );
+    assert_eq!(
+        manager.get_block_locations(group_id, report_block(1).block_id),
+        vec![worker_id]
+    );
+}
+
+#[test]
+fn stale_full_report_epoch_cannot_roll_back_published_view() {
+    let manager = WorkerManager::new(60);
+    let group_id = ShardGroupId::new(25);
+    let worker_id = WorkerId::new(9);
+    let run_id = report_run_id();
+    register_live_report_worker(&manager, group_id, worker_id, run_id);
+
+    manager
+        .receive_full_block_report(group_id, worker_id, run_id, 7, 0, true, vec![report_block(0)])
+        .unwrap();
+    assert_eq!(
+        manager.get_block_locations(group_id, report_block(0).block_id),
+        vec![worker_id]
+    );
+
+    let stale = manager
+        .receive_full_block_report(group_id, worker_id, run_id, 6, 0, true, vec![report_block(1)])
+        .expect_err("stale report_epoch must not reset the published baseline");
+    assert!(stale.to_string().contains("full report required"));
+    assert_eq!(
+        manager.get_block_locations(group_id, report_block(0).block_id),
+        vec![worker_id]
+    );
+    assert!(manager
+        .get_block_locations(group_id, report_block(1).block_id)
+        .is_empty());
+}
+
+#[test]
+fn full_report_rejects_sequence_run_and_registration_errors() {
+    let manager = WorkerManager::new(60);
+    let group_id = ShardGroupId::new(22);
+    let worker_id = WorkerId::new(6);
+    let run_id = report_run_id();
+
+    let missing = manager
+        .receive_full_block_report(group_id, worker_id, run_id, 1, 0, true, vec![report_block(0)])
+        .expect_err("missing registration must fail");
+    assert!(missing.to_string().contains("not registered"));
+
+    register_live_report_worker(&manager, group_id, worker_id, run_id);
+    let stale_run: WorkerRunId = "550e8400-e29b-41d4-a716-446655440101".parse().unwrap();
+    let stale = manager
+        .receive_full_block_report(group_id, worker_id, stale_run, 1, 0, true, vec![report_block(0)])
+        .expect_err("stale worker_run_id must fail");
+    assert!(stale.to_string().contains("worker_run_id mismatch"));
+
+    manager
+        .receive_full_block_report(group_id, worker_id, run_id, 2, 0, false, vec![report_block(0)])
+        .unwrap();
+    let mismatch = manager
+        .receive_full_block_report(group_id, worker_id, run_id, 2, 2, true, vec![report_block(1)])
+        .expect_err("batch_seq gap must fail");
+    assert!(mismatch.to_string().contains("full report required"));
+    assert!(manager.get_worker_blocks(group_id, worker_id).is_empty());
+}
+
+#[test]
+fn delta_report_requires_ready_baseline_and_ordered_sequence() {
+    let manager = WorkerManager::new(60);
+    let group_id = ShardGroupId::new(23);
+    let worker_id = WorkerId::new(7);
+    let run_id = report_run_id();
+    register_live_report_worker(&manager, group_id, worker_id, run_id);
+
+    let before_full = manager
+        .apply_delta_block_report(
+            group_id,
+            worker_id,
+            run_id,
+            1,
+            0,
+            vec![BlockReportDeltaEntry {
+                op: BlockReportDeltaOp::AddUpdate,
+                block: report_block(0),
+            }],
+        )
+        .expect_err("delta before full report must fail");
+    assert!(before_full.to_string().contains("full report required"));
+
+    manager
+        .receive_full_block_report(group_id, worker_id, run_id, 7, 0, true, vec![report_block(0)])
+        .unwrap();
+
+    manager
+        .apply_delta_block_report(
+            group_id,
+            worker_id,
+            run_id,
+            7,
+            0,
+            vec![BlockReportDeltaEntry {
+                op: BlockReportDeltaOp::AddUpdate,
+                block: report_block(1),
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        manager.get_block_locations(group_id, report_block(1).block_id),
+        vec![worker_id]
+    );
+
+    manager
+        .apply_delta_block_report(
+            group_id,
+            worker_id,
+            run_id,
+            7,
+            0,
+            vec![BlockReportDeltaEntry {
+                op: BlockReportDeltaOp::AddUpdate,
+                block: report_block(1),
+            }],
         )
         .unwrap();
 
-    // Try to apply incremental report before full sync
-    let added = vec![types::ids::BlockId::new(
-        types::ids::DataHandleId::new(1),
-        types::ids::BlockIndex::new(0),
-    )];
-    let removed = vec![];
+    let gap = manager
+        .apply_delta_block_report(
+            group_id,
+            worker_id,
+            run_id,
+            7,
+            3,
+            vec![BlockReportDeltaEntry {
+                op: BlockReportDeltaOp::Remove,
+                block: report_block(1),
+            }],
+        )
+        .expect_err("delta gap must require full report");
+    assert!(gap.to_string().contains("full report required"));
 
-    let result = manager.apply_delta_report(ShardGroupId::new(1), worker_id, added, removed);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Full sync required"));
+    let epoch_mismatch = manager
+        .apply_delta_block_report(
+            group_id,
+            worker_id,
+            run_id,
+            8,
+            1,
+            vec![BlockReportDeltaEntry {
+                op: BlockReportDeltaOp::Remove,
+                block: report_block(1),
+            }],
+        )
+        .expect_err("report_epoch mismatch must require full report");
+    assert!(epoch_mismatch.to_string().contains("full report required"));
+}
+
+#[test]
+fn recreated_report_runtime_requires_full_report_again() {
+    let manager = WorkerManager::new(60);
+    let group_id = ShardGroupId::new(24);
+    let worker_id = WorkerId::new(8);
+    let run_id = report_run_id();
+    register_live_report_worker(&manager, group_id, worker_id, run_id);
+    manager
+        .receive_full_block_report(group_id, worker_id, run_id, 1, 0, true, vec![report_block(0)])
+        .unwrap();
+    assert_eq!(
+        manager.get_block_locations(group_id, report_block(0).block_id),
+        vec![worker_id]
+    );
+
+    manager
+        .load_registered_workers(vec![WorkerInfo {
+            group_id,
+            worker_id,
+            address: "127.0.0.1:9090".to_string(),
+            worker_net_protocol: 1,
+            worker_epoch: 0,
+            capacity_total: 0,
+            capacity_used: 0,
+            capacity_available: 0,
+            active_reads: 0,
+            active_writes: 0,
+            health: HealthStatus::Healthy,
+            last_heartbeat: 0,
+            fault_domain: None,
+        }])
+        .unwrap();
+
+    assert!(manager
+        .get_block_locations(group_id, report_block(0).block_id)
+        .is_empty());
+    let delta = manager
+        .apply_delta_block_report(
+            group_id,
+            worker_id,
+            run_id,
+            1,
+            0,
+            vec![BlockReportDeltaEntry {
+                op: BlockReportDeltaOp::AddUpdate,
+                block: report_block(1),
+            }],
+        )
+        .expect_err("metadata restart must require a new full report");
+    assert!(delta.to_string().contains("not registered"));
+}
+
+#[test]
+fn reported_block_locations_are_group_qualified() {
+    let manager = WorkerManager::new(60);
+    let first_group = ShardGroupId::new(31);
+    let second_group = ShardGroupId::new(32);
+    let first_worker = WorkerId::new(10);
+    let second_worker = WorkerId::new(11);
+    let first_run = report_run_id();
+    let second_run: WorkerRunId = "550e8400-e29b-41d4-a716-446655440102".parse().unwrap();
+    let block_id = BlockId::new(DataHandleId::new(41), BlockIndex::new(0));
+
+    register_live_report_worker(&manager, first_group, first_worker, first_run);
+    register_live_report_worker(&manager, second_group, second_worker, second_run);
+    manager
+        .receive_full_block_report(
+            first_group,
+            first_worker,
+            first_run,
+            1,
+            0,
+            true,
+            vec![report_block_with_id(block_id)],
+        )
+        .unwrap();
+    manager
+        .receive_full_block_report(
+            second_group,
+            second_worker,
+            second_run,
+            1,
+            0,
+            true,
+            vec![report_block_with_id(block_id)],
+        )
+        .unwrap();
+
+    assert_eq!(manager.get_block_locations(first_group, block_id), vec![first_worker]);
+    assert_eq!(manager.get_block_locations(second_group, block_id), vec![second_worker]);
+
+    let mut reported = manager.list_reported_blocks();
+    reported.sort_by_key(|key| (key.group_id.as_raw(), key.block_id.to_string()));
+    assert_eq!(
+        reported,
+        vec![
+            BlockLocationKey::new(first_group, block_id),
+            BlockLocationKey::new(second_group, block_id),
+        ]
+    );
+
+    manager
+        .receive_full_block_report(first_group, first_worker, first_run, 2, 0, true, Vec::new())
+        .unwrap();
+
+    assert!(manager.get_block_locations(first_group, block_id).is_empty());
+    assert_eq!(manager.get_block_locations(second_group, block_id), vec![second_worker]);
+    assert_eq!(
+        manager.list_reported_blocks(),
+        vec![BlockLocationKey::new(second_group, block_id)]
+    );
+}
+
+#[test]
+fn block_report_runtime_sources_stay_memory_only() {
+    let manager = include_str!("manager.rs");
+    let service = include_str!("service.rs");
+    let report_storage = ["report", "_storage"].concat();
+    let put_report = ["put_block", "_report"].concat();
+    let a = "block_";
+    let b = "report_";
+    let c = "storage";
+    let block_storage_key = [a, b, c].concat();
+    let d = "Command::";
+    let e = "Report";
+    let report_command = [d, e].concat();
+    let f = "propose";
+    let g = "_report";
+    let propose_key = [f, g].concat();
+
+    assert!(!manager.contains(&report_storage));
+    assert!(!manager.contains(&put_report));
+    assert!(!manager.contains(&block_storage_key));
+    assert!(!manager.contains(&report_command));
+    assert!(!service.contains(&report_command));
+    assert!(!service.contains(&propose_key));
+    assert!(!service.contains(&report_storage));
 }
 
 #[test]
@@ -201,6 +543,10 @@ fn worker_manager_api_does_not_expose_production_any_group_lookup() {
         !source.contains(concat!("pub fn get_worker", "_any_group")),
         "WorkerManager must not expose a production WorkerId-only lookup"
     );
+    assert!(
+        !source.contains("pub fn update_locations"),
+        "WorkerManager must not expose direct block-location mutation outside report handling"
+    );
 }
 
 #[test]
@@ -235,10 +581,6 @@ fn production_worker_lookup_sources_reject_implicit_group_patterns() {
         (
             "metadata/src/maintenance/repair/types.rs",
             include_str!("../maintenance/repair/types.rs"),
-        ),
-        (
-            "metadata/src/worker/command_router.rs",
-            include_str!("command_router.rs"),
         ),
     ];
     let forbidden = [
@@ -328,7 +670,9 @@ fn loading_persisted_workers_drops_live_run_registration() {
             HealthStatus::Healthy,
         )
         .unwrap();
-    manager.mark_full_sync_complete(group_id, worker_id);
+    manager
+        .receive_full_block_report(group_id, worker_id, run_id, 1, 0, true, vec![report_block(0)])
+        .unwrap();
 
     manager
         .load_registered_workers(vec![WorkerInfo {
@@ -351,7 +695,7 @@ fn loading_persisted_workers_drops_live_run_registration() {
     assert!(manager.get_registration(group_id, worker_id).is_none());
     assert!(manager.get_descriptor(group_id, worker_id).is_some());
     assert!(manager.get_worker(group_id, worker_id).is_none());
-    assert!(manager.needs_full_sync(group_id, worker_id));
+    assert!(manager.needs_full_block_report(group_id, worker_id));
 }
 
 #[test]
@@ -442,7 +786,7 @@ fn heartbeat_liveness_expiry_removes_live_run_but_keeps_descriptor() {
         )
         .unwrap();
 
-    manager.set_last_seen_ms_for_test(group_id, worker_id, 0);
+    std::thread::sleep(Duration::from_millis(1100));
     let expired = manager.expire_liveness();
 
     assert_eq!(expired, vec![(group_id, worker_id)]);

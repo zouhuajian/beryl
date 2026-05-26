@@ -73,7 +73,7 @@ message HeartbeatRequestProto {
   common.WorkerNetProtocolProto worker_net_protocol = 6;
   /// Heartbeat identity is group_id + worker_id + worker_run_id.
   /// worker_epoch is not part of startup registration or heartbeat identity.
-  /// Block report and command ack protocols are separate follow-ups.
+  /// Block report and command ack protocols are separate from heartbeat.
   uint64 worker_epoch = 7;
   /// Task acknowledgments (completed tasks).
   repeated TaskAckProto acks = 8;
@@ -108,15 +108,8 @@ enum HealthStatusProto {
 
 message HeartbeatResponseProto {
   common.ResponseHeaderProto header = 1;
-  /// Commands from metadata to worker. PR-6 heartbeat liveness returns this empty.
+  /// Commands from metadata to worker. Followers must not return mutating commands.
   repeated WorkerCommandProto commands = 2;
-  /// Full report lease token (if can_full_report is true).
-  /// Worker must include this token in full block report.
-  uint64 full_report_lease_token = 3;
-  /// Whether worker can send full block report (has slot).
-  bool can_full_report = 4;
-  /// Backoff delay in milliseconds (if can_full_report is false and needs_full_sync).
-  uint32 backoff_ms = 5;
   /// Metadata group that accepted this heartbeat.
   uint64 group_id = 6;
   /// Confirmed stable worker identity.
@@ -140,6 +133,9 @@ enum MetadataServerRoleProto {
 }
 
 message WorkerCommandProto {
+  reserved 7, 8;
+  reserved "request_full_block_report", "block_report_backoff";
+
   /// Task ID for acknowledgment.
   uint64 task_id = 1;
   oneof command {
@@ -149,25 +145,7 @@ message WorkerCommandProto {
     MoveCopyCommandProto move_copy = 4;
     ThrottleCommandProto throttle = 5;
     ConfigRefreshCommandProto config_refresh = 6;
-    RequestFullBlockReportCommandProto request_full_block_report = 7;
-    BlockReportBackoffCommandProto block_report_backoff = 8;
   }
-}
-
-/// Request worker to send a full block report to this metadata node.
-/// Used when metadata restarts and needs to rebuild presence view.
-message RequestFullBlockReportCommandProto {
-  /// Target metadata epoch (to identify this metadata instance).
-  uint64 target_metadata_epoch = 1;
-  /// Reason for requesting full report (e.g., "METADATA_RESTART").
-  string reason = 2;
-}
-
-/// Request worker to back off and retry full block report later.
-/// Used for storm control when too many workers are syncing simultaneously.
-message BlockReportBackoffCommandProto {
-  /// Retry after this many milliseconds (with jitter).
-  uint32 retry_after_ms = 1;
 }
 
 message EvictCommandProto {
@@ -310,59 +288,76 @@ enum TaskFailureClassProto {
 // Worker → Metadata RPC: Block Reporting
 // ============================================================================
 
-/// Block report type: FULL (snapshot) or INCREMENTAL (delta).
-enum BlockReportTypeProto {
-  BLOCK_REPORT_TYPE_UNSPECIFIED = 0;
-  BLOCK_REPORT_TYPE_FULL = 1;
-  BLOCK_REPORT_TYPE_INCREMENTAL = 2;
+/// Block state reported by one worker-local block entry.
+enum BlockReportBlockStateProto {
+  BLOCK_REPORT_BLOCK_STATE_UNSPECIFIED = 0;
+  BLOCK_REPORT_BLOCK_STATE_READY = 1;
+  BLOCK_REPORT_BLOCK_STATE_PARTIAL = 2;
+  BLOCK_REPORT_BLOCK_STATE_CORRUPT = 3;
+  BLOCK_REPORT_BLOCK_STATE_DELETING = 4;
 }
 
-/// Full block report entry (for FULL reports).
-message BlockReportEntryFullProto {
+/// Block-level location entry. Chunk bitmaps and range routing are out of scope.
+message BlockReportBlockProto {
+  reserved 3;
+
   common.BlockIdProto block_id = 1;
-  /// Optional chunk presence bitmap.
-  common.ChunkBitmapProto chunk_bitmap = 2;
+  uint64 data_handle_id = 2;
+  uint32 block_index = 4;
+  uint64 block_stamp = 5;
+  uint64 effective_len = 6;
+  uint64 committed_length = 7;
+  BlockReportBlockStateProto block_state = 8;
 }
 
-/// Incremental block report entry (for INCREMENTAL reports).
-message BlockReportEntryDeltaProto {
-  common.BlockIdProto block_id = 1;
-  /// Operation: ADD or REMOVE.
-  BlockReportDeltaOpProto op = 2;
-  /// Optional chunk presence bitmap (for ADD operations).
-  common.ChunkBitmapProto chunk_bitmap = 3;
-}
-
-/// Delta operation type.
+/// Delta operation type for the current published full-report baseline.
 enum BlockReportDeltaOpProto {
   BLOCK_REPORT_DELTA_OP_UNSPECIFIED = 0;
-  BLOCK_REPORT_DELTA_OP_ADD = 1;
+  BLOCK_REPORT_DELTA_OP_ADD_UPDATE = 1;
   BLOCK_REPORT_DELTA_OP_REMOVE = 2;
+}
+
+message BlockReportDeltaProto {
+  BlockReportDeltaOpProto op = 1;
+  BlockReportBlockProto block = 2;
+}
+
+message FullBlockReportBatchProto {
+  /// Batch sequence starts at 0 for each report_epoch.
+  uint64 batch_seq = 1;
+  /// Publishes the staged full-report view when true.
+  bool last_batch = 2;
+  repeated BlockReportBlockProto blocks = 3;
+}
+
+message DeltaBlockReportProto {
+  /// First delta sequence represented by this request.
+  uint64 delta_seq = 1;
+  repeated BlockReportDeltaProto deltas = 2;
 }
 
 message BlockReportRequestProto {
   common.RequestHeaderProto header = 1;
-  uint64 worker_id = 2;
-  BlockReportTypeProto report_type = 3;
-  
-  /// For FULL reports: complete snapshot of all blocks.
-  repeated BlockReportEntryFullProto full_entries = 4;
-  /// For INCREMENTAL reports: delta operations (ADD/REMOVE).
-  repeated BlockReportEntryDeltaProto delta_entries = 5;
-  /// For INCREMENTAL reports: last report sequence number (optional, for dedup).
-  uint64 last_report_seq = 6;
-  /// Full report lease token (required for FULL reports when needs_full_sync).
-  /// Must match the token received in HeartbeatResponseProto.full_report_lease_token.
-  uint64 full_report_lease_token = 7;
+  /// Metadata group this block report targets.
+  uint64 group_id = 2;
+  /// Stable logical worker identity.
+  uint64 worker_id = 3;
+  /// Current live worker process-run identity.
+  string worker_run_id = 4;
+  /// Full-report generation scoped to one worker run and one group.
+  uint64 report_epoch = 5;
+  oneof report {
+    FullBlockReportBatchProto full = 6;
+    DeltaBlockReportProto delta = 7;
+  }
 }
 
 message BlockReportResponseProto {
   common.ResponseHeaderProto header = 1;
-  /// Acknowledged sequence number for this report (for INCREMENTAL dedup).
-  uint64 report_seq = 2;
-  /// Commands from metadata (can return multiple, e.g., fast-path commands).
-  repeated WorkerCommandProto commands = 3;
-  /// Optional: retry_after_ms for storm control (metadata requests worker to delay FULL report).
+  uint64 report_epoch = 2;
+  /// Next delta sequence expected by metadata for the current published baseline.
+  uint64 next_delta_seq = 3;
+  /// Optional retry hint for throttled full-report submission.
   uint32 retry_after_ms = 4;
 }
 
@@ -377,6 +372,6 @@ service MetadataWorkerServiceProto {
   /// Periodic heartbeat from worker to metadata.
   rpc Heartbeat(HeartbeatRequestProto) returns (HeartbeatResponseProto);
   
-  /// Block report: worker reports blocks/chunks it holds.
+  /// Block report: worker reports block-level entries it holds.
   rpc BlockReport(BlockReportRequestProto) returns (BlockReportResponseProto);
 }

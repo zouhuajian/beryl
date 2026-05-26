@@ -97,24 +97,6 @@ impl GuardChain {
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_readiness_gate(&mut self, gate: Arc<RootReadinessGate>) {
-        self.readiness.readiness_gate = Some(gate);
-    }
-
-    #[cfg(test)]
-    pub fn set_leadership_checker<T>(&mut self, checker: Arc<T>)
-    where
-        T: LeadershipChecker + 'static,
-    {
-        self.leadership.checker = Some(checker);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_permission_checker(&mut self, checker: Arc<dyn PermissionChecker>) {
-        self.permission = checker;
-    }
-
     pub async fn check_meta_read(&self, _ctx: &RequestContext) -> Result<(), GuardFailure> {
         self.readiness.check()
     }
@@ -369,9 +351,8 @@ mod tests {
     #[tokio::test]
     async fn readiness_guard_blocks_when_not_ready() {
         let mount_table = Arc::new(MountTable::new());
-        let mut chain = GuardChain::new(mount_table);
         let gate = Arc::new(RootReadinessGate::new(None));
-        chain.set_readiness_gate(Arc::clone(&gate));
+        let chain = GuardChain::new(mount_table).with_readiness_gate(Some(Arc::clone(&gate)));
 
         let err = chain.check_meta_read(&request_context(1)).await.unwrap_err();
         assert_eq!(err.err.class, ErrorClass::Retryable);
@@ -381,10 +362,10 @@ mod tests {
 
     #[tokio::test]
     async fn check_meta_write_checks_readiness_then_leadership() {
-        let mut chain = GuardChain::new(Arc::new(MountTable::new()));
         let gate = Arc::new(RootReadinessGate::new(None));
-        chain.set_readiness_gate(Arc::clone(&gate));
-        chain.set_leadership_checker(Arc::new(StaticLeader(false)));
+        let chain = GuardChain::new(Arc::new(MountTable::new()))
+            .with_readiness_gate(Some(Arc::clone(&gate)))
+            .with_leadership_checker(Some(Arc::new(StaticLeader(false))));
 
         let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
         assert_eq!(err.err.class, ErrorClass::Retryable);
@@ -393,8 +374,8 @@ mod tests {
 
     #[tokio::test]
     async fn leadership_guard_returns_not_leader() {
-        let mut chain = GuardChain::new(Arc::new(MountTable::new()));
-        chain.set_leadership_checker(Arc::new(StaticLeader(false)));
+        let chain =
+            GuardChain::new(Arc::new(MountTable::new())).with_leadership_checker(Some(Arc::new(StaticLeader(false))));
 
         let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
         assert_eq!(err.err.class, ErrorClass::NeedRefresh);
@@ -414,8 +395,8 @@ mod tests {
                 ROOT_INODE_ID,
             )
             .unwrap();
-        let mut chain = GuardChain::new(Arc::clone(&mount_table));
-        chain.set_leadership_checker(Arc::new(StaticLeader(false)));
+        let chain =
+            GuardChain::new(Arc::clone(&mount_table)).with_leadership_checker(Some(Arc::new(StaticLeader(false))));
 
         let err = chain
             .check_data_write(&request_context(3), root_entry.mount_id)
@@ -455,11 +436,11 @@ mod tests {
     async fn permission_methods_delegate_to_configured_checker() {
         let perm_calls = Arc::new(AtomicUsize::new(0));
         let parent_calls = Arc::new(AtomicUsize::new(0));
-        let mut chain = GuardChain::new(Arc::new(MountTable::new()));
-        chain.set_permission_checker(Arc::new(CountingPermissionChecker {
-            perm_calls: Arc::clone(&perm_calls),
-            parent_calls: Arc::clone(&parent_calls),
-        }));
+        let chain =
+            GuardChain::new(Arc::new(MountTable::new())).with_permission_checker(Arc::new(CountingPermissionChecker {
+                perm_calls: Arc::clone(&perm_calls),
+                parent_calls: Arc::clone(&parent_calls),
+            }));
         let ctx = request_context(5);
         let resolved = resolved_path();
 

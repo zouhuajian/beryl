@@ -143,38 +143,6 @@ impl InflightRegistry {
         }
     }
 
-    /// Check if a block is in-flight (any operation).
-    #[cfg(test)]
-    fn is_inflight(&self, block_id: BlockId) -> bool {
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-
-        let entries = self.entries.read();
-        if let Some(entry) = entries.get(&block_id) {
-            // Check if expired
-            if now_ms >= entry.since_ms + entry.ttl_ms {
-                return false; // Expired, consider as not in-flight
-            }
-            return true;
-        }
-        false
-    }
-
-    /// Get the kind of operation currently in-flight for a block.
-    #[cfg(test)]
-    fn get_inflight_kind(&self, block_id: BlockId) -> Option<InflightKind> {
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-
-        let entries = self.entries.read();
-        if let Some(entry) = entries.get(&block_id) {
-            // Check if expired
-            if now_ms >= entry.since_ms + entry.ttl_ms {
-                return None; // Expired
-            }
-            return Some(entry.kind);
-        }
-        None
-    }
-
     /// Reap expired entries (internal, requires write lock).
     fn reap_expired_internal(&self, entries: &mut HashMap<BlockId, InflightEntry>, now_ms: u64) {
         entries.retain(|block_id, entry| {
@@ -189,36 +157,52 @@ impl InflightRegistry {
             !expired
         });
     }
-
-    /// Reap expired entries (public API).
-    #[cfg(test)]
-    fn reap_expired(&self) {
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-
-        let mut entries = self.entries.write();
-        self.reap_expired_internal(&mut entries, now_ms);
-    }
-
-    /// Get count of in-flight operations.
-    #[cfg(test)]
-    fn get_inflight_count(&self) -> usize {
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-
-        let entries = self.entries.read();
-        entries
-            .iter()
-            .filter(|(_, entry)| now_ms < entry.since_ms + entry.ttl_ms)
-            .count()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{InflightKind, InflightRegistry};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use types::ids::{BlockId, BlockIndex, DataHandleId};
 
     fn block_id(raw: u64) -> BlockId {
         BlockId::new(DataHandleId::new(raw), BlockIndex::new(0))
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    fn is_inflight(registry: &InflightRegistry, block_id: BlockId) -> bool {
+        let entries = registry.entries.read();
+        entries
+            .get(&block_id)
+            .map(|entry| now_ms() < entry.since_ms + entry.ttl_ms)
+            .unwrap_or(false)
+    }
+
+    fn inflight_kind(registry: &InflightRegistry, block_id: BlockId) -> Option<InflightKind> {
+        let entries = registry.entries.read();
+        entries.get(&block_id).and_then(|entry| {
+            if now_ms() < entry.since_ms + entry.ttl_ms {
+                Some(entry.kind)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn reap_expired(registry: &InflightRegistry) {
+        let mut entries = registry.entries.write();
+        registry.reap_expired_internal(&mut entries, now_ms());
+    }
+
+    fn inflight_count(registry: &InflightRegistry) -> usize {
+        let entries = registry.entries.read();
+        entries
+            .iter()
+            .filter(|(_, entry)| now_ms() < entry.since_ms + entry.ttl_ms)
+            .count()
     }
 
     #[test]
@@ -228,7 +212,7 @@ mod tests {
 
         assert!(registry.try_acquire(block_id, InflightKind::Delete, None).unwrap());
         assert!(registry.try_acquire(block_id, InflightKind::Repair, None).unwrap());
-        assert_eq!(registry.get_inflight_kind(block_id), Some(InflightKind::Repair));
+        assert_eq!(inflight_kind(&registry, block_id), Some(InflightKind::Repair));
 
         registry.release(block_id);
         assert!(registry.try_acquire(block_id, InflightKind::Delete, None).unwrap());
@@ -241,7 +225,7 @@ mod tests {
 
         assert!(registry.try_acquire(block_id, InflightKind::Repair, None).unwrap());
         assert!(!registry.try_acquire(block_id, InflightKind::Delete, None).unwrap());
-        assert_eq!(registry.get_inflight_kind(block_id), Some(InflightKind::Repair));
+        assert_eq!(inflight_kind(&registry, block_id), Some(InflightKind::Repair));
     }
 
     #[test]
@@ -250,9 +234,9 @@ mod tests {
         let block_id = block_id(3);
 
         assert!(registry.try_acquire(block_id, InflightKind::Repair, Some(0)).unwrap());
-        registry.reap_expired();
+        reap_expired(&registry);
 
-        assert!(!registry.is_inflight(block_id));
-        assert_eq!(registry.get_inflight_count(), 0);
+        assert!(!is_inflight(&registry, block_id));
+        assert_eq!(inflight_count(&registry), 0);
     }
 }

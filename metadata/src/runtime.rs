@@ -6,10 +6,7 @@
 use crate::ensure_root_mount;
 use crate::inflight_registry::InflightRegistry;
 use crate::maintenance::delete::{DeleteExecutor, DeleteExecutorHandle};
-use crate::maintenance::repair::{
-    OrphanQueue, RepairPlanner, RepairPolicy, RepairQueue, RepairSignalHandler, RepairSignalHandlerDeps,
-    RepairSignalSink,
-};
+use crate::maintenance::repair::{OrphanQueue, RepairPlanner, RepairPolicy, RepairQueue};
 use crate::maintenance::{MaintenanceHandle, MaintenanceService};
 use crate::metrics::MetadataMetrics;
 use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
@@ -19,10 +16,7 @@ use crate::service::{
     MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl, SharedWorkerCommitHook,
 };
 use crate::state::RaftStateStore;
-use crate::worker::{
-    DeleteCommandSource, MetadataWorkerServiceImpl, RepairCommandSource, WorkerBackgroundHandle, WorkerCommandRouter,
-    WorkerManager,
-};
+use crate::worker::{MetadataWorkerServiceImpl, WorkerBackgroundHandle, WorkerManager};
 use crate::{MetadataConfig, MountTable};
 use common::observe::{
     init_observability as init_common_observability, ObservabilityConfig, ObservabilityGuard, ServiceInfo,
@@ -74,7 +68,6 @@ pub(crate) struct MaintenanceRepairState {
 
 /// Worker-owned background lifecycle started after authority and maintenance are available.
 pub struct WorkerBackground {
-    _command_router: Arc<WorkerCommandRouter>,
     _handle: WorkerBackgroundHandle,
 }
 
@@ -82,7 +75,7 @@ pub struct WorkerBackground {
 pub struct Maintenance {
     _repair_state: MaintenanceRepairState,
     _maintenance_service: Arc<MaintenanceService>,
-    delete_executor: Arc<DeleteExecutor>,
+    _delete_executor: Arc<DeleteExecutor>,
     _maintenance_handle: MaintenanceHandle,
     _delete_executor_handle: DeleteExecutorHandle,
 }
@@ -154,20 +147,10 @@ impl WorkerRuntime {
     }
 
     /// Builds the worker RPC service from required runtime state.
-    fn service(&self, authority: &MetadataAuthority, repair: &MaintenanceRepairState) -> MetadataWorkerServiceImpl {
-        let repair_signal_handler: Arc<dyn RepairSignalSink> =
-            Arc::new(RepairSignalHandler::new(RepairSignalHandlerDeps {
-                raft_node: Arc::clone(&authority.raft_node),
-                worker_manager: Arc::clone(&self.manager),
-                repair_queue: Arc::clone(&repair.repair_queue),
-                orphan_queue: Arc::clone(&repair.orphan_queue),
-                repair_planner: Arc::clone(&repair.repair_planner),
-                repair_policy: repair.repair_policy,
-            }));
+    fn service(&self, authority: &MetadataAuthority) -> MetadataWorkerServiceImpl {
         let mut service = MetadataWorkerServiceImpl::new(
             Arc::clone(&authority.raft_node),
             Arc::clone(&self.manager),
-            repair_signal_handler,
             Arc::clone(&authority.mount_table),
             authority.shard_group_id,
         );
@@ -176,32 +159,8 @@ impl WorkerRuntime {
         service
     }
 
-    /// Builds the worker command router after maintenance-owned command sources exist.
-    fn command_router(&self, maintenance: &Maintenance) -> Arc<WorkerCommandRouter> {
-        const MAX_DELETE_COMMANDS_PER_HEARTBEAT: usize = 4;
-        const MAX_REPAIR_COMMANDS_PER_HEARTBEAT: usize = 8;
-
-        let mut router = WorkerCommandRouter::new();
-        router.register_source(
-            Arc::new(DeleteCommandSource::new(Arc::clone(&maintenance.delete_executor))),
-            MAX_DELETE_COMMANDS_PER_HEARTBEAT,
-        );
-        router.register_source(
-            Arc::new(RepairCommandSource::new(Arc::clone(
-                &maintenance._repair_state.repair_queue,
-            ))),
-            MAX_REPAIR_COMMANDS_PER_HEARTBEAT,
-        );
-        Arc::new(router)
-    }
-
-    /// Connects command routing before starting worker background tasks.
-    fn start_background(
-        &self,
-        service: &mut MetadataWorkerServiceImpl,
-        command_router: Arc<WorkerCommandRouter>,
-    ) -> WorkerBackgroundHandle {
-        service.set_command_router(command_router);
+    /// Starts worker-service background tasks.
+    fn start_background(&self, service: &MetadataWorkerServiceImpl) -> WorkerBackgroundHandle {
         service.start_background_tasks()
     }
 }
@@ -340,14 +299,14 @@ pub(crate) fn build_maintenance_repair_state(config: &MetadataConfig) -> Mainten
 /// Builds the required worker runtime without starting heavy background work.
 pub(crate) fn build_worker_runtime(
     authority: &MetadataAuthority,
-    repair: &MaintenanceRepairState,
+    _repair: &MaintenanceRepairState,
 ) -> (WorkerRuntime, MetadataWorkerServiceImpl) {
     let worker = WorkerRuntime::new();
     authority
         .raft_node
         .set_worker_manager(Arc::clone(&worker.manager))
         .expect("worker registration replay into live WorkerManager should succeed");
-    let service = worker.service(authority, repair);
+    let service = worker.service(authority);
     (worker, service)
 }
 
@@ -384,7 +343,7 @@ pub(crate) async fn build_maintenance(
     Maintenance {
         _repair_state: repair,
         _maintenance_service: maintenance_service,
-        delete_executor,
+        _delete_executor: delete_executor,
         _maintenance_handle: maintenance_handle,
         _delete_executor_handle: delete_executor_handle,
     }
@@ -394,15 +353,11 @@ pub(crate) async fn build_maintenance(
 pub fn build_worker_background(
     worker: &WorkerRuntime,
     service: &mut MetadataWorkerServiceImpl,
-    maintenance: &Maintenance,
+    _maintenance: &Maintenance,
 ) -> WorkerBackground {
-    let command_router = worker.command_router(maintenance);
-    let handle = worker.start_background(service, Arc::clone(&command_router));
+    let handle = worker.start_background(service);
 
-    WorkerBackground {
-        _command_router: command_router,
-        _handle: handle,
-    }
+    WorkerBackground { _handle: handle }
 }
 
 /// Starts the root readiness watcher and owns health serving state.
@@ -698,7 +653,7 @@ mod tests {
         let maintenance = build_maintenance(&authority, &worker_runtime, maintenance_repair).await;
         let worker_background = build_worker_background(&worker_runtime, &mut worker_service, &maintenance);
         let _worker_background = worker_background;
-        assert!(Arc::strong_count(&maintenance.delete_executor) >= 3);
+        assert!(Arc::strong_count(&maintenance._delete_executor) >= 2);
         assert_eq!(maintenance._maintenance_handle.task_count(), 8);
         let readiness = build_readiness(&config, &authority).await;
         let _filesystem =
@@ -723,7 +678,7 @@ mod tests {
         let (_services, handles) =
             compose_services(filesystem, worker_service, readiness, worker_background, maintenance);
 
-        assert_eq!(handles._worker_background._handle.task_count(), 1);
+        assert_eq!(handles._worker_background._handle.task_count(), 0);
         assert_eq!(handles._maintenance._maintenance_handle.task_count(), 8);
         assert!(Arc::strong_count(&handles._readiness.gate) >= 1);
         let _readiness_watcher_finished = handles._readiness._watcher.is_finished();
@@ -888,7 +843,7 @@ mod tests {
             .iter()
             .any(|entry| entry.mount_prefix == "/"));
         assert!(server.worker.manager.get_metadata_epoch() > 0);
-        assert_eq!(server.handles._worker_background._handle.task_count(), 1);
+        assert_eq!(server.handles._worker_background._handle.task_count(), 0);
         assert_eq!(server.handles._maintenance._maintenance_handle.task_count(), 8);
         assert!(Arc::strong_count(&server.handles._readiness.gate) >= 1);
     }

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Worker manager: tracks worker liveness, capacity, and block locations.
+//! Worker manager: tracks worker registration, heartbeat liveness, and block report locations.
 
 use crate::error::{MetadataError, MetadataResult};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::warn;
@@ -80,8 +80,20 @@ impl From<i32> for HealthStatus {
     }
 }
 
-/// Block locations: block_id -> [(group_id, worker_id)...]
-pub type BlockLocations = HashMap<BlockId, Vec<WorkerRegistrationKey>>;
+/// Block locations keyed by metadata group and block identity.
+pub type BlockLocations = HashMap<BlockLocationKey, Vec<WorkerRegistrationKey>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BlockLocationKey {
+    pub group_id: ShardGroupId,
+    pub block_id: BlockId,
+}
+
+impl BlockLocationKey {
+    pub const fn new(group_id: ShardGroupId, block_id: BlockId) -> Self {
+        Self { group_id, block_id }
+    }
+}
 
 /// Group-scoped key for worker registration and liveness state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -94,6 +106,13 @@ impl WorkerRegistrationKey {
     pub const fn new(group_id: ShardGroupId, worker_id: WorkerId) -> Self {
         Self { group_id, worker_id }
     }
+}
+
+fn ready_block_ids<'a>(blocks: impl Iterator<Item = &'a BlockReportBlock>) -> HashSet<BlockId> {
+    blocks
+        .filter(|block| block.block_state == BlockReportBlockState::Ready)
+        .map(|block| block.block_id)
+        .collect()
 }
 
 /// Live startup registration state for the current metadata process.
@@ -119,18 +138,69 @@ pub struct WorkerLiveState {
     pub last_seen_ms: u64,
 }
 
-/// Worker sync state: tracks whether a worker has completed full sync with this metadata node.
-/// This is per-metadata-node state (memory-only, soft-state).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockReportBlockState {
+    Ready,
+    Partial,
+    Corrupt,
+    Deleting,
+}
+
+/// Worker-reported block-location entry.
+///
+/// The entry is block-level only. Chunk presence and range routing are not part
+/// of this report view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockReportBlock {
+    pub block_id: BlockId,
+    pub data_handle_id: u64,
+    pub block_index: u32,
+    pub block_stamp: u64,
+    pub effective_len: u64,
+    pub committed_length: u64,
+    pub block_state: BlockReportBlockState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockReportDeltaOp {
+    AddUpdate,
+    Remove,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockReportDeltaEntry {
+    pub op: BlockReportDeltaOp,
+    pub block: BlockReportBlock,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockReportApplyResult {
+    pub added_blocks: Vec<BlockId>,
+    pub removed_blocks: Vec<BlockId>,
+    pub next_delta_seq: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BlockReportState {
+    #[default]
+    Empty,
+    Receiving,
+    Ready,
+}
+
 #[derive(Clone, Debug, Default)]
-pub struct WorkerSyncState {
-    /// Metadata epoch/instance_id (to detect metadata restarts).
-    pub metadata_epoch: u64,
-    /// Whether full block report has been received and processed.
-    pub full_received: bool,
-    /// Timestamp of last full report (Unix timestamp in milliseconds).
-    pub last_full_ts: u64,
-    /// Last sequence number (for INCREMENTAL dedup, optional).
-    pub last_seq: u64,
+struct WorkerBlockReportRuntime {
+    /// WorkerRunId is live-only. A new worker run must publish a new full
+    /// baseline before delta reports are accepted.
+    worker_run_id: Option<WorkerRunId>,
+    state: BlockReportState,
+    /// Full-report generation scoped to one worker run and one group.
+    report_epoch: u64,
+    next_batch_seq: u64,
+    staging_blocks: HashMap<BlockId, BlockReportBlock>,
+    published_blocks: HashMap<BlockId, BlockReportBlock>,
+    /// Next delta sequence expected for the current published full baseline.
+    delta_seq: u64,
 }
 
 /// Block report convergence snapshot for maintenance safety gate.
@@ -150,18 +220,16 @@ pub struct WorkerManager {
     registrations: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerRegistrationState>>>,
     /// Worker runtime (soft-state, memory-only, updated via fanout heartbeat).
     runtime: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerRuntime>>>,
-    /// Block presence: block_id -> [worker_ids] (soft-state, memory-only).
-    locations: Arc<RwLock<BlockLocations>>, // block_id -> [worker_ids]
+    /// Block presence keyed by (group_id, block_id), memory-only.
+    locations: Arc<RwLock<BlockLocations>>,
     /// Worker blocks: (group_id, worker_id) -> [block_ids] (soft-state, memory-only).
     worker_blocks: Arc<RwLock<HashMap<WorkerRegistrationKey, Vec<BlockId>>>>,
-    /// Worker sync state: worker_id -> sync state (per-metadata-node, memory-only).
-    worker_sync_state: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerSyncState>>>,
+    /// Full/delta block report runtime keyed by (group_id, worker_id).
+    block_reports: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerBlockReportRuntime>>>,
     /// Current metadata epoch (incremented on metadata restart).
     metadata_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Heartbeat timeout in seconds.
     heartbeat_timeout_sec: u64,
-    /// Full report lease manager (leader-only, memory-only).
-    lease_manager: Arc<super::full_report_lease::FullReportLeaseManager>,
 }
 
 impl WorkerManager {
@@ -172,24 +240,15 @@ impl WorkerManager {
             .unwrap()
             .as_secs();
 
-        // Create lease manager (default: 10 concurrent leases, 5 minute TTL)
-        const DEFAULT_MAX_CONCURRENT_LEASES: usize = 10;
-        const DEFAULT_LEASE_TTL_MS: u64 = 5 * 60 * 1000; // 5 minutes
-        let lease_manager = Arc::new(super::full_report_lease::FullReportLeaseManager::new(
-            DEFAULT_MAX_CONCURRENT_LEASES,
-            DEFAULT_LEASE_TTL_MS,
-        ));
-
         Self {
             descriptors: Arc::new(RwLock::new(HashMap::new())),
             registrations: Arc::new(RwLock::new(HashMap::new())),
             runtime: Arc::new(RwLock::new(HashMap::new())),
             locations: Arc::new(RwLock::new(HashMap::new())),
             worker_blocks: Arc::new(RwLock::new(HashMap::new())),
-            worker_sync_state: Arc::new(RwLock::new(HashMap::new())),
+            block_reports: Arc::new(RwLock::new(HashMap::new())),
             metadata_epoch: Arc::new(std::sync::atomic::AtomicU64::new(initial_epoch)),
             heartbeat_timeout_sec,
-            lease_manager,
         }
     }
 
@@ -216,139 +275,10 @@ impl WorkerManager {
         self.metadata_epoch
             .store(new_epoch, std::sync::atomic::Ordering::Relaxed);
 
-        // Reset all worker sync states (metadata restart invalidates all full syncs)
-        let mut sync_state = self.worker_sync_state.write();
-        for state in sync_state.values_mut() {
-            state.full_received = false;
-            state.metadata_epoch = new_epoch;
-        }
+        // Metadata restart drops live registration and reconstructable report state.
         self.registrations.write().clear();
-    }
-
-    /// Get worker sync state (creates default if not exists).
-    pub fn get_or_create_sync_state(&self, group_id: ShardGroupId, worker_id: WorkerId) -> WorkerSyncState {
-        let mut sync_state = self.worker_sync_state.write();
-        let current_epoch = self.get_metadata_epoch();
-        let key = WorkerRegistrationKey::new(group_id, worker_id);
-
-        sync_state
-            .entry(key)
-            .and_modify(|state| {
-                // If metadata epoch changed, reset full_received
-                if state.metadata_epoch != current_epoch {
-                    state.full_received = false;
-                    state.metadata_epoch = current_epoch;
-                }
-            })
-            .or_insert_with(|| WorkerSyncState {
-                metadata_epoch: current_epoch,
-                full_received: false,
-                last_full_ts: 0,
-                last_seq: 0,
-            })
-            .clone()
-    }
-
-    /// Check if worker needs full sync (metadata epoch mismatch or never synced).
-    pub fn needs_full_sync(&self, group_id: ShardGroupId, worker_id: WorkerId) -> bool {
-        let sync_state = self.worker_sync_state.read();
-        let current_epoch = self.get_metadata_epoch();
-        let key = WorkerRegistrationKey::new(group_id, worker_id);
-
-        sync_state
-            .get(&key)
-            .map(|state| !state.full_received || state.metadata_epoch != current_epoch)
-            .unwrap_or(true) // If no state exists, needs full sync
-    }
-
-    /// Get lease manager.
-    pub(crate) fn lease_manager(&self) -> Arc<super::full_report_lease::FullReportLeaseManager> {
-        Arc::clone(&self.lease_manager)
-    }
-
-    /// Mark full sync as completed.
-    pub fn mark_full_sync_complete(&self, group_id: ShardGroupId, worker_id: WorkerId) {
-        let mut sync_state = self.worker_sync_state.write();
-        let current_epoch = self.get_metadata_epoch();
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let key = WorkerRegistrationKey::new(group_id, worker_id);
-
-        sync_state
-            .entry(key)
-            .and_modify(|state| {
-                state.full_received = true;
-                state.last_full_ts = now_ms;
-                state.metadata_epoch = current_epoch;
-            })
-            .or_insert_with(|| WorkerSyncState {
-                metadata_epoch: current_epoch,
-                full_received: true,
-                last_full_ts: now_ms,
-                last_seq: 0,
-            });
-    }
-
-    /// Apply full block report (replaces all blocks for this worker).
-    /// Returns (added_blocks, removed_blocks) for repair planning.
-    ///
-    /// NOTE: Lease verification and release should be done before calling this method.
-    /// This method only updates locations and marks sync complete.
-    pub fn apply_full_report(
-        &self,
-        group_id: ShardGroupId,
-        worker_id: WorkerId,
-        reported_blocks: Vec<BlockId>,
-    ) -> MetadataResult<(Vec<BlockId>, Vec<BlockId>)> {
-        // Update locations (full replacement)
-        let result = self.update_locations(group_id, worker_id, reported_blocks)?;
-
-        // Mark full sync as complete
-        self.mark_full_sync_complete(group_id, worker_id);
-
-        // Note: Lease is already released in verify_and_release() before calling this method.
-
-        Ok(result)
-    }
-
-    /// Apply incremental block report (delta operations).
-    /// Returns (added_blocks, removed_blocks) for repair planning.
-    pub fn apply_delta_report(
-        &self,
-        group_id: ShardGroupId,
-        worker_id: WorkerId,
-        added_blocks: Vec<BlockId>,
-        removed_blocks: Vec<BlockId>,
-    ) -> MetadataResult<(Vec<BlockId>, Vec<BlockId>)> {
-        // Check if full sync is required first
-        if self.needs_full_sync(group_id, worker_id) {
-            return Err(MetadataError::InvalidArgument(
-                "Full sync required before incremental reports".to_string(),
-            ));
-        }
-
-        // Get current blocks
-        let worker_blocks = self.worker_blocks.read();
-        let key = WorkerRegistrationKey::new(group_id, worker_id);
-        let mut current_blocks: std::collections::HashSet<BlockId> = worker_blocks
-            .get(&key)
-            .map(|blocks| blocks.iter().copied().collect())
-            .unwrap_or_default();
-        drop(worker_blocks);
-
-        // Apply delta operations
-        for block_id in &added_blocks {
-            current_blocks.insert(*block_id);
-        }
-        for block_id in &removed_blocks {
-            current_blocks.remove(block_id);
-        }
-
-        // Update locations with new block set
-        let new_blocks: Vec<BlockId> = current_blocks.into_iter().collect();
-        self.update_locations(group_id, worker_id, new_blocks)
+        self.runtime.write().clear();
+        self.clear_all_block_reports();
     }
 
     /// Upsert worker descriptor (called from Raft apply).
@@ -370,11 +300,15 @@ impl WorkerManager {
         let mut descriptors = self.descriptors.write();
         let mut registrations = self.registrations.write();
         let mut runtime = self.runtime.write();
-        let mut sync_state = self.worker_sync_state.write();
+        let mut locations = self.locations.write();
+        let mut worker_blocks = self.worker_blocks.write();
+        let mut block_reports = self.block_reports.write();
         descriptors.clear();
         registrations.clear();
         runtime.clear();
-        sync_state.clear();
+        locations.clear();
+        worker_blocks.clear();
+        block_reports.clear();
         for worker in workers {
             let descriptor = WorkerDescriptor {
                 group_id: worker.group_id,
@@ -491,7 +425,259 @@ impl WorkerManager {
                 lease_deadline,
             },
         );
+        drop(registrations);
+        self.clear_block_report_for_worker(WorkerRegistrationKey::new(group_id, worker_id));
         Ok(())
+    }
+
+    /// Receive one full-report batch.
+    ///
+    /// `batch_seq == 0` starts a new staged report for `report_epoch`. Staged
+    /// blocks are not visible through the published location view until
+    /// `last_batch` publishes the full baseline.
+    #[allow(clippy::too_many_arguments)]
+    pub fn receive_full_block_report(
+        &self,
+        group_id: ShardGroupId,
+        worker_id: WorkerId,
+        worker_run_id: WorkerRunId,
+        report_epoch: u64,
+        batch_seq: u64,
+        last_batch: bool,
+        blocks: Vec<BlockReportBlock>,
+    ) -> MetadataResult<BlockReportApplyResult> {
+        self.validate_report_source(group_id, worker_id, worker_run_id)?;
+        let key = WorkerRegistrationKey::new(group_id, worker_id);
+
+        let mut reports = self.block_reports.write();
+        let report = reports.entry(key).or_default();
+        if batch_seq == 0 {
+            if report.worker_run_id == Some(worker_run_id) && report.report_epoch > report_epoch {
+                return Err(MetadataError::FullReportRequired(format!(
+                    "full report required: stale report_epoch {} for group_id={}, worker_id={}, current {}",
+                    report_epoch,
+                    group_id.as_raw(),
+                    worker_id.as_raw(),
+                    report.report_epoch
+                )));
+            }
+            report.worker_run_id = Some(worker_run_id);
+            report.state = BlockReportState::Receiving;
+            report.report_epoch = report_epoch;
+            report.next_batch_seq = 0;
+            report.staging_blocks.clear();
+        }
+
+        if report.state != BlockReportState::Receiving
+            || report.worker_run_id != Some(worker_run_id)
+            || report.report_epoch != report_epoch
+            || report.next_batch_seq != batch_seq
+        {
+            return Err(MetadataError::FullReportRequired(format!(
+                "full report required: expected batch_seq {} for group_id={}, worker_id={}",
+                report.next_batch_seq,
+                group_id.as_raw(),
+                worker_id.as_raw()
+            )));
+        }
+
+        for block in blocks {
+            report.staging_blocks.insert(block.block_id, block);
+        }
+        report.next_batch_seq = batch_seq.saturating_add(1);
+
+        if !last_batch {
+            return Ok(BlockReportApplyResult {
+                next_delta_seq: report.delta_seq,
+                ..BlockReportApplyResult::default()
+            });
+        }
+
+        let old_ready = ready_block_ids(report.published_blocks.values());
+        let published_blocks = std::mem::take(&mut report.staging_blocks);
+        let new_ready = ready_block_ids(published_blocks.values());
+        report.published_blocks = published_blocks;
+        report.state = BlockReportState::Ready;
+        report.delta_seq = 0;
+        let next_delta_seq = report.delta_seq;
+        let published_for_index = report.published_blocks.clone();
+        drop(reports);
+
+        self.rebuild_location_index_for_worker(key, &published_for_index);
+        Ok(BlockReportApplyResult {
+            added_blocks: new_ready.difference(&old_ready).copied().collect(),
+            removed_blocks: old_ready.difference(&new_ready).copied().collect(),
+            next_delta_seq,
+        })
+    }
+
+    /// Apply one ordered delta-report batch to the current published baseline.
+    pub fn apply_delta_block_report(
+        &self,
+        group_id: ShardGroupId,
+        worker_id: WorkerId,
+        worker_run_id: WorkerRunId,
+        report_epoch: u64,
+        delta_seq: u64,
+        deltas: Vec<BlockReportDeltaEntry>,
+    ) -> MetadataResult<BlockReportApplyResult> {
+        self.validate_report_source(group_id, worker_id, worker_run_id)?;
+        let key = WorkerRegistrationKey::new(group_id, worker_id);
+
+        let mut reports = self.block_reports.write();
+        let report = reports.get_mut(&key).ok_or_else(|| {
+            MetadataError::FullReportRequired(format!(
+                "full report required before delta for group_id={}, worker_id={}",
+                group_id.as_raw(),
+                worker_id.as_raw()
+            ))
+        })?;
+        if report.state != BlockReportState::Ready
+            || report.worker_run_id != Some(worker_run_id)
+            || report.report_epoch != report_epoch
+        {
+            return Err(MetadataError::FullReportRequired(format!(
+                "full report required for current baseline: group_id={}, worker_id={}",
+                group_id.as_raw(),
+                worker_id.as_raw()
+            )));
+        }
+
+        let delta_count = u64::try_from(deltas.len()).unwrap_or(u64::MAX);
+        if delta_seq < report.delta_seq {
+            let old_delta_end = delta_seq.saturating_add(delta_count);
+            if old_delta_end <= report.delta_seq {
+                return Ok(BlockReportApplyResult {
+                    next_delta_seq: report.delta_seq,
+                    ..BlockReportApplyResult::default()
+                });
+            }
+            return Err(MetadataError::FullReportRequired(format!(
+                "full report required after overlapping old delta: expected delta_seq {}, got {}",
+                report.delta_seq, delta_seq
+            )));
+        }
+        if delta_seq > report.delta_seq {
+            return Err(MetadataError::FullReportRequired(format!(
+                "full report required after delta gap: expected delta_seq {}, got {}",
+                report.delta_seq, delta_seq
+            )));
+        }
+
+        let old_ready = ready_block_ids(report.published_blocks.values());
+        for delta in deltas {
+            match delta.op {
+                BlockReportDeltaOp::AddUpdate => {
+                    report.published_blocks.insert(delta.block.block_id, delta.block);
+                }
+                BlockReportDeltaOp::Remove => {
+                    report.published_blocks.remove(&delta.block.block_id);
+                }
+            }
+        }
+        report.delta_seq = report.delta_seq.saturating_add(delta_count);
+        let new_ready = ready_block_ids(report.published_blocks.values());
+        let next_delta_seq = report.delta_seq;
+        let published_for_index = report.published_blocks.clone();
+        drop(reports);
+
+        self.rebuild_location_index_for_worker(key, &published_for_index);
+        Ok(BlockReportApplyResult {
+            added_blocks: new_ready.difference(&old_ready).copied().collect(),
+            removed_blocks: old_ready.difference(&new_ready).copied().collect(),
+            next_delta_seq,
+        })
+    }
+
+    /// True when the worker has no published full-report baseline in memory.
+    pub fn needs_full_block_report(&self, group_id: ShardGroupId, worker_id: WorkerId) -> bool {
+        self.block_reports
+            .read()
+            .get(&WorkerRegistrationKey::new(group_id, worker_id))
+            .map(|report| report.state != BlockReportState::Ready)
+            .unwrap_or(true)
+    }
+
+    fn validate_report_source(
+        &self,
+        group_id: ShardGroupId,
+        worker_id: WorkerId,
+        worker_run_id: WorkerRunId,
+    ) -> MetadataResult<()> {
+        self.expire_liveness();
+        let registration = self.get_registration(group_id, worker_id).ok_or_else(|| {
+            MetadataError::NotFound(format!(
+                "worker not registered for group_id={}, worker_id={}",
+                group_id.as_raw(),
+                worker_id.as_raw()
+            ))
+        })?;
+        if registration.worker_run_id != worker_run_id {
+            return Err(MetadataError::StaleState(format!(
+                "worker_run_id mismatch for group_id={}, worker_id={}",
+                group_id.as_raw(),
+                worker_id.as_raw()
+            )));
+        }
+        if !self.is_worker_live(group_id, worker_id) {
+            return Err(MetadataError::NotFound(format!(
+                "worker heartbeat readiness lease not found for group_id={}, worker_id={}",
+                group_id.as_raw(),
+                worker_id.as_raw()
+            )));
+        }
+        Ok(())
+    }
+
+    fn rebuild_location_index_for_worker(
+        &self,
+        key: WorkerRegistrationKey,
+        published_blocks: &HashMap<BlockId, BlockReportBlock>,
+    ) {
+        {
+            let mut worker_blocks = self.worker_blocks.write();
+            worker_blocks.insert(
+                key,
+                published_blocks
+                    .values()
+                    .filter(|block| block.block_state == BlockReportBlockState::Ready)
+                    .map(|block| block.block_id)
+                    .collect(),
+            );
+        }
+
+        let mut locations = self.locations.write();
+        for workers in locations.values_mut() {
+            workers.retain(|worker_key| *worker_key != key);
+        }
+        locations.retain(|_, workers| !workers.is_empty());
+        for block in published_blocks
+            .values()
+            .filter(|block| block.block_state == BlockReportBlockState::Ready)
+        {
+            let workers = locations
+                .entry(BlockLocationKey::new(key.group_id, block.block_id))
+                .or_default();
+            if !workers.contains(&key) {
+                workers.push(key);
+            }
+        }
+    }
+
+    fn clear_block_report_for_worker(&self, key: WorkerRegistrationKey) {
+        self.block_reports.write().remove(&key);
+        self.worker_blocks.write().remove(&key);
+        let mut locations = self.locations.write();
+        for workers in locations.values_mut() {
+            workers.retain(|worker_key| *worker_key != key);
+        }
+        locations.retain(|_, workers| !workers.is_empty());
+    }
+
+    fn clear_all_block_reports(&self) {
+        self.block_reports.write().clear();
+        self.worker_blocks.write().clear();
+        self.locations.write().clear();
     }
 
     /// Record a validated group-scoped heartbeat in volatile live state.
@@ -670,7 +856,7 @@ impl WorkerManager {
             .unwrap_or(false)
     }
 
-    /// List all workers (for background cleanup), preserving group identity.
+    /// List all workers for background scans, preserving group identity.
     pub fn list_all_workers(&self) -> Vec<WorkerRegistrationKey> {
         let descriptors = self.descriptors.read();
         descriptors.keys().copied().collect()
@@ -682,70 +868,10 @@ impl WorkerManager {
         locations.len()
     }
 
-    /// Get all reported blocks (for scanning).
-    pub fn get_all_reported_blocks(&self) -> Vec<BlockId> {
+    /// List group-qualified reported blocks for background scans.
+    pub fn list_reported_blocks(&self) -> Vec<BlockLocationKey> {
         let locations = self.locations.read();
         locations.keys().copied().collect()
-    }
-
-    /// Update block locations from block report (full replacement + diff).
-    /// This must be called ONCE per block_report with the complete reported_blocks set.
-    /// Returns (added_blocks, removed_blocks) for repair planning.
-    pub fn update_locations(
-        &self,
-        group_id: ShardGroupId,
-        worker_id: WorkerId,
-        reported_blocks: Vec<BlockId>,
-    ) -> MetadataResult<(Vec<BlockId>, Vec<BlockId>)> {
-        use std::collections::HashSet;
-
-        let key = WorkerRegistrationKey::new(group_id, worker_id);
-
-        // Get current blocks for this worker (before update)
-        let mut worker_blocks = self.worker_blocks.write();
-        let old_blocks = worker_blocks.get(&key).cloned().unwrap_or_default();
-
-        // Convert to HashSet for O(1) lookup (performance optimization)
-        let old_blocks_set: HashSet<BlockId> = old_blocks.iter().copied().collect();
-        let reported_blocks_set: HashSet<BlockId> = reported_blocks.iter().copied().collect();
-
-        // Full replacement: update worker -> blocks mapping
-        worker_blocks.insert(key, reported_blocks.clone());
-
-        // Update block -> workers mapping
-        let mut locations = self.locations.write();
-
-        // Remove worker from blocks that are no longer reported (O(n) with HashSet)
-        let removed_blocks: Vec<BlockId> = old_blocks
-            .iter()
-            .filter(|b| !reported_blocks_set.contains(b))
-            .copied()
-            .collect();
-
-        for block_id in &removed_blocks {
-            if let Some(workers) = locations.get_mut(block_id) {
-                workers.retain(|&w| w != key);
-                if workers.is_empty() {
-                    locations.remove(block_id);
-                }
-            }
-        }
-
-        // Add worker to newly reported blocks (O(n) with HashSet)
-        let added_blocks: Vec<BlockId> = reported_blocks
-            .iter()
-            .filter(|b| !old_blocks_set.contains(b))
-            .copied()
-            .collect();
-
-        for block_id in &reported_blocks {
-            let workers = locations.entry(*block_id).or_default();
-            if !workers.contains(&key) {
-                workers.push(key);
-            }
-        }
-
-        Ok((added_blocks, removed_blocks))
     }
 
     /// Get block locations for one metadata group (only live workers in that group).
@@ -755,7 +881,7 @@ impl WorkerManager {
         let live_set: std::collections::HashSet<WorkerId> = live_workers.into_iter().collect();
 
         locations
-            .get(&block_id)
+            .get(&BlockLocationKey::new(group_id, block_id))
             .map(|workers| {
                 workers
                     .iter()
@@ -782,10 +908,11 @@ impl WorkerManager {
         // Remove worker from locations
         let mut locations = self.locations.write();
         for block_id in &blocks {
-            if let Some(workers) = locations.get_mut(block_id) {
+            let location_key = BlockLocationKey::new(group_id, *block_id);
+            if let Some(workers) = locations.get_mut(&location_key) {
                 workers.retain(|&w| w != key);
                 if workers.is_empty() {
-                    locations.remove(block_id);
+                    locations.remove(&location_key);
                 }
             }
         }
@@ -971,15 +1098,6 @@ impl WorkerManager {
         }
     }
 
-    /// Clean up stale runtime entries (TTL-based cleanup).
-    pub fn cleanup_stale_runtime(&self) {
-        let mut runtime = self.runtime.write();
-        let now = Instant::now();
-        let timeout = self.heartbeat_timeout() * 2; // 2x timeout for cleanup
-
-        runtime.retain(|_, r| now.duration_since(r.last_seen_at) < timeout);
-    }
-
     /// Expire heartbeat liveness and live process-run registrations.
     pub fn expire_liveness(&self) -> Vec<(ShardGroupId, WorkerId)> {
         let now = Instant::now();
@@ -1018,18 +1136,18 @@ impl WorkerManager {
     ///
     /// Returns a snapshot of block report convergence status:
     /// - active_workers: number of workers that have sent heartbeat within active_ttl_ms
-    /// - full_reported_workers: number of active workers that have completed full sync for required_epoch
+    /// - full_reported_workers: number of active workers with a published report baseline
     /// - ratio: full_reported_workers / active_workers (1.0 if active_workers == 0)
     /// - converged: true if ratio >= threshold
     pub fn blockreport_convergence_snapshot(
         &self,
         now_ms: u64,
         active_ttl_ms: u64,
-        required_epoch: u64,
+        _required_epoch: u64,
         threshold: f64,
     ) -> BlockReportConvergenceSnapshot {
         let runtime = self.runtime.read();
-        let sync_state = self.worker_sync_state.read();
+        let reports = self.block_reports.read();
 
         // Count active workers (last_seen_ms within active_ttl_ms)
         let active_workers: Vec<WorkerRegistrationKey> = runtime
@@ -1040,13 +1158,16 @@ impl WorkerManager {
 
         let active_count = active_workers.len();
 
-        // Count full reported workers (active + full_received + epoch match)
+        // Count full reported workers against the in-memory report baseline.
         let full_reported_count = active_workers
             .iter()
             .filter(|key| {
-                sync_state
+                reports
                     .get(key)
-                    .map(|state| state.full_received && state.metadata_epoch == required_epoch)
+                    .map(|report| {
+                        report.state == BlockReportState::Ready
+                            && report.worker_run_id == Some(runtime.get(key).expect("active runtime").worker_run_id)
+                    })
                     .unwrap_or(false)
             })
             .count();
@@ -1077,91 +1198,6 @@ impl WorkerManager {
 
         self.blockreport_convergence_snapshot(now_ms, active_ttl_ms, required_epoch, DEFAULT_THRESHOLD)
     }
-}
-
-#[cfg(test)]
-impl WorkerManager {
-    /// Test-only helper that creates liveness through the validated heartbeat path.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn record_test_heartbeat(
-        &self,
-        group_id: ShardGroupId,
-        worker_id: WorkerId,
-        capacity_total: u64,
-        capacity_used: u64,
-        capacity_available: u64,
-        active_reads: u32,
-        active_writes: u32,
-        health: HealthStatus,
-    ) -> MetadataResult<WorkerLiveState> {
-        let descriptor = self.get_descriptor(group_id, worker_id).ok_or_else(|| {
-            MetadataError::NotFound(format!(
-                "worker descriptor not found for group_id={}, worker_id={}",
-                group_id.as_raw(),
-                worker_id.as_raw()
-            ))
-        })?;
-        let worker_run_id = worker_run_id_for_test(group_id, worker_id);
-        self.register_worker_run(
-            group_id,
-            worker_id,
-            descriptor.address.clone(),
-            descriptor.worker_net_protocol,
-            worker_run_id,
-            descriptor.fault_domain.clone(),
-        )?;
-        self.upsert_descriptor(descriptor.clone())?;
-        self.record_heartbeat(
-            group_id,
-            worker_id,
-            worker_run_id,
-            1,
-            &descriptor.address,
-            descriptor.worker_net_protocol,
-            capacity_total,
-            capacity_used,
-            capacity_available,
-            active_reads,
-            active_writes,
-            health,
-        )
-    }
-
-    /// Test-only helper to override last_seen_ms for deterministic timeout checks.
-    pub(crate) fn set_last_seen_ms_for_test(&self, group_id: ShardGroupId, worker_id: WorkerId, last_seen_ms: u64) {
-        let mut runtime = self.runtime.write();
-        if let Some(worker) = runtime.get_mut(&WorkerRegistrationKey::new(group_id, worker_id)) {
-            worker.last_seen_ms = last_seen_ms;
-            let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-            let age_ms = now_ms.saturating_sub(last_seen_ms);
-            let fallback = self
-                .heartbeat_timeout_sec
-                .saturating_mul(1000)
-                .saturating_mul(2)
-                .saturating_add(1);
-            worker.last_seen_at = Instant::now()
-                .checked_sub(Duration::from_millis(age_ms))
-                .unwrap_or_else(|| Instant::now() - Duration::from_millis(fallback));
-        }
-        if let Some(registration) = self
-            .registrations
-            .write()
-            .get_mut(&WorkerRegistrationKey::new(group_id, worker_id))
-        {
-            registration.lease_deadline = Instant::now() - Duration::from_millis(1);
-        }
-    }
-}
-
-#[cfg(test)]
-fn worker_run_id_for_test(group_id: ShardGroupId, worker_id: WorkerId) -> WorkerRunId {
-    let suffix = group_id
-        .as_raw()
-        .saturating_mul(1_000_000)
-        .saturating_add(worker_id.as_raw());
-    format!("550e8400-e29b-41d4-a716-{suffix:012x}")
-        .parse()
-        .expect("valid test WorkerRunId")
 }
 
 /// Placement score for worker selection.

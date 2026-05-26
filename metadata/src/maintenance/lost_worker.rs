@@ -111,11 +111,12 @@ mod tests {
     use crate::maintenance::lost_worker::{LostWorkerCleanupDeps, LostWorkerCleanupService};
     use crate::maintenance::repair::{OrphanQueue, RepairPlanner, RepairPolicy, RepairQueue};
     use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
-    use crate::worker::{HealthStatus, WorkerManager};
+    use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerManager};
     use crate::MountTable;
     use std::sync::Arc;
     use tempfile::TempDir;
     use types::ids::{BlockId, BlockIndex, DataHandleId, ShardGroupId, WorkerId};
+    use types::WorkerRunId;
 
     async fn test_raft(dir: &TempDir, leader: bool) -> Arc<AppRaftNode> {
         let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
@@ -142,21 +143,30 @@ mod tests {
         raft_node
     }
 
+    fn worker_run_id(worker_id: WorkerId) -> WorkerRunId {
+        format!("550e8400-e29b-41d4-a716-{:012x}", worker_id.as_raw())
+            .parse()
+            .expect("valid test WorkerRunId")
+    }
+
     fn live_worker(manager: &WorkerManager, worker_id: WorkerId) {
+        let group_id = ShardGroupId::new(1);
+        let address = format!("127.0.0.1:{}", 9000 + worker_id.as_raw());
+        let run_id = worker_run_id(worker_id);
         manager
-            .register_worker(
-                ShardGroupId::new(1),
-                worker_id,
-                format!("127.0.0.1:{}", 9000 + worker_id.as_raw()),
-                1,
-                100,
-                None,
-            )
+            .register_worker(group_id, worker_id, address.clone(), 1, 100, None)
             .unwrap();
         manager
-            .record_test_heartbeat(
-                ShardGroupId::new(1),
+            .register_worker_run(group_id, worker_id, address.clone(), 1, run_id, None)
+            .unwrap();
+        manager
+            .record_heartbeat(
+                group_id,
                 worker_id,
+                run_id,
+                1,
+                &address,
+                1,
                 1_000,
                 500,
                 500,
@@ -167,15 +177,33 @@ mod tests {
             .unwrap();
     }
 
-    fn registered_dead_worker(manager: &WorkerManager, worker_id: WorkerId) {
+    fn report_block(block_id: BlockId) -> BlockReportBlock {
+        BlockReportBlock {
+            block_id,
+            data_handle_id: block_id.data_handle_id.as_raw(),
+            block_index: block_id.index.as_raw(),
+            block_stamp: u64::from(block_id.index.as_raw()) + 1,
+            effective_len: 4096,
+            committed_length: 4096,
+            block_state: BlockReportBlockState::Ready,
+        }
+    }
+
+    fn publish_report(manager: &WorkerManager, worker_id: WorkerId, report_epoch: u64, blocks: Vec<BlockId>) {
+        let group_id = ShardGroupId::new(1);
+        let run_id = manager
+            .get_registration(group_id, worker_id)
+            .expect("worker registration")
+            .worker_run_id;
         manager
-            .register_worker(
-                ShardGroupId::new(1),
+            .receive_full_block_report(
+                group_id,
                 worker_id,
-                format!("127.0.0.1:{}", 9000 + worker_id.as_raw()),
-                1,
-                100,
-                None,
+                run_id,
+                report_epoch,
+                0,
+                true,
+                blocks.into_iter().map(report_block).collect(),
             )
             .unwrap();
     }
@@ -216,7 +244,7 @@ mod tests {
     async fn dead_worker_removed_and_affected_blocks_planned() {
         let dir = TempDir::new().unwrap();
         let raft_node = test_raft(&dir, true).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(1));
         let repair_queue = Arc::new(RepairQueue::new(100));
         let orphan_queue = Arc::new(OrphanQueue::new(100));
         let source = WorkerId::new(1);
@@ -224,16 +252,13 @@ mod tests {
         let target_b = WorkerId::new(3);
         let dead = WorkerId::new(4);
         let block_id = BlockId::new(DataHandleId::new(11), BlockIndex::new(0));
+        live_worker(&worker_manager, dead);
+        publish_report(&worker_manager, dead, 1, vec![block_id]);
+        tokio::time::sleep(tokio::time::Duration::from_millis(1_100)).await;
         live_worker(&worker_manager, source);
         live_worker(&worker_manager, target_a);
         live_worker(&worker_manager, target_b);
-        registered_dead_worker(&worker_manager, dead);
-        worker_manager
-            .update_locations(ShardGroupId::new(1), source, vec![block_id])
-            .unwrap();
-        worker_manager
-            .update_locations(ShardGroupId::new(1), dead, vec![block_id])
-            .unwrap();
+        publish_report(&worker_manager, source, 1, vec![block_id]);
 
         let outcome = service(
             Arc::clone(&raft_node),
@@ -260,7 +285,7 @@ mod tests {
     async fn no_dead_worker_is_noop() {
         let dir = TempDir::new().unwrap();
         let raft_node = test_raft(&dir, true).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(1));
         let repair_queue = Arc::new(RepairQueue::new(100));
         let orphan_queue = Arc::new(OrphanQueue::new(100));
         live_worker(&worker_manager, WorkerId::new(1));
@@ -285,7 +310,7 @@ mod tests {
     async fn dead_worker_cleanup_uses_repair_policy_default_replication_factor() {
         let dir = TempDir::new().unwrap();
         let raft_node = test_raft(&dir, true).await;
-        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_manager = Arc::new(WorkerManager::new(1));
         let repair_queue = Arc::new(RepairQueue::new(100));
         let orphan_queue = Arc::new(OrphanQueue::new(100));
         let source = WorkerId::new(1);
@@ -293,16 +318,13 @@ mod tests {
         let target_b = WorkerId::new(3);
         let dead = WorkerId::new(4);
         let block_id = BlockId::new(DataHandleId::new(13), BlockIndex::new(0));
+        live_worker(&worker_manager, dead);
+        publish_report(&worker_manager, dead, 1, vec![block_id]);
+        tokio::time::sleep(tokio::time::Duration::from_millis(1_100)).await;
         live_worker(&worker_manager, source);
         live_worker(&worker_manager, target_a);
         live_worker(&worker_manager, target_b);
-        registered_dead_worker(&worker_manager, dead);
-        worker_manager
-            .update_locations(ShardGroupId::new(1), source, vec![block_id])
-            .unwrap();
-        worker_manager
-            .update_locations(ShardGroupId::new(1), dead, vec![block_id])
-            .unwrap();
+        publish_report(&worker_manager, source, 1, vec![block_id]);
 
         let outcome = service_with_policy(
             Arc::clone(&raft_node),
@@ -340,10 +362,8 @@ mod tests {
         let orphan_queue = Arc::new(OrphanQueue::new(100));
         let dead = WorkerId::new(1);
         let block_id = BlockId::new(DataHandleId::new(12), BlockIndex::new(0));
-        registered_dead_worker(&worker_manager, dead);
-        worker_manager
-            .update_locations(ShardGroupId::new(1), dead, vec![block_id])
-            .unwrap();
+        live_worker(&worker_manager, dead);
+        publish_report(&worker_manager, dead, 1, vec![block_id]);
 
         let outcome = service(
             Arc::clone(&raft_node),

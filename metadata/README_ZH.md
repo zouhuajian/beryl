@@ -273,7 +273,7 @@ snapshot / state store：
 
 ## 10. Worker metadata 链路
 
-`MetadataWorkerServiceImpl` 当前处理 worker register、heartbeat liveness 与 block report；PR-6 heartbeat 不实现 block report、repair/delete execution 或完整 command ack。
+`MetadataWorkerServiceImpl` handles worker registration, heartbeat liveness, and block report RPCs. Heartbeat, full block report, and delta block report are separate protocols.
 
 register：
 
@@ -285,33 +285,33 @@ register：
 - 同一 live `WorkerId + WorkerRunId` 重放是幂等成功；同一 live `WorkerId` 携带不同 `WorkerRunId` 会被拒绝。metadata reload 后 live registration 为空，新的 `WorkerRunId` 可重新注册。
 - `MetadataWorkerServiceImpl` 只负责校验 served `group_id`、解析请求和提交 Raft proposal；不在 proposal 成功后做 leader-only live registration mutation。
 
-后续 client/data-plane identity 目标模型：
+client / data-plane identity model:
 
 - metadata location 最终应携带 `group_id`、`worker_id`、`worker_run_id`、advertised endpoint、`block_id`、`block_stamp`，以及适用的现有 `file_version` / `route_epoch` freshness 字段。
 - client 直连 worker request 最终应携带 `group_id`、`worker_id`、`worker_run_id`、`block_id`、`block_stamp` 和 range。
 - worker 校验 request `worker_id` 匹配本地 `WorkerId`、`group_id` 已注册、request `worker_run_id` 匹配该 group 已接受的 `WorkerRunId`、`block_stamp` 匹配本地 `BlockMeta`。
 - `WorkerId` 判断是哪一个 worker；`WorkerRunId` 判断是哪一次 worker 进程运行；`block_stamp` 判断是哪一代 block。
 - `WorkerRunId` 不替代 `block_stamp`；`block_stamp` 也不替代 `WorkerRunId`。
-- PR-5 只完成 startup registration 契约和 metadata live registration apply/replay 收口；完整 direct data-plane identity 迁移仍是后续工作。
 
 heartbeat：
 
-- Worker 只在 startup register 成功后启动 heartbeat；请求携带 `group_id`、稳定 `WorkerId`、本进程 `WorkerRunId`、per-group/run `heartbeat_seq`、registered advertised endpoint，以及 PR-6 当前 placeholder/default capacity/load/health snapshot；真实资源采样是后续工作。
+- Worker starts heartbeat only after startup registration succeeds. Requests carry `group_id`, stable `WorkerId`, process-local `WorkerRunId`, per-group/run `heartbeat_seq`, registered advertised endpoint, and capacity/load/health snapshot.
 - Metadata heartbeat 首先校验 served `group_id`、稳定 descriptor、live registration、`WorkerRunId` 与 advertised endpoint；heartbeat 不创建 registration，不写 RocksDB，不提交 Raft proposal。
 - Heartbeat liveness 是 metadata node 本地 memory-only soft state。metadata reload / snapshot recovery 只恢复稳定 descriptor，不恢复 `WorkerRunId` 或 heartbeat liveness；worker 必须重新 register 后才能恢复 ready。
 - Liveness timeout 使用 metadata 本地 monotonic time；worker wall-clock time 不参与 correctness。
-- Follower 可以接受 heartbeat 并预热本地 volatile liveness，但 follower 必须返回空 commands。Leader 返回 leader role/hint；PR-6 commands 也保持为空。
+- Follower 可以接受 heartbeat 并预热本地 volatile liveness，但 follower 必须返回空 commands。Leader 返回 leader role/hint。
 - Heartbeat 与 block report 分离：heartbeat 不分配 full block report lease，不携带 block report，不触发 repair/delete cleanup，不执行完整 worker command ack。
 - Worker 本地 data-plane readiness 要求 registration 与本地 heartbeat lease 同时有效；单次 peer heartbeat 失败不会立即 fail closed，lease 过期后才 fail closed。`WORKER_NOT_REGISTERED / NEED_REGISTER` 和 `WORKER_DESCRIPTOR_MISMATCH / NEED_REGISTER` 会清除本地 registration 并触发重新 register；`WORKER_RUN_MISMATCH` 会显式标记该 group not ready。
 
 block report：
 
-- full report 在需要 full sync 时必须带 lease token。
-- full report 替换该 worker block set；incremental report 在 full sync 基础上应用 delta。
-- block locations 是 memory-only soft state。
-- `MetadataWorkerServiceImpl` 只做 RPC/proto parsing、full report lease 校验、`WorkerManager` soft-state block locations 更新，然后把 `BlockReportDelta` 交给 `maintenance/repair/signal.rs`。
-- `RepairSignalHandler` 对 added blocks 做当前 repair signal 处理：metadata 中缺失的 block 进入 `OrphanQueue`，存在的 block 基于 current locations/live workers/replication factor 规划并 enqueue repair task。
-- `removed_blocks` 会在 `WorkerManager` soft-state 已更新后交给 `RepairSignalHandler`：metadata 中存在的 block 基于当前 locations 触发 repair planning；metadata 中缺失的 removed block 不进入 `OrphanQueue`，也不创建 delete intent。
+- Workers send group-scoped full block reports after successful registration and heartbeat readiness. The local group directory is the authoritative source for report `group_id`.
+- Full reports are batched by `report_epoch` and `batch_seq`. `batch_seq == 0` starts a staged full report; staged blocks are not visible in the published location view until `last_batch` publishes the baseline.
+- Delta reports are accepted only after a full baseline is published. `report_epoch` must match the published baseline and `delta_seq` must be the expected next sequence. Old complete duplicates are acknowledged when safe; gaps return `FULL_REPORT_REQUIRED`.
+- Block report state is reconstructable, memory-only soft state keyed by `(group_id, worker_id)`. It is not written to RocksDB, not applied through Raft, and not restored after metadata restart. Metadata restart requires workers to send a new full report.
+- Leaders and followers may accept reports to warm their local location view. Followers must not return mutating commands, and report handling must not mutate namespace/file layout state.
+- Report handling updates only the in-memory block-location view. It does not schedule repair, rebalance, delete, cleanup, or worker command acknowledgement.
+- The report entry is block-level only and includes the fields needed for block-location routing: `block_id`, `data_handle_id`, `file_version`, `block_index`, `block_stamp`, lengths, and block state. Chunk-ready bitmap and range-aware chunk routing are outside this contract.
 
 旧 `report_presence`：
 

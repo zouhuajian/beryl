@@ -149,23 +149,35 @@ impl OverReplicaCleanupService {
         // Scan blocks from worker_manager blockreport
         // Note: This is a simplified scan - in production, we'd iterate through all blocks efficiently
         // For now, we'll scan blocks that are reported by workers
-        let all_blocks = self.worker_manager.get_all_reported_blocks();
+        let all_blocks = self.worker_manager.list_reported_blocks();
         let scanned_count = all_blocks.len();
 
         // Collect updates first (without holding lock across await)
         let mut updates: Vec<(BlockId, Option<(u32, u32)>)> = Vec::new();
-        for block_id in all_blocks {
-            let group_id = match crate::maintenance::owner_group_for_block(&self.storage, &self.mount_table, block_id) {
-                Ok(group_id) => group_id,
-                Err(error) => {
-                    debug!(
-                        block_id = %block_id,
-                        error = %error,
-                        "Skipping overrep scan: block owner group is not authoritative"
-                    );
-                    continue;
-                }
-            };
+        for reported in all_blocks {
+            let block_id = reported.block_id;
+            let group_id = reported.group_id;
+            let owner_group_id =
+                match crate::maintenance::owner_group_for_block(&self.storage, &self.mount_table, block_id) {
+                    Ok(group_id) => group_id,
+                    Err(error) => {
+                        debug!(
+                            block_id = %block_id,
+                            error = %error,
+                            "Skipping overrep scan: block owner group is not authoritative"
+                        );
+                        continue;
+                    }
+                };
+            if owner_group_id != group_id {
+                debug!(
+                    block_id = %block_id,
+                    reported_group_id = group_id.as_raw(),
+                    owner_group_id = owner_group_id.as_raw(),
+                    "Skipping overrep scan: reported group is not authoritative"
+                );
+                continue;
+            }
             let current_locations = self.worker_manager.get_block_locations(group_id, block_id);
             if current_locations.is_empty() {
                 debug!(

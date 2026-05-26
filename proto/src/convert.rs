@@ -995,6 +995,9 @@ fn rpc_code_proto_to_enum(code: i32) -> RpcErrorCode {
         x if x == proto_common::RpcErrorCodeProto::RpcErrCodeWorkerDescriptorMismatch as i32 => {
             RpcErrorCode::WorkerDescriptorMismatch
         }
+        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeFullReportRequired as i32 => {
+            RpcErrorCode::FullReportRequired
+        }
         x if x == proto_common::RpcErrorCodeProto::RpcErrCodeBlockStampMismatch as i32 => {
             RpcErrorCode::BlockStampMismatch
         }
@@ -1028,6 +1031,7 @@ fn rpc_code_enum_to_proto(code: RpcErrorCode) -> i32 {
         RpcErrorCode::WorkerDescriptorMismatch => {
             proto_common::RpcErrorCodeProto::RpcErrCodeWorkerDescriptorMismatch as i32
         }
+        RpcErrorCode::FullReportRequired => proto_common::RpcErrorCodeProto::RpcErrCodeFullReportRequired as i32,
         RpcErrorCode::BlockStampMismatch => proto_common::RpcErrorCodeProto::RpcErrCodeBlockStampMismatch as i32,
         RpcErrorCode::EpochMismatch => proto_common::RpcErrorCodeProto::RpcErrCodeEpochMismatch as i32,
         RpcErrorCode::Fencing => proto_common::RpcErrorCodeProto::RpcErrCodeFencing as i32,
@@ -1051,6 +1055,7 @@ fn refresh_reason_proto_to_enum(reason: proto_common::RefreshReasonProto) -> Ref
         proto_common::RefreshReasonProto::RefreshReasonGroupMismatch => RefreshReason::GroupMismatch,
         proto_common::RefreshReasonProto::RefreshReasonNeedRegister => RefreshReason::NeedRegister,
         proto_common::RefreshReasonProto::RefreshReasonWorkerRunMismatch => RefreshReason::WorkerRunMismatch,
+        proto_common::RefreshReasonProto::RefreshReasonFullReportRequired => RefreshReason::FullReportRequired,
         proto_common::RefreshReasonProto::RefreshReasonBlockStampMismatch => RefreshReason::BlockStampMismatch,
         proto_common::RefreshReasonProto::RefreshReasonFencing => RefreshReason::Fencing,
         proto_common::RefreshReasonProto::RefreshReasonEpochMismatch => RefreshReason::EpochMismatch,
@@ -1072,6 +1077,7 @@ fn refresh_reason_to_proto(reason: &Option<RefreshReason>) -> i32 {
         RefreshReason::GroupMismatch => proto_common::RefreshReasonProto::RefreshReasonGroupMismatch as i32,
         RefreshReason::NeedRegister => proto_common::RefreshReasonProto::RefreshReasonNeedRegister as i32,
         RefreshReason::WorkerRunMismatch => proto_common::RefreshReasonProto::RefreshReasonWorkerRunMismatch as i32,
+        RefreshReason::FullReportRequired => proto_common::RefreshReasonProto::RefreshReasonFullReportRequired as i32,
         RefreshReason::BlockStampMismatch => proto_common::RefreshReasonProto::RefreshReasonBlockStampMismatch as i32,
         RefreshReason::Fencing => proto_common::RefreshReasonProto::RefreshReasonFencing as i32,
         RefreshReason::EpochMismatch => proto_common::RefreshReasonProto::RefreshReasonEpochMismatch as i32,

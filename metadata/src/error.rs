@@ -87,6 +87,10 @@ pub enum MetadataError {
     #[error("stale state: {0}")]
     StaleState(String),
 
+    /// Worker must publish a new full block report before deltas can continue.
+    #[error("full report required: {0}")]
+    FullReportRequired(String),
+
     /// Internal error.
     #[error("internal error: {0}")]
     Internal(String),
@@ -106,6 +110,7 @@ impl MetadataError {
                 | Self::MountEpochMismatch { .. }
                 | Self::RoutingStale(_)
                 | Self::StaleState(_)
+                | Self::FullReportRequired(_)
         )
     }
 }
@@ -169,6 +174,11 @@ fn map_shared_canonical(err: MetadataError) -> Result<CanonicalError, MetadataEr
             RefreshReason::StaleState,
             msg,
         )),
+        MetadataError::FullReportRequired(msg) => Ok(CanonicalError::need_refresh(
+            RpcErrorCode::FullReportRequired,
+            RefreshReason::FullReportRequired,
+            msg,
+        )),
         MetadataError::LeaseFenced { expected, got } => Ok(CanonicalError::need_refresh(
             RpcErrorCode::Fencing,
             RefreshReason::Fencing,
@@ -202,6 +212,7 @@ fn map_rpc_application_canonical(err: MetadataError) -> CanonicalError {
         | MetadataError::MountEpochMismatch { .. }
         | MetadataError::RoutingStale(_)
         | MetadataError::StaleState(_)
+        | MetadataError::FullReportRequired(_)
         | MetadataError::LeaseFenced { .. }
         | MetadataError::ServiceUnavailable(_) => unreachable!("shared metadata errors must be mapped earlier"),
     }
@@ -226,6 +237,7 @@ fn map_fs_fatal_canonical(err: MetadataError) -> CanonicalError {
         | MetadataError::MountEpochMismatch { .. }
         | MetadataError::RoutingStale(_)
         | MetadataError::StaleState(_)
+        | MetadataError::FullReportRequired(_)
         | MetadataError::LeaseFenced { .. }
         | MetadataError::ServiceUnavailable(_) => unreachable!("shared metadata errors must be mapped earlier"),
     }

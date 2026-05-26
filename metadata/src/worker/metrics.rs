@@ -10,8 +10,6 @@ pub struct WorkerMetrics {
     pub worker_live: AtomicUsize,
     pub blockreport_blocks_total: AtomicU64,
     pub locations_size: AtomicUsize,
-    pub orphan_queue_len: AtomicUsize,
-    pub repair_queue_len: AtomicUsize,
 }
 
 impl WorkerMetrics {
@@ -20,8 +18,6 @@ impl WorkerMetrics {
             worker_live: AtomicUsize::new(0),
             blockreport_blocks_total: AtomicU64::new(0),
             locations_size: AtomicUsize::new(0),
-            orphan_queue_len: AtomicUsize::new(0),
-            repair_queue_len: AtomicUsize::new(0),
         }
     }
 
@@ -35,14 +31,6 @@ impl WorkerMetrics {
 
     pub fn update_locations_size(&self, size: usize) {
         self.locations_size.store(size, Ordering::Relaxed);
-    }
-
-    pub fn update_orphan_queue_len(&self, len: usize) {
-        self.orphan_queue_len.store(len, Ordering::Relaxed);
-    }
-
-    pub fn update_repair_queue_len(&self, len: usize) {
-        self.repair_queue_len.store(len, Ordering::Relaxed);
     }
 }
 

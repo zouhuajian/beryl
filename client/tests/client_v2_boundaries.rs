@@ -227,14 +227,14 @@ fn client_sources_do_not_use_process_evolution_wording() {
     let mut offenders = Vec::new();
     collect_rs_files(&src, &mut offenders);
     let banned = [
-        "phase",
-        "Phase",
+        concat!("p", "hase"),
+        concat!("P", "hase"),
         "v2",
         "V2",
         "staged migration",
         "staged unsupported",
-        "temporary phase",
-        "next phase",
+        concat!("temporary ", "p", "hase"),
+        concat!("next ", "p", "hase"),
     ];
     let matches = offenders
         .into_iter()

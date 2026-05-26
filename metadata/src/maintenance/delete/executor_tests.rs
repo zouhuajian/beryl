@@ -9,24 +9,25 @@ mod tests {
     use crate::config::RaftConfig;
     use crate::error::MetadataResult;
     use crate::inflight_registry::InflightRegistry;
+    use crate::metrics::MetadataMetrics;
     use crate::mount::MountTable;
     use crate::raft::{AppRaftNode, AppRaftStateMachine, Command, DedupKey, RocksDBStorage};
     use crate::state::{BlockMetaState, DeleteIntent, DeleteIntentReason, DeleteIntentStatus};
     use crate::worker::{HealthStatus, WorkerManager};
-    use proto::metadata::{worker_command_proto, DeleteBlocksCommandProto, WorkerCommandProto};
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
     use types::block::{BlockPlacement, BlockState};
     use types::fs::InodeId;
     use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, ShardGroupId, WorkerId};
-    use types::CallId;
-    use types::RaftLogId;
+    use types::{CallId, RaftLogId, WorkerRunId};
 
     struct DeleteExecutorTestEnv {
         _temp_dir: TempDir,
         storage: Arc<RocksDBStorage>,
         worker_manager: Arc<WorkerManager>,
+        metrics: Arc<MetadataMetrics>,
         executor: DeleteExecutor,
     }
 
@@ -55,11 +56,12 @@ mod tests {
         let worker_manager = Arc::new(WorkerManager::new(60));
         worker_manager.increment_metadata_epoch();
         let inflight_registry = Arc::new(InflightRegistry::new(5 * 60 * 1000));
+        let metrics = Arc::new(MetadataMetrics::new());
         let executor = DeleteExecutor::new(
             Arc::clone(&raft_node),
             Arc::clone(&storage),
             Arc::clone(&worker_manager),
-            Arc::new(crate::metrics::MetadataMetrics::new()),
+            Arc::clone(&metrics),
             mount_table,
             Arc::clone(&inflight_registry),
         );
@@ -68,6 +70,7 @@ mod tests {
             _temp_dir: temp_dir,
             storage,
             worker_manager,
+            metrics,
             executor,
         })
     }
@@ -83,22 +86,29 @@ mod tests {
         assert!(raft_node.get_last_applied_state_id().is_some());
     }
 
+    fn worker_run_id(worker_id: WorkerId) -> WorkerRunId {
+        format!("550e8400-e29b-41d4-a716-{:012x}", worker_id.as_raw())
+            .parse()
+            .expect("valid test WorkerRunId")
+    }
+
     fn add_live_worker_with_blocks(
         worker_manager: &WorkerManager,
         worker_id: WorkerId,
         blocks: Vec<BlockId>,
     ) -> MetadataResult<()> {
-        worker_manager.register_worker(
-            ShardGroupId::new(1),
+        let group_id = ShardGroupId::new(1);
+        let address = "127.0.0.1:8080".to_string();
+        let run_id = worker_run_id(worker_id);
+        worker_manager.register_worker(group_id, worker_id, address.clone(), 1, 100, None)?;
+        worker_manager.register_worker_run(group_id, worker_id, address.clone(), 1, run_id, None)?;
+        worker_manager.record_heartbeat(
+            group_id,
             worker_id,
-            "127.0.0.1:8080".to_string(),
+            run_id,
             1,
-            100,
-            None,
-        )?;
-        worker_manager.record_test_heartbeat(
-            ShardGroupId::new(1),
-            worker_id,
+            &address,
+            1,
             1000,
             500,
             500,
@@ -106,7 +116,23 @@ mod tests {
             0,
             HealthStatus::Healthy,
         )?;
-        worker_manager.apply_full_report(ShardGroupId::new(1), worker_id, blocks)?;
+        let run_id = worker_manager
+            .get_registration(ShardGroupId::new(1), worker_id)
+            .expect("test worker registration")
+            .worker_run_id;
+        let report_blocks = blocks
+            .into_iter()
+            .map(|block_id| crate::worker::BlockReportBlock {
+                block_id,
+                data_handle_id: block_id.data_handle_id.as_raw(),
+                block_index: block_id.index.as_raw(),
+                block_stamp: 1,
+                effective_len: 4096,
+                committed_length: 4096,
+                block_state: crate::worker::BlockReportBlockState::Ready,
+            })
+            .collect();
+        worker_manager.receive_full_block_report(ShardGroupId::new(1), worker_id, run_id, 1, 0, true, report_blocks)?;
         Ok(())
     }
 
@@ -140,38 +166,6 @@ mod tests {
             finished_at_ms: None,
             last_error_msg: None,
         })
-    }
-
-    fn delete_command(command: &WorkerCommandProto) -> (u64, BlockId) {
-        match command.command.as_ref() {
-            Some(worker_command_proto::Command::DeleteBlocks(DeleteBlocksCommandProto {
-                intent_id, blocks, ..
-            })) => {
-                let block_id = blocks[0].block_id.unwrap();
-                (
-                    *intent_id,
-                    BlockId::new(
-                        DataHandleId::new(block_id.data_handle_id),
-                        BlockIndex::new(block_id.block_index),
-                    ),
-                )
-            }
-            other => panic!("expected DeleteBlocks command, got {other:?}"),
-        }
-    }
-
-    async fn prepare_two_intents_same_worker() -> MetadataResult<(DeleteExecutorTestEnv, WorkerId, BlockId, BlockId)> {
-        let env = new_delete_executor_test_env().await?;
-        let worker_id = WorkerId::new(1);
-        let first_block = BlockId::new(DataHandleId::new(71), BlockIndex::new(0));
-        let second_block = BlockId::new(DataHandleId::new(72), BlockIndex::new(0));
-        put_sealed_block(&env.storage, first_block, worker_id)?;
-        put_sealed_block(&env.storage, second_block, worker_id)?;
-        add_live_worker_with_blocks(&env.worker_manager, worker_id, vec![first_block, second_block])?;
-        put_pending_delete_intent(&env.storage, 101, first_block)?;
-        put_pending_delete_intent(&env.storage, 102, second_block)?;
-        env.executor.run_once().await?;
-        Ok((env, worker_id, first_block, second_block))
     }
 
     #[tokio::test]
@@ -363,20 +357,22 @@ mod tests {
         let worker_manager = Arc::new(WorkerManager::new(60));
         worker_manager.increment_metadata_epoch();
         let worker_id = WorkerId::new(1);
+        let address = "127.0.0.1:8080".to_string();
+        let run_id = worker_run_id(worker_id);
         worker_manager
-            .register_worker(
-                ShardGroupId::new(1),
-                worker_id,
-                "127.0.0.1:8080".to_string(),
-                1,
-                100,
-                None,
-            )
+            .register_worker(ShardGroupId::new(1), worker_id, address.clone(), 1, 100, None)
             .unwrap();
         worker_manager
-            .record_test_heartbeat(
+            .register_worker_run(ShardGroupId::new(1), worker_id, address.clone(), 1, run_id, None)
+            .unwrap();
+        worker_manager
+            .record_heartbeat(
                 ShardGroupId::new(1),
                 worker_id,
+                run_id,
+                1,
+                &address,
+                1,
                 1000,
                 500,
                 500,
@@ -399,7 +395,23 @@ mod tests {
             committed_length: 4096,
         })?;
         worker_manager
-            .apply_full_report(ShardGroupId::new(1), worker_id, vec![block_id])
+            .receive_full_block_report(
+                ShardGroupId::new(1),
+                worker_id,
+                run_id,
+                1,
+                0,
+                true,
+                vec![crate::worker::BlockReportBlock {
+                    block_id,
+                    data_handle_id: block_id.data_handle_id.as_raw(),
+                    block_index: block_id.index.as_raw(),
+                    block_stamp: 1,
+                    effective_len: 4096,
+                    committed_length: 4096,
+                    block_state: crate::worker::BlockReportBlockState::Ready,
+                }],
+            )
             .unwrap();
         assert_eq!(
             worker_manager.get_block_locations(ShardGroupId::new(1), block_id),
@@ -445,11 +457,12 @@ mod tests {
             .await?;
         assert!(!has_active_lease);
 
+        let metrics = Arc::new(MetadataMetrics::new());
         let executor = DeleteExecutor::new(
             Arc::clone(&raft_node),
             Arc::clone(&storage),
             Arc::clone(&worker_manager),
-            Arc::new(crate::metrics::MetadataMetrics::new()),
+            Arc::clone(&metrics),
             mount_table,
             Arc::new(InflightRegistry::new(5 * 60 * 1000)),
         );
@@ -460,39 +473,7 @@ mod tests {
             worker_manager.get_block_locations(ShardGroupId::new(1), block_id),
             vec![worker_id]
         );
-        let commands = executor.get_pending_commands(worker_id, 10);
-        assert_eq!(commands.len(), 1);
-        match commands[0].command.as_ref() {
-            Some(worker_command_proto::Command::DeleteBlocks(DeleteBlocksCommandProto {
-                intent_id, blocks, ..
-            })) => {
-                assert_eq!(*intent_id, 42);
-                assert_eq!(blocks.len(), 1);
-                assert_eq!(
-                    blocks[0].block_id.as_ref().unwrap().data_handle_id,
-                    block_id.data_handle_id.as_raw()
-                );
-            }
-            other => panic!("expected DeleteBlocks command, got {other:?}"),
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn two_delete_intents_same_worker_get_distinct_task_ids() -> MetadataResult<()> {
-        let (env, worker_id, _first_block, _second_block) = prepare_two_intents_same_worker().await?;
-
-        let commands = env.executor.get_pending_commands(worker_id, 10);
-        assert_eq!(commands.len(), 2);
-        assert_ne!(commands[0].task_id, commands[1].task_id);
-
-        let mut intent_ids = commands
-            .iter()
-            .map(|command| delete_command(command).0)
-            .collect::<Vec<_>>();
-        intent_ids.sort_unstable();
-        assert_eq!(intent_ids, vec![101, 102]);
+        assert_eq!(metrics.delete_executor_requests_total.load(Ordering::Relaxed), 1);
 
         Ok(())
     }
@@ -522,7 +503,7 @@ mod tests {
 
         env.executor.run_once().await?;
 
-        assert!(env.executor.get_pending_commands(worker_id, 10).is_empty());
+        assert_eq!(env.metrics.delete_executor_requests_total.load(Ordering::Relaxed), 0);
         assert!(matches!(
             env.storage.get_delete_intent(150)?.unwrap().status,
             DeleteIntentStatus::Pending
