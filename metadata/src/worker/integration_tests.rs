@@ -92,7 +92,7 @@ fn receive_full_report(
     group_id: ShardGroupId,
     worker_id: WorkerId,
     run_id: WorkerRunId,
-    report_epoch: u64,
+    report_seq: u64,
     blocks: Vec<BlockId>,
 ) -> (Vec<BlockId>, Vec<BlockId>) {
     let result = manager
@@ -100,7 +100,7 @@ fn receive_full_report(
             group_id,
             worker_id,
             run_id,
-            report_epoch,
+            report_seq,
             0,
             true,
             blocks.into_iter().map(report_block).collect(),

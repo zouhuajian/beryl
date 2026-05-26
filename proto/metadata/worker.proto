@@ -323,10 +323,10 @@ message BlockReportDeltaProto {
 }
 
 message FullBlockReportBatchProto {
-  /// Batch sequence starts at 0 for each report_epoch.
+  /// Sequence number within the current report_seq.
   uint64 batch_seq = 1;
-  /// Publishes the staged full-report view when true.
-  bool last_batch = 2;
+  /// True when this is the final batch of the current report_seq.
+  bool final_batch = 2;
   repeated BlockReportBlockProto blocks = 3;
 }
 
@@ -344,8 +344,8 @@ message BlockReportRequestProto {
   uint64 worker_id = 3;
   /// Current live worker process-run identity.
   string worker_run_id = 4;
-  /// Full-report generation scoped to one worker run and one group.
-  uint64 report_epoch = 5;
+  /// Monotonic within one worker run and one group.
+  uint64 report_seq = 5;
   oneof report {
     FullBlockReportBatchProto full = 6;
     DeltaBlockReportProto delta = 7;
@@ -354,7 +354,8 @@ message BlockReportRequestProto {
 
 message BlockReportResponseProto {
   common.ResponseHeaderProto header = 1;
-  uint64 report_epoch = 2;
+  /// Accepted report_seq for this response.
+  uint64 report_seq = 2;
   /// Next delta sequence expected by metadata for the current published baseline.
   uint64 next_delta_seq = 3;
   /// Optional retry hint for throttled full-report submission.

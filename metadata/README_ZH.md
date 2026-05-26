@@ -306,8 +306,8 @@ heartbeat：
 block report：
 
 - Workers send group-scoped full block reports after successful registration and heartbeat readiness. The local group directory is the authoritative source for report `group_id`.
-- Full reports are batched by `report_epoch` and `batch_seq`. `batch_seq == 0` starts a staged full report; staged blocks are not visible in the published location view until `last_batch` publishes the baseline.
-- Delta reports are accepted only after a full baseline is published. `report_epoch` must match the published baseline and `delta_seq` must be the expected next sequence. Old complete duplicates are acknowledged when safe; gaps return `FULL_REPORT_REQUIRED`.
+- `report_seq` identifies one full-report generation within one worker run and one group. `batch_seq` identifies a batch within that `report_seq`; `batch_seq == 0` starts a staged full report. `final_batch` means metadata may publish the staged full report after accepting this batch.
+- Delta reports are accepted only after a full baseline is published. `report_seq` must match the published baseline and `delta_seq` must be the expected next sequence. Old complete duplicates are acknowledged when safe; gaps return `FULL_REPORT_REQUIRED`.
 - Block report state is reconstructable, memory-only soft state keyed by `(group_id, worker_id)`. It is not written to RocksDB, not applied through Raft, and not restored after metadata restart. Metadata restart requires workers to send a new full report.
 - Leaders and followers may accept reports to warm their local location view. Followers must not return mutating commands, and report handling must not mutate namespace/file layout state.
 - Report handling updates only the in-memory block-location view. It does not schedule repair, rebalance, delete, cleanup, or worker command acknowledgement.

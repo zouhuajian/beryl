@@ -293,13 +293,13 @@ mod tests {
             match reply {
                 MockBlockReportReply::Ok => Ok(Response::new(BlockReportResponseProto {
                     header: Some(response_header_from_block_report_request(&request, None)),
-                    report_epoch: request.report_epoch,
+                    report_seq: request.report_seq,
                     next_delta_seq: 0,
                     retry_after_ms: 0,
                 })),
                 MockBlockReportReply::HeaderError(error) => Ok(Response::new(BlockReportResponseProto {
                     header: Some(response_header_from_block_report_request(&request, Some(error))),
-                    report_epoch: request.report_epoch,
+                    report_seq: request.report_seq,
                     next_delta_seq: 0,
                     retry_after_ms: 0,
                 })),
@@ -1122,7 +1122,7 @@ mod tests {
         match requests[0].report.as_ref().expect("first report") {
             proto::metadata::block_report_request_proto::Report::Full(full) => {
                 assert_eq!(full.batch_seq, 0);
-                assert!(!full.last_batch);
+                assert!(!full.final_batch);
                 assert_eq!(full.blocks.len(), 1);
             }
             other => panic!("expected full report, got {other:?}"),
@@ -1130,7 +1130,7 @@ mod tests {
         match requests[1].report.as_ref().expect("second report") {
             proto::metadata::block_report_request_proto::Report::Full(full) => {
                 assert_eq!(full.batch_seq, 1);
-                assert!(full.last_batch);
+                assert!(full.final_batch);
                 assert_eq!(full.blocks.len(), 1);
             }
             other => panic!("expected full report, got {other:?}"),

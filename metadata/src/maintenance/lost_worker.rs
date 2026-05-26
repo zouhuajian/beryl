@@ -189,7 +189,7 @@ mod tests {
         }
     }
 
-    fn publish_report(manager: &WorkerManager, worker_id: WorkerId, report_epoch: u64, blocks: Vec<BlockId>) {
+    fn publish_report(manager: &WorkerManager, worker_id: WorkerId, report_seq: u64, blocks: Vec<BlockId>) {
         let group_id = ShardGroupId::new(1);
         let run_id = manager
             .get_registration(group_id, worker_id)
@@ -200,7 +200,7 @@ mod tests {
                 group_id,
                 worker_id,
                 run_id,
-                report_epoch,
+                report_seq,
                 0,
                 true,
                 blocks.into_iter().map(report_block).collect(),

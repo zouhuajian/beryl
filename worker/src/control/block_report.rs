@@ -64,7 +64,7 @@ pub struct BlockReportRound {
 
 #[derive(Clone, Debug, Default)]
 struct ReportBaseline {
-    report_epoch: u64,
+    report_seq: u64,
     next_delta_seq: u64,
     blocks: HashMap<BlockId, BlockReportBlockProto>,
     ready: bool,
@@ -149,7 +149,7 @@ impl MetadataBlockReportLoop {
             return Ok(BlockReportRound::default());
         };
         let blocks = self.scan_report_blocks(registration.group_id)?;
-        let report_epoch = self.next_report_epoch(registration.group_id);
+        let report_seq = self.next_report_seq(registration.group_id);
         let mut round = BlockReportRound {
             attempted_peers: self.endpoints.len(),
             ..BlockReportRound::default()
@@ -159,7 +159,7 @@ impl MetadataBlockReportLoop {
 
         for endpoint in &self.endpoints {
             match self
-                .send_full_to_peer(endpoint.clone(), &registration, report_epoch, &blocks)
+                .send_full_to_peer(endpoint.clone(), &registration, report_seq, &blocks)
                 .await
             {
                 Ok(BlockReportPeerOutcome::Accepted { next_delta_seq }) => {
@@ -187,7 +187,7 @@ impl MetadataBlockReportLoop {
         }
 
         if round.accepted_peers > 0 && !round.needs_register && !round.worker_run_mismatch {
-            self.publish_baseline(registration.group_id, report_epoch, accepted_next_delta_seq, blocks);
+            self.publish_baseline(registration.group_id, report_seq, accepted_next_delta_seq, blocks);
         } else if round.attempted_peers > 0
             && !round.full_report_required
             && !round.needs_register
@@ -205,7 +205,7 @@ impl MetadataBlockReportLoop {
         let Some(registration) = self.ready_registration() else {
             return Ok(BlockReportRound::default());
         };
-        let Some((report_epoch, delta_seq, deltas)) = self.build_delta_batch(registration.group_id)? else {
+        let Some((report_seq, delta_seq, deltas)) = self.build_delta_batch(registration.group_id)? else {
             return Ok(BlockReportRound::default());
         };
 
@@ -218,7 +218,7 @@ impl MetadataBlockReportLoop {
 
         for endpoint in &self.endpoints {
             match self
-                .send_delta_to_peer(endpoint.clone(), &registration, report_epoch, delta_seq, &deltas)
+                .send_delta_to_peer(endpoint.clone(), &registration, report_seq, delta_seq, &deltas)
                 .await
             {
                 Ok(BlockReportPeerOutcome::Accepted { next_delta_seq }) => {
@@ -284,18 +284,18 @@ impl MetadataBlockReportLoop {
         Ok(blocks)
     }
 
-    fn next_report_epoch(&self, group_id: ShardGroupId) -> u64 {
+    fn next_report_seq(&self, group_id: ShardGroupId) -> u64 {
         let mut baselines = self.baselines.lock().expect("block report baseline state poisoned");
         let baseline = baselines.entry(group_id).or_default();
-        baseline.report_epoch = baseline.report_epoch.saturating_add(1).max(1);
+        baseline.report_seq = baseline.report_seq.saturating_add(1).max(1);
         baseline.ready = false;
-        baseline.report_epoch
+        baseline.report_seq
     }
 
     fn publish_baseline(
         &self,
         group_id: ShardGroupId,
-        report_epoch: u64,
+        report_seq: u64,
         next_delta_seq: u64,
         blocks: Vec<BlockReportBlockProto>,
     ) {
@@ -303,7 +303,7 @@ impl MetadataBlockReportLoop {
         baselines.insert(
             group_id,
             ReportBaseline {
-                report_epoch,
+                report_seq,
                 next_delta_seq,
                 blocks: blocks
                     .into_iter()
@@ -349,7 +349,7 @@ impl MetadataBlockReportLoop {
         if deltas.is_empty() {
             return Ok(None);
         }
-        Ok(Some((baseline.report_epoch, baseline.next_delta_seq, deltas)))
+        Ok(Some((baseline.report_seq, baseline.next_delta_seq, deltas)))
     }
 
     fn apply_delta_baseline(&self, group_id: ShardGroupId, next_delta_seq: u64, deltas: Vec<BlockReportDeltaProto>) {
@@ -392,7 +392,7 @@ impl MetadataBlockReportLoop {
         &self,
         endpoint: Endpoint,
         registration: &Registration,
-        report_epoch: u64,
+        report_seq: u64,
         blocks: &[BlockReportBlockProto],
     ) -> Result<BlockReportPeerOutcome, BlockReportError> {
         let timeout = Duration::from_millis(self.config.register_timeout_ms);
@@ -418,10 +418,10 @@ impl MetadataBlockReportLoop {
                 group_id: registration.group_id.as_raw(),
                 worker_id: registration.worker_id.as_raw(),
                 worker_run_id: registration.worker_run_id.to_string(),
-                report_epoch,
+                report_seq,
                 report: Some(block_report_request_proto::Report::Full(FullBlockReportBatchProto {
                     batch_seq: batch_idx as u64,
-                    last_batch: batch_idx + 1 == total_batches,
+                    final_batch: batch_idx + 1 == total_batches,
                     blocks: batch_blocks,
                 })),
             };
@@ -443,7 +443,7 @@ impl MetadataBlockReportLoop {
         &self,
         endpoint: Endpoint,
         registration: &Registration,
-        report_epoch: u64,
+        report_seq: u64,
         delta_seq: u64,
         deltas: &[BlockReportDeltaProto],
     ) -> Result<BlockReportPeerOutcome, BlockReportError> {
@@ -458,7 +458,7 @@ impl MetadataBlockReportLoop {
             group_id: registration.group_id.as_raw(),
             worker_id: registration.worker_id.as_raw(),
             worker_run_id: registration.worker_run_id.to_string(),
-            report_epoch,
+            report_seq,
             report: Some(block_report_request_proto::Report::Delta(DeltaBlockReportProto {
                 delta_seq,
                 deltas: deltas.to_vec(),
@@ -540,10 +540,10 @@ fn classify_block_report_response(
     if let Some(outcome) = classify_header(response.header.as_ref())? {
         return Ok(outcome);
     }
-    if response.report_epoch != request.report_epoch {
+    if response.report_seq != request.report_seq {
         return Err(BlockReportError::Fatal(format!(
-            "metadata block report response confirmed report_epoch {}, expected {}",
-            response.report_epoch, request.report_epoch
+            "metadata block report response confirmed report_seq {}, expected {}",
+            response.report_seq, request.report_seq
         )));
     }
     Ok(BlockReportPeerOutcome::Accepted {

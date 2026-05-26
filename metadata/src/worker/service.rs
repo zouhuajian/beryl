@@ -780,7 +780,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 )
             }
         };
-        let report_epoch = req.report_epoch;
+        let report_seq = req.report_seq;
         let Some(report) = req.report else {
             return self
                 .invalid_request_response::<BlockReportResponseProto>(&req.header, "block report body is required");
@@ -801,9 +801,9 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     group_id,
                     worker_id,
                     worker_run_id,
-                    report_epoch,
+                    report_seq,
                     full.batch_seq,
-                    full.last_batch,
+                    full.final_batch,
                     blocks,
                 ) {
                     Ok(result) => result,
@@ -824,7 +824,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     group_id,
                     worker_id,
                     worker_run_id,
-                    report_epoch,
+                    report_seq,
                     delta.delta_seq,
                     deltas,
                 ) {
@@ -843,7 +843,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         info!(
             group_id = group_id.as_raw(),
             worker_id = worker_id.as_raw(),
-            report_epoch,
+            report_seq,
             next_delta_seq = result.next_delta_seq,
             added_blocks = result.added_blocks.len(),
             removed_blocks = result.removed_blocks.len(),
@@ -852,7 +852,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 
         Ok(Response::new(BlockReportResponseProto {
             header: Some((&self.create_response_header_from_request(&req.header, Some(group_id.as_raw()))).into()),
-            report_epoch,
+            report_seq,
             next_delta_seq: result.next_delta_seq,
             retry_after_ms: 0,
         }))
@@ -921,9 +921,9 @@ mod tests {
         group_id: ShardGroupId,
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
-        report_epoch: u64,
+        report_seq: u64,
         batch_seq: u64,
-        last_batch: bool,
+        final_batch: bool,
         blocks: Vec<BlockId>,
     ) -> BlockReportRequestProto {
         BlockReportRequestProto {
@@ -934,10 +934,10 @@ mod tests {
             group_id: group_id.as_raw(),
             worker_id: worker_id.as_raw(),
             worker_run_id: worker_run_id.to_string(),
-            report_epoch,
+            report_seq,
             report: Some(block_report_request_proto::Report::Full(FullBlockReportBatchProto {
                 batch_seq,
-                last_batch,
+                final_batch,
                 blocks: blocks.into_iter().map(report_block_proto).collect(),
             })),
         }
@@ -947,7 +947,7 @@ mod tests {
         group_id: ShardGroupId,
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
-        report_epoch: u64,
+        report_seq: u64,
         delta_seq: u64,
         deltas: Vec<(BlockReportDeltaOpProto, BlockId)>,
     ) -> BlockReportRequestProto {
@@ -959,7 +959,7 @@ mod tests {
             group_id: group_id.as_raw(),
             worker_id: worker_id.as_raw(),
             worker_run_id: worker_run_id.to_string(),
-            report_epoch,
+            report_seq,
             report: Some(block_report_request_proto::Report::Delta(DeltaBlockReportProto {
                 delta_seq,
                 deltas: deltas
@@ -1165,7 +1165,7 @@ mod tests {
         .into_inner();
 
         assert!(response.header.as_ref().expect("header").error.is_none());
-        assert_eq!(response.report_epoch, 1);
+        assert_eq!(response.report_seq, 1);
         assert_eq!(response.next_delta_seq, 0);
         assert_eq!(
             worker_manager.get_block_locations(ShardGroupId::new(1), block_id),
@@ -1900,7 +1900,7 @@ mod tests {
                 group_id: 1,
                 worker_id: worker_id.as_raw(),
                 worker_run_id: worker_run_id.to_string(),
-                report_epoch: 1,
+                report_seq: 1,
                 report: Some(block_report_request_proto::Report::Delta(DeltaBlockReportProto {
                     delta_seq: 0,
                     deltas: vec![BlockReportDeltaProto {

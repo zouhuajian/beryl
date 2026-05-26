@@ -88,7 +88,7 @@ fn register_live_report_worker(
 }
 
 #[test]
-fn full_report_batches_publish_only_after_last_batch() {
+fn full_report_batches_publish_only_after_final_batch() {
     let manager = WorkerManager::new(60);
     let group_id = ShardGroupId::new(21);
     let worker_id = WorkerId::new(5);
@@ -120,7 +120,7 @@ fn full_report_batches_publish_only_after_last_batch() {
 }
 
 #[test]
-fn stale_full_report_epoch_cannot_roll_back_published_view() {
+fn stale_full_report_seq_cannot_roll_back_published_view() {
     let manager = WorkerManager::new(60);
     let group_id = ShardGroupId::new(25);
     let worker_id = WorkerId::new(9);
@@ -137,7 +137,7 @@ fn stale_full_report_epoch_cannot_roll_back_published_view() {
 
     let stale = manager
         .receive_full_block_report(group_id, worker_id, run_id, 6, 0, true, vec![report_block(1)])
-        .expect_err("stale report_epoch must not reset the published baseline");
+        .expect_err("stale report_seq must not reset the published baseline");
     assert!(stale.to_string().contains("full report required"));
     assert_eq!(
         manager.get_block_locations(group_id, report_block(0).block_id),
@@ -263,7 +263,7 @@ fn delta_report_requires_ready_baseline_and_ordered_sequence() {
                 block: report_block(1),
             }],
         )
-        .expect_err("report_epoch mismatch must require full report");
+        .expect_err("report_seq mismatch must require full report");
     assert!(epoch_mismatch.to_string().contains("full report required"));
 }
 

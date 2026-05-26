@@ -194,8 +194,8 @@ struct WorkerBlockReportRuntime {
     /// baseline before delta reports are accepted.
     worker_run_id: Option<WorkerRunId>,
     state: BlockReportState,
-    /// Full-report generation scoped to one worker run and one group.
-    report_epoch: u64,
+    /// Monotonic within one worker run and one group.
+    report_seq: u64,
     next_batch_seq: u64,
     staging_blocks: HashMap<BlockId, BlockReportBlock>,
     published_blocks: HashMap<BlockId, BlockReportBlock>,
@@ -432,18 +432,17 @@ impl WorkerManager {
 
     /// Receive one full-report batch.
     ///
-    /// `batch_seq == 0` starts a new staged report for `report_epoch`. Staged
-    /// blocks are not visible through the published location view until
-    /// `last_batch` publishes the full baseline.
+    /// `batch_seq == 0` starts a staged report for `report_seq`. Staged blocks
+    /// are not visible until `final_batch` publishes the full baseline.
     #[allow(clippy::too_many_arguments)]
     pub fn receive_full_block_report(
         &self,
         group_id: ShardGroupId,
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
-        report_epoch: u64,
+        report_seq: u64,
         batch_seq: u64,
-        last_batch: bool,
+        final_batch: bool,
         blocks: Vec<BlockReportBlock>,
     ) -> MetadataResult<BlockReportApplyResult> {
         self.validate_report_source(group_id, worker_id, worker_run_id)?;
@@ -452,25 +451,25 @@ impl WorkerManager {
         let mut reports = self.block_reports.write();
         let report = reports.entry(key).or_default();
         if batch_seq == 0 {
-            if report.worker_run_id == Some(worker_run_id) && report.report_epoch > report_epoch {
+            if report.worker_run_id == Some(worker_run_id) && report.report_seq > report_seq {
                 return Err(MetadataError::FullReportRequired(format!(
-                    "full report required: stale report_epoch {} for group_id={}, worker_id={}, current {}",
-                    report_epoch,
+                    "full report required: stale report_seq {} for group_id={}, worker_id={}, current {}",
+                    report_seq,
                     group_id.as_raw(),
                     worker_id.as_raw(),
-                    report.report_epoch
+                    report.report_seq
                 )));
             }
             report.worker_run_id = Some(worker_run_id);
             report.state = BlockReportState::Receiving;
-            report.report_epoch = report_epoch;
+            report.report_seq = report_seq;
             report.next_batch_seq = 0;
             report.staging_blocks.clear();
         }
 
         if report.state != BlockReportState::Receiving
             || report.worker_run_id != Some(worker_run_id)
-            || report.report_epoch != report_epoch
+            || report.report_seq != report_seq
             || report.next_batch_seq != batch_seq
         {
             return Err(MetadataError::FullReportRequired(format!(
@@ -486,7 +485,7 @@ impl WorkerManager {
         }
         report.next_batch_seq = batch_seq.saturating_add(1);
 
-        if !last_batch {
+        if !final_batch {
             return Ok(BlockReportApplyResult {
                 next_delta_seq: report.delta_seq,
                 ..BlockReportApplyResult::default()
@@ -517,7 +516,7 @@ impl WorkerManager {
         group_id: ShardGroupId,
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
-        report_epoch: u64,
+        report_seq: u64,
         delta_seq: u64,
         deltas: Vec<BlockReportDeltaEntry>,
     ) -> MetadataResult<BlockReportApplyResult> {
@@ -534,7 +533,7 @@ impl WorkerManager {
         })?;
         if report.state != BlockReportState::Ready
             || report.worker_run_id != Some(worker_run_id)
-            || report.report_epoch != report_epoch
+            || report.report_seq != report_seq
         {
             return Err(MetadataError::FullReportRequired(format!(
                 "full report required for current baseline: group_id={}, worker_id={}",

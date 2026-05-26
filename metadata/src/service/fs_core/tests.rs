@@ -169,7 +169,7 @@ fn publish_report_locations(
     manager: &WorkerManager,
     group_id: ShardGroupId,
     worker_id: WorkerId,
-    report_epoch: u64,
+    report_seq: u64,
     blocks: Vec<BlockId>,
 ) {
     let run_id = manager
@@ -181,7 +181,7 @@ fn publish_report_locations(
             group_id,
             worker_id,
             run_id,
-            report_epoch,
+            report_seq,
             0,
             true,
             blocks.into_iter().map(report_block).collect(),
