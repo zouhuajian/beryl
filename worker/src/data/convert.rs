@@ -13,6 +13,7 @@ use proto::worker::{
 };
 use types::chunk::ByteRange;
 use types::ids::{BlockId, ShardGroupId, StreamId};
+use types::layout::BlockFormatId;
 use types::lease::FencingToken;
 
 use crate::data::core::{
@@ -84,6 +85,7 @@ pub fn write_open_request_to_proto(req: WriteOpenRequest, ctx: &RequestHeader) -
         checksum_kind: checksum_kind_to_proto(req.checksum_kind),
         token: Some(fencing_token_to_proto(req.token)),
         frame_size: req.frame_size,
+        block_format_id: req.block_format_id.as_raw(),
     }
 }
 
@@ -172,6 +174,8 @@ pub fn proto_to_write_open_request(proto: OpenWriteStreamRequestProto) -> Worker
     let block_id = proto_to_block_id(proto.block_id, "block_id")?;
     let token = proto_to_required_fencing_token(proto.token, "token")?;
     let checksum_kind = proto_to_checksum_kind(proto.checksum_kind)?;
+    let block_format_id = BlockFormatId::from_raw(proto.block_format_id)
+        .map_err(|err| WorkerError::InvalidArgument(format!("block_format_id invalid: {err}")))?;
 
     Ok(WriteOpenRequest {
         group_id,
@@ -180,6 +184,7 @@ pub fn proto_to_write_open_request(proto: OpenWriteStreamRequestProto) -> Worker
         block_stamp: proto.block_stamp,
         frame_size: proto.frame_size,
         block_size: proto.block_size,
+        block_format_id,
         chunk_size: proto.chunk_size,
         checksum_kind,
     })

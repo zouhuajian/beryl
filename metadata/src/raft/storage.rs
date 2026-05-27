@@ -574,9 +574,14 @@ impl RocksDBStorage {
             .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
         let key = format!("layout:{}", inode_id.as_raw());
         match self.db.get_cf(cf, key.as_bytes()) {
-            Ok(Some(value)) => decode_from_slice(&value, standard())
-                .map(|(layout, _)| layout)
-                .map_err(|e| MetadataError::Internal(format!("Failed to deserialize file layout: {}", e))),
+            Ok(Some(value)) => {
+                let (layout, _): (FileLayout, usize) = decode_from_slice(&value, standard())
+                    .map_err(|e| MetadataError::Internal(format!("Failed to deserialize file layout: {}", e)))?;
+                layout
+                    .validate()
+                    .map_err(|e| MetadataError::Internal(format!("Invalid file layout: {}", e)))?;
+                Ok(layout)
+            }
             Ok(None) => Err(MetadataError::NotFound(format!(
                 "Layout not found for inode {}",
                 inode_id

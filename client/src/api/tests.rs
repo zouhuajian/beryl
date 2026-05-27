@@ -1154,6 +1154,7 @@ fn write_target(data_handle_id: u64, block_index: u32, file_offset: u64, len: u6
         fencing_token: FencingToken::new(block_id, ClientId::new(7), 1),
         block_stamp: 1,
         chunk_size: DEFAULT_CHUNK_SIZE,
+        block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
     }
 }
 

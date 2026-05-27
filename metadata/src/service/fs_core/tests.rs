@@ -14,7 +14,7 @@ use crate::state::{MemoryStateStore, RouteEpoch};
 use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerInfo, WorkerManager};
 use async_trait::async_trait;
 use common::error::canonical::{ErrorCode as CanonicalErrorCode, RefreshReason};
-use common::header::{AuthnType, RequestHeader, RpcErrorCode};
+use common::header::{AuthnType, CallerContext, RequestHeader, RpcErrorCode};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
@@ -154,11 +154,15 @@ fn record_worker_heartbeat(
 }
 
 fn report_block(block_id: BlockId) -> BlockReportBlock {
+    report_block_with_stamp(block_id, u64::from(block_id.index.as_raw()) + 1)
+}
+
+fn report_block_with_stamp(block_id: BlockId, block_stamp: u64) -> BlockReportBlock {
     BlockReportBlock {
         block_id,
         data_handle_id: block_id.data_handle_id.as_raw(),
         block_index: block_id.index.as_raw(),
-        block_stamp: u64::from(block_id.index.as_raw()) + 1,
+        block_stamp,
         effective_len: 4096,
         committed_length: 4096,
         block_state: BlockReportBlockState::Ready,
@@ -170,6 +174,17 @@ fn publish_report_locations(
     group_id: ShardGroupId,
     worker_id: WorkerId,
     report_seq: u64,
+    blocks: Vec<BlockId>,
+) {
+    publish_report_locations_with_stamp(manager, group_id, worker_id, report_seq, None, blocks);
+}
+
+fn publish_report_locations_with_stamp(
+    manager: &WorkerManager,
+    group_id: ShardGroupId,
+    worker_id: WorkerId,
+    report_seq: u64,
+    block_stamp: Option<u64>,
     blocks: Vec<BlockId>,
 ) {
     let run_id = manager
@@ -184,7 +199,14 @@ fn publish_report_locations(
             report_seq,
             0,
             true,
-            blocks.into_iter().map(report_block).collect(),
+            blocks
+                .into_iter()
+                .map(|block_id| {
+                    block_stamp
+                        .map(|stamp| report_block_with_stamp(block_id, stamp))
+                        .unwrap_or_else(|| report_block(block_id))
+                })
+                .collect(),
         )
         .expect("full block report should publish locations");
 }
@@ -223,7 +245,7 @@ fn fs_core_without_mount() -> FsCore {
 }
 
 #[tokio::test]
-async fn get_file_layout_returns_worker_locations_from_worker_manager() {
+async fn get_file_layout_returns_reported_locations_without_read_placement() {
     let dir = TempDir::new().unwrap();
     let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
     let mount_id = MountId::new(48);
@@ -233,10 +255,10 @@ async fn get_file_layout_returns_worker_locations_from_worker_manager() {
     let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
     let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
     let worker_manager = Arc::new(WorkerManager::new(60));
-    for (raw, port) in [(2, 9102), (1, 9101)] {
+    for (raw, endpoint) in [(2, "127.0.0.2:9102"), (1, "127.0.0.1:9101")] {
         let worker_id = WorkerId::new(raw);
         worker_manager
-            .register_worker(group_id, worker_id, format!("127.0.0.1:{port}"), 1, 20 + raw, None)
+            .register_worker(group_id, worker_id, endpoint.to_string(), 1, 20 + raw, None)
             .unwrap();
         record_worker_heartbeat(
             &worker_manager,
@@ -249,7 +271,7 @@ async fn get_file_layout_returns_worker_locations_from_worker_manager() {
             0,
             HealthStatus::Healthy,
         );
-        publish_report_locations(&worker_manager, group_id, worker_id, raw, vec![block_id]);
+        publish_report_locations_with_stamp(&worker_manager, group_id, worker_id, raw, Some(41), vec![block_id]);
     }
     fs_core.set_storage(Arc::clone(&storage));
     fs_core.set_worker_manager(worker_manager);
@@ -273,9 +295,15 @@ async fn get_file_layout_returns_worker_locations_from_worker_manager() {
     storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
     storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
+    let mut ctx = request_context();
+    ctx.caller = ctx.caller.with_caller_context(CallerContext {
+        context: "host=127.0.0.2".to_string(),
+        signature: None,
+    });
+
     let success = fs_core
         .execute_get_file_layout(GetFileLayoutInput {
-            ctx: request_context(),
+            ctx,
             inode_id,
             range: None,
             requested_data_handle_id: None,
@@ -918,6 +946,7 @@ fn install_write_session(fs_core: &FsCore, inode_id: InodeId, mount_id: MountId)
                 },
                 block_stamp: 1,
                 chunk_size: 64,
+                block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
             }],
             writer_identity: crate::write_session::WriterIdentity {
                 client_id: writer,
@@ -1486,6 +1515,7 @@ async fn open_write_cleans_lease_on_error() {
     storage
         .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
         .unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
     storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
     let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(7));
@@ -1520,6 +1550,7 @@ async fn open_write_targets_use_inode_current_data_handle() {
     storage
         .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
         .unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
     storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
     let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
@@ -1541,6 +1572,7 @@ async fn open_write_targets_use_inode_current_data_handle() {
     assert!(!success.payload.write_targets.is_empty());
     for target in &success.payload.write_targets {
         assert_eq!(target.block_id.data_handle_id, data_handle_id);
+        assert_eq!(target.block_format_id, types::BlockFormatId::CURRENT_FOR_NEW_FILE);
     }
     assert_eq!(
         success.payload.session_key.fencing_token.block_id.data_handle_id,
@@ -1550,6 +1582,76 @@ async fn open_write_targets_use_inode_current_data_handle() {
         .write_session_for_handle(success.payload.session_key.file_handle)
         .expect("session should be stored");
     assert_eq!(session.data_handle_id, data_handle_id);
+}
+
+#[tokio::test]
+async fn open_write_rejects_missing_file_layout_without_default_fallback() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(52);
+    let group_id = ShardGroupId::new(9);
+    let inode_id = InodeId::new(520);
+    let data_handle_id = DataHandleId::new(9520);
+    storage
+        .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+        .unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    fs_core.set_storage(storage);
+    fs_core.set_worker_manager(worker_manager_for_write_targets(group_id));
+
+    let failure = fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id,
+            desired_len: Some(4096),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect_err("missing persisted layout must fail open_write");
+
+    assert!(failure.error.message.contains("Layout not found"));
+}
+
+#[tokio::test]
+async fn open_write_rejects_multi_replica_layout_until_durable_replication_exists() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(54);
+    let group_id = ShardGroupId::new(9);
+    let inode_id = InodeId::new(540);
+    let data_handle_id = DataHandleId::new(9540);
+    storage
+        .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
+        .unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 2)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    fs_core.set_storage(storage);
+    fs_core.set_worker_manager(worker_manager_for_write_targets(group_id));
+
+    let failure = fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id,
+            desired_len: Some(4096),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect_err("multi-replica layout must fail active write");
+
+    assert!(
+        failure
+            .error
+            .message
+            .contains("multi-replica write is not supported yet; replication must be 1"),
+        "unexpected error: {}",
+        failure.error.message
+    );
 }
 
 #[test]
@@ -1638,6 +1740,7 @@ async fn commit_worker_epoch_check_rejects_missing_authoritative_group() {
                     },
                     block_stamp: 1,
                     chunk_size: 64,
+                    block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
                 }],
                 writer_identity: crate::write_session::WriterIdentity {
                     client_id: writer,

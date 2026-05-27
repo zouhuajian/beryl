@@ -6,21 +6,92 @@ use crate::ids::{BlockId, BlockIndex, ChunkIndex, DataHandleId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Fixed layout parameters for a file (stable once created).
+/// Vecton block data/meta interpretation format selected by metadata.
+///
+/// This is not a worker StoreBackend or IoEngine. A worker may execute the same
+/// block format on filesystem, mmap, SPDK, or another local engine, but metadata
+/// only sees the stable format capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BlockFormatId(u32);
+
+impl BlockFormatId {
+    /// Complete effective block file format used by the current worker store.
+    pub const FULL_EFFECTIVE: Self = Self(1);
+
+    /// Block format metadata assigns to newly created files.
+    pub const CURRENT_FOR_NEW_FILE: Self = Self::FULL_EFFECTIVE;
+
+    /// Return the raw format identifier.
+    #[inline]
+    pub const fn as_raw(self) -> u32 {
+        self.0
+    }
+
+    /// Decode a persisted or wire block format identifier.
+    pub fn from_raw(value: u32) -> Result<Self, BlockFormatIdError> {
+        match value {
+            1 => Ok(Self::FULL_EFFECTIVE),
+            other => Err(BlockFormatIdError { raw: other }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("unknown block_format_id {raw}")]
+pub struct BlockFormatIdError {
+    pub raw: u32,
+}
+
+/// Metadata-owned logical layout for a file version or data handle.
+///
+/// `block_size`, `chunk_size`, `replication`, and `block_format_id` are chosen
+/// by metadata and then carried to worker writes. Current active writes require
+/// `replication == 1`; larger target counts are reserved for durable
+/// multi-replica write support.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FileLayout {
     pub block_size: u32, // bytes
     pub chunk_size: u32, // bytes
+    pub block_format_id: BlockFormatId,
     pub replication: u8,
 }
 
 impl FileLayout {
+    /// Construct a layout for a newly created file using the current block format.
     pub const fn new(block_size: u32, chunk_size: u32, replication: u8) -> Self {
+        Self::with_block_format(block_size, chunk_size, replication, BlockFormatId::CURRENT_FOR_NEW_FILE)
+    }
+
+    pub const fn with_block_format(
+        block_size: u32,
+        chunk_size: u32,
+        replication: u8,
+        block_format_id: BlockFormatId,
+    ) -> Self {
         Self {
             block_size,
             chunk_size,
+            block_format_id,
             replication,
         }
+    }
+
+    pub fn validate(&self) -> Result<(), FileLayoutError> {
+        if self.block_size == 0 {
+            return Err(FileLayoutError::ZeroBlockSize);
+        }
+        if self.chunk_size == 0 {
+            return Err(FileLayoutError::ZeroChunkSize);
+        }
+        if self.chunk_size > self.block_size {
+            return Err(FileLayoutError::ChunkLargerThanBlock);
+        }
+        if self.replication == 0 {
+            return Err(FileLayoutError::ZeroReplication);
+        }
+        BlockFormatId::from_raw(self.block_format_id.as_raw()).map_err(FileLayoutError::UnknownBlockFormat)?;
+        Ok(())
     }
 
     #[inline]
@@ -125,28 +196,19 @@ impl FileLayout {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum PlacementPolicy {
-    /// Meta decides primary + replicas; client reads nearest/primary first.
-    Default,
-    /// Prefer local rack/zone if you have topology support.
-    RackAware,
-}
-
-impl core::str::FromStr for PlacementPolicy {
-    type Err = PlacementPolicyParseError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "default" | "Default" => Ok(Self::Default),
-            "rack" | "rackaware" | "RackAware" => Ok(Self::RackAware),
-            _ => Err(PlacementPolicyParseError),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[error("invalid placement policy")]
-pub struct PlacementPolicyParseError;
+pub enum FileLayoutError {
+    #[error("block_size must be non-zero")]
+    ZeroBlockSize,
+    #[error("chunk_size must be non-zero")]
+    ZeroChunkSize,
+    #[error("chunk_size must not exceed block_size")]
+    ChunkLargerThanBlock,
+    #[error("replication must be at least one")]
+    ZeroReplication,
+    #[error("{0}")]
+    UnknownBlockFormat(BlockFormatIdError),
+}
 
 #[cfg(test)]
 mod tests {

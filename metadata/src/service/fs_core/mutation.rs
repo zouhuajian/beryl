@@ -8,6 +8,7 @@ use crate::service::domain::{
     CoreResult, CreateInput, CreateOutput, DeleteEmptyDirInput, DeleteEmptyDirOutput, DeleteTreeInput,
     DeleteTreeOutput, MkdirInput, MkdirOutput, RenameInput, RenameOutput, UnlinkInput, UnlinkOutput,
 };
+use crate::service::validate_active_write_layout;
 use std::sync::atomic::Ordering;
 
 impl FsCore {
@@ -84,6 +85,10 @@ impl FsCore {
     }
 
     pub(crate) async fn execute_create(&self, req: CreateInput) -> CoreResult<CreateOutput> {
+        if let Err(err) = validate_active_write_layout(&req.layout) {
+            return self.failure_from_error(&req.ctx, err, None, None);
+        }
+
         let ctx = match self.route_ctx_for_write(&req.ctx, CoreWriteOp::Create, &[req.parent_inode_id], req.freshness) {
             Ok(ctx) => ctx,
             Err(err) => return Err(err),

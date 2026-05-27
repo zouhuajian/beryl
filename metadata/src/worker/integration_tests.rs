@@ -4,11 +4,13 @@
 //! Integration tests for worker management and block reporting.
 
 use crate::maintenance::repair::{OrphanQueue, RepairPlanner, RepairQueue, RepairTask};
+use crate::placement::{PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus};
 use crate::worker::manager::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerRegistrationKey};
 use crate::worker::WorkerManager;
 use std::sync::Arc;
 use std::time::Duration;
 use types::ids::{BlockId, BlockIndex, DataHandleId, ShardGroupId, WorkerId};
+use types::layout::FileLayout;
 use types::WorkerRunId;
 
 fn worker_run_id(group_id: ShardGroupId, worker_id: WorkerId) -> WorkerRunId {
@@ -432,9 +434,9 @@ async fn test_worker_placement_selection() {
         &manager,
         ShardGroupId::new(1),
         worker1,
-        1000,
-        200,
-        800,
+        10_000,
+        2_000,
+        8_000,
         0,
         0,
         HealthStatus::Healthy,
@@ -443,9 +445,9 @@ async fn test_worker_placement_selection() {
         &manager,
         ShardGroupId::new(1),
         worker2,
-        1000,
-        300,
-        700,
+        10_000,
+        3_000,
+        7_000,
         0,
         0,
         HealthStatus::Healthy,
@@ -454,22 +456,34 @@ async fn test_worker_placement_selection() {
         &manager,
         ShardGroupId::new(1),
         worker3,
-        1000,
-        100,
-        900,
+        10_000,
+        1_000,
+        9_000,
         0,
         0,
         HealthStatus::Healthy,
     );
 
-    // Request placement with replication_factor=3
-    let placement = manager
-        .select_workers_for_placement_in_group(ShardGroupId::new(1), 3, None)
-        .unwrap();
+    let group_id = ShardGroupId::new(1);
+    let layout = FileLayout::with_block_format(4096, 1024, 3, types::BlockFormatId::FULL_EFFECTIVE);
+    let placement = PlacementPlanner.plan(
+        &PlacementRequest {
+            group_id,
+            op: PlacementOp::Write,
+            block_id: BlockId::new(DataHandleId::new(1), BlockIndex::new(0)),
+            block_stamp: None,
+            layout,
+            caller: None,
+            existing: Vec::new(),
+            exclude_workers: Vec::new(),
+            target_replicas: layout.replication,
+        },
+        &manager.collect_worker_placement_views(group_id),
+    );
 
     // Verify we got 3 different workers
-    let mut workers = vec![placement.primary];
-    workers.extend(placement.replicas);
+    assert_eq!(placement.status, PlacementStatus::Ok);
+    let workers: Vec<_> = placement.workers.iter().map(|worker| worker.worker_id).collect();
     assert_eq!(workers.len(), 3);
     assert!(workers.contains(&worker1));
     assert!(workers.contains(&worker2));

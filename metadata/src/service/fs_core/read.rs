@@ -314,7 +314,6 @@ impl FsCore {
                 );
             }
         }
-
         let filtered_extents: Vec<Extent> = if let Some(range) = req.range {
             let range_end = match range.offset.checked_add(range.len) {
                 Some(range_end) => range_end,

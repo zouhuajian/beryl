@@ -13,6 +13,7 @@ use common::error::canonical::RefreshReason;
 use common::header::RpcErrorCode;
 use types::chunk::ByteRange;
 use types::ids::{BlockId, ChunkIndex, ShardGroupId, StreamId};
+use types::layout::BlockFormatId;
 use types::lease::FencingToken;
 
 use crate::config::WorkerConfig;
@@ -111,6 +112,8 @@ pub struct WriteOpenRequest {
     /// Requested transport frame payload size, not the worker-local StorageChunk size.
     pub frame_size: u32,
     pub block_size: u64,
+    /// Metadata-selected Vecton block data/meta interpretation format.
+    pub block_format_id: BlockFormatId,
     pub chunk_size: u32,
     pub checksum_kind: ChecksumKind,
 }
@@ -402,6 +405,7 @@ impl WorkerCore {
             group_id: req.group_id,
             block_id: req.block_id,
             block_size: req.block_size,
+            block_format_id: req.block_format_id,
             chunk_size: req.chunk_size,
             checksum_kind: req.checksum_kind,
         })?;
@@ -639,10 +643,21 @@ fn validate_write_open_request(req: &WriteOpenRequest) -> WorkerCoreResult<()> {
             "block_stamp must be metadata-assigned and non-zero".to_string(),
         ));
     }
-    validate_block_format(req.block_size, req.chunk_size, req.checksum_kind)
+    validate_block_format(req.block_format_id, req.block_size, req.chunk_size, req.checksum_kind)
 }
 
-fn validate_block_format(block_size: u64, chunk_size: u32, checksum_kind: ChecksumKind) -> WorkerCoreResult<()> {
+fn validate_block_format(
+    block_format_id: BlockFormatId,
+    block_size: u64,
+    chunk_size: u32,
+    checksum_kind: ChecksumKind,
+) -> WorkerCoreResult<()> {
+    if block_format_id != BlockFormatId::FULL_EFFECTIVE {
+        return Err(WorkerError::InvalidArgument(format!(
+            "unsupported block_format_id {}",
+            block_format_id.as_raw()
+        )));
+    }
     if block_size == 0 {
         return Err(WorkerError::InvalidArgument(
             "block_size must be greater than zero".to_string(),

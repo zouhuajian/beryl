@@ -184,6 +184,7 @@ async fn test_direct_worker_open_write_stream_is_explicitly_unimplemented() {
             epoch: 1,
         }),
         frame_size: 4096,
+        block_format_id: types::BlockFormatId::FULL_EFFECTIVE.as_raw(),
     });
 
     let response = WorkerDataService::open_write_stream(&mock_worker, request)

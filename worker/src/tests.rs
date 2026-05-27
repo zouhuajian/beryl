@@ -38,6 +38,7 @@ mod tests {
     use types::chunk::ByteRange;
     use types::fs::FsErrorCode;
     use types::ids::{BlockId, BlockIndex, ChunkIndex, ClientId, DataHandleId, ShardGroupId, StreamId, WorkerId};
+    use types::layout::BlockFormatId;
     use types::lease::FencingToken;
     use types::WorkerRunId;
 
@@ -1420,6 +1421,7 @@ mod tests {
             block_stamp: BLOCK_STAMP,
             frame_size: 8192,
             block_size: BLOCK_SIZE,
+            block_format_id: BlockFormatId::FULL_EFFECTIVE,
             chunk_size: CHUNK_SIZE,
             checksum_kind: ChecksumKind::None,
         }
@@ -1504,6 +1506,7 @@ mod tests {
                 group_id: group_id(),
                 block_id: block_id(),
                 block_size: BLOCK_SIZE,
+                block_format_id: BlockFormatId::FULL_EFFECTIVE,
                 chunk_size: CHUNK_SIZE,
                 checksum_kind: ChecksumKind::None,
             })
@@ -1533,6 +1536,7 @@ mod tests {
                 group_id,
                 block_id,
                 block_size: BLOCK_SIZE,
+                block_format_id: BlockFormatId::FULL_EFFECTIVE,
                 chunk_size: CHUNK_SIZE,
                 checksum_kind: ChecksumKind::None,
             })
@@ -1585,6 +1589,7 @@ mod tests {
             group_id: Some(test_group_id_proto()),
             block_id: Some(test_block_id_proto()),
             block_size: BLOCK_SIZE,
+            block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
             block_stamp: BLOCK_STAMP,
             chunk_size: CHUNK_SIZE,
             checksum_kind: ChecksumKindProto::ChecksumKindNone as i32,
@@ -1711,10 +1716,22 @@ mod tests {
         assert_eq!(domain.token.owner, ClientId::new(9));
         assert_eq!(domain.token.epoch, 11);
         assert_eq!(domain.block_stamp, BLOCK_STAMP);
+        assert_eq!(domain.block_format_id, BlockFormatId::FULL_EFFECTIVE);
         assert_eq!(domain.frame_size, 8192);
         assert_eq!(domain.block_size, BLOCK_SIZE);
         assert_eq!(domain.chunk_size, CHUNK_SIZE);
         assert_eq!(domain.checksum_kind, ChecksumKind::None);
+    }
+
+    #[test]
+    fn rejects_open_write_stream_request_with_unknown_block_format_id() {
+        let err = proto_to_write_open_request(OpenWriteStreamRequestProto {
+            block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw() + 1,
+            ..open_write_proto(8192)
+        })
+        .expect_err("unknown block format must fail conversion");
+
+        assert!(err.to_string().contains("block_format_id"));
     }
 
     #[test]
@@ -3109,6 +3126,7 @@ mod tests {
                 ("worker.ChecksumKindProto", "checksum_kind", 7),
                 ("common.FencingTokenProto", "token", 8),
                 ("uint32", "frame_size", 9),
+                ("uint32", "block_format_id", 10),
             ]
         );
         assert_eq!(

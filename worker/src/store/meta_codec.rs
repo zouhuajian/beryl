@@ -9,6 +9,7 @@ use proto::worker::{
     BlockVisibilityProto, ChecksumKindProto,
 };
 use types::ids::{BlockId, ShardGroupId};
+use types::layout::BlockFormatId;
 
 use super::block::{
     BlockFormat, BlockIdentity, BlockMetaPayload, BlockSource, BlockState, BlockVisibility, ChecksumKind, StoreResult,
@@ -64,7 +65,7 @@ fn meta_to_proto_without_visibility(meta: &BlockMetaPayload) -> StoreResult<Bloc
             group_id: Some(meta.identity.group_id.into()),
         }),
         format: Some(BlockFormatProto {
-            format_id: meta.format.format_id,
+            format_id: meta.format.format_id.as_raw(),
             block_size: meta.format.block_size,
             chunk_size,
             checksum_kind: checksum_kind_to_proto(meta.format.checksum_kind) as i32,
@@ -149,7 +150,8 @@ fn meta_fields_from_proto(
                 .unwrap_or_else(|()| unreachable!("ShardGroupIdProto conversion is infallible")),
         },
         format: BlockFormat {
-            format_id: format.format_id,
+            format_id: BlockFormatId::from_raw(format.format_id)
+                .map_err(|err| corrupt(format!("unsupported block format id: {err}")))?,
             block_size: format.block_size,
             chunk_size: u64::from(format.chunk_size),
             checksum_kind: checksum_kind_from_proto(format.checksum_kind)?,

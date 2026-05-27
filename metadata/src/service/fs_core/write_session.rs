@@ -3,6 +3,7 @@
 
 use super::{CoreWriteOp, FsCore};
 use crate::error::{MetadataError, MetadataResult};
+use crate::placement::{PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus};
 use crate::raft::{
     AppDataResponse, Command, CommandFingerprint, DedupKey, FileCommitMode, FsCommandResult, RocksDBStorage,
 };
@@ -11,13 +12,13 @@ use crate::service::domain::{
     CloseWriteOutput, CoreResult, OpenWriteInput, OpenWriteOutput, RenewLeaseInput, RenewLeaseOutput, RequestContext,
     SessionKey, SyncWriteInput, SyncWriteMode, SyncWriteOutput,
 };
-use crate::service::worker_endpoint_from_parts;
+use crate::service::{validate_active_write_layout, worker_endpoint_from_parts};
 use common::error::canonical::{RefreshHint, RefreshReason, WorkerEndpointHint};
-use common::header::RpcErrorCode;
+use common::header::{CallerContextFields, RpcErrorCode};
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use types::fs::{Extent, FsErrorCode};
-use types::ids::{BlockId, BlockIndex};
+use types::ids::{BlockId, BlockIndex, DataHandleId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
 use types::{CommittedBlock, WorkerEndpointInfo, WriteTarget};
@@ -688,17 +689,17 @@ impl<'a> WriteSessionCoordinator<'a> {
         };
 
         let desired_len = req.desired_len.unwrap_or(4 * 1024 * 1024);
-        let layout = storage.get_layout(inode_id);
-        let block_size = layout
-            .as_ref()
-            .map(|layout| layout.block_size as u64)
-            .unwrap_or(4 * 1024 * 1024)
-            .max(1);
-        let chunk_size = layout
-            .as_ref()
-            .map(|layout| layout.chunk_size)
-            .unwrap_or(4 * 1024 * 1024)
-            .max(1);
+        let layout = match storage.get_layout(inode_id) {
+            Ok(layout) => layout,
+            Err(err) => {
+                return self.core.failure_from_error(&req.ctx, err, group_id, mount_epoch);
+            }
+        };
+        if let Err(err) = validate_active_write_layout(&layout) {
+            return self.core.failure_from_error(&req.ctx, err, group_id, mount_epoch);
+        }
+        let block_size = u64::from(layout.block_size).max(1);
+        let chunk_size = layout.chunk_size.max(1);
         let current_file_version = match &inode.data {
             types::fs::InodeData::File { file_version, .. } => *file_version,
             _ => None,
@@ -740,40 +741,60 @@ impl<'a> WriteSessionCoordinator<'a> {
             self.core
                 .require_worker_lookup_group(&req.ctx, group_id, mount_epoch, route_epoch, "OpenWrite")?;
 
+        let placement_views = worker_manager.collect_worker_placement_views(placement_group_id);
+        let caller = req
+            .ctx
+            .caller
+            .caller_context
+            .as_ref()
+            .map(CallerContextFields::from_caller_context);
+        let planner = PlacementPlanner;
         let mut planned_targets = Vec::with_capacity(num_blocks as usize);
         for i in 0..num_blocks {
             let block_index = BlockIndex::new(start_index + i as u32);
             let block_id = BlockId::new(data_handle_id, block_index);
             let file_offset = base_size + i * block_size;
             let len = desired_len.saturating_sub(i * block_size).min(block_size).max(1);
-            let placement = match worker_manager.select_workers_for_placement_in_group(placement_group_id, 3, None) {
-                Ok(placement) => placement,
-                Err(e) => {
-                    return self.core.failure_from_error(
-                        &req.ctx,
-                        MetadataError::Internal(format!("Failed to select workers: {}", e)),
-                        group_id,
-                        mount_epoch,
-                    );
-                }
-            };
+            let placement = planner.plan(
+                &PlacementRequest {
+                    group_id: placement_group_id,
+                    op: PlacementOp::Write,
+                    block_id,
+                    block_stamp: Some(block_stamp),
+                    layout,
+                    caller: caller.clone(),
+                    existing: Vec::new(),
+                    exclude_workers: Vec::new(),
+                    target_replicas: layout.replication,
+                },
+                &placement_views,
+            );
+            if placement.status != PlacementStatus::Ok {
+                return self.core.failure_from_error(
+                    &req.ctx,
+                    MetadataError::ServiceUnavailable(format!(
+                        "Failed to select write placement: {:?}",
+                        placement.status
+                    )),
+                    group_id,
+                    mount_epoch,
+                );
+            }
 
-            let mut worker_endpoints = Vec::with_capacity(3);
-            for worker_id in placement.all_workers() {
-                if let Some(worker_info) = worker_manager.get_worker(placement_group_id, worker_id) {
-                    let endpoint = match worker_endpoint_from_parts(
-                        worker_id,
-                        worker_info.address.clone(),
-                        worker_info.worker_net_protocol,
-                        worker_info.worker_epoch,
-                    ) {
-                        Ok(endpoint) => endpoint,
-                        Err(err) => {
-                            return self.core.failure_from_error(&req.ctx, err, group_id, mount_epoch);
-                        }
-                    };
-                    worker_endpoints.push(endpoint);
-                }
+            let mut worker_endpoints = Vec::with_capacity(placement.workers.len());
+            for worker in placement.workers {
+                let endpoint = match worker_endpoint_from_parts(
+                    worker.worker_id,
+                    worker.endpoint,
+                    worker.worker_net_protocol,
+                    worker.worker_epoch,
+                ) {
+                    Ok(endpoint) => endpoint,
+                    Err(err) => {
+                        return self.core.failure_from_error(&req.ctx, err, group_id, mount_epoch);
+                    }
+                };
+                worker_endpoints.push(endpoint);
             }
 
             if worker_endpoints.is_empty() {
@@ -843,6 +864,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 fencing_token: target_token,
                 block_stamp,
                 chunk_size,
+                block_format_id: layout.block_format_id,
             });
         }
 
@@ -1580,6 +1602,12 @@ impl<'a> WriteSessionCoordinator<'a> {
                     .err();
             }
         };
+        if let Err(err) = validate_active_write_layout(&layout) {
+            return self
+                .core
+                .failure_from_error::<()>(req_ctx, err, group_id, mount_epoch)
+                .err();
+        }
         let placement_group_id =
             match self
                 .core
@@ -1592,27 +1620,38 @@ impl<'a> WriteSessionCoordinator<'a> {
         let desired_len = desired_len.unwrap_or(4 * 1024 * 1024);
         let block_size = (layout.block_size as u64).max(1);
         let num_blocks = desired_len.div_ceil(block_size).clamp(1, 10);
-        for _ in 0..num_blocks {
-            let placement = match worker_manager.select_workers_for_placement_in_group(placement_group_id, 3, None) {
-                Ok(placement) => placement,
-                Err(err) => {
-                    return self
-                        .core
-                        .failure_from_error::<()>(req_ctx, err, group_id, mount_epoch)
-                        .err()
-                }
-            };
-            let has_live_endpoint = placement
-                .all_workers()
-                .any(|worker_id| worker_manager.get_worker(placement_group_id, worker_id).is_some());
-            if !has_live_endpoint {
+        let placement_views = worker_manager.collect_worker_placement_views(placement_group_id);
+        let caller = req_ctx
+            .caller
+            .caller_context
+            .as_ref()
+            .map(CallerContextFields::from_caller_context);
+        let planner = PlacementPlanner;
+        for i in 0..num_blocks {
+            let block_id = BlockId::new(DataHandleId::new(0), BlockIndex::new(i as u32));
+            let placement = planner.plan(
+                &PlacementRequest {
+                    group_id: placement_group_id,
+                    op: PlacementOp::Write,
+                    block_id,
+                    block_stamp: None,
+                    layout,
+                    caller: caller.clone(),
+                    existing: Vec::new(),
+                    exclude_workers: Vec::new(),
+                    target_replicas: layout.replication,
+                },
+                &placement_views,
+            );
+            if placement.status != PlacementStatus::Ok || placement.workers.is_empty() {
                 return self
                     .core
                     .failure_from_error::<()>(
                         req_ctx,
-                        MetadataError::ServiceUnavailable(
-                            "selected placement has no live worker endpoints".to_string(),
-                        ),
+                        MetadataError::ServiceUnavailable(format!(
+                            "Failed to select write placement: {:?}",
+                            placement.status
+                        )),
                         group_id,
                         mount_epoch,
                     )

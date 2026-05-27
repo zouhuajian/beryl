@@ -246,7 +246,7 @@ impl FsClient {
                     header: None,
                     path: path.to_string(),
                     attrs: Some(default_file_attrs()),
-                    layout: Some(default_file_layout()),
+                    layout: Some(layout_for_new_file()),
                     disposition: disposition as i32,
                     desired_len: Some(default_write_preallocation_len()),
                 },
@@ -1181,11 +1181,12 @@ fn default_file_attrs() -> proto::fs::FileAttrsProto {
     }
 }
 
-fn default_file_layout() -> proto::common::FileLayoutProto {
+fn layout_for_new_file() -> proto::common::FileLayoutProto {
     proto::common::FileLayoutProto {
         block_size: DEFAULT_BLOCK_SIZE,
         chunk_size: DEFAULT_CHUNK_SIZE,
         replication: DEFAULT_REPLICATION,
+        block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
     }
 }
 

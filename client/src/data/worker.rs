@@ -702,6 +702,7 @@ fn build_open_write_stream_request(
         checksum_kind: proto::worker::ChecksumKindProto::ChecksumKindNone as i32,
         token: Some(target.target.fencing_token.into()),
         frame_size: default_frame_size(target.target.len.min(u64::from(u32::MAX)) as u32),
+        block_format_id: target.target.block_format_id.as_raw(),
     })
 }
 
@@ -1448,6 +1449,10 @@ mod tests {
         assert_eq!(request.block_size, 5);
         assert_eq!(request.block_stamp, 77);
         assert_eq!(request.chunk_size, 4096);
+        assert_eq!(
+            request.block_format_id,
+            types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw()
+        );
         assert_eq!(request.token.as_ref().map(|token| token.owner), Some(7));
     }
 
@@ -2083,6 +2088,7 @@ mod tests {
                 },
                 block_stamp: 77,
                 chunk_size: 4096,
+                block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
             },
         }
     }

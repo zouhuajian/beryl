@@ -77,11 +77,17 @@ message MountIdProto {
 // Common Data Structures
 // ============================================================================
 
-/// File layout parameters (aligned with types::layout::FileLayout).
+/// Metadata-owned logical layout for a file version or data handle.
+/// StoreBackend / IoEngine details are worker-local and are not encoded here.
 message FileLayoutProto {
   uint32 block_size = 1;
   uint32 chunk_size = 2;
+  // Target replica count. Current active writes require value 1.
   uint32 replication = 3;  // Note: proto3 doesn't support uint8, use uint32
+  // Metadata-selected Vecton block data/meta interpretation format. It is
+  // required for persisted and create-time layouts; unknown or missing values
+  // are rejected.
+  uint32 block_format_id = 4;
 }
 
 /// Block placement information (aligned with types::block::BlockPlacement).

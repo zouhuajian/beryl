@@ -271,11 +271,16 @@ pub fn file_attrs_from_proto(attrs: Option<proto::fs::FileAttrsProto>) -> Result
 
 pub fn file_layout_from_proto(layout: Option<proto::common::FileLayoutProto>) -> Result<FileLayout, MetadataError> {
     let layout = layout.ok_or_else(|| MetadataError::InvalidArgument("Missing FileLayout".to_string()))?;
-    Ok(FileLayout::new(
-        layout.block_size,
-        layout.chunk_size,
-        layout.replication as u8,
-    ))
+    FileLayout::try_from(layout).map_err(MetadataError::InvalidArgument)
+}
+
+pub fn validate_active_write_layout(layout: &FileLayout) -> Result<(), MetadataError> {
+    if layout.replication != 1 {
+        return Err(MetadataError::InvalidArgument(
+            "multi-replica write is not supported yet; replication must be 1".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn fatal_fs_header(

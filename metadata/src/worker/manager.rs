@@ -4,14 +4,14 @@
 //! Worker manager: tracks worker registration, heartbeat liveness, and block report locations.
 
 use crate::error::{MetadataError, MetadataResult};
+use crate::placement::{ReportedBlockLocation, WorkerPlacementView};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::warn;
-use types::block::BlockPlacement;
 use types::ids::{BlockId, ShardGroupId, WorkerId};
+use types::layout::BlockFormatId;
 use types::WorkerRunId;
 
 /// Worker descriptor (low-frequency, authoritative, persisted in Raft).
@@ -891,6 +891,87 @@ impl WorkerManager {
             .unwrap_or_default()
     }
 
+    /// Build the placement worker view from group-scoped registration and heartbeat state.
+    pub fn collect_worker_placement_views(&self, group_id: ShardGroupId) -> Vec<WorkerPlacementView> {
+        let descriptors = self.descriptors.read();
+        let registrations = self.registrations.read();
+        let runtime = self.runtime.read();
+        let now = Instant::now();
+        let timeout = self.heartbeat_timeout();
+
+        let mut views = Vec::new();
+        for (key, descriptor) in descriptors.iter().filter(|(key, _)| key.group_id == group_id) {
+            let registration = registrations.get(key);
+            let live = runtime.get(key);
+            let registered = registration.is_some();
+            let lease_valid = registration
+                .map(|registration| registration.lease_deadline > now)
+                .unwrap_or(false)
+                && live
+                    .map(|runtime| now.duration_since(runtime.last_seen_at) < timeout)
+                    .unwrap_or(false);
+            views.push(WorkerPlacementView {
+                group_id: key.group_id,
+                worker_id: key.worker_id,
+                worker_run_id: registration.map(|registration| registration.worker_run_id),
+                endpoint: descriptor.address.clone(),
+                worker_net_protocol: descriptor.worker_net_protocol,
+                worker_epoch: descriptor.worker_epoch,
+                registered,
+                lease_valid,
+                ip: endpoint_host(&descriptor.address),
+                host: endpoint_host(&descriptor.address),
+                az: None,
+                rack: descriptor.fault_domain.clone(),
+                region: None,
+                free_bytes: live.map(|runtime| runtime.capacity_available),
+                supported_block_formats: vec![BlockFormatId::CURRENT_FOR_NEW_FILE],
+            });
+        }
+        views.sort_by_key(|view| view.worker_id.as_raw());
+        views
+    }
+
+    /// Return ready block-report locations with the report's worker run id.
+    pub fn reported_block_locations(&self, group_id: ShardGroupId, block_id: BlockId) -> Vec<ReportedBlockLocation> {
+        let locations = self.locations.read();
+        let reports = self.block_reports.read();
+        let Some(worker_keys) = locations.get(&BlockLocationKey::new(group_id, block_id)) else {
+            return Vec::new();
+        };
+
+        let mut reported = Vec::with_capacity(worker_keys.len());
+        for key in worker_keys {
+            if key.group_id != group_id {
+                continue;
+            }
+            let Some(report) = reports.get(key) else {
+                continue;
+            };
+            if report.state != BlockReportState::Ready {
+                continue;
+            }
+            let Some(worker_run_id) = report.worker_run_id else {
+                continue;
+            };
+            let Some(block) = report.published_blocks.get(&block_id) else {
+                continue;
+            };
+            if block.block_state != BlockReportBlockState::Ready {
+                continue;
+            }
+            reported.push(ReportedBlockLocation {
+                group_id,
+                block_id,
+                block_stamp: block.block_stamp,
+                worker_id: key.worker_id,
+                worker_run_id,
+            });
+        }
+        reported.sort_by_key(|location| location.worker_id.as_raw());
+        reported
+    }
+
     /// Remove dead worker and clean up locations.
     /// Note: descriptor is kept (from Raft state), only runtime and presence are cleaned.
     pub fn remove_dead_worker(&self, group_id: ShardGroupId, worker_id: WorkerId) -> Vec<BlockId> {
@@ -926,153 +1007,6 @@ impl WorkerManager {
             .get(&WorkerRegistrationKey::new(group_id, worker_id))
             .cloned()
             .unwrap_or_default()
-    }
-
-    /// Select workers for block placement within one metadata group.
-    pub fn select_workers_for_placement_in_group(
-        &self,
-        group_id: ShardGroupId,
-        replication_factor: u8,
-        preferred_fault_domain: Option<String>,
-    ) -> MetadataResult<BlockPlacement> {
-        let live_workers = self.list_live_workers_in_group(group_id);
-
-        if live_workers.is_empty() {
-            return Err(MetadataError::ServiceUnavailable(format!(
-                "No live workers available for group_id={}",
-                group_id.as_raw()
-            )));
-        }
-
-        let mut candidates: Vec<(WorkerId, WorkerInfo, PlacementScore)> = live_workers
-            .iter()
-            .filter_map(|&id| {
-                self.get_worker(group_id, id).map(|w| {
-                    let score = self.calculate_placement_score(&w, &preferred_fault_domain);
-                    (id, w, score)
-                })
-            })
-            .collect();
-
-        candidates.sort_by(|a, b| b.2.cmp(&a.2));
-
-        let needed = replication_factor as usize;
-        let available_count = candidates.len();
-        if available_count < needed {
-            warn!(
-                group_id = group_id.as_raw(),
-                available = available_count,
-                needed,
-                "Not enough workers for replication factor"
-            );
-        }
-
-        let selected = self.select_with_fault_domain_distribution(&candidates, needed.min(available_count));
-
-        if selected.is_empty() {
-            return Err(MetadataError::ServiceUnavailable(format!(
-                "No suitable workers found for group_id={}",
-                group_id.as_raw()
-            )));
-        }
-
-        let primary = selected[0];
-        let replicas = selected[1..].to_vec();
-
-        Ok(BlockPlacement { primary, replicas })
-    }
-
-    /// Calculate placement score for a worker.
-    fn calculate_placement_score(
-        &self,
-        worker: &WorkerInfo,
-        preferred_fault_domain: &Option<String>,
-    ) -> PlacementScore {
-        // Base score from available capacity (normalized to 0-1000)
-        let capacity_score = if worker.capacity_total > 0 {
-            (worker.capacity_available * 1000 / worker.capacity_total.max(1)) as i64
-        } else {
-            0
-        };
-
-        // Load penalty: subtract points for high load
-        let load_penalty = {
-            let total_load = worker.active_reads + worker.active_writes;
-            // Penalty: -10 points per active operation (capped at -500)
-            (-(total_load as i64 * 10)).max(-500)
-        };
-
-        // Health bonus/penalty
-        let health_score = match worker.health {
-            HealthStatus::Healthy => 100,
-            HealthStatus::Degraded => 50,
-            HealthStatus::Unhealthy => -500,
-        };
-
-        // Fault domain bonus: prefer workers in preferred domain, but also distribute
-        let fault_domain_bonus =
-            if let (Some(ref preferred), Some(ref worker_domain)) = (preferred_fault_domain, &worker.fault_domain) {
-                if preferred == worker_domain {
-                    50 // Small bonus for preferred domain
-                } else {
-                    0
-                }
-            } else {
-                0
-            };
-
-        let total_score = capacity_score + load_penalty + health_score + fault_domain_bonus;
-
-        PlacementScore {
-            total: total_score,
-            _capacity: capacity_score,
-            _load_penalty: load_penalty,
-            _health: health_score,
-            _fault_domain_bonus: fault_domain_bonus,
-            fault_domain: worker.fault_domain.clone(),
-        }
-    }
-
-    /// Select workers with fault domain distribution.
-    fn select_with_fault_domain_distribution(
-        &self,
-        candidates: &[(WorkerId, WorkerInfo, PlacementScore)],
-        count: usize,
-    ) -> Vec<WorkerId> {
-        use std::collections::HashSet;
-
-        let mut selected = Vec::new();
-        let mut used_fault_domains = HashSet::new();
-
-        // First pass: try to select one worker from each fault domain
-        for (worker_id, _, score) in candidates.iter() {
-            if selected.len() >= count {
-                break;
-            }
-
-            // Get fault domain for this worker
-            let fault_domain = score.fault_domain.as_deref().unwrap_or("default");
-
-            // If we haven't used this fault domain yet, or we need more workers
-            if !used_fault_domains.contains(fault_domain) || selected.len() < count {
-                selected.push(*worker_id);
-                used_fault_domains.insert(fault_domain.to_string());
-            }
-        }
-
-        // Second pass: fill remaining slots with best available workers
-        if selected.len() < count {
-            for (worker_id, _, _) in candidates.iter() {
-                if selected.len() >= count {
-                    break;
-                }
-                if !selected.contains(worker_id) {
-                    selected.push(*worker_id);
-                }
-            }
-        }
-
-        selected
     }
 
     /// Get statistics.
@@ -1199,35 +1133,15 @@ impl WorkerManager {
     }
 }
 
-/// Placement score for worker selection.
-#[derive(Clone, Debug)]
-struct PlacementScore {
-    total: i64,
-    _capacity: i64,
-    _load_penalty: i64,
-    _health: i64,
-    _fault_domain_bonus: i64,
-    fault_domain: Option<String>,
-}
-
-impl PartialEq for PlacementScore {
-    fn eq(&self, other: &Self) -> bool {
-        self.total == other.total
-    }
-}
-
-impl Eq for PlacementScore {}
-
-impl PartialOrd for PlacementScore {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for PlacementScore {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.total.cmp(&other.total)
-    }
+fn endpoint_host(endpoint: &str) -> Option<String> {
+    let without_scheme = endpoint.rsplit_once("://").map(|(_, rest)| rest).unwrap_or(endpoint);
+    let host = without_scheme
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(without_scheme)
+        .trim_matches(['[', ']'])
+        .trim();
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 #[derive(Debug)]

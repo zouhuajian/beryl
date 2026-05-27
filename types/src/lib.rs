@@ -34,6 +34,7 @@ pub use ids::{
     BlockId, BlockIndex, CallId, ChunkId, ChunkIndex, ClientId, DataHandleId, LeaseId, MountId, RequestId,
     ShardGroupId, ShardId, StreamId, WorkerId,
 };
+pub use layout::{BlockFormatId, BlockFormatIdError, FileLayout, FileLayoutError};
 pub use location::{CommittedBlock, FileBlockLocation, WriteTarget};
 pub use raft_log_id::RaftLogId;
 pub use worker::{WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId};

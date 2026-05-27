@@ -56,6 +56,9 @@ message WriteTargetProto {
   uint64 block_stamp = 6;
   // Metadata-selected chunk size for the worker-local block format.
   uint32 chunk_size = 7;
+  // Metadata-selected Vecton block data/meta interpretation format for this target.
+  // StoreBackend / IoEngine selection remains worker-local.
+  uint32 block_format_id = 8;
 }
 
 message CommittedBlockProto {

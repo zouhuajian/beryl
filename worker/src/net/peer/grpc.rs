@@ -157,6 +157,7 @@ mod tests {
                         block_stamp: 1,
                         frame_size: 1024,
                         block_size: 4096,
+                        block_format_id: types::BlockFormatId::FULL_EFFECTIVE,
                         chunk_size: 1024,
                         checksum_kind: ChecksumKind::None,
                     },

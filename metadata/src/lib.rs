@@ -59,6 +59,7 @@ pub mod maintenance;
 pub(crate) mod metrics;
 pub mod mount;
 pub mod path_resolver;
+pub mod placement;
 pub mod raft;
 pub(crate) mod raft_conv;
 pub mod readiness;

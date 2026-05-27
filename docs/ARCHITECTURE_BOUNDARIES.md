@@ -16,6 +16,20 @@ These rules do not replace local `AGENTS.md` files. If a subtree has a stricter 
 - `ufs` must not depend on `metadata`, `worker`, or `client`.
 - `integration_tests` may depend on production crates to validate end-to-end contracts, but must not become a source of shared production helpers.
 
+## Block Layout, Format, and Store Backend Boundaries
+
+Vecton block storage has three separate layers:
+
+| Layer | Owner | Contract |
+| --- | --- | --- |
+| `FileLayout` | `metadata` | Logical file-version or data-handle layout: `block_size`, `chunk_size`, `replication`, and `block_format_id`. Current active writes require `replication == 1`; durable multi-replica write is future work. |
+| `BlockFormat` | `metadata` selects, `worker` persists | Vecton block data/meta interpretation format. Workers persist it in `BlockMeta` together with block size, chunk size, checksum kind, effective length, state, and block stamp. Recovery and local reads interpret blocks from persisted `BlockMeta`, not runtime defaults. |
+| `StoreBackend` / `IoEngine` | `worker` | Worker-local execution implementation such as filesystem IO, mmap, SPDK, memory, or another engine. Metadata must not inspect or control it. |
+
+SPDK is a worker `StoreBackend` / `IoEngine`, not a `BlockFormatId`. The same `BlockFormat` may run on different engines, and one engine may support multiple formats.
+
+Current placement scope is foundation-only: `PlacementPlanner` may plan read, load, write, and repair candidates, but production `GetBlockLocations` does not perform metadata-side read placement. Read placement must be integrated separately from reported locations, and direct worker validation must reject any conflict between expected `FileLayout` and persisted worker `BlockMeta` instead of falling back in either direction.
+
 ## Shared Module Ownership
 
 ### `common`

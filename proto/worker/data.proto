@@ -119,6 +119,10 @@ message OpenWriteStreamRequestProto {
   // Client-preferred transport frame payload size in bytes.
   // This is not the worker-local StorageChunk size.
   uint32 frame_size = 9;
+
+  // Metadata-selected Vecton block data/meta interpretation format.
+  // StoreBackend / IoEngine selection is worker-local and is not encoded here.
+  uint32 block_format_id = 10;
 }
 
 message OpenWriteStreamResponseProto {

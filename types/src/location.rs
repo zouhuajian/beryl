@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ids::BlockId;
+use crate::layout::BlockFormatId;
 use crate::lease::FencingToken;
 use crate::worker::WorkerEndpointInfo;
 
@@ -19,6 +20,8 @@ pub struct WriteTarget {
     pub fencing_token: FencingToken,
     pub block_stamp: u64,
     pub chunk_size: u32,
+    /// Metadata-selected Vecton block data/meta interpretation format.
+    pub block_format_id: BlockFormatId,
 }
 
 /// Metadata commit payload for one worker-published block.

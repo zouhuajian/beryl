@@ -68,6 +68,74 @@ pub struct CallerContext {
     pub signature: Option<Vec<u8>>,
 }
 
+pub const CALLER_CONTEXT_IP: &str = "ip";
+pub const CALLER_CONTEXT_HOST: &str = "host";
+pub const CALLER_CONTEXT_AZ: &str = "az";
+pub const CALLER_CONTEXT_RACK: &str = "rack";
+pub const CALLER_CONTEXT_REGION: &str = "region";
+
+/// Parsed caller locality fields from `CallerContext.context`.
+///
+/// These fields are diagnostic and locality hints only. They are not
+/// authenticated and must not be used as an authorization or fencing boundary.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CallerContextFields {
+    ip: Option<String>,
+    host: Option<String>,
+    az: Option<String>,
+    rack: Option<String>,
+    region: Option<String>,
+}
+
+impl CallerContextFields {
+    pub fn from_caller_context(context: &CallerContext) -> Self {
+        Self::parse(&context.context)
+    }
+
+    pub fn parse(context: &str) -> Self {
+        let mut fields = Self::default();
+        for pair in context.split(',') {
+            let Some((key, value)) = pair.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            let value = value.trim();
+            if key.is_empty() || value.is_empty() {
+                continue;
+            }
+            match key {
+                CALLER_CONTEXT_IP if fields.ip.is_none() => fields.ip = Some(value.to_string()),
+                CALLER_CONTEXT_HOST if fields.host.is_none() => fields.host = Some(value.to_string()),
+                CALLER_CONTEXT_AZ if fields.az.is_none() => fields.az = Some(value.to_string()),
+                CALLER_CONTEXT_RACK if fields.rack.is_none() => fields.rack = Some(value.to_string()),
+                CALLER_CONTEXT_REGION if fields.region.is_none() => fields.region = Some(value.to_string()),
+                _ => {}
+            }
+        }
+        fields
+    }
+
+    pub fn ip(&self) -> Option<&str> {
+        self.ip.as_deref()
+    }
+
+    pub fn host(&self) -> Option<&str> {
+        self.host.as_deref()
+    }
+
+    pub fn az(&self) -> Option<&str> {
+        self.az.as_deref()
+    }
+
+    pub fn rack(&self) -> Option<&str> {
+        self.rack.as_deref()
+    }
+
+    pub fn region(&self) -> Option<&str> {
+        self.region.as_deref()
+    }
+}
+
 /// Authentication type marker for request identity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AuthnType {

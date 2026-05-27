@@ -22,6 +22,7 @@ use types::chunk::ByteRange;
 use types::ids::{
     BlockId, BlockIndex, ChunkId, ChunkIndex, DataHandleId, LeaseId, MountId, ShardGroupId, ShardId, StreamId, WorkerId,
 };
+use types::layout::FileLayout;
 use types::lease::FencingToken;
 use types::{
     CallId, ClientId, CommittedBlock, FileAttrs, FileBlockLocation, GroupStateWatermark, InodeKind, RaftLogId,
@@ -226,6 +227,39 @@ impl From<&proto_common::ByteRangeProto> for ByteRange {
 impl From<proto_common::ByteRangeProto> for ByteRange {
     fn from(range: proto_common::ByteRangeProto) -> Self {
         ByteRange::from(&range)
+    }
+}
+
+impl TryFrom<proto_common::FileLayoutProto> for FileLayout {
+    type Error = String;
+
+    fn try_from(layout: proto_common::FileLayoutProto) -> Result<Self, Self::Error> {
+        let replication =
+            u8::try_from(layout.replication).map_err(|_| "FileLayoutProto.replication does not fit u8".to_string())?;
+        let block_format_id = types::layout::BlockFormatId::from_raw(layout.block_format_id)
+            .map_err(|err| format!("FileLayoutProto.block_format_id invalid: {err}"))?;
+        let layout = FileLayout::with_block_format(layout.block_size, layout.chunk_size, replication, block_format_id);
+        layout
+            .validate()
+            .map_err(|err| format!("FileLayoutProto invalid: {err}"))?;
+        Ok(layout)
+    }
+}
+
+impl From<&FileLayout> for proto_common::FileLayoutProto {
+    fn from(layout: &FileLayout) -> Self {
+        Self {
+            block_size: layout.block_size,
+            chunk_size: layout.chunk_size,
+            replication: u32::from(layout.replication),
+            block_format_id: layout.block_format_id.as_raw(),
+        }
+    }
+}
+
+impl From<FileLayout> for proto_common::FileLayoutProto {
+    fn from(layout: FileLayout) -> Self {
+        Self::from(&layout)
     }
 }
 
@@ -438,6 +472,8 @@ impl TryFrom<proto_metadata::WriteTargetProto> for WriteTarget {
         if target.chunk_size == 0 {
             return Err("WriteTargetProto.chunk_size must be non-zero".to_string());
         }
+        let block_format_id = types::layout::BlockFormatId::from_raw(target.block_format_id)
+            .map_err(|err| format!("WriteTargetProto.block_format_id invalid: {err}"))?;
         let block_id = required_block_id(target.block_id, "WriteTargetProto.block_id")?;
         let fencing_token = required_fencing_token(target.fencing_token, "WriteTargetProto.fencing_token")?;
         if fencing_token.block_id != block_id {
@@ -459,6 +495,7 @@ impl TryFrom<proto_metadata::WriteTargetProto> for WriteTarget {
             fencing_token,
             block_stamp: target.block_stamp,
             chunk_size: target.chunk_size,
+            block_format_id,
         })
     }
 }
@@ -473,6 +510,7 @@ impl From<&WriteTarget> for proto_metadata::WriteTargetProto {
             fencing_token: Some(target.fencing_token.into()),
             block_stamp: target.block_stamp,
             chunk_size: target.chunk_size,
+            block_format_id: target.block_format_id.as_raw(),
         }
     }
 }
@@ -487,6 +525,7 @@ impl From<WriteTarget> for proto_metadata::WriteTargetProto {
             fencing_token: Some(target.fencing_token.into()),
             block_stamp: target.block_stamp,
             chunk_size: target.chunk_size,
+            block_format_id: target.block_format_id.as_raw(),
         }
     }
 }
@@ -1290,6 +1329,37 @@ mod tests {
     }
 
     #[test]
+    fn file_layout_proto_roundtrip_preserves_block_format_id() {
+        let layout =
+            types::layout::FileLayout::with_block_format(4096, 1024, 1, types::layout::BlockFormatId::FULL_EFFECTIVE);
+
+        let proto: proto_common::FileLayoutProto = layout.into();
+        assert_eq!(proto.block_format_id, 1);
+        let decoded = types::layout::FileLayout::try_from(proto).expect("layout decodes");
+
+        assert_eq!(decoded, layout);
+    }
+
+    #[test]
+    fn file_layout_proto_rejects_missing_or_unknown_block_format_id() {
+        let missing = proto_common::FileLayoutProto {
+            block_size: 4096,
+            chunk_size: 1024,
+            replication: 1,
+            block_format_id: 0,
+        };
+        let err = types::layout::FileLayout::try_from(missing).expect_err("missing format must fail");
+        assert!(err.contains("block_format_id"));
+
+        let unknown = proto_common::FileLayoutProto {
+            block_format_id: 99,
+            ..missing
+        };
+        let err = types::layout::FileLayout::try_from(unknown).expect_err("unknown format must fail");
+        assert!(err.contains("block_format_id"));
+    }
+
+    #[test]
     fn inode_kind_proto_converts_to_domain_inode_kind() {
         let cases = [
             (crate::fs::InodeKindProto::InodeKindFile, types::InodeKind::File),
@@ -1490,6 +1560,7 @@ mod tests {
             fencing_token: Some(token.into()),
             block_stamp: 55,
             chunk_size: 1024,
+            block_format_id: types::layout::BlockFormatId::FULL_EFFECTIVE.as_raw(),
         };
         let err = types::WriteTarget::try_from(target.clone()).expect_err("empty target workers must fail");
         assert!(err.contains("worker_endpoints"));
@@ -1536,10 +1607,24 @@ mod tests {
             fencing_token: token,
             block_stamp: 55,
             chunk_size: 1024,
+            block_format_id: types::layout::BlockFormatId::FULL_EFFECTIVE,
         };
         let decoded_target = types::WriteTarget::try_from(proto_metadata::WriteTargetProto::from(target.clone()))
             .expect("write target decodes");
         assert_eq!(decoded_target, target);
+
+        let missing_format = proto_metadata::WriteTargetProto {
+            block_id: Some(block_id.into()),
+            file_offset: 128,
+            len: 4096,
+            worker_endpoints: vec![endpoint.clone().into()],
+            fencing_token: Some(token.into()),
+            block_stamp: 55,
+            chunk_size: 1024,
+            block_format_id: 0,
+        };
+        let err = types::WriteTarget::try_from(missing_format).expect_err("missing format id must fail");
+        assert!(err.contains("block_format_id"));
 
         let committed = types::CommittedBlock {
             block_id,

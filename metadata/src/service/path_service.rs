@@ -20,7 +20,7 @@ use super::MsyncHandler;
 use super::{
     fencing_to_proto, file_attrs_from_proto, file_attrs_to_proto, file_layout_from_proto, header_from_canonical_error,
     header_from_core_failure, lease_id_from_proto, lease_id_to_proto, location_to_proto, ok_header_from_core_success,
-    presented_fencing_from_proto, request_context_from_proto, write_target_to_proto,
+    presented_fencing_from_proto, request_context_from_proto, validate_active_write_layout, write_target_to_proto,
 };
 use super::{FsCore, PermissionBits, PermissionChecker, SharedWorkerCommitHook};
 use crate::error::{to_canonical_fs, MetadataError};
@@ -1077,6 +1077,12 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                             )
                         }
                     };
+                    if let Err(err) = validate_active_write_layout(&layout) {
+                        return error_response!(
+                            CreateFileResponseProto,
+                            self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx))
+                        );
+                    }
                     let parent_inode_id = match resolved.expect_parent() {
                         Ok(parent_inode_id) => parent_inode_id,
                         Err(err) => {
@@ -1173,6 +1179,12 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     )
                 }
             };
+            if let Err(err) = validate_active_write_layout(&layout) {
+                return error_response!(
+                    CreateFileResponseProto,
+                    self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx))
+                );
+            }
             let parent_inode_id = match resolved.expect_parent() {
                 Ok(parent_inode_id) => parent_inode_id,
                 Err(err) => {

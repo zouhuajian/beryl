@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use types::ids::{BlockId, ShardGroupId};
+use types::layout::{BlockFormatId, FileLayout};
 
 use super::meta_codec::{
     decode_meta_payload, decode_staging_meta_payload, encode_meta_payload, encode_staging_meta_payload,
@@ -23,10 +24,6 @@ const BLOCK_META_MAGIC: [u8; 8] = *b"VBLKMETA";
 const BLOCK_META_HEADER_LEN: usize = 24;
 const BLOCK_META_VERSION: u32 = 1;
 const MAX_META_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
-
-// Supported local block file format identifiers.
-
-const BLOCK_FORMAT_FULL_EFFECTIVE: u32 = 1;
 
 /// Fixed little-endian header for a block metadata file.
 /// The header identifies the format and bounds the serialized payload.
@@ -130,11 +127,15 @@ pub struct BlockIdentity {
     pub group_id: ShardGroupId,
 }
 
-/// On-disk format parameters used to interpret this block.
+/// On-disk Vecton block data/meta interpretation parameters.
+///
+/// These fields are persisted in BlockMeta so recovery and local reads interpret
+/// historical blocks from their own metadata, not from the worker's current
+/// StoreBackend / IoEngine configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockFormat {
     /// Identifier of the block file format used by this block.
-    pub format_id: u32,
+    pub format_id: BlockFormatId,
     /// Maximum logical size of this block.
     pub block_size: u64,
     /// StorageChunk size used for local buffering and future data checksums.
@@ -194,8 +195,18 @@ pub struct CreateStagingBlockRequest {
     pub block_id: BlockId,
     /// Maximum logical size for this block's local format.
     pub block_size: u64,
+    /// Metadata-selected Vecton block data/meta interpretation format.
+    pub block_format_id: BlockFormatId,
     pub chunk_size: u32,
     pub checksum_kind: ChecksumKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpectedBlockShape {
+    pub group_id: ShardGroupId,
+    pub block_id: BlockId,
+    pub block_stamp: Option<u64>,
+    pub layout: FileLayout,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -245,7 +256,7 @@ impl FullBlockFileStore {
     /// Creates an unpublished staging block.
     /// This does not create final `.meta` and does not make the block readable.
     pub fn create_staging_block(&self, req: CreateStagingBlockRequest) -> StoreResult<BlockMetaPayload> {
-        validate_create_block_shape(req.block_size, req.chunk_size)?;
+        validate_create_block_shape(req.block_format_id, req.block_size, req.chunk_size)?;
 
         let paths = self.paths(req.group_id, req.block_id);
         let parent = paths.parent_dir()?;
@@ -286,7 +297,7 @@ impl FullBlockFileStore {
                 group_id: req.group_id,
             },
             format: BlockFormat {
-                format_id: BLOCK_FORMAT_FULL_EFFECTIVE,
+                format_id: req.block_format_id,
                 block_size: req.block_size,
                 chunk_size: u64::from(req.chunk_size),
                 checksum_kind: req.checksum_kind,
@@ -807,7 +818,10 @@ fn validate_meta_payload_shape(meta: &BlockMetaPayload, group_id: ShardGroupId, 
     if meta.identity.block_id != block_id {
         return Err(corrupt("block meta block id does not match path"));
     }
-    if meta.format.format_id != BLOCK_FORMAT_FULL_EFFECTIVE {
+    if let Err(err) = BlockFormatId::from_raw(meta.format.format_id.as_raw()) {
+        return Err(corrupt(err.to_string()));
+    }
+    if meta.format.format_id != BlockFormatId::FULL_EFFECTIVE {
         return Err(corrupt("unsupported block format id"));
     }
     if meta.format.checksum_kind != ChecksumKind::None {
@@ -821,7 +835,37 @@ fn validate_meta_payload_shape(meta: &BlockMetaPayload, group_id: ShardGroupId, 
     Ok(())
 }
 
-fn validate_create_block_shape(block_size: u64, chunk_size: u32) -> StoreResult<()> {
+pub fn validate_expected_block_shape(expected: &ExpectedBlockShape, actual: &BlockMetaPayload) -> StoreResult<()> {
+    if expected.group_id != actual.identity.group_id {
+        return Err(invalid_argument("block group_id does not match expected layout"));
+    }
+    if expected.block_id != actual.identity.block_id {
+        return Err(invalid_argument("block_id does not match expected layout"));
+    }
+    if expected.layout.block_format_id != actual.format.format_id {
+        return Err(invalid_argument("block_format_id does not match expected layout"));
+    }
+    if u64::from(expected.layout.block_size) != actual.format.block_size {
+        return Err(invalid_argument("block_size does not match expected layout"));
+    }
+    if u64::from(expected.layout.chunk_size) != actual.format.chunk_size {
+        return Err(invalid_argument("chunk_size does not match expected layout"));
+    }
+    if let Some(block_stamp) = expected.block_stamp {
+        if block_stamp != actual.visibility.block_stamp {
+            return Err(invalid_argument("block_stamp does not match expected layout"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_create_block_shape(block_format_id: BlockFormatId, block_size: u64, chunk_size: u32) -> StoreResult<()> {
+    if block_format_id != BlockFormatId::FULL_EFFECTIVE {
+        return Err(invalid_argument(format!(
+            "unsupported block_format_id {}",
+            block_format_id.as_raw()
+        )));
+    }
     validate_block_shape(block_size, u64::from(chunk_size), block_size, invalid_argument)
 }
 
@@ -1060,6 +1104,7 @@ mod tests {
             group_id,
             block_id,
             block_size,
+            block_format_id: BlockFormatId::FULL_EFFECTIVE,
             chunk_size,
             checksum_kind: ChecksumKind::None,
         }
@@ -1109,6 +1154,16 @@ mod tests {
     fn assert_invalid_argument<T: std::fmt::Debug>(result: Result<T, WorkerError>) {
         match result.expect_err("operation should fail") {
             WorkerError::InvalidArgument(_) => {}
+            other => panic!("expected invalid argument error, got {other:?}"),
+        }
+    }
+
+    fn assert_invalid_argument_contains<T: std::fmt::Debug>(result: Result<T, WorkerError>, expected: &str) {
+        match result.expect_err("operation should fail") {
+            WorkerError::InvalidArgument(message) => assert!(
+                message.contains(expected),
+                "expected invalid argument containing {expected:?}, got {message:?}"
+            ),
             other => panic!("expected invalid argument error, got {other:?}"),
         }
     }
@@ -1186,7 +1241,7 @@ mod tests {
         BlockMetaPayload {
             identity: BlockIdentity { block_id, group_id },
             format: BlockFormat {
-                format_id: BLOCK_FORMAT_FULL_EFFECTIVE,
+                format_id: BlockFormatId::FULL_EFFECTIVE,
                 block_size: 4096,
                 chunk_size: 1024,
                 checksum_kind: ChecksumKind::None,
@@ -1198,6 +1253,66 @@ mod tests {
                 block_state: BlockState::Ready,
                 block_stamp: 99,
             },
+        }
+    }
+
+    fn expected_shape(group_id: ShardGroupId, block_id: BlockId, block_stamp: Option<u64>) -> ExpectedBlockShape {
+        ExpectedBlockShape {
+            group_id,
+            block_id,
+            block_stamp,
+            layout: types::layout::FileLayout::new(4096, 1024, 1),
+        }
+    }
+
+    #[test]
+    fn validate_expected_block_shape_accepts_matching_file_layout_and_block_meta() {
+        let (group_id, block_id) = ids();
+        let meta = ready_meta(group_id, block_id);
+        let expected = expected_shape(group_id, block_id, Some(99));
+
+        validate_expected_block_shape(&expected, &meta).expect("matching shape must pass");
+    }
+
+    #[test]
+    fn validate_expected_block_shape_rejects_layout_meta_conflicts() {
+        let (group_id, block_id) = ids();
+        let meta = ready_meta(group_id, block_id);
+
+        let cases = [
+            (
+                "block_size",
+                ExpectedBlockShape {
+                    layout: types::layout::FileLayout::new(8192, 1024, 1),
+                    ..expected_shape(group_id, block_id, Some(99))
+                },
+            ),
+            (
+                "chunk_size",
+                ExpectedBlockShape {
+                    layout: types::layout::FileLayout::new(4096, 2048, 1),
+                    ..expected_shape(group_id, block_id, Some(99))
+                },
+            ),
+            ("block_stamp", expected_shape(group_id, block_id, Some(100))),
+            (
+                "group_id",
+                ExpectedBlockShape {
+                    group_id: ShardGroupId::new(group_id.as_raw() + 1),
+                    ..expected_shape(group_id, block_id, Some(99))
+                },
+            ),
+            (
+                "block_id",
+                ExpectedBlockShape {
+                    block_id: BlockId::new(block_id.data_handle_id, BlockIndex::new(block_id.index.as_raw() + 1)),
+                    ..expected_shape(group_id, block_id, Some(99))
+                },
+            ),
+        ];
+
+        for (name, expected) in cases {
+            assert_invalid_argument_contains(validate_expected_block_shape(&expected, &meta), name);
         }
     }
 
@@ -1359,6 +1474,12 @@ mod tests {
         replace_field_payload(&encoded, 2, &format)
     }
 
+    fn protobuf_payload_with_format_id(meta: &BlockMetaPayload, format_id: u32) -> Vec<u8> {
+        let encoded = valid_payload(meta);
+        let format = replace_varint_field(&field_payload(&encoded, 2), 1, u64::from(format_id));
+        replace_field_payload(&encoded, 2, &format)
+    }
+
     #[test]
     fn meta_payload_round_trip_uses_protobuf() {
         let (group_id, block_id) = ids();
@@ -1398,6 +1519,7 @@ mod tests {
         assert_eq!(meta.visibility.block_state, BlockState::Loading);
         assert_eq!(meta.visibility.block_stamp, 0);
         assert_eq!(meta.source.effective_block_len, 8 * MB);
+        assert_eq!(meta.format.format_id, BlockFormatId::FULL_EFFECTIVE);
         assert_eq!(meta.format.block_size, 8 * MB);
         assert_eq!(meta.format.chunk_size, MB);
         assert_eq!(meta.format.checksum_kind, ChecksumKind::None);
@@ -1492,6 +1614,7 @@ mod tests {
                 group_id,
                 block_id,
                 block_size: 4096,
+                block_format_id: BlockFormatId::FULL_EFFECTIVE,
                 chunk_size: 1024,
                 checksum_kind: ChecksumKind::None,
             })
@@ -1891,9 +2014,7 @@ mod tests {
 
         let cases = [
             ("unsupported format_id", {
-                let mut invalid = valid.clone();
-                invalid.format.format_id = BLOCK_FORMAT_FULL_EFFECTIVE + 1;
-                encode_meta_payload(&invalid).expect("encode unsupported format")
+                protobuf_payload_with_format_id(&valid, BlockFormatId::FULL_EFFECTIVE.as_raw() + 1)
             }),
             ("zero block_size", {
                 let mut invalid = valid.clone();
