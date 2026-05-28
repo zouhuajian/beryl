@@ -57,10 +57,11 @@ pub struct StreamContext {
     /// Block-local readable committed prefix length.
     /// This is not the sum of ready chunks.
     pub committed_length: u64,
-    /// Final Ready block length read from local metadata.
+    /// Block-local valid length for reads, or the full write bound before commit.
+    ///
+    /// Write commits publish their final valid length through
+    /// `CommitWriteRequest.effective_block_len`.
     pub effective_block_len: u64,
-    /// Worker-local StorageChunk size for this block.
-    pub chunk_size: u32,
     /// Fencing token bound during write open. Read streams do not carry one.
     pub fencing_token: Option<FencingToken>,
 }
@@ -95,9 +96,6 @@ pub struct ReadOpenResult {
     /// Block-local readable committed prefix length.
     /// This is not the sum of ready chunks.
     pub committed_length: u64,
-    /// Worker-local StorageChunk size.
-    /// This is the IO/checksum/valid-bitmap granularity, not a transport frame size.
-    pub chunk_size: u32,
 }
 
 /// Open-write request in worker core terms.
@@ -111,6 +109,10 @@ pub struct WriteOpenRequest {
     pub block_stamp: u64,
     /// Requested transport frame payload size, not the worker-local StorageChunk size.
     pub frame_size: u32,
+    /// Full logical block size from the persisted FileLayout.
+    ///
+    /// The worker persists this value in BlockMeta.format.block_size. Tail or
+    /// bounded valid length is carried later by CommitWrite.effective_block_len.
     pub block_size: u64,
     /// Metadata-selected Vecton block data/meta interpretation format.
     pub block_format_id: BlockFormatId,
@@ -131,9 +133,6 @@ pub struct WriteOpenResult {
     /// Published effective length reported to the caller.
     /// For a newly opened staging block this is zero until CommitWrite publishes Ready metadata.
     pub committed_length: u64,
-    /// Worker-local StorageChunk size.
-    /// This is the IO/checksum/valid-bitmap granularity, not a transport frame size.
-    pub chunk_size: u32,
 }
 
 /// Transport payload returned by a read stream.
@@ -286,14 +285,12 @@ pub struct WorkerCore {
     stream_manager: Arc<StreamManager>,
     block_manager: Arc<BlockManager>,
     block_store: Arc<dyn LocalBlockStore + Send + Sync>,
-    default_chunk_size: u32,
     next_stream_seq: Arc<AtomicU64>,
 }
 
 impl WorkerCore {
-    pub fn new(chunk_size: u32) -> Self {
+    pub fn new() -> Self {
         Self::with_options(
-            chunk_size,
             BlockManager::DEFAULT_FRAME_SIZE,
             BlockManager::MAX_FRAME_SIZE,
             BlockManager::DEFAULT_WINDOW_BYTES,
@@ -303,7 +300,6 @@ impl WorkerCore {
     }
 
     pub fn with_options(
-        chunk_size: u32,
         default_frame_size: u32,
         max_frame_size: u32,
         window_bytes: u32,
@@ -312,7 +308,6 @@ impl WorkerCore {
     ) -> Self {
         let block_store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(storage_root)));
         Self::with_local_store(
-            chunk_size,
             default_frame_size,
             max_frame_size,
             window_bytes,
@@ -322,7 +317,6 @@ impl WorkerCore {
     }
 
     pub fn with_local_store(
-        chunk_size: u32,
         default_frame_size: u32,
         max_frame_size: u32,
         window_bytes: u32,
@@ -334,13 +328,8 @@ impl WorkerCore {
             stream_manager: Arc::new(StreamManager::new(stream_idle_timeout)),
             block_manager,
             block_store,
-            default_chunk_size: chunk_size,
             next_stream_seq: Arc::new(AtomicU64::new(1)),
         }
-    }
-
-    pub fn chunk_size(&self) -> u32 {
-        self.default_chunk_size
     }
 
     pub fn default_frame_size(&self) -> u32 {
@@ -381,7 +370,6 @@ impl WorkerCore {
             block_stamp: snapshot.block_stamp,
             committed_length: snapshot.effective_block_len,
             effective_block_len: snapshot.effective_block_len,
-            chunk_size: snapshot.chunk_size,
             fencing_token: None,
         };
         self.stream_manager.register(StreamState::new(context)).await;
@@ -392,7 +380,6 @@ impl WorkerCore {
             window_bytes: self.window_bytes(),
             block_stamp: snapshot.block_stamp,
             committed_length: snapshot.effective_block_len,
-            chunk_size: snapshot.chunk_size,
         })
     }
 
@@ -423,7 +410,6 @@ impl WorkerCore {
             block_stamp: req.block_stamp,
             committed_length: 0,
             effective_block_len: req.block_size,
-            chunk_size: req.chunk_size,
             fencing_token: Some(req.token),
         };
         self.stream_manager.register(StreamState::new(context)).await;
@@ -434,7 +420,6 @@ impl WorkerCore {
             window_bytes: self.window_bytes(),
             block_stamp: req.block_stamp,
             committed_length: 0,
-            chunk_size: req.chunk_size,
         })
     }
 
@@ -569,7 +554,7 @@ impl WorkerCore {
             .offset_in_block
             .checked_add(len)
             .ok_or_else(|| WorkerError::InvalidArgument("write frame offset overflow".to_string()))?;
-        if written_through > state.context.effective_block_len {
+        if written_through > state.context.end_offset {
             return Ok(rejected_write_frame(&state));
         }
 
@@ -636,6 +621,12 @@ impl WorkerCore {
     }
 }
 
+impl Default for WorkerCore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn validate_write_open_request(req: &WriteOpenRequest) -> WorkerCoreResult<()> {
     validate_fencing_token_shape(req.block_id, req.token)?;
     if req.block_stamp == 0 {
@@ -666,6 +657,11 @@ fn validate_block_format(
     if chunk_size == 0 {
         return Err(WorkerError::InvalidArgument(
             "chunk_size must be greater than zero".to_string(),
+        ));
+    }
+    if u64::from(chunk_size) > block_size {
+        return Err(WorkerError::InvalidArgument(
+            "chunk_size must not exceed block_size".to_string(),
         ));
     }
     if !block_size.is_multiple_of(u64::from(chunk_size)) {
@@ -734,10 +730,10 @@ fn validate_commit_request(state: &StreamState, req: &CommitWriteRequest) -> Wor
             "effective_block_len must be greater than zero".to_string(),
         ));
     }
-    if req.effective_block_len > state.context.effective_block_len {
+    if req.effective_block_len > state.context.end_offset {
         return Err(WorkerError::InvalidArgument(format!(
             "effective_block_len exceeds block_size: requested={}, block_size={}",
-            req.effective_block_len, state.context.effective_block_len
+            req.effective_block_len, state.context.end_offset
         )));
     }
     if state.cursor != req.effective_block_len {

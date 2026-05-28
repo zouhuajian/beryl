@@ -8,6 +8,9 @@ use std::sync::Arc;
 use super::{FsIoEngine, IoResult, IoUringIoEngine, LocalIoEngine, SpdkIoEngine};
 
 /// Worker-local I/O engine kind selection.
+///
+/// These values select local byte execution only. `Fs`, `IoUring`, and `Spdk`
+/// are not block formats and must not be represented as `BlockFormatId`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LocalIoKind {
     /// File system I/O.

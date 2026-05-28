@@ -663,9 +663,19 @@ fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> 
             "write target block_id data_handle_id must be non-zero".to_string(),
         ));
     }
-    if target.target.len == 0 {
+    if target.target.block_size == 0 {
         return Err(ClientError::InvalidLayout(
-            "write target len must be non-zero".to_string(),
+            "write target block_size must be non-zero".to_string(),
+        ));
+    }
+    if target.target.effective_block_len == 0 {
+        return Err(ClientError::InvalidLayout(
+            "write target effective_block_len must be non-zero".to_string(),
+        ));
+    }
+    if target.target.effective_block_len > target.target.block_size {
+        return Err(ClientError::InvalidLayout(
+            "write target effective_block_len must not exceed block_size".to_string(),
         ));
     }
     if target.target.worker_endpoints.is_empty() {
@@ -683,6 +693,20 @@ fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> 
             "write target chunk_size must be non-zero".to_string(),
         ));
     }
+    if u64::from(target.target.chunk_size) > target.target.block_size {
+        return Err(ClientError::InvalidLayout(
+            "write target chunk_size must not exceed block_size".to_string(),
+        ));
+    }
+    if !target
+        .target
+        .block_size
+        .is_multiple_of(u64::from(target.target.chunk_size))
+    {
+        return Err(ClientError::InvalidLayout(
+            "write target block_size must be a multiple of chunk_size".to_string(),
+        ));
+    }
     validate_fencing_token(&target.target)?;
     Ok(())
 }
@@ -696,12 +720,12 @@ fn build_open_write_stream_request(
         header: Some(ctx.data_header()),
         group_id: Some(ShardGroupId::new(target.group_id).into()),
         block_id: Some(target.target.block_id.into()),
-        block_size: target.target.len,
+        block_size: target.target.block_size,
         block_stamp: target.target.block_stamp,
         chunk_size: target.target.chunk_size,
         checksum_kind: proto::worker::ChecksumKindProto::ChecksumKindNone as i32,
         token: Some(target.target.fencing_token.into()),
-        frame_size: default_frame_size(target.target.len.min(u64::from(u32::MAX)) as u32),
+        frame_size: default_frame_size(target.target.effective_block_len.min(u64::from(u32::MAX)) as u32),
         block_format_id: target.target.block_format_id.as_raw(),
     })
 }
@@ -1446,7 +1470,7 @@ mod tests {
 
         assert_eq!(request.group_id.as_ref().map(|group| group.value), Some(9));
         assert_eq!(request.block_id.as_ref().map(|block| block.data_handle_id), Some(202));
-        assert_eq!(request.block_size, 5);
+        assert_eq!(request.block_size, 4096);
         assert_eq!(request.block_stamp, 77);
         assert_eq!(request.chunk_size, 4096);
         assert_eq!(
@@ -2079,7 +2103,8 @@ mod tests {
             target: WriteTarget {
                 block_id: BlockId::new(DataHandleId::new(202), BlockIndex::new(0)),
                 file_offset: 0,
-                len: 5,
+                block_size: 4096,
+                effective_block_len: 5,
                 worker_endpoints: vec![worker_endpoint()],
                 fencing_token: FencingToken {
                     block_id: BlockId::new(DataHandleId::new(202), BlockIndex::new(0)),

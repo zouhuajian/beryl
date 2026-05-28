@@ -76,7 +76,6 @@ impl WorkerDataService for MockWorkerServer {
             window_bytes: 0,
             block_stamp: 0,
             committed_length: 0,
-            chunk_size: 0,
         }))
     }
 
@@ -101,7 +100,6 @@ impl WorkerDataService for MockWorkerServer {
             window_bytes: 0,
             block_stamp: 0,
             committed_length: 0,
-            chunk_size: 0,
         }))
     }
 

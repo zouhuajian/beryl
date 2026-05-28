@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use types::ids::{BlockId, ShardGroupId};
-use types::layout::{BlockFormatId, FileLayout};
+use types::layout::BlockFormatId;
 
 use super::meta_codec::{
     decode_meta_payload, decode_staging_meta_payload, encode_meta_payload, encode_staging_meta_payload,
@@ -136,7 +136,10 @@ pub struct BlockIdentity {
 pub struct BlockFormat {
     /// Identifier of the block file format used by this block.
     pub format_id: BlockFormatId,
-    /// Maximum logical size of this block.
+    /// Full logical block size from the persisted FileLayout.
+    ///
+    /// Tail or bounded valid length is stored in
+    /// `BlockSource.effective_block_len`, not by shrinking this field.
     pub block_size: u64,
     /// StorageChunk size used for local buffering and future data checksums.
     /// This is not a transport frame size.
@@ -193,7 +196,7 @@ impl FullBlockFileStoreConfig {
 pub struct CreateStagingBlockRequest {
     pub group_id: ShardGroupId,
     pub block_id: BlockId,
-    /// Maximum logical size for this block's local format.
+    /// Full logical block size from the persisted FileLayout.
     pub block_size: u64,
     /// Metadata-selected Vecton block data/meta interpretation format.
     pub block_format_id: BlockFormatId,
@@ -205,8 +208,13 @@ pub struct CreateStagingBlockRequest {
 pub struct ExpectedBlockShape {
     pub group_id: ShardGroupId,
     pub block_id: BlockId,
+    pub block_format_id: BlockFormatId,
+    /// Expected full logical block size persisted in BlockMeta.format.block_size.
+    pub block_size: u64,
+    pub chunk_size: u32,
     pub block_stamp: Option<u64>,
-    pub layout: FileLayout,
+    /// Optional expected valid block length persisted in BlockMeta.source.effective_block_len.
+    pub effective_block_len: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -657,20 +665,12 @@ impl LocalBlockStore for FullBlockFileStore {
 ///
 /// The concrete local format lives in FullBlockFileStore and remains
 /// detached from upper worker services until wired explicitly.
-#[derive(Clone, Debug)]
-pub struct BlockStore {
-    /// Worker-local StorageChunk size.
-    /// This is the local buffering unit, not a transport frame size.
-    chunk_size: u32,
-}
+#[derive(Clone, Debug, Default)]
+pub struct BlockStore;
 
 impl BlockStore {
-    pub const fn new(chunk_size: u32) -> Self {
-        Self { chunk_size }
-    }
-
-    pub const fn chunk_size(&self) -> u32 {
-        self.chunk_size
+    pub const fn new() -> Self {
+        Self
     }
 
     /// Read at a block-local offset.
@@ -837,23 +837,28 @@ fn validate_meta_payload_shape(meta: &BlockMetaPayload, group_id: ShardGroupId, 
 
 pub fn validate_expected_block_shape(expected: &ExpectedBlockShape, actual: &BlockMetaPayload) -> StoreResult<()> {
     if expected.group_id != actual.identity.group_id {
-        return Err(invalid_argument("block group_id does not match expected layout"));
+        return Err(invalid_argument("block group_id does not match expected shape"));
     }
     if expected.block_id != actual.identity.block_id {
-        return Err(invalid_argument("block_id does not match expected layout"));
+        return Err(invalid_argument("block_id does not match expected shape"));
     }
-    if expected.layout.block_format_id != actual.format.format_id {
-        return Err(invalid_argument("block_format_id does not match expected layout"));
+    if expected.block_format_id != actual.format.format_id {
+        return Err(invalid_argument("block_format_id does not match expected shape"));
     }
-    if u64::from(expected.layout.block_size) != actual.format.block_size {
-        return Err(invalid_argument("block_size does not match expected layout"));
+    if expected.block_size != actual.format.block_size {
+        return Err(invalid_argument("block_size does not match expected shape"));
     }
-    if u64::from(expected.layout.chunk_size) != actual.format.chunk_size {
-        return Err(invalid_argument("chunk_size does not match expected layout"));
+    if u64::from(expected.chunk_size) != actual.format.chunk_size {
+        return Err(invalid_argument("chunk_size does not match expected shape"));
     }
     if let Some(block_stamp) = expected.block_stamp {
         if block_stamp != actual.visibility.block_stamp {
-            return Err(invalid_argument("block_stamp does not match expected layout"));
+            return Err(invalid_argument("block_stamp does not match expected shape"));
+        }
+    }
+    if let Some(effective_block_len) = expected.effective_block_len {
+        if effective_block_len != actual.source.effective_block_len {
+            return Err(invalid_argument("effective_block_len does not match expected shape"));
         }
     }
     Ok(())
@@ -887,6 +892,9 @@ fn validate_block_shape(
     }
     if chunk_size > u64::from(u32::MAX) {
         return Err(error("chunk size does not fit block metadata format".to_string()));
+    }
+    if chunk_size > block_size {
+        return Err(error("chunk size must not exceed block size".to_string()));
     }
     if !block_size.is_multiple_of(chunk_size) {
         return Err(error("block size must be a multiple of chunk size".to_string()));
@@ -1260,13 +1268,26 @@ mod tests {
         ExpectedBlockShape {
             group_id,
             block_id,
+            block_format_id: BlockFormatId::FULL_EFFECTIVE,
+            block_size: 4096,
+            chunk_size: 1024,
             block_stamp,
-            layout: types::layout::FileLayout::new(4096, 1024, 1),
+            effective_block_len: None,
         }
     }
 
+    fn unknown_block_format_id() -> BlockFormatId {
+        let raw = BlockFormatId::FULL_EFFECTIVE.as_raw() + 1;
+        assert!(BlockFormatId::from_raw(raw).is_err());
+        // SAFETY: BlockFormatId is repr(transparent) over u32. This test-only
+        // helper intentionally builds an invalid domain value to exercise the
+        // expected-vs-actual mismatch branch without adding a production escape
+        // hatch around BlockFormatId::from_raw.
+        unsafe { std::mem::transmute::<u32, BlockFormatId>(raw) }
+    }
+
     #[test]
-    fn validate_expected_block_shape_accepts_matching_file_layout_and_block_meta() {
+    fn validate_expected_block_shape_accepts_matching_block_local_shape() {
         let (group_id, block_id) = ids();
         let meta = ready_meta(group_id, block_id);
         let expected = expected_shape(group_id, block_id, Some(99));
@@ -1275,7 +1296,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_expected_block_shape_rejects_layout_meta_conflicts() {
+    fn validate_expected_block_shape_accepts_tail_effective_length_with_full_block_size() {
+        let (group_id, block_id) = ids();
+        let meta = ready_meta(group_id, block_id);
+        let expected = ExpectedBlockShape {
+            effective_block_len: Some(3072),
+            ..expected_shape(group_id, block_id, Some(99))
+        };
+
+        validate_expected_block_shape(&expected, &meta).expect("tail effective length must pass");
+    }
+
+    #[test]
+    fn validate_expected_block_shape_rejects_shape_meta_conflicts() {
         let (group_id, block_id) = ids();
         let meta = ready_meta(group_id, block_id);
 
@@ -1283,14 +1316,28 @@ mod tests {
             (
                 "block_size",
                 ExpectedBlockShape {
-                    layout: types::layout::FileLayout::new(8192, 1024, 1),
+                    block_size: 8192,
+                    ..expected_shape(group_id, block_id, Some(99))
+                },
+            ),
+            (
+                "effective_block_len",
+                ExpectedBlockShape {
+                    effective_block_len: Some(2048),
                     ..expected_shape(group_id, block_id, Some(99))
                 },
             ),
             (
                 "chunk_size",
                 ExpectedBlockShape {
-                    layout: types::layout::FileLayout::new(4096, 2048, 1),
+                    chunk_size: 2048,
+                    ..expected_shape(group_id, block_id, Some(99))
+                },
+            ),
+            (
+                "block_format_id",
+                ExpectedBlockShape {
+                    block_format_id: unknown_block_format_id(),
                     ..expected_shape(group_id, block_id, Some(99))
                 },
             ),
@@ -1632,6 +1679,8 @@ mod tests {
             .expect("publish ready");
 
         let loaded = store.load_meta(group_id, block_id).expect("load meta");
+        assert_eq!(loaded.format.block_size, 4096);
+        assert_eq!(loaded.source.effective_block_len, 3072);
         assert_eq!(loaded.visibility.block_stamp, 0xfeed_cafe);
     }
 
@@ -1744,15 +1793,18 @@ mod tests {
         store
             .create_staging_block(request(group_id, block_id, 32 * MB, MB as u32))
             .expect("create staging block");
-        let data = Bytes::from(vec![3; (4 * MB) as usize]);
+        let data = Bytes::from(vec![3; (4 * MB + 1) as usize]);
 
         store.write_at(group_id, block_id, 0, data).expect("write");
         store
-            .publish_ready(publish_request(group_id, block_id, 4 * MB, 1))
+            .publish_ready(publish_request(group_id, block_id, 4 * MB + 1, 1))
             .expect("publish");
 
         let paths = store.paths(group_id, block_id);
-        assert_eq!(fs::metadata(paths.data_path).expect("data metadata").len(), 4 * MB);
+        let loaded = store.load_meta(group_id, block_id).expect("load meta");
+        assert_eq!(loaded.format.block_size, 32 * MB);
+        assert_eq!(loaded.source.effective_block_len, 4 * MB + 1);
+        assert_eq!(fs::metadata(paths.data_path).expect("data metadata").len(), 4 * MB + 1);
     }
 
     #[test]

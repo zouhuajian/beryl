@@ -70,10 +70,6 @@ message OpenReadStreamResponseProto {
   // Block-local readable committed prefix length in bytes.
   // This is not the sum of ready chunks.
   uint64 committed_length = 6;
-
-  // Worker-local StorageChunk size in bytes for this block/store format.
-  // Diagnostic only; not negotiated by Stream Open.
-  uint32 chunk_size = 7;
 }
 
 message ReadStreamRequestProto {
@@ -99,30 +95,32 @@ message OpenWriteStreamRequestProto {
   // Target block. Writes are block-local.
   common.BlockIdProto block_id = 3;
 
-  // Metadata-assigned maximum logical size for this block.
-  uint64 block_size = 4;
+  // Metadata-issued expected Vecton block data/meta interpretation format.
+  // StoreBackend / IoEngine selection is worker-local and is not encoded here.
+  uint32 block_format_id = 4;
 
-  // Metadata-assigned logical block stamp to publish on commit.
-  // Must be non-zero for write streams.
-  uint64 block_stamp = 5;
+  // Full logical block size for this block format, from the persisted
+  // FileLayout. This value is persisted in worker BlockMeta.format.block_size.
+  // Tail length is carried separately through CommitWrite.effective_block_len.
+  uint64 block_size = 5;
 
-  // Metadata-assigned StorageChunk size for this block.
+  // Metadata-issued StorageChunk size for this block format.
   uint32 chunk_size = 6;
 
   // StorageChunk checksum algorithm for this local block.
   worker.ChecksumKindProto checksum_kind = 7;
 
+  // Metadata-assigned logical block stamp to publish on commit.
+  // Must be non-zero for write streams.
+  uint64 block_stamp = 8;
+
   // Required fencing token issued by metadata.
   // Worker must reject stale writers before accepting data frames.
-  common.FencingTokenProto token = 8;
+  common.FencingTokenProto token = 9;
 
   // Client-preferred transport frame payload size in bytes.
   // This is not the worker-local StorageChunk size.
-  uint32 frame_size = 9;
-
-  // Metadata-selected Vecton block data/meta interpretation format.
-  // StoreBackend / IoEngine selection is worker-local and is not encoded here.
-  uint32 block_format_id = 10;
+  uint32 frame_size = 10;
 }
 
 message OpenWriteStreamResponseProto {
@@ -146,10 +144,6 @@ message OpenWriteStreamResponseProto {
 
   // Block-local readable committed prefix length in bytes.
   uint64 committed_length = 6;
-
-  // Worker-local StorageChunk size in bytes for this block/store format.
-  // Diagnostic only; not negotiated by Stream Open.
-  uint32 chunk_size = 7;
 }
 
 message WriteStreamRequestProto {

@@ -15,7 +15,16 @@ use crate::worker::WorkerEndpointInfo;
 pub struct WriteTarget {
     pub block_id: BlockId,
     pub file_offset: u64,
-    pub len: u64,
+    /// Full logical block size from the persisted `FileLayout`.
+    ///
+    /// Workers persist this value in `BlockMeta.format.block_size`.
+    pub block_size: u64,
+    /// Valid length for this block target.
+    ///
+    /// It is normally equal to `block_size` for full blocks and may be smaller
+    /// for tail or bounded blocks. Workers publish this as
+    /// `BlockMeta.source.effective_block_len`.
+    pub effective_block_len: u64,
     pub worker_endpoints: Vec<WorkerEndpointInfo>,
     pub fencing_token: FencingToken,
     pub block_stamp: u64,

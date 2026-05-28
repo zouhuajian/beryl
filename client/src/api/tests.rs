@@ -3,7 +3,7 @@
 
 //! Focused unit tests for the public API facade and client runtime behavior.
 
-use super::fs_client::DEFAULT_CHUNK_SIZE;
+use super::fs_client::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE};
 use super::handle::ReadHandle;
 use super::*;
 use crate::canonical::{ClientAction, RefreshHint};
@@ -1149,7 +1149,8 @@ fn write_target(data_handle_id: u64, block_index: u32, file_offset: u64, len: u6
     WriteTarget {
         block_id,
         file_offset,
-        len,
+        block_size: DEFAULT_BLOCK_SIZE.into(),
+        effective_block_len: len,
         worker_endpoints: vec![worker_endpoint()],
         fencing_token: FencingToken::new(block_id, ClientId::new(7), 1),
         block_stamp: 1,

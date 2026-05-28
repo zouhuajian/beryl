@@ -12,6 +12,7 @@ use thiserror::Error;
 /// block format on filesystem, mmap, SPDK, or another local engine, but metadata
 /// only sees the stable format capability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(transparent)]
 #[serde(transparent)]
 pub struct BlockFormatId(u32);
 
@@ -46,8 +47,10 @@ pub struct BlockFormatIdError {
 /// Metadata-owned logical layout for a file version or data handle.
 ///
 /// `block_size`, `chunk_size`, `replication`, and `block_format_id` are chosen
-/// by metadata and then carried to worker writes. Current active writes require
-/// `replication == 1`; larger target counts are reserved for durable
+/// by metadata for new blocks of this file version and then carried to worker
+/// writes. `block_format_id` is not a worker StoreBackend or IoEngine. Current
+/// FULL_EFFECTIVE writes require `block_size` to be a multiple of `chunk_size`
+/// and `replication == 1`; larger target counts are reserved for durable
 /// multi-replica write support.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FileLayout {
@@ -86,6 +89,9 @@ impl FileLayout {
         }
         if self.chunk_size > self.block_size {
             return Err(FileLayoutError::ChunkLargerThanBlock);
+        }
+        if !self.block_size.is_multiple_of(self.chunk_size) {
+            return Err(FileLayoutError::BlockSizeNotChunkAligned);
         }
         if self.replication == 0 {
             return Err(FileLayoutError::ZeroReplication);
@@ -204,6 +210,8 @@ pub enum FileLayoutError {
     ZeroChunkSize,
     #[error("chunk_size must not exceed block_size")]
     ChunkLargerThanBlock,
+    #[error("block_size must be a multiple of chunk_size")]
+    BlockSizeNotChunkAligned,
     #[error("replication must be at least one")]
     ZeroReplication,
     #[error("{0}")]

@@ -460,8 +460,14 @@ impl TryFrom<proto_metadata::WriteTargetProto> for WriteTarget {
     type Error = String;
 
     fn try_from(target: proto_metadata::WriteTargetProto) -> Result<Self, Self::Error> {
-        if target.len == 0 {
-            return Err("WriteTargetProto.len must be non-zero".to_string());
+        if target.block_size == 0 {
+            return Err("WriteTargetProto.block_size must be non-zero".to_string());
+        }
+        if target.effective_block_len == 0 {
+            return Err("WriteTargetProto.effective_block_len must be non-zero".to_string());
+        }
+        if target.effective_block_len > target.block_size {
+            return Err("WriteTargetProto.effective_block_len must not exceed block_size".to_string());
         }
         if target.worker_endpoints.is_empty() {
             return Err("WriteTargetProto.worker_endpoints must not be empty".to_string());
@@ -471,6 +477,12 @@ impl TryFrom<proto_metadata::WriteTargetProto> for WriteTarget {
         }
         if target.chunk_size == 0 {
             return Err("WriteTargetProto.chunk_size must be non-zero".to_string());
+        }
+        if u64::from(target.chunk_size) > target.block_size {
+            return Err("WriteTargetProto.chunk_size must not exceed block_size".to_string());
+        }
+        if !target.block_size.is_multiple_of(u64::from(target.chunk_size)) {
+            return Err("WriteTargetProto.block_size must be a multiple of chunk_size".to_string());
         }
         let block_format_id = types::layout::BlockFormatId::from_raw(target.block_format_id)
             .map_err(|err| format!("WriteTargetProto.block_format_id invalid: {err}"))?;
@@ -490,7 +502,8 @@ impl TryFrom<proto_metadata::WriteTargetProto> for WriteTarget {
         Ok(Self {
             block_id,
             file_offset: target.file_offset,
-            len: target.len,
+            block_size: target.block_size,
+            effective_block_len: target.effective_block_len,
             worker_endpoints,
             fencing_token,
             block_stamp: target.block_stamp,
@@ -505,12 +518,13 @@ impl From<&WriteTarget> for proto_metadata::WriteTargetProto {
         Self {
             block_id: Some(target.block_id.into()),
             file_offset: target.file_offset,
-            len: target.len,
+            effective_block_len: target.effective_block_len,
             worker_endpoints: target.worker_endpoints.iter().map(Into::into).collect(),
             fencing_token: Some(target.fencing_token.into()),
             block_stamp: target.block_stamp,
             chunk_size: target.chunk_size,
             block_format_id: target.block_format_id.as_raw(),
+            block_size: target.block_size,
         }
     }
 }
@@ -520,12 +534,13 @@ impl From<WriteTarget> for proto_metadata::WriteTargetProto {
         Self {
             block_id: Some(target.block_id.into()),
             file_offset: target.file_offset,
-            len: target.len,
+            effective_block_len: target.effective_block_len,
             worker_endpoints: target.worker_endpoints.into_iter().map(Into::into).collect(),
             fencing_token: Some(target.fencing_token.into()),
             block_stamp: target.block_stamp,
             chunk_size: target.chunk_size,
             block_format_id: target.block_format_id.as_raw(),
+            block_size: target.block_size,
         }
     }
 }
@@ -1360,6 +1375,166 @@ mod tests {
     }
 
     #[test]
+    fn block_contract_proto_fields_are_normalized() {
+        let common_proto = include_str!("../common/common.proto");
+        assert_eq!(
+            proto_message_fields(common_proto, "FileLayoutProto"),
+            vec![
+                ("uint32", "block_size", 1),
+                ("uint32", "chunk_size", 2),
+                ("uint32", "replication", 3),
+                ("uint32", "block_format_id", 4),
+            ]
+        );
+
+        let metadata_proto = include_str!("../metadata/filesystem.proto");
+        assert_eq!(
+            proto_message_fields(metadata_proto, "WriteTargetProto"),
+            vec![
+                ("common.BlockIdProto", "block_id", 1),
+                ("uint64", "file_offset", 2),
+                ("uint32", "block_format_id", 3),
+                ("uint64", "block_size", 4),
+                ("uint32", "chunk_size", 5),
+                ("uint64", "block_stamp", 6),
+                ("uint64", "effective_block_len", 7),
+                ("common.WorkerEndpointInfoProto", "worker_endpoints", 8),
+                ("common.FencingTokenProto", "fencing_token", 9),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(metadata_proto, "FileBlockLocationProto"),
+            vec![
+                ("common.BlockIdProto", "block_id", 1),
+                ("uint64", "file_offset", 2),
+                ("uint64", "len", 3),
+                ("common.WorkerEndpointInfoProto", "workers", 4),
+                ("uint64", "worker_epoch", 5),
+                ("uint64", "block_stamp", 6),
+            ]
+        );
+
+        let worker_data_proto = include_str!("../worker/data.proto");
+        assert_eq!(
+            proto_message_fields(worker_data_proto, "OpenReadStreamRequestProto"),
+            vec![
+                ("worker.DataRequestHeaderProto", "header", 1),
+                ("common.ShardGroupIdProto", "group_id", 2),
+                ("common.BlockIdProto", "block_id", 3),
+                ("common.ByteRangeProto", "byte_range", 4),
+                ("uint64", "block_stamp", 5),
+                ("uint32", "frame_size", 6),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(worker_data_proto, "OpenReadStreamResponseProto"),
+            vec![
+                ("worker.DataResponseHeaderProto", "header", 1),
+                ("common.StreamIdProto", "stream_id", 2),
+                ("uint32", "frame_size", 3),
+                ("uint32", "window_bytes", 4),
+                ("uint64", "block_stamp", 5),
+                ("uint64", "committed_length", 6),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(worker_data_proto, "OpenWriteStreamRequestProto"),
+            vec![
+                ("worker.DataRequestHeaderProto", "header", 1),
+                ("common.ShardGroupIdProto", "group_id", 2),
+                ("common.BlockIdProto", "block_id", 3),
+                ("uint32", "block_format_id", 4),
+                ("uint64", "block_size", 5),
+                ("uint32", "chunk_size", 6),
+                ("worker.ChecksumKindProto", "checksum_kind", 7),
+                ("uint64", "block_stamp", 8),
+                ("common.FencingTokenProto", "token", 9),
+                ("uint32", "frame_size", 10),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(worker_data_proto, "OpenWriteStreamResponseProto"),
+            vec![
+                ("worker.DataResponseHeaderProto", "header", 1),
+                ("common.StreamIdProto", "stream_id", 2),
+                ("uint32", "frame_size", 3),
+                ("uint32", "window_bytes", 4),
+                ("uint64", "block_stamp", 5),
+                ("uint64", "committed_length", 6),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(worker_data_proto, "CommitWriteRequestProto"),
+            vec![
+                ("worker.DataRequestHeaderProto", "header", 1),
+                ("common.ShardGroupIdProto", "group_id", 2),
+                ("common.BlockIdProto", "block_id", 3),
+                ("common.StreamIdProto", "stream_id", 4),
+                ("uint64", "effective_block_len", 5),
+                ("uint64", "block_stamp", 6),
+                ("common.FencingTokenProto", "token", 7),
+                ("uint64", "commit_seq", 8),
+                ("bool", "require_sync", 9),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(worker_data_proto, "CommitWriteResponseProto"),
+            vec![
+                ("worker.DataResponseHeaderProto", "header", 1),
+                ("uint64", "effective_block_len", 2),
+                ("uint64", "block_stamp", 3),
+                ("uint64", "written_through", 4),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(worker_data_proto, "SyncCommittedBlockRequestProto"),
+            vec![
+                ("worker.DataRequestHeaderProto", "header", 1),
+                ("common.ShardGroupIdProto", "group_id", 2),
+                ("common.BlockIdProto", "block_id", 3),
+                ("uint64", "block_stamp", 4),
+                ("uint64", "expected_block_len", 5),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(worker_data_proto, "SyncCommittedBlockResponseProto"),
+            vec![
+                ("worker.DataResponseHeaderProto", "header", 1),
+                ("uint64", "effective_block_len", 2),
+                ("uint64", "block_stamp", 3),
+            ]
+        );
+
+        let block_meta_proto = include_str!("../worker/block_meta.proto");
+        assert_eq!(
+            proto_message_fields(block_meta_proto, "BlockMetaPayloadProto"),
+            vec![
+                ("BlockIdentityProto", "identity", 1),
+                ("BlockFormatProto", "format", 2),
+                ("BlockSourceProto", "source", 3),
+                ("BlockVisibilityProto", "visibility", 4),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(block_meta_proto, "BlockFormatProto"),
+            vec![
+                ("uint32", "format_id", 1),
+                ("uint64", "block_size", 2),
+                ("uint32", "chunk_size", 3),
+                ("ChecksumKindProto", "checksum_kind", 4),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(block_meta_proto, "BlockSourceProto"),
+            vec![("uint64", "effective_block_len", 1)]
+        );
+        assert_eq!(
+            proto_message_fields(block_meta_proto, "BlockVisibilityProto"),
+            vec![("BlockStateProto", "block_state", 1), ("uint64", "block_stamp", 2)]
+        );
+    }
+
+    #[test]
     fn inode_kind_proto_converts_to_domain_inode_kind() {
         let cases = [
             (crate::fs::InodeKindProto::InodeKindFile, types::InodeKind::File),
@@ -1555,12 +1730,13 @@ mod tests {
         let mut target = proto_metadata::WriteTargetProto {
             block_id: Some(block_id.into()),
             file_offset: 128,
-            len: 4096,
+            effective_block_len: 4096,
             worker_endpoints: Vec::new(),
             fencing_token: Some(token.into()),
             block_stamp: 55,
             chunk_size: 1024,
             block_format_id: types::layout::BlockFormatId::FULL_EFFECTIVE.as_raw(),
+            block_size: 4096,
         };
         let err = types::WriteTarget::try_from(target.clone()).expect_err("empty target workers must fail");
         assert!(err.contains("worker_endpoints"));
@@ -1602,7 +1778,8 @@ mod tests {
         let target = types::WriteTarget {
             block_id,
             file_offset: 128,
-            len: 4096,
+            block_size: 4096,
+            effective_block_len: 3072,
             worker_endpoints: vec![endpoint.clone()],
             fencing_token: token,
             block_stamp: 55,
@@ -1616,12 +1793,13 @@ mod tests {
         let missing_format = proto_metadata::WriteTargetProto {
             block_id: Some(block_id.into()),
             file_offset: 128,
-            len: 4096,
+            effective_block_len: 4096,
             worker_endpoints: vec![endpoint.clone().into()],
             fencing_token: Some(token.into()),
             block_stamp: 55,
             chunk_size: 1024,
             block_format_id: 0,
+            block_size: 4096,
         };
         let err = types::WriteTarget::try_from(missing_format).expect_err("missing format id must fail");
         assert!(err.contains("block_format_id"));
@@ -1649,5 +1827,42 @@ mod tests {
             types::FileBlockLocation::try_from(proto_metadata::FileBlockLocationProto::from(location.clone()))
                 .expect("file block location decodes");
         assert_eq!(decoded_location, location);
+    }
+
+    fn proto_message_fields<'a>(source: &'a str, message: &str) -> Vec<(&'a str, &'a str, u32)> {
+        proto_message_body(source, message)
+            .lines()
+            .filter_map(|raw_line| {
+                let line = raw_line.split_once("//").map_or(raw_line, |(field, _)| field).trim();
+                if line.is_empty() || line.starts_with("reserved") || !line.ends_with(';') {
+                    return None;
+                }
+
+                let field = line.trim_end_matches(';');
+                let (left, tag) = field.split_once(" = ")?;
+                let mut left_parts = left.split_whitespace();
+                let first = left_parts.next()?;
+                let (ty, name) = if matches!(first, "optional" | "repeated") {
+                    (left_parts.next()?, left_parts.next()?)
+                } else {
+                    (first, left_parts.next()?)
+                };
+                assert!(left_parts.next().is_none(), "unexpected proto field modifier: {line}");
+                Some((ty, name, tag.parse().expect("numeric proto tag")))
+            })
+            .collect()
+    }
+
+    fn proto_message_body<'a>(source: &'a str, message: &str) -> &'a str {
+        let start = format!("message {message} {{");
+        let start_index = source
+            .find(&start)
+            .unwrap_or_else(|| panic!("missing proto message {message}"));
+        let body_start = start_index + start.len();
+        let body_end = source[body_start..]
+            .find("\n}")
+            .map(|offset| body_start + offset)
+            .unwrap_or_else(|| panic!("unterminated proto message {message}"));
+        &source[body_start..body_end]
     }
 }

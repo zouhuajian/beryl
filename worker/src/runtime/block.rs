@@ -17,7 +17,6 @@ pub struct ReadBlockSnapshot {
     pub block_id: BlockId,
     pub effective_block_len: u64,
     pub block_stamp: u64,
-    pub chunk_size: u32,
 }
 
 /// Block-level facade for open and commit decisions.
@@ -117,14 +116,11 @@ impl BlockManager {
             )));
         }
 
-        let chunk_size = u32::try_from(meta.format.chunk_size)
-            .map_err(|_| WorkerError::Corrupt("block chunk size does not fit u32".to_string()))?;
         Ok(ReadBlockSnapshot {
             group_id: req.group_id,
             block_id: req.block_id,
             effective_block_len: meta.source.effective_block_len,
             block_stamp: meta.visibility.block_stamp,
-            chunk_size,
         })
     }
 

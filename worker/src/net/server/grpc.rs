@@ -147,7 +147,6 @@ impl WorkerDataService for WorkerDataServiceImpl {
                 window_bytes: 0,
                 block_stamp: 0,
                 committed_length: 0,
-                chunk_size: self.core.chunk_size(),
             }));
         }
         let response = match proto_to_read_open_request(request) {
@@ -159,7 +158,6 @@ impl WorkerDataService for WorkerDataServiceImpl {
                     window_bytes: result.window_bytes,
                     block_stamp: result.block_stamp,
                     committed_length: result.committed_length,
-                    chunk_size: result.chunk_size,
                 },
                 Err(error) => OpenReadStreamResponseProto {
                     header: Some(Self::error_response_header(header, error)),
@@ -168,7 +166,6 @@ impl WorkerDataService for WorkerDataServiceImpl {
                     window_bytes: 0,
                     block_stamp: 0,
                     committed_length: 0,
-                    chunk_size: self.core.chunk_size(),
                 },
             },
             Err(error) => OpenReadStreamResponseProto {
@@ -178,7 +175,6 @@ impl WorkerDataService for WorkerDataServiceImpl {
                 window_bytes: 0,
                 block_stamp: 0,
                 committed_length: 0,
-                chunk_size: self.core.chunk_size(),
             },
         };
 
@@ -224,7 +220,6 @@ impl WorkerDataService for WorkerDataServiceImpl {
                 window_bytes: 0,
                 block_stamp: 0,
                 committed_length: 0,
-                chunk_size: self.core.chunk_size(),
             }));
         }
         let response = match proto_to_write_open_request(request) {
@@ -236,7 +231,6 @@ impl WorkerDataService for WorkerDataServiceImpl {
                     window_bytes: result.window_bytes,
                     block_stamp: result.block_stamp,
                     committed_length: result.committed_length,
-                    chunk_size: result.chunk_size,
                 },
                 Err(error) => OpenWriteStreamResponseProto {
                     header: Some(Self::error_response_header(header, error)),
@@ -245,7 +239,6 @@ impl WorkerDataService for WorkerDataServiceImpl {
                     window_bytes: 0,
                     block_stamp: 0,
                     committed_length: 0,
-                    chunk_size: self.core.chunk_size(),
                 },
             },
             Err(error) => OpenWriteStreamResponseProto {
@@ -255,7 +248,6 @@ impl WorkerDataService for WorkerDataServiceImpl {
                 window_bytes: 0,
                 block_stamp: 0,
                 committed_length: 0,
-                chunk_size: self.core.chunk_size(),
             },
         };
 

@@ -98,7 +98,8 @@ fn worker_refresh_hint_from_session(
 struct PlannedWriteTarget {
     block_id: BlockId,
     file_offset: u64,
-    len: u64,
+    block_size: u64,
+    effective_block_len: u64,
     worker_endpoints: Vec<WorkerEndpointInfo>,
 }
 
@@ -698,8 +699,8 @@ impl<'a> WriteSessionCoordinator<'a> {
         if let Err(err) = validate_active_write_layout(&layout) {
             return self.core.failure_from_error(&req.ctx, err, group_id, mount_epoch);
         }
-        let block_size = u64::from(layout.block_size).max(1);
-        let chunk_size = layout.chunk_size.max(1);
+        let block_size = u64::from(layout.block_size);
+        let chunk_size = layout.chunk_size;
         let current_file_version = match &inode.data {
             types::fs::InodeData::File { file_version, .. } => *file_version,
             _ => None,
@@ -754,7 +755,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             let block_index = BlockIndex::new(start_index + i as u32);
             let block_id = BlockId::new(data_handle_id, block_index);
             let file_offset = base_size + i * block_size;
-            let len = desired_len.saturating_sub(i * block_size).min(block_size).max(1);
+            let effective_block_len = desired_len.saturating_sub(i * block_size).min(block_size).max(1);
             let placement = planner.plan(
                 &PlacementRequest {
                     group_id: placement_group_id,
@@ -809,7 +810,8 @@ impl<'a> WriteSessionCoordinator<'a> {
             planned_targets.push(PlannedWriteTarget {
                 block_id,
                 file_offset,
-                len,
+                block_size,
+                effective_block_len,
                 worker_endpoints,
             });
         }
@@ -856,16 +858,42 @@ impl<'a> WriteSessionCoordinator<'a> {
                 owner: caller_ctx.client.client_id,
                 epoch: lease_epoch,
             };
-            write_targets.push(WriteTarget {
+            let target = WriteTarget {
                 block_id,
                 file_offset: planned.file_offset,
-                len: planned.len,
+                block_size: planned.block_size,
+                effective_block_len: planned.effective_block_len,
                 worker_endpoints: planned.worker_endpoints,
                 fencing_token: target_token,
                 block_stamp,
                 chunk_size,
                 block_format_id: layout.block_format_id,
-            });
+            };
+            if target.effective_block_len == 0 || target.effective_block_len > target.block_size {
+                return self.core.failure_from_error(
+                    &req.ctx,
+                    MetadataError::InvalidArgument(format!(
+                        "invalid write target length: effective_block_len={}, block_size={}",
+                        target.effective_block_len, target.block_size
+                    )),
+                    group_id,
+                    mount_epoch,
+                );
+            }
+            if target.block_size != block_size
+                || target.chunk_size != layout.chunk_size
+                || target.block_format_id != layout.block_format_id
+            {
+                return self.core.failure_from_error(
+                    &req.ctx,
+                    MetadataError::InvalidArgument(
+                        "write target shape does not match persisted FileLayout".to_string(),
+                    ),
+                    group_id,
+                    mount_epoch,
+                );
+            }
+            write_targets.push(target);
         }
 
         let session_token = FencingToken {
@@ -1095,7 +1123,7 @@ impl<'a> WriteSessionCoordinator<'a> {
     ) -> MetadataResult<Vec<Extent>> {
         let mut issued = HashMap::with_capacity(session.issued_targets.len());
         for target in &session.issued_targets {
-            issued.insert(target.block_id, (target.file_offset, target.len));
+            issued.insert(target.block_id, (target.file_offset, target.effective_block_len));
         }
 
         let mut seen = HashSet::with_capacity(intent.committed_blocks.len());
@@ -1618,7 +1646,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             };
 
         let desired_len = desired_len.unwrap_or(4 * 1024 * 1024);
-        let block_size = (layout.block_size as u64).max(1);
+        let block_size = u64::from(layout.block_size);
         let num_blocks = desired_len.div_ceil(block_size).clamp(1, 10);
         let placement_views = worker_manager.collect_worker_placement_views(placement_group_id);
         let caller = req_ctx

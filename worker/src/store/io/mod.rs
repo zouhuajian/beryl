@@ -2,6 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
 //! Worker-local I/O engine abstraction for file and device I/O.
+//!
+//! An I/O engine controls how bytes are read and written locally. It does not
+//! define Vecton block interpretation, wire schema, placement policy, or
+//! `BlockFormatId`. The same persistent block format can be executed through
+//! filesystem I/O, io_uring, SPDK, or another worker-local engine as long as
+//! the stored `BlockMeta` and block payload interpretation are unchanged.
 
 mod config;
 mod fs;
@@ -44,6 +50,8 @@ pub enum IoError {
 ///
 /// This is an implementation detail below the store boundary. WorkerCore must
 /// continue to depend on LocalBlockStore rather than selecting an I/O engine.
+/// Metadata placement sees supported block formats only, not these execution
+/// internals.
 #[async_trait]
 pub trait LocalIoEngine: Send + Sync {
     /// Write all data to a file at the given path.

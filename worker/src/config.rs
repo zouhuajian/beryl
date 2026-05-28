@@ -66,9 +66,6 @@ pub struct WorkerConfig {
     /// Per-stream application-level in-flight byte window.
     /// This is independent from protocol-native flow control.
     pub window_bytes: u32,
-    /// Worker-local StorageChunk size.
-    /// This is the IO/checksum/valid-bitmap granularity, not a transport frame size.
-    pub chunk_size: u32,
     /// Idle timeout for runtime stream state.
     pub stream_idle_timeout_ms: u64,
     /// Root for worker-local block storage.
@@ -90,7 +87,6 @@ impl Default for WorkerConfig {
             default_frame_size: 1024 * 1024,
             max_frame_size: 4 * 1024 * 1024,
             window_bytes: 8 * 1024 * 1024,
-            chunk_size: 1024 * 1024,
             stream_idle_timeout_ms: 60_000,
             storage_root: PathBuf::from("./data"),
             net: WorkerNetConfig::grpc_from_rpc("0.0.0.0:9090".to_string(), 100, 4 * 1024 * 1024),
@@ -146,7 +142,6 @@ impl WorkerConfig {
             defaults.window_bytes,
             "worker.window_bytes",
         )?;
-        let chunk_size = Self::bytes_u32(&worker_sub, "chunk_size", defaults.chunk_size, "worker.chunk_size")?;
         let stream_idle_timeout_ms = Self::usize_or(
             &worker_sub,
             "stream.idle_timeout_ms",
@@ -205,7 +200,6 @@ impl WorkerConfig {
             default_frame_size,
             max_frame_size,
             window_bytes,
-            chunk_size,
             stream_idle_timeout_ms,
             storage_root,
             net: WorkerNetConfig::grpc_from_rpc(rpc_bind, rpc_max_inflight, max_frame_size),
@@ -223,7 +217,6 @@ impl WorkerConfig {
             default_frame_size = config.default_frame_size,
             max_frame_size = config.max_frame_size,
             window_bytes = config.window_bytes,
-            chunk_size = config.chunk_size,
             storage_root = ?config.storage_root,
             net_listeners = config.net.listeners.len(),
             metadata_endpoint = %config.metadata.endpoint,
@@ -298,13 +291,6 @@ impl WorkerConfig {
             return Err(CommonError::new(
                 CommonErrorCode::InvalidArgument,
                 "worker.window_bytes must be greater than zero",
-            ));
-        }
-
-        if self.chunk_size == 0 {
-            return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
-                "worker.chunk_size must be greater than zero",
             ));
         }
 
@@ -631,7 +617,6 @@ worker:
         assert_eq!(config.default_frame_size, 1024 * 1024);
         assert_eq!(config.max_frame_size, 4 * 1024 * 1024);
         assert_eq!(config.window_bytes, 8 * 1024 * 1024);
-        assert_eq!(config.chunk_size, 1024 * 1024);
         assert_eq!(config.stream_idle_timeout_ms, 60_000);
         assert_eq!(config.storage_root, PathBuf::from("./data"));
         assert_eq!(config.rpc_advertised_endpoint, "http://127.0.0.1:9090");
@@ -670,7 +655,6 @@ worker:
   default_frame_size: 4096
   max_frame_size: 8192
   window_bytes: 16384
-  chunk_size: 32768
   stream:
     idle_timeout_ms: 500
   storage:
@@ -694,7 +678,6 @@ worker:
         assert_eq!(config.default_frame_size, 4096);
         assert_eq!(config.max_frame_size, 8192);
         assert_eq!(config.window_bytes, 16_384);
-        assert_eq!(config.chunk_size, 32_768);
         assert_eq!(config.stream_idle_timeout_ms, 500);
         assert_eq!(config.storage_root, PathBuf::from("/tmp/vecton-worker"));
         assert_eq!(config.rpc_advertised_endpoint, "http://127.0.0.1:19091");
@@ -786,28 +769,6 @@ worker:
         let error = WorkerConfig::load(&config_path).unwrap_err();
 
         assert!(error.message.contains("must be <="));
-    }
-
-    #[test]
-    fn rejects_zero_chunk_size() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("core-site.yaml");
-        fs::write(
-            &config_path,
-            r#"
-worker:
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
-  chunk_size: 0
-  metadata:
-    endpoint: "http://127.0.0.1:18080"
-"#,
-        )
-        .unwrap();
-
-        let error = WorkerConfig::load(&config_path).unwrap_err();
-
-        assert!(error.message.contains("chunk_size"));
     }
 
     #[test]

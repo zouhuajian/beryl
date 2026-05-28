@@ -43,7 +43,6 @@ async fn main() -> Result<()> {
         default_frame_size = config.default_frame_size,
         max_frame_size = config.max_frame_size,
         window_bytes = config.window_bytes,
-        chunk_size = config.chunk_size,
         storage_root = ?config.storage_root,
         net_listeners = config.net.listeners.len(),
         "Starting worker data service skeleton"
@@ -78,7 +77,6 @@ async fn main() -> Result<()> {
         config.storage_root.clone(),
     )));
     let core = Arc::new(WorkerCore::with_local_store(
-        config.chunk_size,
         config.default_frame_size,
         config.max_frame_size,
         config.window_bytes,

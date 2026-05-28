@@ -435,7 +435,7 @@ async fn open_write_session_with_committed_block(
     let committed = CommittedBlockProto {
         block_id: target.block_id,
         file_offset: target.file_offset,
-        len: target.len,
+        len: target.effective_block_len,
         checksum: None,
     };
 
@@ -1210,7 +1210,7 @@ async fn commit_file_public_replay_returns_persisted_result_and_rejects_fingerpr
     let committed_blocks = vec![CommittedBlockProto {
         block_id: Some(block_id),
         file_offset: target.file_offset,
-        len: target.len,
+        len: target.effective_block_len,
         checksum: None,
     }];
 

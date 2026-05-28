@@ -1471,7 +1471,6 @@ mod tests {
             block_stamp: 17,
             committed_length: 4096,
             effective_block_len: 4096,
-            chunk_size: CHUNK_SIZE,
             fencing_token: None,
         }
     }
@@ -1490,7 +1489,6 @@ mod tests {
             temp.path().to_path_buf(),
         )));
         let core = WorkerCore::with_local_store(
-            CHUNK_SIZE,
             default_frame_size,
             max_frame_size,
             window_bytes,
@@ -1870,7 +1868,6 @@ mod tests {
         assert_eq!(result.window_bytes, 4096);
         assert_eq!(result.block_stamp, BLOCK_STAMP);
         assert_eq!(result.committed_length, 0);
-        assert_eq!(result.chunk_size, CHUNK_SIZE);
 
         let paths = store.paths(group_id(), block_id());
         assert!(paths.staging_data_path.exists());
@@ -1887,7 +1884,6 @@ mod tests {
         assert_eq!(state.context.block_id, block_id());
         assert_eq!(state.context.mode, StreamMode::Write);
         assert_eq!(state.context.end_offset, BLOCK_SIZE);
-        assert_eq!(state.context.chunk_size, CHUNK_SIZE);
         assert_eq!(state.cursor, 0);
         assert_eq!(state.last_acked_seq, 0);
         assert_eq!(state.written_through, 0);
@@ -2060,6 +2056,54 @@ mod tests {
         assert_eq!(meta.visibility.block_state, crate::store::block::BlockState::Ready);
         assert_eq!(meta.visibility.block_stamp, BLOCK_STAMP);
         assert_eq!(store.read_at(group_id(), block_id(), 0, BLOCK_SIZE).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn commit_write_accepts_non_chunk_aligned_tail_and_persists_full_block_shape() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        let effective_len = u64::from(CHUNK_SIZE) + 1;
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: Bytes::from(vec![7; effective_len as usize]),
+            checksum32: 0,
+        })
+        .await
+        .expect("tail frame");
+
+        let result = core
+            .commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                commit_seq: 1,
+                effective_block_len: effective_len,
+                ..commit_write_request()
+            })
+            .await
+            .expect("tail commit");
+
+        assert_eq!(result.effective_block_len, effective_len);
+        assert_eq!(result.written_through, effective_len);
+        let meta = store.load_meta(group_id(), block_id()).expect("ready meta");
+        assert_eq!(meta.format.block_size, BLOCK_SIZE);
+        assert_eq!(meta.source.effective_block_len, effective_len);
+    }
+
+    #[tokio::test]
+    async fn commit_write_rejects_effective_len_larger_than_block_size() {
+        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+
+        assert_invalid_argument(
+            core.commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                commit_seq: 0,
+                effective_block_len: BLOCK_SIZE + 1,
+                ..commit_write_request()
+            })
+            .await,
+        );
     }
 
     #[tokio::test]
@@ -2323,7 +2367,6 @@ mod tests {
         assert_eq!(result.window_bytes, 4096);
         assert_eq!(result.block_stamp, BLOCK_STAMP);
         assert_eq!(result.committed_length, BLOCK_SIZE);
-        assert_eq!(result.chunk_size, CHUNK_SIZE);
 
         let state = core
             .stream_manager()
@@ -2347,7 +2390,6 @@ mod tests {
         publish_ready_block(&store, payload(), BLOCK_STAMP);
 
         let core = WorkerCore::with_options(
-            CHUNK_SIZE,
             512,
             2048,
             4096,
@@ -2531,7 +2573,6 @@ mod tests {
         assert_eq!(response.window_bytes, 4096);
         assert_eq!(response.block_stamp, BLOCK_STAMP);
         assert_eq!(response.committed_length, 0);
-        assert_eq!(response.chunk_size, CHUNK_SIZE);
     }
 
     #[tokio::test]
@@ -2672,7 +2713,6 @@ mod tests {
         assert_eq!(response.window_bytes, 4096);
         assert_eq!(response.block_stamp, BLOCK_STAMP);
         assert_eq!(response.committed_length, BLOCK_SIZE);
-        assert_eq!(response.chunk_size, CHUNK_SIZE);
     }
 
     #[tokio::test]
@@ -2758,7 +2798,7 @@ mod tests {
 
     #[tokio::test]
     async fn service_read_stream_rejects_missing_stream() {
-        let service = registered_data_service(Arc::new(WorkerCore::new(1024)));
+        let service = registered_data_service(Arc::new(WorkerCore::new()));
 
         let read_status = match service
             .read_stream(tonic::Request::new(ReadStreamRequestProto {
@@ -3120,13 +3160,35 @@ mod tests {
                 ("worker.DataRequestHeaderProto", "header", 1),
                 ("common.ShardGroupIdProto", "group_id", 2),
                 ("common.BlockIdProto", "block_id", 3),
-                ("uint64", "block_size", 4),
-                ("uint64", "block_stamp", 5),
+                ("uint32", "block_format_id", 4),
+                ("uint64", "block_size", 5),
                 ("uint32", "chunk_size", 6),
                 ("worker.ChecksumKindProto", "checksum_kind", 7),
-                ("common.FencingTokenProto", "token", 8),
-                ("uint32", "frame_size", 9),
-                ("uint32", "block_format_id", 10),
+                ("uint64", "block_stamp", 8),
+                ("common.FencingTokenProto", "token", 9),
+                ("uint32", "frame_size", 10),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(proto, "OpenReadStreamResponseProto"),
+            vec![
+                ("worker.DataResponseHeaderProto", "header", 1),
+                ("common.StreamIdProto", "stream_id", 2),
+                ("uint32", "frame_size", 3),
+                ("uint32", "window_bytes", 4),
+                ("uint64", "block_stamp", 5),
+                ("uint64", "committed_length", 6),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(proto, "OpenWriteStreamResponseProto"),
+            vec![
+                ("worker.DataResponseHeaderProto", "header", 1),
+                ("common.StreamIdProto", "stream_id", 2),
+                ("uint32", "frame_size", 3),
+                ("uint32", "window_bytes", 4),
+                ("uint64", "block_stamp", 5),
+                ("uint64", "committed_length", 6),
             ]
         );
         assert_eq!(
@@ -3240,7 +3302,12 @@ mod tests {
             if in_message && line == "}" {
                 break;
             }
-            if !in_message || line.starts_with("//") || line.is_empty() || !line.ends_with(';') {
+            if !in_message
+                || line.starts_with("//")
+                || line.starts_with("reserved")
+                || line.is_empty()
+                || !line.ends_with(';')
+            {
                 continue;
             }
 

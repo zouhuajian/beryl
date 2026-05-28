@@ -22,11 +22,31 @@ Vecton block storage has three separate layers:
 
 | Layer | Owner | Contract |
 | --- | --- | --- |
-| `FileLayout` | `metadata` | Logical file-version or data-handle layout: `block_size`, `chunk_size`, `replication`, and `block_format_id`. Current active writes require `replication == 1`; durable multi-replica write is future work. |
-| `BlockFormat` | `metadata` selects, `worker` persists | Vecton block data/meta interpretation format. Workers persist it in `BlockMeta` together with block size, chunk size, checksum kind, effective length, state, and block stamp. Recovery and local reads interpret blocks from persisted `BlockMeta`, not runtime defaults. |
-| `StoreBackend` / `IoEngine` | `worker` | Worker-local execution implementation such as filesystem IO, mmap, SPDK, memory, or another engine. Metadata must not inspect or control it. |
+| `FileLayout` | `metadata` | Logical file-version or data-handle layout: `block_size`, `chunk_size`, `replication`, and `block_format_id`. Client-supplied layout is create-time intent; metadata validates and persists the accepted layout, and the persisted `FileLayout` is authoritative for later planning. Current active writes require `replication == 1`; durable multi-replica write is future work. |
+| `BlockFormat` | `metadata` selects, `worker` persists | Vecton block data/meta interpretation format. Workers persist full `FileLayout.block_size` in `BlockMeta.format.block_size`, persist the selected chunk size and format id, and publish tail or bounded valid length in `BlockMeta.source.effective_block_len`. Recovery and local reads interpret blocks from persisted `BlockMeta`, not runtime defaults. |
+| `StoreBackend` / `IoEngine` | `worker` | Worker-local byte execution implementation such as filesystem IO, io_uring, SPDK, mmap, memory, or another engine. Metadata placement may consider supported `BlockFormat` capability, but must not inspect or control the local engine. |
 
-SPDK is a worker `StoreBackend` / `IoEngine`, not a `BlockFormatId`. The same `BlockFormat` may run on different engines, and one engine may support multiple formats.
+SPDK, io_uring, and filesystem IO are worker `StoreBackend` / `IoEngine` choices, not `BlockFormatId` values. The same `BlockFormat` may run on different engines, and one engine may support multiple formats. For example, the current `FULL_EFFECTIVE` block format can be implemented through filesystem IO or io_uring without changing persisted interpretation. SPDK is also an engine/backend choice if it preserves the same `BlockMeta` plus block payload interpretation.
+
+A new `BlockFormat` is needed when historical local block data cannot be interpreted with the old rules. Examples include:
+
+- One logical block no longer maps to one independent block file.
+- Packed small blocks share a physical segment and require a pack index.
+- Fixed-offset addressing changes to an extent table.
+- Compression or encryption changes logical-to-physical offset mapping.
+- Checksum or bitmap layout changes in a non-backward-compatible way.
+- Raw device or SPDK layout stops preserving the same `BlockMeta` plus block payload interpretation.
+
+A new `BlockFormat` is not needed for:
+
+- Changing default `block_size`.
+- Changing default `chunk_size`.
+- Changing worker `IoEngine` from filesystem IO to io_uring.
+- Enabling SPDK while preserving the same persistent block interpretation.
+- Adding optional diagnostics or statistics.
+- Changing placement or eviction policy.
+
+If a future "package block" or "packed small file block" design means multiple logical blocks share a physical pack file and require a pack index, it is a future `BlockFormat`, not merely an `IoEngine`.
 
 Current placement scope is foundation-only: `PlacementPlanner` may plan read, load, write, and repair candidates, but production `GetBlockLocations` does not perform metadata-side read placement. Read placement must be integrated separately from reported locations, and direct worker validation must reject any conflict between expected `FileLayout` and persisted worker `BlockMeta` instead of falling back in either direction.
 

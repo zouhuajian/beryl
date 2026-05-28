@@ -48,17 +48,23 @@ enum CreateDispositionProto {
 message WriteTargetProto {
   common.BlockIdProto block_id = 1;
   uint64 file_offset = 2;
-  uint64 len = 3;
-  repeated common.WorkerEndpointInfoProto worker_endpoints = 4;
-  common.FencingTokenProto fencing_token = 5;
+  // Metadata-selected Vecton block data/meta interpretation format for this target.
+  // Worker-local execution backend selection is not encoded here.
+  uint32 block_format_id = 3;
+  // Full logical block size from the persisted FileLayout. Workers persist this
+  // value in BlockMeta.format.block_size.
+  uint64 block_size = 4;
+  // Metadata-selected chunk size for the worker-local block format.
+  uint32 chunk_size = 5;
   // Metadata-assigned stamp that the worker must persist when publishing this
   // block and future direct readers must present back to the worker.
   uint64 block_stamp = 6;
-  // Metadata-selected chunk size for the worker-local block format.
-  uint32 chunk_size = 7;
-  // Metadata-selected Vecton block data/meta interpretation format for this target.
-  // StoreBackend / IoEngine selection remains worker-local.
-  uint32 block_format_id = 8;
+  // Valid length for this block target. It is normally equal to block_size for
+  // full blocks and may be smaller for tail or bounded blocks. Workers publish
+  // this as BlockMeta.source.effective_block_len.
+  uint64 effective_block_len = 7;
+  repeated common.WorkerEndpointInfoProto worker_endpoints = 8;
+  common.FencingTokenProto fencing_token = 9;
 }
 
 message CommittedBlockProto {

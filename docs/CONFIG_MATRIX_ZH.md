@@ -30,7 +30,6 @@
 | `worker.default_frame_size` | `worker` | `WorkerCore::with_options` | `1MB` | active | 必须大于 0 且不超过 `max_frame_size` | Transport frame 默认载荷大小。 |
 | `worker.max_frame_size` | `worker` | `WorkerCore::with_options` | `4MB` | active | 必须大于 0 | Transport frame 最大载荷大小。 |
 | `worker.window_bytes` | `worker` | `WorkerCore::with_options` | `8MB` | active | 必须大于 0 | Per-stream 应用层 in-flight window。 |
-| `worker.chunk_size` | `worker` | `WorkerCore::with_options` | `1MB` | active | 必须大于 0 | Worker-local StorageChunk 大小。 |
 | `worker.stream.idle_timeout_ms` | `worker` | `WorkerCore::with_options` | `60000` | active | 必须大于 0 | Runtime stream idle timeout。 |
 | `worker.storage.root` | `worker` | `WorkerCore::with_options` / local block store | `./data` | active | 路径字符串不能为空 | 当前只支持单 worker-local storage root。 |
 | `worker.metadata.group_id` | `worker` | `MetadataRegistrar` / worker startup | `1` | active | 必须大于 0 | Worker 启动注册目标 metadata group；当前默认配置只声明一个 group。 |
@@ -95,7 +94,7 @@
 | `metadata.raft.storage.dir` | removed | 当前 metadata 持久化根目录是 `metadata.storage.dir`。 |
 | `observe.*` | removed | 默认配置文件不再列出尚未从文件接入的 observability 键。 |
 | `worker.storage.dirs`, `worker.storage.dir` | removed | 当前 worker 只消费 `worker.storage.root`。 |
-| `worker.storage.chunk_size` | removed | 当前 worker 只消费 `worker.chunk_size`。 |
+| `worker.chunk_size`, `worker.storage.chunk_size` | removed | Active writes use metadata-issued `WriteTarget.chunk_size`; existing blocks are interpreted from worker `BlockMeta.format.chunk_size`, not worker runtime defaults. |
 | `worker.stream.window_bytes` | removed | 当前 worker 只消费 `worker.window_bytes`。 |
 | `worker.transport.default_frame_size`, `worker.transport.max_frame_size` | removed | 当前 worker 只消费 `worker.default_frame_size` / `worker.max_frame_size`；测试仅证明已移除入口不会影响当前 frame 配置。 |
 | `worker.storage.kind` | removed | `io_uring`/`spdk` 不是当前可部署 storage backend。 |

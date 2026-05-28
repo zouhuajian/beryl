@@ -31,5 +31,6 @@ fn file_layout_validation_rejects_invalid_shape() {
     assert!(FileLayout::new(0, 1024, 1).validate().is_err());
     assert!(FileLayout::new(4096, 0, 1).validate().is_err());
     assert!(FileLayout::new(4096, 8192, 1).validate().is_err());
+    assert!(FileLayout::new(4097, 1024, 1).validate().is_err());
     assert!(FileLayout::new(4096, 1024, 0).validate().is_err());
 }

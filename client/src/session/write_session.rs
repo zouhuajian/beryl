@@ -97,11 +97,21 @@ impl WriteSession {
                 self.cursor, target.file_offset
             )));
         }
-        if target.len != expected_len {
+        if target.effective_block_len != expected_len {
             return Err(ClientError::InvalidLayout(format!(
-                "write target len mismatch: expected {}, got {}",
-                expected_len, target.len
+                "write target effective_block_len mismatch: expected {}, got {}",
+                expected_len, target.effective_block_len
             )));
+        }
+        if target.block_size == 0 {
+            return Err(ClientError::InvalidLayout(
+                "write target block_size must be non-zero".to_string(),
+            ));
+        }
+        if target.effective_block_len > target.block_size {
+            return Err(ClientError::InvalidLayout(
+                "write target effective_block_len must not exceed block_size".to_string(),
+            ));
         }
         let block = target.block_id;
         if block.data_handle_id != self.data_handle_id {
@@ -121,6 +131,16 @@ impl WriteSession {
         if target.chunk_size == 0 {
             return Err(ClientError::InvalidLayout(
                 "write target chunk_size must be non-zero".to_string(),
+            ));
+        }
+        if u64::from(target.chunk_size) > target.block_size {
+            return Err(ClientError::InvalidLayout(
+                "write target chunk_size must not exceed block_size".to_string(),
+            ));
+        }
+        if !target.block_size.is_multiple_of(u64::from(target.chunk_size)) {
+            return Err(ClientError::InvalidLayout(
+                "write target block_size must be a multiple of chunk_size".to_string(),
             ));
         }
         Ok(())
@@ -878,7 +898,7 @@ fn append_worker_block_identity(detail: &mut String, worker_block: &WorkerWriteB
     let block_id = worker_block.target.block_id;
     let _ = write!(
         detail,
-        "group={} worker={} protocol={} worker_epoch={} block={} stamp={} offset={} len={} stream={}:{} next_seq={}",
+        "group={} worker={} protocol={} worker_epoch={} block={} stamp={} offset={} effective_len={} stream={}:{} next_seq={}",
         worker_block.group_id,
         worker_block.worker.worker_id,
         proto::common::WorkerNetProtocolProto::from(worker_block.worker.worker_net_protocol) as i32,
@@ -886,7 +906,7 @@ fn append_worker_block_identity(detail: &mut String, worker_block: &WorkerWriteB
         block_id,
         worker_block.target.block_stamp,
         worker_block.target.file_offset,
-        worker_block.target.len,
+        worker_block.target.effective_block_len,
         worker_block.stream_id.high,
         worker_block.stream_id.low,
         worker_block.next_seq
@@ -1351,7 +1371,8 @@ mod tests {
         WriteTarget {
             block_id: BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(block_index)),
             file_offset,
-            len,
+            block_size: 1024,
+            effective_block_len: len,
             worker_endpoints: vec![worker_endpoint()],
             fencing_token: FencingToken {
                 block_id: BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(block_index)),
@@ -1400,7 +1421,7 @@ mod tests {
             proto::common::WorkerNetProtocolProto::from(block.worker.worker_net_protocol) as i32,
             block.worker.worker_epoch,
             block.target.file_offset,
-            block.target.len,
+            block.target.effective_block_len,
             block.target.block_stamp,
             block.target.block_id.index.as_raw(),
             block.target.block_id.data_handle_id.as_raw(),

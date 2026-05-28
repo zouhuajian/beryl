@@ -275,6 +275,9 @@ pub fn file_layout_from_proto(layout: Option<proto::common::FileLayoutProto>) ->
 }
 
 pub fn validate_active_write_layout(layout: &FileLayout) -> Result<(), MetadataError> {
+    layout
+        .validate()
+        .map_err(|err| MetadataError::InvalidArgument(err.to_string()))?;
     if layout.replication != 1 {
         return Err(MetadataError::InvalidArgument(
             "multi-replica write is not supported yet; replication must be 1".to_string(),

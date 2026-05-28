@@ -21,6 +21,8 @@ message BlockIdentityProto {
 
 message BlockFormatProto {
   uint32 format_id = 1;
+  // Full logical block size from the persisted FileLayout. Tail or bounded
+  // valid length is stored in BlockSource.effective_block_len.
   uint64 block_size = 2;
   uint32 chunk_size = 3;
   // Checksum algorithm for .blk StorageChunk data; it does not protect this metadata file.
