@@ -27,7 +27,7 @@
 | `proto/` | `.proto`、codegen、gRPC service 契约、共享结构转换 | 需要优化 | `proto/build.rs`、`proto/src/lib.rs`、`proto/src/convert.rs` | 主转换职责清晰；admin/metadata-peer service surface 状态待确认。 |
 | `metadata/` | metadata authority、inode/dentry/attrs、mount、write session、Raft、worker membership、maintenance | 需要优化 | `metadata/src/lib.rs`、`metadata/src/runtime.rs`、`metadata/src/service/fs_core/`、`metadata/src/worker/service.rs` | 核心 metadata 语义强；worker service 错误语义、Raft 网络、repair/delete 部分仍有 TODO。 |
 | `worker/` | 数据面执行、本地 block store、stream runtime、gRPC WorkerDataService、worker net peer/server | 需要优化 | `worker/src/lib.rs`、`worker/src/data/core.rs`、`worker/src/store/block.rs`、`worker/src/bin/main.rs` | 本地数据面可测；metadata lifecycle、公开读 stamp gate、placeholder backend 是主要缺口。 |
-| `client/` | SDK facade、metadata gateway、layout/endpoint cache、retry/replay、worker data adapter | 已完成 | `client/src/lib.rs`、`client/src/api/fs_client.rs`、`client/src/data/worker.rs`、`client/src/runtime/executor.rs` | 公共 facade 收敛，普通读写路径覆盖较好；默认 client 配置已收敛到当前 active key。 |
+| `client/` | SDK facade、metadata gateway、worker endpoint resolution/cache、channel pooling、retry/refresh orchestration、read planner、worker data adapter | 已完成 | `client/src/lib.rs`、`client/src/api/fs_client.rs`、`client/src/data/worker.rs`、`client/src/runtime/executor.rs` | 公共 facade 收敛；普通读路径从 metadata 获取 authoritative layout/locations，经 `ReadPlanner` 校验后访问 worker；当前架构不保留 client 侧读 layout 缓存；默认 client 配置已收敛到当前 active key。 |
 | `ufs/` | 外部后端抽象、OpenDAL adapter、UFS registry/spec/capability | 需要优化 | `ufs/src/lib.rs`、`ufs/src/opendal_impl.rs`、`ufs/Cargo.toml` | 边界清晰；部分后端能力依赖 feature 或运行环境，测试有 ignored。 |
 | `integration_tests/` | 跨 crate contract tests、mock metadata/worker | 需要优化 | `integration_tests/tests/client_contract.rs`、`integration_tests/tests/common/mock_metadata.rs`、`integration_tests/tests/common/mock_worker.rs` | 能验证 client contract，但不是完整真实 metadata+worker E2E。 |
 | `conf/` | 示例/默认配置 | 已完成 | `conf/core-site.yaml`、`conf/client-site.yaml`、`docs/CONFIG_MATRIX_ZH.md` | 默认配置文件仅包含当前 runtime 实际消费的 active key；planned/unimplemented 能力只在文档中列为 deferred，不作为 deployable default。 |
@@ -218,7 +218,7 @@
 
 #### 3.6.1 模块职责
 
-`client` 提供 Vecton SDK facade，负责 public API、metadata gateway、layout cache、worker endpoint cache、retry/replay 分类、refresh、read planner、direct worker data adapter 和 write session orchestration。`client/src/lib.rs` 通过 `#![deny(missing_docs)]` 和 facade re-export 控制公开 surface。
+`client` 提供 Vecton SDK facade，负责 public API、metadata gateway、state watermark cache、worker endpoint cache、retry/replay 分类、refresh、read planner、direct worker data adapter 和 write session orchestration。`client/src/lib.rs` 通过 `#![deny(missing_docs)]` 和 facade re-export 控制公开 surface。
 
 #### 3.6.2 功能完成情况
 
@@ -226,7 +226,7 @@
 |---|---|---|---|---|
 | public facade | 已完成 | `FsClient`、handle、options、status、errors 对外收敛，避免暴露 worker route/stamp。 | `client/src/lib.rs`、`client/src/api/` | N/A |
 | metadata gateway | 已完成 | 统一校验 metadata response header、身份、refresh hint。 | `client/src/metadata/gateway.rs` | N/A |
-| read planner 和 layout cache | 已完成 | 支持多 block range、coverage/gap/overlap/stamp 校验。 | `client/src/planner/read_planner.rs`、`client/src/cache/layout.rs` | N/A |
+| read planner 和 metadata layout 获取 | 已完成 | read path 通过 `GetBlockLocations` 直接向 metadata 获取 authoritative layout，`ReadPlanner::resolve_response` 负责 layout 校验和 worker endpoint 解析；当前架构不保留 client 侧读 layout 缓存或 layout 请求合并层。 | `client/src/api/fs_client.rs`、`client/src/runtime/executor.rs`、`client/src/planner/read_planner.rs` | N/A |
 | worker data gRPC adapter | 已完成 | 普通读写携带 metadata-provided `block_stamp`，拒绝零 stamp 和 unsupported protocol。 | `client/src/data/worker.rs` | N/A |
 | retry/replay/refresh | 已完成 | 对 metadata read/mutation/session barrier、worker unknown outcome、typed refresh 有分类。 | `client/src/runtime/` | N/A |
 | write API | 已完成 | create/append/write_all/sync visibility/sync durability/close/abort/renew lease 可用。 | `client/src/api/fs_client.rs`、`client/src/api/handle.rs` | N/A |
@@ -235,7 +235,7 @@
 
 #### 3.6.3 架构评价
 
-`client` 在近期重构后边界较好：metadata/worker wire 细节被 adapter 吸收，public facade 不暴露 worker endpoint、route epoch、block stamp 等内部信息。`FsClient` 的读路径坚持 all-or-error，写路径把 UnknownOutcome 与 session barrier 明确区分。当前默认 client config 已与 typed config active key 收敛。
+`client` 在近期重构后边界较好：metadata/worker wire 细节被 adapter 吸收，public facade 不暴露 worker endpoint、route epoch、block stamp 等内部信息。`FsClient` 的读路径坚持 all-or-error，写路径把 UnknownOutcome 与 session barrier 明确区分。当前 read layout 不经过 client-side cache 或请求合并层，现存 client cache 行为限于 state watermark 和 worker endpoint cache 等 live components。当前默认 client config 已与 typed config active key 收敛。
 
 #### 3.6.4 主要问题
 

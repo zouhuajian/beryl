@@ -14,7 +14,6 @@ pub mod decision;
 pub mod executor;
 pub mod policy;
 pub mod refresh;
-pub(crate) mod singleflight;
 
 pub(crate) use backoff::{BackoffPolicy, BackoffSleeper, TokioBackoffSleeper};
 pub use classify::{ErrorClass, ErrorClassifier, RefreshReason};

@@ -1083,12 +1083,17 @@ impl RocksDBStorage {
                 "worker_id must be non-zero for registration".to_string(),
             ));
         }
+        let worker_epoch = self
+            .get_worker_in_group(group_id, worker_id)?
+            .map(|worker| worker.worker_epoch.saturating_add(1))
+            .unwrap_or(1)
+            .max(1);
         Ok(WorkerInfo {
             group_id,
             worker_id,
             address,
             worker_net_protocol,
-            worker_epoch: 0,
+            worker_epoch,
             capacity_total: 0,
             capacity_used: 0,
             capacity_available: 0,

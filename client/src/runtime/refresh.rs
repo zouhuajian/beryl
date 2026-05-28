@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use types::{GroupStateWatermark, ShardGroupId};
 
 use crate::cache::StateIdCache;
-use crate::cache::{CacheInvalidationReason, LayoutCache, WorkerEndpointCache};
+use crate::cache::{CacheInvalidationReason, WorkerEndpointCache};
 use crate::canonical::RefreshHint;
 use crate::error::{ClientError, ClientResult};
 use crate::runtime::classify::RefreshReason;
@@ -39,7 +39,6 @@ struct RefreshState {
 pub struct RefreshManager {
     state: Arc<RwLock<RefreshState>>,
     watermarks: StateIdCache,
-    layout_cache: Option<LayoutCache>,
     worker_endpoint_cache: Option<WorkerEndpointCache>,
 }
 
@@ -60,18 +59,12 @@ impl RefreshManager {
                 route_epoch_cache: HashMap::new(),
             })),
             watermarks: StateIdCache::new(300),
-            layout_cache: None,
             worker_endpoint_cache: None,
         })
     }
 
-    /// Attach correctness caches owned by the client runtime.
-    pub(crate) fn with_caches(
-        mut self,
-        layout_cache: Option<LayoutCache>,
-        worker_endpoint_cache: Option<WorkerEndpointCache>,
-    ) -> Self {
-        self.layout_cache = layout_cache;
+    /// Attach the worker endpoint cache owned by the client runtime.
+    pub(crate) fn with_worker_endpoint_cache(mut self, worker_endpoint_cache: Option<WorkerEndpointCache>) -> Self {
         self.worker_endpoint_cache = worker_endpoint_cache;
         self
     }
@@ -234,30 +227,18 @@ impl RefreshManager {
     fn invalidate_caches_after_refresh(&self, reason: RefreshReason) {
         match reason {
             RefreshReason::RouteEpochMismatch => {
-                self.invalidate_layout(CacheInvalidationReason::RouteEpoch);
                 self.invalidate_worker_endpoints(CacheInvalidationReason::RouteEpoch);
             }
-            RefreshReason::BlockStampMismatch => {
-                self.invalidate_layout(CacheInvalidationReason::BlockStamp);
-            }
             RefreshReason::WorkerEpochMismatch => {
-                self.invalidate_layout(CacheInvalidationReason::WorkerEpoch);
                 self.invalidate_worker_endpoints(CacheInvalidationReason::WorkerEpoch);
             }
             RefreshReason::OwnerGroupMismatch | RefreshReason::MountEpochMismatch => {
-                self.invalidate_layout(CacheInvalidationReason::Owner);
                 self.invalidate_worker_endpoints(CacheInvalidationReason::Owner);
             }
-            RefreshReason::StaleState | RefreshReason::Unknown => {
-                self.invalidate_layout(CacheInvalidationReason::MetadataRefresh);
-            }
-            RefreshReason::NotLeader => {}
-        }
-    }
-
-    fn invalidate_layout(&self, reason: CacheInvalidationReason) {
-        if let Some(cache) = &self.layout_cache {
-            cache.invalidate_all(reason);
+            RefreshReason::BlockStampMismatch
+            | RefreshReason::StaleState
+            | RefreshReason::Unknown
+            | RefreshReason::NotLeader => {}
         }
     }
 
@@ -315,21 +296,16 @@ impl Default for RefreshManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::{LayoutCache, LayoutCacheKey, WorkerEndpointCache};
+    use crate::cache::WorkerEndpointCache;
     use crate::canonical::RefreshHint;
-    use crate::metadata::LayoutSnapshot;
     use crate::metrics::NoopClientMetrics;
-    use crate::planner::read_planner::PlannedReadRange;
     use crate::runtime::classify::RefreshReason;
     use crate::runtime::policy::OperationKind;
     use crate::runtime::{OperationContext, OperationIdentity};
     use proto::common::{GroupStateWatermarkProto, RaftLogIdProto, ShardGroupIdProto};
     use std::sync::Arc;
     use std::time::Duration;
-    use types::{
-        BlockId, BlockIndex, ClientId, DataHandleId, FileBlockLocation, InodeId, WorkerEndpointInfo, WorkerId,
-        WorkerNetProtocol,
-    };
+    use types::{ClientId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
 
     fn manager() -> RefreshManager {
         RefreshManager::new(vec![ConfiguredMetadataGroup {
@@ -501,10 +477,9 @@ mod tests {
     }
 
     #[test]
-    fn route_epoch_refresh_invalidates_attached_layout_and_worker_endpoint_caches() {
-        let layout_cache = seeded_layout_cache();
+    fn route_epoch_refresh_invalidates_attached_worker_endpoint_cache() {
         let endpoint_cache = seeded_worker_endpoint_cache();
-        let manager = manager().with_caches(Some(layout_cache.clone()), Some(endpoint_cache.clone()));
+        let manager = manager().with_worker_endpoint_cache(Some(endpoint_cache.clone()));
         let op = path_operation();
 
         manager
@@ -518,37 +493,32 @@ mod tests {
             )
             .expect("refresh recorded");
 
-        assert_eq!(layout_cache.len(), 0);
         assert_eq!(endpoint_cache.len(), 0);
     }
 
     #[test]
-    fn block_stamp_refresh_invalidates_layout_without_dropping_worker_endpoint_cache() {
-        let layout_cache = seeded_layout_cache();
+    fn block_stamp_refresh_does_not_drop_worker_endpoint_cache() {
         let endpoint_cache = seeded_worker_endpoint_cache();
-        let manager = manager().with_caches(Some(layout_cache.clone()), Some(endpoint_cache.clone()));
+        let manager = manager().with_worker_endpoint_cache(Some(endpoint_cache.clone()));
         let op = path_operation();
 
         manager
             .record_refresh(&op, RefreshReason::BlockStampMismatch, &RefreshHint::default())
             .expect("refresh recorded");
 
-        assert_eq!(layout_cache.len(), 0);
         assert_eq!(endpoint_cache.len(), 1);
     }
 
     #[test]
-    fn worker_epoch_refresh_invalidates_layout_and_worker_endpoint_cache() {
-        let layout_cache = seeded_layout_cache();
+    fn worker_epoch_refresh_invalidates_worker_endpoint_cache() {
         let endpoint_cache = seeded_worker_endpoint_cache();
-        let manager = manager().with_caches(Some(layout_cache.clone()), Some(endpoint_cache.clone()));
+        let manager = manager().with_worker_endpoint_cache(Some(endpoint_cache.clone()));
         let op = path_operation();
 
         manager
             .record_refresh(&op, RefreshReason::WorkerEpochMismatch, &RefreshHint::default())
             .expect("refresh recorded");
 
-        assert_eq!(layout_cache.len(), 0);
         assert_eq!(endpoint_cache.len(), 0);
     }
 
@@ -561,33 +531,6 @@ mod tests {
                 index,
             }),
         }
-    }
-
-    fn seeded_layout_cache() -> LayoutCache {
-        let cache = LayoutCache::new(true, Duration::from_secs(60), 8, Arc::new(NoopClientMetrics));
-        let span = PlannedReadRange { file_offset: 0, len: 4 };
-        let key = LayoutCacheKey::new(InodeId::new(101), DataHandleId::new(202), 3, span);
-        cache
-            .insert_validated(
-                key,
-                LayoutSnapshot {
-                    group_id: 9,
-                    inode_id: InodeId::new(101),
-                    data_handle_id: DataHandleId::new(202),
-                    file_size: 4,
-                    locations: vec![FileBlockLocation {
-                        block_id: BlockId::new(DataHandleId::new(202), BlockIndex::new(0)),
-                        file_offset: 0,
-                        len: 4,
-                        workers: vec![worker_endpoint()],
-                        worker_epoch: Some(7),
-                        block_stamp: 11,
-                    }],
-                    file_version: Some(3),
-                },
-            )
-            .expect("seed layout cache");
-        cache
     }
 
     fn seeded_worker_endpoint_cache() -> WorkerEndpointCache {

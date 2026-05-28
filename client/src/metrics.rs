@@ -56,26 +56,6 @@ pub(crate) enum ClientMetric {
     UnsafeReplayDenied,
     /// Backoff delay selected.
     BackoffDelay,
-    /// Layout cache lookup attempted.
-    LayoutCacheLookup,
-    /// Layout cache hit.
-    LayoutCacheHit,
-    /// Layout cache miss.
-    LayoutCacheMiss,
-    /// Layout cache entry expired.
-    LayoutCacheExpired,
-    /// Layout cache entry inserted.
-    LayoutCacheInsert,
-    /// Layout cache entry invalidated.
-    LayoutCacheInvalidate,
-    /// Layout cache entry evicted.
-    LayoutCacheEvict,
-    /// Layout singleflight waiter joined an in-flight miss.
-    LayoutSingleflightJoin,
-    /// Layout singleflight avoided a duplicate metadata request.
-    LayoutDuplicateRequestAvoided,
-    /// Layout singleflight leader failed.
-    LayoutSingleflightFailure,
     /// Worker endpoint cache lookup attempted.
     WorkerEndpointCacheLookup,
     /// Worker endpoint cache hit.
@@ -88,12 +68,6 @@ pub(crate) enum ClientMetric {
     WorkerEndpointCacheInvalidate,
     /// Worker endpoint cache entry evicted.
     WorkerEndpointCacheEvict,
-    /// Worker endpoint singleflight waiter joined an in-flight miss.
-    WorkerEndpointSingleflightJoin,
-    /// Worker endpoint singleflight avoided a duplicate resolution.
-    WorkerEndpointDuplicateResolutionAvoided,
-    /// Worker endpoint singleflight leader failed.
-    WorkerEndpointSingleflightFailure,
     /// Worker endpoint health recorded a failure threshold event.
     WorkerEndpointHealthFailure,
     /// Worker endpoint health recovered after TTL.
@@ -102,22 +76,10 @@ pub(crate) enum ClientMetric {
     MetadataChannelPoolHit,
     /// Metadata channel pool miss.
     MetadataChannelPoolMiss,
-    /// Metadata channel singleflight waiter joined an in-flight creation.
-    MetadataChannelSingleflightJoin,
-    /// Metadata channel singleflight avoided duplicate creation.
-    MetadataChannelDuplicateCreationAvoided,
-    /// Metadata channel singleflight creation failed.
-    MetadataChannelSingleflightFailure,
     /// Worker channel pool hit.
     WorkerChannelPoolHit,
     /// Worker channel pool miss.
     WorkerChannelPoolMiss,
-    /// Worker channel singleflight waiter joined an in-flight creation.
-    WorkerChannelSingleflightJoin,
-    /// Worker channel singleflight avoided duplicate creation.
-    WorkerChannelDuplicateCreationAvoided,
-    /// Worker channel singleflight creation failed.
-    WorkerChannelSingleflightFailure,
     /// Channel pool connection setup failed.
     ChannelPoolConnectError,
     /// Precise cache invalidation was used.

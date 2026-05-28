@@ -24,7 +24,6 @@ use crate::config::ClientConfig;
 use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics, NoopClientMetrics};
 use crate::planner::read_planner::PlannedReadSegment;
-use crate::runtime::singleflight::{Singleflight, SingleflightMode};
 use crate::runtime::{AttemptContext, ErrorClass, ErrorClassifier, RefreshReason};
 
 #[derive(Debug)]
@@ -33,8 +32,6 @@ struct TonicWorkerDataClient {
     endpoint_cache: WorkerEndpointCache,
     channel_pool_enabled: bool,
     max_channels_per_worker: usize,
-    channel_singleflight_enabled: bool,
-    channel_singleflight: Singleflight<WorkerChannelKey, tonic_net::Channel>,
     metrics: Arc<dyn ClientMetrics>,
 }
 
@@ -44,14 +41,12 @@ impl TonicWorkerDataClient {
     }
 
     fn from_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> Self {
-        let mut client = Self::with_parts(
+        Self::with_parts(
             WorkerEndpointCache::from_config(&config.cache, Arc::clone(&metrics)),
             config.channel_pool.worker_channel_pool_enabled,
             config.channel_pool.worker_channel_pool_max_per_worker,
             metrics,
-        );
-        client.channel_singleflight_enabled = config.channel_pool.worker_channel_singleflight_enabled;
-        client
+        )
     }
 
     fn with_parts(
@@ -65,8 +60,6 @@ impl TonicWorkerDataClient {
             endpoint_cache,
             channel_pool_enabled,
             max_channels_per_worker: max_channels_per_worker.max(1),
-            channel_singleflight_enabled: true,
-            channel_singleflight: Singleflight::default(),
             metrics,
         }
     }
@@ -122,50 +115,20 @@ impl TonicWorkerDataClient {
             self.record_pool_metric(ClientMetric::WorkerChannelPoolHit, operation, "hit");
             return Ok(channel);
         }
-        if !self.channel_singleflight_enabled {
-            let channel = lazy_channel(&key.endpoint).inspect_err(|_err| {
-                self.record_pool_metric(ClientMetric::ChannelPoolConnectError, operation, "error");
-            })?;
-            self.insert_worker_channel(key, channel.clone());
-            return Ok(channel);
-        }
-
-        let endpoint = key.endpoint.clone();
-        let (mode, result) = self
-            .channel_singleflight
-            .run(key.clone(), move || async move {
-                tokio::task::yield_now().await;
-                lazy_channel(&endpoint)
-            })
-            .await;
-        if mode == SingleflightMode::Joined {
-            self.record_pool_metric(ClientMetric::WorkerChannelSingleflightJoin, operation, "join");
-            self.record_pool_metric(
-                ClientMetric::WorkerChannelDuplicateCreationAvoided,
-                operation,
-                "avoided",
-            );
-        }
-        match result {
-            Ok(channel) => {
-                self.insert_worker_channel(key, channel.clone());
-                Ok(channel)
-            }
-            Err(err) => {
-                self.record_pool_metric(ClientMetric::ChannelPoolConnectError, operation, "error");
-                self.record_pool_metric(ClientMetric::WorkerChannelSingleflightFailure, operation, "failure");
-                Err(err)
-            }
-        }
+        let channel = lazy_channel(&key.endpoint).inspect_err(|_err| {
+            self.record_pool_metric(ClientMetric::ChannelPoolConnectError, operation, "error");
+        })?;
+        Ok(self.insert_worker_channel(key, channel))
     }
 
-    fn insert_worker_channel(&self, key: WorkerChannelKey, channel: tonic_net::Channel) {
+    fn insert_worker_channel(&self, key: WorkerChannelKey, channel: tonic_net::Channel) -> tonic_net::Channel {
         let mut channels = self.channels.write();
-        if channels.contains_key(&key) {
-            return;
+        if let Some(existing) = channels.get(&key).cloned() {
+            return existing;
         }
         evict_worker_channel_if_needed(&mut channels, &key, self.max_channels_per_worker);
-        channels.insert(key, channel);
+        channels.insert(key, channel.clone());
+        channel
     }
 
     fn invalidate_endpoint(&self, candidate: &WorkerEndpointInfo, reason: CacheInvalidationReason) {
@@ -1209,7 +1172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_worker_channel_requests_same_key_create_one_channel() {
+    async fn concurrent_worker_channel_requests_same_key_reuse_inserted_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
         let client = Arc::new(TonicWorkerDataClient::with_parts(
             WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone()),
@@ -1231,8 +1194,6 @@ mod tests {
         }
         assert_eq!(client.channels.read().len(), 1);
         let events = metrics.events();
-        assert_metric(&events, ClientMetric::WorkerChannelSingleflightJoin);
-        assert_metric(&events, ClientMetric::WorkerChannelDuplicateCreationAvoided);
         assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
     }
 
@@ -1265,7 +1226,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_worker_channel_creation_wakes_waiters_without_insert() {
+    async fn failed_worker_channel_creation_does_not_insert() {
         let metrics = Arc::new(RecordingMetrics::default());
         let client = Arc::new(TonicWorkerDataClient::with_parts(
             WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone()),
@@ -1288,7 +1249,7 @@ mod tests {
             assert!(matches!(err, ClientError::Worker(msg) if msg.contains("invalid worker endpoint")));
         }
         assert!(client.channels.read().is_empty());
-        assert_metric(&metrics.events(), ClientMetric::WorkerChannelSingleflightFailure);
+        assert_metric(&metrics.events(), ClientMetric::ChannelPoolConnectError);
     }
 
     #[tokio::test]

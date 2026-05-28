@@ -3,12 +3,14 @@
 
 use super::{FsCore, StaleStateStatus};
 use crate::error::MetadataError;
+use crate::placement::{PlacementOp, PlacementPlanner, PlacementRequest, WorkerPlacementView};
 use crate::service::core_util::{need_refresh_core_failure, worker_endpoint_from_parts};
 use crate::service::domain::{
     CoreFailure, CoreResult, Freshness, GetAttrInput, GetAttrOutput, GetFileLayoutInput, GetFileLayoutOutput,
     InodeMountGuardInputs, ReadDirEntry, ReadDirInput, ReadDirOutput, RequestContext,
 };
 use common::error::canonical::RefreshReason;
+use common::header::CallerContextFields;
 use common::header::RpcErrorCode;
 use types::fs::{Extent, InodeId};
 use types::ids::DataHandleId;
@@ -53,6 +55,24 @@ impl FsCore {
             types::fs::InodeData::File { file_version, .. } => *file_version,
             _ => None,
         }
+    }
+
+    fn caller_context_fields(req_ctx: &RequestContext) -> Option<CallerContextFields> {
+        req_ctx
+            .caller
+            .caller_context
+            .as_ref()
+            .map(CallerContextFields::from_caller_context)
+    }
+
+    fn has_usable_read_endpoint(worker: &WorkerPlacementView) -> bool {
+        worker_endpoint_from_parts(
+            worker.worker_id,
+            worker.endpoint.clone(),
+            worker.worker_net_protocol,
+            worker.worker_epoch,
+        )
+        .is_ok()
     }
 
     pub(crate) async fn plan_inode_mount(
@@ -300,6 +320,12 @@ impl FsCore {
         if let Err(err) = storage.validate_data_handle_owner(data_handle_id, Some(req.inode_id)) {
             return self.failure_from_error_with_route_epoch(&req.ctx, err, group_id, mount_epoch, route_epoch);
         }
+        let layout = match storage.get_layout(req.inode_id) {
+            Ok(layout) => layout,
+            Err(err) => {
+                return self.failure_from_error_with_route_epoch(&req.ctx, err, group_id, mount_epoch, route_epoch)
+            }
+        };
         for extent in &extents {
             if extent.block_id.data_handle_id != data_handle_id {
                 return self.failure_from_error_with_route_epoch(
@@ -361,6 +387,12 @@ impl FsCore {
         };
 
         let worker_manager = self.worker_manager.as_ref();
+        let worker_lookup_group_id = if worker_manager.is_some() && !filtered_extents.is_empty() {
+            Some(self.require_worker_lookup_group(&req.ctx, group_id, mount_epoch, route_epoch, "GetFileLayout")?)
+        } else {
+            None
+        };
+        let caller = Self::caller_context_fields(&req.ctx);
         let mut locations = Vec::with_capacity(filtered_extents.len());
         for extent in &filtered_extents {
             let block_stamp = match extent.block_stamp {
@@ -393,31 +425,32 @@ impl FsCore {
                 }
             };
             let mut workers = Vec::new();
-            if let Some(worker_manager) = worker_manager {
-                let worker_lookup_group_id =
-                    self.require_worker_lookup_group(&req.ctx, group_id, mount_epoch, route_epoch, "GetFileLayout")?;
-                let mut worker_ids = worker_manager.get_block_locations(worker_lookup_group_id, extent.block_id);
-                worker_ids.sort_by_key(|worker_id| worker_id.as_raw());
-                workers.reserve(worker_ids.len());
-                for worker_id in worker_ids {
-                    if let Some(descriptor) = worker_manager.get_descriptor(worker_lookup_group_id, worker_id) {
-                        let endpoint = match worker_endpoint_from_parts(
-                            worker_id,
-                            descriptor.address,
-                            descriptor.worker_net_protocol,
-                            descriptor.worker_epoch,
-                        ) {
-                            Ok(endpoint) => endpoint,
-                            Err(err) => {
-                                return self.failure_from_error_with_route_epoch(
-                                    &req.ctx,
-                                    err,
-                                    group_id,
-                                    mount_epoch,
-                                    route_epoch,
-                                );
-                            }
-                        };
+            if let (Some(worker_manager), Some(worker_lookup_group_id)) = (worker_manager, worker_lookup_group_id) {
+                let reported = worker_manager.reported_block_locations(worker_lookup_group_id, extent.block_id);
+                let views = worker_manager.collect_worker_placement_views(worker_lookup_group_id);
+                let usable_views: Vec<_> = views.into_iter().filter(Self::has_usable_read_endpoint).collect();
+                let plan = PlacementPlanner.plan(
+                    &PlacementRequest {
+                        group_id: worker_lookup_group_id,
+                        op: PlacementOp::Read,
+                        block_id: extent.block_id,
+                        block_stamp: Some(block_stamp),
+                        layout,
+                        caller: caller.clone(),
+                        existing: reported,
+                        exclude_workers: Vec::new(),
+                        target_replicas: layout.replication,
+                    },
+                    &usable_views,
+                );
+                workers.reserve(plan.workers.len());
+                for worker in plan.workers {
+                    if let Ok(endpoint) = worker_endpoint_from_parts(
+                        worker.worker_id,
+                        worker.endpoint,
+                        worker.worker_net_protocol,
+                        worker.worker_epoch,
+                    ) {
                         workers.push(endpoint);
                     }
                 }

@@ -21,16 +21,13 @@ use super::{
     AppendOptions, CreateDisposition, CreateOptions, DirectoryListing, FileReader, FileStatus, FileWriter, ListOptions,
     OpenOptions,
 };
-use crate::cache::{LayoutCache, LayoutCacheKey};
 use crate::canonical::{ClientAction, RefreshHint};
 use crate::config::ClientConfig;
 use crate::data::{DataPlaneBoundary, WorkerBlockSyncResult, WorkerCommitResult};
 use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult};
-use crate::metadata::{LayoutSnapshot, MetadataGateway, TonicMetadataGateway, WriteSessionSeed};
+use crate::metadata::{MetadataGateway, TonicMetadataGateway, WriteSessionSeed};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics, NoopClientMetrics};
-use crate::planner::read_planner::{PlannedReadRange, ReadPlanner};
-use crate::runtime::singleflight::Singleflight;
-use crate::runtime::singleflight::SingleflightMode;
+use crate::planner::read_planner::ReadPlanner;
 use crate::runtime::{
     AttemptContext, BackoffPolicy, BackoffSleeper, ErrorClass, ErrorClassifier, OperationContext, OperationExecutor,
     OperationIdentity, OperationKind, OperationRuntime, RefreshManager, RefreshReason, RetryDecision,
@@ -49,8 +46,6 @@ pub struct FsClient {
     pub(super) config: ClientConfig,
     pub(super) executor: OperationExecutor,
     pub(super) data_boundary: DataPlaneBoundary,
-    pub(super) layout_cache: LayoutCache,
-    pub(super) layout_singleflight: Singleflight<LayoutCacheKey, LayoutSnapshot>,
     pub(super) backoff: BackoffPolicy,
     pub(super) sleeper: Arc<dyn BackoffSleeper>,
     pub(super) metrics: Arc<dyn ClientMetrics>,
@@ -107,9 +102,8 @@ impl FsClient {
         metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
         let client_id = config.client_id()?;
-        let layout_cache = LayoutCache::from_config(&config.cache, Arc::clone(&metrics));
         let refresh_manager = RefreshManager::from_config(&config.metadata_group_ids, &config.metadata_endpoints)?
-            .with_caches(Some(layout_cache.clone()), data_boundary.worker_endpoint_cache());
+            .with_worker_endpoint_cache(data_boundary.worker_endpoint_cache());
         let executor = OperationExecutor::with_runtime(
             client_id,
             gateway,
@@ -127,8 +121,6 @@ impl FsClient {
             config,
             executor,
             data_boundary,
-            layout_cache,
-            layout_singleflight: Singleflight::default(),
             backoff,
             sleeper,
             metrics,
@@ -290,7 +282,6 @@ impl FsClient {
         let file_version = handle.file_version();
         let inode_id = handle.inode_id();
         let data_handle_id = handle.data_handle_id();
-        let layout_key = LayoutCacheKey::new(inode_id, data_handle_id, file_version, span);
         let operation = OperationContext::new(
             self.executor.client_id(),
             OperationKind::WorkerReadData,
@@ -304,7 +295,8 @@ impl FsClient {
         let mut attempt = 0u32;
         loop {
             let layout = self
-                .load_layout(handle.path(), data_handle_id, span, layout_key)
+                .executor
+                .read_layout_for_data_handle(handle.path(), data_handle_id, span.file_offset, span.len)
                 .await?;
             let (group_id, segments) =
                 ReadPlanner::resolve_response(inode_id, data_handle_id, Some(file_version), span, &layout)?;
@@ -411,62 +403,6 @@ impl FsClient {
                 }
             }
         }
-    }
-
-    async fn load_layout(
-        &self,
-        path: &str,
-        data_handle_id: DataHandleId,
-        span: PlannedReadRange,
-        layout_key: LayoutCacheKey,
-    ) -> ClientResult<LayoutSnapshot> {
-        if let Some(layout) = self.layout_cache.get(&layout_key) {
-            return Ok(layout);
-        }
-        if !self.config.cache.layout_singleflight_enabled {
-            let layout = self
-                .executor
-                .read_layout_for_data_handle(path, data_handle_id, span.file_offset, span.len)
-                .await?;
-            self.layout_cache.insert_validated(layout_key, layout.clone())?;
-            return Ok(layout);
-        }
-
-        let executor = self.executor.clone();
-        let layout_cache = self.layout_cache.clone();
-        let layout_cache_for_flight = layout_cache.clone();
-        let path = path.to_string();
-        let (mode, result) = self
-            .layout_singleflight
-            .run(layout_key, move || async move {
-                tokio::task::yield_now().await;
-                if let Some(layout) = layout_cache_for_flight.get(&layout_key) {
-                    return Ok(layout);
-                }
-                let layout = executor
-                    .read_layout_for_data_handle(&path, data_handle_id, span.file_offset, span.len)
-                    .await?;
-                layout_cache.insert_validated(layout_key, layout.clone())?;
-                Ok(layout)
-            })
-            .await;
-        if mode == SingleflightMode::Joined {
-            self.record_metric(
-                ClientMetric::LayoutSingleflightJoin,
-                cache_metric_labels("layout", "metadata", "read", "join"),
-            );
-            self.record_metric(
-                ClientMetric::LayoutDuplicateRequestAvoided,
-                cache_metric_labels("layout", "metadata", "read", "avoided"),
-            );
-        }
-        if result.is_err() {
-            self.record_metric(
-                ClientMetric::LayoutSingleflightFailure,
-                cache_metric_labels("layout", "metadata", "read", "failure"),
-            );
-        }
-        result
     }
     pub(crate) async fn write_handle_all(&self, handle: &WriteHandle, data: Bytes) -> ClientResult<u64> {
         let session_ref = handle.write_session();
@@ -1018,7 +954,6 @@ impl fmt::Debug for FsClient {
             .field("config", &self.config)
             .field("executor", &self.executor)
             .field("data_boundary", &self.data_boundary)
-            .field("layout_cache", &self.layout_cache)
             .finish_non_exhaustive()
     }
 }
@@ -1033,19 +968,6 @@ pub(super) fn validate_path(path: &str) -> ClientResult<()> {
 
 pub(super) fn metric_labels(operation: &'static str, kind: OperationKind) -> ClientMetricLabels {
     ClientMetricLabels::default().with_operation(kind.label(), operation, kind.target_plane())
-}
-
-pub(super) fn cache_metric_labels(
-    cache: &'static str,
-    plane: &'static str,
-    operation: &'static str,
-    outcome: &'static str,
-) -> ClientMetricLabels {
-    ClientMetricLabels::default()
-        .with_cache(cache)
-        .with_target_plane(plane)
-        .with_operation_name(operation)
-        .with_outcome(outcome)
 }
 
 fn timeout_error(target_plane: &str, operation: &str, timeout: Duration) -> ClientError {

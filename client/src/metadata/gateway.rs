@@ -24,7 +24,6 @@ use crate::metadata::snapshot::{
     RenameResult, RenewLeaseResult, StateWatermark, StatusSnapshot, SyncWriteResult, WriteSessionSeed,
 };
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
-use crate::runtime::singleflight::{Singleflight, SingleflightMode};
 use crate::runtime::AttemptContext;
 
 /// Client-owned metadata control-plane adapter.
@@ -80,8 +79,6 @@ pub(crate) struct TonicMetadataGateway {
     channels: Arc<parking_lot::RwLock<HashMap<MetadataChannelKey, tonic_net::Channel>>>,
     channel_pool_enabled: bool,
     max_channels_per_group: usize,
-    channel_singleflight_enabled: bool,
-    channel_singleflight: Singleflight<MetadataChannelKey, tonic_net::Channel>,
     metrics: Arc<dyn ClientMetrics>,
 }
 
@@ -96,7 +93,6 @@ impl TonicMetadataGateway {
             endpoint,
             config.channel_pool.metadata_channel_pool_enabled,
             config.channel_pool.metadata_channel_pool_max_per_group,
-            config.channel_pool.metadata_channel_singleflight_enabled,
             metrics,
         )
     }
@@ -108,14 +104,13 @@ impl TonicMetadataGateway {
         max_channels_per_group: usize,
         metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
-        Self::new_lazy_with_pool_options(endpoint, channel_pool_enabled, max_channels_per_group, true, metrics)
+        Self::new_lazy_with_pool_options(endpoint, channel_pool_enabled, max_channels_per_group, metrics)
     }
 
     fn new_lazy_with_pool_options(
         endpoint: impl Into<String>,
         channel_pool_enabled: bool,
         max_channels_per_group: usize,
-        channel_singleflight_enabled: bool,
         metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
         let endpoint = normalize_endpoint(&endpoint.into());
@@ -133,8 +128,6 @@ impl TonicMetadataGateway {
             channels: Arc::new(parking_lot::RwLock::new(channels)),
             channel_pool_enabled,
             max_channels_per_group: max_channels_per_group.max(1),
-            channel_singleflight_enabled,
-            channel_singleflight: Singleflight::default(),
             metrics,
         })
     }
@@ -184,50 +177,20 @@ impl TonicMetadataGateway {
             self.record_pool_metric(ClientMetric::MetadataChannelPoolHit, operation, "hit");
             return Ok(channel);
         }
-        if !self.channel_singleflight_enabled {
-            let channel = lazy_channel(&key.endpoint).inspect_err(|_err| {
-                self.record_pool_metric(ClientMetric::ChannelPoolConnectError, operation, "error");
-            })?;
-            self.insert_metadata_channel(key, channel.clone());
-            return Ok(channel);
-        }
-
-        let endpoint = key.endpoint.clone();
-        let (mode, result) = self
-            .channel_singleflight
-            .run(key.clone(), move || async move {
-                tokio::task::yield_now().await;
-                lazy_channel(&endpoint)
-            })
-            .await;
-        if mode == SingleflightMode::Joined {
-            self.record_pool_metric(ClientMetric::MetadataChannelSingleflightJoin, operation, "join");
-            self.record_pool_metric(
-                ClientMetric::MetadataChannelDuplicateCreationAvoided,
-                operation,
-                "avoided",
-            );
-        }
-        match result {
-            Ok(channel) => {
-                self.insert_metadata_channel(key, channel.clone());
-                Ok(channel)
-            }
-            Err(err) => {
-                self.record_pool_metric(ClientMetric::ChannelPoolConnectError, operation, "error");
-                self.record_pool_metric(ClientMetric::MetadataChannelSingleflightFailure, operation, "failure");
-                Err(err)
-            }
-        }
+        let channel = lazy_channel(&key.endpoint).inspect_err(|_err| {
+            self.record_pool_metric(ClientMetric::ChannelPoolConnectError, operation, "error");
+        })?;
+        Ok(self.insert_metadata_channel(key, channel))
     }
 
-    fn insert_metadata_channel(&self, key: MetadataChannelKey, channel: tonic_net::Channel) {
+    fn insert_metadata_channel(&self, key: MetadataChannelKey, channel: tonic_net::Channel) -> tonic_net::Channel {
         let mut channels = self.channels.write();
-        if channels.contains_key(&key) {
-            return;
+        if let Some(existing) = channels.get(&key).cloned() {
+            return existing;
         }
         evict_metadata_channel_if_needed(&mut channels, &key, self.max_channels_per_group);
-        channels.insert(key, channel);
+        channels.insert(key, channel.clone());
+        channel
     }
 
     fn record_pool_metric(&self, metric: ClientMetric, operation: &'static str, outcome: &'static str) {
@@ -610,7 +573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_metadata_channel_requests_same_key_create_one_channel() {
+    async fn concurrent_metadata_channel_requests_same_key_reuse_inserted_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
         let gateway = Arc::new(
             TonicMetadataGateway::new_lazy_with_pool("127.0.0.1:18080", true, 8, metrics.clone()).expect("gateway"),
@@ -629,13 +592,11 @@ mod tests {
         }
         let events = metrics.events();
         assert_eq!(gateway.channels.read().len(), 2);
-        assert_metric(&events, ClientMetric::MetadataChannelSingleflightJoin);
-        assert_metric(&events, ClientMetric::MetadataChannelDuplicateCreationAvoided);
         assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
     }
 
     #[tokio::test]
-    async fn failed_metadata_channel_creation_wakes_waiters_without_insert() {
+    async fn failed_metadata_channel_creation_does_not_insert() {
         let metrics = Arc::new(RecordingMetrics::default());
         let gateway = Arc::new(
             TonicMetadataGateway::new_lazy_with_pool("127.0.0.1:18080", true, 8, metrics.clone()).expect("gateway"),
@@ -654,7 +615,7 @@ mod tests {
             assert!(matches!(err, ClientError::Metadata(msg) if msg.contains("invalid metadata endpoint")));
         }
         assert_eq!(gateway.channels.read().len(), 1);
-        assert_metric(&metrics.events(), ClientMetric::MetadataChannelSingleflightFailure);
+        assert_metric(&metrics.events(), ClientMetric::ChannelPoolConnectError);
     }
 
     #[tokio::test]

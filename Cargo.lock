@@ -1494,6 +1494,7 @@ dependencies = [
  "client",
  "common",
  "futures",
+ "metadata",
  "parking_lot",
  "proto",
  "tempfile",
@@ -1501,6 +1502,7 @@ dependencies = [
  "tonic",
  "tracing-subscriber",
  "types",
+ "worker",
 ]
 
 [[package]]

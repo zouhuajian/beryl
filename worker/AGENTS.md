@@ -1,65 +1,42 @@
 # `worker` Agent Instructions
 
-This file applies to `worker/`. Follow the root `AGENTS.md` first, then these local rules.
+This file applies to `worker/`. Follow the root `AGENTS.md` first; this crate is a data-plane executor, not namespace authority.
 
-## Crate role
+## Scope
 
-`worker` owns data-plane execution. It executes block-local reads and writes, manages worker-local storage/runtime state, and validates metadata-derived context for direct client-to-worker paths.
+`worker` owns:
 
-## Allowed changes
+- local block store, persisted local block metadata, and physical layout interpretation behind `BlockStore`
+- chunk IO, checksum, and local repair/materialization execution when implemented
+- open/commit control points and stream read/write/abort runtime
+- data service adapters, worker core orchestration, worker networking, block reports, and heartbeats
+- worker typed config, local validation, block stamp, fencing, block format, range, readiness, and publication state
 
-- Local block store implementation and worker-local persisted metadata interpretation.
-- Chunk IO, checksum, repair, replication, relocation, and maintenance execution.
-- Stream open/read/write/commit/abort runtime.
-- Data service adapters and worker core orchestration.
-- Worker net server/client behavior.
-- Worker typed config, defaults, and validation.
-- Worker-local validation of block stamp, fencing, block format, range, and readiness.
+`worker` must not own file-level namespace authority, metadata route ownership, metadata layout authority, client retry/cache/SDK policy, proto schema ownership, shared domain definitions that belong in `types`, or UFS path derivation from `data_handle_id` or `block_id`.
 
-## Forbidden changes
+## Local Rules
 
-- Metadata authority policy, inode/dentry/path authority, mount ownership, or file-level layout authority.
-- Client retry, replay, cache, endpoint-health, or SDK policy.
-- Shared domain definitions that belong in `types`.
-- Generated schema ownership or protobuf business policy.
-- Moving store path layout, publishability, recovery, stream state, or runtime policy into `types`.
-- UFS path inference from `data_handle_id` or `block_id`.
-- Hidden fallback behavior that bypasses route, epoch, fencing, block stamp, or local-ready validation.
-
-## Dependency rules
-
-- `worker` may depend on shared crates where appropriate.
-- `worker` must not depend on `metadata` or `client` in production code.
-- Worker core/store public APIs should use Rust domain types, not prost/generated proto types.
-- Generated worker block-meta proto types must stay behind codec boundaries.
-
-## Conversion and validation rules
-
-- Use shared domain values at service/core/store boundaries where they are stable.
-- Keep store/runtime state local to `worker`.
-- Structural proto/domain conversion should be called from `proto` helpers when shared; worker-only codec conversion may stay local when it is schema-local.
-- Validate metadata-derived block identity and freshness context before data-plane execution.
-- Recoverable mismatches such as stale block stamp, local miss, invalid range, or fencing mismatch must produce structured machine-usable outcomes.
+- Metadata provides block identity, route/source binding, lease/fencing context, and freshness information. Validate that context before data-plane execution.
+- Preserve the distinctions: Block is management/lifecycle/reporting; StorageChunk is local IO/checksum/bitmap/materialization; TransportFrame is stream/network batching and flow control; Stream is a continuous read/write session.
+- `BlockStore` should hide physical layout assumptions from upper layers.
+- Local block metadata must be self-describing; do not interpret persisted blocks through runtime defaults.
+- Keep Open/Commit control points separate from the stream data path.
 - Do not make staging data readable before final publication.
+- Worker owns local repair and materialization when implemented. Unimplemented repair, materialization, QUIC/RDMA, peer RPC, partial-cache, or append surfaces must remain explicit placeholders and must not become half-implemented abstractions.
+- Generated worker block-meta proto types should stay behind codec boundaries.
 
-## Testing guidance
+## Tests
 
-- Add or update tests for block/store publication, staging unreadability, Ready reads, write stream sequencing, abort and recovery, tail effective length, stale block stamp, fencing, persisted metadata interpretation, restart/reopen, structured error mapping, stream cursor/eos/cleanup, and bounded concurrency where relevant.
-- Tests should prove data-plane semantics, not only generic success.
+- Test block publication, staging unreadability, Ready reads, write stream sequencing, commit/abort/recovery, effective tail length, stale block stamp, fencing, persisted metadata interpretation, restart/reopen, structured error mapping, stream cursor/eos/cleanup, and bounded concurrency where relevant.
+- Tests should prove data-plane semantics, not generic success.
 - Use integration tests when metadata/client interaction is the behavior under test.
 
-## Documentation guidance
+## Local Self-Review
 
-- Document publication, fencing, block stamp validation, staging visibility, persisted metadata interpretation, and store/runtime boundaries.
-- Update docs when worker store format, stream contract, config ownership, or data-plane validation changes.
-- Do not document future partial-cache, append, materialization, or repair behavior as current behavior.
+Apply the root self-review checklist, then check:
 
-## Review checklist
-
-- Did Block, StorageChunk, TransportFrame, and Stream remain separate concepts?
-- Did store/runtime policy stay local to `worker`?
-- Did the change avoid production dependencies on `metadata` and `client`?
-- Did persisted block interpretation come from persisted metadata rather than runtime defaults?
-- Did it preserve block stamp, fencing, range, and Ready-state validation?
-- Did it avoid moving worker runtime state into shared crates?
-- Did tests/docs stay aligned with the current store and stream contracts?
+- Did worker remain a data-plane executor without namespace authority?
+- Did metadata-derived context get validated before data-plane execution?
+- Did Block, StorageChunk, TransportFrame, and Stream stay distinct?
+- Did persisted interpretation come from local metadata instead of runtime defaults?
+- Did Open/Commit and stream data paths remain clearly separated?

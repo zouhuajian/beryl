@@ -6,9 +6,11 @@ publish = false
 
 [dev-dependencies]
 client = { path = "../client" }
+metadata = { path = "../metadata" }
 proto = { path = "../proto" }
 common = { path = "../common" }
 types = { path = "../types" }
+worker = { path = "../worker" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 tonic = { workspace = true }
 futures = { workspace = true }

@@ -401,12 +401,17 @@ impl WorkerManager {
         let lease_deadline = Instant::now() + self.heartbeat_timeout();
         let descriptor_address = address.clone();
         let descriptor_fault_domain = fault_domain.clone();
+        let worker_epoch = self
+            .get_descriptor(group_id, worker_id)
+            .map(|descriptor| descriptor.worker_epoch)
+            .unwrap_or(1)
+            .max(1);
         let descriptor = WorkerDescriptor {
             group_id,
             worker_id,
             address: descriptor_address,
             worker_net_protocol,
-            worker_epoch: 0,
+            worker_epoch,
             fault_domain: descriptor_fault_domain,
         };
         self.upsert_descriptor(descriptor)?;

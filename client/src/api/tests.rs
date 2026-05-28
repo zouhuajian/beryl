@@ -202,6 +202,59 @@ async fn reader_reads_normal_range_through_planner_and_worker() {
 }
 
 #[tokio::test]
+async fn reader_repeated_reads_fetch_current_metadata_locations() {
+    let gateway = Arc::new(MockGateway::with_layout(layout_response(
+        9,
+        101,
+        202,
+        Some(3),
+        16,
+        vec![location(202, 0, 0, 16)],
+    )));
+    let worker = Arc::new(MockDataClient::from_file(b"abcdefghijklmnop"));
+    let client = FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker)).expect("client");
+    let reader = read_reader(&client, 16);
+
+    let first = reader.read_at(2, 5).await.expect("first read succeeds");
+    let second = reader.read_at(2, 5).await.expect("second read succeeds");
+
+    assert_eq!(first, Bytes::from_static(b"cdefg"));
+    assert_eq!(second, Bytes::from_static(b"cdefg"));
+    assert_eq!(method_count(&gateway.calls(), "read_layout"), 2);
+}
+
+#[tokio::test]
+async fn concurrent_reader_reads_fetch_layout_per_call() {
+    let gateway = Arc::new(MockGateway::with_layout(layout_response(
+        9,
+        101,
+        202,
+        Some(3),
+        16,
+        vec![location(202, 0, 0, 16)],
+    )));
+    let worker = Arc::new(MockDataClient::from_file(b"abcdefghijklmnop"));
+    let client = FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker)).expect("client");
+    let reader = read_reader(&client, 16);
+
+    let first = {
+        let reader = reader.clone();
+        tokio::spawn(async move { reader.read_at(2, 5).await })
+    };
+    let second = tokio::spawn(async move { reader.read_at(2, 5).await });
+
+    assert_eq!(
+        first.await.expect("first task").expect("first read"),
+        Bytes::from_static(b"cdefg")
+    );
+    assert_eq!(
+        second.await.expect("second task").expect("second read"),
+        Bytes::from_static(b"cdefg")
+    );
+    assert_eq!(method_count(&gateway.calls(), "read_layout"), 2);
+}
+
+#[tokio::test]
 async fn reader_replans_after_worker_refresh() {
     let gateway = Arc::new(MockGateway::with_layout(layout_response(
         9,

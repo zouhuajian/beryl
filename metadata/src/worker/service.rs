@@ -65,7 +65,7 @@ pub struct MetadataWorkerServiceImpl {
 }
 
 impl MetadataWorkerServiceImpl {
-    pub(crate) fn new(
+    pub fn new(
         raft_node: Arc<AppRaftNode>,
         worker_manager: Arc<WorkerManager>,
         mount_table: Arc<crate::mount::MountTable>,

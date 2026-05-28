@@ -56,7 +56,7 @@ Worker startup registration is group-scoped. The worker resolves a stable `Worke
 | `proto` | Wire schema and structural conversion | Protobuf files, generated Rust modules, gRPC service contracts, wire enum values, and proto/domain conversion. |
 | `metadata` | Metadata authority runtime | Inode/dentry/attrs, mounts, leases, write sessions, Raft state, worker membership service, maintenance routing, and metadata config. |
 | `worker` | Data-plane runtime | Local block store, chunk IO, stream runtime, data service adapters, worker networking, and worker config. |
-| `client` | SDK and orchestration runtime | Public facade, metadata gateway, layout and endpoint caches, retry/refresh policy, planner behavior, and client config. |
+| `client` | SDK and orchestration runtime | Public facade, metadata gateway, worker endpoint resolution/cache, channel pooling, retry/refresh orchestration, read planning, worker data-plane access, and client config. The client obtains authoritative layout, write targets, and read locations from metadata, validates read locations with `ReadPlanner`, and then accesses workers on the normal data path. Client-side read layout caching has been removed from the current architecture. |
 | `ufs` | External backend adapter | Backend integration, OpenDAL setup, backend-specific config, UFS path behavior, and backend capability decisions. |
 | `integration_tests` | Test-only contracts | End-to-end fixtures, mock servers, contract assertions, and raw proto wire checks. |
 

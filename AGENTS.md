@@ -1,137 +1,110 @@
 # Vecton Agent Instructions
 
-Vecton is a distributed storage and cache acceleration system with filesystem-facing semantics, inode-centric metadata authority, and a direct client-to-worker data path. This file is the repository-wide execution contract for coding agents.
+Vecton is a data access acceleration layer with metadata-controlled routing and client-to-worker data-plane access. The project is still in active design and stabilization: correctness, freshness, epoch/fencing validation, and clear module boundaries matter more than feature breadth.
 
-If a subtree has a stricter `AGENTS.md`, follow that local file. Keep changes inside the requested scope. Do not introduce architecture direction through opportunistic cleanup.
+`AGENTS.md` files are normative execution rules. `docs/` records architecture, audits, and design context; keep those docs consistent with code, but do not treat stale docs as stronger than current code plus these instructions. If a subtree has a stricter `AGENTS.md`, follow it for that subtree.
 
-## Required reading
+## Required Reading
 
 Before architectural, dependency-boundary, schema, config, shared-module, or cross-crate changes, read:
 
-- this `AGENTS.md`
+- this file
 - the local `AGENTS.md` for every touched subtree
 - `docs/ARCHITECTURE_BOUNDARIES.md`
 - task-specific design or audit documents named by the user
 
-`docs/` is informative by default. `AGENTS.md` files are normative unless the user explicitly says otherwise.
+Keep changes inside the requested scope. Do not introduce architecture direction through opportunistic cleanup.
 
-## Core architecture rules
+## Repository Boundaries
 
-- Inode, dentry, and attrs are authoritative for filesystem metadata.
-- Path is an adapter, not a persisted source of truth.
-- Block is the sole management, reporting, replication, relocation, and repair unit.
-- Chunk is the physical IO, checksum, and repair granularity.
-- Stream is the continuous read/write abstraction.
-- Recoverable business, protocol, and consistency failures use gRPC OK plus `ResponseHeader.error`.
-- Transport, auth, and framework failures use non-OK gRPC status.
-- Direct client-to-worker paths must preserve route, epoch, and fencing validation.
-- Metadata freshness is represented only by repeated `GroupStateWatermark`.
-- `GroupStateWatermark` is `{ group_id, state_id: RaftLogId }`; `state_id` means state-machine-applied `RaftLogId`.
-- Follower successful responses must not advance the client state cache.
-- Production metadata msync is single-group; multi-group msync is future work.
+| Area | Owns | Must not own |
+| --- | --- | --- |
+| `types` | Pure Rust domain model, typed IDs, stable value validation. | Proto/generated types, product runtime policy, implementation details, test fixtures. |
+| `proto` | Wire schema, gRPC contracts, generated modules, structural proto/domain conversion. | Business logic, authority policy, retry/cache policy, worker execution. |
+| `common` | Shared infrastructure: canonical errors, headers, config loading mechanics, observability, generic utilities. | Domain dumping ground, module-specific config semantics, runtime state. |
+| `client` | Public API, metadata RPC orchestration, worker data-plane orchestration, freshness/epoch validation, retry/refresh/replay behavior, caches and channels. | Metadata authority, worker internals, metadata-free cached direct access unless explicitly designed. |
+| `metadata` | Namespace and control-plane truth: inode, dentry, attrs, layout, leases, route ownership, mount routing, guard pipeline, Raft/RocksDB apply semantics. | Worker data execution, client policy, UFS backend behavior. |
+| `worker` | Data-plane execution, block store, local IO, stream handling, block reports, heartbeats. | File-level namespace authority, UFS path derivation from data handles, client retry/cache policy. |
+| `ufs` | Backend integration, backend config, OpenDAL setup, UFS path behavior, backend capability decisions. | Metadata authority, worker runtime, client policy. |
+| `integration_tests` | End-to-end fixtures, mock servers, raw wire checks, cross-crate contract assertions. | Production helpers, canonical conversion code, product runtime helpers. |
+| `docs` | Architecture, audit, and design records. | Normative rules that conflict with `AGENTS.md` or claims that planned features already exist. |
+
+Shared crates must not depend on product crates. `metadata`, `worker`, and `client` must not depend on each other in production code. `ufs` is a backend adapter crate and must not depend on `metadata`, `worker`, or `client`; `metadata` may depend on `ufs` only at mount/backend adapter boundaries. Test-only dependencies must stay explicit and narrow.
+
+## Core Contracts
+
+- Inode, dentry, attrs, layout, leases, and routing state are metadata-owned authority.
+- Paths are external adapters and lookup inputs, not persisted source-of-truth authority.
+- The normal data path is client -> metadata -> worker. Metadata issues layout, route, source, lease/fencing, and freshness context before worker access.
+- Client-to-worker data-plane access after metadata-issued context must preserve freshness, epoch, fencing, and structured refresh semantics.
+- Block is the management, reporting, lifecycle, replication, relocation, and repair unit.
+- StorageChunk is the local IO, checksum, bitmap, and materialization unit.
+- TransportFrame is the stream/network batching and flow-control unit.
+- Stream is the continuous read/write session abstraction.
+- `route_epoch`, `mount_epoch`, `worker_epoch`, and `GroupStateWatermark` are separate freshness domains.
+- Production metadata msync is single-group. Multi-group msync is future work.
 - `applied_seq` must not be reintroduced as runtime, storage, snapshot, header, or client state.
-- Do not add removed `applied_seq` snapshot decode fallback.
-- `route_epoch`, `mount_epoch`, and `worker_epoch` are separate freshness domains.
-- Breaking changes are allowed when requested or necessary. Do not keep compatibility bridges for internal-only stale code unless explicitly required.
 
-## Crate ownership and dependency rules
+## Error Contract
 
-| Crate               | Owns                                                         | Must not own or depend on                                    |
-| ------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
-| `types`             | Pure shared Rust domain values, typed IDs, stable cross-module value validation. | `common`, `proto`, product crates, generated proto types, runtime policy, test fixtures. |
-| `common`            | Generic infrastructure, canonical errors, request/response header domain types, config loading mechanics, observability, generic utilities. | `proto`, product crates, module policy, generated proto types, product runtime state, module-specific config semantics. |
-| `proto`             | `.proto` files, generated modules, gRPC contracts, wire enum values, structural proto/domain conversion, schema-local codecs. | Product crates, business policy, retry/replay/cache behavior, authority routing, worker store behavior. |
-| `metadata`          | Inode/dentry/attrs, mount state, leases, write sessions, `FsCore`, Raft, worker membership, maintenance routing, metadata config. | `worker` or `client` in production, worker execution, client policy, UFS behavior, duplicate shared conversion. |
-| `worker`            | Local block store, chunk IO, checksum/repair execution, stream runtime, data services, worker networking, worker config. | `metadata` or `client` in production, metadata authority, client policy, shared schema ownership. |
-| `client`            | SDK behavior, metadata gateway, layout/endpoint caches, retry/replay classification, planner behavior, data adapters, client config. | `metadata` or `worker` in production, metadata authority, worker runtime behavior, shared retry/cache policy. |
-| `ufs`               | Backend integration, backend config, OpenDAL setup, UFS path behavior, backend capability decisions. | `metadata`, `worker`, or `client`; unrelated shared production helpers. |
-| `integration_tests` | End-to-end fixtures, mock servers, contract assertions, raw wire checks. | Production helpers, canonical conversion code, runtime helpers used by product crates. |
+- Recoverable business, protocol, and consistency failures must use structured `CanonicalError` in response headers where the API has that header error channel.
+- Transport, auth, and framework failures may use non-OK transport errors with minimal correlation metadata.
+- Do not replace machine-usable error class/reason fields with string-only errors.
+- Keep policy-specific error mapping local to the owning crate; shared structural conversion belongs in `proto` or `common` only when it has no product policy.
 
-## Definition, conversion, validation, and config ownership
+## Code Shape
 
-Before adding a struct, enum, trait, function, proto message, config key, helper, or file:
+- Prefer direct, readable, engineering-oriented code with concise names and clear control flow.
+- Use concrete types unless a trait or wrapper defines a real crate/backend boundary, owns state, enforces invariants, isolates side effects, or removes meaningful duplication.
+- Do not create abstractions for future possibilities.
+- Do not introduce builders, managers, contexts, strategies, resolvers, wrappers, parameter structs, or modules unless they encode real semantics or boundaries.
+- Inline trivial one-use helpers that only forward parameters, assign fields, build simple values, or wrap `Option`/`Result`.
+- Avoid single-implementation traits unless they define a real boundary.
+- Keep the main flow readable without forcing readers through helper chains.
+- Prefer the narrowest visibility that works.
+- Delete obsolete internal paths instead of keeping compatibility aliases or fallback paths.
 
-- Put stable Rust domain concepts used by multiple production modules in `types`.
-- Put on-wire schema and gRPC contracts in `proto`.
-- Put generic infrastructure with no module policy in `common`.
-- Keep metadata authority, worker execution, client policy, UFS behavior, and test fixtures local to the owning crate.
-- Do not move a definition if doing so would make `types` or `common` depend on `proto` or a product crate.
-- Treat numeric proto values and external consumers as schema compatibility review.
-- Shared structural proto/domain conversion belongs in `proto`; policy decisions stay local to the owning crate.
-- Raw proto messages should be converted at service or adapter boundaries and should not become long-lived business state.
-- Pure value validation belongs with the value owner; authority, lease, route, repair, cache, and backend policy validation stays local to the owning crate.
-- `common` owns generic config loading mechanics. Each module owns its typed config structs, defaults, validation, and key semantics.
-- Do not centralize every module key/default in `common`.
-- Do not reinterpret persisted state with runtime defaults.
+## Compatibility Policy
 
-## Naming and code shape
+Breaking changes are acceptable during current development when they simplify design or remove stale internal contracts. Do not add compatibility bridges, aliases, decode fallbacks, or old/new parallel paths unless the user explicitly requests compatibility or an external consumer requires it.
 
-- Prefer simple, normal engineering names across files, traits, structs, enums, functions, and fields.
-- Use the surrounding type/module context and clear English comments to explain semantics instead of encoding every detail into a name.
-- Avoid verbose, abstract, or design-document-style names.
-- Do not add IDs, epochs, states, errors, traits, managers, routers, planners, helpers, or wrapper types unless they solve a concrete correctness or ownership problem.
-- Before adding a new abstraction, check whether an existing domain type or local function expresses the concept clearly.
-- Keep code direct, domain-driven, and easy to read.
-- Prefer clean replacement over old/new parallel paths. Delete obsolete internal methods in the same change that introduces their replacements.
-- Prefer the narrowest visibility that works: private, then `pub(super)`, then `pub(crate)`, then `pub`.
-- Keep `use` imports at the top of the file unless a local-scope import is clearly necessary.
-- Use `Vec::with_capacity()` when size is known or can be estimated well.
-- Wrap large or expensive-to-clone shared fields in `Arc<T>` instead of repeatedly deep-cloning.
-- Use `Box::pin(...)` or `.boxed()`, but never both for the same value.
-- Implement `Default` on config/options structs instead of standalone default helper functions.
-- Remove dead code instead of adding `#[allow(dead_code)]`.
-- Extract substantial production logic into normal submodules instead of growing already large files.
-- If a submodule needs deep parent access, treat that as transitional and narrow the dependency surface over time.
-- Choose log levels by audience: `debug!` for routine high-frequency operations, `info!` for operator-visible state changes, and `warn!` for unexpected but recoverable conditions.
+Schema changes still require wire-number and active-consumer review. Do not reuse or silently change proto numeric values.
 
-## Comments and documentation
+## Testing Expectations
 
-- New or modified code comments and project documentation must be in English unless the user requests another language for a specific artifact.
-- Write comments for core structs, enums, traits, functions, protocol fields, invariants, ownership boundaries, lifecycle assumptions, and non-obvious tradeoffs.
-- Do not write comments that only restate the code.
-- Comments must describe stable semantics, not implementation history.
-- Do not mention PR, Phase, review history, temporary milestones, or development process in production comments or proto comments.
-- Update docs when behavior, schema, config, ownership, dependency direction, or public contract changes.
-- Documentation must describe the current contract, not speculative future architecture.
-- Prefer precise tables and checklists over long prose when they are clearer.
-- Do not create broad new architecture documents unless requested.
+- Tests should protect behavior, contracts, invariants, replay semantics, freshness validation, and error mapping.
+- Prefer a few focused regression tests over large brittle suites or redundant implementation-detail tests.
+- Do not add production APIs, `cfg(test)` production fields, special injection hooks, or fake/force helpers just for tests.
+- Keep `#[cfg(test)] mod tests` near the bottom of source files; do not place production logic after test modules.
+- Consolidate obvious redundant tests when modifying test-heavy areas.
+- Use integration tests for observable cross-crate contracts, not as production helper libraries.
 
-## Testing rules
+## Documentation Expectations
 
-- Keep `#[cfg(test)] mod tests` as one block at the bottom of the file; never place production code after it.
-- Do not put test-only logic in production code.
-- Do not add `#[cfg(test)]` to production fields, methods, helper APIs, or production control flow.
-- Do not expose test-only production APIs such as special injection, force, fake, or test helper methods.
-- Test helpers must stay inside test modules, integration test fixtures, or `cfg(test)` test modules.
-- Tests should use real production paths where practical.
-- Do not use `#[path = "..."] mod tests;` in production code.
-- Do not use `#[path = "..."]` to work around normal module organization except as a clearly temporary refactor step.
-- If a file must be split, prefer normal directory modules.
-- Shared crate tests should prove semantics, conversion, validation, and dependency boundaries.
-- Product crate tests should prove module-owned policy and runtime behavior.
-- Integration tests should prove observable cross-crate contracts and must not become production helper libraries.
-- Add only core tests that protect correctness boundaries.
-- Do not over-test trivial wrappers.
-- Delete obsolete tests for removed behavior.
-- Merge redundant or overlapping tests instead of adding parallel cases.
-- Avoid large test modules unless necessary.
+- New or modified comments and docs must be in English unless the user requests another language.
+- Comments should explain semantics, invariants, ownership, ordering, or correctness constraints, not restate syntax.
+- Production and proto comments must describe current behavior, not PRs, phases, review history, or temporary milestones.
+- Update docs only where behavior, schema, config, ownership, dependency direction, or public contract changes.
+- Remove or clearly mark stale architecture statements. Do not claim planned features are current behavior.
 
-## Anti-patterns
+## Self-Review Checklist
 
-- Moving runtime, policy, or state into shared crates.
-- Treating `types` or `common` as dumping grounds.
-- Adding proto messages just because two Rust structs look similar.
-- Silently changing proto wire numeric values.
-- Reimplementing shared structural conversion in each product crate.
-- Keeping raw proto messages as long-lived business state.
-- Adding compatibility wrappers for internal-only stale APIs unless explicitly required.
-- Treating test fixtures as production shared abstractions.
-- Letting a documentation-only task change Rust, proto, config, generated, or build files.
-- Using arbitrary defaults or any-group fallbacks when an authoritative group, route, lease, or owner is required.
+Before handoff, answer these for the actual diff:
 
-## Validation expectations
+- Does this change respect crate boundaries?
+- Did it introduce unnecessary abstraction?
+- Did it introduce stale compatibility code?
+- Did it add test-only logic to production code?
+- Are names concise and clear?
+- Are comments current and semantic?
+- Are errors mapped through the correct contract?
+- Are tests behavior-oriented and non-redundant?
+- Are docs updated only where relevant?
+- Can every new type, trait, or helper be justified in one sentence?
 
-The development toolchain baseline is Rust 1.95.0. Keep the root `rust-toolchain.toml`, workspace `rust-version`, local verify entrypoint, and CI workflow aligned to that baseline.
+Also verify the local `AGENTS.md` files for touched subtrees were read.
+
+## Self-Check Commands
 
 For code changes, run the relevant subset. The default full validation set is:
 
@@ -142,26 +115,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-For documentation-only changes, at minimum run:
+For documentation-only changes, run at least:
 
 ```bash
 git diff --check
 ```
 
-Use `cargo metadata --format-version 1` when dependency or workspace membership claims change.
-
-## Handoff and review checklist
-
-Before handoff, report exact validation results and verify:
-
-- local `AGENTS.md` files for touched subtrees were read.
-- the change stayed inside requested scope.
-- dependency direction was preserved.
-- new definitions live in the owning crate.
-- runtime policy stayed local to the owning product crate.
-- proto wire values and service contracts are explicit.
-- stale internal paths were deleted rather than wrapped when compatibility is not required.
-- tests and docs were updated for changed behavior, schema, config, or ownership.
-- naming is concise and not over-abstracted.
-- no test-only production APIs were introduced.
-- no PR/Phase/development wording appears in production or proto comments.
+Use `cargo metadata --format-version 1` when dependency or workspace membership claims change. The Rust toolchain baseline is 1.95.0; keep `rust-toolchain.toml`, workspace `rust-version`, local verify entrypoints, and CI aligned with that baseline.

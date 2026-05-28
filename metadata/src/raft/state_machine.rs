@@ -935,12 +935,33 @@ impl AppRaftStateMachine {
     }
 
     fn extent_matches_visible(existing: &[Extent], candidate: &Extent) -> bool {
-        existing.iter().any(|visible| {
+        Self::matching_visible_extent(existing, candidate).is_some()
+    }
+
+    fn matching_visible_extent<'a>(existing: &'a [Extent], candidate: &Extent) -> Option<&'a Extent> {
+        existing.iter().find(|visible| {
             visible.block_id == candidate.block_id
                 && visible.file_offset == candidate.file_offset
                 && visible.block_offset == candidate.block_offset
                 && visible.len == candidate.len
         })
+    }
+
+    fn stamp_extents(extents: &mut [Extent], existing: &[Extent], file_version: u64) {
+        for extent in extents {
+            if let Some(visible) = Self::matching_visible_extent(existing, extent) {
+                if let Some(block_stamp) = visible.block_stamp {
+                    extent.file_version = Some(file_version);
+                    extent.block_stamp = Some(block_stamp);
+                    continue;
+                }
+            }
+            extent.file_version = Some(file_version);
+            // The Raft apply boundary assigns the metadata-authoritative stamp
+            // that direct readers must present to workers for newly visible
+            // blocks.
+            extent.block_stamp = Some(file_version);
+        }
     }
 
     /// Validate that a no-op SyncWrite request matches the already visible layout prefix.
@@ -2052,12 +2073,7 @@ impl AppRaftStateMachine {
             }
 
             // Update inode: publish extents and update size/mtime/ctime/file_version/lease_epoch.
-            for extent in &mut extents_to_publish {
-                extent.file_version = Some(file_version);
-                // The Raft apply boundary assigns the metadata-authoritative
-                // stamp that direct readers must present to workers.
-                extent.block_stamp = Some(file_version);
-            }
+            Self::stamp_extents(&mut extents_to_publish, &existing_extents_snapshot, file_version);
             match &mut inode.data {
                 types::fs::InodeData::File {
                     extents: existing_extents,
@@ -2275,10 +2291,7 @@ impl AppRaftStateMachine {
 
             let file_version = Self::next_file_version(inode_id, current_file_version)?;
             let mut stamped_extents = extents_to_publish;
-            for extent in &mut stamped_extents {
-                extent.file_version = Some(file_version);
-                extent.block_stamp = Some(file_version);
-            }
+            Self::stamp_extents(&mut stamped_extents, &existing_extents_snapshot, file_version);
 
             match &mut inode.data {
                 InodeData::File {
@@ -4736,6 +4749,62 @@ mod tests {
                 ..
             })))
         ));
+    }
+
+    #[test]
+    fn close_write_preserves_visible_block_stamp_for_already_published_extent() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
+
+        let parent_inode_id = InodeId::new(910);
+        let inode_id = InodeId::new(911);
+        let data_handle_id = DataHandleId::new(1911);
+        let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+        let mut visible_extent = extent(block_id, 0, 24);
+        visible_extent.file_version = Some(1);
+        visible_extent.block_stamp = Some(1);
+        let mut inode = install_file_with_extents(
+            &storage,
+            parent_inode_id,
+            "file",
+            inode_id,
+            data_handle_id,
+            vec![visible_extent],
+            24,
+        );
+        if let InodeData::File { file_version, .. } = &mut inode.data {
+            *file_version = Some(1);
+        }
+        storage.put_inode(&inode).unwrap();
+
+        expect_fs_ok(
+            sm.apply(Command::CloseWrite {
+                dedup: dedup_for_test(191),
+                inode_id,
+                extents: vec![extent(block_id, 0, 24)],
+                final_size: 24,
+                lease_id: lease_id_for_inode_epoch(inode_id, 1),
+                open_epoch: 1,
+                lease_epoch: 1,
+                commit_mode: FileCommitMode::Replace,
+            })
+            .unwrap(),
+        );
+
+        let updated = storage.get_inode(inode_id).unwrap().unwrap();
+        match updated.data {
+            InodeData::File {
+                extents, file_version, ..
+            } => {
+                assert_eq!(file_version, Some(2));
+                assert_eq!(extents.len(), 1);
+                assert_eq!(extents[0].file_version, Some(2));
+                assert_eq!(extents[0].block_stamp, Some(1));
+            }
+            other => panic!("unexpected inode data: {:?}", other),
+        }
     }
 
     #[test]

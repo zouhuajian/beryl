@@ -158,6 +158,14 @@ fn report_block(block_id: BlockId) -> BlockReportBlock {
 }
 
 fn report_block_with_stamp(block_id: BlockId, block_stamp: u64) -> BlockReportBlock {
+    report_block_with_stamp_and_state(block_id, block_stamp, BlockReportBlockState::Ready)
+}
+
+fn report_block_with_stamp_and_state(
+    block_id: BlockId,
+    block_stamp: u64,
+    block_state: BlockReportBlockState,
+) -> BlockReportBlock {
     BlockReportBlock {
         block_id,
         data_handle_id: block_id.data_handle_id.as_raw(),
@@ -165,7 +173,7 @@ fn report_block_with_stamp(block_id: BlockId, block_stamp: u64) -> BlockReportBl
         block_stamp,
         effective_len: 4096,
         committed_length: 4096,
-        block_state: BlockReportBlockState::Ready,
+        block_state,
     }
 }
 
@@ -211,6 +219,22 @@ fn publish_report_locations_with_stamp(
         .expect("full block report should publish locations");
 }
 
+fn publish_report_block(
+    manager: &WorkerManager,
+    group_id: ShardGroupId,
+    worker_id: WorkerId,
+    report_seq: u64,
+    block: BlockReportBlock,
+) {
+    let run_id = manager
+        .get_registration(group_id, worker_id)
+        .expect("worker registration")
+        .worker_run_id;
+    manager
+        .receive_full_block_report(group_id, worker_id, run_id, report_seq, 0, true, vec![block])
+        .expect("full block report should publish locations");
+}
+
 fn worker_manager_for_write_targets(group_id: ShardGroupId) -> Arc<WorkerManager> {
     let manager = Arc::new(WorkerManager::new(60));
     for raw in 1..=3 {
@@ -245,7 +269,7 @@ fn fs_core_without_mount() -> FsCore {
 }
 
 #[tokio::test]
-async fn get_file_layout_returns_reported_locations_without_read_placement() {
+async fn get_file_layout_returns_reported_locations_using_read_placement() {
     let dir = TempDir::new().unwrap();
     let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
     let mount_id = MountId::new(48);
@@ -321,11 +345,194 @@ async fn get_file_layout_returns_reported_locations_without_read_placement() {
             .iter()
             .map(|worker| worker.worker_id)
             .collect::<Vec<_>>(),
-        vec![WorkerId::new(1), WorkerId::new(2)]
+        vec![WorkerId::new(2), WorkerId::new(1)]
     );
     assert_eq!(location.worker_epoch, Some(22));
     assert_eq!(location.block_stamp, 41);
-    assert_eq!(location.workers[0].endpoint, "127.0.0.1:9101");
+    assert_eq!(location.workers[0].endpoint, "127.0.0.2:9102");
+}
+
+#[tokio::test]
+async fn get_file_layout_returns_empty_workers_when_report_is_missing() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(53);
+    let group_id = ShardGroupId::new(8);
+    let inode_id = InodeId::new(530);
+    let data_handle_id = DataHandleId::new(9530);
+    let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    fs_core.set_storage(Arc::clone(&storage));
+    fs_core.set_worker_manager(Arc::new(WorkerManager::new(60)));
+
+    let mut attrs = FileAttrs::new();
+    attrs.size = 512;
+    let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+    inode.data = types::fs::InodeData::File {
+        extents: vec![types::fs::Extent {
+            file_offset: 0,
+            block_id,
+            block_offset: 0,
+            len: 512,
+            file_version: Some(1),
+            block_stamp: Some(41),
+        }],
+        file_version: Some(1),
+        lease_epoch: None,
+    };
+    storage.put_inode(&inode).unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let success = fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx: request_context(),
+            inode_id,
+            range: None,
+            requested_data_handle_id: None,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("authoritative layout should be returned without reported locations");
+
+    assert_eq!(success.payload.locations.len(), 1);
+    assert_eq!(success.payload.locations[0].block_id, block_id);
+    assert!(success.payload.locations[0].workers.is_empty());
+    assert_eq!(success.payload.locations[0].worker_epoch, None);
+}
+
+#[tokio::test]
+async fn get_file_layout_filters_non_ready_reported_locations() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(54);
+    let group_id = ShardGroupId::new(8);
+    let inode_id = InodeId::new(540);
+    let data_handle_id = DataHandleId::new(9540);
+    let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+    let worker_id = WorkerId::new(1);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let worker_manager = Arc::new(WorkerManager::new(60));
+    worker_manager
+        .register_worker(group_id, worker_id, "127.0.0.1:9101".to_string(), 1, 11, None)
+        .unwrap();
+    record_worker_heartbeat(
+        &worker_manager,
+        group_id,
+        worker_id,
+        1024,
+        0,
+        1024,
+        0,
+        0,
+        HealthStatus::Healthy,
+    );
+    publish_report_block(
+        &worker_manager,
+        group_id,
+        worker_id,
+        1,
+        report_block_with_stamp_and_state(block_id, 41, BlockReportBlockState::Partial),
+    );
+    fs_core.set_storage(Arc::clone(&storage));
+    fs_core.set_worker_manager(worker_manager);
+
+    let mut attrs = FileAttrs::new();
+    attrs.size = 512;
+    let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+    inode.data = types::fs::InodeData::File {
+        extents: vec![types::fs::Extent {
+            file_offset: 0,
+            block_id,
+            block_offset: 0,
+            len: 512,
+            file_version: Some(1),
+            block_stamp: Some(41),
+        }],
+        file_version: Some(1),
+        lease_epoch: None,
+    };
+    storage.put_inode(&inode).unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let success = fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx: request_context(),
+            inode_id,
+            range: None,
+            requested_data_handle_id: None,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("layout read succeeds");
+
+    assert_eq!(success.payload.locations.len(), 1);
+    assert!(success.payload.locations[0].workers.is_empty());
+}
+
+#[tokio::test]
+async fn get_file_layout_filters_reported_locations_with_mismatched_block_stamp() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(55);
+    let group_id = ShardGroupId::new(8);
+    let inode_id = InodeId::new(550);
+    let data_handle_id = DataHandleId::new(9550);
+    let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+    let worker_id = WorkerId::new(1);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let worker_manager = Arc::new(WorkerManager::new(60));
+    worker_manager
+        .register_worker(group_id, worker_id, "127.0.0.1:9101".to_string(), 1, 11, None)
+        .unwrap();
+    record_worker_heartbeat(
+        &worker_manager,
+        group_id,
+        worker_id,
+        1024,
+        0,
+        1024,
+        0,
+        0,
+        HealthStatus::Healthy,
+    );
+    publish_report_locations_with_stamp(&worker_manager, group_id, worker_id, 1, Some(40), vec![block_id]);
+    fs_core.set_storage(Arc::clone(&storage));
+    fs_core.set_worker_manager(worker_manager);
+
+    let mut attrs = FileAttrs::new();
+    attrs.size = 512;
+    let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+    inode.data = types::fs::InodeData::File {
+        extents: vec![types::fs::Extent {
+            file_offset: 0,
+            block_id,
+            block_offset: 0,
+            len: 512,
+            file_version: Some(1),
+            block_stamp: Some(41),
+        }],
+        file_version: Some(1),
+        lease_epoch: None,
+    };
+    storage.put_inode(&inode).unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let success = fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx: request_context(),
+            inode_id,
+            range: None,
+            requested_data_handle_id: None,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("layout read succeeds");
+
+    assert_eq!(success.payload.locations.len(), 1);
+    assert!(success.payload.locations[0].workers.is_empty());
 }
 
 #[tokio::test]

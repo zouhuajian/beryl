@@ -588,9 +588,6 @@ impl TryFrom<proto_metadata::FileBlockLocationProto> for FileBlockLocation {
         if location.len == 0 {
             return Err("FileBlockLocationProto.len must be non-zero".to_string());
         }
-        if location.workers.is_empty() {
-            return Err("FileBlockLocationProto.workers must not be empty".to_string());
-        }
         let block_stamp = location
             .block_stamp
             .ok_or_else(|| "FileBlockLocationProto.block_stamp missing".to_string())?;
@@ -1753,8 +1750,10 @@ mod tests {
             worker_epoch: Some(11),
             block_stamp: Some(55),
         };
-        let err = types::FileBlockLocation::try_from(location.clone()).expect_err("empty location workers must fail");
-        assert!(err.contains("workers"));
+        let decoded_empty =
+            types::FileBlockLocation::try_from(location.clone()).expect("empty read location workers are valid");
+        assert!(decoded_empty.workers.is_empty());
+        assert_eq!(decoded_empty.worker_epoch, Some(11));
         location.workers.push(endpoint());
         location.block_stamp = None;
         let err = types::FileBlockLocation::try_from(location.clone()).expect_err("missing block_stamp must fail");

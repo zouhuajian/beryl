@@ -1,60 +1,40 @@
 # `ufs` Agent Instructions
 
-This file applies to `ufs/`. Follow the root `AGENTS.md` first, then these local rules.
+This file applies to `ufs/`. Follow the root `AGENTS.md` first; this crate owns backend integration and adapter behavior.
 
-## Crate role
+## Scope
 
-`ufs` owns external backend integration and adapter behavior. It bridges backend capabilities into Vecton-facing storage semantics without becoming metadata authority or client-visible policy.
+`ufs` owns:
 
-## Allowed changes
+- external backend adapters such as local FS, HDFS, S3, OSS, and object stores
+- backend-specific config, defaults, validation, and construction
+- OpenDAL adapter setup
+- UFS path/object mapping and backend operation mapping
+- backend capability discovery and explicit capability decisions
+- backend error normalization when it preserves Vecton semantics
 
-- External backend adapters such as HDFS, S3, OSS, object, or file backends.
-- Backend-specific config, defaults, and validation.
-- OpenDAL adapter setup and backend construction.
-- UFS path behavior and backend operation mapping.
-- Backend capability discovery and explicit capability decisions.
-- Backend error normalization when it preserves Vecton semantics.
+`ufs` must not own metadata authority, inode/dentry/mount policy, namespace ownership, worker store/runtime behavior, client retry/replay/cache policy, shared production helpers for unrelated crates, or dependencies on `metadata`, `worker`, or `client`.
 
-## Forbidden changes
+## Local Rules
 
-- Metadata authority, inode/dentry/mount policy, or namespace ownership.
-- Worker store/runtime behavior or client retry/replay/cache policy.
-- Shared production helpers for unrelated crates.
-- Dependencies on `metadata`, `worker`, or `client`.
-- Backend-specific policy promoted into `common` as generic policy.
-- Shortcuts that bypass route, epoch, fencing, or metadata authority validation.
-
-## Dependency rules
-
-- `ufs` may use `common` and `types` values as needed.
-- `ufs` must not depend on `metadata`, `worker`, or `client`.
-- Backend-specific dependencies should remain isolated behind adapter boundaries.
-
-## Conversion and validation rules
-
-- Translate backend capabilities and errors deliberately into Vecton-relevant structured meaning.
 - Backend behavior must not redefine filesystem metadata truth.
-- Keep backend path/object mapping local to `ufs`.
-- Preserve Block/Chunk/Stream semantics at adapter boundaries.
+- Keep backend-specific dependencies and policy isolated behind adapter boundaries.
+- Do not promote backend-specific behavior into `common` as generic policy.
+- Preserve Block, StorageChunk, TransportFrame, Stream, route, epoch, and fencing semantics at adapter boundaries.
 - Do not silently fake unsupported backend semantics such as rename, append, truncate, consistency, or directory behavior.
 
-## Testing guidance
+## Tests
 
-- Add tests for backend capability mapping, backend config validation, error normalization, LocalUFS interpretation, range/object translation, unsupported semantic rejection, and restart/reopen behavior where relevant.
+- Test backend capability mapping, config validation, error normalization, LocalUFS interpretation, range/object translation, unsupported semantic rejection, and restart/reopen behavior where relevant.
 - Tests should prove semantic preservation, not only successful backend IO.
 - Use integration tests when backend behavior affects cross-crate contracts.
 
-## Documentation guidance
+## Local Self-Review
 
-- Document backend capability gaps, semantic mismatches, and adapter-specific config.
-- Update docs when backend behavior, config ownership, or capability decisions change.
-- Do not turn backend-specific limitations into generic Vecton policy in documentation.
-
-## Review checklist
+Apply the root self-review checklist, then check:
 
 - Did metadata authority stay outside `ufs`?
-- Did `ufs` remain free of `metadata`, `worker`, and `client` dependencies?
-- Did backend-specific policy stay local?
-- Did capability gaps surface explicitly?
-- Did the change preserve Block/Chunk/Stream and route/epoch/fencing semantics?
-- Did tests/docs prove the adapter contract?
+- Did backend-specific policy stay local and explicit?
+- Did unsupported backend semantics fail clearly?
+- Did dependency direction avoid `metadata`, `worker`, and `client`?
+- Did docs explain backend capability gaps only where relevant?

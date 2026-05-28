@@ -78,6 +78,8 @@ message FileBlockLocationProto {
   common.BlockIdProto block_id = 1;
   uint64 file_offset = 2;
   uint64 len = 3;
+  // Metadata-issued read candidates. Empty means FileLayout has this block
+  // range but no live reported replica is currently eligible.
   repeated common.WorkerEndpointInfoProto workers = 4;
   optional uint64 worker_epoch = 5;
   // Metadata-authoritative logical stamp for this block generation.

@@ -48,6 +48,8 @@ pub struct FileBlockLocation {
     pub block_id: BlockId,
     pub file_offset: u64,
     pub len: u64,
+    /// Metadata-issued read candidates. Empty means the authoritative layout has
+    /// this block range but no live reported replica is currently eligible.
     pub workers: Vec<WorkerEndpointInfo>,
     pub worker_epoch: Option<u64>,
     pub block_stamp: u64,

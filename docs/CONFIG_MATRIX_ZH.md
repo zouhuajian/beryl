@@ -50,23 +50,16 @@
 | `client.backoff.initial_ms` | `client` | `BackoffPolicy::from_config` | `100` | active | 必须非负 | Retry 初始退避。 |
 | `client.backoff.max_ms` | `client` | `BackoffPolicy::from_config` | `5000` | active | 必须非负且不小于 initial | Retry 最大退避。 |
 | `client.backoff.multiplier` | `client` | `BackoffPolicy::from_config` | `2.0` | active | 必须是有限数字且不小于 1.0 | 指数退避倍率。 |
-| `client.cache.layout.enabled` | `client` | `LayoutCache::from_config` | `false` | active | 必须是 boolean | Validated read-layout cache 开关。 |
-| `client.cache.layout.ttl_secs` | `client` | `LayoutCache::from_config` | `0` | active | 必须非负 | 0 表示命中立即失效。 |
-| `client.cache.layout.max_entries` | `client` | `LayoutCache::from_config` | `1024` | active | cache 开启时必须大于 0 | Layout cache 容量。 |
-| `client.cache.layout.singleflight.enabled` | `client` | `FsClient::load_layout` | `true` | active | 必须是 boolean | 合并并发 layout miss。 |
 | `client.cache.worker_endpoint.enabled` | `client` | `WorkerEndpointCache::from_config` | `false` | active | 必须是 boolean | Metadata-authoritative worker endpoint cache 开关。 |
 | `client.cache.worker_endpoint.ttl_secs` | `client` | `WorkerEndpointCache::from_config` | `0` | active | 必须非负 | 0 表示命中立即失效。 |
 | `client.cache.worker_endpoint.max_entries` | `client` | `WorkerEndpointCache::from_config` | `1024` | active | cache 开启时必须大于 0 | Worker endpoint cache 容量。 |
-| `client.cache.worker_endpoint.singleflight.enabled` | `client` | worker endpoint refresh path | `true` | active | 必须是 boolean | 合并并发 endpoint miss。 |
 | `client.cache.worker_endpoint.health.enabled` | `client` | worker data boundary endpoint health | `true` | active | 必须是 boolean | 临时 endpoint penalty 开关。 |
 | `client.cache.worker_endpoint.health.failure_threshold` | `client` | `WorkerEndpointCache::from_config` | `2` | active | health 开启时必须大于 0 | 连续失败阈值。 |
 | `client.cache.worker_endpoint.health.ttl_secs` | `client` | `WorkerEndpointCache::from_config` | `5` | active | 必须非负 | endpoint penalty TTL。 |
 | `client.channel_pool.metadata.enabled` | `client` | `MetadataGateway::from_config` | `true` | active | 必须是 boolean | Metadata channel pool 开关。 |
 | `client.channel_pool.metadata.max_per_group` | `client` | `MetadataGateway::from_config` | `1` | active | 必须大于 0 | 每 group 最大 metadata channel 数。 |
-| `client.channel_pool.metadata.singleflight.enabled` | `client` | metadata gateway channel creation | `true` | active | 必须是 boolean | 合并并发 metadata channel 创建。 |
 | `client.channel_pool.worker.enabled` | `client` | `TonicWorkerDataClient::from_config` | `true` | active | 必须是 boolean | Worker channel pool 开关。 |
 | `client.channel_pool.worker.max_per_worker` | `client` | `TonicWorkerDataClient::from_config` | `1` | active | 必须大于 0 | 每 worker 最大 channel 数。 |
-| `client.channel_pool.worker.singleflight.enabled` | `client` | worker channel creation | `true` | active | 必须是 boolean | 合并并发 worker channel 创建。 |
 
 ## planned 配置
 

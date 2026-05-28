@@ -12,12 +12,10 @@ use lru::LruCache;
 use parking_lot::RwLock;
 use types::{WorkerEndpointInfo, WorkerNetProtocol};
 
-use crate::cache::layout::{CacheClock, SystemCacheClock};
 use crate::cache::{cache_labels, CacheInvalidationReason};
 use crate::config::CacheConfig;
 use crate::error::{ClientError, ClientResult};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetrics, NoopClientMetrics};
-use crate::runtime::singleflight::{Singleflight, SingleflightMode};
 
 const CACHE_NAME: &str = "worker_endpoint";
 const PLANE: &str = "worker";
@@ -60,14 +58,11 @@ impl CachedWorkerEndpoint {
 pub(crate) struct WorkerEndpointCache {
     enabled: bool,
     ttl: Duration,
-    singleflight_enabled: bool,
     health_enabled: bool,
     health_failure_threshold: usize,
     health_ttl: Duration,
     cache: Arc<RwLock<LruCache<WorkerEndpointCacheKey, CachedWorkerEndpoint>>>,
     health: Arc<RwLock<std::collections::HashMap<WorkerEndpointCacheKey, EndpointHealth>>>,
-    singleflight: Singleflight<WorkerEndpointCacheKey, WorkerEndpointInfo>,
-    clock: Arc<dyn CacheClock>,
     metrics: Arc<dyn ClientMetrics>,
 }
 
@@ -80,57 +75,36 @@ struct EndpointHealth {
 impl WorkerEndpointCache {
     /// Create a worker endpoint cache from client config.
     pub(crate) fn from_config(config: &CacheConfig, metrics: Arc<dyn ClientMetrics>) -> Self {
-        Self::with_policy(config, metrics, Arc::new(SystemCacheClock))
+        Self::with_policy(config, metrics)
     }
 
     /// Create a worker endpoint cache with the system clock.
     pub(crate) fn new(enabled: bool, ttl: Duration, max_entries: usize, metrics: Arc<dyn ClientMetrics>) -> Self {
-        Self::with_clock(enabled, ttl, max_entries, metrics, Arc::new(SystemCacheClock))
-    }
-
-    /// Create a worker endpoint cache with an injected clock.
-    pub(crate) fn with_clock(
-        enabled: bool,
-        ttl: Duration,
-        max_entries: usize,
-        metrics: Arc<dyn ClientMetrics>,
-        clock: Arc<dyn CacheClock>,
-    ) -> Self {
         let capacity = NonZeroUsize::new(max_entries.max(1)).expect("capacity is non-zero");
         Self {
             enabled,
             ttl,
-            singleflight_enabled: true,
             health_enabled: true,
             health_failure_threshold: 2,
             health_ttl: Duration::from_secs(5),
             cache: Arc::new(RwLock::new(LruCache::new(capacity))),
             health: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            singleflight: Singleflight::default(),
-            clock,
             metrics,
         }
     }
 
     /// Create a worker endpoint cache from all cache policy options.
-    pub(crate) fn with_policy(
-        config: &CacheConfig,
-        metrics: Arc<dyn ClientMetrics>,
-        clock: Arc<dyn CacheClock>,
-    ) -> Self {
+    pub(crate) fn with_policy(config: &CacheConfig, metrics: Arc<dyn ClientMetrics>) -> Self {
         let capacity =
             NonZeroUsize::new(config.worker_endpoint_cache_max_entries.max(1)).expect("capacity is non-zero");
         Self {
             enabled: config.worker_endpoint_cache_enabled,
             ttl: config.worker_endpoint_cache_ttl,
-            singleflight_enabled: config.worker_endpoint_singleflight_enabled,
             health_enabled: config.endpoint_health_enabled,
             health_failure_threshold: config.endpoint_health_failure_threshold.max(1),
             health_ttl: config.endpoint_health_ttl,
             cache: Arc::new(RwLock::new(LruCache::new(capacity))),
             health: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            singleflight: Singleflight::default(),
-            clock,
             metrics,
         }
     }
@@ -140,7 +114,7 @@ impl WorkerEndpointCache {
         Self::new(false, Duration::ZERO, 1, Arc::new(NoopClientMetrics))
     }
 
-    /// Resolve and cache a metadata-authoritative endpoint candidate with miss coalescing.
+    /// Resolve and cache a metadata-authoritative endpoint candidate.
     pub(crate) async fn get_or_resolve_authoritative(
         &self,
         candidate: &WorkerEndpointInfo,
@@ -184,39 +158,9 @@ impl WorkerEndpointCache {
             return Ok(endpoint);
         }
 
-        if !self.singleflight_enabled {
-            let resolved = resolver(candidate.clone()).await?;
-            self.insert_resolved(key, resolved.clone());
-            return Ok(resolved);
-        }
-
-        let candidate = candidate.clone();
-        let cache = self.clone();
-        let key_for_flight = key.clone();
-        let (mode, result) = self
-            .singleflight
-            .run(key.clone(), move || async move {
-                tokio::task::yield_now().await;
-                if let Some(endpoint) = cache.get_cached_after_lookup(&key_for_flight) {
-                    return Ok(endpoint);
-                }
-                resolver(candidate).await
-            })
-            .await;
-        if mode == SingleflightMode::Joined {
-            self.record(ClientMetric::WorkerEndpointSingleflightJoin, "join", None);
-            self.record(ClientMetric::WorkerEndpointDuplicateResolutionAvoided, "avoided", None);
-        }
-        match result {
-            Ok(resolved) => {
-                self.insert_resolved(key, resolved.clone());
-                Ok(resolved)
-            }
-            Err(err) => {
-                self.record(ClientMetric::WorkerEndpointSingleflightFailure, "failure", None);
-                Err(err)
-            }
-        }
+        let resolved = resolver(candidate.clone()).await?;
+        self.insert_resolved(key, resolved.clone());
+        Ok(resolved)
     }
 
     /// Resolve and cache a metadata-authoritative endpoint candidate.
@@ -266,7 +210,7 @@ impl WorkerEndpointCache {
             self.invalidate_candidate(candidate, reason);
             return;
         }
-        let now = self.clock.now();
+        let now = Instant::now();
         let mut health = self.health.write();
         let entry = health.entry(key).or_default();
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
@@ -276,15 +220,6 @@ impl WorkerEndpointCache {
             self.record(ClientMetric::WorkerEndpointHealthFailure, "failure", Some(reason));
             self.invalidate_candidate(candidate, reason);
         }
-    }
-
-    /// Return whether the candidate is currently healthy enough to try.
-    #[cfg(test)]
-    pub(crate) fn is_candidate_healthy(&self, candidate: &WorkerEndpointInfo) -> bool {
-        let Ok(key) = WorkerEndpointCacheKey::from_candidate(candidate) else {
-            return false;
-        };
-        self.is_key_healthy(&key)
     }
 
     /// Invalidate all cached endpoints for a correctness reason.
@@ -322,7 +257,7 @@ impl WorkerEndpointCache {
             return None;
         }
 
-        let now = self.clock.now();
+        let now = Instant::now();
         let mut cache = self.cache.write();
         if let Some(entry) = cache.get(key) {
             if entry.is_expired(now, self.ttl) {
@@ -350,13 +285,19 @@ impl WorkerEndpointCache {
         if !self.reuse_enabled() {
             return;
         }
-        let evicted = self.cache.write().push(
-            key.clone(),
-            CachedWorkerEndpoint {
-                endpoint,
-                inserted_at: self.clock.now(),
-            },
-        );
+        let evicted = {
+            let mut cache = self.cache.write();
+            if cache.contains(&key) {
+                return;
+            }
+            cache.push(
+                key.clone(),
+                CachedWorkerEndpoint {
+                    endpoint,
+                    inserted_at: Instant::now(),
+                },
+            )
+        };
         if evicted.is_some() {
             self.record(ClientMetric::WorkerEndpointCacheEvict, "evicted", None);
         }
@@ -367,7 +308,7 @@ impl WorkerEndpointCache {
         if !self.health_enabled {
             return true;
         }
-        let now = self.clock.now();
+        let now = Instant::now();
         let mut health = self.health.write();
         let Some(entry) = health.get(key) else {
             return true;
@@ -438,28 +379,6 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::Notify;
 
-    #[derive(Debug)]
-    struct ManualClock {
-        now: Mutex<Instant>,
-    }
-
-    impl ManualClock {
-        fn new(now: Instant) -> Self {
-            Self { now: Mutex::new(now) }
-        }
-
-        fn advance(&self, duration: Duration) {
-            let mut now = self.now.lock().expect("clock");
-            *now += duration;
-        }
-    }
-
-    impl CacheClock for ManualClock {
-        fn now(&self) -> Instant {
-            *self.now.lock().expect("clock")
-        }
-    }
-
     #[derive(Debug, Default)]
     struct RecordingMetrics {
         events: Mutex<Vec<ClientMetricEvent>>,
@@ -522,22 +441,6 @@ mod tests {
     }
 
     #[test]
-    fn ttl_expiry_is_miss_without_sleeping() {
-        let metrics = Arc::new(RecordingMetrics::default());
-        let clock = Arc::new(ManualClock::new(Instant::now()));
-        let cache = WorkerEndpointCache::with_clock(true, Duration::from_secs(5), 8, metrics.clone(), clock.clone());
-        let candidate = endpoint(1, 7);
-
-        cache.get_or_insert_authoritative(&candidate).expect("insert");
-        clock.advance(Duration::from_secs(5));
-        cache
-            .get_or_insert_authoritative(&candidate)
-            .expect("refresh after expiry");
-
-        assert_metric(&metrics.events(), ClientMetric::WorkerEndpointCacheExpired);
-    }
-
-    #[test]
     fn unavailable_invalidation_evicts_candidate() {
         let metrics = Arc::new(RecordingMetrics::default());
         let cache = WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone());
@@ -551,37 +454,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_same_endpoint_miss_coalesces_to_one_resolution() {
+    async fn concurrent_same_endpoint_misses_resolve_directly_and_keep_one_cached_entry() {
         let metrics = Arc::new(RecordingMetrics::default());
         let cache = WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone());
         let attempts = Arc::new(AtomicUsize::new(0));
+        let all_started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
         let candidate = endpoint(1, 7);
+        const TASKS: usize = 4;
 
-        let mut tasks = Vec::with_capacity(8);
-        for _ in 0..8 {
+        let mut tasks = Vec::with_capacity(TASKS);
+        for _ in 0..TASKS {
             let cache = cache.clone();
             let attempts = Arc::clone(&attempts);
+            let all_started = Arc::clone(&all_started);
+            let release = Arc::clone(&release);
             let candidate = candidate.clone();
             tasks.push(tokio::spawn(async move {
                 cache
                     .get_or_resolve_authoritative_with(&candidate, move |candidate| async move {
-                        attempts.fetch_add(1, Ordering::SeqCst);
-                        tokio::task::yield_now().await;
+                        let current = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                        if current == TASKS {
+                            all_started.notify_one();
+                        }
+                        release.notified().await;
                         Ok(candidate)
                     })
                     .await
             }));
         }
+        all_started.notified().await;
+        release.notify_waiters();
 
         for task in tasks {
             assert_eq!(task.await.expect("task").expect("endpoint"), candidate);
         }
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        assert_metric(&metrics.events(), ClientMetric::WorkerEndpointSingleflightJoin);
-        assert_metric(
-            &metrics.events(),
-            ClientMetric::WorkerEndpointDuplicateResolutionAvoided,
-        );
+        assert_eq!(attempts.load(Ordering::SeqCst), TASKS);
+        assert_eq!(cache.len(), 1);
+        assert_metric(&metrics.events(), ClientMetric::WorkerEndpointCacheMiss);
     }
 
     #[tokio::test]
@@ -622,42 +532,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endpoint_resolution_failure_wakes_waiters_without_poisoning_cache() {
+    async fn endpoint_resolution_failure_does_not_insert_or_poison_cache() {
         let metrics = Arc::new(RecordingMetrics::default());
         let cache = WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone());
         let attempts = Arc::new(AtomicUsize::new(0));
-        let started = Arc::new(Notify::new());
+        let all_started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let candidate = endpoint(1, 7);
+        const TASKS: usize = 4;
 
-        let mut tasks = Vec::with_capacity(4);
-        for _ in 0..4 {
+        let mut tasks = Vec::with_capacity(TASKS);
+        for _ in 0..TASKS {
             let cache = cache.clone();
             let attempts = Arc::clone(&attempts);
-            let started = Arc::clone(&started);
+            let all_started = Arc::clone(&all_started);
             let release = Arc::clone(&release);
             let candidate = candidate.clone();
             tasks.push(tokio::spawn(async move {
                 cache
                     .get_or_resolve_authoritative_with(&candidate, move |_candidate| async move {
-                        attempts.fetch_add(1, Ordering::SeqCst);
-                        started.notify_waiters();
+                        let current = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                        if current == TASKS {
+                            all_started.notify_one();
+                        }
                         release.notified().await;
                         Err(ClientError::Worker("injected endpoint resolution failure".to_string()))
                     })
                     .await
             }));
         }
-        started.notified().await;
+        all_started.notified().await;
         release.notify_waiters();
 
         for task in tasks {
             let err = task.await.expect("task").expect_err("resolution failure");
             assert!(matches!(err, ClientError::Worker(msg) if msg.contains("injected endpoint resolution failure")));
         }
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), TASKS);
         assert_eq!(cache.len(), 0);
-        assert_metric(&metrics.events(), ClientMetric::WorkerEndpointSingleflightFailure);
 
         cache
             .get_or_resolve_authoritative_with(&candidate, |candidate| async move { Ok(candidate) })
@@ -666,24 +578,27 @@ mod tests {
         assert_eq!(cache.len(), 1);
     }
 
-    #[test]
-    fn endpoint_health_is_epoch_scoped_and_recovers_after_ttl() {
+    #[tokio::test]
+    async fn endpoint_health_penalty_is_epoch_scoped() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let clock = Arc::new(ManualClock::new(Instant::now()));
-        let cache = WorkerEndpointCache::with_clock(true, Duration::from_secs(60), 8, metrics.clone(), clock.clone());
+        let cache = WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone());
         let stale_epoch = endpoint(1, 7);
         let fresh_epoch = endpoint(1, 8);
 
         cache.record_candidate_failure(&stale_epoch, CacheInvalidationReason::Unavailable);
-        assert!(cache.is_candidate_healthy(&stale_epoch));
         cache.record_candidate_failure(&stale_epoch, CacheInvalidationReason::Unavailable);
-        assert!(!cache.is_candidate_healthy(&stale_epoch));
-        assert!(cache.is_candidate_healthy(&fresh_epoch));
 
-        clock.advance(Duration::from_secs(5));
-        assert!(cache.is_candidate_healthy(&stale_epoch));
+        let err = cache
+            .get_or_resolve_authoritative_with(&stale_epoch, |candidate| async move { Ok(candidate) })
+            .await
+            .expect_err("penalized endpoint is rejected");
+        assert!(matches!(err, ClientError::Worker(msg) if msg.contains("temporarily unavailable")));
+
+        cache
+            .get_or_resolve_authoritative_with(&fresh_epoch, |candidate| async move { Ok(candidate) })
+            .await
+            .expect("fresh epoch remains usable");
         assert_metric(&metrics.events(), ClientMetric::WorkerEndpointHealthFailure);
-        assert_metric(&metrics.events(), ClientMetric::WorkerEndpointHealthRecovery);
     }
 
     fn assert_metric(events: &[ClientMetricEvent], metric: ClientMetric) {

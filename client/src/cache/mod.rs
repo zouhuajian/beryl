@@ -3,11 +3,9 @@
 
 //! Client-side caching for metadata freshness.
 
-pub(crate) mod layout;
 pub mod state_id;
 pub(crate) mod worker_endpoint;
 
-pub(crate) use layout::{LayoutCache, LayoutCacheKey};
 pub use state_id::StateIdCache;
 pub(crate) use worker_endpoint::WorkerEndpointCache;
 
@@ -20,20 +18,12 @@ pub(crate) enum CacheInvalidationReason {
     Ttl,
     /// Route epoch mismatch.
     RouteEpoch,
-    /// Block stamp mismatch.
-    BlockStamp,
     /// Worker epoch mismatch.
     WorkerEpoch,
     /// Worker endpoint unavailable.
     Unavailable,
-    /// File version changed.
-    FileVersion,
-    /// Data handle changed.
-    DataHandle,
     /// Owner group or mount owner changed.
     Owner,
-    /// Explicit metadata refresh requires re-resolution.
-    MetadataRefresh,
     /// Worker protocol mismatch or invalid protocol.
     Protocol,
 }
@@ -44,13 +34,9 @@ impl CacheInvalidationReason {
         match self {
             Self::Ttl => "ttl",
             Self::RouteEpoch => "route_epoch",
-            Self::BlockStamp => "block_stamp",
             Self::WorkerEpoch => "worker_epoch",
             Self::Unavailable => "unavailable",
-            Self::FileVersion => "file_version",
-            Self::DataHandle => "data_handle",
             Self::Owner => "owner",
-            Self::MetadataRefresh => "refresh",
             Self::Protocol => "protocol",
         }
     }

@@ -86,11 +86,6 @@ impl ReadPlanner {
                     expected_data_handle_id.as_raw()
                 )));
             }
-            if location.workers.is_empty() {
-                return Err(ClientError::InvalidLayout(
-                    "block location has no worker candidates".to_string(),
-                ));
-            }
             let block_stamp = location.block_stamp;
             if block_stamp == 0 {
                 return Err(ClientError::InvalidLayout(format!(
@@ -322,6 +317,23 @@ mod tests {
             .expect_err("zero block stamp must fail");
 
         assert!(format!("{err}").contains("block_stamp"));
+    }
+
+    #[test]
+    fn planner_accepts_empty_worker_candidates_from_metadata() {
+        let span = ReadPlanner::plan_requested_range(0, 4, 20)
+            .expect("range planning succeeds")
+            .expect("non-empty span");
+        let mut location = location(10, 0, 0, 4, 101);
+        location.workers.clear();
+        location.worker_epoch = None;
+
+        let segments =
+            ReadPlanner::resolve_locations(DataHandleId::new(10), span, &[location]).expect("location covers range");
+
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].workers.is_empty());
+        assert_eq!(segments[0].worker_epoch, None);
     }
 
     fn location(
