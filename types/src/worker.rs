@@ -24,7 +24,6 @@ pub struct WorkerEndpointInfo {
     pub worker_id: WorkerId,
     pub endpoint: String,
     pub worker_net_protocol: WorkerNetProtocol,
-    pub worker_epoch: u64,
     pub worker_run_id: WorkerRunId,
 }
 

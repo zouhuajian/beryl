@@ -240,14 +240,7 @@ fn worker_manager_for_write_targets(group_id: ShardGroupId) -> Arc<WorkerManager
     for raw in 1..=3 {
         let worker_id = types::ids::WorkerId::new(raw);
         manager
-            .register_worker(
-                group_id,
-                worker_id,
-                format!("127.0.0.1:{}", 9000 + raw),
-                1,
-                10 + raw,
-                None,
-            )
+            .register_worker(group_id, worker_id, format!("127.0.0.1:{}", 9000 + raw), 1, None)
             .unwrap();
         record_worker_heartbeat(
             &manager,
@@ -282,7 +275,7 @@ async fn get_file_layout_returns_reported_locations_using_read_placement() {
     for (raw, endpoint) in [(2, "127.0.0.2:9102"), (1, "127.0.0.1:9101")] {
         let worker_id = WorkerId::new(raw);
         worker_manager
-            .register_worker(group_id, worker_id, endpoint.to_string(), 1, 20 + raw, None)
+            .register_worker(group_id, worker_id, endpoint.to_string(), 1, None)
             .unwrap();
         record_worker_heartbeat(
             &worker_manager,
@@ -347,7 +340,6 @@ async fn get_file_layout_returns_reported_locations_using_read_placement() {
             .collect::<Vec<_>>(),
         vec![WorkerId::new(2), WorkerId::new(1)]
     );
-    assert_eq!(location.worker_epoch, Some(22));
     assert_eq!(location.block_stamp, 41);
     assert_eq!(location.block_format_id, types::BlockFormatId::CURRENT_FOR_NEW_FILE);
     assert_eq!(location.block_size, 4096);
@@ -406,7 +398,6 @@ async fn get_file_layout_returns_empty_workers_when_report_is_missing() {
     assert_eq!(success.payload.locations.len(), 1);
     assert_eq!(success.payload.locations[0].block_id, block_id);
     assert!(success.payload.locations[0].workers.is_empty());
-    assert_eq!(success.payload.locations[0].worker_epoch, None);
 }
 
 #[tokio::test]
@@ -422,7 +413,7 @@ async fn get_file_layout_filters_non_ready_reported_locations() {
     let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
     let worker_manager = Arc::new(WorkerManager::new(60));
     worker_manager
-        .register_worker(group_id, worker_id, "127.0.0.1:9101".to_string(), 1, 11, None)
+        .register_worker(group_id, worker_id, "127.0.0.1:9101".to_string(), 1, None)
         .unwrap();
     record_worker_heartbeat(
         &worker_manager,
@@ -492,7 +483,7 @@ async fn get_file_layout_filters_reported_locations_with_mismatched_block_stamp(
     let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
     let worker_manager = Arc::new(WorkerManager::new(60));
     worker_manager
-        .register_worker(group_id, worker_id, "127.0.0.1:9101".to_string(), 1, 11, None)
+        .register_worker(group_id, worker_id, "127.0.0.1:9101".to_string(), 1, None)
         .unwrap();
     record_worker_heartbeat(
         &worker_manager,
@@ -557,7 +548,7 @@ async fn get_file_layout_rejects_worker_lookup_without_authoritative_group() {
     let fallback_group = ShardGroupId::new(1);
 
     worker_manager
-        .register_worker(fallback_group, worker_id, "127.0.0.1:9101".to_string(), 1, 11, None)
+        .register_worker(fallback_group, worker_id, "127.0.0.1:9101".to_string(), 1, None)
         .unwrap();
     record_worker_heartbeat(
         &worker_manager,
@@ -695,7 +686,6 @@ async fn get_file_layout_does_not_cross_read_worker_descriptor_from_other_group(
         success.payload.locations[0].workers.is_empty(),
         "served group must not reuse another group's worker descriptor"
     );
-    assert_eq!(success.payload.locations[0].worker_epoch, None);
 }
 
 #[tokio::test]
@@ -818,7 +808,6 @@ async fn get_status_rejects_stale_mount_epoch() {
             freshness: Freshness {
                 mount_epoch: Some(8),
                 route_epoch: None,
-                worker_epoch: None,
             },
         })
         .await
@@ -854,7 +843,6 @@ async fn list_status_rejects_stale_mount_epoch() {
             freshness: Freshness {
                 mount_epoch: Some(8),
                 route_epoch: None,
-                worker_epoch: None,
             },
         })
         .await
@@ -893,7 +881,6 @@ async fn open_file_rejects_stale_route_epoch() {
             freshness: Freshness {
                 mount_epoch: None,
                 route_epoch: Some(0),
-                worker_epoch: None,
             },
         })
         .await
@@ -931,7 +918,6 @@ async fn get_locations_rejects_stale_route_epoch() {
             freshness: Freshness {
                 mount_epoch: None,
                 route_epoch: Some(0),
-                worker_epoch: None,
             },
         })
         .await
@@ -1417,7 +1403,6 @@ fn freshness_validator_rejects_routed_write_mount_epoch_with_replay_hint() {
             Freshness {
                 mount_epoch: Some(4),
                 route_epoch: None,
-                worker_epoch: None,
             },
             mount_id,
         )
@@ -1461,7 +1446,6 @@ fn routed_write_mount_epoch_mismatch_preserves_metrics_and_wire_shape() {
             Freshness {
                 mount_epoch: Some(4),
                 route_epoch: None,
-                worker_epoch: None,
             },
         )
         .unwrap_err();
@@ -1993,7 +1977,7 @@ fn open_write_preflight_rejects_placement_without_authoritative_group() {
 }
 
 #[tokio::test]
-async fn commit_worker_epoch_check_rejects_missing_authoritative_group() {
+async fn commit_worker_run_check_rejects_missing_authoritative_group() {
     let dir = TempDir::new().unwrap();
     let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
     let mount_id = MountId::new(53);
@@ -2045,7 +2029,6 @@ async fn commit_worker_epoch_check_rejects_missing_authoritative_group() {
                         worker_id,
                         endpoint: "127.0.0.1:9001".to_string(),
                         worker_net_protocol: WorkerNetProtocol::Grpc,
-                        worker_epoch: 11,
                         worker_run_id: worker_run_id(ShardGroupId::new(1), worker_id),
                     }],
                     fencing_token: FencingToken {
@@ -2259,7 +2242,7 @@ async fn open_write_target_uses_stored_file_layout_shape() {
 }
 
 #[tokio::test]
-async fn commit_worker_epoch_check_uses_session_group() {
+async fn commit_worker_run_check_uses_session_group() {
     let env = write_flow_env(0).await;
     let open = env
         .fs_core
@@ -2284,7 +2267,6 @@ async fn commit_worker_epoch_check_uses_session_group() {
             worker_id: endpoint.worker_id,
             address: "127.0.0.1:9999".to_string(),
             worker_net_protocol: 1,
-            worker_epoch: endpoint.worker_epoch,
             capacity_total: 0,
             capacity_used: 0,
             capacity_available: 0,
@@ -2307,14 +2289,84 @@ async fn commit_worker_epoch_check_uses_session_group() {
         64,
     )
     .await
-    .expect_err("commit must not validate worker_epoch against another group's descriptor");
+    .expect_err("commit must not validate worker_run_id against another group's registration");
 
     assert_eq!(
         failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::WorkerEpochMismatch))
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::WorkerRunMismatch))
     );
-    assert_eq!(failure.error.reason, Some(RefreshReason::WorkerEpochMismatch));
-    assert!(failure.error.message.contains("worker_epoch mismatch"));
+    assert_eq!(failure.error.reason, Some(RefreshReason::WorkerRunMismatch));
+    assert!(failure.error.message.contains("worker_run_id mismatch"));
+}
+
+#[tokio::test]
+async fn commit_worker_run_check_rejects_stale_live_registration() {
+    let env = write_flow_env(0).await;
+    let open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(64),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("open write should succeed");
+    let key = open.payload.session_key;
+    let target = add_block_for_key(&env.fs_core, &key, 64).await;
+    let endpoint = target.worker_endpoints.first().expect("worker endpoint").clone();
+    let worker_manager = env.fs_core.worker_manager.as_ref().expect("worker manager");
+    let replacement_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-44665544f00d"
+        .parse()
+        .expect("valid replacement WorkerRunId");
+
+    worker_manager
+        .load_registered_workers(vec![WorkerInfo {
+            group_id: env.group_id,
+            worker_id: endpoint.worker_id,
+            address: endpoint.endpoint.clone(),
+            worker_net_protocol: 1,
+            capacity_total: 0,
+            capacity_used: 0,
+            capacity_available: 0,
+            active_reads: 0,
+            active_writes: 0,
+            health: HealthStatus::Healthy,
+            last_heartbeat: 0,
+            fault_domain: None,
+        }])
+        .expect("replace manager descriptors after metadata reload");
+    worker_manager
+        .register_worker_run(
+            env.group_id,
+            endpoint.worker_id,
+            endpoint.endpoint.clone(),
+            1,
+            replacement_run_id,
+            None,
+        )
+        .expect("replacement worker run should register after reload");
+
+    let failure = commit_for_key(
+        &env.fs_core,
+        &key,
+        vec![committed_block(
+            target.block_id,
+            target.file_offset,
+            target.effective_block_len,
+        )],
+        64,
+    )
+    .await
+    .expect_err("commit must reject stale worker process-run identity");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::WorkerRunMismatch))
+    );
+    assert_eq!(failure.error.reason, Some(RefreshReason::WorkerRunMismatch));
+    assert!(failure.error.message.contains("worker_run_id mismatch"));
 }
 
 #[tokio::test]
@@ -3438,7 +3490,6 @@ async fn create_mount_route_epoch_progression_rejects_stale_client_route_epoch()
             Freshness {
                 mount_epoch: Some(1),
                 route_epoch: Some(stale_route_epoch),
-                worker_epoch: None,
             },
             Some(6),
             Some(1),
@@ -3507,7 +3558,6 @@ async fn delete_mount_route_epoch_progression_rejects_stale_client_route_epoch()
             Freshness {
                 mount_epoch: None,
                 route_epoch: Some(stale_route_epoch),
-                worker_epoch: None,
             },
             None,
             None,

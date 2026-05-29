@@ -26,7 +26,6 @@ pub struct RequestContext {
 pub struct Freshness {
     pub mount_epoch: Option<u64>,
     pub route_epoch: Option<u64>,
-    pub worker_epoch: Option<u64>,
 }
 
 #[derive(Clone, Debug)]

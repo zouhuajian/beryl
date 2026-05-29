@@ -18,8 +18,6 @@ pub(crate) enum CacheInvalidationReason {
     Ttl,
     /// Route epoch mismatch.
     RouteEpoch,
-    /// Worker epoch mismatch.
-    WorkerEpoch,
     /// Worker process-run mismatch.
     WorkerRun,
     /// Worker endpoint unavailable.
@@ -36,7 +34,6 @@ impl CacheInvalidationReason {
         match self {
             Self::Ttl => "ttl",
             Self::RouteEpoch => "route_epoch",
-            Self::WorkerEpoch => "worker_epoch",
             Self::WorkerRun => "worker_run",
             Self::Unavailable => "unavailable",
             Self::Owner => "owner",

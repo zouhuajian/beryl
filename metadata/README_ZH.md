@@ -127,7 +127,7 @@ FileSystemService RPC
 - `path_service.rs` 是 adapter/orchestration：tonic request/response、header、guard、path resolve、permission target、proto/domain 转换、FsCore 调用、ResponseHeader 构造。
 - `FsCore` 承载 domain semantics：mount/route/state freshness、write session、lease、fencing、read plan 校验、mutation orchestration。
 - `PathResolver` 只做 path -> mount context -> dentry/inode traversal，不写 path index。
-- `GuardChain` 只做 readiness、leadership、data IO policy、permission extension point；不检查 mount_epoch、route_epoch、state_id、write handle、lease、fencing 或 worker_epoch。
+- `GuardChain` 只做 readiness、leadership、data IO policy、permission extension point；不检查 mount_epoch、route_epoch、state_id、write handle、lease、fencing、WorkerRunId 或 block_stamp。
 
 `path_service.rs` 仍偏大，但当前保留“完整 FileSystemService API 文件”的边界。它不是第二个 metadata authority。
 
@@ -195,7 +195,7 @@ commit/version 当前事实：
 - `CreateFile(CREATE_NEW/OVERWRITE)` 使用 Replace 语义；`AppendFile` 使用 Append 语义。
 - `file_version` 是 durable single file version，持久化在 file inode 中，只由 Raft apply 推进。
 - 当前不引入 `layout_version`。
-- worker block report、worker location、repair placement、route_epoch、mount_epoch、worker_epoch、rename、chmod/chown/mtime-only metadata change 不推进 `file_version`。
+- worker block report、worker location、repair placement、route_epoch、mount_epoch、WorkerRunId、block_stamp、rename、chmod/chown/mtime-only metadata change 不推进 `file_version`。
 - CommitFile 背后的 close-write apply 会同 batch 写 inode extents/size/mtime/file_version/lease_epoch、stable `FileLayout`、block refcount increment/decrement、zero-ref delete intent 和 `AppliedResult`。
 
 限制：
@@ -226,7 +226,7 @@ read-plan 校验：
 worker location 边界：
 
 - `FileBlockLocation` 是 external read plan，不暴露 internal extents schema。
-- 当 `WorkerManager` 有 live block locations 时，会填充 worker id、endpoint、worker net protocol、worker_epoch。
+- 当 `WorkerManager` 有 live block locations 时，会填充 worker id、endpoint、worker net protocol、WorkerRunId。
 - worker locations 来自 heartbeat/block report soft state，不是 Raft authority，不是 placement truth，也不是完整 load-aware/fault-domain/nearest-worker scheduler。
 
 freshness 当前事实：
@@ -234,7 +234,7 @@ freshness 当前事实：
 - `mount_epoch` 校验 request header 和 mount entry `mount_version`。
 - `route_epoch` 校验 request/header 和 authoritative RocksDB route epoch。
 - `state_id` 只通过 repeated `GroupStateWatermark { group_id, state_id }` 表达。
-- `state_id` 表示 state-machine applied `RaftLogId`，不是 committed index、route_epoch、mount_epoch、worker_epoch 或旧 `applied_seq`。
+- `state_id` 表示 state-machine applied `RaftLogId`，不是 committed index、route_epoch、mount_epoch、WorkerRunId、block_stamp 或旧 `applied_seq`。
 - leader success 在已知 group 且有 last applied state 时返回 `ResponseHeader.state`。
 - follower success 必须返回空 `ResponseHeader.state`，不推进 client state cache。
 - `Msync` 当前是 production single-group；返回本地 raft group authoritative state。multi-group msync 未实现。

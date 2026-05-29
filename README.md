@@ -45,7 +45,7 @@ Intentionally not yet implemented in this baseline:
 - Expanded maintenance repair/delete features.
 - Real metadata + worker + client end-to-end system tests.
 
-Worker startup registration is group-scoped. The worker resolves a stable `WorkerId` from `worker.id` or the persisted `worker.identity.path`, generates a UUID `WorkerRunId` once per process start, registers the advertised gRPC endpoint with the configured metadata group leader, and serves data-plane requests for a group only after that group accepts the registration. Metadata persists only the stable worker descriptor; `WorkerRunId` is live registration state and is not restored from metadata restart or snapshot reload. `WorkerRunId` is not an epoch and is not comparable. Heartbeat, block report, command acknowledgment, and data-plane-wide removal of older `worker_epoch` fields remain deferred.
+Worker startup registration is group-scoped. The worker resolves a stable `WorkerId` from `worker.id` or the persisted `worker.identity.path`, generates a UUID `WorkerRunId` once per process start, registers the advertised gRPC endpoint with the configured metadata group leader, and serves data-plane requests for a group only after that group accepts the registration. Metadata persists only the stable worker descriptor; `WorkerRunId` is live registration state and is not restored from metadata restart or snapshot reload. `WorkerRunId` is not an epoch and is not comparable. Client-to-worker reads, writes, commits, and syncs use `WorkerRunId` for worker process-run freshness and `block_stamp` for block generation freshness.
 
 ## Workspace Crates
 

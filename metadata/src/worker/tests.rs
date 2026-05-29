@@ -12,12 +12,11 @@ use types::ids::{BlockId, BlockIndex, DataHandleId, ShardGroupId, WorkerId};
 use types::WorkerRunId;
 
 #[test]
-fn test_worker_registration_with_worker_net_protocol_and_epoch() {
+fn test_worker_registration_with_worker_net_protocol() {
     let manager = WorkerManager::new(60);
     let worker_id = WorkerId::new(1);
     let address = "127.0.0.1:9090".to_string();
     let worker_net_protocol = 1; // GRPC
-    let worker_epoch = 100;
 
     // Register worker
     manager
@@ -26,7 +25,6 @@ fn test_worker_registration_with_worker_net_protocol_and_epoch() {
             worker_id,
             address.clone(),
             worker_net_protocol,
-            worker_epoch,
             None,
         )
         .unwrap();
@@ -36,7 +34,6 @@ fn test_worker_registration_with_worker_net_protocol_and_epoch() {
     assert_eq!(descriptor.worker_id, worker_id);
     assert_eq!(descriptor.address, address);
     assert_eq!(descriptor.worker_net_protocol, worker_net_protocol);
-    assert_eq!(descriptor.worker_epoch, worker_epoch);
 }
 
 fn report_run_id() -> WorkerRunId {
@@ -288,7 +285,6 @@ fn recreated_report_runtime_requires_full_report_again() {
             worker_id,
             address: "127.0.0.1:9090".to_string(),
             worker_net_protocol: 1,
-            worker_epoch: 0,
             capacity_total: 0,
             capacity_used: 0,
             capacity_available: 0,
@@ -680,7 +676,6 @@ fn loading_persisted_workers_drops_live_run_registration() {
             worker_id,
             address: "127.0.0.1:9090".to_string(),
             worker_net_protocol: 1,
-            worker_epoch: 0,
             capacity_total: 0,
             capacity_used: 0,
             capacity_available: 0,

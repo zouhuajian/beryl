@@ -401,7 +401,6 @@ impl TryFrom<proto_common::WorkerEndpointInfoProto> for WorkerEndpointInfo {
             WorkerId::new(endpoint.worker_id),
             endpoint.endpoint,
             endpoint.worker_net_protocol,
-            endpoint.worker_epoch,
             endpoint.worker_run_id,
         )
     }
@@ -415,7 +414,6 @@ pub fn worker_endpoint_info_from_parts(
     worker_id: WorkerId,
     endpoint: String,
     worker_net_protocol: i32,
-    worker_epoch: u64,
     worker_run_id: String,
 ) -> Result<WorkerEndpointInfo, String> {
     if worker_id.as_raw() == 0 {
@@ -423,9 +421,6 @@ pub fn worker_endpoint_info_from_parts(
     }
     if endpoint.is_empty() {
         return Err("WorkerEndpointInfoProto.endpoint must not be empty".to_string());
-    }
-    if worker_epoch == 0 {
-        return Err("WorkerEndpointInfoProto.worker_epoch must be non-zero".to_string());
     }
     if worker_run_id.is_empty() {
         return Err("WorkerEndpointInfoProto.worker_run_id must not be empty".to_string());
@@ -438,7 +433,6 @@ pub fn worker_endpoint_info_from_parts(
         worker_id,
         endpoint,
         worker_net_protocol: protocol.try_into()?,
-        worker_epoch,
         worker_run_id,
     })
 }
@@ -449,7 +443,6 @@ impl From<&WorkerEndpointInfo> for proto_common::WorkerEndpointInfoProto {
             worker_id: endpoint.worker_id.as_raw(),
             endpoint: endpoint.endpoint.clone(),
             worker_net_protocol: proto_common::WorkerNetProtocolProto::from(endpoint.worker_net_protocol) as i32,
-            worker_epoch: endpoint.worker_epoch,
             worker_run_id: endpoint.worker_run_id.to_string(),
         }
     }
@@ -461,7 +454,6 @@ impl From<WorkerEndpointInfo> for proto_common::WorkerEndpointInfoProto {
             worker_id: endpoint.worker_id.as_raw(),
             endpoint: endpoint.endpoint,
             worker_net_protocol: proto_common::WorkerNetProtocolProto::from(endpoint.worker_net_protocol) as i32,
-            worker_epoch: endpoint.worker_epoch,
             worker_run_id: endpoint.worker_run_id.to_string(),
         }
     }
@@ -605,9 +597,6 @@ impl TryFrom<proto_metadata::FileBlockLocationProto> for FileBlockLocation {
         if block_stamp == 0 {
             return Err("FileBlockLocationProto.block_stamp must be non-zero".to_string());
         }
-        if location.worker_epoch == Some(0) {
-            return Err("FileBlockLocationProto.worker_epoch must be non-zero when present".to_string());
-        }
         if location.block_size == 0 {
             return Err("FileBlockLocationProto.block_size must be non-zero".to_string());
         }
@@ -639,7 +628,6 @@ impl TryFrom<proto_metadata::FileBlockLocationProto> for FileBlockLocation {
             file_offset: location.file_offset,
             len: location.len,
             workers,
-            worker_epoch: location.worker_epoch,
             block_stamp,
             block_format_id,
             block_size: location.block_size,
@@ -656,7 +644,6 @@ impl From<&FileBlockLocation> for proto_metadata::FileBlockLocationProto {
             file_offset: location.file_offset,
             len: location.len,
             workers: location.workers.iter().map(Into::into).collect(),
-            worker_epoch: location.worker_epoch,
             block_stamp: Some(location.block_stamp),
             block_format_id: location.block_format_id.as_raw(),
             block_size: location.block_size,
@@ -673,7 +660,6 @@ impl From<FileBlockLocation> for proto_metadata::FileBlockLocationProto {
             file_offset: location.file_offset,
             len: location.len,
             workers: location.workers.into_iter().map(Into::into).collect(),
-            worker_epoch: location.worker_epoch,
             block_stamp: Some(location.block_stamp),
             block_format_id: location.block_format_id.as_raw(),
             block_size: location.block_size,
@@ -1077,9 +1063,6 @@ fn rpc_code_proto_to_enum(code: i32) -> RpcErrorCode {
         x if x == proto_common::RpcErrorCodeProto::RpcErrCodeRouteEpochMismatch as i32 => {
             RpcErrorCode::RouteEpochMismatch
         }
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeWorkerEpochMismatch as i32 => {
-            RpcErrorCode::WorkerEpochMismatch
-        }
         x if x == proto_common::RpcErrorCodeProto::RpcErrCodeWorkerNotRegistered as i32 => {
             RpcErrorCode::WorkerNotRegistered
         }
@@ -1119,7 +1102,6 @@ fn rpc_code_enum_to_proto(code: RpcErrorCode) -> i32 {
         RpcErrorCode::StaleState => proto_common::RpcErrorCodeProto::RpcErrCodeStaleState as i32,
         RpcErrorCode::MountEpochMismatch => proto_common::RpcErrorCodeProto::RpcErrCodeMountEpochMismatch as i32,
         RpcErrorCode::RouteEpochMismatch => proto_common::RpcErrorCodeProto::RpcErrCodeRouteEpochMismatch as i32,
-        RpcErrorCode::WorkerEpochMismatch => proto_common::RpcErrorCodeProto::RpcErrCodeWorkerEpochMismatch as i32,
         RpcErrorCode::WorkerNotRegistered => proto_common::RpcErrorCodeProto::RpcErrCodeWorkerNotRegistered as i32,
         RpcErrorCode::WorkerRunMismatch => proto_common::RpcErrorCodeProto::RpcErrCodeWorkerRunMismatch as i32,
         RpcErrorCode::WorkerDescriptorMismatch => {
@@ -1145,7 +1127,6 @@ fn refresh_reason_proto_to_enum(reason: proto_common::RefreshReasonProto) -> Ref
         proto_common::RefreshReasonProto::RefreshReasonStaleState => RefreshReason::StaleState,
         proto_common::RefreshReasonProto::RefreshReasonMountEpochMismatch => RefreshReason::MountEpochMismatch,
         proto_common::RefreshReasonProto::RefreshReasonRouteEpochMismatch => RefreshReason::RouteEpochMismatch,
-        proto_common::RefreshReasonProto::RefreshReasonWorkerEpochMismatch => RefreshReason::WorkerEpochMismatch,
         proto_common::RefreshReasonProto::RefreshReasonGroupMismatch => RefreshReason::GroupMismatch,
         proto_common::RefreshReasonProto::RefreshReasonNeedRegister => RefreshReason::NeedRegister,
         proto_common::RefreshReasonProto::RefreshReasonWorkerRunMismatch => RefreshReason::WorkerRunMismatch,
@@ -1167,7 +1148,6 @@ fn refresh_reason_to_proto(reason: &Option<RefreshReason>) -> i32 {
         RefreshReason::StaleState => proto_common::RefreshReasonProto::RefreshReasonStaleState as i32,
         RefreshReason::MountEpochMismatch => proto_common::RefreshReasonProto::RefreshReasonMountEpochMismatch as i32,
         RefreshReason::RouteEpochMismatch => proto_common::RefreshReasonProto::RefreshReasonRouteEpochMismatch as i32,
-        RefreshReason::WorkerEpochMismatch => proto_common::RefreshReasonProto::RefreshReasonWorkerEpochMismatch as i32,
         RefreshReason::GroupMismatch => proto_common::RefreshReasonProto::RefreshReasonGroupMismatch as i32,
         RefreshReason::NeedRegister => proto_common::RefreshReasonProto::RefreshReasonNeedRegister as i32,
         RefreshReason::WorkerRunMismatch => proto_common::RefreshReasonProto::RefreshReasonWorkerRunMismatch as i32,
@@ -1187,7 +1167,6 @@ fn refresh_hint_proto_to_hint(hint: Option<&proto_common::RefreshHintProto>) -> 
         mount_epoch: hint.mount_epoch,
         mount_prefix: hint.mount_prefix.clone(),
         route_epoch: hint.route_epoch,
-        worker_epoch: hint.worker_epoch,
         worker_endpoints: hint
             .worker_endpoints
             .iter()
@@ -1195,7 +1174,6 @@ fn refresh_hint_proto_to_hint(hint: Option<&proto_common::RefreshHintProto>) -> 
                 worker_id: endpoint.worker_id,
                 endpoint: endpoint.endpoint.clone(),
                 worker_net_protocol: endpoint.worker_net_protocol,
-                worker_epoch: endpoint.worker_epoch,
             })
             .collect(),
         worker_resolve_required: hint.worker_resolve_required,
@@ -1209,7 +1187,6 @@ fn refresh_hint_to_proto(hint: Option<&CanonicalRefreshHint>) -> Option<proto_co
         mount_epoch: hint.mount_epoch,
         mount_prefix: hint.mount_prefix.clone(),
         route_epoch: hint.route_epoch,
-        worker_epoch: hint.worker_epoch,
         worker_endpoints: hint
             .worker_endpoints
             .iter()
@@ -1217,7 +1194,6 @@ fn refresh_hint_to_proto(hint: Option<&CanonicalRefreshHint>) -> Option<proto_co
                 worker_id: endpoint.worker_id,
                 endpoint: endpoint.endpoint.clone(),
                 worker_net_protocol: endpoint.worker_net_protocol,
-                worker_epoch: endpoint.worker_epoch,
                 worker_run_id: String::new(),
             })
             .collect(),
@@ -1425,12 +1401,85 @@ mod tests {
     fn block_contract_proto_fields_are_normalized() {
         let common_proto = include_str!("../common/common.proto");
         assert_eq!(
+            proto_message_fields(common_proto, "WorkerEndpointInfoProto"),
+            vec![
+                ("uint64", "worker_id", 1),
+                ("string", "endpoint", 2),
+                ("WorkerNetProtocolProto", "worker_net_protocol", 3),
+                ("string", "worker_run_id", 4),
+            ]
+        );
+        assert_eq!(
             proto_message_fields(common_proto, "FileLayoutProto"),
             vec![
                 ("uint32", "block_size", 1),
                 ("uint32", "chunk_size", 2),
                 ("uint32", "replication", 3),
                 ("uint32", "block_format_id", 4),
+            ]
+        );
+
+        let errors_proto = include_str!("../common/errors.proto");
+        assert_eq!(
+            proto_enum_values(errors_proto, "RefreshReasonProto"),
+            vec![
+                ("REFRESH_REASON_UNKNOWN", 0),
+                ("REFRESH_REASON_NOT_LEADER", 1),
+                ("REFRESH_REASON_MOVED", 2),
+                ("REFRESH_REASON_STALE_STATE", 3),
+                ("REFRESH_REASON_MOUNT_EPOCH_MISMATCH", 4),
+                ("REFRESH_REASON_ROUTE_EPOCH_MISMATCH", 5),
+                ("REFRESH_REASON_BLOCK_STAMP_MISMATCH", 6),
+                ("REFRESH_REASON_FENCING", 7),
+                ("REFRESH_REASON_EPOCH_MISMATCH", 8),
+                ("REFRESH_REASON_SESSION_INVALID", 9),
+                ("REFRESH_REASON_SESSION_EXPIRED", 10),
+                ("REFRESH_REASON_OWNER_GROUP_MISMATCH", 11),
+                ("REFRESH_REASON_GROUP_MISMATCH", 12),
+                ("REFRESH_REASON_NEED_REGISTER", 13),
+                ("REFRESH_REASON_WORKER_RUN_MISMATCH", 14),
+                ("REFRESH_REASON_FULL_REPORT_REQUIRED", 15),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(errors_proto, "RefreshHintProto"),
+            vec![
+                ("string", "leader_endpoint", 1),
+                ("uint64", "group_id", 2),
+                ("uint64", "mount_epoch", 3),
+                ("string", "mount_prefix", 4),
+                ("uint64", "route_epoch", 5),
+                ("WorkerEndpointInfoProto", "worker_endpoints", 6),
+                ("bool", "worker_resolve_required", 7),
+            ]
+        );
+        assert_eq!(
+            proto_enum_values(errors_proto, "RpcErrorCodeProto"),
+            vec![
+                ("RPC_ERR_CODE_UNSPECIFIED", 0),
+                ("RPC_ERR_CODE_NO_SUCH_METHOD", 1),
+                ("RPC_ERR_CODE_INVALID_HEADER", 2),
+                ("RPC_ERR_CODE_VERSION_MISMATCH", 3),
+                ("RPC_ERR_CODE_DESERIALIZE_REQUEST", 4),
+                ("RPC_ERR_CODE_SERIALIZE_RESPONSE", 5),
+                ("RPC_ERR_CODE_UNAUTHENTICATED", 20),
+                ("RPC_ERR_CODE_PERMISSION_DENIED", 21),
+                ("RPC_ERR_CODE_NOT_LEADER", 40),
+                ("RPC_ERR_CODE_STALE_STATE", 41),
+                ("RPC_ERR_CODE_FENCING", 42),
+                ("RPC_ERR_CODE_SHARD_MOVED", 43),
+                ("RPC_ERR_CODE_NODE_UNAVAILABLE", 44),
+                ("RPC_ERR_CODE_MOUNT_EPOCH_MISMATCH", 50),
+                ("RPC_ERR_CODE_ROUTE_EPOCH_MISMATCH", 51),
+                ("RPC_ERR_CODE_BLOCK_STAMP_MISMATCH", 52),
+                ("RPC_ERR_CODE_EPOCH_MISMATCH", 53),
+                ("RPC_ERR_CODE_WORKER_NOT_REGISTERED", 54),
+                ("RPC_ERR_CODE_WORKER_RUN_MISMATCH", 55),
+                ("RPC_ERR_CODE_WORKER_DESCRIPTOR_MISMATCH", 56),
+                ("RPC_ERR_CODE_FULL_REPORT_REQUIRED", 57),
+                ("RPC_ERR_CODE_INVALID_ARGUMENT", 100),
+                ("RPC_ERR_CODE_INTERNAL", 101),
+                ("RPC_ERR_CODE_APPLICATION", 102),
             ]
         );
 
@@ -1456,12 +1505,29 @@ mod tests {
                 ("uint64", "file_offset", 2),
                 ("uint64", "len", 3),
                 ("common.WorkerEndpointInfoProto", "workers", 4),
-                ("uint64", "worker_epoch", 5),
-                ("uint64", "block_stamp", 6),
-                ("uint32", "block_format_id", 7),
-                ("uint64", "block_size", 8),
-                ("uint32", "chunk_size", 9),
-                ("uint64", "effective_block_len", 10),
+                ("uint64", "block_stamp", 5),
+                ("uint32", "block_format_id", 6),
+                ("uint64", "block_size", 7),
+                ("uint32", "chunk_size", 8),
+                ("uint64", "effective_block_len", 9),
+            ]
+        );
+
+        let metadata_worker_proto = include_str!("../metadata/worker.proto");
+        assert_eq!(
+            proto_message_fields(metadata_worker_proto, "HeartbeatRequestProto"),
+            vec![
+                ("common.RequestHeaderProto", "header", 1),
+                ("uint64", "group_id", 2),
+                ("uint64", "worker_id", 3),
+                ("string", "worker_run_id", 4),
+                ("uint64", "heartbeat_seq", 5),
+                ("common.EndpointProto", "advertised_endpoint", 6),
+                ("common.WorkerNetProtocolProto", "worker_net_protocol", 7),
+                ("CapacityInfoProto", "capacity", 8),
+                ("LoadInfoProto", "load", 9),
+                ("HealthStatusProto", "health", 10),
+                ("TaskAckProto", "acks", 11),
             ]
         );
 
@@ -1774,7 +1840,6 @@ mod tests {
             worker_id: 7,
             endpoint: "127.0.0.1:19101".to_string(),
             worker_net_protocol: proto_common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified as i32,
-            worker_epoch: 11,
             worker_run_id: test_worker_run_id().to_string(),
         };
 
@@ -1789,7 +1854,6 @@ mod tests {
             worker_id: 7,
             endpoint: "127.0.0.1:19101".to_string(),
             worker_net_protocol: proto_common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-            worker_epoch: 11,
             worker_run_id: test_worker_run_id().to_string(),
         };
         let block_id = BlockId::from_u64_u32(42, 3);
@@ -1818,7 +1882,6 @@ mod tests {
             file_offset: 128,
             len: 4096,
             workers: Vec::new(),
-            worker_epoch: Some(11),
             block_stamp: Some(55),
             block_format_id: types::layout::BlockFormatId::FULL_EFFECTIVE.as_raw(),
             block_size: 4096,
@@ -1828,7 +1891,6 @@ mod tests {
         let decoded_empty =
             types::FileBlockLocation::try_from(location.clone()).expect("empty read location workers are valid");
         assert!(decoded_empty.workers.is_empty());
-        assert_eq!(decoded_empty.worker_epoch, Some(11));
         location.workers.push(endpoint());
         location.block_stamp = None;
         let err = types::FileBlockLocation::try_from(location.clone()).expect_err("missing block_stamp must fail");
@@ -1844,7 +1906,6 @@ mod tests {
             worker_id: WorkerId::new(7),
             endpoint: "127.0.0.1:19101".to_string(),
             worker_net_protocol: types::WorkerNetProtocol::Grpc,
-            worker_epoch: 11,
             worker_run_id: test_worker_run_id(),
         };
         let block_id = BlockId::from_u64_u32(42, 3);
@@ -1895,7 +1956,6 @@ mod tests {
             file_offset: 128,
             len: 4096,
             workers: vec![endpoint],
-            worker_epoch: Some(11),
             block_stamp: 55,
             block_format_id: types::layout::BlockFormatId::FULL_EFFECTIVE,
             block_size: 4096,
@@ -1942,6 +2002,35 @@ mod tests {
             .find("\n}")
             .map(|offset| body_start + offset)
             .unwrap_or_else(|| panic!("unterminated proto message {message}"));
+        &source[body_start..body_end]
+    }
+
+    fn proto_enum_values<'a>(source: &'a str, enum_name: &str) -> Vec<(&'a str, u32)> {
+        proto_enum_body(source, enum_name)
+            .lines()
+            .filter_map(|raw_line| {
+                let line = raw_line.split_once("//").map_or(raw_line, |(value, _)| value).trim();
+                if line.is_empty() || line.starts_with("reserved") || !line.ends_with(';') {
+                    return None;
+                }
+
+                let value = line.trim_end_matches(';');
+                let (name, tag) = value.split_once(" = ")?;
+                Some((name.trim(), tag.trim().parse().expect("numeric proto enum tag")))
+            })
+            .collect()
+    }
+
+    fn proto_enum_body<'a>(source: &'a str, enum_name: &str) -> &'a str {
+        let start = format!("enum {enum_name} {{");
+        let start_index = source
+            .find(&start)
+            .unwrap_or_else(|| panic!("missing proto enum {enum_name}"));
+        let body_start = start_index + start.len();
+        let body_end = source[body_start..]
+            .find("\n}")
+            .map(|offset| body_start + offset)
+            .unwrap_or_else(|| panic!("unterminated proto enum {enum_name}"));
         &source[body_start..body_end]
     }
 }

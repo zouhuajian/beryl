@@ -79,7 +79,6 @@ impl TonicWorkerDataClient {
             worker_id: candidate.worker_id.as_raw(),
             endpoint,
             protocol: candidate.worker_net_protocol,
-            worker_epoch: candidate.worker_epoch,
             worker_run_id: candidate.worker_run_id,
         };
         if !self.channel_pool_enabled {
@@ -146,7 +145,6 @@ impl TonicWorkerDataClient {
                 worker_id: candidate.worker_id.as_raw(),
                 endpoint,
                 protocol: candidate.worker_net_protocol,
-                worker_epoch: candidate.worker_epoch,
                 worker_run_id: candidate.worker_run_id,
             };
             if self.channels.write().remove(&key).is_some() {
@@ -184,7 +182,6 @@ struct WorkerChannelKey {
     worker_id: u64,
     endpoint: String,
     protocol: WorkerNetProtocol,
-    worker_epoch: u64,
     worker_run_id: types::WorkerRunId,
 }
 
@@ -227,16 +224,6 @@ impl WorkerDataClient for TonicWorkerDataClient {
         }
         let mut last_transport_error = None;
         for candidate in &segment.workers {
-            if segment.worker_epoch == Some(0) {
-                return Err(ClientError::InvalidLayout(
-                    "block location worker_epoch must be non-zero when present".to_string(),
-                ));
-            }
-            if candidate.worker_epoch == 0 {
-                return Err(ClientError::InvalidLayout(
-                    "worker candidate epoch must be non-zero".to_string(),
-                ));
-            }
             ensure_supported_worker_protocol(candidate.worker_net_protocol)?;
             let mut client = match self.client(candidate, "read").await {
                 Ok(client) => client,
@@ -288,11 +275,6 @@ impl WorkerDataClient for TonicWorkerDataClient {
         validate_worker_write_target(&target)?;
         let mut last_transport_error = None;
         for candidate in &target.target.worker_endpoints {
-            if candidate.worker_epoch == 0 {
-                return Err(ClientError::InvalidLayout(
-                    "worker write candidate epoch must be non-zero".to_string(),
-                ));
-            }
             ensure_supported_worker_protocol(candidate.worker_net_protocol)?;
             let mut client = match self.client(candidate, "write").await {
                 Ok(client) => client,
@@ -1087,7 +1069,6 @@ fn is_retryable_worker_status(status: &tonic::Status) -> bool {
 
 fn worker_identity_mismatch_invalidation_reason(err: &ClientError) -> Option<CacheInvalidationReason> {
     match ErrorClassifier.classify_error(err) {
-        ErrorClass::NeedRefresh(RefreshReason::WorkerEpochMismatch) => Some(CacheInvalidationReason::WorkerEpoch),
         ErrorClass::NeedRefresh(RefreshReason::WorkerRunMismatch) => Some(CacheInvalidationReason::WorkerRun),
         _ => None,
     }
@@ -1226,7 +1207,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_channel_different_epoch_does_not_share_channel() {
+    async fn worker_channel_different_run_does_not_share_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
         let client = Arc::new(TonicWorkerDataClient::with_parts(
             WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone()),
@@ -1235,9 +1216,13 @@ mod tests {
             metrics,
         ));
         let mut first = worker_endpoint();
-        first.worker_epoch = 7;
+        first.worker_run_id = "550e8400-e29b-41d4-a716-446655440007"
+            .parse()
+            .expect("valid first WorkerRunId");
         let mut second = worker_endpoint();
-        second.worker_epoch = 8;
+        second.worker_run_id = "550e8400-e29b-41d4-a716-446655440008"
+            .parse()
+            .expect("valid second WorkerRunId");
 
         let first_task = {
             let client = Arc::clone(&client);
@@ -1265,18 +1250,11 @@ mod tests {
         let candidate = worker_endpoint();
         let ctx = data_attempt_context();
 
-        for (code, reason, message) in [
-            (
-                RpcErrorCode::WorkerRunMismatch,
-                RefreshReason::WorkerRunMismatch,
-                "worker run mismatch",
-            ),
-            (
-                RpcErrorCode::WorkerEpochMismatch,
-                RefreshReason::WorkerEpochMismatch,
-                "worker epoch mismatch",
-            ),
-        ] {
+        for (code, reason, message) in [(
+            RpcErrorCode::WorkerRunMismatch,
+            RefreshReason::WorkerRunMismatch,
+            "worker run mismatch",
+        )] {
             let _worker_client = client.client(&candidate, "read").await.expect("worker client");
             assert_eq!(client.endpoint_cache().len(), 1);
             assert_eq!(client.channels.read().len(), 1);
@@ -1452,7 +1430,6 @@ mod tests {
             RpcErrorCode::BlockStampMismatch,
             RefreshReason::BlockStampMismatch,
             CanonicalRefreshHint {
-                worker_epoch: Some(44),
                 worker_resolve_required: true,
                 ..CanonicalRefreshHint::default()
             },
@@ -1468,7 +1445,6 @@ mod tests {
         match action(&err) {
             ClientAction::Refresh { reason, hint, .. } => {
                 assert_eq!(*reason, RefreshReason::BlockStampMismatch);
-                assert_eq!(hint.worker_epoch, Some(44));
                 assert!(hint.worker_resolve_required);
             }
             other => panic!("expected refresh action, got {other:?}"),
@@ -1911,28 +1887,6 @@ mod tests {
     }
 
     #[test]
-    fn worker_epoch_mismatch_is_typed_refresh_error() {
-        let ctx = write_attempt_context();
-        let err = parse_worker_control_header(
-            &ctx,
-            Some(&data_header_with_error(
-                &ctx,
-                CanonicalError::need_refresh(
-                    RpcErrorCode::WorkerEpochMismatch,
-                    RefreshReason::WorkerEpochMismatch,
-                    "worker epoch mismatch",
-                ),
-            )),
-        )
-        .expect_err("worker epoch mismatch must fail");
-
-        assert_eq!(
-            ErrorClassifier.classify_error(&err),
-            ErrorClass::NeedRefresh(crate::runtime::RefreshReason::WorkerEpochMismatch)
-        );
-    }
-
-    #[test]
     fn worker_run_mismatch_is_typed_refresh_error() {
         let ctx = write_attempt_context();
         let err = parse_worker_control_header(
@@ -2243,7 +2197,6 @@ mod tests {
             worker_id: WorkerId::new(1),
             endpoint: "127.0.0.1:19101".to_string(),
             worker_net_protocol: WorkerNetProtocol::Grpc,
-            worker_epoch: 7,
             worker_run_id: test_worker_run_id(),
         }
     }
@@ -2267,7 +2220,6 @@ mod tests {
             block_id: BlockId::new(DataHandleId::new(202), BlockIndex::new(0)),
             block_offset: 0,
             workers: vec![worker_endpoint()],
-            worker_epoch: Some(7),
             block_stamp,
             block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
             block_size: 4096,

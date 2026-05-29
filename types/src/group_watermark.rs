@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 /// Group state watermark for a specific metadata Raft owner group.
 ///
 /// `state_id` is the state-machine applied RaftLogId for `group_id`. It is not
-/// an append index, committed index, private apply counter, or any route/mount/worker epoch.
+/// an append index, committed index, private apply counter, route epoch,
+/// mount epoch, worker process-run identity, or block stamp.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GroupStateWatermark {
     /// Metadata Raft owner group this watermark applies to.

@@ -22,5 +22,4 @@ pub struct WorkerNetEndpoint {
     pub role: WorkerEndpointRole,
     pub priority: u32,
     pub capabilities: WorkerNetCapabilities,
-    pub worker_epoch: u64,
 }

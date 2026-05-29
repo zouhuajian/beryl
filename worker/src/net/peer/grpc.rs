@@ -255,7 +255,6 @@ mod tests {
             role: WorkerEndpointRole::PeerData,
             priority: 0,
             capabilities: WorkerNetCapabilities::default(),
-            worker_epoch: 1,
         }
     }
 

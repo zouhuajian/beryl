@@ -170,7 +170,6 @@ impl MetadataHeartbeatLoop {
             }),
             health: HealthStatusProto::HealthStatusHealthy as i32,
             worker_net_protocol: worker_protocol_to_proto(self.descriptor.worker_net_protocol) as i32,
-            worker_epoch: 0,
             acks: Vec::new(),
         }
     }

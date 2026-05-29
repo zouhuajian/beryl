@@ -75,7 +75,7 @@ The regular data path is metadata issued: client create/open/append/add-block/re
 
 - Stable Rust domain models shared by multiple production modules.
 - Typed identifiers and value objects such as inode, block, chunk, stream, lease, worker, shard group, mount, and state watermark identities.
-- Cross-module domain concepts when they are not protobuf-specific and are not tied to one runtime: worker endpoint information, read/write block location, write target, committed block, byte range, fencing token, worker epoch, block stamp, and group state watermark.
+- Cross-module domain concepts when they are not protobuf-specific and are not tied to one runtime: worker endpoint information, read/write block location, write target, committed block, byte range, fencing token, worker run identity, block stamp, and group state watermark.
 - Shared validation helpers for these domain concepts when validation is pure and does not choose business policy.
 
 #### Does Not Own

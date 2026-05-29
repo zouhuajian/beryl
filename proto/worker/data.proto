@@ -37,9 +37,9 @@ message OpenReadStreamRequestProto {
   // not relative to the file/data handle.
   common.ByteRangeProto byte_range = 4;
 
-  // Metadata-authoritative logical block stamp for direct read validation.
-  // Normal client reads must send a non-zero value. A zero value is reserved
-  // for explicitly allowed internal/debug callers that bypass stamp checks.
+  // Metadata-issued logical block stamp for direct read validation.
+  // Must be non-zero. Worker validation rejects zero, stale, or mismatched
+  // block stamps.
   uint64 block_stamp = 5;
 
   // Client-preferred transport frame payload size in bytes.

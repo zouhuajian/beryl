@@ -68,8 +68,6 @@ pub mod canonical {
         MountEpochMismatch,
         /// Route epoch mismatch.
         RouteEpochMismatch,
-        /// Worker epoch / boot id mismatch.
-        WorkerEpochMismatch,
         /// Request targeted a metadata group this server does not serve.
         GroupMismatch,
         /// Worker must run startup registration for the target group.
@@ -96,7 +94,6 @@ pub mod canonical {
         pub worker_id: u64,
         pub endpoint: String,
         pub worker_net_protocol: i32,
-        pub worker_epoch: u64,
     }
 
     /// Structured refresh hints attached to canonical errors.
@@ -107,7 +104,6 @@ pub mod canonical {
         pub mount_epoch: Option<u64>,
         pub mount_prefix: Option<String>,
         pub route_epoch: Option<u64>,
-        pub worker_epoch: Option<u64>,
         pub worker_endpoints: Vec<WorkerEndpointHint>,
         pub worker_resolve_required: bool,
     }

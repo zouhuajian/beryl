@@ -9,7 +9,7 @@ This file applies to `client/`. Follow the root `AGENTS.md` first; this crate ow
 - SDK facade and public API shape
 - metadata RPC orchestration and response validation
 - worker data-plane orchestration after metadata-issued layout, route, source, lease/fencing, and freshness context
-- freshness, route epoch, mount epoch, worker epoch, fencing, retry, refresh, replay, and unknown-outcome behavior
+- freshness, route epoch, mount epoch, worker run identity, block stamp, fencing, retry, refresh, replay, and unknown-outcome behavior
 - worker endpoint cache, channel pooling, endpoint health, attempt scheduling, and client typed config
 - session-scoped open/write/flush/sync/close state
 
@@ -27,7 +27,7 @@ This file applies to `client/`. Follow the root `AGENTS.md` first; this crate ow
 
 ## Tests
 
-- Test route refresh, not-leader refresh/replay, stale route/mount/worker epoch behavior, follower-read watermark gating, group-scoped watermark comparison, write-session invalidation, fencing/session-expired behavior, transport-vs-business failure classification, and stale direct-path fallback-to-refresh where relevant.
+- Test route refresh, not-leader refresh/replay, stale route/mount/worker-run/block-stamp behavior, follower-read watermark gating, group-scoped watermark comparison, write-session invalidation, fencing/session-expired behavior, transport-vs-business failure classification, and stale direct-path fallback-to-refresh where relevant.
 - Assert explicit client actions and policies, not only eventual success.
 - Use integration tests for end-to-end metadata/worker/client contracts.
 

@@ -100,7 +100,7 @@ mod tests {
         let group_id = ShardGroupId::new(1);
         let address = "127.0.0.1:8080".to_string();
         let run_id = worker_run_id(worker_id);
-        worker_manager.register_worker(group_id, worker_id, address.clone(), 1, 100, None)?;
+        worker_manager.register_worker(group_id, worker_id, address.clone(), 1, None)?;
         worker_manager.register_worker_run(group_id, worker_id, address.clone(), 1, run_id, None)?;
         worker_manager.record_heartbeat(
             group_id,
@@ -360,7 +360,7 @@ mod tests {
         let address = "127.0.0.1:8080".to_string();
         let run_id = worker_run_id(worker_id);
         worker_manager
-            .register_worker(ShardGroupId::new(1), worker_id, address.clone(), 1, 100, None)
+            .register_worker(ShardGroupId::new(1), worker_id, address.clone(), 1, None)
             .unwrap();
         worker_manager
             .register_worker_run(ShardGroupId::new(1), worker_id, address.clone(), 1, run_id, None)

@@ -51,7 +51,6 @@ pub struct FileBlockLocation {
     /// Metadata-issued read candidates. Empty means the authoritative layout has
     /// this block range but no live reported replica is currently eligible.
     pub workers: Vec<WorkerEndpointInfo>,
-    pub worker_epoch: Option<u64>,
     pub block_stamp: u64,
     /// Metadata-selected Vecton block data/meta interpretation format.
     pub block_format_id: BlockFormatId,

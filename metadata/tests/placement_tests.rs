@@ -23,7 +23,6 @@ fn worker(group_id: ShardGroupId, worker_id: u64, worker_run_id: WorkerRunId, ho
         worker_run_id: Some(worker_run_id),
         endpoint: format!("{host}:19101"),
         worker_net_protocol: 1,
-        worker_epoch: 1,
         registered: true,
         lease_valid: true,
         ip: None,

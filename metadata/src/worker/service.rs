@@ -1079,7 +1079,6 @@ mod tests {
             }),
             health: HealthStatusProto::HealthStatusHealthy as i32,
             worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-            worker_epoch: 0,
             acks: Vec::new(),
         }
     }
@@ -1121,14 +1120,7 @@ mod tests {
         let worker_id = WorkerId::new(7);
         let block_id = BlockId::from_u64_u32(70, 0);
         worker_manager
-            .register_worker(
-                ShardGroupId::new(1),
-                worker_id,
-                "127.0.0.1:9090".to_string(),
-                1,
-                100,
-                None,
-            )
+            .register_worker(ShardGroupId::new(1), worker_id, "127.0.0.1:9090".to_string(), 1, None)
             .unwrap();
         let worker_run_id = record_heartbeat(
             &worker_manager,
@@ -1182,14 +1174,7 @@ mod tests {
         let worker_id = WorkerId::new(8);
         let block_id = BlockId::from_u64_u32(80, 0);
         worker_manager
-            .register_worker(
-                ShardGroupId::new(1),
-                worker_id,
-                "127.0.0.1:9091".to_string(),
-                1,
-                100,
-                None,
-            )
+            .register_worker(ShardGroupId::new(1), worker_id, "127.0.0.1:9091".to_string(), 1, None)
             .unwrap();
         let worker_run_id = record_heartbeat(
             &worker_manager,
@@ -1562,14 +1547,7 @@ mod tests {
         let worker_manager = Arc::new(WorkerManager::new(60));
         let worker_id = WorkerId::new(10);
         worker_manager
-            .register_worker(
-                ShardGroupId::new(1),
-                worker_id,
-                "127.0.0.1:9090".to_string(),
-                1,
-                0,
-                None,
-            )
+            .register_worker(ShardGroupId::new(1), worker_id, "127.0.0.1:9090".to_string(), 1, None)
             .unwrap();
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
@@ -1860,14 +1838,7 @@ mod tests {
         let worker_manager = Arc::new(WorkerManager::new(60));
         let worker_id = WorkerId::new(99);
         worker_manager
-            .register_worker(
-                ShardGroupId::new(1),
-                worker_id,
-                "127.0.0.1:9099".to_string(),
-                1,
-                100,
-                None,
-            )
+            .register_worker(ShardGroupId::new(1), worker_id, "127.0.0.1:9099".to_string(), 1, None)
             .unwrap();
         let worker_run_id = record_heartbeat(
             &worker_manager,

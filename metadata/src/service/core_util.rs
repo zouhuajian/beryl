@@ -362,17 +362,10 @@ pub fn worker_endpoint_from_parts(
     worker_id: WorkerId,
     endpoint: String,
     worker_net_protocol: i32,
-    worker_epoch: u64,
     worker_run_id: types::WorkerRunId,
 ) -> Result<WorkerEndpointInfo, MetadataError> {
-    proto::convert::worker_endpoint_info_from_parts(
-        worker_id,
-        endpoint,
-        worker_net_protocol,
-        worker_epoch,
-        worker_run_id.to_string(),
-    )
-    .map_err(MetadataError::InvalidArgument)
+    proto::convert::worker_endpoint_info_from_parts(worker_id, endpoint, worker_net_protocol, worker_run_id.to_string())
+        .map_err(MetadataError::InvalidArgument)
 }
 
 pub fn write_target_to_proto(target: &WriteTarget) -> proto::metadata::WriteTargetProto {

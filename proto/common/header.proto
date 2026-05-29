@@ -130,7 +130,7 @@ message RaftLogIdProto {
 ///
 /// group_id identifies the metadata Raft owner group. state_id is that group's
 /// state-machine applied RaftLogId. It is not a committed index, append index,
-/// private apply counter, route_epoch, mount_epoch, worker_epoch, call_id, or request_id.
+/// private apply counter, route_epoch, mount_epoch, call_id, or request_id.
 message GroupStateWatermarkProto {
   /// Metadata Raft owner group this watermark belongs to.
   ShardGroupIdProto group_id = 1;

@@ -103,9 +103,8 @@ message WorkerEndpointInfoProto {
   uint64 worker_id = 1;
   string endpoint = 2;  // host:port
   WorkerNetProtocolProto worker_net_protocol = 3;
-  uint64 worker_epoch = 4;
   // Metadata-confirmed worker process-run identity for this endpoint.
-  string worker_run_id = 5;
+  string worker_run_id = 4;
 }
 
 /// Byte range within a file.

@@ -51,7 +51,6 @@ pub struct WorkerPlacementView {
     pub worker_run_id: Option<WorkerRunId>,
     pub endpoint: String,
     pub worker_net_protocol: i32,
-    pub worker_epoch: u64,
     pub registered: bool,
     pub lease_valid: bool,
     pub ip: Option<String>,
@@ -71,7 +70,6 @@ pub struct PlacementWorker {
     pub worker_run_id: WorkerRunId,
     pub endpoint: String,
     pub worker_net_protocol: i32,
-    pub worker_epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,7 +212,6 @@ fn workers_from_views(workers: Vec<&WorkerPlacementView>) -> Vec<PlacementWorker
                 worker_run_id,
                 endpoint: worker.endpoint.clone(),
                 worker_net_protocol: worker.worker_net_protocol,
-                worker_epoch: worker.worker_epoch,
             })
         })
         .collect()

@@ -154,7 +154,7 @@ mod tests {
         let address = format!("127.0.0.1:{}", 9000 + worker_id.as_raw());
         let run_id = worker_run_id(worker_id);
         manager
-            .register_worker(group_id, worker_id, address.clone(), 1, 100, None)
+            .register_worker(group_id, worker_id, address.clone(), 1, None)
             .unwrap();
         manager
             .register_worker_run(group_id, worker_id, address.clone(), 1, run_id, None)

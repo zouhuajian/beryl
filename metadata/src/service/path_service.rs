@@ -224,7 +224,6 @@ impl MetadataFileSystemServiceImpl {
         Freshness {
             mount_epoch: header.as_ref().and_then(|h| h.mount_epoch),
             route_epoch: header.as_ref().and_then(|h| h.route_epoch),
-            worker_epoch: None,
         }
     }
 

@@ -214,7 +214,6 @@ pub enum RpcErrorCode {
     StaleState,
     MountEpochMismatch,
     RouteEpochMismatch,
-    WorkerEpochMismatch,
     WorkerNotRegistered,
     WorkerRunMismatch,
     WorkerDescriptorMismatch,

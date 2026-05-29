@@ -22,8 +22,6 @@ pub struct WorkerDescriptor {
     pub address: String,
     /// Worker network protocol (0=unspecified/grpc, 1=grpc, 2=quic, 3=rdma).
     pub worker_net_protocol: i32,
-    /// Existing data-plane freshness field, separate from startup registration.
-    pub worker_epoch: u64,
     pub fault_domain: Option<String>,
 }
 
@@ -50,8 +48,6 @@ pub struct WorkerInfo {
     pub address: String,
     /// Worker network protocol (0=unspecified/grpc, 1=grpc, 2=quic, 3=rdma).
     pub worker_net_protocol: i32,
-    /// Existing data-plane freshness field, separate from startup registration.
-    pub worker_epoch: u64,
     pub capacity_total: u64,
     pub capacity_used: u64,
     pub capacity_available: u64,
@@ -315,7 +311,6 @@ impl WorkerManager {
                 worker_id: worker.worker_id,
                 address: worker.address,
                 worker_net_protocol: worker.worker_net_protocol,
-                worker_epoch: worker.worker_epoch,
                 fault_domain: worker.fault_domain,
             };
             descriptors.insert(
@@ -372,7 +367,6 @@ impl WorkerManager {
         worker_id: WorkerId,
         address: String,
         worker_net_protocol: i32,
-        worker_epoch: u64,
         fault_domain: Option<String>,
     ) -> MetadataResult<()> {
         let descriptor = WorkerDescriptor {
@@ -380,7 +374,6 @@ impl WorkerManager {
             worker_id,
             address,
             worker_net_protocol,
-            worker_epoch,
             fault_domain,
         };
         self.upsert_descriptor(descriptor)
@@ -401,17 +394,11 @@ impl WorkerManager {
         let lease_deadline = Instant::now() + self.heartbeat_timeout();
         let descriptor_address = address.clone();
         let descriptor_fault_domain = fault_domain.clone();
-        let worker_epoch = self
-            .get_descriptor(group_id, worker_id)
-            .map(|descriptor| descriptor.worker_epoch)
-            .unwrap_or(1)
-            .max(1);
         let descriptor = WorkerDescriptor {
             group_id,
             worker_id,
             address: descriptor_address,
             worker_net_protocol,
-            worker_epoch,
             fault_domain: descriptor_fault_domain,
         };
         self.upsert_descriptor(descriptor)?;
@@ -809,7 +796,6 @@ impl WorkerManager {
             worker_id: descriptor.worker_id,
             address: descriptor.address.clone(),
             worker_net_protocol: descriptor.worker_net_protocol,
-            worker_epoch: descriptor.worker_epoch,
             capacity_total: runtime_data.capacity_total,
             capacity_used: runtime_data.capacity_used,
             capacity_available: runtime_data.capacity_available,
@@ -921,7 +907,6 @@ impl WorkerManager {
                 worker_run_id: registration.map(|registration| registration.worker_run_id),
                 endpoint: descriptor.address.clone(),
                 worker_net_protocol: descriptor.worker_net_protocol,
-                worker_epoch: descriptor.worker_epoch,
                 registered,
                 lease_valid,
                 ip: endpoint_host(&descriptor.address),

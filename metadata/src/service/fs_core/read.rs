@@ -73,7 +73,6 @@ impl FsCore {
             worker.worker_id,
             worker.endpoint.clone(),
             worker.worker_net_protocol,
-            worker.worker_epoch,
             worker_run_id,
         )
         .is_ok()
@@ -468,21 +467,18 @@ impl FsCore {
                         worker.worker_id,
                         worker.endpoint,
                         worker.worker_net_protocol,
-                        worker.worker_epoch,
                         worker.worker_run_id,
                     ) {
                         workers.push(endpoint);
                     }
                 }
             }
-            let worker_epoch = workers.iter().map(|worker| worker.worker_epoch).max();
             locations.push(FileBlockLocation {
                 block_id: extent.block_id,
                 file_offset: extent.file_offset,
                 len: extent.len,
                 block_stamp,
                 workers,
-                worker_epoch,
                 block_format_id: layout.block_format_id,
                 block_size: u64::from(layout.block_size),
                 chunk_size: layout.chunk_size,

@@ -22,8 +22,6 @@ pub struct EndpointHint {
     pub endpoint: String,
     /// Worker network protocol as proto enum raw value.
     pub worker_net_protocol: i32,
-    /// Worker epoch for the hinted endpoint.
-    pub worker_epoch: u64,
 }
 
 impl From<proto::common::WorkerEndpointInfoProto> for EndpointHint {
@@ -32,7 +30,6 @@ impl From<proto::common::WorkerEndpointInfoProto> for EndpointHint {
             worker_id: value.worker_id,
             endpoint: value.endpoint,
             worker_net_protocol: value.worker_net_protocol,
-            worker_epoch: value.worker_epoch,
         }
     }
 }
@@ -43,7 +40,6 @@ impl From<common::error::canonical::WorkerEndpointHint> for EndpointHint {
             worker_id: value.worker_id,
             endpoint: value.endpoint,
             worker_net_protocol: value.worker_net_protocol,
-            worker_epoch: value.worker_epoch,
         }
     }
 }
@@ -61,8 +57,6 @@ pub struct RefreshHint {
     pub route_epoch: Option<u64>,
     /// Mount epoch hint from metadata header.
     pub mount_epoch: Option<u64>,
-    /// Worker epoch hint from data header.
-    pub worker_epoch: Option<u64>,
     /// Primary endpoint hint for callers that expect a single target.
     pub endpoint_hint: Option<EndpointHint>,
     /// All worker endpoint hints from the canonical refresh hint.
@@ -212,7 +206,6 @@ fn refresh_hint_from_canonical(canonical_hint: Option<&common::error::canonical:
         mount_prefix: canonical_hint.mount_prefix.clone(),
         route_epoch: canonical_hint.route_epoch,
         mount_epoch: canonical_hint.mount_epoch,
-        worker_epoch: canonical_hint.worker_epoch,
         endpoint_hint: worker_endpoints.first().cloned(),
         worker_endpoints,
         worker_resolve_required: canonical_hint.worker_resolve_required,
@@ -327,19 +320,16 @@ mod tests {
                 mount_epoch: Some(31),
                 mount_prefix: Some("/mnt".to_string()),
                 route_epoch: Some(23),
-                worker_epoch: Some(47),
                 worker_endpoints: vec![
                     WorkerEndpointHint {
                         worker_id: 5,
                         endpoint: "127.0.0.1:9005".to_string(),
                         worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-                        worker_epoch: 47,
                     },
                     WorkerEndpointHint {
                         worker_id: 6,
                         endpoint: "127.0.0.1:9006".to_string(),
                         worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-                        worker_epoch: 48,
                     },
                 ],
                 worker_resolve_required: true,
@@ -360,7 +350,6 @@ mod tests {
                 assert_eq!(hint.mount_epoch, Some(31));
                 assert_eq!(hint.mount_prefix.as_deref(), Some("/mnt"));
                 assert_eq!(hint.route_epoch, Some(23));
-                assert_eq!(hint.worker_epoch, Some(47));
                 assert!(hint.worker_resolve_required);
                 assert_eq!(hint.worker_endpoints.len(), 2);
                 assert_eq!(hint.worker_endpoints[0].endpoint, "127.0.0.1:9005");

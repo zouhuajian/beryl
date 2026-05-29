@@ -666,7 +666,6 @@ mod tests {
                 route_epoch: Some(23),
                 mount_epoch: Some(31),
                 mount_prefix: Some("/mnt".to_string()),
-                worker_epoch: Some(47),
                 worker_resolve_required: true,
                 ..CanonicalRefreshHint::default()
             },
@@ -690,7 +689,6 @@ mod tests {
                 assert_eq!(hint.route_epoch, Some(23));
                 assert_eq!(hint.mount_epoch, Some(31));
                 assert_eq!(hint.mount_prefix.as_deref(), Some("/mnt"));
-                assert_eq!(hint.worker_epoch, Some(47));
                 assert!(hint.worker_resolve_required);
             }
             other => panic!("expected refresh action, got {other:?}"),

@@ -898,11 +898,11 @@ fn append_worker_block_identity(detail: &mut String, worker_block: &WorkerWriteB
     let block_id = worker_block.target.block_id;
     let _ = write!(
         detail,
-        "group={} worker={} protocol={} worker_epoch={} block={} stamp={} offset={} effective_len={} stream={}:{} next_seq={}",
+        "group={} worker={} protocol={} worker_run_id={} block={} stamp={} offset={} effective_len={} stream={}:{} next_seq={}",
         worker_block.group_id,
         worker_block.worker.worker_id,
         proto::common::WorkerNetProtocolProto::from(worker_block.worker.worker_net_protocol) as i32,
-        worker_block.worker.worker_epoch,
+        worker_block.worker.worker_run_id,
         block_id,
         worker_block.target.block_stamp,
         worker_block.target.file_offset,
@@ -1390,7 +1390,6 @@ mod tests {
             worker_id: WorkerId::new(11),
             endpoint: "127.0.0.1:19101".to_string(),
             worker_net_protocol: WorkerNetProtocol::Grpc,
-            worker_epoch: 13,
             worker_run_id: "550e8400-e29b-41d4-a716-446655440000"
                 .parse()
                 .expect("valid test WorkerRunId"),
@@ -1417,12 +1416,12 @@ mod tests {
         }
     }
 
-    fn worker_block_signature(block: &WorkerWriteBlock) -> (u64, u64, i32, u64, u64, u64, u64, u32, u64, u64, u64) {
+    fn worker_block_signature(block: &WorkerWriteBlock) -> (u64, u64, i32, String, u64, u64, u64, u32, u64, u64, u64) {
         (
             block.group_id,
             block.worker.worker_id.as_raw(),
             proto::common::WorkerNetProtocolProto::from(block.worker.worker_net_protocol) as i32,
-            block.worker.worker_epoch,
+            block.worker.worker_run_id.to_string(),
             block.target.file_offset,
             block.target.effective_block_len,
             block.target.block_stamp,

@@ -36,7 +36,6 @@ pub(crate) struct PlannedReadSegment {
     pub(crate) chunk_size: u32,
     pub(crate) effective_block_len: u64,
     pub(crate) workers: Vec<WorkerEndpointInfo>,
-    pub(crate) worker_epoch: Option<u64>,
 }
 
 impl ReadPlanner {
@@ -176,7 +175,6 @@ impl ReadPlanner {
                 chunk_size: location.chunk_size,
                 effective_block_len: location.effective_block_len,
                 workers: location.workers.clone(),
-                worker_epoch: location.worker_epoch,
             });
             cursor = read_end;
             if cursor == requested_end {
@@ -362,14 +360,12 @@ mod tests {
             .expect("non-empty span");
         let mut location = location(10, 0, 0, 4, 101);
         location.workers.clear();
-        location.worker_epoch = None;
 
         let segments =
             ReadPlanner::resolve_locations(DataHandleId::new(10), span, &[location]).expect("location covers range");
 
         assert_eq!(segments.len(), 1);
         assert!(segments[0].workers.is_empty());
-        assert_eq!(segments[0].worker_epoch, None);
     }
 
     fn location(
@@ -387,10 +383,8 @@ mod tests {
                 worker_id: WorkerId::new(1),
                 endpoint: "127.0.0.1:19101".to_string(),
                 worker_net_protocol: WorkerNetProtocol::Grpc,
-                worker_epoch: 7,
                 worker_run_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
             }],
-            worker_epoch: Some(7),
             block_stamp,
             block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
             block_size: 4096,

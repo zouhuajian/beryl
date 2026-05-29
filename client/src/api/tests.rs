@@ -266,7 +266,7 @@ async fn reader_replans_after_worker_refresh() {
     )));
     let worker = Arc::new(MockDataClient::with_refresh_once(
         b"abcdefghijklmnop",
-        RefreshReason::WorkerEpochMismatch,
+        RefreshReason::WorkerRunMismatch,
     ));
     let client = FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker)).expect("client");
     let reader = read_reader(&client, 16);
@@ -295,7 +295,7 @@ async fn writer_debug_redacts_write_session_identity_names() {
         concat!("write", "_handle"),
         "fencing",
         concat!("route", "_epoch"),
-        concat!("worker", "_epoch"),
+        concat!("worker", "_run_id"),
         concat!("block", "_stamp"),
         concat!("call", "_id"),
         concat!("stream", "_id"),
@@ -1217,7 +1217,6 @@ fn worker_endpoint() -> WorkerEndpointInfo {
         worker_id: WorkerId::new(1),
         endpoint: "127.0.0.1:19101".to_string(),
         worker_net_protocol: WorkerNetProtocol::Grpc,
-        worker_epoch: 7,
         worker_run_id: "550e8400-e29b-41d4-a716-446655440000"
             .parse()
             .expect("valid test WorkerRunId"),
@@ -1230,7 +1229,6 @@ fn location(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -
         file_offset,
         len,
         workers: vec![worker_endpoint()],
-        worker_epoch: Some(7),
         block_stamp: u64::from(block_index) + 1,
         block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
         block_size: DEFAULT_BLOCK_SIZE as u64,
@@ -1241,14 +1239,13 @@ fn location(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -
 
 fn refresh_action_error(reason: RefreshReason) -> ClientError {
     let code = match reason {
-        RefreshReason::WorkerEpochMismatch => RpcErrorCode::WorkerEpochMismatch,
+        RefreshReason::WorkerRunMismatch => RpcErrorCode::WorkerRunMismatch,
         other => panic!("unsupported test refresh reason {other:?}"),
     };
     let canonical = CanonicalError::need_refresh_with_hint(
         code,
         reason,
         CanonicalRefreshHint {
-            worker_epoch: Some(66),
             worker_resolve_required: true,
             ..CanonicalRefreshHint::default()
         },
@@ -1257,7 +1254,6 @@ fn refresh_action_error(reason: RefreshReason) -> ClientError {
     ClientError::from(ClientAction::Refresh {
         reason,
         hint: Box::new(RefreshHint {
-            worker_epoch: Some(66),
             worker_resolve_required: true,
             ..RefreshHint::default()
         }),

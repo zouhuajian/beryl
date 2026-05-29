@@ -122,8 +122,7 @@ async fn test_worker_registration_and_heartbeat() {
             ShardGroupId::new(1),
             worker_id,
             "127.0.0.1:8080".to_string(),
-            1,   // worker_net_protocol: GRPC
-            100, // worker_epoch
+            1, // worker_net_protocol: GRPC
             None,
         )
         .unwrap();
@@ -160,8 +159,7 @@ async fn test_block_report_updates_locations() {
             ShardGroupId::new(1),
             worker_id,
             "127.0.0.1:8080".to_string(),
-            1,   // worker_net_protocol: GRPC
-            100, // worker_epoch
+            1, // worker_net_protocol: GRPC
             None,
         )
         .unwrap();
@@ -220,14 +218,7 @@ async fn test_block_report_batching_correctness() {
     let worker_id = WorkerId::new(1);
 
     manager
-        .register_worker(
-            ShardGroupId::new(1),
-            worker_id,
-            "127.0.0.1:8080".to_string(),
-            1,
-            100,
-            None,
-        )
+        .register_worker(ShardGroupId::new(1), worker_id, "127.0.0.1:8080".to_string(), 1, None)
         .unwrap();
 
     // Send heartbeat to make worker live.
@@ -283,8 +274,7 @@ async fn test_dead_worker_cleanup() {
             ShardGroupId::new(1),
             worker_id,
             "127.0.0.1:8080".to_string(),
-            1,   // worker_net_protocol: GRPC
-            100, // worker_epoch
+            1, // worker_net_protocol: GRPC
             None,
         )
         .unwrap();
@@ -399,34 +389,13 @@ async fn test_worker_placement_selection() {
     let worker3 = WorkerId::new(3);
 
     manager
-        .register_worker(
-            ShardGroupId::new(1),
-            worker1,
-            "127.0.0.1:8080".to_string(),
-            1,
-            100,
-            None,
-        )
+        .register_worker(ShardGroupId::new(1), worker1, "127.0.0.1:8080".to_string(), 1, None)
         .unwrap();
     manager
-        .register_worker(
-            ShardGroupId::new(1),
-            worker2,
-            "127.0.0.1:8081".to_string(),
-            1,
-            100,
-            None,
-        )
+        .register_worker(ShardGroupId::new(1), worker2, "127.0.0.1:8081".to_string(), 1, None)
         .unwrap();
     manager
-        .register_worker(
-            ShardGroupId::new(1),
-            worker3,
-            "127.0.0.1:8082".to_string(),
-            1,
-            100,
-            None,
-        )
+        .register_worker(ShardGroupId::new(1), worker3, "127.0.0.1:8082".to_string(), 1, None)
         .unwrap();
 
     // Send heartbeats to make workers live and update capacity.
@@ -561,44 +530,16 @@ async fn test_replication_check_triggers_repair() {
 
     // Register workers
     manager
-        .register_worker(
-            ShardGroupId::new(1),
-            worker1,
-            "127.0.0.1:8080".to_string(),
-            1,
-            100,
-            None,
-        )
+        .register_worker(ShardGroupId::new(1), worker1, "127.0.0.1:8080".to_string(), 1, None)
         .unwrap();
     manager
-        .register_worker(
-            ShardGroupId::new(1),
-            worker2,
-            "127.0.0.1:8081".to_string(),
-            1,
-            100,
-            None,
-        )
+        .register_worker(ShardGroupId::new(1), worker2, "127.0.0.1:8081".to_string(), 1, None)
         .unwrap();
     manager
-        .register_worker(
-            ShardGroupId::new(1),
-            worker3,
-            "127.0.0.1:8082".to_string(),
-            1,
-            100,
-            None,
-        )
+        .register_worker(ShardGroupId::new(1), worker3, "127.0.0.1:8082".to_string(), 1, None)
         .unwrap();
     manager
-        .register_worker(
-            ShardGroupId::new(1),
-            worker4,
-            "127.0.0.1:8083".to_string(),
-            1,
-            100,
-            None,
-        )
+        .register_worker(ShardGroupId::new(1), worker4, "127.0.0.1:8083".to_string(), 1, None)
         .unwrap();
 
     // Send heartbeats to make all workers live.

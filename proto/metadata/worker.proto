@@ -54,29 +54,26 @@ message WorkerConfigProto {
 message HeartbeatRequestProto {
   common.RequestHeaderProto header = 1;
   /// Metadata group this heartbeat targets.
-  uint64 group_id = 9;
-  uint64 worker_id = 2;
+  uint64 group_id = 2;
+  uint64 worker_id = 3;
   /// UUID accepted by RegisterWorker for this worker process run.
-  string worker_run_id = 10;
+  string worker_run_id = 4;
   /// Monotonic sequence number scoped to (group_id, worker_run_id).
-  uint64 heartbeat_seq = 11;
+  uint64 heartbeat_seq = 5;
   /// Current advertised data endpoint; must match the registered descriptor.
-  common.EndpointProto advertised_endpoint = 12;
-  
-  /// Capacity information.
-  CapacityInfoProto capacity = 3;
-  /// Load information.
-  LoadInfoProto load = 4;
-  /// Health status.
-  HealthStatusProto health = 5;
+  common.EndpointProto advertised_endpoint = 6;
   /// Worker network protocol (grpc/quic/rdma).
-  common.WorkerNetProtocolProto worker_net_protocol = 6;
+  common.WorkerNetProtocolProto worker_net_protocol = 7;
+  /// Capacity information.
+  CapacityInfoProto capacity = 8;
+  /// Load information.
+  LoadInfoProto load = 9;
+  /// Health status.
+  HealthStatusProto health = 10;
   /// Heartbeat identity is group_id + worker_id + worker_run_id.
-  /// worker_epoch is not part of startup registration or heartbeat identity.
   /// Block report and command ack protocols are separate from heartbeat.
-  uint64 worker_epoch = 7;
   /// Task acknowledgments (completed tasks).
-  repeated TaskAckProto acks = 8;
+  repeated TaskAckProto acks = 11;
 }
 
 message CapacityInfoProto {

@@ -346,12 +346,11 @@ fn worker_manager_for_write_targets() -> Arc<WorkerManager> {
     for raw in 1..=3 {
         let worker_id = WorkerId::new(raw);
         let endpoint = format!("127.0.0.1:{}", 9000 + raw);
-        let worker_epoch = 10 + raw;
         let worker_run_id: WorkerRunId = format!("550e8400-e29b-41d4-a716-{raw:012x}")
             .parse()
             .expect("valid test worker run id");
         manager
-            .register_worker(ShardGroupId::new(1), worker_id, endpoint.clone(), 1, worker_epoch, None)
+            .register_worker(ShardGroupId::new(1), worker_id, endpoint.clone(), 1, None)
             .expect("register worker descriptor");
         manager
             .register_worker_run(
@@ -364,7 +363,7 @@ fn worker_manager_for_write_targets() -> Arc<WorkerManager> {
             )
             .expect("register worker run");
         manager
-            .register_worker(ShardGroupId::new(1), worker_id, endpoint.clone(), 1, worker_epoch, None)
+            .register_worker(ShardGroupId::new(1), worker_id, endpoint.clone(), 1, None)
             .expect("restore worker descriptor");
         manager
             .record_heartbeat(

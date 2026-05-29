@@ -41,7 +41,8 @@ Shared crates must not depend on product crates. `metadata`, `worker`, and `clie
 - StorageChunk is the local IO, checksum, bitmap, and materialization unit.
 - TransportFrame is the stream/network batching and flow-control unit.
 - Stream is the continuous read/write session abstraction.
-- `route_epoch`, `mount_epoch`, `worker_epoch`, and `GroupStateWatermark` are separate freshness domains.
+- `route_epoch`, `mount_epoch`, and `GroupStateWatermark` are separate metadata freshness domains.
+- `WorkerRunId` is the worker process-run identity; `block_stamp` is the block data generation identifier.
 - Production metadata msync is single-group. Multi-group msync is future work.
 - `applied_seq` must not be reintroduced as runtime, storage, snapshot, header, or client state.
 

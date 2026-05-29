@@ -13,7 +13,7 @@ use crate::service::domain::{
     SessionKey, SyncWriteInput, SyncWriteMode, SyncWriteOutput,
 };
 use crate::service::{validate_active_write_layout, worker_endpoint_from_parts};
-use common::error::canonical::{RefreshHint, RefreshReason, WorkerEndpointHint};
+use common::error::canonical::{RefreshHint, RefreshReason};
 use common::header::{CallerContextFields, RpcErrorCode};
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -66,30 +66,10 @@ impl FsCore {
 }
 
 fn worker_refresh_hint_from_session(
-    session: &crate::write_session::WriteSession,
-    worker_epoch: Option<u64>,
+    _session: &crate::write_session::WriteSession,
     resolve_required: bool,
 ) -> RefreshHint {
-    let capacity = session
-        .write_targets
-        .iter()
-        .map(|target| target.worker_endpoints.len())
-        .sum();
-    let mut worker_endpoints = Vec::with_capacity(capacity);
-    for target in &session.write_targets {
-        for endpoint in &target.worker_endpoints {
-            worker_endpoints.push(WorkerEndpointHint {
-                worker_id: endpoint.worker_id.as_raw(),
-                endpoint: endpoint.endpoint.clone(),
-                worker_net_protocol: proto::common::WorkerNetProtocolProto::from(endpoint.worker_net_protocol) as i32,
-                worker_epoch: endpoint.worker_epoch,
-            });
-        }
-    }
-
     RefreshHint {
-        worker_epoch,
-        worker_endpoints,
         worker_resolve_required: resolve_required,
         ..Default::default()
     }
@@ -788,7 +768,6 @@ impl<'a> WriteSessionCoordinator<'a> {
                     worker.worker_id,
                     worker.endpoint,
                     worker.worker_net_protocol,
-                    worker.worker_epoch,
                     worker.worker_run_id,
                 ) {
                     Ok(endpoint) => endpoint,
@@ -1294,20 +1273,20 @@ impl<'a> WriteSessionCoordinator<'a> {
             for target in &session.write_targets {
                 for endpoint in &target.worker_endpoints {
                     let worker_id = endpoint.worker_id;
-                    let current_epoch = worker_manager
-                        .get_descriptor(worker_lookup_group_id, worker_id)
-                        .map(|d| d.worker_epoch);
-                    if current_epoch != Some(endpoint.worker_epoch) {
-                        let hint = worker_refresh_hint_from_session(&session, current_epoch, true);
+                    let current_run_id = worker_manager
+                        .get_registration(worker_lookup_group_id, worker_id)
+                        .map(|registration| registration.worker_run_id);
+                    if current_run_id != Some(endpoint.worker_run_id) {
+                        let hint = worker_refresh_hint_from_session(&session, true);
                         return self.core.need_refresh_failure_with_hint(
                             &req.ctx,
-                            RpcErrorCode::WorkerEpochMismatch,
-                            RefreshReason::WorkerEpochMismatch,
+                            RpcErrorCode::WorkerRunMismatch,
+                            RefreshReason::WorkerRunMismatch,
                             format!(
-                                "worker_epoch mismatch for worker_id={}: client/session={}, server={:?}; {}",
+                                "worker_run_id mismatch for worker_id={}: client/session={}, server={:?}; {}",
                                 endpoint.worker_id,
-                                endpoint.worker_epoch,
-                                current_epoch,
+                                endpoint.worker_run_id,
+                                current_run_id,
                                 FsCore::replay_hint("CommitFile")
                             ),
                             group_id,

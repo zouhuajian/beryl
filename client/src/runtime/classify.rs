@@ -20,8 +20,6 @@ pub enum RefreshReason {
     StaleState,
     /// Route/layout epoch changed.
     RouteEpochMismatch,
-    /// Worker epoch changed. The current client records this only.
-    WorkerEpochMismatch,
     /// Worker process run changed while WorkerId and endpoint may be reused.
     WorkerRunMismatch,
     /// Worker reported that the metadata-provided block stamp is stale.
@@ -39,7 +37,6 @@ impl RefreshReason {
             Self::MountEpochMismatch => "mount_epoch_mismatch",
             Self::StaleState => "stale_state",
             Self::RouteEpochMismatch => "route_epoch_mismatch",
-            Self::WorkerEpochMismatch => "worker_epoch_mismatch",
             Self::WorkerRunMismatch => "worker_run_mismatch",
             Self::BlockStampMismatch => "block_stamp_mismatch",
             Self::Unknown => "unknown",
@@ -164,7 +161,6 @@ fn refresh_reason_from_canonical(reason: CanonicalRefreshReason) -> RefreshReaso
         CanonicalRefreshReason::StaleState => RefreshReason::StaleState,
         CanonicalRefreshReason::MountEpochMismatch => RefreshReason::MountEpochMismatch,
         CanonicalRefreshReason::RouteEpochMismatch => RefreshReason::RouteEpochMismatch,
-        CanonicalRefreshReason::WorkerEpochMismatch => RefreshReason::WorkerEpochMismatch,
         CanonicalRefreshReason::WorkerRunMismatch => RefreshReason::WorkerRunMismatch,
         CanonicalRefreshReason::GroupMismatch
         | CanonicalRefreshReason::NeedRegister

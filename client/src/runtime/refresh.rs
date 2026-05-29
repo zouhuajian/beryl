@@ -184,7 +184,6 @@ impl RefreshManager {
                 }
             }
             RefreshReason::StaleState
-            | RefreshReason::WorkerEpochMismatch
             | RefreshReason::WorkerRunMismatch
             | RefreshReason::BlockStampMismatch
             | RefreshReason::Unknown => {}
@@ -229,9 +228,6 @@ impl RefreshManager {
         match reason {
             RefreshReason::RouteEpochMismatch => {
                 self.invalidate_worker_endpoints(CacheInvalidationReason::RouteEpoch);
-            }
-            RefreshReason::WorkerEpochMismatch => {
-                self.invalidate_worker_endpoints(CacheInvalidationReason::WorkerEpoch);
             }
             RefreshReason::OwnerGroupMismatch | RefreshReason::MountEpochMismatch => {
                 self.invalidate_worker_endpoints(CacheInvalidationReason::Owner);
@@ -511,19 +507,6 @@ mod tests {
         assert_eq!(endpoint_cache.len(), 1);
     }
 
-    #[test]
-    fn worker_epoch_refresh_invalidates_worker_endpoint_cache() {
-        let endpoint_cache = seeded_worker_endpoint_cache();
-        let manager = manager().with_worker_endpoint_cache(Some(endpoint_cache.clone()));
-        let op = path_operation();
-
-        manager
-            .record_refresh(&op, RefreshReason::WorkerEpochMismatch, &RefreshHint::default())
-            .expect("refresh recorded");
-
-        assert_eq!(endpoint_cache.len(), 0);
-    }
-
     fn watermark_proto(group_id: u64, index: u64) -> GroupStateWatermarkProto {
         GroupStateWatermarkProto {
             group_id: Some(ShardGroupIdProto { value: group_id }),
@@ -548,7 +531,6 @@ mod tests {
             worker_id: WorkerId::new(1),
             endpoint: "127.0.0.1:19101".to_string(),
             worker_net_protocol: WorkerNetProtocol::Grpc,
-            worker_epoch: 7,
             worker_run_id: "550e8400-e29b-41d4-a716-446655440000"
                 .parse()
                 .expect("valid test WorkerRunId"),

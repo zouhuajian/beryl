@@ -9,10 +9,10 @@
 - 审计时工作区状态：`git status --porcelain -uall` 曾显示旧 client API split 文件为 `AD`，即已暂存新增但工作区删除；本轮稳定化重新检查后未发现这些 stale index entries。
 - 稳定化后基线：Rust development baseline 固定为 Rust 1.95.0；根目录 `rust-toolchain.toml` pin `1.95.0` 并安装 `rustfmt`/`clippy`；workspace `rust-version` 为 `1.95.0`；根目录 `Makefile` 提供本地 verify 入口；`.github/workflows/ci.yml` 提供最小 CI；`conf/core-site.yaml` 和 `conf/client-site.yaml` 只保留当前 runtime 实际消费的 active 默认 key。
 - PR-5 更新：worker startup register 已由 worker 二进制接入；注册模型为稳定 `WorkerId` + 每进程启动 UUID `WorkerRunId`，按 metadata group 注册 advertised endpoint。leader 通过 Raft apply 持久化稳定 worker descriptor，`WorkerRunId` 只进入 live registration state；metadata restart / snapshot reload 后必须重新 register。heartbeat、block report、command ack 和真实 metadata+worker+client E2E 仍未完成。
-- 总体结论：Vecton 的分层方向基本清晰，`common`、`types`、`proto`、`client`、`metadata`、`worker` 的主要职责经过近期重构后比旧版更收敛；`types` 以纯领域值为主，`proto` 承担结构转换，`client` 侧读写、刷新、重试与缓存边界较完整，`metadata` 侧 inode/dentry/attrs、写会话、Raft apply、freshness 语义覆盖较强，`worker` 的本地块存储和 gRPC 数据面已形成可测闭环。系统仍未达到完整生产闭环，主要风险集中在 worker 到 metadata 的生命周期闭合、worker 公开读请求的 `block_stamp=0` 绕过、MetadataWorkerService 错误返回语义、未落地的 proto/API surface、以及端到端集成测试不足。
+- 总体结论：Vecton 的分层方向基本清晰，`common`、`types`、`proto`、`client`、`metadata`、`worker` 的主要职责经过近期重构后比旧版更收敛；`types` 以纯领域值为主，`proto` 承担结构转换，`client` 侧读写、刷新、重试与缓存边界较完整，`metadata` 侧 inode/dentry/attrs、写会话、Raft apply、freshness 语义覆盖较强，`worker` 的本地块存储和 gRPC 数据面已形成可测闭环。系统仍未达到完整生产闭环，主要风险集中在 worker 到 metadata 的生命周期闭合、MetadataWorkerService 错误返回语义、未落地的 proto/API surface、以及端到端集成测试不足。
 - 最高优先级问题摘要：
   - P1：worker startup register 已接入；worker heartbeat、block report、command ack 到 metadata 的完整生命周期闭环仍未实现。
-  - P1：`worker/src/runtime/block.rs::validate_read` 仅在请求 `block_stamp != 0` 时校验元数据 stamp；正常 client 已拒绝零值，但公开 WorkerDataService 仍可被直接请求零值读，存在新鲜度绕过风险。
+  - 已解决：client planner 和 worker validation 均拒绝零 `block_stamp`；公开 WorkerDataService 读请求不能再通过零 stamp 绕过 generation 校验。
   - P1：MetadataWorkerService register 已改为结构化 header error；heartbeat/block report 的业务/协议错误语义仍需后续收敛。
   - P2：`proto/admin/admin.proto`、`proto/metadata/peer.proto` 等生成并导出，但当前 Rust workspace 未发现对应生产实现、注册或调用方，外部 contract 状态待确认。审计时发现的 stale `BlockReportEntryProto` 已在本轮基线稳定化中删除。
   - 已解决：原始审计发现的 Rust baseline 不一致、local/CI verify baseline 尚未建立、默认配置暴露未接线 key、`docs/` 默认不可跟踪、client API split 文件 `AD` 状态，均已由本轮稳定化处理。
@@ -82,7 +82,7 @@
 |---|---|---|---|---|
 | typed ID 和显示/序列化稳定性 | 已完成 | 避免 inode、block、data handle、worker 等 ID 混用。 | `types/src/ids.rs`、`types/src/lib.rs` | N/A |
 | block/location/write target 域对象 | 已完成 | 承载 metadata 到 client/worker 的 block 布局、写目标、提交块信息。 | `types/src/location.rs`、`types/src/block.rs` | N/A |
-| worker endpoint 和 worker_epoch | 已完成 | 表达 worker data endpoint、net protocol、epoch。 | `types/src/worker.rs` | N/A |
+| worker endpoint 和 WorkerRunId | 已完成 | 表达 worker data endpoint、net protocol、进程运行身份。 | `types/src/worker.rs` | N/A |
 | GroupStateWatermark | 已完成 | `state_id` 语义为 state-machine applied `RaftLogId`，符合边界文档。 | `types/src/group_watermark.rs`、`types/src/raft_log_id.rs` | N/A |
 | symlink target 领域表达 | TODO / 未完成 | 当前 `InodeData::Symlink` 中 target 标注为 placeholder，未见完整 symlink 创建接口。 | `types/src/fs.rs` | P3 |
 
@@ -166,7 +166,7 @@
 |---|---|---|---|---|---|
 | MetadataWorkerService heartbeat/block report 仍需继续收敛 structured error | 架构风险 | register 已使用 `ResponseHeader.error`，但后续 worker lifecycle RPC 还需要同样收敛 recoverable 错误语义。 | 继续将 heartbeat/block report 业务错误收敛为 OK + header，transport/framework 错误才非 OK。 | P1 | `metadata/src/worker/service.rs`、`metadata/tests/service_error_contract_tests.rs` |
 | Raft network 仍 placeholder | 功能缺失 | 多 metadata 节点复制/选主 RPC 不完整，生产多节点语义待确认。 | 明确当前只支持单节点/单组，或落地 peer RPC client/server。 | P2 | `metadata/src/raft/network.rs` |
-| maintenance delete executor 缺 expected state/epoch 校验 | 架构风险 | 删除/repair 对 worker 命令的 fencing 语义不完整。 | 接入 block/worker epoch 和 state watermark；补端到端测试。 | P2 | `metadata/src/maintenance/delete/executor.rs` |
+| maintenance delete executor 缺 expected state 校验 | 架构风险 | 删除/repair 对 worker 命令的 fencing 语义不完整。 | 接入 block stamp、worker run identity 和 state watermark；补端到端测试。 | P2 | `metadata/src/maintenance/delete/executor.rs` |
 | repair planner fault domain/hotness 仍 TODO | 可扩展性 | 大规模复制/迁移策略可能无法满足生产放置约束。 | 定义 placement policy 输入，先覆盖 fault-domain。 | P3 | `metadata/src/maintenance/repair/planner.rs` |
 
 #### 3.4.5 建议后续动作
@@ -190,7 +190,7 @@
 | read/write stream runtime | 已完成 | open/write/commit/read/sync/abort 有核心实现和 gRPC adapter。 | `worker/src/data/core.rs`、`worker/src/net/server/grpc.rs` | N/A |
 | metadata-assigned `block_stamp` 写入 | 已完成 | write/commit/sync 要求非零 stamp，store 持久化 metadata supplied stamp。 | `worker/src/data/core.rs`、`worker/src/store/block.rs` | N/A |
 | 普通 client 读的 block_stamp 防线 | 已完成 | client data boundary 拒绝 planned segment 零 stamp。 | `client/src/data/worker.rs` | N/A |
-| 公开 WorkerDataService 读的 block_stamp 防线 | 存在风险 | worker read 只在请求 stamp 非零时校验，零值可绕过 freshness。 | `worker/src/runtime/block.rs` | P1 |
+| 公开 WorkerDataService 读的 block_stamp 防线 | 已完成 | worker validation 拒绝零 stamp，并对 stale/mismatched stamp 返回 structured refresh。 | `worker/src/runtime/block.rs`、`worker/src/tests.rs` | N/A |
 | worker metadata startup register | 已实现 | worker 二进制启动时解析 WorkerId、生成 WorkerRunId，并调用 MetadataWorkerService register。 | `worker/src/bin/main.rs`、`worker/src/control/registrar.rs`、`proto/metadata/worker.proto` | heartbeat/block report/command ack 仍未实现 |
 | io_uring/SPDK/RDMA/QUIC | TODO / 未完成 | 代码为 placeholder 或 explicit unimplemented；默认配置不再把这些能力列为 deployable default。 | `worker/src/store/io/io_uring.rs`、`worker/src/store/io/spdk.rs`、`worker/src/net/peer/quic.rs`、`worker/src/net/peer/rdma.rs` | P2 |
 | worker config | 已完成 | 默认配置只保留当前 worker data service/runtime 实际消费的 active key；metadata lifecycle、replication、多协议等仍为 deferred work。 | `worker/src/config.rs`、`conf/core-site.yaml`、`docs/CONFIG_MATRIX_ZH.md` | N/A |
@@ -204,7 +204,7 @@
 | 问题 | 类型 | 影响 | 建议 | 优先级 | 证据 |
 |---|---|---|---|---|---|
 | worker 二进制未接入 heartbeat/block report/command ack | 功能缺失 | startup register 已能自动提交 worker endpoint，但 metadata 仍不能自动获得 capacity、block location、command ack。 | 在 startup register 基础上实现 heartbeat/block report/command ack。 | P1 | `worker/src/bin/main.rs`、`metadata/src/worker/service.rs` |
-| `validate_read` 允许 `block_stamp=0` 跳过 freshness 校验 | 安全/一致性风险 | 直接调用 WorkerDataService 可能读取过期或错误 generation 的 block。 | worker open_read 强制非零 stamp；若需要 debug bypass，放到受控 internal-only 接口。 | P1 | `worker/src/runtime/block.rs`、`proto/worker/data.proto` |
+| WorkerDataService 读请求的零 stamp 防线 | 已解决 | client planner 和 worker validation 均拒绝零 stamp；直接 worker read 不能用零 stamp 绕过 generation 校验。 | 继续保持 worker open_read 非零 stamp contract。 | N/A | `worker/src/runtime/block.rs`、`worker/src/tests.rs` |
 | protocol fallback 到 gRPC | 架构风险 | unknown/unspecified protocol 被静默视为 gRPC，违背 proto conversion strictness。 | 删除生产 fallback，保持 unknown/unspecified 为错误。 | P2 | `worker/src/net/protocol.rs`、`proto/src/convert.rs` |
 | placeholder backend 暴露为 enum 能力 | 可维护性问题 | `io_uring`/`spdk`/QUIC/RDMA 容易被误认为已支持。 | 文档标 unsupported；真正接入前不进入 active config。 | P2 | `worker/src/store/io/config.rs`、`worker/src/store/io/io_uring.rs`、`worker/src/store/io/spdk.rs` |
 
@@ -347,7 +347,7 @@
 | 配置加载链路 | `common`、`metadata`、`client`、`worker`、`conf` | 已完成 | 默认配置已收敛到当前 active consumed keys；typed validation 由各消费模块负责。 | 新增 key 时必须同步 owner/consumer/status 和 wrong-type validation。 | `common/src/config/flat.rs`、`metadata/src/config.rs`、`client/src/config.rs`、`worker/src/config.rs`、`docs/CONFIG_MATRIX_ZH.md` |
 | metadata 启动链路 | `metadata`、`common`、`proto`、`ufs` | 已完成 | 单节点/多节点部署语义需说明，Raft network placeholder。 | 文档明确当前 deployment mode；若要多节点，落地 peer network。 | `metadata/src/bin/main.rs`、`metadata/src/runtime.rs`、`metadata/src/raft/network.rs` |
 | client metadata 请求链路 | `client`、`proto`、`metadata`、`common` | 已完成 | 依赖 header/error contract，filesystem service 测试覆盖较强。 | 保持 service_error_contract_tests，禁止业务错误走 Status。 | `client/src/metadata/gateway.rs`、`metadata/src/service/path_service.rs`、`metadata/tests/service_error_contract_tests.rs` |
-| client read 链路 | `client`、`metadata`、`worker`、`types`、`proto` | 需要优化 | 正常 client 拒绝零 `block_stamp`，但 direct worker public read 可绕过。 | worker `open_read` 也强制非零 stamp。 | `metadata/src/service/fs_core/read.rs`、`client/src/data/worker.rs`、`worker/src/runtime/block.rs` |
+| client read 链路 | `client`、`metadata`、`worker`、`types`、`proto` | 已完成 | client planner 和 worker validation 均拒绝零 `block_stamp`；stale/mismatched stamp 走 structured refresh。 | 后续由真实 E2E 覆盖完整 metadata+worker+client 闭环。 | `metadata/src/service/fs_core/read.rs`、`client/src/data/worker.rs`、`worker/src/runtime/block.rs` |
 | client write 链路 | `client`、`metadata`、`worker`、`proto` | 需要优化 | create/add/write/commit/sync 实现较完整，startup register 已接入，但 block report 尚未自动把 block location 回 metadata。 | 打通 worker block report 与 metadata layout 可见性。 | `client/src/api/fs_client.rs`、`worker/src/data/core.rs`、`metadata/src/service/fs_core/write_session.rs` |
 | worker 数据面执行链路 | `worker`、`proto`、`types` | 已完成 | gRPC control calls 走 structured header，streaming error taxonomy 较窄。 | 对 streaming 失败分类补 contract tests。 | `worker/src/net/server/grpc.rs`、`worker/src/data/core.rs` |
 | worker 到 metadata 控制链路 | `worker`、`metadata`、`proto` | TODO / 未完成 | metadata 服务端存在，worker 生产调用方未发现。 | 实现 worker control-plane loop 或标明外部组件负责。 | `proto/metadata/worker.proto`、`metadata/src/worker/service.rs`、`worker/src/bin/main.rs` |
@@ -371,8 +371,8 @@
 
 ### 5.3 数据模型与协议
 
-- 当前状态：`GroupStateWatermark`、`block_stamp`、`worker_epoch`、`route_epoch`、`mount_epoch` 等领域分界较清楚；proto/domain 转换有非零和 known enum 校验。
-- 主要风险：direct worker read 的零 `block_stamp`、worker protocol fallback、admin/metapeer 未实现 surface。
+- 当前状态：`GroupStateWatermark`、`block_stamp`、`WorkerRunId`、`route_epoch`、`mount_epoch` 等领域分界较清楚；proto/domain 转换有非零和 known enum 校验。
+- 主要风险：worker protocol fallback、admin/metapeer 未实现 surface。
 - 建议改进：worker 服务入口也执行与 client/planner 等价的结构校验；对 schema contract 状态建立文档。
 
 ### 5.4 错误处理
@@ -401,7 +401,7 @@
 
 ### 5.8 可扩展性
 
-- 当前状态：架构上为 worker endpoint epoch、多协议、maintenance、multi-group msync、UFS 多后端预留了位置。
+- 当前状态：架构上为 worker endpoint identity、多协议、maintenance、multi-group msync、UFS 多后端预留了位置。
 - 主要风险：过多 planned surface 未标明状态，会增加维护成本；Raft network 和 multi-group 语义未闭合。
 - 建议改进：短期收敛 active surface，长期再扩展 QUIC/RDMA、multi-group、fault-domain aware repair。
 
@@ -428,7 +428,7 @@
 | `proto` | conversion tests 覆盖 ID/header/watermark/location/protocol | active surface service 实现状态未测试 | 增加 static test 检查未实现 service 的状态标注。 |
 | `client` | 单元/contract 覆盖 public facade、read/write、cache、retry/replay、worker adapter | 真实 worker lifecycle 不在 client tests 中 | 由 integration E2E 覆盖真实 metadata+worker+client。 |
 | `metadata` | 单元和 regression tests 很强，覆盖 FsCore、Raft apply/storage、freshness、worker service、maintenance | Raft network placeholder、worker heartbeat/block report error follow-up、ignored tests | 补后续 worker lifecycle structured error contract，明确 ignored tests 去留。 |
-| `worker` | 本地 store、data core、gRPC adapter、config、proto shape、sync committed block 覆盖较强 | public zero stamp bypass 未被负例锁住；metadata lifecycle 缺测试 | 增加 direct WorkerDataService zero stamp rejection test；新增 control-plane tests。 |
+| `worker` | 本地 store、data core、gRPC adapter、config、proto shape、sync committed block 覆盖较强 | metadata lifecycle 缺测试 | 新增 control-plane tests。 |
 | `ufs` | registry/capability/fallback 有覆盖 | 真实 backend tests ignored | 增加环境隔离的 fs backend integration，后端 matrix 分层运行。 |
 | `integration_tests` | client contract mock tests | 缺真实 E2E | 新增 single-group end-to-end smoke。 |
 
@@ -451,7 +451,6 @@
 | 优先级 | 问题 | 涉及模块 | 影响 | 建议 |
 |---|---|---|---|---|
 | P1 | worker metadata lifecycle 未闭合 | `worker`、`metadata`、`proto` | worker 无法自动注册/心跳/report，metadata block location 与 worker 状态依赖外部注入或测试路径。 | 实现 worker control-plane loop，或明确外部组件责任。 |
-| P1 | WorkerDataService 公开读允许 `block_stamp=0` 绕过 | `worker`、`client`、`proto` | 直接 worker 请求可能绕过 freshness/generation 校验。 | worker `open_read` 强制非零 stamp。 |
 | P1 | MetadataWorkerService 后续错误契约不一致 | `metadata`、`common`、`proto` | register 已收敛；heartbeat/block report 仍需按统一 header error 语义继续收敛。 | 后续 RPC 改为 OK + structured header，transport/framework 才非 OK。 |
 | P2 | admin/metapeer proto service 未实现但导出 | `proto`、`metadata` | 外部 API surface 状态不清。 | 标注 planned/stale 或删除/隔离。 |
 | P2 | Raft network placeholder | `metadata` | 多节点 metadata 不完整。 | 明确单节点支持或实现 peer RPC。 |
@@ -465,9 +464,8 @@
 
 ### 9.1 短期：必须优先处理
 
-1. 在 `worker/src/runtime/block.rs::validate_read` 或更早入口强制 `ReadOpenRequest.block_stamp != 0`。
-2. 将 `metadata/src/worker/service.rs` heartbeat/block report 的 recoverable 业务/协议错误继续改为 structured header error，收敛 `service_error_contract_tests` allowlist。
-3. 在 worker 自身负责 metadata lifecycle 的方向上，后续 PR 实现 heartbeat/block report/command ack。
+1. 将 `metadata/src/worker/service.rs` heartbeat/block report 的 recoverable 业务/协议错误继续改为 structured header error，收敛 `service_error_contract_tests` allowlist。
+2. 在 worker 自身负责 metadata lifecycle 的方向上，后续 PR 实现 heartbeat/block report/command ack。
 
 ### 9.2 中期：架构与质量提升
 

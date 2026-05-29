@@ -1615,7 +1615,6 @@ mod tests {
             worker_id: WorkerId::new(1),
             endpoint: "127.0.0.1:19101".to_string(),
             worker_net_protocol: WorkerNetProtocol::Grpc,
-            worker_epoch: 7,
             worker_run_id: "550e8400-e29b-41d4-a716-446655440000"
                 .parse()
                 .expect("valid test WorkerRunId"),
@@ -1826,7 +1825,6 @@ mod tests {
             route_epoch: hint.route_epoch,
             mount_epoch: hint.mount_epoch,
             mount_prefix: hint.mount_prefix.clone(),
-            worker_epoch: hint.worker_epoch,
             endpoint_hint: worker_endpoints.first().cloned(),
             worker_endpoints,
             worker_resolve_required: hint.worker_resolve_required,

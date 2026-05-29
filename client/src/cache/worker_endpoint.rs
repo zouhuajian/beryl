@@ -26,7 +26,6 @@ struct WorkerEndpointCacheKey {
     worker_id: u64,
     protocol: WorkerNetProtocol,
     endpoint: String,
-    worker_epoch: u64,
     worker_run_id: types::WorkerRunId,
 }
 
@@ -37,7 +36,6 @@ impl WorkerEndpointCacheKey {
             worker_id: candidate.worker_id.as_raw(),
             protocol: candidate.worker_net_protocol,
             endpoint: candidate.endpoint.clone(),
-            worker_epoch: candidate.worker_epoch,
             worker_run_id: candidate.worker_run_id,
         })
     }
@@ -361,11 +359,6 @@ fn validate_worker_endpoint(candidate: &WorkerEndpointInfo) -> ClientResult<()> 
             "worker endpoint must not be empty".to_string(),
         ));
     }
-    if candidate.worker_epoch == 0 {
-        return Err(ClientError::InvalidLayout(
-            "worker endpoint candidate worker_epoch must be non-zero".to_string(),
-        ));
-    }
     match candidate.worker_net_protocol {
         WorkerNetProtocol::Grpc => Ok(()),
         WorkerNetProtocol::Quic | WorkerNetProtocol::Rdma => {
@@ -399,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_cache_hits_for_same_worker_identity_and_epoch() {
+    fn endpoint_cache_hits_for_same_worker_identity_and_run() {
         let metrics = Arc::new(RecordingMetrics::default());
         let cache = WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone());
         let candidate = endpoint(1, 7);
@@ -417,13 +410,11 @@ mod tests {
     }
 
     #[test]
-    fn worker_epoch_mismatch_uses_distinct_cache_key() {
+    fn worker_run_mismatch_uses_distinct_cache_key() {
         let cache = WorkerEndpointCache::new(true, Duration::from_secs(60), 8, Arc::new(NoopClientMetrics));
 
-        cache.get_or_insert_authoritative(&endpoint(1, 7)).expect("first epoch");
-        cache
-            .get_or_insert_authoritative(&endpoint(1, 8))
-            .expect("second epoch");
+        cache.get_or_insert_authoritative(&endpoint(1, 0)).expect("first run");
+        cache.get_or_insert_authoritative(&endpoint(1, 1)).expect("second run");
 
         assert_eq!(cache.len(), 2);
     }
@@ -431,7 +422,7 @@ mod tests {
     #[test]
     fn unsupported_protocol_is_rejected_without_insert() {
         let cache = WorkerEndpointCache::new(true, Duration::from_secs(60), 8, Arc::new(NoopClientMetrics));
-        let mut unsupported = endpoint(1, 7);
+        let mut unsupported = endpoint(1, 0);
         unsupported.worker_net_protocol = WorkerNetProtocol::Quic;
 
         let err = cache
@@ -497,7 +488,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_endpoint_different_epoch_does_not_share_resolution() {
+    async fn worker_endpoint_different_run_does_not_share_resolution() {
         let cache = WorkerEndpointCache::new(true, Duration::from_secs(60), 8, Arc::new(NoopClientMetrics));
         let attempts = Arc::new(AtomicUsize::new(0));
 
@@ -581,25 +572,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endpoint_health_penalty_is_epoch_scoped() {
+    async fn endpoint_health_penalty_is_worker_run_scoped() {
         let metrics = Arc::new(RecordingMetrics::default());
         let cache = WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone());
-        let stale_epoch = endpoint(1, 7);
-        let fresh_epoch = endpoint(1, 8);
+        let stale_run = endpoint(1, 7);
+        let fresh_run = endpoint(1, 8);
 
-        cache.record_candidate_failure(&stale_epoch, CacheInvalidationReason::Unavailable);
-        cache.record_candidate_failure(&stale_epoch, CacheInvalidationReason::Unavailable);
+        cache.record_candidate_failure(&stale_run, CacheInvalidationReason::Unavailable);
+        cache.record_candidate_failure(&stale_run, CacheInvalidationReason::Unavailable);
 
         let err = cache
-            .get_or_resolve_authoritative_with(&stale_epoch, |candidate| async move { Ok(candidate) })
+            .get_or_resolve_authoritative_with(&stale_run, |candidate| async move { Ok(candidate) })
             .await
             .expect_err("penalized endpoint is rejected");
         assert!(matches!(err, ClientError::Worker(msg) if msg.contains("temporarily unavailable")));
 
         cache
-            .get_or_resolve_authoritative_with(&fresh_epoch, |candidate| async move { Ok(candidate) })
+            .get_or_resolve_authoritative_with(&fresh_run, |candidate| async move { Ok(candidate) })
             .await
-            .expect("fresh epoch remains usable");
+            .expect("fresh run remains usable");
         assert_metric(&metrics.events(), ClientMetric::WorkerEndpointHealthFailure);
     }
 
@@ -610,13 +601,12 @@ mod tests {
         );
     }
 
-    fn endpoint(worker_id: u64, worker_epoch: u64) -> WorkerEndpointInfo {
+    fn endpoint(worker_id: u64, run_suffix: u64) -> WorkerEndpointInfo {
         WorkerEndpointInfo {
             worker_id: types::WorkerId::new(worker_id),
             endpoint: "127.0.0.1:19101".to_string(),
             worker_net_protocol: WorkerNetProtocol::Grpc,
-            worker_epoch,
-            worker_run_id: "550e8400-e29b-41d4-a716-446655440000"
+            worker_run_id: format!("550e8400-e29b-41d4-a716-{run_suffix:012x}")
                 .parse()
                 .expect("valid test WorkerRunId"),
         }

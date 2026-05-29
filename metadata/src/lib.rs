@@ -44,8 +44,8 @@
 //! ## Freshness and Current Limitations
 //!
 //! `GroupStateWatermark` carries state-machine applied `RaftLogId` freshness.
-//! `route_epoch`, `mount_epoch`, and `worker_epoch` remain separate freshness
-//! domains. Current no-op, stale unsupported, and partially wired boundaries
+//! `route_epoch` and `mount_epoch` remain separate metadata freshness domains.
+//! Current no-op, stale unsupported, and partially wired boundaries
 //! are tracked in `metadata/README_ZH.md`.
 
 pub mod bootstrap;
