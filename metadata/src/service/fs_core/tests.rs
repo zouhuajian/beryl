@@ -6,9 +6,9 @@ use crate::config::RaftConfig;
 use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
 use crate::raft::{AppRaftNode, AppRaftStateMachine, Command, DedupKey, RocksDBStorage};
 use crate::service::domain::{
-    AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CoreResult, Freshness, GetAttrInput,
-    GetFileLayoutInput, OpenWriteInput, PresentedFencingToken, ReadDirInput, RenameInput, RenewLeaseInput,
-    RequestContext, SessionKey, SyncWriteInput, SyncWriteMode, UnlinkInput,
+    AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CoreResult, CreateInput, Freshness,
+    GetAttrInput, GetFileLayoutInput, OpenWriteInput, PresentedFencingToken, ReadDirInput, RenameInput,
+    RenewLeaseInput, RequestContext, SessionKey, SyncWriteInput, SyncWriteMode, UnlinkInput,
 };
 use crate::state::{MemoryStateStore, RouteEpoch};
 use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerInfo, WorkerManager};
@@ -349,7 +349,15 @@ async fn get_file_layout_returns_reported_locations_using_read_placement() {
     );
     assert_eq!(location.worker_epoch, Some(22));
     assert_eq!(location.block_stamp, 41);
+    assert_eq!(location.block_format_id, types::BlockFormatId::CURRENT_FOR_NEW_FILE);
+    assert_eq!(location.block_size, 4096);
+    assert_eq!(location.chunk_size, 4096);
+    assert_eq!(location.effective_block_len, 512);
     assert_eq!(location.workers[0].endpoint, "127.0.0.2:9102");
+    assert_eq!(
+        location.workers[0].worker_run_id,
+        worker_run_id(group_id, WorkerId::new(2))
+    );
 }
 
 #[tokio::test]
@@ -1827,6 +1835,59 @@ async fn open_write_rejects_missing_file_layout_without_default_fallback() {
 }
 
 #[tokio::test]
+async fn create_file_persists_valid_client_layout_shape() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let mount_id = MountId::new(59);
+    let group_id = ShardGroupId::new(9);
+    let parent_inode_id = InodeId::new(590);
+    storage
+        .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
+        .unwrap();
+    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mount_table = Arc::clone(&fs_core.mount_table);
+    let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+    fs_core.set_storage(Arc::clone(&storage));
+    fs_core.set_raft_node(raft_node);
+    fs_core.set_worker_manager(worker_manager_for_write_targets(group_id));
+    let layout = FileLayout::with_block_format(8192, 1024, 1, types::BlockFormatId::FULL_EFFECTIVE);
+
+    let success = fs_core
+        .execute_create(CreateInput {
+            ctx: request_context(),
+            parent_inode_id,
+            name: "file".to_string(),
+            attrs: FileAttrs::new(),
+            layout,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("valid create layout should succeed");
+    let inode_id = success.payload.inode_id.expect("created inode id");
+
+    assert_eq!(storage.get_layout(inode_id).unwrap(), layout);
+}
+
+#[tokio::test]
+async fn create_file_rejects_invalid_block_chunk_shape() {
+    let fs_core = fs_core_without_mount();
+
+    let failure = fs_core
+        .execute_create(CreateInput {
+            ctx: request_context(),
+            parent_inode_id: InodeId::new(1),
+            name: "file".to_string(),
+            attrs: FileAttrs::new(),
+            layout: FileLayout::new(4097, 1024, 1),
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect_err("invalid create layout must fail before storage mutation");
+
+    assert!(failure.error.message.contains("multiple of chunk_size"));
+}
+
+#[tokio::test]
 async fn open_write_rejects_multi_replica_layout_until_durable_replication_exists() {
     let dir = TempDir::new().unwrap();
     let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
@@ -1985,6 +2046,7 @@ async fn commit_worker_epoch_check_rejects_missing_authoritative_group() {
                         endpoint: "127.0.0.1:9001".to_string(),
                         worker_net_protocol: WorkerNetProtocol::Grpc,
                         worker_epoch: 11,
+                        worker_run_id: worker_run_id(ShardGroupId::new(1), worker_id),
                     }],
                     fencing_token: FencingToken {
                         block_id,
@@ -2149,6 +2211,10 @@ async fn create_then_add_block() {
     assert_eq!(target.block_format_id, types::BlockFormatId::CURRENT_FOR_NEW_FILE);
     assert!(target.worker_endpoints[0].endpoint.starts_with("127.0.0.1:900"));
     assert!(!target.worker_endpoints[0].endpoint.ends_with(":0"));
+    assert_eq!(
+        target.worker_endpoints[0].worker_run_id,
+        worker_run_id(env.group_id, target.worker_endpoints[0].worker_id)
+    );
     let session_after_add = env
         .fs_core
         .write_session_for_handle(key.file_handle)
@@ -2164,6 +2230,32 @@ async fn create_then_add_block() {
     assert_eq!(success.payload.file_version, Some(1));
     assert!(env.fs_core.write_session_for_handle(key.file_handle).is_none());
     assert_eq!(env.storage.get_inode(env.inode_id).unwrap().unwrap().attrs.size, 512);
+}
+
+#[tokio::test]
+async fn open_write_target_uses_stored_file_layout_shape() {
+    let env = write_flow_env(0).await;
+    let layout = FileLayout::with_block_format(8192, 1024, 1, types::BlockFormatId::FULL_EFFECTIVE);
+    env.storage.put_layout(env.inode_id, layout).unwrap();
+    let open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(2048),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("open write should use stored layout");
+    let key = open.payload.session_key;
+
+    let target = add_block_for_key(&env.fs_core, &key, 2048).await;
+
+    assert_eq!(target.block_format_id, layout.block_format_id);
+    assert_eq!(target.block_size, u64::from(layout.block_size));
+    assert_eq!(target.chunk_size, layout.chunk_size);
+    assert_eq!(target.effective_block_len, 2048);
 }
 
 #[tokio::test]

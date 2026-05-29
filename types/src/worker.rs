@@ -25,6 +25,7 @@ pub struct WorkerEndpointInfo {
     pub endpoint: String,
     pub worker_net_protocol: WorkerNetProtocol,
     pub worker_epoch: u64,
+    pub worker_run_id: WorkerRunId,
 }
 
 /// UUID generated once for a worker process run.

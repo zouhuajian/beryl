@@ -15,6 +15,7 @@ use types::chunk::ByteRange;
 use types::ids::{BlockId, ChunkIndex, ShardGroupId, StreamId};
 use types::layout::BlockFormatId;
 use types::lease::FencingToken;
+use types::WorkerRunId;
 
 use crate::config::WorkerConfig;
 use crate::error::WorkerError;
@@ -41,6 +42,7 @@ pub struct StreamContext {
     pub group_id: ShardGroupId,
     pub block_id: BlockId,
     pub mode: StreamMode,
+    pub worker_run_id: WorkerRunId,
     /// First block-local byte offset in this stream.
     pub start_offset: u64,
     /// Exclusive block-local byte offset where this stream stops.
@@ -54,6 +56,9 @@ pub struct StreamContext {
     /// Logical block stamp used for direct read/write validation.
     /// It changes on logical commit or block metadata changes, not on ordinary reads.
     pub block_stamp: u64,
+    pub block_format_id: BlockFormatId,
+    pub block_size: u64,
+    pub chunk_size: u32,
     /// Block-local readable committed prefix length.
     /// This is not the sum of ready chunks.
     pub committed_length: u64,
@@ -71,12 +76,17 @@ pub struct StreamContext {
 pub struct ReadOpenRequest {
     pub group_id: ShardGroupId,
     pub block_id: BlockId,
+    pub worker_run_id: WorkerRunId,
     /// Block-local byte range. The offset is relative to block_id, not to the file.
     pub byte_range: ByteRange,
     /// Logical block stamp used for direct read validation.
     /// Normal client reads must use a non-zero metadata-authoritative stamp.
     /// Public worker read opens reject 0 before local block metadata lookup.
     pub block_stamp: u64,
+    pub block_format_id: BlockFormatId,
+    pub block_size: u64,
+    pub chunk_size: u32,
+    pub effective_block_len: u64,
     /// Requested transport frame payload size, not the worker-local StorageChunk size.
     pub frame_size: u32,
 }
@@ -103,6 +113,7 @@ pub struct ReadOpenResult {
 pub struct WriteOpenRequest {
     pub group_id: ShardGroupId,
     pub block_id: BlockId,
+    pub worker_run_id: WorkerRunId,
     pub token: FencingToken,
     /// Logical block stamp used for direct write validation.
     /// Supplied by metadata for this block write plan.
@@ -117,6 +128,7 @@ pub struct WriteOpenRequest {
     /// Metadata-selected Vecton block data/meta interpretation format.
     pub block_format_id: BlockFormatId,
     pub chunk_size: u32,
+    pub effective_block_len: u64,
     pub checksum_kind: ChecksumKind,
 }
 
@@ -170,12 +182,16 @@ pub struct CommitWriteRequest {
     pub stream_id: StreamId,
     pub group_id: ShardGroupId,
     pub block_id: BlockId,
+    pub worker_run_id: WorkerRunId,
     pub token: FencingToken,
     pub commit_seq: u64,
     /// Complete effective block length to publish.
     pub effective_block_len: u64,
     /// Metadata-assigned logical block stamp to persist at publish time.
     pub block_stamp: u64,
+    pub block_format_id: BlockFormatId,
+    pub block_size: u64,
+    pub chunk_size: u32,
     pub require_sync: bool,
 }
 
@@ -196,10 +212,14 @@ pub struct CommitWriteResult {
 pub struct SyncCommittedBlockRequest {
     pub group_id: ShardGroupId,
     pub block_id: BlockId,
+    pub worker_run_id: WorkerRunId,
     /// Metadata-authoritative block stamp for the committed generation.
     pub block_stamp: u64,
     /// Complete committed block length expected by the metadata-visible prefix.
     pub expected_block_len: u64,
+    pub block_format_id: BlockFormatId,
+    pub block_size: u64,
+    pub chunk_size: u32,
 }
 
 /// Durable sync result for an already committed block.
@@ -363,11 +383,15 @@ impl WorkerCore {
             group_id: snapshot.group_id,
             block_id: snapshot.block_id,
             mode: StreamMode::Read,
+            worker_run_id: req.worker_run_id,
             start_offset: req.byte_range.offset,
             end_offset,
             frame_size,
             window_bytes: self.window_bytes(),
             block_stamp: snapshot.block_stamp,
+            block_format_id: snapshot.block_format_id,
+            block_size: snapshot.block_size,
+            chunk_size: snapshot.chunk_size,
             committed_length: snapshot.effective_block_len,
             effective_block_len: snapshot.effective_block_len,
             fencing_token: None,
@@ -403,13 +427,17 @@ impl WorkerCore {
             group_id: req.group_id,
             block_id: req.block_id,
             mode: StreamMode::Write,
+            worker_run_id: req.worker_run_id,
             start_offset: 0,
-            end_offset: req.block_size,
+            end_offset: req.effective_block_len,
             frame_size,
             window_bytes: self.window_bytes(),
             block_stamp: req.block_stamp,
+            block_format_id: req.block_format_id,
+            block_size: req.block_size,
+            chunk_size: req.chunk_size,
             committed_length: 0,
-            effective_block_len: req.block_size,
+            effective_block_len: req.effective_block_len,
             fencing_token: Some(req.token),
         };
         self.stream_manager.register(StreamState::new(context)).await;
@@ -450,7 +478,17 @@ impl WorkerCore {
         req: SyncCommittedBlockRequest,
     ) -> WorkerCoreResult<SyncCommittedBlockResult> {
         validate_sync_committed_block_request(&req)?;
-        let meta = self.block_store.load_meta(req.group_id, req.block_id)?;
+        let meta = match self.block_store.load_meta(req.group_id, req.block_id) {
+            Ok(meta) => meta,
+            Err(WorkerError::NotFound(message)) => {
+                return Err(WorkerError::NeedRefresh {
+                    code: RpcErrorCode::ShardMoved,
+                    reason: RefreshReason::Moved,
+                    message: format!("local block is not available for durable sync: {message}"),
+                });
+            }
+            Err(error) => return Err(error),
+        };
         validate_sync_committed_block_meta(&req, &meta)?;
         let synced = self.block_store.sync_ready_block(SyncReadyBlockRequest {
             group_id: req.group_id,
@@ -634,7 +672,18 @@ fn validate_write_open_request(req: &WriteOpenRequest) -> WorkerCoreResult<()> {
             "block_stamp must be metadata-assigned and non-zero".to_string(),
         ));
     }
-    validate_block_format(req.block_format_id, req.block_size, req.chunk_size, req.checksum_kind)
+    validate_block_format(req.block_format_id, req.block_size, req.chunk_size, req.checksum_kind)?;
+    if req.effective_block_len == 0 {
+        return Err(WorkerError::InvalidArgument(
+            "effective_block_len must be greater than zero".to_string(),
+        ));
+    }
+    if req.effective_block_len > req.block_size {
+        return Err(WorkerError::InvalidArgument(
+            "effective_block_len must not exceed block_size".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_block_format(
@@ -698,22 +747,56 @@ fn reject_existing_final_block(
     req: &WriteOpenRequest,
 ) -> WorkerCoreResult<()> {
     match store.load_meta(req.group_id, req.block_id) {
-        Ok(meta) => match meta.visibility.block_state {
-            BlockState::Ready | BlockState::Corrupt => Err(WorkerError::NeedRefresh {
-                code: RpcErrorCode::ShardMoved,
-                reason: RefreshReason::Moved,
-                message: format!(
-                    "local block already has final metadata: group_id={}, block_id={}, state={:?}",
-                    req.group_id, req.block_id, meta.visibility.block_state
-                ),
-            }),
-            BlockState::Loading => Err(WorkerError::Corrupt(
-                "loading block metadata is not valid final metadata".to_string(),
-            )),
-        },
+        Ok(meta) => {
+            validate_existing_block_shape(req, &meta)?;
+            match meta.visibility.block_state {
+                BlockState::Ready | BlockState::Corrupt => Err(WorkerError::NeedRefresh {
+                    code: RpcErrorCode::ShardMoved,
+                    reason: RefreshReason::Moved,
+                    message: format!(
+                        "local block already has final metadata: group_id={}, block_id={}, state={:?}",
+                        req.group_id, req.block_id, meta.visibility.block_state
+                    ),
+                }),
+                BlockState::Loading => Err(WorkerError::Corrupt(
+                    "loading block metadata is not valid final metadata".to_string(),
+                )),
+            }
+        }
         Err(WorkerError::NotFound(_)) => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn validate_existing_block_shape(
+    req: &WriteOpenRequest,
+    meta: &crate::store::block::BlockMetaPayload,
+) -> WorkerCoreResult<()> {
+    if meta.visibility.block_stamp != req.block_stamp {
+        return Err(WorkerError::NeedRefresh {
+            code: RpcErrorCode::BlockStampMismatch,
+            reason: RefreshReason::BlockStampMismatch,
+            message: format!(
+                "block stamp mismatch: group_id={}, block_id={}, requested={}, local={}",
+                req.group_id, req.block_id, req.block_stamp, meta.visibility.block_stamp
+            ),
+        });
+    }
+    if meta.format.format_id != req.block_format_id
+        || meta.format.block_size != req.block_size
+        || meta.format.chunk_size != u64::from(req.chunk_size)
+        || meta.source.effective_block_len != req.effective_block_len
+    {
+        return Err(WorkerError::NeedRefresh {
+            code: RpcErrorCode::StaleState,
+            reason: RefreshReason::StaleState,
+            message: format!(
+                "block layout mismatch: group_id={}, block_id={}",
+                req.group_id, req.block_id
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn validate_commit_request(state: &StreamState, req: &CommitWriteRequest) -> WorkerCoreResult<()> {
@@ -757,6 +840,17 @@ fn validate_commit_request(state: &StreamState, req: &CommitWriteRequest) -> Wor
             ),
         });
     }
+    if req.worker_run_id != state.context.worker_run_id
+        || req.block_format_id != state.context.block_format_id
+        || req.block_size != state.context.block_size
+        || req.chunk_size != state.context.chunk_size
+    {
+        return Err(WorkerError::NeedRefresh {
+            code: RpcErrorCode::StaleState,
+            reason: RefreshReason::StaleState,
+            message: "commit block expectation does not match open write context".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -769,6 +863,12 @@ fn validate_sync_committed_block_request(req: &SyncCommittedBlockRequest) -> Wor
     if req.expected_block_len == 0 {
         return Err(WorkerError::InvalidArgument(
             "sync committed block requires non-zero expected_block_len".to_string(),
+        ));
+    }
+    validate_block_format(req.block_format_id, req.block_size, req.chunk_size, ChecksumKind::None)?;
+    if req.expected_block_len > req.block_size {
+        return Err(WorkerError::InvalidArgument(
+            "sync committed block expected_block_len must not exceed block_size".to_string(),
         ));
     }
     Ok(())
@@ -799,10 +899,27 @@ fn validate_sync_committed_block_meta(
         });
     }
     if meta.source.effective_block_len != req.expected_block_len {
-        return Err(WorkerError::InvalidArgument(format!(
-            "effective block length mismatch during durable sync: group_id={}, block_id={}, expected={}, local={}",
-            req.group_id, req.block_id, req.expected_block_len, meta.source.effective_block_len
-        )));
+        return Err(WorkerError::NeedRefresh {
+            code: RpcErrorCode::StaleState,
+            reason: RefreshReason::StaleState,
+            message: format!(
+                "effective block length mismatch during durable sync: group_id={}, block_id={}, expected={}, local={}",
+                req.group_id, req.block_id, req.expected_block_len, meta.source.effective_block_len
+            ),
+        });
+    }
+    if req.block_format_id != meta.format.format_id
+        || req.block_size != meta.format.block_size
+        || u64::from(req.chunk_size) != meta.format.chunk_size
+    {
+        return Err(WorkerError::NeedRefresh {
+            code: RpcErrorCode::StaleState,
+            reason: RefreshReason::StaleState,
+            message: format!(
+                "block layout mismatch during durable sync: group_id={}, block_id={}",
+                req.group_id, req.block_id
+            ),
+        });
     }
     Ok(())
 }

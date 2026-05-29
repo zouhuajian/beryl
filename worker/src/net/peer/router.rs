@@ -239,8 +239,13 @@ mod tests {
                 ReadOpenRequest {
                     group_id: ShardGroupId::new(3),
                     block_id: BlockId::from_u64_u32(7, 0),
+                    worker_run_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
                     byte_range: ByteRange { offset: 0, len: 1024 },
                     block_stamp: 1,
+                    block_format_id: types::BlockFormatId::FULL_EFFECTIVE,
+                    block_size: 4096,
+                    chunk_size: 1024,
+                    effective_block_len: 4096,
                     frame_size: 1024,
                 },
                 RequestHeader::new(ClientId::new(42)),

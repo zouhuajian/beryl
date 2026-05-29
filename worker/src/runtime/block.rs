@@ -6,6 +6,7 @@
 use common::error::canonical::RefreshReason;
 use common::header::RpcErrorCode;
 use types::ids::{BlockId, ShardGroupId};
+use types::layout::BlockFormatId;
 
 use crate::data::core::{ReadOpenRequest, WorkerCoreResult};
 use crate::error::WorkerError;
@@ -17,6 +18,9 @@ pub struct ReadBlockSnapshot {
     pub block_id: BlockId,
     pub effective_block_len: u64,
     pub block_stamp: u64,
+    pub block_format_id: BlockFormatId,
+    pub block_size: u64,
+    pub chunk_size: u32,
 }
 
 /// Block-level facade for open and commit decisions.
@@ -70,6 +74,31 @@ impl BlockManager {
                 "block_stamp must be metadata-assigned and non-zero".to_string(),
             ));
         }
+        if req.block_size == 0 {
+            return Err(WorkerError::InvalidArgument(
+                "block_size must be greater than zero".to_string(),
+            ));
+        }
+        if req.chunk_size == 0 {
+            return Err(WorkerError::InvalidArgument(
+                "chunk_size must be greater than zero".to_string(),
+            ));
+        }
+        if !req.block_size.is_multiple_of(u64::from(req.chunk_size)) {
+            return Err(WorkerError::InvalidArgument(
+                "block_size must be a multiple of chunk_size".to_string(),
+            ));
+        }
+        if req.effective_block_len == 0 {
+            return Err(WorkerError::InvalidArgument(
+                "effective_block_len must be greater than zero".to_string(),
+            ));
+        }
+        if req.effective_block_len > req.block_size {
+            return Err(WorkerError::InvalidArgument(
+                "effective_block_len must not exceed block_size".to_string(),
+            ));
+        }
 
         let meta = match store.load_meta(req.group_id, req.block_id) {
             Ok(meta) => meta,
@@ -103,6 +132,29 @@ impl BlockManager {
                 ),
             ));
         }
+        if req.block_format_id != meta.format.format_id
+            || req.block_size != meta.format.block_size
+            || u64::from(req.chunk_size) != meta.format.chunk_size
+            || req.effective_block_len != meta.source.effective_block_len
+        {
+            return Err(Self::need_refresh(
+                RpcErrorCode::StaleState,
+                RefreshReason::StaleState,
+                format!(
+                    "block layout mismatch: group_id={}, block_id={}, requested_format={}, local_format={}, requested_block_size={}, local_block_size={}, requested_chunk_size={}, local_chunk_size={}, requested_effective_block_len={}, local_effective_block_len={}",
+                    req.group_id,
+                    req.block_id,
+                    req.block_format_id.as_raw(),
+                    meta.format.format_id.as_raw(),
+                    req.block_size,
+                    meta.format.block_size,
+                    req.chunk_size,
+                    meta.format.chunk_size,
+                    req.effective_block_len,
+                    meta.source.effective_block_len
+                ),
+            ));
+        }
 
         let range_end = req
             .byte_range
@@ -121,6 +173,10 @@ impl BlockManager {
             block_id: req.block_id,
             effective_block_len: meta.source.effective_block_len,
             block_stamp: meta.visibility.block_stamp,
+            block_format_id: meta.format.format_id,
+            block_size: meta.format.block_size,
+            chunk_size: u32::try_from(meta.format.chunk_size)
+                .map_err(|_| WorkerError::Corrupt("local chunk_size does not fit u32".to_string()))?,
         })
     }
 

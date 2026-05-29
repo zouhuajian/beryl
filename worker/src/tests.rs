@@ -1417,12 +1417,14 @@ mod tests {
         WriteOpenRequest {
             group_id: group_id(),
             block_id: block_id(),
+            worker_run_id: test_worker_run_id(),
             token: token(),
             block_stamp: BLOCK_STAMP,
             frame_size: 8192,
             block_size: BLOCK_SIZE,
             block_format_id: BlockFormatId::FULL_EFFECTIVE,
             chunk_size: CHUNK_SIZE,
+            effective_block_len: BLOCK_SIZE,
             checksum_kind: ChecksumKind::None,
         }
     }
@@ -1432,10 +1434,14 @@ mod tests {
             stream_id: stream_id(),
             group_id: group_id(),
             block_id: block_id(),
+            worker_run_id: test_worker_run_id(),
             token: token(),
             commit_seq: 8,
             effective_block_len: 4096,
             block_stamp: BLOCK_STAMP,
+            block_format_id: BlockFormatId::FULL_EFFECTIVE,
+            block_size: BLOCK_SIZE,
+            chunk_size: CHUNK_SIZE,
             require_sync: true,
         }
     }
@@ -1453,8 +1459,12 @@ mod tests {
         SyncCommittedBlockRequest {
             group_id: group_id(),
             block_id: block_id(),
+            worker_run_id: test_worker_run_id(),
             block_stamp,
             expected_block_len,
+            block_format_id: BlockFormatId::FULL_EFFECTIVE,
+            block_size: BLOCK_SIZE,
+            chunk_size: CHUNK_SIZE,
         }
     }
 
@@ -1469,8 +1479,12 @@ mod tests {
             frame_size: 8192,
             window_bytes: 65_536,
             block_stamp: 17,
+            block_format_id: BlockFormatId::FULL_EFFECTIVE,
+            block_size: BLOCK_SIZE,
+            chunk_size: CHUNK_SIZE,
             committed_length: 4096,
             effective_block_len: 4096,
+            worker_run_id: test_worker_run_id(),
             fencing_token: None,
         }
     }
@@ -1556,8 +1570,13 @@ mod tests {
         ReadOpenRequest {
             group_id: group_id(),
             block_id: block_id(),
+            worker_run_id: test_worker_run_id(),
             byte_range: ByteRange { offset, len },
             block_stamp,
+            block_format_id: BlockFormatId::FULL_EFFECTIVE,
+            block_size: BLOCK_SIZE,
+            chunk_size: CHUNK_SIZE,
+            effective_block_len: BLOCK_SIZE,
             frame_size,
         }
     }
@@ -1578,6 +1597,11 @@ mod tests {
             byte_range: Some(ByteRangeProto { offset, len }),
             block_stamp,
             frame_size,
+            worker_run_id: test_worker_run_id().to_string(),
+            block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
+            block_size: BLOCK_SIZE,
+            chunk_size: CHUNK_SIZE,
+            effective_block_len: BLOCK_SIZE,
         }
     }
 
@@ -1593,6 +1617,8 @@ mod tests {
             checksum_kind: ChecksumKindProto::ChecksumKindNone as i32,
             token: Some(test_token_proto()),
             frame_size,
+            worker_run_id: test_worker_run_id().to_string(),
+            effective_block_len: BLOCK_SIZE,
         }
     }
 
@@ -1607,6 +1633,10 @@ mod tests {
             token: Some(test_token_proto()),
             commit_seq,
             require_sync: true,
+            worker_run_id: test_worker_run_id().to_string(),
+            block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
+            block_size: BLOCK_SIZE,
+            chunk_size: CHUNK_SIZE,
         }
     }
 
@@ -1617,6 +1647,10 @@ mod tests {
             block_id: Some(test_block_id_proto()),
             block_stamp,
             expected_block_len,
+            worker_run_id: test_worker_run_id().to_string(),
+            block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
+            block_size: BLOCK_SIZE,
+            chunk_size: CHUNK_SIZE,
         }
     }
 
@@ -1685,14 +1719,7 @@ mod tests {
 
     #[test]
     fn converts_open_read_stream_request_to_domain() {
-        let request = OpenReadStreamRequestProto {
-            header: Some(test_header()),
-            group_id: Some(test_group_id_proto()),
-            block_id: Some(test_block_id_proto()),
-            byte_range: Some(ByteRangeProto { offset: 128, len: 4096 }),
-            block_stamp: 0,
-            frame_size: 8192,
-        };
+        let request = open_read_proto(128, 4096, 0, 8192);
 
         let domain = proto_to_read_open_request(request).unwrap();
 
@@ -1700,6 +1727,11 @@ mod tests {
         assert_eq!(domain.block_id, block_id());
         assert_eq!(domain.byte_range, ByteRange { offset: 128, len: 4096 });
         assert_eq!(domain.block_stamp, 0);
+        assert_eq!(domain.worker_run_id, test_worker_run_id());
+        assert_eq!(domain.block_format_id, BlockFormatId::FULL_EFFECTIVE);
+        assert_eq!(domain.block_size, BLOCK_SIZE);
+        assert_eq!(domain.chunk_size, CHUNK_SIZE);
+        assert_eq!(domain.effective_block_len, BLOCK_SIZE);
         assert_eq!(domain.frame_size, 8192);
     }
 
@@ -1713,11 +1745,13 @@ mod tests {
         assert_eq!(domain.block_id, block_id());
         assert_eq!(domain.token.owner, ClientId::new(9));
         assert_eq!(domain.token.epoch, 11);
+        assert_eq!(domain.worker_run_id, test_worker_run_id());
         assert_eq!(domain.block_stamp, BLOCK_STAMP);
         assert_eq!(domain.block_format_id, BlockFormatId::FULL_EFFECTIVE);
         assert_eq!(domain.frame_size, 8192);
         assert_eq!(domain.block_size, BLOCK_SIZE);
         assert_eq!(domain.chunk_size, CHUNK_SIZE);
+        assert_eq!(domain.effective_block_len, BLOCK_SIZE);
         assert_eq!(domain.checksum_kind, ChecksumKind::None);
     }
 
@@ -1755,26 +1789,19 @@ mod tests {
 
     #[test]
     fn converts_commit_and_abort_write_requests_to_domain() {
-        let commit = proto_to_commit_write_request(CommitWriteRequestProto {
-            header: Some(test_header()),
-            group_id: Some(test_group_id_proto()),
-            block_id: Some(test_block_id_proto()),
-            stream_id: Some(test_stream_id_proto()),
-            effective_block_len: 4096,
-            block_stamp: BLOCK_STAMP,
-            token: Some(test_token_proto()),
-            commit_seq: 8,
-            require_sync: true,
-        })
-        .unwrap();
+        let commit = proto_to_commit_write_request(commit_write_proto(stream_id(), 8, 4096)).unwrap();
 
         assert_eq!(commit.stream_id, stream_id());
         assert_eq!(commit.group_id, group_id());
         assert_eq!(commit.block_id, block_id());
         assert_eq!(commit.token.epoch, 11);
+        assert_eq!(commit.worker_run_id, test_worker_run_id());
         assert_eq!(commit.commit_seq, 8);
         assert_eq!(commit.effective_block_len, 4096);
         assert_eq!(commit.block_stamp, BLOCK_STAMP);
+        assert_eq!(commit.block_format_id, BlockFormatId::FULL_EFFECTIVE);
+        assert_eq!(commit.block_size, BLOCK_SIZE);
+        assert_eq!(commit.chunk_size, CHUNK_SIZE);
         assert!(commit.require_sync);
 
         let abort = proto_to_abort_write_request(AbortWriteRequestProto {
@@ -1798,8 +1825,12 @@ mod tests {
 
         assert_eq!(sync.group_id, group_id());
         assert_eq!(sync.block_id, block_id());
+        assert_eq!(sync.worker_run_id, test_worker_run_id());
         assert_eq!(sync.block_stamp, BLOCK_STAMP);
         assert_eq!(sync.expected_block_len, BLOCK_SIZE);
+        assert_eq!(sync.block_format_id, BlockFormatId::FULL_EFFECTIVE);
+        assert_eq!(sync.block_size, BLOCK_SIZE);
+        assert_eq!(sync.chunk_size, CHUNK_SIZE);
     }
 
     #[test]
@@ -1811,6 +1842,11 @@ mod tests {
             byte_range: Some(ByteRangeProto { offset: 0, len: 1 }),
             block_stamp: 0,
             frame_size: 1024,
+            worker_run_id: test_worker_run_id().to_string(),
+            block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
+            block_size: BLOCK_SIZE,
+            chunk_size: CHUNK_SIZE,
+            effective_block_len: BLOCK_SIZE,
         })
         .unwrap_err();
         assert!(read_err.to_string().contains("missing block_id"));
@@ -1822,6 +1858,11 @@ mod tests {
             byte_range: Some(ByteRangeProto { offset: 0, len: 1 }),
             block_stamp: 0,
             frame_size: 1024,
+            worker_run_id: test_worker_run_id().to_string(),
+            block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
+            block_size: BLOCK_SIZE,
+            chunk_size: CHUNK_SIZE,
+            effective_block_len: BLOCK_SIZE,
         })
         .unwrap_err();
         assert!(read_err.to_string().contains("missing group_id"));
@@ -1853,6 +1894,10 @@ mod tests {
             token: Some(test_token_proto()),
             commit_seq: 1,
             require_sync: false,
+            worker_run_id: test_worker_run_id().to_string(),
+            block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
+            block_size: BLOCK_SIZE,
+            chunk_size: CHUNK_SIZE,
         })
         .unwrap_err();
         assert!(commit_err.to_string().contains("missing stream_id"));
@@ -1890,6 +1935,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_write_rejects_invalid_metadata_shape_before_staging() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let paths = store.paths(group_id(), block_id());
+
+        let mut zero_stamp = write_open_request();
+        zero_stamp.block_stamp = 0;
+        assert_invalid_argument(core.open_write(zero_stamp).await);
+
+        let mut non_aligned = write_open_request();
+        non_aligned.chunk_size = 1000;
+        assert_invalid_argument(core.open_write(non_aligned).await);
+
+        let mut over_len = write_open_request();
+        over_len.effective_block_len = BLOCK_SIZE + 1;
+        assert_invalid_argument(core.open_write(over_len).await);
+
+        assert!(!paths.staging_data_path.exists());
+        assert!(!paths.staging_meta_path.exists());
+        assert_eq!(core.stream_manager().active_count().await, 0);
+    }
+
+    #[tokio::test]
     async fn open_write_rejects_invalid_fencing_token() {
         let (_temp, _store, core) = core_with_store(512, 2048, 4096);
         let mut req = write_open_request();
@@ -1909,6 +1976,32 @@ mod tests {
         assert_need_refresh(
             core.open_write(write_open_request()).await,
             common::error::canonical::RefreshReason::Moved,
+        );
+        assert_eq!(core.stream_manager().active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn open_write_rejects_existing_ready_block_shape_mismatch() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+        let mut req = write_open_request();
+        req.block_size = BLOCK_SIZE * 2;
+
+        assert_need_refresh(
+            core.open_write(req).await,
+            common::error::canonical::RefreshReason::StaleState,
+        );
+        assert_eq!(core.stream_manager().active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn open_write_rejects_existing_ready_block_stamp_mismatch() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        publish_ready_block(&store, payload(), BLOCK_STAMP + 1);
+
+        assert_need_refresh(
+            core.open_write(write_open_request()).await,
+            common::error::canonical::RefreshReason::BlockStampMismatch,
         );
         assert_eq!(core.stream_manager().active_count().await, 0);
     }
@@ -2107,6 +2200,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_write_rejects_layout_mismatch_against_open_request() {
+        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let mut open_req = write_open_request();
+        open_req.effective_block_len = 4;
+        let open = core.open_write(open_req).await.expect("open write");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: Bytes::from_static(b"abcd"),
+            checksum32: 0,
+        })
+        .await
+        .expect("write frame");
+
+        assert_need_refresh(
+            core.commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                commit_seq: 1,
+                effective_block_len: 4,
+                chunk_size: CHUNK_SIZE * 2,
+                ..commit_write_request()
+            })
+            .await,
+            common::error::canonical::RefreshReason::StaleState,
+        );
+    }
+
+    #[tokio::test]
     async fn commit_write_rejects_incomplete_block() {
         let (_temp, _store, core) = core_with_store(512, 2048, 4096);
         let open = core.open_write(write_open_request()).await.expect("open write");
@@ -2233,9 +2355,10 @@ mod tests {
     #[tokio::test]
     async fn sync_committed_block_rejects_missing_wrong_generation_and_uncommitted_block() {
         let (_temp, _store, core) = core_with_store(512, 2048, 4096);
-        assert_not_found(
+        assert_need_refresh(
             core.sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE))
                 .await,
+            common::error::canonical::RefreshReason::Moved,
         );
 
         let open = core.open_write(write_open_request()).await.expect("open write");
@@ -2248,9 +2371,10 @@ mod tests {
         })
         .await
         .expect("write frame");
-        assert_not_found(
+        assert_need_refresh(
             core.sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE))
                 .await,
+            common::error::canonical::RefreshReason::Moved,
         );
 
         core.commit_write(CommitWriteRequest {
@@ -2266,9 +2390,30 @@ mod tests {
                 .await,
             common::error::canonical::RefreshReason::BlockStampMismatch,
         );
-        assert_invalid_argument(
+        assert_need_refresh(
             core.sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE - 1))
                 .await,
+            common::error::canonical::RefreshReason::StaleState,
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_committed_block_rejects_block_layout_mismatch() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        publish_ready_block(store.as_ref(), payload(), BLOCK_STAMP);
+
+        let mut block_size_mismatch = sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE);
+        block_size_mismatch.block_size = BLOCK_SIZE * 2;
+        assert_need_refresh(
+            core.sync_committed_block(block_size_mismatch).await,
+            common::error::canonical::RefreshReason::StaleState,
+        );
+
+        let mut chunk_size_mismatch = sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE);
+        chunk_size_mismatch.chunk_size = CHUNK_SIZE * 2;
+        assert_need_refresh(
+            core.sync_committed_block(chunk_size_mismatch).await,
+            common::error::canonical::RefreshReason::StaleState,
         );
     }
 
@@ -2441,6 +2586,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_read_rejects_block_layout_mismatch() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+
+        let mut block_size_mismatch = read_open_request_for(0, 1024, BLOCK_STAMP, 512);
+        block_size_mismatch.block_size = BLOCK_SIZE * 2;
+        assert_need_refresh(
+            core.open_read(block_size_mismatch).await,
+            common::error::canonical::RefreshReason::StaleState,
+        );
+
+        let mut chunk_size_mismatch = read_open_request_for(0, 1024, BLOCK_STAMP, 512);
+        chunk_size_mismatch.chunk_size = CHUNK_SIZE * 2;
+        assert_need_refresh(
+            core.open_read(chunk_size_mismatch).await,
+            common::error::canonical::RefreshReason::StaleState,
+        );
+        assert_eq!(core.stream_manager().active_count().await, 0);
+    }
+
+    #[tokio::test]
     async fn open_read_rejects_zero_block_stamp_for_ready_block() {
         let (_temp, store, core) = core_with_store(512, 2048, 4096);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
@@ -2608,6 +2774,29 @@ mod tests {
 
         assert!(response.header.expect("header").error.is_none());
         assert!(response.stream_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn guarded_data_service_rejects_stale_worker_run_id() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+        let service = registered_data_service(Arc::new(core));
+        let mut request = open_read_proto(0, 1024, BLOCK_STAMP, 0);
+        request.worker_run_id = other_worker_run_id().to_string();
+
+        let response = service
+            .open_read_stream(tonic::Request::new(request))
+            .await
+            .expect("open read response")
+            .into_inner();
+        let error = response.header.expect("header").error.expect("header error");
+
+        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+        assert_eq!(
+            error.refresh_reason,
+            RefreshReasonProto::RefreshReasonWorkerRunMismatch as i32
+        );
+        assert!(response.stream_id.is_none());
     }
 
     #[tokio::test]
@@ -3167,6 +3356,8 @@ mod tests {
                 ("uint64", "block_stamp", 8),
                 ("common.FencingTokenProto", "token", 9),
                 ("uint32", "frame_size", 10),
+                ("string", "worker_run_id", 11),
+                ("uint64", "effective_block_len", 12),
             ]
         );
         assert_eq!(
@@ -3203,6 +3394,10 @@ mod tests {
                 ("common.FencingTokenProto", "token", 7),
                 ("uint64", "commit_seq", 8),
                 ("bool", "require_sync", 9),
+                ("string", "worker_run_id", 10),
+                ("uint32", "block_format_id", 11),
+                ("uint64", "block_size", 12),
+                ("uint32", "chunk_size", 13),
             ]
         );
         assert_eq!(
@@ -3222,6 +3417,10 @@ mod tests {
                 ("common.BlockIdProto", "block_id", 3),
                 ("uint64", "block_stamp", 4),
                 ("uint64", "expected_block_len", 5),
+                ("string", "worker_run_id", 6),
+                ("uint32", "block_format_id", 7),
+                ("uint64", "block_size", 8),
+                ("uint32", "chunk_size", 9),
             ]
         );
         assert_eq!(

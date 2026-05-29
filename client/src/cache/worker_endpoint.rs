@@ -27,6 +27,7 @@ struct WorkerEndpointCacheKey {
     protocol: WorkerNetProtocol,
     endpoint: String,
     worker_epoch: u64,
+    worker_run_id: types::WorkerRunId,
 }
 
 impl WorkerEndpointCacheKey {
@@ -37,6 +38,7 @@ impl WorkerEndpointCacheKey {
             protocol: candidate.worker_net_protocol,
             endpoint: candidate.endpoint.clone(),
             worker_epoch: candidate.worker_epoch,
+            worker_run_id: candidate.worker_run_id,
         })
     }
 }
@@ -614,6 +616,9 @@ mod tests {
             endpoint: "127.0.0.1:19101".to_string(),
             worker_net_protocol: WorkerNetProtocol::Grpc,
             worker_epoch,
+            worker_run_id: "550e8400-e29b-41d4-a716-446655440000"
+                .parse()
+                .expect("valid test WorkerRunId"),
         }
     }
 }

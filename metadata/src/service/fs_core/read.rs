@@ -66,11 +66,15 @@ impl FsCore {
     }
 
     fn has_usable_read_endpoint(worker: &WorkerPlacementView) -> bool {
+        let Some(worker_run_id) = worker.worker_run_id else {
+            return false;
+        };
         worker_endpoint_from_parts(
             worker.worker_id,
             worker.endpoint.clone(),
             worker.worker_net_protocol,
             worker.worker_epoch,
+            worker_run_id,
         )
         .is_ok()
     }
@@ -424,6 +428,21 @@ impl FsCore {
                     );
                 }
             };
+            let effective_block_len = match extent.block_offset.checked_add(extent.len) {
+                Some(len) => len,
+                None => {
+                    return self.failure_from_error_with_route_epoch(
+                        &req.ctx,
+                        MetadataError::Internal(format!(
+                            "extent block range overflows: block_offset={}, len={}",
+                            extent.block_offset, extent.len
+                        )),
+                        group_id,
+                        mount_epoch,
+                        route_epoch,
+                    );
+                }
+            };
             let mut workers = Vec::new();
             if let (Some(worker_manager), Some(worker_lookup_group_id)) = (worker_manager, worker_lookup_group_id) {
                 let reported = worker_manager.reported_block_locations(worker_lookup_group_id, extent.block_id);
@@ -450,6 +469,7 @@ impl FsCore {
                         worker.endpoint,
                         worker.worker_net_protocol,
                         worker.worker_epoch,
+                        worker.worker_run_id,
                     ) {
                         workers.push(endpoint);
                     }
@@ -463,6 +483,10 @@ impl FsCore {
                 block_stamp,
                 workers,
                 worker_epoch,
+                block_format_id: layout.block_format_id,
+                block_size: u64::from(layout.block_size),
+                chunk_size: layout.chunk_size,
+                effective_block_len,
             });
         }
 

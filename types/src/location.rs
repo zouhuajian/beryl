@@ -53,4 +53,12 @@ pub struct FileBlockLocation {
     pub workers: Vec<WorkerEndpointInfo>,
     pub worker_epoch: Option<u64>,
     pub block_stamp: u64,
+    /// Metadata-selected Vecton block data/meta interpretation format.
+    pub block_format_id: BlockFormatId,
+    /// Full logical block size from the persisted `FileLayout`.
+    pub block_size: u64,
+    /// Metadata-selected StorageChunk size for this block.
+    pub chunk_size: u32,
+    /// Block-local readable prefix expected by metadata.
+    pub effective_block_len: u64,
 }

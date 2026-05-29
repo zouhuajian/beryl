@@ -1218,6 +1218,9 @@ fn worker_endpoint() -> WorkerEndpointInfo {
         endpoint: "127.0.0.1:19101".to_string(),
         worker_net_protocol: WorkerNetProtocol::Grpc,
         worker_epoch: 7,
+        worker_run_id: "550e8400-e29b-41d4-a716-446655440000"
+            .parse()
+            .expect("valid test WorkerRunId"),
     }
 }
 
@@ -1229,6 +1232,10 @@ fn location(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -
         workers: vec![worker_endpoint()],
         worker_epoch: Some(7),
         block_stamp: u64::from(block_index) + 1,
+        block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
+        block_size: DEFAULT_BLOCK_SIZE as u64,
+        chunk_size: DEFAULT_CHUNK_SIZE,
+        effective_block_len: len,
     }
 }
 

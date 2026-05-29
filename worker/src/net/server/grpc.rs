@@ -30,6 +30,7 @@ use crate::error::WorkerError;
 use common::error::canonical::RefreshReason;
 use common::header::RpcErrorCode;
 use types::ids::ShardGroupId;
+use types::WorkerRunId;
 
 /// Worker data service implementation.
 #[derive(Clone)]
@@ -88,6 +89,49 @@ impl WorkerDataServiceImpl {
         })
     }
 
+    fn ensure_group_ready_for_run(
+        &self,
+        group_id: Option<proto::common::ShardGroupIdProto>,
+        worker_run_id: &str,
+    ) -> Result<(), WorkerError> {
+        let group_id = group_id
+            .map(|group_id| ShardGroupId::new(group_id.value))
+            .ok_or_else(|| WorkerError::InvalidArgument("missing group_id".to_string()))?;
+        if worker_run_id.is_empty() {
+            return Err(WorkerError::InvalidArgument(
+                "worker_run_id must not be empty".to_string(),
+            ));
+        }
+        let requested = worker_run_id
+            .parse::<WorkerRunId>()
+            .map_err(|err| WorkerError::InvalidArgument(format!("worker_run_id invalid: {err}")))?;
+        let Some(registration) = self.registration_state.registration(group_id) else {
+            return Err(WorkerError::NeedRefresh {
+                code: RpcErrorCode::NodeUnavailable,
+                reason: RefreshReason::StaleState,
+                message: format!("worker is not registered for metadata group {}", group_id.as_raw()),
+            });
+        };
+        if !self.registration_state.is_ready(group_id) {
+            return Err(WorkerError::NeedRefresh {
+                code: RpcErrorCode::NodeUnavailable,
+                reason: RefreshReason::StaleState,
+                message: format!("worker is not ready for metadata group {}", group_id.as_raw()),
+            });
+        }
+        if requested != registration.worker_run_id {
+            return Err(WorkerError::NeedRefresh {
+                code: RpcErrorCode::WorkerRunMismatch,
+                reason: RefreshReason::WorkerRunMismatch,
+                message: format!(
+                    "worker_run_id mismatch: requested={}, current={}",
+                    requested, registration.worker_run_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn ensure_any_ready(&self) -> Result<(), WorkerError> {
         if self.registration_state.is_any_ready() {
             return Ok(());
@@ -139,7 +183,7 @@ impl WorkerDataService for WorkerDataServiceImpl {
     ) -> Result<Response<OpenReadStreamResponseProto>, Status> {
         let request = request.into_inner();
         let header = request.header.clone();
-        if let Err(error) = self.ensure_group_ready(request.group_id) {
+        if let Err(error) = self.ensure_group_ready_for_run(request.group_id, &request.worker_run_id) {
             return Ok(Response::new(OpenReadStreamResponseProto {
                 header: Some(Self::error_response_header(header, error)),
                 stream_id: None,
@@ -212,7 +256,7 @@ impl WorkerDataService for WorkerDataServiceImpl {
     ) -> Result<Response<OpenWriteStreamResponseProto>, Status> {
         let request = request.into_inner();
         let header = request.header.clone();
-        if let Err(error) = self.ensure_group_ready(request.group_id) {
+        if let Err(error) = self.ensure_group_ready_for_run(request.group_id, &request.worker_run_id) {
             return Ok(Response::new(OpenWriteStreamResponseProto {
                 header: Some(Self::error_response_header(header, error)),
                 stream_id: None,
@@ -269,7 +313,7 @@ impl WorkerDataService for WorkerDataServiceImpl {
     ) -> Result<Response<CommitWriteResponseProto>, Status> {
         let request = request.into_inner();
         let header = request.header.clone();
-        if let Err(error) = self.ensure_group_ready(request.group_id) {
+        if let Err(error) = self.ensure_group_ready_for_run(request.group_id, &request.worker_run_id) {
             return Ok(Response::new(CommitWriteResponseProto {
                 header: Some(Self::error_response_header(header, error)),
                 effective_block_len: 0,
@@ -309,7 +353,7 @@ impl WorkerDataService for WorkerDataServiceImpl {
     ) -> Result<Response<SyncCommittedBlockResponseProto>, Status> {
         let request = request.into_inner();
         let header = request.header.clone();
-        if let Err(error) = self.ensure_group_ready(request.group_id) {
+        if let Err(error) = self.ensure_group_ready_for_run(request.group_id, &request.worker_run_id) {
             return Ok(Response::new(SyncCommittedBlockResponseProto {
                 header: Some(Self::error_response_header(header, error)),
                 effective_block_len: 0,

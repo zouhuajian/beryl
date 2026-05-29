@@ -1391,6 +1391,9 @@ mod tests {
             endpoint: "127.0.0.1:19101".to_string(),
             worker_net_protocol: WorkerNetProtocol::Grpc,
             worker_epoch: 13,
+            worker_run_id: "550e8400-e29b-41d4-a716-446655440000"
+                .parse()
+                .expect("valid test WorkerRunId"),
         }
     }
 

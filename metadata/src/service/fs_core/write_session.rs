@@ -789,6 +789,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     worker.endpoint,
                     worker.worker_net_protocol,
                     worker.worker_epoch,
+                    worker.worker_run_id,
                 ) {
                     Ok(endpoint) => endpoint,
                     Err(err) => {

@@ -131,8 +131,13 @@ mod tests {
                     ReadOpenRequest {
                         group_id: ShardGroupId::new(3),
                         block_id,
+                        worker_run_id: test_worker_run_id(),
                         byte_range: ByteRange { offset: 0, len: 1024 },
                         block_stamp: 1,
+                        block_format_id: types::BlockFormatId::FULL_EFFECTIVE,
+                        block_size: 4096,
+                        chunk_size: 1024,
+                        effective_block_len: 4096,
                         frame_size: 1024,
                     },
                     header.clone(),
@@ -153,12 +158,14 @@ mod tests {
                     WriteOpenRequest {
                         group_id: ShardGroupId::new(3),
                         block_id,
+                        worker_run_id: test_worker_run_id(),
                         token,
                         block_stamp: 1,
                         frame_size: 1024,
                         block_size: 4096,
                         block_format_id: types::BlockFormatId::FULL_EFFECTIVE,
                         chunk_size: 1024,
+                        effective_block_len: 4096,
                         checksum_kind: ChecksumKind::None,
                     },
                     header.clone(),
@@ -190,10 +197,14 @@ mod tests {
                         stream_id: StreamId::new(11),
                         group_id: ShardGroupId::new(3),
                         block_id,
+                        worker_run_id: test_worker_run_id(),
                         token,
                         commit_seq: 1,
                         effective_block_len: 4,
                         block_stamp: 1,
+                        block_format_id: types::BlockFormatId::FULL_EFFECTIVE,
+                        block_size: 4096,
+                        chunk_size: 1024,
                         require_sync: false,
                     },
                     header.clone(),
@@ -208,8 +219,12 @@ mod tests {
                     SyncCommittedBlockRequest {
                         group_id: ShardGroupId::new(3),
                         block_id,
+                        worker_run_id: test_worker_run_id(),
                         block_stamp: 1,
                         expected_block_len: 4,
+                        block_format_id: types::BlockFormatId::FULL_EFFECTIVE,
+                        block_size: 4096,
+                        chunk_size: 1024,
                     },
                     header.clone(),
                 )
@@ -242,6 +257,10 @@ mod tests {
             capabilities: WorkerNetCapabilities::default(),
             worker_epoch: 1,
         }
+    }
+
+    fn test_worker_run_id() -> types::WorkerRunId {
+        "550e8400-e29b-41d4-a716-446655440000".parse().unwrap()
     }
 
     fn assert_peer_grpc_unimplemented(error: WorkerError) {

@@ -31,6 +31,10 @@ pub(crate) struct PlannedReadSegment {
     pub(crate) block_id: BlockId,
     pub(crate) block_offset: u64,
     pub(crate) block_stamp: u64,
+    pub(crate) block_format_id: types::BlockFormatId,
+    pub(crate) block_size: u64,
+    pub(crate) chunk_size: u32,
+    pub(crate) effective_block_len: u64,
     pub(crate) workers: Vec<WorkerEndpointInfo>,
     pub(crate) worker_epoch: Option<u64>,
 }
@@ -93,6 +97,30 @@ impl ReadPlanner {
                     block_id
                 )));
             }
+            if location.block_size == 0 {
+                return Err(ClientError::InvalidLayout(format!(
+                    "block location {} has zero block_size",
+                    block_id
+                )));
+            }
+            if location.chunk_size == 0 {
+                return Err(ClientError::InvalidLayout(format!(
+                    "block location {} has zero chunk_size",
+                    block_id
+                )));
+            }
+            if location.effective_block_len == 0 {
+                return Err(ClientError::InvalidLayout(format!(
+                    "block location {} has zero effective_block_len",
+                    block_id
+                )));
+            }
+            if location.effective_block_len > location.block_size {
+                return Err(ClientError::InvalidLayout(format!(
+                    "block location {} effective_block_len exceeds block_size",
+                    block_id
+                )));
+            }
             if end <= span.file_offset || location.file_offset >= span.end_file_offset() {
                 continue;
             }
@@ -143,6 +171,10 @@ impl ReadPlanner {
                 block_id,
                 block_offset: read_start - start,
                 block_stamp,
+                block_format_id: location.block_format_id,
+                block_size: location.block_size,
+                chunk_size: location.chunk_size,
+                effective_block_len: location.effective_block_len,
                 workers: location.workers.clone(),
                 worker_epoch: location.worker_epoch,
             });
@@ -242,6 +274,10 @@ mod tests {
         assert_eq!(segments[0].block_offset, 2);
         assert_eq!(segments[0].len, 6);
         assert_eq!(segments[0].block_stamp, 101);
+        assert_eq!(segments[0].block_format_id, types::BlockFormatId::CURRENT_FOR_NEW_FILE);
+        assert_eq!(segments[0].block_size, 4096);
+        assert_eq!(segments[0].chunk_size, 1024);
+        assert_eq!(segments[0].effective_block_len, 8);
         assert_eq!(segments[1].file_offset, 8);
         assert_eq!(segments[1].block_offset, 0);
         assert_eq!(segments[1].len, 6);
@@ -352,9 +388,14 @@ mod tests {
                 endpoint: "127.0.0.1:19101".to_string(),
                 worker_net_protocol: WorkerNetProtocol::Grpc,
                 worker_epoch: 7,
+                worker_run_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
             }],
             worker_epoch: Some(7),
             block_stamp,
+            block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
+            block_size: 4096,
+            chunk_size: 1024,
+            effective_block_len: len,
         }
     }
 }

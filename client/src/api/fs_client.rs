@@ -1116,7 +1116,10 @@ fn should_replan_after_worker_error(err: &ClientError) -> bool {
     matches!(
         ErrorClassifier.classify_error(err),
         ErrorClass::NeedRefresh(
-            RefreshReason::RouteEpochMismatch | RefreshReason::WorkerEpochMismatch | RefreshReason::BlockStampMismatch
+            RefreshReason::RouteEpochMismatch
+                | RefreshReason::WorkerEpochMismatch
+                | RefreshReason::WorkerRunMismatch
+                | RefreshReason::BlockStampMismatch
         )
     )
 }
@@ -1256,6 +1259,7 @@ fn is_write_refresh_error(err: &ClientError) -> bool {
         ErrorClass::NeedRefresh(
             RefreshReason::RouteEpochMismatch
                 | RefreshReason::WorkerEpochMismatch
+                | RefreshReason::WorkerRunMismatch
                 | RefreshReason::BlockStampMismatch
                 | RefreshReason::Unknown
         )

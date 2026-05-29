@@ -185,6 +185,7 @@ impl RefreshManager {
             }
             RefreshReason::StaleState
             | RefreshReason::WorkerEpochMismatch
+            | RefreshReason::WorkerRunMismatch
             | RefreshReason::BlockStampMismatch
             | RefreshReason::Unknown => {}
         }
@@ -236,6 +237,7 @@ impl RefreshManager {
                 self.invalidate_worker_endpoints(CacheInvalidationReason::Owner);
             }
             RefreshReason::BlockStampMismatch
+            | RefreshReason::WorkerRunMismatch
             | RefreshReason::StaleState
             | RefreshReason::Unknown
             | RefreshReason::NotLeader => {}
@@ -547,6 +549,9 @@ mod tests {
             endpoint: "127.0.0.1:19101".to_string(),
             worker_net_protocol: WorkerNetProtocol::Grpc,
             worker_epoch: 7,
+            worker_run_id: "550e8400-e29b-41d4-a716-446655440000"
+                .parse()
+                .expect("valid test WorkerRunId"),
         }
     }
 }

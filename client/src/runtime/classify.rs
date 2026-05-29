@@ -22,6 +22,8 @@ pub enum RefreshReason {
     RouteEpochMismatch,
     /// Worker epoch changed. The current client records this only.
     WorkerEpochMismatch,
+    /// Worker process run changed while WorkerId and endpoint may be reused.
+    WorkerRunMismatch,
     /// Worker reported that the metadata-provided block stamp is stale.
     BlockStampMismatch,
     /// Refresh was requested without enough structured detail.
@@ -38,6 +40,7 @@ impl RefreshReason {
             Self::StaleState => "stale_state",
             Self::RouteEpochMismatch => "route_epoch_mismatch",
             Self::WorkerEpochMismatch => "worker_epoch_mismatch",
+            Self::WorkerRunMismatch => "worker_run_mismatch",
             Self::BlockStampMismatch => "block_stamp_mismatch",
             Self::Unknown => "unknown",
         }
@@ -162,9 +165,9 @@ fn refresh_reason_from_canonical(reason: CanonicalRefreshReason) -> RefreshReaso
         CanonicalRefreshReason::MountEpochMismatch => RefreshReason::MountEpochMismatch,
         CanonicalRefreshReason::RouteEpochMismatch => RefreshReason::RouteEpochMismatch,
         CanonicalRefreshReason::WorkerEpochMismatch => RefreshReason::WorkerEpochMismatch,
+        CanonicalRefreshReason::WorkerRunMismatch => RefreshReason::WorkerRunMismatch,
         CanonicalRefreshReason::GroupMismatch
         | CanonicalRefreshReason::NeedRegister
-        | CanonicalRefreshReason::WorkerRunMismatch
         | CanonicalRefreshReason::FullReportRequired => RefreshReason::Unknown,
         CanonicalRefreshReason::BlockStampMismatch => RefreshReason::BlockStampMismatch,
         CanonicalRefreshReason::Unknown => RefreshReason::Unknown,
@@ -274,6 +277,24 @@ mod tests {
         let classified = ErrorClassifier.classify_error(&err);
 
         assert_eq!(classified, ErrorClass::NeedRefresh(RefreshReason::BlockStampMismatch));
+    }
+
+    #[test]
+    fn worker_run_mismatch_classifies_as_typed_refresh_reason() {
+        let canonical = CanonicalError::need_refresh(
+            RpcErrorCode::WorkerRunMismatch,
+            common::error::canonical::RefreshReason::WorkerRunMismatch,
+            "worker run mismatch",
+        );
+        let err = ClientError::from(ClientAction::Refresh {
+            reason: common::error::canonical::RefreshReason::WorkerRunMismatch,
+            hint: Box::default(),
+            canonical: Box::new(canonical),
+        });
+
+        let classified = ErrorClassifier.classify_error(&err);
+
+        assert_eq!(classified, ErrorClass::NeedRefresh(RefreshReason::WorkerRunMismatch));
     }
 
     #[test]

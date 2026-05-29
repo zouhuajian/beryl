@@ -80,6 +80,7 @@ impl TonicWorkerDataClient {
             endpoint,
             protocol: candidate.worker_net_protocol,
             worker_epoch: candidate.worker_epoch,
+            worker_run_id: candidate.worker_run_id,
         };
         if !self.channel_pool_enabled {
             self.record_pool_metric(ClientMetric::WorkerChannelPoolMiss, operation, "miss");
@@ -146,6 +147,7 @@ impl TonicWorkerDataClient {
                 endpoint,
                 protocol: candidate.worker_net_protocol,
                 worker_epoch: candidate.worker_epoch,
+                worker_run_id: candidate.worker_run_id,
             };
             if self.channels.write().remove(&key).is_some() {
                 self.record_pool_metric(
@@ -155,6 +157,14 @@ impl TonicWorkerDataClient {
                 );
             }
         }
+    }
+
+    fn invalidate_worker_identity_mismatch(&self, candidate: &WorkerEndpointInfo, err: &ClientError) {
+        let Some(reason) = worker_identity_mismatch_invalidation_reason(err) else {
+            return;
+        };
+        self.invalidate_endpoint(candidate, reason);
+        self.invalidate_channel(candidate, reason);
     }
 
     fn record_pool_metric(&self, metric: ClientMetric, operation: &'static str, outcome: &'static str) {
@@ -169,12 +179,13 @@ impl TonicWorkerDataClient {
     }
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct WorkerChannelKey {
     worker_id: u64,
     endpoint: String,
     protocol: WorkerNetProtocol,
     worker_epoch: u64,
+    worker_run_id: types::WorkerRunId,
 }
 
 fn evict_worker_channel_if_needed(
@@ -194,8 +205,7 @@ fn evict_worker_channel_if_needed(
     }
     if let Some(evicted) = channels
         .keys()
-        .filter(|existing| existing.worker_id == key.worker_id)
-        .min()
+        .find(|existing| existing.worker_id == key.worker_id)
         .cloned()
     {
         channels.remove(&evicted);
@@ -236,7 +246,7 @@ impl WorkerDataClient for TonicWorkerDataClient {
                 }
                 Err(err) => return Err(err),
             };
-            let request = build_open_read_stream_request(&ctx, group_id, segment)?;
+            let request = build_open_read_stream_request(&ctx, group_id, segment, candidate)?;
             let open_response = match client.open_read_stream(tonic_request(&ctx, request)).await {
                 Ok(response) => response.into_inner(),
                 Err(status) if is_retryable_worker_status(&status) => {
@@ -247,10 +257,7 @@ impl WorkerDataClient for TonicWorkerDataClient {
                 Err(status) => return Err(ClientError::from(status)),
             };
             if let Err(err) = parse_worker_control_header(&ctx, open_response.header.as_ref()) {
-                if is_worker_epoch_mismatch(&err) {
-                    self.invalidate_endpoint(candidate, CacheInvalidationReason::WorkerEpoch);
-                    self.invalidate_channel(candidate, CacheInvalidationReason::WorkerEpoch);
-                }
+                self.invalidate_worker_identity_mismatch(candidate, &err);
                 return Err(err);
             }
             let stream_id = open_response
@@ -295,7 +302,7 @@ impl WorkerDataClient for TonicWorkerDataClient {
                 }
                 Err(err) => return Err(err),
             };
-            let request = build_open_write_stream_request(&ctx, &target)?;
+            let request = build_open_write_stream_request(&ctx, &target, candidate)?;
             let response = match client.open_write_stream(tonic_request(&ctx, request)).await {
                 Ok(response) => response.into_inner(),
                 Err(status) if is_retryable_worker_status(&status) => {
@@ -309,12 +316,8 @@ impl WorkerDataClient for TonicWorkerDataClient {
                 }
                 Err(status) => return Err(ClientError::from(status)),
             };
-            return worker_write_block_from_open_response(&ctx, &target, candidate, response).inspect_err(|err| {
-                if is_worker_epoch_mismatch(err) {
-                    self.invalidate_endpoint(candidate, CacheInvalidationReason::WorkerEpoch);
-                    self.invalidate_channel(candidate, CacheInvalidationReason::WorkerEpoch);
-                }
-            });
+            return worker_write_block_from_open_response(&ctx, &target, candidate, response)
+                .inspect_err(|err| self.invalidate_worker_identity_mismatch(candidate, err));
         }
         Err(last_transport_error
             .unwrap_or_else(|| ClientError::Worker("worker write has no reachable worker candidates".to_string())))
@@ -381,12 +384,8 @@ impl WorkerDataClient for TonicWorkerDataClient {
                 ))
             })?
             .into_inner();
-        worker_commit_result_from_response(&ctx, block, effective_len, response).inspect_err(|err| {
-            if is_worker_epoch_mismatch(err) {
-                self.invalidate_endpoint(&endpoint, CacheInvalidationReason::WorkerEpoch);
-                self.invalidate_channel(&endpoint, CacheInvalidationReason::WorkerEpoch);
-            }
-        })
+        worker_commit_result_from_response(&ctx, block, effective_len, response)
+            .inspect_err(|err| self.invalidate_worker_identity_mismatch(&endpoint, err))
     }
 
     async fn sync_committed_block(
@@ -409,12 +408,8 @@ impl WorkerDataClient for TonicWorkerDataClient {
                 ))
             })?
             .into_inner();
-        worker_block_sync_result_from_response(&ctx, block, expected_len, response).inspect_err(|err| {
-            if is_worker_epoch_mismatch(err) {
-                self.invalidate_endpoint(&endpoint, CacheInvalidationReason::WorkerEpoch);
-                self.invalidate_channel(&endpoint, CacheInvalidationReason::WorkerEpoch);
-            }
-        })
+        worker_block_sync_result_from_response(&ctx, block, expected_len, response)
+            .inspect_err(|err| self.invalidate_worker_identity_mismatch(&endpoint, err))
     }
 
     async fn abort_write(&self, ctx: AttemptContext, block: &WorkerWriteBlock) -> ClientResult<()> {
@@ -587,6 +582,7 @@ fn build_open_read_stream_request(
     ctx: &AttemptContext,
     group_id: u64,
     segment: &PlannedReadSegment,
+    candidate: &WorkerEndpointInfo,
 ) -> ClientResult<proto::worker::OpenReadStreamRequestProto> {
     if group_id == 0 {
         return Err(ClientError::InvalidArgument(
@@ -596,6 +592,15 @@ fn build_open_read_stream_request(
     if segment.block_stamp == 0 {
         return Err(ClientError::InvalidLayout(
             "planned read segment has zero block_stamp".to_string(),
+        ));
+    }
+    if segment.block_size == 0
+        || segment.chunk_size == 0
+        || segment.effective_block_len == 0
+        || segment.effective_block_len > segment.block_size
+    {
+        return Err(ClientError::InvalidLayout(
+            "planned read segment has invalid expected block shape".to_string(),
         ));
     }
     Ok(proto::worker::OpenReadStreamRequestProto {
@@ -611,6 +616,11 @@ fn build_open_read_stream_request(
         ),
         block_stamp: segment.block_stamp,
         frame_size: default_frame_size(segment.len),
+        worker_run_id: candidate.worker_run_id.to_string(),
+        block_format_id: segment.block_format_id.as_raw(),
+        block_size: segment.block_size,
+        chunk_size: segment.chunk_size,
+        effective_block_len: segment.effective_block_len,
     })
 }
 
@@ -677,6 +687,7 @@ fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> 
 fn build_open_write_stream_request(
     ctx: &AttemptContext,
     target: &WorkerWriteTarget,
+    candidate: &WorkerEndpointInfo,
 ) -> ClientResult<proto::worker::OpenWriteStreamRequestProto> {
     validate_worker_write_target(target)?;
     Ok(proto::worker::OpenWriteStreamRequestProto {
@@ -690,6 +701,8 @@ fn build_open_write_stream_request(
         token: Some(target.target.fencing_token.into()),
         frame_size: default_frame_size(target.target.effective_block_len.min(u64::from(u32::MAX)) as u32),
         block_format_id: target.target.block_format_id.as_raw(),
+        worker_run_id: candidate.worker_run_id.to_string(),
+        effective_block_len: target.target.effective_block_len,
     })
 }
 
@@ -737,6 +750,10 @@ fn build_commit_write_request(
         token: Some(block.target.fencing_token.into()),
         commit_seq,
         require_sync,
+        worker_run_id: block.worker.worker_run_id.to_string(),
+        block_format_id: block.target.block_format_id.as_raw(),
+        block_size: block.target.block_size,
+        chunk_size: block.target.chunk_size,
     })
 }
 
@@ -752,6 +769,10 @@ fn build_sync_committed_block_request(
         block_id: Some(block.target.block_id.into()),
         block_stamp: block.target.block_stamp,
         expected_block_len: expected_len,
+        worker_run_id: block.worker.worker_run_id.to_string(),
+        block_format_id: block.target.block_format_id.as_raw(),
+        block_size: block.target.block_size,
+        chunk_size: block.target.chunk_size,
     })
 }
 
@@ -1064,11 +1085,12 @@ fn is_retryable_worker_status(status: &tonic::Status) -> bool {
     )
 }
 
-fn is_worker_epoch_mismatch(err: &ClientError) -> bool {
-    matches!(
-        ErrorClassifier.classify_error(err),
-        ErrorClass::NeedRefresh(RefreshReason::WorkerEpochMismatch)
-    )
+fn worker_identity_mismatch_invalidation_reason(err: &ClientError) -> Option<CacheInvalidationReason> {
+    match ErrorClassifier.classify_error(err) {
+        ErrorClass::NeedRefresh(RefreshReason::WorkerEpochMismatch) => Some(CacheInvalidationReason::WorkerEpoch),
+        ErrorClass::NeedRefresh(RefreshReason::WorkerRunMismatch) => Some(CacheInvalidationReason::WorkerRun),
+        _ => None,
+    }
 }
 
 fn is_endpoint_health_error(err: &ClientError) -> bool {
@@ -1128,6 +1150,12 @@ mod tests {
     use crate::metrics::NoopClientMetrics;
     use crate::planner::read_planner::PlannedReadSegment;
     use crate::runtime::{ErrorClass, ErrorClassifier, OperationContext, OperationIdentity, OperationKind};
+
+    fn test_worker_run_id() -> types::WorkerRunId {
+        "550e8400-e29b-41d4-a716-446655440000"
+            .parse()
+            .expect("valid test WorkerRunId")
+    }
 
     #[derive(Debug, Default)]
     struct RecordingMetrics {
@@ -1223,6 +1251,51 @@ mod tests {
         first_task.await.expect("first").expect("first client");
         second_task.await.expect("second").expect("second client");
         assert_eq!(client.channels.read().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn worker_identity_mismatch_invalidates_target_endpoint_and_channel() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let client = TonicWorkerDataClient::with_parts(
+            WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone()),
+            true,
+            1,
+            metrics.clone(),
+        );
+        let candidate = worker_endpoint();
+        let ctx = data_attempt_context();
+
+        for (code, reason, message) in [
+            (
+                RpcErrorCode::WorkerRunMismatch,
+                RefreshReason::WorkerRunMismatch,
+                "worker run mismatch",
+            ),
+            (
+                RpcErrorCode::WorkerEpochMismatch,
+                RefreshReason::WorkerEpochMismatch,
+                "worker epoch mismatch",
+            ),
+        ] {
+            let _worker_client = client.client(&candidate, "read").await.expect("worker client");
+            assert_eq!(client.endpoint_cache().len(), 1);
+            assert_eq!(client.channels.read().len(), 1);
+
+            let err = parse_worker_control_header(
+                &ctx,
+                Some(&data_header_with_error(
+                    &ctx,
+                    CanonicalError::need_refresh(code, reason, message),
+                )),
+            )
+            .expect_err("worker identity mismatch must fail");
+
+            client.invalidate_worker_identity_mismatch(&candidate, &err);
+
+            assert_eq!(client.endpoint_cache().len(), 0);
+            assert_eq!(client.channels.read().len(), 0);
+        }
+        assert_metric(&metrics.events(), ClientMetric::CachePreciseInvalidation);
     }
 
     #[tokio::test]
@@ -1406,28 +1479,52 @@ mod tests {
     fn open_read_stream_request_uses_metadata_block_stamp() {
         let ctx = data_attempt_context();
         let segment = planned_segment(77);
+        let candidate = worker_endpoint();
 
-        let request = build_open_read_stream_request(&ctx, 9, &segment).expect("request");
+        let request = build_open_read_stream_request(&ctx, 9, &segment, &candidate).expect("request");
 
         assert_eq!(request.block_stamp, 77);
+        assert_eq!(request.worker_run_id, test_worker_run_id().to_string());
+        assert_eq!(
+            request.block_format_id,
+            types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw()
+        );
+        assert_eq!(request.block_size, 4096);
+        assert_eq!(request.chunk_size, 4096);
+        assert_eq!(request.effective_block_len, 5);
     }
 
     #[test]
     fn open_read_stream_request_rejects_zero_block_stamp() {
         let ctx = data_attempt_context();
         let segment = planned_segment(0);
+        let candidate = worker_endpoint();
 
-        let err = build_open_read_stream_request(&ctx, 9, &segment).expect_err("zero stamp must fail");
+        let err = build_open_read_stream_request(&ctx, 9, &segment, &candidate).expect_err("zero stamp must fail");
 
         assert!(matches!(err, ClientError::InvalidLayout(msg) if msg.contains("block_stamp")));
+    }
+
+    #[test]
+    fn open_read_stream_request_rejects_zero_expected_fields() {
+        let ctx = data_attempt_context();
+        let mut segment = planned_segment(77);
+        segment.block_size = 0;
+        let candidate = worker_endpoint();
+
+        let err = build_open_read_stream_request(&ctx, 9, &segment, &candidate)
+            .expect_err("zero block_size must not be defaulted");
+
+        assert!(matches!(err, ClientError::InvalidLayout(msg) if msg.contains("expected block shape")));
     }
 
     #[test]
     fn open_write_stream_request_uses_metadata_target_fields() {
         let ctx = write_attempt_context();
         let target = worker_write_target();
+        let candidate = target.target.worker_endpoints[0].clone();
 
-        let request = build_open_write_stream_request(&ctx, &target).expect("open write request");
+        let request = build_open_write_stream_request(&ctx, &target, &candidate).expect("open write request");
 
         assert_eq!(request.group_id.as_ref().map(|group| group.value), Some(9));
         assert_eq!(request.block_id.as_ref().map(|block| block.data_handle_id), Some(202));
@@ -1438,7 +1535,22 @@ mod tests {
             request.block_format_id,
             types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw()
         );
+        assert_eq!(request.worker_run_id, test_worker_run_id().to_string());
+        assert_eq!(request.effective_block_len, 5);
         assert_eq!(request.token.as_ref().map(|token| token.owner), Some(7));
+    }
+
+    #[test]
+    fn open_write_stream_request_rejects_zero_metadata_target_shape() {
+        let ctx = write_attempt_context();
+        let mut target = worker_write_target();
+        target.target.chunk_size = 0;
+        let candidate = target.target.worker_endpoints[0].clone();
+
+        let err = build_open_write_stream_request(&ctx, &target, &candidate)
+            .expect_err("zero chunk_size must not be defaulted");
+
+        assert!(matches!(err, ClientError::InvalidLayout(msg) if msg.contains("chunk_size")));
     }
 
     #[test]
@@ -1465,6 +1577,13 @@ mod tests {
 
         assert_eq!(request.effective_block_len, 5);
         assert_eq!(request.block_stamp, 77);
+        assert_eq!(request.worker_run_id, test_worker_run_id().to_string());
+        assert_eq!(
+            request.block_format_id,
+            types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw()
+        );
+        assert_eq!(request.block_size, 4096);
+        assert_eq!(request.chunk_size, 4096);
         assert_eq!(request.commit_seq, 1);
         assert!(!request.require_sync);
         assert_eq!(request.token.as_ref().map(|token| token.owner), Some(7));
@@ -1478,6 +1597,24 @@ mod tests {
         let request = build_commit_write_request(&ctx, &block, 5, 1, true).expect("commit write request");
 
         assert!(request.require_sync);
+    }
+
+    #[test]
+    fn sync_committed_block_request_uses_metadata_target_shape() {
+        let ctx = write_attempt_context();
+        let block = worker_write_block(1024);
+
+        let request = build_sync_committed_block_request(&ctx, &block, 5).expect("sync request");
+
+        assert_eq!(request.block_stamp, 77);
+        assert_eq!(request.expected_block_len, 5);
+        assert_eq!(request.worker_run_id, test_worker_run_id().to_string());
+        assert_eq!(
+            request.block_format_id,
+            types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw()
+        );
+        assert_eq!(request.block_size, 4096);
+        assert_eq!(request.chunk_size, 4096);
     }
 
     #[test]
@@ -1796,6 +1933,28 @@ mod tests {
     }
 
     #[test]
+    fn worker_run_mismatch_is_typed_refresh_error() {
+        let ctx = write_attempt_context();
+        let err = parse_worker_control_header(
+            &ctx,
+            Some(&data_header_with_error(
+                &ctx,
+                CanonicalError::need_refresh(
+                    RpcErrorCode::WorkerRunMismatch,
+                    RefreshReason::WorkerRunMismatch,
+                    "worker run mismatch",
+                ),
+            )),
+        )
+        .expect_err("worker run mismatch must fail");
+
+        assert_eq!(
+            ErrorClassifier.classify_error(&err),
+            ErrorClass::NeedRefresh(crate::runtime::RefreshReason::WorkerRunMismatch)
+        );
+    }
+
+    #[test]
     fn worker_unsupported_error_is_not_retryable_transport() {
         let ctx = write_attempt_context();
         let err = parse_worker_control_header(
@@ -2085,6 +2244,7 @@ mod tests {
             endpoint: "127.0.0.1:19101".to_string(),
             worker_net_protocol: WorkerNetProtocol::Grpc,
             worker_epoch: 7,
+            worker_run_id: test_worker_run_id(),
         }
     }
 
@@ -2109,6 +2269,10 @@ mod tests {
             workers: vec![worker_endpoint()],
             worker_epoch: Some(7),
             block_stamp,
+            block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
+            block_size: 4096,
+            chunk_size: 4096,
+            effective_block_len: 5,
         }
     }
 

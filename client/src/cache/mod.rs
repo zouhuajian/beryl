@@ -20,6 +20,8 @@ pub(crate) enum CacheInvalidationReason {
     RouteEpoch,
     /// Worker epoch mismatch.
     WorkerEpoch,
+    /// Worker process-run mismatch.
+    WorkerRun,
     /// Worker endpoint unavailable.
     Unavailable,
     /// Owner group or mount owner changed.
@@ -35,6 +37,7 @@ impl CacheInvalidationReason {
             Self::Ttl => "ttl",
             Self::RouteEpoch => "route_epoch",
             Self::WorkerEpoch => "worker_epoch",
+            Self::WorkerRun => "worker_run",
             Self::Unavailable => "unavailable",
             Self::Owner => "owner",
             Self::Protocol => "protocol",

@@ -46,6 +46,15 @@ message OpenReadStreamRequestProto {
   // The worker may clamp or adjust it and returns the accepted value.
   // This is not the worker-local StorageChunk size.
   uint32 frame_size = 6;
+
+  // Metadata-confirmed worker process-run identity for the selected endpoint.
+  string worker_run_id = 7;
+
+  // Metadata-issued expected block layout facts from the authoritative FileLayout.
+  uint32 block_format_id = 8;
+  uint64 block_size = 9;
+  uint32 chunk_size = 10;
+  uint64 effective_block_len = 11;
 }
 
 message OpenReadStreamResponseProto {
@@ -121,6 +130,12 @@ message OpenWriteStreamRequestProto {
   // Client-preferred transport frame payload size in bytes.
   // This is not the worker-local StorageChunk size.
   uint32 frame_size = 10;
+
+  // Metadata-confirmed worker process-run identity for the selected endpoint.
+  string worker_run_id = 11;
+
+  // Metadata-issued valid length for this write target.
+  uint64 effective_block_len = 12;
 }
 
 message OpenWriteStreamResponseProto {
@@ -175,6 +190,14 @@ message CommitWriteRequestProto {
   common.FencingTokenProto token = 7;
   uint64 commit_seq = 8;
   bool require_sync = 9;
+
+  // Metadata-confirmed worker process-run identity for the selected endpoint.
+  string worker_run_id = 10;
+
+  // Metadata-issued expected block layout facts from the authoritative FileLayout.
+  uint32 block_format_id = 11;
+  uint64 block_size = 12;
+  uint32 chunk_size = 13;
 }
 
 message CommitWriteResponseProto {
@@ -198,6 +221,14 @@ message SyncCommittedBlockRequestProto {
 
   // Complete committed block length expected by the metadata-visible prefix.
   uint64 expected_block_len = 5;
+
+  // Metadata-confirmed worker process-run identity for the selected endpoint.
+  string worker_run_id = 6;
+
+  // Metadata-issued expected block layout facts from the authoritative FileLayout.
+  uint32 block_format_id = 7;
+  uint64 block_size = 8;
+  uint32 chunk_size = 9;
 }
 
 message SyncCommittedBlockResponseProto {

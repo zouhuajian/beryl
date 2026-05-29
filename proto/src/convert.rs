@@ -26,7 +26,7 @@ use types::layout::FileLayout;
 use types::lease::FencingToken;
 use types::{
     CallId, ClientId, CommittedBlock, FileAttrs, FileBlockLocation, GroupStateWatermark, InodeKind, RaftLogId,
-    WorkerEndpointInfo, WorkerNetProtocol, WriteTarget,
+    WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId, WriteTarget,
 };
 
 // ============================================================================
@@ -402,6 +402,7 @@ impl TryFrom<proto_common::WorkerEndpointInfoProto> for WorkerEndpointInfo {
             endpoint.endpoint,
             endpoint.worker_net_protocol,
             endpoint.worker_epoch,
+            endpoint.worker_run_id,
         )
     }
 }
@@ -415,6 +416,7 @@ pub fn worker_endpoint_info_from_parts(
     endpoint: String,
     worker_net_protocol: i32,
     worker_epoch: u64,
+    worker_run_id: String,
 ) -> Result<WorkerEndpointInfo, String> {
     if worker_id.as_raw() == 0 {
         return Err("WorkerEndpointInfoProto.worker_id must be non-zero".to_string());
@@ -425,12 +427,19 @@ pub fn worker_endpoint_info_from_parts(
     if worker_epoch == 0 {
         return Err("WorkerEndpointInfoProto.worker_epoch must be non-zero".to_string());
     }
+    if worker_run_id.is_empty() {
+        return Err("WorkerEndpointInfoProto.worker_run_id must not be empty".to_string());
+    }
+    let worker_run_id = worker_run_id
+        .parse::<WorkerRunId>()
+        .map_err(|err| format!("WorkerEndpointInfoProto.worker_run_id invalid: {err}"))?;
     let protocol = parse_known_worker_net_protocol(worker_net_protocol)?;
     Ok(WorkerEndpointInfo {
         worker_id,
         endpoint,
         worker_net_protocol: protocol.try_into()?,
         worker_epoch,
+        worker_run_id,
     })
 }
 
@@ -441,6 +450,7 @@ impl From<&WorkerEndpointInfo> for proto_common::WorkerEndpointInfoProto {
             endpoint: endpoint.endpoint.clone(),
             worker_net_protocol: proto_common::WorkerNetProtocolProto::from(endpoint.worker_net_protocol) as i32,
             worker_epoch: endpoint.worker_epoch,
+            worker_run_id: endpoint.worker_run_id.to_string(),
         }
     }
 }
@@ -452,6 +462,7 @@ impl From<WorkerEndpointInfo> for proto_common::WorkerEndpointInfoProto {
             endpoint: endpoint.endpoint,
             worker_net_protocol: proto_common::WorkerNetProtocolProto::from(endpoint.worker_net_protocol) as i32,
             worker_epoch: endpoint.worker_epoch,
+            worker_run_id: endpoint.worker_run_id.to_string(),
         }
     }
 }
@@ -597,6 +608,26 @@ impl TryFrom<proto_metadata::FileBlockLocationProto> for FileBlockLocation {
         if location.worker_epoch == Some(0) {
             return Err("FileBlockLocationProto.worker_epoch must be non-zero when present".to_string());
         }
+        if location.block_size == 0 {
+            return Err("FileBlockLocationProto.block_size must be non-zero".to_string());
+        }
+        if location.effective_block_len == 0 {
+            return Err("FileBlockLocationProto.effective_block_len must be non-zero".to_string());
+        }
+        if location.effective_block_len > location.block_size {
+            return Err("FileBlockLocationProto.effective_block_len must not exceed block_size".to_string());
+        }
+        if location.chunk_size == 0 {
+            return Err("FileBlockLocationProto.chunk_size must be non-zero".to_string());
+        }
+        if u64::from(location.chunk_size) > location.block_size {
+            return Err("FileBlockLocationProto.chunk_size must not exceed block_size".to_string());
+        }
+        if !location.block_size.is_multiple_of(u64::from(location.chunk_size)) {
+            return Err("FileBlockLocationProto.block_size must be a multiple of chunk_size".to_string());
+        }
+        let block_format_id = types::layout::BlockFormatId::from_raw(location.block_format_id)
+            .map_err(|err| format!("FileBlockLocationProto.block_format_id invalid: {err}"))?;
         let block_id = required_block_id(location.block_id, "FileBlockLocationProto.block_id")?;
         let workers = location
             .workers
@@ -610,6 +641,10 @@ impl TryFrom<proto_metadata::FileBlockLocationProto> for FileBlockLocation {
             workers,
             worker_epoch: location.worker_epoch,
             block_stamp,
+            block_format_id,
+            block_size: location.block_size,
+            chunk_size: location.chunk_size,
+            effective_block_len: location.effective_block_len,
         })
     }
 }
@@ -623,6 +658,10 @@ impl From<&FileBlockLocation> for proto_metadata::FileBlockLocationProto {
             workers: location.workers.iter().map(Into::into).collect(),
             worker_epoch: location.worker_epoch,
             block_stamp: Some(location.block_stamp),
+            block_format_id: location.block_format_id.as_raw(),
+            block_size: location.block_size,
+            chunk_size: location.chunk_size,
+            effective_block_len: location.effective_block_len,
         }
     }
 }
@@ -636,6 +675,10 @@ impl From<FileBlockLocation> for proto_metadata::FileBlockLocationProto {
             workers: location.workers.into_iter().map(Into::into).collect(),
             worker_epoch: location.worker_epoch,
             block_stamp: Some(location.block_stamp),
+            block_format_id: location.block_format_id.as_raw(),
+            block_size: location.block_size,
+            chunk_size: location.chunk_size,
+            effective_block_len: location.effective_block_len,
         }
     }
 }
@@ -1175,6 +1218,7 @@ fn refresh_hint_to_proto(hint: Option<&CanonicalRefreshHint>) -> Option<proto_co
                 endpoint: endpoint.endpoint.clone(),
                 worker_net_protocol: endpoint.worker_net_protocol,
                 worker_epoch: endpoint.worker_epoch,
+                worker_run_id: String::new(),
             })
             .collect(),
         worker_resolve_required: hint.worker_resolve_required,
@@ -1247,6 +1291,12 @@ pub fn canonical_to_error_detail(err: &CanonicalError) -> proto_common::ErrorDet
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_worker_run_id() -> types::WorkerRunId {
+        "550e8400-e29b-41d4-a716-446655440000"
+            .parse()
+            .expect("valid test WorkerRunId")
+    }
 
     #[test]
     fn msync_request_proto_shape_is_header_only() {
@@ -1408,6 +1458,10 @@ mod tests {
                 ("common.WorkerEndpointInfoProto", "workers", 4),
                 ("uint64", "worker_epoch", 5),
                 ("uint64", "block_stamp", 6),
+                ("uint32", "block_format_id", 7),
+                ("uint64", "block_size", 8),
+                ("uint32", "chunk_size", 9),
+                ("uint64", "effective_block_len", 10),
             ]
         );
 
@@ -1421,6 +1475,11 @@ mod tests {
                 ("common.ByteRangeProto", "byte_range", 4),
                 ("uint64", "block_stamp", 5),
                 ("uint32", "frame_size", 6),
+                ("string", "worker_run_id", 7),
+                ("uint32", "block_format_id", 8),
+                ("uint64", "block_size", 9),
+                ("uint32", "chunk_size", 10),
+                ("uint64", "effective_block_len", 11),
             ]
         );
         assert_eq!(
@@ -1447,6 +1506,8 @@ mod tests {
                 ("uint64", "block_stamp", 8),
                 ("common.FencingTokenProto", "token", 9),
                 ("uint32", "frame_size", 10),
+                ("string", "worker_run_id", 11),
+                ("uint64", "effective_block_len", 12),
             ]
         );
         assert_eq!(
@@ -1472,6 +1533,10 @@ mod tests {
                 ("common.FencingTokenProto", "token", 7),
                 ("uint64", "commit_seq", 8),
                 ("bool", "require_sync", 9),
+                ("string", "worker_run_id", 10),
+                ("uint32", "block_format_id", 11),
+                ("uint64", "block_size", 12),
+                ("uint32", "chunk_size", 13),
             ]
         );
         assert_eq!(
@@ -1491,6 +1556,10 @@ mod tests {
                 ("common.BlockIdProto", "block_id", 3),
                 ("uint64", "block_stamp", 4),
                 ("uint64", "expected_block_len", 5),
+                ("string", "worker_run_id", 6),
+                ("uint32", "block_format_id", 7),
+                ("uint64", "block_size", 8),
+                ("uint32", "chunk_size", 9),
             ]
         );
         assert_eq!(
@@ -1706,6 +1775,7 @@ mod tests {
             endpoint: "127.0.0.1:19101".to_string(),
             worker_net_protocol: proto_common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified as i32,
             worker_epoch: 11,
+            worker_run_id: test_worker_run_id().to_string(),
         };
 
         let err = types::WorkerEndpointInfo::try_from(endpoint).expect_err("unspecified protocol must fail");
@@ -1720,6 +1790,7 @@ mod tests {
             endpoint: "127.0.0.1:19101".to_string(),
             worker_net_protocol: proto_common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
             worker_epoch: 11,
+            worker_run_id: test_worker_run_id().to_string(),
         };
         let block_id = BlockId::from_u64_u32(42, 3);
         let token = FencingToken::new(block_id, ClientId::new(9), 17);
@@ -1749,6 +1820,10 @@ mod tests {
             workers: Vec::new(),
             worker_epoch: Some(11),
             block_stamp: Some(55),
+            block_format_id: types::layout::BlockFormatId::FULL_EFFECTIVE.as_raw(),
+            block_size: 4096,
+            chunk_size: 1024,
+            effective_block_len: 4096,
         };
         let decoded_empty =
             types::FileBlockLocation::try_from(location.clone()).expect("empty read location workers are valid");
@@ -1770,6 +1845,7 @@ mod tests {
             endpoint: "127.0.0.1:19101".to_string(),
             worker_net_protocol: types::WorkerNetProtocol::Grpc,
             worker_epoch: 11,
+            worker_run_id: test_worker_run_id(),
         };
         let block_id = BlockId::from_u64_u32(42, 3);
         let token = FencingToken::new(block_id, ClientId::new(9), 17);
@@ -1821,6 +1897,10 @@ mod tests {
             workers: vec![endpoint],
             worker_epoch: Some(11),
             block_stamp: 55,
+            block_format_id: types::layout::BlockFormatId::FULL_EFFECTIVE,
+            block_size: 4096,
+            chunk_size: 1024,
+            effective_block_len: 3072,
         };
         let decoded_location =
             types::FileBlockLocation::try_from(proto_metadata::FileBlockLocationProto::from(location.clone()))

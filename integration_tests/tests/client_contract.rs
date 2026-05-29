@@ -75,6 +75,11 @@ async fn test_direct_worker_open_read_stream_is_explicitly_unimplemented() {
         byte_range: Some(ByteRangeProto { offset: 0, len: 9 }),
         block_stamp: 1,
         frame_size: 4096,
+        worker_run_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+        block_format_id: types::BlockFormatId::FULL_EFFECTIVE.as_raw(),
+        block_size: 4096,
+        chunk_size: 1024,
+        effective_block_len: 9,
     });
 
     let response = WorkerDataService::open_read_stream(&mock_worker, request)
@@ -185,6 +190,8 @@ async fn test_direct_worker_open_write_stream_is_explicitly_unimplemented() {
         }),
         frame_size: 4096,
         block_format_id: types::BlockFormatId::FULL_EFFECTIVE.as_raw(),
+        worker_run_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+        effective_block_len: 4,
     });
 
     let response = WorkerDataService::open_write_stream(&mock_worker, request)
@@ -218,6 +225,10 @@ async fn test_direct_worker_commit_write_is_explicitly_unimplemented() {
         }),
         commit_seq: 1,
         require_sync: true,
+        worker_run_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+        block_format_id: types::BlockFormatId::FULL_EFFECTIVE.as_raw(),
+        block_size: 4096,
+        chunk_size: 1024,
     });
 
     let response = WorkerDataService::commit_write(&mock_worker, request)

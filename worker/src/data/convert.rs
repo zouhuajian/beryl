@@ -15,6 +15,7 @@ use types::chunk::ByteRange;
 use types::ids::{BlockId, ShardGroupId, StreamId};
 use types::layout::BlockFormatId;
 use types::lease::FencingToken;
+use types::WorkerRunId;
 
 use crate::data::core::{
     AbortWriteRequest, CommitWriteRequest, ReadFrame, ReadOpenRequest, SyncCommittedBlockRequest, WorkerCoreResult,
@@ -71,6 +72,11 @@ pub fn read_open_request_to_proto(req: ReadOpenRequest, ctx: &RequestHeader) -> 
         byte_range: Some(byte_range_to_proto(req.byte_range)),
         block_stamp: req.block_stamp,
         frame_size: req.frame_size,
+        worker_run_id: req.worker_run_id.to_string(),
+        block_format_id: req.block_format_id.as_raw(),
+        block_size: req.block_size,
+        chunk_size: req.chunk_size,
+        effective_block_len: req.effective_block_len,
     }
 }
 
@@ -86,6 +92,8 @@ pub fn write_open_request_to_proto(req: WriteOpenRequest, ctx: &RequestHeader) -
         token: Some(fencing_token_to_proto(req.token)),
         frame_size: req.frame_size,
         block_format_id: req.block_format_id.as_raw(),
+        worker_run_id: req.worker_run_id.to_string(),
+        effective_block_len: req.effective_block_len,
     }
 }
 
@@ -110,6 +118,10 @@ pub fn commit_write_request_to_proto(req: CommitWriteRequest, ctx: &RequestHeade
         token: Some(fencing_token_to_proto(req.token)),
         commit_seq: req.commit_seq,
         require_sync: req.require_sync,
+        worker_run_id: req.worker_run_id.to_string(),
+        block_format_id: req.block_format_id.as_raw(),
+        block_size: req.block_size,
+        chunk_size: req.chunk_size,
     }
 }
 
@@ -123,6 +135,10 @@ pub fn sync_committed_block_request_to_proto(
         block_id: Some(block_id_to_proto(req.block_id)),
         block_stamp: req.block_stamp,
         expected_block_len: req.expected_block_len,
+        worker_run_id: req.worker_run_id.to_string(),
+        block_format_id: req.block_format_id.as_raw(),
+        block_size: req.block_size,
+        chunk_size: req.chunk_size,
     }
 }
 
@@ -159,12 +175,20 @@ pub fn proto_to_read_open_request(proto: OpenReadStreamRequestProto) -> WorkerCo
     let byte_range = proto
         .byte_range
         .ok_or_else(|| WorkerError::InvalidArgument("missing byte_range".to_string()))?;
+    let worker_run_id = proto_to_worker_run_id(&proto.worker_run_id)?;
+    let block_format_id = BlockFormatId::from_raw(proto.block_format_id)
+        .map_err(|err| WorkerError::InvalidArgument(format!("block_format_id invalid: {err}")))?;
 
     Ok(ReadOpenRequest {
         group_id,
         block_id,
+        worker_run_id,
         byte_range: proto_to_byte_range(&byte_range),
         block_stamp: proto.block_stamp,
+        block_format_id,
+        block_size: proto.block_size,
+        chunk_size: proto.chunk_size,
+        effective_block_len: proto.effective_block_len,
         frame_size: proto.frame_size,
     })
 }
@@ -176,16 +200,19 @@ pub fn proto_to_write_open_request(proto: OpenWriteStreamRequestProto) -> Worker
     let checksum_kind = proto_to_checksum_kind(proto.checksum_kind)?;
     let block_format_id = BlockFormatId::from_raw(proto.block_format_id)
         .map_err(|err| WorkerError::InvalidArgument(format!("block_format_id invalid: {err}")))?;
+    let worker_run_id = proto_to_worker_run_id(&proto.worker_run_id)?;
 
     Ok(WriteOpenRequest {
         group_id,
         block_id,
+        worker_run_id,
         token,
         block_stamp: proto.block_stamp,
         frame_size: proto.frame_size,
         block_size: proto.block_size,
         block_format_id,
         chunk_size: proto.chunk_size,
+        effective_block_len: proto.effective_block_len,
         checksum_kind,
     })
 }
@@ -207,15 +234,22 @@ pub fn proto_to_commit_write_request(proto: CommitWriteRequestProto) -> WorkerCo
     let group_id = proto_to_group_id(proto.group_id, "group_id")?;
     let block_id = proto_to_block_id(proto.block_id, "block_id")?;
     let token = proto_to_required_fencing_token(proto.token, "token")?;
+    let worker_run_id = proto_to_worker_run_id(&proto.worker_run_id)?;
+    let block_format_id = BlockFormatId::from_raw(proto.block_format_id)
+        .map_err(|err| WorkerError::InvalidArgument(format!("block_format_id invalid: {err}")))?;
 
     Ok(CommitWriteRequest {
         stream_id,
         group_id,
         block_id,
+        worker_run_id,
         token,
         commit_seq: proto.commit_seq,
         effective_block_len: proto.effective_block_len,
         block_stamp: proto.block_stamp,
+        block_format_id,
+        block_size: proto.block_size,
+        chunk_size: proto.chunk_size,
         require_sync: proto.require_sync,
     })
 }
@@ -225,12 +259,19 @@ pub fn proto_to_sync_committed_block_request(
 ) -> WorkerCoreResult<SyncCommittedBlockRequest> {
     let group_id = proto_to_group_id(proto.group_id, "group_id")?;
     let block_id = proto_to_block_id(proto.block_id, "block_id")?;
+    let worker_run_id = proto_to_worker_run_id(&proto.worker_run_id)?;
+    let block_format_id = BlockFormatId::from_raw(proto.block_format_id)
+        .map_err(|err| WorkerError::InvalidArgument(format!("block_format_id invalid: {err}")))?;
 
     Ok(SyncCommittedBlockRequest {
         group_id,
         block_id,
+        worker_run_id,
         block_stamp: proto.block_stamp,
         expected_block_len: proto.expected_block_len,
+        block_format_id,
+        block_size: proto.block_size,
+        chunk_size: proto.chunk_size,
     })
 }
 
@@ -257,6 +298,17 @@ fn proto_to_required_fencing_token(
     field_name: &str,
 ) -> WorkerCoreResult<FencingToken> {
     proto_convert::required_fencing_token(proto, field_name).map_err(WorkerError::InvalidArgument)
+}
+
+fn proto_to_worker_run_id(value: &str) -> WorkerCoreResult<WorkerRunId> {
+    if value.is_empty() {
+        return Err(WorkerError::InvalidArgument(
+            "worker_run_id must not be empty".to_string(),
+        ));
+    }
+    value
+        .parse::<WorkerRunId>()
+        .map_err(|err| WorkerError::InvalidArgument(format!("worker_run_id invalid: {err}")))
 }
 
 fn proto_to_checksum_kind(checksum_kind: i32) -> WorkerCoreResult<ChecksumKind> {
