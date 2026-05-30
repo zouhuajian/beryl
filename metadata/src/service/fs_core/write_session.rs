@@ -913,6 +913,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     open_epoch,
                     fencing_token: session_token,
                 },
+                layout,
                 write_targets,
                 base_size,
                 expires_at_ms,

@@ -14,7 +14,7 @@ use proto::metadata::{
     GetStatusRequestProto, ListStatusRequestProto, OpenFileRequestProto, RenameRequestProto, RenewLeaseRequestProto,
     SyncWriteRequestProto, WriteSyncModeProto,
 };
-use types::{DataHandleId, InodeId};
+use types::{DataHandleId, FileLayout, InodeId};
 
 use super::handle::{ReadHandle, WriteHandle};
 use super::{
@@ -203,6 +203,9 @@ impl FsClient {
     }
 
     /// Opens an existing file for reads and returns a snapshot reader.
+    ///
+    /// Existing files use the metadata-stored `FileLayout`; open options do not
+    /// override layout shape.
     pub async fn open(&self, path: &str, _options: OpenOptions) -> ClientResult<FileReader> {
         validate_path(path)?;
         let snapshot = self
@@ -224,6 +227,9 @@ impl FsClient {
     }
 
     /// Creates a file write session according to the supplied creation options.
+    ///
+    /// `CreateOptions` layout fields are create-time intent for new file
+    /// creation. Metadata validates and persists the accepted `FileLayout`.
     pub async fn create(&self, path: &str, options: CreateOptions) -> ClientResult<FileWriter> {
         validate_path(path)?;
         let disposition = match options.disposition {
@@ -238,7 +244,7 @@ impl FsClient {
                     header: None,
                     path: path.to_string(),
                     attrs: Some(default_file_attrs()),
-                    layout: Some(layout_for_new_file()),
+                    layout: Some(layout_for_new_file(&options)),
                     disposition: disposition as i32,
                     desired_len: Some(default_write_preallocation_len()),
                 },
@@ -254,6 +260,9 @@ impl FsClient {
     }
 
     /// Opens an append write session for an existing file.
+    ///
+    /// Append uses the metadata-stored `FileLayout` and does not send a new
+    /// layout override.
     pub async fn append(&self, path: &str, _options: AppendOptions) -> ClientResult<FileWriter> {
         validate_path(path)?;
         let seed = match self
@@ -412,9 +421,10 @@ impl FsClient {
             return Ok(session.cursor());
         }
         let mut submitted = 0usize;
+        let block_size = session.block_size() as usize;
         while submitted < data.len() {
             let remaining = data.len() - submitted;
-            let block_len = remaining.min(DEFAULT_BLOCK_SIZE as usize);
+            let block_len = remaining.min(block_size);
             let chunk = data.slice(submitted..submitted + block_len);
             self.write_one_block(&mut session, chunk).await?;
             handle.store_write_cursor(session.cursor());
@@ -1022,6 +1032,7 @@ fn write_handle_from_create(
 ) -> ClientResult<WriteHandle> {
     let inode_id = inode_id_from_proto(response.inode_id, "CreateFileResponseProto.inode_id")?;
     let data_handle_id = data_handle_id_from_proto(response.data_handle_id, "CreateFileResponseProto.data_handle_id")?;
+    let layout = write_layout_from_proto(response.layout, "CreateFileResponseProto.layout")?;
     let write_handle = response
         .write_handle
         .ok_or_else(|| ClientError::Metadata("CreateFileResponseProto.write_handle missing".to_string()))?;
@@ -1029,6 +1040,7 @@ fn write_handle_from_create(
         path.to_string(),
         inode_id,
         data_handle_id,
+        layout,
         write_handle,
         response.base_size,
     )?;
@@ -1047,6 +1059,7 @@ fn write_handle_from_append(
 ) -> ClientResult<WriteHandle> {
     let inode_id = inode_id_from_proto(response.inode_id, "AppendFileResponseProto.inode_id")?;
     let data_handle_id = data_handle_id_from_proto(response.data_handle_id, "AppendFileResponseProto.data_handle_id")?;
+    let layout = write_layout_from_proto(response.layout, "AppendFileResponseProto.layout")?;
     let write_handle = response
         .write_handle
         .ok_or_else(|| ClientError::Metadata("AppendFileResponseProto.write_handle missing".to_string()))?;
@@ -1054,6 +1067,7 @@ fn write_handle_from_append(
         path.to_string(),
         inode_id,
         data_handle_id,
+        layout,
         write_handle,
         response.base_size,
     )?;
@@ -1086,6 +1100,11 @@ fn file_version_from_proto(value: Option<u64>, field: &str) -> ClientResult<u64>
     value.ok_or_else(|| ClientError::Metadata(format!("{field} missing")))
 }
 
+fn write_layout_from_proto(value: Option<proto::common::FileLayoutProto>, field: &str) -> ClientResult<FileLayout> {
+    let layout = value.ok_or_else(|| ClientError::Metadata(format!("{field} missing")))?;
+    FileLayout::try_from(layout).map_err(|err| ClientError::InvalidLayout(format!("{field} invalid: {err}")))
+}
+
 fn default_write_preallocation_len() -> u64 {
     u64::from(DEFAULT_BLOCK_SIZE) * MAX_PREALLOCATED_WRITE_BLOCKS
 }
@@ -1103,12 +1122,12 @@ fn default_file_attrs() -> proto::fs::FileAttrsProto {
     }
 }
 
-fn layout_for_new_file() -> proto::common::FileLayoutProto {
+fn layout_for_new_file(options: &CreateOptions) -> proto::common::FileLayoutProto {
     proto::common::FileLayoutProto {
-        block_size: DEFAULT_BLOCK_SIZE,
-        chunk_size: DEFAULT_CHUNK_SIZE,
+        block_size: options.block_size,
+        chunk_size: options.chunk_size,
         replication: DEFAULT_REPLICATION,
-        block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
+        block_format_id: options.block_format_id.as_raw(),
     }
 }
 

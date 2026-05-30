@@ -12,7 +12,7 @@ pub use fs_client::FsClient;
 pub use handle::{FileReader, FileWriter};
 pub use options::{AppendOptions, CreateDisposition, CreateOptions, ListOptions, OpenOptions};
 pub use status::{DirectoryEntry, DirectoryListing, FileStatus};
-pub use types::{FileAttrs, InodeKind};
+pub use types::{BlockFormatId, FileAttrs, InodeKind};
 
 #[cfg(test)]
 mod tests;

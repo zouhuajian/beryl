@@ -3,7 +3,7 @@
 
 //! Focused unit tests for the public API facade and client runtime behavior.
 
-use super::fs_client::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE};
+use super::fs_client::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_REPLICATION};
 use super::handle::ReadHandle;
 use super::*;
 use crate::canonical::{ClientAction, RefreshHint};
@@ -77,6 +77,87 @@ async fn create_returns_writer_and_maps_create_disposition() {
 }
 
 #[tokio::test]
+async fn create_options_default_maps_current_layout_defaults() {
+    let gateway = Arc::new(MockGateway::default());
+    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+
+    client
+        .create("/created", CreateOptions::default())
+        .await
+        .expect("create writer");
+
+    let calls = gateway.calls();
+    assert_eq!(methods(&calls), vec!["create_file"]);
+    assert_eq!(calls[0].create_layout, Some(default_layout()));
+}
+
+#[tokio::test]
+async fn create_options_custom_layout_maps_to_create_request() {
+    let gateway = Arc::new(MockGateway::default());
+    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+
+    client
+        .create(
+            "/created",
+            CreateOptions::create()
+                .with_block_format_id(types::BlockFormatId::CURRENT_FOR_NEW_FILE)
+                .with_block_size(8 * 1024 * 1024)
+                .with_chunk_size(1024 * 1024),
+        )
+        .await
+        .expect("create writer");
+
+    let calls = gateway.calls();
+    assert_eq!(methods(&calls), vec!["create_file"]);
+    assert_eq!(
+        calls[0].create_layout,
+        Some(RecordedLayout {
+            block_size: 8 * 1024 * 1024,
+            chunk_size: 1024 * 1024,
+            replication: DEFAULT_REPLICATION,
+            block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
+        })
+    );
+}
+
+#[tokio::test]
+async fn create_rejects_missing_response_layout() {
+    let gateway = Arc::new(MockGateway::with_create_response_layout(None));
+    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+
+    let err = client
+        .create("/created", CreateOptions::create())
+        .await
+        .expect_err("missing create response layout must fail");
+
+    assert!(
+        matches!(&err, ClientError::Metadata(msg) if msg.contains("CreateFileResponseProto.layout missing")),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(methods(&gateway.calls()), vec!["create_file"]);
+}
+
+#[tokio::test]
+async fn create_rejects_invalid_response_layout() {
+    let gateway = Arc::new(MockGateway::with_create_response_layout(Some(recorded_layout_values(
+        0,
+        DEFAULT_CHUNK_SIZE,
+    ))));
+    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+
+    let err = client
+        .create("/created", CreateOptions::create())
+        .await
+        .expect_err("invalid create response layout must fail");
+
+    assert!(
+        matches!(&err, ClientError::InvalidLayout(msg) if msg.contains("CreateFileResponseProto.layout invalid")),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(methods(&gateway.calls()), vec!["create_file"]);
+}
+
+#[tokio::test]
 async fn overwrite_returns_writer_and_maps_overwrite_disposition() {
     let gateway = Arc::new(MockGateway::default());
     let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
@@ -96,6 +177,39 @@ async fn overwrite_returns_writer_and_maps_overwrite_disposition() {
 }
 
 #[tokio::test]
+async fn overwrite_preserves_custom_create_layout_mapping() {
+    let gateway = Arc::new(MockGateway::default());
+    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+
+    client
+        .create(
+            "/overwrite",
+            CreateOptions::overwrite()
+                .with_block_format_id(types::BlockFormatId::CURRENT_FOR_NEW_FILE)
+                .with_block_size(16 * 1024 * 1024)
+                .with_chunk_size(2 * 1024 * 1024),
+        )
+        .await
+        .expect("overwrite writer");
+
+    let calls = gateway.calls();
+    assert_eq!(methods(&calls), vec!["create_file"]);
+    assert_eq!(
+        calls[0].create_disposition,
+        Some(CreateDispositionProto::Overwrite as i32)
+    );
+    assert_eq!(
+        calls[0].create_layout,
+        Some(RecordedLayout {
+            block_size: 16 * 1024 * 1024,
+            chunk_size: 2 * 1024 * 1024,
+            replication: DEFAULT_REPLICATION,
+            block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
+        })
+    );
+}
+
+#[tokio::test]
 async fn append_returns_writer_from_metadata_session() {
     let gateway = Arc::new(MockGateway::default());
     let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
@@ -107,6 +221,44 @@ async fn append_returns_writer_from_metadata_session() {
 
     assert_eq!(writer.path(), "/append");
     assert_eq!(writer.cursor(), 10);
+    let calls = gateway.calls();
+    assert_eq!(methods(&calls), vec!["append_file"]);
+    assert_eq!(calls[0].create_layout, None);
+}
+
+#[tokio::test]
+async fn append_rejects_missing_response_layout() {
+    let gateway = Arc::new(MockGateway::with_append_response_layout(None));
+    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+
+    let err = client
+        .append("/append", AppendOptions::default())
+        .await
+        .expect_err("missing append response layout must fail");
+
+    assert!(
+        matches!(&err, ClientError::Metadata(msg) if msg.contains("AppendFileResponseProto.layout missing")),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(methods(&gateway.calls()), vec!["append_file"]);
+}
+
+#[tokio::test]
+async fn append_rejects_invalid_response_layout() {
+    let gateway = Arc::new(MockGateway::with_append_response_layout(Some(recorded_layout_values(
+        8, 3,
+    ))));
+    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+
+    let err = client
+        .append("/append", AppendOptions::default())
+        .await
+        .expect_err("invalid append response layout must fail");
+
+    assert!(
+        matches!(&err, ClientError::InvalidLayout(msg) if msg.contains("AppendFileResponseProto.layout invalid")),
+        "unexpected error: {err:?}"
+    );
     assert_eq!(methods(&gateway.calls()), vec!["append_file"]);
 }
 
@@ -329,6 +481,105 @@ async fn writer_write_all_and_close_commit_final_size() {
         .expect("commit_file call");
     assert_eq!(commit.final_size, Some(5));
     assert_eq!(commit.committed_block_lens, vec![5]);
+}
+
+#[tokio::test]
+async fn writer_create_uses_metadata_layout_block_size_for_chunking() {
+    let layout = recorded_layout_values(8, 4);
+    let gateway = Arc::new(MockGateway::default());
+    let worker = Arc::new(MockDataClient::default());
+    let client =
+        FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone())).expect("client");
+    let mut writer = client
+        .create(
+            "/created",
+            CreateOptions::create()
+                .with_block_size(layout.block_size)
+                .with_chunk_size(layout.chunk_size),
+        )
+        .await
+        .expect("writer");
+
+    writer
+        .write_all(Bytes::from(vec![b'x'; 20]))
+        .await
+        .expect("write should split by metadata layout");
+    writer.close().await.expect("close");
+
+    let calls = gateway.calls();
+    let add_lens = add_block_lens(&calls);
+    assert_eq!(add_lens, vec![8, 8, 4]);
+    assert_eq!(worker.write_lens(), vec![8, 8, 4]);
+    let commit = calls
+        .into_iter()
+        .find(|call| call.method == "commit_file")
+        .expect("commit_file call");
+    assert_eq!(commit.final_size, Some(20));
+    assert_eq!(commit.committed_block_lens, vec![8, 8, 4]);
+}
+
+#[tokio::test]
+async fn writer_append_uses_metadata_layout_block_size_for_chunking() {
+    let layout = recorded_layout_values(6, 3);
+    let gateway = Arc::new(MockGateway::with_append_write_layout(layout));
+    let worker = Arc::new(MockDataClient::default());
+    let client =
+        FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone())).expect("client");
+    let mut writer = client
+        .append("/append", AppendOptions::default())
+        .await
+        .expect("writer");
+
+    writer
+        .write_all(Bytes::from(vec![b'x'; 14]))
+        .await
+        .expect("append write should split by metadata layout");
+    writer.close().await.expect("close");
+
+    let calls = gateway.calls();
+    let append = calls
+        .iter()
+        .find(|call| call.method == "append_file")
+        .expect("append_file call");
+    assert_eq!(append.create_layout, None);
+    assert_eq!(add_block_lens(&calls), vec![6, 6, 2]);
+    assert_eq!(worker.write_lens(), vec![6, 6, 2]);
+    let commit = calls
+        .into_iter()
+        .find(|call| call.method == "commit_file")
+        .expect("commit_file call");
+    assert_eq!(commit.final_size, Some(24));
+    assert_eq!(commit.committed_block_offsets, vec![10, 16, 22]);
+    assert_eq!(commit.committed_block_lens, vec![6, 6, 2]);
+}
+
+#[tokio::test]
+async fn writer_default_create_layout_uses_default_block_size_for_chunking() {
+    let gateway = Arc::new(MockGateway::default());
+    let worker = Arc::new(MockDataClient::without_recorded_body());
+    let client =
+        FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone())).expect("client");
+    let mut writer = client
+        .create("/created", CreateOptions::default())
+        .await
+        .expect("writer");
+    let len = DEFAULT_BLOCK_SIZE as usize + 3;
+
+    writer
+        .write_all(Bytes::from(vec![b'x'; len]))
+        .await
+        .expect("write should split by default metadata layout");
+    writer.close().await.expect("close");
+
+    let calls = gateway.calls();
+    assert_eq!(add_block_lens(&calls), vec![u64::from(DEFAULT_BLOCK_SIZE), 3]);
+    assert_eq!(worker.write_lens(), vec![u64::from(DEFAULT_BLOCK_SIZE), 3]);
+    let commit = calls
+        .into_iter()
+        .find(|call| call.method == "commit_file")
+        .expect("commit_file call");
+    assert_eq!(commit.final_size, Some(len as u64));
+    assert_eq!(commit.committed_block_lens, vec![u64::from(DEFAULT_BLOCK_SIZE), 3]);
 }
 
 #[tokio::test]
@@ -604,6 +855,55 @@ struct RecordedCall {
     committed_block_lens: Vec<u64>,
     sync_mode: Option<i32>,
     create_disposition: Option<i32>,
+    create_layout: Option<RecordedLayout>,
+    add_block_desired_len: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecordedLayout {
+    block_size: u32,
+    chunk_size: u32,
+    replication: u32,
+    block_format_id: u32,
+}
+
+fn default_layout() -> RecordedLayout {
+    recorded_layout_values(DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE)
+}
+
+fn recorded_layout_values(block_size: u32, chunk_size: u32) -> RecordedLayout {
+    RecordedLayout {
+        block_size,
+        chunk_size,
+        replication: DEFAULT_REPLICATION,
+        block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
+    }
+}
+
+fn recorded_layout(layout: &proto::common::FileLayoutProto) -> RecordedLayout {
+    RecordedLayout {
+        block_size: layout.block_size,
+        chunk_size: layout.chunk_size,
+        replication: layout.replication,
+        block_format_id: layout.block_format_id,
+    }
+}
+
+fn layout_proto(layout: RecordedLayout) -> proto::common::FileLayoutProto {
+    proto::common::FileLayoutProto {
+        block_size: layout.block_size,
+        chunk_size: layout.chunk_size,
+        replication: layout.replication,
+        block_format_id: layout.block_format_id,
+    }
+}
+
+fn add_block_lens(calls: &[RecordedCall]) -> Vec<u64> {
+    calls
+        .iter()
+        .filter(|call| call.method == "add_block")
+        .map(|call| call.add_block_desired_len.expect("add_block desired_len"))
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -613,6 +913,10 @@ struct MockGateway {
     list_requests: Mutex<Vec<ListStatusOp>>,
     next_offsets: Mutex<HashMap<u64, u64>>,
     next_block_indexes: Mutex<HashMap<u64, u32>>,
+    write_layouts: Mutex<HashMap<u64, RecordedLayout>>,
+    append_write_layout: Mutex<Option<RecordedLayout>>,
+    create_response_layout: Mutex<Option<Option<RecordedLayout>>>,
+    append_response_layout: Mutex<Option<Option<RecordedLayout>>>,
     add_block_outcomes: Mutex<VecDeque<AddBlockOutcome>>,
     renew_outcomes: Mutex<VecDeque<RenewOutcome>>,
     events: Option<EventLog>,
@@ -639,6 +943,27 @@ impl MockGateway {
         layouts.push_back(layout);
         Self {
             layouts: Mutex::new(layouts),
+            ..Self::default()
+        }
+    }
+
+    fn with_create_response_layout(layout: Option<RecordedLayout>) -> Self {
+        Self {
+            create_response_layout: Mutex::new(Some(layout)),
+            ..Self::default()
+        }
+    }
+
+    fn with_append_write_layout(layout: RecordedLayout) -> Self {
+        Self {
+            append_write_layout: Mutex::new(Some(layout)),
+            ..Self::default()
+        }
+    }
+
+    fn with_append_response_layout(layout: Option<RecordedLayout>) -> Self {
+        Self {
+            append_response_layout: Mutex::new(Some(layout)),
             ..Self::default()
         }
     }
@@ -687,6 +1012,8 @@ impl MockGateway {
             committed_block_lens: Vec::new(),
             sync_mode: None,
             create_disposition: None,
+            create_layout: None,
+            add_block_desired_len: None,
         });
     }
 
@@ -704,6 +1031,8 @@ impl MockGateway {
             committed_block_lens: Vec::new(),
             sync_mode: None,
             create_disposition: Some(req.disposition),
+            create_layout: req.layout.as_ref().map(recorded_layout),
+            add_block_desired_len: None,
         });
     }
 
@@ -726,6 +1055,8 @@ impl MockGateway {
             committed_block_lens: Vec::new(),
             sync_mode: None,
             create_disposition: None,
+            create_layout: None,
+            add_block_desired_len: None,
         });
     }
 
@@ -744,6 +1075,8 @@ impl MockGateway {
             committed_block_lens: req.committed_blocks.iter().map(|block| block.len).collect(),
             sync_mode: None,
             create_disposition: None,
+            create_layout: None,
+            add_block_desired_len: None,
         });
     }
 
@@ -761,6 +1094,27 @@ impl MockGateway {
             committed_block_lens: req.committed_blocks.iter().map(|block| block.len).collect(),
             sync_mode: Some(req.mode),
             create_disposition: None,
+            create_layout: None,
+            add_block_desired_len: None,
+        });
+    }
+
+    fn record_add_block(&self, ctx: &AttemptContext, req: &AddBlockOp) {
+        let header = ctx.metadata_header().expect("metadata header");
+        self.calls.lock().expect("calls").push(RecordedCall {
+            method: "add_block",
+            group_id: header.group_id,
+            call_id: header.client.as_ref().expect("client").call_id.clone(),
+            target_data_handle_id: None,
+            range: None,
+            target_size: None,
+            final_size: None,
+            committed_block_offsets: Vec::new(),
+            committed_block_lens: Vec::new(),
+            sync_mode: None,
+            create_disposition: None,
+            create_layout: None,
+            add_block_desired_len: req.desired_len,
         });
     }
 
@@ -830,11 +1184,19 @@ impl MetadataGateway for MockGateway {
     async fn create_file(&self, ctx: AttemptContext, req: CreateFileOp) -> ClientResult<WriteSessionSeed> {
         self.record_create_file(&ctx, &req);
         self.next_offsets.lock().expect("offsets").insert(1, 0);
+        let layout = req.layout.as_ref().map(recorded_layout).unwrap_or_else(default_layout);
+        self.write_layouts.lock().expect("write layouts").insert(1, layout);
+        let response_layout = self
+            .create_response_layout
+            .lock()
+            .expect("create response layout")
+            .unwrap_or(Some(layout));
         Ok(WriteSessionSeed::Create(CreateFileResponseProto {
             write_handle: Some(write_handle_proto(1, 302)),
             inode_id: Some(proto::fs::InodeIdProto { value: 301 }),
             data_handle_id: Some(proto::common::DataHandleIdProto { value: 302 }),
             base_size: 0,
+            layout: response_layout.map(layout_proto),
             ..CreateFileResponseProto::default()
         }))
     }
@@ -842,24 +1204,44 @@ impl MetadataGateway for MockGateway {
     async fn append_file(&self, ctx: AttemptContext, _req: AppendFileOp) -> ClientResult<WriteSessionSeed> {
         self.record("append_file", &ctx);
         self.next_offsets.lock().expect("offsets").insert(2, 10);
+        let layout = self
+            .append_write_layout
+            .lock()
+            .expect("append write layout")
+            .unwrap_or_else(default_layout);
+        self.write_layouts.lock().expect("write layouts").insert(2, layout);
+        let response_layout = self
+            .append_response_layout
+            .lock()
+            .expect("append response layout")
+            .unwrap_or(Some(layout));
         Ok(WriteSessionSeed::Append(AppendFileResponseProto {
             write_handle: Some(write_handle_proto(2, 402)),
             inode_id: Some(proto::fs::InodeIdProto { value: 401 }),
             data_handle_id: Some(proto::common::DataHandleIdProto { value: 402 }),
             base_size: 10,
+            layout: response_layout.map(layout_proto),
             ..AppendFileResponseProto::default()
         }))
     }
 
     async fn add_block(&self, ctx: AttemptContext, req: AddBlockOp) -> ClientResult<AddBlockResult> {
-        self.record("add_block", &ctx);
+        self.record_add_block(&ctx, &req);
         if matches!(self.next_add_block_outcome(), AddBlockOutcome::TransportUnknown) {
             return Err(ClientError::from(tonic::Status::unavailable(
                 "injected AddBlock transport uncertainty",
             )));
         }
         let write_handle = req.write_handle.as_ref().expect("write handle");
-        let len = req.desired_len.expect("desired len");
+        let requested_len = req.desired_len.expect("desired len");
+        let layout = self
+            .write_layouts
+            .lock()
+            .expect("write layouts")
+            .get(&write_handle.handle_id)
+            .copied()
+            .unwrap_or_else(default_layout);
+        let len = requested_len.min(u64::from(layout.block_size)).max(1);
         let offset = {
             let mut offsets = self.next_offsets.lock().expect("offsets");
             let offset = *offsets.entry(write_handle.handle_id).or_insert(0);
@@ -881,7 +1263,7 @@ impl MetadataGateway for MockGateway {
         let header = ctx.metadata_header().expect("metadata header");
         Ok(AddBlockResult {
             group_id: header.group_id,
-            target: write_target(data_handle_id, block_index, offset, len),
+            target: write_target_with_layout(data_handle_id, block_index, offset, len, layout),
         })
     }
 
@@ -952,10 +1334,12 @@ struct MockDataClient {
     refresh_once: Mutex<Option<RefreshReason>>,
     calls: Mutex<usize>,
     written: Mutex<Vec<u8>>,
+    written_lens: Mutex<Vec<u64>>,
     committed: Mutex<Vec<u64>>,
     committed_streams: Mutex<std::collections::HashSet<(u64, u64)>>,
     commit_sync_flags: Mutex<Vec<bool>>,
     block_syncs: Mutex<Vec<u64>>,
+    record_written_body: bool,
     events: Option<EventLog>,
 }
 
@@ -966,11 +1350,20 @@ impl MockDataClient {
             refresh_once: Mutex::new(None),
             calls: Mutex::new(0),
             written: Mutex::new(Vec::new()),
+            written_lens: Mutex::new(Vec::new()),
             committed: Mutex::new(Vec::new()),
             committed_streams: Mutex::new(std::collections::HashSet::new()),
             commit_sync_flags: Mutex::new(Vec::new()),
             block_syncs: Mutex::new(Vec::new()),
+            record_written_body: true,
             events: None,
+        }
+    }
+
+    fn without_recorded_body() -> Self {
+        Self {
+            record_written_body: false,
+            ..Self::default()
         }
     }
 
@@ -994,6 +1387,10 @@ impl MockDataClient {
 
     fn written_bytes(&self) -> Bytes {
         Bytes::from(self.written.lock().expect("written").clone())
+    }
+
+    fn write_lens(&self) -> Vec<u64> {
+        self.written_lens.lock().expect("written lens").clone()
     }
 
     fn commit_sync_flags(&self) -> Vec<bool> {
@@ -1066,7 +1463,10 @@ impl WorkerDataClient for MockDataClient {
         data: Bytes,
     ) -> ClientResult<proto::worker::WriteStreamResponseProto> {
         self.record_event("write_stream");
-        self.written.lock().expect("written").extend_from_slice(&data);
+        self.written_lens.lock().expect("written lens").push(data.len() as u64);
+        if self.record_written_body {
+            self.written.lock().expect("written").extend_from_slice(&data);
+        }
         let frame_size = block.frame_size.max(1) as usize;
         let frame_count = data.len().div_ceil(frame_size) as u64;
         Ok(proto::worker::WriteStreamResponseProto {
@@ -1197,18 +1597,24 @@ fn write_handle_proto(handle_id: u64, data_handle_id: u64) -> WriteHandleProto {
     }
 }
 
-fn write_target(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -> WriteTarget {
+fn write_target_with_layout(
+    data_handle_id: u64,
+    block_index: u32,
+    file_offset: u64,
+    len: u64,
+    layout: RecordedLayout,
+) -> WriteTarget {
     let block_id = BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(block_index));
     WriteTarget {
         block_id,
         file_offset,
-        block_size: DEFAULT_BLOCK_SIZE.into(),
+        block_size: u64::from(layout.block_size),
         effective_block_len: len,
         worker_endpoints: vec![worker_endpoint()],
         fencing_token: FencingToken::new(block_id, ClientId::new(7), 1),
         block_stamp: 1,
-        chunk_size: DEFAULT_CHUNK_SIZE,
-        block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
+        chunk_size: layout.chunk_size,
+        block_format_id: types::BlockFormatId::from_raw(layout.block_format_id).expect("known test block format"),
     }
 }
 

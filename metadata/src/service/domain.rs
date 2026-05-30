@@ -260,6 +260,7 @@ pub struct OpenWriteOutput {
     pub inode_id: InodeId,
     pub data_handle_id: DataHandleId,
     pub session_key: SessionKey,
+    pub layout: FileLayout,
     pub write_targets: Vec<WriteTarget>,
     pub base_size: u64,
     pub expires_at_ms: u64,

@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use proto::metadata::{AbortFileWriteRequestProto, CommitFileRequestProto, WriteHandleProto};
-use types::{CallId, ClientId, CommittedBlock, DataHandleId, InodeId, WriteTarget};
+use types::{CallId, ClientId, CommittedBlock, DataHandleId, FileLayout, InodeId, WriteTarget};
 
 use crate::data::WorkerWriteBlock;
 use crate::error::{ClientError, ClientResult};
@@ -22,6 +22,7 @@ pub(crate) struct WriteSession {
     path: String,
     inode_id: InodeId,
     data_handle_id: DataHandleId,
+    layout: FileLayout,
     file_version: Option<u64>,
     write_handle: WriteHandleProto,
     cursor: u64,
@@ -39,14 +40,19 @@ impl WriteSession {
         path: String,
         inode_id: InodeId,
         data_handle_id: DataHandleId,
+        layout: FileLayout,
         write_handle: WriteHandleProto,
         base_size: u64,
     ) -> ClientResult<Self> {
         validate_write_handle(&write_handle)?;
+        layout
+            .validate()
+            .map_err(|err| ClientError::InvalidLayout(format!("write session layout invalid: {err}")))?;
         Ok(Self {
             path,
             inode_id,
             data_handle_id,
+            layout,
             file_version: None,
             write_handle,
             cursor: base_size,
@@ -67,6 +73,11 @@ impl WriteSession {
     /// Current sequential write cursor.
     pub(crate) fn cursor(&self) -> u64 {
         self.cursor
+    }
+
+    /// Authoritative metadata block size for splitting public writes.
+    pub(crate) fn block_size(&self) -> u32 {
+        self.layout.block_size
     }
 
     /// Metadata write handle.
@@ -1002,6 +1013,7 @@ mod tests {
             "/alpha".to_string(),
             InodeId::new(301),
             DataHandleId::new(302),
+            test_layout(),
             write_handle_proto(1, 302),
             0,
         )
@@ -1033,6 +1045,7 @@ mod tests {
             "/alpha".to_string(),
             InodeId::new(301),
             DataHandleId::new(302),
+            test_layout(),
             write_handle_proto(1, 302),
             0,
         )
@@ -1054,6 +1067,7 @@ mod tests {
             "/alpha".to_string(),
             InodeId::new(301),
             DataHandleId::new(302),
+            test_layout(),
             write_handle_proto(1, 302),
             0,
         )
@@ -1098,6 +1112,7 @@ mod tests {
             "/alpha".to_string(),
             InodeId::new(301),
             DataHandleId::new(302),
+            test_layout(),
             write_handle_proto(1, 302),
             0,
         )
@@ -1151,6 +1166,7 @@ mod tests {
             "/alpha".to_string(),
             InodeId::new(301),
             DataHandleId::new(302),
+            test_layout(),
             write_handle_proto(1, 302),
             0,
         )
@@ -1188,6 +1204,7 @@ mod tests {
             "/alpha".to_string(),
             InodeId::new(301),
             DataHandleId::new(302),
+            test_layout(),
             write_handle_proto(1, 302),
             0,
         )
@@ -1218,6 +1235,7 @@ mod tests {
             "/alpha".to_string(),
             InodeId::new(301),
             DataHandleId::new(302),
+            test_layout(),
             write_handle_proto(1, 302),
             0,
         )
@@ -1304,6 +1322,7 @@ mod tests {
                 "/alpha".to_string(),
                 InodeId::new(301),
                 DataHandleId::new(302),
+                test_layout(),
                 write_handle_proto(1, 302),
                 0,
             )
@@ -1336,6 +1355,10 @@ mod tests {
         OperationIdentity::session("/alpha", "session-1")
             .with_detail(detail)
             .fingerprint(OperationKind::MetadataSessionBarrier, "CommitFile")
+    }
+
+    fn test_layout() -> FileLayout {
+        FileLayout::new(1024, 1024, 1)
     }
 
     fn write_handle_proto(handle_id: u64, data_handle_id: u64) -> WriteHandleProto {

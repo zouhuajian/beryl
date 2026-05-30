@@ -3,19 +3,34 @@
 
 //! Public filesystem operation options.
 
+use super::fs_client::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE};
+use types::BlockFormatId;
+
 /// Options for opening an existing file for reads.
 ///
 /// This type is intentionally empty until the client supports stable read-open
-/// options. It exists to keep the public entrypoint explicit without implying
-/// write, create, append, or truncate behavior.
+/// options. Existing files use the metadata-stored `FileLayout`; read-open
+/// options do not carry create-time layout overrides.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OpenOptions {}
 
-/// Options for creating a file write session.
+/// Options for creating a file write session and, for new files only, proposing a `FileLayout`.
+///
+/// Metadata validates and persists the accepted layout. Existing files opened
+/// for append do not use these create-time layout fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CreateOptions {
     /// Creation behavior for the target path.
     pub disposition: CreateDisposition,
+
+    /// Block data/meta interpretation format for newly created files.
+    pub block_format_id: BlockFormatId,
+
+    /// Logical block size in bytes for newly created files.
+    pub block_size: u32,
+
+    /// Logical chunk size in bytes for newly created files.
+    pub chunk_size: u32,
 }
 
 impl Default for CreateOptions {
@@ -29,6 +44,9 @@ impl CreateOptions {
     pub fn create() -> Self {
         Self {
             disposition: CreateDisposition::Create,
+            block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
+            block_size: DEFAULT_BLOCK_SIZE,
+            chunk_size: DEFAULT_CHUNK_SIZE,
         }
     }
 
@@ -36,13 +54,36 @@ impl CreateOptions {
     pub fn overwrite() -> Self {
         Self {
             disposition: CreateDisposition::Overwrite,
+            block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
+            block_size: DEFAULT_BLOCK_SIZE,
+            chunk_size: DEFAULT_CHUNK_SIZE,
         }
+    }
+
+    /// Set the block format id proposed for a newly created file.
+    pub fn with_block_format_id(mut self, block_format_id: BlockFormatId) -> Self {
+        self.block_format_id = block_format_id;
+        self
+    }
+
+    /// Set the block size proposed for a newly created file.
+    pub fn with_block_size(mut self, block_size: u32) -> Self {
+        self.block_size = block_size;
+        self
+    }
+
+    /// Set the chunk size proposed for a newly created file.
+    pub fn with_chunk_size(mut self, chunk_size: u32) -> Self {
+        self.chunk_size = chunk_size;
+        self
     }
 }
 
 /// Options for opening an append write session.
 ///
 /// This type is intentionally empty until append has stable public options.
+/// Append uses the metadata-stored `FileLayout` for the existing file and does
+/// not carry create-time layout overrides.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AppendOptions {}
 

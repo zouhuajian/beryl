@@ -1512,6 +1512,32 @@ mod tests {
                 ("uint64", "effective_block_len", 9),
             ]
         );
+        assert_eq!(
+            proto_message_fields(metadata_proto, "CreateFileResponseProto"),
+            vec![
+                ("common.ResponseHeaderProto", "header", 1),
+                ("WriteHandleProto", "write_handle", 2),
+                ("fs.InodeIdProto", "inode_id", 3),
+                ("common.DataHandleIdProto", "data_handle_id", 4),
+                ("uint64", "base_size", 5),
+                ("WriteTargetProto", "initial_targets", 6),
+                ("uint64", "expires_at_ms", 7),
+                ("common.FileLayoutProto", "layout", 8),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(metadata_proto, "AppendFileResponseProto"),
+            vec![
+                ("common.ResponseHeaderProto", "header", 1),
+                ("WriteHandleProto", "write_handle", 2),
+                ("fs.InodeIdProto", "inode_id", 3),
+                ("common.DataHandleIdProto", "data_handle_id", 4),
+                ("uint64", "base_size", 5),
+                ("WriteTargetProto", "initial_targets", 6),
+                ("uint64", "expires_at_ms", 7),
+                ("common.FileLayoutProto", "layout", 8),
+            ]
+        );
 
         let metadata_worker_proto = include_str!("../metadata/worker.proto");
         assert_eq!(

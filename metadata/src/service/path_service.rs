@@ -1264,6 +1264,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         base_size: payload.base_size,
                         initial_targets: Vec::new(),
                         expires_at_ms: payload.expires_at_ms,
+                        layout: Some((&payload.layout).into()),
                         ..Default::default()
                     },
                     header
@@ -1339,6 +1340,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         base_size: payload.base_size,
                         initial_targets: Vec::new(),
                         expires_at_ms: payload.expires_at_ms,
+                        layout: Some((&payload.layout).into()),
                         ..Default::default()
                     },
                     header

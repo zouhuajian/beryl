@@ -220,6 +220,8 @@ message CreateFileResponseProto {
   // P0 contract: CreateFile does not issue write targets; callers must use AddBlock.
   repeated WriteTargetProto initial_targets = 6;
   uint64 expires_at_ms = 7;
+  // Metadata-stored FileLayout accepted for this write session.
+  common.FileLayoutProto layout = 8;
 }
 
 message AppendFileRequestProto {
@@ -237,6 +239,8 @@ message AppendFileResponseProto {
   // P0 contract: AppendFile does not issue write targets; callers must use AddBlock.
   repeated WriteTargetProto initial_targets = 6;
   uint64 expires_at_ms = 7;
+  // Metadata-stored FileLayout for the existing file.
+  common.FileLayoutProto layout = 8;
 }
 
 message AddBlockRequestProto {

@@ -95,6 +95,33 @@ pub fn probe(_handle: FileHandle, _mode: CreateMode) {}
     );
 }
 
+#[test]
+fn existing_file_options_do_not_expose_layout_overrides() {
+    assert_external_snippet_fails(
+        "existing_file_options_layout_free",
+        r#"
+use client::{AppendOptions, OpenOptions};
+
+pub fn probe_layout_free_existing_file_options(open: OpenOptions, append: AppendOptions) {
+    let _ = open.block_format_id;
+    let _ = open.block_size;
+    let _ = open.chunk_size;
+    let _ = append.block_format_id;
+    let _ = append.block_size;
+    let _ = append.chunk_size;
+}
+"#,
+        &[
+            "no field `block_format_id` on type `client::OpenOptions`",
+            "no field `block_size` on type `client::OpenOptions`",
+            "no field `chunk_size` on type `client::OpenOptions`",
+            "no field `block_format_id` on type `AppendOptions`",
+            "no field `block_size` on type `AppendOptions`",
+            "no field `chunk_size` on type `AppendOptions`",
+        ],
+    );
+}
+
 fn assert_external_snippet_fails(name: &str, source: &str, expected_stderr: &[&str]) {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_dir = manifest_dir.parent().expect("client crate lives under workspace root");

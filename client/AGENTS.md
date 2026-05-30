@@ -25,6 +25,14 @@ This file applies to `client/`. Follow the root `AGENTS.md` first; this crate ow
 - Avoid blind retry loops; classify retry, refresh, replay, endpoint invalidation, and unknown outcome explicitly.
 - Do not add test-only cache seeding, injection, force, or fake APIs to production modules.
 
+## Public API Contract
+
+- Create-time layout options apply only to new file creation.
+- Existing files use metadata-stored `FileLayout`; `OpenOptions` and `AppendOptions` must not carry layout overrides.
+- Rust native writer sync APIs are only sync_write_visibility and sync_write_durability.
+- Public reads must not add a read layout cache.
+- Public reads and writes must not add metadata-less direct worker access.
+
 ## Tests
 
 - Test route refresh, not-leader refresh/replay, stale route/mount/worker-run/block-stamp behavior, follower-read watermark gating, group-scoped watermark comparison, write-session invalidation, fencing/session-expired behavior, transport-vs-business failure classification, and stale direct-path fallback-to-refresh where relevant.
