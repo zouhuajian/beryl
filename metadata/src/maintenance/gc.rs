@@ -709,7 +709,12 @@ mod tests {
     use tempfile::TempDir;
     use types::block::{BlockPlacement, BlockState};
     use types::fs::{FileAttrs, Inode, InodeId};
-    use types::ids::{ShardGroupId, WorkerId};
+    use types::GroupName;
+    use types::WorkerId;
+
+    fn group_name(raw: &str) -> GroupName {
+        GroupName::parse(raw).unwrap()
+    }
 
     struct GcTestEnv {
         _temp_dir: TempDir,
@@ -722,13 +727,10 @@ mod tests {
 
     async fn new_gc_test_env() -> MetadataResult<GcTestEnv> {
         let temp_dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(temp_dir.path())?);
+        let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path())?);
         let mount_table = Arc::new(MountTable::new());
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
-        let raft_config = RaftConfig {
-            node_id: 1,
-            peers: vec!["127.0.0.1:0".to_string()],
-        };
+        let raft_config = RaftConfig::default();
         let raft_node = Arc::new(
             AppRaftNode::new(
                 raft_config.node_id,
@@ -739,6 +741,10 @@ mod tests {
             .await
             .unwrap(),
         );
+        raft_node
+            .initialize_single_node("127.0.0.1:0".to_string())
+            .await
+            .unwrap();
         wait_for_test_leader(&raft_node).await;
 
         let worker_manager = Arc::new(WorkerManager::new(60));
@@ -807,7 +813,7 @@ mod tests {
         mount_table: &MountTable,
         block_id: BlockId,
         inode_id: InodeId,
-        owner_group: ShardGroupId,
+        owner_group: GroupName,
     ) -> MetadataResult<()> {
         let mount_entry = mount_table.create_mount(
             format!("/gc-{}", block_id.data_handle_id.as_raw()),
@@ -853,7 +859,7 @@ mod tests {
             &env.mount_table,
             built_block,
             InodeId::new(902),
-            ShardGroupId::new(7),
+            group_name("g7"),
         )?;
         seed_eligible_candidate(&env.candidates, failed_block);
         seed_eligible_candidate(&env.candidates, built_block);
@@ -885,7 +891,7 @@ mod tests {
             &env.mount_table,
             built_block,
             InodeId::new(912),
-            ShardGroupId::new(8),
+            group_name("g8"),
         )?;
         seed_eligible_candidate(&env.candidates, failed_block);
         seed_eligible_candidate(&env.candidates, built_block);

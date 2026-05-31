@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 use types::group_watermark::{GroupStateWatermark, MountEpoch};
-use types::ids::{BlockId, ShardGroupId};
-use types::RaftLogId;
+use types::ids::BlockId;
+use types::{GroupName, RaftLogId};
 
 /// Result of destructive action gate check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,11 +39,11 @@ pub struct DestructiveCheckContext {
     /// Block ID (if applicable).
     pub block_id: Option<BlockId>,
     /// Shard group ID (required for cross-group gate control).
-    pub group_id: Option<ShardGroupId>,
+    pub group_name: Option<GroupName>,
     /// Mount epoch (for route consistency checking).
     /// If provided, must match current mount_table.version().
     pub mount_epoch: Option<MountEpoch>,
-    /// Guard watermark (group_id + state_id).
+    /// Guard watermark (group_name + state_id).
     /// If provided, the target shard group must have applied at least up to this state_id.
     pub guard_watermark: Option<GroupStateWatermark>,
     /// Single-group guard state ID used when no group-scoped watermark is provided.
@@ -59,7 +59,7 @@ impl DestructiveCheckContext {
     pub fn new(action_type: impl Into<String>) -> Self {
         Self {
             block_id: None,
-            group_id: None,
+            group_name: None,
             mount_epoch: None,
             guard_watermark: None,
             guard_state_id: None,
@@ -73,8 +73,8 @@ impl DestructiveCheckContext {
         self
     }
 
-    pub fn with_group_id(mut self, group_id: ShardGroupId) -> Self {
-        self.group_id = Some(group_id);
+    pub fn with_group_name(mut self, group_name: GroupName) -> Self {
+        self.group_name = Some(group_name);
         self
     }
 
@@ -153,7 +153,10 @@ impl DestructiveGate {
                         current_mount_epoch.as_u64()
                     ),
                     latest_mount_epoch: Some(current_mount_epoch),
-                    route_hint: ctx.group_id.map(|gid| format!("group_id={}", gid.as_raw())),
+                    route_hint: ctx
+                        .group_name
+                        .as_ref()
+                        .map(|group_name| format!("group_name={}", group_name)),
                 });
             }
         }
@@ -189,17 +192,15 @@ impl DestructiveGate {
                 if !guard_watermark.is_reached(&current) {
                     return Ok(DestructiveCheckResult::Blocked {
                         reason: format!(
-                            "watermark_not_reached: group_id={}, current={:?}, guard={:?}",
-                            guard_watermark.group_id.as_raw(),
-                            current,
-                            guard_watermark.state_id
+                            "watermark_not_reached: group_name={}, current={:?}, guard={:?}",
+                            guard_watermark.group_name, current, guard_watermark.state_id
                         ),
                     });
                 }
             } else {
                 // No state_id yet, block
                 return Ok(DestructiveCheckResult::Blocked {
-                    reason: format!("state_id_not_available: group_id={}", guard_watermark.group_id.as_raw()),
+                    reason: format!("state_id_not_available: group_name={}", guard_watermark.group_name),
                 });
             }
         } else if let Some(guard_state_id) = ctx.guard_state_id {

@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Metadata bootstrap helpers.
+//! Root namespace initialization helpers.
 
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::{DataIoPolicy, MountKind, MountTable, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
 use crate::raft::{AppRaftNode, Command, DedupKey};
 use std::sync::Arc;
 use tracing::warn;
-use types::ids::ShardGroupId;
+use types::GroupName;
 
-/// Ensure the root mount exists and is durable.
-pub async fn ensure_root_mount(
+/// Ensure the root mount exists and is durable during metadata format.
+pub async fn ensure_root_mount_for_format(
     raft_node: Arc<AppRaftNode>,
     mount_table: Arc<MountTable>,
-    namespace_owner_group_id: ShardGroupId,
+    namespace_owner_group_name: GroupName,
 ) -> MetadataResult<()> {
     if let Some(existing) = mount_table
         .list_mounts()
@@ -51,7 +51,7 @@ pub async fn ensure_root_mount(
         mount_kind: MountKind::Internal,
         ufs_uri: None,
         data_io_policy: DataIoPolicy::Forbid,
-        namespace_owner_group_id,
+        namespace_owner_group_name,
         root_inode_id: ROOT_INODE_ID,
     };
 
@@ -75,28 +75,31 @@ mod tests {
     use tempfile::TempDir;
     use types::fs::InodeId;
     use types::ids::MountId;
+    use types::GroupName;
 
     #[tokio::test]
-    async fn bootstrap_root_mount_exists() {
+    async fn root_init_root_mount_exists() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::load_from_storage(&storage).unwrap());
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
 
-        let raft_config = RaftConfig {
-            node_id: 1,
-            peers: vec!["127.0.0.1:0".to_string()],
-        };
+        let raft_config = RaftConfig::default();
         let raft_node = Arc::new(
             AppRaftNode::new(1, Arc::clone(&storage), Arc::clone(&state_machine), &raft_config)
                 .await
                 .unwrap(),
         );
-
-        ensure_root_mount(Arc::clone(&raft_node), Arc::clone(&mount_table), ShardGroupId::new(1))
+        raft_node
+            .initialize_single_node("127.0.0.1:0".to_string())
             .await
             .unwrap();
-        ensure_root_mount(Arc::clone(&raft_node), Arc::clone(&mount_table), ShardGroupId::new(1))
+
+        let group_name = GroupName::parse("root").unwrap();
+        ensure_root_mount_for_format(Arc::clone(&raft_node), Arc::clone(&mount_table), group_name.clone())
+            .await
+            .unwrap();
+        ensure_root_mount_for_format(Arc::clone(&raft_node), Arc::clone(&mount_table), group_name.clone())
             .await
             .unwrap();
 
@@ -105,11 +108,13 @@ mod tests {
             initial_backoff_ms: 10,
             max_backoff_ms: 50,
             warn_after_ms: 200,
+            timeout_ms: 2_000,
+            fail_fast: true,
         };
         wait_for_root_ready(
             Arc::clone(&raft_node),
             Arc::clone(&mount_table),
-            ShardGroupId::new(1),
+            group_name,
             Arc::clone(&readiness_gate),
             readiness_config,
         )
@@ -140,9 +145,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_rejects_root_inode_mismatch() {
+    async fn root_init_rejects_root_inode_mismatch() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let bad_root_inode = InodeId::new(2);
         let entry = crate::mount::MountEntry {
             mount_id: MountId::new(1),
@@ -151,7 +156,7 @@ mod tests {
             ufs_uri: None,
             data_io_policy: DataIoPolicy::Forbid,
             mount_version: 1,
-            namespace_owner_group_id: ShardGroupId::new(1),
+            namespace_owner_group_name: GroupName::parse("root").unwrap(),
             root_inode_id: bad_root_inode,
         };
         storage.put_mount(&entry).unwrap();
@@ -159,17 +164,14 @@ mod tests {
         let mount_table = Arc::new(MountTable::load_from_storage(&storage).unwrap());
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
 
-        let raft_config = RaftConfig {
-            node_id: 1,
-            peers: vec!["127.0.0.1:0".to_string()],
-        };
+        let raft_config = RaftConfig::default();
         let raft_node = Arc::new(
             AppRaftNode::new(1, Arc::clone(&storage), Arc::clone(&state_machine), &raft_config)
                 .await
                 .unwrap(),
         );
 
-        let err = ensure_root_mount(raft_node, mount_table, ShardGroupId::new(1))
+        let err = ensure_root_mount_for_format(raft_node, mount_table, GroupName::parse("root").unwrap())
             .await
             .unwrap_err();
         let msg = format!("{err}");

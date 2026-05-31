@@ -2,9 +2,9 @@ use common::header::CallerContextFields;
 use metadata::placement::{
     PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus, ReportedBlockLocation, WorkerPlacementView,
 };
-use types::ids::{BlockId, BlockIndex, DataHandleId, ShardGroupId, WorkerId};
+use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
 use types::layout::{BlockFormatId, FileLayout};
-use types::WorkerRunId;
+use types::{GroupName, WorkerRunId};
 
 fn run_id(suffix: u32) -> WorkerRunId {
     format!("550e8400-e29b-41d4-a716-{suffix:012}")
@@ -16,9 +16,13 @@ fn block(data_handle_id: u64, index: u32) -> BlockId {
     BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(index))
 }
 
-fn worker(group_id: ShardGroupId, worker_id: u64, worker_run_id: WorkerRunId, host: &str) -> WorkerPlacementView {
+fn group_name(raw: &str) -> GroupName {
+    GroupName::parse(raw).unwrap()
+}
+
+fn worker(group_name: &GroupName, worker_id: u64, worker_run_id: WorkerRunId, host: &str) -> WorkerPlacementView {
     WorkerPlacementView {
-        group_id,
+        group_name: group_name.clone(),
         worker_id: WorkerId::new(worker_id),
         worker_run_id: Some(worker_run_id),
         endpoint: format!("{host}:19101"),
@@ -35,10 +39,10 @@ fn worker(group_id: ShardGroupId, worker_id: u64, worker_run_id: WorkerRunId, ho
     }
 }
 
-fn request(group_id: ShardGroupId, op: PlacementOp, block_id: BlockId) -> PlacementRequest {
+fn request(group_name: &GroupName, op: PlacementOp, block_id: BlockId) -> PlacementRequest {
     let layout = FileLayout::new(4096, 1024, 1);
     PlacementRequest {
-        group_id,
+        group_name: group_name.clone(),
         op,
         block_id,
         block_stamp: Some(9),
@@ -51,14 +55,14 @@ fn request(group_id: ShardGroupId, op: PlacementOp, block_id: BlockId) -> Placem
 }
 
 fn location(
-    group_id: ShardGroupId,
+    group_name: &GroupName,
     block_id: BlockId,
     block_stamp: u64,
     worker_id: u64,
     worker_run_id: WorkerRunId,
 ) -> ReportedBlockLocation {
     ReportedBlockLocation {
-        group_id,
+        group_name: group_name.clone(),
         block_id,
         block_stamp,
         worker_id: WorkerId::new(worker_id),
@@ -68,33 +72,33 @@ fn location(
 
 #[test]
 fn read_uses_live_matching_replicas_in_deterministic_order() {
-    let group = ShardGroupId::new(7);
-    let other_group = ShardGroupId::new(8);
+    let group = group_name("g7");
+    let other_group = group_name("g8");
     let block_id = block(44, 0);
     let worker_a_run = run_id(1);
     let worker_b_run = run_id(2);
     let stale_run = run_id(3);
-    let mut req = request(group, PlacementOp::Read, block_id);
+    let mut req = request(&group, PlacementOp::Read, block_id);
     req.caller = Some(CallerContextFields::parse("host=host-b"));
     req.existing = vec![
-        location(group, block_id, 9, 1, worker_a_run),
-        location(group, block_id, 9, 2, worker_b_run),
-        location(group, block_id, 9, 3, stale_run),
-        location(other_group, block_id, 9, 4, run_id(4)),
-        location(group, block(44, 1), 9, 5, run_id(5)),
-        location(group, block_id, 8, 6, run_id(6)),
-        location(group, block_id, 9, 7, run_id(7)),
+        location(&group, block_id, 9, 1, worker_a_run),
+        location(&group, block_id, 9, 2, worker_b_run),
+        location(&group, block_id, 9, 3, stale_run),
+        location(&other_group, block_id, 9, 4, run_id(4)),
+        location(&group, block(44, 1), 9, 5, run_id(5)),
+        location(&group, block_id, 8, 6, run_id(6)),
+        location(&group, block_id, 9, 7, run_id(7)),
     ];
     let workers = vec![
-        worker(group, 1, worker_a_run, "host-a"),
-        worker(group, 2, worker_b_run, "host-b"),
-        worker(group, 3, run_id(30), "host-c"),
-        worker(other_group, 4, run_id(4), "host-d"),
-        worker(group, 5, run_id(5), "host-e"),
-        worker(group, 6, run_id(6), "host-f"),
+        worker(&group, 1, worker_a_run, "host-a"),
+        worker(&group, 2, worker_b_run, "host-b"),
+        worker(&group, 3, run_id(30), "host-c"),
+        worker(&other_group, 4, run_id(4), "host-d"),
+        worker(&group, 5, run_id(5), "host-e"),
+        worker(&group, 6, run_id(6), "host-f"),
         WorkerPlacementView {
             lease_valid: false,
-            ..worker(group, 7, run_id(7), "host-g")
+            ..worker(&group, 7, run_id(7), "host-g")
         },
     ];
 
@@ -114,15 +118,15 @@ fn read_uses_live_matching_replicas_in_deterministic_order() {
 
 #[test]
 fn load_and_write_filter_workers_without_required_block_format() {
-    let group = ShardGroupId::new(9);
+    let group = group_name("g9");
     let unsupported = WorkerPlacementView {
         supported_block_formats: Vec::new(),
-        ..worker(group, 1, run_id(11), "host-a")
+        ..worker(&group, 1, run_id(11), "host-a")
     };
-    let supported = worker(group, 2, run_id(12), "host-b");
+    let supported = worker(&group, 2, run_id(12), "host-b");
 
     for op in [PlacementOp::Load, PlacementOp::Write] {
-        let req = request(group, op, block(55, 0));
+        let req = request(&group, op, block(55, 0));
         let plan = PlacementPlanner.plan(&req, &[unsupported.clone(), supported.clone()]);
 
         assert_eq!(
@@ -147,13 +151,13 @@ fn load_and_write_filter_workers_without_required_block_format() {
 
 #[test]
 fn write_uses_layout_replication_and_prefers_caller_locality() {
-    let group = ShardGroupId::new(10);
+    let group = group_name("g10");
     let block_id = block(66, 0);
-    let mut req = request(group, PlacementOp::Write, block_id);
+    let mut req = request(&group, PlacementOp::Write, block_id);
     req.caller = Some(CallerContextFields::parse("host=host-b"));
     let workers = vec![
-        worker(group, 1, run_id(21), "host-a"),
-        worker(group, 2, run_id(22), "host-b"),
+        worker(&group, 1, run_id(21), "host-a"),
+        worker(&group, 2, run_id(22), "host-b"),
     ];
 
     let plan = PlacementPlanner.plan(&req, &workers);
@@ -169,8 +173,8 @@ fn write_uses_layout_replication_and_prefers_caller_locality() {
 
 #[test]
 fn repair_is_inert() {
-    let group = ShardGroupId::new(11);
-    let req = request(group, PlacementOp::Repair, block(77, 0));
+    let group = group_name("g11");
+    let req = request(&group, PlacementOp::Repair, block(77, 0));
 
     let plan = PlacementPlanner.plan(&req, &[]);
 

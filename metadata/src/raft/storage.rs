@@ -8,8 +8,8 @@
 //! - leases/{block_id} -> LeaseState (serialized)
 //! - mounts/{mount_id} -> MountEntry (serialized)
 //! - dedup/{client_id}:{call_id} -> AppliedResult (serialized)
-//! - shard_groups/{group_id} -> ShardGroupInfo (serialized)
-//! - shard_routing/{shard_id} -> group_id (u64 as string)
+//! - shard_groups/{group_name} -> ShardGroupInfo (serialized)
+//! - shard_routing/{shard_id} -> group_name (validated string)
 //! - route_epoch -> u64
 //! - mount_version -> u64
 //!
@@ -41,8 +41,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::warn;
 use types::fs::{Inode, InodeId};
-use types::ids::{BlockId, DataHandleId, MountId, ShardGroupId, ShardId, WorkerId};
+use types::ids::{BlockId, DataHandleId, MountId, ShardId, WorkerId};
 use types::layout::FileLayout;
+use types::GroupName;
 
 type DentryPage = (Vec<(String, InodeId)>, Option<Vec<u8>>, bool);
 
@@ -52,7 +53,7 @@ const CF_LEASES: &str = "leases";
 const CF_MOUNTS: &str = "mounts";
 const CF_DEDUP: &str = "dedup";
 const CF_SHARD_GROUPS: &str = "shard_groups";
-const CF_SHARD_ROUTING: &str = "shard_routing"; // shard_id -> group_id mapping
+const CF_SHARD_ROUTING: &str = "shard_routing"; // shard_id -> group_name mapping
 const CF_WORKERS: &str = "workers";
 const CF_BLOCK_REF_COUNTS: &str = "block_ref_counts"; // block_id -> u64 (global refcount)
 const CF_DELETE_INTENTS: &str = "delete_intents"; // intent_id -> DeleteIntent
@@ -69,8 +70,8 @@ const DEDUP_MAX_ENTRIES: usize = if cfg!(debug_assertions) { 128 } else { 10_000
 const NEXT_INODE_ID_KEY: &[u8] = b"next_inode_id";
 const NEXT_DELETE_INTENT_ID_KEY: &[u8] = b"next_delete_intent_id";
 
-fn worker_key(group_id: ShardGroupId, worker_id: WorkerId) -> String {
-    format!("{}/{}", group_id.as_raw(), worker_id.as_raw())
+fn worker_key(group_name: &GroupName, worker_id: WorkerId) -> String {
+    format!("{}/{}", group_name.as_str(), worker_id.as_raw())
 }
 
 // FS column families
@@ -155,43 +156,45 @@ impl RocksDBStorage {
         &self.db
     }
 
-    /// Open or create a RocksDB database.
-    pub fn open<P: AsRef<Path>>(path: P) -> MetadataResult<Self> {
+    /// Create RocksDB state for `metadata format`.
+    pub fn create_for_format<P: AsRef<Path>>(path: P) -> MetadataResult<Self> {
+        Self::open_with_create_policy(path, true)
+    }
+
+    /// Open already formatted RocksDB state for `metadata start`.
+    pub fn open_existing_for_start<P: AsRef<Path>>(path: P) -> MetadataResult<Self> {
+        Self::open_with_create_policy(path, false)
+    }
+
+    fn open_with_create_policy<P: AsRef<Path>>(path: P, create_missing: bool) -> MetadataResult<Self> {
         let path_buf = path.as_ref().to_path_buf();
+        let snapshot_dir = path_buf.join("snapshots");
+        if !create_missing {
+            validate_existing_rocksdb_state(&path_buf, &snapshot_dir)?;
+        }
+
         let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
+        opts.create_if_missing(create_missing);
+        opts.create_missing_column_families(create_missing);
         // TODO: Optimize rocksdb opts
         // opts.set_allow_mmap_writes(true);
         // opts.set_allow_mmap_reads(true);
 
-        let cfs = vec![
-            ColumnFamilyDescriptor::new(CF_BLOCKS, Options::default()),
-            ColumnFamilyDescriptor::new(CF_LEASES, Options::default()),
-            ColumnFamilyDescriptor::new(CF_MOUNTS, Options::default()),
-            ColumnFamilyDescriptor::new(CF_DEDUP, Options::default()),
-            ColumnFamilyDescriptor::new(CF_SHARD_GROUPS, Options::default()),
-            ColumnFamilyDescriptor::new(CF_SHARD_ROUTING, Options::default()),
-            ColumnFamilyDescriptor::new(CF_WORKERS, Options::default()),
-            ColumnFamilyDescriptor::new(CF_BLOCK_REF_COUNTS, Options::default()),
-            ColumnFamilyDescriptor::new(CF_DELETE_INTENTS, Options::default()),
-            ColumnFamilyDescriptor::new(CF_META, Options::default()),
-            ColumnFamilyDescriptor::new(CF_RAFT_LOG, Options::default()),
-            ColumnFamilyDescriptor::new(CF_RAFT_STATE, Options::default()),
-            ColumnFamilyDescriptor::new(CF_RAFT_SNAPSHOT, Options::default()),
-            ColumnFamilyDescriptor::new(CF_INODES, Options::default()),
-            ColumnFamilyDescriptor::new(CF_DENTRIES, Options::default()),
-        ];
+        let db = DB::open_cf_descriptors(&opts, &path_buf, cf_descriptors()).map_err(|e| {
+            if create_missing {
+                MetadataError::Internal(format!("Failed to create RocksDB state at {}: {e}", path_buf.display()))
+            } else {
+                missing_rocksdb_state_error(&path_buf, &format!("RocksDB open failed: {e}"))
+            }
+        })?;
 
-        let db = DB::open_cf_descriptors(&opts, &path_buf, cfs)
-            .map_err(|e| MetadataError::Internal(format!("Failed to open RocksDB: {}", e)))?;
-
-        // Clear obsolete dedup entries when format version changes.
-        reset_dedup_if_stale(&db)?;
-
-        let snapshot_dir = path_buf.join("snapshots");
-        std::fs::create_dir_all(&snapshot_dir)
-            .map_err(|e| MetadataError::Internal(format!("Failed to create snapshot dir {:?}: {}", snapshot_dir, e)))?;
+        if create_missing {
+            // Format is the create-capable path; start must not rewrite existing state.
+            reset_dedup_if_stale(&db)?;
+            std::fs::create_dir_all(&snapshot_dir).map_err(|e| {
+                MetadataError::Internal(format!("Failed to create snapshot dir {:?}: {}", snapshot_dir, e))
+            })?;
+        }
 
         Ok(Self {
             db: Arc::new(db),
@@ -604,12 +607,12 @@ impl RocksDBStorage {
     }
 
     /// Get shard group info.
-    pub fn get_shard_group(&self, group_id: ShardGroupId) -> MetadataResult<Option<ShardGroupInfo>> {
+    pub fn get_shard_group(&self, group_name: &GroupName) -> MetadataResult<Option<ShardGroupInfo>> {
         let cf = self
             .db
             .cf_handle(CF_SHARD_GROUPS)
             .ok_or_else(|| MetadataError::Internal("ShardGroups CF not found".to_string()))?;
-        let key = format!("{}", group_id.as_raw());
+        let key = group_name.as_str();
 
         match self.db.get_cf(cf, key.as_bytes()) {
             Ok(Some(value)) => {
@@ -629,7 +632,7 @@ impl RocksDBStorage {
             .db
             .cf_handle(CF_SHARD_GROUPS)
             .ok_or_else(|| MetadataError::Internal("ShardGroups CF not found".to_string()))?;
-        let key = format!("{}", info.group_id.as_raw());
+        let key = info.group_name.as_str();
         let value = encode_to_vec(info, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize ShardGroupInfo: {}", e)))?;
 
@@ -640,7 +643,7 @@ impl RocksDBStorage {
     }
 
     fn batch_put_shard_group(batch: &mut WriteBatch, cf: &ColumnFamily, info: &ShardGroupInfo) -> MetadataResult<()> {
-        let key = format!("{}", info.group_id.as_raw());
+        let key = info.group_name.as_str();
         let value = encode_to_vec(info, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize ShardGroupInfo: {}", e)))?;
         batch.put_cf(cf, key.as_bytes(), value);
@@ -648,13 +651,13 @@ impl RocksDBStorage {
     }
 
     /// Put shard to group routing mapping.
-    pub fn put_shard_routing(&self, shard_id: ShardId, group_id: ShardGroupId) -> MetadataResult<()> {
+    pub fn put_shard_routing(&self, shard_id: ShardId, group_name: &GroupName) -> MetadataResult<()> {
         let cf = self
             .db
             .cf_handle(CF_SHARD_ROUTING)
             .ok_or_else(|| MetadataError::Internal("ShardRouting CF not found".to_string()))?;
         let key = format!("{}", shard_id.as_raw());
-        let value = format!("{}", group_id.as_raw());
+        let value = group_name.as_str();
 
         self.db
             .put_cf(cf, key.as_bytes(), value.as_bytes())
@@ -662,14 +665,14 @@ impl RocksDBStorage {
         Ok(())
     }
 
-    fn batch_put_shard_routing(batch: &mut WriteBatch, cf: &ColumnFamily, shard_id: ShardId, group_id: ShardGroupId) {
+    fn batch_put_shard_routing(batch: &mut WriteBatch, cf: &ColumnFamily, shard_id: ShardId, group_name: &GroupName) {
         let key = format!("{}", shard_id.as_raw());
-        let value = format!("{}", group_id.as_raw());
+        let value = group_name.as_str();
         batch.put_cf(cf, key.as_bytes(), value.as_bytes());
     }
 
     /// Get shard to group routing mapping.
-    pub fn get_shard_routing(&self, shard_id: ShardId) -> MetadataResult<Option<ShardGroupId>> {
+    pub fn get_shard_routing(&self, shard_id: ShardId) -> MetadataResult<Option<GroupName>> {
         let cf = self
             .db
             .cf_handle(CF_SHARD_ROUTING)
@@ -678,12 +681,11 @@ impl RocksDBStorage {
 
         match self.db.get_cf(cf, key.as_bytes()) {
             Ok(Some(value)) => {
-                let group_id_str = String::from_utf8(value)
-                    .map_err(|e| MetadataError::Internal(format!("Failed to parse group_id: {}", e)))?;
-                let group_id_raw = group_id_str
-                    .parse::<u64>()
-                    .map_err(|e| MetadataError::Internal(format!("Failed to parse group_id as u64: {}", e)))?;
-                Ok(Some(ShardGroupId::new(group_id_raw)))
+                let group_name = String::from_utf8(value)
+                    .map_err(|e| MetadataError::Internal(format!("Failed to parse group_name: {}", e)))?;
+                let group_name = GroupName::parse(group_name)
+                    .map_err(|e| MetadataError::Internal(format!("Failed to parse group_name value: {}", e)))?;
+                Ok(Some(group_name))
             }
             Ok(None) => Ok(None),
             Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
@@ -691,7 +693,7 @@ impl RocksDBStorage {
     }
 
     /// Load all shard to group routing mappings.
-    pub fn load_all_shard_routings(&self) -> MetadataResult<std::collections::HashMap<ShardId, ShardGroupId>> {
+    pub fn load_all_shard_routings(&self) -> MetadataResult<std::collections::HashMap<ShardId, GroupName>> {
         let cf = self
             .db
             .cf_handle(CF_SHARD_ROUTING)
@@ -710,14 +712,12 @@ impl RocksDBStorage {
                 .map_err(|e| MetadataError::Internal(format!("Failed to parse shard_id as u64: {}", e)))?;
             let shard_id = ShardId::new(shard_id_raw);
 
-            let group_id_str = String::from_utf8(value.to_vec())
-                .map_err(|e| MetadataError::Internal(format!("Failed to parse group_id value: {}", e)))?;
-            let group_id_raw = group_id_str
-                .parse::<u64>()
-                .map_err(|e| MetadataError::Internal(format!("Failed to parse group_id as u64: {}", e)))?;
-            let group_id = ShardGroupId::new(group_id_raw);
+            let group_name = String::from_utf8(value.to_vec())
+                .map_err(|e| MetadataError::Internal(format!("Failed to parse group_name value: {}", e)))?;
+            let group_name = GroupName::parse(group_name)
+                .map_err(|e| MetadataError::Internal(format!("Failed to parse group_name value: {}", e)))?;
 
-            mappings.insert(shard_id, group_id);
+            mappings.insert(shard_id, group_name);
         }
 
         Ok(mappings)
@@ -1025,14 +1025,14 @@ impl RocksDBStorage {
     /// Get worker info accepted by a metadata group.
     pub fn get_worker_in_group(
         &self,
-        group_id: ShardGroupId,
+        group_name: &GroupName,
         worker_id: WorkerId,
     ) -> MetadataResult<Option<WorkerInfo>> {
         let cf = self
             .db
             .cf_handle(CF_WORKERS)
             .ok_or_else(|| MetadataError::Internal("Workers CF not found".to_string()))?;
-        let key = worker_key(group_id, worker_id);
+        let key = worker_key(group_name, worker_id);
 
         match self.db.get_cf(cf, key.as_bytes()) {
             Ok(Some(value)) => {
@@ -1052,7 +1052,7 @@ impl RocksDBStorage {
             .db
             .cf_handle(CF_WORKERS)
             .ok_or_else(|| MetadataError::Internal("Workers CF not found".to_string()))?;
-        let key = worker_key(info.group_id, info.worker_id);
+        let key = worker_key(&info.group_name, info.worker_id);
         let value = encode_to_vec(info, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize WorkerInfo: {}", e)))?;
 
@@ -1063,7 +1063,7 @@ impl RocksDBStorage {
     }
 
     fn batch_put_worker(batch: &mut WriteBatch, cf: &ColumnFamily, info: &WorkerInfo) -> MetadataResult<()> {
-        let key = worker_key(info.group_id, info.worker_id);
+        let key = worker_key(&info.group_name, info.worker_id);
         let value = encode_to_vec(info, standard())
             .map_err(|e| MetadataError::Internal(format!("Failed to serialize WorkerInfo: {}", e)))?;
         batch.put_cf(cf, key.as_bytes(), value);
@@ -1072,7 +1072,7 @@ impl RocksDBStorage {
 
     pub fn prepare_worker_registration(
         &self,
-        group_id: ShardGroupId,
+        group_name: GroupName,
         worker_id: WorkerId,
         address: String,
         worker_net_protocol: i32,
@@ -1084,7 +1084,7 @@ impl RocksDBStorage {
             ));
         }
         Ok(WorkerInfo {
-            group_id,
+            group_name,
             worker_id,
             address,
             worker_net_protocol,
@@ -1862,7 +1862,7 @@ impl RocksDBStorage {
         let mut batch = WriteBatch::default();
         Self::batch_put_shard_group(&mut batch, cf_groups, info)?;
         for shard_id in shard_ids {
-            Self::batch_put_shard_routing(&mut batch, cf_routing, *shard_id, info.group_id);
+            Self::batch_put_shard_routing(&mut batch, cf_routing, *shard_id, &info.group_name);
         }
         self.commit_apply_batch(batch, dedup_key, applied_result)
     }
@@ -2115,7 +2115,7 @@ impl RocksDBStorage {
                     reason: crate::state::DeleteIntentReason::Gc,
                     created_at_ms: now_ms,
                     not_before_ms: now_ms,
-                    shard_group_id: None,
+                    group_name: None,
                     guard_watermark: None,
                     mount_epoch: None,
                     guard_state_id: types::RaftLogId {
@@ -2719,6 +2719,43 @@ impl RocksDBStorage {
     }
 }
 
+fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
+    vec![
+        ColumnFamilyDescriptor::new(CF_BLOCKS, Options::default()),
+        ColumnFamilyDescriptor::new(CF_LEASES, Options::default()),
+        ColumnFamilyDescriptor::new(CF_MOUNTS, Options::default()),
+        ColumnFamilyDescriptor::new(CF_DEDUP, Options::default()),
+        ColumnFamilyDescriptor::new(CF_SHARD_GROUPS, Options::default()),
+        ColumnFamilyDescriptor::new(CF_SHARD_ROUTING, Options::default()),
+        ColumnFamilyDescriptor::new(CF_WORKERS, Options::default()),
+        ColumnFamilyDescriptor::new(CF_BLOCK_REF_COUNTS, Options::default()),
+        ColumnFamilyDescriptor::new(CF_DELETE_INTENTS, Options::default()),
+        ColumnFamilyDescriptor::new(CF_META, Options::default()),
+        ColumnFamilyDescriptor::new(CF_RAFT_LOG, Options::default()),
+        ColumnFamilyDescriptor::new(CF_RAFT_STATE, Options::default()),
+        ColumnFamilyDescriptor::new(CF_RAFT_SNAPSHOT, Options::default()),
+        ColumnFamilyDescriptor::new(CF_INODES, Options::default()),
+        ColumnFamilyDescriptor::new(CF_DENTRIES, Options::default()),
+    ]
+}
+
+fn validate_existing_rocksdb_state(path: &Path, snapshot_dir: &Path) -> MetadataResult<()> {
+    if !path.is_dir() {
+        return Err(missing_rocksdb_state_error(path, "storage directory is missing"));
+    }
+    if !snapshot_dir.is_dir() {
+        return Err(missing_rocksdb_state_error(path, "snapshot directory is missing"));
+    }
+    Ok(())
+}
+
+fn missing_rocksdb_state_error(path: &Path, detail: &str) -> MetadataError {
+    MetadataError::InvalidArgument(format!(
+        "metadata storage is formatted but RocksDB state is missing or corrupt at {}; {detail}; run `metadata format --config <path>` only on empty storage, or clean/reset manually",
+        path.display()
+    ))
+}
+
 fn reset_dedup_if_stale(db: &DB) -> MetadataResult<()> {
     let meta_cf = db
         .cf_handle(CF_META)
@@ -2777,7 +2814,7 @@ mod tests {
     fn test_data_handle_allocator_unique_and_durable() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("allocator_db");
-        let storage = RocksDBStorage::open(&db_path).unwrap();
+        let storage = RocksDBStorage::create_for_format(&db_path).unwrap();
 
         let first = storage.get_and_increment_data_handle_id().unwrap();
         let second = storage.get_and_increment_data_handle_id().unwrap();
@@ -2786,7 +2823,7 @@ mod tests {
 
         // Re-open to ensure durability.
         drop(storage);
-        let reopened = RocksDBStorage::open(&db_path).unwrap();
+        let reopened = RocksDBStorage::create_for_format(&db_path).unwrap();
         let third = reopened.get_and_increment_data_handle_id().unwrap();
         assert!(third.as_raw() > second.as_raw());
     }
@@ -2796,7 +2833,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("inode_allocator_db");
         {
-            let storage = RocksDBStorage::open(&db_path).unwrap();
+            let storage = RocksDBStorage::create_for_format(&db_path).unwrap();
             storage
                 .put_inode(&Inode::new_dir(InodeId::new(42), FileAttrs::new(), MountId::new(1)))
                 .unwrap();
@@ -2807,7 +2844,7 @@ mod tests {
             assert_eq!(second, InodeId::new(44));
         }
 
-        let reopened = RocksDBStorage::open(&db_path).unwrap();
+        let reopened = RocksDBStorage::create_for_format(&db_path).unwrap();
         let third = reopened.allocate_inode_id().unwrap();
         assert_eq!(third, InodeId::new(45));
     }
@@ -2815,7 +2852,7 @@ mod tests {
     #[test]
     fn create_file_atomic_persists_namespace_and_data_handle_owner() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
 
         let parent_inode_id = InodeId::new(10);
         let mut parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
@@ -2845,7 +2882,7 @@ mod tests {
     #[test]
     fn create_file_with_apply_result_atomic_persists_namespace_dedup() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
 
         let parent_inode_id = InodeId::new(10);
         let mut parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
@@ -2882,7 +2919,7 @@ mod tests {
     #[test]
     fn delete_empty_file_with_apply_result_atomic_removes_namespace_data_owner_dedup() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
 
         let parent_inode_id = InodeId::new(10);
         let mut parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
@@ -2926,7 +2963,7 @@ mod tests {
     #[test]
     fn delete_empty_dir_with_apply_result_atomic_removes_namespace_dedup() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
 
         let parent_inode_id = InodeId::new(20);
         let mut parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
@@ -2959,7 +2996,7 @@ mod tests {
     #[test]
     fn put_inode_with_apply_result_atomic_persists_inode_dedup() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
 
         let inode_id = InodeId::new(12);
         let mut inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), DataHandleId::new(120));
@@ -2983,7 +3020,7 @@ mod tests {
     #[test]
     fn close_write_with_apply_result_atomic_persists_inode_block_refs_dedup() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
 
         let inode_id = InodeId::new(13);
         let data_handle_id = DataHandleId::new(130);
@@ -3032,7 +3069,7 @@ mod tests {
     #[test]
     fn create_dir_atomic_persists_inode_and_dentry() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
 
         let parent_inode_id = InodeId::new(20);
         let mut parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
@@ -3054,7 +3091,7 @@ mod tests {
     #[test]
     fn rename_atomic_moves_dentry_and_preserves_inode() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
 
         let src_parent_id = InodeId::new(30);
         let dst_parent_id = InodeId::new(31);
@@ -3094,7 +3131,7 @@ mod tests {
     fn setup_dir_with_entries(parent_inode_id: InodeId, entries: &[(&str, InodeId)]) -> (TempDir, RocksDBStorage) {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test_db_dentries");
-        let storage = RocksDBStorage::open(&db_path).unwrap();
+        let storage = RocksDBStorage::create_for_format(&db_path).unwrap();
 
         // Create parent dir and some child nodes.
         let parent_inode = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
@@ -3177,7 +3214,7 @@ mod tests {
         }
 
         // Try to open with new code; obsolete CF layouts must fail fast.
-        let result = RocksDBStorage::open(&db_path);
+        let result = RocksDBStorage::create_for_format(&db_path);
         assert!(result.is_err(), "Opening DB with obsolete 'files' CF should fail");
         match result {
             Err(e) => {
@@ -3195,7 +3232,7 @@ mod tests {
     #[test]
     fn dedup_ttl_evicts_and_returns_miss() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
         let key = DedupKey::new(ClientId::new(42), CallId::new());
         let result = AppliedResult {
             fingerprint: CommandFingerprint(1),
@@ -3212,7 +3249,7 @@ mod tests {
     #[test]
     fn dedup_size_bound_evicts_oldest() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::open(temp_dir.path()).unwrap();
+        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
 
         for _ in 0..(DEDUP_MAX_ENTRIES + 2) {
             let key = DedupKey::new(ClientId::new(7), CallId::new());

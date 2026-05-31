@@ -33,6 +33,8 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 prost = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 # RPC
 tonic = { workspace = true }

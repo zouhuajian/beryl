@@ -1,0 +1,270 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Vecton Contributors
+
+use tempfile::TempDir;
+use worker::config::WorkerConfig;
+use worker::control::{prepare_worker_start, worker_storage_info_path, MetadataRegistrar};
+
+fn prepare_start_descriptor(config: &WorkerConfig) -> Result<(), String> {
+    let worker_id = prepare_worker_start(config).map_err(|err| err.to_string())?;
+    MetadataRegistrar::descriptor_from_config(config, worker_id)
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+fn write_config(dir: &TempDir, cluster_id: &str, group_name: &str) -> std::path::PathBuf {
+    let storage_root = dir.path().join("worker");
+    let identity_path = storage_root.join("worker.identity");
+    let config_path = dir.path().join("core-site.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+vecton.cluster.id: "{cluster_id}"
+worker.identity.path: "{}"
+worker.storage.root: "{}"
+worker.rpc.bind: "127.0.0.1:0"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:19090"
+worker.metadata.group.name: "{group_name}"
+worker.metadata.endpoints: "http://127.0.0.1:18080"
+"#,
+            identity_path.display(),
+            storage_root.display()
+        ),
+    )
+    .unwrap();
+    config_path
+}
+
+#[test]
+fn worker_start_on_missing_root_creates_identity_info_and_group_dir() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "cluster-a", "root");
+    let config = WorkerConfig::load(&config_path).unwrap();
+
+    let worker_id = prepare_worker_start(&config).unwrap();
+
+    assert!(worker_id.as_raw() > 0);
+    assert!(config.identity_path.exists());
+    assert!(worker_storage_info_path(&config).exists());
+    assert!(config.storage_root.join("groups").join("root").exists());
+
+    let info_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(worker_storage_info_path(&config)).unwrap()).unwrap();
+    assert_eq!(info_json["cluster_id"], "cluster-a");
+    assert_eq!(info_json["worker_id"], worker_id.as_raw());
+    assert!(info_json.get("group_id").is_none());
+    assert!(info_json.get("metadata_group_id").is_none());
+}
+
+#[test]
+fn worker_start_on_empty_root_creates_identity_info_and_group_dir() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "cluster-a", "root");
+    let config = WorkerConfig::load(&config_path).unwrap();
+    std::fs::create_dir_all(&config.storage_root).unwrap();
+
+    let worker_id = prepare_worker_start(&config).unwrap();
+
+    assert!(worker_id.as_raw() > 0);
+    assert!(config.identity_path.exists());
+    assert!(worker_storage_info_path(&config).exists());
+    assert!(config.storage_root.join("groups").join("root").exists());
+}
+
+#[test]
+fn worker_start_on_existing_info_and_identity_succeeds_without_rewriting_identity() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "cluster-a", "root");
+    let config = WorkerConfig::load(&config_path).unwrap();
+    let worker_id = prepare_worker_start(&config).unwrap();
+    let identity_before = std::fs::read(&config.identity_path).unwrap();
+    let info_before = std::fs::read(worker_storage_info_path(&config)).unwrap();
+
+    let second_worker_id = prepare_worker_start(&config).unwrap();
+
+    assert_eq!(second_worker_id, worker_id);
+    assert_eq!(std::fs::read(&config.identity_path).unwrap(), identity_before);
+    assert_eq!(std::fs::read(worker_storage_info_path(&config)).unwrap(), info_before);
+}
+
+#[test]
+fn worker_start_refuses_existing_info_with_missing_identity_without_recreating_it() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "cluster-a", "root");
+    let config = WorkerConfig::load(&config_path).unwrap();
+    prepare_worker_start(&config).unwrap();
+    std::fs::remove_file(&config.identity_path).unwrap();
+
+    let err = prepare_worker_start(&config).unwrap_err();
+
+    assert!(err.to_string().contains("worker.identity.path"));
+    assert!(!config.identity_path.exists());
+}
+
+#[test]
+fn worker_start_refuses_malformed_identity_without_rewriting_it() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "cluster-a", "root");
+    let config = WorkerConfig::load(&config_path).unwrap();
+    prepare_worker_start(&config).unwrap();
+    let info_before = std::fs::read(worker_storage_info_path(&config)).unwrap();
+    std::fs::write(&config.identity_path, b"not-a-uuid\n").unwrap();
+    let identity_before = std::fs::read(&config.identity_path).unwrap();
+
+    let err = prepare_start_descriptor(&config).unwrap_err();
+
+    assert!(err.contains("worker.identity.path"));
+    assert!(err.contains("must contain a UUID"));
+    assert_eq!(std::fs::read(worker_storage_info_path(&config)).unwrap(), info_before);
+    assert_eq!(std::fs::read(&config.identity_path).unwrap(), identity_before);
+}
+
+#[test]
+fn worker_start_refuses_worker_id_mismatch_without_rewriting_storage() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "cluster-a", "root");
+    let config = WorkerConfig::load(&config_path).unwrap();
+    prepare_worker_start(&config).unwrap();
+    let mut info: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(worker_storage_info_path(&config)).unwrap()).unwrap();
+    let original_worker_id = info["worker_id"].as_u64().unwrap();
+    info["worker_id"] = serde_json::Value::from(original_worker_id + 1);
+    let info_payload = serde_json::to_vec_pretty(&info).unwrap();
+    std::fs::write(worker_storage_info_path(&config), &info_payload).unwrap();
+    let identity_before = std::fs::read(&config.identity_path).unwrap();
+
+    let err = prepare_start_descriptor(&config).unwrap_err();
+
+    assert!(err.contains("worker storage info mismatch"));
+    assert!(err.contains("worker_id"));
+    assert_eq!(std::fs::read(worker_storage_info_path(&config)).unwrap(), info_payload);
+    assert_eq!(std::fs::read(&config.identity_path).unwrap(), identity_before);
+}
+
+#[test]
+fn explicit_worker_id_cannot_bypass_missing_identity_for_existing_info() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "cluster-a", "root");
+    let config = WorkerConfig::load(&config_path).unwrap();
+    let worker_id = prepare_worker_start(&config).unwrap();
+    std::fs::remove_file(&config.identity_path).unwrap();
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+vecton.cluster.id: "cluster-a"
+worker.id: {}
+worker.identity.path: "{}"
+worker.storage.root: "{}"
+worker.rpc.bind: "127.0.0.1:0"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:19090"
+worker.metadata.group.name: "root"
+worker.metadata.endpoints: "http://127.0.0.1:18080"
+"#,
+            worker_id.as_raw(),
+            config.identity_path.display(),
+            config.storage_root.display()
+        ),
+    )
+    .unwrap();
+
+    let err = WorkerConfig::load(&config_path).unwrap_err();
+
+    assert!(err.to_string().contains("worker.id"));
+    assert!(!config.identity_path.exists());
+}
+
+#[test]
+fn worker_storage_info_rejects_legacy_group_id_and_unknown_fields() {
+    for extra_field in ["group_id", "unknown_field"] {
+        let dir = TempDir::new().unwrap();
+        let config_path = write_config(&dir, "cluster-a", "root");
+        let config = WorkerConfig::load(&config_path).unwrap();
+        let worker_id = prepare_worker_start(&config).unwrap();
+        std::fs::write(
+            worker_storage_info_path(&config),
+            format!(
+                r#"{{
+  "cluster_id": "cluster-a",
+  "worker_id": {},
+  "storage_uuid": "storage-a",
+  "format_version": 1,
+  "created_at_ms": 1,
+  "software_version": "test",
+  "{extra_field}": 1
+}}"#,
+                worker_id.as_raw()
+            ),
+        )
+        .unwrap();
+
+        let err = prepare_worker_start(&config).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("old worker storage info format unsupported"),
+            "{message}"
+        );
+        assert!(message.contains("clean storage"), "{message}");
+        assert!(message.contains("future migration command"), "{message}");
+    }
+}
+
+#[test]
+fn worker_start_refuses_non_empty_unknown_root_without_creating_identity() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "cluster-a", "root");
+    let config = WorkerConfig::load(&config_path).unwrap();
+    std::fs::create_dir_all(&config.storage_root).unwrap();
+    std::fs::write(config.storage_root.join("old-block-file"), b"stale").unwrap();
+
+    let err = prepare_worker_start(&config).unwrap_err();
+    let message = err.to_string();
+
+    assert!(message.contains("worker.storage.root"));
+    assert!(message.contains("WorkerStorageInfo missing"));
+    assert!(!worker_storage_info_path(&config).exists());
+    assert!(!config.identity_path.exists());
+}
+
+#[test]
+fn worker_registration_descriptor_uses_resolved_worker_id_and_group_name() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "cluster-a", "root");
+    let config = WorkerConfig::load(&config_path).unwrap();
+    let worker_id = prepare_worker_start(&config).unwrap();
+    std::fs::remove_file(&config.identity_path).unwrap();
+
+    let descriptor = MetadataRegistrar::descriptor_from_config(&config, worker_id).unwrap();
+
+    assert_eq!(descriptor.worker_id, worker_id);
+    assert_eq!(descriptor.group_name.as_str(), "root");
+    assert!(!config.identity_path.exists());
+}
+
+#[test]
+fn group_name_validation_accepts_valid_names_and_rejects_invalid_names() {
+    for group_name in ["root", "default", "analytics", "tenant-a", "hot_cache", "group.1"] {
+        let dir = TempDir::new().unwrap();
+        let config_path = write_config(&dir, "cluster-a", group_name);
+        let config = WorkerConfig::load(&config_path).unwrap();
+        assert_eq!(config.metadata.group_name.as_str(), group_name);
+    }
+
+    for group_name in [
+        "",
+        " ",
+        "Root",
+        "ROOT",
+        "root/prod",
+        "root prod",
+        "-root",
+        "root/",
+        "a234567890123456789012345678901234567890123456789012345678901234",
+    ] {
+        let dir = TempDir::new().unwrap();
+        let config_path = write_config(&dir, "cluster-a", group_name);
+        let err = WorkerConfig::load(&config_path).unwrap_err();
+        assert!(err.message.contains("worker.metadata.group.name"));
+    }
+}

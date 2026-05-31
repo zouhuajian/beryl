@@ -108,7 +108,7 @@ The regular data path is metadata issued: client create/open/append/add-block/re
 #### Owns
 
 - Filesystem metadata authority: inode, dentry, attrs, mount state, leases, write sessions, `FsCore`, Raft state machine, worker membership, and maintenance routing.
-- WorkerId is a stable worker identity only. Metadata-group-specific worker descriptor, registration, runtime, liveness, routing, placement, report, delete, and repair state must be looked up by `(ShardGroupId, WorkerId)`. Production code must not infer a metadata group from WorkerId alone, fall back to group 1, or treat report-derived group uniqueness as authoritative unless the report state has already been validated in a group-scoped domain object. `WorkerRunId` remains live-only state tied to group registration and heartbeat.
+- WorkerId is a stable worker identity only. Metadata-group-specific worker descriptor, registration, runtime, liveness, routing, placement, report, delete, and repair state must be looked up by `(GroupName, WorkerId)`. Production code must not infer a metadata group from WorkerId alone, fall back to a default group, or treat report-derived group uniqueness as authoritative unless the report state has already been validated in a group-scoped domain object. `WorkerRunId` remains live-only state tied to group registration and heartbeat.
 - Authority-side request/result DTOs that are not exposed as stable shared contracts.
 - Decisions about owner group, route freshness, lease renewal, block allocation, and committed metadata publication.
 

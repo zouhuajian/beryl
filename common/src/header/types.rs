@@ -7,7 +7,7 @@ use crate::{
     error::canonical::{CanonicalError, ErrorClass as CanonicalErrorClass},
     time::Deadline,
 };
-use types::{CallId, ClientId, GroupStateWatermark};
+use types::{CallId, ClientId, GroupName, GroupStateWatermark};
 
 /// Client information for correlation and routing.
 #[derive(Clone, Debug)]
@@ -25,9 +25,8 @@ pub struct ClientInfo {
 pub struct RequestHeader {
     /// Client information (call_id, client_id, client_name).
     pub client: ClientInfo,
-    /// Group ID for this request (required for metadata-plane RPCs).
-    /// Client must fill this field for all metadata RPCs.
-    pub group_id: Option<u64>,
+    /// Metadata group name for this request.
+    pub group_name: Option<GroupName>,
     /// Mount epoch for FS write operations.
     /// Client should provide the mount_epoch it knows for the mount being accessed.
     /// Server validates this against current mount.mount_epoch and returns NEED_REFRESH if mismatch.
@@ -40,7 +39,7 @@ pub struct RequestHeader {
     pub caller_context: Option<CallerContext>,
     /// Client-required state-machine applied watermarks.
     ///
-    /// Each watermark is scoped by metadata Raft owner group. Empty means the
+    /// Each watermark is scoped by metadata group name. Empty means the
     /// request has no state freshness requirement.
     pub state: Vec<GroupStateWatermark>,
     /// Optional retry count from client perspective (0 = first attempt).
@@ -160,9 +159,8 @@ pub struct ResponseHeader {
     /// Leaders and msync may return non-empty state. Follower successful
     /// responses must leave this empty. Empty means no cache update, not stale.
     pub state: Vec<GroupStateWatermark>,
-    /// Group ID that this response applies to (required for metadata-plane RPCs).
-    /// Server must echo back the actual group_id that processed this request.
-    pub group_id: Option<u64>,
+    /// Metadata group name that this response applies to.
+    pub group_name: Option<GroupName>,
     /// Mount epoch returned by server (for FS operations).
     /// Server fills this with the current mount.mount_epoch so client can update its cache.
     pub mount_epoch: Option<u64>,
@@ -259,7 +257,7 @@ impl RequestHeader {
             caller_context: None,
             state: Vec::new(),
             retry_count: 0,
-            group_id: None,
+            group_name: None,
             mount_epoch: None,
             route_epoch: None,
             principal: None,
@@ -275,9 +273,9 @@ impl RequestHeader {
         self
     }
 
-    /// Set the group ID.
-    pub fn with_group_id(mut self, group_id: u64) -> Self {
-        self.group_id = Some(group_id);
+    /// Set the metadata group name.
+    pub fn with_group_name(mut self, group_name: GroupName) -> Self {
+        self.group_name = Some(group_name);
         self
     }
 
@@ -325,7 +323,7 @@ impl RequestHeader {
 
     /// Create a child header (for nested calls).
     ///
-    /// Inherits client_id, deadline, traceparent, state watermarks, and group_id.
+    /// Inherits client_id, deadline, traceparent, state watermarks, and group name.
     /// Generates a new call_id by default.
     pub fn child(&self) -> Self {
         Self {
@@ -339,7 +337,7 @@ impl RequestHeader {
             caller_context: self.caller_context.clone(),
             state: self.state.clone(),
             retry_count: 0,
-            group_id: self.group_id,
+            group_name: self.group_name.clone(),
             mount_epoch: self.mount_epoch,
             route_epoch: self.route_epoch,
             principal: self.principal.clone(),
@@ -362,7 +360,7 @@ impl RequestHeader {
             caller_context: self.caller_context.clone(),
             state: self.state.clone(),
             retry_count: self.retry_count + 1,
-            group_id: self.group_id,
+            group_name: self.group_name.clone(),
             mount_epoch: self.mount_epoch,
             route_epoch: self.route_epoch,
             principal: self.principal.clone(),
@@ -414,7 +412,7 @@ impl ResponseHeader {
             status: RpcStatus::Ok,
             canonical_error: None,
             state: Vec::new(),
-            group_id: None,
+            group_name: None,
             mount_epoch: None,
             route_epoch: None,
         }
@@ -445,7 +443,7 @@ impl ResponseHeader {
             status,
             canonical_error: Some(canonical_error),
             state: Vec::new(),
-            group_id: None,
+            group_name: None,
             mount_epoch: None,
             route_epoch: None,
         }
@@ -457,9 +455,9 @@ impl ResponseHeader {
         self
     }
 
-    /// Set the group ID.
-    pub fn with_group_id(mut self, group_id: u64) -> Self {
-        self.group_id = Some(group_id);
+    /// Set the metadata group name.
+    pub fn with_group_name(mut self, group_name: GroupName) -> Self {
+        self.group_name = Some(group_name);
         self
     }
 }

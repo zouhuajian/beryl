@@ -124,7 +124,7 @@ impl ErrorClassifier {
             ClientAction::TransportFail { status } if is_retryable_transport(status) => ErrorClass::RetryableTransport,
             ClientAction::TransportFail { .. } => ErrorClass::Fatal,
             ClientAction::Retry { .. } => ErrorClass::RetryableTransport,
-            ClientAction::Refresh { reason, hint, .. } => classify_refresh_reason(*reason, hint.group_id),
+            ClientAction::Refresh { reason, hint, .. } => classify_refresh_reason(*reason, hint.group_name.as_ref()),
             ClientAction::Fail { canonical } => {
                 use common::error::canonical::ErrorCode;
                 use types::fs::FsErrorCode;
@@ -144,7 +144,7 @@ impl ErrorClassifier {
     }
 }
 
-fn classify_refresh_reason(reason: CanonicalRefreshReason, _group_hint: Option<u64>) -> ErrorClass {
+fn classify_refresh_reason(reason: CanonicalRefreshReason, _group_hint: Option<&types::GroupName>) -> ErrorClass {
     match reason {
         CanonicalRefreshReason::Fencing | CanonicalRefreshReason::EpochMismatch => ErrorClass::Fencing,
         CanonicalRefreshReason::SessionInvalid => ErrorClass::SessionInvalid,
@@ -188,6 +188,7 @@ mod tests {
     use crate::error::ClientError;
     use common::error::canonical::{CanonicalError, RefreshHint as CanonicalRefreshHint};
     use common::header::RpcErrorCode;
+    use types::GroupName;
 
     #[test]
     fn owner_group_mismatch_reason_classifies_as_owner_group_mismatch() {
@@ -195,7 +196,7 @@ mod tests {
             RpcErrorCode::ShardMoved,
             common::error::canonical::RefreshReason::OwnerGroupMismatch,
             CanonicalRefreshHint {
-                group_id: Some(11),
+                group_name: Some("analytics".to_string()),
                 ..CanonicalRefreshHint::default()
             },
             "owner moved",
@@ -203,7 +204,7 @@ mod tests {
         let err = ClientError::from(ClientAction::Refresh {
             reason: common::error::canonical::RefreshReason::OwnerGroupMismatch,
             hint: Box::new(RefreshHint {
-                group_id: Some(11),
+                group_name: Some(GroupName::parse("analytics").unwrap()),
                 ..RefreshHint::default()
             }),
             canonical: Box::new(canonical),
@@ -220,7 +221,7 @@ mod tests {
             RpcErrorCode::ShardMoved,
             common::error::canonical::RefreshReason::Moved,
             CanonicalRefreshHint {
-                group_id: Some(11),
+                group_name: Some("analytics".to_string()),
                 ..CanonicalRefreshHint::default()
             },
             "resource moved",
@@ -228,7 +229,7 @@ mod tests {
         let err = ClientError::from(ClientAction::Refresh {
             reason: common::error::canonical::RefreshReason::Moved,
             hint: Box::new(RefreshHint {
-                group_id: Some(11),
+                group_name: Some(GroupName::parse("analytics").unwrap()),
                 ..RefreshHint::default()
             }),
             canonical: Box::new(canonical),

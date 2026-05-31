@@ -16,6 +16,7 @@ use common::header::RpcErrorCode;
 use std::sync::Arc;
 use types::fs::FsErrorCode;
 use types::ids::MountId;
+use types::GroupName;
 
 pub trait LeadershipChecker: Send + Sync {
     fn is_leader(&self) -> bool;
@@ -40,7 +41,7 @@ impl LeadershipChecker for AppRaftNode {
 #[derive(Clone, Debug)]
 pub struct GuardFailure {
     pub err: Box<CanonicalError>,
-    pub group_id: Option<u64>,
+    pub group_name: Option<GroupName>,
     pub mount_epoch: Option<u64>,
 }
 
@@ -48,7 +49,7 @@ impl GuardFailure {
     fn new(err: CanonicalError) -> Self {
         Self {
             err: Box::new(err),
-            group_id: None,
+            group_name: None,
             mount_epoch: None,
         }
     }
@@ -57,8 +58,8 @@ impl GuardFailure {
         Self::new(to_canonical_rpc(err))
     }
 
-    fn with_mount(mut self, group_id: Option<u64>, mount_epoch: Option<u64>) -> Self {
-        self.group_id = group_id;
+    fn with_mount(mut self, group_name: Option<GroupName>, mount_epoch: Option<u64>) -> Self {
+        self.group_name = group_name;
         self.mount_epoch = mount_epoch;
         self
     }
@@ -197,7 +198,7 @@ impl LeadershipGuard {
         } else {
             let hint = RefreshHint {
                 leader_endpoint: checker.leader_endpoint(),
-                group_id: ctx.caller.group_id,
+                group_name: ctx.caller.group_name.as_ref().map(ToString::to_string),
                 ..Default::default()
             };
             Err(GuardFailure::new(CanonicalError::need_refresh_with_hint(
@@ -242,7 +243,7 @@ impl DataIoPolicyGuard {
             format!("{reason}: op={} mount_prefix={}", op.as_str(), mount_entry.mount_prefix),
         );
         Err(GuardFailure::new(err).with_mount(
-            Some(mount_entry.namespace_owner_group_id.as_raw()),
+            Some(mount_entry.namespace_owner_group_name),
             Some(mount_entry.mount_version),
         ))
     }
@@ -257,7 +258,11 @@ mod tests {
     use common::error::canonical::{ErrorClass, ErrorCode};
     use common::header::{RequestHeader, RpcErrorCode};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use types::ids::ShardGroupId;
+    use types::GroupName;
+
+    fn group_name(raw: &str) -> GroupName {
+        GroupName::parse(raw).unwrap()
+    }
 
     struct StaticLeader(bool);
 
@@ -338,7 +343,7 @@ mod tests {
             mount_ctx: crate::path_resolver::MountContext {
                 mount_id: MountId::new(1),
                 mount_epoch: 1,
-                owner_group_id: ShardGroupId::new(1),
+                owner_group_name: group_name("root"),
                 root_inode_id: ROOT_INODE_ID,
             },
             parent_inode_id: Some(ROOT_INODE_ID),
@@ -391,7 +396,7 @@ mod tests {
                 MountKind::Internal,
                 None,
                 DataIoPolicy::Forbid,
-                ShardGroupId::new(1),
+                group_name("root"),
                 ROOT_INODE_ID,
             )
             .unwrap();
@@ -415,7 +420,7 @@ mod tests {
                 MountKind::Internal,
                 None,
                 DataIoPolicy::Forbid,
-                ShardGroupId::new(1),
+                group_name("root"),
                 ROOT_INODE_ID,
             )
             .unwrap();
@@ -428,7 +433,7 @@ mod tests {
         assert_eq!(err.err.class, ErrorClass::Fatal);
         assert_eq!(err.err.code, Some(ErrorCode::FsErrno(FsErrorCode::ENotsup)));
         assert!(err.err.message.contains("RootDataIoForbidden"));
-        assert_eq!(err.group_id, Some(root_entry.namespace_owner_group_id.as_raw()));
+        assert_eq!(err.group_name, Some(root_entry.namespace_owner_group_name.clone()));
         assert_eq!(err.mount_epoch, Some(root_entry.mount_version));
     }
 

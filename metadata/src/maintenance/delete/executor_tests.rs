@@ -20,8 +20,8 @@ mod tests {
     use tempfile::TempDir;
     use types::block::{BlockPlacement, BlockState};
     use types::fs::InodeId;
-    use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, ShardGroupId, WorkerId};
-    use types::{CallId, RaftLogId, WorkerRunId};
+    use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, WorkerId};
+    use types::{CallId, GroupName, RaftLogId, WorkerRunId};
 
     struct DeleteExecutorTestEnv {
         _temp_dir: TempDir,
@@ -34,13 +34,10 @@ mod tests {
     async fn new_delete_executor_test_env() -> MetadataResult<DeleteExecutorTestEnv> {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test_db_executor");
-        let storage = Arc::new(RocksDBStorage::open(&db_path)?);
+        let storage = Arc::new(RocksDBStorage::create_for_format(&db_path)?);
         let mount_table = Arc::new(MountTable::new());
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
-        let raft_config = RaftConfig {
-            node_id: 1,
-            peers: vec!["127.0.0.1:0".to_string()],
-        };
+        let raft_config = RaftConfig::default();
         let raft_node = Arc::new(
             AppRaftNode::new(
                 raft_config.node_id,
@@ -51,6 +48,10 @@ mod tests {
             .await
             .unwrap(),
         );
+        raft_node
+            .initialize_single_node("127.0.0.1:0".to_string())
+            .await
+            .unwrap();
         wait_for_test_leader(&raft_node).await;
 
         let worker_manager = Arc::new(WorkerManager::new(60));
@@ -92,18 +93,22 @@ mod tests {
             .expect("valid test WorkerRunId")
     }
 
+    fn group_name(raw: &str) -> GroupName {
+        GroupName::parse(raw).unwrap()
+    }
+
     fn add_live_worker_with_blocks(
         worker_manager: &WorkerManager,
         worker_id: WorkerId,
         blocks: Vec<BlockId>,
     ) -> MetadataResult<()> {
-        let group_id = ShardGroupId::new(1);
+        let group_name = group_name("root");
         let address = "127.0.0.1:8080".to_string();
         let run_id = worker_run_id(worker_id);
-        worker_manager.register_worker(group_id, worker_id, address.clone(), 1, None)?;
-        worker_manager.register_worker_run(group_id, worker_id, address.clone(), 1, run_id, None)?;
+        worker_manager.register_worker(&group_name, worker_id, address.clone(), 1, None)?;
+        worker_manager.register_worker_run(&group_name, worker_id, address.clone(), 1, run_id, None)?;
         worker_manager.record_heartbeat(
-            group_id,
+            &group_name,
             worker_id,
             run_id,
             1,
@@ -117,7 +122,7 @@ mod tests {
             HealthStatus::Healthy,
         )?;
         let run_id = worker_manager
-            .get_registration(ShardGroupId::new(1), worker_id)
+            .get_registration(&group_name, worker_id)
             .expect("test worker registration")
             .worker_run_id;
         let report_blocks = blocks
@@ -132,7 +137,7 @@ mod tests {
                 block_state: crate::worker::BlockReportBlockState::Ready,
             })
             .collect();
-        worker_manager.receive_full_block_report(ShardGroupId::new(1), worker_id, run_id, 1, 0, true, report_blocks)?;
+        worker_manager.receive_full_block_report(&group_name, worker_id, run_id, 1, 0, true, report_blocks)?;
         Ok(())
     }
 
@@ -157,7 +162,7 @@ mod tests {
             reason: DeleteIntentReason::Gc,
             created_at_ms: 0,
             not_before_ms: 0,
-            shard_group_id: Some(ShardGroupId::new(1)),
+            group_name: Some(group_name("root")),
             guard_watermark: None,
             mount_epoch: None,
             guard_state_id: RaftLogId::default(),
@@ -173,7 +178,7 @@ mod tests {
         // Setup: Create temporary RocksDB
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test_db");
-        let storage = Arc::new(RocksDBStorage::open(&db_path)?);
+        let storage = Arc::new(RocksDBStorage::create_for_format(&db_path)?);
         let state_machine = AppRaftStateMachine::new(Arc::clone(&storage), Arc::new(MountTable::new()));
 
         // Create a test intent
@@ -190,7 +195,7 @@ mod tests {
             created_at_ms: now_ms,
             not_before_ms: now_ms - 1000, // Already ready
             // Intent without cross-group metadata uses single-group guard_state_id only.
-            shard_group_id: None,
+            group_name: None,
             guard_watermark: None,
             mount_epoch: None,
             guard_state_id,
@@ -278,7 +283,7 @@ mod tests {
 
         // Create and complete an intent
         {
-            let storage = Arc::new(RocksDBStorage::open(&db_path)?);
+            let storage = Arc::new(RocksDBStorage::create_for_format(&db_path)?);
             let state_machine = AppRaftStateMachine::new(Arc::clone(&storage), Arc::new(MountTable::new()));
             let intent = DeleteIntent {
                 intent_id,
@@ -287,7 +292,7 @@ mod tests {
                 created_at_ms: now_ms,
                 not_before_ms: now_ms - 1000,
                 // Intent without cross-group metadata uses single-group guard_state_id only.
-                shard_group_id: None,
+                group_name: None,
                 guard_watermark: None,
                 mount_epoch: None,
                 guard_state_id,
@@ -308,7 +313,7 @@ mod tests {
 
         // "Restart": open storage again
         {
-            let storage = RocksDBStorage::open(&db_path)?;
+            let storage = RocksDBStorage::create_for_format(&db_path)?;
 
             // Verify completed intent is not in pending list
             let pending = storage.list_pending_delete_intents(10, now_ms + 10000)?;
@@ -329,13 +334,10 @@ mod tests {
     async fn test_delete_executor_polls_pending_intent_and_generates_delete_blocks_command() -> MetadataResult<()> {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test_db_executor_commands");
-        let storage = Arc::new(RocksDBStorage::open(&db_path)?);
+        let storage = Arc::new(RocksDBStorage::create_for_format(&db_path)?);
         let mount_table = Arc::new(MountTable::new());
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
-        let raft_config = RaftConfig {
-            node_id: 1,
-            peers: vec!["127.0.0.1:0".to_string()],
-        };
+        let raft_config = RaftConfig::default();
         let raft_node = Arc::new(
             AppRaftNode::new(
                 raft_config.node_id,
@@ -346,6 +348,10 @@ mod tests {
             .await
             .unwrap(),
         );
+        raft_node
+            .initialize_single_node("127.0.0.1:0".to_string())
+            .await
+            .unwrap();
         for _ in 0..100 {
             if raft_node.is_leader() && raft_node.get_last_applied_state_id().is_some() {
                 break;
@@ -360,14 +366,14 @@ mod tests {
         let address = "127.0.0.1:8080".to_string();
         let run_id = worker_run_id(worker_id);
         worker_manager
-            .register_worker(ShardGroupId::new(1), worker_id, address.clone(), 1, None)
+            .register_worker(&group_name("root"), worker_id, address.clone(), 1, None)
             .unwrap();
         worker_manager
-            .register_worker_run(ShardGroupId::new(1), worker_id, address.clone(), 1, run_id, None)
+            .register_worker_run(&group_name("root"), worker_id, address.clone(), 1, run_id, None)
             .unwrap();
         worker_manager
             .record_heartbeat(
-                ShardGroupId::new(1),
+                &group_name("root"),
                 worker_id,
                 run_id,
                 1,
@@ -396,7 +402,7 @@ mod tests {
         })?;
         worker_manager
             .receive_full_block_report(
-                ShardGroupId::new(1),
+                &group_name("root"),
                 worker_id,
                 run_id,
                 1,
@@ -414,7 +420,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            worker_manager.get_block_locations(ShardGroupId::new(1), block_id),
+            worker_manager.get_block_locations(&group_name("root"), block_id),
             vec![worker_id]
         );
 
@@ -424,7 +430,7 @@ mod tests {
             reason: DeleteIntentReason::Gc,
             created_at_ms: 0,
             not_before_ms: 0,
-            shard_group_id: Some(ShardGroupId::new(1)),
+            group_name: Some(group_name("root")),
             guard_watermark: None,
             mount_epoch: None,
             guard_state_id: RaftLogId::default(),
@@ -470,7 +476,7 @@ mod tests {
         assert!(raft_node.is_leader());
         executor.run_once().await?;
         assert_eq!(
-            worker_manager.get_block_locations(ShardGroupId::new(1), block_id),
+            worker_manager.get_block_locations(&group_name("root"), block_id),
             vec![worker_id]
         );
         assert_eq!(metrics.delete_executor_requests_total.load(Ordering::Relaxed), 1);
@@ -491,7 +497,7 @@ mod tests {
             reason: DeleteIntentReason::Gc,
             created_at_ms: 0,
             not_before_ms: 0,
-            shard_group_id: None,
+            group_name: None,
             guard_watermark: None,
             mount_epoch: None,
             guard_state_id: RaftLogId::default(),

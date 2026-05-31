@@ -19,11 +19,11 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use types::fs::{FileAttrs, Inode};
-use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, LeaseId, MountId, ShardGroupId, WorkerId};
+use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, LeaseId, MountId, WorkerId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
 use types::worker::WorkerNetProtocol;
-use types::{CommittedBlock, WorkerEndpointInfo, WorkerRunId, WriteTarget};
+use types::{CommittedBlock, GroupName, WorkerEndpointInfo, WorkerRunId, WriteTarget};
 
 use super::freshness::{FreshnessValidator, StaleStateStatus};
 
@@ -73,7 +73,11 @@ fn request_context() -> RequestContext {
     }
 }
 
-fn fs_core_with_mount(mount_id: MountId, mount_epoch: u64, group_id: ShardGroupId) -> FsCore {
+fn group_name(raw: &str) -> GroupName {
+    GroupName::parse(raw).unwrap()
+}
+
+fn fs_core_with_mount(mount_id: MountId, mount_epoch: u64, group_name: &GroupName) -> FsCore {
     let mount_table = Arc::new(MountTable::new());
     mount_table
         .upsert(MountEntry {
@@ -83,16 +87,19 @@ fn fs_core_with_mount(mount_id: MountId, mount_epoch: u64, group_id: ShardGroupI
             ufs_uri: None,
             data_io_policy: DataIoPolicy::Allow,
             mount_version: mount_epoch,
-            namespace_owner_group_id: group_id,
+            namespace_owner_group_name: group_name.clone(),
             root_inode_id: ROOT_INODE_ID,
         })
         .unwrap();
     FsCore::new_default(Arc::new(MemoryStateStore::new()), mount_table)
 }
 
-fn worker_run_id(group_id: ShardGroupId, worker_id: WorkerId) -> WorkerRunId {
-    let suffix = group_id
-        .as_raw()
+fn worker_run_id(group_name: &GroupName, worker_id: WorkerId) -> WorkerRunId {
+    let group_component = group_name
+        .as_str()
+        .bytes()
+        .fold(0u64, |acc, byte| acc.saturating_add(u64::from(byte)));
+    let suffix = group_component
         .saturating_mul(1_000_000)
         .saturating_add(worker_id.as_raw());
     format!("550e8400-e29b-41d4-a716-{suffix:012x}")
@@ -103,7 +110,7 @@ fn worker_run_id(group_id: ShardGroupId, worker_id: WorkerId) -> WorkerRunId {
 #[allow(clippy::too_many_arguments)]
 fn record_worker_heartbeat(
     manager: &WorkerManager,
-    group_id: ShardGroupId,
+    group_name: &GroupName,
     worker_id: WorkerId,
     capacity_total: u64,
     capacity_used: u64,
@@ -113,16 +120,16 @@ fn record_worker_heartbeat(
     health: HealthStatus,
 ) {
     let descriptor = manager
-        .get_descriptor(group_id, worker_id)
+        .get_descriptor(group_name, worker_id)
         .expect("worker descriptor should be registered");
     let run_id = manager
-        .get_registration(group_id, worker_id)
+        .get_registration(group_name, worker_id)
         .map(|registration| registration.worker_run_id)
         .unwrap_or_else(|| {
-            let run_id = worker_run_id(group_id, worker_id);
+            let run_id = worker_run_id(group_name, worker_id);
             manager
                 .register_worker_run(
-                    group_id,
+                    group_name,
                     worker_id,
                     descriptor.address.clone(),
                     descriptor.worker_net_protocol,
@@ -134,7 +141,7 @@ fn record_worker_heartbeat(
         });
     manager
         .record_heartbeat(
-            group_id,
+            group_name,
             worker_id,
             run_id,
             1,
@@ -179,29 +186,29 @@ fn report_block_with_stamp_and_state(
 
 fn publish_report_locations(
     manager: &WorkerManager,
-    group_id: ShardGroupId,
+    group_name: &GroupName,
     worker_id: WorkerId,
     report_seq: u64,
     blocks: Vec<BlockId>,
 ) {
-    publish_report_locations_with_stamp(manager, group_id, worker_id, report_seq, None, blocks);
+    publish_report_locations_with_stamp(manager, group_name, worker_id, report_seq, None, blocks);
 }
 
 fn publish_report_locations_with_stamp(
     manager: &WorkerManager,
-    group_id: ShardGroupId,
+    group_name: &GroupName,
     worker_id: WorkerId,
     report_seq: u64,
     block_stamp: Option<u64>,
     blocks: Vec<BlockId>,
 ) {
     let run_id = manager
-        .get_registration(group_id, worker_id)
+        .get_registration(group_name, worker_id)
         .expect("worker registration")
         .worker_run_id;
     manager
         .receive_full_block_report(
-            group_id,
+            group_name,
             worker_id,
             run_id,
             report_seq,
@@ -221,30 +228,30 @@ fn publish_report_locations_with_stamp(
 
 fn publish_report_block(
     manager: &WorkerManager,
-    group_id: ShardGroupId,
+    group_name: &GroupName,
     worker_id: WorkerId,
     report_seq: u64,
     block: BlockReportBlock,
 ) {
     let run_id = manager
-        .get_registration(group_id, worker_id)
+        .get_registration(group_name, worker_id)
         .expect("worker registration")
         .worker_run_id;
     manager
-        .receive_full_block_report(group_id, worker_id, run_id, report_seq, 0, true, vec![block])
+        .receive_full_block_report(group_name, worker_id, run_id, report_seq, 0, true, vec![block])
         .expect("full block report should publish locations");
 }
 
-fn worker_manager_for_write_targets(group_id: ShardGroupId) -> Arc<WorkerManager> {
+fn worker_manager_for_write_targets(group_name: &GroupName) -> Arc<WorkerManager> {
     let manager = Arc::new(WorkerManager::new(60));
     for raw in 1..=3 {
         let worker_id = types::ids::WorkerId::new(raw);
         manager
-            .register_worker(group_id, worker_id, format!("127.0.0.1:{}", 9000 + raw), 1, None)
+            .register_worker(group_name, worker_id, format!("127.0.0.1:{}", 9000 + raw), 1, None)
             .unwrap();
         record_worker_heartbeat(
             &manager,
-            group_id,
+            group_name,
             worker_id,
             1024 * 1024,
             0,
@@ -264,22 +271,22 @@ fn fs_core_without_mount() -> FsCore {
 #[tokio::test]
 async fn get_file_layout_returns_reported_locations_using_read_placement() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(48);
-    let group_id = ShardGroupId::new(8);
+    let group_name_value = group_name("g8");
     let inode_id = InodeId::new(480);
     let data_handle_id = DataHandleId::new(9480);
     let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name_value);
     let worker_manager = Arc::new(WorkerManager::new(60));
     for (raw, endpoint) in [(2, "127.0.0.2:9102"), (1, "127.0.0.1:9101")] {
         let worker_id = WorkerId::new(raw);
         worker_manager
-            .register_worker(group_id, worker_id, endpoint.to_string(), 1, None)
+            .register_worker(&group_name_value, worker_id, endpoint.to_string(), 1, None)
             .unwrap();
         record_worker_heartbeat(
             &worker_manager,
-            group_id,
+            &group_name_value,
             worker_id,
             1024,
             0,
@@ -288,7 +295,14 @@ async fn get_file_layout_returns_reported_locations_using_read_placement() {
             0,
             HealthStatus::Healthy,
         );
-        publish_report_locations_with_stamp(&worker_manager, group_id, worker_id, raw, Some(41), vec![block_id]);
+        publish_report_locations_with_stamp(
+            &worker_manager,
+            &group_name_value,
+            worker_id,
+            raw,
+            Some(41),
+            vec![block_id],
+        );
     }
     fs_core.set_storage(Arc::clone(&storage));
     fs_core.set_worker_manager(worker_manager);
@@ -348,20 +362,20 @@ async fn get_file_layout_returns_reported_locations_using_read_placement() {
     assert_eq!(location.workers[0].endpoint, "127.0.0.2:9102");
     assert_eq!(
         location.workers[0].worker_run_id,
-        worker_run_id(group_id, WorkerId::new(2))
+        worker_run_id(&group_name_value, WorkerId::new(2))
     );
 }
 
 #[tokio::test]
 async fn get_file_layout_returns_empty_workers_when_report_is_missing() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(53);
-    let group_id = ShardGroupId::new(8);
+    let group_name_value = group_name("g8");
     let inode_id = InodeId::new(530);
     let data_handle_id = DataHandleId::new(9530);
     let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name_value);
     fs_core.set_storage(Arc::clone(&storage));
     fs_core.set_worker_manager(Arc::new(WorkerManager::new(60)));
 
@@ -403,21 +417,21 @@ async fn get_file_layout_returns_empty_workers_when_report_is_missing() {
 #[tokio::test]
 async fn get_file_layout_filters_non_ready_reported_locations() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(54);
-    let group_id = ShardGroupId::new(8);
+    let group_name_value = group_name("g8");
     let inode_id = InodeId::new(540);
     let data_handle_id = DataHandleId::new(9540);
     let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
     let worker_id = WorkerId::new(1);
-    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name_value);
     let worker_manager = Arc::new(WorkerManager::new(60));
     worker_manager
-        .register_worker(group_id, worker_id, "127.0.0.1:9101".to_string(), 1, None)
+        .register_worker(&group_name_value, worker_id, "127.0.0.1:9101".to_string(), 1, None)
         .unwrap();
     record_worker_heartbeat(
         &worker_manager,
-        group_id,
+        &group_name_value,
         worker_id,
         1024,
         0,
@@ -428,7 +442,7 @@ async fn get_file_layout_filters_non_ready_reported_locations() {
     );
     publish_report_block(
         &worker_manager,
-        group_id,
+        &group_name_value,
         worker_id,
         1,
         report_block_with_stamp_and_state(block_id, 41, BlockReportBlockState::Partial),
@@ -473,21 +487,21 @@ async fn get_file_layout_filters_non_ready_reported_locations() {
 #[tokio::test]
 async fn get_file_layout_filters_reported_locations_with_mismatched_block_stamp() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(55);
-    let group_id = ShardGroupId::new(8);
+    let group_name_value = group_name("g8");
     let inode_id = InodeId::new(550);
     let data_handle_id = DataHandleId::new(9550);
     let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
     let worker_id = WorkerId::new(1);
-    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name_value);
     let worker_manager = Arc::new(WorkerManager::new(60));
     worker_manager
-        .register_worker(group_id, worker_id, "127.0.0.1:9101".to_string(), 1, None)
+        .register_worker(&group_name_value, worker_id, "127.0.0.1:9101".to_string(), 1, None)
         .unwrap();
     record_worker_heartbeat(
         &worker_manager,
-        group_id,
+        &group_name_value,
         worker_id,
         1024,
         0,
@@ -496,7 +510,14 @@ async fn get_file_layout_filters_reported_locations_with_mismatched_block_stamp(
         0,
         HealthStatus::Healthy,
     );
-    publish_report_locations_with_stamp(&worker_manager, group_id, worker_id, 1, Some(40), vec![block_id]);
+    publish_report_locations_with_stamp(
+        &worker_manager,
+        &group_name_value,
+        worker_id,
+        1,
+        Some(40),
+        vec![block_id],
+    );
     fs_core.set_storage(Arc::clone(&storage));
     fs_core.set_worker_manager(worker_manager);
 
@@ -537,7 +558,7 @@ async fn get_file_layout_filters_reported_locations_with_mismatched_block_stamp(
 #[tokio::test]
 async fn get_file_layout_rejects_worker_lookup_without_authoritative_group() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(52);
     let inode_id = InodeId::new(520);
     let data_handle_id = DataHandleId::new(9520);
@@ -545,14 +566,14 @@ async fn get_file_layout_rejects_worker_lookup_without_authoritative_group() {
     let worker_id = WorkerId::new(1);
     let mut fs_core = fs_core_without_mount();
     let worker_manager = Arc::new(WorkerManager::new(60));
-    let fallback_group = ShardGroupId::new(1);
+    let fallback_group = group_name("root");
 
     worker_manager
-        .register_worker(fallback_group, worker_id, "127.0.0.1:9101".to_string(), 1, None)
+        .register_worker(&fallback_group, worker_id, "127.0.0.1:9101".to_string(), 1, None)
         .unwrap();
     record_worker_heartbeat(
         &worker_manager,
-        fallback_group,
+        &fallback_group,
         worker_id,
         1024,
         0,
@@ -561,7 +582,7 @@ async fn get_file_layout_rejects_worker_lookup_without_authoritative_group() {
         0,
         HealthStatus::Healthy,
     );
-    publish_report_locations(&worker_manager, fallback_group, worker_id, 1, vec![block_id]);
+    publish_report_locations(&worker_manager, &fallback_group, worker_id, 1, vec![block_id]);
     fs_core.set_storage(Arc::clone(&storage));
     fs_core.set_worker_manager(worker_manager);
 
@@ -603,27 +624,27 @@ async fn get_file_layout_rejects_worker_lookup_without_authoritative_group() {
         "unexpected error: {}",
         failure.error.message
     );
-    assert_eq!(failure.group_id, None);
+    assert_eq!(failure.group_name, None);
 }
 
 #[tokio::test]
 async fn get_file_layout_does_not_cross_read_worker_descriptor_from_other_group() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(51);
-    let served_group = ShardGroupId::new(9);
-    let other_group = ShardGroupId::new(10);
+    let served_group = group_name("g9");
+    let other_group = group_name("g10");
     let inode_id = InodeId::new(510);
     let data_handle_id = DataHandleId::new(9510);
     let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
     let worker_id = WorkerId::new(1);
     let worker_run_id: types::WorkerRunId = "550e8400-e29b-41d4-a716-446655440052".parse().unwrap();
-    let mut fs_core = fs_core_with_mount(mount_id, 9, served_group);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &served_group);
     let worker_manager = Arc::new(WorkerManager::new(60));
 
     worker_manager
         .register_worker_run(
-            other_group,
+            &other_group,
             worker_id,
             "127.0.0.1:9999".to_string(),
             1,
@@ -633,7 +654,7 @@ async fn get_file_layout_does_not_cross_read_worker_descriptor_from_other_group(
         .unwrap();
     worker_manager
         .record_heartbeat(
-            other_group,
+            &other_group,
             worker_id,
             worker_run_id,
             1,
@@ -647,7 +668,7 @@ async fn get_file_layout_does_not_cross_read_worker_descriptor_from_other_group(
             HealthStatus::Healthy,
         )
         .unwrap();
-    publish_report_locations(&worker_manager, other_group, worker_id, 1, vec![block_id]);
+    publish_report_locations(&worker_manager, &other_group, worker_id, 1, vec![block_id]);
     fs_core.set_storage(Arc::clone(&storage));
     fs_core.set_worker_manager(worker_manager);
 
@@ -691,12 +712,12 @@ async fn get_file_layout_does_not_cross_read_worker_descriptor_from_other_group(
 #[tokio::test]
 async fn get_file_layout_rejects_returned_extent_without_block_stamp() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(49);
     let inode_id = InodeId::new(490);
     let data_handle_id = DataHandleId::new(9490);
     let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(8));
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name("g8"));
     fs_core.set_storage(Arc::clone(&storage));
 
     let mut attrs = FileAttrs::new();
@@ -739,12 +760,12 @@ async fn get_file_layout_rejects_returned_extent_without_block_stamp() {
 #[tokio::test]
 async fn get_file_layout_rejects_returned_extent_with_zero_block_stamp() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(50);
     let inode_id = InodeId::new(500);
     let data_handle_id = DataHandleId::new(9500);
     let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
-    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(8));
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name("g8"));
     fs_core.set_storage(Arc::clone(&storage));
 
     let mut attrs = FileAttrs::new();
@@ -787,10 +808,10 @@ async fn get_file_layout_rejects_returned_extent_with_zero_block_stamp() {
 #[tokio::test]
 async fn get_status_rejects_stale_mount_epoch() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(70);
     let inode_id = InodeId::new(700);
-    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(17));
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name("g17"));
     fs_core.set_storage(Arc::clone(&storage));
     storage
         .put_inode(&Inode::new_file(
@@ -818,17 +839,17 @@ async fn get_status_rejects_stale_mount_epoch() {
         Some(CanonicalErrorCode::RpcCode(RpcErrorCode::MountEpochMismatch))
     );
     assert_eq!(failure.error.reason, Some(RefreshReason::MountEpochMismatch));
-    assert_eq!(failure.group_id, Some(17));
+    assert_eq!(failure.group_name, Some(group_name("g17")));
     assert_eq!(failure.mount_epoch, Some(9));
 }
 
 #[tokio::test]
 async fn list_status_rejects_stale_mount_epoch() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(71);
     let parent_inode_id = InodeId::new(710);
-    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(18));
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name("g18"));
     fs_core.set_storage(Arc::clone(&storage));
     storage
         .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
@@ -853,18 +874,18 @@ async fn list_status_rejects_stale_mount_epoch() {
         Some(CanonicalErrorCode::RpcCode(RpcErrorCode::MountEpochMismatch))
     );
     assert_eq!(failure.error.reason, Some(RefreshReason::MountEpochMismatch));
-    assert_eq!(failure.group_id, Some(18));
+    assert_eq!(failure.group_name, Some(group_name("g18")));
     assert_eq!(failure.mount_epoch, Some(9));
 }
 
 #[tokio::test]
 async fn open_file_rejects_stale_route_epoch() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(72);
     let inode_id = InodeId::new(720);
     let data_handle_id = DataHandleId::new(9720);
-    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(19));
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name("g19"));
     fs_core.set_storage(Arc::clone(&storage));
     storage
         .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
@@ -897,11 +918,11 @@ async fn open_file_rejects_stale_route_epoch() {
 #[tokio::test]
 async fn get_locations_rejects_stale_route_epoch() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(73);
     let inode_id = InodeId::new(730);
     let data_handle_id = DataHandleId::new(9730);
-    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(20));
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name("g20"));
     fs_core.set_storage(Arc::clone(&storage));
     storage
         .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
@@ -934,10 +955,10 @@ async fn get_locations_rejects_stale_route_epoch() {
 #[tokio::test]
 async fn read_success_returns_freshness_hints() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(74);
     let inode_id = InodeId::new(740);
-    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(21));
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name("g21"));
     fs_core.set_storage(Arc::clone(&storage));
     storage
         .put_inode(&Inode::new_file(
@@ -957,7 +978,7 @@ async fn read_success_returns_freshness_hints() {
         .await
         .expect("read should succeed");
 
-    assert_eq!(success.group_id, Some(21));
+    assert_eq!(success.group_name, Some(group_name("g21")));
     assert_eq!(success.mount_epoch, Some(9));
     assert_eq!(success.route_epoch, Some(1));
 }
@@ -965,11 +986,11 @@ async fn read_success_returns_freshness_hints() {
 #[tokio::test]
 async fn get_locations_rejects_range_overflow() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(75);
     let inode_id = InodeId::new(750);
     let data_handle_id = DataHandleId::new(9750);
-    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(22));
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name("g22"));
     fs_core.set_storage(Arc::clone(&storage));
     storage
         .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
@@ -1001,7 +1022,7 @@ async fn get_locations_rejects_range_overflow() {
 #[tokio::test]
 async fn get_locations_handles_empty_range() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(76);
     let inode_id = InodeId::new(760);
     let data_handle_id = DataHandleId::new(9760);
@@ -1021,7 +1042,7 @@ async fn get_locations_handles_empty_range() {
         file_version: Some(4),
         lease_epoch: Some(4),
     };
-    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(23));
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name("g23"));
     fs_core.set_storage(Arc::clone(&storage));
     storage.put_inode(&inode).unwrap();
     storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
@@ -1047,7 +1068,7 @@ async fn get_locations_handles_empty_range() {
 #[tokio::test]
 async fn get_locations_filters_range() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(77);
     let inode_id = InodeId::new(770);
     let data_handle_id = DataHandleId::new(9770);
@@ -1068,7 +1089,7 @@ async fn get_locations_filters_range() {
         file_version: Some(5),
         lease_epoch: Some(5),
     };
-    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(24));
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name("g24"));
     fs_core.set_storage(Arc::clone(&storage));
     storage.put_inode(&inode).unwrap();
     storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
@@ -1286,22 +1307,22 @@ struct WriteFlowEnv {
     fs_core: FsCore,
     inode_id: InodeId,
     data_handle_id: DataHandleId,
-    group_id: ShardGroupId,
+    group_name: GroupName,
 }
 
 async fn write_flow_env(base_size: u64) -> WriteFlowEnv {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(57 + base_size);
-    let group_id = ShardGroupId::new(15 + base_size);
+    let group_name = group_name(&format!("g{}", 15 + base_size));
     let inode_id = InodeId::new(570 + base_size);
     let data_handle_id = DataHandleId::new(9570 + base_size);
-    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name);
     let mount_table = Arc::clone(&fs_core.mount_table);
     let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
     fs_core.set_storage(Arc::clone(&storage));
     fs_core.set_raft_node(raft_node);
-    fs_core.set_worker_manager(worker_manager_for_write_targets(group_id));
+    fs_core.set_worker_manager(worker_manager_for_write_targets(&group_name));
 
     let mut attrs = FileAttrs::new();
     attrs.size = base_size;
@@ -1317,7 +1338,7 @@ async fn write_flow_env(base_size: u64) -> WriteFlowEnv {
         fs_core,
         inode_id,
         data_handle_id,
-        group_id,
+        group_name,
     }
 }
 
@@ -1365,22 +1386,23 @@ async fn single_node_raft(
     mount_table: Arc<MountTable>,
 ) -> (Arc<AppRaftNode>, Arc<AppRaftStateMachine>) {
     let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), mount_table));
-    let raft_config = RaftConfig {
-        node_id: 1,
-        peers: vec!["127.0.0.1:0".to_string()],
-    };
+    let raft_config = RaftConfig::default();
     let raft_node = Arc::new(
         AppRaftNode::new(1, storage, Arc::clone(&state_machine), &raft_config)
             .await
             .unwrap(),
     );
+    raft_node
+        .initialize_single_node("127.0.0.1:0".to_string())
+        .await
+        .unwrap();
     (raft_node, state_machine)
 }
 
 #[test]
 fn freshness_validator_rejects_routed_write_mount_epoch_with_replay_hint() {
     let mount_id = MountId::new(12);
-    let group_id = ShardGroupId::new(4);
+    let group_name_value = group_name("g4");
     let mount_table = Arc::new(MountTable::new());
     mount_table
         .upsert(MountEntry {
@@ -1390,7 +1412,7 @@ fn freshness_validator_rejects_routed_write_mount_epoch_with_replay_hint() {
             ufs_uri: None,
             data_io_policy: DataIoPolicy::Allow,
             mount_version: 9,
-            namespace_owner_group_id: group_id,
+            namespace_owner_group_name: group_name_value.clone(),
             root_inode_id: ROOT_INODE_ID,
         })
         .unwrap();
@@ -1418,22 +1440,22 @@ fn freshness_validator_rejects_routed_write_mount_epoch_with_replay_hint() {
         "mount_epoch mismatch: client=4, server=9; refresh metadata and reopen write handle, then replay request"
     );
     let hint = failure.error.refresh_hint.expect("refresh hint");
-    assert_eq!(hint.group_id, Some(group_id.as_raw()));
+    assert_eq!(hint.group_name, Some(group_name_value.to_string()));
     assert_eq!(hint.mount_epoch, Some(9));
-    assert_eq!(failure.group_id, Some(group_id.as_raw()));
+    assert_eq!(failure.group_name, Some(group_name_value.clone()));
     assert_eq!(failure.mount_epoch, Some(9));
 }
 
 #[test]
 fn routed_write_mount_epoch_mismatch_preserves_metrics_and_wire_shape() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(13);
     let parent_inode_id = InodeId::new(130);
     storage
         .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
         .unwrap();
-    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(5));
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name("g5"));
     fs_core.set_storage(storage);
     let metrics = Arc::new(crate::metrics::MetadataMetrics::new());
     fs_core.set_metrics(Arc::clone(&metrics));
@@ -1460,20 +1482,20 @@ fn routed_write_mount_epoch_mismatch_preserves_metrics_and_wire_shape() {
         "mount_epoch mismatch: client=4, server=9; refresh metadata and reopen write handle, then replay request"
     );
     let hint = failure.error.refresh_hint.expect("refresh hint");
-    assert_eq!(hint.group_id, Some(5));
+    assert_eq!(hint.group_name, Some("g5".to_string()));
     assert_eq!(hint.mount_epoch, Some(9));
-    assert_eq!(failure.group_id, Some(5));
+    assert_eq!(failure.group_name, Some(group_name("g5")));
     assert_eq!(failure.mount_epoch, Some(9));
     assert_eq!(metrics.fs_write_mount_epoch_mismatch_total.load(Ordering::Relaxed), 1);
 }
 
 #[test]
 fn freshness_validator_rejects_stale_state_watermark() {
-    let group_id = ShardGroupId::new(4);
+    let group_name_value = group_name("g4");
     let validator = FreshnessValidator::new(Arc::new(MemoryStateStore::new()), Arc::new(MountTable::new()));
     let mut ctx = request_context();
     ctx.caller.state = vec![types::GroupStateWatermark::new(
-        group_id,
+        group_name_value.clone(),
         types::RaftLogId::new(1, 7, 12),
     )];
 
@@ -1481,7 +1503,7 @@ fn freshness_validator_rejects_stale_state_watermark() {
         .validate_stale_state(
             &ctx,
             Some(types::RaftLogId::new(1, 7, 10)),
-            Some(group_id.as_raw()),
+            Some(group_name_value.clone()),
             Some(9),
         )
         .unwrap_err();
@@ -1495,12 +1517,12 @@ fn freshness_validator_rejects_stale_state_watermark() {
         failure.error.message,
         "Stale state: last_applied=RaftLogId { term: 1, leader_node_id: 7, index: 10 } < required=RaftLogId { term: 1, leader_node_id: 7, index: 12 }"
     );
-    assert_eq!(failure.group_id, Some(group_id.as_raw()));
+    assert_eq!(failure.group_name, Some(group_name_value.clone()));
     assert_eq!(failure.mount_epoch, Some(9));
     assert!(failure.state.is_empty());
 
     let unknown = validator
-        .validate_stale_state(&ctx, None, Some(group_id.as_raw()), Some(9))
+        .validate_stale_state(&ctx, None, Some(group_name_value.clone()), Some(9))
         .expect("missing last_applied should preserve existing precheck fallback");
     assert_eq!(unknown, StaleStateStatus::UnknownLastApplied);
 }
@@ -1508,9 +1530,9 @@ fn freshness_validator_rejects_stale_state_watermark() {
 #[tokio::test]
 async fn abort_releases_lease() {
     let mount_id = MountId::new(41);
-    let group_id = ShardGroupId::new(4);
+    let group_name_value = group_name("g4");
     let inode_id = InodeId::new(410);
-    let fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let fs_core = fs_core_with_mount(mount_id, 9, &group_name_value);
     let file_handle = install_write_session(&fs_core, inode_id, mount_id);
     let session = fs_core
         .write_session_for_handle(file_handle)
@@ -1527,14 +1549,14 @@ async fn abort_releases_lease() {
         .get_active_lease(inode_id)
         .is_none());
     assert_eq!(success.mount_epoch, Some(9));
-    assert_eq!(success.group_id, Some(group_id.as_raw()));
+    assert_eq!(success.group_name, Some(group_name_value));
 }
 
 #[tokio::test]
 async fn abort_checks_handle() {
     let mount_id = MountId::new(43);
     let inode_id = InodeId::new(430);
-    let fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(6));
+    let fs_core = fs_core_with_mount(mount_id, 9, &group_name("g6"));
 
     let failure = fs_core
         .execute_abort_write(AbortWriteInput {
@@ -1587,7 +1609,7 @@ async fn abort_checks_handle() {
 async fn renew_lease_checks_open_epoch() {
     let mount_id = MountId::new(44);
     let inode_id = InodeId::new(440);
-    let fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(6));
+    let fs_core = fs_core_with_mount(mount_id, 9, &group_name("g6"));
     let file_handle = install_write_session(&fs_core, inode_id, mount_id);
     let session = fs_core
         .write_session_for_handle(file_handle)
@@ -1616,7 +1638,7 @@ async fn renew_lease_checks_open_epoch() {
 async fn renew_lease_checks_fencing() {
     let mount_id = MountId::new(45);
     let inode_id = InodeId::new(450);
-    let fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(6));
+    let fs_core = fs_core_with_mount(mount_id, 9, &group_name("g6"));
     let file_handle = install_write_session(&fs_core, inode_id, mount_id);
     let session = fs_core
         .write_session_for_handle(file_handle)
@@ -1657,7 +1679,7 @@ async fn renew_lease_checks_fencing() {
 async fn renew_lease_rejects_lease_epoch_mismatch() {
     let mount_id = MountId::new(46);
     let inode_id = InodeId::new(460);
-    let fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(6));
+    let fs_core = fs_core_with_mount(mount_id, 9, &group_name("g6"));
     let file_handle = install_write_session(&fs_core, inode_id, mount_id);
     let session = fs_core
         .write_session_for_handle(file_handle)
@@ -1679,7 +1701,7 @@ async fn renew_lease_rejects_lease_epoch_mismatch() {
 
 #[tokio::test]
 async fn renew_lease_rejects_missing_or_stale_handle() {
-    let fs_core = fs_core_with_mount(MountId::new(47), 9, ShardGroupId::new(6));
+    let fs_core = fs_core_with_mount(MountId::new(47), 9, &group_name("g6"));
 
     let failure = fs_core
         .execute_renew_inode_lease(RenewLeaseInput {
@@ -1708,7 +1730,7 @@ async fn renew_lease_rejects_missing_or_stale_handle() {
 #[tokio::test]
 async fn open_write_cleans_lease_on_error() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(50);
     let inode_id = InodeId::new(500);
     let data_handle_id = DataHandleId::new(9500);
@@ -1718,7 +1740,7 @@ async fn open_write_cleans_lease_on_error() {
     storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
     storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
-    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(7));
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name("g7"));
     fs_core.set_storage(storage);
 
     let failure = fs_core
@@ -1742,9 +1764,9 @@ async fn open_write_cleans_lease_on_error() {
 #[tokio::test]
 async fn open_write_targets_use_inode_current_data_handle() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(51);
-    let group_id = ShardGroupId::new(9);
+    let group_name_value = group_name("g9");
     let inode_id = InodeId::new(510);
     let data_handle_id = DataHandleId::new(9510);
     storage
@@ -1753,9 +1775,9 @@ async fn open_write_targets_use_inode_current_data_handle() {
     storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
     storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
-    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name_value);
     fs_core.set_storage(storage);
-    fs_core.set_worker_manager(worker_manager_for_write_targets(group_id));
+    fs_core.set_worker_manager(worker_manager_for_write_targets(&group_name_value));
 
     let success = fs_core
         .execute_open_write(OpenWriteInput {
@@ -1790,9 +1812,9 @@ async fn open_write_targets_use_inode_current_data_handle() {
 #[tokio::test]
 async fn open_write_rejects_missing_file_layout_without_default_fallback() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(52);
-    let group_id = ShardGroupId::new(9);
+    let group_name_value = group_name("g9");
     let inode_id = InodeId::new(520);
     let data_handle_id = DataHandleId::new(9520);
     storage
@@ -1800,9 +1822,9 @@ async fn open_write_rejects_missing_file_layout_without_default_fallback() {
         .unwrap();
     storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
-    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name_value);
     fs_core.set_storage(storage);
-    fs_core.set_worker_manager(worker_manager_for_write_targets(group_id));
+    fs_core.set_worker_manager(worker_manager_for_write_targets(&group_name_value));
 
     let failure = fs_core
         .execute_open_write(OpenWriteInput {
@@ -1821,19 +1843,19 @@ async fn open_write_rejects_missing_file_layout_without_default_fallback() {
 #[tokio::test]
 async fn create_file_persists_valid_client_layout_shape() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(59);
-    let group_id = ShardGroupId::new(9);
+    let group_name_value = group_name("g9");
     let parent_inode_id = InodeId::new(590);
     storage
         .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
         .unwrap();
-    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name_value);
     let mount_table = Arc::clone(&fs_core.mount_table);
     let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
     fs_core.set_storage(Arc::clone(&storage));
     fs_core.set_raft_node(raft_node);
-    fs_core.set_worker_manager(worker_manager_for_write_targets(group_id));
+    fs_core.set_worker_manager(worker_manager_for_write_targets(&group_name_value));
     let layout = FileLayout::with_block_format(8192, 1024, 1, types::BlockFormatId::FULL_EFFECTIVE);
 
     let success = fs_core
@@ -1874,9 +1896,9 @@ async fn create_file_rejects_invalid_block_chunk_shape() {
 #[tokio::test]
 async fn open_write_rejects_multi_replica_layout_until_durable_replication_exists() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(54);
-    let group_id = ShardGroupId::new(9);
+    let group_name_value = group_name("g9");
     let inode_id = InodeId::new(540);
     let data_handle_id = DataHandleId::new(9540);
     storage
@@ -1885,9 +1907,9 @@ async fn open_write_rejects_multi_replica_layout_until_durable_replication_exist
     storage.put_layout(inode_id, FileLayout::new(4096, 4096, 2)).unwrap();
     storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
-    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name_value);
     fs_core.set_storage(storage);
-    fs_core.set_worker_manager(worker_manager_for_write_targets(group_id));
+    fs_core.set_worker_manager(worker_manager_for_write_targets(&group_name_value));
 
     let failure = fs_core
         .execute_open_write(OpenWriteInput {
@@ -1917,9 +1939,9 @@ async fn open_write_rejects_layout_shape_worker_would_reject() {
         (FileLayout::new(1024, 4096, 1), "chunk_size must not exceed block_size"),
     ] {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_id = MountId::new(55);
-        let group_id = ShardGroupId::new(9);
+        let group_name_value = group_name("g9");
         let inode_id = InodeId::new(550);
         let data_handle_id = DataHandleId::new(9550);
         storage
@@ -1928,9 +1950,9 @@ async fn open_write_rejects_layout_shape_worker_would_reject() {
         storage.put_layout(inode_id, layout).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
-        let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+        let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name_value);
         fs_core.set_storage(storage);
-        fs_core.set_worker_manager(worker_manager_for_write_targets(group_id));
+        fs_core.set_worker_manager(worker_manager_for_write_targets(&group_name_value));
 
         let failure = fs_core
             .execute_open_write(OpenWriteInput {
@@ -1954,7 +1976,7 @@ async fn open_write_rejects_layout_shape_worker_would_reject() {
 #[test]
 fn open_write_preflight_rejects_placement_without_authoritative_group() {
     let mut fs_core = fs_core_without_mount();
-    fs_core.set_worker_manager(worker_manager_for_write_targets(ShardGroupId::new(1)));
+    fs_core.set_worker_manager(worker_manager_for_write_targets(&group_name("root")));
 
     let failure = fs_core
         .preflight_open_write_runtime(
@@ -1979,7 +2001,7 @@ fn open_write_preflight_rejects_placement_without_authoritative_group() {
 #[tokio::test]
 async fn commit_worker_run_check_rejects_missing_authoritative_group() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(53);
     let inode_id = InodeId::new(530);
     let data_handle_id = DataHandleId::new(9530);
@@ -1987,7 +2009,7 @@ async fn commit_worker_run_check_rejects_missing_authoritative_group() {
     let worker_id = WorkerId::new(1);
     let mut fs_core = fs_core_without_mount();
     fs_core.set_storage(Arc::clone(&storage));
-    fs_core.set_worker_manager(worker_manager_for_write_targets(ShardGroupId::new(1)));
+    fs_core.set_worker_manager(worker_manager_for_write_targets(&group_name("root")));
 
     storage
         .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
@@ -2029,7 +2051,7 @@ async fn commit_worker_run_check_rejects_missing_authoritative_group() {
                         worker_id,
                         endpoint: "127.0.0.1:9001".to_string(),
                         worker_net_protocol: WorkerNetProtocol::Grpc,
-                        worker_run_id: worker_run_id(ShardGroupId::new(1), worker_id),
+                        worker_run_id: worker_run_id(&group_name("root"), worker_id),
                     }],
                     fencing_token: FencingToken {
                         block_id,
@@ -2095,7 +2117,7 @@ async fn commit_worker_run_check_rejects_missing_authoritative_group() {
 #[tokio::test]
 async fn open_write_rejects_file_missing_current_data_handle() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(52);
     let inode_id = InodeId::new(520);
     storage
@@ -2107,9 +2129,9 @@ async fn open_write_rejects_file_missing_current_data_handle() {
         ))
         .unwrap();
 
-    let mut fs_core = fs_core_with_mount(mount_id, 9, ShardGroupId::new(10));
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name("g10"));
     fs_core.set_storage(storage);
-    fs_core.set_worker_manager(worker_manager_for_write_targets(ShardGroupId::new(10)));
+    fs_core.set_worker_manager(worker_manager_for_write_targets(&group_name("g10")));
 
     let failure = fs_core
         .execute_open_write(OpenWriteInput {
@@ -2196,7 +2218,7 @@ async fn create_then_add_block() {
     assert!(!target.worker_endpoints[0].endpoint.ends_with(":0"));
     assert_eq!(
         target.worker_endpoints[0].worker_run_id,
-        worker_run_id(env.group_id, target.worker_endpoints[0].worker_id)
+        worker_run_id(&env.group_name, target.worker_endpoints[0].worker_id)
     );
     let session_after_add = env
         .fs_core
@@ -2259,11 +2281,11 @@ async fn commit_worker_run_check_uses_session_group() {
     let target = add_block_for_key(&env.fs_core, &key, 64).await;
     let endpoint = target.worker_endpoints.first().expect("worker endpoint").clone();
     let worker_manager = env.fs_core.worker_manager.as_ref().expect("worker manager");
-    let other_group = ShardGroupId::new(env.group_id.as_raw() + 1);
+    let other_group = group_name("other");
 
     worker_manager
         .load_registered_workers(vec![WorkerInfo {
-            group_id: other_group,
+            group_name: other_group,
             worker_id: endpoint.worker_id,
             address: "127.0.0.1:9999".to_string(),
             worker_net_protocol: 1,
@@ -2323,7 +2345,7 @@ async fn commit_worker_run_check_rejects_stale_live_registration() {
 
     worker_manager
         .load_registered_workers(vec![WorkerInfo {
-            group_id: env.group_id,
+            group_name: env.group_name.clone(),
             worker_id: endpoint.worker_id,
             address: endpoint.endpoint.clone(),
             worker_net_protocol: 1,
@@ -2339,7 +2361,7 @@ async fn commit_worker_run_check_rejects_stale_live_registration() {
         .expect("replace manager descriptors after metadata reload");
     worker_manager
         .register_worker_run(
-            env.group_id,
+            &env.group_name,
             endpoint.worker_id,
             endpoint.endpoint.clone(),
             1,
@@ -2534,7 +2556,7 @@ async fn worker_report_does_not_change_file_version() {
     let worker_manager = env.fs_core.worker_manager.as_ref().expect("worker manager");
     record_worker_heartbeat(
         worker_manager,
-        env.group_id,
+        &env.group_name,
         WorkerId::new(1),
         1024,
         1,
@@ -2543,7 +2565,13 @@ async fn worker_report_does_not_change_file_version() {
         3,
         HealthStatus::Healthy,
     );
-    publish_report_locations(worker_manager, env.group_id, WorkerId::new(1), 1, vec![target.block_id]);
+    publish_report_locations(
+        worker_manager,
+        &env.group_name,
+        WorkerId::new(1),
+        1,
+        vec![target.block_id],
+    );
 
     let locations = env
         .fs_core
@@ -2599,7 +2627,7 @@ async fn get_locations_rejects_stale_state_watermark() {
         .expect("commit should advance applied state");
     let mut ctx = request_context();
     ctx.caller.state.push(types::GroupStateWatermark::new(
-        ShardGroupId::new(15),
+        group_name("g15"),
         types::RaftLogId {
             term: current_state.term,
             leader_node_id: current_state.leader_node_id,
@@ -2629,9 +2657,9 @@ async fn get_locations_rejects_stale_state_watermark() {
 #[tokio::test]
 async fn close_write_invalid_lease_or_fencing_does_not_clear_runtime_session() {
     let mount_id = MountId::new(53);
-    let group_id = ShardGroupId::new(11);
+    let group_name_value = group_name("g11");
     let inode_id = InodeId::new(530);
-    let fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let fs_core = fs_core_with_mount(mount_id, 9, &group_name_value);
     let file_handle = install_write_session(&fs_core, inode_id, mount_id);
     let session = fs_core
         .write_session_for_handle(file_handle)
@@ -2705,12 +2733,12 @@ async fn close_write_invalid_lease_or_fencing_does_not_clear_runtime_session() {
 #[tokio::test]
 async fn commit_rejects_unissued_block() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(56);
-    let group_id = ShardGroupId::new(14);
+    let group_name_value = group_name("g14");
     let inode_id = InodeId::new(560);
     let data_handle_id = DataHandleId::new(424_242);
-    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name_value);
     let mount_table = Arc::clone(&fs_core.mount_table);
     let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
     fs_core.set_storage(Arc::clone(&storage));
@@ -3021,12 +3049,12 @@ async fn append_uses_base_size() {
 #[tokio::test]
 async fn replay_keeps_file_version() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(54);
-    let group_id = ShardGroupId::new(12);
+    let group_name_value = group_name("g12");
     let inode_id = InodeId::new(540);
     let data_handle_id = DataHandleId::new(424_242);
-    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name_value);
     let mount_table = Arc::clone(&fs_core.mount_table);
     let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
     fs_core.set_storage(Arc::clone(&storage));
@@ -3167,13 +3195,13 @@ async fn replay_keeps_append_commit_mode() {
 #[tokio::test]
 async fn delete_file_with_active_write_session_returns_busy_without_namespace_mutation() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(55);
-    let group_id = ShardGroupId::new(13);
+    let group_name_value = group_name("g13");
     let parent_inode_id = InodeId::new(550);
     let inode_id = InodeId::new(551);
     let data_handle_id = DataHandleId::new(552);
-    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name_value);
     let mount_table = Arc::clone(&fs_core.mount_table);
     let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
     fs_core.set_storage(Arc::clone(&storage));
@@ -3212,15 +3240,15 @@ async fn delete_file_with_active_write_session_returns_busy_without_namespace_mu
 #[tokio::test]
 async fn rename_rejects_active_write_target() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(56);
-    let group_id = ShardGroupId::new(14);
+    let group_name_value = group_name("g14");
     let parent_inode_id = InodeId::new(560);
     let source_inode_id = InodeId::new(561);
     let target_inode_id = InodeId::new(562);
     let source_handle = DataHandleId::new(563);
     let target_handle = DataHandleId::new(564);
-    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name_value);
     let mount_table = Arc::clone(&fs_core.mount_table);
     let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
     fs_core.set_storage(Arc::clone(&storage));
@@ -3289,15 +3317,15 @@ async fn rename_rejects_active_write_target() {
 #[tokio::test]
 async fn rename_keeps_file_version() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(59);
-    let group_id = ShardGroupId::new(16);
+    let group_name_value = group_name("g16");
     let parent_inode_id = InodeId::new(590);
     let source_inode_id = InodeId::new(591);
     let target_inode_id = InodeId::new(592);
     let source_handle = DataHandleId::new(593);
     let target_handle = DataHandleId::new(594);
-    let mut fs_core = fs_core_with_mount(mount_id, 9, group_id);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name_value);
     let mount_table = Arc::clone(&fs_core.mount_table);
     let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
     fs_core.set_storage(Arc::clone(&storage));
@@ -3365,13 +3393,13 @@ async fn rename_keeps_file_version() {
 #[tokio::test]
 async fn rename_rejects_cross_mount() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let src_mount_id = MountId::new(57);
     let dst_mount_id = MountId::new(58);
     let src_parent_inode_id = InodeId::new(570);
     let dst_parent_inode_id = InodeId::new(580);
     let source_inode_id = InodeId::new(571);
-    let mut fs_core = fs_core_with_mount(src_mount_id, 9, ShardGroupId::new(15));
+    let mut fs_core = fs_core_with_mount(src_mount_id, 9, &group_name("g15"));
     fs_core.set_storage(Arc::clone(&storage));
 
     storage
@@ -3418,7 +3446,7 @@ async fn rename_rejects_cross_mount() {
 
 #[tokio::test]
 async fn close_write_session_missing_without_applied_result_stays_session_invalid() {
-    let fs_core = fs_core_with_mount(MountId::new(55), 9, ShardGroupId::new(13));
+    let fs_core = fs_core_with_mount(MountId::new(55), 9, &group_name("g13"));
 
     let failure = fs_core
         .execute_close_write(CloseWriteInput {
@@ -3451,7 +3479,7 @@ async fn close_write_session_missing_without_applied_result_stays_session_invali
 #[tokio::test]
 async fn create_mount_route_epoch_progression_rejects_stale_client_route_epoch() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_table = Arc::new(MountTable::new());
     let state_machine = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3470,7 +3498,7 @@ async fn create_mount_route_epoch_progression_rejects_stale_client_route_epoch()
             mount_kind: MountKind::External,
             ufs_uri: Some("ufs://route".to_string()),
             data_io_policy: DataIoPolicy::Allow,
-            namespace_owner_group_id: ShardGroupId::new(6),
+            namespace_owner_group_name: group_name("g6"),
             root_inode_id,
         })
         .unwrap();
@@ -3491,7 +3519,7 @@ async fn create_mount_route_epoch_progression_rejects_stale_client_route_epoch()
                 mount_epoch: Some(1),
                 route_epoch: Some(stale_route_epoch),
             },
-            Some(6),
+            Some(group_name("g6")),
             Some(1),
             "OpenWrite",
         )
@@ -3512,7 +3540,7 @@ async fn create_mount_route_epoch_progression_rejects_stale_client_route_epoch()
 #[tokio::test]
 async fn delete_mount_route_epoch_progression_rejects_stale_client_route_epoch() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_table = Arc::new(MountTable::new());
     let state_machine = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3530,7 +3558,7 @@ async fn delete_mount_route_epoch_progression_rejects_stale_client_route_epoch()
             mount_kind: MountKind::External,
             ufs_uri: Some("ufs://delete-route".to_string()),
             data_io_policy: DataIoPolicy::Allow,
-            namespace_owner_group_id: ShardGroupId::new(8),
+            namespace_owner_group_name: group_name("g8"),
             root_inode_id,
         })
         .unwrap();

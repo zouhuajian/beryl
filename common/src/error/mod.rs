@@ -100,7 +100,7 @@ pub mod canonical {
     #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct RefreshHint {
         pub leader_endpoint: Option<String>,
-        pub group_id: Option<u64>,
+        pub group_name: Option<String>,
         pub mount_epoch: Option<u64>,
         pub mount_prefix: Option<String>,
         pub route_epoch: Option<u64>,

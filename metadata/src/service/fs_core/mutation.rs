@@ -24,7 +24,7 @@ impl FsCore {
                 return self.failure_from_error(
                     &req.ctx,
                     err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
@@ -47,7 +47,7 @@ impl FsCore {
                 return self.failure_from_error(
                     &req.ctx,
                     err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
@@ -70,7 +70,7 @@ impl FsCore {
                         inode_id: ok.inode_id,
                         attrs: created_attrs,
                     },
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 )
             }
@@ -78,7 +78,7 @@ impl FsCore {
                 &req.ctx,
                 err.errno,
                 err.message,
-                Some(ctx.namespace_owner_group_id.as_raw()),
+                Some(ctx.namespace_owner_group_name.clone()),
                 Some(ctx.mount_epoch),
             ),
         }
@@ -100,7 +100,7 @@ impl FsCore {
                 return self.failure_from_error(
                     &req.ctx,
                     err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
@@ -124,7 +124,7 @@ impl FsCore {
                 return self.failure_from_error(
                     &req.ctx,
                     err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
@@ -148,7 +148,7 @@ impl FsCore {
                         attrs: created_attrs,
                         data_handle_id: ok.data_handle_id,
                     },
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 )
             }
@@ -156,7 +156,7 @@ impl FsCore {
                 &req.ctx,
                 err.errno,
                 err.message,
-                Some(ctx.namespace_owner_group_id.as_raw()),
+                Some(ctx.namespace_owner_group_name.clone()),
                 Some(ctx.mount_epoch),
             ),
         }
@@ -179,7 +179,7 @@ impl FsCore {
                                 &req.ctx,
                                 types::fs::FsErrorCode::EBusy,
                                 format!("File has an active write session or lease: {}", child_inode_id),
-                                Some(ctx.namespace_owner_group_id.as_raw()),
+                                Some(ctx.namespace_owner_group_name.clone()),
                                 Some(ctx.mount_epoch),
                             );
                         }
@@ -189,7 +189,7 @@ impl FsCore {
                         return self.failure_from_error(
                             &req.ctx,
                             err,
-                            Some(ctx.namespace_owner_group_id.as_raw()),
+                            Some(ctx.namespace_owner_group_name.clone()),
                             Some(ctx.mount_epoch),
                         );
                     }
@@ -199,7 +199,7 @@ impl FsCore {
                     return self.failure_from_error(
                         &req.ctx,
                         err,
-                        Some(ctx.namespace_owner_group_id.as_raw()),
+                        Some(ctx.namespace_owner_group_name.clone()),
                         Some(ctx.mount_epoch),
                     );
                 }
@@ -212,7 +212,7 @@ impl FsCore {
                 return self.failure_from_error(
                     &req.ctx,
                     err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
@@ -234,7 +234,7 @@ impl FsCore {
                 return self.failure_from_error(
                     &req.ctx,
                     err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
@@ -244,14 +244,14 @@ impl FsCore {
             FsCommandResult::Ok(_) => self.success(
                 &req.ctx,
                 UnlinkOutput,
-                Some(ctx.namespace_owner_group_id.as_raw()),
+                Some(ctx.namespace_owner_group_name.clone()),
                 Some(ctx.mount_epoch),
             ),
             FsCommandResult::Err(err) => self.fatal_fs_failure(
                 &req.ctx,
                 err.errno,
                 err.message,
-                Some(ctx.namespace_owner_group_id.as_raw()),
+                Some(ctx.namespace_owner_group_name.clone()),
                 Some(ctx.mount_epoch),
             ),
         }
@@ -274,7 +274,7 @@ impl FsCore {
                 return self.failure_from_error(
                     &req.ctx,
                     err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
@@ -296,7 +296,7 @@ impl FsCore {
                 return self.failure_from_error(
                     &req.ctx,
                     err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
@@ -306,14 +306,14 @@ impl FsCore {
             FsCommandResult::Ok(_) => self.success(
                 &req.ctx,
                 DeleteEmptyDirOutput,
-                Some(ctx.namespace_owner_group_id.as_raw()),
+                Some(ctx.namespace_owner_group_name.clone()),
                 Some(ctx.mount_epoch),
             ),
             FsCommandResult::Err(err) => self.fatal_fs_failure(
                 &req.ctx,
                 err.errno,
                 err.message,
-                Some(ctx.namespace_owner_group_id.as_raw()),
+                Some(ctx.namespace_owner_group_name.clone()),
                 Some(ctx.mount_epoch),
             ),
         }
@@ -332,7 +332,7 @@ impl FsCore {
                 return self.failure_from_error(
                     &req.ctx,
                     err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
@@ -354,7 +354,7 @@ impl FsCore {
                                 "call_id {} reused with different command payload",
                                 dedup.call_id
                             )),
-                            Some(ctx.namespace_owner_group_id.as_raw()),
+                            Some(ctx.namespace_owner_group_name.clone()),
                             Some(ctx.mount_epoch),
                         );
                     }
@@ -369,7 +369,7 @@ impl FsCore {
                     return self.failure_from_error(
                         &req.ctx,
                         err,
-                        Some(ctx.namespace_owner_group_id.as_raw()),
+                        Some(ctx.namespace_owner_group_name.clone()),
                         Some(ctx.mount_epoch),
                     );
                 }
@@ -379,7 +379,7 @@ impl FsCore {
                 return self.failure_from_error(
                     &req.ctx,
                     err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
@@ -391,7 +391,7 @@ impl FsCore {
                 return self.failure_from_error(
                     &req.ctx,
                     err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
@@ -410,14 +410,14 @@ impl FsCore {
             FsCommandResult::Ok(_) => self.success(
                 &req.ctx,
                 DeleteTreeOutput,
-                Some(ctx.namespace_owner_group_id.as_raw()),
+                Some(ctx.namespace_owner_group_name.clone()),
                 Some(ctx.mount_epoch),
             ),
             FsCommandResult::Err(err) => self.fatal_fs_failure(
                 &req.ctx,
                 err.errno,
                 err.message,
-                Some(ctx.namespace_owner_group_id.as_raw()),
+                Some(ctx.namespace_owner_group_name.clone()),
                 Some(ctx.mount_epoch),
             ),
         }
@@ -520,14 +520,14 @@ impl FsCore {
                     .fs_write_cross_mount_rename_exdev_total
                     .fetch_add(1, Ordering::Relaxed);
             }
-            let (group_id, mount_epoch) = self.mount_hints_for_mount(src_parent_inode.mount_id);
+            let (group_name, mount_epoch) = self.mount_hints_for_mount(src_parent_inode.mount_id);
             return self.failure_from_error(
                 &req.ctx,
                 MetadataError::CrossMountRename(format!(
                     "Cross-mount rename not allowed: src_mount={:?}, dst_mount={:?}",
                     src_parent_inode.mount_id, dst_parent_inode.mount_id
                 )),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -549,7 +549,7 @@ impl FsCore {
                     match self.validate_stale_state(
                         &req.ctx,
                         raft_node.get_last_applied_state_id(),
-                        Some(ctx.namespace_owner_group_id.as_raw()),
+                        Some(ctx.namespace_owner_group_name.clone()),
                         Some(ctx.mount_epoch),
                     ) {
                         Ok(StaleStateStatus::Ready) => {}
@@ -568,7 +568,7 @@ impl FsCore {
                                         "Destination exists and RENAME_NOREPLACE set: {}",
                                         req.dst_name
                                     )),
-                                    Some(ctx.namespace_owner_group_id.as_raw()),
+                                    Some(ctx.namespace_owner_group_name.clone()),
                                     Some(ctx.mount_epoch),
                                 );
                             }
@@ -577,7 +577,7 @@ impl FsCore {
                                 return self.failure_from_error(
                                     &req.ctx,
                                     err,
-                                    Some(ctx.namespace_owner_group_id.as_raw()),
+                                    Some(ctx.namespace_owner_group_name.clone()),
                                     Some(ctx.mount_epoch),
                                 );
                             }
@@ -597,7 +597,7 @@ impl FsCore {
                             &req.ctx,
                             types::fs::FsErrorCode::EBusy,
                             format!("Rename target has an active write session or lease: {}", dst_inode_id),
-                            Some(ctx.namespace_owner_group_id.as_raw()),
+                            Some(ctx.namespace_owner_group_name.clone()),
                             Some(ctx.mount_epoch),
                         );
                     }
@@ -607,7 +607,7 @@ impl FsCore {
                     return self.failure_from_error(
                         &req.ctx,
                         err,
-                        Some(ctx.namespace_owner_group_id.as_raw()),
+                        Some(ctx.namespace_owner_group_name.clone()),
                         Some(ctx.mount_epoch),
                     );
                 }
@@ -617,7 +617,7 @@ impl FsCore {
                 return self.failure_from_error(
                     &req.ctx,
                     err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
@@ -629,7 +629,7 @@ impl FsCore {
                 return self.failure_from_error(
                     &req.ctx,
                     err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
@@ -654,7 +654,7 @@ impl FsCore {
                 return self.failure_from_error(
                     &req.ctx,
                     err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
@@ -664,14 +664,14 @@ impl FsCore {
             FsCommandResult::Ok(_) => self.success(
                 &req.ctx,
                 RenameOutput,
-                Some(ctx.namespace_owner_group_id.as_raw()),
+                Some(ctx.namespace_owner_group_name.clone()),
                 Some(ctx.mount_epoch),
             ),
             FsCommandResult::Err(err) => self.fatal_fs_failure(
                 &req.ctx,
                 err.errno,
                 err.message,
-                Some(ctx.namespace_owner_group_id.as_raw()),
+                Some(ctx.namespace_owner_group_name.clone()),
                 Some(ctx.mount_epoch),
             ),
         }

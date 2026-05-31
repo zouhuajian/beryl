@@ -11,7 +11,9 @@ use common::observe::{init_observability, ObservabilityConfig, ServiceInfo};
 use tracing::{error, info};
 use worker::{
     config::WorkerConfig,
-    control::{MetadataBlockReportLoop, MetadataHeartbeatLoop, MetadataRegistrar, RegistrationSet},
+    control::{
+        prepare_worker_start, MetadataBlockReportLoop, MetadataHeartbeatLoop, MetadataRegistrar, RegistrationSet,
+    },
     net,
     store::block::{FullBlockFileStore, FullBlockFileStoreConfig},
     WorkerCore,
@@ -19,13 +21,18 @@ use worker::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config_path = std::env::args()
-        .nth(1)
+    let command = WorkerCommand::parse(std::env::args().skip(1))?;
+    let config_path = command
+        .config_path
+        .clone()
         .unwrap_or_else(|| "conf/core-site.yaml".to_string());
 
     let config = WorkerConfig::load(&config_path).context("Failed to load worker configuration")?;
 
-    let obs_config = ObservabilityConfig::default();
+    let worker_id = prepare_worker_start(&config).context("Worker storage start validation failed")?;
+
+    let mut obs_config = ObservabilityConfig::default();
+    obs_config.metrics.prometheus.bind = config.http_bind.clone();
     let service_info = ServiceInfo {
         name: "vecton-worker".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -59,8 +66,8 @@ async fn main() -> Result<()> {
     }
 
     let registration_state = Arc::new(RegistrationSet::new());
-    let descriptor =
-        MetadataRegistrar::descriptor_from_config(&config).context("Failed to build worker registration descriptor")?;
+    let descriptor = MetadataRegistrar::descriptor_from_config(&config, worker_id)
+        .context("Failed to build worker registration descriptor")?;
     let block_report_descriptor = descriptor.clone();
     let heartbeat = MetadataHeartbeatLoop::new(
         config.metadata.clone(),
@@ -109,4 +116,88 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+struct WorkerCommand {
+    config_path: Option<String>,
+}
+
+impl WorkerCommand {
+    fn parse<I>(args: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut args = args.into_iter().peekable();
+        if let Some(first) = args.peek().cloned() {
+            match first.as_str() {
+                "start" => {
+                    args.next();
+                }
+                _ if first.starts_with('-') => {}
+                _ if looks_like_path(&first) => {
+                    anyhow::bail!("worker config path must be passed with --config: {first}");
+                }
+                _ => anyhow::bail!("unsupported worker command: {first}"),
+            }
+        }
+
+        let mut config_path = None;
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--config" => {
+                    let Some(path) = args.next() else {
+                        anyhow::bail!("--config requires a path");
+                    };
+                    config_path = Some(path);
+                }
+                "--force" => anyhow::bail!("--force is not supported for worker start"),
+                _ => anyhow::bail!("unknown worker argument: {arg}"),
+            }
+        }
+
+        Ok(Self { config_path })
+    }
+}
+
+fn looks_like_path(value: &str) -> bool {
+    value.contains('/') || value.ends_with(".yaml") || value.ends_with(".yml") || value.ends_with(".toml")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<WorkerCommand> {
+        WorkerCommand::parse(args.iter().map(|arg| arg.to_string()))
+    }
+
+    #[test]
+    fn valid_worker_start_command_parses() {
+        let start = parse(&["start", "--config", "conf/local/core-site.yaml"]).unwrap();
+        assert_eq!(start.config_path.as_deref(), Some("conf/local/core-site.yaml"));
+
+        let default_start = parse(&[]).unwrap();
+        assert!(default_start.config_path.is_none());
+    }
+
+    #[test]
+    fn removed_worker_command_words_fail() {
+        for args in [
+            &["format"][..],
+            &["bootstrap"][..],
+            &["auto-format"][..],
+            &["format", "--config", "conf/core-site.yaml"][..],
+        ] {
+            let err = parse(args).err().expect("removed worker command must fail");
+            assert!(err.to_string().contains("unsupported worker command"));
+        }
+    }
+
+    #[test]
+    fn worker_config_path_requires_explicit_config_flag() {
+        let err = parse(&["conf/local/core-site.yaml"])
+            .err()
+            .expect("positional worker config path must fail");
+        assert!(err.to_string().contains("--config"));
+    }
 }

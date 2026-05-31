@@ -20,13 +20,13 @@ use ::common::{
 use std::str::FromStr;
 use types::chunk::ByteRange;
 use types::ids::{
-    BlockId, BlockIndex, ChunkId, ChunkIndex, DataHandleId, LeaseId, MountId, ShardGroupId, ShardId, StreamId, WorkerId,
+    BlockId, BlockIndex, ChunkId, ChunkIndex, DataHandleId, LeaseId, MountId, ShardId, StreamId, WorkerId,
 };
 use types::layout::FileLayout;
 use types::lease::FencingToken;
 use types::{
-    CallId, ClientId, CommittedBlock, FileAttrs, FileBlockLocation, GroupStateWatermark, InodeKind, RaftLogId,
-    WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId, WriteTarget,
+    CallId, ClientId, CommittedBlock, FileAttrs, FileBlockLocation, GroupName, GroupStateWatermark, InodeKind,
+    RaftLogId, WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId, WriteTarget,
 };
 
 // ============================================================================
@@ -149,31 +149,6 @@ impl TryFrom<proto_common::ShardIdProto> for ShardId {
     fn try_from(id: proto_common::ShardIdProto) -> Result<Self, Self::Error> {
         Ok(ShardId::new(id.value))
     }
-}
-
-impl From<ShardGroupId> for proto_common::ShardGroupIdProto {
-    fn from(id: ShardGroupId) -> Self {
-        proto_common::ShardGroupIdProto { value: id.as_raw() }
-    }
-}
-
-impl TryFrom<proto_common::ShardGroupIdProto> for ShardGroupId {
-    type Error = ();
-
-    fn try_from(id: proto_common::ShardGroupIdProto) -> Result<Self, Self::Error> {
-        Ok(ShardGroupId::new(id.value))
-    }
-}
-
-/// Parse a required shard group id field without choosing caller error policy.
-pub fn required_group_id(
-    proto: Option<proto_common::ShardGroupIdProto>,
-    field_name: &str,
-) -> Result<ShardGroupId, String> {
-    proto
-        .ok_or_else(|| format!("missing {field_name}"))?
-        .try_into()
-        .map_err(|_| format!("invalid {field_name}"))
 }
 
 impl From<MountId> for proto_common::MountIdProto {
@@ -703,24 +678,21 @@ impl TryFrom<proto_common::GroupStateWatermarkProto> for GroupStateWatermark {
     type Error = String;
 
     fn try_from(proto: proto_common::GroupStateWatermarkProto) -> Result<Self, Self::Error> {
-        let group_id = proto
-            .group_id
-            .ok_or_else(|| "missing group_id in GroupStateWatermarkProto".to_string())?
-            .try_into()
-            .map_err(|_| "invalid group_id in GroupStateWatermarkProto".to_string())?;
+        let group_name = GroupName::parse(&proto.group_name)
+            .map_err(|err| format!("invalid group_name in GroupStateWatermarkProto: {err}"))?;
         let state_id = proto
             .state_id
             .ok_or_else(|| "missing state_id in GroupStateWatermarkProto".to_string())?
             .into();
-        Ok(GroupStateWatermark::new(group_id, state_id))
+        Ok(GroupStateWatermark::new(group_name, state_id))
     }
 }
 
 impl From<&GroupStateWatermark> for proto_common::GroupStateWatermarkProto {
     fn from(watermark: &GroupStateWatermark) -> Self {
         proto_common::GroupStateWatermarkProto {
-            group_id: Some(watermark.group_id.into()),
             state_id: Some(watermark.state_id.into()),
+            group_name: watermark.group_name.to_string(),
         }
     }
 }
@@ -807,10 +779,10 @@ impl TryFrom<proto_common::RequestHeaderProto> for RequestHeader {
 
         Ok(RequestHeader {
             client,
-            group_id: if proto.group_id == 0 {
+            group_name: if proto.group_name.is_empty() {
                 None
             } else {
-                Some(proto.group_id)
+                Some(GroupName::parse(&proto.group_name).map_err(|err| format!("invalid header group_name: {err}"))?)
             },
             mount_epoch: proto.mount_epoch,
             deadline,
@@ -846,7 +818,7 @@ impl From<&RequestHeader> for proto_common::RequestHeaderProto {
                 .map(proto_common::GroupStateWatermarkProto::from)
                 .collect(),
             retry_count: header.retry_count,
-            group_id: header.group_id.unwrap_or(0),
+            group_name: header.group_name.as_ref().map(ToString::to_string).unwrap_or_default(),
             mount_epoch: header.mount_epoch,
             route_epoch: header.route_epoch,
             principal: header.principal.clone().unwrap_or_default(),
@@ -905,10 +877,10 @@ impl TryFrom<proto_common::ResponseHeaderProto> for ResponseHeader {
             status,
             canonical_error,
             state,
-            group_id: if proto.group_id == 0 {
+            group_name: if proto.group_name.is_empty() {
                 None
             } else {
-                Some(proto.group_id)
+                Some(GroupName::parse(&proto.group_name).map_err(|err| format!("invalid header group_name: {err}"))?)
             },
             mount_epoch: proto.mount_epoch,
             route_epoch: proto.route_epoch,
@@ -952,7 +924,7 @@ impl From<&ResponseHeader> for proto_common::ResponseHeaderProto {
                 .iter()
                 .map(proto_common::GroupStateWatermarkProto::from)
                 .collect(),
-            group_id: header.group_id.unwrap_or(0),
+            group_name: header.group_name.as_ref().map(ToString::to_string).unwrap_or_default(),
             mount_epoch: header.mount_epoch,
             route_epoch: header.route_epoch,
         }
@@ -1163,7 +1135,7 @@ fn refresh_reason_to_proto(reason: &Option<RefreshReason>) -> i32 {
 fn refresh_hint_proto_to_hint(hint: Option<&proto_common::RefreshHintProto>) -> Option<CanonicalRefreshHint> {
     hint.map(|hint| CanonicalRefreshHint {
         leader_endpoint: hint.leader_endpoint.clone(),
-        group_id: hint.group_id,
+        group_name: hint.group_name.clone(),
         mount_epoch: hint.mount_epoch,
         mount_prefix: hint.mount_prefix.clone(),
         route_epoch: hint.route_epoch,
@@ -1183,7 +1155,7 @@ fn refresh_hint_proto_to_hint(hint: Option<&proto_common::RefreshHintProto>) -> 
 fn refresh_hint_to_proto(hint: Option<&CanonicalRefreshHint>) -> Option<proto_common::RefreshHintProto> {
     hint.map(|hint| proto_common::RefreshHintProto {
         leader_endpoint: hint.leader_endpoint.clone(),
-        group_id: hint.group_id,
+        group_name: hint.group_name.clone(),
         mount_epoch: hint.mount_epoch,
         mount_prefix: hint.mount_prefix.clone(),
         route_epoch: hint.route_epoch,
@@ -1445,12 +1417,12 @@ mod tests {
             proto_message_fields(errors_proto, "RefreshHintProto"),
             vec![
                 ("string", "leader_endpoint", 1),
-                ("uint64", "group_id", 2),
                 ("uint64", "mount_epoch", 3),
                 ("string", "mount_prefix", 4),
                 ("uint64", "route_epoch", 5),
                 ("WorkerEndpointInfoProto", "worker_endpoints", 6),
                 ("bool", "worker_resolve_required", 7),
+                ("string", "group_name", 8),
             ]
         );
         assert_eq!(
@@ -1541,10 +1513,32 @@ mod tests {
 
         let metadata_worker_proto = include_str!("../metadata/worker.proto");
         assert_eq!(
+            proto_message_fields(metadata_worker_proto, "RegisterWorkerRequestProto"),
+            vec![
+                ("common.RequestHeaderProto", "header", 1),
+                ("uint64", "worker_id", 3),
+                ("string", "worker_run_id", 4),
+                ("common.EndpointProto", "advertised_endpoint", 5),
+                ("uint64", "capabilities", 6),
+                ("string", "version", 7),
+                ("map<string, string>", "labels", 8),
+                ("common.WorkerNetProtocolProto", "worker_net_protocol", 9),
+                ("string", "group_name", 10),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(metadata_worker_proto, "RegisterWorkerResponseProto"),
+            vec![
+                ("common.ResponseHeaderProto", "header", 1),
+                ("uint64", "worker_id", 3),
+                ("string", "accepted_worker_run_id", 4),
+                ("string", "group_name", 5),
+            ]
+        );
+        assert_eq!(
             proto_message_fields(metadata_worker_proto, "HeartbeatRequestProto"),
             vec![
                 ("common.RequestHeaderProto", "header", 1),
-                ("uint64", "group_id", 2),
                 ("uint64", "worker_id", 3),
                 ("string", "worker_run_id", 4),
                 ("uint64", "heartbeat_seq", 5),
@@ -1554,6 +1548,33 @@ mod tests {
                 ("LoadInfoProto", "load", 9),
                 ("HealthStatusProto", "health", 10),
                 ("TaskAckProto", "acks", 11),
+                ("string", "group_name", 12),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(metadata_worker_proto, "HeartbeatResponseProto"),
+            vec![
+                ("common.ResponseHeaderProto", "header", 1),
+                ("WorkerCommandProto", "commands", 2),
+                ("uint64", "worker_id", 7),
+                ("string", "accepted_worker_run_id", 8),
+                ("uint32", "heartbeat_interval_ms", 9),
+                ("uint32", "liveness_timeout_ms", 10),
+                ("MetadataServerRoleProto", "server_role", 11),
+                ("common.EndpointProto", "leader_hint", 12),
+                ("string", "group_name", 13),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(metadata_worker_proto, "BlockReportRequestProto"),
+            vec![
+                ("common.RequestHeaderProto", "header", 1),
+                ("uint64", "worker_id", 3),
+                ("string", "worker_run_id", 4),
+                ("uint64", "report_seq", 5),
+                ("FullBlockReportBatchProto", "full", 6),
+                ("DeltaBlockReportProto", "delta", 7),
+                ("string", "group_name", 8),
             ]
         );
 
@@ -1562,7 +1583,6 @@ mod tests {
             proto_message_fields(worker_data_proto, "OpenReadStreamRequestProto"),
             vec![
                 ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.ShardGroupIdProto", "group_id", 2),
                 ("common.BlockIdProto", "block_id", 3),
                 ("common.ByteRangeProto", "byte_range", 4),
                 ("uint64", "block_stamp", 5),
@@ -1572,6 +1592,7 @@ mod tests {
                 ("uint64", "block_size", 9),
                 ("uint32", "chunk_size", 10),
                 ("uint64", "effective_block_len", 11),
+                ("string", "group_name", 12),
             ]
         );
         assert_eq!(
@@ -1589,7 +1610,6 @@ mod tests {
             proto_message_fields(worker_data_proto, "OpenWriteStreamRequestProto"),
             vec![
                 ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.ShardGroupIdProto", "group_id", 2),
                 ("common.BlockIdProto", "block_id", 3),
                 ("uint32", "block_format_id", 4),
                 ("uint64", "block_size", 5),
@@ -1600,6 +1620,7 @@ mod tests {
                 ("uint32", "frame_size", 10),
                 ("string", "worker_run_id", 11),
                 ("uint64", "effective_block_len", 12),
+                ("string", "group_name", 13),
             ]
         );
         assert_eq!(
@@ -1617,7 +1638,6 @@ mod tests {
             proto_message_fields(worker_data_proto, "CommitWriteRequestProto"),
             vec![
                 ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.ShardGroupIdProto", "group_id", 2),
                 ("common.BlockIdProto", "block_id", 3),
                 ("common.StreamIdProto", "stream_id", 4),
                 ("uint64", "effective_block_len", 5),
@@ -1629,6 +1649,7 @@ mod tests {
                 ("uint32", "block_format_id", 11),
                 ("uint64", "block_size", 12),
                 ("uint32", "chunk_size", 13),
+                ("string", "group_name", 14),
             ]
         );
         assert_eq!(
@@ -1644,7 +1665,6 @@ mod tests {
             proto_message_fields(worker_data_proto, "SyncCommittedBlockRequestProto"),
             vec![
                 ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.ShardGroupIdProto", "group_id", 2),
                 ("common.BlockIdProto", "block_id", 3),
                 ("uint64", "block_stamp", 4),
                 ("uint64", "expected_block_len", 5),
@@ -1652,6 +1672,7 @@ mod tests {
                 ("uint32", "block_format_id", 7),
                 ("uint64", "block_size", 8),
                 ("uint32", "chunk_size", 9),
+                ("string", "group_name", 10),
             ]
         );
         assert_eq!(
@@ -1681,6 +1702,10 @@ mod tests {
                 ("uint32", "chunk_size", 3),
                 ("ChecksumKindProto", "checksum_kind", 4),
             ]
+        );
+        assert_eq!(
+            proto_message_fields(block_meta_proto, "BlockIdentityProto"),
+            vec![("common.BlockIdProto", "block_id", 1), ("string", "group_name", 3),]
         );
         assert_eq!(
             proto_message_fields(block_meta_proto, "BlockSourceProto"),
@@ -1733,7 +1758,7 @@ mod tests {
                 refresh_hint: None,
             }),
             state: Vec::new(),
-            group_id: 10,
+            group_name: "root".to_string(),
             mount_epoch: Some(7),
             route_epoch: Some(9),
         };
@@ -1789,8 +1814,8 @@ mod tests {
     #[test]
     fn header_state_vector_roundtrip_preserves_multiple_groups() {
         let state = vec![
-            GroupStateWatermark::new(ShardGroupId::new(1), RaftLogId::new(1, 1, 10)),
-            GroupStateWatermark::new(ShardGroupId::new(2), RaftLogId::new(2, 3, 20)),
+            GroupStateWatermark::new(GroupName::parse("root").unwrap(), RaftLogId::new(1, 1, 10)),
+            GroupStateWatermark::new(GroupName::parse("analytics").unwrap(), RaftLogId::new(2, 3, 20)),
         ];
 
         let request = RequestHeader::new(ClientId::new(42)).with_state(state.clone());
@@ -2005,14 +2030,11 @@ mod tests {
 
                 let field = line.trim_end_matches(';');
                 let (left, tag) = field.split_once(" = ")?;
-                let mut left_parts = left.split_whitespace();
-                let first = left_parts.next()?;
-                let (ty, name) = if matches!(first, "optional" | "repeated") {
-                    (left_parts.next()?, left_parts.next()?)
-                } else {
-                    (first, left_parts.next()?)
-                };
-                assert!(left_parts.next().is_none(), "unexpected proto field modifier: {line}");
+                let (decl, name) = left.rsplit_once(' ')?;
+                let ty = decl
+                    .strip_prefix("optional ")
+                    .or_else(|| decl.strip_prefix("repeated "))
+                    .unwrap_or(decl);
                 Some((ty, name, tag.parse().expect("numeric proto tag")))
             })
             .collect()

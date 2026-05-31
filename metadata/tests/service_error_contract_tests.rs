@@ -9,6 +9,7 @@ use metadata::service::header_from_canonical_error;
 use proto::common::{ErrorClassProto, RefreshReasonProto};
 use std::fs;
 use std::path::{Path, PathBuf};
+use types::GroupName;
 
 const SCAN_ROOTS: &[&str] = &["src/service", "src/worker", "../worker/src"];
 const REQUIRED_SCAN_FILES: &[&str] = &[
@@ -206,7 +207,7 @@ mod canonical_header_invariant_tests {
     #[test]
     fn ok_header_has_no_error() {
         let ok = CanonicalError::ok("success");
-        let header = header_from_canonical_error(&None, Some(1), Some(7), &ok);
+        let header = header_from_canonical_error(&None, Some(GroupName::parse("root").unwrap()), Some(7), &ok);
 
         assert!(header.error.is_none(), "Ok must not carry header.error");
     }
@@ -218,7 +219,7 @@ mod canonical_header_invariant_tests {
             RefreshReason::MountEpochMismatch,
             "mount epoch mismatch",
         );
-        let header = header_from_canonical_error(&None, Some(1), Some(7), &err);
+        let header = header_from_canonical_error(&None, Some(GroupName::parse("root").unwrap()), Some(7), &err);
         let detail = header.error.expect("NeedRefresh must carry header.error");
 
         assert_eq!(detail.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);

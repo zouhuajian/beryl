@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::transport as tonic_net;
+use types::GroupName;
 
 use crate::canonical::{invalid_header_action, validate_header_or_action};
 use crate::config::ClientConfig;
@@ -118,7 +119,7 @@ impl TonicMetadataGateway {
         let mut channels = HashMap::new();
         channels.insert(
             MetadataChannelKey {
-                group_id: 0,
+                group_name: GroupName::parse("root").expect("default group name is valid"),
                 endpoint: endpoint.clone(),
             },
             channel,
@@ -141,8 +142,11 @@ impl TonicMetadataGateway {
             .metadata_endpoint()
             .map(normalize_endpoint)
             .unwrap_or_else(|| self.default_endpoint.clone());
-        let group_id = ctx.metadata_header()?.group_id;
-        let key = MetadataChannelKey { group_id, endpoint };
+        let group_name = ctx
+            .group_name()
+            .cloned()
+            .ok_or_else(|| ClientError::InvalidArgument("metadata AttemptContext missing group_name".to_string()))?;
+        let key = MetadataChannelKey { group_name, endpoint };
         if !self.channel_pool_enabled {
             self.record_pool_metric(ClientMetric::MetadataChannelPoolMiss, operation, "miss");
             return lazy_channel(&key.endpoint)
@@ -207,7 +211,7 @@ impl TonicMetadataGateway {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 struct MetadataChannelKey {
-    group_id: u64,
+    group_name: GroupName,
     endpoint: String,
 }
 
@@ -221,14 +225,14 @@ fn evict_metadata_channel_if_needed(
     }
     let count = channels
         .keys()
-        .filter(|existing| existing.group_id == key.group_id)
+        .filter(|existing| existing.group_name == key.group_name)
         .count();
     if count < max_per_group {
         return;
     }
     if let Some(evicted) = channels
         .keys()
-        .filter(|existing| existing.group_id == key.group_id)
+        .filter(|existing| existing.group_name == key.group_name)
         .min()
         .cloned()
     {
@@ -312,8 +316,8 @@ impl MetadataGateway for TonicMetadataGateway {
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        let group_id = parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        LayoutSnapshot::from_proto(group_id, response)
+        let group_name = parse_metadata_response_header(&ctx, response.header.as_ref())?;
+        LayoutSnapshot::from_proto(group_name, response)
     }
 
     async fn create_file(&self, ctx: AttemptContext, mut req: CreateFileOp) -> ClientResult<WriteSessionSeed> {
@@ -351,14 +355,14 @@ impl MetadataGateway for TonicMetadataGateway {
             .await
             .map_err(ClientError::from)?
             .into_inner();
-        let group_id = parse_metadata_response_header(&ctx, response.header.as_ref())?;
+        let group_name = parse_metadata_response_header(&ctx, response.header.as_ref())?;
         let target = response
             .target
             .ok_or_else(|| side_effect_response_body_mismatch("AddBlock", "missing target"))?;
         let target = target
             .try_into()
             .map_err(|err| side_effect_response_body_mismatch("AddBlock", err))?;
-        Ok(AddBlockResult { group_id, target })
+        Ok(AddBlockResult { group_name, target })
     }
 
     async fn commit_file(&self, ctx: AttemptContext, mut req: CommitFileOp) -> ClientResult<CommitFileResult> {
@@ -436,15 +440,15 @@ impl MetadataGateway for TonicMetadataGateway {
 fn parse_metadata_response_header(
     ctx: &AttemptContext,
     header: Option<&proto::common::ResponseHeaderProto>,
-) -> ClientResult<u64> {
+) -> ClientResult<GroupName> {
     let Some(header) = header else {
         return Err(ClientError::from(invalid_header_action(
             "metadata OK response missing ResponseHeader",
         )));
     };
-    if header.group_id == 0 {
+    if header.group_name.is_empty() {
         return Err(ClientError::from(invalid_header_action(
-            "metadata OK response invalid ResponseHeader: group_id must be non-zero",
+            "metadata OK response invalid ResponseHeader: group_name missing",
         )));
     }
     validate_metadata_response_identity(ctx, header)?;
@@ -454,9 +458,9 @@ fn parse_metadata_response_header(
         )))
     })?;
     validate_header_or_action(&header).map_err(ClientError::from)?;
-    header.group_id.ok_or_else(|| {
+    header.group_name.ok_or_else(|| {
         ClientError::from(invalid_header_action(
-            "metadata OK response invalid ResponseHeader: group_id missing",
+            "metadata OK response invalid ResponseHeader: group_name missing",
         ))
     })
 }
@@ -465,12 +469,12 @@ fn validate_metadata_response_identity(
     ctx: &AttemptContext,
     header: &proto::common::ResponseHeaderProto,
 ) -> ClientResult<()> {
-    if header.group_id != 0 {
-        if let Some(request_group_id) = ctx.group_id() {
-            if header.group_id != request_group_id {
+    if !header.group_name.is_empty() {
+        if let Some(request_group_name) = ctx.group_name() {
+            if header.group_name != request_group_name.as_str() {
                 return Err(ClientError::from(invalid_header_action(format!(
-                    "metadata OK response invalid ResponseHeader: group_id mismatch: expected {}, got {}",
-                    request_group_id, header.group_id
+                    "metadata OK response invalid ResponseHeader: group_name mismatch: expected {}, got {}",
+                    request_group_name, header.group_name
                 ))));
             }
         }
@@ -561,14 +565,16 @@ mod tests {
         let metrics = Arc::new(RecordingMetrics::default());
         let gateway =
             TonicMetadataGateway::new_lazy_with_pool("127.0.0.1:18080", true, 1, metrics.clone()).expect("gateway");
-        let ctx = metadata_attempt(9, None);
+        let ctx = metadata_attempt("root", None);
 
         let _first = gateway.client(&ctx, "read").await.expect("first client");
         let _second = gateway.client(&ctx, "read").await.expect("second client");
 
         let events = metrics.events();
-        assert_metric(&events, ClientMetric::MetadataChannelPoolMiss);
         assert_metric(&events, ClientMetric::MetadataChannelPoolHit);
+        assert!(events
+            .iter()
+            .all(|event| event.metric != ClientMetric::MetadataChannelPoolMiss));
         assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
     }
 
@@ -578,7 +584,7 @@ mod tests {
         let gateway = Arc::new(
             TonicMetadataGateway::new_lazy_with_pool("127.0.0.1:18080", true, 8, metrics.clone()).expect("gateway"),
         );
-        let ctx = metadata_attempt(9, None);
+        let ctx = metadata_attempt("root", None);
 
         let mut tasks = Vec::with_capacity(8);
         for _ in 0..8 {
@@ -591,7 +597,7 @@ mod tests {
             let _client = task.await.expect("task").expect("metadata client");
         }
         let events = metrics.events();
-        assert_eq!(gateway.channels.read().len(), 2);
+        assert_eq!(gateway.channels.read().len(), 1);
         assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
     }
 
@@ -601,7 +607,7 @@ mod tests {
         let gateway = Arc::new(
             TonicMetadataGateway::new_lazy_with_pool("127.0.0.1:18080", true, 8, metrics.clone()).expect("gateway"),
         );
-        let ctx = metadata_attempt(9, Some("http://[invalid"));
+        let ctx = metadata_attempt("root", Some("http://[invalid"));
 
         let mut tasks = Vec::with_capacity(4);
         for _ in 0..4 {
@@ -623,7 +629,7 @@ mod tests {
         let metrics = Arc::new(RecordingMetrics::default());
         let gateway =
             TonicMetadataGateway::new_lazy_with_pool("127.0.0.1:18080", false, 1, metrics.clone()).expect("gateway");
-        let ctx = metadata_attempt(9, None);
+        let ctx = metadata_attempt("root", None);
 
         let _first = gateway.client(&ctx, "read").await.expect("first client");
         let _second = gateway.client(&ctx, "read").await.expect("second client");
@@ -646,7 +652,7 @@ mod tests {
         let metrics = Arc::new(RecordingMetrics::default());
         let gateway =
             TonicMetadataGateway::new_lazy_with_pool("127.0.0.1:18080", true, 1, metrics.clone()).expect("gateway");
-        let ctx = metadata_attempt(9, Some("http://[invalid"));
+        let ctx = metadata_attempt("root", Some("http://[invalid"));
 
         let err = gateway.client(&ctx, "read").await.expect_err("invalid endpoint fails");
 
@@ -656,13 +662,13 @@ mod tests {
 
     #[test]
     fn metadata_response_header_preserves_need_refresh_hints() {
-        let ctx = metadata_attempt(17, None);
+        let ctx = metadata_attempt("analytics", None);
         let canonical = CanonicalError::need_refresh_with_hint(
             RpcErrorCode::ShardMoved,
             RefreshReason::RouteEpochMismatch,
             CanonicalRefreshHint {
                 leader_endpoint: Some("http://127.0.0.1:18081".to_string()),
-                group_id: Some(17),
+                group_name: Some("analytics".to_string()),
                 route_epoch: Some(23),
                 mount_epoch: Some(31),
                 mount_prefix: Some("/mnt".to_string()),
@@ -675,7 +681,7 @@ mod tests {
             client: Some(ctx.client_info()),
             error: Some(canonical_to_error_detail(&canonical)),
             state: Vec::new(),
-            group_id: 17,
+            group_name: "analytics".to_string(),
             mount_epoch: Some(31),
             route_epoch: Some(23),
         };
@@ -685,7 +691,7 @@ mod tests {
             ClientAction::Refresh { reason, hint, .. } => {
                 assert_eq!(*reason, RefreshReason::RouteEpochMismatch);
                 assert_eq!(hint.leader_endpoint.as_deref(), Some("http://127.0.0.1:18081"));
-                assert_eq!(hint.group_id, Some(17));
+                assert_eq!(hint.group_name, Some(GroupName::parse("analytics").unwrap()));
                 assert_eq!(hint.route_epoch, Some(23));
                 assert_eq!(hint.mount_epoch, Some(31));
                 assert_eq!(hint.mount_prefix.as_deref(), Some("/mnt"));
@@ -697,7 +703,7 @@ mod tests {
 
     #[test]
     fn missing_metadata_response_header_is_invalid_header_action() {
-        let ctx = metadata_attempt(9, None);
+        let ctx = metadata_attempt("root", None);
         let err = parse_metadata_response_header(&ctx, None).expect_err("missing response header must fail");
 
         assert_ne!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
@@ -718,7 +724,7 @@ mod tests {
 
     #[test]
     fn malformed_metadata_response_header_is_invalid_header_action() {
-        let ctx = metadata_attempt(9, None);
+        let ctx = metadata_attempt("root", None);
         let malformed = proto::common::ResponseHeaderProto::default();
 
         let err =
@@ -741,9 +747,8 @@ mod tests {
     }
 
     #[test]
-    fn metadata_response_header_with_zero_group_id_is_invalid_header_action() {
-        const INVALID_GROUP_ID: u64 = 0;
-        let ctx = metadata_attempt(9, None);
+    fn metadata_response_header_with_missing_group_name_is_invalid_header_action() {
+        let ctx = metadata_attempt("root", None);
         let header = proto::common::ResponseHeaderProto {
             client: Some(proto::common::ClientInfoProto {
                 call_id: types::CallId::new().to_string(),
@@ -752,12 +757,12 @@ mod tests {
             }),
             error: None,
             state: Vec::new(),
-            group_id: INVALID_GROUP_ID,
+            group_name: String::new(),
             mount_epoch: None,
             route_epoch: None,
         };
 
-        let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("zero group_id must fail");
+        let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("missing group_name must fail");
 
         assert_ne!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
         match action(&err) {
@@ -769,7 +774,7 @@ mod tests {
                         HeaderRpcErrorCode::InvalidHeader
                     ))
                 ));
-                assert!(canonical.message.contains("group_id"));
+                assert!(canonical.message.contains("group_name"));
             }
             other => panic!("expected invalid header Fail action, got {other:?}"),
         }
@@ -777,7 +782,7 @@ mod tests {
 
     #[test]
     fn metadata_response_header_with_wrong_call_id_is_invalid_header_action() {
-        let ctx = metadata_attempt(9, None);
+        let ctx = metadata_attempt("root", None);
         let mut header = ok_metadata_header(&ctx);
         header.client.as_mut().expect("client").call_id = types::CallId::new().to_string();
 
@@ -788,7 +793,7 @@ mod tests {
 
     #[test]
     fn metadata_response_header_with_wrong_client_id_is_invalid_header_action() {
-        let ctx = metadata_attempt(9, None);
+        let ctx = metadata_attempt("root", None);
         let mut header = ok_metadata_header(&ctx);
         header.client.as_mut().expect("client").client_id = ctx.client_id().as_raw() + 1;
 
@@ -798,19 +803,19 @@ mod tests {
     }
 
     #[test]
-    fn metadata_response_header_with_wrong_group_id_is_invalid_header_action() {
-        let ctx = metadata_attempt(9, None);
+    fn metadata_response_header_with_wrong_group_name_is_invalid_header_action() {
+        let ctx = metadata_attempt("root", None);
         let mut header = ok_metadata_header(&ctx);
-        header.group_id = 11;
+        header.group_name = "analytics".to_string();
 
-        let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("wrong group_id must fail");
+        let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("wrong group_name must fail");
 
-        assert_invalid_metadata_header(&err, "group_id");
+        assert_invalid_metadata_header(&err, "group_name");
     }
 
     #[test]
     fn metadata_response_header_with_missing_client_identity_is_invalid_header_action() {
-        let ctx = metadata_attempt(9, None);
+        let ctx = metadata_attempt("root", None);
         let mut header = ok_metadata_header(&ctx);
         header.client = None;
 
@@ -821,7 +826,7 @@ mod tests {
 
     #[test]
     fn metadata_response_header_with_empty_call_id_is_invalid_header_action() {
-        let ctx = metadata_attempt(9, None);
+        let ctx = metadata_attempt("root", None);
         let mut header = ok_metadata_header(&ctx);
         header.client.as_mut().expect("client").call_id.clear();
 
@@ -864,7 +869,7 @@ mod tests {
         );
     }
 
-    fn metadata_attempt(group_id: u64, endpoint: Option<&str>) -> AttemptContext {
+    fn metadata_attempt(group_name: &str, endpoint: Option<&str>) -> AttemptContext {
         let operation = OperationContext::new(
             ClientId::new(7),
             OperationKind::MetadataRead,
@@ -872,7 +877,7 @@ mod tests {
             OperationIdentity::path("/alpha"),
         )
         .expect("operation");
-        let ctx = AttemptContext::for_metadata(&operation, group_id, 0).expect("attempt");
+        let ctx = AttemptContext::for_metadata(&operation, GroupName::parse(group_name).unwrap(), 0).expect("attempt");
         if let Some(endpoint) = endpoint {
             ctx.with_metadata_endpoint(endpoint.to_string())
         } else {
@@ -886,7 +891,7 @@ mod tests {
             client: request.client,
             error: None,
             state: Vec::new(),
-            group_id: request.group_id,
+            group_name: request.group_name,
             mount_epoch: request.mount_epoch,
             route_epoch: request.route_epoch,
         }

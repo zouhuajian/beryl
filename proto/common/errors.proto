@@ -51,11 +51,11 @@ enum RefreshReasonProto {
 
 /// Structured hints for NEED_REFRESH handling.
 message RefreshHintProto {
+  reserved 2;
+  reserved "group_id";
+
   /// Metadata leader endpoint (`host:port` or URL).
   optional string leader_endpoint = 1;
-
-  /// Optional raft/shard group identifier.
-  optional uint64 group_id = 2;
 
   /// Authoritative mount epoch for the target mount.
   optional uint64 mount_epoch = 3;
@@ -71,6 +71,9 @@ message RefreshHintProto {
 
   /// Server requests client to re-resolve worker placement.
   bool worker_resolve_required = 7;
+
+  /// Stable metadata group name associated with the refresh.
+  optional string group_name = 8;
 }
 
 /// Filesystem error codes (POSIX errno).

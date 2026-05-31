@@ -61,12 +61,6 @@ message ShardIdProto {
   uint64 value = 1;
 }
 
-/// Shard group identity.
-/// Aligns with types::ShardGroupId (u64).
-message ShardGroupIdProto {
-  uint64 value = 1;
-}
-
 /// Mount identity.
 /// Aligns with types::MountId (u64).
 message MountIdProto {

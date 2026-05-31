@@ -24,7 +24,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 use types::block::BlockState;
-use types::ids::{BlockId, ShardGroupId, WorkerId};
+use types::ids::{BlockId, WorkerId};
+use types::GroupName;
 
 use super::delete::DeleteIntentBuilder;
 use super::repair::RepairPolicy;
@@ -156,10 +157,10 @@ impl OverReplicaCleanupService {
         let mut updates: Vec<(BlockId, Option<(u32, u32)>)> = Vec::new();
         for reported in all_blocks {
             let block_id = reported.block_id;
-            let group_id = reported.group_id;
-            let owner_group_id =
+            let group_name = reported.group_name;
+            let owner_group_name =
                 match crate::maintenance::owner_group_for_block(&self.storage, &self.mount_table, block_id) {
-                    Ok(group_id) => group_id,
+                    Ok(group_name) => group_name,
                     Err(error) => {
                         debug!(
                             block_id = %block_id,
@@ -169,20 +170,20 @@ impl OverReplicaCleanupService {
                         continue;
                     }
                 };
-            if owner_group_id != group_id {
+            if owner_group_name != group_name {
                 debug!(
                     block_id = %block_id,
-                    reported_group_id = group_id.as_raw(),
-                    owner_group_id = owner_group_id.as_raw(),
+                    reported_group_name = %group_name,
+                    owner_group_name = %owner_group_name,
                     "Skipping overrep scan: reported group is not authoritative"
                 );
                 continue;
             }
-            let current_locations = self.worker_manager.get_block_locations(group_id, block_id);
+            let current_locations = self.worker_manager.get_block_locations(&group_name, block_id);
             if current_locations.is_empty() {
                 debug!(
                     block_id = %block_id,
-                    group_id = group_id.as_raw(),
+                    group_name = %group_name,
                     "Skipping overrep scan: block has no live locations in owner group"
                 );
                 continue;
@@ -332,8 +333,9 @@ impl OverReplicaCleanupService {
                 continue;
             }
 
-            let group_id = match crate::maintenance::owner_group_for_block(&self.storage, &self.mount_table, block_id) {
-                Ok(group_id) => group_id,
+            let group_name = match crate::maintenance::owner_group_for_block(&self.storage, &self.mount_table, block_id)
+            {
+                Ok(group_name) => group_name,
                 Err(error) => {
                     self.inflight_registry.release(block_id);
                     debug!(
@@ -344,12 +346,12 @@ impl OverReplicaCleanupService {
                     continue;
                 }
             };
-            let current_locations = self.worker_manager.get_block_locations(group_id, block_id);
+            let current_locations = self.worker_manager.get_block_locations(&group_name, block_id);
             if current_locations.is_empty() {
                 self.inflight_registry.release(block_id);
                 debug!(
                     block_id = %block_id,
-                    group_id = group_id.as_raw(),
+                    group_name = %group_name,
                     "Skipping overrep cleanup: block has no live locations in owner group"
                 );
                 continue;
@@ -364,7 +366,7 @@ impl OverReplicaCleanupService {
 
             // Select target workers to evict
             let target_workers = self.select_target_workers(
-                group_id,
+                &group_name,
                 &current_locations,
                 candidate.current_replicas,
                 candidate.desired_replicas,
@@ -388,13 +390,13 @@ impl OverReplicaCleanupService {
                 .with_not_before_ms(not_before_ms)
                 .with_guard_state_id(guard_state_id);
 
-            // Resolve group_id and guard_watermark using inode -> mount owner group.
-            let group_id = crate::maintenance::owner_group_for_block(&self.storage, &self.mount_table, block_id)
+            // Resolve group_name and guard_watermark using inode -> mount owner group.
+            let group_name = crate::maintenance::owner_group_for_block(&self.storage, &self.mount_table, block_id)
                 .inspect_err(|_e| {
                     self.inflight_registry.release(block_id);
                 })?;
-            ctx = ctx.with_group_id(group_id);
-            let guard_watermark = types::group_watermark::GroupStateWatermark::new(group_id, guard_state_id);
+            ctx = ctx.with_group_name(group_name.clone());
+            let guard_watermark = types::group_watermark::GroupStateWatermark::new(group_name, guard_state_id);
             ctx = ctx.with_guard_watermark(guard_watermark);
             let mount_epoch = types::group_watermark::MountEpoch::new(self.mount_table.version());
             ctx = ctx.with_mount_epoch(mount_epoch);
@@ -501,7 +503,7 @@ impl OverReplicaCleanupService {
     /// 4. Stable random (hash-based sorting for determinism)
     fn select_target_workers(
         &self,
-        group_id: ShardGroupId,
+        group_name: &GroupName,
         current_locations: &[WorkerId],
         current_replicas: u32,
         desired_replicas: u32,
@@ -516,7 +518,7 @@ impl OverReplicaCleanupService {
             .iter()
             .map(|&worker_id| {
                 // Get worker info (combined descriptor + runtime)
-                let worker_info = self.worker_manager.get_worker(group_id, worker_id);
+                let worker_info = self.worker_manager.get_worker(group_name, worker_id);
 
                 let load_score = worker_info.as_ref().map(|w| {
                     // Calculate load score: capacity_used_ratio + active_ops_penalty

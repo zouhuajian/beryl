@@ -19,8 +19,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
-use types::ids::{BlockId, ShardGroupId, WorkerId};
-use types::WorkerRunId;
+use types::{BlockId, GroupName, WorkerId, WorkerRunId};
 
 /// Worker service background task handles.
 pub struct WorkerBackgroundHandle {}
@@ -61,7 +60,7 @@ pub struct MetadataWorkerServiceImpl {
     slot_metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
     /// Mount table used to compute mount_epoch for lease gating.
     _mount_table: Arc<crate::mount::MountTable>,
-    served_group_id: ShardGroupId,
+    served_group_name: GroupName,
 }
 
 impl MetadataWorkerServiceImpl {
@@ -69,7 +68,7 @@ impl MetadataWorkerServiceImpl {
         raft_node: Arc<AppRaftNode>,
         worker_manager: Arc<WorkerManager>,
         mount_table: Arc<crate::mount::MountTable>,
-        served_group_id: ShardGroupId,
+        served_group_name: GroupName,
     ) -> Self {
         let metrics = Arc::new(WorkerMetrics::new());
 
@@ -79,7 +78,7 @@ impl MetadataWorkerServiceImpl {
             metrics,
             slot_metrics: None, // Will be set via set_slot_metrics
             _mount_table: mount_table,
-            served_group_id,
+            served_group_name,
         }
     }
 
@@ -88,11 +87,11 @@ impl MetadataWorkerServiceImpl {
         self.slot_metrics = Some(metrics);
     }
 
-    /// Helper: create a response header from request header with group_id.
+    /// Helper: create a response header from request header with group name.
     fn create_response_header_from_request(
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
-        group_id: Option<u64>,
+        group_name: Option<&GroupName>,
     ) -> ::common::header::ResponseHeader {
         let client = req_header
             .as_ref()
@@ -100,35 +99,22 @@ impl MetadataWorkerServiceImpl {
             .and_then(|c| ::common::header::ClientInfo::try_from(c.clone()).ok())
             .unwrap_or_else(|| ::common::header::ClientInfo::new(types::ClientId::new(0)));
         let mut header = ResponseHeader::ok(client);
-        if let Some(gid) = group_id {
-            header = header.with_group_id(gid);
+        if let Some(group_name) = group_name {
+            header = header.with_group_name(group_name.clone());
         }
         if self.raft_node.is_leader() {
-            if let (Some(gid), Some(sid)) = (group_id, self.raft_node.get_last_applied_state_id()) {
-                header = header.with_state(vec![types::GroupStateWatermark::new(
-                    types::ShardGroupId::new(gid),
-                    sid,
-                )]);
+            if let (Some(group_name), Some(sid)) = (group_name, self.raft_node.get_last_applied_state_id()) {
+                header = header.with_state(vec![types::GroupStateWatermark::new(group_name.clone(), sid)]);
             }
         }
         header
     }
 
-    fn group_id_from_request_header(req_header: &Option<proto::common::RequestHeaderProto>) -> Option<u64> {
-        req_header.as_ref().and_then(|header| {
-            if header.group_id != 0 {
-                Some(header.group_id)
-            } else {
-                None
-            }
-        })
-    }
-
-    fn ok_response_header_from_request(
-        &self,
-        req_header: &Option<proto::common::RequestHeaderProto>,
-    ) -> proto::common::ResponseHeaderProto {
-        (&self.create_response_header_from_request(req_header, Self::group_id_from_request_header(req_header))).into()
+    fn group_name_from_request_header(req_header: &Option<proto::common::RequestHeaderProto>) -> Option<GroupName> {
+        req_header
+            .as_ref()
+            .and_then(|header| (!header.group_name.is_empty()).then_some(header.group_name.as_str()))
+            .and_then(|group_name| GroupName::parse(group_name).ok())
     }
 
     fn error_response_header_from_request(
@@ -140,8 +126,8 @@ impl MetadataWorkerServiceImpl {
             error.class != ErrorClass::Ok,
             "metadata worker error response must carry a non-OK canonical error"
         );
-        let mut header =
-            self.create_response_header_from_request(req_header, Self::group_id_from_request_header(req_header));
+        let mut header = self
+            .create_response_header_from_request(req_header, Self::group_name_from_request_header(req_header).as_ref());
         header.status = match error.class {
             ErrorClass::Ok => RpcStatus::Ok,
             ErrorClass::NeedRefresh | ErrorClass::Retryable => RpcStatus::Error,
@@ -440,31 +426,21 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             );
         }
 
-        let header_group_id = Self::group_id_from_request_header(&req.header);
-        let group_id = if req.group_id != 0 {
-            req.group_id
-        } else {
-            header_group_id.unwrap_or(0)
-        };
-        if group_id == 0 {
-            return self
-                .invalid_request_response::<RegisterWorkerResponseProto>(&req.header, "group_id must be non-zero");
-        }
-        if let Some(header_group_id) = header_group_id {
-            if header_group_id != group_id {
+        let group_name = match GroupName::parse(&req.group_name) {
+            Ok(group_name) => group_name,
+            Err(error) => {
                 return self.invalid_request_response::<RegisterWorkerResponseProto>(
                     &req.header,
-                    "request header group_id must match register group_id",
-                );
+                    format!("group_name is invalid: {error}"),
+                )
             }
-        }
-        if ShardGroupId::new(group_id) != self.served_group_id {
+        };
+        if group_name != self.served_group_name {
             return self.invalid_request_response::<RegisterWorkerResponseProto>(
                 &req.header,
                 format!(
-                    "register group_id {} does not match served metadata group {}",
-                    group_id,
-                    self.served_group_id.as_raw()
+                    "register group_name {} does not match served metadata group {}",
+                    group_name, self.served_group_name
                 ),
             );
         }
@@ -503,10 +479,16 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             Ok(address) => address,
             Err(message) => return self.invalid_request_response::<RegisterWorkerResponseProto>(&req.header, message),
         };
+        if let Err(error) = self
+            .worker_manager
+            .validate_worker_run_registration(&group_name, worker_id, worker_run_id)
+        {
+            return self.metadata_error_response::<RegisterWorkerResponseProto>(&req.header, error);
+        }
 
         let command = Command::RegisterWorker {
             dedup: crate::raft::DedupKey::new(_caller_ctx.client.client_id, _caller_ctx.client.call_id),
-            group_id: ShardGroupId::new(group_id),
+            group_name: group_name.clone(),
             worker_id,
             worker_run_id,
             address: address.clone(),
@@ -530,17 +512,17 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         }
 
         info!(
-            group_id,
+            group_name = %group_name,
             worker_id = accepted_worker_id.as_raw(),
             worker_run_id = %worker_run_id,
             "Worker registered"
         );
 
         Ok(Response::new(RegisterWorkerResponseProto {
-            header: Some(self.ok_response_header_from_request(&req.header)),
-            group_id,
+            header: Some((&self.create_response_header_from_request(&req.header, Some(&group_name))).into()),
             worker_id: accepted_worker_id.as_raw(),
             accepted_worker_run_id: worker_run_id.to_string(),
+            group_name: group_name.to_string(),
         }))
     }
 
@@ -552,35 +534,24 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         let req = request.into_inner();
         let _caller_ctx = extract_and_inject_context(&req.header);
 
-        let header_group_id = Self::group_id_from_request_header(&req.header);
-        let group_id = if req.group_id != 0 {
-            req.group_id
-        } else {
-            header_group_id.unwrap_or(0)
-        };
-        if group_id == 0 {
-            return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, "group_id must be non-zero");
-        }
-        if let Some(header_group_id) = header_group_id {
-            if header_group_id != group_id {
-                return self.group_mismatch_response::<HeartbeatResponseProto>(
+        let group_name = match GroupName::parse(&req.group_name) {
+            Ok(group_name) => group_name,
+            Err(error) => {
+                return self.invalid_request_response::<HeartbeatResponseProto>(
                     &req.header,
-                    "request header group_id must match heartbeat group_id",
-                );
+                    format!("group_name is invalid: {error}"),
+                )
             }
-        }
-        let group_id = ShardGroupId::new(group_id);
-        if group_id != self.served_group_id {
+        };
+        if group_name != self.served_group_name {
             return self.group_mismatch_response::<HeartbeatResponseProto>(
                 &req.header,
                 format!(
-                    "heartbeat group_id {} does not match served metadata group {}",
-                    group_id.as_raw(),
-                    self.served_group_id.as_raw()
+                    "heartbeat group_name {} does not match served metadata group {}",
+                    group_name, self.served_group_name
                 ),
             );
         }
-
         let worker_id = WorkerId::new(req.worker_id);
         if worker_id.as_raw() == 0 {
             return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, "worker_id must be non-zero");
@@ -627,27 +598,27 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 
         self.worker_manager.expire_liveness();
 
-        let descriptor = match self.worker_manager.get_descriptor(group_id, worker_id) {
+        let descriptor = match self.worker_manager.get_descriptor(&group_name, worker_id) {
             Some(descriptor) => descriptor,
             None => {
                 return self.need_register_response::<HeartbeatResponseProto>(
                     &req.header,
                     format!(
-                        "worker descriptor not found for group_id={}, worker_id={}",
-                        group_id.as_raw(),
+                        "worker descriptor not found for group_name={}, worker_id={}",
+                        group_name,
                         worker_id.as_raw()
                     ),
                 );
             }
         };
-        let registration = match self.worker_manager.get_registration(group_id, worker_id) {
+        let registration = match self.worker_manager.get_registration(&group_name, worker_id) {
             Some(registration) => registration,
             None => {
                 return self.need_register_response::<HeartbeatResponseProto>(
                     &req.header,
                     format!(
-                        "live worker registration not found for group_id={}, worker_id={}",
-                        group_id.as_raw(),
+                        "live worker registration not found for group_name={}, worker_id={}",
+                        group_name,
                         worker_id.as_raw()
                     ),
                 );
@@ -657,8 +628,8 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             return self.worker_run_mismatch_response::<HeartbeatResponseProto>(
                 &req.header,
                 format!(
-                    "worker_run_id mismatch for group_id={}, worker_id={}",
-                    group_id.as_raw(),
+                    "worker_run_id mismatch for group_name={}, worker_id={}",
+                    group_name,
                     worker_id.as_raw()
                 ),
             );
@@ -667,8 +638,8 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             return self.worker_descriptor_mismatch_response::<HeartbeatResponseProto>(
                 &req.header,
                 format!(
-                    "advertised endpoint or protocol does not match registration for group_id={}, worker_id={}",
-                    group_id.as_raw(),
+                    "advertised endpoint or protocol does not match registration for group_name={}, worker_id={}",
+                    group_name,
                     worker_id.as_raw()
                 ),
             );
@@ -678,7 +649,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         let health_status = HealthStatus::from(health_proto as i32);
 
         let live_state = match self.worker_manager.record_heartbeat(
-            group_id,
+            &group_name,
             worker_id,
             worker_run_id,
             req.heartbeat_seq,
@@ -717,15 +688,15 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         }
 
         Ok(Response::new(HeartbeatResponseProto {
-            header: Some((&self.create_response_header_from_request(&req.header, Some(group_id.as_raw()))).into()),
+            header: Some((&self.create_response_header_from_request(&req.header, Some(&group_name))).into()),
             commands: Vec::new(),
-            group_id: group_id.as_raw(),
             worker_id: live_state.worker_id.as_raw(),
             accepted_worker_run_id: live_state.worker_run_id.to_string(),
             heartbeat_interval_ms: self.heartbeat_interval_ms(),
             liveness_timeout_ms: self.liveness_timeout_ms(),
             server_role: self.server_role() as i32,
             leader_hint: self.leader_hint(),
+            group_name: group_name.to_string(),
         }))
     }
 
@@ -737,35 +708,24 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         let req = request.into_inner();
         let _caller_ctx = extract_and_inject_context(&req.header);
 
-        let header_group_id = Self::group_id_from_request_header(&req.header);
-        let group_id = if req.group_id != 0 {
-            req.group_id
-        } else {
-            header_group_id.unwrap_or(0)
-        };
-        if group_id == 0 {
-            return self.invalid_request_response::<BlockReportResponseProto>(&req.header, "group_id must be non-zero");
-        }
-        if let Some(header_group_id) = header_group_id {
-            if header_group_id != group_id {
-                return self.group_mismatch_response::<BlockReportResponseProto>(
+        let group_name = match GroupName::parse(&req.group_name) {
+            Ok(group_name) => group_name,
+            Err(error) => {
+                return self.invalid_request_response::<BlockReportResponseProto>(
                     &req.header,
-                    "request header group_id must match block report group_id",
-                );
+                    format!("group_name is invalid: {error}"),
+                )
             }
-        }
-        let group_id = ShardGroupId::new(group_id);
-        if group_id != self.served_group_id {
+        };
+        if group_name != self.served_group_name {
             return self.group_mismatch_response::<BlockReportResponseProto>(
                 &req.header,
                 format!(
-                    "block report group_id {} does not match served metadata group {}",
-                    group_id.as_raw(),
-                    self.served_group_id.as_raw()
+                    "block report group_name {} does not match served metadata group {}",
+                    group_name, self.served_group_name
                 ),
             );
         }
-
         let worker_id = WorkerId::new(req.worker_id);
         if worker_id.as_raw() == 0 {
             return self
@@ -798,7 +758,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     }
                 }
                 match self.worker_manager.receive_full_block_report(
-                    group_id,
+                    &group_name,
                     worker_id,
                     worker_run_id,
                     report_seq,
@@ -821,7 +781,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     }
                 }
                 match self.worker_manager.apply_delta_block_report(
-                    group_id,
+                    &group_name,
                     worker_id,
                     worker_run_id,
                     report_seq,
@@ -841,7 +801,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         self.metrics.update_locations_size(locations_size);
 
         info!(
-            group_id = group_id.as_raw(),
+            group_name = %group_name,
             worker_id = worker_id.as_raw(),
             report_seq,
             next_delta_seq = result.next_delta_seq,
@@ -851,7 +811,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         );
 
         Ok(Response::new(BlockReportResponseProto {
-            header: Some((&self.create_response_header_from_request(&req.header, Some(group_id.as_raw()))).into()),
+            header: Some((&self.create_response_header_from_request(&req.header, Some(&group_name))).into()),
             report_seq,
             next_delta_seq: result.next_delta_seq,
             retry_after_ms: 0,
@@ -869,15 +829,20 @@ mod tests {
     use proto::common::{error_detail_proto, ErrorClassProto, RefreshReasonProto, RpcErrorCodeProto};
     use tempfile::TempDir;
 
+    fn group_name(raw: &str) -> GroupName {
+        GroupName::parse(raw).unwrap()
+    }
+
     async fn leader_raft(dir: &TempDir) -> Arc<AppRaftNode> {
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), mount_table));
-        let raft_config = crate::config::RaftConfig {
-            node_id: 1,
-            peers: vec!["127.0.0.1:0".to_string()],
-        };
+        let raft_config = crate::config::RaftConfig::default();
         let raft_node = Arc::new(AppRaftNode::new(1, storage, state_machine, &raft_config).await.unwrap());
+        raft_node
+            .initialize_single_node("127.0.0.1:0".to_string())
+            .await
+            .unwrap();
         for _ in 0..100 {
             if raft_node.is_leader() {
                 break;
@@ -889,13 +854,10 @@ mod tests {
     }
 
     async fn nonleader_raft(dir: &TempDir) -> Arc<AppRaftNode> {
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), mount_table));
-        let raft_config = crate::config::RaftConfig {
-            node_id: 1,
-            peers: Vec::new(),
-        };
+        let raft_config = crate::config::RaftConfig::default();
         let raft_node = Arc::new(AppRaftNode::new(1, storage, state_machine, &raft_config).await.unwrap());
         assert!(!raft_node.is_leader());
         raft_node
@@ -918,7 +880,7 @@ mod tests {
     }
 
     fn full_report_request(
-        group_id: ShardGroupId,
+        group_name: GroupName,
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
         report_seq: u64,
@@ -926,12 +888,12 @@ mod tests {
         final_batch: bool,
         blocks: Vec<BlockId>,
     ) -> BlockReportRequestProto {
+        let group_name = group_name.to_string();
         BlockReportRequestProto {
             header: Some(proto::common::RequestHeaderProto {
-                group_id: group_id.as_raw(),
+                group_name: group_name.clone(),
                 ..Default::default()
             }),
-            group_id: group_id.as_raw(),
             worker_id: worker_id.as_raw(),
             worker_run_id: worker_run_id.to_string(),
             report_seq,
@@ -940,23 +902,24 @@ mod tests {
                 final_batch,
                 blocks: blocks.into_iter().map(report_block_proto).collect(),
             })),
+            group_name,
         }
     }
 
     fn delta_report_request(
-        group_id: ShardGroupId,
+        group_name: GroupName,
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
         report_seq: u64,
         delta_seq: u64,
         deltas: Vec<(BlockReportDeltaOpProto, BlockId)>,
     ) -> BlockReportRequestProto {
+        let group_name = group_name.to_string();
         BlockReportRequestProto {
             header: Some(proto::common::RequestHeaderProto {
-                group_id: group_id.as_raw(),
+                group_name: group_name.clone(),
                 ..Default::default()
             }),
-            group_id: group_id.as_raw(),
             worker_id: worker_id.as_raw(),
             worker_run_id: worker_run_id.to_string(),
             report_seq,
@@ -970,6 +933,7 @@ mod tests {
                     })
                     .collect(),
             })),
+            group_name,
         }
     }
 
@@ -981,9 +945,12 @@ mod tests {
         "550e8400-e29b-41d4-a716-446655440001".parse().unwrap()
     }
 
-    fn worker_run_id_for(group_id: ShardGroupId, worker_id: WorkerId) -> WorkerRunId {
-        let suffix = group_id
-            .as_raw()
+    fn worker_run_id_for(group_name: &GroupName, worker_id: WorkerId) -> WorkerRunId {
+        let group_component = group_name
+            .as_str()
+            .bytes()
+            .fold(0u64, |acc, byte| acc.saturating_add(u64::from(byte)));
+        let suffix = group_component
             .saturating_mul(1_000_000)
             .saturating_add(worker_id.as_raw());
         format!("550e8400-e29b-41d4-a716-{suffix:012x}")
@@ -994,7 +961,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn record_heartbeat(
         worker_manager: &WorkerManager,
-        group_id: ShardGroupId,
+        group_name: &GroupName,
         worker_id: WorkerId,
         capacity_total: u64,
         capacity_used: u64,
@@ -1004,16 +971,16 @@ mod tests {
         health: HealthStatus,
     ) -> WorkerRunId {
         let descriptor = worker_manager
-            .get_descriptor(group_id, worker_id)
+            .get_descriptor(group_name, worker_id)
             .expect("worker descriptor should be registered");
         let worker_run_id = worker_manager
-            .get_registration(group_id, worker_id)
+            .get_registration(group_name, worker_id)
             .map(|registration| registration.worker_run_id)
             .unwrap_or_else(|| {
-                let worker_run_id = worker_run_id_for(group_id, worker_id);
+                let worker_run_id = worker_run_id_for(group_name, worker_id);
                 worker_manager
                     .register_worker_run(
-                        group_id,
+                        group_name,
                         worker_id,
                         descriptor.address.clone(),
                         descriptor.worker_net_protocol,
@@ -1025,7 +992,7 @@ mod tests {
             });
         worker_manager
             .record_heartbeat(
-                group_id,
+                group_name,
                 worker_id,
                 worker_run_id,
                 1,
@@ -1046,18 +1013,18 @@ mod tests {
     }
 
     fn heartbeat_request(
-        group_id: u64,
+        group_name: GroupName,
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
         heartbeat_seq: u64,
         endpoint_port: u32,
     ) -> HeartbeatRequestProto {
+        let group_name = group_name.to_string();
         HeartbeatRequestProto {
             header: Some(proto::common::RequestHeaderProto {
-                group_id,
+                group_name: group_name.clone(),
                 ..Default::default()
             }),
-            group_id,
             worker_id: worker_id.as_raw(),
             worker_run_id: worker_run_id.to_string(),
             heartbeat_seq,
@@ -1080,6 +1047,7 @@ mod tests {
             health: HealthStatusProto::HealthStatusHealthy as i32,
             worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
             acks: Vec::new(),
+            group_name,
         }
     }
 
@@ -1120,11 +1088,11 @@ mod tests {
         let worker_id = WorkerId::new(7);
         let block_id = BlockId::from_u64_u32(70, 0);
         worker_manager
-            .register_worker(ShardGroupId::new(1), worker_id, "127.0.0.1:9090".to_string(), 1, None)
+            .register_worker(&group_name("root"), worker_id, "127.0.0.1:9090".to_string(), 1, None)
             .unwrap();
         let worker_run_id = record_heartbeat(
             &worker_manager,
-            ShardGroupId::new(1),
+            &group_name("root"),
             worker_id,
             1_000,
             500,
@@ -1137,13 +1105,13 @@ mod tests {
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
             Arc::new(MountTable::new()),
-            ShardGroupId::new(1),
+            group_name("root"),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
             &service,
             Request::new(full_report_request(
-                ShardGroupId::new(1),
+                group_name("root"),
                 worker_id,
                 worker_run_id,
                 1,
@@ -1160,7 +1128,7 @@ mod tests {
         assert_eq!(response.report_seq, 1);
         assert_eq!(response.next_delta_seq, 0);
         assert_eq!(
-            worker_manager.get_block_locations(ShardGroupId::new(1), block_id),
+            worker_manager.get_block_locations(&group_name("root"), block_id),
             vec![worker_id]
         );
         assert_eq!(raft_node.get_last_applied_state_id(), before_state_id);
@@ -1174,11 +1142,11 @@ mod tests {
         let worker_id = WorkerId::new(8);
         let block_id = BlockId::from_u64_u32(80, 0);
         worker_manager
-            .register_worker(ShardGroupId::new(1), worker_id, "127.0.0.1:9091".to_string(), 1, None)
+            .register_worker(&group_name("root"), worker_id, "127.0.0.1:9091".to_string(), 1, None)
             .unwrap();
         let worker_run_id = record_heartbeat(
             &worker_manager,
-            ShardGroupId::new(1),
+            &group_name("root"),
             worker_id,
             1_000,
             500,
@@ -1189,7 +1157,7 @@ mod tests {
         );
         worker_manager
             .receive_full_block_report(
-                ShardGroupId::new(1),
+                &group_name("root"),
                 worker_id,
                 worker_run_id,
                 3,
@@ -1210,13 +1178,13 @@ mod tests {
             raft_node,
             Arc::clone(&worker_manager),
             Arc::new(MountTable::new()),
-            ShardGroupId::new(1),
+            group_name("root"),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
             &service,
             Request::new(delta_report_request(
-                ShardGroupId::new(1),
+                group_name("root"),
                 worker_id,
                 worker_run_id,
                 3,
@@ -1231,7 +1199,7 @@ mod tests {
         assert!(response.header.as_ref().expect("header").error.is_none());
         assert_eq!(response.next_delta_seq, 1);
         assert!(worker_manager
-            .get_block_locations(ShardGroupId::new(1), block_id)
+            .get_block_locations(&group_name("root"), block_id)
             .is_empty());
     }
 
@@ -1244,14 +1212,13 @@ mod tests {
             raft_node,
             worker_manager,
             Arc::new(MountTable::new()),
-            ShardGroupId::new(1),
+            group_name("root"),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
             &service,
             Request::new(RegisterWorkerRequestProto {
                 header: None,
-                group_id: 1,
                 worker_id: 9,
                 worker_run_id: test_worker_run_id().to_string(),
                 advertised_endpoint: None,
@@ -1259,6 +1226,7 @@ mod tests {
                 version: String::new(),
                 labels: Default::default(),
                 worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+                group_name: "root".to_string(),
             }),
         )
         .await
@@ -1279,14 +1247,13 @@ mod tests {
             raft_node,
             worker_manager,
             Arc::new(MountTable::new()),
-            ShardGroupId::new(1),
+            group_name("root"),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
             &service,
             Request::new(RegisterWorkerRequestProto {
                 header: None,
-                group_id: 1,
                 worker_id: 123,
                 worker_run_id: test_worker_run_id().to_string(),
                 advertised_endpoint: Some(proto::common::EndpointProto {
@@ -1298,6 +1265,7 @@ mod tests {
                 version: "0.1.0".to_string(),
                 labels: Default::default(),
                 worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+                group_name: "root".to_string(),
             }),
         )
         .await
@@ -1320,14 +1288,13 @@ mod tests {
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
             Arc::new(MountTable::new()),
-            ShardGroupId::new(1),
+            group_name("root"),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
             &service,
             Request::new(RegisterWorkerRequestProto {
                 header: None,
-                group_id: 1,
                 worker_id: 123,
                 worker_run_id: worker_run_id.to_string(),
                 advertised_endpoint: Some(proto::common::EndpointProto {
@@ -1339,6 +1306,7 @@ mod tests {
                 version: "0.1.0".to_string(),
                 labels: Default::default(),
                 worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+                group_name: "root".to_string(),
             }),
         )
         .await
@@ -1346,16 +1314,16 @@ mod tests {
         .into_inner();
 
         assert!(response.header.as_ref().expect("header").error.is_none());
-        assert_eq!(response.group_id, 1);
+        assert_eq!(response.group_name, "root");
         assert_eq!(response.worker_id, 123);
         assert_eq!(response.accepted_worker_run_id, worker_run_id.to_string());
         let descriptor = worker_manager
-            .get_descriptor(ShardGroupId::new(1), WorkerId::new(123))
+            .get_descriptor(&group_name("root"), WorkerId::new(123))
             .unwrap();
         assert_eq!(descriptor.address, "127.0.0.1:9090");
         assert_eq!(
             worker_manager
-                .get_registration(ShardGroupId::new(1), WorkerId::new(123))
+                .get_registration(&group_name("root"), WorkerId::new(123))
                 .expect("live registration")
                 .worker_run_id,
             worker_run_id
@@ -1372,14 +1340,13 @@ mod tests {
             raft_node,
             Arc::clone(&worker_manager),
             Arc::new(MountTable::new()),
-            ShardGroupId::new(1),
+            group_name("root"),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
             &service,
             Request::new(RegisterWorkerRequestProto {
                 header: None,
-                group_id: 1,
                 worker_id: 124,
                 worker_run_id: worker_run_id.to_string(),
                 advertised_endpoint: Some(proto::common::EndpointProto {
@@ -1391,6 +1358,7 @@ mod tests {
                 version: "0.1.0".to_string(),
                 labels: Default::default(),
                 worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+                group_name: "root".to_string(),
             }),
         )
         .await
@@ -1399,10 +1367,10 @@ mod tests {
 
         assert!(response.header.as_ref().expect("header").error.is_none());
         assert!(worker_manager
-            .get_descriptor(ShardGroupId::new(1), WorkerId::new(124))
+            .get_descriptor(&group_name("root"), WorkerId::new(124))
             .is_none());
         assert!(worker_manager
-            .get_registration(ShardGroupId::new(1), WorkerId::new(124))
+            .get_registration(&group_name("root"), WorkerId::new(124))
             .is_none());
     }
 
@@ -1416,11 +1384,10 @@ mod tests {
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
             Arc::new(MountTable::new()),
-            ShardGroupId::new(1),
+            group_name("root"),
         );
         let request = |worker_run_id: WorkerRunId| RegisterWorkerRequestProto {
             header: None,
-            group_id: 1,
             worker_id: 123,
             worker_run_id: worker_run_id.to_string(),
             advertised_endpoint: Some(proto::common::EndpointProto {
@@ -1432,6 +1399,7 @@ mod tests {
             version: "0.1.0".to_string(),
             labels: Default::default(),
             worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+            group_name: "root".to_string(),
         };
 
         let first = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
@@ -1455,11 +1423,27 @@ mod tests {
         assert!(error.message.contains("already registered"));
         assert_eq!(
             worker_manager
-                .get_registration(ShardGroupId::new(1), WorkerId::new(123))
+                .get_registration(&group_name("root"), WorkerId::new(123))
                 .expect("registration")
                 .worker_run_id,
             test_worker_run_id()
         );
+
+        let mut next_request = request(second_worker_run_id());
+        next_request.worker_id = 124;
+        next_request.advertised_endpoint = Some(proto::common::EndpointProto {
+            host: "127.0.0.1".to_string(),
+            port: 9091,
+            protocol: "grpc".to_string(),
+        });
+        let next = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
+            &service,
+            Request::new(next_request),
+        )
+        .await
+        .expect("raft core remains available after conflicting register")
+        .into_inner();
+        assert!(next.header.expect("header").error.is_none());
     }
 
     #[tokio::test]
@@ -1471,17 +1455,16 @@ mod tests {
             raft_node,
             Arc::clone(&worker_manager),
             Arc::new(MountTable::new()),
-            ShardGroupId::new(1),
+            group_name("root"),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
             &service,
             Request::new(RegisterWorkerRequestProto {
                 header: Some(proto::common::RequestHeaderProto {
-                    group_id: 2,
+                    group_name: "other".to_string(),
                     ..Default::default()
                 }),
-                group_id: 2,
                 worker_id: 123,
                 worker_run_id: test_worker_run_id().to_string(),
                 advertised_endpoint: Some(proto::common::EndpointProto {
@@ -1493,6 +1476,7 @@ mod tests {
                 version: "0.1.0".to_string(),
                 labels: Default::default(),
                 worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+                group_name: "other".to_string(),
             }),
         )
         .await
@@ -1503,7 +1487,7 @@ mod tests {
         assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
         assert!(error.message.contains("served metadata group"));
         assert!(worker_manager
-            .get_descriptor(ShardGroupId::new(2), WorkerId::new(123))
+            .get_descriptor(&group_name("g2"), WorkerId::new(123))
             .is_none());
     }
 
@@ -1516,12 +1500,18 @@ mod tests {
             raft_node,
             worker_manager,
             Arc::new(MountTable::new()),
-            ShardGroupId::new(1),
+            group_name("root"),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
             &service,
-            Request::new(heartbeat_request(1, WorkerId::new(99), test_worker_run_id(), 1, 9090)),
+            Request::new(heartbeat_request(
+                group_name("root"),
+                WorkerId::new(99),
+                test_worker_run_id(),
+                1,
+                9090,
+            )),
         )
         .await
         .expect("business validation must return gRPC OK")
@@ -1547,18 +1537,24 @@ mod tests {
         let worker_manager = Arc::new(WorkerManager::new(60));
         let worker_id = WorkerId::new(10);
         worker_manager
-            .register_worker(ShardGroupId::new(1), worker_id, "127.0.0.1:9090".to_string(), 1, None)
+            .register_worker(&group_name("root"), worker_id, "127.0.0.1:9090".to_string(), 1, None)
             .unwrap();
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             worker_manager,
             Arc::new(MountTable::new()),
-            ShardGroupId::new(1),
+            group_name("root"),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
             &service,
-            Request::new(heartbeat_request(1, worker_id, test_worker_run_id(), 1, 9090)),
+            Request::new(heartbeat_request(
+                group_name("root"),
+                worker_id,
+                test_worker_run_id(),
+                1,
+                9090,
+            )),
         )
         .await
         .expect("heartbeat business error uses gRPC OK")
@@ -1586,7 +1582,7 @@ mod tests {
         let worker_id = WorkerId::new(11);
         worker_manager
             .register_worker_run(
-                ShardGroupId::new(1),
+                &group_name("root"),
                 worker_id,
                 "127.0.0.1:9090".to_string(),
                 1,
@@ -1598,12 +1594,18 @@ mod tests {
             raft_node,
             worker_manager,
             Arc::new(MountTable::new()),
-            ShardGroupId::new(1),
+            group_name("root"),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
             &service,
-            Request::new(heartbeat_request(1, worker_id, second_worker_run_id(), 1, 9090)),
+            Request::new(heartbeat_request(
+                group_name("root"),
+                worker_id,
+                second_worker_run_id(),
+                1,
+                9090,
+            )),
         )
         .await
         .expect("heartbeat business error uses gRPC OK")
@@ -1630,7 +1632,7 @@ mod tests {
         let worker_id = WorkerId::new(110);
         worker_manager
             .register_worker_run(
-                ShardGroupId::new(1),
+                &group_name("root"),
                 worker_id,
                 "127.0.0.1:9090".to_string(),
                 1,
@@ -1643,12 +1645,18 @@ mod tests {
             raft_node,
             worker_manager,
             Arc::new(MountTable::new()),
-            ShardGroupId::new(1),
+            group_name("root"),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
             &service,
-            Request::new(heartbeat_request(1, worker_id, second_worker_run_id(), 1, 9090)),
+            Request::new(heartbeat_request(
+                group_name("root"),
+                worker_id,
+                second_worker_run_id(),
+                1,
+                9090,
+            )),
         )
         .await
         .expect("expired registration heartbeat returns gRPC OK")
@@ -1675,7 +1683,7 @@ mod tests {
         let worker_id = WorkerId::new(12);
         worker_manager
             .register_worker_run(
-                ShardGroupId::new(1),
+                &group_name("root"),
                 worker_id,
                 "127.0.0.1:9090".to_string(),
                 1,
@@ -1687,19 +1695,25 @@ mod tests {
             raft_node,
             Arc::clone(&worker_manager),
             Arc::new(MountTable::new()),
-            ShardGroupId::new(1),
+            group_name("root"),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
             &service,
-            Request::new(heartbeat_request(1, worker_id, test_worker_run_id(), 7, 9090)),
+            Request::new(heartbeat_request(
+                group_name("root"),
+                worker_id,
+                test_worker_run_id(),
+                7,
+                9090,
+            )),
         )
         .await
         .expect("follower heartbeat succeeds")
         .into_inner();
 
         assert!(response.header.as_ref().expect("header").error.is_none());
-        assert_eq!(response.group_id, 1);
+        assert_eq!(response.group_name, "root");
         assert_eq!(response.worker_id, worker_id.as_raw());
         assert_eq!(response.accepted_worker_run_id, test_worker_run_id().to_string());
         assert_eq!(
@@ -1707,7 +1721,7 @@ mod tests {
             MetadataServerRoleProto::MetadataServerRoleFollower
         );
         assert!(response.commands.is_empty());
-        assert!(worker_manager.is_worker_live(ShardGroupId::new(1), worker_id));
+        assert!(worker_manager.is_worker_live(&group_name("root"), worker_id));
     }
 
     #[tokio::test]
@@ -1719,7 +1733,7 @@ mod tests {
         let worker_id = WorkerId::new(13);
         worker_manager
             .register_worker_run(
-                ShardGroupId::new(1),
+                &group_name("root"),
                 worker_id,
                 "127.0.0.1:9090".to_string(),
                 1,
@@ -1731,12 +1745,18 @@ mod tests {
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
             Arc::new(MountTable::new()),
-            ShardGroupId::new(1),
+            group_name("root"),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
             &service,
-            Request::new(heartbeat_request(1, worker_id, test_worker_run_id(), 1, 9090)),
+            Request::new(heartbeat_request(
+                group_name("root"),
+                worker_id,
+                test_worker_run_id(),
+                1,
+                9090,
+            )),
         )
         .await
         .expect("leader heartbeat succeeds")
@@ -1749,7 +1769,7 @@ mod tests {
         );
         assert!(response.commands.is_empty());
         assert_eq!(raft_node.get_last_applied_state_id(), before_state_id);
-        assert!(worker_manager.is_worker_live(ShardGroupId::new(1), worker_id));
+        assert!(worker_manager.is_worker_live(&group_name("root"), worker_id));
     }
 
     #[tokio::test]
@@ -1761,16 +1781,17 @@ mod tests {
             raft_node,
             worker_manager,
             Arc::new(MountTable::new()),
-            ShardGroupId::new(1),
+            group_name("root"),
         );
 
-        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
-            &service,
-            Request::new(heartbeat_request(2, WorkerId::new(14), test_worker_run_id(), 1, 9090)),
-        )
-        .await
-        .expect("wrong group returns gRPC OK")
-        .into_inner();
+        let mut request = heartbeat_request(group_name("root"), WorkerId::new(14), test_worker_run_id(), 1, 9090);
+        request.group_name = "other".to_string();
+
+        let response =
+            <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(&service, Request::new(request))
+                .await
+                .expect("wrong group returns gRPC OK")
+                .into_inner();
 
         let error = response.header.expect("header").error.expect("header error");
         assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
@@ -1794,7 +1815,7 @@ mod tests {
         let worker_id = WorkerId::new(9);
         worker_manager
             .register_worker_run(
-                ShardGroupId::new(1),
+                &group_name("root"),
                 worker_id,
                 "127.0.0.1:9099".to_string(),
                 1,
@@ -1806,12 +1827,18 @@ mod tests {
             raft_node,
             worker_manager,
             Arc::new(MountTable::new()),
-            ShardGroupId::new(1),
+            group_name("root"),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
             &service,
-            Request::new(heartbeat_request(1, worker_id, test_worker_run_id(), 1, 9098)),
+            Request::new(heartbeat_request(
+                group_name("root"),
+                worker_id,
+                test_worker_run_id(),
+                1,
+                9098,
+            )),
         )
         .await
         .expect("business validation must return gRPC OK")
@@ -1838,11 +1865,11 @@ mod tests {
         let worker_manager = Arc::new(WorkerManager::new(60));
         let worker_id = WorkerId::new(99);
         worker_manager
-            .register_worker(ShardGroupId::new(1), worker_id, "127.0.0.1:9099".to_string(), 1, None)
+            .register_worker(&group_name("root"), worker_id, "127.0.0.1:9099".to_string(), 1, None)
             .unwrap();
         let worker_run_id = record_heartbeat(
             &worker_manager,
-            ShardGroupId::new(1),
+            &group_name("root"),
             worker_id,
             1_000,
             500,
@@ -1852,23 +1879,22 @@ mod tests {
             HealthStatus::Healthy,
         );
         worker_manager
-            .receive_full_block_report(ShardGroupId::new(1), worker_id, worker_run_id, 1, 0, true, Vec::new())
+            .receive_full_block_report(&group_name("root"), worker_id, worker_run_id, 1, 0, true, Vec::new())
             .unwrap();
         let service = MetadataWorkerServiceImpl::new(
             raft_node,
             worker_manager,
             Arc::new(MountTable::new()),
-            ShardGroupId::new(1),
+            group_name("root"),
         );
 
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
             &service,
             Request::new(BlockReportRequestProto {
                 header: Some(proto::common::RequestHeaderProto {
-                    group_id: 1,
+                    group_name: "root".to_string(),
                     ..Default::default()
                 }),
-                group_id: 1,
                 worker_id: worker_id.as_raw(),
                 worker_run_id: worker_run_id.to_string(),
                 report_seq: 1,
@@ -1879,6 +1905,7 @@ mod tests {
                         block: None,
                     }],
                 })),
+                group_name: "root".to_string(),
             }),
         )
         .await

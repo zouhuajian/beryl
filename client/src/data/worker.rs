@@ -14,8 +14,7 @@ use parking_lot::RwLock;
 use proto::worker::worker_data_service_client::WorkerDataServiceClient;
 use tonic::transport as tonic_net;
 use types::chunk::ByteRange;
-use types::ids::ShardGroupId;
-use types::{WorkerEndpointInfo, WorkerNetProtocol, WriteTarget};
+use types::{GroupName, WorkerEndpointInfo, WorkerNetProtocol, WriteTarget};
 
 use super::{WorkerBlockSyncResult, WorkerCommitResult, WorkerDataClient, WorkerWriteBlock, WorkerWriteTarget};
 use crate::cache::{CacheInvalidationReason, WorkerEndpointCache};
@@ -214,14 +213,9 @@ impl WorkerDataClient for TonicWorkerDataClient {
     async fn read_segment(
         &self,
         ctx: AttemptContext,
-        group_id: u64,
+        group_name: GroupName,
         segment: &PlannedReadSegment,
     ) -> ClientResult<Bytes> {
-        if group_id == 0 {
-            return Err(ClientError::InvalidArgument(
-                "worker read requires non-zero group_id".to_string(),
-            ));
-        }
         let mut last_transport_error = None;
         for candidate in &segment.workers {
             ensure_supported_worker_protocol(candidate.worker_net_protocol)?;
@@ -233,7 +227,7 @@ impl WorkerDataClient for TonicWorkerDataClient {
                 }
                 Err(err) => return Err(err),
             };
-            let request = build_open_read_stream_request(&ctx, group_id, segment, candidate)?;
+            let request = build_open_read_stream_request(&ctx, &group_name, segment, candidate)?;
             let open_response = match client.open_read_stream(tonic_request(&ctx, request)).await {
                 Ok(response) => response.into_inner(),
                 Err(status) if is_retryable_worker_status(&status) => {
@@ -459,7 +453,7 @@ impl DataPlaneBoundary {
     pub(crate) async fn read_all(
         &self,
         ctx: AttemptContext,
-        group_id: u64,
+        group_name: GroupName,
         segments: &[PlannedReadSegment],
     ) -> ClientResult<Bytes> {
         let total_len = segments.iter().map(|segment| segment.len as usize).sum();
@@ -479,7 +473,10 @@ impl DataPlaneBoundary {
                     "planned read segment coverage is inconsistent".to_string(),
                 ));
             }
-            let bytes = self.client.read_segment(ctx.clone(), group_id, segment).await?;
+            let bytes = self
+                .client
+                .read_segment(ctx.clone(), group_name.clone(), segment)
+                .await?;
             if bytes.len() != segment.len as usize {
                 return Err(ClientError::Worker(format!(
                     "worker read returned {} bytes for {} byte segment",
@@ -495,10 +492,10 @@ impl DataPlaneBoundary {
     pub(crate) async fn open_write(
         &self,
         ctx: AttemptContext,
-        group_id: u64,
+        group_name: GroupName,
         target: WriteTarget,
     ) -> ClientResult<WorkerWriteBlock> {
-        let worker_target = WorkerWriteTarget { group_id, target };
+        let worker_target = WorkerWriteTarget { group_name, target };
         self.client.open_write(ctx, worker_target).await
     }
 
@@ -562,15 +559,10 @@ fn ensure_supported_worker_protocol(protocol: WorkerNetProtocol) -> ClientResult
 
 fn build_open_read_stream_request(
     ctx: &AttemptContext,
-    group_id: u64,
+    group_name: &GroupName,
     segment: &PlannedReadSegment,
     candidate: &WorkerEndpointInfo,
 ) -> ClientResult<proto::worker::OpenReadStreamRequestProto> {
-    if group_id == 0 {
-        return Err(ClientError::InvalidArgument(
-            "worker read requires non-zero group_id".to_string(),
-        ));
-    }
     if segment.block_stamp == 0 {
         return Err(ClientError::InvalidLayout(
             "planned read segment has zero block_stamp".to_string(),
@@ -587,7 +579,7 @@ fn build_open_read_stream_request(
     }
     Ok(proto::worker::OpenReadStreamRequestProto {
         header: Some(ctx.data_header()),
-        group_id: Some(ShardGroupId::new(group_id).into()),
+        group_name: group_name.to_string(),
         block_id: Some(segment.block_id.into()),
         byte_range: Some(
             ByteRange {
@@ -607,11 +599,6 @@ fn build_open_read_stream_request(
 }
 
 fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> {
-    if target.group_id == 0 {
-        return Err(ClientError::InvalidArgument(
-            "worker write requires non-zero group_id".to_string(),
-        ));
-    }
     let block = target.target.block_id;
     if block.data_handle_id.as_raw() == 0 {
         return Err(ClientError::InvalidLayout(
@@ -674,7 +661,7 @@ fn build_open_write_stream_request(
     validate_worker_write_target(target)?;
     Ok(proto::worker::OpenWriteStreamRequestProto {
         header: Some(ctx.data_header()),
-        group_id: Some(ShardGroupId::new(target.group_id).into()),
+        group_name: target.group_name.to_string(),
         block_id: Some(target.target.block_id.into()),
         block_size: target.target.block_size,
         block_stamp: target.target.block_stamp,
@@ -724,7 +711,7 @@ fn build_commit_write_request(
     validate_block_for_worker_control(block)?;
     Ok(proto::worker::CommitWriteRequestProto {
         header: Some(ctx.data_header()),
-        group_id: Some(ShardGroupId::new(block.group_id).into()),
+        group_name: block.group_name.to_string(),
         block_id: Some(block.target.block_id.into()),
         stream_id: Some(block.stream_id),
         effective_block_len: effective_len,
@@ -747,7 +734,7 @@ fn build_sync_committed_block_request(
     validate_block_for_worker_sync(block)?;
     Ok(proto::worker::SyncCommittedBlockRequestProto {
         header: Some(ctx.data_header()),
-        group_id: Some(ShardGroupId::new(block.group_id).into()),
+        group_name: block.group_name.to_string(),
         block_id: Some(block.target.block_id.into()),
         block_stamp: block.target.block_stamp,
         expected_block_len: expected_len,
@@ -765,7 +752,7 @@ fn build_abort_write_request(
     validate_block_for_worker_control(block)?;
     Ok(proto::worker::AbortWriteRequestProto {
         header: Some(ctx.data_header()),
-        group_id: Some(ShardGroupId::new(block.group_id).into()),
+        group_name: block.group_name.to_string(),
         block_id: Some(block.target.block_id.into()),
         stream_id: Some(block.stream_id),
         token: Some(block.target.fencing_token.into()),
@@ -804,7 +791,7 @@ fn worker_write_block_from_open_response(
         ));
     }
     Ok(WorkerWriteBlock {
-        group_id: target.group_id,
+        group_name: target.group_name.clone(),
         worker: candidate.clone(),
         target: target.target.clone(),
         stream_id,
@@ -923,11 +910,6 @@ fn validate_abort_write_response(
 }
 
 fn validate_block_for_worker_control(block: &WorkerWriteBlock) -> ClientResult<()> {
-    if block.group_id == 0 {
-        return Err(ClientError::InvalidArgument(
-            "worker write control requires non-zero group_id".to_string(),
-        ));
-    }
     if block.stream_id.high == 0 && block.stream_id.low == 0 {
         return Err(ClientError::InvalidArgument(
             "worker write control requires non-zero stream_id".to_string(),
@@ -953,11 +935,6 @@ fn validate_fencing_token(target: &WriteTarget) -> ClientResult<()> {
 }
 
 fn validate_block_for_worker_sync(block: &WorkerWriteBlock) -> ClientResult<()> {
-    if block.group_id == 0 {
-        return Err(ClientError::InvalidArgument(
-            "worker block sync requires non-zero group_id".to_string(),
-        ));
-    }
     if block.target.block_stamp == 0 {
         return Err(ClientError::InvalidArgument(
             "worker block sync requires non-zero block_stamp".to_string(),
@@ -1457,7 +1434,8 @@ mod tests {
         let segment = planned_segment(77);
         let candidate = worker_endpoint();
 
-        let request = build_open_read_stream_request(&ctx, 9, &segment, &candidate).expect("request");
+        let group_name = test_group_name();
+        let request = build_open_read_stream_request(&ctx, &group_name, &segment, &candidate).expect("request");
 
         assert_eq!(request.block_stamp, 77);
         assert_eq!(request.worker_run_id, test_worker_run_id().to_string());
@@ -1476,7 +1454,9 @@ mod tests {
         let segment = planned_segment(0);
         let candidate = worker_endpoint();
 
-        let err = build_open_read_stream_request(&ctx, 9, &segment, &candidate).expect_err("zero stamp must fail");
+        let group_name = test_group_name();
+        let err =
+            build_open_read_stream_request(&ctx, &group_name, &segment, &candidate).expect_err("zero stamp must fail");
 
         assert!(matches!(err, ClientError::InvalidLayout(msg) if msg.contains("block_stamp")));
     }
@@ -1488,7 +1468,8 @@ mod tests {
         segment.block_size = 0;
         let candidate = worker_endpoint();
 
-        let err = build_open_read_stream_request(&ctx, 9, &segment, &candidate)
+        let group_name = test_group_name();
+        let err = build_open_read_stream_request(&ctx, &group_name, &segment, &candidate)
             .expect_err("zero block_size must not be defaulted");
 
         assert!(matches!(err, ClientError::InvalidLayout(msg) if msg.contains("expected block shape")));
@@ -1502,7 +1483,7 @@ mod tests {
 
         let request = build_open_write_stream_request(&ctx, &target, &candidate).expect("open write request");
 
-        assert_eq!(request.group_id.as_ref().map(|group| group.value), Some(9));
+        assert_eq!(request.group_name, "root");
         assert_eq!(request.block_id.as_ref().map(|block| block.data_handle_id), Some(202));
         assert_eq!(request.block_size, 4096);
         assert_eq!(request.block_stamp, 77);
@@ -1978,7 +1959,7 @@ mod tests {
         let segment = planned_segment(0);
 
         let err = boundary
-            .read_all(data_attempt_context(), 9, &[segment])
+            .read_all(data_attempt_context(), test_group_name(), &[segment])
             .await
             .expect_err("zero stamp must fail before worker IO");
 
@@ -2075,7 +2056,7 @@ mod tests {
         async fn read_segment(
             &self,
             _ctx: AttemptContext,
-            _group_id: u64,
+            _group_name: GroupName,
             segment: &PlannedReadSegment,
         ) -> ClientResult<Bytes> {
             self.calls.fetch_add(1, Ordering::Relaxed);
@@ -2085,7 +2066,7 @@ mod tests {
         async fn open_write(&self, _ctx: AttemptContext, target: WorkerWriteTarget) -> ClientResult<WorkerWriteBlock> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(WorkerWriteBlock {
-                group_id: target.group_id,
+                group_name: target.group_name,
                 worker: worker_endpoint(),
                 target: target.target,
                 stream_id: proto::common::StreamIdProto { high: 1, low: 1 },
@@ -2173,7 +2154,7 @@ mod tests {
 
     fn worker_write_target() -> WorkerWriteTarget {
         WorkerWriteTarget {
-            group_id: 9,
+            group_name: test_group_name(),
             target: WriteTarget {
                 block_id: BlockId::new(DataHandleId::new(202), BlockIndex::new(0)),
                 file_offset: 0,
@@ -2203,13 +2184,17 @@ mod tests {
 
     fn worker_write_block(frame_size: u32) -> WorkerWriteBlock {
         WorkerWriteBlock {
-            group_id: 9,
+            group_name: test_group_name(),
             worker: worker_endpoint(),
             target: worker_write_target().target,
             stream_id: proto::common::StreamIdProto { high: 1, low: 1 },
             frame_size,
             next_seq: 1,
         }
+    }
+
+    fn test_group_name() -> GroupName {
+        GroupName::parse("root").unwrap()
     }
 
     fn planned_segment(block_stamp: u64) -> PlannedReadSegment {

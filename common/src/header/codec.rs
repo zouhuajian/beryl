@@ -9,7 +9,7 @@
 use crate::header::{AuthnType, RequestHeader};
 use crate::time::Deadline;
 use std::str::FromStr;
-use types::{CallId, ClientId, GroupStateWatermark, RaftLogId, ShardGroupId};
+use types::{CallId, ClientId, GroupName, GroupStateWatermark, RaftLogId};
 
 /// Header keys for context propagation.
 pub const HEADER_CALL_ID: &str = "x-call-id";
@@ -43,7 +43,7 @@ impl RequestHeaderCodec {
             header.client.client_id.as_raw().to_string(),
         ));
 
-        // x-state-id (if present): comma-separated group:term:leader:index entries.
+        // x-state-id (if present): comma-separated group_name:term:leader:index entries.
         if !header.state.is_empty() {
             let state_id_str = header
                 .state
@@ -51,7 +51,7 @@ impl RequestHeaderCodec {
                 .map(|watermark| {
                     format!(
                         "{}:{}:{}:{}",
-                        watermark.group_id.as_raw(),
+                        watermark.group_name,
                         watermark.state_id.term,
                         watermark.state_id.leader_node_id,
                         watermark.state_id.index
@@ -142,19 +142,19 @@ impl RequestHeaderCodec {
                     client_id = value.parse::<u64>().ok().map(ClientId::new);
                 }
                 k if k.eq_ignore_ascii_case(HEADER_STATE_ID) => {
-                    // Parse format: "group:term:leader_node_id:index[,group:term:leader_node_id:index]"
+                    // Parse format: "group_name:term:leader_node_id:index[,group_name:term:leader_node_id:index]"
                     for entry in value.split(',') {
                         let parts: Vec<&str> = entry.split(':').collect();
                         if parts.len() == 4
-                            && let (Ok(group_id), Ok(term), Ok(leader_node_id), Ok(index)) = (
-                                parts[0].parse::<u64>(),
+                            && let (Ok(group_name), Ok(term), Ok(leader_node_id), Ok(index)) = (
+                                GroupName::parse(parts[0]),
                                 parts[1].parse::<u64>(),
                                 parts[2].parse::<u64>(),
                                 parts[3].parse::<u64>(),
                             )
                         {
                             state.push(GroupStateWatermark::new(
-                                ShardGroupId::new(group_id),
+                                group_name,
                                 RaftLogId::new(term, leader_node_id, index),
                             ));
                         }
@@ -225,7 +225,7 @@ impl RequestHeaderCodec {
             caller_context: None,
             state,
             retry_count: 0,
-            group_id: None,
+            group_name: None,
             mount_epoch,
             route_epoch: None,
             principal,
@@ -274,7 +274,7 @@ mod tests {
         let deadline = Deadline::from_now(std::time::Duration::from_secs(60));
         let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string();
         let state = vec![GroupStateWatermark::new(
-            ShardGroupId::new(9),
+            GroupName::parse("root").unwrap(),
             RaftLogId::new(1, 2, 100),
         )];
 
@@ -289,7 +289,7 @@ mod tests {
             caller_context: None,
             state: state.clone(),
             retry_count: 0,
-            group_id: None,
+            group_name: None,
             mount_epoch: None,
             route_epoch: None,
             principal: None,

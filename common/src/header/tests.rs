@@ -6,7 +6,7 @@ use crate::header::ClientInfo;
 use crate::time::Deadline;
 use crate::{CallerContext, CallerContextFields, RequestHeader, ResponseHeader, RpcErrorCode, RpcStatus};
 use std::time::Duration;
-use types::{ClientId, GroupStateWatermark, RaftLogId, ShardGroupId};
+use types::{ClientId, GroupName, GroupStateWatermark, RaftLogId};
 
 #[test]
 fn test_client_info() {
@@ -69,12 +69,12 @@ fn test_response_header_with_client_info() {
 
 #[test]
 fn request_and_response_headers_use_group_state_vectors() {
-    let watermark = GroupStateWatermark::new(ShardGroupId::new(7), RaftLogId::new(1, 2, 3));
+    let watermark = GroupStateWatermark::new(GroupName::parse("root").unwrap(), RaftLogId::new(1, 2, 3));
 
-    let request = RequestHeader::new(ClientId::new(1)).with_state(vec![watermark]);
-    assert_eq!(request.state, vec![watermark]);
+    let request = RequestHeader::new(ClientId::new(1)).with_state(vec![watermark.clone()]);
+    assert_eq!(request.state, vec![watermark.clone()]);
 
-    let response = ResponseHeader::ok(ClientInfo::new(ClientId::new(1))).with_state(vec![watermark]);
+    let response = ResponseHeader::ok(ClientInfo::new(ClientId::new(1))).with_state(vec![watermark.clone()]);
     assert_eq!(response.state, vec![watermark]);
 }
 

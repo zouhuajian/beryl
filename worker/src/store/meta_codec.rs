@@ -8,8 +8,9 @@ use proto::worker::{
     BlockFormatProto, BlockIdentityProto, BlockMetaPayloadProto, BlockSourceProto, BlockStateProto,
     BlockVisibilityProto, ChecksumKindProto,
 };
-use types::ids::{BlockId, ShardGroupId};
+use types::ids::BlockId;
 use types::layout::BlockFormatId;
+use types::GroupName;
 
 use super::block::{
     BlockFormat, BlockIdentity, BlockMetaPayload, BlockSource, BlockState, BlockVisibility, ChecksumKind, StoreResult,
@@ -62,7 +63,7 @@ fn meta_to_proto_without_visibility(meta: &BlockMetaPayload) -> StoreResult<Bloc
     Ok(BlockMetaPayloadProto {
         identity: Some(BlockIdentityProto {
             block_id: Some(meta.identity.block_id.into()),
-            group_id: Some(meta.identity.group_id.into()),
+            group_name: meta.identity.group_name.to_string(),
         }),
         format: Some(BlockFormatProto {
             format_id: meta.format.format_id.as_raw(),
@@ -136,9 +137,8 @@ fn meta_fields_from_proto(
     let block_id = identity
         .block_id
         .ok_or_else(|| corrupt("block meta payload missing block id"))?;
-    let group_id = identity
-        .group_id
-        .ok_or_else(|| corrupt("block meta payload missing group id"))?;
+    let group_name = GroupName::parse(&identity.group_name)
+        .map_err(|err| corrupt(format!("block meta payload invalid group name: {err}")))?;
     let format = format.ok_or_else(|| corrupt("block meta payload missing format"))?;
     let source = source.ok_or_else(|| corrupt("block meta payload missing source"))?;
 
@@ -146,8 +146,7 @@ fn meta_fields_from_proto(
         identity: BlockIdentity {
             block_id: BlockId::try_from(block_id)
                 .unwrap_or_else(|()| unreachable!("BlockIdProto conversion is infallible")),
-            group_id: ShardGroupId::try_from(group_id)
-                .unwrap_or_else(|()| unreachable!("ShardGroupIdProto conversion is infallible")),
+            group_name,
         },
         format: BlockFormat {
             format_id: BlockFormatId::from_raw(format.format_id)

@@ -203,7 +203,8 @@ impl WorkerPeerClient for WorkerPeerClientRouter {
 mod tests {
     use common::header::RequestHeader;
     use types::chunk::ByteRange;
-    use types::ids::{BlockId, ClientId, ShardGroupId};
+    use types::ids::{BlockId, ClientId};
+    use types::GroupName;
 
     use super::*;
     use crate::net::capability::WorkerNetCapabilities;
@@ -237,7 +238,7 @@ mod tests {
             .open_read(
                 &endpoint(WorkerNetProtocol::Grpc, "127.0.0.1:1"),
                 ReadOpenRequest {
-                    group_id: ShardGroupId::new(3),
+                    group_name: GroupName::parse("root").unwrap(),
                     block_id: BlockId::from_u64_u32(7, 0),
                     worker_run_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
                     byte_range: ByteRange { offset: 0, len: 1024 },

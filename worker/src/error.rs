@@ -11,7 +11,7 @@ use common::header::RpcErrorCode;
 use thiserror::Error;
 use tonic::Status;
 use types::fs::FsErrorCode;
-use types::ids::ShardGroupId;
+use types::GroupName;
 
 /// Worker error types.
 #[derive(Error, Debug, Clone)]
@@ -92,8 +92,8 @@ pub struct ErrorMetadata {
     pub limit_type: Option<String>,
     /// Leader hint (if leader changed).
     pub leader_hint: Option<u64>,
-    /// Group ID (if applicable).
-    pub group_id: Option<ShardGroupId>,
+    /// Metadata group name (if applicable).
+    pub group_name: Option<GroupName>,
     /// Additional context.
     pub context: std::collections::HashMap<String, String>,
 }
@@ -144,7 +144,7 @@ impl WorkerError {
             retry_after_ms,
             limit_type,
             leader_hint,
-            group_id: None,
+            group_name: None,
             context: std::collections::HashMap::new(),
         }
     }

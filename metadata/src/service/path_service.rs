@@ -112,7 +112,7 @@ pub struct FileSystemAuthorityDeps {
     pub mount_table: Arc<MountTable>,
     pub storage: Arc<RocksDBStorage>,
     pub raft_node: Option<Arc<crate::raft::AppRaftNode>>,
-    pub shard_group_id: types::ids::ShardGroupId,
+    pub group_name: types::GroupName,
 }
 
 pub struct FileSystemRuntimeDeps {
@@ -141,7 +141,7 @@ impl MetadataFileSystemServiceImpl {
             mount_table,
             storage,
             raft_node,
-            shard_group_id,
+            group_name,
         } = authority;
         let FileSystemRuntimeDeps {
             write_session_manager,
@@ -187,7 +187,7 @@ impl MetadataFileSystemServiceImpl {
             .with_permission_checker(permission_checker);
         let msync = raft_node
             .as_ref()
-            .map(|raft_node| MsyncHandler::new(Arc::clone(raft_node), shard_group_id));
+            .map(|raft_node| MsyncHandler::new(Arc::clone(raft_node), group_name));
 
         Self {
             path_resolver,
@@ -204,12 +204,12 @@ impl MetadataFileSystemServiceImpl {
         err: MetadataError,
         mount_ctx: Option<&MountContext>,
     ) -> proto::common::ResponseHeaderProto {
-        let (group_id, mount_epoch) = mount_ctx
-            .map(|ctx| (Some(ctx.owner_group_id.as_raw()), Some(ctx.mount_epoch)))
+        let (group_name, mount_epoch) = mount_ctx
+            .map(|ctx| (Some(ctx.owner_group_name.clone()), Some(ctx.mount_epoch)))
             .unwrap_or((None, None));
 
         let canonical = to_canonical_fs(err);
-        header_from_canonical_error(req_header, group_id, mount_epoch, &canonical)
+        header_from_canonical_error(req_header, group_name, mount_epoch, &canonical)
     }
 
     fn header_from_guard_failure(
@@ -217,7 +217,7 @@ impl MetadataFileSystemServiceImpl {
         req_header: &Option<proto::common::RequestHeaderProto>,
         failure: GuardFailure,
     ) -> proto::common::ResponseHeaderProto {
-        header_from_canonical_error(req_header, failure.group_id, failure.mount_epoch, &failure.err)
+        header_from_canonical_error(req_header, failure.group_name, failure.mount_epoch, &failure.err)
     }
 
     fn freshness_from_header(header: &Option<proto::common::RequestHeaderProto>) -> Freshness {
@@ -1104,7 +1104,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         &req_ctx,
                         req.desired_len,
                         layout,
-                        Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                        Some(resolved.mount_ctx.owner_group_name.clone()),
                         Some(resolved.mount_ctx.mount_epoch),
                     ) {
                         return error_response!(CreateFileResponseProto, header_from_core_failure(&req_ctx, &failure));
@@ -1206,7 +1206,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 &req_ctx,
                 req.desired_len,
                 layout,
-                Some(resolved.mount_ctx.owner_group_id.as_raw()),
+                Some(resolved.mount_ctx.owner_group_name.clone()),
                 Some(resolved.mount_ctx.mount_epoch),
             ) {
                 return error_response!(CreateFileResponseProto, header_from_core_failure(&req_ctx, &failure));

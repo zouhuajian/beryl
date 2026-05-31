@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use types::fs::InodeId;
-use types::ids::{MountId, ShardGroupId};
+use types::ids::MountId;
+use types::GroupName;
 
 pub const ROOT_MOUNT_PREFIX: &str = "/";
 pub const ROOT_INODE_ID: InodeId = InodeId::new(1);
@@ -44,7 +45,7 @@ pub enum DataIoPolicy {
 
 /// Mount entry: maps vecton path prefix to UFS URI.
 ///
-/// Extended with namespace_owner_group_id and root_inode_id for FS operations.
+/// Extended with namespace_owner_group_name and root_inode_id for FS operations.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MountEntry {
     pub mount_id: MountId,
@@ -53,9 +54,9 @@ pub struct MountEntry {
     pub ufs_uri: Option<String>, // e.g., "s3://bucket/path"
     pub data_io_policy: DataIoPolicy,
     pub mount_version: u64,
-    /// Namespace owner group ID: all FS write operations within this mount
+    /// Namespace owner group name: all FS write operations within this mount
     /// must route to this single Raft group for atomic rename within mount.
-    pub namespace_owner_group_id: ShardGroupId,
+    pub namespace_owner_group_name: GroupName,
     /// Root inode ID: the root directory inode for this mount.
     /// Must be a directory inode and must exist when mount is created/loaded.
     pub root_inode_id: InodeId,
@@ -128,7 +129,7 @@ impl MountTable {
         mount_kind: MountKind,
         ufs_uri: Option<String>,
         data_io_policy: DataIoPolicy,
-        namespace_owner_group_id: ShardGroupId,
+        namespace_owner_group_name: GroupName,
         root_inode_id: InodeId,
     ) -> MetadataResult<MountEntry> {
         let mut entries = self.entries.write();
@@ -154,7 +155,7 @@ impl MountTable {
             ufs_uri,
             data_io_policy,
             mount_version: *version,
-            namespace_owner_group_id,
+            namespace_owner_group_name,
             root_inode_id,
         };
 
@@ -306,7 +307,7 @@ mod tests {
 
         // Create mount (test-only: use placeholder values)
         use types::fs::InodeId;
-        use types::ids::ShardGroupId;
+        use types::GroupName;
         let root_inode_id = InodeId::new(1);
         let _entry = table
             .create_mount(
@@ -314,7 +315,7 @@ mod tests {
                 MountKind::External,
                 Some("s3://bucket/path".to_string()),
                 DataIoPolicy::Allow,
-                ShardGroupId::new(1),
+                GroupName::parse("g1").unwrap(),
                 root_inode_id,
             )
             .unwrap();
@@ -332,7 +333,7 @@ mod tests {
         let table = MountTable::new();
 
         use types::fs::InodeId;
-        use types::ids::ShardGroupId;
+        use types::GroupName;
         let root1 = InodeId::new(1);
         let root2 = InodeId::new(2);
         table
@@ -341,7 +342,7 @@ mod tests {
                 MountKind::External,
                 Some("s3://bucket1".to_string()),
                 DataIoPolicy::Allow,
-                ShardGroupId::new(1),
+                GroupName::parse("g1").unwrap(),
                 root1,
             )
             .unwrap();
@@ -351,7 +352,7 @@ mod tests {
                 MountKind::External,
                 Some("s3://bucket2".to_string()),
                 DataIoPolicy::Allow,
-                ShardGroupId::new(2),
+                GroupName::parse("g2").unwrap(),
                 root2,
             )
             .unwrap();
@@ -368,14 +369,14 @@ mod tests {
         let table = MountTable::new();
 
         use types::fs::InodeId;
-        use types::ids::ShardGroupId;
+        use types::GroupName;
         table
             .create_mount(
                 "/".to_string(),
                 MountKind::External,
                 Some("ufs://root".to_string()),
                 DataIoPolicy::Allow,
-                ShardGroupId::new(1),
+                GroupName::parse("g1").unwrap(),
                 InodeId::new(1),
             )
             .unwrap();
@@ -385,7 +386,7 @@ mod tests {
                 MountKind::External,
                 Some("ufs://mnt".to_string()),
                 DataIoPolicy::Allow,
-                ShardGroupId::new(2),
+                GroupName::parse("g2").unwrap(),
                 InodeId::new(2),
             )
             .unwrap();
@@ -395,7 +396,7 @@ mod tests {
                 MountKind::External,
                 Some("ufs://s3".to_string()),
                 DataIoPolicy::Allow,
-                ShardGroupId::new(3),
+                GroupName::parse("g3").unwrap(),
                 InodeId::new(3),
             )
             .unwrap();
@@ -434,11 +435,11 @@ mod tests {
     fn test_mount_persistence_and_consistency() {
         // Create temporary RocksDB
         let temp_dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(temp_dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).unwrap());
 
         // Create initial mount entries via storage (simulating Raft apply)
         use types::fs::InodeId;
-        use types::ids::ShardGroupId;
+        use types::GroupName;
         let entry1 = MountEntry {
             mount_id: MountId::new(1),
             mount_prefix: "/mnt/s3".to_string(),
@@ -446,7 +447,7 @@ mod tests {
             ufs_uri: Some("s3://bucket1/path".to_string()),
             data_io_policy: DataIoPolicy::Allow,
             mount_version: 1,
-            namespace_owner_group_id: ShardGroupId::new(1),
+            namespace_owner_group_name: GroupName::parse("g1").unwrap(),
             root_inode_id: InodeId::new(1),
         };
         let entry2 = MountEntry {
@@ -456,7 +457,7 @@ mod tests {
             ufs_uri: Some("oss://bucket2/path".to_string()),
             data_io_policy: DataIoPolicy::Allow,
             mount_version: 2,
-            namespace_owner_group_id: ShardGroupId::new(2),
+            namespace_owner_group_name: GroupName::parse("g2").unwrap(),
             root_inode_id: InodeId::new(2),
         };
 
@@ -510,7 +511,7 @@ mod tests {
     #[test]
     fn test_load_from_storage_empty() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(temp_dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).unwrap());
 
         // Should return empty table, not error
         let mount_table = MountTable::load_from_storage(&storage).unwrap();

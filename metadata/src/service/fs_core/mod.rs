@@ -23,8 +23,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tracing::debug;
 use types::fs::{FsErrorCode, InodeId};
-use types::ids::{MountId, ShardGroupId};
-use types::{GroupStateWatermark, RaftLogId};
+use types::ids::MountId;
+use types::{GroupName, GroupStateWatermark, RaftLogId};
 
 use freshness::{FreshnessValidator, StaleStateStatus};
 
@@ -35,7 +35,7 @@ pub type SharedWorkerCommitHook = Arc<Mutex<Option<WorkerCommitHook>>>;
 #[derive(Clone, Debug)]
 struct RoutedFsWriteCtx {
     mount_id: MountId,
-    namespace_owner_group_id: ShardGroupId,
+    namespace_owner_group_name: GroupName,
     mount_epoch: u64,
 }
 
@@ -113,8 +113,8 @@ impl FsCore {
         self.freshness_validator.authoritative_route_epoch().await
     }
 
-    fn response_state_for_success(&self, group_id: Option<u64>) -> Vec<GroupStateWatermark> {
-        let (Some(group_id), Some(raft_node)) = (group_id, self.raft_node.as_ref()) else {
+    fn response_state_for_success(&self, group_name: Option<&GroupName>) -> Vec<GroupStateWatermark> {
+        let (Some(group_name), Some(raft_node)) = (group_name, self.raft_node.as_ref()) else {
             // A response without a known owner group cannot authorize a state cache advance.
             return Vec::new();
         };
@@ -123,7 +123,7 @@ impl FsCore {
         }
         raft_node
             .get_last_applied_state_id()
-            .map(|state_id| GroupStateWatermark::new(ShardGroupId::new(group_id), state_id))
+            .map(|state_id| GroupStateWatermark::new(group_name.clone(), state_id))
             .into_iter()
             .collect()
     }
@@ -132,26 +132,26 @@ impl FsCore {
         &self,
         ctx: &RequestContext,
         payload: T,
-        group_id: Option<u64>,
+        group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
     ) -> CoreResult<T> {
-        self.success_with_route_epoch(ctx, payload, group_id, mount_epoch, None)
+        self.success_with_route_epoch(ctx, payload, group_name, mount_epoch, None)
     }
 
     fn success_with_route_epoch<T>(
         &self,
         _ctx: &RequestContext,
         payload: T,
-        group_id: Option<u64>,
+        group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
         route_epoch: Option<u64>,
     ) -> CoreResult<T> {
         Ok(CoreSuccess {
             payload,
-            group_id,
+            group_name: group_name.clone(),
             mount_epoch,
             route_epoch,
-            state: self.response_state_for_success(group_id),
+            state: self.response_state_for_success(group_name.as_ref()),
         })
     }
 
@@ -159,24 +159,24 @@ impl FsCore {
         &self,
         ctx: &RequestContext,
         err: MetadataError,
-        group_id: Option<u64>,
+        group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
     ) -> CoreResult<T> {
-        self.failure_from_error_with_route_epoch(ctx, err, group_id, mount_epoch, None)
+        self.failure_from_error_with_route_epoch(ctx, err, group_name, mount_epoch, None)
     }
 
     fn failure_from_error_with_route_epoch<T>(
         &self,
         ctx: &RequestContext,
         err: MetadataError,
-        group_id: Option<u64>,
+        group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
         route_epoch: Option<u64>,
     ) -> CoreResult<T> {
         Err(core_failure_from_metadata_error(
             ctx,
             err,
-            group_id,
+            group_name,
             mount_epoch,
             route_epoch,
         ))
@@ -185,16 +185,16 @@ impl FsCore {
     fn require_worker_lookup_group(
         &self,
         ctx: &RequestContext,
-        group_id: Option<u64>,
+        group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
         route_epoch: Option<u64>,
         intent: &str,
-    ) -> Result<ShardGroupId, CoreFailure> {
-        group_id.map(ShardGroupId::new).ok_or_else(|| {
+    ) -> Result<GroupName, CoreFailure> {
+        group_name.clone().ok_or_else(|| {
             core_failure_from_metadata_error(
                 ctx,
                 MetadataError::Internal(format!("{intent} worker lookup requires authoritative metadata group")),
-                group_id,
+                group_name,
                 mount_epoch,
                 route_epoch,
             )
@@ -209,13 +209,13 @@ impl FsCore {
         rpc_code: RpcErrorCode,
         reason: RefreshReason,
         message: impl Into<String>,
-        group_id: Option<u64>,
+        group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
         route_epoch: Option<u64>,
         mut hint: Option<RefreshHint>,
     ) -> CoreResult<T> {
-        if let Some(group_id_value) = group_id {
-            hint.get_or_insert_with(RefreshHint::default).group_id = Some(group_id_value);
+        if let Some(group_name_value) = &group_name {
+            hint.get_or_insert_with(RefreshHint::default).group_name = Some(group_name_value.to_string());
         }
         if let Some(mount_epoch_value) = mount_epoch {
             hint.get_or_insert_with(RefreshHint::default).mount_epoch = Some(mount_epoch_value);
@@ -229,7 +229,7 @@ impl FsCore {
             rpc_code,
             reason,
             message,
-            group_id,
+            group_name.clone(),
             mount_epoch,
             route_epoch,
             hint,
@@ -241,10 +241,10 @@ impl FsCore {
         ctx: &RequestContext,
         errno: FsErrorCode,
         message: impl Into<String>,
-        group_id: Option<u64>,
+        group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
     ) -> CoreResult<T> {
-        Err(fatal_fs_core_failure(ctx, errno, message, group_id, mount_epoch))
+        Err(fatal_fs_core_failure(ctx, errno, message, group_name, mount_epoch))
     }
 
     fn session_terminal_failure<T>(
@@ -253,7 +253,7 @@ impl FsCore {
         reason: RefreshReason,
         rpc_code: RpcErrorCode,
         message: impl Into<String>,
-        group_id: Option<u64>,
+        group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
     ) -> CoreResult<T> {
         Err(terminal_rpc_core_failure(
@@ -261,7 +261,7 @@ impl FsCore {
             reason,
             rpc_code,
             message,
-            group_id,
+            group_name,
             mount_epoch,
         ))
     }
@@ -270,7 +270,7 @@ impl FsCore {
         format!("refresh metadata and reopen write handle, then replay {}", intent)
     }
 
-    pub(crate) fn mount_hints_for_mount(&self, mount_id: MountId) -> (Option<u64>, Option<u64>) {
+    pub(crate) fn mount_hints_for_mount(&self, mount_id: MountId) -> (Option<GroupName>, Option<u64>) {
         self.freshness_validator.mount_hints_for_mount(mount_id)
     }
 
@@ -279,7 +279,7 @@ impl FsCore {
         ctx: &RequestContext,
         freshness: Freshness,
         mount_id: MountId,
-    ) -> Result<(Option<u64>, Option<u64>), CoreFailure> {
+    ) -> Result<(Option<GroupName>, Option<u64>), CoreFailure> {
         self.freshness_validator
             .validate_mount_epoch_for_mount(ctx, freshness, mount_id)
     }
@@ -288,12 +288,12 @@ impl FsCore {
         &self,
         ctx: &RequestContext,
         freshness: Freshness,
-        group_id: Option<u64>,
+        group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
         intent: &str,
     ) -> Result<Option<u64>, CoreFailure> {
         self.freshness_validator
-            .validate_route_epoch(ctx, freshness, group_id, mount_epoch, intent)
+            .validate_route_epoch(ctx, freshness, group_name, mount_epoch, intent)
             .await
     }
 
@@ -301,11 +301,11 @@ impl FsCore {
         &self,
         ctx: &RequestContext,
         last_applied: Option<RaftLogId>,
-        group_id: Option<u64>,
+        group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
     ) -> Result<StaleStateStatus, CoreFailure> {
         self.freshness_validator
-            .validate_stale_state(ctx, last_applied, group_id, mount_epoch)
+            .validate_stale_state(ctx, last_applied, group_name, mount_epoch)
     }
 
     fn fencing_token_matches_session(
@@ -337,7 +337,7 @@ impl FsCore {
         op: CoreWriteOp,
         parent_inode_ids: &[InodeId],
         freshness: Freshness,
-        error_group_id: Option<u64>,
+        error_group_name: Option<GroupName>,
         error_mount_epoch: Option<u64>,
     ) -> Result<RoutedFsWriteCtx, CoreFailure> {
         let ctx = match self.route_fs_write_ctx(op, parent_inode_ids) {
@@ -346,7 +346,7 @@ impl FsCore {
                 return Err(core_failure_from_metadata_error(
                     req_ctx,
                     err,
-                    error_group_id,
+                    error_group_name,
                     error_mount_epoch,
                     None,
                 ));
@@ -412,7 +412,7 @@ impl FsCore {
         debug!(
             op = ?op,
             mount_id = %mount_id.as_raw(),
-            owner_group_id = %mount_entry.namespace_owner_group_id.as_raw(),
+            owner_group_name = %mount_entry.namespace_owner_group_name,
             mount_epoch = mount_entry.mount_version,
             "FS write routed to mount namespace owner group"
         );
@@ -425,7 +425,7 @@ impl FsCore {
 
         Ok(RoutedFsWriteCtx {
             mount_id,
-            namespace_owner_group_id: mount_entry.namespace_owner_group_id,
+            namespace_owner_group_name: mount_entry.namespace_owner_group_name,
             mount_epoch: mount_entry.mount_version,
         })
     }

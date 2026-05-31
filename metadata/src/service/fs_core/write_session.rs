@@ -21,7 +21,7 @@ use types::fs::{Extent, FsErrorCode};
 use types::ids::{BlockId, BlockIndex, DataHandleId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
-use types::{CommittedBlock, WorkerEndpointInfo, WriteTarget};
+use types::{CommittedBlock, GroupName, WorkerEndpointInfo, WriteTarget};
 
 impl FsCore {
     pub(crate) fn write_session_for_handle(&self, file_handle: u64) -> Option<crate::write_session::WriteSession> {
@@ -50,10 +50,16 @@ impl FsCore {
         ctx: &RequestContext,
         desired_len: Option<u64>,
         layout: FileLayout,
-        group_id: Option<u64>,
+        group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
     ) -> Option<crate::service::domain::CoreFailure> {
-        WriteSessionCoordinator::new(self).preflight_open_write_runtime(ctx, desired_len, layout, group_id, mount_epoch)
+        WriteSessionCoordinator::new(self).preflight_open_write_runtime(
+            ctx,
+            desired_len,
+            layout,
+            group_name,
+            mount_epoch,
+        )
     }
 
     pub(crate) async fn execute_add_block(&self, req: AddBlockInput) -> CoreResult<AddBlockOutput> {
@@ -118,7 +124,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             }
         };
 
-        let (group_id, mount_epoch) =
+        let (group_name, mount_epoch) =
             match self
                 .core
                 .validate_mount_epoch_for_mount(&req.ctx, req.freshness, session.mount_id)
@@ -128,7 +134,13 @@ impl<'a> WriteSessionCoordinator<'a> {
             };
         let route_epoch = match self
             .core
-            .validate_route_epoch(&req.ctx, req.freshness, group_id, mount_epoch, "AbortFileWrite")
+            .validate_route_epoch(
+                &req.ctx,
+                req.freshness,
+                group_name.clone(),
+                mount_epoch,
+                "AbortFileWrite",
+            )
             .await
         {
             Ok(route_epoch) => route_epoch,
@@ -141,7 +153,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 return self.core.failure_from_error(
                     &req.ctx,
                     MetadataError::InvalidArgument("Missing lease_id".to_string()),
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
@@ -155,7 +167,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     "lease/write handle mismatch for handle={}; AbortFileWrite cannot be replayed automatically",
                     file_handle
                 ),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -168,7 +180,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     "open_epoch mismatch: expected {}, got {}; AbortFileWrite cannot be replayed automatically",
                     session.open_epoch, req.open_epoch
                 ),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -183,7 +195,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                         "missing fencing_token for handle={}; AbortFileWrite cannot be replayed automatically",
                         file_handle
                     ),
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
@@ -197,7 +209,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     "fencing_token mismatch for handle={}; AbortFileWrite cannot be replayed automatically",
                     file_handle
                 ),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -215,7 +227,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     "lease validation rejected for handle={}; write lease expired and AbortFileWrite cannot be replayed automatically",
                     file_handle,
                 ),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -226,7 +238,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         self.core.write_session_manager.remove_session(file_handle);
 
         self.core
-            .success_with_route_epoch(&req.ctx, AbortWriteOutput, group_id, mount_epoch, route_epoch)
+            .success_with_route_epoch(&req.ctx, AbortWriteOutput, group_name, mount_epoch, route_epoch)
     }
 
     async fn execute_renew_inode_lease(&self, req: RenewLeaseInput) -> CoreResult<RenewLeaseOutput> {
@@ -249,7 +261,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             }
         };
 
-        let (group_id, mount_epoch) =
+        let (group_name, mount_epoch) =
             match self
                 .core
                 .validate_mount_epoch_for_mount(&req.ctx, req.freshness, session.mount_id)
@@ -264,7 +276,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 return self.core.failure_from_error(
                     &req.ctx,
                     MetadataError::InvalidArgument("Missing lease_id".to_string()),
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
@@ -282,7 +294,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     lease_id_typed,
                     req.lease_epoch,
                 ),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -296,7 +308,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     "open_epoch mismatch: expected {}, got {}; RenewLease cannot be replayed automatically",
                     session.open_epoch, req.open_epoch,
                 ),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -312,7 +324,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                         "missing fencing_token for handle={}; RenewLease cannot be replayed automatically",
                         file_handle,
                     ),
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
@@ -326,7 +338,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     "fencing_token mismatch for handle={}; RenewLease cannot be replayed automatically",
                     file_handle,
                 ),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -346,7 +358,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                         "lease renewal rejected for handle={}; write lease expired and RenewLease cannot be replayed automatically",
                         file_handle,
                     ),
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
@@ -356,7 +368,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         self.core.success_with_route_epoch(
             &req.ctx,
             RenewLeaseOutput { expires_at_ms },
-            group_id,
+            group_name,
             mount_epoch,
             route_epoch,
         )
@@ -382,7 +394,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             }
         };
 
-        let (group_id, mount_epoch) =
+        let (group_name, mount_epoch) =
             match self
                 .core
                 .validate_mount_epoch_for_mount(&req.ctx, req.freshness, session.mount_id)
@@ -393,7 +405,7 @@ impl<'a> WriteSessionCoordinator<'a> {
 
         let route_epoch = match self
             .core
-            .validate_route_epoch(&req.ctx, req.freshness, group_id, mount_epoch, "SyncWrite")
+            .validate_route_epoch(&req.ctx, req.freshness, group_name.clone(), mount_epoch, "SyncWrite")
             .await
         {
             Ok(route_epoch) => route_epoch,
@@ -407,7 +419,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     "SyncWrite data_handle_id {} does not match write handle data_handle_id {}",
                     req.data_handle_id, session.data_handle_id
                 )),
-                group_id,
+                group_name,
                 mount_epoch,
                 route_epoch,
             );
@@ -420,7 +432,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                         "SyncWrite committed block data_handle_id {} does not match write handle data_handle_id {}",
                         block.block_id.data_handle_id, session.data_handle_id
                     )),
-                    group_id,
+                    group_name,
                     mount_epoch,
                     route_epoch,
                 );
@@ -433,7 +445,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 return self.core.failure_from_error_with_route_epoch(
                     &req.ctx,
                     MetadataError::InvalidArgument("Missing lease_id".to_string()),
-                    group_id,
+                    group_name,
                     mount_epoch,
                     route_epoch,
                 );
@@ -451,7 +463,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     lease_id_typed,
                     req.lease_epoch,
                 ),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -464,7 +476,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     "open_epoch mismatch: expected {}, got {}; SyncWrite cannot be replayed automatically",
                     session.open_epoch, req.open_epoch,
                 ),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -479,7 +491,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                         "missing fencing_token for handle={}; SyncWrite cannot be replayed automatically",
                         file_handle,
                     ),
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
@@ -493,7 +505,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     "fencing_token mismatch for handle={}; SyncWrite cannot be replayed automatically",
                     file_handle,
                 ),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -511,7 +523,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     "lease validation rejected for handle={}; SyncWrite cannot be replayed automatically",
                     file_handle,
                 ),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -529,7 +541,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         let extents = match Self::validate_committed_blocks(&intent, &session) {
             Ok(extents) => extents,
             Err(err) => {
-                return Err(self.invalid_sync_write_failure(&req, err.to_string(), group_id, mount_epoch));
+                return Err(self.invalid_sync_write_failure(&req, err.to_string(), group_name, mount_epoch));
             }
         };
 
@@ -538,7 +550,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             CoreWriteOp::SetAttr,
             &[session.inode_id],
             req.freshness,
-            group_id,
+            group_name.clone(),
             mount_epoch,
         ) {
             Ok(ctx) => ctx,
@@ -547,7 +559,11 @@ impl<'a> WriteSessionCoordinator<'a> {
 
         let dedup = match self.core.dedup_key(&req.ctx.caller) {
             Ok(k) => k,
-            Err(err) => return self.core.failure_from_error(&req.ctx, err, group_id, mount_epoch),
+            Err(err) => {
+                return self
+                    .core
+                    .failure_from_error(&req.ctx, err, group_name.clone(), mount_epoch)
+            }
         };
         let command = Command::SyncWrite {
             dedup,
@@ -566,7 +582,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     &req.ctx,
                     err.errno,
                     err.message,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
@@ -574,7 +590,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 return self.core.failure_from_error(
                     &req.ctx,
                     err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
@@ -586,7 +602,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 synced_size: req.target_size,
                 file_version,
             },
-            Some(ctx.namespace_owner_group_id.as_raw()),
+            Some(ctx.namespace_owner_group_name.clone()),
             Some(ctx.mount_epoch),
             route_epoch,
         )
@@ -645,7 +661,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             return self.core.failure_from_error(&req.ctx, err, None, None);
         }
 
-        let (group_id, mount_epoch) =
+        let (group_name, mount_epoch) =
             match self
                 .core
                 .validate_mount_epoch_for_mount(&req.ctx, req.freshness, inode.mount_id)
@@ -656,7 +672,7 @@ impl<'a> WriteSessionCoordinator<'a> {
 
         let route_epoch = match self
             .core
-            .validate_route_epoch(&req.ctx, req.freshness, group_id, mount_epoch, "OpenWrite")
+            .validate_route_epoch(&req.ctx, req.freshness, group_name.clone(), mount_epoch, "OpenWrite")
             .await
         {
             Ok(route_epoch) => route_epoch,
@@ -673,11 +689,11 @@ impl<'a> WriteSessionCoordinator<'a> {
         let layout = match storage.get_layout(inode_id) {
             Ok(layout) => layout,
             Err(err) => {
-                return self.core.failure_from_error(&req.ctx, err, group_id, mount_epoch);
+                return self.core.failure_from_error(&req.ctx, err, group_name, mount_epoch);
             }
         };
         if let Err(err) = validate_active_write_layout(&layout) {
-            return self.core.failure_from_error(&req.ctx, err, group_id, mount_epoch);
+            return self.core.failure_from_error(&req.ctx, err, group_name, mount_epoch);
         }
         let block_size = u64::from(layout.block_size);
         let chunk_size = layout.chunk_size;
@@ -691,7 +707,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 return self.core.failure_from_error(
                     &req.ctx,
                     MetadataError::InvalidArgument(format!("file_version overflow for inode {}", inode_id)),
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
@@ -713,16 +729,20 @@ impl<'a> WriteSessionCoordinator<'a> {
                 return self.core.failure_from_error(
                     &req.ctx,
                     MetadataError::ServiceUnavailable("Worker manager not available".to_string()),
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
         };
-        let placement_group_id =
-            self.core
-                .require_worker_lookup_group(&req.ctx, group_id, mount_epoch, route_epoch, "OpenWrite")?;
+        let placement_group_name = self.core.require_worker_lookup_group(
+            &req.ctx,
+            group_name.clone(),
+            mount_epoch,
+            route_epoch,
+            "OpenWrite",
+        )?;
 
-        let placement_views = worker_manager.collect_worker_placement_views(placement_group_id);
+        let placement_views = worker_manager.collect_worker_placement_views(&placement_group_name);
         let caller = req
             .ctx
             .caller
@@ -738,7 +758,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             let effective_block_len = desired_len.saturating_sub(i * block_size).min(block_size).max(1);
             let placement = planner.plan(
                 &PlacementRequest {
-                    group_id: placement_group_id,
+                    group_name: placement_group_name.clone(),
                     op: PlacementOp::Write,
                     block_id,
                     block_stamp: Some(block_stamp),
@@ -757,7 +777,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                         "Failed to select write placement: {:?}",
                         placement.status
                     )),
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
@@ -772,7 +792,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 ) {
                     Ok(endpoint) => endpoint,
                     Err(err) => {
-                        return self.core.failure_from_error(&req.ctx, err, group_id, mount_epoch);
+                        return self.core.failure_from_error(&req.ctx, err, group_name, mount_epoch);
                     }
                 };
                 worker_endpoints.push(endpoint);
@@ -782,7 +802,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 return self.core.failure_from_error(
                     &req.ctx,
                     MetadataError::ServiceUnavailable("selected placement has no live worker endpoints".to_string()),
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
@@ -814,7 +834,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     &req.ctx,
                     FsErrorCode::EBusy,
                     format!("File already has an active write lease: {}", inode_id),
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
@@ -823,7 +843,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     &req.ctx,
                     e,
                     format!("Failed to acquire lease: {}", inode_id),
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
@@ -856,7 +876,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                         "invalid write target length: effective_block_len={}, block_size={}",
                         target.effective_block_len, target.block_size
                     )),
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
@@ -869,7 +889,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     MetadataError::InvalidArgument(
                         "write target shape does not match persisted FileLayout".to_string(),
                     ),
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
@@ -918,7 +938,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 base_size,
                 expires_at_ms,
             },
-            group_id,
+            group_name,
             mount_epoch,
             route_epoch,
         )
@@ -943,7 +963,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             }
         };
 
-        let (group_id, mount_epoch) =
+        let (group_name, mount_epoch) =
             match self
                 .core
                 .validate_mount_epoch_for_mount(&req.ctx, req.freshness, session.mount_id)
@@ -953,7 +973,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             };
         let route_epoch = match self
             .core
-            .validate_route_epoch(&req.ctx, req.freshness, group_id, mount_epoch, "AddBlock")
+            .validate_route_epoch(&req.ctx, req.freshness, group_name.clone(), mount_epoch, "AddBlock")
             .await
         {
             Ok(route_epoch) => route_epoch,
@@ -966,7 +986,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 return self.core.failure_from_error(
                     &req.ctx,
                     MetadataError::InvalidArgument("Missing lease_id".to_string()),
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
@@ -977,7 +997,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 RefreshReason::SessionInvalid,
                 RpcErrorCode::Fencing,
                 format!("lease mismatch for handle={}; reopen before AddBlock", file_handle),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -990,7 +1010,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     "open_epoch mismatch: expected {}, got {}; reopen before AddBlock",
                     session.open_epoch, req.open_epoch
                 ),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -1005,7 +1025,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                         "missing fencing_token for handle={}; reopen before AddBlock",
                         file_handle
                     ),
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
@@ -1019,7 +1039,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     "fencing_token mismatch for handle={}; reopen before AddBlock",
                     file_handle
                 ),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -1037,7 +1057,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     "lease validation rejected for handle={}; reopen before AddBlock",
                     file_handle
                 ),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -1053,25 +1073,30 @@ impl<'a> WriteSessionCoordinator<'a> {
                     &req.ctx,
                     FsErrorCode::EAgain,
                     "no preallocated write target available; reopen with a larger desired_len",
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
         };
-        self.core
-            .success_with_route_epoch(&req.ctx, AddBlockOutput { target }, group_id, mount_epoch, route_epoch)
+        self.core.success_with_route_epoch(
+            &req.ctx,
+            AddBlockOutput { target },
+            group_name,
+            mount_epoch,
+            route_epoch,
+        )
     }
 
     fn invalid_commit_failure(
         &self,
         req: &CloseWriteInput,
         message: impl Into<String>,
-        group_id: Option<u64>,
+        group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
     ) -> crate::service::domain::CoreFailure {
         match self
             .core
-            .fatal_fs_failure::<()>(&req.ctx, FsErrorCode::EInval, message, group_id, mount_epoch)
+            .fatal_fs_failure::<()>(&req.ctx, FsErrorCode::EInval, message, group_name, mount_epoch)
         {
             Err(failure) => failure,
             Ok(_) => unreachable!("fatal_fs_failure always returns Err"),
@@ -1082,12 +1107,12 @@ impl<'a> WriteSessionCoordinator<'a> {
         &self,
         req: &SyncWriteInput,
         message: impl Into<String>,
-        group_id: Option<u64>,
+        group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
     ) -> crate::service::domain::CoreFailure {
         match self
             .core
-            .fatal_fs_failure::<()>(&req.ctx, FsErrorCode::EInval, message, group_id, mount_epoch)
+            .fatal_fs_failure::<()>(&req.ctx, FsErrorCode::EInval, message, group_name, mount_epoch)
         {
             Err(failure) => failure,
             Ok(_) => unreachable!("fatal_fs_failure always returns Err"),
@@ -1249,7 +1274,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             }
         };
 
-        let (group_id, mount_epoch) =
+        let (group_name, mount_epoch) =
             match self
                 .core
                 .validate_mount_epoch_for_mount(&req.ctx, req.freshness, session.mount_id)
@@ -1260,7 +1285,7 @@ impl<'a> WriteSessionCoordinator<'a> {
 
         let route_epoch = match self
             .core
-            .validate_route_epoch(&req.ctx, req.freshness, group_id, mount_epoch, "CommitFile")
+            .validate_route_epoch(&req.ctx, req.freshness, group_name.clone(), mount_epoch, "CommitFile")
             .await
         {
             Ok(route_epoch) => route_epoch,
@@ -1268,14 +1293,18 @@ impl<'a> WriteSessionCoordinator<'a> {
         };
 
         if let Some(worker_manager) = self.core.worker_manager.as_ref() {
-            let worker_lookup_group_id =
-                self.core
-                    .require_worker_lookup_group(&req.ctx, group_id, mount_epoch, route_epoch, "CommitFile")?;
+            let worker_lookup_group_name = self.core.require_worker_lookup_group(
+                &req.ctx,
+                group_name.clone(),
+                mount_epoch,
+                route_epoch,
+                "CommitFile",
+            )?;
             for target in &session.write_targets {
                 for endpoint in &target.worker_endpoints {
                     let worker_id = endpoint.worker_id;
                     let current_run_id = worker_manager
-                        .get_registration(worker_lookup_group_id, worker_id)
+                        .get_registration(&worker_lookup_group_name, worker_id)
                         .map(|registration| registration.worker_run_id);
                     if current_run_id != Some(endpoint.worker_run_id) {
                         let hint = worker_refresh_hint_from_session(&session, true);
@@ -1290,7 +1319,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                                 current_run_id,
                                 FsCore::replay_hint("CommitFile")
                             ),
-                            group_id,
+                            group_name,
                             mount_epoch,
                             route_epoch,
                             Some(hint),
@@ -1306,7 +1335,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 return self.core.failure_from_error(
                     &req.ctx,
                     MetadataError::InvalidArgument("Missing lease_id".to_string()),
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
@@ -1325,7 +1354,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     lease_id_typed,
                     request_lease_epoch,
                 ),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -1341,7 +1370,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                         "missing fencing_token for handle={}; CommitFile cannot be replayed automatically",
                         file_handle,
                     ),
-                    group_id,
+                    group_name,
                     mount_epoch,
                 );
             }
@@ -1355,7 +1384,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     "fencing_token mismatch for handle={}; CommitFile cannot be replayed automatically",
                     file_handle,
                 ),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -1369,7 +1398,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     "open_epoch mismatch: expected {}, got {}; CommitFile cannot be replayed automatically",
                     session.open_epoch, req.open_epoch,
                 ),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
@@ -1388,14 +1417,16 @@ impl<'a> WriteSessionCoordinator<'a> {
                     "lease validation rejected for handle={}; write lease expired and CommitFile cannot be replayed automatically",
                     file_handle,
                 ),
-                group_id,
+                group_name,
                 mount_epoch,
             );
         }
 
         let extents = match Self::validate_committed_blocks(&req.intent, &session) {
             Ok(extents) => extents,
-            Err(err) => return Err(self.invalid_commit_failure(&req, err.to_string(), group_id, mount_epoch)),
+            Err(err) => {
+                return Err(self.invalid_commit_failure(&req, err.to_string(), group_name.clone(), mount_epoch))
+            }
         };
 
         let ctx = match self.core.route_ctx_for_write_with_error_hints(
@@ -1403,7 +1434,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             CoreWriteOp::SetAttr,
             &[session.inode_id],
             req.freshness,
-            group_id,
+            group_name.clone(),
             mount_epoch,
         ) {
             Ok(ctx) => ctx,
@@ -1427,7 +1458,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     &req.ctx,
                     err.errno,
                     err.message,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
@@ -1435,7 +1466,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 return self.core.failure_from_error(
                     &req.ctx,
                     err,
-                    Some(ctx.namespace_owner_group_id.as_raw()),
+                    Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),
                 );
             }
@@ -1452,7 +1483,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 committed_size: req.intent.final_size,
                 file_version,
             },
-            Some(ctx.namespace_owner_group_id.as_raw()),
+            Some(ctx.namespace_owner_group_name.clone()),
             Some(ctx.mount_epoch),
             route_epoch,
         )
@@ -1470,7 +1501,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             Err(err) => return Some(self.core.failure_from_error(&req.ctx, err, None, None)),
         };
 
-        let (command, group_id, mount_epoch) =
+        let (command, group_name, mount_epoch) =
             match self.close_write_replay_command(req, dedup, storage, applied.fingerprint) {
                 Ok(replay) => replay,
                 Err(err) => return Some(self.core.failure_from_error(&req.ctx, err, None, None)),
@@ -1483,7 +1514,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     "call_id {} reused with different command payload",
                     dedup.call_id
                 )),
-                group_id,
+                group_name,
                 mount_epoch,
             ));
         }
@@ -1496,14 +1527,14 @@ impl<'a> WriteSessionCoordinator<'a> {
                     committed_size: req.intent.final_size,
                     file_version: ok.file_version,
                 },
-                group_id,
+                group_name,
                 mount_epoch,
                 route_epoch,
             )),
             AppDataResponse::Fs(FsCommandResult::Err(err)) => {
                 Some(
                     self.core
-                        .fatal_fs_failure(&req.ctx, err.errno, err.message, group_id, mount_epoch),
+                        .fatal_fs_failure(&req.ctx, err.errno, err.message, group_name, mount_epoch),
                 )
             }
             _ => Some(self.core.failure_from_error(
@@ -1512,7 +1543,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     "applied result for call_id {} is not a CloseWrite filesystem result",
                     dedup.call_id
                 )),
-                group_id,
+                group_name,
                 mount_epoch,
             )),
         }
@@ -1524,7 +1555,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         dedup: &DedupKey,
         storage: &RocksDBStorage,
         applied_fingerprint: CommandFingerprint,
-    ) -> MetadataResult<(Command, Option<u64>, Option<u64>)> {
+    ) -> MetadataResult<(Command, Option<GroupName>, Option<u64>)> {
         let lease_id = req
             .lease_id
             .ok_or_else(|| MetadataError::InvalidArgument("Missing lease_id".to_string()))?;
@@ -1546,7 +1577,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         let inode = storage
             .get_inode(inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {}", inode_id)))?;
-        let (group_id, mount_epoch) = self.core.mount_hints_for_mount(inode.mount_id);
+        let (group_name, mount_epoch) = self.core.mount_hints_for_mount(inode.mount_id);
 
         let extents: Vec<_> = req
             .intent
@@ -1586,7 +1617,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             )));
         };
 
-        Ok((command, group_id, mount_epoch))
+        Ok((command, group_name, mount_epoch))
     }
 
     pub(crate) fn preflight_open_write_runtime(
@@ -1594,7 +1625,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         req_ctx: &RequestContext,
         desired_len: Option<u64>,
         layout: FileLayout,
-        group_id: Option<u64>,
+        group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
     ) -> Option<crate::service::domain::CoreFailure> {
         let worker_manager = match self.core.worker_manager.as_ref() {
@@ -1605,7 +1636,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     .failure_from_error::<()>(
                         req_ctx,
                         MetadataError::ServiceUnavailable("Worker manager not available".to_string()),
-                        group_id,
+                        group_name,
                         mount_epoch,
                     )
                     .err();
@@ -1614,22 +1645,24 @@ impl<'a> WriteSessionCoordinator<'a> {
         if let Err(err) = validate_active_write_layout(&layout) {
             return self
                 .core
-                .failure_from_error::<()>(req_ctx, err, group_id, mount_epoch)
+                .failure_from_error::<()>(req_ctx, err, group_name, mount_epoch)
                 .err();
         }
-        let placement_group_id =
-            match self
-                .core
-                .require_worker_lookup_group(req_ctx, group_id, mount_epoch, None, "OpenWrite preflight")
-            {
-                Ok(group_id) => group_id,
-                Err(failure) => return Some(failure),
-            };
+        let placement_group_name = match self.core.require_worker_lookup_group(
+            req_ctx,
+            group_name.clone(),
+            mount_epoch,
+            None,
+            "OpenWrite preflight",
+        ) {
+            Ok(group_name) => group_name,
+            Err(failure) => return Some(failure),
+        };
 
         let desired_len = desired_len.unwrap_or(4 * 1024 * 1024);
         let block_size = u64::from(layout.block_size);
         let num_blocks = desired_len.div_ceil(block_size).clamp(1, 10);
-        let placement_views = worker_manager.collect_worker_placement_views(placement_group_id);
+        let placement_views = worker_manager.collect_worker_placement_views(&placement_group_name);
         let caller = req_ctx
             .caller
             .caller_context
@@ -1640,7 +1673,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             let block_id = BlockId::new(DataHandleId::new(0), BlockIndex::new(i as u32));
             let placement = planner.plan(
                 &PlacementRequest {
-                    group_id: placement_group_id,
+                    group_name: placement_group_name.clone(),
                     op: PlacementOp::Write,
                     block_id,
                     block_stamp: None,
@@ -1661,7 +1694,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                             "Failed to select write placement: {:?}",
                             placement.status
                         )),
-                        group_id,
+                        group_name,
                         mount_epoch,
                     )
                     .err();

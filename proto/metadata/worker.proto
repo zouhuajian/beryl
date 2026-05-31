@@ -13,9 +13,10 @@ import "common/header.proto";
 // ============================================================================
 
 message RegisterWorkerRequestProto {
+  reserved 2;
+  reserved "group_id";
+
   common.RequestHeaderProto header = 1;
-  /// Metadata group this registration targets.
-  uint64 group_id = 2;
   /// Stable logical worker identity supplied by the worker.
   uint64 worker_id = 3;
   /// UUID generated once for this worker process start; not an epoch.
@@ -30,16 +31,21 @@ message RegisterWorkerRequestProto {
   map<string, string> labels = 8;
   /// Worker network protocol (grpc/quic/rdma).
   common.WorkerNetProtocolProto worker_net_protocol = 9;
+  /// Stable metadata group name this registration targets.
+  string group_name = 10;
 }
 
 message RegisterWorkerResponseProto {
+  reserved 2;
+  reserved "group_id";
+
   common.ResponseHeaderProto header = 1;
-  /// Metadata group that accepted this registration.
-  uint64 group_id = 2;
   /// Confirmed stable worker identity.
   uint64 worker_id = 3;
   /// Accepted process-run identity for this group.
   string accepted_worker_run_id = 4;
+  /// Stable metadata group name that accepted this registration.
+  string group_name = 5;
 }
 
 message WorkerConfigProto {
@@ -52,13 +58,14 @@ message WorkerConfigProto {
 }
 
 message HeartbeatRequestProto {
+  reserved 2;
+  reserved "group_id";
+
   common.RequestHeaderProto header = 1;
-  /// Metadata group this heartbeat targets.
-  uint64 group_id = 2;
   uint64 worker_id = 3;
   /// UUID accepted by RegisterWorker for this worker process run.
   string worker_run_id = 4;
-  /// Monotonic sequence number scoped to (group_id, worker_run_id).
+  /// Monotonic sequence number scoped to (group_name, worker_run_id).
   uint64 heartbeat_seq = 5;
   /// Current advertised data endpoint; must match the registered descriptor.
   common.EndpointProto advertised_endpoint = 6;
@@ -70,10 +77,12 @@ message HeartbeatRequestProto {
   LoadInfoProto load = 9;
   /// Health status.
   HealthStatusProto health = 10;
-  /// Heartbeat identity is group_id + worker_id + worker_run_id.
+  /// Heartbeat identity is group_name + worker_id + worker_run_id.
   /// Block report and command ack protocols are separate from heartbeat.
   /// Task acknowledgments (completed tasks).
   repeated TaskAckProto acks = 11;
+  /// Stable metadata group name this heartbeat targets.
+  string group_name = 12;
 }
 
 message CapacityInfoProto {
@@ -104,11 +113,12 @@ enum HealthStatusProto {
 }
 
 message HeartbeatResponseProto {
+  reserved 6;
+  reserved "group_id";
+
   common.ResponseHeaderProto header = 1;
   /// Commands from metadata to worker. Followers must not return mutating commands.
   repeated WorkerCommandProto commands = 2;
-  /// Metadata group that accepted this heartbeat.
-  uint64 group_id = 6;
   /// Confirmed stable worker identity.
   uint64 worker_id = 7;
   /// Accepted live worker process-run identity.
@@ -121,6 +131,8 @@ message HeartbeatResponseProto {
   MetadataServerRoleProto server_role = 11;
   /// Best-effort leader endpoint hint when this node knows one.
   common.EndpointProto leader_hint = 12;
+  /// Stable metadata group name that accepted this heartbeat.
+  string group_name = 13;
 }
 
 enum MetadataServerRoleProto {
@@ -334,9 +346,10 @@ message DeltaBlockReportProto {
 }
 
 message BlockReportRequestProto {
+  reserved 2;
+  reserved "group_id";
+
   common.RequestHeaderProto header = 1;
-  /// Metadata group this block report targets.
-  uint64 group_id = 2;
   /// Stable logical worker identity.
   uint64 worker_id = 3;
   /// Current live worker process-run identity.
@@ -347,6 +360,8 @@ message BlockReportRequestProto {
     FullBlockReportBatchProto full = 6;
     DeltaBlockReportProto delta = 7;
   }
+  /// Stable metadata group name this block report targets.
+  string group_name = 8;
 }
 
 message BlockReportResponseProto {

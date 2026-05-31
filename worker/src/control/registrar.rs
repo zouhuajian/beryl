@@ -19,17 +19,16 @@ use tokio::time;
 use tonic::transport::{Channel, Endpoint};
 use tonic::Code;
 use tracing::{info, warn};
-use types::ids::{ClientId, ShardGroupId, WorkerId};
-use types::WorkerRunId;
+use types::{ClientId, GroupName, WorkerId, WorkerRunId};
 
 use crate::config::{WorkerConfig, WorkerRegistrationConfig};
-use crate::control::{resolve_worker_id, Registration, RegistrationSet};
+use crate::control::{Registration, RegistrationSet};
 use crate::net::protocol::WorkerNetProtocol;
 
 /// Worker descriptor sent to metadata during startup registration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegistrationDescriptor {
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     pub worker_id: WorkerId,
     pub worker_run_id: WorkerRunId,
     pub endpoint_host: String,
@@ -70,8 +69,13 @@ impl MetadataRegistrar {
         config
             .validate()
             .map_err(|err| RegistrationError::InvalidConfig(err.message))?;
-        let endpoint = Endpoint::from_shared(config.endpoint.clone())
-            .map_err(|err| RegistrationError::InvalidConfig(format!("worker.metadata.endpoint: {err}")))?;
+        let registration_endpoint = config
+            .endpoints
+            .first()
+            .ok_or_else(|| RegistrationError::InvalidConfig("worker.metadata.endpoints must not be empty".into()))?
+            .clone();
+        let endpoint = Endpoint::from_shared(registration_endpoint)
+            .map_err(|err| RegistrationError::InvalidConfig(format!("worker.metadata.endpoints: {err}")))?;
         Ok(Self {
             config,
             descriptor,
@@ -80,7 +84,10 @@ impl MetadataRegistrar {
         })
     }
 
-    pub fn descriptor_from_config(config: &WorkerConfig) -> Result<RegistrationDescriptor, RegistrationError> {
+    pub fn descriptor_from_config(
+        config: &WorkerConfig,
+        worker_id: WorkerId,
+    ) -> Result<RegistrationDescriptor, RegistrationError> {
         let listener = config
             .net
             .listeners
@@ -92,10 +99,9 @@ impl MetadataRegistrar {
         let (endpoint_host, endpoint_port) = config
             .rpc_advertised_endpoint_parts()
             .map_err(|err| RegistrationError::InvalidConfig(err.message))?;
-        let worker_id = resolve_worker_id(config)?;
 
         Ok(RegistrationDescriptor {
-            group_id: config.metadata.group_id,
+            group_name: config.metadata.group_name.clone(),
             worker_id,
             worker_run_id: WorkerRunId::new(),
             endpoint_host,
@@ -136,7 +142,7 @@ impl MetadataRegistrar {
             match self.register_once().await {
                 Ok(registration) => {
                     info!(
-                        group_id = registration.group_id.as_raw(),
+                        group_name = %registration.group_name,
                         worker_id = registration.worker_id.as_raw(),
                         worker_run_id = %registration.worker_run_id,
                         "Worker registered with metadata"
@@ -169,8 +175,7 @@ impl MetadataRegistrar {
 
     fn build_request(&self) -> RegisterWorkerRequestProto {
         RegisterWorkerRequestProto {
-            header: Some(registration_request_header(self.descriptor.group_id)),
-            group_id: self.descriptor.group_id.as_raw(),
+            header: Some(registration_request_header()),
             worker_id: self.descriptor.worker_id.as_raw(),
             worker_run_id: self.descriptor.worker_run_id.to_string(),
             advertised_endpoint: Some(EndpointProto {
@@ -182,6 +187,7 @@ impl MetadataRegistrar {
             version: self.descriptor.version.clone(),
             labels: self.descriptor.labels.clone().into_iter().collect::<HashMap<_, _>>(),
             worker_net_protocol: worker_protocol_to_proto(self.descriptor.worker_net_protocol) as i32,
+            group_name: self.descriptor.group_name.to_string(),
         }
     }
 
@@ -190,11 +196,10 @@ impl MetadataRegistrar {
         response: RegisterWorkerResponseProto,
     ) -> Result<Registration, RegistrationError> {
         classify_header(response.header)?;
-        if response.group_id != self.descriptor.group_id.as_raw() {
+        if response.group_name != self.descriptor.group_name.as_str() {
             return Err(RegistrationError::Fatal(format!(
-                "metadata register response confirmed group_id {}, expected {}",
-                response.group_id,
-                self.descriptor.group_id.as_raw()
+                "metadata register response confirmed group_name {}, expected {}",
+                response.group_name, self.descriptor.group_name
             )));
         }
         if response.worker_id != self.descriptor.worker_id.as_raw() {
@@ -214,7 +219,7 @@ impl MetadataRegistrar {
         };
 
         Ok(Registration {
-            group_id: self.descriptor.group_id,
+            group_name: self.descriptor.group_name.clone(),
             worker_id: self.descriptor.worker_id,
             worker_run_id: accepted_worker_run_id,
             advertised_endpoint: self.descriptor.advertised_endpoint.clone(),
@@ -222,9 +227,9 @@ impl MetadataRegistrar {
     }
 }
 
-fn registration_request_header(group_id: ShardGroupId) -> RequestHeaderProto {
+fn registration_request_header() -> RequestHeaderProto {
     let client_id = u64::from(std::process::id()).max(1);
-    let header = RequestHeader::new(ClientId::new(client_id)).with_group_id(group_id.as_raw());
+    let header = RequestHeader::new(ClientId::new(client_id));
     (&header).into()
 }
 

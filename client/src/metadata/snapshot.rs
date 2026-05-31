@@ -4,7 +4,7 @@
 //! Metadata operation result types.
 
 use crate::error::{ClientError, ClientResult};
-use types::{DataHandleId, FileBlockLocation, InodeId, WriteTarget};
+use types::{DataHandleId, FileBlockLocation, GroupName, InodeId, WriteTarget};
 
 /// File status snapshot returned by metadata.
 pub type StatusSnapshot = proto::metadata::GetStatusResponseProto;
@@ -25,7 +25,7 @@ pub type FileSnapshot = proto::metadata::OpenFileResponseProto;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayoutSnapshot {
     /// Metadata owner group from the validated response header.
-    pub group_id: u64,
+    pub group_name: GroupName,
     /// Inode identity this layout belongs to.
     pub inode_id: InodeId,
     /// Data handle identity this layout belongs to.
@@ -41,7 +41,7 @@ pub struct LayoutSnapshot {
 impl LayoutSnapshot {
     /// Convert a metadata wire response into the client read-layout domain view.
     pub(crate) fn from_proto(
-        group_id: u64,
+        group_name: GroupName,
         response: proto::metadata::GetBlockLocationsResponseProto,
     ) -> ClientResult<Self> {
         let inode_id = response
@@ -64,7 +64,7 @@ impl LayoutSnapshot {
             .collect::<Result<Vec<_>, _>>()
             .map_err(ClientError::InvalidLayout)?;
         Ok(Self {
-            group_id,
+            group_name,
             inode_id,
             data_handle_id,
             file_size: response.file_size,
@@ -87,7 +87,7 @@ pub enum WriteSessionSeed {
 #[derive(Clone, Debug)]
 pub struct AddBlockResult {
     /// Metadata owner group for the block target.
-    pub group_id: u64,
+    pub group_name: GroupName,
     /// Worker target for this block.
     pub target: WriteTarget,
 }

@@ -31,8 +31,8 @@ pub use acl::{
 pub use fs::{DirEntry, Extent, FileAttrs, FsErrorCode, Inode, InodeData, InodeId, InodeKind};
 pub use group_watermark::{GroupStateWatermark, MountEpoch};
 pub use ids::{
-    BlockId, BlockIndex, CallId, ChunkId, ChunkIndex, ClientId, DataHandleId, LeaseId, MountId, RequestId,
-    ShardGroupId, ShardId, StreamId, WorkerId,
+    BlockId, BlockIndex, CallId, ChunkId, ChunkIndex, ClientId, DataHandleId, GroupName, GroupNameError, LeaseId,
+    MountId, RequestId, ShardId, StreamId, WorkerId,
 };
 pub use layout::{BlockFormatId, BlockFormatIdError, FileLayout, FileLayoutError};
 pub use location::{CommittedBlock, FileBlockLocation, WriteTarget};

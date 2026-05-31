@@ -6,27 +6,27 @@
 //! This module defines types for tracking state-machine applied progress per
 //! metadata Raft owner group.
 
+use crate::GroupName;
 use crate::RaftLogId;
-use crate::ids::ShardGroupId;
 use serde::{Deserialize, Serialize};
 
 /// Group state watermark for a specific metadata Raft owner group.
 ///
-/// `state_id` is the state-machine applied RaftLogId for `group_id`. It is not
+/// `state_id` is the state-machine applied RaftLogId for `group_name`. It is not
 /// an append index, committed index, private apply counter, route epoch,
 /// mount epoch, worker process-run identity, or block stamp.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GroupStateWatermark {
     /// Metadata Raft owner group this watermark applies to.
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     /// Applied state-machine RaftLogId that must be reached.
     pub state_id: RaftLogId,
 }
 
 impl GroupStateWatermark {
     /// Create a new GroupStateWatermark.
-    pub fn new(group_id: ShardGroupId, state_id: RaftLogId) -> Self {
-        Self { group_id, state_id }
+    pub fn new(group_name: GroupName, state_id: RaftLogId) -> Self {
+        Self { group_name, state_id }
     }
 
     /// Check if this watermark has been reached by the given applied state ID.
@@ -37,7 +37,7 @@ impl GroupStateWatermark {
     /// Compare two watermarks from the same group.
     /// Returns Some(Ordering) if they are from the same group, None otherwise.
     pub fn cmp_same_group(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        if self.group_id != other.group_id {
+        if self.group_name != other.group_name {
             return None;
         }
         Some(self.state_id.cmp(&other.state_id))

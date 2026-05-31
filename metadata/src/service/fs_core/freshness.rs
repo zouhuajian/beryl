@@ -8,8 +8,8 @@ use crate::state::StateStore;
 use common::error::canonical::{RefreshHint, RefreshReason};
 use common::header::RpcErrorCode;
 use std::sync::Arc;
-use types::ids::{MountId, ShardGroupId};
-use types::RaftLogId;
+use types::ids::MountId;
+use types::{GroupName, RaftLogId};
 
 #[derive(Clone)]
 pub(super) struct FreshnessValidator {
@@ -35,10 +35,10 @@ impl FreshnessValidator {
         self.state_store.get_route_epoch().await.ok().map(|v| v.as_u64())
     }
 
-    pub(super) fn mount_hints_for_mount(&self, mount_id: MountId) -> (Option<u64>, Option<u64>) {
+    pub(super) fn mount_hints_for_mount(&self, mount_id: MountId) -> (Option<GroupName>, Option<u64>) {
         match self.mount_table.get_mount(mount_id) {
             Ok(Some(mount_entry)) => (
-                Some(mount_entry.namespace_owner_group_id.as_raw()),
+                Some(mount_entry.namespace_owner_group_name),
                 Some(mount_entry.mount_version),
             ),
             _ => (None, None),
@@ -50,7 +50,7 @@ impl FreshnessValidator {
         ctx: &RequestContext,
         freshness: Freshness,
         mount_id: MountId,
-    ) -> Result<(Option<u64>, Option<u64>), CoreFailure> {
+    ) -> Result<(Option<GroupName>, Option<u64>), CoreFailure> {
         self.validate_routed_write_mount_epoch(ctx, freshness, mount_id)
     }
 
@@ -59,7 +59,7 @@ impl FreshnessValidator {
         ctx: &RequestContext,
         freshness: Freshness,
         mount_id: MountId,
-    ) -> Result<(Option<u64>, Option<u64>), CoreFailure> {
+    ) -> Result<(Option<GroupName>, Option<u64>), CoreFailure> {
         self.validate_mount_epoch_for_mount_with_replay(ctx, freshness, mount_id, Some("request"))
     }
 
@@ -69,8 +69,8 @@ impl FreshnessValidator {
         freshness: Freshness,
         mount_id: MountId,
         replay_intent: Option<&str>,
-    ) -> Result<(Option<u64>, Option<u64>), CoreFailure> {
-        let (group_id, mount_epoch) = self.mount_hints_for_mount(mount_id);
+    ) -> Result<(Option<GroupName>, Option<u64>), CoreFailure> {
+        let (group_name, mount_epoch) = self.mount_hints_for_mount(mount_id);
         if let (Some(client_mount_epoch), Some(server_mount_epoch)) =
             (freshness.mount_epoch.or(ctx.caller.mount_epoch), mount_epoch)
         {
@@ -92,25 +92,25 @@ impl FreshnessValidator {
                     RpcErrorCode::MountEpochMismatch,
                     RefreshReason::MountEpochMismatch,
                     message,
-                    group_id,
+                    group_name.clone(),
                     Some(server_mount_epoch),
                     None,
                     Some(RefreshHint {
-                        group_id,
+                        group_name: group_name.as_ref().map(ToString::to_string),
                         mount_epoch: Some(server_mount_epoch),
                         ..Default::default()
                     }),
                 ));
             }
         }
-        Ok((group_id, mount_epoch))
+        Ok((group_name, mount_epoch))
     }
 
     pub(super) async fn validate_route_epoch(
         &self,
         ctx: &RequestContext,
         freshness: Freshness,
-        group_id: Option<u64>,
+        group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
         intent: &str,
     ) -> Result<Option<u64>, CoreFailure> {
@@ -119,7 +119,13 @@ impl FreshnessValidator {
         let server_route_epoch = match self.state_store.get_route_epoch().await {
             Ok(v) => v.as_u64(),
             Err(err) => {
-                return Err(core_failure_from_metadata_error(ctx, err, group_id, mount_epoch, None));
+                return Err(core_failure_from_metadata_error(
+                    ctx,
+                    err,
+                    group_name.clone(),
+                    mount_epoch,
+                    None,
+                ));
             }
         };
 
@@ -133,11 +139,11 @@ impl FreshnessValidator {
                         "route_epoch mismatch: client={}, server={}; refresh route and replay {}",
                         client_route_epoch, server_route_epoch, intent
                     ),
-                    group_id,
+                    group_name.clone(),
                     mount_epoch,
                     Some(server_route_epoch),
                     Some(RefreshHint {
-                        group_id,
+                        group_name: group_name.as_ref().map(ToString::to_string),
                         route_epoch: Some(server_route_epoch),
                         mount_epoch,
                         ..Default::default()
@@ -153,17 +159,17 @@ impl FreshnessValidator {
         &self,
         ctx: &RequestContext,
         last_applied: Option<RaftLogId>,
-        group_id: Option<u64>,
+        group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
     ) -> Result<StaleStateStatus, CoreFailure> {
-        let Some(group_id) = group_id else {
+        let Some(group_name) = group_name else {
             return Ok(StaleStateStatus::Ready);
         };
         let required_state_id = ctx
             .caller
             .state
             .iter()
-            .find(|watermark| watermark.group_id == ShardGroupId::new(group_id))
+            .find(|watermark| watermark.group_name == group_name)
             .map(|watermark| watermark.state_id);
         let Some(required_state_id) = required_state_id else {
             return Ok(StaleStateStatus::Ready);
@@ -180,7 +186,7 @@ impl FreshnessValidator {
                     "Stale state: last_applied={:?} < required={:?}",
                     last_applied, required_state_id
                 ),
-                Some(group_id),
+                Some(group_name),
                 mount_epoch,
                 None,
                 None,

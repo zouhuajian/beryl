@@ -341,18 +341,92 @@ impl fmt::Display for ShardId {
     }
 }
 
-id_new_uint!(
-    /// Shard group identity.
-    ///
-    /// A shard group contains multiple shards and defines placement/replication policies.
-    ShardGroupId(u64)
-);
+/// Stable metadata group identity.
+///
+/// Group names are identity, not display labels. Renaming a group means creating
+/// a different group.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct GroupName(String);
 
-impl fmt::Display for ShardGroupId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+impl GroupName {
+    /// Parses and validates a metadata group name.
+    pub fn parse(raw: impl AsRef<str>) -> Result<Self, GroupNameError> {
+        let value = raw.as_ref().trim();
+        if value.is_empty() {
+            return Err(GroupNameError::Empty);
+        }
+        if value.len() > 63 {
+            return Err(GroupNameError::TooLong);
+        }
+        let mut chars = value.chars();
+        let first = chars.next().ok_or(GroupNameError::Empty)?;
+        if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+            return Err(GroupNameError::InvalidStart);
+        }
+        if !chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')) {
+            return Err(GroupNameError::InvalidCharacter);
+        }
+        Ok(Self(value.to_string()))
+    }
+
+    /// Returns the validated group name.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
+
+impl fmt::Debug for GroupName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("GroupName").field(&self.0).finish()
+    }
+}
+
+impl fmt::Display for GroupName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::str::FromStr for GroupName {
+    type Err = GroupNameError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for GroupName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Validation error for `GroupName`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GroupNameError {
+    Empty,
+    TooLong,
+    InvalidStart,
+    InvalidCharacter,
+}
+
+impl fmt::Display for GroupNameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("must not be empty"),
+            Self::TooLong => f.write_str("must be at most 63 characters"),
+            Self::InvalidStart => f.write_str("must start with lowercase ASCII letter or digit"),
+            Self::InvalidCharacter => f.write_str("must contain only lowercase ASCII letters, digits, '.', '_' or '-'"),
+        }
+    }
+}
+
+impl std::error::Error for GroupNameError {}
 
 id_new_uint!(
     /// Mount identity.
@@ -398,5 +472,26 @@ mod tests {
         let s2 = serde_json::to_string(&cid).unwrap();
         let back2: ChunkId = serde_json::from_str(&s2).unwrap();
         assert_eq!(cid, back2);
+    }
+
+    #[test]
+    fn group_name_validation_contract() {
+        for value in ["root", "default", "analytics", "tenant-a", "hot_cache", "group.1"] {
+            assert_eq!(GroupName::parse(value).unwrap().as_str(), value);
+        }
+
+        for value in [
+            "",
+            " ",
+            "Root",
+            "ROOT",
+            "root/prod",
+            "root prod",
+            "-root",
+            "root/",
+            "a234567890123456789012345678901234567890123456789012345678901234",
+        ] {
+            assert!(GroupName::parse(value).is_err(), "{value} must be invalid");
+        }
     }
 }

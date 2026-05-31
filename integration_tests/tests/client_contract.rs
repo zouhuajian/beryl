@@ -7,7 +7,7 @@ use client::{ClientConfig, FsClient};
 use common::{init_logging, MockMetadataServer, MockWorkerServer};
 use proto::common::{
     error_detail_proto, BlockIdProto, ByteRangeProto, ClientInfoProto, ErrorClassProto, FencingTokenProto,
-    FsErrnoProto, ShardGroupIdProto, StreamIdProto,
+    FsErrnoProto, StreamIdProto,
 };
 use proto::metadata::MsyncRequestProto;
 use proto::worker::worker_data_service_server::WorkerDataService;
@@ -27,7 +27,10 @@ async fn test_client_init() {
 
     let client = FsClient::try_new(config).expect("FsClient construction must stay lazy");
 
-    assert_eq!(client.config().metadata_group_ids, vec![1]);
+    assert_eq!(
+        client.config().metadata_group_names,
+        vec![types::GroupName::parse("root").unwrap()]
+    );
 }
 
 fn data_request_header(call_id: &str) -> DataRequestHeaderProto {
@@ -48,10 +51,6 @@ fn block_id(data_handle_id: u64, block_index: u32) -> BlockIdProto {
     }
 }
 
-fn group_id(value: u64) -> ShardGroupIdProto {
-    ShardGroupIdProto { value }
-}
-
 fn assert_stream_unimplemented_header(header: DataResponseHeaderProto, operation: &str) {
     let error = header.error.expect("placeholder response should carry error detail");
     assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
@@ -70,7 +69,7 @@ async fn test_direct_worker_open_read_stream_is_explicitly_unimplemented() {
     let mock_worker = MockWorkerServer::new(1);
     let request = Request::new(OpenReadStreamRequestProto {
         header: Some(data_request_header("open-read-stream")),
-        group_id: Some(group_id(1)),
+        group_name: "root".to_string(),
         block_id: Some(block_id(100, 0)),
         byte_range: Some(ByteRangeProto { offset: 0, len: 9 }),
         block_stamp: 1,
@@ -113,7 +112,7 @@ async fn test_msync_with_mock() {
         caller_context: None,
         state: Vec::new(),
         retry_count: 0,
-        group_id: 1,
+        group_name: "root".to_string(),
         mount_epoch: None,
         route_epoch: None,
         principal: String::new(),
@@ -132,7 +131,7 @@ async fn test_msync_with_mock() {
 }
 
 #[tokio::test]
-async fn test_msync_mock_rejects_missing_group_id() {
+async fn test_msync_mock_rejects_missing_group_name() {
     init_logging();
 
     let mock_server = MockMetadataServer::new(1, vec![2, 3]);
@@ -148,7 +147,7 @@ async fn test_msync_mock_rejects_missing_group_id() {
             caller_context: None,
             state: Vec::new(),
             retry_count: 0,
-            group_id: 0,
+            group_name: String::new(),
             mount_epoch: None,
             route_epoch: None,
             principal: String::new(),
@@ -177,7 +176,7 @@ async fn test_direct_worker_open_write_stream_is_explicitly_unimplemented() {
     let mock_worker = MockWorkerServer::new(1);
     let request = Request::new(OpenWriteStreamRequestProto {
         header: Some(data_request_header("open-write-stream")),
-        group_id: Some(ShardGroupIdProto { value: 1 }),
+        group_name: "root".to_string(),
         block_id: Some(block_id(10, 0)),
         block_size: 4096,
         block_stamp: 1,
@@ -213,7 +212,7 @@ async fn test_direct_worker_commit_write_is_explicitly_unimplemented() {
     let mock_worker = MockWorkerServer::new(1);
     let request = Request::new(CommitWriteRequestProto {
         header: Some(data_request_header("commit-write")),
-        group_id: Some(ShardGroupIdProto { value: 1 }),
+        group_name: "root".to_string(),
         block_id: Some(block_id(20, 0)),
         stream_id: Some(StreamIdProto { high: 0, low: 7 }),
         effective_block_len: 4,

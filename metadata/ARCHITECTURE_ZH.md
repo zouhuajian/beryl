@@ -50,7 +50,7 @@ metadata/src/
   runtime.rs
   config.rs
   error.rs
-  bootstrap.rs
+  root_init.rs
   readiness.rs
 
   fs/
@@ -246,7 +246,7 @@ safety 是后台维护的横切能力，主要服务 GC、orphan、overrep、rep
 - runtime composition。
 - config。
 - error。
-- bootstrap。
+- root namespace initialization。
 - readiness。
 
 处理原则：

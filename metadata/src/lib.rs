@@ -48,13 +48,13 @@
 //! Current no-op, stale unsupported, and partially wired boundaries
 //! are tracked in `metadata/README_ZH.md`.
 
-pub mod bootstrap;
 pub mod config;
 pub(crate) mod data_io;
 pub(crate) mod destructive_gate;
 pub mod error;
 pub(crate) mod inflight_registry;
 pub mod inode_lease;
+pub mod lifecycle;
 pub mod maintenance;
 pub(crate) mod metrics;
 pub mod mount;
@@ -63,16 +63,17 @@ pub mod placement;
 pub mod raft;
 pub(crate) mod raft_conv;
 pub mod readiness;
+pub mod root_init;
 pub mod runtime;
 pub mod service;
 pub mod state;
 pub mod worker;
 pub mod write_session;
 
-pub use bootstrap::ensure_root_mount;
 pub use config::MetadataConfig;
 pub use error::{MetadataError, MetadataResult};
 pub use metrics::MetadataMetrics;
 pub use mount::MountTable;
 pub use readiness::{wait_for_root_ready, RootReadinessConfig, RootReadinessGate};
+pub use root_init::ensure_root_mount_for_format;
 pub use state::{RouteEpoch, StateStore};

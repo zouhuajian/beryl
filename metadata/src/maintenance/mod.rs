@@ -22,7 +22,8 @@ pub use service::{MaintenanceHandle, MaintenanceService};
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::MountTable;
 use crate::raft::RocksDBStorage;
-use types::ids::{BlockId, ShardGroupId};
+use types::ids::BlockId;
+use types::GroupName;
 
 /// Resolve the owner group for a block by looking up its inode and mount entry.
 /// Uses the authoritative data_handle_id -> inode_id mapping persisted in metadata.
@@ -30,7 +31,7 @@ pub(crate) fn owner_group_for_block(
     storage: &RocksDBStorage,
     mount_table: &MountTable,
     block_id: BlockId,
-) -> MetadataResult<ShardGroupId> {
+) -> MetadataResult<GroupName> {
     let inode_id = storage.validate_data_handle_owner(block_id.data_handle_id, None)?;
     let inode = storage.get_inode(inode_id)?.ok_or_else(|| {
         MetadataError::StaleState(format!(
@@ -44,7 +45,7 @@ pub(crate) fn owner_group_for_block(
             inode.mount_id, inode_id
         ))
     })?;
-    Ok(mount.namespace_owner_group_id)
+    Ok(mount.namespace_owner_group_name)
 }
 
 #[cfg(test)]
@@ -54,13 +55,17 @@ mod tests {
     use crate::raft::RocksDBStorage;
     use tempfile::TempDir;
     use types::fs::{FileAttrs, Inode, InodeId, InodeKind};
-    use types::ids::{BlockId, DataHandleId, MountId, ShardGroupId};
-    use types::BlockIndex;
+    use types::ids::{BlockId, DataHandleId, MountId};
+    use types::{BlockIndex, GroupName};
+
+    fn group_name(raw: &str) -> GroupName {
+        GroupName::parse(raw).unwrap()
+    }
 
     #[test]
     fn owner_group_errors_when_inode_missing() {
         let dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::open(dir.path()).unwrap();
+        let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
         let mount_table = MountTable::new();
         let block_id = BlockId::new(DataHandleId::new(42), BlockIndex::new(0));
         storage
@@ -73,7 +78,7 @@ mod tests {
     #[test]
     fn owner_group_resolves_mount_owner() {
         let dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::open(dir.path()).unwrap();
+        let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
         let mount_table = MountTable::new();
         let mount_id = MountId::new(1);
         let root_inode_id = InodeId::new(100);
@@ -91,14 +96,14 @@ mod tests {
             .put_data_handle_owner(root_data_handle_id, root_inode_id)
             .unwrap();
 
-        let owner_group = ShardGroupId::new(7);
+        let owner_group = group_name("g7");
         let mount_entry = mount_table
             .create_mount(
                 "/mnt/test".to_string(),
                 crate::mount::MountKind::External,
                 Some("ufs://test".to_string()),
                 crate::mount::DataIoPolicy::Allow,
-                owner_group,
+                owner_group.clone(),
                 root_inode_id,
             )
             .unwrap();

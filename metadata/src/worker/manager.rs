@@ -10,14 +10,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use types::ids::{BlockId, ShardGroupId, WorkerId};
+use types::ids::{BlockId, WorkerId};
 use types::layout::BlockFormatId;
-use types::WorkerRunId;
+use types::{GroupName, WorkerRunId};
 
 /// Worker descriptor (low-frequency, authoritative, persisted in Raft).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerDescriptor {
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     pub worker_id: WorkerId,
     pub address: String,
     /// Worker network protocol (0=unspecified/grpc, 1=grpc, 2=quic, 3=rdma).
@@ -43,7 +43,7 @@ pub struct WorkerRuntime {
 /// Worker information persisted by RocksDB storage.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerInfo {
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     pub worker_id: WorkerId,
     pub address: String,
     /// Worker network protocol (0=unspecified/grpc, 1=grpc, 2=quic, 3=rdma).
@@ -79,28 +79,34 @@ impl From<i32> for HealthStatus {
 /// Block locations keyed by metadata group and block identity.
 pub type BlockLocations = HashMap<BlockLocationKey, Vec<WorkerRegistrationKey>>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BlockLocationKey {
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     pub block_id: BlockId,
 }
 
 impl BlockLocationKey {
-    pub const fn new(group_id: ShardGroupId, block_id: BlockId) -> Self {
-        Self { group_id, block_id }
+    pub fn new(group_name: &GroupName, block_id: BlockId) -> Self {
+        Self {
+            group_name: group_name.clone(),
+            block_id,
+        }
     }
 }
 
 /// Group-scoped key for worker registration and liveness state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WorkerRegistrationKey {
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     pub worker_id: WorkerId,
 }
 
 impl WorkerRegistrationKey {
-    pub const fn new(group_id: ShardGroupId, worker_id: WorkerId) -> Self {
-        Self { group_id, worker_id }
+    pub fn new(group_name: &GroupName, worker_id: WorkerId) -> Self {
+        Self {
+            group_name: group_name.clone(),
+            worker_id,
+        }
     }
 }
 
@@ -114,7 +120,7 @@ fn ready_block_ids<'a>(blocks: impl Iterator<Item = &'a BlockReportBlock>) -> Ha
 /// Live startup registration state for the current metadata process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkerRegistrationState {
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     pub worker_id: WorkerId,
     pub worker_run_id: WorkerRunId,
     pub address: String,
@@ -127,7 +133,7 @@ pub struct WorkerRegistrationState {
 /// Worker liveness view updated only by group-scoped heartbeat.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkerLiveState {
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     pub worker_id: WorkerId,
     pub worker_run_id: WorkerRunId,
     pub heartbeat_seq: u64,
@@ -216,11 +222,11 @@ pub struct WorkerManager {
     registrations: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerRegistrationState>>>,
     /// Worker runtime (soft-state, memory-only, updated via fanout heartbeat).
     runtime: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerRuntime>>>,
-    /// Block presence keyed by (group_id, block_id), memory-only.
+    /// Block presence keyed by (group_name, block_id), memory-only.
     locations: Arc<RwLock<BlockLocations>>,
-    /// Worker blocks: (group_id, worker_id) -> [block_ids] (soft-state, memory-only).
+    /// Worker blocks: (group_name, worker_id) -> [block_ids] (soft-state, memory-only).
     worker_blocks: Arc<RwLock<HashMap<WorkerRegistrationKey, Vec<BlockId>>>>,
-    /// Full/delta block report runtime keyed by (group_id, worker_id).
+    /// Full/delta block report runtime keyed by (group_name, worker_id).
     block_reports: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerBlockReportRuntime>>>,
     /// Current metadata epoch (incremented on metadata restart).
     metadata_epoch: Arc<std::sync::atomic::AtomicU64>,
@@ -281,7 +287,7 @@ impl WorkerManager {
     pub fn upsert_descriptor(&self, descriptor: WorkerDescriptor) -> MetadataResult<()> {
         let mut descriptors = self.descriptors.write();
         descriptors.insert(
-            WorkerRegistrationKey::new(descriptor.group_id, descriptor.worker_id),
+            WorkerRegistrationKey::new(&descriptor.group_name, descriptor.worker_id),
             descriptor,
         );
         Ok(())
@@ -307,14 +313,14 @@ impl WorkerManager {
         block_reports.clear();
         for worker in workers {
             let descriptor = WorkerDescriptor {
-                group_id: worker.group_id,
+                group_name: worker.group_name,
                 worker_id: worker.worker_id,
                 address: worker.address,
                 worker_net_protocol: worker.worker_net_protocol,
                 fault_domain: worker.fault_domain,
             };
             descriptors.insert(
-                WorkerRegistrationKey::new(descriptor.group_id, descriptor.worker_id),
+                WorkerRegistrationKey::new(&descriptor.group_name, descriptor.worker_id),
                 descriptor,
             );
         }
@@ -322,37 +328,37 @@ impl WorkerManager {
     }
 
     /// Get a worker descriptor scoped to one metadata group.
-    pub fn get_descriptor(&self, group_id: ShardGroupId, worker_id: WorkerId) -> Option<WorkerDescriptor> {
+    pub fn get_descriptor(&self, group_name: &GroupName, worker_id: WorkerId) -> Option<WorkerDescriptor> {
         let descriptors = self.descriptors.read();
         descriptors
-            .get(&WorkerRegistrationKey::new(group_id, worker_id))
+            .get(&WorkerRegistrationKey::new(group_name, worker_id))
             .cloned()
     }
 
     /// Get live startup registration state scoped to one metadata group.
-    pub fn get_registration(&self, group_id: ShardGroupId, worker_id: WorkerId) -> Option<WorkerRegistrationState> {
+    pub fn get_registration(&self, group_name: &GroupName, worker_id: WorkerId) -> Option<WorkerRegistrationState> {
         let registrations = self.registrations.read();
         registrations
-            .get(&WorkerRegistrationKey::new(group_id, worker_id))
+            .get(&WorkerRegistrationKey::new(group_name, worker_id))
             .cloned()
     }
 
     /// Validate same-run idempotence and same-live-worker replacement conflicts.
     pub fn validate_worker_run_registration(
         &self,
-        group_id: ShardGroupId,
+        group_name: &GroupName,
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
     ) -> MetadataResult<()> {
         self.expire_liveness();
         let registrations = self.registrations.read();
-        let key = WorkerRegistrationKey::new(group_id, worker_id);
+        let key = WorkerRegistrationKey::new(group_name, worker_id);
         if let Some(existing) = registrations.get(&key) {
             if existing.worker_run_id != worker_run_id {
                 return Err(MetadataError::AlreadyExists(format!(
-                    "worker_id {} in group_id {} is already registered with worker_run_id {}",
+                    "worker_id {} in group_name {} is already registered with worker_run_id {}",
                     worker_id.as_raw(),
-                    group_id.as_raw(),
+                    group_name,
                     existing.worker_run_id
                 )));
             }
@@ -363,14 +369,14 @@ impl WorkerManager {
     /// Register or update a worker descriptor in runtime soft state after Raft apply succeeds.
     pub fn register_worker(
         &self,
-        group_id: ShardGroupId,
+        group_name: &GroupName,
         worker_id: WorkerId,
         address: String,
         worker_net_protocol: i32,
         fault_domain: Option<String>,
     ) -> MetadataResult<()> {
         let descriptor = WorkerDescriptor {
-            group_id,
+            group_name: group_name.clone(),
             worker_id,
             address,
             worker_net_protocol,
@@ -382,20 +388,20 @@ impl WorkerManager {
     /// Register or update live startup-registration state after Raft apply succeeds.
     pub fn register_worker_run(
         &self,
-        group_id: ShardGroupId,
+        group_name: &GroupName,
         worker_id: WorkerId,
         address: String,
         worker_net_protocol: i32,
         worker_run_id: WorkerRunId,
         fault_domain: Option<String>,
     ) -> MetadataResult<()> {
-        self.validate_worker_run_registration(group_id, worker_id, worker_run_id)?;
+        self.validate_worker_run_registration(group_name, worker_id, worker_run_id)?;
         let registered_at_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         let lease_deadline = Instant::now() + self.heartbeat_timeout();
         let descriptor_address = address.clone();
         let descriptor_fault_domain = fault_domain.clone();
         let descriptor = WorkerDescriptor {
-            group_id,
+            group_name: group_name.clone(),
             worker_id,
             address: descriptor_address,
             worker_net_protocol,
@@ -405,9 +411,9 @@ impl WorkerManager {
 
         let mut registrations = self.registrations.write();
         registrations.insert(
-            WorkerRegistrationKey::new(group_id, worker_id),
+            WorkerRegistrationKey::new(group_name, worker_id),
             WorkerRegistrationState {
-                group_id,
+                group_name: group_name.clone(),
                 worker_id,
                 worker_run_id,
                 address,
@@ -418,7 +424,7 @@ impl WorkerManager {
             },
         );
         drop(registrations);
-        self.clear_block_report_for_worker(WorkerRegistrationKey::new(group_id, worker_id));
+        self.clear_block_report_for_worker(WorkerRegistrationKey::new(group_name, worker_id));
         Ok(())
     }
 
@@ -429,7 +435,7 @@ impl WorkerManager {
     #[allow(clippy::too_many_arguments)]
     pub fn receive_full_block_report(
         &self,
-        group_id: ShardGroupId,
+        group_name: &GroupName,
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
         report_seq: u64,
@@ -437,17 +443,17 @@ impl WorkerManager {
         final_batch: bool,
         blocks: Vec<BlockReportBlock>,
     ) -> MetadataResult<BlockReportApplyResult> {
-        self.validate_report_source(group_id, worker_id, worker_run_id)?;
-        let key = WorkerRegistrationKey::new(group_id, worker_id);
+        self.validate_report_source(group_name, worker_id, worker_run_id)?;
+        let key = WorkerRegistrationKey::new(group_name, worker_id);
 
         let mut reports = self.block_reports.write();
-        let report = reports.entry(key).or_default();
+        let report = reports.entry(key.clone()).or_default();
         if batch_seq == 0 {
             if report.worker_run_id == Some(worker_run_id) && report.report_seq > report_seq {
                 return Err(MetadataError::FullReportRequired(format!(
-                    "full report required: stale report_seq {} for group_id={}, worker_id={}, current {}",
+                    "full report required: stale report_seq {} for group_name={}, worker_id={}, current {}",
                     report_seq,
-                    group_id.as_raw(),
+                    group_name,
                     worker_id.as_raw(),
                     report.report_seq
                 )));
@@ -465,9 +471,9 @@ impl WorkerManager {
             || report.next_batch_seq != batch_seq
         {
             return Err(MetadataError::FullReportRequired(format!(
-                "full report required: expected batch_seq {} for group_id={}, worker_id={}",
+                "full report required: expected batch_seq {} for group_name={}, worker_id={}",
                 report.next_batch_seq,
-                group_id.as_raw(),
+                group_name,
                 worker_id.as_raw()
             )));
         }
@@ -505,21 +511,21 @@ impl WorkerManager {
     /// Apply one ordered delta-report batch to the current published baseline.
     pub fn apply_delta_block_report(
         &self,
-        group_id: ShardGroupId,
+        group_name: &GroupName,
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
         report_seq: u64,
         delta_seq: u64,
         deltas: Vec<BlockReportDeltaEntry>,
     ) -> MetadataResult<BlockReportApplyResult> {
-        self.validate_report_source(group_id, worker_id, worker_run_id)?;
-        let key = WorkerRegistrationKey::new(group_id, worker_id);
+        self.validate_report_source(group_name, worker_id, worker_run_id)?;
+        let key = WorkerRegistrationKey::new(group_name, worker_id);
 
         let mut reports = self.block_reports.write();
         let report = reports.get_mut(&key).ok_or_else(|| {
             MetadataError::FullReportRequired(format!(
-                "full report required before delta for group_id={}, worker_id={}",
-                group_id.as_raw(),
+                "full report required before delta for group_name={}, worker_id={}",
+                group_name,
                 worker_id.as_raw()
             ))
         })?;
@@ -528,8 +534,8 @@ impl WorkerManager {
             || report.report_seq != report_seq
         {
             return Err(MetadataError::FullReportRequired(format!(
-                "full report required for current baseline: group_id={}, worker_id={}",
-                group_id.as_raw(),
+                "full report required for current baseline: group_name={}, worker_id={}",
+                group_name,
                 worker_id.as_raw()
             )));
         }
@@ -581,39 +587,39 @@ impl WorkerManager {
     }
 
     /// True when the worker has no published full-report baseline in memory.
-    pub fn needs_full_block_report(&self, group_id: ShardGroupId, worker_id: WorkerId) -> bool {
+    pub fn needs_full_block_report(&self, group_name: &GroupName, worker_id: WorkerId) -> bool {
         self.block_reports
             .read()
-            .get(&WorkerRegistrationKey::new(group_id, worker_id))
+            .get(&WorkerRegistrationKey::new(group_name, worker_id))
             .map(|report| report.state != BlockReportState::Ready)
             .unwrap_or(true)
     }
 
     fn validate_report_source(
         &self,
-        group_id: ShardGroupId,
+        group_name: &GroupName,
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
     ) -> MetadataResult<()> {
         self.expire_liveness();
-        let registration = self.get_registration(group_id, worker_id).ok_or_else(|| {
+        let registration = self.get_registration(group_name, worker_id).ok_or_else(|| {
             MetadataError::NotFound(format!(
-                "worker not registered for group_id={}, worker_id={}",
-                group_id.as_raw(),
+                "worker not registered for group_name={}, worker_id={}",
+                group_name,
                 worker_id.as_raw()
             ))
         })?;
         if registration.worker_run_id != worker_run_id {
             return Err(MetadataError::StaleState(format!(
-                "worker_run_id mismatch for group_id={}, worker_id={}",
-                group_id.as_raw(),
+                "worker_run_id mismatch for group_name={}, worker_id={}",
+                group_name,
                 worker_id.as_raw()
             )));
         }
-        if !self.is_worker_live(group_id, worker_id) {
+        if !self.is_worker_live(group_name, worker_id) {
             return Err(MetadataError::NotFound(format!(
-                "worker heartbeat readiness lease not found for group_id={}, worker_id={}",
-                group_id.as_raw(),
+                "worker heartbeat readiness lease not found for group_name={}, worker_id={}",
+                group_name,
                 worker_id.as_raw()
             )));
         }
@@ -628,7 +634,7 @@ impl WorkerManager {
         {
             let mut worker_blocks = self.worker_blocks.write();
             worker_blocks.insert(
-                key,
+                key.clone(),
                 published_blocks
                     .values()
                     .filter(|block| block.block_state == BlockReportBlockState::Ready)
@@ -639,7 +645,7 @@ impl WorkerManager {
 
         let mut locations = self.locations.write();
         for workers in locations.values_mut() {
-            workers.retain(|worker_key| *worker_key != key);
+            workers.retain(|worker_key| worker_key != &key);
         }
         locations.retain(|_, workers| !workers.is_empty());
         for block in published_blocks
@@ -647,10 +653,10 @@ impl WorkerManager {
             .filter(|block| block.block_state == BlockReportBlockState::Ready)
         {
             let workers = locations
-                .entry(BlockLocationKey::new(key.group_id, block.block_id))
+                .entry(BlockLocationKey::new(&key.group_name, block.block_id))
                 .or_default();
             if !workers.contains(&key) {
-                workers.push(key);
+                workers.push(key.clone());
             }
         }
     }
@@ -660,7 +666,7 @@ impl WorkerManager {
         self.worker_blocks.write().remove(&key);
         let mut locations = self.locations.write();
         for workers in locations.values_mut() {
-            workers.retain(|worker_key| *worker_key != key);
+            workers.retain(|worker_key| worker_key != &key);
         }
         locations.retain(|_, workers| !workers.is_empty());
     }
@@ -678,7 +684,7 @@ impl WorkerManager {
     #[allow(clippy::too_many_arguments)]
     pub fn record_heartbeat(
         &self,
-        group_id: ShardGroupId,
+        group_name: &GroupName,
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
         heartbeat_seq: u64,
@@ -692,13 +698,13 @@ impl WorkerManager {
         health: HealthStatus,
     ) -> MetadataResult<WorkerLiveState> {
         self.expire_liveness();
-        let key = WorkerRegistrationKey::new(group_id, worker_id);
+        let key = WorkerRegistrationKey::new(group_name, worker_id);
         let descriptor = {
             let descriptors = self.descriptors.read();
             descriptors.get(&key).cloned().ok_or_else(|| {
                 MetadataError::NotFound(format!(
-                    "worker descriptor not found for group_id={}, worker_id={}",
-                    group_id.as_raw(),
+                    "worker descriptor not found for group_name={}, worker_id={}",
+                    group_name,
                     worker_id.as_raw()
                 ))
             })?
@@ -707,8 +713,8 @@ impl WorkerManager {
             let registrations = self.registrations.read();
             registrations.get(&key).cloned().ok_or_else(|| {
                 MetadataError::NotFound(format!(
-                    "live worker registration not found for group_id={}, worker_id={}",
-                    group_id.as_raw(),
+                    "live worker registration not found for group_name={}, worker_id={}",
+                    group_name,
                     worker_id.as_raw()
                 ))
             })?
@@ -716,15 +722,15 @@ impl WorkerManager {
 
         if registration.worker_run_id != worker_run_id {
             return Err(MetadataError::StaleState(format!(
-                "worker_run_id mismatch for group_id={}, worker_id={}",
-                group_id.as_raw(),
+                "worker_run_id mismatch for group_name={}, worker_id={}",
+                group_name,
                 worker_id.as_raw()
             )));
         }
         if descriptor.address != advertised_endpoint || descriptor.worker_net_protocol != worker_net_protocol {
             return Err(MetadataError::InvalidArgument(format!(
-                "worker descriptor mismatch for group_id={}, worker_id={}",
-                group_id.as_raw(),
+                "worker descriptor mismatch for group_name={}, worker_id={}",
+                group_name,
                 worker_id.as_raw()
             )));
         }
@@ -738,7 +744,7 @@ impl WorkerManager {
                 existing.last_seen_ms = now_ms;
                 existing.worker_run_id = worker_run_id;
                 WorkerLiveState {
-                    group_id,
+                    group_name: group_name.clone(),
                     worker_id,
                     worker_run_id,
                     heartbeat_seq: existing.heartbeat_seq,
@@ -761,11 +767,11 @@ impl WorkerManager {
                 match existing {
                     Some(slot) => *slot = worker_runtime,
                     None => {
-                        runtime.insert(key, worker_runtime);
+                        runtime.insert(key.clone(), worker_runtime);
                     }
                 }
                 WorkerLiveState {
-                    group_id,
+                    group_name: group_name.clone(),
                     worker_id,
                     worker_run_id,
                     heartbeat_seq,
@@ -783,16 +789,16 @@ impl WorkerManager {
     }
 
     /// Get worker info by combining persisted descriptor and current runtime state.
-    pub fn get_worker(&self, group_id: ShardGroupId, worker_id: WorkerId) -> Option<WorkerInfo> {
+    pub fn get_worker(&self, group_name: &GroupName, worker_id: WorkerId) -> Option<WorkerInfo> {
         let descriptors = self.descriptors.read();
         let runtime = self.runtime.read();
-        let key = WorkerRegistrationKey::new(group_id, worker_id);
+        let key = WorkerRegistrationKey::new(group_name, worker_id);
 
         let descriptor = descriptors.get(&key)?;
         let runtime_data = runtime.get(&key)?;
 
         Some(WorkerInfo {
-            group_id: descriptor.group_id,
+            group_name: descriptor.group_name.clone(),
             worker_id: descriptor.worker_id,
             address: descriptor.address.clone(),
             worker_net_protocol: descriptor.worker_net_protocol,
@@ -816,29 +822,29 @@ impl WorkerManager {
         runtime
             .iter()
             .filter(|(_, r)| now.duration_since(r.last_seen_at) < timeout)
-            .map(|(key, _)| *key)
+            .map(|(key, _)| key.clone())
             .collect()
     }
 
     /// List live workers scoped to one metadata group.
-    pub fn list_live_workers_in_group(&self, group_id: ShardGroupId) -> Vec<WorkerId> {
+    pub fn list_live_workers_in_group(&self, group_name: &GroupName) -> Vec<WorkerId> {
         let runtime = self.runtime.read();
         let now = Instant::now();
         let timeout = self.heartbeat_timeout();
 
         runtime
             .iter()
-            .filter(|(key, r)| key.group_id == group_id && now.duration_since(r.last_seen_at) < timeout)
+            .filter(|(key, r)| &key.group_name == group_name && now.duration_since(r.last_seen_at) < timeout)
             .map(|(key, _)| key.worker_id)
             .collect()
     }
 
     /// Check if worker is live (based on runtime last_seen_ms).
-    pub fn is_worker_live(&self, group_id: ShardGroupId, worker_id: WorkerId) -> bool {
+    pub fn is_worker_live(&self, group_name: &GroupName, worker_id: WorkerId) -> bool {
         let runtime = self.runtime.read();
         let now = Instant::now();
         let timeout = self.heartbeat_timeout();
-        let key = WorkerRegistrationKey::new(group_id, worker_id);
+        let key = WorkerRegistrationKey::new(group_name, worker_id);
 
         runtime
             .get(&key)
@@ -849,7 +855,7 @@ impl WorkerManager {
     /// List all workers for background scans, preserving group identity.
     pub fn list_all_workers(&self) -> Vec<WorkerRegistrationKey> {
         let descriptors = self.descriptors.read();
-        descriptors.keys().copied().collect()
+        descriptors.keys().cloned().collect()
     }
 
     /// Get total number of block locations (for metrics).
@@ -861,21 +867,21 @@ impl WorkerManager {
     /// List group-qualified reported blocks for background scans.
     pub fn list_reported_blocks(&self) -> Vec<BlockLocationKey> {
         let locations = self.locations.read();
-        locations.keys().copied().collect()
+        locations.keys().cloned().collect()
     }
 
     /// Get block locations for one metadata group (only live workers in that group).
-    pub fn get_block_locations(&self, group_id: ShardGroupId, block_id: BlockId) -> Vec<WorkerId> {
+    pub fn get_block_locations(&self, group_name: &GroupName, block_id: BlockId) -> Vec<WorkerId> {
         let locations = self.locations.read();
-        let live_workers = self.list_live_workers_in_group(group_id);
+        let live_workers = self.list_live_workers_in_group(group_name);
         let live_set: std::collections::HashSet<WorkerId> = live_workers.into_iter().collect();
 
         locations
-            .get(&BlockLocationKey::new(group_id, block_id))
+            .get(&BlockLocationKey::new(group_name, block_id))
             .map(|workers| {
                 workers
                     .iter()
-                    .filter(|key| key.group_id == group_id && live_set.contains(&key.worker_id))
+                    .filter(|key| &key.group_name == group_name && live_set.contains(&key.worker_id))
                     .map(|key| key.worker_id)
                     .collect()
             })
@@ -883,7 +889,7 @@ impl WorkerManager {
     }
 
     /// Build the placement worker view from group-scoped registration and heartbeat state.
-    pub fn collect_worker_placement_views(&self, group_id: ShardGroupId) -> Vec<WorkerPlacementView> {
+    pub fn collect_worker_placement_views(&self, group_name: &GroupName) -> Vec<WorkerPlacementView> {
         let descriptors = self.descriptors.read();
         let registrations = self.registrations.read();
         let runtime = self.runtime.read();
@@ -891,7 +897,7 @@ impl WorkerManager {
         let timeout = self.heartbeat_timeout();
 
         let mut views = Vec::new();
-        for (key, descriptor) in descriptors.iter().filter(|(key, _)| key.group_id == group_id) {
+        for (key, descriptor) in descriptors.iter().filter(|(key, _)| &key.group_name == group_name) {
             let registration = registrations.get(key);
             let live = runtime.get(key);
             let registered = registration.is_some();
@@ -902,7 +908,7 @@ impl WorkerManager {
                     .map(|runtime| now.duration_since(runtime.last_seen_at) < timeout)
                     .unwrap_or(false);
             views.push(WorkerPlacementView {
-                group_id: key.group_id,
+                group_name: key.group_name.clone(),
                 worker_id: key.worker_id,
                 worker_run_id: registration.map(|registration| registration.worker_run_id),
                 endpoint: descriptor.address.clone(),
@@ -923,16 +929,16 @@ impl WorkerManager {
     }
 
     /// Return ready block-report locations with the report's worker run id.
-    pub fn reported_block_locations(&self, group_id: ShardGroupId, block_id: BlockId) -> Vec<ReportedBlockLocation> {
+    pub fn reported_block_locations(&self, group_name: &GroupName, block_id: BlockId) -> Vec<ReportedBlockLocation> {
         let locations = self.locations.read();
         let reports = self.block_reports.read();
-        let Some(worker_keys) = locations.get(&BlockLocationKey::new(group_id, block_id)) else {
+        let Some(worker_keys) = locations.get(&BlockLocationKey::new(group_name, block_id)) else {
             return Vec::new();
         };
 
         let mut reported = Vec::with_capacity(worker_keys.len());
         for key in worker_keys {
-            if key.group_id != group_id {
+            if &key.group_name != group_name {
                 continue;
             }
             let Some(report) = reports.get(key) else {
@@ -951,7 +957,7 @@ impl WorkerManager {
                 continue;
             }
             reported.push(ReportedBlockLocation {
-                group_id,
+                group_name: group_name.clone(),
                 block_id,
                 block_stamp: block.block_stamp,
                 worker_id: key.worker_id,
@@ -964,8 +970,8 @@ impl WorkerManager {
 
     /// Remove dead worker and clean up locations.
     /// Note: descriptor is kept (from Raft state), only runtime and presence are cleaned.
-    pub fn remove_dead_worker(&self, group_id: ShardGroupId, worker_id: WorkerId) -> Vec<BlockId> {
-        let key = WorkerRegistrationKey::new(group_id, worker_id);
+    pub fn remove_dead_worker(&self, group_name: &GroupName, worker_id: WorkerId) -> Vec<BlockId> {
+        let key = WorkerRegistrationKey::new(group_name, worker_id);
 
         // Remove runtime (soft-state)
         let mut runtime = self.runtime.write();
@@ -978,9 +984,9 @@ impl WorkerManager {
         // Remove worker from locations
         let mut locations = self.locations.write();
         for block_id in &blocks {
-            let location_key = BlockLocationKey::new(group_id, *block_id);
+            let location_key = BlockLocationKey::new(group_name, *block_id);
             if let Some(workers) = locations.get_mut(&location_key) {
-                workers.retain(|&w| w != key);
+                workers.retain(|w| w != &key);
                 if workers.is_empty() {
                     locations.remove(&location_key);
                 }
@@ -991,10 +997,10 @@ impl WorkerManager {
     }
 
     /// Get all blocks for a worker.
-    pub fn get_worker_blocks(&self, group_id: ShardGroupId, worker_id: WorkerId) -> Vec<BlockId> {
+    pub fn get_worker_blocks(&self, group_name: &GroupName, worker_id: WorkerId) -> Vec<BlockId> {
         let worker_blocks = self.worker_blocks.read();
         worker_blocks
-            .get(&WorkerRegistrationKey::new(group_id, worker_id))
+            .get(&WorkerRegistrationKey::new(group_name, worker_id))
             .cloned()
             .unwrap_or_default()
     }
@@ -1022,7 +1028,7 @@ impl WorkerManager {
     }
 
     /// Expire heartbeat liveness and live process-run registrations.
-    pub fn expire_liveness(&self) -> Vec<(ShardGroupId, WorkerId)> {
+    pub fn expire_liveness(&self) -> Vec<(GroupName, WorkerId)> {
         let now = Instant::now();
         let timeout = self.heartbeat_timeout();
         let mut expired = Vec::new();
@@ -1032,7 +1038,7 @@ impl WorkerManager {
             runtime.retain(|key, runtime| {
                 let is_live = now.duration_since(runtime.last_seen_at) < timeout;
                 if !is_live {
-                    expired.push((key.group_id, key.worker_id));
+                    expired.push((key.group_name.clone(), key.worker_id));
                 }
                 is_live
             });
@@ -1043,7 +1049,7 @@ impl WorkerManager {
             registrations.retain(|key, registration| {
                 let is_live = registration.lease_deadline > now;
                 if !is_live {
-                    let entry = (key.group_id, key.worker_id);
+                    let entry = (key.group_name.clone(), key.worker_id);
                     if !expired.contains(&entry) {
                         expired.push(entry);
                     }
@@ -1076,7 +1082,7 @@ impl WorkerManager {
         let active_workers: Vec<WorkerRegistrationKey> = runtime
             .iter()
             .filter(|(_, r)| now_ms.saturating_sub(r.last_seen_ms) < active_ttl_ms)
-            .map(|(key, _)| *key)
+            .map(|(key, _)| key.clone())
             .collect();
 
         let active_count = active_workers.len();

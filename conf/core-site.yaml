@@ -5,6 +5,8 @@
 # This file intentionally contains only keys consumed by the current metadata
 # and worker runtimes.
 
+vecton.cluster.id: "local-vecton"
+
 # Metadata RPC service.
 metadata.rpc.addr: "0.0.0.0"
 metadata.rpc.port: 18080
@@ -17,11 +19,12 @@ metadata.storage.dir: "data/metadata"
 metadata.authz.filesystem.mode: "NONE"
 
 # Single-group metadata authority baseline.
-metadata.authority.group_id: 1
+metadata.group.name: "root"
 
-# Raft identity and initial peer list for the configured authority group.
+# Raft identity for the configured authority group. Cluster mode parses but is
+# not a supported startup mode yet.
 metadata.raft.node_id: 1
-metadata.raft.peers: ""
+metadata.raft.mode: "single"
 
 # Root mount readiness backoff.
 metadata.bootstrap.root_ready_initial_backoff_ms: 200
@@ -37,19 +40,18 @@ metadata.repair.max_backoff_ms: 60000
 metadata.repair.worker_inflight_limit: 4
 
 # Worker data service.
-worker.identity.path: "./data/worker.identity"
+worker.identity.path: "data/worker/worker.identity"
 worker.rpc.bind: "0.0.0.0:9090"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:19090"
 worker.rpc.max_inflight: 100
 worker.default_frame_size: "1MB"
 worker.max_frame_size: "4MB"
 worker.window_bytes: "8MB"
 worker.stream.idle_timeout_ms: 60000
-worker.storage.root: "./data"
+worker.storage.root: "data/worker"
 
-# Worker metadata startup registration.
-worker.metadata.group_id: 1
-worker.metadata.endpoint: "http://127.0.0.1:18080"
+# Worker metadata registration, heartbeat, and block report.
+worker.metadata.group.name: "root"
 worker.metadata.endpoints: "http://127.0.0.1:18080"
 worker.metadata.register_timeout_ms: 5000
 worker.metadata.register_retry_initial_backoff_ms: 200

@@ -8,22 +8,18 @@ use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode, RefreshRea
 use common::header::{ClientInfo, RequestHeader, ResponseHeader, RpcErrorCode};
 use proto::metadata::{MsyncRequestProto, MsyncResponseProto};
 use std::sync::Arc;
-use types::ids::ShardGroupId;
-use types::{ClientId, GroupStateWatermark};
+use types::{ClientId, GroupName, GroupStateWatermark};
 
 /// Handles metadata state sync for one local metadata raft group.
 pub struct MsyncHandler {
     raft_node: Arc<AppRaftNode>,
-    shard_group_id: ShardGroupId,
+    group_name: GroupName,
 }
 
 impl MsyncHandler {
     /// Create an Msync handler bound to one authoritative metadata group.
-    pub fn new(raft_node: Arc<AppRaftNode>, shard_group_id: ShardGroupId) -> Self {
-        Self {
-            raft_node,
-            shard_group_id,
-        }
+    pub fn new(raft_node: Arc<AppRaftNode>, group_name: GroupName) -> Self {
+        Self { raft_node, group_name }
     }
 
     /// Handle one Msync request using application-level response errors.
@@ -36,23 +32,23 @@ impl MsyncHandler {
         };
         let client = header.client.clone();
 
-        let Some(header_group_id) = header.group_id.map(ShardGroupId::new) else {
+        let Some(header_group_name) = header.group_name else {
             return Self::error_response(
                 client,
                 None,
-                Self::fatal_invalid_header("MsyncRequestProto requires header.group_id"),
+                Self::fatal_invalid_header("MsyncRequestProto requires header.group_name"),
             );
         };
-        if header_group_id != self.shard_group_id {
+        if header_group_name != self.group_name {
             let canonical = CanonicalError::need_refresh(
                 RpcErrorCode::ShardMoved,
                 RefreshReason::OwnerGroupMismatch,
                 format!(
                     "requested group {} is not served by this metadata runtime",
-                    header_group_id.as_raw()
+                    header_group_name
                 ),
             );
-            return Self::error_response(client, Some(header_group_id), canonical);
+            return Self::error_response(client, Some(header_group_name), canonical);
         }
 
         if !self.raft_node.is_leader() {
@@ -61,7 +57,7 @@ impl MsyncHandler {
                 RefreshReason::NotLeader,
                 "msync requires leader",
             );
-            return Self::error_response(client, Some(header_group_id), canonical);
+            return Self::error_response(client, Some(header_group_name), canonical);
         }
 
         let Some(last_applied) = self.raft_node.get_last_applied_state_id() else {
@@ -70,12 +66,12 @@ impl MsyncHandler {
                 Some(10),
                 "last_applied_log_id is not available for msync",
             );
-            return Self::error_response(client, Some(header_group_id), canonical);
+            return Self::error_response(client, Some(header_group_name), canonical);
         };
 
-        let authoritative = GroupStateWatermark::new(self.shard_group_id, last_applied);
+        let authoritative = GroupStateWatermark::new(self.group_name.clone(), last_applied);
         MsyncResponseProto {
-            header: Some((&ResponseHeader::ok(client).with_group_id(self.shard_group_id.as_raw())).into()),
+            header: Some((&ResponseHeader::ok(client).with_group_name(self.group_name.clone())).into()),
             state: Some((&authoritative).into()),
         }
     }
@@ -83,13 +79,14 @@ impl MsyncHandler {
     /// Return a structured application error for test-only services built without raft.
     pub fn unavailable(req: MsyncRequestProto) -> MsyncResponseProto {
         let client = client_from_proto(req.header.as_ref());
-        let group_id = req
+        let group_name = req
             .header
             .as_ref()
-            .and_then(|header| (header.group_id != 0).then_some(ShardGroupId::new(header.group_id)));
+            .and_then(|header| (!header.group_name.is_empty()).then_some(header.group_name.as_str()))
+            .and_then(|group_name| GroupName::parse(group_name).ok());
         Self::error_response(
             client,
-            group_id,
+            group_name,
             CanonicalError::retryable(
                 RpcErrorCode::NodeUnavailable,
                 Some(10),
@@ -111,12 +108,12 @@ impl MsyncHandler {
 
     fn error_response(
         client: ClientInfo,
-        group_id: Option<ShardGroupId>,
+        group_name: Option<GroupName>,
         canonical: CanonicalError,
     ) -> MsyncResponseProto {
         let mut header = ResponseHeader::from_canonical(client, canonical);
-        if let Some(group_id) = group_id {
-            header.group_id = Some(group_id.as_raw());
+        if let Some(group_name) = group_name {
+            header.group_name = Some(group_name);
         }
         MsyncResponseProto {
             header: Some((&header).into()),

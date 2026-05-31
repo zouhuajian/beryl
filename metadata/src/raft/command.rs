@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use types::block::{BlockPlacement, BlockState};
 use types::fs::{FileAttrs, InodeId};
-use types::ids::{BlockId, ClientId, MountId, ShardGroupId, ShardId, WorkerId};
+use types::ids::{BlockId, ClientId, MountId, ShardId, WorkerId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
-use types::{CallId, WorkerRunId};
+use types::{CallId, GroupName, WorkerRunId};
 
 /// File layout publication semantics for a committed write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,7 +78,7 @@ pub enum Command {
         mount_kind: crate::mount::MountKind,
         ufs_uri: Option<String>,
         data_io_policy: crate::mount::DataIoPolicy,
-        namespace_owner_group_id: ShardGroupId,
+        namespace_owner_group_name: GroupName,
         root_inode_id: InodeId,
     },
 
@@ -88,7 +88,7 @@ pub enum Command {
     /// Add a new shard group.
     AddShardGroup {
         dedup: DedupKey,
-        shard_group_id: ShardGroupId,
+        group_name: GroupName,
         shard_ids: Vec<ShardId>,
         initial_members: Vec<u64>, // node IDs
     },
@@ -96,7 +96,7 @@ pub enum Command {
     /// Register worker identity and descriptor through the Raft apply boundary.
     RegisterWorker {
         dedup: DedupKey,
-        group_id: ShardGroupId,
+        group_name: GroupName,
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
         address: String,
@@ -296,19 +296,19 @@ enum FingerprintView {
         mount_kind: crate::mount::MountKind,
         ufs_uri: Option<String>,
         data_io_policy: crate::mount::DataIoPolicy,
-        namespace_owner_group_id: ShardGroupId,
+        namespace_owner_group_name: GroupName,
         root_inode_id: InodeId,
     },
     DeleteMount {
         mount_id: MountId,
     },
     AddShardGroup {
-        shard_group_id: ShardGroupId,
+        group_name: GroupName,
         shard_ids: Vec<ShardId>,
         initial_members: Vec<u64>,
     },
     RegisterWorker {
-        group_id: ShardGroupId,
+        group_name: GroupName,
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
         address: String,
@@ -428,7 +428,7 @@ impl From<&Command> for FingerprintView {
                 mount_kind,
                 ufs_uri,
                 data_io_policy,
-                namespace_owner_group_id,
+                namespace_owner_group_name,
                 root_inode_id,
                 ..
             } => FingerprintView::CreateMount {
@@ -437,22 +437,22 @@ impl From<&Command> for FingerprintView {
                 mount_kind: *mount_kind,
                 ufs_uri: ufs_uri.clone(),
                 data_io_policy: *data_io_policy,
-                namespace_owner_group_id: *namespace_owner_group_id,
+                namespace_owner_group_name: namespace_owner_group_name.clone(),
                 root_inode_id: *root_inode_id,
             },
             Command::DeleteMount { mount_id, .. } => FingerprintView::DeleteMount { mount_id: *mount_id },
             Command::AddShardGroup {
-                shard_group_id,
+                group_name,
                 shard_ids,
                 initial_members,
                 ..
             } => FingerprintView::AddShardGroup {
-                shard_group_id: *shard_group_id,
+                group_name: group_name.clone(),
                 shard_ids: shard_ids.clone(),
                 initial_members: initial_members.clone(),
             },
             Command::RegisterWorker {
-                group_id,
+                group_name,
                 worker_id,
                 worker_run_id,
                 address,
@@ -460,7 +460,7 @@ impl From<&Command> for FingerprintView {
                 fault_domain,
                 ..
             } => FingerprintView::RegisterWorker {
-                group_id: *group_id,
+                group_name: group_name.clone(),
                 worker_id: *worker_id,
                 worker_run_id: *worker_run_id,
                 address: address.clone(),

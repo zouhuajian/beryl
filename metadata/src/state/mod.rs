@@ -88,7 +88,7 @@ pub enum DeleteIntentStatus {
 /// Current DeleteExecutor status transitions use `Command::UpdateDeleteIntentStatus`.
 /// Do not use this model as justification for direct RocksDB status writes.
 ///
-/// Enhanced with shard_group_id and guard_watermark for cross-group gate control.
+/// Carries the metadata group name and guard watermark used for delete execution gating.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeleteIntent {
     /// Unique intent ID (UUID or u64).
@@ -102,12 +102,12 @@ pub struct DeleteIntent {
     /// Not before timestamp (milliseconds since epoch).
     /// Intent should not be executed before this time (grace window).
     pub not_before_ms: u64,
-    /// Shard group ID this intent belongs to.
-    /// Required for cross-group gate control.
+    /// Metadata group name this intent belongs to.
+    /// Required for execution gate control.
     #[serde(default)]
-    pub shard_group_id: Option<types::ids::ShardGroupId>,
-    /// Guard watermark (shard_group_id + state_id).
-    /// Used for execution gating: only execute if the target shard group
+    pub group_name: Option<types::GroupName>,
+    /// Guard watermark (group_name + state_id).
+    /// Used for execution gating: only execute if the target metadata group
     /// has applied at least up to guard_watermark.state_id.
     #[serde(default)]
     pub guard_watermark: Option<types::group_watermark::GroupStateWatermark>,
@@ -173,7 +173,7 @@ mod tests {
         use tempfile::TempDir;
 
         let dir = TempDir::new().unwrap();
-        let storage = RocksDBStorage::open(dir.path()).unwrap();
+        let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
         let dh1 = DataHandleId::new(1);
         let inode1 = types::fs::InodeId::new(10);
         storage.put_data_handle_owner(dh1, inode1).unwrap();

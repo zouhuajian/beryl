@@ -39,14 +39,11 @@ message ClientInfoProto {
 /// NOTE:
 /// - Keep this message small and stable. Do not use it as a "catch-all".
 message RequestHeaderProto {
+  reserved 2;
+  reserved "group_id";
+
   /// Client information (call_id, client_id, client_name).
   ClientInfoProto client = 1;
-
-  /// Group ID for this request (required for metadata-plane RPCs).
-  /// Client must fill this field for all metadata RPCs (including msync, read, and write requests).
-  /// Server uses this for routing, validation, logging, and must echo it back in response.
-  /// Aligns with types::ShardGroupId (u64).
-  uint64 group_id = 2;
 
   /// Mount epoch for FS write operations.
   /// Client should provide the mount_epoch it knows for the mount being accessed.
@@ -91,6 +88,9 @@ message RequestHeaderProto {
 
   /// Authentication type marker (stub enum for future authn integrations).
   AuthnTypeProto authn_type = 13;
+
+  /// Stable metadata group name for metadata-plane routing.
+  string group_name = 14;
 }
 
 /// Authentication type of the request principal.
@@ -128,15 +128,18 @@ message RaftLogIdProto {
 
 /// Metadata state-machine applied watermark for one owner group.
 ///
-/// group_id identifies the metadata Raft owner group. state_id is that group's
+/// group_name identifies the metadata Raft owner group. state_id is that group's
 /// state-machine applied RaftLogId. It is not a committed index, append index,
 /// private apply counter, route_epoch, mount_epoch, call_id, or request_id.
 message GroupStateWatermarkProto {
-  /// Metadata Raft owner group this watermark belongs to.
-  ShardGroupIdProto group_id = 1;
+  reserved 1;
+  reserved "group_id";
 
   /// State-machine applied RaftLogId for this group.
   RaftLogIdProto state_id = 2;
+
+  /// Stable metadata group name this watermark belongs to.
+  string group_name = 3;
 }
 
 /// Response header carried with every RPC response.
@@ -149,6 +152,9 @@ message GroupStateWatermarkProto {
 /// Use non-OK gRPC status only for unrecoverable transport/auth/framework errors, and include
 /// minimal correlation info (e.g., x-call-id, x-error-code) in trailers metadata.
 message ResponseHeaderProto {
+  reserved 5;
+  reserved "group_id";
+
   /// Client information (call_id, client_id, client_name).
   ClientInfoProto client = 1;
 
@@ -164,13 +170,6 @@ message ResponseHeaderProto {
   /// canonical stale-state error.
   repeated GroupStateWatermarkProto state = 4;
 
-  /// Group ID that this response applies to (required for metadata-plane RPCs).
-  /// Server must echo back the actual group_id that processed this request.
-  /// Client must use this group_id (not the request group_id) as the key for updating group->watermark cache,
-  /// to avoid updating the wrong group when route epoch changes.
-  /// Aligns with types::ShardGroupId (u64).
-  uint64 group_id = 5;
-
   /// Mount epoch returned by server (for FS operations).
   /// Server fills this with the current mount.mount_epoch so client can update its cache.
   /// Only set for FS operations that access a mount.
@@ -179,4 +178,7 @@ message ResponseHeaderProto {
   /// Route epoch returned by server (for FS route/layout operations).
   /// Server should fill this with authoritative layout version when available.
   optional uint64 route_epoch = 11;
+
+  /// Stable metadata group name that processed this request.
+  string group_name = 12;
 }

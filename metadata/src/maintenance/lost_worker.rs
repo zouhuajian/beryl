@@ -57,7 +57,7 @@ impl LostWorkerCleanupService {
 
         let live_workers = self.worker_manager.list_live_workers();
         let all_workers = self.worker_manager.list_all_workers();
-        let live_set: HashSet<_> = live_workers.iter().copied().collect();
+        let live_set: HashSet<_> = live_workers.iter().cloned().collect();
         let dead_workers: Vec<_> = all_workers
             .into_iter()
             .filter(|worker| !live_set.contains(worker))
@@ -66,19 +66,21 @@ impl LostWorkerCleanupService {
         let mut outcome = LostWorkerCleanupOutcome::default();
         for dead_worker in dead_workers {
             info!(
-                group_id = dead_worker.group_id.as_raw(),
+                group_name = %dead_worker.group_name,
                 worker_id = dead_worker.worker_id.as_raw(),
                 "Removing dead worker"
             );
             let affected_blocks = self
                 .worker_manager
-                .remove_dead_worker(dead_worker.group_id, dead_worker.worker_id);
+                .remove_dead_worker(&dead_worker.group_name, dead_worker.worker_id);
             outcome.removed_workers += 1;
             outcome.affected_blocks += affected_blocks.len();
 
-            let live_workers_after = self.worker_manager.list_live_workers_in_group(dead_worker.group_id);
+            let live_workers_after = self.worker_manager.list_live_workers_in_group(&dead_worker.group_name);
             for block_id in affected_blocks {
-                let current_locations = self.worker_manager.get_block_locations(dead_worker.group_id, block_id);
+                let current_locations = self
+                    .worker_manager
+                    .get_block_locations(&dead_worker.group_name, block_id);
                 let replication_factor = self.repair_policy.default_replication_factor;
                 let actions = self.repair_planner.plan_replication(
                     block_id,
@@ -115,21 +117,24 @@ mod tests {
     use crate::MountTable;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use types::ids::{BlockId, BlockIndex, DataHandleId, ShardGroupId, WorkerId};
-    use types::WorkerRunId;
+    use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
+    use types::{GroupName, WorkerRunId};
+
+    fn group_name(raw: &str) -> GroupName {
+        GroupName::parse(raw).unwrap()
+    }
 
     async fn test_raft(dir: &TempDir, leader: bool) -> Arc<AppRaftNode> {
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), mount_table));
-        let peers = if leader {
-            vec!["127.0.0.1:0".to_string()]
-        } else {
-            Vec::new()
-        };
-        let raft_config = crate::config::RaftConfig { node_id: 1, peers };
+        let raft_config = crate::config::RaftConfig::default();
         let raft_node = Arc::new(AppRaftNode::new(1, storage, state_machine, &raft_config).await.unwrap());
         if leader {
+            raft_node
+                .initialize_single_node("127.0.0.1:0".to_string())
+                .await
+                .unwrap();
             for _ in 0..100 {
                 if raft_node.is_leader() {
                     break;
@@ -150,18 +155,18 @@ mod tests {
     }
 
     fn live_worker(manager: &WorkerManager, worker_id: WorkerId) {
-        let group_id = ShardGroupId::new(1);
+        let group_name = group_name("root");
         let address = format!("127.0.0.1:{}", 9000 + worker_id.as_raw());
         let run_id = worker_run_id(worker_id);
         manager
-            .register_worker(group_id, worker_id, address.clone(), 1, None)
+            .register_worker(&group_name, worker_id, address.clone(), 1, None)
             .unwrap();
         manager
-            .register_worker_run(group_id, worker_id, address.clone(), 1, run_id, None)
+            .register_worker_run(&group_name, worker_id, address.clone(), 1, run_id, None)
             .unwrap();
         manager
             .record_heartbeat(
-                group_id,
+                &group_name,
                 worker_id,
                 run_id,
                 1,
@@ -190,14 +195,14 @@ mod tests {
     }
 
     fn publish_report(manager: &WorkerManager, worker_id: WorkerId, report_seq: u64, blocks: Vec<BlockId>) {
-        let group_id = ShardGroupId::new(1);
+        let group_name = group_name("root");
         let run_id = manager
-            .get_registration(group_id, worker_id)
+            .get_registration(&group_name, worker_id)
             .expect("worker registration")
             .worker_run_id;
         manager
             .receive_full_block_report(
-                group_id,
+                &group_name,
                 worker_id,
                 run_id,
                 report_seq,
@@ -273,9 +278,9 @@ mod tests {
         assert_eq!(outcome.removed_workers, 1);
         assert_eq!(outcome.affected_blocks, 1);
         assert_eq!(outcome.repair_tasks_enqueued, 2);
-        assert!(worker_manager.get_worker_blocks(ShardGroupId::new(1), dead).is_empty());
+        assert!(worker_manager.get_worker_blocks(&group_name("root"), dead).is_empty());
         assert_eq!(
-            worker_manager.get_block_locations(ShardGroupId::new(1), block_id),
+            worker_manager.get_block_locations(&group_name("root"), block_id),
             vec![source]
         );
         assert_eq!(repair_queue.len_pending(), 2);
@@ -378,7 +383,7 @@ mod tests {
         assert_eq!(outcome.removed_workers, 0);
         assert_eq!(outcome.skipped_dead_workers, 0);
         assert_eq!(
-            worker_manager.get_worker_blocks(ShardGroupId::new(1), dead),
+            worker_manager.get_worker_blocks(&group_name("root"), dead),
             vec![block_id]
         );
         assert_eq!(repair_queue.len_pending(), 0);

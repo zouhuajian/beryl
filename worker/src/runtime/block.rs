@@ -5,16 +5,17 @@
 
 use common::error::canonical::RefreshReason;
 use common::header::RpcErrorCode;
-use types::ids::{BlockId, ShardGroupId};
+use types::ids::BlockId;
 use types::layout::BlockFormatId;
+use types::GroupName;
 
 use crate::data::core::{ReadOpenRequest, WorkerCoreResult};
 use crate::error::WorkerError;
 use crate::store::block::{BlockState, LocalBlockStore};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadBlockSnapshot {
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     pub block_id: BlockId,
     pub effective_block_len: u64,
     pub block_stamp: u64,
@@ -100,7 +101,7 @@ impl BlockManager {
             ));
         }
 
-        let meta = match store.load_meta(req.group_id, req.block_id) {
+        let meta = match store.load_meta(&req.group_name, req.block_id) {
             Ok(meta) => meta,
             Err(WorkerError::NotFound(message)) => {
                 return Err(Self::need_refresh(
@@ -117,8 +118,8 @@ impl BlockManager {
                 RpcErrorCode::ShardMoved,
                 RefreshReason::Moved,
                 format!(
-                    "local block is not Ready: group_id={}, block_id={}, state={:?}",
-                    req.group_id, req.block_id, meta.visibility.block_state
+                    "local block is not Ready: group_name={}, block_id={}, state={:?}",
+                    req.group_name, req.block_id, meta.visibility.block_state
                 ),
             ));
         }
@@ -127,8 +128,8 @@ impl BlockManager {
                 RpcErrorCode::BlockStampMismatch,
                 RefreshReason::BlockStampMismatch,
                 format!(
-                    "block stamp mismatch: group_id={}, block_id={}, requested={}, local={}",
-                    req.group_id, req.block_id, req.block_stamp, meta.visibility.block_stamp
+                    "block stamp mismatch: group_name={}, block_id={}, requested={}, local={}",
+                    req.group_name, req.block_id, req.block_stamp, meta.visibility.block_stamp
                 ),
             ));
         }
@@ -141,8 +142,8 @@ impl BlockManager {
                 RpcErrorCode::StaleState,
                 RefreshReason::StaleState,
                 format!(
-                    "block layout mismatch: group_id={}, block_id={}, requested_format={}, local_format={}, requested_block_size={}, local_block_size={}, requested_chunk_size={}, local_chunk_size={}, requested_effective_block_len={}, local_effective_block_len={}",
-                    req.group_id,
+                    "block layout mismatch: group_name={}, block_id={}, requested_format={}, local_format={}, requested_block_size={}, local_block_size={}, requested_chunk_size={}, local_chunk_size={}, requested_effective_block_len={}, local_effective_block_len={}",
+                    req.group_name,
                     req.block_id,
                     req.block_format_id.as_raw(),
                     meta.format.format_id.as_raw(),
@@ -163,13 +164,13 @@ impl BlockManager {
             .ok_or_else(|| WorkerError::InvalidArgument("byte range offset overflow".to_string()))?;
         if req.byte_range.offset > meta.source.effective_block_len || range_end > meta.source.effective_block_len {
             return Err(WorkerError::InvalidArgument(format!(
-                "byte range exceeds effective block length: group_id={}, block_id={}, offset={}, len={}, effective_block_len={}",
-                req.group_id, req.block_id, req.byte_range.offset, req.byte_range.len, meta.source.effective_block_len
+                "byte range exceeds effective block length: group_name={}, block_id={}, offset={}, len={}, effective_block_len={}",
+                req.group_name, req.block_id, req.byte_range.offset, req.byte_range.len, meta.source.effective_block_len
             )));
         }
 
         Ok(ReadBlockSnapshot {
-            group_id: req.group_id,
+            group_name: req.group_name.clone(),
             block_id: req.block_id,
             effective_block_len: meta.source.effective_block_len,
             block_stamp: meta.visibility.block_stamp,

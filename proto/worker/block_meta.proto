@@ -15,8 +15,11 @@ message BlockMetaPayloadProto {
 }
 
 message BlockIdentityProto {
+  reserved 2;
+  reserved "group_id";
+
   common.BlockIdProto block_id = 1;
-  common.ShardGroupIdProto group_id = 2;
+  string group_name = 3;
 }
 
 message BlockFormatProto {

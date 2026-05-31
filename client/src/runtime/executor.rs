@@ -336,12 +336,12 @@ impl OperationExecutor {
         let mut attempt = 0u32;
 
         loop {
-            let endpoint = self.refresh_manager.endpoint_for_group(target_group)?;
-            let mut ctx = AttemptContext::for_metadata(&operation, target_group, attempt)?
+            let endpoint = self.refresh_manager.endpoint_for_group(&target_group)?;
+            let mut ctx = AttemptContext::for_metadata(&operation, target_group.clone(), attempt)?
                 .with_operation_timeout_ms(self.retry.operation_timeout_ms);
             ctx = ctx.with_metadata_endpoint(endpoint);
             ctx = self.refresh_manager.enrich_attempt_context(&operation, ctx);
-            if let Some(watermark) = self.refresh_manager.state_watermark_proto(target_group) {
+            if let Some(watermark) = self.refresh_manager.state_watermark_proto(&target_group) {
                 ctx = ctx.with_state(vec![watermark]);
             }
             let observed_fingerprint = ctx.operation_fingerprint();
@@ -415,7 +415,7 @@ impl OperationExecutor {
                             );
                             self.refresh_manager.record_refresh(&operation, reason, &hint)?;
                             if reason == RefreshReason::StaleState {
-                                self.refresh_state(&operation, target_group, attempt.saturating_add(1))
+                                self.refresh_state(&operation, target_group.clone(), attempt.saturating_add(1))
                                     .await?;
                             }
                             target_group = self.refresh_manager.choose_group_for_operation(&operation)?;
@@ -476,10 +476,10 @@ impl OperationExecutor {
     async fn refresh_state(
         &self,
         operation: &OperationContext,
-        target_group: u64,
+        target_group: types::GroupName,
         attempt_number: u32,
     ) -> ClientResult<()> {
-        let endpoint = self.refresh_manager.endpoint_for_group(target_group)?;
+        let endpoint = self.refresh_manager.endpoint_for_group(&target_group)?;
         let ctx = AttemptContext::for_metadata(operation, target_group, attempt_number)?
             .with_operation_timeout_ms(self.retry.operation_timeout_ms)
             .with_metadata_endpoint(endpoint);
@@ -661,7 +661,7 @@ mod tests {
         RefreshHint as CanonicalRefreshHint, RefreshReason as CanonicalRefreshReason,
     };
     use common::header::RpcErrorCode;
-    use proto::common::{GroupStateWatermarkProto, RaftLogIdProto, ShardGroupIdProto};
+    use proto::common::{GroupStateWatermarkProto, RaftLogIdProto};
     use proto::metadata::{
         AbortFileWriteResponseProto, AppendFileResponseProto, CommitFileResponseProto, CreateFileResponseProto,
         DeleteRequestProto, DeleteResponseProto, GetStatusRequestProto, GetStatusResponseProto,
@@ -672,8 +672,8 @@ mod tests {
     use std::time::Duration;
     use types::lease::FencingToken;
     use types::{
-        BlockId, BlockIndex, CallId, ClientId, DataHandleId, InodeId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol,
-        WriteTarget,
+        BlockId, BlockIndex, CallId, ClientId, DataHandleId, GroupName, InodeId, WorkerEndpointInfo, WorkerId,
+        WorkerNetProtocol, WriteTarget,
     };
 
     #[derive(Debug, Default)]
@@ -715,30 +715,16 @@ mod tests {
         )
         .expect("operation context");
 
-        let first = AttemptContext::for_metadata(&op, 9, 0).expect("first attempt");
-        let second = AttemptContext::for_metadata(&op, 11, 1).expect("replay attempt");
+        let first = AttemptContext::for_metadata(&op, group_name("root"), 0).expect("first attempt");
+        let second = AttemptContext::for_metadata(&op, group_name("analytics"), 1).expect("replay attempt");
 
         assert_eq!(first.call_id(), second.call_id());
-        assert_eq!(first.metadata_header().expect("first header").group_id, 9);
-        assert_eq!(second.metadata_header().expect("second header").group_id, 11);
+        assert_eq!(first.metadata_header().expect("first header").group_name, "root");
+        assert_eq!(second.metadata_header().expect("second header").group_name, "analytics");
         assert_eq!(
             op.operation_fingerprint(),
             OperationIdentity::path("/alpha").fingerprint(OperationKind::MetadataRead, "OpenFile")
         );
-    }
-
-    #[test]
-    fn metadata_attempt_context_rejects_zero_group_id() {
-        let op = OperationContext::new(
-            ClientId::new(7),
-            OperationKind::MetadataRead,
-            "OpenFile",
-            OperationIdentity::path("/alpha"),
-        )
-        .expect("operation context");
-        let err = AttemptContext::for_metadata(&op, 0, 0).expect_err("metadata attempts must not use fake group_id 0");
-
-        assert!(matches!(err, crate::error::ClientError::InvalidArgument(msg) if msg.contains("group_id")));
     }
 
     #[test]
@@ -764,11 +750,11 @@ mod tests {
             OperationIdentity::path("/alpha"),
         )
         .expect("operation context");
-        let ctx = AttemptContext::for_metadata(&op, 9, 0).expect("metadata context");
+        let ctx = AttemptContext::for_metadata(&op, group_name("root"), 0).expect("metadata context");
         let header = ctx.metadata_header().expect("metadata header");
 
         assert_eq!(header.client.as_ref().map(|client| client.client_id), Some(7));
-        assert_eq!(header.group_id, 9);
+        assert_eq!(header.group_name, "root");
         assert!(!header.client.as_ref().unwrap().call_id.is_empty());
     }
 
@@ -779,7 +765,7 @@ mod tests {
                 RpcErrorCode::NotLeader,
                 CanonicalRefreshReason::NotLeader,
                 CanonicalRefreshHint {
-                    group_id: Some(9),
+                    group_name: Some("root".to_string()),
                     leader_endpoint: Some("http://127.0.0.1:18081".to_string()),
                     ..CanonicalRefreshHint::default()
                 },
@@ -813,7 +799,7 @@ mod tests {
                 RpcErrorCode::ShardMoved,
                 CanonicalRefreshReason::OwnerGroupMismatch,
                 CanonicalRefreshHint {
-                    group_id: Some(11),
+                    group_name: Some("analytics".to_string()),
                     ..CanonicalRefreshHint::default()
                 },
             ),
@@ -834,8 +820,8 @@ mod tests {
 
         let calls = gateway.calls();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].group_id, 9);
-        assert_eq!(calls[1].group_id, 11);
+        assert_eq!(calls[0].group_name, group_name("root"));
+        assert_eq!(calls[1].group_name, group_name("analytics"));
         assert_eq!(calls[0].call_id, calls[1].call_id);
     }
 
@@ -846,7 +832,7 @@ mod tests {
                 RpcErrorCode::ShardMoved,
                 CanonicalRefreshReason::OwnerGroupMismatch,
                 CanonicalRefreshHint {
-                    group_id: Some(11),
+                    group_name: Some("analytics".to_string()),
                     leader_endpoint: Some("http://127.0.0.1:18082".to_string()),
                     ..CanonicalRefreshHint::default()
                 },
@@ -868,8 +854,8 @@ mod tests {
 
         let calls = gateway.calls();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].group_id, 9);
-        assert_eq!(calls[1].group_id, 11);
+        assert_eq!(calls[0].group_name, group_name("root"));
+        assert_eq!(calls[1].group_name, group_name("analytics"));
         assert_eq!(calls[0].call_id, calls[1].call_id);
         assert_eq!(calls[1].endpoint.as_deref(), Some("http://127.0.0.1:18082"));
     }
@@ -881,7 +867,7 @@ mod tests {
                 RpcErrorCode::ShardMoved,
                 CanonicalRefreshReason::OwnerGroupMismatch,
                 CanonicalRefreshHint {
-                    group_id: Some(11),
+                    group_name: Some("analytics".to_string()),
                     ..CanonicalRefreshHint::default()
                 },
             ),
@@ -903,27 +889,27 @@ mod tests {
 
         let calls = gateway.calls();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].group_id, 9);
-        assert_eq!(calls[1].group_id, 11);
+        assert_eq!(calls[0].group_name, group_name("root"));
+        assert_eq!(calls[1].group_name, group_name("analytics"));
         assert_eq!(calls[0].call_id, calls[1].call_id);
     }
 
     #[tokio::test]
     async fn stale_state_refresh_replays_with_state_watermark() {
-        let watermark = watermark_proto(9, 44);
+        let watermark = watermark_proto("root", 44);
         let gateway = Arc::new(
             ScriptedGateway::new(vec![
                 refresh_outcome(
                     RpcErrorCode::StaleState,
                     CanonicalRefreshReason::StaleState,
                     CanonicalRefreshHint {
-                        group_id: Some(9),
+                        group_name: Some("root".to_string()),
                         ..CanonicalRefreshHint::default()
                     },
                 ),
                 GatewayOutcome::Ok,
             ])
-            .with_msync_watermark(watermark),
+            .with_msync_watermark(watermark.clone()),
         );
         let executor = test_executor(gateway.clone());
 
@@ -1126,8 +1112,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutation_zero_group_id_ok_header_is_fatal_and_not_replayed() {
-        let gateway = Arc::new(ScriptedGateway::new(vec![GatewayOutcome::ZeroGroupIdOkHeader]));
+    async fn mutation_missing_group_name_ok_header_is_fatal_and_not_replayed() {
+        let gateway = Arc::new(ScriptedGateway::new(vec![GatewayOutcome::MissingGroupNameOkHeader]));
         let executor = test_executor(gateway.clone());
 
         let err = executor
@@ -1140,7 +1126,7 @@ mod tests {
                 },
             )
             .await
-            .expect_err("zero group_id OK header must fail");
+            .expect_err("missing group_name OK header must fail");
 
         assert_invalid_header_not_retryable(&err);
         assert_eq!(gateway.calls().len(), 1);
@@ -1175,8 +1161,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_barrier_zero_group_id_ok_header_is_fatal_and_not_replayed() {
-        let gateway = Arc::new(ScriptedGateway::new(vec![GatewayOutcome::ZeroGroupIdOkHeader]));
+    async fn session_barrier_missing_group_name_ok_header_is_fatal_and_not_replayed() {
+        let gateway = Arc::new(ScriptedGateway::new(vec![GatewayOutcome::MissingGroupNameOkHeader]));
         let executor = test_executor(gateway.clone());
         let operation = OperationContext::new(
             ClientId::new(7),
@@ -1196,7 +1182,7 @@ mod tests {
                 |gateway, ctx, req| async move { gateway.get_status(ctx, req).await },
             )
             .await
-            .expect_err("zero group_id OK header must fail");
+            .expect_err("missing group_name OK header must fail");
 
         assert_invalid_header_not_retryable(&err);
         assert_eq!(gateway.calls().len(), 1);
@@ -1223,8 +1209,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_read_zero_group_id_ok_header_is_not_retried_as_transport() {
-        let gateway = Arc::new(ScriptedGateway::new(vec![GatewayOutcome::ZeroGroupIdOkHeader]));
+    async fn metadata_read_missing_group_name_ok_header_is_not_retried_as_transport() {
+        let gateway = Arc::new(ScriptedGateway::new(vec![GatewayOutcome::MissingGroupNameOkHeader]));
         let executor = test_executor(gateway.clone());
 
         let err = executor
@@ -1236,7 +1222,7 @@ mod tests {
                 },
             )
             .await
-            .expect_err("zero group_id OK header must fail");
+            .expect_err("missing group_name OK header must fail");
 
         assert_invalid_header_not_retryable(&err);
         assert_eq!(gateway.calls().len(), 1);
@@ -1297,7 +1283,7 @@ mod tests {
             RpcErrorCode::NotLeader,
             CanonicalRefreshReason::NotLeader,
             CanonicalRefreshHint {
-                group_id: Some(9),
+                group_name: Some("root".to_string()),
                 leader_endpoint: Some("http://127.0.0.1:18081".to_string()),
                 ..CanonicalRefreshHint::default()
             },
@@ -1520,14 +1506,14 @@ mod tests {
         },
         TransportUnavailable,
         MissingHeader,
-        ZeroGroupIdOkHeader,
+        MissingGroupNameOkHeader,
         Pending,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct RecordedAttempt {
         method: &'static str,
-        group_id: u64,
+        group_name: GroupName,
         endpoint: Option<String>,
         call_id: String,
         deadline_ms: i64,
@@ -1548,7 +1534,7 @@ mod tests {
             Self {
                 outcomes: Mutex::new(VecDeque::from(outcomes)),
                 calls: Mutex::new(Vec::new()),
-                msync_watermark: watermark_proto(9, 1),
+                msync_watermark: watermark_proto("root", 1),
             }
         }
 
@@ -1565,7 +1551,7 @@ mod tests {
             let header = ctx.metadata_header().expect("metadata header");
             self.calls.lock().expect("calls").push(RecordedAttempt {
                 method,
-                group_id: header.group_id,
+                group_name: GroupName::parse(&header.group_name).expect("recorded metadata header group_name"),
                 endpoint: ctx.metadata_endpoint().map(ToOwned::to_owned),
                 call_id: header.client.expect("client").call_id,
                 deadline_ms: header.deadline_ms,
@@ -1590,7 +1576,7 @@ mod tests {
                 GatewayOutcome::MissingHeader => {
                     Err(invalid_header_error("metadata OK response missing ResponseHeader"))
                 }
-                GatewayOutcome::ZeroGroupIdOkHeader => zero_group_id_ok_header_error(),
+                GatewayOutcome::MissingGroupNameOkHeader => missing_group_name_ok_header_error(),
                 GatewayOutcome::Pending => {
                     std::future::pending::<()>().await;
                     Ok(())
@@ -1599,9 +1585,9 @@ mod tests {
         }
     }
 
-    fn layout_snapshot(group_id: u64) -> LayoutSnapshot {
+    fn layout_snapshot(group_name: GroupName) -> LayoutSnapshot {
         LayoutSnapshot {
-            group_id,
+            group_name,
             inode_id: InodeId::new(101),
             data_handle_id: DataHandleId::new(202),
             file_size: 0,
@@ -1669,7 +1655,9 @@ mod tests {
 
         async fn read_layout(&self, ctx: AttemptContext, _req: GetBlockLocationsOp) -> ClientResult<LayoutSnapshot> {
             self.next_result("read_layout", &ctx).await?;
-            Ok(layout_snapshot(ctx.metadata_header()?.group_id))
+            Ok(layout_snapshot(
+                GroupName::parse(&ctx.metadata_header()?.group_name).unwrap(),
+            ))
         }
 
         async fn create_file(&self, ctx: AttemptContext, _req: CreateFileOp) -> ClientResult<WriteSessionSeed> {
@@ -1685,7 +1673,7 @@ mod tests {
         async fn add_block(&self, ctx: AttemptContext, _req: AddBlockOp) -> ClientResult<AddBlockResult> {
             self.next_result("add_block", &ctx).await?;
             Ok(AddBlockResult {
-                group_id: ctx.metadata_header()?.group_id,
+                group_name: GroupName::parse(&ctx.metadata_header()?.group_name).unwrap(),
                 target: write_target(),
             })
         }
@@ -1720,7 +1708,7 @@ mod tests {
             _req: MsyncOp,
         ) -> ClientResult<proto::common::GroupStateWatermarkProto> {
             self.record("msync", &ctx);
-            Ok(self.msync_watermark)
+            Ok(self.msync_watermark.clone())
         }
     }
 
@@ -1756,7 +1744,7 @@ mod tests {
     ) -> OperationExecutor {
         let gateway: Arc<dyn MetadataGateway> = gateway;
         let refresh_manager = RefreshManager::new(vec![ConfiguredMetadataGroup {
-            group_id: 9,
+            group_name: group_name("root"),
             endpoint: "http://127.0.0.1:18080".to_string(),
         }])
         .expect("refresh manager");
@@ -1821,7 +1809,7 @@ mod tests {
             .collect::<Vec<_>>();
         crate::canonical::RefreshHint {
             leader_endpoint: hint.leader_endpoint.clone(),
-            group_id: hint.group_id,
+            group_name: hint.group_name.as_deref().and_then(|name| GroupName::parse(name).ok()),
             route_epoch: hint.route_epoch,
             mount_epoch: hint.mount_epoch,
             mount_prefix: hint.mount_prefix.clone(),
@@ -1844,10 +1832,8 @@ mod tests {
         })
     }
 
-    fn zero_group_id_ok_header_error() -> ClientResult<()> {
-        Err(invalid_header_error(
-            "invalid response header: group_id must be non-zero",
-        ))
+    fn missing_group_name_ok_header_error() -> ClientResult<()> {
+        Err(invalid_header_error("invalid response header: group_name missing"))
     }
 
     fn assert_invalid_header_not_retryable(err: &ClientError) {
@@ -1875,14 +1861,18 @@ mod tests {
         }
     }
 
-    fn watermark_proto(group_id: u64, index: u64) -> GroupStateWatermarkProto {
+    fn watermark_proto(group_name: &str, index: u64) -> GroupStateWatermarkProto {
         GroupStateWatermarkProto {
-            group_id: Some(ShardGroupIdProto { value: group_id }),
+            group_name: group_name.to_string(),
             state_id: Some(RaftLogIdProto {
                 term: 1,
                 leader_node_id: 1,
                 index,
             }),
         }
+    }
+
+    fn group_name(raw: &str) -> GroupName {
+        GroupName::parse(raw).unwrap()
     }
 }

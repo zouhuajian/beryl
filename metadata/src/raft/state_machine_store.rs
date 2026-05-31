@@ -736,8 +736,8 @@ mod tests {
         let dir_a = TempDir::new().unwrap();
         let dir_b = TempDir::new().unwrap();
 
-        let storage_a = Arc::new(RocksDBStorage::open(dir_a.path()).unwrap());
-        let storage_b = Arc::new(RocksDBStorage::open(dir_b.path()).unwrap());
+        let storage_a = Arc::new(RocksDBStorage::create_for_format(dir_a.path()).unwrap());
+        let storage_b = Arc::new(RocksDBStorage::create_for_format(dir_b.path()).unwrap());
 
         let mount_table = Arc::new(MountTable::new());
         let sm_a = Arc::new(AppRaftStateMachine::new(

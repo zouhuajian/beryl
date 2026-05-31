@@ -12,7 +12,7 @@ use types::ids::{BlockId, BlockIndex, DataHandleId};
 #[test]
 fn test_refcount_increment_on_commit() {
     let temp_dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(temp_dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).unwrap());
 
     let block_id = BlockId::new(DataHandleId::new(1), BlockIndex::new(0));
 
@@ -33,7 +33,7 @@ fn test_refcount_increment_on_commit() {
 #[test]
 fn test_refcount_decrement_to_zero_generates_intent() {
     let temp_dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(temp_dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).unwrap());
 
     let block_id = BlockId::new(DataHandleId::new(1), BlockIndex::new(0));
 
@@ -50,7 +50,7 @@ fn test_refcount_decrement_to_zero_generates_intent() {
 #[test]
 fn test_refcount_decrement_below_zero_clamped() {
     let temp_dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::open(temp_dir.path()).unwrap());
+    let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).unwrap());
 
     let block_id = BlockId::new(DataHandleId::new(1), BlockIndex::new(0));
 

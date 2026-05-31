@@ -14,7 +14,7 @@ use types::fs::FsErrorCode;
 use types::ids::{BlockId, LeaseId, WorkerId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
-use types::{FileBlockLocation, GroupStateWatermark, WorkerEndpointInfo, WriteTarget};
+use types::{FileBlockLocation, GroupName, GroupStateWatermark, WorkerEndpointInfo, WriteTarget};
 
 pub fn request_context_from_proto(req_header: &Option<proto::common::RequestHeaderProto>) -> RequestContext {
     let caller = if let Some(proto_header) = req_header {
@@ -80,12 +80,15 @@ fn error_detail_from_canonical(err: &CanonicalError) -> Option<proto::common::Er
 
 fn build_base_response_header(
     ctx: &RequestContext,
-    group_id: Option<u64>,
+    group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
     route_epoch: Option<u64>,
     state: Vec<GroupStateWatermark>,
 ) -> proto::common::ResponseHeaderProto {
-    let mut resp_header = ResponseHeader::ok(ctx.caller.client.clone()).with_group_id(group_id.unwrap_or(0));
+    let mut resp_header = ResponseHeader::ok(ctx.caller.client.clone());
+    if let Some(group_name) = group_name {
+        resp_header = resp_header.with_group_name(group_name);
+    }
     resp_header.state = state;
     let mut proto_header: proto::common::ResponseHeaderProto = (&resp_header).into();
     if let Some(epoch) = mount_epoch {
@@ -99,23 +102,23 @@ fn build_base_response_header(
 
 pub fn ok_header_from_context(
     ctx: &RequestContext,
-    group_id: Option<u64>,
+    group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
     route_epoch: Option<u64>,
     state: Vec<GroupStateWatermark>,
 ) -> proto::common::ResponseHeaderProto {
-    build_base_response_header(ctx, group_id, mount_epoch, route_epoch, state)
+    build_base_response_header(ctx, group_name, mount_epoch, route_epoch, state)
 }
 
 pub fn header_from_canonical_error_with_context(
     ctx: &RequestContext,
-    group_id: Option<u64>,
+    group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
     route_epoch: Option<u64>,
     state: Vec<GroupStateWatermark>,
     err: &CanonicalError,
 ) -> proto::common::ResponseHeaderProto {
-    let mut header = build_base_response_header(ctx, group_id, mount_epoch, route_epoch, state);
+    let mut header = build_base_response_header(ctx, group_name, mount_epoch, route_epoch, state);
     header.error = error_detail_from_canonical(err);
     header
 }
@@ -126,7 +129,7 @@ pub fn ok_header_from_core_success<T>(
 ) -> proto::common::ResponseHeaderProto {
     ok_header_from_context(
         ctx,
-        success.group_id,
+        success.group_name.clone(),
         success.mount_epoch,
         success.route_epoch,
         success.state.clone(),
@@ -136,7 +139,7 @@ pub fn ok_header_from_core_success<T>(
 pub fn header_from_core_failure(ctx: &RequestContext, failure: &CoreFailure) -> proto::common::ResponseHeaderProto {
     header_from_canonical_error_with_context(
         ctx,
-        failure.group_id,
+        failure.group_name.clone(),
         failure.mount_epoch,
         failure.route_epoch,
         failure.state.clone(),
@@ -147,21 +150,21 @@ pub fn header_from_core_failure(ctx: &RequestContext, failure: &CoreFailure) -> 
 pub(crate) fn core_failure_from_metadata_error(
     ctx: &RequestContext,
     err: MetadataError,
-    group_id: Option<u64>,
+    group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
     route_epoch: Option<u64>,
 ) -> CoreFailure {
-    core_failure_from_canonical_error(ctx, to_canonical_fs(err), group_id, mount_epoch, route_epoch)
+    core_failure_from_canonical_error(ctx, to_canonical_fs(err), group_name, mount_epoch, route_epoch)
 }
 
 fn core_failure_from_canonical_error(
     _ctx: &RequestContext,
     err: CanonicalError,
-    group_id: Option<u64>,
+    group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
     route_epoch: Option<u64>,
 ) -> CoreFailure {
-    CoreFailure::new(err, group_id, mount_epoch, route_epoch, Vec::new())
+    CoreFailure::new(err, group_name, mount_epoch, route_epoch, Vec::new())
 }
 
 // Refresh failures must keep caller and server hint fields explicit.
@@ -171,7 +174,7 @@ pub(crate) fn need_refresh_core_failure(
     rpc_code: RpcErrorCode,
     reason: RefreshReason,
     message: impl Into<String>,
-    group_id: Option<u64>,
+    group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
     route_epoch: Option<u64>,
     hint: Option<RefreshHint>,
@@ -180,20 +183,20 @@ pub(crate) fn need_refresh_core_failure(
         Some(hint) => CanonicalError::need_refresh_with_hint(rpc_code, reason, hint, message),
         None => CanonicalError::need_refresh(rpc_code, reason, message),
     };
-    core_failure_from_canonical_error(ctx, err, group_id, mount_epoch, route_epoch)
+    core_failure_from_canonical_error(ctx, err, group_name, mount_epoch, route_epoch)
 }
 
 pub(crate) fn fatal_fs_core_failure(
     ctx: &RequestContext,
     errno: FsErrorCode,
     message: impl Into<String>,
-    group_id: Option<u64>,
+    group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
 ) -> CoreFailure {
     core_failure_from_canonical_error(
         ctx,
         CanonicalError::fatal_fs(errno, message),
-        group_id,
+        group_name,
         mount_epoch,
         None,
     )
@@ -204,7 +207,7 @@ pub(crate) fn terminal_rpc_core_failure(
     reason: RefreshReason,
     rpc_code: RpcErrorCode,
     message: impl Into<String>,
-    group_id: Option<u64>,
+    group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
 ) -> CoreFailure {
     core_failure_from_canonical_error(
@@ -217,7 +220,7 @@ pub(crate) fn terminal_rpc_core_failure(
             message: message.into(),
             refresh_hint: None,
         },
-        group_id,
+        group_name,
         mount_epoch,
         None,
     )
@@ -225,21 +228,21 @@ pub(crate) fn terminal_rpc_core_failure(
 
 pub fn ok_header_from_request(
     req_header: &Option<proto::common::RequestHeaderProto>,
-    group_id: Option<u64>,
+    group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
 ) -> proto::common::ResponseHeaderProto {
     let ctx = request_context_from_proto(req_header);
-    ok_header_from_context(&ctx, group_id, mount_epoch, None, Vec::new())
+    ok_header_from_context(&ctx, group_name, mount_epoch, None, Vec::new())
 }
 
 pub fn header_from_canonical_error(
     req_header: &Option<proto::common::RequestHeaderProto>,
-    group_id: Option<u64>,
+    group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
     err: &CanonicalError,
 ) -> proto::common::ResponseHeaderProto {
     let ctx = request_context_from_proto(req_header);
-    header_from_canonical_error_with_context(&ctx, group_id, mount_epoch, None, Vec::new(), err)
+    header_from_canonical_error_with_context(&ctx, group_name, mount_epoch, None, Vec::new(), err)
 }
 
 pub fn file_attrs_to_proto(attrs: &types::fs::FileAttrs) -> proto::fs::FileAttrsProto {
@@ -290,11 +293,11 @@ pub fn fatal_fs_header(
     req_header: &Option<proto::common::RequestHeaderProto>,
     errno: FsErrorCode,
     message: impl Into<String>,
-    group_id: Option<u64>,
+    group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
 ) -> proto::common::ResponseHeaderProto {
     let err = CanonicalError::fatal_fs(errno, message);
-    header_from_canonical_error(req_header, group_id, mount_epoch, &err)
+    header_from_canonical_error(req_header, group_name, mount_epoch, &err)
 }
 
 pub fn need_refresh_header(
@@ -302,16 +305,16 @@ pub fn need_refresh_header(
     rpc_code: RpcErrorCode,
     reason: common::error::canonical::RefreshReason,
     message: impl Into<String>,
-    group_id: Option<u64>,
+    group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
 ) -> proto::common::ResponseHeaderProto {
     let hint = RefreshHint {
-        group_id,
+        group_name: group_name.as_ref().map(ToString::to_string),
         mount_epoch,
         ..Default::default()
     };
     let err = CanonicalError::need_refresh_with_hint(rpc_code, reason, hint, message);
-    header_from_canonical_error(req_header, group_id, mount_epoch, &err)
+    header_from_canonical_error(req_header, group_name, mount_epoch, &err)
 }
 
 pub fn retryable_header(
@@ -319,11 +322,11 @@ pub fn retryable_header(
     rpc_code: RpcErrorCode,
     retry_after_ms: Option<u64>,
     message: impl Into<String>,
-    group_id: Option<u64>,
+    group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
 ) -> proto::common::ResponseHeaderProto {
     let err = CanonicalError::retryable(rpc_code, retry_after_ms, message);
-    header_from_canonical_error(req_header, group_id, mount_epoch, &err)
+    header_from_canonical_error(req_header, group_name, mount_epoch, &err)
 }
 
 pub fn permission_denied_canonical_error(op: Option<&str>, detail: Option<&str>) -> CanonicalError {
@@ -381,7 +384,7 @@ mod tests {
     use super::header_from_canonical_error;
     use common::error::canonical::{CanonicalError, RefreshReason};
     use common::header::{RequestHeader, RpcErrorCode};
-    use types::ClientId;
+    use types::{ClientId, GroupName};
 
     #[test]
     fn filesystem_header_builder_does_not_emit_moved_reason() {
@@ -393,7 +396,12 @@ mod tests {
             "moved should be de-scoped",
         );
 
-        let header = header_from_canonical_error(&req_header, Some(1), Some(7), &canonical);
+        let header = header_from_canonical_error(
+            &req_header,
+            Some(GroupName::parse("root").unwrap()),
+            Some(7),
+            &canonical,
+        );
         let error = header.error.expect("expected canonical error header");
         assert_eq!(
             error.refresh_reason,

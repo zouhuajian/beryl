@@ -9,13 +9,20 @@ use crate::worker::manager::{BlockReportBlock, BlockReportBlockState, HealthStat
 use crate::worker::WorkerManager;
 use std::sync::Arc;
 use std::time::Duration;
-use types::ids::{BlockId, BlockIndex, DataHandleId, ShardGroupId, WorkerId};
+use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
 use types::layout::FileLayout;
-use types::WorkerRunId;
+use types::{GroupName, WorkerRunId};
 
-fn worker_run_id(group_id: ShardGroupId, worker_id: WorkerId) -> WorkerRunId {
-    let suffix = group_id
-        .as_raw()
+fn group_name(raw: &str) -> GroupName {
+    GroupName::parse(raw).unwrap()
+}
+
+fn worker_run_id(group_name: &GroupName, worker_id: WorkerId) -> WorkerRunId {
+    let group_component = group_name
+        .as_str()
+        .bytes()
+        .fold(0u64, |acc, byte| acc.saturating_add(u64::from(byte)));
+    let suffix = group_component
         .saturating_mul(1_000_000)
         .saturating_add(worker_id.as_raw());
     format!("550e8400-e29b-41d4-a716-{suffix:012x}")
@@ -26,7 +33,7 @@ fn worker_run_id(group_id: ShardGroupId, worker_id: WorkerId) -> WorkerRunId {
 #[allow(clippy::too_many_arguments)]
 fn record_heartbeat(
     manager: &WorkerManager,
-    group_id: ShardGroupId,
+    group_name: &GroupName,
     worker_id: WorkerId,
     capacity_total: u64,
     capacity_used: u64,
@@ -36,16 +43,16 @@ fn record_heartbeat(
     health: HealthStatus,
 ) -> WorkerRunId {
     let descriptor = manager
-        .get_descriptor(group_id, worker_id)
+        .get_descriptor(group_name, worker_id)
         .expect("worker descriptor should be registered");
     let run_id = manager
-        .get_registration(group_id, worker_id)
+        .get_registration(group_name, worker_id)
         .map(|registration| registration.worker_run_id)
         .unwrap_or_else(|| {
-            let run_id = worker_run_id(group_id, worker_id);
+            let run_id = worker_run_id(group_name, worker_id);
             manager
                 .register_worker_run(
-                    group_id,
+                    group_name,
                     worker_id,
                     descriptor.address.clone(),
                     descriptor.worker_net_protocol,
@@ -57,7 +64,7 @@ fn record_heartbeat(
         });
     manager
         .record_heartbeat(
-            group_id,
+            group_name,
             worker_id,
             run_id,
             1,
@@ -91,7 +98,7 @@ fn report_block(block_id: BlockId) -> BlockReportBlock {
 
 fn receive_full_report(
     manager: &WorkerManager,
-    group_id: ShardGroupId,
+    group_name: &GroupName,
     worker_id: WorkerId,
     run_id: WorkerRunId,
     report_seq: u64,
@@ -99,7 +106,7 @@ fn receive_full_report(
 ) -> (Vec<BlockId>, Vec<BlockId>) {
     let result = manager
         .receive_full_block_report(
-            group_id,
+            group_name,
             worker_id,
             run_id,
             report_seq,
@@ -119,7 +126,7 @@ async fn test_worker_registration_and_heartbeat() {
     // Register worker
     manager
         .register_worker(
-            ShardGroupId::new(1),
+            &group_name("root"),
             worker_id,
             "127.0.0.1:8080".to_string(),
             1, // worker_net_protocol: GRPC
@@ -130,7 +137,7 @@ async fn test_worker_registration_and_heartbeat() {
     // Send heartbeat through the validated live-registration path.
     record_heartbeat(
         &manager,
-        ShardGroupId::new(1),
+        &group_name("root"),
         worker_id,
         1000,
         500,
@@ -141,10 +148,10 @@ async fn test_worker_registration_and_heartbeat() {
     );
 
     // Verify worker is live
-    assert!(manager.is_worker_live(ShardGroupId::new(1), worker_id));
+    assert!(manager.is_worker_live(&group_name("root"), worker_id));
 
     let live_workers = manager.list_live_workers();
-    assert!(live_workers.contains(&WorkerRegistrationKey::new(ShardGroupId::new(1), worker_id)));
+    assert!(live_workers.contains(&WorkerRegistrationKey::new(&group_name("root"), worker_id)));
 }
 
 #[tokio::test]
@@ -156,7 +163,7 @@ async fn test_block_report_updates_locations() {
 
     manager
         .register_worker(
-            ShardGroupId::new(1),
+            &group_name("root"),
             worker_id,
             "127.0.0.1:8080".to_string(),
             1, // worker_net_protocol: GRPC
@@ -167,7 +174,7 @@ async fn test_block_report_updates_locations() {
     // Send heartbeat to make worker live.
     let run_id = record_heartbeat(
         &manager,
-        ShardGroupId::new(1),
+        &group_name("root"),
         worker_id,
         1000,
         500,
@@ -180,7 +187,7 @@ async fn test_block_report_updates_locations() {
     // First block report
     let (added1, removed1) = receive_full_report(
         &manager,
-        ShardGroupId::new(1),
+        &group_name("root"),
         worker_id,
         run_id,
         1,
@@ -190,14 +197,14 @@ async fn test_block_report_updates_locations() {
     assert_eq!(removed1.len(), 0);
 
     // Verify locations (only live workers returned)
-    assert_eq!(manager.get_block_locations(ShardGroupId::new(1), block_id1).len(), 1);
-    assert_eq!(manager.get_block_locations(ShardGroupId::new(1), block_id2).len(), 1);
+    assert_eq!(manager.get_block_locations(&group_name("root"), block_id1).len(), 1);
+    assert_eq!(manager.get_block_locations(&group_name("root"), block_id2).len(), 1);
 
     // Second block report (remove block_id2, add block_id3)
     let block_id3 = BlockId::new(DataHandleId::new(1), BlockIndex::new(2));
     let (added2, removed2) = receive_full_report(
         &manager,
-        ShardGroupId::new(1),
+        &group_name("root"),
         worker_id,
         run_id,
         2,
@@ -207,9 +214,9 @@ async fn test_block_report_updates_locations() {
     assert_eq!(removed2.len(), 1); // block_id2
 
     // Verify locations updated
-    assert_eq!(manager.get_block_locations(ShardGroupId::new(1), block_id1).len(), 1);
-    assert_eq!(manager.get_block_locations(ShardGroupId::new(1), block_id2).len(), 0); // Removed
-    assert_eq!(manager.get_block_locations(ShardGroupId::new(1), block_id3).len(), 1);
+    assert_eq!(manager.get_block_locations(&group_name("root"), block_id1).len(), 1);
+    assert_eq!(manager.get_block_locations(&group_name("root"), block_id2).len(), 0); // Removed
+    assert_eq!(manager.get_block_locations(&group_name("root"), block_id3).len(), 1);
 }
 
 #[tokio::test]
@@ -218,13 +225,13 @@ async fn test_block_report_batching_correctness() {
     let worker_id = WorkerId::new(1);
 
     manager
-        .register_worker(ShardGroupId::new(1), worker_id, "127.0.0.1:8080".to_string(), 1, None)
+        .register_worker(&group_name("root"), worker_id, "127.0.0.1:8080".to_string(), 1, None)
         .unwrap();
 
     // Send heartbeat to make worker live.
     let run_id = record_heartbeat(
         &manager,
-        ShardGroupId::new(1),
+        &group_name("root"),
         worker_id,
         1000,
         500,
@@ -242,7 +249,7 @@ async fn test_block_report_batching_correctness() {
 
     let (added, removed) = receive_full_report(
         &manager,
-        ShardGroupId::new(1),
+        &group_name("root"),
         worker_id,
         run_id,
         1,
@@ -253,13 +260,13 @@ async fn test_block_report_batching_correctness() {
 
     // Verify all blocks are present (only live workers returned)
     for block_id in &reported_blocks {
-        let locations = manager.get_block_locations(ShardGroupId::new(1), *block_id);
+        let locations = manager.get_block_locations(&group_name("root"), *block_id);
         assert_eq!(locations.len(), 1, "Block {} should have 1 location", block_id);
         assert!(locations.contains(&worker_id));
     }
 
     // Verify worker_blocks mapping
-    let worker_blocks = manager.get_worker_blocks(ShardGroupId::new(1), worker_id);
+    let worker_blocks = manager.get_worker_blocks(&group_name("root"), worker_id);
     assert_eq!(worker_blocks.len(), 2001);
 }
 
@@ -271,7 +278,7 @@ async fn test_dead_worker_cleanup() {
 
     manager
         .register_worker(
-            ShardGroupId::new(1),
+            &group_name("root"),
             worker_id,
             "127.0.0.1:8080".to_string(),
             1, // worker_net_protocol: GRPC
@@ -282,7 +289,7 @@ async fn test_dead_worker_cleanup() {
     // Send heartbeat to make worker live.
     let run_id = record_heartbeat(
         &manager,
-        ShardGroupId::new(1),
+        &group_name("root"),
         worker_id,
         1000,
         500,
@@ -292,20 +299,20 @@ async fn test_dead_worker_cleanup() {
         HealthStatus::Healthy,
     );
 
-    receive_full_report(&manager, ShardGroupId::new(1), worker_id, run_id, 1, vec![block_id]);
+    receive_full_report(&manager, &group_name("root"), worker_id, run_id, 1, vec![block_id]);
 
     // Verify worker is live
-    assert!(manager.is_worker_live(ShardGroupId::new(1), worker_id));
-    assert_eq!(manager.get_block_locations(ShardGroupId::new(1), block_id).len(), 1);
+    assert!(manager.is_worker_live(&group_name("root"), worker_id));
+    assert_eq!(manager.get_block_locations(&group_name("root"), block_id).len(), 1);
 
     tokio::time::sleep(Duration::from_millis(1100)).await;
     manager.expire_liveness();
 
     // Verify worker is dead
-    assert!(!manager.is_worker_live(ShardGroupId::new(1), worker_id));
+    assert!(!manager.is_worker_live(&group_name("root"), worker_id));
 
     // Verify locations are cleaned up (only live workers returned)
-    assert_eq!(manager.get_block_locations(ShardGroupId::new(1), block_id).len(), 0);
+    assert_eq!(manager.get_block_locations(&group_name("root"), block_id).len(), 0);
 }
 
 #[tokio::test]
@@ -389,19 +396,19 @@ async fn test_worker_placement_selection() {
     let worker3 = WorkerId::new(3);
 
     manager
-        .register_worker(ShardGroupId::new(1), worker1, "127.0.0.1:8080".to_string(), 1, None)
+        .register_worker(&group_name("root"), worker1, "127.0.0.1:8080".to_string(), 1, None)
         .unwrap();
     manager
-        .register_worker(ShardGroupId::new(1), worker2, "127.0.0.1:8081".to_string(), 1, None)
+        .register_worker(&group_name("root"), worker2, "127.0.0.1:8081".to_string(), 1, None)
         .unwrap();
     manager
-        .register_worker(ShardGroupId::new(1), worker3, "127.0.0.1:8082".to_string(), 1, None)
+        .register_worker(&group_name("root"), worker3, "127.0.0.1:8082".to_string(), 1, None)
         .unwrap();
 
     // Send heartbeats to make workers live and update capacity.
     record_heartbeat(
         &manager,
-        ShardGroupId::new(1),
+        &group_name("root"),
         worker1,
         10_000,
         2_000,
@@ -412,7 +419,7 @@ async fn test_worker_placement_selection() {
     );
     record_heartbeat(
         &manager,
-        ShardGroupId::new(1),
+        &group_name("root"),
         worker2,
         10_000,
         3_000,
@@ -423,7 +430,7 @@ async fn test_worker_placement_selection() {
     );
     record_heartbeat(
         &manager,
-        ShardGroupId::new(1),
+        &group_name("root"),
         worker3,
         10_000,
         1_000,
@@ -433,11 +440,11 @@ async fn test_worker_placement_selection() {
         HealthStatus::Healthy,
     );
 
-    let group_id = ShardGroupId::new(1);
+    let group_name = group_name("root");
     let layout = FileLayout::with_block_format(4096, 1024, 3, types::BlockFormatId::FULL_EFFECTIVE);
     let placement = PlacementPlanner.plan(
         &PlacementRequest {
-            group_id,
+            group_name: group_name.clone(),
             op: PlacementOp::Write,
             block_id: BlockId::new(DataHandleId::new(1), BlockIndex::new(0)),
             block_stamp: None,
@@ -447,7 +454,7 @@ async fn test_worker_placement_selection() {
             exclude_workers: Vec::new(),
             target_replicas: layout.replication,
         },
-        &manager.collect_worker_placement_views(group_id),
+        &manager.collect_worker_placement_views(&group_name),
     );
 
     // Verify we got 3 different workers
@@ -530,22 +537,22 @@ async fn test_replication_check_triggers_repair() {
 
     // Register workers
     manager
-        .register_worker(ShardGroupId::new(1), worker1, "127.0.0.1:8080".to_string(), 1, None)
+        .register_worker(&group_name("root"), worker1, "127.0.0.1:8080".to_string(), 1, None)
         .unwrap();
     manager
-        .register_worker(ShardGroupId::new(1), worker2, "127.0.0.1:8081".to_string(), 1, None)
+        .register_worker(&group_name("root"), worker2, "127.0.0.1:8081".to_string(), 1, None)
         .unwrap();
     manager
-        .register_worker(ShardGroupId::new(1), worker3, "127.0.0.1:8082".to_string(), 1, None)
+        .register_worker(&group_name("root"), worker3, "127.0.0.1:8082".to_string(), 1, None)
         .unwrap();
     manager
-        .register_worker(ShardGroupId::new(1), worker4, "127.0.0.1:8083".to_string(), 1, None)
+        .register_worker(&group_name("root"), worker4, "127.0.0.1:8083".to_string(), 1, None)
         .unwrap();
 
     // Send heartbeats to make all workers live.
     let worker1_run_id = record_heartbeat(
         &manager,
-        ShardGroupId::new(1),
+        &group_name("root"),
         worker1,
         1000,
         500,
@@ -556,7 +563,7 @@ async fn test_replication_check_triggers_repair() {
     );
     record_heartbeat(
         &manager,
-        ShardGroupId::new(1),
+        &group_name("root"),
         worker2,
         1000,
         500,
@@ -567,7 +574,7 @@ async fn test_replication_check_triggers_repair() {
     );
     record_heartbeat(
         &manager,
-        ShardGroupId::new(1),
+        &group_name("root"),
         worker3,
         1000,
         500,
@@ -578,7 +585,7 @@ async fn test_replication_check_triggers_repair() {
     );
     record_heartbeat(
         &manager,
-        ShardGroupId::new(1),
+        &group_name("root"),
         worker4,
         1000,
         500,
@@ -590,7 +597,7 @@ async fn test_replication_check_triggers_repair() {
 
     receive_full_report(
         &manager,
-        ShardGroupId::new(1),
+        &group_name("root"),
         worker1,
         worker1_run_id,
         1,

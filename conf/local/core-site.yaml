@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Vecton Contributors
+
+# Local one-metadata, one-worker debug profile.
+
+vecton.cluster.id: "local-vecton"
+
+metadata.group.name: "root"
+metadata.storage.dir: "/tmp/vecton-debug/metadata"
+metadata.rpc.addr: "127.0.0.1"
+metadata.rpc.port: 18080
+metadata.http.bind: "127.0.0.1:18081"
+metadata.raft.mode: "single"
+metadata.raft.node_id: 1
+metadata.bootstrap.ready.timeout_ms: 10000
+metadata.bootstrap.ready.warn_after_ms: 1000
+metadata.bootstrap.ready.fail_fast: true
+
+metadata.authz.filesystem.mode: "NONE"
+metadata.repair.max_queue_size: 10000
+metadata.repair.max_attempts: 3
+metadata.repair.inflight_timeout_ms: 300000
+metadata.repair.initial_backoff_ms: 1000
+metadata.repair.max_backoff_ms: 60000
+metadata.repair.worker_inflight_limit: 4
+
+worker.identity.path: "/tmp/vecton-debug/worker/worker.identity"
+worker.storage.root: "/tmp/vecton-debug/worker"
+worker.rpc.bind: "127.0.0.1:19090"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:19090"
+worker.http.bind: "127.0.0.1:19091"
+worker.metadata.group.name: "root"
+worker.metadata.endpoints: "http://127.0.0.1:18080"
+worker.rpc.max_inflight: 100
+worker.default_frame_size: "1MB"
+worker.max_frame_size: "4MB"
+worker.window_bytes: "8MB"
+worker.stream.idle_timeout_ms: 60000
+worker.metadata.register_timeout_ms: 5000
+worker.metadata.register_retry_initial_backoff_ms: 200
+worker.metadata.register_retry_max_backoff_ms: 5000

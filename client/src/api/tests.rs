@@ -34,7 +34,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use types::lease::FencingToken;
 use types::{
-    BlockId, BlockIndex, ClientId, DataHandleId, FileBlockLocation, InodeId, WorkerEndpointInfo, WorkerId,
+    BlockId, BlockIndex, ClientId, DataHandleId, FileBlockLocation, GroupName, InodeId, WorkerEndpointInfo, WorkerId,
     WorkerNetProtocol, WriteTarget,
 };
 
@@ -43,7 +43,7 @@ type EventLog = Arc<Mutex<Vec<&'static str>>>;
 #[tokio::test]
 async fn open_returns_reader_from_metadata_snapshot() {
     let gateway = Arc::new(MockGateway::default());
-    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+    let client = FsClient::with_metadata_gateway(test_config("root"), gateway.clone()).expect("client");
 
     let reader = client
         .open("/alpha", OpenOptions::default())
@@ -60,7 +60,7 @@ async fn open_returns_reader_from_metadata_snapshot() {
 #[tokio::test]
 async fn create_returns_writer_and_maps_create_disposition() {
     let gateway = Arc::new(MockGateway::default());
-    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+    let client = FsClient::with_metadata_gateway(test_config("root"), gateway.clone()).expect("client");
 
     let writer = client
         .create("/created", CreateOptions::create())
@@ -79,7 +79,7 @@ async fn create_returns_writer_and_maps_create_disposition() {
 #[tokio::test]
 async fn create_options_default_maps_current_layout_defaults() {
     let gateway = Arc::new(MockGateway::default());
-    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+    let client = FsClient::with_metadata_gateway(test_config("root"), gateway.clone()).expect("client");
 
     client
         .create("/created", CreateOptions::default())
@@ -94,7 +94,7 @@ async fn create_options_default_maps_current_layout_defaults() {
 #[tokio::test]
 async fn create_options_custom_layout_maps_to_create_request() {
     let gateway = Arc::new(MockGateway::default());
-    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+    let client = FsClient::with_metadata_gateway(test_config("root"), gateway.clone()).expect("client");
 
     client
         .create(
@@ -123,7 +123,7 @@ async fn create_options_custom_layout_maps_to_create_request() {
 #[tokio::test]
 async fn create_rejects_missing_response_layout() {
     let gateway = Arc::new(MockGateway::with_create_response_layout(None));
-    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+    let client = FsClient::with_metadata_gateway(test_config("root"), gateway.clone()).expect("client");
 
     let err = client
         .create("/created", CreateOptions::create())
@@ -143,7 +143,7 @@ async fn create_rejects_invalid_response_layout() {
         0,
         DEFAULT_CHUNK_SIZE,
     ))));
-    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+    let client = FsClient::with_metadata_gateway(test_config("root"), gateway.clone()).expect("client");
 
     let err = client
         .create("/created", CreateOptions::create())
@@ -160,7 +160,7 @@ async fn create_rejects_invalid_response_layout() {
 #[tokio::test]
 async fn overwrite_returns_writer_and_maps_overwrite_disposition() {
     let gateway = Arc::new(MockGateway::default());
-    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+    let client = FsClient::with_metadata_gateway(test_config("root"), gateway.clone()).expect("client");
 
     let writer = client
         .create("/overwrite", CreateOptions::overwrite())
@@ -179,7 +179,7 @@ async fn overwrite_returns_writer_and_maps_overwrite_disposition() {
 #[tokio::test]
 async fn overwrite_preserves_custom_create_layout_mapping() {
     let gateway = Arc::new(MockGateway::default());
-    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+    let client = FsClient::with_metadata_gateway(test_config("root"), gateway.clone()).expect("client");
 
     client
         .create(
@@ -212,7 +212,7 @@ async fn overwrite_preserves_custom_create_layout_mapping() {
 #[tokio::test]
 async fn append_returns_writer_from_metadata_session() {
     let gateway = Arc::new(MockGateway::default());
-    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+    let client = FsClient::with_metadata_gateway(test_config("root"), gateway.clone()).expect("client");
 
     let writer = client
         .append("/append", AppendOptions::default())
@@ -229,7 +229,7 @@ async fn append_returns_writer_from_metadata_session() {
 #[tokio::test]
 async fn append_rejects_missing_response_layout() {
     let gateway = Arc::new(MockGateway::with_append_response_layout(None));
-    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+    let client = FsClient::with_metadata_gateway(test_config("root"), gateway.clone()).expect("client");
 
     let err = client
         .append("/append", AppendOptions::default())
@@ -248,7 +248,7 @@ async fn append_rejects_invalid_response_layout() {
     let gateway = Arc::new(MockGateway::with_append_response_layout(Some(recorded_layout_values(
         8, 3,
     ))));
-    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+    let client = FsClient::with_metadata_gateway(test_config("root"), gateway.clone()).expect("client");
 
     let err = client
         .append("/append", AppendOptions::default())
@@ -265,7 +265,7 @@ async fn append_rejects_invalid_response_layout() {
 #[tokio::test]
 async fn stat_list_delete_and_rename_use_metadata_gateway() {
     let gateway = Arc::new(MockGateway::default());
-    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+    let client = FsClient::with_metadata_gateway(test_config("root"), gateway.clone()).expect("client");
 
     let status = client.stat("/alpha").await.expect("stat");
     let listing = client.list("/alpha", ListOptions::default()).await.expect("list");
@@ -294,7 +294,7 @@ async fn stat_list_delete_and_rename_use_metadata_gateway() {
 #[tokio::test]
 async fn list_options_map_to_metadata_request() {
     let gateway = Arc::new(MockGateway::default());
-    let client = FsClient::with_metadata_gateway(test_config(9), gateway.clone()).expect("client");
+    let client = FsClient::with_metadata_gateway(test_config("root"), gateway.clone()).expect("client");
 
     client
         .list(
@@ -319,7 +319,8 @@ async fn list_options_map_to_metadata_request() {
 async fn reader_empty_ranges_do_not_use_worker_io() {
     let gateway = Arc::new(MockGateway::default());
     let worker = Arc::new(MockDataClient::default());
-    let client = FsClient::with_data_boundary(test_config(9), gateway, data_boundary(worker.clone())).expect("client");
+    let client =
+        FsClient::with_data_boundary(test_config("root"), gateway, data_boundary(worker.clone())).expect("client");
     let reader = read_reader(&client, 10);
 
     assert!(reader.read_at(0, 0).await.expect("zero read").is_empty());
@@ -330,7 +331,7 @@ async fn reader_empty_ranges_do_not_use_worker_io() {
 #[tokio::test]
 async fn reader_reads_normal_range_through_planner_and_worker() {
     let gateway = Arc::new(MockGateway::with_layout(layout_response(
-        9,
+        "root",
         101,
         202,
         Some(3),
@@ -338,7 +339,8 @@ async fn reader_reads_normal_range_through_planner_and_worker() {
         vec![location(202, 0, 0, 16)],
     )));
     let worker = Arc::new(MockDataClient::from_file(b"abcdefghijklmnop"));
-    let client = FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker)).expect("client");
+    let client =
+        FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker)).expect("client");
     let reader = read_reader(&client, 16);
 
     let bytes = reader.read_at(2, 5).await.expect("read succeeds");
@@ -356,7 +358,7 @@ async fn reader_reads_normal_range_through_planner_and_worker() {
 #[tokio::test]
 async fn reader_repeated_reads_fetch_current_metadata_locations() {
     let gateway = Arc::new(MockGateway::with_layout(layout_response(
-        9,
+        "root",
         101,
         202,
         Some(3),
@@ -364,7 +366,8 @@ async fn reader_repeated_reads_fetch_current_metadata_locations() {
         vec![location(202, 0, 0, 16)],
     )));
     let worker = Arc::new(MockDataClient::from_file(b"abcdefghijklmnop"));
-    let client = FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker)).expect("client");
+    let client =
+        FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker)).expect("client");
     let reader = read_reader(&client, 16);
 
     let first = reader.read_at(2, 5).await.expect("first read succeeds");
@@ -378,7 +381,7 @@ async fn reader_repeated_reads_fetch_current_metadata_locations() {
 #[tokio::test]
 async fn concurrent_reader_reads_fetch_layout_per_call() {
     let gateway = Arc::new(MockGateway::with_layout(layout_response(
-        9,
+        "root",
         101,
         202,
         Some(3),
@@ -386,7 +389,8 @@ async fn concurrent_reader_reads_fetch_layout_per_call() {
         vec![location(202, 0, 0, 16)],
     )));
     let worker = Arc::new(MockDataClient::from_file(b"abcdefghijklmnop"));
-    let client = FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker)).expect("client");
+    let client =
+        FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker)).expect("client");
     let reader = read_reader(&client, 16);
 
     let first = {
@@ -409,7 +413,7 @@ async fn concurrent_reader_reads_fetch_layout_per_call() {
 #[tokio::test]
 async fn reader_replans_after_worker_refresh() {
     let gateway = Arc::new(MockGateway::with_layout(layout_response(
-        9,
+        "root",
         101,
         202,
         Some(3),
@@ -420,7 +424,8 @@ async fn reader_replans_after_worker_refresh() {
         b"abcdefghijklmnop",
         RefreshReason::WorkerRunMismatch,
     ));
-    let client = FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker)).expect("client");
+    let client =
+        FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker)).expect("client");
     let reader = read_reader(&client, 16);
 
     let bytes = reader.read_at(1, 3).await.expect("read succeeds after refresh");
@@ -432,7 +437,7 @@ async fn reader_replans_after_worker_refresh() {
 #[tokio::test]
 async fn writer_debug_redacts_write_session_identity_names() {
     let gateway = Arc::new(MockGateway::default());
-    let client = FsClient::with_metadata_gateway(test_config(9), gateway).expect("client");
+    let client = FsClient::with_metadata_gateway(test_config("root"), gateway).expect("client");
     let writer = client
         .create("/created", CreateOptions::create())
         .await
@@ -463,8 +468,8 @@ async fn writer_debug_redacts_write_session_identity_names() {
 async fn writer_write_all_and_close_commit_final_size() {
     let gateway = Arc::new(MockGateway::default());
     let worker = Arc::new(MockDataClient::default());
-    let client =
-        FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone())).expect("client");
+    let client = FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker.clone()))
+        .expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
         .await
@@ -488,8 +493,8 @@ async fn writer_create_uses_metadata_layout_block_size_for_chunking() {
     let layout = recorded_layout_values(8, 4);
     let gateway = Arc::new(MockGateway::default());
     let worker = Arc::new(MockDataClient::default());
-    let client =
-        FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone())).expect("client");
+    let client = FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker.clone()))
+        .expect("client");
     let mut writer = client
         .create(
             "/created",
@@ -523,8 +528,8 @@ async fn writer_append_uses_metadata_layout_block_size_for_chunking() {
     let layout = recorded_layout_values(6, 3);
     let gateway = Arc::new(MockGateway::with_append_write_layout(layout));
     let worker = Arc::new(MockDataClient::default());
-    let client =
-        FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone())).expect("client");
+    let client = FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker.clone()))
+        .expect("client");
     let mut writer = client
         .append("/append", AppendOptions::default())
         .await
@@ -557,8 +562,8 @@ async fn writer_append_uses_metadata_layout_block_size_for_chunking() {
 async fn writer_default_create_layout_uses_default_block_size_for_chunking() {
     let gateway = Arc::new(MockGateway::default());
     let worker = Arc::new(MockDataClient::without_recorded_body());
-    let client =
-        FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone())).expect("client");
+    let client = FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker.clone()))
+        .expect("client");
     let mut writer = client
         .create("/created", CreateOptions::default())
         .await
@@ -586,8 +591,8 @@ async fn writer_default_create_layout_uses_default_block_size_for_chunking() {
 async fn writer_multiple_sequential_writes_preserve_cursor_and_final_size() {
     let gateway = Arc::new(MockGateway::default());
     let worker = Arc::new(MockDataClient::default());
-    let client =
-        FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone())).expect("client");
+    let client = FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker.clone()))
+        .expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
         .await
@@ -613,8 +618,8 @@ async fn writer_multiple_sequential_writes_preserve_cursor_and_final_size() {
 async fn writer_visibility_sync_publishes_prefix_and_keeps_writer_usable() {
     let gateway = Arc::new(MockGateway::default());
     let worker = Arc::new(MockDataClient::default());
-    let client =
-        FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone())).expect("client");
+    let client = FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker.clone()))
+        .expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
         .await
@@ -646,8 +651,8 @@ async fn writer_visibility_sync_publishes_prefix_and_keeps_writer_usable() {
 async fn writer_durability_sync_publishes_prefix_and_keeps_writer_usable() {
     let gateway = Arc::new(MockGateway::default());
     let worker = Arc::new(MockDataClient::default());
-    let client =
-        FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone())).expect("client");
+    let client = FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker.clone()))
+        .expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
         .await
@@ -679,8 +684,8 @@ async fn writer_durability_sync_publishes_prefix_and_keeps_writer_usable() {
 async fn writer_durability_after_visibility_uses_sync_committed_block() {
     let gateway = Arc::new(MockGateway::default());
     let worker = Arc::new(MockDataClient::default());
-    let client =
-        FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone())).expect("client");
+    let client = FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker.clone()))
+        .expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
         .await
@@ -711,7 +716,7 @@ async fn writer_durability_after_visibility_uses_sync_committed_block() {
 async fn writer_renew_lease_updates_session_state() {
     let gateway = Arc::new(MockGateway::default());
     let worker = Arc::new(MockDataClient::default());
-    let client = FsClient::with_data_boundary(test_config(9), gateway, data_boundary(worker)).expect("client");
+    let client = FsClient::with_data_boundary(test_config("root"), gateway, data_boundary(worker)).expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
         .await
@@ -729,8 +734,8 @@ async fn writer_abort_cleans_worker_then_metadata_and_blocks_session() {
     let events = event_log();
     let gateway = Arc::new(MockGateway::with_events(events.clone()));
     let worker = Arc::new(MockDataClient::with_events(events.clone()));
-    let client =
-        FsClient::with_data_boundary(test_config(9), gateway.clone(), data_boundary(worker.clone())).expect("client");
+    let client = FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker.clone()))
+        .expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
         .await
@@ -754,8 +759,12 @@ async fn writer_unknown_add_block_blocks_followup_writes() {
         AddBlockOutcome::TransportUnknown,
     ]));
     let worker = Arc::new(MockDataClient::default());
-    let client = FsClient::with_data_boundary(test_config_with_retries(9, 0), gateway.clone(), data_boundary(worker))
-        .expect("client");
+    let client = FsClient::with_data_boundary(
+        test_config_with_retries("root", 0),
+        gateway.clone(),
+        data_boundary(worker),
+    )
+    .expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
         .await
@@ -779,7 +788,7 @@ async fn writer_unknown_add_block_blocks_followup_writes() {
 async fn writer_session_expiry_blocks_followup_writes() {
     let gateway = Arc::new(MockGateway::with_renew_outcomes(vec![RenewOutcome::SessionExpired]));
     let worker = Arc::new(MockDataClient::default());
-    let client = FsClient::with_data_boundary(test_config(9), gateway, data_boundary(worker)).expect("client");
+    let client = FsClient::with_data_boundary(test_config("root"), gateway, data_boundary(worker)).expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
         .await
@@ -806,6 +815,10 @@ fn method_count(calls: &[RecordedCall], method: &str) -> usize {
     calls.iter().filter(|call| call.method == method).count()
 }
 
+fn group_name_from(raw: &str) -> GroupName {
+    GroupName::parse(raw).unwrap()
+}
+
 fn assert_event_order(events: &EventLog, before: &'static str, after: &'static str) {
     let events = events.lock().expect("events");
     let before_index = events
@@ -822,18 +835,18 @@ fn assert_event_order(events: &EventLog, before: &'static str, after: &'static s
     );
 }
 
-fn test_config(group_id: u64) -> ClientConfig {
+fn test_config(group_name: &str) -> ClientConfig {
     let mut config = ClientConfig {
         metadata_endpoints: vec!["http://127.0.0.1:18080".to_string()],
-        metadata_group_ids: vec![group_id],
+        metadata_group_names: vec![group_name_from(group_name)],
         ..ClientConfig::default()
     };
     config.inner.inner.set("client.id", 7i64);
     config
 }
 
-fn test_config_with_retries(group_id: u64, max_retries: usize) -> ClientConfig {
-    let mut config = test_config(group_id);
+fn test_config_with_retries(group_name: &str, max_retries: usize) -> ClientConfig {
+    let mut config = test_config(group_name);
     config.retry.max_retries = max_retries;
     config.retry.max_retry_attempts = max_retries;
     config.retry.metadata_retry_budget = max_retries;
@@ -845,7 +858,7 @@ fn test_config_with_retries(group_id: u64, max_retries: usize) -> ClientConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RecordedCall {
     method: &'static str,
-    group_id: u64,
+    group_name: GroupName,
     call_id: String,
     target_data_handle_id: Option<u64>,
     range: Option<(u64, u32)>,
@@ -1002,7 +1015,7 @@ impl MockGateway {
         let header = ctx.metadata_header().expect("metadata header");
         self.calls.lock().expect("calls").push(RecordedCall {
             method,
-            group_id: header.group_id,
+            group_name: group_name_from(&header.group_name),
             call_id: header.client.as_ref().expect("client").call_id.clone(),
             target_data_handle_id: None,
             range: None,
@@ -1021,7 +1034,7 @@ impl MockGateway {
         let header = ctx.metadata_header().expect("metadata header");
         self.calls.lock().expect("calls").push(RecordedCall {
             method: "create_file",
-            group_id: header.group_id,
+            group_name: group_name_from(&header.group_name),
             call_id: header.client.as_ref().expect("client").call_id.clone(),
             target_data_handle_id: None,
             range: None,
@@ -1045,7 +1058,7 @@ impl MockGateway {
         let range = req.range.as_ref().map(|range| (range.offset, range.len));
         self.calls.lock().expect("calls").push(RecordedCall {
             method: "read_layout",
-            group_id: header.group_id,
+            group_name: group_name_from(&header.group_name),
             call_id: header.client.as_ref().expect("client").call_id.clone(),
             target_data_handle_id,
             range,
@@ -1065,7 +1078,7 @@ impl MockGateway {
         let header = ctx.metadata_header().expect("metadata header");
         self.calls.lock().expect("calls").push(RecordedCall {
             method: "commit_file",
-            group_id: header.group_id,
+            group_name: group_name_from(&header.group_name),
             call_id: header.client.as_ref().expect("client").call_id.clone(),
             target_data_handle_id: req.data_handle_id.as_ref().map(|id| id.value),
             range: None,
@@ -1084,7 +1097,7 @@ impl MockGateway {
         let header = ctx.metadata_header().expect("metadata header");
         self.calls.lock().expect("calls").push(RecordedCall {
             method: "sync_write",
-            group_id: header.group_id,
+            group_name: group_name_from(&header.group_name),
             call_id: header.client.as_ref().expect("client").call_id.clone(),
             target_data_handle_id: req.data_handle_id.as_ref().map(|id| id.value),
             range: None,
@@ -1103,7 +1116,7 @@ impl MockGateway {
         let header = ctx.metadata_header().expect("metadata header");
         self.calls.lock().expect("calls").push(RecordedCall {
             method: "add_block",
-            group_id: header.group_id,
+            group_name: group_name_from(&header.group_name),
             call_id: header.client.as_ref().expect("client").call_id.clone(),
             target_data_handle_id: None,
             range: None,
@@ -1178,7 +1191,7 @@ impl MetadataGateway for MockGateway {
         Ok(layouts
             .front()
             .cloned()
-            .unwrap_or_else(|| layout_response(9, 101, 202, Some(3), 10, Vec::new())))
+            .unwrap_or_else(|| layout_response("root", 101, 202, Some(3), 10, Vec::new())))
     }
 
     async fn create_file(&self, ctx: AttemptContext, req: CreateFileOp) -> ClientResult<WriteSessionSeed> {
@@ -1262,7 +1275,7 @@ impl MetadataGateway for MockGateway {
             .expect("fencing block");
         let header = ctx.metadata_header().expect("metadata header");
         Ok(AddBlockResult {
-            group_id: header.group_id,
+            group_name: group_name_from(&header.group_name),
             target: write_target_with_layout(data_handle_id, block_index, offset, len, layout),
         })
     }
@@ -1419,7 +1432,7 @@ impl WorkerDataClient for MockDataClient {
     async fn read_segment(
         &self,
         _ctx: AttemptContext,
-        _group_id: u64,
+        _group_name: GroupName,
         segment: &PlannedReadSegment,
     ) -> ClientResult<Bytes> {
         let call_number = {
@@ -1445,7 +1458,7 @@ impl WorkerDataClient for MockDataClient {
             *calls
         };
         Ok(WorkerWriteBlock {
-            group_id: target.group_id,
+            group_name: target.group_name,
             worker: worker_endpoint(),
             target: target.target,
             stream_id: proto::common::StreamIdProto {
@@ -1547,7 +1560,7 @@ fn read_reader(client: &FsClient, file_size: u64) -> FileReader {
 }
 
 fn layout_response(
-    group_id: u64,
+    group_name: &str,
     inode_id: u64,
     data_handle_id: u64,
     file_version: Option<u64>,
@@ -1555,7 +1568,7 @@ fn layout_response(
     locations: Vec<FileBlockLocation>,
 ) -> LayoutSnapshot {
     LayoutSnapshot {
-        group_id,
+        group_name: group_name_from(group_name),
         inode_id: InodeId::new(inode_id),
         data_handle_id: DataHandleId::new(data_handle_id),
         file_size,

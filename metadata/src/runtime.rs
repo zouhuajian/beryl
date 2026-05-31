@@ -3,14 +3,13 @@
 
 //! Runtime composition root for the metadata binary.
 
-use crate::ensure_root_mount;
 use crate::inflight_registry::InflightRegistry;
 use crate::maintenance::delete::{DeleteExecutor, DeleteExecutorHandle};
 use crate::maintenance::repair::{OrphanQueue, RepairPlanner, RepairPolicy, RepairQueue};
 use crate::maintenance::{MaintenanceHandle, MaintenanceService};
 use crate::metrics::MetadataMetrics;
 use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
-use crate::readiness::{wait_for_root_ready_with_metrics, RootReadinessGate};
+use crate::readiness::{wait_for_root_ready_with_inputs, RootReadinessGate, RootReadinessLogFields, RootReadyInputs};
 use crate::service::{
     filesystem_permission_checker, FileSystemAuthorityDeps, FileSystemPolicyDeps, FileSystemRuntimeDeps,
     MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl, SharedWorkerCommitHook,
@@ -30,7 +29,7 @@ use tonic::transport as tonic_net;
 use tonic_health::pb::health_server::HealthServer;
 use tonic_health::server::{HealthReporter, HealthService};
 use tracing::info;
-use types::ids::ShardGroupId;
+use types::GroupName;
 
 pub type DynError = Box<dyn std::error::Error>;
 
@@ -48,7 +47,7 @@ pub struct MetadataAuthority {
     pub raft_node: Arc<AppRaftNode>,
     pub state_store: Arc<dyn crate::state::StateStore>,
     pub metadata_metrics: Arc<MetadataMetrics>,
-    pub shard_group_id: ShardGroupId,
+    pub group_name: GroupName,
 }
 
 /// Required worker runtime soft state shared by worker RPC and background work.
@@ -152,7 +151,7 @@ impl WorkerRuntime {
             Arc::clone(&authority.raft_node),
             Arc::clone(&self.manager),
             Arc::clone(&authority.mount_table),
-            authority.shard_group_id,
+            authority.group_name.clone(),
         );
         service.set_slot_metrics(Arc::clone(&authority.metadata_metrics));
 
@@ -177,6 +176,7 @@ pub struct MetadataServer {
 impl MetadataServer {
     /// Builds long-lived metadata runtime objects in startup dependency order.
     pub async fn build(config: Arc<MetadataConfig>) -> Result<Self, DynError> {
+        crate::lifecycle::prepare_metadata_start(config.as_ref()).await?;
         let authority = build_authority(config.as_ref()).await?;
         let maintenance_repair = build_maintenance_repair_state(config.as_ref());
         let (worker, mut worker_service) = build_worker_runtime(&authority, &maintenance_repair);
@@ -222,7 +222,8 @@ pub fn load_config() -> Result<Arc<MetadataConfig>, DynError> {
 
 /// Initializes process-wide observability after configuration has been loaded.
 pub fn init_observability(config: &MetadataConfig) -> Result<Observability, DynError> {
-    let obs_config = ObservabilityConfig::default();
+    let mut obs_config = ObservabilityConfig::default();
+    obs_config.metrics.prometheus.bind = config.http_bind.to_string();
     let service_info = ServiceInfo {
         name: "metadata".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -234,11 +235,12 @@ pub fn init_observability(config: &MetadataConfig) -> Result<Observability, DynE
 
     info!(
         rpc_addr = %config.rpc_addr,
+        http_bind = %config.http_bind,
         storage_dir = %config.storage_dir.display(),
         authz_filesystem_mode = ?config.authz.filesystem.mode,
         node_id = config.raft.node_id,
-        peers_count = config.raft.peers.len(),
-        authority_group_id = config.authority.group_id,
+        raft_mode = ?config.raft.mode,
+        authority_group_name = %config.authority.group_name,
         "Configuration loaded (sensitive values redacted)"
     );
 
@@ -250,7 +252,9 @@ pub fn init_observability(config: &MetadataConfig) -> Result<Observability, DynE
 /// Builds authoritative storage, mount, raft, and state-store dependencies in startup order.
 pub async fn build_authority(config: &MetadataConfig) -> Result<MetadataAuthority, DynError> {
     let db_path = effective_storage_dir(config);
-    let storage = Arc::new(RocksDBStorage::open(&db_path).map_err(|e| format!("Failed to initialize RocksDB: {e}"))?);
+    let storage = Arc::new(
+        RocksDBStorage::open_existing_for_start(&db_path).map_err(|e| format!("Failed to initialize RocksDB: {e}"))?,
+    );
 
     let mount_table = Arc::new(
         MountTable::load_from_storage(storage.as_ref())
@@ -270,11 +274,6 @@ pub async fn build_authority(config: &MetadataConfig) -> Result<MetadataAuthorit
         .map_err(|e| format!("Failed to initialize Raft node: {e}"))?,
     );
 
-    let authority_group_id = ShardGroupId::new(config.authority.group_id);
-    ensure_root_mount(Arc::clone(&raft_node), Arc::clone(&mount_table), authority_group_id)
-        .await
-        .map_err(|e| format!("Failed to ensure root mount: {e}"))?;
-
     let state_store: Arc<dyn crate::state::StateStore> = Arc::new(RaftStateStore::new(Arc::clone(&raft_node)));
 
     Ok(MetadataAuthority {
@@ -283,7 +282,7 @@ pub async fn build_authority(config: &MetadataConfig) -> Result<MetadataAuthorit
         raft_node,
         state_store,
         metadata_metrics: Arc::new(MetadataMetrics::new()),
-        shard_group_id: authority_group_id,
+        group_name: config.authority.group_name.clone(),
     })
 }
 
@@ -373,17 +372,27 @@ pub async fn build_readiness(config: &MetadataConfig, authority: &MetadataAuthor
     let readiness_gate_clone = Arc::clone(&readiness_gate);
     let mount_table_clone = Arc::clone(&authority.mount_table);
     let raft_node_clone = Arc::clone(&authority.raft_node);
-    let shard_group_id = authority.shard_group_id;
+    let storage_clone = Arc::clone(&authority.storage);
+    let group_name = authority.group_name.clone();
     let metrics = Arc::clone(&authority.metadata_metrics);
+    let fail_fast = config.bootstrap.root_readiness.fail_fast;
+    let log_fields = RootReadinessLogFields {
+        cluster_id: config.cluster_id.clone(),
+        group_name: config.authority.group_name.to_string(),
+        node_id: config.raft.node_id,
+        storage_dir: config.storage_dir.display().to_string(),
+    };
     let readiness_watcher = tokio::spawn(async move {
-        let result = wait_for_root_ready_with_metrics(
-            raft_node_clone,
-            mount_table_clone,
-            shard_group_id,
-            readiness_gate_clone,
-            readiness_config,
-            Some(metrics),
-        )
+        let result = wait_for_root_ready_with_inputs(RootReadyInputs {
+            raft_node: raft_node_clone,
+            mount_table: mount_table_clone,
+            storage: Some(storage_clone),
+            namespace_owner_group_name: group_name,
+            readiness_gate: readiness_gate_clone,
+            config: readiness_config,
+            metrics: Some(metrics),
+            log_fields,
+        })
         .await;
         match result {
             Ok(()) => {
@@ -393,6 +402,9 @@ pub async fn build_readiness(config: &MetadataConfig, authority: &MetadataAuthor
             }
             Err(err) => {
                 tracing::error!(error = %err, "Root readiness watcher failed");
+                if fail_fast {
+                    std::process::exit(1);
+                }
             }
         }
     });
@@ -428,7 +440,7 @@ pub async fn build_filesystem_service(
             mount_table: Arc::clone(&authority.mount_table),
             storage: Arc::clone(&authority.storage),
             raft_node: Some(Arc::clone(&authority.raft_node)),
-            shard_group_id: authority.shard_group_id,
+            group_name: authority.group_name.clone(),
         },
         runtime: FileSystemRuntimeDeps {
             write_session_manager,
@@ -516,21 +528,19 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use crate::config::{BootstrapConfig, MetadataAuthorityConfig, MetadataAuthzConfig, RaftConfig, WorkerConfig};
+    use crate::ensure_root_mount_for_format;
     use common::error::canonical::{ErrorClass, ErrorCode, RefreshReason};
     use common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
     use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
     use proto::metadata::{MsyncRequestProto, MsyncResponseProto};
     use tempfile::TempDir;
-    use types::{ClientId, GroupStateWatermark, RaftLogId};
+    use types::{ClientId, GroupName, GroupStateWatermark, RaftLogId};
 
     async fn test_authority(dir: &TempDir) -> MetadataAuthority {
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::load_from_storage(storage.as_ref()).unwrap());
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
-        let raft_config = RaftConfig {
-            node_id: 1,
-            peers: vec!["127.0.0.1:0".to_string()],
-        };
+        let raft_config = RaftConfig::default();
         let raft_node = Arc::new(
             AppRaftNode::new(
                 raft_config.node_id,
@@ -541,9 +551,13 @@ mod tests {
             .await
             .unwrap(),
         );
+        raft_node
+            .initialize_single_node("127.0.0.1:0".to_string())
+            .await
+            .unwrap();
 
-        let shard_group_id = ShardGroupId::new(1);
-        ensure_root_mount(Arc::clone(&raft_node), Arc::clone(&mount_table), shard_group_id)
+        let group_name = GroupName::parse("root").unwrap();
+        ensure_root_mount_for_format(Arc::clone(&raft_node), Arc::clone(&mount_table), group_name.clone())
             .await
             .unwrap();
 
@@ -553,7 +567,7 @@ mod tests {
             raft_node: Arc::clone(&raft_node),
             state_store: Arc::new(RaftStateStore::new(raft_node)),
             metadata_metrics: Arc::new(MetadataMetrics::new()),
-            shard_group_id,
+            group_name,
         }
     }
 
@@ -570,13 +584,10 @@ mod tests {
     }
 
     async fn nonleader_filesystem_service(dir: &TempDir) -> MetadataFileSystemServiceImpl {
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::load_from_storage(storage.as_ref()).unwrap());
         let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
-        let raft_config = RaftConfig {
-            node_id: 1,
-            peers: Vec::new(),
-        };
+        let raft_config = RaftConfig::default();
         let raft_node = Arc::new(
             AppRaftNode::new(raft_config.node_id, Arc::clone(&storage), state_machine, &raft_config)
                 .await
@@ -588,7 +599,7 @@ mod tests {
                 mount_table,
                 storage,
                 raft_node: Some(raft_node),
-                shard_group_id: ShardGroupId::new(1),
+                group_name: GroupName::parse("root").unwrap(),
             },
             runtime: FileSystemRuntimeDeps {
                 write_session_manager: Arc::new(crate::write_session::WriteSessionManager::default()),
@@ -628,14 +639,15 @@ mod tests {
 
     fn test_config() -> MetadataConfig {
         MetadataConfig {
+            cluster_id: "local".to_string(),
             rpc_addr: "127.0.0.1:18080".parse().unwrap(),
+            http_bind: "127.0.0.1:18081".parse().unwrap(),
             storage_dir: std::path::PathBuf::from("data/metadata"),
             authz: MetadataAuthzConfig::default(),
-            raft: RaftConfig {
-                node_id: 1,
-                peers: vec!["127.0.0.1:0".to_string()],
+            raft: RaftConfig::default(),
+            authority: MetadataAuthorityConfig {
+                group_name: GroupName::parse("root").unwrap(),
             },
-            authority: MetadataAuthorityConfig { group_id: 1 },
             worker: WorkerConfig::default(),
             bootstrap: BootstrapConfig {
                 root_readiness: crate::readiness::RootReadinessConfig::default(),
@@ -696,21 +708,21 @@ mod tests {
         let service = build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
             .await
             .unwrap();
-        let group_id = ShardGroupId::new(1);
+        let group_name = GroupName::parse("root").unwrap();
 
         let response = call_msync(
             &service,
-            RequestHeader::new(ClientId::new(7)).with_group_id(group_id.as_raw()),
+            RequestHeader::new(ClientId::new(7)).with_group_name(group_name.clone()),
         )
         .await;
         let header = parse_msync_header(&response);
 
-        assert_eq!(header.group_id, Some(group_id.as_raw()));
+        assert_eq!(header.group_name, Some(group_name.clone()));
         assert!(header.canonical_error.is_none());
         assert!(header.state.is_empty());
         assert_eq!(
             response.state,
-            Some((&GroupStateWatermark::new(group_id, expected_state_id)).into())
+            Some((&GroupStateWatermark::new(group_name, expected_state_id)).into())
         );
     }
 
@@ -726,9 +738,12 @@ mod tests {
         let service = build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
             .await
             .unwrap();
-        let group_id = ShardGroupId::new(1);
-        let mut header = RequestHeader::new(ClientId::new(7)).with_group_id(group_id.as_raw());
-        header.state = vec![GroupStateWatermark::new(group_id, RaftLogId::new(99, 99, u64::MAX))];
+        let group_name = GroupName::parse("root").unwrap();
+        let mut header = RequestHeader::new(ClientId::new(7)).with_group_name(group_name.clone());
+        header.state = vec![GroupStateWatermark::new(
+            group_name.clone(),
+            RaftLogId::new(99, 99, u64::MAX),
+        )];
 
         let response = call_msync(&service, header).await;
         let response_header = parse_msync_header(&response);
@@ -736,12 +751,12 @@ mod tests {
         assert!(response_header.canonical_error.is_none());
         assert_eq!(
             response.state,
-            Some((&GroupStateWatermark::new(group_id, expected_state_id)).into())
+            Some((&GroupStateWatermark::new(group_name, expected_state_id)).into())
         );
     }
 
     #[tokio::test]
-    async fn msync_rejects_missing_header_group_id() {
+    async fn msync_rejects_missing_header_group_name() {
         let dir = TempDir::new().unwrap();
         let authority = test_authority(&dir).await;
         wait_for_leader_state(&authority).await;
@@ -775,11 +790,11 @@ mod tests {
         let service = build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
             .await
             .unwrap();
-        let group_id = ShardGroupId::new(2);
+        let group_name = GroupName::parse("other").unwrap();
 
         let response = call_msync(
             &service,
-            RequestHeader::new(ClientId::new(7)).with_group_id(group_id.as_raw()),
+            RequestHeader::new(ClientId::new(7)).with_group_name(group_name),
         )
         .await;
         let header = parse_msync_header(&response);
@@ -797,7 +812,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let service = nonleader_filesystem_service(&dir).await;
 
-        let response = call_msync(&service, RequestHeader::new(ClientId::new(7)).with_group_id(1)).await;
+        let response = call_msync(
+            &service,
+            RequestHeader::new(ClientId::new(7)).with_group_name(GroupName::parse("root").unwrap()),
+        )
+        .await;
         let header = parse_msync_header(&response);
         let canonical = header.canonical_error.expect("not-leader error");
 
@@ -830,11 +849,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.storage_dir = dir.path().to_path_buf();
+        crate::lifecycle::format_metadata_storage(&config).await.unwrap();
 
         let server = MetadataServer::build(Arc::new(config)).await.unwrap();
 
         assert_eq!(server.config.rpc_addr, "127.0.0.1:18080".parse().unwrap());
-        assert_eq!(server.authority.shard_group_id, ShardGroupId::new(1));
+        assert_eq!(server.authority.group_name, GroupName::parse("root").unwrap());
         assert!(dir.path().join("CURRENT").exists());
         assert!(server
             .authority
@@ -853,6 +873,7 @@ mod tests {
         let configured = TempDir::new().unwrap();
         let mut config = test_config();
         config.storage_dir = configured.path().to_path_buf();
+        crate::lifecycle::format_metadata_storage(&config).await.unwrap();
 
         let authority = build_authority(&config).await.unwrap();
 

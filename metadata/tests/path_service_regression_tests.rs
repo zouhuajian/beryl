@@ -19,7 +19,7 @@ use openraft::{LeaderId, LogId};
 use proto::common::{
     error_detail_proto::Code as ErrorCodeProto, DataHandleIdProto, ErrorClassProto, FsErrnoProto,
     GroupStateWatermarkProto, RaftLogIdProto, RefreshReasonProto, RequestHeaderProto, ResponseHeaderProto,
-    RpcErrorCodeProto, ShardGroupIdProto,
+    RpcErrorCodeProto,
 };
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::{
@@ -32,11 +32,11 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tonic::Request;
 use types::fs::{Extent, FileAttrs, Inode, InodeId};
-use types::ids::{BlockId, BlockIndex, DataHandleId, ShardGroupId, WorkerId};
+use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
 use types::layout::FileLayout;
-use types::{ClientId, RaftLogId, WorkerRunId};
+use types::{ClientId, GroupName, RaftLogId, WorkerRunId};
 
-const TEST_GROUP_ID: u64 = 1;
+const TEST_GROUP_NAME: &str = "root";
 
 struct PathTestEnv {
     _temp_dir: TempDir,
@@ -81,16 +81,20 @@ fn header_with_freshness(
     state: Vec<GroupStateWatermarkProto>,
 ) -> Option<RequestHeaderProto> {
     let mut request_header = header(client_id).expect("request header");
-    request_header.group_id = TEST_GROUP_ID;
+    request_header.group_name = TEST_GROUP_NAME.to_string();
     request_header.mount_epoch = mount_epoch;
     request_header.route_epoch = route_epoch;
     request_header.state = state;
     Some(request_header)
 }
 
-fn watermark_proto(group_id: u64, state_id: RaftLogId) -> GroupStateWatermarkProto {
+fn group_name(raw: &str) -> GroupName {
+    GroupName::parse(raw).unwrap()
+}
+
+fn watermark_proto(group_name: &str, state_id: RaftLogId) -> GroupStateWatermarkProto {
     GroupStateWatermarkProto {
-        group_id: Some(ShardGroupIdProto { value: group_id }),
+        group_name: group_name.to_string(),
         state_id: Some(RaftLogIdProto {
             term: state_id.term,
             leader_node_id: state_id.leader_node_id,
@@ -168,7 +172,7 @@ fn build_env(
     permission_builder: impl FnOnce(&Arc<RocksDBStorage>) -> Arc<dyn PermissionChecker>,
 ) -> PathTestEnv {
     let temp_dir = TempDir::new().expect("create temp dir");
-    let storage = Arc::new(RocksDBStorage::open(temp_dir.path()).expect("open rocksdb"));
+    let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).expect("open rocksdb"));
     let mount_table = Arc::new(MountTable::new());
 
     let (mount_kind, ufs_uri, root_inode_id) = if mount_prefix == "/" {
@@ -186,7 +190,7 @@ fn build_env(
             mount_kind,
             ufs_uri,
             data_io_policy,
-            ShardGroupId::new(1),
+            group_name("root"),
             root_inode_id,
         )
         .expect("create mount");
@@ -211,7 +215,7 @@ fn build_env(
             mount_table: Arc::clone(&mount_table),
             storage: Arc::clone(&storage),
             raft_node: None,
-            shard_group_id: ShardGroupId::new(1),
+            group_name: group_name("root"),
         },
         runtime: FileSystemRuntimeDeps {
             write_session_manager: Arc::clone(&write_session_manager),
@@ -253,7 +257,7 @@ async fn build_env_with_raft_and_workers(
     permission_builder: impl FnOnce(&Arc<RocksDBStorage>) -> Arc<dyn PermissionChecker>,
 ) -> PathTestEnv {
     let temp_dir = TempDir::new().expect("create temp dir");
-    let storage = Arc::new(RocksDBStorage::open(temp_dir.path()).expect("open rocksdb"));
+    let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).expect("open rocksdb"));
     let mount_table = Arc::new(MountTable::new());
 
     let (mount_kind, ufs_uri, root_inode_id) = if mount_prefix == "/" {
@@ -271,7 +275,7 @@ async fn build_env_with_raft_and_workers(
             mount_kind,
             ufs_uri,
             data_io_policy,
-            ShardGroupId::new(1),
+            group_name("root"),
             root_inode_id,
         )
         .expect("create mount");
@@ -285,15 +289,16 @@ async fn build_env_with_raft_and_workers(
         .expect("put root inode");
 
     let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
-    let raft_config = RaftConfig {
-        node_id: 1,
-        peers: vec!["127.0.0.1:0".to_string()],
-    };
+    let raft_config = RaftConfig::default();
     let raft_node = Arc::new(
         AppRaftNode::new(1, Arc::clone(&storage), state_machine, &raft_config)
             .await
             .expect("create raft node"),
     );
+    raft_node
+        .initialize_single_node("127.0.0.1:0".to_string())
+        .await
+        .expect("initialize single-node raft");
     for _ in 0..50 {
         if raft_node.is_leader() {
             break;
@@ -314,7 +319,7 @@ async fn build_env_with_raft_and_workers(
             mount_table: Arc::clone(&mount_table),
             storage: Arc::clone(&storage),
             raft_node: Some(raft_node),
-            shard_group_id: ShardGroupId::new(1),
+            group_name: group_name("root"),
         },
         runtime: FileSystemRuntimeDeps {
             write_session_manager: Arc::clone(&write_session_manager),
@@ -350,24 +355,17 @@ fn worker_manager_for_write_targets() -> Arc<WorkerManager> {
             .parse()
             .expect("valid test worker run id");
         manager
-            .register_worker(ShardGroupId::new(1), worker_id, endpoint.clone(), 1, None)
+            .register_worker(&group_name("root"), worker_id, endpoint.clone(), 1, None)
             .expect("register worker descriptor");
         manager
-            .register_worker_run(
-                ShardGroupId::new(1),
-                worker_id,
-                endpoint.clone(),
-                1,
-                worker_run_id,
-                None,
-            )
+            .register_worker_run(&group_name("root"), worker_id, endpoint.clone(), 1, worker_run_id, None)
             .expect("register worker run");
         manager
-            .register_worker(ShardGroupId::new(1), worker_id, endpoint.clone(), 1, None)
+            .register_worker(&group_name("root"), worker_id, endpoint.clone(), 1, None)
             .expect("restore worker descriptor");
         manager
             .record_heartbeat(
-                ShardGroupId::new(1),
+                &group_name("root"),
                 worker_id,
                 worker_run_id,
                 1,
@@ -544,10 +542,10 @@ async fn stale_mount_epoch_returns_need_refresh_header_with_consumable_mount_hin
         RpcErrorCodeProto::RpcErrCodeMountEpochMismatch,
         RefreshReasonProto::RefreshReasonMountEpochMismatch,
     );
-    assert_eq!(response_header.group_id, TEST_GROUP_ID);
+    assert_eq!(response_header.group_name, TEST_GROUP_NAME);
     assert_eq!(response_header.mount_epoch, Some(1));
     let hint = err.refresh_hint.expect("refresh hint");
-    assert_eq!(hint.group_id, Some(TEST_GROUP_ID));
+    assert_eq!(hint.group_name, Some(TEST_GROUP_NAME.to_string()));
     assert_eq!(hint.mount_epoch, Some(1));
     assert_eq!(hint.route_epoch, None);
 }
@@ -580,11 +578,11 @@ async fn stale_route_epoch_returns_need_refresh_header_with_consumable_route_hin
         RpcErrorCodeProto::RpcErrCodeRouteEpochMismatch,
         RefreshReasonProto::RefreshReasonRouteEpochMismatch,
     );
-    assert_eq!(response_header.group_id, TEST_GROUP_ID);
+    assert_eq!(response_header.group_name, TEST_GROUP_NAME);
     assert_eq!(response_header.mount_epoch, Some(1));
     assert_eq!(response_header.route_epoch, Some(1));
     let hint = err.refresh_hint.expect("refresh hint");
-    assert_eq!(hint.group_id, Some(TEST_GROUP_ID));
+    assert_eq!(hint.group_name, Some(TEST_GROUP_NAME.to_string()));
     assert_eq!(hint.mount_epoch, Some(1));
     assert_eq!(hint.route_epoch, Some(1));
 }
@@ -603,7 +601,7 @@ async fn stale_state_id_returns_stale_state_without_epoch_domain_mixup() {
                 103,
                 Some(1),
                 Some(1),
-                vec![watermark_proto(TEST_GROUP_ID, required_state_id)],
+                vec![watermark_proto(TEST_GROUP_NAME, required_state_id)],
             ),
             path: "/mnt/test".to_string(),
         }),
@@ -619,7 +617,7 @@ async fn stale_state_id_returns_stale_state_without_epoch_domain_mixup() {
         RpcErrorCodeProto::RpcErrCodeStaleState,
         RefreshReasonProto::RefreshReasonStaleState,
     );
-    assert_eq!(response_header.group_id, TEST_GROUP_ID);
+    assert_eq!(response_header.group_name, TEST_GROUP_NAME);
     assert_eq!(response_header.mount_epoch, Some(1));
     assert_ne!(response_header.mount_epoch, Some(required_state_id.index));
     assert_ne!(response_header.route_epoch, Some(required_state_id.index));
@@ -646,12 +644,12 @@ async fn leader_success_header_includes_group_state_watermark_when_last_applied_
 
     let response_header = response.header.expect("response header must exist");
     assert!(response_header.error.is_none());
-    assert_eq!(response_header.group_id, TEST_GROUP_ID);
+    assert_eq!(response_header.group_name, TEST_GROUP_NAME);
     assert_eq!(response_header.mount_epoch, Some(1));
     assert_eq!(response_header.route_epoch, Some(1));
     assert_eq!(response_header.state.len(), 1);
     let state = &response_header.state[0];
-    assert_eq!(state.group_id.as_ref().expect("state group").value, TEST_GROUP_ID);
+    assert_eq!(state.group_name, TEST_GROUP_NAME);
     assert_state_id(state.state_id.as_ref().expect("state id"), last_applied);
 }
 
@@ -678,7 +676,7 @@ async fn non_leader_success_header_leaves_state_empty() {
 
     let response_header = response.header.expect("response header must exist");
     assert!(response_header.error.is_none());
-    assert_eq!(response_header.group_id, TEST_GROUP_ID);
+    assert_eq!(response_header.group_name, TEST_GROUP_NAME);
     assert_eq!(response_header.mount_epoch, Some(1));
     assert_eq!(response_header.route_epoch, Some(1));
     assert!(response_header.state.is_empty());
@@ -1571,7 +1569,7 @@ async fn recursive_delete_rejects_cross_mount_subtree_without_half_delete() {
             MountKind::External,
             Some("file:///tmp/mnt_test_dir_mnt".to_string()),
             DataIoPolicy::Allow,
-            ShardGroupId::new(1),
+            group_name("root"),
             child_mount_root,
         )
         .expect("create child mount");

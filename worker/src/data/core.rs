@@ -12,10 +12,10 @@ use bytes::Bytes;
 use common::error::canonical::RefreshReason;
 use common::header::RpcErrorCode;
 use types::chunk::ByteRange;
-use types::ids::{BlockId, ChunkIndex, ShardGroupId, StreamId};
+use types::ids::{BlockId, ChunkIndex, StreamId};
 use types::layout::BlockFormatId;
 use types::lease::FencingToken;
-use types::WorkerRunId;
+use types::{GroupName, WorkerRunId};
 
 use crate::config::WorkerConfig;
 use crate::error::WorkerError;
@@ -39,7 +39,7 @@ pub enum StreamMode {
 #[derive(Clone, Debug)]
 pub struct StreamContext {
     pub stream_id: StreamId,
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     pub block_id: BlockId,
     pub mode: StreamMode,
     pub worker_run_id: WorkerRunId,
@@ -74,7 +74,7 @@ pub struct StreamContext {
 /// Open-read request in worker core terms.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadOpenRequest {
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     pub block_id: BlockId,
     pub worker_run_id: WorkerRunId,
     /// Block-local byte range. The offset is relative to block_id, not to the file.
@@ -111,7 +111,7 @@ pub struct ReadOpenResult {
 /// Open-write request in worker core terms.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WriteOpenRequest {
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     pub block_id: BlockId,
     pub worker_run_id: WorkerRunId,
     pub token: FencingToken,
@@ -180,7 +180,7 @@ pub struct WriteFrameResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitWriteRequest {
     pub stream_id: StreamId,
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     pub block_id: BlockId,
     pub worker_run_id: WorkerRunId,
     pub token: FencingToken,
@@ -210,7 +210,7 @@ pub struct CommitWriteResult {
 /// Durable sync request for an already committed block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyncCommittedBlockRequest {
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     pub block_id: BlockId,
     pub worker_run_id: WorkerRunId,
     /// Metadata-authoritative block stamp for the committed generation.
@@ -233,7 +233,7 @@ pub struct SyncCommittedBlockResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AbortWriteRequest {
     pub stream_id: StreamId,
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     pub block_id: BlockId,
     pub token: FencingToken,
 }
@@ -380,7 +380,7 @@ impl WorkerCore {
 
         let context = StreamContext {
             stream_id,
-            group_id: snapshot.group_id,
+            group_name: snapshot.group_name,
             block_id: snapshot.block_id,
             mode: StreamMode::Read,
             worker_run_id: req.worker_run_id,
@@ -413,7 +413,7 @@ impl WorkerCore {
         reject_existing_final_block(self.block_store.as_ref(), &req)?;
 
         self.block_store.create_staging_block(CreateStagingBlockRequest {
-            group_id: req.group_id,
+            group_name: req.group_name.clone(),
             block_id: req.block_id,
             block_size: req.block_size,
             block_format_id: req.block_format_id,
@@ -424,7 +424,7 @@ impl WorkerCore {
         let stream_id = self.next_stream_id()?;
         let context = StreamContext {
             stream_id,
-            group_id: req.group_id,
+            group_name: req.group_name,
             block_id: req.block_id,
             mode: StreamMode::Write,
             worker_run_id: req.worker_run_id,
@@ -459,7 +459,7 @@ impl WorkerCore {
         // selects the same conservative path as the default commit.
         let _require_sync = req.require_sync;
         let meta = self.block_store.publish_ready(PublishReadyRequest {
-            group_id: req.group_id,
+            group_name: req.group_name,
             block_id: req.block_id,
             effective_block_len: req.effective_block_len,
             block_stamp: req.block_stamp,
@@ -478,7 +478,7 @@ impl WorkerCore {
         req: SyncCommittedBlockRequest,
     ) -> WorkerCoreResult<SyncCommittedBlockResult> {
         validate_sync_committed_block_request(&req)?;
-        let meta = match self.block_store.load_meta(req.group_id, req.block_id) {
+        let meta = match self.block_store.load_meta(&req.group_name, req.block_id) {
             Ok(meta) => meta,
             Err(WorkerError::NotFound(message)) => {
                 return Err(WorkerError::NeedRefresh {
@@ -491,7 +491,7 @@ impl WorkerCore {
         };
         validate_sync_committed_block_meta(&req, &meta)?;
         let synced = self.block_store.sync_ready_block(SyncReadyBlockRequest {
-            group_id: req.group_id,
+            group_name: req.group_name.clone(),
             block_id: req.block_id,
         })?;
         validate_sync_committed_block_meta(&req, &synced)?;
@@ -505,7 +505,7 @@ impl WorkerCore {
         let state = self.write_state(req.stream_id).await?;
         validate_abort_request(&state, &req)?;
         self.stream_manager.remove(req.stream_id).await;
-        self.block_store.abort_staging_block(req.group_id, req.block_id)?;
+        self.block_store.abort_staging_block(&req.group_name, req.block_id)?;
         Ok(AbortWriteResult { aborted: true })
     }
 
@@ -542,9 +542,12 @@ impl WorkerCore {
 
         let remaining = state.context.end_offset - state.cursor;
         let read_len = remaining.min(u64::from(frame_budget));
-        let data = self
-            .block_store
-            .read_at(state.context.group_id, state.context.block_id, state.cursor, read_len)?;
+        let data = self.block_store.read_at(
+            &state.context.group_name,
+            state.context.block_id,
+            state.cursor,
+            read_len,
+        )?;
         let next_cursor = state
             .cursor
             .checked_add(
@@ -597,7 +600,7 @@ impl WorkerCore {
         }
 
         self.block_store.write_at(
-            state.context.group_id,
+            &state.context.group_name,
             state.context.block_id,
             frame.offset_in_block,
             frame.data,
@@ -746,7 +749,7 @@ fn reject_existing_final_block(
     store: &(dyn LocalBlockStore + Send + Sync),
     req: &WriteOpenRequest,
 ) -> WorkerCoreResult<()> {
-    match store.load_meta(req.group_id, req.block_id) {
+    match store.load_meta(&req.group_name, req.block_id) {
         Ok(meta) => {
             validate_existing_block_shape(req, &meta)?;
             match meta.visibility.block_state {
@@ -754,8 +757,8 @@ fn reject_existing_final_block(
                     code: RpcErrorCode::ShardMoved,
                     reason: RefreshReason::Moved,
                     message: format!(
-                        "local block already has final metadata: group_id={}, block_id={}, state={:?}",
-                        req.group_id, req.block_id, meta.visibility.block_state
+                        "local block already has final metadata: group_name={}, block_id={}, state={:?}",
+                        req.group_name, req.block_id, meta.visibility.block_state
                     ),
                 }),
                 BlockState::Loading => Err(WorkerError::Corrupt(
@@ -777,8 +780,8 @@ fn validate_existing_block_shape(
             code: RpcErrorCode::BlockStampMismatch,
             reason: RefreshReason::BlockStampMismatch,
             message: format!(
-                "block stamp mismatch: group_id={}, block_id={}, requested={}, local={}",
-                req.group_id, req.block_id, req.block_stamp, meta.visibility.block_stamp
+                "block stamp mismatch: group_name={}, block_id={}, requested={}, local={}",
+                req.group_name, req.block_id, req.block_stamp, meta.visibility.block_stamp
             ),
         });
     }
@@ -791,8 +794,8 @@ fn validate_existing_block_shape(
             code: RpcErrorCode::StaleState,
             reason: RefreshReason::StaleState,
             message: format!(
-                "block layout mismatch: group_id={}, block_id={}",
-                req.group_id, req.block_id
+                "block layout mismatch: group_name={}, block_id={}",
+                req.group_name, req.block_id
             ),
         });
     }
@@ -800,7 +803,7 @@ fn validate_existing_block_shape(
 }
 
 fn validate_commit_request(state: &StreamState, req: &CommitWriteRequest) -> WorkerCoreResult<()> {
-    validate_stream_identity(state, req.group_id, req.block_id)?;
+    validate_stream_identity(state, &req.group_name, req.block_id)?;
     validate_matching_token(state, req.token)?;
     if req.commit_seq != state.last_acked_seq {
         return Err(WorkerError::InvalidArgument(format!(
@@ -883,8 +886,8 @@ fn validate_sync_committed_block_meta(
             code: RpcErrorCode::ShardMoved,
             reason: RefreshReason::Moved,
             message: format!(
-                "local block is not Ready for durable sync: group_id={}, block_id={}, state={:?}",
-                req.group_id, req.block_id, meta.visibility.block_state
+                "local block is not Ready for durable sync: group_name={}, block_id={}, state={:?}",
+                req.group_name, req.block_id, meta.visibility.block_state
             ),
         });
     }
@@ -893,8 +896,8 @@ fn validate_sync_committed_block_meta(
             code: RpcErrorCode::BlockStampMismatch,
             reason: RefreshReason::BlockStampMismatch,
             message: format!(
-                "block stamp mismatch during durable sync: group_id={}, block_id={}, requested={}, local={}",
-                req.group_id, req.block_id, req.block_stamp, meta.visibility.block_stamp
+                "block stamp mismatch during durable sync: group_name={}, block_id={}, requested={}, local={}",
+                req.group_name, req.block_id, req.block_stamp, meta.visibility.block_stamp
             ),
         });
     }
@@ -903,8 +906,8 @@ fn validate_sync_committed_block_meta(
             code: RpcErrorCode::StaleState,
             reason: RefreshReason::StaleState,
             message: format!(
-                "effective block length mismatch during durable sync: group_id={}, block_id={}, expected={}, local={}",
-                req.group_id, req.block_id, req.expected_block_len, meta.source.effective_block_len
+                "effective block length mismatch during durable sync: group_name={}, block_id={}, expected={}, local={}",
+                req.group_name, req.block_id, req.expected_block_len, meta.source.effective_block_len
             ),
         });
     }
@@ -916,8 +919,8 @@ fn validate_sync_committed_block_meta(
             code: RpcErrorCode::StaleState,
             reason: RefreshReason::StaleState,
             message: format!(
-                "block layout mismatch during durable sync: group_id={}, block_id={}",
-                req.group_id, req.block_id
+                "block layout mismatch during durable sync: group_name={}, block_id={}",
+                req.group_name, req.block_id
             ),
         });
     }
@@ -925,15 +928,15 @@ fn validate_sync_committed_block_meta(
 }
 
 fn validate_abort_request(state: &StreamState, req: &AbortWriteRequest) -> WorkerCoreResult<()> {
-    validate_stream_identity(state, req.group_id, req.block_id)?;
+    validate_stream_identity(state, &req.group_name, req.block_id)?;
     validate_matching_token(state, req.token)
 }
 
-fn validate_stream_identity(state: &StreamState, group_id: ShardGroupId, block_id: BlockId) -> WorkerCoreResult<()> {
-    if state.context.group_id != group_id {
+fn validate_stream_identity(state: &StreamState, group_name: &GroupName, block_id: BlockId) -> WorkerCoreResult<()> {
+    if &state.context.group_name != group_name {
         return Err(WorkerError::InvalidArgument(format!(
-            "write stream group_id mismatch: stream={}, request={}",
-            state.context.group_id, group_id
+            "write stream group_name mismatch: stream={}, request={}",
+            state.context.group_name, group_name
         )));
     }
     if state.context.block_id != block_id {

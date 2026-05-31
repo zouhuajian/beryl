@@ -23,8 +23,7 @@ use tokio::time;
 use tonic::transport::Endpoint;
 use tonic::Code;
 use tracing::{debug, info, warn};
-use types::ids::{ClientId, ShardGroupId};
-use types::WorkerRunId;
+use types::{ClientId, GroupName, WorkerRunId};
 
 use crate::config::WorkerRegistrationConfig;
 use crate::control::{MetadataRegistrar, Registration, RegistrationDescriptor, RegistrationSet};
@@ -66,7 +65,7 @@ pub struct MetadataHeartbeatLoop {
     descriptor: RegistrationDescriptor,
     state: Arc<RegistrationSet>,
     endpoints: Vec<Endpoint>,
-    heartbeat_seq: Mutex<HashMap<(ShardGroupId, WorkerRunId), u64>>,
+    heartbeat_seq: Mutex<HashMap<(GroupName, WorkerRunId), u64>>,
 }
 
 impl MetadataHeartbeatLoop {
@@ -99,7 +98,7 @@ impl MetadataHeartbeatLoop {
     }
 
     pub async fn send_once(&self, snapshot: HeartbeatSnapshot) -> Result<HeartbeatRound, HeartbeatError> {
-        let Some(registration) = self.state.registration(self.config.group_id) else {
+        let Some(registration) = self.state.registration(&self.config.group_name) else {
             return Ok(HeartbeatRound::default());
         };
         let seq = self.next_heartbeat_seq(&registration);
@@ -115,15 +114,15 @@ impl MetadataHeartbeatLoop {
                 Ok(HeartbeatPeerOutcome::Accepted { liveness_timeout }) => {
                     round.accepted_peers += 1;
                     self.state
-                        .record_heartbeat_success(registration.group_id, liveness_timeout);
+                        .record_heartbeat_success(&registration.group_name, liveness_timeout);
                 }
                 Ok(HeartbeatPeerOutcome::NeedRegister) => {
                     round.needs_register = true;
-                    self.state.mark_needs_register(registration.group_id);
+                    self.state.mark_needs_register(&registration.group_name);
                 }
                 Ok(HeartbeatPeerOutcome::WorkerRunMismatch) => {
                     round.worker_run_mismatch = true;
-                    self.state.mark_needs_register(registration.group_id);
+                    self.state.mark_needs_register(&registration.group_name);
                 }
                 Err(error) => {
                     debug!(%error, "Worker heartbeat peer attempt failed");
@@ -147,8 +146,7 @@ impl MetadataHeartbeatLoop {
         snapshot: &HeartbeatSnapshot,
     ) -> HeartbeatRequestProto {
         HeartbeatRequestProto {
-            header: Some(heartbeat_request_header(registration.group_id)),
-            group_id: registration.group_id.as_raw(),
+            header: Some(heartbeat_request_header()),
             worker_id: registration.worker_id.as_raw(),
             worker_run_id: registration.worker_run_id.to_string(),
             heartbeat_seq,
@@ -171,13 +169,14 @@ impl MetadataHeartbeatLoop {
             health: HealthStatusProto::HealthStatusHealthy as i32,
             worker_net_protocol: worker_protocol_to_proto(self.descriptor.worker_net_protocol) as i32,
             acks: Vec::new(),
+            group_name: registration.group_name.to_string(),
         }
     }
 
     fn next_heartbeat_seq(&self, registration: &Registration) -> u64 {
         let mut seqs = self.heartbeat_seq.lock().expect("heartbeat seq state poisoned");
         let entry = seqs
-            .entry((registration.group_id, registration.worker_run_id))
+            .entry((registration.group_name.clone(), registration.worker_run_id))
             .or_insert(0);
         *entry = entry.saturating_add(1);
         *entry
@@ -206,11 +205,11 @@ impl MetadataHeartbeatLoop {
         let mut interval = time::interval(Duration::from_millis(1_000));
         loop {
             interval.tick().await;
-            if self.state.registration(self.config.group_id).is_none() {
+            if self.state.registration(&self.config.group_name).is_none() {
                 match registrar.register_with_retry(future::pending::<()>()).await {
                     Ok(registration) => {
                         info!(
-                            group_id = registration.group_id.as_raw(),
+                            group_name = %registration.group_name,
                             worker_id = registration.worker_id.as_raw(),
                             worker_run_id = %registration.worker_run_id,
                             "Worker re-registered after heartbeat requested registration"
@@ -250,10 +249,10 @@ fn classify_heartbeat_response(
     if let Some(outcome) = classify_header(response.header.as_ref())? {
         return Ok(outcome);
     }
-    if response.group_id != request.group_id {
+    if response.group_name != request.group_name {
         return Err(HeartbeatError::Fatal(format!(
-            "metadata heartbeat response confirmed group_id {}, expected {}",
-            response.group_id, request.group_id
+            "metadata heartbeat response confirmed group_name {}, expected {}",
+            response.group_name, request.group_name
         )));
     }
     if response.worker_id != request.worker_id {
@@ -325,9 +324,9 @@ fn classify_status(status: tonic::Status) -> HeartbeatError {
     }
 }
 
-fn heartbeat_request_header(group_id: ShardGroupId) -> RequestHeaderProto {
+fn heartbeat_request_header() -> RequestHeaderProto {
     let client_id = u64::from(std::process::id()).max(1);
-    let header = RequestHeader::new(ClientId::new(client_id)).with_group_id(group_id.as_raw());
+    let header = RequestHeader::new(ClientId::new(client_id));
     (&header).into()
 }
 

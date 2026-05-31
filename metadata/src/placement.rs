@@ -10,9 +10,9 @@
 use std::collections::HashSet;
 
 use common::header::CallerContextFields;
-use types::ids::{BlockId, ShardGroupId, WorkerId};
+use types::ids::{BlockId, WorkerId};
 use types::layout::{BlockFormatId, FileLayout};
-use types::WorkerRunId;
+use types::{GroupName, WorkerRunId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlacementOp {
@@ -24,7 +24,7 @@ pub enum PlacementOp {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlacementRequest {
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     pub op: PlacementOp,
     pub block_id: BlockId,
     pub block_stamp: Option<u64>,
@@ -35,9 +35,9 @@ pub struct PlacementRequest {
     pub target_replicas: u8,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReportedBlockLocation {
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     pub block_id: BlockId,
     pub block_stamp: u64,
     pub worker_id: WorkerId,
@@ -46,7 +46,7 @@ pub struct ReportedBlockLocation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkerPlacementView {
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     pub worker_id: WorkerId,
     pub worker_run_id: Option<WorkerRunId>,
     pub endpoint: String,
@@ -83,7 +83,7 @@ pub enum PlacementStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlacementPlan {
-    pub group_id: ShardGroupId,
+    pub group_name: GroupName,
     pub op: PlacementOp,
     pub workers: Vec<PlacementWorker>,
     pub status: PlacementStatus,
@@ -107,7 +107,7 @@ fn choose_read(req: &PlacementRequest, workers: &[WorkerPlacementView]) -> Place
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
     for location in &req.existing {
-        if location.group_id != req.group_id
+        if location.group_name != req.group_name
             || location.block_id != req.block_id
             || req
                 .block_stamp
@@ -119,7 +119,7 @@ fn choose_read(req: &PlacementRequest, workers: &[WorkerPlacementView]) -> Place
         }
         let Some(worker) = workers
             .iter()
-            .find(|worker| worker.group_id == req.group_id && worker.worker_id == location.worker_id)
+            .find(|worker| worker.group_name == req.group_name && worker.worker_id == location.worker_id)
         else {
             continue;
         };
@@ -148,7 +148,7 @@ fn choose_live_targets(
     let mut candidates: Vec<_> = workers
         .iter()
         .filter(|worker| {
-            worker.group_id == req.group_id
+            worker.group_name == req.group_name
                 && is_live(worker)
                 && !exclude.contains(&worker.worker_id)
                 && supports_block_format(worker, req.layout.block_format_id)
@@ -197,7 +197,7 @@ fn sort_workers(req: &PlacementRequest, workers: &mut Vec<&WorkerPlacementView>,
         };
         (
             locality,
-            stable_order(req.group_id, req.block_id, worker.worker_id),
+            stable_order(&req.group_name, req.block_id, worker.worker_id),
             worker.worker_id.as_raw(),
         )
     });
@@ -219,7 +219,7 @@ fn workers_from_views(workers: Vec<&WorkerPlacementView>) -> Vec<PlacementWorker
 
 fn plan(req: &PlacementRequest, workers: Vec<PlacementWorker>, status: PlacementStatus) -> PlacementPlan {
     PlacementPlan {
-        group_id: req.group_id,
+        group_name: req.group_name.clone(),
         op: req.op,
         workers,
         status,
@@ -246,10 +246,13 @@ fn matches_pair(left: Option<&str>, right: &Option<String>) -> bool {
         .unwrap_or(false)
 }
 
-fn stable_order(group_id: ShardGroupId, block_id: BlockId, worker_id: WorkerId) -> u64 {
+fn stable_order(group_name: &GroupName, block_id: BlockId, worker_id: WorkerId) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325;
+    for value in group_name.as_str().as_bytes() {
+        hash ^= u64::from(*value);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
     for value in [
-        group_id.as_raw(),
         block_id.data_handle_id.as_raw(),
         u64::from(block_id.index.as_raw()),
         worker_id.as_raw(),

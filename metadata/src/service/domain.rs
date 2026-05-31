@@ -9,7 +9,7 @@ use types::fs::{Extent, FileAttrs, InodeId, InodeKind};
 use types::ids::{BlockId, DataHandleId, LeaseId, MountId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
-use types::{CommittedBlock, FileBlockLocation, GroupStateWatermark, WriteTarget};
+use types::{CommittedBlock, FileBlockLocation, GroupName, GroupStateWatermark, WriteTarget};
 
 #[derive(Clone, Debug)]
 pub struct RequestContext {
@@ -59,7 +59,7 @@ pub struct FileRange {
 #[derive(Clone, Debug)]
 pub struct CoreSuccess<T> {
     pub payload: T,
-    pub group_id: Option<u64>,
+    pub group_name: Option<GroupName>,
     pub mount_epoch: Option<u64>,
     pub route_epoch: Option<u64>,
     pub state: Vec<GroupStateWatermark>,
@@ -68,7 +68,7 @@ pub struct CoreSuccess<T> {
 #[derive(Clone, Debug)]
 pub struct CoreFailure {
     pub error: Box<CanonicalError>,
-    pub group_id: Option<u64>,
+    pub group_name: Option<GroupName>,
     pub mount_epoch: Option<u64>,
     pub route_epoch: Option<u64>,
     pub state: Vec<GroupStateWatermark>,
@@ -77,14 +77,14 @@ pub struct CoreFailure {
 impl CoreFailure {
     pub fn new(
         error: CanonicalError,
-        group_id: Option<u64>,
+        group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
         route_epoch: Option<u64>,
         state: Vec<GroupStateWatermark>,
     ) -> Self {
         Self {
             error: Box::new(error),
-            group_id,
+            group_name,
             mount_epoch,
             route_epoch,
             state,

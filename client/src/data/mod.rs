@@ -11,7 +11,7 @@ mod worker;
 use async_trait::async_trait;
 use bytes::Bytes;
 use proto::worker::WriteStreamResponseProto;
-use types::{WorkerEndpointInfo, WriteTarget};
+use types::{GroupName, WorkerEndpointInfo, WriteTarget};
 
 use crate::error::ClientResult;
 use crate::planner::read_planner::PlannedReadSegment;
@@ -24,7 +24,7 @@ pub(crate) trait WorkerDataClient: Send + Sync {
     async fn read_segment(
         &self,
         ctx: AttemptContext,
-        group_id: u64,
+        group_name: GroupName,
         segment: &PlannedReadSegment,
     ) -> ClientResult<Bytes>;
 
@@ -55,7 +55,7 @@ pub(crate) trait WorkerDataClient: Send + Sync {
 #[derive(Clone, Debug)]
 pub(crate) struct WorkerWriteTarget {
     /// Metadata owner group for the target block.
-    pub(crate) group_id: u64,
+    pub(crate) group_name: GroupName,
     /// Metadata AddBlock target.
     pub(crate) target: WriteTarget,
 }
@@ -64,7 +64,7 @@ pub(crate) struct WorkerWriteTarget {
 #[derive(Clone, Debug)]
 pub(crate) struct WorkerWriteBlock {
     /// Metadata owner group for the block.
-    pub(crate) group_id: u64,
+    pub(crate) group_name: GroupName,
     /// Stable worker identity selected by metadata.
     pub(crate) worker: WorkerEndpointInfo,
     /// Metadata AddBlock target.

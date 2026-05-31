@@ -146,7 +146,12 @@ mod tests {
     use super::*;
     use common::header::RequestHeader;
     use types::fs::InodeId;
-    use types::ids::{ClientId, MountId, ShardGroupId};
+    use types::ids::{ClientId, MountId};
+    use types::GroupName;
+
+    fn group_name(raw: &str) -> GroupName {
+        GroupName::parse(raw).unwrap()
+    }
 
     fn test_request_context() -> RequestContext {
         RequestContext {
@@ -165,7 +170,7 @@ mod tests {
             mount_ctx: crate::path_resolver::MountContext {
                 mount_id: MountId::new(1),
                 mount_epoch: 1,
-                owner_group_id: ShardGroupId::new(1),
+                owner_group_name: group_name("root"),
                 root_inode_id: traverse.first().copied().unwrap_or(parent_inode_id),
             },
             parent_inode_id: Some(parent_inode_id),

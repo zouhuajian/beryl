@@ -102,7 +102,7 @@ impl FsClient {
         metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
         let client_id = config.client_id()?;
-        let refresh_manager = RefreshManager::from_config(&config.metadata_group_ids, &config.metadata_endpoints)?
+        let refresh_manager = RefreshManager::from_config(&config.metadata_group_names, &config.metadata_endpoints)?
             .with_worker_endpoint_cache(data_boundary.worker_endpoint_cache());
         let executor = OperationExecutor::with_runtime(
             client_id,
@@ -307,14 +307,14 @@ impl FsClient {
                 .executor
                 .read_layout_for_data_handle(handle.path(), data_handle_id, span.file_offset, span.len)
                 .await?;
-            let (group_id, segments) =
+            let (group_name, segments) =
                 ReadPlanner::resolve_response(inode_id, data_handle_id, Some(file_version), span, &layout)?;
             let ctx = self.data_attempt_context(&operation, attempt);
             match self
                 .worker_rpc_with_timeout(
                     "Read",
                     OperationKind::WorkerReadData,
-                    self.data_boundary.read_all(ctx, group_id, &segments),
+                    self.data_boundary.read_all(ctx, group_name, &segments),
                 )
                 .await
             {
@@ -639,7 +639,7 @@ impl FsClient {
                 "OpenWriteStream",
                 OperationKind::WorkerWriteData,
                 self.data_boundary
-                    .open_write(ctx, add_block.group_id, add_block.target.clone()),
+                    .open_write(ctx, add_block.group_name.clone(), add_block.target.clone()),
             )
             .await
         {

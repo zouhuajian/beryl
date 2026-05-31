@@ -195,16 +195,16 @@ impl DeleteExecutor {
                 continue; // Not yet ready
             }
 
-            // Unified gate check (enhanced with shard_group_id and guard_watermark)
+            // Unified gate check (enhanced with group_name and guard_watermark)
             let mut ctx = DestructiveCheckContext::new("delete_executor_execute")
                 .with_block_id(intent.block_id)
                 .with_not_before_ms(intent.not_before_ms);
 
             // Prefer guard_watermark if available, otherwise fallback to guard_state_id
-            if let Some(guard_watermark) = intent.guard_watermark {
+            if let Some(guard_watermark) = &intent.guard_watermark {
                 ctx = ctx
-                    .with_group_id(guard_watermark.group_id)
-                    .with_guard_watermark(guard_watermark);
+                    .with_group_name(guard_watermark.group_name.clone())
+                    .with_guard_watermark(guard_watermark.clone());
                 if let Some(mount_epoch) = intent.mount_epoch {
                     ctx = ctx.with_mount_epoch(mount_epoch);
                 }
@@ -381,16 +381,16 @@ impl DeleteExecutor {
             let target_workers = if !intent.target_workers.is_empty() {
                 // Use explicit target_workers (e.g., for Orphan)
                 intent.target_workers.clone()
-            } else if let Some(group_id) = intent.shard_group_id {
-                self.worker_manager.get_block_locations(group_id, intent.block_id)
+            } else if let Some(group_name) = intent.group_name {
+                self.worker_manager.get_block_locations(&group_name, intent.block_id)
             } else {
-                // Delete execution requires an authoritative shard_group_id for
+                // Delete execution requires an authoritative group_name for
                 // implicit target resolution. Do not infer a group from
                 // block-report soft state.
                 debug!(
                     intent_id,
                     block_id = %intent.block_id,
-                    "Skipping delete intent without authoritative shard_group_id"
+                    "Skipping delete intent without authoritative group_name"
                 );
                 continue;
             };

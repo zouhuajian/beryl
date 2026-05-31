@@ -5,7 +5,7 @@
 
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::LayoutSnapshot;
-use types::{BlockId, DataHandleId, FileBlockLocation, InodeId, WorkerEndpointInfo};
+use types::{BlockId, DataHandleId, FileBlockLocation, GroupName, InodeId, WorkerEndpointInfo};
 
 /// Splits public read ranges into block-local worker reads.
 #[derive(Clone, Debug, Default)]
@@ -196,13 +196,8 @@ impl ReadPlanner {
         expected_file_version: Option<u64>,
         span: PlannedReadRange,
         response: &LayoutSnapshot,
-    ) -> ClientResult<(u64, Vec<PlannedReadSegment>)> {
-        if response.group_id == 0 {
-            return Err(ClientError::InvalidLayout(
-                "GetBlockLocations response header has group_id 0".to_string(),
-            ));
-        }
-        let group_id = response.group_id;
+    ) -> ClientResult<(GroupName, Vec<PlannedReadSegment>)> {
+        let group_name = response.group_name.clone();
         let inode_id = response.inode_id;
         if inode_id != expected_inode_id {
             return Err(ClientError::StaleHandle {
@@ -234,7 +229,7 @@ impl ReadPlanner {
             });
         }
         let segments = Self::resolve_locations(expected_data_handle_id, span, &response.locations)?;
-        Ok((group_id, segments))
+        Ok((group_name, segments))
     }
 }
 

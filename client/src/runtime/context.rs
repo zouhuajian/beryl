@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use proto::common::{ClientInfoProto, RequestHeaderProto};
 use proto::worker::DataRequestHeaderProto;
-use types::{CallId, ClientId};
+use types::{CallId, ClientId, GroupName};
 
 use crate::error::{ClientError, ClientResult};
 use crate::runtime::policy::{OperationKind, ReplaySafety};
@@ -184,7 +184,7 @@ impl OperationContext {
 pub struct AttemptContext {
     operation: OperationContext,
     call_id_text: String,
-    group_id: Option<u64>,
+    group_name: Option<GroupName>,
     metadata_endpoint: Option<String>,
     attempt_number: u32,
     mount_epoch: Option<u64>,
@@ -194,18 +194,17 @@ pub struct AttemptContext {
 }
 
 impl AttemptContext {
-    /// Create a metadata context and require an explicit non-zero group id.
-    pub fn for_metadata(operation: &OperationContext, group_id: u64, attempt_number: u32) -> ClientResult<Self> {
-        if group_id == 0 {
-            return Err(ClientError::InvalidArgument(
-                "metadata AttemptContext requires non-zero group_id".to_string(),
-            ));
-        }
+    /// Create a metadata context and require an explicit group name.
+    pub fn for_metadata(
+        operation: &OperationContext,
+        group_name: GroupName,
+        attempt_number: u32,
+    ) -> ClientResult<Self> {
         validate_client_id(operation.client_id)?;
         Ok(Self {
             call_id_text: operation.call_id.to_string(),
             operation: operation.clone(),
-            group_id: Some(group_id),
+            group_name: Some(group_name),
             metadata_endpoint: None,
             attempt_number,
             mount_epoch: None,
@@ -220,7 +219,7 @@ impl AttemptContext {
         Self {
             call_id_text: operation.call_id.to_string(),
             operation: operation.clone(),
-            group_id: None,
+            group_name: None,
             metadata_endpoint: None,
             attempt_number,
             mount_epoch: None,
@@ -272,9 +271,9 @@ impl AttemptContext {
         self.operation.client_id
     }
 
-    /// Return the metadata group id carried by this attempt, when present.
-    pub(crate) fn group_id(&self) -> Option<u64> {
-        self.group_id
+    /// Return the metadata group name carried by this attempt, when present.
+    pub(crate) fn group_name(&self) -> Option<&GroupName> {
+        self.group_name.as_ref()
     }
 
     /// Return the absolute deadline in Unix epoch milliseconds, or zero when unset.
@@ -316,14 +315,10 @@ impl AttemptContext {
 
     /// Build a metadata request header for this attempt.
     pub fn metadata_header(&self) -> ClientResult<RequestHeaderProto> {
-        let group_id = self
-            .group_id
-            .ok_or_else(|| ClientError::InvalidArgument("metadata AttemptContext missing group_id".to_string()))?;
-        if group_id == 0 {
-            return Err(ClientError::InvalidArgument(
-                "metadata AttemptContext requires non-zero group_id".to_string(),
-            ));
-        }
+        let group_name = self
+            .group_name
+            .as_ref()
+            .ok_or_else(|| ClientError::InvalidArgument("metadata AttemptContext missing group_name".to_string()))?;
         if self.operation.client_id.as_raw() == 0 {
             return Err(ClientError::InvalidArgument(
                 "metadata AttemptContext requires non-zero client_id".to_string(),
@@ -331,7 +326,7 @@ impl AttemptContext {
         }
         Ok(RequestHeaderProto {
             client: Some(self.client_info()),
-            group_id,
+            group_name: group_name.to_string(),
             mount_epoch: self.mount_epoch,
             deadline_ms: self.deadline_ms(),
             traceparent: self.call_id_text.clone(),
@@ -421,37 +416,29 @@ mod tests {
             identity: OperationIdentity::path("/alpha"),
         };
 
-        let err = AttemptContext::for_metadata(&invalid_operation, 9, 0)
+        let err = AttemptContext::for_metadata(&invalid_operation, GroupName::parse("root").unwrap(), 0)
             .expect_err("metadata attempt must reject zero client_id");
 
         assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("client_id")));
     }
 
     #[test]
-    fn attempt_context_rejects_zero_group_id() {
-        let operation = metadata_operation();
-
-        let err =
-            AttemptContext::for_metadata(&operation, 0, 0).expect_err("metadata attempt must reject zero group_id");
-
-        assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("group_id")));
-    }
-
-    #[test]
     fn replay_attempt_preserves_call_id() {
         let operation = metadata_operation();
-        let first = AttemptContext::for_metadata(&operation, 9, 0).expect("first attempt");
-        let replay = AttemptContext::for_metadata(&operation, 11, 1).expect("replay attempt");
+        let first =
+            AttemptContext::for_metadata(&operation, GroupName::parse("root").unwrap(), 0).expect("first attempt");
+        let replay = AttemptContext::for_metadata(&operation, GroupName::parse("analytics").unwrap(), 1)
+            .expect("replay attempt");
 
         assert_eq!(first.call_id(), replay.call_id());
-        assert_eq!(first.metadata_header().expect("first header").group_id, 9);
-        assert_eq!(replay.metadata_header().expect("replay header").group_id, 11);
+        assert_eq!(first.metadata_header().expect("first header").group_name, "root");
+        assert_eq!(replay.metadata_header().expect("replay header").group_name, "analytics");
     }
 
     #[test]
     fn operation_timeout_sets_attempt_deadline_without_changing_call_id() {
         let operation = metadata_operation();
-        let base = AttemptContext::for_metadata(&operation, 9, 0).expect("attempt");
+        let base = AttemptContext::for_metadata(&operation, GroupName::parse("root").unwrap(), 0).expect("attempt");
         let call_id = base.call_id().to_string();
 
         let timed = base.with_operation_timeout_ms(Some(50));
@@ -468,7 +455,7 @@ mod tests {
     #[test]
     fn absent_operation_timeout_keeps_no_deadline_behavior() {
         let operation = metadata_operation();
-        let ctx = AttemptContext::for_metadata(&operation, 9, 0)
+        let ctx = AttemptContext::for_metadata(&operation, GroupName::parse("root").unwrap(), 0)
             .expect("attempt")
             .with_operation_timeout_ms(None);
 

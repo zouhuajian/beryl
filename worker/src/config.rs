@@ -10,7 +10,7 @@ use common::config::CoreConfig;
 use common::error::{CommonError, CommonErrorCode};
 use tonic::transport::Endpoint;
 use tracing::info;
-use types::ids::{ShardGroupId, WorkerId};
+use types::GroupName;
 
 use crate::net::config::WorkerNetConfig;
 use crate::net::protocol::WorkerNetProtocol;
@@ -18,11 +18,10 @@ use crate::net::protocol::WorkerNetProtocol;
 /// Worker metadata registration configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkerRegistrationConfig {
-    /// Metadata group registered by this worker process.
-    pub group_id: ShardGroupId,
-    /// MetadataWorkerService endpoint URI used during worker startup registration.
-    pub endpoint: String,
-    /// MetadataWorkerService peer endpoint URIs used for heartbeat fanout.
+    /// Stable metadata group name registered by this worker process.
+    pub group_name: GroupName,
+    /// Metadata service endpoints used by worker registration, heartbeat, and block report.
+    /// The first endpoint may be used as the initial registration target.
     pub endpoints: Vec<String>,
     /// Per-attempt registration timeout shared by startup registration and heartbeat RPCs.
     pub register_timeout_ms: u64,
@@ -35,8 +34,7 @@ pub struct WorkerRegistrationConfig {
 impl Default for WorkerRegistrationConfig {
     fn default() -> Self {
         Self {
-            group_id: ShardGroupId::new(1),
-            endpoint: "http://127.0.0.1:18080".to_string(),
+            group_name: GroupName::parse("root").expect("default group name is valid"),
             endpoints: vec!["http://127.0.0.1:18080".to_string()],
             register_timeout_ms: 5_000,
             register_retry_initial_backoff_ms: 200,
@@ -48,12 +46,14 @@ impl Default for WorkerRegistrationConfig {
 /// Worker configuration.
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
-    /// Optional explicit stable worker identity.
-    pub worker_id: Option<WorkerId>,
-    /// Local persisted identity file used when worker_id is not explicit.
+    /// Cluster identity validated against local worker storage marker.
+    pub cluster_id: String,
+    /// Local persisted worker identity file.
     pub identity_path: PathBuf,
     /// RPC server bind address.
     pub rpc_bind: String,
+    /// HTTP/admin/metrics bind address.
+    pub http_bind: String,
     /// Routable gRPC data endpoint registered with metadata.
     pub rpc_advertised_endpoint: String,
     /// Maximum concurrent RPC requests per gRPC connection.
@@ -79,16 +79,17 @@ pub struct WorkerConfig {
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
-            worker_id: None,
-            identity_path: PathBuf::from("./data/worker.identity"),
+            cluster_id: "local-vecton".to_string(),
+            identity_path: PathBuf::from("data/worker/worker.identity"),
             rpc_bind: "0.0.0.0:9090".to_string(),
+            http_bind: "0.0.0.0:19091".to_string(),
             rpc_advertised_endpoint: "http://127.0.0.1:9090".to_string(),
             rpc_max_inflight: 100,
             default_frame_size: 1024 * 1024,
             max_frame_size: 4 * 1024 * 1024,
             window_bytes: 8 * 1024 * 1024,
             stream_idle_timeout_ms: 60_000,
-            storage_root: PathBuf::from("./data"),
+            storage_root: PathBuf::from("data/worker"),
             net: WorkerNetConfig::grpc_from_rpc("0.0.0.0:9090".to_string(), 100, 4 * 1024 * 1024),
             metadata: WorkerRegistrationConfig::default(),
         }
@@ -105,19 +106,21 @@ impl WorkerConfig {
     /// Create worker configuration from the repository-wide config shape.
     pub fn from_core_config(core_config: &CoreConfig) -> Result<Self, CommonError> {
         let worker_sub = core_config.as_flat().sub("worker");
+        let flat = core_config.as_flat();
         let defaults = Self::default();
         let metadata_defaults = WorkerRegistrationConfig::default();
 
-        let worker_id = Self::optional_worker_id(&worker_sub)?;
-        let identity_path = worker_sub
-            .get_str("identity.path")
-            .map(PathBuf::from)
-            .or_else(|| (!worker_sub.contains_key("identity.path")).then(|| defaults.identity_path.clone()))
-            .ok_or_else(|| invalid_config("worker.identity.path", "must be a string"))?;
+        let cluster_id = Self::root_str_or(flat, "vecton.cluster.id", &defaults.cluster_id)?;
+        reject_removed_keys(&worker_sub)?;
+        let identity_path = Self::path_or(&worker_sub, "identity.path", defaults.identity_path.clone())?;
         let rpc_bind = Self::str_or(&worker_sub, "rpc.bind", &defaults.rpc_bind, "worker.rpc.bind")?;
+        let http_bind = Self::str_or(&worker_sub, "http.bind", &defaults.http_bind, "worker.http.bind")?;
         let rpc_advertised_endpoint = worker_sub
             .get_str("rpc.advertised_endpoint")
             .ok_or_else(|| invalid_config("worker.rpc.advertised_endpoint", "must be present and be a string"))?;
+        if worker_sub.contains_key("rpc.advertised_endpoint") && rpc_advertised_endpoint.trim().is_empty() {
+            return Err(invalid_config("worker.rpc.advertised_endpoint", "must not be empty"));
+        }
         let rpc_max_inflight = Self::usize_or(
             &worker_sub,
             "rpc.max_inflight",
@@ -153,23 +156,15 @@ impl WorkerConfig {
             .map(PathBuf::from)
             .or_else(|| (!worker_sub.contains_key("storage.root")).then(|| defaults.storage_root.clone()))
             .ok_or_else(|| invalid_config("worker.storage.root", "must be a string"))?;
-        let endpoint = worker_sub
-            .get_str("metadata.endpoint")
-            .ok_or_else(|| invalid_config("worker.metadata.endpoint", "must be present and be a string"))?;
-        let endpoints = worker_sub
-            .get_str("metadata.endpoints")
-            .map(parse_csv_endpoints)
-            .transpose()?
-            .unwrap_or_else(|| vec![endpoint.clone()]);
-        let group_id = ShardGroupId::new(Self::usize_or(
+        let endpoints = metadata_endpoints(&worker_sub, &metadata_defaults)?;
+        let group_name = Self::str_or(
             &worker_sub,
-            "metadata.group_id",
-            metadata_defaults.group_id.as_raw() as usize,
-            "worker.metadata.group_id",
-        )? as u64);
+            "metadata.group.name",
+            metadata_defaults.group_name.as_str(),
+            "worker.metadata.group.name",
+        )?;
         let metadata = WorkerRegistrationConfig {
-            group_id,
-            endpoint,
+            group_name: parse_group_name("worker.metadata.group.name", group_name)?,
             endpoints,
             register_timeout_ms: Self::usize_or(
                 &worker_sub,
@@ -192,9 +187,10 @@ impl WorkerConfig {
         };
 
         let config = Self {
-            worker_id,
+            cluster_id,
             identity_path,
             rpc_bind: rpc_bind.clone(),
+            http_bind,
             rpc_advertised_endpoint,
             rpc_max_inflight,
             default_frame_size,
@@ -209,9 +205,9 @@ impl WorkerConfig {
         config.validate()?;
 
         info!(
-            worker_id = config.worker_id.map(|id| id.as_raw()),
             identity_path = ?config.identity_path,
             rpc_bind = %config.rpc_bind,
+            http_bind = %config.http_bind,
             rpc_advertised_endpoint = %config.rpc_advertised_endpoint,
             rpc_max_inflight = config.rpc_max_inflight,
             default_frame_size = config.default_frame_size,
@@ -219,9 +215,8 @@ impl WorkerConfig {
             window_bytes = config.window_bytes,
             storage_root = ?config.storage_root,
             net_listeners = config.net.listeners.len(),
-            metadata_endpoint = %config.metadata.endpoint,
             metadata_endpoints = ?config.metadata.endpoints,
-            metadata_group_id = config.metadata.group_id.as_raw(),
+            metadata_group_name = %config.metadata.group_name,
             register_timeout_ms = config.metadata.register_timeout_ms,
             register_retry_initial_backoff_ms = config.metadata.register_retry_initial_backoff_ms,
             register_retry_max_backoff_ms = config.metadata.register_retry_max_backoff_ms,
@@ -233,10 +228,10 @@ impl WorkerConfig {
 
     /// Validate shape-only constraints without touching local storage.
     pub fn validate(&self) -> Result<(), CommonError> {
-        if self.worker_id == Some(WorkerId::new(0)) {
+        if self.cluster_id.trim().is_empty() {
             return Err(CommonError::new(
                 CommonErrorCode::InvalidArgument,
-                "worker.id must be a non-zero integer",
+                "vecton.cluster.id must not be empty",
             ));
         }
 
@@ -251,6 +246,13 @@ impl WorkerConfig {
             return Err(CommonError::new(
                 CommonErrorCode::InvalidArgument,
                 format!("invalid worker.rpc.bind address: {}", self.rpc_bind),
+            ));
+        }
+
+        if self.http_bind.parse::<std::net::SocketAddr>().is_err() {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!("invalid worker.http.bind address: {}", self.http_bind),
             ));
         }
 
@@ -346,6 +348,10 @@ impl WorkerConfig {
         parse_advertised_endpoint(&self.rpc_advertised_endpoint)
     }
 
+    pub fn group_storage_root(&self) -> PathBuf {
+        self.storage_root.join("groups").join(self.metadata.group_name.as_str())
+    }
+
     fn str_or(
         flat: &common::config::FlatConfig,
         key: &str,
@@ -359,6 +365,30 @@ impl WorkerConfig {
             return Err(invalid_config(field_name, "must be a string"));
         }
         Ok(fallback.to_string())
+    }
+
+    fn root_str_or(
+        flat: &common::config::FlatConfig,
+        key: &'static str,
+        fallback: &str,
+    ) -> Result<String, CommonError> {
+        if let Some(value) = flat.get_str(key) {
+            return Ok(value);
+        }
+        if flat.contains_key(key) {
+            return Err(invalid_config(key, "must be a string"));
+        }
+        Ok(fallback.to_string())
+    }
+
+    fn path_or(flat: &common::config::FlatConfig, key: &str, fallback: PathBuf) -> Result<PathBuf, CommonError> {
+        if let Some(value) = flat.get_str(key) {
+            return Ok(PathBuf::from(value));
+        }
+        if flat.contains_key(key) {
+            return Err(invalid_config("worker.identity.path", "must be a string"));
+        }
+        Ok(fallback)
     }
 
     fn usize_or(
@@ -393,58 +423,50 @@ impl WorkerConfig {
             None => Ok(fallback),
         }
     }
+}
 
-    fn optional_worker_id(flat: &common::config::FlatConfig) -> Result<Option<WorkerId>, CommonError> {
-        let Some(value) = flat.get_str("id") else {
-            if flat.contains_key("id") {
-                return Err(invalid_config("worker.id", "must be a non-zero integer"));
-            }
-            return Ok(None);
-        };
-        if value.trim().is_empty() {
-            return Err(invalid_config("worker.id", "must not be empty"));
+fn reject_removed_keys(flat: &common::config::FlatConfig) -> Result<(), CommonError> {
+    for (key, full_key, detail) in [
+        (
+            "id",
+            "worker.id",
+            "worker.id is unsupported; worker identity must come from worker.identity.path",
+        ),
+        (
+            "metadata.group_id",
+            "worker.metadata.group_id",
+            "worker.metadata.group_id is unsupported; use worker.metadata.group.name",
+        ),
+        (
+            "metadata.group.id",
+            "worker.metadata.group.id",
+            "worker.metadata.group.id is unsupported; use worker.metadata.group.name",
+        ),
+        (
+            "metadata.endpoint",
+            "worker.metadata.endpoint",
+            "worker.metadata.endpoint is unsupported; use worker.metadata.endpoints",
+        ),
+        (
+            "bootstrap.auto_format",
+            "worker.bootstrap.auto_format",
+            "worker.bootstrap.auto_format is unsupported",
+        ),
+        ("auto_format", "worker.auto_format", "worker.auto_format is unsupported"),
+    ] {
+        if flat.contains_key(key) {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!("{full_key} is unsupported: {detail}"),
+            ));
         }
-        let raw = value
-            .parse::<u64>()
-            .map_err(|_| invalid_config("worker.id", "must be a non-zero integer"))?;
-        if raw == 0 {
-            return Err(invalid_config("worker.id", "must be a non-zero integer"));
-        }
-        Ok(Some(WorkerId::new(raw)))
     }
+    Ok(())
 }
 
 impl WorkerRegistrationConfig {
     /// Validate worker metadata registration config without opening a connection.
     pub fn validate(&self) -> Result<(), CommonError> {
-        if self.group_id.as_raw() == 0 {
-            return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
-                "worker.metadata.group_id must be greater than zero",
-            ));
-        }
-
-        if self.endpoint.is_empty() {
-            return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
-                "worker.metadata.endpoint must not be empty",
-            ));
-        }
-
-        if !(self.endpoint.starts_with("http://") || self.endpoint.starts_with("https://")) {
-            return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
-                "worker.metadata.endpoint must include http:// or https:// scheme",
-            ));
-        }
-
-        Endpoint::from_shared(self.endpoint.clone()).map_err(|err| {
-            CommonError::new(
-                CommonErrorCode::InvalidArgument,
-                format!("worker.metadata.endpoint must be a valid tonic endpoint URI: {err}"),
-            )
-        })?;
-
         if self.endpoints.is_empty() {
             return Err(CommonError::new(
                 CommonErrorCode::InvalidArgument,
@@ -510,6 +532,23 @@ impl WorkerRegistrationConfig {
 
 fn invalid_config(key: &'static str, detail: &'static str) -> CommonError {
     CommonError::new(CommonErrorCode::InvalidArgument, format!("{key} {detail}"))
+}
+
+fn parse_group_name(key: &'static str, raw: String) -> Result<GroupName, CommonError> {
+    GroupName::parse(raw).map_err(|err| CommonError::new(CommonErrorCode::InvalidArgument, format!("{key} {err}")))
+}
+
+fn metadata_endpoints(
+    worker_sub: &common::config::FlatConfig,
+    defaults: &WorkerRegistrationConfig,
+) -> Result<Vec<String>, CommonError> {
+    if let Some(endpoints) = worker_sub.get_str("metadata.endpoints") {
+        return parse_csv_endpoints(endpoints);
+    }
+    if worker_sub.contains_key("metadata.endpoints") {
+        return Err(invalid_config("worker.metadata.endpoints", "must be a string"));
+    }
+    Ok(defaults.endpoints.clone())
 }
 
 fn parse_csv_endpoints(value: String) -> Result<Vec<String>, CommonError> {
@@ -603,7 +642,7 @@ worker:
     bind: "127.0.0.1:9090"
     advertised_endpoint: "http://127.0.0.1:9090"
   metadata:
-    endpoint: "http://127.0.0.1:18080"
+    endpoints: "http://127.0.0.1:18080"
 "#,
         )
         .unwrap();
@@ -611,17 +650,16 @@ worker:
         let config = WorkerConfig::load(&config_path).unwrap();
 
         assert_eq!(config.rpc_bind, "127.0.0.1:9090");
-        assert_eq!(config.worker_id, None);
-        assert_eq!(config.identity_path, PathBuf::from("./data/worker.identity"));
+        assert_eq!(config.identity_path, PathBuf::from("data/worker/worker.identity"));
         assert_eq!(config.rpc_max_inflight, 100);
         assert_eq!(config.default_frame_size, 1024 * 1024);
         assert_eq!(config.max_frame_size, 4 * 1024 * 1024);
         assert_eq!(config.window_bytes, 8 * 1024 * 1024);
         assert_eq!(config.stream_idle_timeout_ms, 60_000);
-        assert_eq!(config.storage_root, PathBuf::from("./data"));
+        assert_eq!(config.storage_root, PathBuf::from("data/worker"));
         assert_eq!(config.rpc_advertised_endpoint, "http://127.0.0.1:9090");
-        assert_eq!(config.metadata.group_id, ShardGroupId::new(1));
-        assert_eq!(config.metadata.endpoint, "http://127.0.0.1:18080");
+        assert_eq!(config.metadata.group_name.as_str(), "root");
+        assert_eq!(config.metadata.endpoints, vec!["http://127.0.0.1:18080"]);
         assert_eq!(config.metadata.register_timeout_ms, 5_000);
         assert_eq!(config.metadata.register_retry_initial_backoff_ms, 200);
         assert_eq!(config.metadata.register_retry_max_backoff_ms, 5_000);
@@ -645,7 +683,6 @@ worker:
             &config_path,
             r#"
 worker:
-  id: 77
   identity:
     path: "/tmp/vecton-worker.identity"
   rpc:
@@ -660,8 +697,9 @@ worker:
   storage:
     root: "/tmp/vecton-worker"
   metadata:
-    group_id: 12
-    endpoint: "http://127.0.0.1:18080"
+    group:
+      name: "analytics"
+    endpoints: "http://127.0.0.1:18080,http://127.0.0.1:18081"
     register_timeout_ms: 2500
     register_retry_initial_backoff_ms: 25
     register_retry_max_backoff_ms: 250
@@ -671,7 +709,6 @@ worker:
 
         let config = WorkerConfig::load(&config_path).unwrap();
 
-        assert_eq!(config.worker_id, Some(WorkerId::new(77)));
         assert_eq!(config.identity_path, PathBuf::from("/tmp/vecton-worker.identity"));
         assert_eq!(config.rpc_bind, "127.0.0.1:9091");
         assert_eq!(config.rpc_max_inflight, 8);
@@ -681,8 +718,11 @@ worker:
         assert_eq!(config.stream_idle_timeout_ms, 500);
         assert_eq!(config.storage_root, PathBuf::from("/tmp/vecton-worker"));
         assert_eq!(config.rpc_advertised_endpoint, "http://127.0.0.1:19091");
-        assert_eq!(config.metadata.group_id, ShardGroupId::new(12));
-        assert_eq!(config.metadata.endpoint, "http://127.0.0.1:18080");
+        assert_eq!(config.metadata.group_name.as_str(), "analytics");
+        assert_eq!(
+            config.metadata.endpoints,
+            vec!["http://127.0.0.1:18080", "http://127.0.0.1:18081"]
+        );
         assert_eq!(config.metadata.register_timeout_ms, 2_500);
         assert_eq!(config.metadata.register_retry_initial_backoff_ms, 25);
         assert_eq!(config.metadata.register_retry_max_backoff_ms, 250);
@@ -691,25 +731,33 @@ worker:
     }
 
     #[test]
-    fn worker_id_config_loads_explicit_worker_id() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("core-site.yaml");
-        fs::write(
-            &config_path,
-            r#"
+    fn removed_worker_identity_and_group_keys_are_rejected() {
+        for removed_key in [
+            "id: 91",
+            "metadata:\n    group_id: 7\n    endpoints: \"http://127.0.0.1:18080\"",
+            "metadata:\n    group:\n      id: 7\n    endpoints: \"http://127.0.0.1:18080\"",
+            "bootstrap:\n    auto_format: true\n  metadata:\n    endpoints: \"http://127.0.0.1:18080\"",
+            "auto_format: true\n  metadata:\n    endpoints: \"http://127.0.0.1:18080\"",
+        ] {
+            let temp_dir = TempDir::new().unwrap();
+            let config_path = temp_dir.path().join("core-site.yaml");
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
 worker:
-  id: 91
+  {removed_key}
   rpc:
     advertised_endpoint: "http://127.0.0.1:9090"
-  metadata:
-    endpoint: "http://127.0.0.1:18080"
-"#,
-        )
-        .unwrap();
+"#
+                ),
+            )
+            .unwrap();
 
-        let config = WorkerConfig::load(&config_path).unwrap();
+            let err = WorkerConfig::load(&config_path).expect_err("removed worker key must fail");
 
-        assert_eq!(config.worker_id, Some(WorkerId::new(91)));
+            assert!(err.message.contains("unsupported"));
+        }
     }
 
     #[test]
@@ -726,7 +774,7 @@ worker:
     default_frame_size: 8388608
     max_frame_size: 16777216
   metadata:
-    endpoint: "http://127.0.0.1:18080"
+    endpoints: "http://127.0.0.1:18080"
 "#,
         )
         .unwrap();
@@ -761,7 +809,7 @@ worker:
   default_frame_size: 8192
   max_frame_size: 4096
   metadata:
-    endpoint: "http://127.0.0.1:18080"
+    endpoints: "http://127.0.0.1:18080"
 "#,
         )
         .unwrap();
@@ -783,7 +831,7 @@ worker:
     advertised_endpoint: "http://127.0.0.1:9090"
     max_inflight: false
   metadata:
-    endpoint: "http://127.0.0.1:18080"
+    endpoints: "http://127.0.0.1:18080"
 "#,
         )
         .unwrap();
@@ -807,7 +855,7 @@ worker:
     dir: "/data/a"
     dirs: "/data/b,/data/c"
   metadata:
-    endpoint: "http://127.0.0.1:18080"
+    endpoints: "http://127.0.0.1:18080"
 "#,
         )
         .unwrap();
@@ -818,7 +866,7 @@ worker:
     }
 
     #[test]
-    fn rejects_missing_worker_metadata_endpoint() {
+    fn uses_default_worker_metadata_endpoints_when_absent() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("core-site.yaml");
         fs::write(
@@ -827,9 +875,52 @@ worker:
         )
         .unwrap();
 
+        let config = WorkerConfig::load(&config_path).unwrap();
+
+        assert_eq!(config.metadata.endpoints, WorkerRegistrationConfig::default().endpoints);
+    }
+
+    #[test]
+    fn worker_metadata_endpoint_key_is_rejected() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("core-site.yaml");
+        fs::write(
+            &config_path,
+            r#"
+worker:
+  rpc:
+    advertised_endpoint: "http://127.0.0.1:9090"
+  metadata:
+    endpoint: "http://127.0.0.1:19080"
+"#,
+        )
+        .unwrap();
+
+        let err = WorkerConfig::load(&config_path).unwrap_err();
+
+        assert!(err.message.contains("worker.metadata.endpoint"));
+        assert!(err.message.contains("unsupported"));
+    }
+
+    #[test]
+    fn rejects_empty_worker_metadata_endpoints() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("core-site.yaml");
+        fs::write(
+            &config_path,
+            r#"
+worker:
+  rpc:
+    advertised_endpoint: "http://127.0.0.1:9090"
+  metadata:
+    endpoints: " , "
+"#,
+        )
+        .unwrap();
+
         let error = WorkerConfig::load(&config_path).unwrap_err();
 
-        assert!(error.message.contains("worker.metadata.endpoint"));
+        assert!(error.message.contains("worker.metadata.endpoints"));
     }
 
     #[test]
@@ -846,7 +937,7 @@ worker:
   rpc:
     advertised_endpoint: "http://127.0.0.1:9090"
   metadata:
-    endpoint: "http://127.0.0.1:18080"
+    endpoints: "http://127.0.0.1:18080"
 "#
                 ),
             )
@@ -859,7 +950,7 @@ worker:
     }
 
     #[test]
-    fn rejects_invalid_worker_metadata_endpoint() {
+    fn rejects_invalid_worker_metadata_endpoints() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("core-site.yaml");
         fs::write(
@@ -869,14 +960,14 @@ worker:
   rpc:
     advertised_endpoint: "http://127.0.0.1:9090"
   metadata:
-    endpoint: "127.0.0.1:18080"
+    endpoints: "127.0.0.1:18080"
 "#,
         )
         .unwrap();
 
         let error = WorkerConfig::load(&config_path).unwrap_err();
 
-        assert!(error.message.contains("worker.metadata.endpoint"));
+        assert!(error.message.contains("worker.metadata.endpoints"));
     }
 
     #[test]
@@ -890,7 +981,7 @@ worker:
   rpc:
     bind: "0.0.0.0:9090"
   metadata:
-    endpoint: "http://127.0.0.1:18080"
+    endpoints: "http://127.0.0.1:18080"
 "#,
         )
         .unwrap();
@@ -914,7 +1005,7 @@ worker:
     bind: "0.0.0.0:9090"
     advertised_endpoint: "{advertised_endpoint}"
   metadata:
-    endpoint: "http://127.0.0.1:18080"
+    endpoints: "http://127.0.0.1:18080"
 "#
                 ),
             )
@@ -938,7 +1029,7 @@ worker:
   rpc:
     advertised_endpoint: "http://127.0.0.1:9090"
   metadata:
-    endpoint: "http://127.0.0.1:18080"
+    endpoints: "http://127.0.0.1:18080"
     register_timeout_ms: 0
 "#,
         )
@@ -955,7 +1046,7 @@ worker:
   rpc:
     advertised_endpoint: "http://127.0.0.1:9090"
   metadata:
-    endpoint: "http://127.0.0.1:18080"
+    endpoints: "http://127.0.0.1:18080"
     register_retry_initial_backoff_ms: 0
 "#,
         )
@@ -974,7 +1065,7 @@ worker:
   rpc:
     advertised_endpoint: "http://127.0.0.1:9090"
   metadata:
-    endpoint: "http://127.0.0.1:18080"
+    endpoints: "http://127.0.0.1:18080"
     register_retry_initial_backoff_ms: 500
     register_retry_max_backoff_ms: 100
 "#,

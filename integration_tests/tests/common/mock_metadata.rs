@@ -5,7 +5,7 @@
 
 use ::common::error::canonical::{CanonicalError, ErrorClass, ErrorCode};
 use ::common::header::RpcErrorCode;
-use proto::common::{GroupStateWatermarkProto, RaftLogIdProto, ResponseHeaderProto, ShardGroupIdProto};
+use proto::common::{GroupStateWatermarkProto, RaftLogIdProto, ResponseHeaderProto};
 use proto::convert::canonical_to_error_detail;
 use proto::metadata::*;
 use std::sync::Arc;
@@ -33,10 +33,10 @@ impl MockMetadataServer {
     pub async fn msync(&self, request: Request<MsyncRequestProto>) -> Result<Response<MsyncResponseProto>, Status> {
         let req = request.into_inner();
 
-        let Some(group_id) = req
+        let Some(group_name) = req
             .header
             .as_ref()
-            .and_then(|header| (header.group_id != 0).then_some(header.group_id))
+            .and_then(|header| (!header.group_name.is_empty()).then_some(header.group_name.clone()))
         else {
             return Ok(Response::new(MsyncResponseProto {
                 header: Some(ResponseHeaderProto {
@@ -46,11 +46,11 @@ impl MockMetadataServer {
                         code: Some(ErrorCode::RpcCode(RpcErrorCode::InvalidHeader)),
                         reason: None,
                         retry_after_ms: None,
-                        message: "MsyncRequestProto requires header.group_id".to_string(),
+                        message: "MsyncRequestProto requires header.group_name".to_string(),
                         refresh_hint: None,
                     })),
                     state: Vec::new(),
-                    group_id: 0,
+                    group_name: String::new(),
                     mount_epoch: None,
                     route_epoch: None,
                 }),
@@ -69,7 +69,7 @@ impl MockMetadataServer {
             client: req.header.as_ref().and_then(|h| h.client.clone()),
             error: None,
             state: Vec::new(),
-            group_id,
+            group_name: group_name.clone(),
             mount_epoch: None,
             route_epoch: Some(route_epoch),
         };
@@ -77,7 +77,7 @@ impl MockMetadataServer {
         Ok(Response::new(MsyncResponseProto {
             header: Some(response_header),
             state: Some(GroupStateWatermarkProto {
-                group_id: Some(ShardGroupIdProto { value: group_id }),
+                group_name,
                 state_id: Some(state_id),
             }),
         }))

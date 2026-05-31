@@ -24,9 +24,10 @@ use std::sync::Arc;
 use tracing::warn;
 use types::block::{BlockPlacement, BlockState};
 use types::fs::{Extent, FileAttrs, FsErrorCode, Inode, InodeData, InodeId, InodeKind};
-use types::ids::{BlockId, ClientId, DataHandleId, LeaseId, MountId, ShardGroupId, ShardId, WorkerId};
+use types::ids::{BlockId, ClientId, DataHandleId, LeaseId, MountId, ShardId, WorkerId};
 use types::layout::FileLayout;
 use types::lease::{FencingToken, Lease};
+use types::GroupName;
 
 fn meta_err_to_fs_errno(err: &MetadataError) -> Option<FsErrorCode> {
     match to_canonical_fs(err.clone()).code {
@@ -171,7 +172,7 @@ impl AppRaftStateMachine {
                 mount_kind,
                 ufs_uri,
                 data_io_policy,
-                namespace_owner_group_id,
+                namespace_owner_group_name,
                 root_inode_id,
                 ..
             } => {
@@ -181,7 +182,7 @@ impl AppRaftStateMachine {
                     mount_kind,
                     ufs_uri,
                     data_io_policy,
-                    namespace_owner_group_id,
+                    namespace_owner_group_name,
                     root_inode_id,
                     &dedup_key,
                     fingerprint,
@@ -193,17 +194,17 @@ impl AppRaftStateMachine {
                 Ok(AppDataResponse::Mount(result))
             }
             Command::AddShardGroup {
-                shard_group_id,
+                group_name,
                 shard_ids,
                 initial_members,
                 ..
             } => {
                 let result =
-                    self.apply_add_shard_group(shard_group_id, shard_ids, initial_members, &dedup_key, fingerprint)?;
+                    self.apply_add_shard_group(group_name, shard_ids, initial_members, &dedup_key, fingerprint)?;
                 Ok(AppDataResponse::ShardGroup(result))
             }
             Command::RegisterWorker {
-                group_id,
+                group_name,
                 worker_id,
                 worker_run_id,
                 address,
@@ -212,7 +213,7 @@ impl AppRaftStateMachine {
                 ..
             } => {
                 let result = self.apply_register_worker(
-                    group_id,
+                    group_name,
                     worker_id,
                     worker_run_id,
                     address,
@@ -559,17 +560,11 @@ impl AppRaftStateMachine {
         mount_kind: crate::mount::MountKind,
         ufs_uri: Option<String>,
         data_io_policy: crate::mount::DataIoPolicy,
-        namespace_owner_group_id: ShardGroupId,
+        namespace_owner_group_name: GroupName,
         root_inode_id: InodeId,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
     ) -> MetadataResult<MountCommandResult> {
-        if namespace_owner_group_id.as_raw() == 0 {
-            return Err(MetadataError::InvalidArgument(
-                "namespace_owner_group_id must be provided".to_string(),
-            ));
-        }
-
         if mount_prefix == crate::mount::ROOT_MOUNT_PREFIX {
             if root_inode_id != crate::mount::ROOT_INODE_ID {
                 return Err(MetadataError::InvalidArgument(format!(
@@ -686,7 +681,7 @@ impl AppRaftStateMachine {
             ufs_uri,
             data_io_policy,
             mount_version: new_version,
-            namespace_owner_group_id,
+            namespace_owner_group_name,
             root_inode_id,
         };
 
@@ -754,23 +749,23 @@ impl AppRaftStateMachine {
 
     fn apply_add_shard_group(
         &self,
-        shard_group_id: ShardGroupId,
+        group_name: GroupName,
         shard_ids: Vec<ShardId>,
         initial_members: Vec<u64>,
         dedup_key: &DedupKey,
         fingerprint: CommandFingerprint,
     ) -> MetadataResult<ShardGroupInfo> {
         // Check if group already exists
-        if self.storage.get_shard_group(shard_group_id)?.is_some() {
+        if self.storage.get_shard_group(&group_name)?.is_some() {
             return Err(MetadataError::AlreadyExists(format!(
-                "Shard group already exists: {:?}",
-                shard_group_id
+                "Shard group already exists: {}",
+                group_name
             )));
         }
 
         // Create shard group info
         let info = ShardGroupInfo {
-            group_id: shard_group_id,
+            group_name,
             shard_ids: shard_ids.iter().map(|s| s.as_raw()).collect(),
             initial_members,
             version: 1,
@@ -789,7 +784,7 @@ impl AppRaftStateMachine {
     #[allow(clippy::too_many_arguments)]
     fn apply_register_worker(
         &self,
-        group_id: ShardGroupId,
+        group_name: GroupName,
         worker_id: WorkerId,
         worker_run_id: types::WorkerRunId,
         address: String,
@@ -799,10 +794,10 @@ impl AppRaftStateMachine {
         fingerprint: CommandFingerprint,
     ) -> MetadataResult<WorkerCommandResult> {
         if let Some(worker_manager) = self.worker_manager.read().clone() {
-            worker_manager.validate_worker_run_registration(group_id, worker_id, worker_run_id)?;
+            worker_manager.validate_worker_run_registration(&group_name, worker_id, worker_run_id)?;
         }
         let worker_info = self.storage.prepare_worker_registration(
-            group_id,
+            group_name,
             worker_id,
             address,
             worker_net_protocol,
@@ -814,7 +809,7 @@ impl AppRaftStateMachine {
             .register_worker_with_apply_result_atomic(&worker_info, dedup_key, applied_result)?;
         if let Some(worker_manager) = self.worker_manager.read().clone() {
             worker_manager.register_worker_run(
-                worker_info.group_id,
+                &worker_info.group_name,
                 worker_info.worker_id,
                 worker_info.address,
                 worker_info.worker_net_protocol,
@@ -2515,6 +2510,10 @@ mod tests {
     use types::layout::FileLayout;
     use types::CallId;
 
+    fn group_name(raw: &str) -> GroupName {
+        GroupName::parse(raw).unwrap()
+    }
+
     fn dedup_for_test(client: u64) -> crate::raft::types::DedupKey {
         crate::raft::types::DedupKey::new(ClientId::new(client), CallId::new())
     }
@@ -2626,7 +2625,7 @@ mod tests {
             reason: crate::state::DeleteIntentReason::Gc,
             created_at_ms: 1,
             not_before_ms: 1,
-            shard_group_id: None,
+            group_name: None,
             guard_watermark: None,
             mount_epoch: None,
             guard_state_id: types::RaftLogId {
@@ -2701,9 +2700,9 @@ mod tests {
     }
 
     #[test]
-    fn create_mount_requires_owner_group() {
+    fn create_mount_rejects_missing_non_root_inode() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -2714,17 +2713,17 @@ mod tests {
             mount_kind: crate::mount::MountKind::External,
             ufs_uri: Some("ufs://a".to_string()),
             data_io_policy: crate::mount::DataIoPolicy::Allow,
-            namespace_owner_group_id: ShardGroupId::new(0),
+            namespace_owner_group_name: group_name("g0"),
             root_inode_id: InodeId::new(1),
         };
         let res = sm.apply(cmd);
-        assert!(matches!(res, Err(MetadataError::InvalidArgument(_))));
+        assert!(matches!(res, Err(MetadataError::NotFound(_))));
     }
 
     #[test]
     fn create_mount_validates_root_inode() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -2747,7 +2746,7 @@ mod tests {
             mount_kind: crate::mount::MountKind::External,
             ufs_uri: Some("ufs://b".to_string()),
             data_io_policy: crate::mount::DataIoPolicy::Allow,
-            namespace_owner_group_id: ShardGroupId::new(2),
+            namespace_owner_group_name: group_name("g2"),
             root_inode_id,
         };
         let res = sm.apply(cmd);
@@ -2757,7 +2756,7 @@ mod tests {
     #[test]
     fn create_mount_succeeds_with_valid_root() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -2780,20 +2779,20 @@ mod tests {
             mount_kind: crate::mount::MountKind::External,
             ufs_uri: Some("ufs://c".to_string()),
             data_io_policy: crate::mount::DataIoPolicy::Allow,
-            namespace_owner_group_id: ShardGroupId::new(5),
+            namespace_owner_group_name: group_name("g5"),
             root_inode_id,
         };
         sm.apply(cmd).unwrap();
 
         let entry = mount_table.get_mount(mount_id).unwrap().unwrap();
-        assert_eq!(entry.namespace_owner_group_id, ShardGroupId::new(5));
+        assert_eq!(entry.namespace_owner_group_name, group_name("g5"));
         assert_eq!(entry.root_inode_id, root_inode_id);
     }
 
     #[test]
     fn create_file_persists_data_handle_mapping() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -2832,7 +2831,7 @@ mod tests {
     #[test]
     fn create_reapply_returns_original_success_result_and_replay_result() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -2863,7 +2862,7 @@ mod tests {
     #[test]
     fn mkdir_persists_inode_and_dentry() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -2892,7 +2891,7 @@ mod tests {
     #[test]
     fn mkdir_reapply_returns_original_success_result_and_replay_result() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -2922,7 +2921,7 @@ mod tests {
     #[test]
     fn rename_moves_dentry_and_preserves_inode() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -2963,7 +2962,7 @@ mod tests {
     #[test]
     fn rename_reapply_returns_original_success_result_and_replay_result() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3007,7 +3006,7 @@ mod tests {
     #[test]
     fn set_attr_reapply_returns_original_result_and_replay_result() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3041,7 +3040,7 @@ mod tests {
     #[test]
     fn mount_commands_reapply_return_original_result_and_update_mount_table_after_apply() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3058,7 +3057,7 @@ mod tests {
             mount_kind: crate::mount::MountKind::External,
             ufs_uri: Some("ufs://reapply".to_string()),
             data_io_policy: crate::mount::DataIoPolicy::Allow,
-            namespace_owner_group_id: ShardGroupId::new(73),
+            namespace_owner_group_name: group_name("g73"),
             root_inode_id,
         };
         let first = expect_mount_upserted(sm.apply(create_mount.clone()).unwrap());
@@ -3084,13 +3083,13 @@ mod tests {
     #[test]
     fn shard_group_reapply_returns_original_result_and_replay_result() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
         let cmd = Command::AddShardGroup {
             dedup: dedup_for_test(75),
-            shard_group_id: ShardGroupId::new(75),
+            group_name: group_name("g75"),
             shard_ids: vec![ShardId::new(750), ShardId::new(751)],
             initial_members: vec![1, 2],
         };
@@ -3100,14 +3099,14 @@ mod tests {
         assert_eq!(second, first);
         assert_eq!(
             storage.get_shard_routing(ShardId::new(750)).unwrap(),
-            Some(ShardGroupId::new(75))
+            Some(group_name("g75"))
         );
     }
 
     #[test]
     fn worker_descriptor_reapply_returns_original_result_and_replay_result() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
         let worker_id = WorkerId::new(76);
@@ -3115,7 +3114,7 @@ mod tests {
 
         let cmd = Command::RegisterWorker {
             dedup: dedup_for_test(76),
-            group_id: ShardGroupId::new(1),
+            group_name: group_name("root"),
             worker_id,
             worker_run_id,
             address: "127.0.0.1:17076".to_string(),
@@ -3126,18 +3125,18 @@ mod tests {
         assert_eq!(expect_worker_upserted(sm.apply(cmd.clone()).unwrap()), worker_id);
         assert_eq!(expect_worker_upserted(sm.apply(cmd).unwrap()), worker_id);
         let stored = storage
-            .get_worker_in_group(ShardGroupId::new(1), worker_id)
+            .get_worker_in_group(&group_name("root"), worker_id)
             .unwrap()
             .unwrap();
         assert_eq!(stored.address, "127.0.0.1:17076");
         assert_eq!(stored.worker_id, worker_id);
-        assert_eq!(stored.group_id, ShardGroupId::new(1));
+        assert_eq!(stored.group_name, group_name("root"));
     }
 
     #[test]
     fn register_worker_rejects_live_worker_run_id_conflict() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let worker_manager = Arc::new(crate::worker::WorkerManager::new(60));
         let sm = AppRaftStateMachine::new_with_worker_manager(
@@ -3151,7 +3150,7 @@ mod tests {
 
         let first = Command::RegisterWorker {
             dedup: dedup_for_test(760),
-            group_id: ShardGroupId::new(1),
+            group_name: group_name("root"),
             worker_id,
             worker_run_id: first_run_id,
             address: "127.0.0.1:17060".to_string(),
@@ -3160,7 +3159,7 @@ mod tests {
         };
         let second = Command::RegisterWorker {
             dedup: dedup_for_test(761),
-            group_id: ShardGroupId::new(1),
+            group_name: group_name("root"),
             worker_id,
             worker_run_id: second_run_id,
             address: "127.0.0.1:17061".to_string(),
@@ -3175,13 +3174,13 @@ mod tests {
             .expect_err("different live worker_run_id must be rejected");
         assert!(error.to_string().contains("already registered"));
         let stored = storage
-            .get_worker_in_group(ShardGroupId::new(1), worker_id)
+            .get_worker_in_group(&group_name("root"), worker_id)
             .unwrap()
             .unwrap();
         assert_eq!(stored.address, "127.0.0.1:17060");
         assert_eq!(
             worker_manager
-                .get_registration(ShardGroupId::new(1), worker_id)
+                .get_registration(&group_name("root"), worker_id)
                 .expect("live registration")
                 .worker_run_id,
             first_run_id
@@ -3191,13 +3190,13 @@ mod tests {
     #[test]
     fn register_worker_accepts_new_worker_run_id_after_reload() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let first_manager = Arc::new(crate::worker::WorkerManager::new(60));
         let first_sm =
             AppRaftStateMachine::new_with_worker_manager(Arc::clone(&storage), Arc::clone(&mount_table), first_manager);
         let worker_id = WorkerId::new(7601);
-        let group_id = ShardGroupId::new(1);
+        let group_name = group_name("root");
         let first_run_id: types::WorkerRunId = "550e8400-e29b-41d4-a716-446655440030".parse().unwrap();
         let second_run_id: types::WorkerRunId = "550e8400-e29b-41d4-a716-446655440031".parse().unwrap();
 
@@ -3206,7 +3205,7 @@ mod tests {
                 first_sm
                     .apply(Command::RegisterWorker {
                         dedup: dedup_for_test(7601),
-                        group_id,
+                        group_name: group_name.clone(),
                         worker_id,
                         worker_run_id: first_run_id,
                         address: "127.0.0.1:17601".to_string(),
@@ -3224,15 +3223,15 @@ mod tests {
             mount_table,
             Arc::clone(&reloaded_manager),
         );
-        assert!(reloaded_manager.get_registration(group_id, worker_id).is_none());
-        assert!(reloaded_manager.get_descriptor(group_id, worker_id).is_some());
+        assert!(reloaded_manager.get_registration(&group_name, worker_id).is_none());
+        assert!(reloaded_manager.get_descriptor(&group_name, worker_id).is_some());
 
         assert_eq!(
             expect_worker_upserted(
                 reloaded_sm
                     .apply(Command::RegisterWorker {
                         dedup: dedup_for_test(7602),
-                        group_id,
+                        group_name: group_name.clone(),
                         worker_id,
                         worker_run_id: second_run_id,
                         address: "127.0.0.1:17602".to_string(),
@@ -3245,7 +3244,7 @@ mod tests {
         );
         assert_eq!(
             reloaded_manager
-                .get_registration(group_id, worker_id)
+                .get_registration(&group_name, worker_id)
                 .expect("new live registration")
                 .worker_run_id,
             second_run_id
@@ -3255,18 +3254,18 @@ mod tests {
     #[test]
     fn register_worker_is_scoped_by_metadata_group() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
         let worker_id = WorkerId::new(761);
-        let first_group = ShardGroupId::new(1);
-        let second_group = ShardGroupId::new(2);
+        let first_group = group_name("root");
+        let second_group = group_name("g2");
         let first_run_id: types::WorkerRunId = "550e8400-e29b-41d4-a716-446655440010".parse().unwrap();
         let second_run_id: types::WorkerRunId = "550e8400-e29b-41d4-a716-446655440011".parse().unwrap();
 
         let first = Command::RegisterWorker {
             dedup: dedup_for_test(762),
-            group_id: first_group,
+            group_name: first_group.clone(),
             worker_id,
             worker_run_id: first_run_id,
             address: "127.0.0.1:17062".to_string(),
@@ -3275,7 +3274,7 @@ mod tests {
         };
         let second = Command::RegisterWorker {
             dedup: dedup_for_test(763),
-            group_id: second_group,
+            group_name: second_group.clone(),
             worker_id,
             worker_run_id: second_run_id,
             address: "127.0.0.1:17063".to_string(),
@@ -3286,18 +3285,18 @@ mod tests {
         assert_eq!(expect_worker_upserted(sm.apply(first).unwrap()), worker_id);
         assert_eq!(expect_worker_upserted(sm.apply(second).unwrap()), worker_id);
 
-        let first_stored = storage.get_worker_in_group(first_group, worker_id).unwrap().unwrap();
-        let second_stored = storage.get_worker_in_group(second_group, worker_id).unwrap().unwrap();
-        assert_eq!(first_stored.group_id, first_group);
+        let first_stored = storage.get_worker_in_group(&first_group, worker_id).unwrap().unwrap();
+        let second_stored = storage.get_worker_in_group(&second_group, worker_id).unwrap().unwrap();
+        assert_eq!(first_stored.group_name, first_group);
         assert_eq!(first_stored.address, "127.0.0.1:17062");
-        assert_eq!(second_stored.group_id, second_group);
+        assert_eq!(second_stored.group_name, second_group);
         assert_eq!(second_stored.address, "127.0.0.1:17063");
     }
 
     #[test]
     fn register_worker_apply_updates_live_worker_manager_by_group() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let worker_manager = Arc::new(crate::worker::WorkerManager::new(60));
         let sm = AppRaftStateMachine::new_with_worker_manager(
@@ -3306,8 +3305,8 @@ mod tests {
             Arc::clone(&worker_manager),
         );
         let worker_id = WorkerId::new(762);
-        let first_group = ShardGroupId::new(1);
-        let second_group = ShardGroupId::new(2);
+        let first_group = group_name("root");
+        let second_group = group_name("g2");
         let first_run_id: types::WorkerRunId = "550e8400-e29b-41d4-a716-446655440020".parse().unwrap();
         let second_run_id: types::WorkerRunId = "550e8400-e29b-41d4-a716-446655440021".parse().unwrap();
 
@@ -3315,7 +3314,7 @@ mod tests {
             expect_worker_upserted(
                 sm.apply(Command::RegisterWorker {
                     dedup: dedup_for_test(764),
-                    group_id: first_group,
+                    group_name: first_group.clone(),
                     worker_id,
                     worker_run_id: first_run_id,
                     address: "127.0.0.1:17064".to_string(),
@@ -3330,7 +3329,7 @@ mod tests {
             expect_worker_upserted(
                 sm.apply(Command::RegisterWorker {
                     dedup: dedup_for_test(765),
-                    group_id: second_group,
+                    group_name: second_group.clone(),
                     worker_id,
                     worker_run_id: second_run_id,
                     address: "127.0.0.1:17065".to_string(),
@@ -3343,16 +3342,16 @@ mod tests {
         );
 
         let first = worker_manager
-            .get_descriptor(first_group, worker_id)
+            .get_descriptor(&first_group, worker_id)
             .expect("first group descriptor");
         let second = worker_manager
-            .get_descriptor(second_group, worker_id)
+            .get_descriptor(&second_group, worker_id)
             .expect("second group descriptor");
         let first_registration = worker_manager
-            .get_registration(first_group, worker_id)
+            .get_registration(&first_group, worker_id)
             .expect("first group registration");
         let second_registration = worker_manager
-            .get_registration(second_group, worker_id)
+            .get_registration(&second_group, worker_id)
             .expect("second group registration");
         assert_eq!(first.address, "127.0.0.1:17064");
         assert_eq!(first_registration.worker_run_id, first_run_id);
@@ -3363,7 +3362,7 @@ mod tests {
     #[test]
     fn create_delete_intents_replay_and_fingerprint_mismatch_do_not_duplicate_intents() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3399,7 +3398,7 @@ mod tests {
     #[test]
     fn create_delete_intents_rejects_duplicate_ids_without_partial_write() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3426,7 +3425,7 @@ mod tests {
     #[test]
     fn create_delete_intents_rejects_existing_id_without_overwrite() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3459,7 +3458,7 @@ mod tests {
     #[test]
     fn allocate_delete_intents_assigns_ids_in_apply_and_replay_is_noop() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3496,7 +3495,7 @@ mod tests {
     #[test]
     fn update_delete_intent_status_is_raft_authoritative_and_replay_stable() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3545,7 +3544,7 @@ mod tests {
     #[test]
     fn update_delete_intent_status_rejects_missing_and_invalid_transition_without_half_write() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3580,7 +3579,7 @@ mod tests {
     #[test]
     fn truncate_shrink_within_extent_updates_inode_layout_applied_result_and_replay_result() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3634,7 +3633,7 @@ mod tests {
     #[test]
     fn truncate_drops_full_blocks_creates_intent_and_replay_does_not_double_decrement() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3677,7 +3676,7 @@ mod tests {
     #[test]
     fn truncate_same_block_kept_and_dropped_does_not_release_kept_reference() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3724,7 +3723,7 @@ mod tests {
     #[test]
     fn truncate_multiple_zero_ref_blocks_allocates_stable_intent_ids_and_replay_is_noop() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3768,7 +3767,7 @@ mod tests {
     #[test]
     fn truncate_delete_intent_allocator_missing_bumps_above_existing_intent_id() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3820,7 +3819,7 @@ mod tests {
     #[test]
     fn truncate_delete_intent_allocator_lagging_bumps_above_existing_intent_id() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3874,7 +3873,7 @@ mod tests {
     #[test]
     fn truncate_delete_intent_allocator_ahead_does_not_rewind() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3917,7 +3916,7 @@ mod tests {
     #[test]
     fn truncate_rejects_data_handle_mismatch_and_missing_refcount_without_half_commit() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -3979,7 +3978,7 @@ mod tests {
     #[test]
     fn truncate_grow_remains_not_supported_and_same_size_is_stable_noop() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4039,7 +4038,7 @@ mod tests {
     #[test]
     fn truncate_rejects_invalid_lease_identity_and_epoch_without_half_commit() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4091,7 +4090,7 @@ mod tests {
     #[test]
     fn lease_commands_reapply_return_original_result_and_replay_result() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4137,7 +4136,7 @@ mod tests {
     #[test]
     fn rename_overwrites_empty_file() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4211,7 +4210,7 @@ mod tests {
     #[test]
     fn rename_overwrites_file_with_extents() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4270,7 +4269,7 @@ mod tests {
     #[test]
     fn rename_overwrite_releases_old_blocks() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4321,7 +4320,7 @@ mod tests {
     #[test]
     fn rename_overwrite_creates_delete_intents() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4373,7 +4372,7 @@ mod tests {
     #[test]
     fn rename_rejects_non_empty_directory_target() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4433,7 +4432,7 @@ mod tests {
     #[test]
     fn rename_overwrite_is_dedup_safe() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4489,7 +4488,7 @@ mod tests {
     #[test]
     fn rename_replay_does_not_double_release_blocks() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4541,7 +4540,7 @@ mod tests {
     #[test]
     fn rename_reusing_call_id_for_different_target_is_rejected() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4596,7 +4595,7 @@ mod tests {
     #[test]
     fn create_allocates_distinct_inode_ids() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4641,7 +4640,7 @@ mod tests {
         let db_path = dir.path().join("state_machine_inode_allocator");
         let parent_inode_id = InodeId::new(100);
         let first_inode_id = {
-            let storage = Arc::new(RocksDBStorage::open(&db_path).unwrap());
+            let storage = Arc::new(RocksDBStorage::create_for_format(&db_path).unwrap());
             storage
                 .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1)))
                 .unwrap();
@@ -4662,7 +4661,7 @@ mod tests {
             }
         };
 
-        let storage = Arc::new(RocksDBStorage::open(&db_path).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(&db_path).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), mount_table);
         let response = sm
@@ -4686,7 +4685,7 @@ mod tests {
     #[test]
     fn close_write_extents_must_use_inode_data_handle() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4754,7 +4753,7 @@ mod tests {
     #[test]
     fn close_write_preserves_visible_block_stamp_for_already_published_extent() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4810,7 +4809,7 @@ mod tests {
     #[test]
     fn apply_rejects_duplicate_blocks() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4841,7 +4840,7 @@ mod tests {
     #[test]
     fn apply_rejects_overlapping_ranges() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4872,7 +4871,7 @@ mod tests {
     #[test]
     fn apply_rejects_zero_length_block() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4900,7 +4899,7 @@ mod tests {
     #[test]
     fn apply_rejects_bad_final_size() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4934,7 +4933,7 @@ mod tests {
     #[test]
     fn apply_replace_removes_old_layout() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -4979,7 +4978,7 @@ mod tests {
     #[test]
     fn apply_append_keeps_old_layout() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5025,7 +5024,7 @@ mod tests {
     #[test]
     fn apply_rejects_append_offset_not_current_size() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5059,7 +5058,7 @@ mod tests {
     #[test]
     fn dedup_rejects_commit_mode_mismatch() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5097,7 +5096,7 @@ mod tests {
     #[test]
     fn apply_replace_releases_old_blocks() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5159,7 +5158,7 @@ mod tests {
     #[test]
     fn close_write_success_replay_returns_original_result_without_reapplying_mutation() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5214,7 +5213,7 @@ mod tests {
     #[test]
     fn close_write_extent_data_handle_mismatch_persists_error_without_half_commit() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5257,7 +5256,7 @@ mod tests {
     #[test]
     fn close_write_fingerprint_mismatch_does_not_reapply_mutation() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5320,7 +5319,7 @@ mod tests {
     #[ignore = "pending identity-pivot follow-ups"]
     fn allocate_block_validates_handle_owner() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5358,7 +5357,7 @@ mod tests {
     #[test]
     fn acquire_lease_validates_handle_owner() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5416,7 +5415,7 @@ mod tests {
     #[test]
     fn dedup_fingerprint_mismatch_does_not_apply_mutation_or_reapply_mutation() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5451,7 +5450,7 @@ mod tests {
     #[test]
     fn unlink_empty_file_deletes_namespace_data_owner_and_replays_without_mutating_again() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5486,7 +5485,7 @@ mod tests {
     #[test]
     fn unlink_file_with_extents_deletes_layout_owner_refcount_and_creates_intent_once() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5527,7 +5526,7 @@ mod tests {
     #[test]
     fn unlink_file_with_shared_extent_only_decrements_refcount() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5563,7 +5562,7 @@ mod tests {
     #[test]
     fn unlink_file_with_missing_refcount_returns_error_without_half_delete() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5603,7 +5602,7 @@ mod tests {
     #[test]
     fn delete_empty_dir_deletes_namespace_and_replays_without_mutating_again() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5634,7 +5633,7 @@ mod tests {
     #[test]
     fn delete_empty_dir_non_empty_dir_returns_directory_not_empty_and_preserves_namespace() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5669,7 +5668,7 @@ mod tests {
     #[test]
     fn delete_tree_nested_extent_files_delete_layout_refs_intents_and_replay_once() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5737,7 +5736,7 @@ mod tests {
     #[test]
     fn delete_tree_missing_refcount_returns_error_without_half_delete() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5785,7 +5784,7 @@ mod tests {
     #[test]
     fn delete_tree_missing_layout_returns_error_without_half_delete_and_replay_is_stable() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 
@@ -5846,7 +5845,7 @@ mod tests {
     #[test]
     fn delete_tree_fingerprint_mismatch_preserves_second_tree() {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
         let sm = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
 

@@ -104,8 +104,9 @@ mod tests {
     use bytes::Bytes;
     use common::header::RequestHeader;
     use types::chunk::ByteRange;
-    use types::ids::{BlockId, ClientId, ShardGroupId, StreamId};
+    use types::ids::{BlockId, ClientId, StreamId};
     use types::lease::FencingToken;
+    use types::GroupName;
 
     use super::*;
     use crate::data::core::{
@@ -129,7 +130,7 @@ mod tests {
                 .open_read(
                     &endpoint,
                     ReadOpenRequest {
-                        group_id: ShardGroupId::new(3),
+                        group_name: GroupName::parse("root").unwrap(),
                         block_id,
                         worker_run_id: test_worker_run_id(),
                         byte_range: ByteRange { offset: 0, len: 1024 },
@@ -156,7 +157,7 @@ mod tests {
                 .open_write(
                     &endpoint,
                     WriteOpenRequest {
-                        group_id: ShardGroupId::new(3),
+                        group_name: GroupName::parse("root").unwrap(),
                         block_id,
                         worker_run_id: test_worker_run_id(),
                         token,
@@ -195,7 +196,7 @@ mod tests {
                     &endpoint,
                     CommitWriteRequest {
                         stream_id: StreamId::new(11),
-                        group_id: ShardGroupId::new(3),
+                        group_name: GroupName::parse("root").unwrap(),
                         block_id,
                         worker_run_id: test_worker_run_id(),
                         token,
@@ -217,7 +218,7 @@ mod tests {
                 .sync_committed_block(
                     &endpoint,
                     SyncCommittedBlockRequest {
-                        group_id: ShardGroupId::new(3),
+                        group_name: GroupName::parse("root").unwrap(),
                         block_id,
                         worker_run_id: test_worker_run_id(),
                         block_stamp: 1,
@@ -237,7 +238,7 @@ mod tests {
                     &endpoint,
                     AbortWriteRequest {
                         stream_id: StreamId::new(11),
-                        group_id: ShardGroupId::new(3),
+                        group_name: GroupName::parse("root").unwrap(),
                         block_id,
                         token,
                     },

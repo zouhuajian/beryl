@@ -41,8 +41,8 @@ message ShardSpec {
 
 message CreateShardGroupRequest {
   common.RequestHeaderProto header = 1;
-  /// Optional: explicit shard group ID (if omitted, auto-generated).
-  common.ShardGroupIdProto shard_group_id = 2;
+  reserved 2;
+  reserved "shard_group_id";
   /// Shard group policy.
   ShardGroupPolicy policy = 3;
   /// Shard specification.
@@ -53,6 +53,8 @@ message CreateShardGroupRequest {
   map<uint64, common.ShardIdProto> mount_bindings = 6;
   /// Optional: idempotency key (for retry safety).
   string idempotency_key = 7;
+  /// Stable group identity.
+  string group_name = 8;
 }
 
 message CreateShardGroupResponse {
@@ -73,13 +75,16 @@ message CreateShardGroupResponse {
 
 message AddShardsToGroupRequest {
   common.RequestHeaderProto header = 1;
-  common.ShardGroupIdProto shard_group_id = 2;
+  reserved 2;
+  reserved "shard_group_id";
   /// Shard specification for new shards.
   ShardSpec shards_to_add = 3;
   /// Optional: target node IDs for placement.
   repeated uint64 target_nodes = 4;
   /// Optional: idempotency key.
   string idempotency_key = 5;
+  /// Stable group identity.
+  string group_name = 6;
 }
 
 message AddShardsToGroupResponse {
@@ -141,11 +146,14 @@ message MergeShardResponse {
 
 message RebalanceShardGroupRequest {
   common.RequestHeaderProto header = 1;
-  common.ShardGroupIdProto shard_group_id = 2;
+  reserved 2;
+  reserved "shard_group_id";
   /// Rebalance strategy: BALANCE_LOAD, MINIMIZE_MOVEMENT, etc.
   string strategy = 3;
   /// Optional: target node IDs (if specified, rebalance to these nodes).
   repeated uint64 target_nodes = 4;
+  /// Stable group identity.
+  string group_name = 5;
 }
 
 message RebalanceShardGroupResponse {
@@ -174,9 +182,12 @@ message ShardMovement {
 
 message GetShardGroupRequest {
   common.RequestHeaderProto header = 1;
-  common.ShardGroupIdProto shard_group_id = 2;
+  reserved 2;
+  reserved "shard_group_id";
   /// Optional: include detailed shard information.
   bool include_shards = 3;
+  /// Stable group identity.
+  string group_name = 4;
 }
 
 message GetShardGroupResponse {
@@ -236,4 +247,3 @@ service ShardAdminService {
   /// List shard groups (with optional filtering).
   rpc ListShardGroups(ListShardGroupsRequest) returns (ListShardGroupsResponse);
 }
-

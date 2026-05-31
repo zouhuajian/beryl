@@ -77,18 +77,18 @@ flowchart TB
 
 ## 3. 启动链路
 
-`metadata/src/bin/main.rs` 仍是薄入口，只执行：
+`metadata/src/bin/main.rs` 是薄命令入口：
 
-1. `load_config()`
-2. `init_observability(config.as_ref())`
-3. `MetadataServer::build(config).await`
-4. `server.serve().await`
+1. 解析 metadata 命令，当前支持 `metadata format --config <path>` 和 `metadata start --config <path>`。
+2. 加载 metadata config。
+3. `format` 调用 metadata format lifecycle，创建 metadata marker、single-node Raft membership 和 root namespace，然后退出；该离线命令不初始化 Prometheus/metrics endpoint。
+4. `start` 初始化完整 observability/metrics，调用 `MetadataServer::build(config).await` 构造长期 runtime，然后 `server.serve().await`。
 
 `MetadataServer::build()` 当前按依赖顺序构造长期对象：
 
 | 阶段 | 当前事实 | 状态 |
 | --- | --- | --- |
-| `build_authority()` | 打开 RocksDB，加载 `MountTable`，构造 `AppRaftStateMachine` / `AppRaftNode`，执行 root mount bootstrap，构造 `RaftStateStore`。 | 已实现 |
+| `build_authority()` | 通过 existing-only RocksDB open 加载已格式化状态，加载 `MountTable`，构造 `AppRaftStateMachine` / `AppRaftNode`，构造 `RaftStateStore`；start 路径只加载和校验已有 root 状态。 | 已实现 |
 | `build_maintenance_repair_state()` | 创建 maintenance-owned `RepairQueue`、`OrphanQueue`、`RepairPlanner` 和 shared `InflightRegistry`。 | 已实现 |
 | `build_worker_runtime()` | 创建 required `WorkerRuntime`、`WorkerManager`，构造只持有 repair signal handler 的 `MetadataWorkerServiceImpl`。 | 已实现 |
 | `build_readiness()` | 启动 root readiness watcher，HealthService 初始 not-serving，root ready 后标记 serving。 | 已实现 |
@@ -144,17 +144,18 @@ FileSystemService RPC
 namespace / mount / route 当前事实：
 
 - `MountTable::load_from_storage()` 启动时从 RocksDB mounts CF 载入；Raft apply `CreateMount` / `DeleteMount` 后同步更新内存表。
-- `namespace_owner_group_id` 是 mount 内 filesystem mutation owner group。
+- `namespace_owner_group_name` 是 mount 内 filesystem mutation owner group。
 - `MountEntry.mount_version` / `MountEntryProto.mount_version` 是 per-mount entry version，对外作为 `mount_epoch` freshness token 使用。
 - `MountTable::version()` 是 table-level version counter，不是 per-entry `MountEntry.mount_version` getter。
 - `route_epoch` 存在 RocksDB meta CF；`CreateMount` / `DeleteMount` 推进；`AddShardGroup` 当前不推进 filesystem-facing `route_epoch`。
 - rename/delete/create/mkdir 等 namespace mutation 通过 `Command` propose 到 Raft authority。
 - same-mount rename 是当前实现边界；cross-mount rename 返回 structured EXDEV/CrossMountRename。
 
-root mount bootstrap：
+root mount 格式化与 readiness：
 
 - 已有 `/` mount 时必须满足 `ROOT_INODE_ID`、`MountKind::Internal`、无 `ufs_uri`、`DataIoPolicy::Forbid`。
-- 缺失时 leader 通过 `Command::CreateMount` 创建；非 leader 直接返回，readiness watcher 等待。
+- `metadata format` 缺失 root mount 时通过 `Command::CreateMount` 创建。
+- `metadata start` 不创建 root mount；缺失时 start preparation/readiness 路径返回 not-ready/error。
 - root mount 不能删除。
 
 ## 6. FileSystem API 当前状态
@@ -233,7 +234,7 @@ freshness 当前事实：
 
 - `mount_epoch` 校验 request header 和 mount entry `mount_version`。
 - `route_epoch` 校验 request/header 和 authoritative RocksDB route epoch。
-- `state_id` 只通过 repeated `GroupStateWatermark { group_id, state_id }` 表达。
+- `state_id` 只通过 repeated `GroupStateWatermark { group_name, state_id }` 表达。
 - `state_id` 表示 state-machine applied `RaftLogId`，不是 committed index、route_epoch、mount_epoch、WorkerRunId、block_stamp 或旧 `applied_seq`。
 - leader success 在已知 group 且有 last applied state 时返回 `ResponseHeader.state`。
 - follower success 必须返回空 `ResponseHeader.state`，不推进 client state cache。
@@ -277,26 +278,26 @@ snapshot / state store：
 
 register：
 
-- Worker 在请求中提交稳定 `WorkerId`、本次进程启动生成的 UUID `WorkerRunId`、目标 `group_id` 与 advertised gRPC endpoint。
+- Worker 在请求中提交稳定 `WorkerId`、本次进程启动生成的 UUID `WorkerRunId`、目标 `group_name` 与 advertised gRPC endpoint。
 - `WorkerRunId` 不是 epoch，不比较大小，也不替代 block_stamp。
 - `Command::RegisterWorker` 通过当前 metadata group 的 Raft apply 持久化稳定 worker descriptor（`WorkerId`、advertised endpoint、protocol 等）和 `AppliedResult`；`WorkerRunId` 只写入 group-scoped live `WorkerManager` registration state。
 - metadata restart / snapshot reload 只恢复稳定 descriptor，不恢复旧 `WorkerRunId` readiness；worker 必须重新 register 后才重新成为该 group 的 accepted process run。
 - leader 才接受 register；follower 返回结构化 NotLeader / NEED_REFRESH，之后只通过 Raft apply/replay 学到 registration state。
 - 同一 live `WorkerId + WorkerRunId` 重放是幂等成功；同一 live `WorkerId` 携带不同 `WorkerRunId` 会被拒绝。metadata reload 后 live registration 为空，新的 `WorkerRunId` 可重新注册。
-- `MetadataWorkerServiceImpl` 只负责校验 served `group_id`、解析请求和提交 Raft proposal；不在 proposal 成功后做 leader-only live registration mutation。
+- `MetadataWorkerServiceImpl` 只负责校验 served group name、解析请求和提交 Raft proposal；不在 proposal 成功后做 leader-only live registration mutation。
 
 client / data-plane identity model:
 
-- metadata location 最终应携带 `group_id`、`worker_id`、`worker_run_id`、advertised endpoint、`block_id`、`block_stamp`，以及适用的现有 `file_version` / `route_epoch` freshness 字段。
-- client 直连 worker request 最终应携带 `group_id`、`worker_id`、`worker_run_id`、`block_id`、`block_stamp` 和 range。
-- worker 校验 request `worker_id` 匹配本地 `WorkerId`、`group_id` 已注册、request `worker_run_id` 匹配该 group 已接受的 `WorkerRunId`、`block_stamp` 匹配本地 `BlockMeta`。
+- metadata location 最终应携带 `group_name`、`worker_id`、`worker_run_id`、advertised endpoint、`block_id`、`block_stamp`，以及适用的现有 `file_version` / `route_epoch` freshness 字段。
+- client 直连 worker request 最终应携带 `group_name`、`worker_id`、`worker_run_id`、`block_id`、`block_stamp` 和 range。
+- worker 校验 request `worker_id` 匹配本地 `WorkerId`、`group_name` 已注册、request `worker_run_id` 匹配该 group 已接受的 `WorkerRunId`、`block_stamp` 匹配本地 `BlockMeta`。
 - `WorkerId` 判断是哪一个 worker；`WorkerRunId` 判断是哪一次 worker 进程运行；`block_stamp` 判断是哪一代 block。
 - `WorkerRunId` 不替代 `block_stamp`；`block_stamp` 也不替代 `WorkerRunId`。
 
 heartbeat：
 
-- Worker starts heartbeat only after startup registration succeeds. Requests carry `group_id`, stable `WorkerId`, process-local `WorkerRunId`, per-group/run `heartbeat_seq`, registered advertised endpoint, and capacity/load/health snapshot.
-- Metadata heartbeat 首先校验 served `group_id`、稳定 descriptor、live registration、`WorkerRunId` 与 advertised endpoint；heartbeat 不创建 registration，不写 RocksDB，不提交 Raft proposal。
+- Worker starts heartbeat only after startup registration succeeds. Requests carry `group_name`, stable `WorkerId`, process-local `WorkerRunId`, per-group/run `heartbeat_seq`, registered advertised endpoint, and capacity/load/health snapshot.
+- Metadata heartbeat 首先校验 served group name、稳定 descriptor、live registration、`WorkerRunId` 与 advertised endpoint；heartbeat 不创建 registration，不写 RocksDB，不提交 Raft proposal。
 - Heartbeat liveness 是 metadata node 本地 memory-only soft state。metadata reload / snapshot recovery 只恢复稳定 descriptor，不恢复 `WorkerRunId` 或 heartbeat liveness；worker 必须重新 register 后才能恢复 ready。
 - Liveness timeout 使用 metadata 本地 monotonic time；worker wall-clock time 不参与 correctness。
 - Follower 可以接受 heartbeat 并预热本地 volatile liveness，但 follower 必须返回空 commands。Leader 返回 leader role/hint。
@@ -305,10 +306,10 @@ heartbeat：
 
 block report：
 
-- Workers send group-scoped full block reports after successful registration and heartbeat readiness. The local group directory is the authoritative source for report `group_id`.
+- Workers send group-scoped full block reports after successful registration and heartbeat readiness. The local group directory is the authoritative source for report `group_name`.
 - `report_seq` identifies one full-report generation within one worker run and one group. `batch_seq` identifies a batch within that `report_seq`; `batch_seq == 0` starts a staged full report. `final_batch` means metadata may publish the staged full report after accepting this batch.
 - Delta reports are accepted only after a full baseline is published. `report_seq` must match the published baseline and `delta_seq` must be the expected next sequence. Old complete duplicates are acknowledged when safe; gaps return `FULL_REPORT_REQUIRED`.
-- Block report state is reconstructable, memory-only soft state keyed by `(group_id, worker_id)`. It is not written to RocksDB, not applied through Raft, and not restored after metadata restart. Metadata restart requires workers to send a new full report.
+- Block report state is reconstructable, memory-only soft state keyed by `(group_name, worker_id)`. It is not written to RocksDB, not applied through Raft, and not restored after metadata restart. Metadata restart requires workers to send a new full report.
 - Leaders and followers may accept reports to warm their local location view. Followers must not return mutating commands, and report handling must not mutate namespace/file layout state.
 - Report handling updates only the in-memory block-location view. It does not schedule repair, rebalance, delete, cleanup, or worker command acknowledgement.
 - The report entry is block-level only and includes the fields needed for block-location routing: `block_id`, `data_handle_id`, `file_version`, `block_index`, `block_stamp`, lengths, and block state. Chunk-ready bitmap and range-aware chunk routing are outside this contract.
@@ -509,7 +510,7 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 
 1. `metadata/src/bin/main.rs`
 2. `metadata/src/runtime.rs`
-3. `metadata/src/bootstrap.rs`
+3. `metadata/src/root_init.rs`
 4. `metadata/src/readiness.rs`
 5. `metadata/src/metrics.rs`
 6. `metadata/src/service/path_service.rs`

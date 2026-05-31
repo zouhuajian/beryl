@@ -22,7 +22,7 @@ use tokio::time;
 use tonic::transport::Endpoint;
 use tonic::Code;
 use tracing::{debug, warn};
-use types::ids::{BlockId, ClientId, ShardGroupId};
+use types::{BlockId, ClientId, GroupName};
 
 use crate::config::WorkerRegistrationConfig;
 use crate::control::{Registration, RegistrationDescriptor, RegistrationSet};
@@ -78,7 +78,7 @@ pub struct MetadataBlockReportLoop {
     endpoints: Vec<Endpoint>,
     store: Arc<FullBlockFileStore>,
     options: BlockReportOptions,
-    baselines: Mutex<HashMap<ShardGroupId, ReportBaseline>>,
+    baselines: Mutex<HashMap<GroupName, ReportBaseline>>,
 }
 
 impl MetadataBlockReportLoop {
@@ -135,11 +135,11 @@ impl MetadataBlockReportLoop {
         tokio::spawn(async move { self.run().await })
     }
 
-    pub fn has_delta_baseline(&self, group_id: ShardGroupId) -> bool {
+    pub fn has_delta_baseline(&self, group_name: &GroupName) -> bool {
         self.baselines
             .lock()
             .expect("block report baseline state poisoned")
-            .get(&group_id)
+            .get(group_name)
             .map(|baseline| baseline.ready)
             .unwrap_or(false)
     }
@@ -148,8 +148,8 @@ impl MetadataBlockReportLoop {
         let Some(registration) = self.ready_registration() else {
             return Ok(BlockReportRound::default());
         };
-        let blocks = self.scan_report_blocks(registration.group_id)?;
-        let report_seq = self.next_report_seq(registration.group_id);
+        let blocks = self.scan_report_blocks()?;
+        let report_seq = self.next_report_seq(&registration.group_name);
         let mut round = BlockReportRound {
             attempted_peers: self.endpoints.len(),
             ..BlockReportRound::default()
@@ -169,14 +169,14 @@ impl MetadataBlockReportLoop {
                 Ok(BlockReportPeerOutcome::FullReportRequired) => round.full_report_required = true,
                 Ok(BlockReportPeerOutcome::NeedRegister) => {
                     round.needs_register = true;
-                    self.state.mark_needs_register(registration.group_id);
-                    self.reset_baseline(registration.group_id);
+                    self.state.mark_needs_register(&registration.group_name);
+                    self.reset_baseline(&registration.group_name);
                     break;
                 }
                 Ok(BlockReportPeerOutcome::WorkerRunMismatch) => {
                     round.worker_run_mismatch = true;
-                    self.state.mark_needs_register(registration.group_id);
-                    self.reset_baseline(registration.group_id);
+                    self.state.mark_needs_register(&registration.group_name);
+                    self.reset_baseline(&registration.group_name);
                     break;
                 }
                 Err(error) => {
@@ -187,7 +187,7 @@ impl MetadataBlockReportLoop {
         }
 
         if round.accepted_peers > 0 && !round.needs_register && !round.worker_run_mismatch {
-            self.publish_baseline(registration.group_id, report_seq, accepted_next_delta_seq, blocks);
+            self.publish_baseline(&registration.group_name, report_seq, accepted_next_delta_seq, blocks);
         } else if round.attempted_peers > 0
             && !round.full_report_required
             && !round.needs_register
@@ -205,7 +205,7 @@ impl MetadataBlockReportLoop {
         let Some(registration) = self.ready_registration() else {
             return Ok(BlockReportRound::default());
         };
-        let Some((report_seq, delta_seq, deltas)) = self.build_delta_batch(registration.group_id)? else {
+        let Some((report_seq, delta_seq, deltas)) = self.build_delta_batch(&registration.group_name)? else {
             return Ok(BlockReportRound::default());
         };
 
@@ -227,18 +227,18 @@ impl MetadataBlockReportLoop {
                 }
                 Ok(BlockReportPeerOutcome::FullReportRequired) => {
                     round.full_report_required = true;
-                    self.reset_baseline(registration.group_id);
+                    self.reset_baseline(&registration.group_name);
                 }
                 Ok(BlockReportPeerOutcome::NeedRegister) => {
                     round.needs_register = true;
-                    self.state.mark_needs_register(registration.group_id);
-                    self.reset_baseline(registration.group_id);
+                    self.state.mark_needs_register(&registration.group_name);
+                    self.reset_baseline(&registration.group_name);
                     break;
                 }
                 Ok(BlockReportPeerOutcome::WorkerRunMismatch) => {
                     round.worker_run_mismatch = true;
-                    self.state.mark_needs_register(registration.group_id);
-                    self.reset_baseline(registration.group_id);
+                    self.state.mark_needs_register(&registration.group_name);
+                    self.reset_baseline(&registration.group_name);
                     break;
                 }
                 Err(error) => {
@@ -253,7 +253,7 @@ impl MetadataBlockReportLoop {
             && !round.needs_register
             && !round.worker_run_mismatch
         {
-            self.apply_delta_baseline(registration.group_id, accepted_next_delta_seq, deltas);
+            self.apply_delta_baseline(&registration.group_name, accepted_next_delta_seq, deltas);
         } else if round.attempted_peers > 0
             && !round.full_report_required
             && !round.needs_register
@@ -268,14 +268,14 @@ impl MetadataBlockReportLoop {
     }
 
     fn ready_registration(&self) -> Option<Registration> {
-        let registration = self.state.registration(self.config.group_id)?;
-        self.state.is_ready(registration.group_id).then_some(registration)
+        let registration = self.state.registration(&self.config.group_name)?;
+        self.state.is_ready(&registration.group_name).then_some(registration)
     }
 
-    fn scan_report_blocks(&self, group_id: ShardGroupId) -> Result<Vec<BlockReportBlockProto>, BlockReportError> {
+    fn scan_report_blocks(&self) -> Result<Vec<BlockReportBlockProto>, BlockReportError> {
         let metas = self
             .store
-            .scan_group_blocks(group_id)
+            .scan_group_blocks(&self.config.group_name)
             .map_err(|err| BlockReportError::Retryable(format!("scan local block report group failed: {err}")))?;
         let mut blocks = Vec::with_capacity(metas.len());
         for meta in metas {
@@ -284,9 +284,9 @@ impl MetadataBlockReportLoop {
         Ok(blocks)
     }
 
-    fn next_report_seq(&self, group_id: ShardGroupId) -> u64 {
+    fn next_report_seq(&self, group_name: &GroupName) -> u64 {
         let mut baselines = self.baselines.lock().expect("block report baseline state poisoned");
-        let baseline = baselines.entry(group_id).or_default();
+        let baseline = baselines.entry(group_name.clone()).or_default();
         baseline.report_seq = baseline.report_seq.saturating_add(1).max(1);
         baseline.ready = false;
         baseline.report_seq
@@ -294,14 +294,14 @@ impl MetadataBlockReportLoop {
 
     fn publish_baseline(
         &self,
-        group_id: ShardGroupId,
+        group_name: &GroupName,
         report_seq: u64,
         next_delta_seq: u64,
         blocks: Vec<BlockReportBlockProto>,
     ) {
         let mut baselines = self.baselines.lock().expect("block report baseline state poisoned");
         baselines.insert(
-            group_id,
+            group_name.clone(),
             ReportBaseline {
                 report_seq,
                 next_delta_seq,
@@ -316,15 +316,15 @@ impl MetadataBlockReportLoop {
 
     fn build_delta_batch(
         &self,
-        group_id: ShardGroupId,
+        group_name: &GroupName,
     ) -> Result<Option<(u64, u64, Vec<BlockReportDeltaProto>)>, BlockReportError> {
-        let current = self.scan_report_blocks(group_id)?;
+        let current = self.scan_report_blocks()?;
         let current: HashMap<BlockId, BlockReportBlockProto> = current
             .into_iter()
             .filter_map(|block| block_id(&block).map(|id| (id, block)))
             .collect();
         let baselines = self.baselines.lock().expect("block report baseline state poisoned");
-        let Some(baseline) = baselines.get(&group_id).filter(|baseline| baseline.ready) else {
+        let Some(baseline) = baselines.get(group_name).filter(|baseline| baseline.ready) else {
             return Ok(None);
         };
 
@@ -352,9 +352,9 @@ impl MetadataBlockReportLoop {
         Ok(Some((baseline.report_seq, baseline.next_delta_seq, deltas)))
     }
 
-    fn apply_delta_baseline(&self, group_id: ShardGroupId, next_delta_seq: u64, deltas: Vec<BlockReportDeltaProto>) {
+    fn apply_delta_baseline(&self, group_name: &GroupName, next_delta_seq: u64, deltas: Vec<BlockReportDeltaProto>) {
         let mut baselines = self.baselines.lock().expect("block report baseline state poisoned");
-        let Some(baseline) = baselines.get_mut(&group_id) else {
+        let Some(baseline) = baselines.get_mut(group_name) else {
             return;
         };
         for delta in deltas {
@@ -377,12 +377,12 @@ impl MetadataBlockReportLoop {
         baseline.next_delta_seq = next_delta_seq;
     }
 
-    fn reset_baseline(&self, group_id: ShardGroupId) {
+    fn reset_baseline(&self, group_name: &GroupName) {
         if let Some(baseline) = self
             .baselines
             .lock()
             .expect("block report baseline state poisoned")
-            .get_mut(&group_id)
+            .get_mut(group_name)
         {
             baseline.ready = false;
         }
@@ -414,8 +414,7 @@ impl MetadataBlockReportLoop {
                 Vec::new()
             };
             let request = BlockReportRequestProto {
-                header: Some(block_report_request_header(registration.group_id)),
-                group_id: registration.group_id.as_raw(),
+                header: Some(block_report_request_header()),
                 worker_id: registration.worker_id.as_raw(),
                 worker_run_id: registration.worker_run_id.to_string(),
                 report_seq,
@@ -424,6 +423,7 @@ impl MetadataBlockReportLoop {
                     final_batch: batch_idx + 1 == total_batches,
                     blocks: batch_blocks,
                 })),
+                group_name: registration.group_name.to_string(),
             };
             let response = time::timeout(timeout, client.block_report(tonic::Request::new(request.clone())))
                 .await
@@ -454,8 +454,7 @@ impl MetadataBlockReportLoop {
             .map_err(|err| BlockReportError::Retryable(format!("metadata delta report endpoint unavailable: {err}")))?;
         let mut client = MetadataWorkerServiceProtoClient::new(channel);
         let request = BlockReportRequestProto {
-            header: Some(block_report_request_header(registration.group_id)),
-            group_id: registration.group_id.as_raw(),
+            header: Some(block_report_request_header()),
             worker_id: registration.worker_id.as_raw(),
             worker_run_id: registration.worker_run_id.to_string(),
             report_seq,
@@ -463,6 +462,7 @@ impl MetadataBlockReportLoop {
                 delta_seq,
                 deltas: deltas.to_vec(),
             })),
+            group_name: registration.group_name.to_string(),
         };
         let response = time::timeout(timeout, client.block_report(tonic::Request::new(request.clone())))
             .await
@@ -607,8 +607,8 @@ fn classify_status(status: tonic::Status) -> BlockReportError {
     }
 }
 
-fn block_report_request_header(group_id: ShardGroupId) -> RequestHeaderProto {
+fn block_report_request_header() -> RequestHeaderProto {
     let client_id = u64::from(std::process::id()).max(1);
-    let header = RequestHeader::new(ClientId::new(client_id)).with_group_id(group_id.as_raw());
+    let header = RequestHeader::new(ClientId::new(client_id));
     (&header).into()
 }

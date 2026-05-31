@@ -14,7 +14,7 @@ use common::header::CallerContextFields;
 use common::header::RpcErrorCode;
 use types::fs::{Extent, InodeId};
 use types::ids::DataHandleId;
-use types::FileBlockLocation;
+use types::{FileBlockLocation, GroupName};
 
 impl FsCore {
     async fn validate_read_freshness_for_mount(
@@ -23,26 +23,26 @@ impl FsCore {
         freshness: Freshness,
         mount_id: types::ids::MountId,
         intent: &str,
-    ) -> Result<(Option<u64>, Option<u64>, Option<u64>), CoreFailure> {
-        let (group_id, mount_epoch) = self.validate_mount_epoch_for_mount(req_ctx, freshness, mount_id)?;
+    ) -> Result<(Option<GroupName>, Option<u64>, Option<u64>), CoreFailure> {
+        let (group_name, mount_epoch) = self.validate_mount_epoch_for_mount(req_ctx, freshness, mount_id)?;
         let route_epoch = self
-            .validate_route_epoch(req_ctx, freshness, group_id, mount_epoch, intent)
+            .validate_route_epoch(req_ctx, freshness, group_name.clone(), mount_epoch, intent)
             .await?;
         match self.validate_stale_state(
             req_ctx,
             self.raft_node
                 .as_ref()
                 .and_then(|raft_node| raft_node.get_last_applied_state_id()),
-            group_id,
+            group_name.clone(),
             mount_epoch,
         )? {
-            StaleStateStatus::Ready => Ok((group_id, mount_epoch, route_epoch)),
+            StaleStateStatus::Ready => Ok((group_name, mount_epoch, route_epoch)),
             StaleStateStatus::UnknownLastApplied => Err(need_refresh_core_failure(
                 req_ctx,
                 RpcErrorCode::StaleState,
                 RefreshReason::StaleState,
                 "local applied state is unavailable for read freshness validation",
-                group_id,
+                group_name,
                 mount_epoch,
                 route_epoch,
                 None,
@@ -136,7 +136,7 @@ impl FsCore {
             Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
         };
 
-        let (group_id, mount_epoch, route_epoch) = self
+        let (group_name, mount_epoch, route_epoch) = self
             .validate_read_freshness_for_mount(&req.ctx, req.freshness, inode.mount_id, "GetStatus")
             .await?;
         self.success_with_route_epoch(
@@ -144,7 +144,7 @@ impl FsCore {
             GetAttrOutput {
                 attrs: inode.attrs.clone(),
             },
-            group_id,
+            group_name,
             mount_epoch,
             route_epoch,
         )
@@ -215,7 +215,7 @@ impl FsCore {
             );
         }
 
-        let (group_id, mount_epoch, route_epoch) = self
+        let (group_name, mount_epoch, route_epoch) = self
             .validate_read_freshness_for_mount(&req.ctx, req.freshness, parent_inode.mount_id, "ListStatus")
             .await?;
 
@@ -223,7 +223,7 @@ impl FsCore {
         let (entries, next_cursor_key, eof) =
             match storage.list_dentries_with_cursor(req.parent_inode_id, cursor_key, req.max_entries) {
                 Ok(result) => result,
-                Err(err) => return self.failure_from_error(&req.ctx, err, group_id, mount_epoch),
+                Err(err) => return self.failure_from_error(&req.ctx, err, group_name, mount_epoch),
             };
 
         let mut dir_entries = Vec::with_capacity(entries.len());
@@ -244,7 +244,7 @@ impl FsCore {
                 next_cursor_key: next_cursor_key.unwrap_or_default(),
                 eof,
             },
-            group_id,
+            group_name,
             mount_epoch,
             route_epoch,
         )
@@ -287,7 +287,7 @@ impl FsCore {
             );
         }
 
-        let (group_id, mount_epoch, route_epoch) = self
+        let (group_name, mount_epoch, route_epoch) = self
             .validate_read_freshness_for_mount(&req.ctx, req.freshness, inode.mount_id, "GetFileLayout")
             .await?;
 
@@ -301,7 +301,7 @@ impl FsCore {
             return self.failure_from_error_with_route_epoch(
                 &req.ctx,
                 MetadataError::Internal(format!("File inode {} is missing current_data_handle_id", req.inode_id)),
-                group_id,
+                group_name,
                 mount_epoch,
                 route_epoch,
             );
@@ -314,19 +314,19 @@ impl FsCore {
                         "requested data_handle_id {} is not current data_handle_id {} for inode {}; refresh metadata state",
                         requested_data_handle_id, data_handle_id, req.inode_id
                     )),
-                    group_id,
+                    group_name,
                     mount_epoch,
                     route_epoch,
                 );
             }
         }
         if let Err(err) = storage.validate_data_handle_owner(data_handle_id, Some(req.inode_id)) {
-            return self.failure_from_error_with_route_epoch(&req.ctx, err, group_id, mount_epoch, route_epoch);
+            return self.failure_from_error_with_route_epoch(&req.ctx, err, group_name, mount_epoch, route_epoch);
         }
         let layout = match storage.get_layout(req.inode_id) {
             Ok(layout) => layout,
             Err(err) => {
-                return self.failure_from_error_with_route_epoch(&req.ctx, err, group_id, mount_epoch, route_epoch)
+                return self.failure_from_error_with_route_epoch(&req.ctx, err, group_name, mount_epoch, route_epoch)
             }
         };
         for extent in &extents {
@@ -337,7 +337,7 @@ impl FsCore {
                         "Extent block data_handle_id {} does not match inode {} current_data_handle_id {}",
                         extent.block_id.data_handle_id, req.inode_id, data_handle_id
                     )),
-                    group_id,
+                    group_name,
                     mount_epoch,
                     route_epoch,
                 );
@@ -353,7 +353,7 @@ impl FsCore {
                             "range end overflows: offset={}, len={}",
                             range.offset, range.len
                         )),
-                        group_id,
+                        group_name,
                         mount_epoch,
                         route_epoch,
                     );
@@ -373,7 +373,7 @@ impl FsCore {
                                     "extent range overflows: file_offset={}, len={}",
                                     extent.file_offset, extent.len
                                 )),
-                                group_id,
+                                group_name,
                                 mount_epoch,
                                 route_epoch,
                             );
@@ -390,8 +390,14 @@ impl FsCore {
         };
 
         let worker_manager = self.worker_manager.as_ref();
-        let worker_lookup_group_id = if worker_manager.is_some() && !filtered_extents.is_empty() {
-            Some(self.require_worker_lookup_group(&req.ctx, group_id, mount_epoch, route_epoch, "GetFileLayout")?)
+        let worker_lookup_group_name = if worker_manager.is_some() && !filtered_extents.is_empty() {
+            Some(self.require_worker_lookup_group(
+                &req.ctx,
+                group_name.clone(),
+                mount_epoch,
+                route_epoch,
+                "GetFileLayout",
+            )?)
         } else {
             None
         };
@@ -407,7 +413,7 @@ impl FsCore {
                                 "extent {} at file_offset {} has zero block_stamp",
                                 extent.block_id, extent.file_offset
                             )),
-                            group_id,
+                            group_name,
                             mount_epoch,
                             route_epoch,
                         );
@@ -421,7 +427,7 @@ impl FsCore {
                             "extent {} at file_offset {} missing block_stamp",
                             extent.block_id, extent.file_offset
                         )),
-                        group_id,
+                        group_name,
                         mount_epoch,
                         route_epoch,
                     );
@@ -436,20 +442,22 @@ impl FsCore {
                             "extent block range overflows: block_offset={}, len={}",
                             extent.block_offset, extent.len
                         )),
-                        group_id,
+                        group_name,
                         mount_epoch,
                         route_epoch,
                     );
                 }
             };
             let mut workers = Vec::new();
-            if let (Some(worker_manager), Some(worker_lookup_group_id)) = (worker_manager, worker_lookup_group_id) {
-                let reported = worker_manager.reported_block_locations(worker_lookup_group_id, extent.block_id);
-                let views = worker_manager.collect_worker_placement_views(worker_lookup_group_id);
+            if let (Some(worker_manager), Some(worker_lookup_group_name)) =
+                (worker_manager, worker_lookup_group_name.as_ref())
+            {
+                let reported = worker_manager.reported_block_locations(worker_lookup_group_name, extent.block_id);
+                let views = worker_manager.collect_worker_placement_views(worker_lookup_group_name);
                 let usable_views: Vec<_> = views.into_iter().filter(Self::has_usable_read_endpoint).collect();
                 let plan = PlacementPlanner.plan(
                     &PlacementRequest {
-                        group_id: worker_lookup_group_id,
+                        group_name: worker_lookup_group_name.clone(),
                         op: PlacementOp::Read,
                         block_id: extent.block_id,
                         block_stamp: Some(block_stamp),
@@ -494,7 +502,7 @@ impl FsCore {
                 file_version,
                 locations,
             },
-            group_id,
+            group_name,
             mount_epoch,
             route_epoch,
         )

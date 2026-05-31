@@ -4,7 +4,7 @@
 //! Explicit conversion between worker wire messages and core domain types.
 
 use common::header::RequestHeader;
-use proto::common::{BlockIdProto, ByteRangeProto, FencingTokenProto, ShardGroupIdProto, StreamIdProto};
+use proto::common::{BlockIdProto, ByteRangeProto, FencingTokenProto, StreamIdProto};
 use proto::convert as proto_convert;
 use proto::worker::{
     AbortWriteRequestProto, ChecksumKindProto, CommitWriteRequestProto, DataRequestHeaderProto,
@@ -12,10 +12,10 @@ use proto::worker::{
     WriteStreamRequestProto, WriteStreamResponseProto,
 };
 use types::chunk::ByteRange;
-use types::ids::{BlockId, ShardGroupId, StreamId};
+use types::ids::{BlockId, StreamId};
 use types::layout::BlockFormatId;
 use types::lease::FencingToken;
-use types::WorkerRunId;
+use types::{GroupName, WorkerRunId};
 
 use crate::data::core::{
     AbortWriteRequest, CommitWriteRequest, ReadFrame, ReadOpenRequest, SyncCommittedBlockRequest, WorkerCoreResult,
@@ -32,20 +32,12 @@ pub fn proto_to_stream_id(proto: Option<StreamIdProto>, field_name: &str) -> Wor
     proto_convert::required_stream_id(proto, field_name).map_err(WorkerError::InvalidArgument)
 }
 
-pub fn proto_to_group_id(proto: Option<ShardGroupIdProto>, field_name: &str) -> WorkerCoreResult<ShardGroupId> {
-    proto_convert::required_group_id(proto, field_name).map_err(WorkerError::InvalidArgument)
-}
-
 pub fn stream_id_to_proto(stream_id: StreamId) -> StreamIdProto {
     stream_id.into()
 }
 
 pub fn proto_to_byte_range(proto: &ByteRangeProto) -> ByteRange {
     proto.into()
-}
-
-pub fn group_id_to_proto(group_id: ShardGroupId) -> ShardGroupIdProto {
-    group_id.into()
 }
 
 pub fn block_id_to_proto(block_id: BlockId) -> BlockIdProto {
@@ -67,7 +59,7 @@ pub fn request_header_to_data_proto(ctx: &RequestHeader) -> DataRequestHeaderPro
 pub fn read_open_request_to_proto(req: ReadOpenRequest, ctx: &RequestHeader) -> OpenReadStreamRequestProto {
     OpenReadStreamRequestProto {
         header: Some(request_header_to_data_proto(ctx)),
-        group_id: Some(group_id_to_proto(req.group_id)),
+        group_name: req.group_name.to_string(),
         block_id: Some(block_id_to_proto(req.block_id)),
         byte_range: Some(byte_range_to_proto(req.byte_range)),
         block_stamp: req.block_stamp,
@@ -83,7 +75,7 @@ pub fn read_open_request_to_proto(req: ReadOpenRequest, ctx: &RequestHeader) -> 
 pub fn write_open_request_to_proto(req: WriteOpenRequest, ctx: &RequestHeader) -> OpenWriteStreamRequestProto {
     OpenWriteStreamRequestProto {
         header: Some(request_header_to_data_proto(ctx)),
-        group_id: Some(group_id_to_proto(req.group_id)),
+        group_name: req.group_name.to_string(),
         block_id: Some(block_id_to_proto(req.block_id)),
         block_size: req.block_size,
         block_stamp: req.block_stamp,
@@ -110,7 +102,7 @@ pub fn write_frame_to_proto(frame: WriteFrame) -> WriteStreamRequestProto {
 pub fn commit_write_request_to_proto(req: CommitWriteRequest, ctx: &RequestHeader) -> CommitWriteRequestProto {
     CommitWriteRequestProto {
         header: Some(request_header_to_data_proto(ctx)),
-        group_id: Some(group_id_to_proto(req.group_id)),
+        group_name: req.group_name.to_string(),
         block_id: Some(block_id_to_proto(req.block_id)),
         stream_id: Some(stream_id_to_proto(req.stream_id)),
         effective_block_len: req.effective_block_len,
@@ -131,7 +123,7 @@ pub fn sync_committed_block_request_to_proto(
 ) -> SyncCommittedBlockRequestProto {
     SyncCommittedBlockRequestProto {
         header: Some(request_header_to_data_proto(ctx)),
-        group_id: Some(group_id_to_proto(req.group_id)),
+        group_name: req.group_name.to_string(),
         block_id: Some(block_id_to_proto(req.block_id)),
         block_stamp: req.block_stamp,
         expected_block_len: req.expected_block_len,
@@ -145,7 +137,7 @@ pub fn sync_committed_block_request_to_proto(
 pub fn abort_write_request_to_proto(req: AbortWriteRequest, ctx: &RequestHeader) -> AbortWriteRequestProto {
     AbortWriteRequestProto {
         header: Some(request_header_to_data_proto(ctx)),
-        group_id: Some(group_id_to_proto(req.group_id)),
+        group_name: req.group_name.to_string(),
         block_id: Some(block_id_to_proto(req.block_id)),
         stream_id: Some(stream_id_to_proto(req.stream_id)),
         token: Some(fencing_token_to_proto(req.token)),
@@ -170,7 +162,7 @@ pub fn proto_to_write_frame_result(proto: WriteStreamResponseProto) -> WriteFram
 }
 
 pub fn proto_to_read_open_request(proto: OpenReadStreamRequestProto) -> WorkerCoreResult<ReadOpenRequest> {
-    let group_id = proto_to_group_id(proto.group_id, "group_id")?;
+    let group_name = proto_to_group_name(&proto.group_name, "group_name")?;
     let block_id = proto_to_block_id(proto.block_id, "block_id")?;
     let byte_range = proto
         .byte_range
@@ -180,7 +172,7 @@ pub fn proto_to_read_open_request(proto: OpenReadStreamRequestProto) -> WorkerCo
         .map_err(|err| WorkerError::InvalidArgument(format!("block_format_id invalid: {err}")))?;
 
     Ok(ReadOpenRequest {
-        group_id,
+        group_name,
         block_id,
         worker_run_id,
         byte_range: proto_to_byte_range(&byte_range),
@@ -194,7 +186,7 @@ pub fn proto_to_read_open_request(proto: OpenReadStreamRequestProto) -> WorkerCo
 }
 
 pub fn proto_to_write_open_request(proto: OpenWriteStreamRequestProto) -> WorkerCoreResult<WriteOpenRequest> {
-    let group_id = proto_to_group_id(proto.group_id, "group_id")?;
+    let group_name = proto_to_group_name(&proto.group_name, "group_name")?;
     let block_id = proto_to_block_id(proto.block_id, "block_id")?;
     let token = proto_to_required_fencing_token(proto.token, "token")?;
     let checksum_kind = proto_to_checksum_kind(proto.checksum_kind)?;
@@ -203,7 +195,7 @@ pub fn proto_to_write_open_request(proto: OpenWriteStreamRequestProto) -> Worker
     let worker_run_id = proto_to_worker_run_id(&proto.worker_run_id)?;
 
     Ok(WriteOpenRequest {
-        group_id,
+        group_name,
         block_id,
         worker_run_id,
         token,
@@ -231,7 +223,7 @@ pub fn proto_to_write_frame(proto: WriteStreamRequestProto) -> WorkerCoreResult<
 
 pub fn proto_to_commit_write_request(proto: CommitWriteRequestProto) -> WorkerCoreResult<CommitWriteRequest> {
     let stream_id = proto_to_stream_id(proto.stream_id, "stream_id")?;
-    let group_id = proto_to_group_id(proto.group_id, "group_id")?;
+    let group_name = proto_to_group_name(&proto.group_name, "group_name")?;
     let block_id = proto_to_block_id(proto.block_id, "block_id")?;
     let token = proto_to_required_fencing_token(proto.token, "token")?;
     let worker_run_id = proto_to_worker_run_id(&proto.worker_run_id)?;
@@ -240,7 +232,7 @@ pub fn proto_to_commit_write_request(proto: CommitWriteRequestProto) -> WorkerCo
 
     Ok(CommitWriteRequest {
         stream_id,
-        group_id,
+        group_name,
         block_id,
         worker_run_id,
         token,
@@ -257,14 +249,14 @@ pub fn proto_to_commit_write_request(proto: CommitWriteRequestProto) -> WorkerCo
 pub fn proto_to_sync_committed_block_request(
     proto: SyncCommittedBlockRequestProto,
 ) -> WorkerCoreResult<SyncCommittedBlockRequest> {
-    let group_id = proto_to_group_id(proto.group_id, "group_id")?;
+    let group_name = proto_to_group_name(&proto.group_name, "group_name")?;
     let block_id = proto_to_block_id(proto.block_id, "block_id")?;
     let worker_run_id = proto_to_worker_run_id(&proto.worker_run_id)?;
     let block_format_id = BlockFormatId::from_raw(proto.block_format_id)
         .map_err(|err| WorkerError::InvalidArgument(format!("block_format_id invalid: {err}")))?;
 
     Ok(SyncCommittedBlockRequest {
-        group_id,
+        group_name,
         block_id,
         worker_run_id,
         block_stamp: proto.block_stamp,
@@ -277,13 +269,13 @@ pub fn proto_to_sync_committed_block_request(
 
 pub fn proto_to_abort_write_request(proto: AbortWriteRequestProto) -> WorkerCoreResult<AbortWriteRequest> {
     let stream_id = proto_to_stream_id(proto.stream_id, "stream_id")?;
-    let group_id = proto_to_group_id(proto.group_id, "group_id")?;
+    let group_name = proto_to_group_name(&proto.group_name, "group_name")?;
     let block_id = proto_to_block_id(proto.block_id, "block_id")?;
     let token = proto_to_required_fencing_token(proto.token, "token")?;
 
     Ok(AbortWriteRequest {
         stream_id,
-        group_id,
+        group_name,
         block_id,
         token,
     })
@@ -309,6 +301,13 @@ fn proto_to_worker_run_id(value: &str) -> WorkerCoreResult<WorkerRunId> {
     value
         .parse::<WorkerRunId>()
         .map_err(|err| WorkerError::InvalidArgument(format!("worker_run_id invalid: {err}")))
+}
+
+fn proto_to_group_name(value: &str, field_name: &str) -> WorkerCoreResult<GroupName> {
+    if value.is_empty() {
+        return Err(WorkerError::InvalidArgument(format!("missing {field_name}")));
+    }
+    GroupName::parse(value).map_err(|err| WorkerError::InvalidArgument(format!("{field_name} invalid: {err}")))
 }
 
 fn proto_to_checksum_kind(checksum_kind: i32) -> WorkerCoreResult<ChecksumKind> {

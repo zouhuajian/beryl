@@ -9,7 +9,7 @@ use openraft::RaftTypeConfig;
 use serde::{Deserialize, Serialize};
 use types::fs::{FsErrorCode, InodeId};
 use types::ids::{ClientId, DataHandleId, WorkerId};
-use types::CallId;
+use types::{CallId, GroupName};
 
 /// Raft type configuration for metadata service.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -192,7 +192,7 @@ pub struct DeleteIntentStatusResult {
 /// Shard group information.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShardGroupInfo {
-    pub group_id: types::ids::ShardGroupId,
+    pub group_name: GroupName,
     pub shard_ids: Vec<u64>,
     pub initial_members: Vec<u64>,
     pub version: u64,

@@ -16,7 +16,7 @@ mod tests {
     use futures::StreamExt;
     use proto::common::{
         BlockIdProto, ByteRangeProto, ClientInfoProto, EndpointProto, ErrorClassProto, FencingTokenProto,
-        RefreshReasonProto, ResponseHeaderProto, ShardGroupIdProto, StreamIdProto,
+        RefreshReasonProto, ResponseHeaderProto, StreamIdProto,
     };
     use proto::convert::canonical_to_error_detail;
     use proto::metadata::metadata_worker_service_proto_server::{
@@ -37,15 +37,16 @@ mod tests {
     use tonic::{Request, Response, Status};
     use types::chunk::ByteRange;
     use types::fs::FsErrorCode;
-    use types::ids::{BlockId, BlockIndex, ChunkIndex, ClientId, DataHandleId, ShardGroupId, StreamId, WorkerId};
+    use types::ids::{BlockId, BlockIndex, ChunkIndex, ClientId, DataHandleId, StreamId, WorkerId};
     use types::layout::BlockFormatId;
     use types::lease::FencingToken;
-    use types::WorkerRunId;
+    use types::{GroupName, WorkerRunId};
 
     use crate::config::{WorkerConfig, WorkerRegistrationConfig};
+    use crate::control::identity::resolve_worker_id;
     use crate::control::{
-        resolve_worker_id, BlockReportOptions, HeartbeatSnapshot, MetadataBlockReportLoop, MetadataHeartbeatLoop,
-        MetadataRegistrar, Registration, RegistrationDescriptor, RegistrationSet,
+        BlockReportOptions, HeartbeatSnapshot, MetadataBlockReportLoop, MetadataHeartbeatLoop, MetadataRegistrar,
+        Registration, RegistrationDescriptor, RegistrationSet,
     };
     use crate::data::convert::{
         proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_open_request,
@@ -72,8 +73,8 @@ mod tests {
         BlockId::new(DataHandleId::new(7), BlockIndex::new(3))
     }
 
-    fn group_id() -> ShardGroupId {
-        ShardGroupId::new(9)
+    fn group_name() -> GroupName {
+        GroupName::parse("root").expect("test group name is valid")
     }
 
     fn stream_id() -> StreamId {
@@ -89,10 +90,6 @@ mod tests {
             data_handle_id: 7,
             block_index: 3,
         }
-    }
-
-    fn test_group_id_proto() -> ShardGroupIdProto {
-        ShardGroupIdProto { value: 9 }
     }
 
     fn test_stream_id_proto() -> StreamIdProto {
@@ -207,7 +204,7 @@ mod tests {
                     worker_run_id,
                 } => Ok(Response::new(RegisterWorkerResponseProto {
                     header: Some(response_header_from_request(&request, None)),
-                    group_id: request.group_id,
+                    group_name: request.group_name.clone(),
                     worker_id,
                     accepted_worker_run_id: worker_run_id.to_string(),
                 })),
@@ -219,13 +216,13 @@ mod tests {
                         &request,
                         Some(CanonicalError::ok("malformed ok")),
                     )),
-                    group_id: request.group_id,
+                    group_name: request.group_name.clone(),
                     worker_id,
                     accepted_worker_run_id: worker_run_id.to_string(),
                 })),
                 MockRegisterReply::HeaderError(error) => Ok(Response::new(RegisterWorkerResponseProto {
                     header: Some(response_header_from_request(&request, Some(error))),
-                    group_id: request.group_id,
+                    group_name: request.group_name.clone(),
                     worker_id: 0,
                     accepted_worker_run_id: String::new(),
                 })),
@@ -261,7 +258,7 @@ mod tests {
                 } => Ok(Response::new(HeartbeatResponseProto {
                     header: Some(response_header_from_heartbeat_request(&request, None)),
                     commands,
-                    group_id: request.group_id,
+                    group_name: request.group_name.clone(),
                     worker_id,
                     accepted_worker_run_id: worker_run_id.to_string(),
                     heartbeat_interval_ms: 1_000,
@@ -317,7 +314,11 @@ mod tests {
             client: request.header.as_ref().and_then(|header| header.client.clone()),
             error: error.as_ref().map(canonical_to_error_detail),
             state: Vec::new(),
-            group_id: request.header.as_ref().map(|header| header.group_id).unwrap_or(0),
+            group_name: request
+                .header
+                .as_ref()
+                .map(|header| header.group_name.clone())
+                .unwrap_or_default(),
             mount_epoch: None,
             route_epoch: None,
         }
@@ -331,7 +332,11 @@ mod tests {
             client: request.header.as_ref().and_then(|header| header.client.clone()),
             error: error.as_ref().map(canonical_to_error_detail),
             state: Vec::new(),
-            group_id: request.header.as_ref().map(|header| header.group_id).unwrap_or(0),
+            group_name: request
+                .header
+                .as_ref()
+                .map(|header| header.group_name.clone())
+                .unwrap_or_default(),
             mount_epoch: None,
             route_epoch: None,
         }
@@ -345,7 +350,11 @@ mod tests {
             client: request.header.as_ref().and_then(|header| header.client.clone()),
             error: error.as_ref().map(canonical_to_error_detail),
             state: Vec::new(),
-            group_id: request.header.as_ref().map(|header| header.group_id).unwrap_or(0),
+            group_name: request
+                .header
+                .as_ref()
+                .map(|header| header.group_name.clone())
+                .unwrap_or_default(),
             mount_epoch: None,
             route_epoch: None,
         }
@@ -406,9 +415,8 @@ mod tests {
 
     fn test_registration_config(endpoint: String) -> WorkerRegistrationConfig {
         WorkerRegistrationConfig {
-            group_id: group_id(),
-            endpoints: vec![endpoint.clone()],
-            endpoint,
+            group_name: group_name(),
+            endpoints: vec![endpoint],
             register_timeout_ms: 1_000,
             register_retry_initial_backoff_ms: 1,
             register_retry_max_backoff_ms: 1,
@@ -425,7 +433,7 @@ mod tests {
 
     fn test_registration_descriptor(worker_run_id: WorkerRunId) -> RegistrationDescriptor {
         RegistrationDescriptor {
-            group_id: group_id(),
+            group_name: group_name(),
             worker_id: WorkerId::new(42),
             worker_run_id,
             endpoint_host: "127.0.0.1".to_string(),
@@ -440,12 +448,12 @@ mod tests {
 
     fn mark_registered(state: &RegistrationSet) {
         state.record_registered(Registration {
-            group_id: group_id(),
+            group_name: group_name(),
             worker_id: WorkerId::new(46),
             worker_run_id: test_worker_run_id(),
             advertised_endpoint: "http://127.0.0.1:9090".to_string(),
         });
-        state.record_heartbeat_success(group_id(), Duration::from_secs(60));
+        state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
     }
 
     fn registered_data_service(core: Arc<WorkerCore>) -> WorkerDataServiceImpl {
@@ -458,7 +466,6 @@ mod tests {
     fn worker_id_local_identity_generation_and_load_are_stable() {
         let temp = TempDir::new().expect("tempdir");
         let config = WorkerConfig {
-            worker_id: None,
             identity_path: temp.path().join("worker.identity"),
             ..WorkerConfig::default()
         };
@@ -492,17 +499,17 @@ mod tests {
 
         assert_eq!(registration.worker_id, WorkerId::new(42));
         assert_eq!(registration.worker_run_id, worker_run_id);
-        assert!(state.is_registered(group_id()));
-        assert!(!state.is_ready(group_id()));
+        assert!(state.is_registered(&group_name()));
+        assert!(!state.is_ready(&group_name()));
         assert_eq!(
-            state.registration(group_id()).expect("state registration"),
+            state.registration(&group_name()).expect("state registration"),
             registration
         );
 
         let requests = mock.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
-        assert_eq!(request.group_id, group_id().as_raw());
+        assert_eq!(request.group_name, group_name().as_str());
         assert_eq!(request.worker_id, 42);
         assert_eq!(request.worker_run_id, worker_run_id.to_string());
         assert_eq!(
@@ -543,8 +550,8 @@ mod tests {
             .expect_err("malformed OK header error must fail registration");
 
         assert!(error.to_string().contains("malformed"));
-        assert!(!state.is_registered(group_id()));
-        assert!(!state.is_ready(group_id()));
+        assert!(!state.is_registered(&group_name()));
+        assert!(!state.is_ready(&group_name()));
         assert_eq!(mock.requests.lock().unwrap().len(), 1);
         shutdown.send(()).ok();
     }
@@ -571,20 +578,19 @@ mod tests {
             .expect_err("mismatched worker_run_id must fail registration");
 
         assert!(error.to_string().contains("worker_run_id"));
-        assert!(!state.is_ready(group_id()));
+        assert!(!state.is_ready(&group_name()));
         shutdown.send(()).ok();
     }
 
     #[test]
     fn descriptor_from_config_uses_advertised_endpoint_not_bind() {
         let mut config = WorkerConfig::default();
-        config.worker_id = Some(WorkerId::new(42));
         config.rpc_bind = "0.0.0.0:9090".to_string();
         config.rpc_advertised_endpoint = "http://127.0.0.1:19090".to_string();
         config.net =
             WorkerNetConfig::grpc_from_rpc(config.rpc_bind.clone(), config.rpc_max_inflight, config.max_frame_size);
 
-        let descriptor = MetadataRegistrar::descriptor_from_config(&config).expect("descriptor");
+        let descriptor = MetadataRegistrar::descriptor_from_config(&config, WorkerId::new(42)).expect("descriptor");
 
         assert_eq!(descriptor.endpoint_host, "127.0.0.1");
         assert_eq!(descriptor.endpoint_port, 19090);
@@ -621,8 +627,8 @@ mod tests {
 
         assert_eq!(registration.worker_id, WorkerId::new(42));
         assert_eq!(registration.worker_run_id, worker_run_id);
-        assert!(state.is_registered(group_id()));
-        assert!(!state.is_ready(group_id()));
+        assert!(state.is_registered(&group_name()));
+        assert!(!state.is_ready(&group_name()));
         let requests = mock.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].worker_run_id, worker_run_id.to_string());
@@ -656,8 +662,8 @@ mod tests {
 
         assert_eq!(registration.worker_id, WorkerId::new(42));
         assert_eq!(registration.worker_run_id, worker_run_id);
-        assert!(state.is_registered(group_id()));
-        assert!(!state.is_ready(group_id()));
+        assert!(state.is_registered(&group_name()));
+        assert!(!state.is_ready(&group_name()));
         assert_eq!(mock.requests.lock().unwrap().len(), 2);
         shutdown.send(()).ok();
     }
@@ -680,7 +686,7 @@ mod tests {
             .expect_err("fatal registration error");
 
         assert!(error.to_string().contains("fatal metadata registration error"));
-        assert!(!state.is_ready(group_id()));
+        assert!(!state.is_ready(&group_name()));
         assert_eq!(mock.requests.lock().unwrap().len(), 1);
         shutdown.send(()).ok();
     }
@@ -704,7 +710,7 @@ mod tests {
         .await;
         let state = Arc::new(RegistrationSet::new());
         state.record_registered(Registration {
-            group_id: group_id(),
+            group_name: group_name(),
             worker_id: WorkerId::new(42),
             worker_run_id,
             advertised_endpoint: "http://127.0.0.1:9090".to_string(),
@@ -734,12 +740,12 @@ mod tests {
 
         assert_eq!(round.attempted_peers, 2);
         assert_eq!(round.accepted_peers, 2);
-        assert!(state.is_ready(group_id()));
+        assert!(state.is_ready(&group_name()));
         for mock in [&mock_a, &mock_b] {
             let requests = mock.heartbeat_requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
             let request = &requests[0];
-            assert_eq!(request.group_id, group_id().as_raw());
+            assert_eq!(request.group_name, group_name().as_str());
             assert_eq!(request.worker_id, 42);
             assert_eq!(request.worker_run_id, worker_run_id.to_string());
             assert_eq!(request.heartbeat_seq, 1);
@@ -791,12 +797,12 @@ mod tests {
         .await;
         let state = Arc::new(RegistrationSet::new());
         state.record_registered(Registration {
-            group_id: group_id(),
+            group_name: group_name(),
             worker_id: WorkerId::new(42),
             worker_run_id,
             advertised_endpoint: "http://127.0.0.1:9090".to_string(),
         });
-        state.record_heartbeat_success(group_id(), Duration::from_secs(60));
+        state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
         let heartbeat = MetadataHeartbeatLoop::new(
             WorkerRegistrationConfig {
                 endpoints: vec![endpoint_a.clone(), endpoint_b.clone()],
@@ -811,7 +817,7 @@ mod tests {
 
         assert_eq!(round.attempted_peers, 2);
         assert_eq!(round.accepted_peers, 1);
-        assert!(state.is_ready(group_id()));
+        assert!(state.is_ready(&group_name()));
         shutdown_a.send(()).ok();
         shutdown_b.send(()).ok();
     }
@@ -830,7 +836,7 @@ mod tests {
                 .await;
             let state = Arc::new(RegistrationSet::new());
             state.record_registered(Registration {
-                group_id: group_id(),
+                group_name: group_name(),
                 worker_id: WorkerId::new(42),
                 worker_run_id,
                 advertised_endpoint: "http://127.0.0.1:9090".to_string(),
@@ -845,8 +851,11 @@ mod tests {
             let round = heartbeat.send_once(HeartbeatSnapshot::default()).await.unwrap();
 
             assert!(round.needs_register, "{code:?} should request registration");
-            assert!(!state.is_registered(group_id()), "{code:?} should clear registration");
-            assert!(!state.is_ready(group_id()), "{code:?} should clear readiness");
+            assert!(
+                !state.is_registered(&group_name()),
+                "{code:?} should clear registration"
+            );
+            assert!(!state.is_ready(&group_name()), "{code:?} should clear readiness");
             shutdown.send(()).ok();
         }
     }
@@ -867,12 +876,12 @@ mod tests {
             ))]);
         let state = Arc::new(RegistrationSet::new());
         state.record_registered(Registration {
-            group_id: group_id(),
+            group_name: group_name(),
             worker_id: WorkerId::new(42),
             worker_run_id,
             advertised_endpoint: "http://127.0.0.1:9090".to_string(),
         });
-        state.record_heartbeat_success(group_id(), Duration::from_secs(60));
+        state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
         let heartbeat = MetadataHeartbeatLoop::new(
             test_registration_config(endpoint.clone()),
             test_registration_descriptor(worker_run_id),
@@ -889,7 +898,7 @@ mod tests {
         let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
             temp.path().to_path_buf(),
         )));
-        publish_ready_block_for(store.as_ref(), group_id(), block_id(), payload(), 101);
+        publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
         let reporter = MetadataBlockReportLoop::new(
             test_registration_config(endpoint),
             test_registration_descriptor(worker_run_id),
@@ -901,17 +910,17 @@ mod tests {
         let round = heartbeat.send_once(HeartbeatSnapshot::default()).await.unwrap();
 
         assert!(round.worker_run_mismatch);
-        assert!(!state.is_registered(group_id()));
-        assert!(!state.is_ready(group_id()));
+        assert!(!state.is_registered(&group_name()));
+        assert!(!state.is_ready(&group_name()));
         assert_eq!(reporter.send_full_once().await.unwrap().attempted_peers, 0);
 
         registrar.register_once().await.expect("re-register after mismatch");
-        assert!(state.is_registered(group_id()));
-        assert!(!state.is_ready(group_id()));
+        assert!(state.is_registered(&group_name()));
+        assert!(!state.is_ready(&group_name()));
 
         let ready = heartbeat.send_once(HeartbeatSnapshot::default()).await.unwrap();
         assert_eq!(ready.accepted_peers, 1);
-        assert!(state.is_ready(group_id()));
+        assert!(state.is_ready(&group_name()));
 
         let report_round = reporter.send_full_once().await.expect("block report after recovery");
         assert_eq!(report_round.accepted_peers, 1);
@@ -933,7 +942,7 @@ mod tests {
         .await;
         let state = Arc::new(RegistrationSet::new());
         state.record_registered(Registration {
-            group_id: group_id(),
+            group_name: group_name(),
             worker_id: WorkerId::new(42),
             worker_run_id,
             advertised_endpoint: "http://127.0.0.1:9090".to_string(),
@@ -948,7 +957,7 @@ mod tests {
         let round = heartbeat.send_once(HeartbeatSnapshot::default()).await.unwrap();
 
         assert_eq!(round.accepted_peers, 1);
-        assert!(state.is_ready(group_id()));
+        assert!(state.is_ready(&group_name()));
         shutdown.send(()).ok();
     }
 
@@ -961,7 +970,7 @@ mod tests {
         .await;
         let state = Arc::new(RegistrationSet::new());
         state.record_registered(Registration {
-            group_id: group_id(),
+            group_name: group_name(),
             worker_id: WorkerId::new(42),
             worker_run_id,
             advertised_endpoint: "http://127.0.0.1:9090".to_string(),
@@ -986,53 +995,53 @@ mod tests {
     fn worker_readiness_is_false_before_registration_and_true_after() {
         let state = RegistrationSet::new();
 
-        assert!(!state.is_registered(group_id()));
-        assert!(!state.is_ready(group_id()));
+        assert!(!state.is_registered(&group_name()));
+        assert!(!state.is_ready(&group_name()));
         assert!(!state.is_any_ready());
-        assert!(state.registration(group_id()).is_none());
+        assert!(state.registration(&group_name()).is_none());
 
         state.record_registered(Registration {
-            group_id: group_id(),
+            group_name: group_name(),
             worker_id: WorkerId::new(44),
             worker_run_id: test_worker_run_id(),
             advertised_endpoint: "http://127.0.0.1:9090".to_string(),
         });
 
-        assert!(state.is_registered(group_id()));
-        assert!(!state.is_ready(group_id()));
+        assert!(state.is_registered(&group_name()));
+        assert!(!state.is_ready(&group_name()));
         assert!(!state.is_any_ready());
-        state.record_heartbeat_success(group_id(), Duration::from_millis(1_000));
-        assert!(state.is_ready(group_id()));
+        state.record_heartbeat_success(&group_name(), Duration::from_millis(1_000));
+        assert!(state.is_ready(&group_name()));
         assert!(state.is_any_ready());
         assert_eq!(
-            state.registration(group_id()),
+            state.registration(&group_name()),
             Some(Registration {
-                group_id: group_id(),
+                group_name: group_name(),
                 worker_id: WorkerId::new(44),
                 worker_run_id: test_worker_run_id(),
                 advertised_endpoint: "http://127.0.0.1:9090".to_string(),
             })
         );
-        state.mark_not_ready(group_id());
-        assert!(state.is_registered(group_id()));
-        assert!(!state.is_ready(group_id()));
+        state.mark_not_ready(&group_name());
+        assert!(state.is_registered(&group_name()));
+        assert!(!state.is_ready(&group_name()));
     }
 
     #[test]
     fn block_report_scans_local_blocks_by_group_directory() {
         let temp = TempDir::new().expect("tempdir");
         let store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(temp.path().to_path_buf()));
-        let report_group = ShardGroupId::new(12);
-        let other_group = ShardGroupId::new(1);
+        let report_group = GroupName::parse("report").unwrap();
+        let other_group = group_name();
         let report_block = BlockId::new(DataHandleId::new(77), BlockIndex::new(0));
         let other_block = BlockId::new(DataHandleId::new(78), BlockIndex::new(0));
-        publish_ready_block_for(&store, report_group, report_block, payload(), 101);
+        publish_ready_block_for(&store, report_group.clone(), report_block, payload(), 101);
         publish_ready_block_for(&store, other_group, other_block, payload(), 102);
 
-        let scanned = store.scan_group_blocks(report_group).expect("scan group blocks");
+        let scanned = store.scan_group_blocks(&report_group).expect("scan group blocks");
 
         assert_eq!(scanned.len(), 1);
-        assert_eq!(scanned[0].identity.group_id, report_group);
+        assert_eq!(scanned[0].identity.group_name, report_group);
         assert_eq!(scanned[0].identity.block_id, report_block);
     }
 
@@ -1045,7 +1054,7 @@ mod tests {
         let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
             temp.path().to_path_buf(),
         )));
-        publish_ready_block_for(store.as_ref(), group_id(), block_id(), payload(), 101);
+        publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
         let reporter = MetadataBlockReportLoop::new(
             test_registration_config(endpoint),
             test_registration_descriptor(worker_run_id),
@@ -1057,7 +1066,7 @@ mod tests {
         let without_registration = reporter.send_full_once().await.expect("skip unregistered");
         assert_eq!(without_registration.attempted_peers, 0);
         state.record_registered(Registration {
-            group_id: group_id(),
+            group_name: group_name(),
             worker_id: WorkerId::new(42),
             worker_run_id,
             advertised_endpoint: "http://127.0.0.1:9090".to_string(),
@@ -1075,26 +1084,26 @@ mod tests {
         let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(Vec::new()).await;
         let state = Arc::new(RegistrationSet::new());
         state.record_registered(Registration {
-            group_id: group_id(),
+            group_name: group_name(),
             worker_id: WorkerId::new(42),
             worker_run_id,
             advertised_endpoint: "http://127.0.0.1:9090".to_string(),
         });
-        state.record_heartbeat_success(group_id(), Duration::from_secs(60));
+        state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
         let temp = TempDir::new().expect("tempdir");
         let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
             temp.path().to_path_buf(),
         )));
         publish_ready_block_for(
             store.as_ref(),
-            group_id(),
+            group_name(),
             BlockId::new(DataHandleId::new(7), BlockIndex::new(0)),
             payload(),
             101,
         );
         publish_ready_block_for(
             store.as_ref(),
-            group_id(),
+            group_name(),
             BlockId::new(DataHandleId::new(7), BlockIndex::new(1)),
             payload(),
             102,
@@ -1117,7 +1126,7 @@ mod tests {
         assert_eq!(round.accepted_peers, 1);
         let requests = mock.block_report_requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].group_id, group_id().as_raw());
+        assert_eq!(requests[0].group_name, group_name().as_str());
         assert_eq!(requests[0].worker_id, 42);
         assert_eq!(requests[0].worker_run_id, worker_run_id.to_string());
         match requests[0].report.as_ref().expect("first report") {
@@ -1164,26 +1173,26 @@ mod tests {
                 start_mock_metadata_with_block_reports(vec![MockBlockReportReply::HeaderError(error)]).await;
             let state = Arc::new(RegistrationSet::new());
             state.record_registered(Registration {
-                group_id: group_id(),
+                group_name: group_name(),
                 worker_id: WorkerId::new(42),
                 worker_run_id,
                 advertised_endpoint: "http://127.0.0.1:9090".to_string(),
             });
-            state.record_heartbeat_success(group_id(), Duration::from_secs(60));
+            state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
             let temp = TempDir::new().expect("tempdir");
             let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
                 temp.path().to_path_buf(),
             )));
             publish_ready_block_for(
                 store.as_ref(),
-                group_id(),
+                group_name(),
                 BlockId::new(DataHandleId::new(7), BlockIndex::new(0)),
                 payload(),
                 101,
             );
             publish_ready_block_for(
                 store.as_ref(),
-                group_id(),
+                group_name(),
                 BlockId::new(DataHandleId::new(7), BlockIndex::new(1)),
                 payload(),
                 102,
@@ -1230,26 +1239,26 @@ mod tests {
         let (second_endpoint, second_mock, second_shutdown) = start_mock_metadata_with_block_reports(Vec::new()).await;
         let state = Arc::new(RegistrationSet::new());
         state.record_registered(Registration {
-            group_id: group_id(),
+            group_name: group_name(),
             worker_id: WorkerId::new(42),
             worker_run_id,
             advertised_endpoint: "http://127.0.0.1:9090".to_string(),
         });
-        state.record_heartbeat_success(group_id(), Duration::from_secs(60));
+        state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
         let temp = TempDir::new().expect("tempdir");
         let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
             temp.path().to_path_buf(),
         )));
         publish_ready_block_for(
             store.as_ref(),
-            group_id(),
+            group_name(),
             BlockId::new(DataHandleId::new(7), BlockIndex::new(0)),
             payload(),
             101,
         );
         publish_ready_block_for(
             store.as_ref(),
-            group_id(),
+            group_name(),
             BlockId::new(DataHandleId::new(7), BlockIndex::new(1)),
             payload(),
             102,
@@ -1290,17 +1299,17 @@ mod tests {
             start_mock_metadata_with_block_reports(vec![MockBlockReportReply::HeaderError(mismatch)]).await;
         let state = Arc::new(RegistrationSet::new());
         state.record_registered(Registration {
-            group_id: group_id(),
+            group_name: group_name(),
             worker_id: WorkerId::new(42),
             worker_run_id,
             advertised_endpoint: "http://127.0.0.1:9090".to_string(),
         });
-        state.record_heartbeat_success(group_id(), Duration::from_secs(60));
+        state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
         let temp = TempDir::new().expect("tempdir");
         let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
             temp.path().to_path_buf(),
         )));
-        publish_ready_block_for(store.as_ref(), group_id(), block_id(), payload(), 101);
+        publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
         let reporter = MetadataBlockReportLoop::new(
             test_registration_config(endpoint),
             test_registration_descriptor(worker_run_id),
@@ -1313,7 +1322,7 @@ mod tests {
         let after_mismatch = reporter.send_full_once().await.expect("stale registration skipped");
 
         assert!(round.worker_run_mismatch);
-        assert!(state.registration(group_id()).is_none());
+        assert!(state.registration(&group_name()).is_none());
         assert_eq!(after_mismatch.attempted_peers, 0);
         assert_eq!(mock.block_report_requests.lock().unwrap().len(), 1);
         shutdown.send(()).ok();
@@ -1330,17 +1339,17 @@ mod tests {
         let (second_endpoint, second_mock, second_shutdown) = start_mock_metadata_with_block_reports(Vec::new()).await;
         let state = Arc::new(RegistrationSet::new());
         state.record_registered(Registration {
-            group_id: group_id(),
+            group_name: group_name(),
             worker_id: WorkerId::new(42),
             worker_run_id,
             advertised_endpoint: "http://127.0.0.1:9090".to_string(),
         });
-        state.record_heartbeat_success(group_id(), Duration::from_secs(60));
+        state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
         let temp = TempDir::new().expect("tempdir");
         let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
             temp.path().to_path_buf(),
         )));
-        publish_ready_block_for(store.as_ref(), group_id(), block_id(), payload(), 101);
+        publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
         let mut config = test_registration_config(first_endpoint);
         config.endpoints.push(second_endpoint);
         let reporter = MetadataBlockReportLoop::new(
@@ -1376,19 +1385,19 @@ mod tests {
         .await;
         let state = Arc::new(RegistrationSet::new());
         state.record_registered(Registration {
-            group_id: group_id(),
+            group_name: group_name(),
             worker_id: WorkerId::new(42),
             worker_run_id,
             advertised_endpoint: "http://127.0.0.1:9090".to_string(),
         });
-        state.record_heartbeat_success(group_id(), Duration::from_secs(60));
+        state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
         let temp = TempDir::new().expect("tempdir");
         let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
             temp.path().to_path_buf(),
         )));
         let first = BlockId::new(DataHandleId::new(7), BlockIndex::new(0));
         let second = BlockId::new(DataHandleId::new(7), BlockIndex::new(1));
-        publish_ready_block_for(store.as_ref(), group_id(), first, payload(), 101);
+        publish_ready_block_for(store.as_ref(), group_name(), first, payload(), 101);
         let reporter = MetadataBlockReportLoop::new(
             test_registration_config(endpoint),
             test_registration_descriptor(worker_run_id),
@@ -1400,11 +1409,11 @@ mod tests {
         let before_full = reporter.send_delta_once().await.expect("no delta baseline");
         assert_eq!(before_full.attempted_peers, 0);
         reporter.send_full_once().await.expect("full report");
-        publish_ready_block_for(store.as_ref(), group_id(), second, payload(), 102);
+        publish_ready_block_for(store.as_ref(), group_name(), second, payload(), 102);
         let delta = reporter.send_delta_once().await.expect("delta report");
 
         assert!(delta.full_report_required);
-        assert!(!reporter.has_delta_baseline(group_id()));
+        assert!(!reporter.has_delta_baseline(&group_name()));
         let requests = mock.block_report_requests.lock().unwrap();
         assert!(matches!(
             requests.last().and_then(|request| request.report.as_ref()),
@@ -1415,7 +1424,7 @@ mod tests {
 
     fn write_open_request() -> WriteOpenRequest {
         WriteOpenRequest {
-            group_id: group_id(),
+            group_name: group_name(),
             block_id: block_id(),
             worker_run_id: test_worker_run_id(),
             token: token(),
@@ -1432,7 +1441,7 @@ mod tests {
     fn commit_write_request() -> CommitWriteRequest {
         CommitWriteRequest {
             stream_id: stream_id(),
-            group_id: group_id(),
+            group_name: group_name(),
             block_id: block_id(),
             worker_run_id: test_worker_run_id(),
             token: token(),
@@ -1449,7 +1458,7 @@ mod tests {
     fn abort_write_request() -> AbortWriteRequest {
         AbortWriteRequest {
             stream_id: stream_id(),
-            group_id: group_id(),
+            group_name: group_name(),
             block_id: block_id(),
             token: token(),
         }
@@ -1457,7 +1466,7 @@ mod tests {
 
     fn sync_committed_block_request(block_stamp: u64, expected_block_len: u64) -> SyncCommittedBlockRequest {
         SyncCommittedBlockRequest {
-            group_id: group_id(),
+            group_name: group_name(),
             block_id: block_id(),
             worker_run_id: test_worker_run_id(),
             block_stamp,
@@ -1471,7 +1480,7 @@ mod tests {
     fn stream_context() -> StreamContext {
         StreamContext {
             stream_id: stream_id(),
-            group_id: group_id(),
+            group_name: group_name(),
             block_id: block_id(),
             mode: StreamMode::Read,
             start_offset: 0,
@@ -1515,7 +1524,7 @@ mod tests {
     fn publish_ready_block(store: &FullBlockFileStore, data: Bytes, block_stamp: u64) {
         store
             .create_staging_block(CreateStagingBlockRequest {
-                group_id: group_id(),
+                group_name: group_name(),
                 block_id: block_id(),
                 block_size: BLOCK_SIZE,
                 block_format_id: BlockFormatId::FULL_EFFECTIVE,
@@ -1524,11 +1533,11 @@ mod tests {
             })
             .expect("create staging block");
         store
-            .write_at(group_id(), block_id(), 0, data.clone())
+            .write_at(&group_name(), block_id(), 0, data.clone())
             .expect("write staging block");
         store
             .publish_ready(PublishReadyRequest {
-                group_id: group_id(),
+                group_name: group_name(),
                 block_id: block_id(),
                 effective_block_len: data.len() as u64,
                 block_stamp,
@@ -1538,14 +1547,14 @@ mod tests {
 
     fn publish_ready_block_for(
         store: &FullBlockFileStore,
-        group_id: ShardGroupId,
+        group_name: GroupName,
         block_id: BlockId,
         data: Bytes,
         block_stamp: u64,
     ) {
         store
             .create_staging_block(CreateStagingBlockRequest {
-                group_id,
+                group_name: group_name.clone(),
                 block_id,
                 block_size: BLOCK_SIZE,
                 block_format_id: BlockFormatId::FULL_EFFECTIVE,
@@ -1554,11 +1563,11 @@ mod tests {
             })
             .expect("create staging block");
         store
-            .write_at(group_id, block_id, 0, data.clone())
+            .write_at(&group_name, block_id, 0, data.clone())
             .expect("write block");
         store
             .publish_ready(PublishReadyRequest {
-                group_id,
+                group_name,
                 block_id,
                 effective_block_len: data.len() as u64,
                 block_stamp,
@@ -1568,7 +1577,7 @@ mod tests {
 
     fn read_open_request_for(offset: u64, len: u32, block_stamp: u64, frame_size: u32) -> ReadOpenRequest {
         ReadOpenRequest {
-            group_id: group_id(),
+            group_name: group_name(),
             block_id: block_id(),
             worker_run_id: test_worker_run_id(),
             byte_range: ByteRange { offset, len },
@@ -1592,7 +1601,7 @@ mod tests {
     fn open_read_proto(offset: u64, len: u32, block_stamp: u64, frame_size: u32) -> OpenReadStreamRequestProto {
         OpenReadStreamRequestProto {
             header: Some(test_header()),
-            group_id: Some(test_group_id_proto()),
+            group_name: "root".to_string(),
             block_id: Some(test_block_id_proto()),
             byte_range: Some(ByteRangeProto { offset, len }),
             block_stamp,
@@ -1608,7 +1617,7 @@ mod tests {
     fn open_write_proto(frame_size: u32) -> OpenWriteStreamRequestProto {
         OpenWriteStreamRequestProto {
             header: Some(test_header()),
-            group_id: Some(test_group_id_proto()),
+            group_name: "root".to_string(),
             block_id: Some(test_block_id_proto()),
             block_size: BLOCK_SIZE,
             block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
@@ -1625,7 +1634,7 @@ mod tests {
     fn commit_write_proto(stream_id: StreamId, commit_seq: u64, effective_block_len: u64) -> CommitWriteRequestProto {
         CommitWriteRequestProto {
             header: Some(test_header()),
-            group_id: Some(test_group_id_proto()),
+            group_name: "root".to_string(),
             block_id: Some(test_block_id_proto()),
             stream_id: Some(crate::data::convert::stream_id_to_proto(stream_id)),
             effective_block_len,
@@ -1643,7 +1652,7 @@ mod tests {
     fn sync_committed_block_proto(block_stamp: u64, expected_block_len: u64) -> SyncCommittedBlockRequestProto {
         SyncCommittedBlockRequestProto {
             header: Some(test_header()),
-            group_id: Some(test_group_id_proto()),
+            group_name: "root".to_string(),
             block_id: Some(test_block_id_proto()),
             block_stamp,
             expected_block_len,
@@ -1723,7 +1732,7 @@ mod tests {
 
         let domain = proto_to_read_open_request(request).unwrap();
 
-        assert_eq!(domain.group_id, group_id());
+        assert_eq!(domain.group_name, group_name());
         assert_eq!(domain.block_id, block_id());
         assert_eq!(domain.byte_range, ByteRange { offset: 128, len: 4096 });
         assert_eq!(domain.block_stamp, 0);
@@ -1741,7 +1750,7 @@ mod tests {
 
         let domain = proto_to_write_open_request(request).unwrap();
 
-        assert_eq!(domain.group_id, group_id());
+        assert_eq!(domain.group_name, group_name());
         assert_eq!(domain.block_id, block_id());
         assert_eq!(domain.token.owner, ClientId::new(9));
         assert_eq!(domain.token.epoch, 11);
@@ -1792,7 +1801,7 @@ mod tests {
         let commit = proto_to_commit_write_request(commit_write_proto(stream_id(), 8, 4096)).unwrap();
 
         assert_eq!(commit.stream_id, stream_id());
-        assert_eq!(commit.group_id, group_id());
+        assert_eq!(commit.group_name, group_name());
         assert_eq!(commit.block_id, block_id());
         assert_eq!(commit.token.epoch, 11);
         assert_eq!(commit.worker_run_id, test_worker_run_id());
@@ -1806,7 +1815,7 @@ mod tests {
 
         let abort = proto_to_abort_write_request(AbortWriteRequestProto {
             header: Some(test_header()),
-            group_id: Some(test_group_id_proto()),
+            group_name: "root".to_string(),
             block_id: Some(test_block_id_proto()),
             stream_id: Some(test_stream_id_proto()),
             token: Some(test_token_proto()),
@@ -1814,7 +1823,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(abort.stream_id, stream_id());
-        assert_eq!(abort.group_id, group_id());
+        assert_eq!(abort.group_name, group_name());
         assert_eq!(abort.block_id, block_id());
         assert_eq!(abort.token.owner, ClientId::new(9));
     }
@@ -1823,7 +1832,7 @@ mod tests {
     fn converts_sync_committed_block_request_to_domain() {
         let sync = proto_to_sync_committed_block_request(sync_committed_block_proto(BLOCK_STAMP, BLOCK_SIZE)).unwrap();
 
-        assert_eq!(sync.group_id, group_id());
+        assert_eq!(sync.group_name, group_name());
         assert_eq!(sync.block_id, block_id());
         assert_eq!(sync.worker_run_id, test_worker_run_id());
         assert_eq!(sync.block_stamp, BLOCK_STAMP);
@@ -1837,7 +1846,7 @@ mod tests {
     fn conversion_reports_missing_required_fields_without_panic() {
         let read_err = proto_to_read_open_request(OpenReadStreamRequestProto {
             header: Some(test_header()),
-            group_id: Some(test_group_id_proto()),
+            group_name: "root".to_string(),
             block_id: None,
             byte_range: Some(ByteRangeProto { offset: 0, len: 1 }),
             block_stamp: 0,
@@ -1853,7 +1862,7 @@ mod tests {
 
         let read_err = proto_to_read_open_request(OpenReadStreamRequestProto {
             header: Some(test_header()),
-            group_id: None,
+            group_name: String::new(),
             block_id: Some(test_block_id_proto()),
             byte_range: Some(ByteRangeProto { offset: 0, len: 1 }),
             block_stamp: 0,
@@ -1865,7 +1874,23 @@ mod tests {
             effective_block_len: BLOCK_SIZE,
         })
         .unwrap_err();
-        assert!(read_err.to_string().contains("missing group_id"));
+        assert!(read_err.to_string().contains("missing group_name"));
+
+        let read_err = proto_to_read_open_request(OpenReadStreamRequestProto {
+            header: Some(test_header()),
+            group_name: "Root".to_string(),
+            block_id: Some(test_block_id_proto()),
+            byte_range: Some(ByteRangeProto { offset: 0, len: 1 }),
+            block_stamp: 0,
+            frame_size: 1024,
+            worker_run_id: test_worker_run_id().to_string(),
+            block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
+            block_size: BLOCK_SIZE,
+            chunk_size: CHUNK_SIZE,
+            effective_block_len: BLOCK_SIZE,
+        })
+        .unwrap_err();
+        assert!(read_err.to_string().contains("group_name invalid"));
 
         let write_open_err = proto_to_write_open_request(OpenWriteStreamRequestProto {
             token: None,
@@ -1886,7 +1911,7 @@ mod tests {
 
         let commit_err = proto_to_commit_write_request(CommitWriteRequestProto {
             header: Some(test_header()),
-            group_id: Some(test_group_id_proto()),
+            group_name: "root".to_string(),
             block_id: Some(test_block_id_proto()),
             stream_id: None,
             effective_block_len: 1,
@@ -1914,18 +1939,18 @@ mod tests {
         assert_eq!(result.block_stamp, BLOCK_STAMP);
         assert_eq!(result.committed_length, 0);
 
-        let paths = store.paths(group_id(), block_id());
+        let paths = store.paths(&group_name(), block_id());
         assert!(paths.staging_data_path.exists());
         assert!(paths.staging_meta_path.exists());
         assert!(!paths.meta_path.exists());
-        assert_not_found(store.read_at(group_id(), block_id(), 0, 1));
+        assert_not_found(store.read_at(&group_name(), block_id(), 0, 1));
 
         let state = core
             .stream_manager()
             .get(result.stream_id)
             .await
             .expect("write stream registered");
-        assert_eq!(state.context.group_id, group_id());
+        assert_eq!(state.context.group_name, group_name());
         assert_eq!(state.context.block_id, block_id());
         assert_eq!(state.context.mode, StreamMode::Write);
         assert_eq!(state.context.end_offset, BLOCK_SIZE);
@@ -1937,7 +1962,7 @@ mod tests {
     #[tokio::test]
     async fn open_write_rejects_invalid_metadata_shape_before_staging() {
         let (_temp, store, core) = core_with_store(512, 2048, 4096);
-        let paths = store.paths(group_id(), block_id());
+        let paths = store.paths(&group_name(), block_id());
 
         let mut zero_stamp = write_open_request();
         zero_stamp.block_stamp = 0;
@@ -2030,7 +2055,7 @@ mod tests {
         assert_eq!(state.cursor, data.len() as u64);
         assert_eq!(state.last_acked_seq, 1);
         assert_eq!(state.written_through, data.len() as u64);
-        assert!(!store.paths(group_id(), block_id()).meta_path.exists());
+        assert!(!store.paths(&group_name(), block_id()).meta_path.exists());
     }
 
     #[tokio::test]
@@ -2145,10 +2170,10 @@ mod tests {
         assert_eq!(result.effective_block_len, BLOCK_SIZE);
         assert_eq!(result.block_stamp, BLOCK_STAMP);
         assert_eq!(result.written_through, BLOCK_SIZE);
-        let meta = store.load_meta(group_id(), block_id()).expect("ready meta");
+        let meta = store.load_meta(&group_name(), block_id()).expect("ready meta");
         assert_eq!(meta.visibility.block_state, crate::store::block::BlockState::Ready);
         assert_eq!(meta.visibility.block_stamp, BLOCK_STAMP);
-        assert_eq!(store.read_at(group_id(), block_id(), 0, BLOCK_SIZE).unwrap(), data);
+        assert_eq!(store.read_at(&group_name(), block_id(), 0, BLOCK_SIZE).unwrap(), data);
     }
 
     #[tokio::test]
@@ -2178,7 +2203,7 @@ mod tests {
 
         assert_eq!(result.effective_block_len, effective_len);
         assert_eq!(result.written_through, effective_len);
-        let meta = store.load_meta(group_id(), block_id()).expect("ready meta");
+        let meta = store.load_meta(&group_name(), block_id()).expect("ready meta");
         assert_eq!(meta.format.block_size, BLOCK_SIZE);
         assert_eq!(meta.source.effective_block_len, effective_len);
     }
@@ -2458,7 +2483,7 @@ mod tests {
 
         assert!(result.aborted);
         assert!(core.stream_manager().get(open.stream_id).await.is_none());
-        let paths = store.paths(group_id(), block_id());
+        let paths = store.paths(&group_name(), block_id());
         assert!(!paths.staging_data_path.exists());
         assert!(!paths.staging_meta_path.exists());
     }
@@ -2475,8 +2500,8 @@ mod tests {
         .await
         .expect("abort write");
 
-        assert_not_found(store.read_at(group_id(), block_id(), 0, 1));
-        assert!(!store.paths(group_id(), block_id()).meta_path.exists());
+        assert_not_found(store.read_at(&group_name(), block_id(), 0, 1));
+        assert!(!store.paths(&group_name(), block_id()).meta_path.exists());
     }
 
     #[tokio::test]
@@ -2494,8 +2519,8 @@ mod tests {
         .expect("write frame");
 
         let recovered_store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(temp.path().to_path_buf()));
-        assert_not_found(recovered_store.recover_block(group_id(), block_id()));
-        assert_not_found(recovered_store.read_at(group_id(), block_id(), 0, 1));
+        assert_not_found(recovered_store.recover_block(&group_name(), block_id()));
+        assert_not_found(recovered_store.read_at(&group_name(), block_id(), 0, 1));
     }
 
     #[tokio::test]
@@ -2518,7 +2543,7 @@ mod tests {
             .get(result.stream_id)
             .await
             .expect("read stream registered");
-        assert_eq!(state.context.group_id, group_id());
+        assert_eq!(state.context.group_name, group_name());
         assert_eq!(state.context.block_id, block_id());
         assert_eq!(state.context.mode, StreamMode::Read);
         assert_eq!(state.context.start_offset, 128);
@@ -2548,7 +2573,7 @@ mod tests {
             .expect("open read from configured root");
         assert!(core.stream_manager().get(result.stream_id).await.is_some());
 
-        let paths = store.paths(group_id(), block_id());
+        let paths = store.paths(&group_name(), block_id());
         assert!(paths.data_path.starts_with(custom_root.path()));
         assert!(paths.meta_path.starts_with(custom_root.path()));
         assert!(
@@ -2561,7 +2586,7 @@ mod tests {
         );
 
         let other_store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(other_root.path().to_path_buf()));
-        let other_paths = other_store.paths(group_id(), block_id());
+        let other_paths = other_store.paths(&group_name(), block_id());
         assert!(
             !other_paths.data_path.exists(),
             "ready block data must not be created under other root"
@@ -3159,6 +3184,17 @@ mod tests {
                 "worker main must not initialize inactive path: {forbidden}"
             );
         }
+
+        let prepare_idx = main
+            .find("prepare_worker_start(&config)")
+            .expect("worker main must validate local storage before startup");
+        let observability_idx = main
+            .find("init_observability(&obs_config")
+            .expect("worker main must initialize observability");
+        assert!(
+            prepare_idx < observability_idx,
+            "worker main must validate local storage before binding observability or metrics"
+        );
     }
 
     #[test]
@@ -3347,7 +3383,6 @@ mod tests {
             proto_message_fields(proto, "OpenWriteStreamRequestProto"),
             vec![
                 ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.ShardGroupIdProto", "group_id", 2),
                 ("common.BlockIdProto", "block_id", 3),
                 ("uint32", "block_format_id", 4),
                 ("uint64", "block_size", 5),
@@ -3358,6 +3393,7 @@ mod tests {
                 ("uint32", "frame_size", 10),
                 ("string", "worker_run_id", 11),
                 ("uint64", "effective_block_len", 12),
+                ("string", "group_name", 13),
             ]
         );
         assert_eq!(
@@ -3386,7 +3422,6 @@ mod tests {
             proto_message_fields(proto, "CommitWriteRequestProto"),
             vec![
                 ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.ShardGroupIdProto", "group_id", 2),
                 ("common.BlockIdProto", "block_id", 3),
                 ("common.StreamIdProto", "stream_id", 4),
                 ("uint64", "effective_block_len", 5),
@@ -3398,6 +3433,7 @@ mod tests {
                 ("uint32", "block_format_id", 11),
                 ("uint64", "block_size", 12),
                 ("uint32", "chunk_size", 13),
+                ("string", "group_name", 14),
             ]
         );
         assert_eq!(
@@ -3413,7 +3449,6 @@ mod tests {
             proto_message_fields(proto, "SyncCommittedBlockRequestProto"),
             vec![
                 ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.ShardGroupIdProto", "group_id", 2),
                 ("common.BlockIdProto", "block_id", 3),
                 ("uint64", "block_stamp", 4),
                 ("uint64", "expected_block_len", 5),
@@ -3421,6 +3456,7 @@ mod tests {
                 ("uint32", "block_format_id", 7),
                 ("uint64", "block_size", 8),
                 ("uint32", "chunk_size", 9),
+                ("string", "group_name", 10),
             ]
         );
         assert_eq!(
@@ -3435,10 +3471,10 @@ mod tests {
             proto_message_fields(proto, "AbortWriteRequestProto"),
             vec![
                 ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.ShardGroupIdProto", "group_id", 2),
                 ("common.BlockIdProto", "block_id", 3),
                 ("common.StreamIdProto", "stream_id", 4),
                 ("common.FencingTokenProto", "token", 5),
+                ("string", "group_name", 6),
             ]
         );
         assert_eq!(

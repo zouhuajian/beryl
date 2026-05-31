@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use types::{GroupStateWatermark, ShardGroupId};
+use types::{GroupName, GroupStateWatermark};
 
 use crate::cache::StateIdCache;
 use crate::cache::{CacheInvalidationReason, WorkerEndpointCache};
@@ -19,8 +19,8 @@ use crate::runtime::context::{AttemptContext, OperationContext};
 /// Configured metadata group bootstrap target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfiguredMetadataGroup {
-    /// Non-zero metadata group id.
-    pub group_id: u64,
+    /// Stable metadata group name.
+    pub group_name: GroupName,
     /// Metadata endpoint for this group.
     pub endpoint: String,
 }
@@ -28,8 +28,8 @@ pub struct ConfiguredMetadataGroup {
 #[derive(Debug)]
 struct RefreshState {
     configured_groups: Vec<ConfiguredMetadataGroup>,
-    leader_cache: HashMap<u64, String>,
-    mount_route_cache: HashMap<String, u64>,
+    leader_cache: HashMap<GroupName, String>,
+    mount_route_cache: HashMap<String, GroupName>,
     mount_epoch_cache: HashMap<String, u64>,
     route_epoch_cache: HashMap<String, u64>,
 }
@@ -43,11 +43,11 @@ pub struct RefreshManager {
 }
 
 impl RefreshManager {
-    /// Create a refresh manager from configured non-zero metadata groups.
+    /// Create a refresh manager from configured metadata groups.
     pub fn new(configured_groups: Vec<ConfiguredMetadataGroup>) -> ClientResult<Self> {
-        if configured_groups.is_empty() || configured_groups.iter().any(|group| group.group_id == 0) {
+        if configured_groups.is_empty() {
             return Err(ClientError::InvalidArgument(
-                "RefreshManager requires at least one non-zero metadata group".to_string(),
+                "RefreshManager requires at least one metadata group".to_string(),
             ));
         }
         Ok(Self {
@@ -69,17 +69,17 @@ impl RefreshManager {
         self
     }
 
-    /// Build configured groups from parallel group id and endpoint lists.
-    pub fn from_config(metadata_group_ids: &[u64], metadata_endpoints: &[String]) -> ClientResult<Self> {
+    /// Build configured groups from parallel group name and endpoint lists.
+    pub fn from_config(metadata_group_names: &[GroupName], metadata_endpoints: &[String]) -> ClientResult<Self> {
         let fallback_endpoint = metadata_endpoints
             .first()
             .cloned()
             .ok_or_else(|| ClientError::Config("client.metadata.endpoints must not be empty".to_string()))?;
-        let groups = metadata_group_ids
+        let groups = metadata_group_names
             .iter()
             .enumerate()
-            .map(|(index, group_id)| ConfiguredMetadataGroup {
-                group_id: *group_id,
+            .map(|(index, group_name)| ConfiguredMetadataGroup {
+                group_name: group_name.clone(),
                 endpoint: metadata_endpoints
                     .get(index)
                     .cloned()
@@ -90,20 +90,20 @@ impl RefreshManager {
     }
 
     /// Choose the owner group for a path, using owner cache before bootstrap config.
-    pub fn choose_group_for_path(&self, path: &str) -> ClientResult<u64> {
+    pub fn choose_group_for_path(&self, path: &str) -> ClientResult<GroupName> {
         let state = self.state.read();
-        if let Some(group_id) = state.mount_route_cache.get(path) {
-            return Ok(*group_id);
+        if let Some(group_name) = state.mount_route_cache.get(path) {
+            return Ok(group_name.clone());
         }
         state
             .configured_groups
             .first()
-            .map(|group| group.group_id)
+            .map(|group| group.group_name.clone())
             .ok_or_else(|| ClientError::Config("metadata group configuration is empty".to_string()))
     }
 
     /// Choose the owner group for an operation.
-    pub fn choose_group_for_operation(&self, operation: &OperationContext) -> ClientResult<u64> {
+    pub fn choose_group_for_operation(&self, operation: &OperationContext) -> ClientResult<GroupName> {
         if let Some(path) = operation.original_target_path() {
             self.choose_group_for_path(path)
         } else {
@@ -122,15 +122,15 @@ impl RefreshManager {
     }
 
     /// Select endpoint for the next attempt.
-    pub fn endpoint_for_group(&self, group_id: u64) -> ClientResult<String> {
+    pub fn endpoint_for_group(&self, group_name: &GroupName) -> ClientResult<String> {
         let state = self.state.read();
-        if let Some(endpoint) = state.leader_cache.get(&group_id) {
+        if let Some(endpoint) = state.leader_cache.get(group_name) {
             return Ok(endpoint.clone());
         }
         state
             .configured_groups
             .iter()
-            .find(|group| group.group_id == group_id)
+            .find(|group| &group.group_name == group_name)
             .or_else(|| state.configured_groups.first())
             .map(|group| group.endpoint.clone())
             .ok_or_else(|| ClientError::Config("metadata endpoint configuration is empty".to_string()))
@@ -146,21 +146,21 @@ impl RefreshManager {
         let mut state = self.state.write();
         match reason {
             RefreshReason::NotLeader => {
-                if let (Some(group_id), Some(endpoint)) = (hint.group_id, hint.leader_endpoint.as_ref()) {
-                    state.leader_cache.insert(group_id, endpoint.clone());
+                if let (Some(group_name), Some(endpoint)) = (hint.group_name.as_ref(), hint.leader_endpoint.as_ref()) {
+                    state.leader_cache.insert(group_name.clone(), endpoint.clone());
                 }
             }
             RefreshReason::OwnerGroupMismatch => {
-                let Some(group_id) = hint.group_id else {
+                let Some(group_name) = hint.group_name.as_ref() else {
                     return Err(ClientError::Metadata(
-                        "owner group mismatch refresh missing group_id hint".to_string(),
+                        "owner group mismatch refresh missing group_name hint".to_string(),
                     ));
                 };
                 if let Some(path) = operation.original_target_path() {
-                    state.mount_route_cache.insert(path.to_string(), group_id);
+                    state.mount_route_cache.insert(path.to_string(), group_name.clone());
                 }
                 if let Some(endpoint) = hint.leader_endpoint.as_ref() {
-                    state.leader_cache.insert(group_id, endpoint.clone());
+                    state.leader_cache.insert(group_name.clone(), endpoint.clone());
                 }
             }
             RefreshReason::MountEpochMismatch => {
@@ -216,10 +216,8 @@ impl RefreshManager {
     }
 
     /// Return cached watermark as proto for a group.
-    pub fn state_watermark_proto(&self, group_id: u64) -> Option<proto::common::GroupStateWatermarkProto> {
-        self.watermarks
-            .get(&ShardGroupId::new(group_id))
-            .map(|watermark| (&watermark).into())
+    pub fn state_watermark_proto(&self, group_name: &GroupName) -> Option<proto::common::GroupStateWatermarkProto> {
+        self.watermarks.get(group_name).map(|watermark| (&watermark).into())
     }
 }
 
@@ -284,10 +282,10 @@ fn path_matches_prefix(path: &str, prefix: &str) -> bool {
 impl Default for RefreshManager {
     fn default() -> Self {
         Self::new(vec![ConfiguredMetadataGroup {
-            group_id: 1,
+            group_name: GroupName::parse("root").expect("default group name is valid"),
             endpoint: "http://127.0.0.1:18080".to_string(),
         }])
-        .expect("default metadata group must be non-zero")
+        .expect("default metadata group must be valid")
     }
 }
 
@@ -300,14 +298,14 @@ mod tests {
     use crate::runtime::classify::RefreshReason;
     use crate::runtime::policy::OperationKind;
     use crate::runtime::{OperationContext, OperationIdentity};
-    use proto::common::{GroupStateWatermarkProto, RaftLogIdProto, ShardGroupIdProto};
+    use proto::common::{GroupStateWatermarkProto, RaftLogIdProto};
     use std::sync::Arc;
     use std::time::Duration;
-    use types::{ClientId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
+    use types::{ClientId, GroupName, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
 
     fn manager() -> RefreshManager {
         RefreshManager::new(vec![ConfiguredMetadataGroup {
-            group_id: 9,
+            group_name: group_name("root"),
             endpoint: "http://127.0.0.1:18080".to_string(),
         }])
         .expect("refresh manager")
@@ -324,14 +322,17 @@ mod tests {
     }
 
     fn metadata_attempt(operation: &OperationContext) -> AttemptContext {
-        AttemptContext::for_metadata(operation, 9, 0).expect("metadata attempt")
+        AttemptContext::for_metadata(operation, group_name("root"), 0).expect("metadata attempt")
     }
 
     #[test]
     fn path_operation_initially_uses_configured_default_group() {
         let manager = manager();
 
-        assert_eq!(manager.choose_group_for_path("/alpha").expect("group"), 9);
+        assert_eq!(
+            manager.choose_group_for_path("/alpha").expect("group"),
+            group_name("root")
+        );
     }
 
     #[test]
@@ -344,13 +345,16 @@ mod tests {
                 &op,
                 RefreshReason::OwnerGroupMismatch,
                 &RefreshHint {
-                    group_id: Some(11),
+                    group_name: Some(group_name("analytics")),
                     ..RefreshHint::default()
                 },
             )
             .expect("refresh recorded");
 
-        assert_eq!(manager.choose_group_for_path("/alpha/file").expect("group"), 11);
+        assert_eq!(
+            manager.choose_group_for_path("/alpha/file").expect("group"),
+            group_name("analytics")
+        );
     }
 
     #[test]
@@ -363,16 +367,21 @@ mod tests {
                 &op,
                 RefreshReason::OwnerGroupMismatch,
                 &RefreshHint {
-                    group_id: Some(11),
+                    group_name: Some(group_name("analytics")),
                     leader_endpoint: Some("http://127.0.0.1:18082".to_string()),
                     ..RefreshHint::default()
                 },
             )
             .expect("refresh recorded");
 
-        assert_eq!(manager.choose_group_for_path("/alpha/file").expect("group"), 11);
         assert_eq!(
-            manager.endpoint_for_group(11).expect("owner endpoint"),
+            manager.choose_group_for_path("/alpha/file").expect("group"),
+            group_name("analytics")
+        );
+        assert_eq!(
+            manager
+                .endpoint_for_group(&group_name("analytics"))
+                .expect("owner endpoint"),
             "http://127.0.0.1:18082"
         );
     }
@@ -387,7 +396,7 @@ mod tests {
                 &op,
                 RefreshReason::NotLeader,
                 &RefreshHint {
-                    group_id: Some(9),
+                    group_name: Some(group_name("root")),
                     leader_endpoint: Some("http://127.0.0.1:18081".to_string()),
                     ..RefreshHint::default()
                 },
@@ -395,7 +404,9 @@ mod tests {
             .expect("refresh recorded");
 
         assert_eq!(
-            manager.endpoint_for_group(9).expect("leader endpoint"),
+            manager
+                .endpoint_for_group(&group_name("root"))
+                .expect("leader endpoint"),
             "http://127.0.0.1:18081"
         );
     }
@@ -451,24 +462,24 @@ mod tests {
         let manager = manager();
 
         manager
-            .record_state_watermark(watermark_proto(9, 10))
+            .record_state_watermark(watermark_proto("root", 10))
             .expect("watermark");
         manager
-            .record_state_watermark(watermark_proto(9, 8))
+            .record_state_watermark(watermark_proto("root", 8))
             .expect("older watermark");
         manager
-            .record_state_watermark(watermark_proto(11, 3))
+            .record_state_watermark(watermark_proto("analytics", 3))
             .expect("other group");
 
         assert_eq!(
             manager
-                .state_watermark_proto(9)
+                .state_watermark_proto(&group_name("root"))
                 .and_then(|watermark| watermark.state_id.map(|state_id| state_id.index)),
             Some(10)
         );
         assert_eq!(
             manager
-                .state_watermark_proto(11)
+                .state_watermark_proto(&group_name("analytics"))
                 .and_then(|watermark| watermark.state_id.map(|state_id| state_id.index)),
             Some(3)
         );
@@ -507,15 +518,19 @@ mod tests {
         assert_eq!(endpoint_cache.len(), 1);
     }
 
-    fn watermark_proto(group_id: u64, index: u64) -> GroupStateWatermarkProto {
+    fn watermark_proto(group_name: &str, index: u64) -> GroupStateWatermarkProto {
         GroupStateWatermarkProto {
-            group_id: Some(ShardGroupIdProto { value: group_id }),
+            group_name: group_name.to_string(),
             state_id: Some(RaftLogIdProto {
                 term: 1,
                 leader_node_id: 1,
                 index,
             }),
         }
+    }
+
+    fn group_name(raw: &str) -> GroupName {
+        GroupName::parse(raw).unwrap()
     }
 
     fn seeded_worker_endpoint_cache() -> WorkerEndpointCache {

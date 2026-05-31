@@ -12,6 +12,7 @@ use crate::error::ClientError;
 use common::error::canonical::{CanonicalError, ErrorClass, RefreshReason};
 use common::header::{ResponseHeader, RpcErrorCode};
 use proto::convert::error_detail_to_canonical;
+use types::GroupName;
 
 /// Endpoint hint preserved on refresh actions.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,8 +50,8 @@ impl From<common::error::canonical::WorkerEndpointHint> for EndpointHint {
 pub struct RefreshHint {
     /// Metadata leader endpoint from canonical refresh hint.
     pub leader_endpoint: Option<String>,
-    /// Group ID hint from metadata header.
-    pub group_id: Option<u64>,
+    /// Stable metadata group name hint from metadata header.
+    pub group_name: Option<GroupName>,
     /// Mount prefix associated with the mount epoch, when the server provides it.
     pub mount_prefix: Option<String>,
     /// Route epoch hint (if present in future headers).
@@ -184,7 +185,7 @@ fn refresh_hint_from_canonical_and_header(
     header: &ResponseHeader,
 ) -> RefreshHint {
     let mut hint = refresh_hint_from_canonical(canonical_hint);
-    hint.group_id = hint.group_id.or(header.group_id);
+    hint.group_name = hint.group_name.or_else(|| header.group_name.clone());
     hint.route_epoch = hint.route_epoch.or(header.route_epoch);
     hint.mount_epoch = hint.mount_epoch.or(header.mount_epoch);
     hint
@@ -202,7 +203,10 @@ fn refresh_hint_from_canonical(canonical_hint: Option<&common::error::canonical:
         .collect::<Vec<_>>();
     RefreshHint {
         leader_endpoint: canonical_hint.leader_endpoint.clone(),
-        group_id: canonical_hint.group_id,
+        group_name: canonical_hint
+            .group_name
+            .as_deref()
+            .and_then(|group_name| GroupName::parse(group_name).ok()),
         mount_prefix: canonical_hint.mount_prefix.clone(),
         route_epoch: canonical_hint.route_epoch,
         mount_epoch: canonical_hint.mount_epoch,
@@ -257,9 +261,9 @@ mod tests {
                 let Some(header) = response_header else {
                     return RpcEnvelope::CanonicalError(invalid_header_canonical("missing response header"));
                 };
-                if header.group_id == 0 {
+                if header.group_name.is_empty() {
                     return RpcEnvelope::CanonicalError(invalid_header_canonical(
-                        "invalid response header: group_id must be non-zero",
+                        "invalid response header: group_name missing",
                     ));
                 }
                 let header = match ResponseHeader::try_from(header.clone()) {
@@ -289,7 +293,7 @@ mod tests {
     fn validate_need_refresh_preserves_reason_and_hint() {
         let canonical = CanonicalError::need_refresh(RpcErrorCode::NotLeader, RefreshReason::NotLeader, "not leader");
         let mut header = ResponseHeader::error(ClientInfo::new(types::ClientId::new(1)), canonical.clone());
-        header.group_id = Some(7);
+        header.group_name = Some(GroupName::parse("root").unwrap());
         header.mount_epoch = Some(12);
 
         let result = validate_header_or_action(&header);
@@ -300,7 +304,7 @@ mod tests {
                 canonical: returned,
             }) => {
                 assert_eq!(reason, RefreshReason::NotLeader);
-                assert_eq!(hint.group_id, Some(7));
+                assert_eq!(hint.group_name, Some(GroupName::parse("root").unwrap()));
                 assert_eq!(hint.mount_epoch, Some(12));
                 assert_eq!(returned.reason, canonical.reason);
                 assert_eq!(returned.code, canonical.code);
@@ -316,7 +320,7 @@ mod tests {
             RefreshReason::OwnerGroupMismatch,
             CanonicalRefreshHint {
                 leader_endpoint: Some("http://127.0.0.1:18081".to_string()),
-                group_id: Some(17),
+                group_name: Some("analytics".to_string()),
                 mount_epoch: Some(31),
                 mount_prefix: Some("/mnt".to_string()),
                 route_epoch: Some(23),
@@ -337,7 +341,7 @@ mod tests {
             "route moved",
         );
         let mut header = ResponseHeader::error(ClientInfo::new(types::ClientId::new(1)), canonical);
-        header.group_id = Some(99);
+        header.group_name = Some(GroupName::parse("root").unwrap());
         header.mount_epoch = Some(111);
         header.route_epoch = Some(222);
 
@@ -346,7 +350,7 @@ mod tests {
         match result {
             Err(ClientAction::Refresh { hint, .. }) => {
                 assert_eq!(hint.leader_endpoint.as_deref(), Some("http://127.0.0.1:18081"));
-                assert_eq!(hint.group_id, Some(17));
+                assert_eq!(hint.group_name, Some(GroupName::parse("analytics").unwrap()));
                 assert_eq!(hint.mount_epoch, Some(31));
                 assert_eq!(hint.mount_prefix.as_deref(), Some("/mnt"));
                 assert_eq!(hint.route_epoch, Some(23));
@@ -417,7 +421,7 @@ mod tests {
             }),
             error: Some(canonical_to_error_detail(&canonical)),
             state: Vec::new(),
-            group_id: 7,
+            group_name: "root".to_string(),
             mount_epoch: None,
             route_epoch: None,
         };
@@ -462,8 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_rpc_envelope_zero_group_id_ok_header_is_fatal_canonical() {
-        const INVALID_GROUP_ID: u64 = 0;
+    fn parse_rpc_envelope_missing_group_name_ok_header_is_fatal_canonical() {
         let header = proto::common::ResponseHeaderProto {
             client: Some(proto::common::ClientInfoProto {
                 call_id: types::CallId::new().to_string(),
@@ -472,7 +475,7 @@ mod tests {
             }),
             error: None,
             state: Vec::new(),
-            group_id: INVALID_GROUP_ID,
+            group_name: String::new(),
             mount_epoch: None,
             route_epoch: None,
         };
@@ -484,7 +487,7 @@ mod tests {
                     err.code,
                     Some(CanonicalErrorCode::RpcCode(RpcErrorCode::InvalidHeader))
                 ));
-                assert!(err.message.contains("group_id"));
+                assert!(err.message.contains("group_name"));
             }
             _ => panic!("expected fatal canonical envelope"),
         }

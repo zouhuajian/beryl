@@ -6,6 +6,7 @@
 use common::{ClientConfig as CommonClientConfig, CommonError, FlatConfig};
 use std::path::Path;
 use std::time::Duration;
+use types::GroupName;
 
 /// Client-specific configuration.
 #[derive(Clone, Debug)]
@@ -24,8 +25,8 @@ pub struct ClientConfig {
     pub channel_pool: ChannelPoolConfig,
     /// Metadata endpoints.
     pub metadata_endpoints: Vec<String>,
-    /// Configured metadata owner groups used as non-zero bootstrap targets.
-    pub metadata_group_ids: Vec<u64>,
+    /// Configured metadata owner groups used as bootstrap targets.
+    pub metadata_group_names: Vec<GroupName>,
 }
 
 /// Cache configuration.
@@ -196,7 +197,7 @@ impl ClientConfig {
             vec!["127.0.0.1:18080".to_string()]
         };
 
-        let metadata_group_ids = parse_metadata_group_ids(&flat)?;
+        let metadata_group_names = parse_metadata_group_names(&flat)?;
 
         Ok(Self {
             inner: CommonClientConfig::from_flat(flat),
@@ -206,7 +207,7 @@ impl ClientConfig {
             backoff,
             channel_pool,
             metadata_endpoints,
-            metadata_group_ids,
+            metadata_group_names,
         })
     }
 
@@ -315,29 +316,34 @@ fn channel_pool_config_from_flat(flat: &FlatConfig) -> Result<ChannelPoolConfig,
     Ok(config)
 }
 
-fn parse_metadata_group_ids(flat: &FlatConfig) -> Result<Vec<u64>, CommonError> {
-    let groups = if let Some(groups_str) = flat.get_str("client.metadata.group_ids") {
-        let parsed = groups_str
+fn parse_metadata_group_names(flat: &FlatConfig) -> Result<Vec<GroupName>, CommonError> {
+    if flat.contains_key("client.metadata.group_ids") {
+        return Err(CommonError::new(
+            common::CommonErrorCode::InvalidArgument,
+            "client.metadata.group_ids is unsupported; use client.metadata.group.names",
+        ));
+    }
+    let groups = if let Some(groups_str) = flat.get_str("client.metadata.group.names") {
+        groups_str
             .split(',')
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(|value| value.parse::<u64>())
+            .map(GroupName::parse)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|err| {
                 CommonError::new(
                     common::CommonErrorCode::InvalidArgument,
-                    format!("invalid client.metadata.group_ids: {err}"),
+                    format!("invalid client.metadata.group.names: {err}"),
                 )
-            })?;
-        parsed
+            })?
     } else {
-        vec![1]
+        vec![GroupName::parse("root").expect("default group name is valid")]
     };
 
-    if groups.is_empty() || groups.contains(&0) {
+    if groups.is_empty() {
         return Err(CommonError::new(
             common::CommonErrorCode::InvalidArgument,
-            "client.metadata.group_ids must contain non-zero group ids",
+            "client.metadata.group.names must contain at least one group name",
         ));
     }
     Ok(groups)
@@ -491,12 +497,15 @@ mod tests {
     }
 
     #[test]
-    fn negative_client_identity_values_are_rejected() {
+    fn removed_numeric_metadata_group_config_is_rejected() {
         let mut flat = FlatConfig::new();
         flat.set("client.metadata.group_ids", "-1");
-        let err = ClientConfig::from_flat(flat).expect_err("negative metadata group id must fail");
+        let err = ClientConfig::from_flat(flat).expect_err("numeric metadata group config must fail");
         assert!(err.to_string().contains("client.metadata.group_ids"));
+    }
 
+    #[test]
+    fn negative_client_identity_values_are_rejected() {
         let mut flat = FlatConfig::new();
         flat.set("client.id", -1i64);
         let config = ClientConfig::from_flat(flat).expect("client.id is checked when request identity is needed");
@@ -622,13 +631,20 @@ mod tests {
     }
 
     #[test]
-    fn metadata_group_ids_parse_comma_separated_values() {
+    fn metadata_group_names_parse_comma_separated_values() {
         let mut flat = FlatConfig::new();
-        flat.set("client.metadata.group_ids", "1,2,3");
+        flat.set("client.metadata.group.names", "root,analytics,tenant-a");
 
-        let config = ClientConfig::from_flat(flat).expect("metadata group ids config");
+        let config = ClientConfig::from_flat(flat).expect("metadata group names config");
 
-        assert_eq!(config.metadata_group_ids, vec![1, 2, 3]);
+        assert_eq!(
+            config.metadata_group_names,
+            vec![
+                GroupName::parse("root").unwrap(),
+                GroupName::parse("analytics").unwrap(),
+                GroupName::parse("tenant-a").unwrap()
+            ]
+        );
     }
 
     #[test]

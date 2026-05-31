@@ -40,7 +40,7 @@ impl AppRaftNode {
         node_id: NodeId,
         storage: Arc<RocksDBStorage>,
         state_machine: Arc<AppStateMachine>,
-        raft_config: &RaftConfig,
+        _raft_config: &RaftConfig,
     ) -> MetadataResult<Self> {
         info!(node_id = node_id, "Initializing Raft node");
 
@@ -87,34 +87,12 @@ impl AppRaftNode {
             .await
             .map_err(|e| MetadataError::Internal(format!("Failed to create Raft instance: {}", e)))?;
 
-        // Bootstrap if this is the first node and configured to bootstrap
-        if !raft_config.peers.is_empty() {
-            let is_initialized = raft
-                .is_initialized()
-                .await
-                .map_err(|e| MetadataError::Internal(format!("Failed to check if initialized: {}", e)))?;
-
-            if !is_initialized {
-                // Bootstrap the cluster
-                let mut members = std::collections::BTreeMap::new();
-                for (idx, peer) in raft_config.peers.iter().enumerate() {
-                    let peer_node_id = (idx + 1) as u64;
-                    let node = MetadataNode {
-                        node_id: peer_node_id,
-                        address: peer.clone(),
-                    };
-                    members.insert(peer_node_id, node);
-                }
-
-                // Initialize with BTreeMap directly (it implements IntoNodes)
-                raft.initialize(members)
-                    .await
-                    .map_err(|e| MetadataError::Internal(format!("Failed to initialize Raft cluster: {}", e)))?;
-
-                info!(node_id = node_id, "Raft cluster initialized");
-            } else {
-                info!(node_id = node_id, "Raft cluster already initialized");
-            }
+        let is_initialized = raft
+            .is_initialized()
+            .await
+            .map_err(|e| MetadataError::Internal(format!("Failed to check if initialized: {}", e)))?;
+        if is_initialized {
+            info!(node_id = node_id, "Raft cluster already initialized");
         }
 
         Ok(Self {
@@ -123,6 +101,34 @@ impl AppRaftNode {
             state_machine,
             _storage: storage,
         })
+    }
+
+    /// Initializes single-node membership for explicit metadata format.
+    pub async fn initialize_single_node(&self, address: String) -> MetadataResult<()> {
+        let is_initialized = self
+            .raft
+            .is_initialized()
+            .await
+            .map_err(|e| MetadataError::Internal(format!("Failed to check if initialized: {}", e)))?;
+        if is_initialized {
+            return Ok(());
+        }
+
+        let mut members = std::collections::BTreeMap::new();
+        members.insert(
+            self.node_id,
+            MetadataNode {
+                node_id: self.node_id,
+                address,
+            },
+        );
+        self.raft
+            .initialize(members)
+            .await
+            .map_err(|e| MetadataError::Internal(format!("Failed to initialize Raft cluster: {}", e)))?;
+
+        info!(node_id = self.node_id, "Single-node Raft cluster initialized");
+        Ok(())
     }
 
     /// Propose a command to Raft.
@@ -164,6 +170,22 @@ impl AppRaftNode {
         let metrics = self.raft.metrics();
         let metrics_guard = metrics.borrow();
         matches!(metrics_guard.state, ServerState::Leader)
+    }
+
+    /// Check whether Raft storage has initialized membership.
+    pub async fn is_initialized(&self) -> MetadataResult<bool> {
+        self.raft
+            .is_initialized()
+            .await
+            .map_err(|e| MetadataError::Internal(format!("Failed to check if initialized: {}", e)))
+    }
+
+    /// Stop the local Raft runtime and wait for background tasks to exit.
+    pub async fn shutdown(&self) -> MetadataResult<()> {
+        self.raft
+            .shutdown()
+            .await
+            .map_err(|e| MetadataError::Internal(format!("Failed to shutdown Raft node: {e}")))
     }
 
     /// Get current leader ID (if known).

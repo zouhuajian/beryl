@@ -21,13 +21,12 @@ import "worker/data_header.proto";
 // message.
 
 message OpenReadStreamRequestProto {
+  reserved 2;
+  reserved "group_id";
+
   // Low-frequency data-plane control header.
   // High-frequency ReadStream frames must not carry this header.
   worker.DataRequestHeaderProto header = 1;
-
-  // Owning group for the local block-store lookup.
-  // This is target block identity context, not a file layout field.
-  common.ShardGroupIdProto group_id = 2;
 
   // Target block. Worker data-plane APIs are block-local and must not parse
   // file-level offsets or layouts.
@@ -55,6 +54,9 @@ message OpenReadStreamRequestProto {
   uint64 block_size = 9;
   uint32 chunk_size = 10;
   uint64 effective_block_len = 11;
+
+  // Stable metadata group name for the local block-store lookup.
+  string group_name = 12;
 }
 
 message OpenReadStreamResponseProto {
@@ -94,12 +96,12 @@ message ReadStreamResponseProto {
 }
 
 message OpenWriteStreamRequestProto {
+  reserved 2;
+  reserved "group_id";
+
   // Low-frequency data-plane control header.
   // High-frequency WriteStream frames must not carry this header.
   worker.DataRequestHeaderProto header = 1;
-
-  // Owning group for the local block-store staging lookup.
-  common.ShardGroupIdProto group_id = 2;
 
   // Target block. Writes are block-local.
   common.BlockIdProto block_id = 3;
@@ -136,6 +138,9 @@ message OpenWriteStreamRequestProto {
 
   // Metadata-issued valid length for this write target.
   uint64 effective_block_len = 12;
+
+  // Stable metadata group name for the local block-store staging lookup.
+  string group_name = 13;
 }
 
 message OpenWriteStreamResponseProto {
@@ -176,8 +181,10 @@ message WriteStreamResponseProto {
 }
 
 message CommitWriteRequestProto {
+  reserved 2;
+  reserved "group_id";
+
   worker.DataRequestHeaderProto header = 1;
-  common.ShardGroupIdProto group_id = 2;
   common.BlockIdProto block_id = 3;
   common.StreamIdProto stream_id = 4;
 
@@ -198,6 +205,9 @@ message CommitWriteRequestProto {
   uint32 block_format_id = 11;
   uint64 block_size = 12;
   uint32 chunk_size = 13;
+
+  // Stable metadata group name for the local block-store lookup.
+  string group_name = 14;
 }
 
 message CommitWriteResponseProto {
@@ -212,8 +222,10 @@ message CommitWriteResponseProto {
 }
 
 message SyncCommittedBlockRequestProto {
+  reserved 2;
+  reserved "group_id";
+
   worker.DataRequestHeaderProto header = 1;
-  common.ShardGroupIdProto group_id = 2;
   common.BlockIdProto block_id = 3;
 
   // Metadata-authoritative logical block stamp for the committed generation.
@@ -229,6 +241,9 @@ message SyncCommittedBlockRequestProto {
   uint32 block_format_id = 7;
   uint64 block_size = 8;
   uint32 chunk_size = 9;
+
+  // Stable metadata group name for the local block-store lookup.
+  string group_name = 10;
 }
 
 message SyncCommittedBlockResponseProto {
@@ -240,11 +255,16 @@ message SyncCommittedBlockResponseProto {
 }
 
 message AbortWriteRequestProto {
+  reserved 2;
+  reserved "group_id";
+
   worker.DataRequestHeaderProto header = 1;
-  common.ShardGroupIdProto group_id = 2;
   common.BlockIdProto block_id = 3;
   common.StreamIdProto stream_id = 4;
   common.FencingTokenProto token = 5;
+
+  // Stable metadata group name for the local block-store lookup.
+  string group_name = 6;
 }
 
 message AbortWriteResponseProto {

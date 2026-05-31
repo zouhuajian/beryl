@@ -13,18 +13,29 @@ use uuid::Uuid;
 use crate::config::WorkerConfig;
 use crate::control::RegistrationError;
 
-/// Resolve the stable WorkerId from explicit config or a persisted local identity file.
-pub fn resolve_worker_id(config: &WorkerConfig) -> Result<WorkerId, RegistrationError> {
-    if let Some(worker_id) = config.worker_id {
-        if worker_id.as_raw() == 0 {
-            return Err(RegistrationError::InvalidConfig(
-                "worker.id must be a non-zero integer".to_string(),
-            ));
-        }
-        return Ok(worker_id);
-    }
-
+/// Resolve the stable WorkerId from the persisted local identity file.
+pub(crate) fn resolve_worker_id(config: &WorkerConfig) -> Result<WorkerId, RegistrationError> {
     load_or_create_identity(&config.identity_path)
+}
+
+pub(super) fn resolve_existing_worker_id(config: &WorkerConfig) -> Result<WorkerId, RegistrationError> {
+    load_identity(&config.identity_path)
+}
+
+fn load_identity(path: &Path) -> Result<WorkerId, RegistrationError> {
+    read_identity(path).map_err(|error| match error {
+        IdentityFileError::Io(error) if error.kind() == ErrorKind::NotFound => {
+            RegistrationError::InvalidConfig(format!(
+                "worker.identity.path {} is missing; worker start cannot recreate identity for existing WorkerStorageInfo",
+                path.display()
+            ))
+        }
+        IdentityFileError::Io(error) => RegistrationError::InvalidConfig(format!(
+            "failed to read worker.identity.path {}: {error}",
+            path.display()
+        )),
+        IdentityFileError::Malformed(message) => RegistrationError::InvalidConfig(message),
+    })
 }
 
 fn load_or_create_identity(path: &Path) -> Result<WorkerId, RegistrationError> {

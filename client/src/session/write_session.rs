@@ -910,7 +910,7 @@ fn append_worker_block_identity(detail: &mut String, worker_block: &WorkerWriteB
     let _ = write!(
         detail,
         "group={} worker={} protocol={} worker_run_id={} block={} stamp={} offset={} effective_len={} stream={}:{} next_seq={}",
-        worker_block.group_id,
+        worker_block.group_name,
         worker_block.worker.worker_id,
         proto::common::WorkerNetProtocolProto::from(worker_block.worker.worker_net_protocol) as i32,
         worker_block.worker.worker_run_id,
@@ -954,8 +954,8 @@ mod tests {
     use proto::common::{BlockIdProto, FencingTokenProto, LeaseIdProto, StreamIdProto};
     use types::lease::FencingToken;
     use types::{
-        BlockId, BlockIndex, ClientId, CommittedBlock, DataHandleId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol,
-        WriteTarget,
+        BlockId, BlockIndex, ClientId, CommittedBlock, DataHandleId, GroupName, WorkerEndpointInfo, WorkerId,
+        WorkerNetProtocol, WriteTarget,
     };
 
     use crate::data::WorkerWriteBlock;
@@ -1028,8 +1028,8 @@ mod tests {
             .prepare_commit_file(ClientId::new(7), blocks, 5)
             .expect("retry commit plan");
 
-        let first_ctx = AttemptContext::for_metadata(&first_operation, 9, 0).expect("first context");
-        let second_ctx = AttemptContext::for_metadata(&second_operation, 9, 0).expect("second context");
+        let first_ctx = AttemptContext::for_metadata(&first_operation, test_group_name(), 0).expect("first context");
+        let second_ctx = AttemptContext::for_metadata(&second_operation, test_group_name(), 0).expect("second context");
         assert_eq!(first_ctx.call_id(), second_ctx.call_id());
         assert_eq!(
             first_operation.operation_fingerprint(),
@@ -1077,7 +1077,7 @@ mod tests {
         let (first_operation, _) = session
             .prepare_commit_file(ClientId::new(7), blocks.clone(), 5)
             .expect("first commit plan");
-        let first_ctx = AttemptContext::for_metadata(&first_operation, 9, 0).expect("first context");
+        let first_ctx = AttemptContext::for_metadata(&first_operation, test_group_name(), 0).expect("first context");
         session.mark_commit_unknown();
 
         session.write_handle.lease_epoch = 2;
@@ -1090,7 +1090,7 @@ mod tests {
         let (retry_operation, retry_request) = session
             .prepare_commit_file(ClientId::new(7), blocks, 5)
             .expect("retry commit plan");
-        let retry_ctx = AttemptContext::for_metadata(&retry_operation, 9, 0).expect("retry context");
+        let retry_ctx = AttemptContext::for_metadata(&retry_operation, test_group_name(), 0).expect("retry context");
 
         assert_eq!(first_ctx.call_id(), retry_ctx.call_id());
         assert_eq!(
@@ -1124,8 +1124,8 @@ mod tests {
         let first = session
             .prepare_abort_cleanup(ClientId::new(7))
             .expect("first abort plan");
-        let first_metadata =
-            AttemptContext::for_metadata(&first.metadata_operation(), 9, 0).expect("first metadata context");
+        let first_metadata = AttemptContext::for_metadata(&first.metadata_operation(), test_group_name(), 0)
+            .expect("first metadata context");
         let first_worker = first.worker_cleanups()[0].operation();
         let first_worker_ctx = AttemptContext::for_data(&first_worker, 0);
         let first_worker_snapshot = worker_block_signature(first.worker_cleanups()[0].worker_block());
@@ -1134,8 +1134,8 @@ mod tests {
         let second = session
             .prepare_abort_cleanup(ClientId::new(7))
             .expect("retry abort plan");
-        let second_metadata =
-            AttemptContext::for_metadata(&second.metadata_operation(), 9, 0).expect("second metadata context");
+        let second_metadata = AttemptContext::for_metadata(&second.metadata_operation(), test_group_name(), 0)
+            .expect("second metadata context");
         let second_worker = second.worker_cleanups()[0].operation();
         let second_worker_ctx = AttemptContext::for_data(&second_worker, 0);
 
@@ -1175,8 +1175,8 @@ mod tests {
         let first = session
             .prepare_abort_cleanup(ClientId::new(7))
             .expect("first abort plan");
-        let first_ctx =
-            AttemptContext::for_metadata(&first.metadata_operation(), 9, 0).expect("first metadata context");
+        let first_ctx = AttemptContext::for_metadata(&first.metadata_operation(), test_group_name(), 0)
+            .expect("first metadata context");
 
         session.write_handle.lease_epoch = 2;
         let err = match session.prepare_abort_cleanup(ClientId::new(7)) {
@@ -1189,8 +1189,8 @@ mod tests {
         let retry = session
             .prepare_abort_cleanup(ClientId::new(7))
             .expect("retry abort plan");
-        let retry_ctx =
-            AttemptContext::for_metadata(&retry.metadata_operation(), 9, 0).expect("retry metadata context");
+        let retry_ctx = AttemptContext::for_metadata(&retry.metadata_operation(), test_group_name(), 0)
+            .expect("retry metadata context");
         assert_eq!(first_ctx.call_id(), retry_ctx.call_id());
         assert_eq!(
             first.metadata_operation().operation_fingerprint(),
@@ -1427,7 +1427,7 @@ mod tests {
         stream_low: u64,
     ) -> WorkerWriteBlock {
         WorkerWriteBlock {
-            group_id: 9,
+            group_name: test_group_name(),
             worker: worker_endpoint(),
             target: write_target(data_handle_id, block_index, file_offset, len),
             stream_id: StreamIdProto {
@@ -1439,9 +1439,11 @@ mod tests {
         }
     }
 
-    fn worker_block_signature(block: &WorkerWriteBlock) -> (u64, u64, i32, String, u64, u64, u64, u32, u64, u64, u64) {
+    fn worker_block_signature(
+        block: &WorkerWriteBlock,
+    ) -> (String, u64, i32, String, u64, u64, u64, u32, u64, u64, u64) {
         (
-            block.group_id,
+            block.group_name.to_string(),
             block.worker.worker_id.as_raw(),
             proto::common::WorkerNetProtocolProto::from(block.worker.worker_net_protocol) as i32,
             block.worker.worker_run_id.to_string(),
@@ -1453,5 +1455,9 @@ mod tests {
             block.stream_id.high,
             block.stream_id.low,
         )
+    }
+
+    fn test_group_name() -> GroupName {
+        GroupName::parse("root").unwrap()
     }
 }

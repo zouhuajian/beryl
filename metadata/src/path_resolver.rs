@@ -11,14 +11,15 @@ use crate::mount::{mount_prefix_matches_path, MountEntry, MountTable};
 use crate::raft::RocksDBStorage;
 use std::sync::Arc;
 use types::fs::{Inode, InodeId};
-use types::ids::{MountId, ShardGroupId};
+use types::ids::MountId;
+use types::GroupName;
 
 /// Mount context: information about the mount point for a resolved path.
 #[derive(Clone, Debug)]
 pub struct MountContext {
     pub mount_id: MountId,
     pub mount_epoch: u64,
-    pub owner_group_id: ShardGroupId,
+    pub owner_group_name: GroupName,
     pub root_inode_id: InodeId,
 }
 
@@ -224,7 +225,7 @@ impl PathResolver {
             mount_ctx: MountContext {
                 mount_id: mount_entry.mount_id,
                 mount_epoch: mount_entry.mount_version,
-                owner_group_id: mount_entry.namespace_owner_group_id,
+                owner_group_name: mount_entry.namespace_owner_group_name,
                 root_inode_id: mount_entry.root_inode_id,
             },
             parent_inode_id: Some(parent_inode_id),
@@ -255,7 +256,7 @@ impl PathResolver {
             mount_ctx: MountContext {
                 mount_id: mount_entry.mount_id,
                 mount_epoch: mount_entry.mount_version,
-                owner_group_id: mount_entry.namespace_owner_group_id,
+                owner_group_name: mount_entry.namespace_owner_group_name,
                 root_inode_id: mount_entry.root_inode_id,
             },
             parent_inode_id,
@@ -294,7 +295,8 @@ mod tests {
     use crate::mount::{DataIoPolicy, MountKind, MountTable};
     use tempfile::TempDir;
     use types::fs::{FileAttrs, Inode, InodeId};
-    use types::ids::{DataHandleId, ShardGroupId};
+    use types::ids::DataHandleId;
+    use types::GroupName;
 
     #[test]
     fn test_normalize() {
@@ -309,7 +311,7 @@ mod tests {
     #[test]
     fn test_resolve_mount() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(temp_dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
 
         // Create test mount
@@ -320,7 +322,7 @@ mod tests {
                 crate::mount::MountKind::External,
                 Some("s3://bucket/path".to_string()),
                 crate::mount::DataIoPolicy::Allow,
-                ShardGroupId::new(1),
+                GroupName::parse("g1").unwrap(),
                 root_inode_id,
             )
             .unwrap();
@@ -342,7 +344,7 @@ mod tests {
                 crate::mount::MountKind::External,
                 Some("s3://bucket2".to_string()),
                 crate::mount::DataIoPolicy::Allow,
-                ShardGroupId::new(2),
+                GroupName::parse("g2").unwrap(),
                 InodeId::new(2),
             )
             .unwrap();
@@ -356,7 +358,7 @@ mod tests {
                 crate::mount::MountKind::Internal,
                 None,
                 crate::mount::DataIoPolicy::Forbid,
-                ShardGroupId::new(3),
+                GroupName::parse("g3").unwrap(),
                 InodeId::new(3),
             )
             .unwrap();
@@ -377,7 +379,7 @@ mod tests {
     #[test]
     fn resolve_inode_collects_traverse_directories_for_nested_path() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(temp_dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
 
         let root_inode_id = InodeId::new(100);
@@ -387,7 +389,7 @@ mod tests {
                 MountKind::External,
                 Some("file:///tmp/test".to_string()),
                 DataIoPolicy::Allow,
-                ShardGroupId::new(1),
+                GroupName::parse("g1").unwrap(),
                 root_inode_id,
             )
             .unwrap();
@@ -438,7 +440,7 @@ mod tests {
     #[test]
     fn resolve_path_collects_traverse_directories_including_parent() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = Arc::new(RocksDBStorage::open(temp_dir.path()).unwrap());
+        let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
 
         let root_inode_id = InodeId::new(200);
@@ -448,7 +450,7 @@ mod tests {
                 MountKind::External,
                 Some("file:///tmp/test2".to_string()),
                 DataIoPolicy::Allow,
-                ShardGroupId::new(2),
+                GroupName::parse("g2").unwrap(),
                 root_inode_id,
             )
             .unwrap();
