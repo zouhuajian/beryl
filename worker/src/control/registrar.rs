@@ -175,7 +175,7 @@ impl MetadataRegistrar {
 
     fn build_request(&self) -> RegisterWorkerRequestProto {
         RegisterWorkerRequestProto {
-            header: Some(registration_request_header()),
+            header: Some(registration_request_header(&self.descriptor.group_name)),
             worker_id: self.descriptor.worker_id.as_raw(),
             worker_run_id: self.descriptor.worker_run_id.to_string(),
             advertised_endpoint: Some(EndpointProto {
@@ -227,9 +227,9 @@ impl MetadataRegistrar {
     }
 }
 
-fn registration_request_header() -> RequestHeaderProto {
+fn registration_request_header(group_name: &GroupName) -> RequestHeaderProto {
     let client_id = u64::from(std::process::id()).max(1);
-    let header = RequestHeader::new(ClientId::new(client_id));
+    let header = RequestHeader::new(ClientId::new(client_id)).with_group_name(group_name.clone());
     (&header).into()
 }
 

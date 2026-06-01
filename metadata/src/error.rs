@@ -55,6 +55,10 @@ pub enum MetadataError {
     #[error("resource busy: {0}")]
     Busy(String),
 
+    /// Same stable WorkerId is still live from a different endpoint.
+    #[error("active worker conflict: {0}")]
+    ActiveWorkerConflict(String),
+
     /// Resource temporarily unavailable.
     #[error("resource temporarily unavailable: {0}")]
     Again(String),
@@ -205,6 +209,7 @@ fn map_rpc_application_canonical(err: MetadataError) -> CanonicalError {
         MetadataError::PermissionDenied(msg) => application_canonical("permission denied", msg),
         MetadataError::NotSupported(msg) => application_canonical("operation not supported", msg),
         MetadataError::Busy(msg) => application_canonical("resource busy", msg),
+        MetadataError::ActiveWorkerConflict(msg) => application_canonical("active worker conflict", msg),
         MetadataError::Again(msg) => application_canonical("resource temporarily unavailable", msg),
         MetadataError::Internal(msg) => application_canonical("internal error", msg),
         MetadataError::LeaderChanged(_)
@@ -230,6 +235,7 @@ fn map_fs_fatal_canonical(err: MetadataError) -> CanonicalError {
         MetadataError::PermissionDenied(msg) => CanonicalError::fatal_fs(FsErrorCode::EAcces, msg),
         MetadataError::NotSupported(msg) => CanonicalError::fatal_fs(FsErrorCode::ENotsup, msg),
         MetadataError::Busy(msg) => CanonicalError::fatal_fs(FsErrorCode::EBusy, msg),
+        MetadataError::ActiveWorkerConflict(msg) => CanonicalError::fatal_fs(FsErrorCode::EBusy, msg),
         MetadataError::Again(msg) => CanonicalError::fatal_fs(FsErrorCode::EAgain, msg),
         MetadataError::Internal(msg) => CanonicalError::fatal_fs(FsErrorCode::EInval, msg),
         MetadataError::LeaderChanged(_)
@@ -291,6 +297,7 @@ mod tests {
             (MetadataError::PermissionDenied("x".to_string()), FsErrorCode::EAcces),
             (MetadataError::NotSupported("x".to_string()), FsErrorCode::ENotsup),
             (MetadataError::Busy("x".to_string()), FsErrorCode::EBusy),
+            (MetadataError::ActiveWorkerConflict("x".to_string()), FsErrorCode::EBusy),
             (MetadataError::Again("x".to_string()), FsErrorCode::EAgain),
         ];
 
@@ -335,6 +342,10 @@ mod tests {
                 "operation not supported: x".to_string(),
             ),
             (MetadataError::Busy("x".to_string()), "resource busy: x".to_string()),
+            (
+                MetadataError::ActiveWorkerConflict("x".to_string()),
+                "active worker conflict: x".to_string(),
+            ),
             (
                 MetadataError::Again("x".to_string()),
                 "resource temporarily unavailable: x".to_string(),

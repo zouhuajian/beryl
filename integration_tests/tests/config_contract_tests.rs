@@ -16,9 +16,9 @@ fn repository_core_site_storage_roots_do_not_overlap() {
     );
     assert_storage_roots_do_not_overlap(
         &repo_root().join("conf/local/core-site.yaml"),
-        Path::new("/tmp/vecton-debug/metadata"),
-        Path::new("/tmp/vecton-debug/worker"),
-        Path::new("/tmp/vecton-debug/worker/worker.identity"),
+        Path::new("./data/metadata"),
+        Path::new("./data/worker"),
+        Path::new("./data/worker/worker.identity"),
     );
 }
 

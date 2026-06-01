@@ -794,7 +794,13 @@ impl AppRaftStateMachine {
         fingerprint: CommandFingerprint,
     ) -> MetadataResult<WorkerCommandResult> {
         if let Some(worker_manager) = self.worker_manager.read().clone() {
-            worker_manager.validate_worker_run_registration(&group_name, worker_id, worker_run_id)?;
+            worker_manager.validate_worker_registration_for_apply(
+                &group_name,
+                worker_id,
+                worker_run_id,
+                &address,
+                worker_net_protocol,
+            )?;
         }
         let worker_info = self.storage.prepare_worker_registration(
             group_name,
@@ -3134,7 +3140,7 @@ mod tests {
     }
 
     #[test]
-    fn register_worker_rejects_live_worker_run_id_conflict() {
+    fn register_worker_replaces_worker_run_id_for_restart() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
@@ -3169,21 +3175,183 @@ mod tests {
 
         assert_eq!(expect_worker_upserted(sm.apply(first.clone()).unwrap()), worker_id);
         assert_eq!(expect_worker_upserted(sm.apply(first).unwrap()), worker_id);
-        let error = sm
-            .apply(second)
-            .expect_err("different live worker_run_id must be rejected");
-        assert!(error.to_string().contains("already registered"));
+        assert_eq!(expect_worker_upserted(sm.apply(second).unwrap()), worker_id);
         let stored = storage
             .get_worker_in_group(&group_name("root"), worker_id)
             .unwrap()
             .unwrap();
-        assert_eq!(stored.address, "127.0.0.1:17060");
+        assert_eq!(stored.address, "127.0.0.1:17061");
         assert_eq!(
             worker_manager
                 .get_registration(&group_name("root"), worker_id)
                 .expect("live registration")
                 .worker_run_id,
-            first_run_id
+            second_run_id
+        );
+    }
+
+    #[test]
+    fn register_worker_apply_rejects_same_run_descriptor_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let worker_manager = Arc::new(crate::worker::WorkerManager::new(60));
+        let sm = AppRaftStateMachine::new_with_worker_manager(
+            Arc::clone(&storage),
+            Arc::clone(&mount_table),
+            Arc::clone(&worker_manager),
+        );
+        let endpoint_worker_id = WorkerId::new(762);
+        let protocol_worker_id = WorkerId::new(763);
+        let run_id: types::WorkerRunId = "550e8400-e29b-41d4-a716-446655440002".parse().unwrap();
+
+        assert_eq!(
+            expect_worker_upserted(
+                sm.apply(Command::RegisterWorker {
+                    dedup: dedup_for_test(762),
+                    group_name: group_name("root"),
+                    worker_id: endpoint_worker_id,
+                    worker_run_id: run_id,
+                    address: "127.0.0.1:17062".to_string(),
+                    worker_net_protocol: 1,
+                    fault_domain: None,
+                })
+                .unwrap()
+            ),
+            endpoint_worker_id
+        );
+        let endpoint_error = sm
+            .apply(Command::RegisterWorker {
+                dedup: dedup_for_test(763),
+                group_name: group_name("root"),
+                worker_id: endpoint_worker_id,
+                worker_run_id: run_id,
+                address: "127.0.0.1:17063".to_string(),
+                worker_net_protocol: 1,
+                fault_domain: None,
+            })
+            .expect_err("same worker_run_id endpoint mismatch must fail");
+        assert!(matches!(endpoint_error, MetadataError::InvalidArgument(_)));
+        assert_eq!(
+            storage
+                .get_worker_in_group(&group_name("root"), endpoint_worker_id)
+                .unwrap()
+                .expect("stored worker")
+                .address,
+            "127.0.0.1:17062"
+        );
+
+        assert_eq!(
+            expect_worker_upserted(
+                sm.apply(Command::RegisterWorker {
+                    dedup: dedup_for_test(764),
+                    group_name: group_name("root"),
+                    worker_id: protocol_worker_id,
+                    worker_run_id: run_id,
+                    address: "127.0.0.1:17064".to_string(),
+                    worker_net_protocol: 1,
+                    fault_domain: None,
+                })
+                .unwrap()
+            ),
+            protocol_worker_id
+        );
+        let protocol_error = sm
+            .apply(Command::RegisterWorker {
+                dedup: dedup_for_test(765),
+                group_name: group_name("root"),
+                worker_id: protocol_worker_id,
+                worker_run_id: run_id,
+                address: "127.0.0.1:17064".to_string(),
+                worker_net_protocol: 2,
+                fault_domain: None,
+            })
+            .expect_err("same worker_run_id protocol mismatch must fail");
+        assert!(matches!(protocol_error, MetadataError::InvalidArgument(_)));
+        assert_eq!(
+            storage
+                .get_worker_in_group(&group_name("root"), protocol_worker_id)
+                .unwrap()
+                .expect("stored worker")
+                .worker_net_protocol,
+            1
+        );
+    }
+
+    #[test]
+    fn register_worker_apply_accepts_live_endpoint_replacement() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let worker_manager = Arc::new(crate::worker::WorkerManager::new(60));
+        let sm = AppRaftStateMachine::new_with_worker_manager(
+            Arc::clone(&storage),
+            Arc::clone(&mount_table),
+            Arc::clone(&worker_manager),
+        );
+        let worker_id = WorkerId::new(766);
+        let first_run_id: types::WorkerRunId = "550e8400-e29b-41d4-a716-446655440040".parse().unwrap();
+        let second_run_id: types::WorkerRunId = "550e8400-e29b-41d4-a716-446655440041".parse().unwrap();
+
+        assert_eq!(
+            expect_worker_upserted(
+                sm.apply(Command::RegisterWorker {
+                    dedup: dedup_for_test(766),
+                    group_name: group_name("root"),
+                    worker_id,
+                    worker_run_id: first_run_id,
+                    address: "127.0.0.1:17066".to_string(),
+                    worker_net_protocol: 1,
+                    fault_domain: None,
+                })
+                .unwrap()
+            ),
+            worker_id
+        );
+        worker_manager
+            .record_heartbeat(
+                &group_name("root"),
+                worker_id,
+                first_run_id,
+                1,
+                "127.0.0.1:17066",
+                1,
+                1_000,
+                100,
+                900,
+                0,
+                0,
+                crate::worker::HealthStatus::Healthy,
+            )
+            .unwrap();
+
+        assert_eq!(
+            expect_worker_upserted(
+                sm.apply(Command::RegisterWorker {
+                    dedup: dedup_for_test(767),
+                    group_name: group_name("root"),
+                    worker_id,
+                    worker_run_id: second_run_id,
+                    address: "127.0.0.1:17067".to_string(),
+                    worker_net_protocol: 2,
+                    fault_domain: Some("rack-b".to_string()),
+                })
+                .unwrap()
+            ),
+            worker_id
+        );
+
+        let stored = storage
+            .get_worker_in_group(&group_name("root"), worker_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.address, "127.0.0.1:17067");
+        assert_eq!(
+            worker_manager
+                .get_registration(&group_name("root"), worker_id)
+                .expect("live registration")
+                .worker_run_id,
+            second_run_id
         );
     }
 

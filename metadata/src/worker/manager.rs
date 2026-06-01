@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing::info;
 use types::ids::{BlockId, WorkerId};
 use types::layout::BlockFormatId;
 use types::{GroupName, WorkerRunId};
@@ -117,6 +118,38 @@ fn ready_block_ids<'a>(blocks: impl Iterator<Item = &'a BlockReportBlock>) -> Ha
         .collect()
 }
 
+pub(super) fn worker_net_protocol_label(worker_net_protocol: i32) -> &'static str {
+    match proto::common::WorkerNetProtocolProto::try_from(worker_net_protocol) {
+        Ok(proto::common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified) => "unspecified",
+        Ok(proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc) => "grpc",
+        Ok(proto::common::WorkerNetProtocolProto::WorkerNetProtocolQuic) => "quic",
+        Ok(proto::common::WorkerNetProtocolProto::WorkerNetProtocolRdma) => "rdma",
+        Err(_) => "unknown",
+    }
+}
+
+fn validate_same_run_descriptor(
+    group_name: &GroupName,
+    worker_id: WorkerId,
+    existing: &WorkerRegistrationState,
+    address: &str,
+    worker_net_protocol: i32,
+) -> MetadataResult<()> {
+    if existing.address == address && existing.worker_net_protocol == worker_net_protocol {
+        return Ok(());
+    }
+    Err(MetadataError::InvalidArgument(format!(
+        "worker descriptor mismatch for group_name={}, worker_id={}, worker_run_id={}: registered endpoint {} protocol {}, requested endpoint {} protocol {}",
+        group_name,
+        worker_id.as_raw(),
+        existing.worker_run_id,
+        existing.address,
+        worker_net_protocol_label(existing.worker_net_protocol),
+        address,
+        worker_net_protocol_label(worker_net_protocol)
+    )))
+}
+
 /// Live startup registration state for the current metadata process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkerRegistrationState {
@@ -126,8 +159,6 @@ pub struct WorkerRegistrationState {
     pub address: String,
     pub worker_net_protocol: i32,
     pub fault_domain: Option<String>,
-    pub registered_at_ms: u64,
-    pub lease_deadline: Instant,
 }
 
 /// Worker liveness view updated only by group-scoped heartbeat.
@@ -343,24 +374,70 @@ impl WorkerManager {
             .cloned()
     }
 
-    /// Validate same-run idempotence and same-live-worker replacement conflicts.
-    pub fn validate_worker_run_registration(
+    /// Runtime preflight rejects a live different-run endpoint conflict before Raft proposal.
+    pub fn validate_worker_registration_preflight(
         &self,
         group_name: &GroupName,
         worker_id: WorkerId,
         worker_run_id: WorkerRunId,
+        address: &str,
+        worker_net_protocol: i32,
     ) -> MetadataResult<()> {
         self.expire_liveness();
-        let registrations = self.registrations.read();
         let key = WorkerRegistrationKey::new(group_name, worker_id);
-        if let Some(existing) = registrations.get(&key) {
-            if existing.worker_run_id != worker_run_id {
-                return Err(MetadataError::AlreadyExists(format!(
-                    "worker_id {} in group_name {} is already registered with worker_run_id {}",
+        let existing = {
+            let registrations = self.registrations.read();
+            registrations.get(&key).cloned()
+        };
+        if let Some(existing) = existing {
+            let same_run = existing.worker_run_id == worker_run_id;
+            let endpoint_changed = existing.address != address || existing.worker_net_protocol != worker_net_protocol;
+            if same_run {
+                validate_same_run_descriptor(group_name, worker_id, &existing, address, worker_net_protocol)?;
+            }
+            if !same_run && endpoint_changed && self.is_worker_live(group_name, worker_id) {
+                return Err(MetadataError::ActiveWorkerConflict(format!(
+                    "worker_id {} in group_name {} is live at {} protocol {} with worker_run_id {}, rejected registration from {} protocol {} with worker_run_id {}",
                     worker_id.as_raw(),
                     group_name,
-                    existing.worker_run_id
+                    existing.address,
+                    worker_net_protocol_label(existing.worker_net_protocol),
+                    existing.worker_run_id,
+                    address,
+                    worker_net_protocol_label(worker_net_protocol),
+                    worker_run_id
                 )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Deterministic apply validation for a registration command already in the Raft log.
+    pub fn validate_worker_registration_for_apply(
+        &self,
+        group_name: &GroupName,
+        worker_id: WorkerId,
+        worker_run_id: WorkerRunId,
+        address: &str,
+        worker_net_protocol: i32,
+    ) -> MetadataResult<()> {
+        if worker_id.as_raw() == 0 {
+            return Err(MetadataError::InvalidArgument(
+                "worker_id must be non-zero for registration".to_string(),
+            ));
+        }
+        let key = WorkerRegistrationKey::new(group_name, worker_id);
+        if let Some(existing) = self.registrations.read().get(&key) {
+            if &existing.group_name != group_name || existing.worker_id != worker_id {
+                return Err(MetadataError::Internal(format!(
+                    "worker registration key mismatch for group_name={}, worker_id={}",
+                    group_name,
+                    worker_id.as_raw()
+                )));
+            }
+            if existing.worker_run_id == worker_run_id {
+                validate_same_run_descriptor(group_name, worker_id, existing, address, worker_net_protocol)?;
+                return Ok(());
             }
         }
         Ok(())
@@ -395,9 +472,21 @@ impl WorkerManager {
         worker_run_id: WorkerRunId,
         fault_domain: Option<String>,
     ) -> MetadataResult<()> {
-        self.validate_worker_run_registration(group_name, worker_id, worker_run_id)?;
-        let registered_at_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        let lease_deadline = Instant::now() + self.heartbeat_timeout();
+        self.validate_worker_registration_for_apply(
+            group_name,
+            worker_id,
+            worker_run_id,
+            &address,
+            worker_net_protocol,
+        )?;
+        let key = WorkerRegistrationKey::new(group_name, worker_id);
+        let same_registered_run = {
+            let registrations = self.registrations.read();
+            registrations
+                .get(&key)
+                .map(|registration| registration.worker_run_id == worker_run_id)
+                .unwrap_or(false)
+        };
         let descriptor_address = address.clone();
         let descriptor_fault_domain = fault_domain.clone();
         let descriptor = WorkerDescriptor {
@@ -411,7 +500,7 @@ impl WorkerManager {
 
         let mut registrations = self.registrations.write();
         registrations.insert(
-            WorkerRegistrationKey::new(group_name, worker_id),
+            key.clone(),
             WorkerRegistrationState {
                 group_name: group_name.clone(),
                 worker_id,
@@ -419,12 +508,13 @@ impl WorkerManager {
                 address,
                 worker_net_protocol,
                 fault_domain,
-                registered_at_ms,
-                lease_deadline,
             },
         );
         drop(registrations);
-        self.clear_block_report_for_worker(WorkerRegistrationKey::new(group_name, worker_id));
+        if !same_registered_run {
+            self.runtime.write().remove(&key);
+            self.clear_block_report_for_worker(key);
+        }
         Ok(())
     }
 
@@ -501,6 +591,13 @@ impl WorkerManager {
         drop(reports);
 
         self.rebuild_location_index_for_worker(key, &published_for_index);
+        info!(
+            group_name = %group_name,
+            worker_id = worker_id.as_raw(),
+            worker_run_id = %worker_run_id,
+            report_seq,
+            "Worker full block report converged"
+        );
         Ok(BlockReportApplyResult {
             added_blocks: new_ready.difference(&old_ready).copied().collect(),
             removed_blocks: old_ready.difference(&new_ready).copied().collect(),
@@ -781,10 +878,6 @@ impl WorkerManager {
         };
         drop(runtime);
 
-        if let Some(registration) = self.registrations.write().get_mut(&key) {
-            registration.lease_deadline = now + self.heartbeat_timeout();
-        }
-
         Ok(live_state)
     }
 
@@ -901,9 +994,7 @@ impl WorkerManager {
             let registration = registrations.get(key);
             let live = runtime.get(key);
             let registered = registration.is_some();
-            let lease_valid = registration
-                .map(|registration| registration.lease_deadline > now)
-                .unwrap_or(false)
+            let lease_valid = registered
                 && live
                     .map(|runtime| now.duration_since(runtime.last_seen_at) < timeout)
                     .unwrap_or(false);
@@ -1027,7 +1118,7 @@ impl WorkerManager {
         }
     }
 
-    /// Expire heartbeat liveness and live process-run registrations.
+    /// Expire heartbeat liveness.
     pub fn expire_liveness(&self) -> Vec<(GroupName, WorkerId)> {
         let now = Instant::now();
         let timeout = self.heartbeat_timeout();
@@ -1039,20 +1130,6 @@ impl WorkerManager {
                 let is_live = now.duration_since(runtime.last_seen_at) < timeout;
                 if !is_live {
                     expired.push((key.group_name.clone(), key.worker_id));
-                }
-                is_live
-            });
-        }
-
-        {
-            let mut registrations = self.registrations.write();
-            registrations.retain(|key, registration| {
-                let is_live = registration.lease_deadline > now;
-                if !is_live {
-                    let entry = (key.group_name.clone(), key.worker_id);
-                    if !expired.contains(&entry) {
-                        expired.push(entry);
-                    }
                 }
                 is_live
             });

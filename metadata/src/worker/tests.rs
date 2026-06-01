@@ -4,15 +4,37 @@
 //! Tests for worker manager and registration.
 
 use super::manager::{
-    BlockLocationKey, BlockReportBlock, BlockReportBlockState, BlockReportDeltaEntry, BlockReportDeltaOp, HealthStatus,
-    WorkerInfo, WorkerManager, WorkerRegistrationKey,
+    worker_net_protocol_label, BlockLocationKey, BlockReportBlock, BlockReportBlockState, BlockReportDeltaEntry,
+    BlockReportDeltaOp, HealthStatus, WorkerInfo, WorkerManager, WorkerRegistrationKey,
 };
+use crate::error::MetadataError;
 use std::time::Duration;
 use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
 use types::{GroupName, WorkerRunId};
 
 fn group_name(raw: &str) -> GroupName {
     GroupName::parse(raw).unwrap()
+}
+
+#[test]
+fn worker_net_protocol_label_uses_readable_names() {
+    assert_eq!(
+        worker_net_protocol_label(proto::common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified as i32),
+        "unspecified"
+    );
+    assert_eq!(
+        worker_net_protocol_label(proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32),
+        "grpc"
+    );
+    assert_eq!(
+        worker_net_protocol_label(proto::common::WorkerNetProtocolProto::WorkerNetProtocolQuic as i32),
+        "quic"
+    );
+    assert_eq!(
+        worker_net_protocol_label(proto::common::WorkerNetProtocolProto::WorkerNetProtocolRdma as i32),
+        "rdma"
+    );
+    assert_eq!(worker_net_protocol_label(99), "unknown");
 }
 
 #[test]
@@ -112,6 +134,33 @@ fn full_report_batches_publish_only_after_final_batch() {
         manager.get_block_locations(&group_name_value, report_block(1).block_id),
         vec![worker_id]
     );
+}
+
+#[test]
+fn final_full_report_marks_active_worker_converged() {
+    let manager = WorkerManager::new(60);
+    let group_name_value = group_name("g22");
+    let worker_id = WorkerId::new(6);
+    let run_id = report_run_id();
+    register_live_report_worker(&manager, &group_name_value, worker_id, run_id);
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let before = manager.blockreport_convergence_snapshot(now_ms, 60_000, manager.get_metadata_epoch(), 0.80);
+    assert_eq!(before.active_workers, 1);
+    assert_eq!(before.full_reported_workers, 0);
+    assert!(!before.converged);
+
+    manager
+        .receive_full_block_report(&group_name_value, worker_id, run_id, 1, 0, true, vec![report_block(0)])
+        .unwrap();
+
+    let after = manager.blockreport_convergence_snapshot(now_ms, 60_000, manager.get_metadata_epoch(), 0.80);
+    assert_eq!(after.active_workers, 1);
+    assert_eq!(after.full_reported_workers, 1);
+    assert!(after.converged);
 }
 
 #[test]
@@ -614,22 +663,27 @@ fn production_worker_lookup_sources_reject_implicit_group_patterns() {
 }
 
 #[test]
-fn worker_run_registration_conflict_is_live_group_local() {
+fn worker_run_registration_same_run_same_descriptor_is_idempotent() {
     let manager = WorkerManager::new(60);
     let worker_id = WorkerId::new(1);
     let group_name_value = group_name("g1");
     let first_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440020".parse().unwrap();
-    let second_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440021".parse().unwrap();
 
+    register_live_report_worker(&manager, &group_name_value, worker_id, first_run_id);
     manager
-        .register_worker_run(
+        .receive_full_block_report(
             &group_name_value,
             worker_id,
-            "127.0.0.1:9090".to_string(),
-            1,
             first_run_id,
-            None,
+            1,
+            0,
+            true,
+            vec![report_block(0)],
         )
+        .unwrap();
+
+    manager
+        .validate_worker_registration_preflight(&group_name_value, worker_id, first_run_id, "127.0.0.1:9090", 1)
         .unwrap();
     manager
         .register_worker_run(
@@ -640,19 +694,305 @@ fn worker_run_registration_conflict_is_live_group_local() {
             first_run_id,
             None,
         )
+        .unwrap();
+
+    let descriptor = manager.get_descriptor(&group_name_value, worker_id).unwrap();
+    assert_eq!(descriptor.address, "127.0.0.1:9090");
+    assert_eq!(descriptor.worker_net_protocol, 1);
+    assert_eq!(
+        manager
+            .get_registration(&group_name_value, worker_id)
+            .unwrap()
+            .worker_run_id,
+        first_run_id
+    );
+    assert!(manager.is_worker_live(&group_name_value, worker_id));
+    assert!(!manager.needs_full_block_report(&group_name_value, worker_id));
+    assert_eq!(
+        manager.get_block_locations(&group_name_value, report_block(0).block_id),
+        vec![worker_id]
+    );
+}
+
+#[test]
+fn worker_run_registration_rejects_same_run_endpoint_mismatch_without_clearing_state() {
+    let manager = WorkerManager::new(60);
+    let worker_id = WorkerId::new(2);
+    let group_name_value = group_name("g1");
+    let run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440021".parse().unwrap();
+
+    register_live_report_worker(&manager, &group_name_value, worker_id, run_id);
+    manager
+        .receive_full_block_report(&group_name_value, worker_id, run_id, 1, 0, true, vec![report_block(0)])
         .unwrap();
 
     let error = manager
+        .validate_worker_registration_preflight(&group_name_value, worker_id, run_id, "127.0.0.1:9091", 1)
+        .expect_err("same worker_run_id must not change endpoint");
+    assert!(matches!(error, MetadataError::InvalidArgument(_)));
+    assert!(error.to_string().contains("worker descriptor mismatch"));
+
+    let apply_error = manager
         .register_worker_run(
             &group_name_value,
             worker_id,
             "127.0.0.1:9091".to_string(),
             1,
+            run_id,
+            None,
+        )
+        .expect_err("same worker_run_id endpoint mismatch must fail at apply");
+    assert!(matches!(apply_error, MetadataError::InvalidArgument(_)));
+    assert!(apply_error.to_string().contains("worker descriptor mismatch"));
+
+    let descriptor = manager.get_descriptor(&group_name_value, worker_id).unwrap();
+    assert_eq!(descriptor.address, "127.0.0.1:9090");
+    assert_eq!(descriptor.worker_net_protocol, 1);
+    assert_eq!(
+        manager
+            .get_registration(&group_name_value, worker_id)
+            .unwrap()
+            .worker_run_id,
+        run_id
+    );
+    assert!(manager.is_worker_live(&group_name_value, worker_id));
+    assert!(!manager.needs_full_block_report(&group_name_value, worker_id));
+    assert_eq!(
+        manager.get_block_locations(&group_name_value, report_block(0).block_id),
+        vec![worker_id]
+    );
+}
+
+#[test]
+fn worker_run_registration_rejects_same_run_protocol_mismatch() {
+    let manager = WorkerManager::new(60);
+    let worker_id = WorkerId::new(3);
+    let group_name_value = group_name("g1");
+    let run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440022".parse().unwrap();
+
+    manager
+        .register_worker_run(
+            &group_name_value,
+            worker_id,
+            "127.0.0.1:9090".to_string(),
+            1,
+            run_id,
+            None,
+        )
+        .unwrap();
+
+    let error = manager
+        .validate_worker_registration_preflight(&group_name_value, worker_id, run_id, "127.0.0.1:9090", 2)
+        .expect_err("same worker_run_id must not change protocol");
+    assert!(matches!(error, MetadataError::InvalidArgument(_)));
+    assert!(error.to_string().contains("worker descriptor mismatch"));
+
+    let apply_error = manager
+        .register_worker_run(
+            &group_name_value,
+            worker_id,
+            "127.0.0.1:9090".to_string(),
+            2,
+            run_id,
+            None,
+        )
+        .expect_err("same worker_run_id protocol mismatch must fail at apply");
+    assert!(matches!(apply_error, MetadataError::InvalidArgument(_)));
+    assert!(apply_error.to_string().contains("worker descriptor mismatch"));
+}
+
+#[test]
+fn worker_run_registration_replaces_restart_and_resets_run_state() {
+    let manager = WorkerManager::new(60);
+    let worker_id = WorkerId::new(4);
+    let group_name_value = group_name("g1");
+    let first_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440023".parse().unwrap();
+    let second_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440024".parse().unwrap();
+
+    register_live_report_worker(&manager, &group_name_value, worker_id, first_run_id);
+    manager
+        .receive_full_block_report(
+            &group_name_value,
+            worker_id,
+            first_run_id,
+            1,
+            0,
+            true,
+            vec![report_block(0)],
+        )
+        .unwrap();
+    assert_eq!(
+        manager.get_block_locations(&group_name_value, report_block(0).block_id),
+        vec![worker_id]
+    );
+
+    manager
+        .register_worker_run(
+            &group_name_value,
+            worker_id,
+            "127.0.0.1:9090".to_string(),
+            1,
             second_run_id,
             None,
         )
-        .expect_err("different live WorkerRunId must conflict");
-    assert!(error.to_string().contains("already registered"));
+        .unwrap();
+
+    assert_eq!(
+        manager
+            .get_registration(&group_name_value, worker_id)
+            .unwrap()
+            .worker_run_id,
+        second_run_id
+    );
+    assert!(!manager.is_worker_live(&group_name_value, worker_id));
+    assert!(manager.needs_full_block_report(&group_name_value, worker_id));
+    assert!(manager.get_worker_blocks(&group_name_value, worker_id).is_empty());
+    assert!(manager
+        .get_block_locations(&group_name_value, report_block(0).block_id)
+        .is_empty());
+    let after_restart_snapshot = manager.blockreport_convergence_snapshot(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+        60_000,
+        manager.get_metadata_epoch(),
+        0.80,
+    );
+    assert_eq!(after_restart_snapshot.active_workers, 0);
+    assert_eq!(after_restart_snapshot.full_reported_workers, 0);
+
+    let old_heartbeat = manager
+        .record_heartbeat(
+            &group_name_value,
+            worker_id,
+            first_run_id,
+            2,
+            "127.0.0.1:9090",
+            1,
+            1_000,
+            100,
+            900,
+            0,
+            0,
+            HealthStatus::Healthy,
+        )
+        .expect_err("old worker_run_id must be fenced after replacement");
+    assert!(matches!(old_heartbeat, MetadataError::StaleState(_)));
+    assert!(old_heartbeat.to_string().contains("worker_run_id mismatch"));
+
+    let old_report = manager
+        .receive_full_block_report(
+            &group_name_value,
+            worker_id,
+            first_run_id,
+            2,
+            0,
+            true,
+            vec![report_block(1)],
+        )
+        .expect_err("old worker_run_id block report must be fenced after replacement");
+    assert!(matches!(old_report, MetadataError::StaleState(_)));
+    assert!(old_report.to_string().contains("worker_run_id mismatch"));
+
+    manager
+        .record_heartbeat(
+            &group_name_value,
+            worker_id,
+            second_run_id,
+            1,
+            "127.0.0.1:9090",
+            1,
+            1_000,
+            100,
+            900,
+            0,
+            0,
+            HealthStatus::Healthy,
+        )
+        .unwrap();
+    let before_new_full_report = manager.blockreport_convergence_snapshot(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+        60_000,
+        manager.get_metadata_epoch(),
+        0.80,
+    );
+    assert_eq!(before_new_full_report.active_workers, 1);
+    assert_eq!(before_new_full_report.full_reported_workers, 0);
+    assert!(!before_new_full_report.converged);
+
+    let delta = manager
+        .apply_delta_block_report(
+            &group_name_value,
+            worker_id,
+            second_run_id,
+            1,
+            0,
+            vec![BlockReportDeltaEntry {
+                op: BlockReportDeltaOp::AddUpdate,
+                block: report_block(1),
+            }],
+        )
+        .expect_err("replacement must require a new full report baseline");
+    assert!(matches!(delta, MetadataError::FullReportRequired(_)));
+}
+
+#[test]
+fn worker_run_registration_updates_endpoint_when_previous_run_is_not_live() {
+    let manager = WorkerManager::new(60);
+    let worker_id = WorkerId::new(5);
+    let group_name_value = group_name("g1");
+    let first_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440025".parse().unwrap();
+    let second_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440026".parse().unwrap();
+
+    manager
+        .register_worker_run(
+            &group_name_value,
+            worker_id,
+            "127.0.0.1:9090".to_string(),
+            1,
+            first_run_id,
+            None,
+        )
+        .unwrap();
+    manager
+        .validate_worker_registration_preflight(&group_name_value, worker_id, second_run_id, "127.0.0.1:9091", 2)
+        .unwrap();
+    manager
+        .register_worker_run(
+            &group_name_value,
+            worker_id,
+            "127.0.0.1:9091".to_string(),
+            2,
+            second_run_id,
+            None,
+        )
+        .unwrap();
+
+    let descriptor = manager.get_descriptor(&group_name_value, worker_id).unwrap();
+    let registration = manager.get_registration(&group_name_value, worker_id).unwrap();
+    assert_eq!(descriptor.address, "127.0.0.1:9091");
+    assert_eq!(descriptor.worker_net_protocol, 2);
+    assert_eq!(registration.worker_run_id, second_run_id);
+}
+
+#[test]
+fn worker_run_registration_rejects_live_endpoint_conflict() {
+    let manager = WorkerManager::new(60);
+    let worker_id = WorkerId::new(6);
+    let group_name_value = group_name("g1");
+    let first_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440027".parse().unwrap();
+    let second_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440028".parse().unwrap();
+
+    register_live_report_worker(&manager, &group_name_value, worker_id, first_run_id);
+    let error = manager
+        .validate_worker_registration_preflight(&group_name_value, worker_id, second_run_id, "127.0.0.1:9091", 2)
+        .expect_err("different endpoint for a live WorkerId must conflict");
+    assert!(matches!(error, MetadataError::ActiveWorkerConflict(_)));
+    assert!(error.to_string().contains("active worker conflict"));
     assert_eq!(
         manager
             .get_registration(&group_name_value, worker_id)
@@ -787,7 +1127,7 @@ fn worker_heartbeat_updates_live_state_without_moving_stale_seq_backward() {
 }
 
 #[test]
-fn heartbeat_liveness_expiry_removes_live_run_but_keeps_descriptor() {
+fn heartbeat_liveness_expiry_removes_runtime_but_keeps_registration() {
     let manager = WorkerManager::new(1);
     let group_name_value = group_name("g1");
     let worker_id = WorkerId::new(1);
@@ -825,6 +1165,12 @@ fn heartbeat_liveness_expiry_removes_live_run_but_keeps_descriptor() {
 
     assert_eq!(expired, vec![(group_name_value.clone(), worker_id)]);
     assert!(!manager.is_worker_live(&group_name_value, worker_id));
-    assert!(manager.get_registration(&group_name_value, worker_id).is_none());
+    assert_eq!(
+        manager
+            .get_registration(&group_name_value, worker_id)
+            .expect("current run registration")
+            .worker_run_id,
+        run_id
+    );
     assert!(manager.get_descriptor(&group_name_value, worker_id).is_some());
 }

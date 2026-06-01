@@ -11,8 +11,8 @@
 //! - maintenance/orphan.rs: OrphanBlockCleaner
 //! - maintenance/lease_cleanup.rs: LeaseCleanupService
 
-use super::gate::TaskGate;
-use super::gc::{GcCandidate, GcService};
+use super::gate::{GateCheckResult, TaskGate};
+use super::gc::{GcCandidate, GcService, BLOCKREPORT_CONVERGENCE_THRESHOLD};
 use super::lease_cleanup::LeaseCleanupService;
 use super::lost_worker::{LostWorkerCleanupDeps, LostWorkerCleanupService};
 use super::orphan::{OrphanBlockCleaner, PendingOrphan};
@@ -22,6 +22,7 @@ use crate::destructive_gate::DestructiveGate;
 use crate::inflight_registry::InflightRegistry;
 use crate::metrics::MetadataMetrics;
 use crate::raft::{AppRaftNode, RocksDBStorage};
+use crate::readiness::RootReadinessGate;
 use crate::worker::WorkerManager;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -83,6 +84,7 @@ pub struct MaintenanceService {
     inflight_registry: Arc<InflightRegistry>,
     // Mount table for computing mount_epoch during destructive gate checks
     mount_table: Arc<crate::mount::MountTable>,
+    root_readiness_gate: Arc<RootReadinessGate>,
 }
 
 impl MaintenanceService {
@@ -99,6 +101,7 @@ impl MaintenanceService {
         metrics: Arc<MetadataMetrics>,
         inflight_registry: Option<Arc<InflightRegistry>>,
         mount_table: Arc<crate::mount::MountTable>,
+        root_readiness_gate: Arc<RootReadinessGate>,
         repair_policy: RepairPolicy,
     ) -> Self {
         // Create unified destructive gate
@@ -175,6 +178,7 @@ impl MaintenanceService {
             destructive_gate,
             inflight_registry,
             mount_table,
+            root_readiness_gate,
         }
     }
 
@@ -281,12 +285,110 @@ impl MaintenanceService {
 
             let orphan = Arc::clone(&orphan_service);
             let raft_node = Arc::clone(&self.raft_node);
+            let worker_manager = Arc::clone(&self.worker_manager);
+            let root_readiness_gate = Arc::clone(&self.root_readiness_gate);
+            let orphan_gate = Arc::clone(&self.orphan_gate);
+            let metrics = Arc::clone(&self.metrics);
             let interval_sec = self.orphan_cleanup_interval_sec;
             tasks.push(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(interval_sec));
+                let mut activated = false;
+                let mut pending_logged = false;
+                let mut paused_logged = false;
                 loop {
                     interval.tick().await;
                     if raft_node.is_leader() {
+                        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                        let gate_check = {
+                            let gate = orphan_gate.read();
+                            gate.check("orphan_cleanup", now_ms)
+                        };
+                        let epoch = worker_manager.get_metadata_epoch();
+                        let active_ttl_ms = worker_manager.heartbeat_timeout_sec() * 1000;
+                        let snapshot = worker_manager.blockreport_convergence_snapshot(
+                            now_ms,
+                            active_ttl_ms,
+                            epoch,
+                            BLOCKREPORT_CONVERGENCE_THRESHOLD,
+                        );
+                        metrics
+                            .maintenance_blockreport_active_workers
+                            .store(snapshot.active_workers, Ordering::Relaxed);
+                        metrics
+                            .maintenance_blockreport_full_reported_workers
+                            .store(snapshot.full_reported_workers, Ordering::Relaxed);
+                        metrics
+                            .maintenance_blockreport_ratio
+                            .store((snapshot.ratio * 1000.0) as usize, Ordering::Relaxed);
+                        metrics
+                            .maintenance_blockreport_converged
+                            .store(if snapshot.converged { 1 } else { 0 }, Ordering::Relaxed);
+
+                        let block_reason = orphan_evict_activation_block_reason(
+                            root_readiness_gate.is_ready(),
+                            &gate_check,
+                            snapshot.converged,
+                        );
+                        if let Some(reason) = block_reason {
+                            metrics.orphan_gate_state.store(0, Ordering::Relaxed);
+                            if activated {
+                                if !paused_logged {
+                                    info!(
+                                        task = "orphan_cleanup",
+                                        gate_state = gate_state_label(&gate_check),
+                                        reason,
+                                        active_workers = snapshot.active_workers,
+                                        full_reported_workers = snapshot.full_reported_workers,
+                                        ratio = snapshot.ratio,
+                                        threshold = BLOCKREPORT_CONVERGENCE_THRESHOLD,
+                                        epoch,
+                                        "Orphan cleanup evict paused"
+                                    );
+                                    paused_logged = true;
+                                }
+                            } else if reason == "blockreport_not_converged" && !pending_logged {
+                                info!(
+                                    task = "orphan_cleanup",
+                                    gate_state = gate_state_label(&gate_check),
+                                    reason,
+                                    active_workers = snapshot.active_workers,
+                                    full_reported_workers = snapshot.full_reported_workers,
+                                    ratio = snapshot.ratio,
+                                    threshold = BLOCKREPORT_CONVERGENCE_THRESHOLD,
+                                    epoch,
+                                    "Orphan cleanup evict pending block report convergence"
+                                );
+                                pending_logged = true;
+                            }
+                            continue;
+                        }
+
+                        if !activated {
+                            info!(
+                                task = "orphan_cleanup",
+                                active_workers = snapshot.active_workers,
+                                full_reported_workers = snapshot.full_reported_workers,
+                                ratio = snapshot.ratio,
+                                threshold = BLOCKREPORT_CONVERGENCE_THRESHOLD,
+                                epoch,
+                                "Orphan cleanup evict activated"
+                            );
+                            activated = true;
+                            pending_logged = false;
+                            paused_logged = false;
+                        } else if paused_logged {
+                            info!(
+                                task = "orphan_cleanup",
+                                active_workers = snapshot.active_workers,
+                                full_reported_workers = snapshot.full_reported_workers,
+                                ratio = snapshot.ratio,
+                                threshold = BLOCKREPORT_CONVERGENCE_THRESHOLD,
+                                epoch,
+                                "Orphan cleanup evict resumed"
+                            );
+                            paused_logged = false;
+                        }
+
                         if let Err(e) = orphan.run_once().await {
                             error!(task = "orphan_cleanup", error = %e, "Orphan cleanup task failed");
                         }
@@ -395,6 +497,30 @@ impl MaintenanceService {
         info!("Maintenance service started with fail-closed gates");
 
         MaintenanceHandle { tasks }
+    }
+}
+
+fn orphan_evict_activation_block_reason(
+    root_ready: bool,
+    gate_check: &GateCheckResult,
+    blockreport_converged: bool,
+) -> Option<&'static str> {
+    if !root_ready {
+        return Some("root_not_ready");
+    }
+    match gate_check {
+        GateCheckResult::Ready if blockreport_converged => None,
+        GateCheckResult::Ready => Some("blockreport_not_converged"),
+        GateCheckResult::Degraded { .. } => Some("gate_degraded"),
+        GateCheckResult::Blocked { .. } => Some("gate_blocked"),
+    }
+}
+
+fn gate_state_label(gate_check: &GateCheckResult) -> &'static str {
+    match gate_check {
+        GateCheckResult::Ready => "ready",
+        GateCheckResult::Degraded { .. } => "degraded",
+        GateCheckResult::Blocked { .. } => "blocked",
     }
 }
 

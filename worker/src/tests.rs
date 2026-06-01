@@ -510,6 +510,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         assert_eq!(request.group_name, group_name().as_str());
+        assert_eq!(request.header.as_ref().expect("header").group_name, request.group_name);
         assert_eq!(request.worker_id, 42);
         assert_eq!(request.worker_run_id, worker_run_id.to_string());
         assert_eq!(
@@ -746,6 +747,7 @@ mod tests {
             assert_eq!(requests.len(), 1);
             let request = &requests[0];
             assert_eq!(request.group_name, group_name().as_str());
+            assert_eq!(request.header.as_ref().expect("header").group_name, request.group_name);
             assert_eq!(request.worker_id, 42);
             assert_eq!(request.worker_run_id, worker_run_id.to_string());
             assert_eq!(request.heartbeat_seq, 1);
@@ -1127,6 +1129,10 @@ mod tests {
         let requests = mock.block_report_requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].group_name, group_name().as_str());
+        assert_eq!(
+            requests[0].header.as_ref().expect("header").group_name,
+            requests[0].group_name
+        );
         assert_eq!(requests[0].worker_id, 42);
         assert_eq!(requests[0].worker_run_id, worker_run_id.to_string());
         match requests[0].report.as_ref().expect("first report") {
@@ -1415,8 +1421,10 @@ mod tests {
         assert!(delta.full_report_required);
         assert!(!reporter.has_delta_baseline(&group_name()));
         let requests = mock.block_report_requests.lock().unwrap();
+        let request = requests.last().expect("delta report request");
+        assert_eq!(request.header.as_ref().expect("header").group_name, request.group_name);
         assert!(matches!(
-            requests.last().and_then(|request| request.report.as_ref()),
+            request.report.as_ref(),
             Some(proto::metadata::block_report_request_proto::Report::Delta(_))
         ));
         shutdown.send(()).ok();

@@ -183,7 +183,7 @@ impl MetadataServer {
         let readiness = build_readiness(config.as_ref(), &authority).await;
         let filesystem =
             build_filesystem_service(config.as_ref(), &authority, Arc::clone(&worker.manager), &readiness).await?;
-        let maintenance = build_maintenance(&authority, &worker, maintenance_repair).await;
+        let maintenance = build_maintenance(&authority, &worker, &readiness, maintenance_repair).await;
         let worker_background = build_worker_background(&worker, &mut worker_service, &maintenance);
         let (services, handles) =
             compose_services(filesystem, worker_service, readiness, worker_background, maintenance);
@@ -313,6 +313,7 @@ pub(crate) fn build_worker_runtime(
 pub(crate) async fn build_maintenance(
     authority: &MetadataAuthority,
     worker: &WorkerRuntime,
+    readiness: &Readiness,
     repair: MaintenanceRepairState,
 ) -> Maintenance {
     let maintenance_service = Arc::new(MaintenanceService::new_with_inflight_registry(
@@ -325,6 +326,7 @@ pub(crate) async fn build_maintenance(
         Arc::clone(&authority.metadata_metrics),
         Some(Arc::clone(&repair.shared_inflight_registry)),
         Arc::clone(&authority.mount_table),
+        readiness.gate(),
         repair.repair_policy,
     ));
     let maintenance_handle = maintenance_service.start();
@@ -662,12 +664,12 @@ mod tests {
         let authority = test_authority(&dir).await;
         let maintenance_repair = build_maintenance_repair_state(&config);
         let (worker_runtime, mut worker_service) = build_worker_runtime(&authority, &maintenance_repair);
-        let maintenance = build_maintenance(&authority, &worker_runtime, maintenance_repair).await;
+        let readiness = build_readiness(&config, &authority).await;
+        let maintenance = build_maintenance(&authority, &worker_runtime, &readiness, maintenance_repair).await;
         let worker_background = build_worker_background(&worker_runtime, &mut worker_service, &maintenance);
         let _worker_background = worker_background;
         assert!(Arc::strong_count(&maintenance._delete_executor) >= 2);
         assert_eq!(maintenance._maintenance_handle.task_count(), 8);
-        let readiness = build_readiness(&config, &authority).await;
         let _filesystem =
             build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
                 .await
@@ -685,7 +687,7 @@ mod tests {
         let filesystem = build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
             .await
             .unwrap();
-        let maintenance = build_maintenance(&authority, &worker_runtime, maintenance_repair).await;
+        let maintenance = build_maintenance(&authority, &worker_runtime, &readiness, maintenance_repair).await;
         let worker_background = build_worker_background(&worker_runtime, &mut worker_service, &maintenance);
         let (_services, handles) =
             compose_services(filesystem, worker_service, readiness, worker_background, maintenance);
@@ -835,7 +837,8 @@ mod tests {
         let repair = build_maintenance_repair_state(&config);
         let expected_registry = Arc::clone(&repair.shared_inflight_registry);
         let (worker_runtime, _worker_service) = build_worker_runtime(&authority, &repair);
-        let maintenance = build_maintenance(&authority, &worker_runtime, repair).await;
+        let readiness = build_readiness(&config, &authority).await;
+        let maintenance = build_maintenance(&authority, &worker_runtime, &readiness, repair).await;
 
         assert!(Arc::ptr_eq(
             &maintenance._repair_state.shared_inflight_registry,

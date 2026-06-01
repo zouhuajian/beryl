@@ -6,7 +6,7 @@
 vecton.cluster.id: "local-vecton"
 
 metadata.group.name: "root"
-metadata.storage.dir: "/tmp/vecton-debug/metadata"
+metadata.storage.dir: "./data/metadata"
 metadata.rpc.addr: "127.0.0.1"
 metadata.rpc.port: 18080
 metadata.http.bind: "127.0.0.1:18081"
@@ -24,8 +24,8 @@ metadata.repair.initial_backoff_ms: 1000
 metadata.repair.max_backoff_ms: 60000
 metadata.repair.worker_inflight_limit: 4
 
-worker.identity.path: "/tmp/vecton-debug/worker/worker.identity"
-worker.storage.root: "/tmp/vecton-debug/worker"
+worker.identity.path: "./data/worker/worker.identity"
+worker.storage.root: "./data/worker"
 worker.rpc.bind: "127.0.0.1:19090"
 worker.rpc.advertised_endpoint: "http://127.0.0.1:19090"
 worker.http.bind: "127.0.0.1:19091"

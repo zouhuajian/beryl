@@ -202,7 +202,7 @@ impl OrphanBlockCleaner {
                     } else {
                         "blockreport_not_converged"
                     };
-                    warn!(
+                    debug!(
                         task = "orphan_cleanup",
                         gate_state,
                         reason,
@@ -211,7 +211,7 @@ impl OrphanBlockCleaner {
                         ratio = snapshot.ratio,
                         threshold = BLOCKREPORT_CONVERGENCE_THRESHOLD,
                         epoch = epoch,
-                        "Orphan evict blocked: gate not ready or block report not converged. Scan/pending allowed."
+                        "Skipping orphan evict: activation prerequisites are not satisfied"
                     );
                     *last_log = now_ms;
                 }
