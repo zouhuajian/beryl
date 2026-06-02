@@ -17,11 +17,33 @@ use crate::spec::{BackendConfig, BackendKind, UfsId, UfsSpec};
 use crate::traits::{UfsData, UfsDirEntry, UfsFileStatus, UfsMeta};
 
 // Import from common
-use common::observe::{
-    error::{classify_ufs_error_from_message, ErrorKind},
-    metrics::ufs,
-};
+use common::observe::error::ErrorKind;
 use common::{header::RequestHeader, retry_async, timeout_at, ConcurrencyLimiter, RetryPolicy};
+
+mod ufs_metrics {
+    pub const OPS_TOTAL: &str = "ufs_ops_total";
+    pub const OP_LATENCY_MS: &str = "ufs_op_latency_ms";
+    pub const BYTES_TOTAL: &str = "ufs_bytes_total";
+}
+
+fn classify_ufs_error_from_message(error_msg: &str) -> ErrorKind {
+    let msg_lower = error_msg.to_lowercase();
+    if msg_lower.contains("not found") {
+        ErrorKind::NotFound
+    } else if msg_lower.contains("permission denied") {
+        ErrorKind::PermissionDenied
+    } else if msg_lower.contains("unsupported") || msg_lower.contains("not supported") {
+        ErrorKind::Unsupported
+    } else if msg_lower.contains("not implemented") {
+        ErrorKind::NotImplemented
+    } else if msg_lower.contains("invalid") && (msg_lower.contains("path") || msg_lower.contains("range")) {
+        ErrorKind::InvalidArgument
+    } else if msg_lower.contains("backend error") {
+        ErrorKind::Io
+    } else {
+        ErrorKind::Unknown
+    }
+}
 
 /// OpenDAL-based UFS implementation.
 pub struct OpendalUfs {
@@ -247,8 +269,8 @@ impl OpendalUfs {
                 };
 
                 // Record metrics
-                metrics::counter!(ufs::OPS_TOTAL, "backend" => backend, "op" => op, "status" => status, "error_kind" => error_kind.as_str()).increment(1);
-                metrics::histogram!(ufs::OP_LATENCY_MS, "backend" => backend, "op" => op).record(latency_ms.as_secs_f64() * 1000.0);
+                metrics::counter!(ufs_metrics::OPS_TOTAL, "backend" => backend, "op" => op, "status" => status, "error_kind" => error_kind.as_str()).increment(1);
+                metrics::histogram!(ufs_metrics::OP_LATENCY_MS, "backend" => backend, "op" => op).record(latency_ms.as_secs_f64() * 1000.0);
 
                 span_inner.record("status", status);
                 span_inner.record("latency_ms", latency_ms.as_millis() as u64);
@@ -452,7 +474,8 @@ impl UfsData for OpendalUfs {
         let bytes_read = result.len();
 
         // Record additional metrics for bytes (execute_op already records latency via instrument_op)
-        metrics::counter!(ufs::BYTES_TOTAL, "backend" => backend, "direction" => "read").increment(bytes_read as u64);
+        metrics::counter!(ufs_metrics::BYTES_TOTAL, "backend" => backend, "direction" => "read")
+            .increment(bytes_read as u64);
         span_clone.record("bytes", bytes_read);
 
         // Convert opendal::Buffer to Bytes via Vec<u8>

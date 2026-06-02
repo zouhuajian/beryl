@@ -8,6 +8,7 @@ pub mod control;
 pub mod data;
 pub mod error;
 pub mod net;
+pub mod observe;
 pub mod runtime;
 pub mod store;
 

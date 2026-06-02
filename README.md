@@ -71,6 +71,21 @@ Default configuration files are active baselines, not roadmaps:
 
 See `docs/CONFIG_MATRIX_ZH.md` for the current key ownership and status matrix.
 
+## Observability
+
+`common/src/observe` owns process-wide observability infrastructure: configuration structs,
+initialization, the metrics recorder/exporter, the Prometheus `/metrics` endpoint, and the
+tracing/logging subscriber. Product crates own their own signal names and emission. Metadata,
+worker, and client code should emit through the `metrics` crate and `tracing`; common must not
+contain metadata/worker/client/UFS business metric definitions.
+
+The default metrics exporter is Prometheus. Metadata start binds it from `metadata.http.bind`,
+worker start binds it from `worker.http.bind`, and both expose the common recorder output at
+`/metrics`. `metadata format` does not initialize observability. Trace/log output defaults to the
+local tracing subscriber; OTLP integration is optional/feature-gated where present, and
+OpenTelemetry logs are not part of the current runtime. Client observability is still partial and
+does not set up its own exporter.
+
 ## License
 
 Apache-2.0. See `LICENSE`.

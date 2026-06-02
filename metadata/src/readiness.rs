@@ -6,6 +6,7 @@
 use crate::error::{MetadataError, MetadataResult};
 use crate::metrics::MetadataMetrics;
 use crate::mount::{DataIoPolicy, MountKind, MountTable, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
+use crate::observe;
 use crate::raft::{AppRaftNode, RocksDBStorage};
 use parking_lot::RwLock;
 use rand::Rng;
@@ -98,6 +99,7 @@ impl RootReadinessGate {
     pub fn new(metrics: Option<Arc<MetadataMetrics>>) -> Self {
         if let Some(metrics) = &metrics {
             metrics.root_ready.store(0, Ordering::Relaxed);
+            observe::record_root_ready(false);
         }
         Self {
             ready: AtomicUsize::new(0),
@@ -116,6 +118,7 @@ impl RootReadinessGate {
         if self.ready.swap(1, Ordering::Release) == 0 {
             if let Some(metrics) = &self.metrics {
                 metrics.root_ready.store(1, Ordering::Relaxed);
+                observe::record_root_ready(true);
             }
             self.notify.notify_waiters();
         }
@@ -126,6 +129,7 @@ impl RootReadinessGate {
         self.ready.store(0, Ordering::Release);
         if let Some(metrics) = &self.metrics {
             metrics.root_ready.store(0, Ordering::Relaxed);
+            observe::record_root_ready(false);
         }
     }
 

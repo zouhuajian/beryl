@@ -73,7 +73,7 @@ flowchart TB
 | 部分实现 | maintenance/repair/delete framework、worker command heartbeat pull、full block report lease、GC/orphan/overrep intent creation、repair queue ack/retry、client refresh/replay 配合。 |
 | 未实现 | recursive directory delete、ACL/Ranger、完整 UFS-backed namespace、生产级 repair/move/evict/rebalance 策略、多 group msync、follower read 全路径、专用 mount refresh API、path->group route cache。 |
 | 历史残留 | `MemoryStateStore` route-epoch 测试 helper。 |
-| 可保留但暂缓 | maintenance/repair 的 RepairPlanner/RepairQueue/OrphanQueue、maintenance/delete 的 DeleteExecutor、MaintenanceService、authz extension point、共享 `metrics.rs` 导出聚合。 |
+| 可保留但暂缓 | maintenance/repair 的 RepairPlanner/RepairQueue/OrphanQueue、maintenance/delete 的 DeleteExecutor、MaintenanceService、authz extension point。 |
 
 ## 3. 启动链路
 
@@ -82,7 +82,7 @@ flowchart TB
 1. 解析 metadata 命令，当前支持 `metadata format --config <path>` 和 `metadata start --config <path>`。
 2. 加载 metadata config。
 3. `format` 调用 metadata format lifecycle，创建 metadata marker、single-node Raft membership 和 root namespace，然后退出；该离线命令不初始化 Prometheus/metrics endpoint。
-4. `start` 初始化完整 observability/metrics，调用 `MetadataServer::build(config).await` 构造长期 runtime，然后 `server.serve().await`。
+4. `start` 初始化 common observability/metrics recorder/exporter，调用 `MetadataServer::build(config).await` 构造长期 runtime，然后 `server.serve().await`。
 
 `MetadataServer::build()` 当前按依赖顺序构造长期对象：
 
@@ -437,8 +437,7 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 - P4.6 边界校准已修正 ARCHITECTURE/README 的 command router、P1-P4.6 状态和 repair/delete/repair-signal 路径漂移；runtime 中 repair state 归为 maintenance-owned state。
 - P4.7 已补强 repair signal 语义：`removed_blocks` 会触发基于当前 locations 的 repair planning，且默认 replication factor 集中到 `RepairPolicy`。
 - P5 已收窄 crate public surface：`data_io`、`destructive_gate`、`inflight_registry`、`metrics`、`raft_conv` 为 crate-private，`maintenance/mod.rs` 不再聚合 re-export GC/orphan/overrep/lost-worker/gate/delete/repair internals，`worker/mod.rs` 不再 re-export full-report lease internals 或 worker metrics。
-- P5 已清理 metrics ownership：repair queue/task metrics 归入 `maintenance/repair/metrics.rs`；无 updater 的 metadata 文件/块/lease/UFS/Raft/request-latency 零值导出、旧 `gc_ready`、delete executor inflight gauge、无实现的 ACL/Ranger authz counters 和无 caller `OrphanMetrics` 已删除。
-- P5 暂不拆分 `metrics.rs` 为目录模块；共享导出仍被 readiness、FsCore、maintenance、delete executor 和 worker full-report lease 多处共同更新，当前先保持导出格式稳定并把拆分作为后续 import-only 工作。
+- 当前 observability ownership：`common/src/observe` 负责配置、初始化、metrics recorder/exporter、Prometheus `/metrics` endpoint 和 tracing/logging subscriber；metadata/worker/client 各自拥有 signal 名称与 emission。common 不保存 UFS、replication、metadata、worker 或 client 业务指标常量。
 
 ## 16. 当前风险、历史包袱、TODO
 
@@ -455,7 +454,6 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 历史残留：
 
 - `MemoryStateStore` 仍作为 route-epoch test helper 暴露在 `metadata::state`，不是生产 authority。
-- `metrics.rs` 仍是共享 Prometheus 导出聚合入口；已删除无 updater 零值项，但尚未按 fs/worker/maintenance/authz 完全拆分。
 
 验证状态：
 
@@ -468,7 +466,6 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 | 文件/模块 | 当前引用情况 | 为什么可疑 | 建议 | 风险 |
 | --- | --- | --- | --- | --- |
 | `metadata/src/state/memory.rs` / `MemoryStateStore` | regression/FsCore tests 使用；保留在 `metadata::state` 下 | 生产 runtime 使用 `RaftStateStore`，但 integration tests 仍需构造 route-epoch store | 已收窄为 route-epoch helper；后续如有测试辅助 crate 可继续取消 public state exposure | 直接删除会破坏现有 tests |
-| `metadata/src/metrics.rs` shared export surface | 仍由多个 subsystem 共同更新 | 聚合层可能继续混合 fs/maintenance/worker/authz 命名 | 后续做纯 metrics-module split | 本轮强拆会造成大面积 import churn |
 | `docs/architecture/*` | 本轮扫描未发现 `docs/architecture` 目录 | 用户指定的背景目录当前不存在 | 无需处理；后续若新增再审 | 无 |
 
 ## 18. Metadata 瘦身建议
@@ -502,7 +499,6 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 - 对 direct RocksDB write 保持审计压力，不把它混入 authoritative Raft apply closure。
 - 对 maintenance/repair/rebalance 只保留当前能证明的闭环，避免扩展策略复杂度。
 - 对 external mount 和 ACL/Ranger 保持 fail-fast/未接入描述，避免隐式 allow-all 或半成品代理。
-- 后续 metrics 拆分应保持现有 Prometheus 文本格式，不引入新 framework，不把无实现的 ACL/Ranger/old lease runtime 指标重新加入。
 
 ## 19. 快速阅读路径
 
@@ -512,35 +508,34 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 2. `metadata/src/runtime.rs`
 3. `metadata/src/root_init.rs`
 4. `metadata/src/readiness.rs`
-5. `metadata/src/metrics.rs`
-6. `metadata/src/service/path_service.rs`
-7. `metadata/src/service/guard.rs`
-8. `metadata/src/service/auth.rs`
-9. `metadata/src/path_resolver.rs`
-10. `metadata/src/service/fs_core/mod.rs`
-11. `metadata/src/service/fs_core/freshness.rs`
-12. `metadata/src/service/fs_core/read.rs`
-13. `metadata/src/service/fs_core/mutation.rs`
-14. `metadata/src/service/fs_core/write_session.rs`
-15. `metadata/src/raft/command.rs`
-16. `metadata/src/raft/state_machine.rs`
-17. `metadata/src/raft/storage.rs`
-18. `metadata/src/raft/state_machine_store.rs`
-19. `metadata/src/state/raft_store.rs`
-20. `metadata/src/mount/mod.rs`
-21. `metadata/src/worker/service.rs`
-22. `metadata/src/worker/manager.rs`
-23. `metadata/src/worker/command_router.rs`
-24. `metadata/src/maintenance/delete/`
-25. `metadata/src/maintenance/repair/`
-26. `metadata/src/maintenance/repair/metrics.rs`
-27. `metadata/src/maintenance/repair/signal.rs`
-28. `metadata/src/maintenance/lost_worker.rs`
-29. `metadata/src/maintenance/service.rs`
-30. `metadata/src/maintenance/gc.rs`
-31. `metadata/src/maintenance/orphan.rs`
-32. `metadata/src/maintenance/overrep.rs`
-33. `metadata/tests/path_service_regression_tests.rs`
-34. `metadata/tests/service_error_contract_tests.rs`
+5. `metadata/src/service/path_service.rs`
+6. `metadata/src/service/guard.rs`
+7. `metadata/src/service/auth.rs`
+8. `metadata/src/path_resolver.rs`
+9. `metadata/src/service/fs_core/mod.rs`
+10. `metadata/src/service/fs_core/freshness.rs`
+11. `metadata/src/service/fs_core/read.rs`
+12. `metadata/src/service/fs_core/mutation.rs`
+13. `metadata/src/service/fs_core/write_session.rs`
+14. `metadata/src/raft/command.rs`
+15. `metadata/src/raft/state_machine.rs`
+16. `metadata/src/raft/storage.rs`
+17. `metadata/src/raft/state_machine_store.rs`
+18. `metadata/src/state/raft_store.rs`
+19. `metadata/src/mount/mod.rs`
+20. `metadata/src/worker/service.rs`
+21. `metadata/src/worker/manager.rs`
+22. `metadata/src/worker/command_router.rs`
+23. `metadata/src/maintenance/delete/`
+24. `metadata/src/maintenance/repair/`
+25. `metadata/src/maintenance/repair/metrics.rs`
+26. `metadata/src/maintenance/repair/signal.rs`
+27. `metadata/src/maintenance/lost_worker.rs`
+28. `metadata/src/maintenance/service.rs`
+29. `metadata/src/maintenance/gc.rs`
+30. `metadata/src/maintenance/orphan.rs`
+31. `metadata/src/maintenance/overrep.rs`
+32. `metadata/tests/path_service_regression_tests.rs`
+33. `metadata/tests/service_error_contract_tests.rs`
 
 不要从旧 docs 或模块名反推能力；以这些代码路径当前行为为准。

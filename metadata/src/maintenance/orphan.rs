@@ -9,6 +9,7 @@ use crate::destructive_gate::DestructiveGate;
 use crate::error::{MetadataError, MetadataResult};
 use crate::metrics::MetadataMetrics;
 use crate::mount::MountTable;
+use crate::observe;
 use crate::raft::{AppRaftNode, RocksDBStorage};
 use crate::state::DeleteIntentReason;
 use crate::worker::WorkerManager;
@@ -132,6 +133,7 @@ impl OrphanBlockCleaner {
             self.metrics
                 .orphan_cleanup_skipped_total
                 .fetch_add(1, Ordering::Relaxed);
+            observe::record_orphan_cleanup_skipped();
             self.metrics.orphan_gate_state.store(0, Ordering::Relaxed);
 
             const LOG_INTERVAL_MS: u64 = 5 * 60 * 1000;
@@ -186,6 +188,7 @@ impl OrphanBlockCleaner {
             self.metrics
                 .orphan_cleanup_skipped_total
                 .fetch_add(1, Ordering::Relaxed);
+            observe::record_orphan_cleanup_skipped();
             self.metrics.orphan_gate_state.store(0, Ordering::Relaxed);
 
             const LOG_INTERVAL_MS: u64 = 5 * 60 * 1000;
@@ -261,6 +264,7 @@ impl OrphanBlockCleaner {
                     self.metrics
                         .orphan_cleanup_skipped_total
                         .fetch_add(1, Ordering::Relaxed);
+                    observe::record_orphan_cleanup_skipped();
                     warn!(
                         task = "orphan_cleanup",
                         block_id = %block_id,
@@ -391,6 +395,7 @@ impl OrphanBlockCleaner {
                             self.metrics
                                 .orphan_cleanup_skipped_total
                                 .fetch_add(1, Ordering::Relaxed);
+                            observe::record_orphan_cleanup_skipped();
                             continue;
                         }
                     }

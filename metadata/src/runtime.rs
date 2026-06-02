@@ -16,7 +16,7 @@ use crate::service::{
 };
 use crate::state::RaftStateStore;
 use crate::worker::{MetadataWorkerServiceImpl, WorkerBackgroundHandle, WorkerManager};
-use crate::{MetadataConfig, MountTable};
+use crate::{observe, MetadataConfig, MountTable};
 use common::observe::{
     init_observability as init_common_observability, ObservabilityConfig, ObservabilityGuard, ServiceInfo,
 };
@@ -232,6 +232,7 @@ pub fn init_observability(config: &MetadataConfig) -> Result<Observability, DynE
         node_name: None,
     };
     let observability_guard = init_common_observability(&obs_config, service_info)?;
+    observe::record_metadata_started();
 
     info!(
         rpc_addr = %config.rpc_addr,

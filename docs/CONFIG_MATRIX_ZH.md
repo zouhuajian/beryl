@@ -25,6 +25,21 @@ storage and refuses to recreate or rewrite identity for existing worker storage.
 HTTP `/ready` and `/health` endpoints are not implemented. Root readiness uses
 the existing metadata readiness watcher.
 
+## Observability
+
+`common/src/observe` owns observability initialization, the metrics
+recorder/exporter, the Prometheus `/metrics` endpoint, and tracing/logging
+subscriber setup. Metadata, worker, and client own their own signal names and
+metric/log/span emission.
+
+The default metrics exporter is Prometheus. `metadata start` exposes the common
+recorder output on `metadata.http.bind` at `/metrics`; `worker start` does the
+same on `worker.http.bind`. `metadata format` does not initialize metrics or
+bind the Prometheus endpoint. Trace/log output defaults to the local tracing
+subscriber. OTLP integration is optional/feature-gated where present, and
+OpenTelemetry logs are not implemented. Client observability is partial and
+does not install a client-owned exporter.
+
 ## Identity Model
 
 Metadata group identity is the stable string `GroupName`, not a numeric group
@@ -51,7 +66,7 @@ lock the root to one metadata group.
 | `metadata.raft.node_id` | `1` | positive integer | Local Raft node id for the formatted metadata node. |
 | `metadata.rpc.addr` | `0.0.0.0` | valid socket host with port below | Metadata RPC bind host. |
 | `metadata.rpc.port` | `18080` | `1..=65535` | Metadata RPC bind port. |
-| `metadata.http.bind` | `0.0.0.0:18081` | valid socket address | Metrics/admin bind; not an HTTP readiness endpoint. |
+| `metadata.http.bind` | `0.0.0.0:18081` | valid socket address | Common Prometheus `/metrics` bind; not an HTTP readiness endpoint. |
 | `metadata.authz.filesystem.mode` | `NONE` | `NONE`, `RANGER`, or `ACL` | Current runnable deployments use `NONE`. |
 | `metadata.bootstrap.root_ready_initial_backoff_ms` | `200` | positive integer | Root readiness initial backoff. |
 | `metadata.bootstrap.root_ready_max_backoff_ms` | `5000` | positive integer | Root readiness maximum backoff. |
@@ -75,7 +90,7 @@ lock the root to one metadata group.
 | `worker.storage.root` | `data/worker` | non-empty path string | Worker local storage root. Group data lives under `groups/<group_name>/`. |
 | `worker.rpc.bind` | `0.0.0.0:9090` | valid socket address | Worker data-plane gRPC listener. |
 | `worker.rpc.advertised_endpoint` | required in file configs | valid URI with host and port | Endpoint registered with metadata and returned to clients. |
-| `worker.http.bind` | `0.0.0.0:19091` | valid socket address | Metrics/admin bind. |
+| `worker.http.bind` | `0.0.0.0:19091` | valid socket address | Common Prometheus `/metrics` bind. |
 | `worker.rpc.max_inflight` | `100` | positive integer | Per-connection concurrency limit. |
 | `worker.default_frame_size` | `1MB` | positive bytes and <= max frame size | Default transport frame payload. |
 | `worker.max_frame_size` | `4MB` | positive bytes | Maximum transport frame payload. |

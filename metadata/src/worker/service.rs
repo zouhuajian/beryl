@@ -9,6 +9,7 @@ use super::manager::{
 };
 use super::metrics::WorkerMetrics;
 use crate::error::{to_canonical_rpc, MetadataError, MetadataResult};
+use crate::observe;
 use crate::raft::Command;
 use crate::raft::{AppDataResponse, AppRaftNode, WorkerCommandResult};
 use crate::service::extract_and_inject_context;
@@ -550,6 +551,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             protocol = worker_net_protocol_label(worker_net_protocol),
             "Worker registered"
         );
+        observe::record_worker_registered();
 
         Ok(Response::new(RegisterWorkerResponseProto {
             header: Some((&self.create_response_header_from_request(&req.header, Some(&group_name))).into()),
@@ -872,11 +874,14 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         Span::current().record("added_blocks", result.added_blocks.len() as u64);
         Span::current().record("removed_blocks", result.removed_blocks.len() as u64);
 
-        // Update metrics
+        // In-memory worker state counters.
         let total_blocks = result.added_blocks.len() + result.removed_blocks.len();
         self.metrics.record_blockreport_blocks(total_blocks as u64);
         let locations_size = self.worker_manager.get_all_locations_count();
         self.metrics.update_locations_size(locations_size);
+
+        // Exported metric via the shared recorder.
+        observe::record_worker_block_report_processed();
 
         info!(
             group_name = %group_name,

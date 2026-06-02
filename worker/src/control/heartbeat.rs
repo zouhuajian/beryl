@@ -28,6 +28,7 @@ use types::{ClientId, GroupName, WorkerRunId};
 use crate::config::WorkerRegistrationConfig;
 use crate::control::{MetadataRegistrar, Registration, RegistrationDescriptor, RegistrationSet};
 use crate::net::protocol::WorkerNetProtocol;
+use crate::observe;
 
 /// Lightweight local resource snapshot sent on heartbeat.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -115,6 +116,7 @@ impl MetadataHeartbeatLoop {
                     round.accepted_peers += 1;
                     self.state
                         .record_heartbeat_success(&registration.group_name, liveness_timeout);
+                    observe::record_heartbeat_sent();
                 }
                 Ok(HeartbeatPeerOutcome::NeedRegister) => {
                     round.needs_register = true;

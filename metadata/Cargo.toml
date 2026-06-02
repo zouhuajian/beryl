@@ -27,6 +27,7 @@ anyhow = { workspace = true }
 
 # Logging & Observability
 tracing = { workspace = true }
+metrics = { workspace = true }
 
 # Utilities
 parking_lot = { workspace = true }

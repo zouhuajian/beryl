@@ -28,6 +28,7 @@ thiserror = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+metrics = { workspace = true }
 
 # Utilities
 bytes = { workspace = true }

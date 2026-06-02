@@ -14,7 +14,7 @@ use worker::{
     control::{
         prepare_worker_start, MetadataBlockReportLoop, MetadataHeartbeatLoop, MetadataRegistrar, RegistrationSet,
     },
-    net,
+    net, observe,
     store::block::{FullBlockFileStore, FullBlockFileStoreConfig},
     WorkerCore,
 };
@@ -42,6 +42,8 @@ async fn main() -> Result<()> {
     };
     let _obs_guard = init_observability(&obs_config, service_info)
         .map_err(|e| anyhow::anyhow!("Failed to initialize observability: {}", e))?;
+    observe::record_worker_started();
+    observe::set_worker_registered(false);
 
     info!(
         rpc_bind = %config.rpc_bind,

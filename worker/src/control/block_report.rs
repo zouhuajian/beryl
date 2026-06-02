@@ -26,6 +26,7 @@ use types::{BlockId, ClientId, GroupName};
 
 use crate::config::WorkerRegistrationConfig;
 use crate::control::{Registration, RegistrationDescriptor, RegistrationSet};
+use crate::observe;
 use crate::store::block::{BlockMetaPayload, BlockState, FullBlockFileStore};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,6 +166,7 @@ impl MetadataBlockReportLoop {
                 Ok(BlockReportPeerOutcome::Accepted { next_delta_seq }) => {
                     round.accepted_peers += 1;
                     accepted_next_delta_seq = next_delta_seq;
+                    observe::record_block_report_sent();
                 }
                 Ok(BlockReportPeerOutcome::FullReportRequired) => round.full_report_required = true,
                 Ok(BlockReportPeerOutcome::NeedRegister) => {
@@ -224,6 +226,7 @@ impl MetadataBlockReportLoop {
                 Ok(BlockReportPeerOutcome::Accepted { next_delta_seq }) => {
                     round.accepted_peers += 1;
                     accepted_next_delta_seq = next_delta_seq;
+                    observe::record_block_report_sent();
                 }
                 Ok(BlockReportPeerOutcome::FullReportRequired) => {
                     round.full_report_required = true;

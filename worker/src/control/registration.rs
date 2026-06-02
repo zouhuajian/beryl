@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use types::{GroupName, WorkerId, WorkerRunId};
 
+use crate::observe;
+
 /// Metadata-confirmed worker registration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Registration {
@@ -43,6 +45,7 @@ impl RegistrationSet {
                 heartbeat_deadline: None,
             },
         );
+        observe::set_worker_registered(true);
     }
 
     pub fn record_heartbeat_success(&self, group_name: &GroupName, lease_duration: Duration) {
@@ -72,6 +75,7 @@ impl RegistrationSet {
             .write()
             .expect("registration state poisoned")
             .remove(group_name);
+        observe::set_worker_registered(false);
     }
 
     pub fn registration(&self, group_name: &GroupName) -> Option<Registration> {
@@ -110,5 +114,95 @@ impl RegistrationSet {
 
     pub fn registration_for_group(&self, group_name: &GroupName) -> Option<Registration> {
         self.registration(group_name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use metrics::{Counter, Gauge, GaugeFn, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
+
+    use super::*;
+
+    #[test]
+    fn new_registration_set_starts_unregistered() {
+        let state = RegistrationSet::new();
+        let group_name = test_group_name();
+
+        assert!(!state.is_registered(&group_name));
+        assert!(!state.is_ready(&group_name));
+    }
+
+    #[test]
+    fn registration_state_updates_registered_gauge() {
+        let recorder = GaugeRecorder::default();
+        let group_name = test_group_name();
+        let registration = test_registration(group_name.clone());
+
+        metrics::with_local_recorder(&recorder, || {
+            let state = RegistrationSet::new();
+
+            state.record_registered(registration);
+            state.mark_needs_register(&group_name);
+        });
+
+        assert_eq!(*recorder.values.lock().expect("gauge values poisoned"), vec![1.0, 0.0]);
+    }
+
+    fn test_group_name() -> GroupName {
+        GroupName::parse("root").expect("test group name is valid")
+    }
+
+    fn test_registration(group_name: GroupName) -> Registration {
+        Registration {
+            group_name,
+            worker_id: WorkerId::new(42),
+            worker_run_id: WorkerRunId::new(),
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        }
+    }
+
+    #[derive(Default)]
+    struct GaugeRecorder {
+        values: Arc<Mutex<Vec<f64>>>,
+    }
+
+    impl Recorder for GaugeRecorder {
+        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn register_counter(&self, _key: &Key, _metadata: &Metadata<'_>) -> Counter {
+            Counter::noop()
+        }
+
+        fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+            assert_eq!(key.name(), observe::WORKER_REGISTERED);
+            assert_eq!(key.labels().count(), 0);
+            Gauge::from_arc(Arc::new(TestGauge(Arc::clone(&self.values))))
+        }
+
+        fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+            Histogram::noop()
+        }
+    }
+
+    struct TestGauge(Arc<Mutex<Vec<f64>>>);
+
+    impl GaugeFn for TestGauge {
+        fn increment(&self, value: f64) {
+            self.set(value);
+        }
+
+        fn decrement(&self, value: f64) {
+            self.set(-value);
+        }
+
+        fn set(&self, value: f64) {
+            self.0.lock().expect("gauge values poisoned").push(value);
+        }
     }
 }

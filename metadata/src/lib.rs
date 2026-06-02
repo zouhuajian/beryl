@@ -58,6 +58,7 @@ pub mod lifecycle;
 pub mod maintenance;
 pub(crate) mod metrics;
 pub mod mount;
+pub(crate) mod observe;
 pub mod path_resolver;
 pub mod placement;
 pub mod raft;
