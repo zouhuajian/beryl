@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Integration tests for worker management and block reporting.
+//! Contract tests for worker management and block reporting.
 
 use crate::maintenance::repair::{OrphanQueue, RepairPlanner, RepairQueue, RepairTask};
 use crate::placement::{PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus};

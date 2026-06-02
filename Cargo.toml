@@ -7,7 +7,6 @@ members = [
     "ufs",
     "worker",
     "client",
-    "integration_tests",
 ]
 resolver = "2"
 

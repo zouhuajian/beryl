@@ -26,7 +26,6 @@ Keep changes inside the requested scope. Do not introduce architecture direction
 | `metadata` | Namespace and control-plane truth: inode, dentry, attrs, layout, leases, route ownership, mount routing, guard pipeline, Raft/RocksDB apply semantics. | Worker data execution, client policy, UFS backend behavior. |
 | `worker` | Data-plane execution, block store, local IO, stream handling, block reports, heartbeats. | File-level namespace authority, UFS path derivation from data handles, client retry/cache policy. |
 | `ufs` | Backend integration, backend config, OpenDAL setup, UFS path behavior, backend capability decisions. | Metadata authority, worker runtime, client policy. |
-| `integration_tests` | End-to-end fixtures, mock servers, raw wire checks, cross-crate contract assertions. | Production helpers, canonical conversion code, product runtime helpers. |
 | `docs` | Architecture, audit, and design records. | Normative rules that conflict with `AGENTS.md` or claims that planned features already exist. |
 
 Shared crates must not depend on product crates. `metadata`, `worker`, and `client` must not depend on each other in production code. `ufs` is a backend adapter crate and must not depend on `metadata`, `worker`, or `client`; `metadata` may depend on `ufs` only at mount/backend adapter boundaries. Test-only dependencies must stay explicit and narrow.
@@ -78,7 +77,7 @@ Schema changes still require wire-number and active-consumer review. Do not reus
 - Do not add production APIs, `cfg(test)` production fields, special injection hooks, or fake/force helpers just for tests.
 - Keep `#[cfg(test)] mod tests` near the bottom of source files; do not place production logic after test modules.
 - Consolidate obvious redundant tests when modifying test-heavy areas.
-- Use integration tests for observable cross-crate contracts, not as production helper libraries.
+- Use owner-crate integration tests for observable cross-crate contracts, not as production helper libraries.
 
 ## Documentation Expectations
 

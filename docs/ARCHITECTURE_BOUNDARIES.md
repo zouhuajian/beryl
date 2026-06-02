@@ -8,13 +8,13 @@ These rules do not replace local `AGENTS.md` files. If a subtree has a stricter 
 
 ## Workspace Dependency Rules
 
-- Dependency direction is one-way from product modules to shared modules: `metadata`, `worker`, `client`, `ufs`, and `integration_tests` may depend on `common`, `types`, and `proto` where appropriate.
-- `types` is a pure Rust domain-model crate. It must not depend on `proto`, `metadata`, `worker`, `client`, `ufs`, or `integration_tests`.
+- Dependency direction is one-way from product modules to shared modules: `metadata`, `worker`, `client`, and `ufs` may depend on `common`, `types`, and `proto` where appropriate.
+- `types` is a pure Rust domain-model crate. It must not depend on `proto`, `metadata`, `worker`, `client`, or `ufs`.
 - `common` may depend on `types` for stable identifiers and shared primitives, but must not depend on `proto`, `metadata`, `worker`, `client`, or `ufs`.
 - `proto` owns generated wire schema and Rust-side proto/domain conversion. It may depend on `types` and `common`; it must not depend on `metadata`, `worker`, `client`, or `ufs`.
 - `metadata`, `worker`, and `client` must not depend on each other in production code. Test-only dependencies must stay explicit and narrow.
 - `ufs` must not depend on `metadata`, `worker`, or `client`.
-- `integration_tests` may depend on production crates to validate end-to-end contracts, but must not become a source of shared production helpers.
+- Owner-crate integration tests may depend on production crates only when the dependency is test-only, explicit, narrow, and needed for the contract under test.
 
 ## Block Layout, Format, and Store Backend Boundaries
 
@@ -168,12 +168,6 @@ The regular data path is metadata issued: client create/open/append/add-block/re
 #### Must Stay Local
 
 - Backend-specific config maps, storage-service construction, file path mapping, adapter error mapping, and backend capability decisions.
-
-### `integration_tests`
-
-- Owns end-to-end fixtures, mock servers, and contract assertions.
-- May use raw proto messages to validate wire contracts.
-- Must not provide production shared modules, runtime helpers, or canonical conversion code.
 
 ## Where Conversion Logic Belongs
 

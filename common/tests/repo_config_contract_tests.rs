@@ -3,8 +3,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use metadata::MetadataConfig;
-use worker::config::WorkerConfig;
+use common::{CoreConfig, FlatConfig};
 
 #[test]
 fn repository_core_site_storage_roots_do_not_overlap() {
@@ -28,30 +27,40 @@ fn assert_storage_roots_do_not_overlap(
     expected_worker_root: &Path,
     expected_identity_path: &Path,
 ) {
-    let metadata = MetadataConfig::load(config_path).expect("metadata config loads");
-    let worker = WorkerConfig::load(config_path).expect("worker config loads");
+    let config = CoreConfig::load(config_path).expect("core config loads");
+    let flat = config.as_flat();
+    let metadata_dir = required_path(flat, "metadata.storage.dir");
+    let worker_root = required_path(flat, "worker.storage.root");
+    let identity_path = required_path(flat, "worker.identity.path");
 
-    assert_eq!(metadata.storage_dir, expected_metadata_dir);
-    assert_eq!(worker.storage_root, expected_worker_root);
-    assert_eq!(worker.identity_path, expected_identity_path);
+    assert_eq!(metadata_dir, expected_metadata_dir);
+    assert_eq!(worker_root, expected_worker_root);
+    assert_eq!(identity_path, expected_identity_path);
     assert!(
-        !same_or_ancestor(&metadata.storage_dir, &worker.storage_root),
+        !same_or_ancestor(&metadata_dir, &worker_root),
         "metadata storage dir must not contain worker storage root"
     );
     assert!(
-        !same_or_ancestor(&worker.storage_root, &metadata.storage_dir),
+        !same_or_ancestor(&worker_root, &metadata_dir),
         "worker storage root must not contain metadata storage dir"
     );
     assert!(
-        same_or_ancestor(&worker.storage_root, &worker.identity_path),
+        same_or_ancestor(&worker_root, &identity_path),
         "worker identity path must live under worker storage root in repository configs"
     );
+}
+
+fn required_path(flat: &FlatConfig, key: &str) -> PathBuf {
+    PathBuf::from(
+        flat.get_str(key)
+            .unwrap_or_else(|| panic!("repository config must define {key}")),
+    )
 }
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("integration_tests lives under workspace root")
+        .expect("common lives under workspace root")
         .to_path_buf()
 }
 

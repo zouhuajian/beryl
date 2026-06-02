@@ -3,7 +3,7 @@
 ## 1. 审计概览
 
 - 审计日期：2026-05-24
-- 审计范围：仓库根目录、`Cargo.toml` 工作区、`README.md`、`AGENTS.md`、各子目录 `AGENTS.md`、`docs/ARCHITECTURE_BOUNDARIES.md`、`conf/`、`common`、`types`、`proto`、`client`、`metadata`、`worker`、`ufs`、`integration_tests`。
+- 审计范围：仓库根目录、`Cargo.toml` 工作区、`README.md`、`AGENTS.md`、各子目录 `AGENTS.md`、`docs/ARCHITECTURE_BOUNDARIES.md`、`conf/`、`common`、`types`、`proto`、`client`、`metadata`、`worker`、`ufs`、owner-crate tests。
 - 审计重点：功能完整性、模块边界、依赖方向、核心读写链路、配置与部署可信度、错误语义、测试覆盖、文档一致性。
 - 审计基线：当前分支 `dev`，`HEAD=ba813d89c48d66cf775c89bd1d32689bbfb5f215`。
 - 审计时工作区状态：`git status --porcelain -uall` 曾显示旧 client API split 文件为 `AD`，即已暂存新增但工作区删除；本轮稳定化重新检查后未发现这些 stale index entries。
@@ -21,7 +21,7 @@
 
 | 模块 / 路径 | 主要职责 | 当前状态 | 证据 | 备注 |
 |---|---|---|---|---|
-| `Cargo.toml` | Rust workspace 聚合、统一依赖版本、成员声明 | 已完成 | `Cargo.toml`、`cargo metadata --format-version 1 --no-deps` | 成员为 `common/types/proto/metadata/ufs/client/worker/integration_tests`；workspace `rust-version=1.95.0`。`common`/`types`/`proto` 使用 edition 2024，其他主要 crate 使用 edition 2021；该混用由 Rust 1.95.0 baseline 支持。 |
+| `Cargo.toml` | Rust workspace 聚合、统一依赖版本、成员声明 | 已完成 | `Cargo.toml`、`cargo metadata --format-version 1 --no-deps` | 成员为 `common/types/proto/metadata/ufs/client/worker`；workspace `rust-version=1.95.0`。`common`/`types`/`proto` 使用 edition 2024，其他主要 crate 使用 edition 2021；该混用由 Rust 1.95.0 baseline 支持。 |
 | `common/` | 通用配置加载、错误/header 域模型、观测、重试、时间工具 | 需要优化 | `common/src/lib.rs`、`common/src/config/flat.rs`、`common/src/header/codec.rs` | 职责大体符合边界；`FlatConfig` 偏宽松，`deadline_ms` 默认仍有 TODO。 |
 | `types/` | 纯 Rust 共享领域值：ID、block/location、lease、watermark、worker endpoint、fs 基础对象 | 已完成 | `types/src/lib.rs`、`types/src/ids.rs`、`types/src/location.rs`、`types/src/group_watermark.rs` | 未依赖 workspace crate；有少量 future placeholder，如 symlink target。 |
 | `proto/` | `.proto`、codegen、gRPC service 契约、共享结构转换 | 需要优化 | `proto/build.rs`、`proto/src/lib.rs`、`proto/src/convert.rs` | 主转换职责清晰；admin/metadata-peer service surface 状态待确认。 |
@@ -29,7 +29,7 @@
 | `worker/` | 数据面执行、本地 block store、stream runtime、gRPC WorkerDataService、worker net peer/server | 需要优化 | `worker/src/lib.rs`、`worker/src/data/core.rs`、`worker/src/store/block.rs`、`worker/src/bin/main.rs` | 本地数据面可测；metadata lifecycle、公开读 stamp gate、placeholder backend 是主要缺口。 |
 | `client/` | SDK facade、metadata gateway、worker endpoint resolution/cache、channel pooling、retry/refresh orchestration、read planner、worker data adapter | 已完成 | `client/src/lib.rs`、`client/src/api/fs_client.rs`、`client/src/data/worker.rs`、`client/src/runtime/executor.rs` | 公共 facade 收敛；普通读路径从 metadata 获取 authoritative layout/locations，经 `ReadPlanner` 校验后访问 worker；当前架构不保留 client 侧读 layout 缓存；默认 client 配置已收敛到当前 active key。 |
 | `ufs/` | 外部后端抽象、OpenDAL adapter、UFS registry/spec/capability | 需要优化 | `ufs/src/lib.rs`、`ufs/src/opendal_impl.rs`、`ufs/Cargo.toml` | 边界清晰；部分后端能力依赖 feature 或运行环境，测试有 ignored。 |
-| `integration_tests/` | 跨 crate contract tests、mock metadata/worker | 需要优化 | `integration_tests/tests/client_contract.rs`、`integration_tests/tests/common/mock_metadata.rs`、`integration_tests/tests/common/mock_worker.rs` | 能验证 client contract，但不是完整真实 metadata+worker E2E。 |
+| owner-crate tests | 跨 crate contract tests、repo config contracts | 需要优化 | `client/tests/`、`metadata/tests/`、`worker/tests/`、`common/tests/` | 能验证 client/config contract，但不是完整真实 metadata+worker E2E。 |
 | `conf/` | 示例/默认配置 | 已完成 | `conf/core-site.yaml`、`conf/client-site.yaml`、`docs/CONFIG_MATRIX_ZH.md` | 默认配置文件仅包含当前 runtime 实际消费的 active key；planned/unimplemented 能力只在文档中列为 deferred，不作为 deployable default。 |
 | `docs/` | 架构边界与审计材料 | 已完成 | `docs/ARCHITECTURE_BOUNDARIES.md`、`docs/20260524_GLOBAL_SYSTEM_AUDIT_ZH.md`、`.gitignore` | `docs/` 不再被整目录忽略，重要 Markdown 文档默认可被 git 发现。 |
 | `.github/workflows` / `Makefile` / `rust-toolchain.toml` | CI、统一验证入口、工具链 baseline | 已完成 | `.github/workflows/ci.yml`、`Makefile`、`rust-toolchain.toml` | CI 和本地 verify 均运行 Rust 1.95.0 下的 fmt-check、metadata、check、clippy、test。 |
@@ -279,36 +279,34 @@
 1. 写 UFS backend support matrix：fs/s3/oss/hdfs 的 feature、必需配置、测试状态。
 2. 为 fs backend 提供默认可运行的临时目录 integration test，减少 ignored 覆盖。
 
-### 3.8 integration_tests
+### 3.8 Owner-crate contract tests
 
 #### 3.8.1 模块职责
 
-`integration_tests` 是测试 crate，包含 client contract tests 和 mock metadata/worker server。它通过 dev-dependencies 依赖生产 crate，生产 crate 不依赖它，方向正确。
+跨 crate contract 测试应放在行为所属 crate 的 `tests/` 目录。只测试本地 test fixture 的 mock contract 已删除；生产 crate 不依赖测试夹具。
 
 #### 3.8.2 功能完成情况
 
 | 功能点 | 状态 | 说明 | 证据 | 优先级 |
 |---|---|---|---|---|
-| client contract mock tests | 已完成 | 验证 client 对 metadata/worker structured response 的处理。 | `integration_tests/tests/client_contract.rs` | N/A |
-| raw proto mock servers | 已完成 | mock metadata/worker 使用 proto 契约，适合 wire contract 验证。 | `integration_tests/tests/common/mock_metadata.rs`、`integration_tests/tests/common/mock_worker.rs` | N/A |
-| 真实 metadata+worker+client E2E | TODO / 未完成 | 当前主要是 mock contract，不是完整真实多进程或 in-process E2E。 | `integration_tests/tests/client_contract.rs` | P2 |
-| placeholder 语义残留 | 需要优化 | 测试注释仍称 direct worker reads/writes 为 placeholder，与当前 worker core 已实现不完全一致。 | `integration_tests/tests/client_contract.rs` | P3 |
+| client config contract tests | 已完成 | 验证 client 初始化和配置 contract。 | `client/tests/config_contract_tests.rs` | N/A |
+| repo config contract tests | 已完成 | 验证 repo config flat-key 一致性和 owner typed config 解析。 | `common/tests/repo_config_contract_tests.rs`、`metadata/tests/config_contract_tests.rs`、`worker/tests/config_contract_tests.rs` | N/A |
+| 真实 metadata+worker+client E2E | TODO / 未完成 | 默认测试不启动服务；真实本地 CRUD smoke 只在显式运行 ignored test 时执行。 | `client/tests/local_crud.rs` | P2 |
 
 #### 3.8.3 架构评价
 
-测试 crate 的边界正确，适合作为跨 crate contract 守门。当前不足是 mock contract 与真实系统闭环之间缺少一层：真实 metadata server、真实 worker data service、client SDK 三者之间的 read/write 生命周期测试。
+owner-crate tests 更符合行为归属。当前不足是 repo config / owner config contract 与真实系统闭环之间缺少默认可运行的一层：真实 metadata server、真实 worker data service、client SDK 三者之间的 read/write 生命周期测试。
 
 #### 3.8.4 主要问题
 
 | 问题 | 类型 | 影响 | 建议 | 优先级 | 证据 |
 |---|---|---|---|---|---|
-| 缺少真实 E2E | 测试不足 | worker lifecycle、block report、metadata layout、client read/write 真实闭环无法由默认测试保障。 | 增加 in-process metadata+worker+client test profile，先覆盖 single-group create/write/read/delete。 | P2 | `integration_tests/tests/client_contract.rs` |
-| placeholder 注释/行为可能过期 | 文档缺失 | 测试意图与当前实现状态不一致，影响后续维护判断。 | 更新 contract tests 注释，区分 mock placeholder 与真实 worker implementation。 | P3 | `integration_tests/tests/client_contract.rs` |
+| 缺少默认真实 E2E | 测试不足 | worker lifecycle、block report、metadata layout、client read/write 真实闭环无法由默认测试保障。 | 增加不污染默认 `cargo test --workspace` 的显式 profile，先覆盖 single-group create/write/read/delete。 | P2 | `client/tests/local_crud.rs` |
 
 #### 3.8.5 建议后续动作
 
-1. 新增真实 E2E smoke：启动 metadata runtime、worker data server、注册 worker、client create/write/close/read。
-2. 用 mock tests 保留错误契约覆盖，不替代真实生命周期测试。
+1. 在显式 profile 中运行真实 E2E smoke：启动 metadata runtime、worker data server、注册 worker、client create/write/close/read。
+2. 保留 owner-crate production-path contract 覆盖，不用只验证本地 mock fixture 的测试替代真实生命周期测试。
 
 ### 3.9 配置、脚本与文档边界
 
@@ -396,7 +394,7 @@
 ### 5.7 可测试性
 
 - 当前状态：默认 `cargo test --workspace` 通过，client/metadata/worker 单元和 crate-level contract 覆盖较强。
-- 主要风险：真实 metadata+worker+client E2E 缺失；UFS 真实后端和部分 lease/list 测试 ignored；mock placeholder 注释有漂移。
+- 主要风险：真实 metadata+worker+client E2E 缺失；UFS 真实后端和部分 lease/list 测试 ignored。
 - 建议改进：增加 single-process E2E profile 和 backend integration profile；将 ignored 测试原因写入测试矩阵。
 
 ### 5.8 可扩展性
@@ -426,11 +424,11 @@
 | `common` | 单元测试覆盖 header/error/config/observe/retry 基础语义 | 部分 placeholder 指标和 deadline 默认未形成强 contract | 为 TODO 项补 policy test 或移除 TODO。 |
 | `types` | ID、ACL、fs、layout、chunk、serde roundtrip 覆盖 | symlink/future fields 无完整流程 | 未公开前保持低优先级；公开前补完整测试。 |
 | `proto` | conversion tests 覆盖 ID/header/watermark/location/protocol | active surface service 实现状态未测试 | 增加 static test 检查未实现 service 的状态标注。 |
-| `client` | 单元/contract 覆盖 public facade、read/write、cache、retry/replay、worker adapter | 真实 worker lifecycle 不在 client tests 中 | 由 integration E2E 覆盖真实 metadata+worker+client。 |
+| `client` | 单元/contract 覆盖 public facade、read/write、cache、retry/replay、worker adapter | 真实 worker lifecycle 不在默认 client tests 中 | 由显式本地 CRUD / E2E profile 覆盖真实 metadata+worker+client。 |
 | `metadata` | 单元和 regression tests 很强，覆盖 FsCore、Raft apply/storage、freshness、worker service、maintenance | Raft network placeholder、worker heartbeat/block report error follow-up、ignored tests | 补后续 worker lifecycle structured error contract，明确 ignored tests 去留。 |
 | `worker` | 本地 store、data core、gRPC adapter、config、proto shape、sync committed block 覆盖较强 | metadata lifecycle 缺测试 | 新增 control-plane tests。 |
 | `ufs` | registry/capability/fallback 有覆盖 | 真实 backend tests ignored | 增加环境隔离的 fs backend integration，后端 matrix 分层运行。 |
-| `integration_tests` | client contract mock tests | 缺真实 E2E | 新增 single-group end-to-end smoke。 |
+| owner-crate contract tests | client/config/mock contract tests | 缺默认真实 E2E | 新增 single-group end-to-end smoke 的显式 profile。 |
 
 ## 7. 文档审计
 
@@ -455,7 +453,7 @@
 | P2 | admin/metapeer proto service 未实现但导出 | `proto`、`metadata` | 外部 API surface 状态不清。 | 标注 planned/stale 或删除/隔离。 |
 | P2 | Raft network placeholder | `metadata` | 多节点 metadata 不完整。 | 明确单节点支持或实现 peer RPC。 |
 | P2 | io_uring/SPDK/QUIC/RDMA placeholder | `worker` | 实现前不能作为 deployable capability。 | 继续排除在默认配置之外；实现和验证完成后再进入 active config。 |
-| P2 | 缺少真实 metadata+worker+client E2E | `integration_tests`、`client`、`metadata`、`worker` | 默认测试无法证明完整系统闭环。 | 新增 single-group E2E smoke。 |
+| P2 | 缺少真实 metadata+worker+client E2E | `client`、`metadata`、`worker` | 默认测试无法证明完整系统闭环。 | 新增 single-group E2E smoke 的显式 profile。 |
 | P3 | header deadline 默认 TODO | `common` | 默认超时策略不清。 | 明确 config 注入或无默认。 |
 | P3 | symlink target placeholder | `types`、`metadata` | symlink 能力未完整。 | 未公开前标未完成，公开前补全链路。 |
 | P3 | UFS 后端默认测试不足 | `ufs` | 后端适配不能由默认测试证明。 | 增加 feature-gated/backend profile。 |

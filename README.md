@@ -35,6 +35,7 @@ Currently supported:
 - MetadataWorkerService structured application-error response contract for worker registration.
 - Client facade with metadata gateway, retry/refresh classification, read planning, worker endpoint validation, and sequential write handles.
 - Default `conf/core-site.yaml` and `conf/client-site.yaml` containing only keys consumed by current runtime code.
+- Owner-crate config and contract tests. Default workspace tests do not start metadata or worker services.
 
 Intentionally not yet implemented in this baseline:
 
@@ -42,7 +43,7 @@ Intentionally not yet implemented in this baseline:
 - Raft network implementation for production multi-node metadata.
 - QUIC, RDMA, io_uring, or SPDK production data paths.
 - Expanded maintenance repair/delete features.
-- Real metadata + worker + client end-to-end system tests.
+- Default-on real metadata + worker + client end-to-end system tests. The local client CRUD smoke lives in `client/tests/local_crud.rs` and is ignored by default.
 
 Worker startup registration is group-scoped. The worker resolves a stable `WorkerId` from the persisted `worker.identity.path`, generates a UUID `WorkerRunId` once per process start, registers the advertised gRPC endpoint with the configured metadata group leader, and serves data-plane requests for a group only after that group accepts the registration. Metadata persists only the stable worker descriptor; `WorkerRunId` is live registration state and is not restored from metadata restart or snapshot reload. `WorkerRunId` is not an epoch and is not comparable. Client-to-worker reads, writes, commits, and syncs use `WorkerRunId` for worker process-run freshness and `block_stamp` for block generation freshness.
 
@@ -57,7 +58,6 @@ Worker startup registration is group-scoped. The worker resolves a stable `Worke
 | `worker` | Data-plane runtime | Local block store, chunk IO, stream runtime, data service adapters, worker networking, and worker config. |
 | `client` | SDK and orchestration runtime | Public facade, metadata gateway, worker endpoint resolution/cache, channel pooling, retry/refresh orchestration, read planning, worker data-plane access, and client config. The client obtains authoritative layout, write targets, and read locations from metadata, validates read locations with `ReadPlanner`, and then accesses workers on the normal data path. Client-side read layout caching has been removed from the current architecture. |
 | `ufs` | External backend adapter | Backend integration, OpenDAL setup, backend-specific config, UFS path behavior, and backend capability decisions. |
-| `integration_tests` | Test-only contracts | End-to-end fixtures, mock servers, contract assertions, and raw proto wire checks. |
 
 Dependency direction is one-way from product crates to shared crates. `types` must not depend on workspace crates; `common` may depend on `types` but not `proto` or product crates; `proto` may depend on `types` and `common`; production `metadata`, `worker`, `client`, and `ufs` must not depend on each other in production code.
 
