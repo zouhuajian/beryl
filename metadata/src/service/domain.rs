@@ -40,7 +40,7 @@ pub struct SessionKey {
 #[derive(Clone, Debug)]
 pub struct PresentedFencingToken {
     pub block_id: Option<BlockId>,
-    pub owner: u64,
+    pub owner: types::ClientId,
     pub epoch: u64,
 }
 

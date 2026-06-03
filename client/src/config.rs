@@ -8,11 +8,15 @@ use std::path::Path;
 use std::time::Duration;
 use types::GroupName;
 
+pub const DEFAULT_CLIENT_NAME: &str = "default_client";
+
 /// Client-specific configuration.
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
     /// Underlying common client config.
     pub inner: CommonClientConfig,
+    /// Low-cardinality display identity carried in request headers.
+    pub client_name: String,
     /// Cache configuration.
     pub cache: CacheConfig,
     /// Retry configuration.
@@ -179,6 +183,7 @@ impl ClientConfig {
 
     /// Create from FlatConfig.
     pub fn from_flat(flat: FlatConfig) -> Result<Self, CommonError> {
+        let client_name = client_name_from_flat(&flat)?;
         let cache = cache_config_from_flat(&flat)?;
 
         let retry = retry_config_from_flat(&flat)?;
@@ -201,6 +206,7 @@ impl ClientConfig {
 
         Ok(Self {
             inner: CommonClientConfig::from_flat(flat),
+            client_name,
             cache,
             retry,
             refresh,
@@ -216,28 +222,23 @@ impl ClientConfig {
         &self.inner
     }
 
-    /// Return the configured non-zero client id for request headers.
-    pub fn client_id(&self) -> crate::error::ClientResult<types::ClientId> {
-        let flat = self.inner.as_flat();
-        let raw_id = if let Some(id) = flat.get_i64("client.id") {
-            id
-        } else if flat.contains_key("client.id") {
-            return Err(crate::error::ClientError::InvalidArgument(
-                "client.id must be an integer".to_string(),
-            ));
-        } else {
-            0
-        };
-        let id = u64::try_from(raw_id)
-            .map_err(|_| crate::error::ClientError::InvalidArgument("client.id must be non-negative".to_string()))?;
-        if id == 0 {
-            Err(crate::error::ClientError::InvalidArgument(
-                "client metadata operations require non-zero client.id".to_string(),
-            ))
-        } else {
-            Ok(types::ClientId::new(id))
-        }
+    /// Return the low-cardinality display identity used in request headers.
+    pub fn client_name(&self) -> &str {
+        &self.client_name
     }
+}
+
+fn client_name_from_flat(flat: &FlatConfig) -> Result<String, CommonError> {
+    if !flat.contains_key("client.name") {
+        return Ok(DEFAULT_CLIENT_NAME.to_string());
+    }
+    let name = flat
+        .get_str("client.name")
+        .ok_or_else(|| invalid_config("client.name", "must be a string"))?;
+    if name.trim().is_empty() {
+        return Err(invalid_config("client.name", "must not be blank"));
+    }
+    Ok(name)
 }
 
 fn cache_config_from_flat(flat: &FlatConfig) -> Result<CacheConfig, CommonError> {
@@ -505,12 +506,20 @@ mod tests {
     }
 
     #[test]
-    fn negative_client_identity_values_are_rejected() {
-        let mut flat = FlatConfig::new();
-        flat.set("client.id", -1i64);
-        let config = ClientConfig::from_flat(flat).expect("client.id is checked when request identity is needed");
-        let err = config.client_id().expect_err("negative client id must fail");
-        assert!(err.to_string().contains("client.id"));
+    fn client_name_defaults_preserves_nonblank_and_rejects_blank() {
+        assert_eq!(ClientConfig::default().client_name(), DEFAULT_CLIENT_NAME);
+
+        let mut named = FlatConfig::new();
+        named.set("client.name", " prod_ns01 ");
+        let config = ClientConfig::from_flat(named).expect("client name config");
+
+        assert_eq!(config.client_name(), " prod_ns01 ");
+
+        let mut blank = FlatConfig::new();
+        blank.set("client.name", "   ");
+        let err = ClientConfig::from_flat(blank).expect_err("blank client name must fail");
+
+        assert!(err.to_string().contains("client.name"));
     }
 
     #[test]

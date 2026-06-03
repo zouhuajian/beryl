@@ -11,12 +11,58 @@ use proto::common::{ClientInfoProto, RequestHeaderProto};
 use proto::worker::DataRequestHeaderProto;
 use types::{CallId, ClientId, GroupName};
 
+#[cfg(test)]
+use crate::config::DEFAULT_CLIENT_NAME;
 use crate::error::{ClientError, ClientResult};
 use crate::runtime::policy::{OperationKind, ReplaySafety};
 
 /// Stable operation fingerprint used to guard replay of mutations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct OperationFingerprint(u64);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClientIdentity {
+    client_id: ClientId,
+    client_name: String,
+}
+
+impl ClientIdentity {
+    pub(crate) fn generate(client_name: impl Into<String>) -> ClientResult<Self> {
+        Self::new_checked(ClientId::generate(), client_name)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts(client_id: ClientId, client_name: impl Into<String>) -> ClientResult<Self> {
+        Self::new_checked(client_id, client_name)
+    }
+
+    fn new_checked(client_id: ClientId, client_name: impl Into<String>) -> ClientResult<Self> {
+        if client_id.is_zero() {
+            return Err(ClientError::InvalidArgument(
+                "ClientIdentity requires non-zero client_id".to_string(),
+            ));
+        }
+        let client_name = client_name.into();
+        if client_name.trim().is_empty() {
+            return Err(ClientError::InvalidArgument(
+                "ClientIdentity requires non-blank client_name".to_string(),
+            ));
+        }
+        Ok(Self { client_id, client_name })
+    }
+
+    pub(crate) fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+
+    pub(crate) fn client_name(&self) -> &str {
+        &self.client_name
+    }
+
+    pub(crate) fn new_call_id(&self) -> CallId {
+        CallId::new()
+    }
+}
 
 /// Stable identity fields that define one logical public operation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -88,6 +134,7 @@ impl OperationIdentity {
 #[derive(Clone, Debug)]
 pub struct OperationContext {
     client_id: ClientId,
+    client_name: String,
     call_id: CallId,
     kind: OperationKind,
     operation_name: String,
@@ -98,29 +145,78 @@ pub struct OperationContext {
 
 impl OperationContext {
     /// Create a new logical operation with a fresh call id.
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         client_id: ClientId,
         kind: OperationKind,
         operation_name: impl Into<String>,
         identity: OperationIdentity,
     ) -> ClientResult<Self> {
-        Self::with_call_id(client_id, CallId::new(), kind, operation_name, identity)
+        Self::with_call_id_named(
+            client_id,
+            DEFAULT_CLIENT_NAME,
+            CallId::new(),
+            kind,
+            operation_name,
+            identity,
+        )
+    }
+
+    pub(crate) fn new_with_identity(
+        client_identity: &ClientIdentity,
+        kind: OperationKind,
+        operation_name: impl Into<String>,
+        identity: OperationIdentity,
+    ) -> ClientResult<Self> {
+        Self::with_call_id_named(
+            client_identity.client_id(),
+            client_identity.client_name(),
+            client_identity.new_call_id(),
+            kind,
+            operation_name,
+            identity,
+        )
+    }
+
+    pub(crate) fn new_named(
+        client_id: ClientId,
+        client_name: impl Into<String>,
+        kind: OperationKind,
+        operation_name: impl Into<String>,
+        identity: OperationIdentity,
+    ) -> ClientResult<Self> {
+        Self::with_call_id_named(client_id, client_name, CallId::new(), kind, operation_name, identity)
     }
 
     /// Create a logical operation with an explicit call id.
-    pub fn with_call_id(
+    #[cfg(test)]
+    pub(crate) fn with_call_id(
         client_id: ClientId,
         call_id: CallId,
         kind: OperationKind,
         operation_name: impl Into<String>,
         identity: OperationIdentity,
     ) -> ClientResult<Self> {
+        Self::with_call_id_named(client_id, DEFAULT_CLIENT_NAME, call_id, kind, operation_name, identity)
+    }
+
+    pub(crate) fn with_call_id_named(
+        client_id: ClientId,
+        client_name: impl Into<String>,
+        call_id: CallId,
+        kind: OperationKind,
+        operation_name: impl Into<String>,
+        identity: OperationIdentity,
+    ) -> ClientResult<Self> {
         validate_client_id(client_id)?;
+        let client_name = client_name.into();
+        validate_client_name(&client_name)?;
         let operation_name = operation_name.into();
         let replay_safety = crate::runtime::policy::ReplayPolicyTable::safety_for(kind);
         let operation_fingerprint = identity.fingerprint(kind, &operation_name);
         Ok(Self {
             client_id,
+            client_name,
             call_id,
             kind,
             operation_name,
@@ -130,16 +226,16 @@ impl OperationContext {
         })
     }
 
-    /// Create a logical operation with an explicit call id and expected fingerprint.
-    pub(crate) fn with_call_id_and_fingerprint(
+    pub(crate) fn with_call_id_named_and_fingerprint(
         client_id: ClientId,
+        client_name: impl Into<String>,
         call_id: CallId,
         kind: OperationKind,
         operation_name: impl Into<String>,
         identity: OperationIdentity,
         expected_fingerprint: OperationFingerprint,
     ) -> ClientResult<Self> {
-        let operation = Self::with_call_id(client_id, call_id, kind, operation_name, identity)?;
+        let operation = Self::with_call_id_named(client_id, client_name, call_id, kind, operation_name, identity)?;
         if operation.operation_fingerprint != expected_fingerprint {
             return Err(ClientError::InvalidArgument(
                 "operation fingerprint changed for stable call_id".to_string(),
@@ -308,8 +404,8 @@ impl AttemptContext {
     pub fn client_info(&self) -> ClientInfoProto {
         ClientInfoProto {
             call_id: self.call_id_text.clone(),
-            client_id: self.operation.client_id.as_raw(),
-            client_name: String::new(),
+            client_id: Some(self.operation.client_id.into()),
+            client_name: self.operation.client_name.clone(),
         }
     }
 
@@ -319,7 +415,7 @@ impl AttemptContext {
             .group_name
             .as_ref()
             .ok_or_else(|| ClientError::InvalidArgument("metadata AttemptContext missing group_name".to_string()))?;
-        if self.operation.client_id.as_raw() == 0 {
+        if self.operation.client_id.is_zero() {
             return Err(ClientError::InvalidArgument(
                 "metadata AttemptContext requires non-zero client_id".to_string(),
             ));
@@ -351,9 +447,19 @@ impl AttemptContext {
 }
 
 fn validate_client_id(client_id: ClientId) -> ClientResult<()> {
-    if client_id.as_raw() == 0 {
+    if client_id.is_zero() {
         Err(ClientError::InvalidArgument(
             "AttemptContext requires non-zero client_id".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_client_name(client_name: &str) -> ClientResult<()> {
+    if client_name.trim().is_empty() {
+        Err(ClientError::InvalidArgument(
+            "AttemptContext requires non-blank client_name".to_string(),
         ))
     } else {
         Ok(())
@@ -404,9 +510,32 @@ mod tests {
     }
 
     #[test]
+    fn metadata_header_carries_runtime_client_identity() {
+        let identity = ClientIdentity::from_parts(ClientId::new(7), "prod_ns01").expect("client identity");
+        let operation = OperationContext::new_with_identity(
+            &identity,
+            OperationKind::MetadataRead,
+            "OpenFile",
+            OperationIdentity::path("/alpha"),
+        )
+        .expect("operation context");
+        let ctx =
+            AttemptContext::for_metadata(&operation, GroupName::parse("root").unwrap(), 0).expect("metadata context");
+
+        let header = ctx.metadata_header().expect("metadata header");
+        let client = header.client.as_ref().expect("client info");
+        let header_client_id = proto::convert::required_client_id(client.client_id, "client_id").expect("client id");
+
+        assert_eq!(header_client_id, identity.client_id());
+        assert_eq!(client.client_name, identity.client_name());
+        assert!(!client.call_id.is_empty());
+    }
+
+    #[test]
     fn attempt_context_rejects_zero_client_id() {
         let invalid_operation = OperationContext {
-            client_id: ClientId::new(0),
+            client_id: ClientId::new(u128::MIN),
+            client_name: "default_client".to_string(),
             call_id: CallId::new(),
             kind: OperationKind::MetadataRead,
             operation_name: "OpenFile".to_string(),

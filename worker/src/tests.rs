@@ -99,7 +99,7 @@ mod tests {
     fn test_token_proto() -> FencingTokenProto {
         FencingTokenProto {
             block_id: Some(test_block_id_proto()),
-            owner: 9,
+            owner: Some(ClientId::new(9).into()),
             epoch: 11,
         }
     }
@@ -108,7 +108,7 @@ mod tests {
         DataRequestHeaderProto {
             client: Some(ClientInfoProto {
                 call_id: "call-1".to_string(),
-                client_id: 9,
+                client_id: Some(ClientId::new(9).into()),
                 client_name: "worker-test".to_string(),
             }),
             traceparent: String::new(),
@@ -358,6 +358,13 @@ mod tests {
             mount_epoch: None,
             route_epoch: None,
         }
+    }
+
+    fn control_request_identity(header: &proto::common::RequestHeaderProto) -> (ClientId, String) {
+        let client = header.client.as_ref().expect("client info");
+        let client_id = proto::convert::required_client_id(client.client_id, "client_id").expect("client_id");
+        assert!(!client_id.is_zero());
+        (client_id, client.call_id.clone())
     }
 
     async fn start_mock_metadata(
@@ -634,6 +641,20 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].worker_run_id, worker_run_id.to_string());
         assert_eq!(requests[1].worker_run_id, worker_run_id.to_string());
+        let first_header = requests[0].header.as_ref().expect("first header");
+        let second_header = requests[1].header.as_ref().expect("second header");
+        let first_client = first_header.client.as_ref().expect("first client info");
+        let second_client = second_header.client.as_ref().expect("second client info");
+        let first_client_id =
+            proto::convert::required_client_id(first_client.client_id, "client_id").expect("client id");
+        let second_client_id =
+            proto::convert::required_client_id(second_client.client_id, "client_id").expect("client id");
+
+        assert_ne!(first_client_id.as_raw(), 0);
+        assert_eq!(first_client_id, second_client_id);
+        assert_eq!(first_client.call_id, second_client.call_id);
+        assert_eq!(first_header.retry_count, 0);
+        assert_eq!(second_header.retry_count, 1);
         shutdown.send(()).ok();
     }
 
@@ -742,12 +763,14 @@ mod tests {
         assert_eq!(round.attempted_peers, 2);
         assert_eq!(round.accepted_peers, 2);
         assert!(state.is_ready(&group_name()));
+        let mut identities = Vec::new();
         for mock in [&mock_a, &mock_b] {
             let requests = mock.heartbeat_requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
             let request = &requests[0];
             assert_eq!(request.group_name, group_name().as_str());
             assert_eq!(request.header.as_ref().expect("header").group_name, request.group_name);
+            identities.push(control_request_identity(request.header.as_ref().expect("header")));
             assert_eq!(request.worker_id, 42);
             assert_eq!(request.worker_run_id, worker_run_id.to_string());
             assert_eq!(request.heartbeat_seq, 1);
@@ -761,8 +784,49 @@ mod tests {
                 })
             );
         }
+        assert_eq!(identities[0], identities[1]);
         shutdown_a.send(()).ok();
         shutdown_b.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_ticks_reuse_runtime_client_id_with_new_call_id() {
+        let worker_run_id = test_worker_run_id();
+        let (endpoint, mock, shutdown) = start_mock_metadata_with_heartbeat(Vec::new()).await;
+        let state = Arc::new(RegistrationSet::new());
+        state.record_registered(Registration {
+            group_name: group_name(),
+            worker_id: WorkerId::new(42),
+            worker_run_id,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        });
+        let heartbeat = MetadataHeartbeatLoop::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+        )
+        .expect("heartbeat loop");
+
+        heartbeat
+            .send_once(HeartbeatSnapshot::default())
+            .await
+            .expect("first heartbeat");
+        heartbeat
+            .send_once(HeartbeatSnapshot::default())
+            .await
+            .expect("second heartbeat");
+
+        let requests = mock.heartbeat_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let (first_client_id, first_call_id) =
+            control_request_identity(requests[0].header.as_ref().expect("first header"));
+        let (second_client_id, second_call_id) =
+            control_request_identity(requests[1].header.as_ref().expect("second header"));
+        assert_eq!(first_client_id, second_client_id);
+        assert_ne!(first_call_id, second_call_id);
+        assert_eq!(requests[0].heartbeat_seq, 1);
+        assert_eq!(requests[1].heartbeat_seq, 2);
+        shutdown.send(()).ok();
     }
 
     #[tokio::test]
@@ -1133,6 +1197,12 @@ mod tests {
             requests[0].header.as_ref().expect("header").group_name,
             requests[0].group_name
         );
+        let (first_client_id, first_call_id) =
+            control_request_identity(requests[0].header.as_ref().expect("first header"));
+        let (second_client_id, second_call_id) =
+            control_request_identity(requests[1].header.as_ref().expect("second header"));
+        assert_eq!(first_client_id, second_client_id);
+        assert_ne!(first_call_id, second_call_id);
         assert_eq!(requests[0].worker_id, 42);
         assert_eq!(requests[0].worker_run_id, worker_run_id.to_string());
         match requests[0].report.as_ref().expect("first report") {
@@ -1421,7 +1491,12 @@ mod tests {
         assert!(delta.full_report_required);
         assert!(!reporter.has_delta_baseline(&group_name()));
         let requests = mock.block_report_requests.lock().unwrap();
+        let (full_client_id, full_call_id) =
+            control_request_identity(requests[0].header.as_ref().expect("full header"));
         let request = requests.last().expect("delta report request");
+        let (delta_client_id, delta_call_id) = control_request_identity(request.header.as_ref().expect("delta header"));
+        assert_eq!(full_client_id, delta_client_id);
+        assert_ne!(full_call_id, delta_call_id);
         assert_eq!(request.header.as_ref().expect("header").group_name, request.group_name);
         assert!(matches!(
             request.report.as_ref(),

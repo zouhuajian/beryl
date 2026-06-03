@@ -739,7 +739,7 @@ fn validate_fencing_token_shape(block_id: BlockId, token: FencingToken) -> Worke
     if token.epoch == 0 {
         return Err(WorkerError::Fencing("fencing token epoch must be non-zero".to_string()));
     }
-    if token.owner.as_raw() == 0 {
+    if token.owner.is_zero() {
         return Err(WorkerError::Fencing("fencing token owner must be present".to_string()));
     }
     Ok(())

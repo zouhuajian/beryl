@@ -3,12 +3,13 @@
 
 //! FileSystemService Msync handler.
 
+use super::core_util::{header_from_canonical_error, ok_header_from_request};
 use crate::raft::AppRaftNode;
 use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode, RefreshReason};
-use common::header::{ClientInfo, RequestHeader, ResponseHeader, RpcErrorCode};
+use common::header::{RequestHeader, RpcErrorCode};
 use proto::metadata::{MsyncRequestProto, MsyncResponseProto};
 use std::sync::Arc;
-use types::{ClientId, GroupName, GroupStateWatermark};
+use types::{GroupName, GroupStateWatermark};
 
 /// Handles metadata state sync for one local metadata raft group.
 pub struct MsyncHandler {
@@ -24,17 +25,17 @@ impl MsyncHandler {
 
     /// Handle one Msync request using application-level response errors.
     pub fn handle(&self, req: MsyncRequestProto) -> MsyncResponseProto {
-        let header = match Self::parse_header(req.header) {
+        let req_header = req.header;
+        let header = match Self::parse_header(req_header.clone()) {
             Ok(header) => header,
-            Err((client, message)) => {
-                return Self::error_response(client, None, Self::fatal_invalid_header(message));
+            Err(canonical) => {
+                return Self::error_response(&req_header, None, canonical);
             }
         };
-        let client = header.client.clone();
 
-        let Some(header_group_name) = header.group_name else {
+        let Some(header_group_name) = header.group_name.clone() else {
             return Self::error_response(
-                client,
+                &req_header,
                 None,
                 Self::fatal_invalid_header("MsyncRequestProto requires header.group_name"),
             );
@@ -48,7 +49,7 @@ impl MsyncHandler {
                     header_group_name
                 ),
             );
-            return Self::error_response(client, Some(header_group_name), canonical);
+            return Self::error_response(&req_header, Some(header_group_name), canonical);
         }
 
         if !self.raft_node.is_leader() {
@@ -57,7 +58,7 @@ impl MsyncHandler {
                 RefreshReason::NotLeader,
                 "msync requires leader",
             );
-            return Self::error_response(client, Some(header_group_name), canonical);
+            return Self::error_response(&req_header, Some(header_group_name), canonical);
         }
 
         let Some(last_applied) = self.raft_node.get_last_applied_state_id() else {
@@ -66,26 +67,25 @@ impl MsyncHandler {
                 Some(10),
                 "last_applied_log_id is not available for msync",
             );
-            return Self::error_response(client, Some(header_group_name), canonical);
+            return Self::error_response(&req_header, Some(header_group_name), canonical);
         };
 
         let authoritative = GroupStateWatermark::new(self.group_name.clone(), last_applied);
         MsyncResponseProto {
-            header: Some((&ResponseHeader::ok(client).with_group_name(self.group_name.clone())).into()),
+            header: Some(ok_header_from_request(&req_header, Some(self.group_name.clone()), None)),
             state: Some((&authoritative).into()),
         }
     }
 
     /// Return a structured application error for test-only services built without raft.
     pub fn unavailable(req: MsyncRequestProto) -> MsyncResponseProto {
-        let client = client_from_proto(req.header.as_ref());
         let group_name = req
             .header
             .as_ref()
             .and_then(|header| (!header.group_name.is_empty()).then_some(header.group_name.as_str()))
             .and_then(|group_name| GroupName::parse(group_name).ok());
         Self::error_response(
-            client,
+            &req.header,
             group_name,
             CanonicalError::retryable(
                 RpcErrorCode::NodeUnavailable,
@@ -95,28 +95,22 @@ impl MsyncHandler {
         )
     }
 
-    fn parse_header(proto: Option<proto::common::RequestHeaderProto>) -> Result<RequestHeader, (ClientInfo, String)> {
+    #[allow(clippy::result_large_err)]
+    fn parse_header(proto: Option<proto::common::RequestHeaderProto>) -> Result<RequestHeader, CanonicalError> {
         let Some(proto) = proto else {
-            return Err((
-                ClientInfo::new(ClientId::new(0)),
-                "MsyncRequestProto requires RequestHeader".to_string(),
-            ));
+            return Err(Self::fatal_invalid_header("MsyncRequestProto requires RequestHeader"));
         };
-        let client = client_from_proto(Some(&proto));
-        RequestHeader::try_from(proto).map_err(|err| (client, format!("invalid Msync RequestHeader: {err}")))
+        RequestHeader::try_from(proto)
+            .map_err(|err| Self::fatal_invalid_header(format!("invalid Msync RequestHeader: {err}")))
     }
 
     fn error_response(
-        client: ClientInfo,
+        req_header: &Option<proto::common::RequestHeaderProto>,
         group_name: Option<GroupName>,
         canonical: CanonicalError,
     ) -> MsyncResponseProto {
-        let mut header = ResponseHeader::from_canonical(client, canonical);
-        if let Some(group_name) = group_name {
-            header.group_name = Some(group_name);
-        }
         MsyncResponseProto {
-            header: Some((&header).into()),
+            header: Some(header_from_canonical_error(req_header, group_name, None, &canonical)),
             state: None,
         }
     }
@@ -131,11 +125,4 @@ impl MsyncHandler {
             refresh_hint: None,
         }
     }
-}
-
-fn client_from_proto(header: Option<&proto::common::RequestHeaderProto>) -> ClientInfo {
-    header
-        .and_then(|header| header.client.clone())
-        .and_then(|client| ClientInfo::try_from(client).ok())
-        .unwrap_or_else(|| ClientInfo::new(ClientId::new(0)))
 }

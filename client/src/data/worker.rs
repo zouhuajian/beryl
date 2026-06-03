@@ -921,7 +921,7 @@ fn validate_block_for_worker_control(block: &WorkerWriteBlock) -> ClientResult<(
 fn validate_fencing_token(target: &WriteTarget) -> ClientResult<()> {
     let block = target.block_id;
     let token = target.fencing_token;
-    if token.owner.as_raw() == 0 || token.epoch == 0 {
+    if token.owner.is_zero() || token.epoch == 0 {
         return Err(ClientError::InvalidLayout(
             "write target fencing_token owner and epoch must be non-zero".to_string(),
         ));
@@ -1010,12 +1010,9 @@ fn parse_worker_control_header(
     let client = header.client.as_ref().ok_or_else(|| {
         invalid_worker_header("worker OK response invalid DataResponseHeader: missing client identity")
     })?;
-    if client.client_id == 0 {
-        return Err(invalid_worker_header(
-            "worker OK response invalid DataResponseHeader: client_id must be non-zero",
-        ));
-    }
-    if client.client_id != ctx.client_id().as_raw() {
+    let client_id = proto::convert::required_client_id(client.client_id, "client_id")
+        .map_err(|err| invalid_worker_header(format!("worker OK response invalid DataResponseHeader: {err}")))?;
+    if client_id != ctx.client_id() {
         return Err(invalid_worker_header(
             "worker OK response invalid DataResponseHeader: client_id mismatch",
         ));
@@ -1494,7 +1491,10 @@ mod tests {
         );
         assert_eq!(request.worker_run_id, test_worker_run_id().to_string());
         assert_eq!(request.effective_block_len, 5);
-        assert_eq!(request.token.as_ref().map(|token| token.owner), Some(7));
+        assert_eq!(
+            request.token.as_ref().and_then(|token| token.owner),
+            Some(ClientId::new(7).into())
+        );
     }
 
     #[test]
@@ -1543,7 +1543,10 @@ mod tests {
         assert_eq!(request.chunk_size, 4096);
         assert_eq!(request.commit_seq, 1);
         assert!(!request.require_sync);
-        assert_eq!(request.token.as_ref().map(|token| token.owner), Some(7));
+        assert_eq!(
+            request.token.as_ref().and_then(|token| token.owner),
+            Some(ClientId::new(7).into())
+        );
     }
 
     #[test]
@@ -1626,7 +1629,7 @@ mod tests {
     fn worker_control_header_with_wrong_client_id_is_invalid_header() {
         let ctx = write_attempt_context();
         let mut header = ok_data_header(&ctx);
-        header.client.as_mut().expect("client").client_id = ctx.client_id().as_raw() + 1;
+        header.client.as_mut().expect("client").client_id = Some(ClientId::new(ctx.client_id().as_raw() + 1).into());
 
         let err = parse_worker_control_header(&ctx, Some(&header)).expect_err("wrong client_id must fail");
 

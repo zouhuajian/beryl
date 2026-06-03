@@ -22,10 +22,10 @@ use tokio::time;
 use tonic::transport::Endpoint;
 use tonic::Code;
 use tracing::{debug, warn};
-use types::{BlockId, ClientId, GroupName};
+use types::{BlockId, GroupName};
 
 use crate::config::WorkerRegistrationConfig;
-use crate::control::{Registration, RegistrationDescriptor, RegistrationSet};
+use crate::control::{ControlIdentity, ControlOp, Registration, RegistrationDescriptor, RegistrationSet};
 use crate::observe;
 use crate::store::block::{BlockMetaPayload, BlockState, FullBlockFileStore};
 
@@ -79,6 +79,7 @@ pub struct MetadataBlockReportLoop {
     endpoints: Vec<Endpoint>,
     store: Arc<FullBlockFileStore>,
     options: BlockReportOptions,
+    control_identity: ControlIdentity,
     baselines: Mutex<HashMap<GroupName, ReportBaseline>>,
 }
 
@@ -128,6 +129,7 @@ impl MetadataBlockReportLoop {
             endpoints,
             store,
             options,
+            control_identity: ControlIdentity::new_local(),
             baselines: Mutex::new(HashMap::new()),
         })
     }
@@ -416,8 +418,11 @@ impl MetadataBlockReportLoop {
             } else {
                 Vec::new()
             };
+            // Each batch is submitted once here. If retry is added, create this op before
+            // the retry loop and preserve it across attempts, changing only retry_count.
+            let op = self.control_identity.new_op();
             let request = BlockReportRequestProto {
-                header: Some(block_report_request_header(&registration.group_name)),
+                header: Some(block_report_request_header(&registration.group_name, &op)),
                 worker_id: registration.worker_id.as_raw(),
                 worker_run_id: registration.worker_run_id.to_string(),
                 report_seq,
@@ -456,8 +461,10 @@ impl MetadataBlockReportLoop {
             .map_err(|_| BlockReportError::Retryable("metadata delta report connect timed out".to_string()))?
             .map_err(|err| BlockReportError::Retryable(format!("metadata delta report endpoint unavailable: {err}")))?;
         let mut client = MetadataWorkerServiceProtoClient::new(channel);
+        // The delta RPC is submitted once here. If retry is added, reuse this op across attempts.
+        let op = self.control_identity.new_op();
         let request = BlockReportRequestProto {
-            header: Some(block_report_request_header(&registration.group_name)),
+            header: Some(block_report_request_header(&registration.group_name, &op)),
             worker_id: registration.worker_id.as_raw(),
             worker_run_id: registration.worker_run_id.to_string(),
             report_seq,
@@ -610,8 +617,8 @@ fn classify_status(status: tonic::Status) -> BlockReportError {
     }
 }
 
-fn block_report_request_header(group_name: &GroupName) -> RequestHeaderProto {
-    let client_id = u64::from(std::process::id()).max(1);
-    let header = RequestHeader::new(ClientId::new(client_id)).with_group_name(group_name.clone());
+fn block_report_request_header(group_name: &GroupName, op: &ControlOp) -> RequestHeaderProto {
+    let mut header = RequestHeader::new(op.client_id).with_group_name(group_name.clone());
+    header.client.call_id = op.call_id;
     (&header).into()
 }

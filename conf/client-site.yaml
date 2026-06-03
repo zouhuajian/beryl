@@ -5,8 +5,8 @@
 # This file intentionally contains only keys consumed by the current client
 # runtime.
 
-# Client identity and metadata bootstrap targets.
-client.id: 1
+# Client display identity and metadata bootstrap targets.
+client.name: "default_client"
 client.metadata.endpoints: "127.0.0.1:18080"
 client.metadata.group.names: "root"
 

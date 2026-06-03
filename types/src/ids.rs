@@ -265,14 +265,71 @@ impl fmt::Display for RequestId {
     }
 }
 
-id_new_uint!(
-  /// Client ID for tracing across services.
-  ClientId(u64)
-);
+/// Internal client runtime identity.
+///
+/// This is generated when a client runtime is created. Display names belong in
+/// client_name and must not be used as a correctness identity.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ClientId(u128);
+
+impl ClientId {
+    /// Creates a new ID from a raw value.
+    #[inline]
+    pub const fn new(v: u128) -> Self {
+        Self(v)
+    }
+
+    /// Generates a non-zero 128-bit client identity.
+    pub fn generate() -> Self {
+        loop {
+            let value = Uuid::new_v4().as_u128();
+            if value != 0 {
+                return Self(value);
+            }
+        }
+    }
+
+    /// Returns the inner value.
+    #[inline]
+    pub const fn as_raw(self) -> u128 {
+        self.0
+    }
+
+    /// Returns true when the identity is the invalid all-zero value.
+    #[inline]
+    pub const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl fmt::Debug for ClientId {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ClientId")
+            .field(&format_args!("0x{:032x}", self.0))
+            .finish()
+    }
+}
+
+impl From<u128> for ClientId {
+    #[inline]
+    fn from(v: u128) -> Self {
+        Self(v)
+    }
+}
+
+impl From<ClientId> for u128 {
+    #[inline]
+    fn from(v: ClientId) -> Self {
+        v.0
+    }
+}
 
 impl fmt::Display for ClientId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "0x{:032x}", self.0)
     }
 }
 

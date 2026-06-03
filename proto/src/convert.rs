@@ -99,6 +99,28 @@ impl TryFrom<proto_common::WorkerIdProto> for WorkerId {
     }
 }
 
+impl From<ClientId> for proto_common::ClientIdProto {
+    fn from(id: ClientId) -> Self {
+        let value = id.as_raw();
+        proto_common::ClientIdProto {
+            high: (value >> 64) as u64,
+            low: value as u64,
+        }
+    }
+}
+
+impl TryFrom<proto_common::ClientIdProto> for ClientId {
+    type Error = String;
+
+    fn try_from(id: proto_common::ClientIdProto) -> Result<Self, Self::Error> {
+        let value = ((id.high as u128) << 64) | (id.low as u128);
+        if value == 0 {
+            return Err("client_id must be non-zero".to_string());
+        }
+        Ok(ClientId::new(value))
+    }
+}
+
 impl From<StreamId> for proto_common::StreamIdProto {
     fn from(id: StreamId) -> Self {
         let value = id.as_raw();
@@ -179,6 +201,14 @@ pub fn required_stream_id(proto: Option<proto_common::StreamIdProto>, field_name
         .ok_or_else(|| format!("missing {field_name}"))?
         .try_into()
         .map_err(|_| format!("invalid {field_name}"))
+}
+
+/// Parse a required client id field without choosing caller error policy.
+pub fn required_client_id(proto: Option<proto_common::ClientIdProto>, field_name: &str) -> Result<ClientId, String> {
+    proto
+        .ok_or_else(|| format!("missing {field_name}"))?
+        .try_into()
+        .map_err(|err| format!("invalid {field_name}: {err}"))
 }
 
 impl From<ByteRange> for proto_common::ByteRangeProto {
@@ -307,7 +337,7 @@ impl From<FencingToken> for proto_common::FencingTokenProto {
     fn from(token: FencingToken) -> Self {
         proto_common::FencingTokenProto {
             block_id: Some(token.block_id.into()),
-            owner: token.owner.as_raw(),
+            owner: Some(token.owner.into()),
             epoch: token.epoch,
         }
     }
@@ -318,7 +348,8 @@ impl TryFrom<proto_common::FencingTokenProto> for FencingToken {
 
     fn try_from(token: proto_common::FencingTokenProto) -> Result<Self, Self::Error> {
         let block_id = required_block_id(token.block_id, "block_id in token")?;
-        Ok(FencingToken::new(block_id, ClientId::new(token.owner), token.epoch))
+        let owner = required_client_id(token.owner, "owner in token")?;
+        Ok(FencingToken::new(block_id, owner, token.epoch))
     }
 }
 
@@ -469,7 +500,7 @@ impl TryFrom<proto_metadata::WriteTargetProto> for WriteTarget {
         if fencing_token.block_id != block_id {
             return Err("WriteTargetProto.fencing_token block_id must match block_id".to_string());
         }
-        if fencing_token.owner.as_raw() == 0 || fencing_token.epoch == 0 {
+        if fencing_token.owner.is_zero() || fencing_token.epoch == 0 {
             return Err("WriteTargetProto.fencing_token owner and epoch must be non-zero".to_string());
         }
         let worker_endpoints = target
@@ -710,7 +741,7 @@ impl TryFrom<proto_common::ClientInfoProto> for ClientInfo {
 
     fn try_from(proto: proto_common::ClientInfoProto) -> Result<Self, Self::Error> {
         let call_id = CallId::from_str(&proto.call_id).map_err(|e| format!("Invalid call_id: {}", e))?;
-        let client_id = ClientId::new(proto.client_id);
+        let client_id = required_client_id(proto.client_id, "client_id")?;
         let client_name = if proto.client_name.is_empty() {
             None
         } else {
@@ -729,7 +760,7 @@ impl From<&ClientInfo> for proto_common::ClientInfoProto {
     fn from(info: &ClientInfo) -> Self {
         proto_common::ClientInfoProto {
             call_id: info.call_id.to_string(),
-            client_id: info.client_id.as_raw(),
+            client_id: Some(info.client_id.into()),
             client_name: info.client_name.clone().unwrap_or_default(),
         }
     }
@@ -1737,6 +1768,22 @@ mod tests {
     }
 
     #[test]
+    fn client_id_proto_roundtrips_128_bit_value_and_rejects_zero() {
+        let raw_client_id = 0x0102_0304_0506_0708_1112_1314_1516_1718u128;
+        let client_id = ClientId::new(raw_client_id);
+
+        let proto: proto_common::ClientIdProto = client_id.into();
+        let decoded = ClientId::try_from(proto).expect("client id decode");
+
+        assert_eq!(decoded, client_id);
+
+        let err =
+            ClientId::try_from(proto_common::ClientIdProto { high: 0, low: 0 }).expect_err("zero client id must fail");
+
+        assert!(err.contains("client_id"));
+    }
+
+    #[test]
     fn test_response_header_proto_to_canonical_need_refresh() {
         use common::error::canonical::ErrorCode as CanonicalErrorCode;
         use common::header::RpcStatus;
@@ -1744,7 +1791,7 @@ mod tests {
         let proto_header = proto_common::ResponseHeaderProto {
             client: Some(proto_common::ClientInfoProto {
                 call_id: types::CallId::new().to_string(),
-                client_id: 99,
+                client_id: Some(ClientId::new(99).into()),
                 client_name: String::new(),
             }),
             error: Some(proto_common::ErrorDetailProto {
@@ -1836,7 +1883,7 @@ mod tests {
 
         let missing_block = proto_common::FencingTokenProto {
             block_id: None,
-            owner: 7,
+            owner: Some(ClientId::new(7).into()),
             epoch: 11,
         };
         let missing_block =

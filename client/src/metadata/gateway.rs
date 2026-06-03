@@ -484,16 +484,16 @@ fn validate_metadata_response_identity(
             "metadata OK response invalid ResponseHeader: missing client identity",
         ))
     })?;
-    if client.client_id == 0 {
-        return Err(ClientError::from(invalid_header_action(
-            "metadata OK response invalid ResponseHeader: client_id must be non-zero",
-        )));
-    }
-    if client.client_id != ctx.client_id().as_raw() {
+    let client_id = proto::convert::required_client_id(client.client_id, "client_id").map_err(|err| {
+        ClientError::from(invalid_header_action(format!(
+            "metadata OK response invalid ResponseHeader: {err}"
+        )))
+    })?;
+    if client_id != ctx.client_id() {
         return Err(ClientError::from(invalid_header_action(format!(
             "metadata OK response invalid ResponseHeader: client_id mismatch: expected {}, got {}",
-            ctx.client_id().as_raw(),
-            client.client_id
+            ctx.client_id(),
+            client_id
         ))));
     }
     if client.call_id.is_empty() {
@@ -752,7 +752,7 @@ mod tests {
         let header = proto::common::ResponseHeaderProto {
             client: Some(proto::common::ClientInfoProto {
                 call_id: types::CallId::new().to_string(),
-                client_id: 7,
+                client_id: Some(types::ClientId::new(7).into()),
                 client_name: "test".to_string(),
             }),
             error: None,
@@ -795,7 +795,7 @@ mod tests {
     fn metadata_response_header_with_wrong_client_id_is_invalid_header_action() {
         let ctx = metadata_attempt("root", None);
         let mut header = ok_metadata_header(&ctx);
-        header.client.as_mut().expect("client").client_id = ctx.client_id().as_raw() + 1;
+        header.client.as_mut().expect("client").client_id = Some(ClientId::new(ctx.client_id().as_raw() + 1).into());
 
         let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("wrong client_id must fail");
 

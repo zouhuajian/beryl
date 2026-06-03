@@ -70,12 +70,12 @@ impl LeadershipChecker for NotLeader {
     }
 }
 
-fn header(client_id: u64) -> Option<RequestHeaderProto> {
+fn header(client_id: u128) -> Option<RequestHeaderProto> {
     Some((&RequestHeader::new(ClientId::new(client_id))).into())
 }
 
 fn header_with_freshness(
-    client_id: u64,
+    client_id: u128,
     mount_epoch: Option<u64>,
     route_epoch: Option<u64>,
     state: Vec<GroupStateWatermarkProto>,
@@ -386,7 +386,7 @@ fn worker_manager_for_write_targets() -> Arc<WorkerManager> {
 async fn open_write_session_with_committed_block(
     env: &PathTestEnv,
     path: &str,
-    client_id: u64,
+    client_id: u128,
 ) -> (WriteHandleProto, u64, CommittedBlockProto) {
     let create = FileSystemServiceProto::create_file(
         &env.service,
@@ -902,7 +902,7 @@ async fn sync_write_valid_request_publishes_prefix_and_keeps_session_open() {
         let response = FileSystemServiceProto::sync_write(
             &env.service,
             Request::new(SyncWriteRequestProto {
-                header: header(52 + idx as u64),
+                header: header(52 + idx as u128),
                 write_handle: Some(write_handle),
                 data_handle_id: Some(DataHandleIdProto { value: data_handle_id }),
                 committed_blocks: vec![committed.clone()],

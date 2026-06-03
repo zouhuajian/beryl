@@ -17,6 +17,7 @@ pub mod refresh;
 
 pub(crate) use backoff::{BackoffPolicy, BackoffSleeper, TokioBackoffSleeper};
 pub use classify::{ErrorClass, ErrorClassifier, RefreshReason};
+pub(crate) use context::ClientIdentity;
 pub use context::{AttemptContext, OperationContext, OperationIdentity};
 pub(crate) use decision::{RetryDecision, RetryDecisionInput};
 pub(crate) use executor::{OperationExecutor, OperationRuntime};

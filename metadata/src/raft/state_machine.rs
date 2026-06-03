@@ -2520,7 +2520,7 @@ mod tests {
         GroupName::parse(raw).unwrap()
     }
 
-    fn dedup_for_test(client: u64) -> crate::raft::types::DedupKey {
+    fn dedup_for_test(client: u128) -> crate::raft::types::DedupKey {
         crate::raft::types::DedupKey::new(ClientId::new(client), CallId::new())
     }
 

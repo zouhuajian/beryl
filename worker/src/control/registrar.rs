@@ -19,10 +19,10 @@ use tokio::time;
 use tonic::transport::{Channel, Endpoint};
 use tonic::Code;
 use tracing::{info, warn};
-use types::{ClientId, GroupName, WorkerId, WorkerRunId};
+use types::{GroupName, WorkerId, WorkerRunId};
 
 use crate::config::{WorkerConfig, WorkerRegistrationConfig};
-use crate::control::{Registration, RegistrationSet};
+use crate::control::{ControlIdentity, ControlOp, Registration, RegistrationSet};
 use crate::net::protocol::WorkerNetProtocol;
 
 /// Worker descriptor sent to metadata during startup registration.
@@ -58,6 +58,7 @@ pub struct MetadataRegistrar {
     descriptor: RegistrationDescriptor,
     state: Arc<RegistrationSet>,
     endpoint: Endpoint,
+    control_identity: ControlIdentity,
 }
 
 impl MetadataRegistrar {
@@ -81,6 +82,7 @@ impl MetadataRegistrar {
             descriptor,
             state,
             endpoint,
+            control_identity: ControlIdentity::new_local(),
         })
     }
 
@@ -115,10 +117,15 @@ impl MetadataRegistrar {
     }
 
     pub async fn register_once(&self) -> Result<Registration, RegistrationError> {
+        let op = self.control_identity.new_op();
+        self.register_once_with_op(&op, 0).await
+    }
+
+    async fn register_once_with_op(&self, op: &ControlOp, retry_count: i32) -> Result<Registration, RegistrationError> {
         let timeout = Duration::from_millis(self.config.register_timeout_ms);
         let channel = self.connect(timeout).await?;
         let mut client = MetadataWorkerServiceProtoClient::new(channel);
-        let request = self.build_request();
+        let request = self.build_request(op, retry_count);
         let response = time::timeout(timeout, client.register_worker(tonic::Request::new(request)))
             .await
             .map_err(|_| RegistrationError::Retryable("metadata register request timed out".to_string()))?
@@ -137,9 +144,11 @@ impl MetadataRegistrar {
         tokio::pin!(shutdown);
         let mut backoff = Duration::from_millis(self.config.register_retry_initial_backoff_ms);
         let max_backoff = Duration::from_millis(self.config.register_retry_max_backoff_ms);
+        let op = self.control_identity.new_op();
+        let mut retry_count = 0i32;
 
         loop {
-            match self.register_once().await {
+            match self.register_once_with_op(&op, retry_count).await {
                 Ok(registration) => {
                     info!(
                         group_name = %registration.group_name,
@@ -160,6 +169,7 @@ impl MetadataRegistrar {
                         _ = &mut shutdown => return Err(RegistrationError::Cancelled),
                     }
                     backoff = (backoff * 2).min(max_backoff);
+                    retry_count = retry_count.saturating_add(1);
                 }
                 Err(error) => return Err(error),
             }
@@ -173,9 +183,13 @@ impl MetadataRegistrar {
             .map_err(|err| RegistrationError::Retryable(format!("metadata endpoint unavailable: {err}")))
     }
 
-    fn build_request(&self) -> RegisterWorkerRequestProto {
+    fn build_request(&self, op: &ControlOp, retry_count: i32) -> RegisterWorkerRequestProto {
         RegisterWorkerRequestProto {
-            header: Some(registration_request_header(&self.descriptor.group_name)),
+            header: Some(registration_request_header(
+                &self.descriptor.group_name,
+                op,
+                retry_count,
+            )),
             worker_id: self.descriptor.worker_id.as_raw(),
             worker_run_id: self.descriptor.worker_run_id.to_string(),
             advertised_endpoint: Some(EndpointProto {
@@ -227,9 +241,11 @@ impl MetadataRegistrar {
     }
 }
 
-fn registration_request_header(group_name: &GroupName) -> RequestHeaderProto {
-    let client_id = u64::from(std::process::id()).max(1);
-    let header = RequestHeader::new(ClientId::new(client_id)).with_group_name(group_name.clone());
+fn registration_request_header(group_name: &GroupName, op: &ControlOp, retry_count: i32) -> RequestHeaderProto {
+    let mut header = RequestHeader::new(op.client_id)
+        .with_group_name(group_name.clone())
+        .with_retry_count(retry_count);
+    header.client.call_id = op.call_id;
     (&header).into()
 }
 

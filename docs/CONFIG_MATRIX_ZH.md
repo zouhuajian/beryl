@@ -106,7 +106,7 @@ lock the root to one metadata group.
 
 | key | default | validation | notes |
 | --- | --- | --- | --- |
-| `client.id` | `1` | non-zero integer for metadata operations | Client request identity. |
+| `client.name` | `default_client` | non-blank string | Low-cardinality client display identity for diagnostics and audit. |
 | `client.metadata.endpoints` | `127.0.0.1:18080` | at least one endpoint | Comma-separated metadata endpoint list. |
 | `client.metadata.group.names` | `root` | one or more valid `GroupName` values | Paired with metadata endpoints by position. |
 | `client.retry.max_retry_attempts` | `3` | non-negative integer | Logical operation retry limit. |

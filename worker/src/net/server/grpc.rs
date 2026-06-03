@@ -63,7 +63,7 @@ impl WorkerDataServiceImpl {
     fn default_client() -> ClientInfoProto {
         ClientInfoProto {
             call_id: String::new(),
-            client_id: 0,
+            client_id: None,
             client_name: String::new(),
         }
     }

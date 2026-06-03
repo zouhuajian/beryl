@@ -325,7 +325,7 @@ mod tests {
         }
     }
 
-    fn request_context(client_id: u64) -> RequestContext {
+    fn request_context(client_id: u128) -> RequestContext {
         let caller = RequestHeader::new(types::ClientId::new(client_id));
         RequestContext {
             caller: caller.clone(),

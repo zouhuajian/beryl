@@ -40,6 +40,23 @@ use types::{
 
 type EventLog = Arc<Mutex<Vec<&'static str>>>;
 
+#[test]
+fn independent_fs_clients_generate_distinct_nonzero_client_ids() {
+    let first =
+        FsClient::with_metadata_gateway(test_config("root"), Arc::new(MockGateway::default())).expect("first client");
+    let second =
+        FsClient::with_metadata_gateway(test_config("root"), Arc::new(MockGateway::default())).expect("second client");
+
+    let first_id = first.executor.client_id();
+    let second_id = second.executor.client_id();
+
+    assert_ne!(first_id.as_raw(), 0);
+    assert_ne!(second_id.as_raw(), 0);
+    assert_ne!(first_id, second_id);
+    assert_eq!(first.executor.client_name(), "default_client");
+    assert_eq!(second.executor.client_name(), "default_client");
+}
+
 #[tokio::test]
 async fn open_returns_reader_from_metadata_snapshot() {
     let gateway = Arc::new(MockGateway::default());
@@ -836,13 +853,11 @@ fn assert_event_order(events: &EventLog, before: &'static str, after: &'static s
 }
 
 fn test_config(group_name: &str) -> ClientConfig {
-    let mut config = ClientConfig {
+    ClientConfig {
         metadata_endpoints: vec!["http://127.0.0.1:18080".to_string()],
         metadata_group_names: vec![group_name_from(group_name)],
         ..ClientConfig::default()
-    };
-    config.inner.inner.set("client.id", 7i64);
-    config
+    }
 }
 
 fn test_config_with_retries(group_name: &str, max_retries: usize) -> ClientConfig {
@@ -1604,7 +1619,7 @@ fn write_handle_proto(handle_id: u64, data_handle_id: u64) -> WriteHandleProto {
                 data_handle_id,
                 block_index: 0,
             }),
-            owner: 7,
+            owner: Some(types::ClientId::new(7).into()),
             epoch: 1,
         }),
     }

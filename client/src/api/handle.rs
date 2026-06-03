@@ -247,11 +247,10 @@ mod tests {
 
     #[tokio::test]
     async fn file_reader_debug_redacts_identity_names() {
-        let mut config = ClientConfig {
+        let config = ClientConfig {
             metadata_endpoints: vec!["http://127.0.0.1:18080".to_string()],
             ..ClientConfig::default()
         };
-        config.inner.inner.set("client.id", 7i64);
         let client = FsClient::try_new(config).expect("client");
         let read = FileReader::new(
             client,

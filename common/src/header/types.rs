@@ -14,7 +14,7 @@ use types::{CallId, ClientId, GroupName, GroupStateWatermark};
 pub struct ClientInfo {
     /// Unique identifier for this call.
     pub call_id: CallId,
-    /// Client identifier.
+    /// Internal client runtime identity.
     pub client_id: ClientId,
     /// Optional client name for diagnostics.
     pub client_name: Option<String>,
@@ -374,7 +374,7 @@ impl RequestHeader {
     ///
     /// This function creates metadata entries for:
     /// - x-call-id: Call ID (UUID string)
-    /// - x-client-id: Client ID (u64 as string)
+    /// - x-client-id: Client ID (u128 as string)
     /// - x-state-id: Group state watermarks as group:term:leader_node_id:index entries
     /// - traceparent: W3C Trace Context (if present)
     /// - grpc-timeout: Deadline as gRPC timeout format (e.g., "30S")
@@ -394,8 +394,7 @@ impl RequestHeader {
     /// - traceparent: W3C Trace Context
     /// - grpc-timeout: Deadline (converted from timeout to absolute deadline)
     ///
-    /// Missing fields are filled with defaults (generates new call_id, uses unknown client_id).
-    pub fn from_grpc_metadata<I>(iter: I) -> Self
+    pub fn from_grpc_metadata<I>(iter: I) -> Result<Self, String>
     where
         I: Iterator<Item = (String, String)>,
     {

@@ -318,7 +318,7 @@ impl FsCore {
             .map(|b| b.data_handle_id == session_block_id.data_handle_id && b.index == session_block_id.index)
             .unwrap_or(false);
 
-        block_ok && token.owner == session.fencing_token.owner.as_raw() && token.epoch == session.fencing_token.epoch
+        block_ok && token.owner == session.fencing_token.owner && token.epoch == session.fencing_token.epoch
     }
 
     fn route_ctx_for_write(

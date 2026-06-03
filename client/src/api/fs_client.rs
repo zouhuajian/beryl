@@ -29,9 +29,9 @@ use crate::metadata::{MetadataGateway, TonicMetadataGateway, WriteSessionSeed};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics, NoopClientMetrics};
 use crate::planner::read_planner::ReadPlanner;
 use crate::runtime::{
-    AttemptContext, BackoffPolicy, BackoffSleeper, ErrorClass, ErrorClassifier, OperationContext, OperationExecutor,
-    OperationIdentity, OperationKind, OperationRuntime, RefreshManager, RefreshReason, RetryDecision,
-    RetryDecisionInput, TokioBackoffSleeper,
+    AttemptContext, BackoffPolicy, BackoffSleeper, ClientIdentity, ErrorClass, ErrorClassifier, OperationContext,
+    OperationExecutor, OperationIdentity, OperationKind, OperationRuntime, RefreshManager, RefreshReason,
+    RetryDecision, RetryDecisionInput, TokioBackoffSleeper,
 };
 use crate::session::write_session::{PendingBlock, WorkerCommitLevel, WriteSession};
 
@@ -101,11 +101,11 @@ impl FsClient {
         sleeper: Arc<dyn BackoffSleeper>,
         metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
-        let client_id = config.client_id()?;
+        let identity = ClientIdentity::generate(config.client_name.clone())?;
         let refresh_manager = RefreshManager::from_config(&config.metadata_group_names, &config.metadata_endpoints)?
             .with_worker_endpoint_cache(data_boundary.worker_endpoint_cache());
         let executor = OperationExecutor::with_runtime(
-            client_id,
+            identity,
             gateway,
             refresh_manager,
             OperationRuntime {
@@ -291,8 +291,9 @@ impl FsClient {
         let file_version = handle.file_version();
         let inode_id = handle.inode_id();
         let data_handle_id = handle.data_handle_id();
-        let operation = OperationContext::new(
+        let operation = OperationContext::new_named(
             self.executor.client_id(),
+            self.executor.client_name(),
             OperationKind::WorkerReadData,
             "Read",
             OperationIdentity::path(handle.path().to_string()),
@@ -444,8 +445,12 @@ impl FsClient {
             .await?;
 
         let retrying_unknown_commit = session.is_commit_unknown();
-        let (operation, request) =
-            session.prepare_commit_file(self.executor.client_id(), committed_blocks, final_size)?;
+        let (operation, request) = session.prepare_commit_file(
+            self.executor.client_id(),
+            self.executor.client_name(),
+            committed_blocks,
+            final_size,
+        )?;
         if retrying_unknown_commit {
             self.record_metric(
                 ClientMetric::CommitUnknownRetry,
@@ -537,7 +542,7 @@ impl FsClient {
         let session_ref = handle.write_session();
         let mut session = session_ref.lock().await;
         session.ensure_open_for_abort()?;
-        let plan = session.prepare_abort_cleanup(self.executor.client_id())?;
+        let plan = session.prepare_abort_cleanup(self.executor.client_id(), self.executor.client_name())?;
         let mut abort_error = None;
         self.record_metric(
             ClientMetric::AbortAttempt,
@@ -629,6 +634,7 @@ impl FsClient {
         }
         let operation = worker_write_operation(
             self.executor.client_id(),
+            self.executor.client_name(),
             "OpenWriteStream",
             session.path(),
             &session.session_identity(),
@@ -751,6 +757,7 @@ impl FsClient {
                     let require_sync = required_level.requires_sync();
                     let operation = worker_write_operation(
                         self.executor.client_id(),
+                        self.executor.client_name(),
                         "CommitWrite",
                         &worker_path,
                         &worker_session_identity,
@@ -797,6 +804,7 @@ impl FsClient {
                 (WorkerCommitLevel::Visible, WorkerCommitLevel::Durable) => {
                     let operation = worker_write_operation(
                         self.executor.client_id(),
+                        self.executor.client_name(),
                         "SyncCommittedBlock",
                         &worker_path,
                         &worker_session_identity,
@@ -1152,12 +1160,14 @@ fn sync_write_required_commit_level(mode: WriteSyncModeProto) -> ClientResult<Wo
 
 fn worker_write_operation(
     client_id: types::ClientId,
+    client_name: &str,
     operation_name: &str,
     path: &str,
     session_identity: &str,
 ) -> ClientResult<OperationContext> {
-    OperationContext::new(
+    OperationContext::new_named(
         client_id,
+        client_name,
         OperationKind::WorkerWriteData,
         operation_name,
         OperationIdentity::session(path, session_identity),
@@ -1279,4 +1289,27 @@ fn is_write_refresh_error(err: &ClientError) -> bool {
                 | RefreshReason::Unknown
         )
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fs_client_creates_runtime_identity_from_client_name_config() {
+        let default_client = FsClient::try_new(ClientConfig::default()).expect("default client");
+        assert!(!default_client.executor.client_id().is_zero());
+        assert_eq!(
+            default_client.executor.client_name(),
+            crate::config::DEFAULT_CLIENT_NAME
+        );
+
+        let mut flat = common::FlatConfig::new();
+        flat.set("client.name", "prod_ns01");
+        let config = ClientConfig::from_flat(flat).expect("config");
+        let named_client = FsClient::try_new(config).expect("named client");
+
+        assert!(!named_client.executor.client_id().is_zero());
+        assert_eq!(named_client.executor.client_name(), "prod_ns01");
+    }
 }

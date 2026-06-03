@@ -1181,7 +1181,7 @@ fn install_write_session(fs_core: &FsCore, inode_id: InodeId, mount_id: MountId)
 fn presented_session_token(session: &crate::write_session::WriteSession) -> PresentedFencingToken {
     PresentedFencingToken {
         block_id: Some(session.fencing_token.block_id),
-        owner: session.fencing_token.owner.as_raw(),
+        owner: session.fencing_token.owner,
         epoch: session.fencing_token.epoch,
     }
 }
@@ -1230,7 +1230,7 @@ fn committed_block(block_id: BlockId, file_offset: u64, len: u64) -> CommittedBl
 fn presented_key_token(key: &SessionKey) -> PresentedFencingToken {
     PresentedFencingToken {
         block_id: Some(key.fencing_token.block_id),
-        owner: key.fencing_token.owner.as_raw(),
+        owner: key.fencing_token.owner,
         epoch: key.fencing_token.epoch,
     }
 }
@@ -1567,7 +1567,7 @@ async fn abort_checks_handle() {
             open_epoch: 1,
             fencing_token: Some(PresentedFencingToken {
                 block_id: Some(BlockId::new(DataHandleId::new(1), BlockIndex::new(0))),
-                owner: 7,
+                owner: ClientId::new(7),
                 epoch: 1,
             }),
             freshness: Freshness::default(),
@@ -1647,7 +1647,7 @@ async fn renew_lease_checks_fencing() {
     let mut stale_fencing = renew_input_for_session(&session, file_handle, request_context());
     stale_fencing.fencing_token = Some(PresentedFencingToken {
         block_id: Some(BlockId::new(DataHandleId::new(999_999), BlockIndex::new(0))),
-        owner: session.fencing_token.owner.as_raw(),
+        owner: session.fencing_token.owner,
         epoch: session.fencing_token.epoch,
     });
     let failure = fs_core
@@ -1712,7 +1712,7 @@ async fn renew_lease_rejects_missing_or_stale_handle() {
             open_epoch: 1,
             fencing_token: Some(PresentedFencingToken {
                 block_id: Some(BlockId::new(DataHandleId::new(1), BlockIndex::new(0))),
-                owner: 7,
+                owner: ClientId::new(7),
                 epoch: 1,
             }),
             freshness: Freshness::default(),
@@ -2674,7 +2674,7 @@ async fn close_write_invalid_lease_or_fencing_does_not_clear_runtime_session() {
             open_epoch: session.open_epoch,
             fencing_token: Some(PresentedFencingToken {
                 block_id: Some(session.fencing_token.block_id),
-                owner: session.fencing_token.owner.as_raw(),
+                owner: session.fencing_token.owner,
                 epoch: session.fencing_token.epoch,
             }),
             intent: CloseWriteIntent {
@@ -2706,7 +2706,7 @@ async fn close_write_invalid_lease_or_fencing_does_not_clear_runtime_session() {
             open_epoch: session.open_epoch,
             fencing_token: Some(PresentedFencingToken {
                 block_id: Some(BlockId::new(DataHandleId::new(999_999), BlockIndex::new(0))),
-                owner: session.fencing_token.owner.as_raw(),
+                owner: session.fencing_token.owner,
                 epoch: session.fencing_token.epoch,
             }),
             intent: CloseWriteIntent {
@@ -2762,7 +2762,7 @@ async fn commit_rejects_unissued_block() {
             open_epoch: session.open_epoch,
             fencing_token: Some(PresentedFencingToken {
                 block_id: Some(session.fencing_token.block_id),
-                owner: session.fencing_token.owner.as_raw(),
+                owner: session.fencing_token.owner,
                 epoch: session.fencing_token.epoch,
             }),
             intent: CloseWriteIntent {
@@ -3082,7 +3082,7 @@ async fn replay_keeps_file_version() {
         open_epoch: session.open_epoch,
         fencing_token: Some(PresentedFencingToken {
             block_id: Some(session.fencing_token.block_id),
-            owner: session.fencing_token.owner.as_raw(),
+            owner: session.fencing_token.owner,
             epoch: session.fencing_token.epoch,
         }),
         intent: CloseWriteIntent {
@@ -3457,7 +3457,7 @@ async fn close_write_session_missing_without_applied_result_stays_session_invali
             open_epoch: 1,
             fencing_token: Some(PresentedFencingToken {
                 block_id: Some(BlockId::new(DataHandleId::new(1), BlockIndex::new(0))),
-                owner: 7,
+                owner: ClientId::new(7),
                 epoch: 1,
             }),
             intent: CloseWriteIntent {

@@ -11,6 +11,8 @@ use types::fs::{FsErrorCode, InodeId};
 use types::ids::{ClientId, DataHandleId, WorkerId};
 use types::{CallId, GroupName};
 
+const SYSTEM_CLIENT_ID: ClientId = ClientId::new(u128::MAX);
+
 /// Raft type configuration for metadata service.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct MetadataRaftTypeConfig;
@@ -130,11 +132,11 @@ impl DedupKey {
     }
 
     /// Generate a dedup key for internal/system-triggered commands.
-    /// Uses client_id=0 to mark non-user initiated operations.
+    /// Uses an explicit non-zero reserved identity for non-user initiated operations.
     /// System calls generate a fresh call_id per submitted logical op; retries must reuse it.
     pub fn system() -> Self {
         Self {
-            client_id: ClientId::new(0),
+            client_id: SYSTEM_CLIENT_ID,
             call_id: CallId::new(),
         }
     }

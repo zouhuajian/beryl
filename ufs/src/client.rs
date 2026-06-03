@@ -70,8 +70,7 @@ impl UfsClient for UfsClientAdapter {
         let offset = block_start + chunk_start_in_block;
         let len = layout.chunk_size as usize;
 
-        // Create a default context for UFS operations
-        let ctx = RequestHeader::new(types::ClientId::new(0));
+        let ctx = RequestHeader::new(types::ClientId::generate());
 
         self.ufs.read_range(&path, offset, len, &ctx).await
     }

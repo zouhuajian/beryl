@@ -16,18 +16,18 @@ use types::layout::FileLayout;
 use types::lease::FencingToken;
 use types::{FileBlockLocation, GroupName, GroupStateWatermark, WorkerEndpointInfo, WriteTarget};
 
-pub fn request_context_from_proto(req_header: &Option<proto::common::RequestHeaderProto>) -> RequestContext {
-    let caller = if let Some(proto_header) = req_header {
-        RequestHeader::try_from(proto_header.clone()).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "Failed to parse RequestHeaderProto, using default");
-            RequestHeader::new(types::ClientId::new(0))
-        })
-    } else {
-        RequestHeader::new(types::ClientId::new(0))
-    };
+#[allow(clippy::result_large_err)]
+pub fn request_context_from_proto(
+    req_header: &Option<proto::common::RequestHeaderProto>,
+) -> Result<RequestContext, CanonicalError> {
+    let proto_header = req_header
+        .clone()
+        .ok_or_else(|| invalid_header_canonical_error("external request requires RequestHeader"))?;
+    let caller = RequestHeader::try_from(proto_header)
+        .map_err(|err| invalid_header_canonical_error(format!("invalid RequestHeader: {err}")))?;
 
     Span::current().record("call_id", caller.client.call_id.to_string());
-    Span::current().record("client_id", caller.client.client_id.as_raw());
+    Span::current().record("client_id", caller.client.client_id.to_string());
     if let Some(ref client_name) = caller.client.client_name {
         Span::current().record("client_name", client_name);
     }
@@ -41,7 +41,7 @@ pub fn request_context_from_proto(req_header: &Option<proto::common::RequestHead
         Span::current().record("principal", principal);
     }
 
-    RequestContext {
+    Ok(RequestContext {
         traceparent: caller.traceparent.clone(),
         route_epoch: req_header.as_ref().and_then(|h| h.route_epoch),
         principal: caller.principal.clone(),
@@ -49,11 +49,25 @@ pub fn request_context_from_proto(req_header: &Option<proto::common::RequestHead
         doas: caller.doas.clone(),
         authn_type: caller.authn_type,
         caller,
-    }
+    })
 }
 
-pub fn extract_and_inject_context(req_header: &Option<proto::common::RequestHeaderProto>) -> RequestHeader {
-    request_context_from_proto(req_header).caller
+#[allow(clippy::result_large_err)]
+pub fn extract_and_inject_context(
+    req_header: &Option<proto::common::RequestHeaderProto>,
+) -> Result<RequestHeader, CanonicalError> {
+    request_context_from_proto(req_header).map(|ctx| ctx.caller)
+}
+
+pub fn invalid_header_canonical_error(message: impl Into<String>) -> CanonicalError {
+    CanonicalError {
+        class: ErrorClass::Fatal,
+        code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::InvalidHeader)),
+        reason: None,
+        retry_after_ms: None,
+        message: message.into(),
+        refresh_hint: None,
+    }
 }
 
 fn error_detail_from_canonical(err: &CanonicalError) -> Option<proto::common::ErrorDetailProto> {
@@ -98,6 +112,15 @@ fn build_base_response_header(
         proto_header.route_epoch = Some(epoch);
     }
     proto_header
+}
+
+fn client_from_request_header(
+    req_header: &Option<proto::common::RequestHeaderProto>,
+) -> Option<common::header::ClientInfo> {
+    req_header
+        .as_ref()
+        .and_then(|header| header.client.clone())
+        .and_then(|client| common::header::ClientInfo::try_from(client).ok())
 }
 
 pub fn ok_header_from_context(
@@ -231,8 +254,20 @@ pub fn ok_header_from_request(
     group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
 ) -> proto::common::ResponseHeaderProto {
-    let ctx = request_context_from_proto(req_header);
-    ok_header_from_context(&ctx, group_name, mount_epoch, None, Vec::new())
+    let mut header: proto::common::ResponseHeaderProto = client_from_request_header(req_header)
+        .map(|client| {
+            let mut header = ResponseHeader::ok(client);
+            if let Some(group_name) = group_name.clone() {
+                header = header.with_group_name(group_name);
+            }
+            (&header).into()
+        })
+        .unwrap_or_default();
+    if let Some(group_name) = group_name {
+        header.group_name = group_name.to_string();
+    }
+    header.mount_epoch = mount_epoch;
+    header
 }
 
 pub fn header_from_canonical_error(
@@ -241,8 +276,21 @@ pub fn header_from_canonical_error(
     mount_epoch: Option<u64>,
     err: &CanonicalError,
 ) -> proto::common::ResponseHeaderProto {
-    let ctx = request_context_from_proto(req_header);
-    header_from_canonical_error_with_context(&ctx, group_name, mount_epoch, None, Vec::new(), err)
+    let mut header: proto::common::ResponseHeaderProto = client_from_request_header(req_header)
+        .map(|client| {
+            let mut header = ResponseHeader::from_canonical(client, err.clone());
+            if let Some(group_name) = group_name.clone() {
+                header = header.with_group_name(group_name);
+            }
+            (&header).into()
+        })
+        .unwrap_or_default();
+    if let Some(group_name) = group_name {
+        header.group_name = group_name.to_string();
+    }
+    header.mount_epoch = mount_epoch;
+    header.error = error_detail_from_canonical(err);
+    header
 }
 
 pub fn file_attrs_to_proto(attrs: &types::fs::FileAttrs) -> proto::fs::FileAttrsProto {
@@ -350,10 +398,13 @@ pub fn lease_id_to_proto(lease_id: LeaseId) -> proto::common::LeaseIdProto {
 }
 
 pub fn presented_fencing_from_proto(token: Option<proto::common::FencingTokenProto>) -> Option<PresentedFencingToken> {
-    token.map(|token_proto| PresentedFencingToken {
-        block_id: token_proto.block_id.and_then(|block| BlockId::try_from(block).ok()),
-        owner: token_proto.owner,
-        epoch: token_proto.epoch,
+    token.and_then(|token_proto| {
+        let owner = proto::convert::required_client_id(token_proto.owner, "owner").ok()?;
+        Some(PresentedFencingToken {
+            block_id: token_proto.block_id.and_then(|block| BlockId::try_from(block).ok()),
+            owner,
+            epoch: token_proto.epoch,
+        })
     })
 }
 
@@ -381,10 +432,33 @@ pub fn location_to_proto(location: &FileBlockLocation) -> proto::metadata::FileB
 
 #[cfg(test)]
 mod tests {
-    use super::header_from_canonical_error;
-    use common::error::canonical::{CanonicalError, RefreshReason};
+    use super::{header_from_canonical_error, request_context_from_proto};
+    use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshReason};
     use common::header::{RequestHeader, RpcErrorCode};
     use types::{ClientId, GroupName};
+
+    fn assert_invalid_header_error(error: &CanonicalError, expected_message: &str) {
+        assert_eq!(error.class, ErrorClass::Fatal);
+        assert_eq!(
+            error.code,
+            Some(CanonicalErrorCode::RpcCode(RpcErrorCode::InvalidHeader))
+        );
+        assert!(
+            error.message.contains(expected_message),
+            "message {:?} did not contain {:?}",
+            error.message,
+            expected_message
+        );
+    }
+
+    fn request_header_with_client(
+        client: Option<proto::common::ClientInfoProto>,
+    ) -> Option<proto::common::RequestHeaderProto> {
+        Some(proto::common::RequestHeaderProto {
+            client,
+            ..Default::default()
+        })
+    }
 
     #[test]
     fn filesystem_header_builder_does_not_emit_moved_reason() {
@@ -407,5 +481,60 @@ mod tests {
             error.refresh_reason,
             proto::common::RefreshReasonProto::RefreshReasonUnknown as i32
         );
+    }
+
+    #[test]
+    fn external_request_context_rejects_missing_header() {
+        let error = request_context_from_proto(&None).expect_err("missing header must fail");
+
+        assert_invalid_header_error(&error, "RequestHeader");
+    }
+
+    #[test]
+    fn external_request_context_rejects_missing_client_info() {
+        let header = request_header_with_client(None);
+
+        let error = request_context_from_proto(&header).expect_err("missing client info must fail");
+
+        assert_invalid_header_error(&error, "client");
+    }
+
+    #[test]
+    fn external_request_context_rejects_missing_client_id() {
+        let header = request_header_with_client(Some(proto::common::ClientInfoProto {
+            call_id: types::CallId::new().to_string(),
+            client_id: None,
+            client_name: "worker-control".to_string(),
+        }));
+
+        let error = request_context_from_proto(&header).expect_err("missing client_id must fail");
+
+        assert_invalid_header_error(&error, "client_id");
+    }
+
+    #[test]
+    fn external_request_context_rejects_zero_client_id() {
+        let header = request_header_with_client(Some(proto::common::ClientInfoProto {
+            call_id: types::CallId::new().to_string(),
+            client_id: Some(proto::common::ClientIdProto { high: 0, low: 0 }),
+            client_name: "worker-control".to_string(),
+        }));
+
+        let error = request_context_from_proto(&header).expect_err("zero client_id must fail");
+
+        assert_invalid_header_error(&error, "client_id");
+    }
+
+    #[test]
+    fn external_request_context_rejects_invalid_call_id() {
+        let header = request_header_with_client(Some(proto::common::ClientInfoProto {
+            call_id: "not-a-uuid".to_string(),
+            client_id: Some(ClientId::new(7).into()),
+            client_name: "worker-control".to_string(),
+        }));
+
+        let error = request_context_from_proto(&header).expect_err("invalid call_id must fail");
+
+        assert_invalid_header_error(&error, "call_id");
     }
 }

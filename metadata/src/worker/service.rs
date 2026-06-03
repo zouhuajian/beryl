@@ -14,7 +14,7 @@ use crate::raft::Command;
 use crate::raft::{AppDataResponse, AppRaftNode, WorkerCommandResult};
 use crate::service::extract_and_inject_context;
 use ::common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshReason};
-use ::common::header::{ResponseHeader, RpcErrorCode, RpcStatus};
+use ::common::header::{ResponseHeader, RpcErrorCode};
 use proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProto;
 use proto::metadata::*;
 use std::net::IpAddr;
@@ -94,19 +94,19 @@ impl MetadataWorkerServiceImpl {
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
         group_name: Option<&GroupName>,
-    ) -> ::common::header::ResponseHeader {
-        let client = req_header
+    ) -> proto::common::ResponseHeaderProto {
+        let mut header: proto::common::ResponseHeaderProto = req_header
             .as_ref()
             .and_then(|h| h.client.as_ref())
             .and_then(|c| ::common::header::ClientInfo::try_from(c.clone()).ok())
-            .unwrap_or_else(|| ::common::header::ClientInfo::new(types::ClientId::new(0)));
-        let mut header = ResponseHeader::ok(client);
+            .map(|client| (&ResponseHeader::ok(client)).into())
+            .unwrap_or_default();
         if let Some(group_name) = group_name {
-            header = header.with_group_name(group_name.clone());
+            header.group_name = group_name.to_string();
         }
         if self.raft_node.is_leader() {
             if let (Some(group_name), Some(sid)) = (group_name, self.raft_node.get_last_applied_state_id()) {
-                header = header.with_state(vec![types::GroupStateWatermark::new(group_name.clone(), sid)]);
+                header.state = vec![(&types::GroupStateWatermark::new(group_name.clone(), sid)).into()];
             }
         }
         header
@@ -130,13 +130,8 @@ impl MetadataWorkerServiceImpl {
         );
         let mut header = self
             .create_response_header_from_request(req_header, Self::group_name_from_request_header(req_header).as_ref());
-        header.status = match error.class {
-            ErrorClass::Ok => RpcStatus::Ok,
-            ErrorClass::NeedRefresh | ErrorClass::Retryable => RpcStatus::Error,
-            ErrorClass::Fatal => RpcStatus::Fatal,
-        };
-        header.canonical_error = Some(error);
-        (&header).into()
+        header.error = Some(proto::convert::canonical_to_error_detail(&error));
+        header
     }
 
     fn response_with_error<T>(
@@ -438,7 +433,10 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         request: Request<RegisterWorkerRequestProto>,
     ) -> Result<Response<RegisterWorkerResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let _caller_ctx = match extract_and_inject_context(&req.header) {
+            Ok(ctx) => ctx,
+            Err(error) => return self.response_with_error::<RegisterWorkerResponseProto>(&req.header, error),
+        };
 
         if !self.raft_node.is_leader() {
             return self.metadata_error_response::<RegisterWorkerResponseProto>(
@@ -554,7 +552,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         observe::record_worker_registered();
 
         Ok(Response::new(RegisterWorkerResponseProto {
-            header: Some((&self.create_response_header_from_request(&req.header, Some(&group_name))).into()),
+            header: Some(self.create_response_header_from_request(&req.header, Some(&group_name))),
             worker_id: accepted_worker_id.as_raw(),
             accepted_worker_run_id: worker_run_id.to_string(),
             group_name: group_name.to_string(),
@@ -570,7 +568,10 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         request: Request<HeartbeatRequestProto>,
     ) -> Result<Response<HeartbeatResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let _caller_ctx = match extract_and_inject_context(&req.header) {
+            Ok(ctx) => ctx,
+            Err(error) => return self.response_with_error::<HeartbeatResponseProto>(&req.header, error),
+        };
 
         let group_name = match GroupName::parse(&req.group_name) {
             Ok(group_name) => group_name,
@@ -734,7 +735,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         }
 
         Ok(Response::new(HeartbeatResponseProto {
-            header: Some((&self.create_response_header_from_request(&req.header, Some(&group_name))).into()),
+            header: Some(self.create_response_header_from_request(&req.header, Some(&group_name))),
             commands: Vec::new(),
             worker_id: live_state.worker_id.as_raw(),
             accepted_worker_run_id: live_state.worker_run_id.to_string(),
@@ -768,7 +769,10 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         request: Request<BlockReportRequestProto>,
     ) -> Result<Response<BlockReportResponseProto>, Status> {
         let req = request.into_inner();
-        let _caller_ctx = extract_and_inject_context(&req.header);
+        let _caller_ctx = match extract_and_inject_context(&req.header) {
+            Ok(ctx) => ctx,
+            Err(error) => return self.response_with_error::<BlockReportResponseProto>(&req.header, error),
+        };
 
         let group_name = match GroupName::parse(&req.group_name) {
             Ok(group_name) => group_name,
@@ -898,7 +902,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         );
 
         Ok(Response::new(BlockReportResponseProto {
-            header: Some((&self.create_response_header_from_request(&req.header, Some(&group_name))).into()),
+            header: Some(self.create_response_header_from_request(&req.header, Some(&group_name))),
             report_seq,
             next_delta_seq: result.next_delta_seq,
             retry_after_ms: 0,
@@ -915,6 +919,7 @@ mod tests {
     use crate::MountTable;
     use proto::common::{error_detail_proto, ErrorClassProto, RefreshReasonProto, RpcErrorCodeProto};
     use tempfile::TempDir;
+    use types::ClientId;
 
     fn group_name(raw: &str) -> GroupName {
         GroupName::parse(raw).unwrap()
@@ -977,10 +982,10 @@ mod tests {
     ) -> BlockReportRequestProto {
         let group_name = group_name.to_string();
         BlockReportRequestProto {
-            header: Some(proto::common::RequestHeaderProto {
-                group_name: group_name.clone(),
-                ..Default::default()
-            }),
+            header: Some(valid_request_header(
+                &GroupName::parse(&group_name).expect("valid test group name"),
+                ClientId::new(71),
+            )),
             worker_id: worker_id.as_raw(),
             worker_run_id: worker_run_id.to_string(),
             report_seq,
@@ -1003,10 +1008,10 @@ mod tests {
     ) -> BlockReportRequestProto {
         let group_name = group_name.to_string();
         BlockReportRequestProto {
-            header: Some(proto::common::RequestHeaderProto {
-                group_name: group_name.clone(),
-                ..Default::default()
-            }),
+            header: Some(valid_request_header(
+                &GroupName::parse(&group_name).expect("valid test group name"),
+                ClientId::new(72),
+            )),
             worker_id: worker_id.as_raw(),
             worker_run_id: worker_run_id.to_string(),
             report_seq,
@@ -1108,10 +1113,10 @@ mod tests {
     ) -> HeartbeatRequestProto {
         let group_name = group_name.to_string();
         HeartbeatRequestProto {
-            header: Some(proto::common::RequestHeaderProto {
-                group_name: group_name.clone(),
-                ..Default::default()
-            }),
+            header: Some(valid_request_header(
+                &GroupName::parse(&group_name).expect("valid test group name"),
+                ClientId::new(73),
+            )),
             worker_id: worker_id.as_raw(),
             worker_run_id: worker_run_id.to_string(),
             heartbeat_seq,
@@ -1136,6 +1141,46 @@ mod tests {
             acks: Vec::new(),
             group_name,
         }
+    }
+
+    fn valid_request_header(group_name: &GroupName, client_id: ClientId) -> proto::common::RequestHeaderProto {
+        (&::common::header::RequestHeader::new(client_id).with_group_name(group_name.clone())).into()
+    }
+
+    fn register_request_with_header(
+        header: Option<proto::common::RequestHeaderProto>,
+        worker_id: WorkerId,
+    ) -> RegisterWorkerRequestProto {
+        RegisterWorkerRequestProto {
+            header,
+            worker_id: worker_id.as_raw(),
+            worker_run_id: test_worker_run_id().to_string(),
+            advertised_endpoint: Some(proto::common::EndpointProto {
+                host: "127.0.0.1".to_string(),
+                port: 9090 + worker_id.as_raw() as u32,
+                protocol: "grpc".to_string(),
+            }),
+            capabilities: 0,
+            version: "0.1.0".to_string(),
+            labels: Default::default(),
+            worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+            group_name: "root".to_string(),
+        }
+    }
+
+    fn assert_invalid_header(error: &proto::common::ErrorDetailProto, expected_message: &str) {
+        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
+        assert!(matches!(
+            error.code,
+            Some(error_detail_proto::Code::RpcCode(code))
+                if code == RpcErrorCodeProto::RpcErrCodeInvalidHeader as i32
+        ));
+        assert!(
+            error.message.contains(expected_message),
+            "message {:?} did not contain {:?}",
+            error.message,
+            expected_message
+        );
     }
 
     #[tokio::test]
@@ -1164,6 +1209,60 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unexpected Raft response"));
+    }
+
+    #[tokio::test]
+    async fn register_worker_rejects_invalid_request_header_before_raft_mutation() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = leader_raft(&dir).await;
+        let before_state_id = raft_node.get_last_applied_state_id();
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        raft_node.set_worker_manager(Arc::clone(&worker_manager)).unwrap();
+        let service = MetadataWorkerServiceImpl::new(
+            Arc::clone(&raft_node),
+            Arc::clone(&worker_manager),
+            Arc::new(MountTable::new()),
+            group_name("root"),
+        );
+        let mut zero_client_header = valid_request_header(&group_name("root"), ClientId::new(7));
+        zero_client_header.client.as_mut().expect("client").client_id =
+            Some(proto::common::ClientIdProto { high: 0, low: 0 });
+        let mut missing_client_id_header = valid_request_header(&group_name("root"), ClientId::new(8));
+        missing_client_id_header.client.as_mut().expect("client").client_id = None;
+        let mut invalid_call_id_header = valid_request_header(&group_name("root"), ClientId::new(9));
+        invalid_call_id_header.client.as_mut().expect("client").call_id = "not-a-uuid".to_string();
+        let cases = [
+            (None, WorkerId::new(201), "RequestHeader"),
+            (
+                Some(proto::common::RequestHeaderProto {
+                    group_name: "root".to_string(),
+                    ..Default::default()
+                }),
+                WorkerId::new(202),
+                "client",
+            ),
+            (Some(missing_client_id_header), WorkerId::new(203), "client_id"),
+            (Some(zero_client_header), WorkerId::new(204), "client_id"),
+            (Some(invalid_call_id_header), WorkerId::new(205), "call_id"),
+        ];
+
+        for (header, worker_id, expected_message) in cases {
+            let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
+                &service,
+                Request::new(register_request_with_header(header, worker_id)),
+            )
+            .await
+            .expect("malformed header returns gRPC OK")
+            .into_inner();
+
+            let error = response.header.expect("header").error.expect("header error");
+            assert_invalid_header(&error, expected_message);
+            assert!(worker_manager.get_descriptor(&group_name("root"), worker_id).is_none());
+            assert!(worker_manager
+                .get_registration(&group_name("root"), worker_id)
+                .is_none());
+            assert_eq!(raft_node.get_last_applied_state_id(), before_state_id);
+        }
     }
 
     #[tokio::test]
@@ -1305,7 +1404,7 @@ mod tests {
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
             &service,
             Request::new(RegisterWorkerRequestProto {
-                header: None,
+                header: Some(valid_request_header(&group_name("root"), ClientId::new(80))),
                 worker_id: 9,
                 worker_run_id: test_worker_run_id().to_string(),
                 advertised_endpoint: None,
@@ -1340,10 +1439,7 @@ mod tests {
         let register_response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
             &service,
             Request::new(RegisterWorkerRequestProto {
-                header: Some(proto::common::RequestHeaderProto {
-                    group_name: "other".to_string(),
-                    ..Default::default()
-                }),
+                header: Some(valid_request_header(&group_name("other"), ClientId::new(81))),
                 worker_id: 9,
                 worker_run_id: test_worker_run_id().to_string(),
                 advertised_endpoint: Some(proto::common::EndpointProto {
@@ -1427,7 +1523,7 @@ mod tests {
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
             &service,
             Request::new(RegisterWorkerRequestProto {
-                header: None,
+                header: Some(valid_request_header(&group_name("root"), ClientId::new(82))),
                 worker_id: 123,
                 worker_run_id: test_worker_run_id().to_string(),
                 advertised_endpoint: Some(proto::common::EndpointProto {
@@ -1468,7 +1564,7 @@ mod tests {
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
             &service,
             Request::new(RegisterWorkerRequestProto {
-                header: None,
+                header: Some(valid_request_header(&group_name("root"), ClientId::new(83))),
                 worker_id: 123,
                 worker_run_id: worker_run_id.to_string(),
                 advertised_endpoint: Some(proto::common::EndpointProto {
@@ -1520,7 +1616,7 @@ mod tests {
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
             &service,
             Request::new(RegisterWorkerRequestProto {
-                header: None,
+                header: Some(valid_request_header(&group_name("root"), ClientId::new(84))),
                 worker_id: 124,
                 worker_run_id: worker_run_id.to_string(),
                 advertised_endpoint: Some(proto::common::EndpointProto {
@@ -1561,7 +1657,7 @@ mod tests {
             group_name("root"),
         );
         let request = |worker_run_id: WorkerRunId| RegisterWorkerRequestProto {
-            header: None,
+            header: Some(valid_request_header(&group_name("root"), ClientId::new(85))),
             worker_id: 123,
             worker_run_id: worker_run_id.to_string(),
             advertised_endpoint: Some(proto::common::EndpointProto {
@@ -1686,7 +1782,7 @@ mod tests {
             group_name("root"),
         );
         let request = |worker_run_id: WorkerRunId, port: u32| RegisterWorkerRequestProto {
-            header: None,
+            header: Some(valid_request_header(&group_name("root"), ClientId::new(86))),
             worker_id: 125,
             worker_run_id: worker_run_id.to_string(),
             advertised_endpoint: Some(proto::common::EndpointProto {
@@ -1756,7 +1852,7 @@ mod tests {
             group_name("root"),
         );
         let request = |port: u32| RegisterWorkerRequestProto {
-            header: None,
+            header: Some(valid_request_header(&group_name("root"), ClientId::new(87))),
             worker_id: 126,
             worker_run_id: test_worker_run_id().to_string(),
             advertised_endpoint: Some(proto::common::EndpointProto {
@@ -1855,10 +1951,7 @@ mod tests {
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
             &service,
             Request::new(RegisterWorkerRequestProto {
-                header: Some(proto::common::RequestHeaderProto {
-                    group_name: "other".to_string(),
-                    ..Default::default()
-                }),
+                header: Some(valid_request_header(&group_name("other"), ClientId::new(88))),
                 worker_id: 123,
                 worker_run_id: test_worker_run_id().to_string(),
                 advertised_endpoint: Some(proto::common::EndpointProto {
@@ -2302,10 +2395,7 @@ mod tests {
         let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
             &service,
             Request::new(BlockReportRequestProto {
-                header: Some(proto::common::RequestHeaderProto {
-                    group_name: "root".to_string(),
-                    ..Default::default()
-                }),
+                header: Some(valid_request_header(&group_name("root"), ClientId::new(89))),
                 worker_id: worker_id.as_raw(),
                 worker_run_id: worker_run_id.to_string(),
                 report_seq: 1,

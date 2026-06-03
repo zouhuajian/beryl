@@ -19,7 +19,7 @@ pub struct AuditRecord {
     /// Request ID (UUID).
     pub request_id: String,
     /// Client ID.
-    pub client_id: u64,
+    pub client_id: u128,
     /// Operation name.
     pub operation: String,
     /// File path (primary key for audit queries).

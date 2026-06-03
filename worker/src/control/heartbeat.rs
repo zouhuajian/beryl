@@ -23,10 +23,12 @@ use tokio::time;
 use tonic::transport::Endpoint;
 use tonic::Code;
 use tracing::{debug, info, warn};
-use types::{ClientId, GroupName, WorkerRunId};
+use types::{GroupName, WorkerRunId};
 
 use crate::config::WorkerRegistrationConfig;
-use crate::control::{MetadataRegistrar, Registration, RegistrationDescriptor, RegistrationSet};
+use crate::control::{
+    ControlIdentity, ControlOp, MetadataRegistrar, Registration, RegistrationDescriptor, RegistrationSet,
+};
 use crate::net::protocol::WorkerNetProtocol;
 use crate::observe;
 
@@ -66,6 +68,7 @@ pub struct MetadataHeartbeatLoop {
     descriptor: RegistrationDescriptor,
     state: Arc<RegistrationSet>,
     endpoints: Vec<Endpoint>,
+    control_identity: ControlIdentity,
     heartbeat_seq: Mutex<HashMap<(GroupName, WorkerRunId), u64>>,
 }
 
@@ -90,6 +93,7 @@ impl MetadataHeartbeatLoop {
             descriptor,
             state,
             endpoints,
+            control_identity: ControlIdentity::new_local(),
             heartbeat_seq: Mutex::new(HashMap::new()),
         })
     }
@@ -103,7 +107,8 @@ impl MetadataHeartbeatLoop {
             return Ok(HeartbeatRound::default());
         };
         let seq = self.next_heartbeat_seq(&registration);
-        let request = self.build_request(&registration, seq, &snapshot);
+        let op = self.control_identity.new_op();
+        let request = self.build_request(&registration, &op, seq, &snapshot);
         let mut round = HeartbeatRound {
             attempted_peers: self.endpoints.len(),
             ..HeartbeatRound::default()
@@ -144,11 +149,12 @@ impl MetadataHeartbeatLoop {
     fn build_request(
         &self,
         registration: &Registration,
+        op: &ControlOp,
         heartbeat_seq: u64,
         snapshot: &HeartbeatSnapshot,
     ) -> HeartbeatRequestProto {
         HeartbeatRequestProto {
-            header: Some(heartbeat_request_header(&registration.group_name)),
+            header: Some(heartbeat_request_header(&registration.group_name, op)),
             worker_id: registration.worker_id.as_raw(),
             worker_run_id: registration.worker_run_id.to_string(),
             heartbeat_seq,
@@ -326,9 +332,9 @@ fn classify_status(status: tonic::Status) -> HeartbeatError {
     }
 }
 
-fn heartbeat_request_header(group_name: &GroupName) -> RequestHeaderProto {
-    let client_id = u64::from(std::process::id()).max(1);
-    let header = RequestHeader::new(ClientId::new(client_id)).with_group_name(group_name.clone());
+fn heartbeat_request_header(group_name: &GroupName, op: &ControlOp) -> RequestHeaderProto {
+    let mut header = RequestHeader::new(op.client_id).with_group_name(group_name.clone());
+    header.client.call_id = op.call_id;
     (&header).into()
 }
 

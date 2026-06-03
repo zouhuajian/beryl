@@ -194,6 +194,7 @@ impl WriteSession {
     pub(crate) fn prepare_commit_file(
         &mut self,
         client_id: ClientId,
+        client_name: &str,
         committed_blocks: Vec<CommittedBlock>,
         final_size: u64,
     ) -> ClientResult<(OperationContext, CommitFileRequestProto)> {
@@ -281,8 +282,9 @@ impl WriteSession {
             .commit
             .as_ref()
             .ok_or_else(|| ClientError::InvalidArgument("CommitFile state missing frozen identity".to_string()))?;
-        let operation = OperationContext::with_call_id_and_fingerprint(
+        let operation = OperationContext::with_call_id_named_and_fingerprint(
             client_id,
+            client_name,
             commit.commit_call_id,
             OperationKind::MetadataSessionBarrier,
             "CommitFile",
@@ -305,7 +307,11 @@ impl WriteSession {
     }
 
     /// Freeze and return the abort cleanup plan for this write session.
-    pub(crate) fn prepare_abort_cleanup(&mut self, client_id: ClientId) -> ClientResult<AbortCleanupPlan> {
+    pub(crate) fn prepare_abort_cleanup(
+        &mut self,
+        client_id: ClientId,
+        client_name: &str,
+    ) -> ClientResult<AbortCleanupPlan> {
         match self.state {
             WriteSessionState::Open => {
                 if self.pending_blocks.iter().any(PendingBlock::has_worker_commit) {
@@ -370,8 +376,9 @@ impl WriteSession {
             .abort
             .as_ref()
             .ok_or_else(|| ClientError::InvalidArgument("abort cleanup state missing frozen plan".to_string()))?;
-        let metadata_operation = OperationContext::with_call_id_and_fingerprint(
+        let metadata_operation = OperationContext::with_call_id_named_and_fingerprint(
             client_id,
+            client_name,
             abort.metadata_call_id,
             OperationKind::CleanupBestEffort,
             "AbortFileWrite",
@@ -385,8 +392,9 @@ impl WriteSession {
         };
         let mut worker_cleanups = Vec::with_capacity(abort.worker_cleanups.len());
         for cleanup in &abort.worker_cleanups {
-            let operation = OperationContext::with_call_id_and_fingerprint(
+            let operation = OperationContext::with_call_id_named_and_fingerprint(
                 client_id,
+                client_name,
                 cleanup.abort_call_id,
                 OperationKind::WorkerWriteData,
                 "AbortWrite",
@@ -942,7 +950,12 @@ fn fencing_identity(write_handle: &WriteHandleProto) -> String {
                 .as_ref()
                 .map(|block| format!("{}:{}", block.data_handle_id, block.block_index))
                 .unwrap_or_else(|| "missing".to_string());
-            format!("block={} owner={} epoch={}", block, token.owner, token.epoch)
+            let owner = token
+                .owner
+                .as_ref()
+                .map(|owner| format!("{}:{}", owner.high, owner.low))
+                .unwrap_or_else(|| "missing".to_string());
+            format!("block={} owner={} epoch={}", block, owner, token.epoch)
         })
         .unwrap_or_else(|| "missing".to_string())
 }
@@ -1021,11 +1034,11 @@ mod tests {
         let blocks = vec![committed_block(302, 0, 0, 5)];
 
         let (first_operation, first_request) = session
-            .prepare_commit_file(ClientId::new(7), blocks.clone(), 5)
+            .prepare_commit_file(ClientId::new(7), "test-client", blocks.clone(), 5)
             .expect("first commit plan");
         session.mark_commit_unknown();
         let (second_operation, second_request) = session
-            .prepare_commit_file(ClientId::new(7), blocks, 5)
+            .prepare_commit_file(ClientId::new(7), "test-client", blocks, 5)
             .expect("retry commit plan");
 
         let first_ctx = AttemptContext::for_metadata(&first_operation, test_group_name(), 0).expect("first context");
@@ -1052,10 +1065,10 @@ mod tests {
         .expect("session");
 
         session
-            .prepare_commit_file(ClientId::new(7), vec![committed_block(302, 0, 0, 5)], 5)
+            .prepare_commit_file(ClientId::new(7), "test-client", vec![committed_block(302, 0, 0, 5)], 5)
             .expect("first commit plan");
         let err = session
-            .prepare_commit_file(ClientId::new(7), vec![committed_block(302, 0, 0, 6)], 6)
+            .prepare_commit_file(ClientId::new(7), "test-client", vec![committed_block(302, 0, 0, 6)], 6)
             .expect_err("changed commit payload must fail");
 
         assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("payload changed")));
@@ -1075,20 +1088,20 @@ mod tests {
         let blocks = vec![committed_block(302, 0, 0, 5)];
 
         let (first_operation, _) = session
-            .prepare_commit_file(ClientId::new(7), blocks.clone(), 5)
+            .prepare_commit_file(ClientId::new(7), "test-client", blocks.clone(), 5)
             .expect("first commit plan");
         let first_ctx = AttemptContext::for_metadata(&first_operation, test_group_name(), 0).expect("first context");
         session.mark_commit_unknown();
 
         session.write_handle.lease_epoch = 2;
         let err = session
-            .prepare_commit_file(ClientId::new(7), blocks.clone(), 5)
+            .prepare_commit_file(ClientId::new(7), "test-client", blocks.clone(), 5)
             .expect_err("changed session identity must fail");
         assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("identity changed")));
 
         session.write_handle.lease_epoch = 1;
         let (retry_operation, retry_request) = session
-            .prepare_commit_file(ClientId::new(7), blocks, 5)
+            .prepare_commit_file(ClientId::new(7), "test-client", blocks, 5)
             .expect("retry commit plan");
         let retry_ctx = AttemptContext::for_metadata(&retry_operation, test_group_name(), 0).expect("retry context");
 
@@ -1122,7 +1135,7 @@ mod tests {
             .expect("pending block");
 
         let first = session
-            .prepare_abort_cleanup(ClientId::new(7))
+            .prepare_abort_cleanup(ClientId::new(7), "test-client")
             .expect("first abort plan");
         let first_metadata = AttemptContext::for_metadata(&first.metadata_operation(), test_group_name(), 0)
             .expect("first metadata context");
@@ -1132,7 +1145,7 @@ mod tests {
         session.pending_blocks.clear();
 
         let second = session
-            .prepare_abort_cleanup(ClientId::new(7))
+            .prepare_abort_cleanup(ClientId::new(7), "test-client")
             .expect("retry abort plan");
         let second_metadata = AttemptContext::for_metadata(&second.metadata_operation(), test_group_name(), 0)
             .expect("second metadata context");
@@ -1173,13 +1186,13 @@ mod tests {
         .expect("session");
 
         let first = session
-            .prepare_abort_cleanup(ClientId::new(7))
+            .prepare_abort_cleanup(ClientId::new(7), "test-client")
             .expect("first abort plan");
         let first_ctx = AttemptContext::for_metadata(&first.metadata_operation(), test_group_name(), 0)
             .expect("first metadata context");
 
         session.write_handle.lease_epoch = 2;
-        let err = match session.prepare_abort_cleanup(ClientId::new(7)) {
+        let err = match session.prepare_abort_cleanup(ClientId::new(7), "test-client") {
             Ok(_) => panic!("identity drift must reject abort replay"),
             Err(err) => err,
         };
@@ -1187,7 +1200,7 @@ mod tests {
 
         session.write_handle.lease_epoch = 1;
         let retry = session
-            .prepare_abort_cleanup(ClientId::new(7))
+            .prepare_abort_cleanup(ClientId::new(7), "test-client")
             .expect("retry abort plan");
         let retry_ctx = AttemptContext::for_metadata(&retry.metadata_operation(), test_group_name(), 0)
             .expect("retry metadata context");
@@ -1214,7 +1227,7 @@ mod tests {
             .expect("pending block");
         session.pending_blocks[0].mark_worker_committed(false);
 
-        let err = match session.prepare_abort_cleanup(ClientId::new(7)) {
+        let err = match session.prepare_abort_cleanup(ClientId::new(7), "test-client") {
             Ok(_) => panic!("committed worker block cannot be safely aborted"),
             Err(err) => err,
         };
@@ -1375,7 +1388,7 @@ mod tests {
                     data_handle_id,
                     block_index: 0,
                 }),
-                owner: 7,
+                owner: Some(ClientId::new(7).into()),
                 epoch: 1,
             }),
         }

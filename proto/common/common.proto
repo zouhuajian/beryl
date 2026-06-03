@@ -39,6 +39,14 @@ message WorkerIdProto {
   uint64 value = 1;
 }
 
+/// Internal client runtime identity.
+/// Aligns with types::ClientId (u128).
+message ClientIdProto {
+  // u128 encoded as two uint64 (high, low)
+  uint64 high = 1;
+  uint64 low = 2;
+}
+
 /// Stream identity.
 /// Aligns with types::StreamId (u128).
 message StreamIdProto {
@@ -118,7 +126,7 @@ message ChunkBitmapProto {
 /// Aligns with types::lease::FencingToken { block_id: BlockId, owner: ClientId, epoch: u64 }.
 message FencingTokenProto {
   BlockIdProto block_id = 1;
-  uint64 owner = 2;  // ClientId
+  ClientIdProto owner = 2;
   uint64 epoch = 3;
 }
 

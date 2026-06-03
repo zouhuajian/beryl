@@ -604,7 +604,7 @@ mod tests {
     use types::ids::DataHandleId;
     use uuid::Uuid;
 
-    fn dedup(client: u64, call: u128) -> DedupKey {
+    fn dedup(client: u128, call: u128) -> DedupKey {
         DedupKey::new(ClientId::new(client), CallId::from_uuid(Uuid::from_u128(call)))
     }
 

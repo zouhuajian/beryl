@@ -3,7 +3,7 @@
 
 # Local client debug profile.
 
-client.id: 1
+client.name: "default_client"
 client.metadata.endpoints: "127.0.0.1:18080"
 client.metadata.group.names: "root"
 

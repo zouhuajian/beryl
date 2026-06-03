@@ -92,6 +92,17 @@ macro_rules! error_response {
     }};
 }
 
+macro_rules! request_context_or_error {
+    ($req:expr, $resp_ty:ty) => {{
+        match request_context_from_proto(&$req.header) {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                return error_response!($resp_ty, header_from_canonical_error(&$req.header, None, None, &err));
+            }
+        }
+    }};
+}
+
 macro_rules! guard_or_error {
     ($svc:expr, $req:expr, $resp_ty:ty, $check:expr) => {{
         if let Err(failure) = $check.await {
@@ -283,7 +294,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<GetStatusRequestProto>,
     ) -> Result<Response<GetStatusResponseProto>, Status> {
         let req = request.into_inner();
-        let req_ctx = request_context_from_proto(&req.header);
+        let req_ctx = request_context_or_error!(req, GetStatusResponseProto);
         guard_or_error!(
             self,
             req,
@@ -340,7 +351,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<CreateDirectoryRequestProto>,
     ) -> Result<Response<CreateDirectoryResponseProto>, Status> {
         let req = request.into_inner();
-        let req_ctx = request_context_from_proto(&req.header);
+        let req_ctx = request_context_or_error!(req, CreateDirectoryResponseProto);
         guard_or_error!(
             self,
             req,
@@ -418,7 +429,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     #[instrument(skip(self), fields(call_id, client_id))]
     async fn delete(&self, request: Request<DeleteRequestProto>) -> Result<Response<DeleteResponseProto>, Status> {
         let req = request.into_inner();
-        let req_ctx = request_context_from_proto(&req.header);
+        let req_ctx = request_context_or_error!(req, DeleteResponseProto);
         guard_or_error!(
             self,
             req,
@@ -531,7 +542,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     #[instrument(skip(self), fields(call_id, client_id))]
     async fn rename(&self, request: Request<RenameRequestProto>) -> Result<Response<RenameResponseProto>, Status> {
         let req = request.into_inner();
-        let req_ctx = request_context_from_proto(&req.header);
+        let req_ctx = request_context_or_error!(req, RenameResponseProto);
         guard_or_error!(
             self,
             req,
@@ -623,7 +634,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<ListStatusRequestProto>,
     ) -> Result<Response<ListStatusResponseProto>, Status> {
         let req = request.into_inner();
-        let req_ctx = request_context_from_proto(&req.header);
+        let req_ctx = request_context_or_error!(req, ListStatusResponseProto);
         guard_or_error!(
             self,
             req,
@@ -716,7 +727,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<OpenFileRequestProto>,
     ) -> Result<Response<OpenFileResponseProto>, Status> {
         let req = request.into_inner();
-        let req_ctx = request_context_from_proto(&req.header);
+        let req_ctx = request_context_or_error!(req, OpenFileResponseProto);
         guard_or_error!(
             self,
             req,
@@ -828,7 +839,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<GetBlockLocationsRequestProto>,
     ) -> Result<Response<GetBlockLocationsResponseProto>, Status> {
         let req = request.into_inner();
-        let req_ctx = request_context_from_proto(&req.header);
+        let req_ctx = request_context_or_error!(req, GetBlockLocationsResponseProto);
         guard_or_error!(
             self,
             req,
@@ -995,7 +1006,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<CreateFileRequestProto>,
     ) -> Result<Response<CreateFileResponseProto>, Status> {
         let req = request.into_inner();
-        let req_ctx = request_context_from_proto(&req.header);
+        let req_ctx = request_context_or_error!(req, CreateFileResponseProto);
         guard_or_error!(
             self,
             req,
@@ -1280,7 +1291,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<AppendFileRequestProto>,
     ) -> Result<Response<AppendFileResponseProto>, Status> {
         let req = request.into_inner();
-        let req_ctx = request_context_from_proto(&req.header);
+        let req_ctx = request_context_or_error!(req, AppendFileResponseProto);
         guard_or_error!(
             self,
             req,
@@ -1356,7 +1367,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<AddBlockRequestProto>,
     ) -> Result<Response<AddBlockResponseProto>, Status> {
         let req = request.into_inner();
-        let req_ctx = request_context_from_proto(&req.header);
+        let req_ctx = request_context_or_error!(req, AddBlockResponseProto);
         let handle = match Self::write_handle_or_error(&req.header, req.write_handle) {
             Ok(handle) => handle,
             Err(header) => return response_with_header!(AddBlockResponseProto::default(), *header),
@@ -1407,7 +1418,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<CommitFileRequestProto>,
     ) -> Result<Response<CommitFileResponseProto>, Status> {
         let req = request.into_inner();
-        let req_ctx = request_context_from_proto(&req.header);
+        let req_ctx = request_context_or_error!(req, CommitFileResponseProto);
         let handle = match Self::write_handle_or_error(&req.header, req.write_handle) {
             Ok(handle) => handle,
             Err(header) => return response_with_header!(CommitFileResponseProto::default(), *header),
@@ -1499,7 +1510,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<AbortFileWriteRequestProto>,
     ) -> Result<Response<AbortFileWriteResponseProto>, Status> {
         let req = request.into_inner();
-        let req_ctx = request_context_from_proto(&req.header);
+        let req_ctx = request_context_or_error!(req, AbortFileWriteResponseProto);
         let handle = match Self::write_handle_or_error(&req.header, req.write_handle) {
             Ok(handle) => handle,
             Err(header) => return response_with_header!(AbortFileWriteResponseProto::default(), *header),
@@ -1549,7 +1560,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<RenewLeaseRequestProto>,
     ) -> Result<Response<RenewLeaseResponseProto>, Status> {
         let req = request.into_inner();
-        let req_ctx = request_context_from_proto(&req.header);
+        let req_ctx = request_context_or_error!(req, RenewLeaseResponseProto);
         let handle = match Self::write_handle_or_error(&req.header, req.write_handle) {
             Ok(handle) => handle,
             Err(header) => return response_with_header!(RenewLeaseResponseProto::default(), *header),
@@ -1599,7 +1610,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         request: Request<SyncWriteRequestProto>,
     ) -> Result<Response<SyncWriteResponseProto>, Status> {
         let req = request.into_inner();
-        let req_ctx = request_context_from_proto(&req.header);
+        let req_ctx = request_context_or_error!(req, SyncWriteResponseProto);
         let handle = match Self::write_handle_or_error(&req.header, req.write_handle) {
             Ok(handle) => handle,
             Err(header) => return response_with_header!(SyncWriteResponseProto::default(), *header),

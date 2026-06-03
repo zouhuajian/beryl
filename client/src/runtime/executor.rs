@@ -23,13 +23,14 @@ pub use crate::runtime::context::{AttemptContext, OperationContext, OperationIde
 use crate::runtime::decision::{RetryDecision, RetryDecisionInput};
 use crate::runtime::policy::{OperationKind, ReplayPolicyTable};
 use crate::runtime::refresh::RefreshManager;
+use crate::runtime::ClientIdentity;
 use crate::runtime::{BackoffPolicy, BackoffSleeper};
 use types::DataHandleId;
 
 /// Executes public operations through policy, classification, refresh, and replay gates.
 #[derive(Clone)]
 pub struct OperationExecutor {
-    client_id: types::ClientId,
+    identity: ClientIdentity,
     gateway: Arc<dyn MetadataGateway>,
     refresh_manager: RefreshManager,
     replay_policy: ReplayPolicyTable,
@@ -53,18 +54,13 @@ pub(crate) struct OperationRuntime {
 impl OperationExecutor {
     /// Create a metadata executor with explicit runtime policy and hooks.
     pub(crate) fn with_runtime(
-        client_id: types::ClientId,
+        identity: ClientIdentity,
         gateway: Arc<dyn MetadataGateway>,
         refresh_manager: RefreshManager,
         runtime: OperationRuntime,
     ) -> ClientResult<Self> {
-        if client_id.as_raw() == 0 {
-            return Err(ClientError::InvalidArgument(
-                "OperationExecutor requires non-zero client_id".to_string(),
-            ));
-        }
         Ok(Self {
-            client_id,
+            identity,
             gateway,
             refresh_manager,
             replay_policy: ReplayPolicyTable::new(),
@@ -79,8 +75,8 @@ impl OperationExecutor {
 
     /// Execute OpenFile.
     pub(crate) async fn open_file(&self, path: &str, req: OpenFileOp) -> ClientResult<crate::metadata::FileSnapshot> {
-        let operation = OperationContext::new(
-            self.client_id,
+        let operation = OperationContext::new_with_identity(
+            &self.identity,
             OperationKind::MetadataRead,
             "OpenFile",
             OperationIdentity::path(path),
@@ -93,8 +89,8 @@ impl OperationExecutor {
 
     /// Execute a metadata layout read.
     pub(crate) async fn read_layout(&self, path: &str, req: GetBlockLocationsOp) -> ClientResult<LayoutSnapshot> {
-        let operation = OperationContext::new(
-            self.client_id,
+        let operation = OperationContext::new_with_identity(
+            &self.identity,
             OperationKind::MetadataRead,
             "GetBlockLocations",
             OperationIdentity::path(path),
@@ -130,9 +126,13 @@ impl OperationExecutor {
         .await
     }
 
-    /// Return the configured client id.
+    /// Return the generated client id.
     pub(crate) fn client_id(&self) -> types::ClientId {
-        self.client_id
+        self.identity.client_id()
+    }
+
+    pub(crate) fn client_name(&self) -> &str {
+        self.identity.client_name()
     }
 
     /// Record a worker data-path refresh and run owned cache invalidation.
@@ -147,8 +147,8 @@ impl OperationExecutor {
 
     /// Execute GetStatus.
     pub(crate) async fn get_status(&self, path: &str, req: GetStatusOp) -> ClientResult<StatusSnapshot> {
-        let operation = OperationContext::new(
-            self.client_id,
+        let operation = OperationContext::new_with_identity(
+            &self.identity,
             OperationKind::MetadataRead,
             "GetStatus",
             OperationIdentity::path(path),
@@ -165,8 +165,8 @@ impl OperationExecutor {
         path: &str,
         req: ListStatusOp,
     ) -> ClientResult<crate::metadata::ListSnapshot> {
-        let operation = OperationContext::new(
-            self.client_id,
+        let operation = OperationContext::new_with_identity(
+            &self.identity,
             OperationKind::MetadataRead,
             "ListStatus",
             OperationIdentity::path(path),
@@ -180,8 +180,8 @@ impl OperationExecutor {
     /// Execute CreateFile.
     pub(crate) async fn create_file(&self, path: &str, req: CreateFileOp) -> ClientResult<WriteSessionSeed> {
         let detail = format!("disposition={}", req.disposition);
-        let operation = OperationContext::new(
-            self.client_id,
+        let operation = OperationContext::new_with_identity(
+            &self.identity,
             OperationKind::MetadataMutation,
             "CreateFile",
             OperationIdentity::path(path).with_detail(detail),
@@ -194,8 +194,8 @@ impl OperationExecutor {
 
     /// Execute AppendFile.
     pub(crate) async fn append_file(&self, path: &str, req: AppendFileOp) -> ClientResult<WriteSessionSeed> {
-        let operation = OperationContext::new(
-            self.client_id,
+        let operation = OperationContext::new_with_identity(
+            &self.identity,
             OperationKind::MetadataMutation,
             "AppendFile",
             OperationIdentity::path(path),
@@ -214,8 +214,8 @@ impl OperationExecutor {
         req: AddBlockOp,
     ) -> ClientResult<AddBlockResult> {
         let detail = format!("desired_len={:?}", req.desired_len);
-        let operation = OperationContext::new(
-            self.client_id,
+        let operation = OperationContext::new_with_identity(
+            &self.identity,
             OperationKind::MetadataMutation,
             "AddBlock",
             OperationIdentity::session(path, session_identity).with_detail(detail),
@@ -257,8 +257,8 @@ impl OperationExecutor {
         session_identity: String,
         req: RenewLeaseOp,
     ) -> ClientResult<RenewLeaseResult> {
-        let operation = OperationContext::new(
-            self.client_id,
+        let operation = OperationContext::new_with_identity(
+            &self.identity,
             OperationKind::MetadataSessionBarrier,
             "RenewLease",
             OperationIdentity::session(path, session_identity),
@@ -277,8 +277,8 @@ impl OperationExecutor {
         req: SyncWriteOp,
     ) -> ClientResult<SyncWriteResult> {
         let detail = format!("mode={} target_size={}", req.mode, req.target_size);
-        let operation = OperationContext::new(
-            self.client_id,
+        let operation = OperationContext::new_with_identity(
+            &self.identity,
             OperationKind::MetadataSessionBarrier,
             "SyncWrite",
             OperationIdentity::session(path, session_identity).with_detail(detail),
@@ -291,8 +291,8 @@ impl OperationExecutor {
 
     /// Execute Delete.
     pub(crate) async fn delete(&self, path: &str, req: DeleteOp) -> ClientResult<DeleteResult> {
-        let operation = OperationContext::new(
-            self.client_id,
+        let operation = OperationContext::new_with_identity(
+            &self.identity,
             OperationKind::MetadataMutation,
             "Delete",
             OperationIdentity::path(path).with_detail(format!("recursive={}", req.recursive)),
@@ -305,8 +305,8 @@ impl OperationExecutor {
 
     /// Execute Rename.
     pub(crate) async fn rename(&self, src: &str, dst: &str, req: RenameOp) -> ClientResult<RenameResult> {
-        let operation = OperationContext::new(
-            self.client_id,
+        let operation = OperationContext::new_with_identity(
+            &self.identity,
             OperationKind::MetadataMutation,
             "Rename",
             OperationIdentity::path_pair(src, dst).with_detail(format!("flags={}", req.flags)),
@@ -616,7 +616,8 @@ fn timeout_error(target_plane: &str, operation: &str, timeout: Duration) -> Clie
 impl fmt::Debug for OperationExecutor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OperationExecutor")
-            .field("client_id", &self.client_id)
+            .field("client_id", &self.identity.client_id())
+            .field("client_name", &self.identity.client_name())
             .field("refresh_manager", &self.refresh_manager)
             .field("retry", &self.retry)
             .field("refresh", &self.refresh)
@@ -730,7 +731,7 @@ mod tests {
     #[test]
     fn metadata_attempt_context_rejects_zero_client_id() {
         let err = OperationContext::new(
-            ClientId::new(0),
+            ClientId::new(u128::MIN),
             OperationKind::MetadataRead,
             "OpenFile",
             OperationIdentity::path("/alpha"),
@@ -753,7 +754,10 @@ mod tests {
         let ctx = AttemptContext::for_metadata(&op, group_name("root"), 0).expect("metadata context");
         let header = ctx.metadata_header().expect("metadata header");
 
-        assert_eq!(header.client.as_ref().map(|client| client.client_id), Some(7));
+        assert_eq!(
+            header.client.as_ref().and_then(|client| client.client_id),
+            Some(ClientId::new(7).into())
+        );
         assert_eq!(header.group_name, "root");
         assert!(!header.client.as_ref().unwrap().call_id.is_empty());
     }
@@ -1749,7 +1753,7 @@ mod tests {
         }])
         .expect("refresh manager");
         OperationExecutor::with_runtime(
-            ClientId::new(7),
+            ClientIdentity::from_parts(ClientId::new(7), "test-client").expect("client identity"),
             gateway,
             refresh_manager,
             OperationRuntime {

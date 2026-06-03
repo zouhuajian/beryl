@@ -18,11 +18,10 @@ message ClientInfoProto {
   /// Aligns with types::CallId.
   string call_id = 1;
 
-  /// Client identifier (stable per client process / instance).
-  /// Aligns with types::ClientId (u64).
-  uint64 client_id = 2;
+  /// Internal client runtime identity.
+  ClientIdProto client_id = 2;
 
-  /// Optional client name for diagnostics.
+  /// Low-cardinality client display name for diagnostics.
   string client_name = 3;
 }
 

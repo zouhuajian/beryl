@@ -117,13 +117,15 @@ impl RequestHeaderCodec {
     /// Decode RequestHeader from headers.
     ///
     /// Takes an iterator of (key, value) pairs where values are strings.
-    /// Missing fields are filled with defaults (generates new call_id, uses unknown client_id).
-    pub fn decode_from_headers<I>(iter: I) -> RequestHeader
+    pub fn decode_from_headers<I>(iter: I) -> Result<RequestHeader, String>
     where
         I: Iterator<Item = (String, String)>,
     {
         let mut call_id = None;
         let mut client_id = None;
+        let mut saw_header = false;
+        let mut saw_call_id = false;
+        let mut saw_client_id = false;
         let mut state = Vec::new();
         let mut traceparent = None;
         let mut deadline_ms = None;
@@ -134,34 +136,31 @@ impl RequestHeaderCodec {
         let mut authn_type = AuthnType::Unspecified;
 
         for (key, value) in iter {
+            saw_header = true;
             match key.as_str() {
                 k if k.eq_ignore_ascii_case(HEADER_CALL_ID) => {
-                    call_id = CallId::from_str(&value).ok();
+                    saw_call_id = true;
+                    call_id = Some(CallId::from_str(&value).map_err(|err| format!("invalid call_id: {err}"))?);
                 }
                 k if k.eq_ignore_ascii_case(HEADER_CLIENT_ID) => {
-                    client_id = value.parse::<u64>().ok().map(ClientId::new);
+                    saw_client_id = true;
+                    let raw = value
+                        .parse::<u128>()
+                        .map_err(|err| format!("invalid client_id: {err}"))?;
+                    if raw == 0 {
+                        return Err("client_id must be non-zero".to_string());
+                    }
+                    client_id = Some(ClientId::new(raw));
                 }
                 k if k.eq_ignore_ascii_case(HEADER_STATE_ID) => {
-                    // Parse format: "group_name:term:leader_node_id:index[,group_name:term:leader_node_id:index]"
-                    for entry in value.split(',') {
-                        let parts: Vec<&str> = entry.split(':').collect();
-                        if parts.len() == 4
-                            && let (Ok(group_name), Ok(term), Ok(leader_node_id), Ok(index)) = (
-                                GroupName::parse(parts[0]),
-                                parts[1].parse::<u64>(),
-                                parts[2].parse::<u64>(),
-                                parts[3].parse::<u64>(),
-                            )
-                        {
-                            state.push(GroupStateWatermark::new(
-                                group_name,
-                                RaftLogId::new(term, leader_node_id, index),
-                            ));
-                        }
-                    }
+                    state.extend(parse_state_header(&value)?);
                 }
                 k if k.eq_ignore_ascii_case(HEADER_MOUNT_EPOCH) => {
-                    mount_epoch = value.parse::<u64>().ok();
+                    mount_epoch = Some(
+                        value
+                            .parse::<u64>()
+                            .map_err(|err| format!("invalid mount_epoch: {err}"))?,
+                    );
                 }
                 k if k.eq_ignore_ascii_case(HEADER_TRACEPARENT) => {
                     traceparent = Some(value);
@@ -177,45 +176,57 @@ impl RequestHeaderCodec {
                 }
                 k if k.eq_ignore_ascii_case(HEADER_AUTHN_TYPE) => {
                     authn_type = match value.to_ascii_lowercase().as_str() {
+                        "unspecified" => AuthnType::Unspecified,
                         "simple" => AuthnType::Simple,
                         "kerberos" => AuthnType::Kerberos,
                         "token" => AuthnType::Token,
-                        _ => AuthnType::Unspecified,
+                        _ => return Err(format!("invalid authn_type: {value}")),
                     };
                 }
                 k if k.eq_ignore_ascii_case(HEADER_GRPC_TIMEOUT) => {
                     // Parse gRPC timeout format (e.g., "30S", "500M")
                     // Precedence: grpc-timeout is lossy, x-deadline-ms is authoritative.
                     // If x-deadline-ms is present, keep it and ignore grpc-timeout.
-                    let timeout_ms = if value.ends_with('S') {
-                        value[..value.len() - 1].parse::<u64>().ok().map(|s| s * 1000)
-                    } else if value.ends_with('M') {
-                        value[..value.len() - 1].parse::<u64>().ok()
-                    } else {
-                        None
-                    };
-                    if deadline_ms.is_none()
-                        && let Some(ms) = timeout_ms
-                    {
+                    let timeout_ms = parse_grpc_timeout_ms(&value)?;
+                    if deadline_ms.is_none() {
                         let now_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
                             .as_millis() as i64;
-                        deadline_ms = Some(now_ms + ms as i64);
+                        let timeout_ms = i64::try_from(timeout_ms)
+                            .map_err(|_| "grpc-timeout exceeds supported deadline range".to_string())?;
+                        deadline_ms = Some(
+                            now_ms
+                                .checked_add(timeout_ms)
+                                .ok_or_else(|| "grpc-timeout deadline overflow".to_string())?,
+                        );
                     }
                 }
                 k if k.eq_ignore_ascii_case(HEADER_DEADLINE_MS) => {
                     // Absolute deadline overrides any derived grpc-timeout.
-                    deadline_ms = value.parse::<i64>().ok();
+                    deadline_ms = Some(
+                        value
+                            .parse::<i64>()
+                            .map_err(|err| format!("invalid deadline_ms: {err}"))?,
+                    );
                 }
                 _ => {}
             }
         }
+        if !saw_header {
+            return Err("missing RequestHeader".to_string());
+        }
+        if !saw_call_id && !saw_client_id {
+            return Err("missing client info".to_string());
+        }
+        let call_id = call_id.ok_or_else(|| "missing call_id".to_string())?;
+        let client_id = client_id.ok_or_else(|| "missing client_id".to_string())?;
+
         // TODO: The default deadline_ms value needs from config
-        RequestHeader {
+        Ok(RequestHeader {
             client: crate::header::ClientInfo {
-                call_id: call_id.unwrap_or_else(CallId::new),
-                client_id: client_id.unwrap_or_else(|| ClientId::new(0)),
+                call_id,
+                client_id,
                 client_name: None,
             },
             deadline: deadline_ms
@@ -232,8 +243,52 @@ impl RequestHeaderCodec {
             real_user,
             doas,
             authn_type,
-        }
+        })
     }
+}
+
+fn parse_state_header(value: &str) -> Result<Vec<GroupStateWatermark>, String> {
+    if value.is_empty() {
+        return Err("x-state-id must not be empty".to_string());
+    }
+    let mut state = Vec::new();
+    for entry in value.split(',') {
+        let parts: Vec<&str> = entry.split(':').collect();
+        if parts.len() != 4 {
+            return Err(format!("invalid x-state-id entry: {entry}"));
+        }
+        let group_name = GroupName::parse(parts[0]).map_err(|err| format!("invalid x-state-id group_name: {err}"))?;
+        let term = parts[1]
+            .parse::<u64>()
+            .map_err(|err| format!("invalid x-state-id term: {err}"))?;
+        let leader_node_id = parts[2]
+            .parse::<u64>()
+            .map_err(|err| format!("invalid x-state-id leader_node_id: {err}"))?;
+        let index = parts[3]
+            .parse::<u64>()
+            .map_err(|err| format!("invalid x-state-id index: {err}"))?;
+        state.push(GroupStateWatermark::new(
+            group_name,
+            RaftLogId::new(term, leader_node_id, index),
+        ));
+    }
+    Ok(state)
+}
+
+fn parse_grpc_timeout_ms(value: &str) -> Result<u64, String> {
+    if let Some(seconds) = value.strip_suffix('S') {
+        return seconds
+            .parse::<u64>()
+            .map_err(|err| format!("invalid grpc-timeout: {err}"))?
+            .checked_mul(1_000)
+            .ok_or_else(|| "grpc-timeout overflow".to_string());
+    }
+    if let Some(milliseconds) = value.strip_suffix('M') {
+        return milliseconds
+            .parse::<u64>()
+            .map_err(|err| format!("invalid grpc-timeout: {err}"));
+    }
+    Err(format!("invalid grpc-timeout: {value}"))
 }
 
 /// Helper functions for writing error information to gRPC trailers.
@@ -302,7 +357,7 @@ mod tests {
         let headers = RequestHeaderCodec::encode_to_headers(&header);
 
         // Decode
-        let decoded = RequestHeaderCodec::decode_from_headers(headers.into_iter());
+        let decoded = RequestHeaderCodec::decode_from_headers(headers.into_iter()).expect("decode header");
 
         // Verify
         assert_eq!(decoded.client.call_id, header.client.call_id);
@@ -313,16 +368,82 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_missing_fields() {
-        // Empty headers should create a header with defaults
-        let decoded = RequestHeaderCodec::decode_from_headers(std::iter::empty());
+    fn test_decode_missing_header_rejects() {
+        let error = RequestHeaderCodec::decode_from_headers(std::iter::empty()).expect_err("missing header must fail");
 
-        // Should have generated a new call_id
-        assert_ne!(decoded.client.call_id, CallId::new()); // Different call_ids
-        // Should have default client_id (0)
-        assert_eq!(decoded.client.client_id, ClientId::new(0));
-        // Should have default deadline
-        assert!(!decoded.deadline.has_passed());
+        assert!(error.contains("RequestHeader"));
+    }
+
+    #[test]
+    fn test_decode_missing_client_info_rejects() {
+        let error = RequestHeaderCodec::decode_from_headers(
+            vec![(HEADER_DEADLINE_MS.to_string(), "123".to_string())].into_iter(),
+        )
+        .expect_err("missing client info must fail");
+
+        assert!(error.contains("client info"));
+    }
+
+    #[test]
+    fn test_decode_missing_client_id_rejects() {
+        let error = RequestHeaderCodec::decode_from_headers(
+            vec![(HEADER_CALL_ID.to_string(), CallId::new().to_string())].into_iter(),
+        )
+        .expect_err("missing client_id must fail");
+
+        assert!(error.contains("client_id"));
+    }
+
+    #[test]
+    fn test_decode_zero_client_id_rejects() {
+        let error = RequestHeaderCodec::decode_from_headers(
+            vec![
+                (HEADER_CALL_ID.to_string(), CallId::new().to_string()),
+                (HEADER_CLIENT_ID.to_string(), "0".to_string()),
+            ]
+            .into_iter(),
+        )
+        .expect_err("zero client_id must fail");
+
+        assert!(error.contains("client_id"));
+    }
+
+    #[test]
+    fn test_decode_malformed_client_id_rejects_without_generation() {
+        let error = RequestHeaderCodec::decode_from_headers(
+            vec![
+                (HEADER_CALL_ID.to_string(), CallId::new().to_string()),
+                (HEADER_CLIENT_ID.to_string(), "not-a-client-id".to_string()),
+            ]
+            .into_iter(),
+        )
+        .expect_err("malformed client_id must fail");
+
+        assert!(error.contains("client_id"));
+    }
+
+    #[test]
+    fn test_decode_missing_call_id_rejects() {
+        let error = RequestHeaderCodec::decode_from_headers(
+            vec![(HEADER_CLIENT_ID.to_string(), ClientId::new(99).as_raw().to_string())].into_iter(),
+        )
+        .expect_err("missing call_id must fail");
+
+        assert!(error.contains("call_id"));
+    }
+
+    #[test]
+    fn test_decode_invalid_call_id_rejects() {
+        let error = RequestHeaderCodec::decode_from_headers(
+            vec![
+                (HEADER_CALL_ID.to_string(), "not-a-call-id".to_string()),
+                (HEADER_CLIENT_ID.to_string(), ClientId::new(99).as_raw().to_string()),
+            ]
+            .into_iter(),
+        )
+        .expect_err("invalid call_id must fail");
+
+        assert!(error.contains("call_id"));
     }
 
     #[test]
@@ -332,8 +453,11 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         let decoded = RequestHeaderCodec::decode_from_headers(
-            vec![(HEADER_GRPC_TIMEOUT.to_string(), "5S".to_string())].into_iter(),
-        );
+            valid_identity_headers()
+                .into_iter()
+                .chain(vec![(HEADER_GRPC_TIMEOUT.to_string(), "5S".to_string())]),
+        )
+        .expect("decode grpc timeout");
         let after_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -347,8 +471,11 @@ mod tests {
     fn test_decode_only_deadline_ms() {
         let deadline_ms = 123_456_789i64;
         let decoded = RequestHeaderCodec::decode_from_headers(
-            vec![(HEADER_DEADLINE_MS.to_string(), deadline_ms.to_string())].into_iter(),
-        );
+            valid_identity_headers()
+                .into_iter()
+                .chain(vec![(HEADER_DEADLINE_MS.to_string(), deadline_ms.to_string())]),
+        )
+        .expect("decode deadline");
         assert_eq!(decoded.deadline.as_unix_ms(), deadline_ms);
     }
 
@@ -361,7 +488,7 @@ mod tests {
         header.authn_type = AuthnType::Simple;
 
         let encoded = RequestHeaderCodec::encode_to_headers(&header);
-        let decoded = RequestHeaderCodec::decode_from_headers(encoded.into_iter());
+        let decoded = RequestHeaderCodec::decode_from_headers(encoded.into_iter()).expect("decode identity fields");
         assert_eq!(decoded.principal, Some("1000".to_string()));
         assert_eq!(decoded.real_user, Some("alice".to_string()));
         assert_eq!(decoded.doas, Some("bob".to_string()));
@@ -371,11 +498,23 @@ mod tests {
     #[test]
     fn test_decode_deadline_precedence() {
         let deadline_ms = 987_654_321i64;
-        let headers = vec![
+        let headers = valid_identity_headers().into_iter().chain(vec![
             (HEADER_GRPC_TIMEOUT.to_string(), "1S".to_string()),
             (HEADER_DEADLINE_MS.to_string(), deadline_ms.to_string()),
-        ];
-        let decoded = RequestHeaderCodec::decode_from_headers(headers.into_iter());
+        ]);
+        let decoded = RequestHeaderCodec::decode_from_headers(headers.into_iter()).expect("decode deadline precedence");
         assert_eq!(decoded.deadline.as_unix_ms(), deadline_ms);
+    }
+
+    fn valid_identity_headers() -> Vec<(String, String)> {
+        vec![
+            (HEADER_CALL_ID.to_string(), CallId::new().to_string()),
+            (
+                HEADER_CLIENT_ID.to_string(),
+                ClientId::new(0x0102_0304_0506_0708_1112_1314_1516_1718)
+                    .as_raw()
+                    .to_string(),
+            ),
+        ]
     }
 }

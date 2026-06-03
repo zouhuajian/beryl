@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use client::{AppendOptions, ClientConfig, CreateOptions, FsClient, ListOptions, OpenOptions};
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "requires local metadata and worker"]
 async fn local_client_crud_roundtrip() {
     let config_path =
