@@ -919,6 +919,12 @@ impl WorkerManager {
             .collect()
     }
 
+    /// List current in-memory worker run registrations for runtime scans.
+    pub fn list_registered_workers(&self) -> Vec<WorkerRegistrationKey> {
+        let registrations = self.registrations.read();
+        registrations.keys().cloned().collect()
+    }
+
     /// List live workers scoped to one metadata group.
     pub fn list_live_workers_in_group(&self, group_name: &GroupName) -> Vec<WorkerId> {
         let runtime = self.runtime.read();
@@ -945,8 +951,8 @@ impl WorkerManager {
             .unwrap_or(false)
     }
 
-    /// List all workers for background scans, preserving group identity.
-    pub fn list_all_workers(&self) -> Vec<WorkerRegistrationKey> {
+    /// List persisted worker descriptors. Descriptors are not active runtime state.
+    pub fn list_worker_descriptors(&self) -> Vec<WorkerRegistrationKey> {
         let descriptors = self.descriptors.read();
         descriptors.keys().cloned().collect()
     }
@@ -1059,32 +1065,45 @@ impl WorkerManager {
         reported
     }
 
-    /// Remove dead worker and clean up locations.
-    /// Note: descriptor is kept (from Raft state), only runtime and presence are cleaned.
-    pub fn remove_dead_worker(&self, group_name: &GroupName, worker_id: WorkerId) -> Vec<BlockId> {
+    /// Remove dead-worker runtime state and keep the persisted descriptor.
+    pub fn remove_dead_worker(&self, group_name: &GroupName, worker_id: WorkerId) -> (bool, Vec<BlockId>) {
         let key = WorkerRegistrationKey::new(group_name, worker_id);
+        let mut removed = false;
+        let mut affected_blocks = HashSet::new();
 
-        // Remove runtime (soft-state)
-        let mut runtime = self.runtime.write();
-        runtime.remove(&key);
-
-        // Remove worker blocks and locations
-        let mut worker_blocks = self.worker_blocks.write();
-        let blocks = worker_blocks.remove(&key).unwrap_or_default();
-
-        // Remove worker from locations
-        let mut locations = self.locations.write();
-        for block_id in &blocks {
-            let location_key = BlockLocationKey::new(group_name, *block_id);
-            if let Some(workers) = locations.get_mut(&location_key) {
-                workers.retain(|w| w != &key);
-                if workers.is_empty() {
-                    locations.remove(&location_key);
-                }
-            }
+        if self.registrations.write().remove(&key).is_some() {
+            removed = true;
+        }
+        if self.runtime.write().remove(&key).is_some() {
+            removed = true;
         }
 
-        blocks
+        if let Some(report) = self.block_reports.write().remove(&key) {
+            removed = true;
+            affected_blocks.extend(ready_block_ids(report.published_blocks.values()));
+        }
+
+        if let Some(blocks) = self.worker_blocks.write().remove(&key) {
+            removed = true;
+            affected_blocks.extend(blocks);
+        }
+
+        {
+            let mut locations = self.locations.write();
+            for (location_key, workers) in locations.iter_mut() {
+                let before = workers.len();
+                workers.retain(|worker_key| worker_key != &key);
+                if workers.len() != before {
+                    removed = true;
+                    affected_blocks.insert(location_key.block_id);
+                }
+            }
+            locations.retain(|_, workers| !workers.is_empty());
+        }
+
+        let mut affected_blocks: Vec<_> = affected_blocks.into_iter().collect();
+        affected_blocks.sort_by_key(|block_id| (block_id.data_handle_id.as_raw(), block_id.index.as_raw()));
+        (removed, affected_blocks)
     }
 
     /// Get all blocks for a worker.

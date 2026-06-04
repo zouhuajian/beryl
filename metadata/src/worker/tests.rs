@@ -1060,6 +1060,11 @@ fn loading_persisted_workers_drops_live_run_registration() {
     assert!(manager.get_descriptor(&group_name_value, worker_id).is_some());
     assert!(manager.get_worker(&group_name_value, worker_id).is_none());
     assert!(manager.needs_full_block_report(&group_name_value, worker_id));
+    assert_eq!(
+        manager.list_worker_descriptors(),
+        vec![WorkerRegistrationKey::new(&group_name_value, worker_id)]
+    );
+    assert!(manager.list_registered_workers().is_empty());
 }
 
 #[test]
@@ -1173,4 +1178,56 @@ fn heartbeat_liveness_expiry_removes_runtime_but_keeps_registration() {
         run_id
     );
     assert!(manager.get_descriptor(&group_name_value, worker_id).is_some());
+}
+
+#[test]
+fn remove_dead_worker_clears_runtime_state_but_keeps_descriptor() {
+    let manager = WorkerManager::new(60);
+    let group_name_value = group_name("g1");
+    let worker_id = WorkerId::new(1);
+    let run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440042".parse().unwrap();
+    let block = report_block(0).block_id;
+
+    register_live_report_worker(&manager, &group_name_value, worker_id, run_id);
+    manager
+        .receive_full_block_report(
+            &group_name_value,
+            worker_id,
+            run_id,
+            1,
+            0,
+            true,
+            vec![report_block_with_id(block)],
+        )
+        .unwrap();
+    assert_eq!(manager.get_worker_blocks(&group_name_value, worker_id), vec![block]);
+    assert_eq!(
+        manager.list_registered_workers(),
+        vec![WorkerRegistrationKey::new(&group_name_value, worker_id)]
+    );
+    assert_eq!(
+        manager.list_reported_blocks(),
+        vec![BlockLocationKey::new(&group_name_value, block)]
+    );
+    assert!(!manager.needs_full_block_report(&group_name_value, worker_id));
+
+    let (removed, affected_blocks) = manager.remove_dead_worker(&group_name_value, worker_id);
+
+    assert!(removed);
+    assert_eq!(affected_blocks, vec![block]);
+    assert!(manager.get_registration(&group_name_value, worker_id).is_none());
+    assert!(manager.get_worker(&group_name_value, worker_id).is_none());
+    assert!(manager.get_worker_blocks(&group_name_value, worker_id).is_empty());
+    assert!(manager.list_reported_blocks().is_empty());
+    assert!(manager.needs_full_block_report(&group_name_value, worker_id));
+    assert!(manager.get_descriptor(&group_name_value, worker_id).is_some());
+    assert!(manager.list_registered_workers().is_empty());
+    assert_eq!(
+        manager.list_worker_descriptors(),
+        vec![WorkerRegistrationKey::new(&group_name_value, worker_id)]
+    );
+
+    let (removed_again, affected_again) = manager.remove_dead_worker(&group_name_value, worker_id);
+    assert!(!removed_again);
+    assert!(affected_again.is_empty());
 }
