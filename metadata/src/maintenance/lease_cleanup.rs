@@ -199,7 +199,11 @@ impl LeaseCleanupService {
             self.metrics
                 .lease_cleanup_actions_total
                 .fetch_add(released as u64, Ordering::Relaxed);
-            info!(task = "lease_cleanup", released, "Lease cleanup completed");
+            if released > 0 {
+                info!(task = "lease_cleanup", released, "Lease cleanup completed");
+            } else {
+                debug!(task = "lease_cleanup", released, "Lease cleanup completed");
+            }
         }
 
         Ok(())

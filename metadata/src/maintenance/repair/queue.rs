@@ -190,7 +190,7 @@ impl RepairQueue {
                         if let Some(metrics) = &self.metrics {
                             metrics.inc_task_dedup_skipped();
                         }
-                        warn!(
+                        debug!(
                             task_id = existing_id.0,
                             state = ?existing_record.state,
                             "Duplicate repair task (active), skipping"
@@ -532,7 +532,7 @@ impl RepairQueue {
                             metrics_update.pending = state.count_pending();
                             metrics_update.retry = true;
 
-                            info!(
+                            warn!(
                                 task_id = task_id.0,
                                 attempt = attempt,
                                 error_class = ?error_class,

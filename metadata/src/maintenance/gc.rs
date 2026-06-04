@@ -265,17 +265,20 @@ impl GcService {
         self.metrics
             .gc_candidates_total
             .fetch_add((new_candidates + updated_candidates) as u64, Ordering::Relaxed);
-        self.metrics
-            .gc_candidates
-            .store(self.candidates.read().len(), Ordering::Relaxed);
+        let total_candidates = self.candidates.read().len();
+        self.metrics.gc_candidates.store(total_candidates, Ordering::Relaxed);
 
-        info!(
-            task = "gc",
-            new_candidates,
-            updated_candidates,
-            total_candidates = self.candidates.read().len(),
-            "GC mark pass completed"
-        );
+        if new_candidates > 0 || updated_candidates > 0 || total_candidates > 0 {
+            info!(
+                task = "gc",
+                new_candidates, updated_candidates, total_candidates, "GC mark pass completed"
+            );
+        } else {
+            debug!(
+                task = "gc",
+                new_candidates, updated_candidates, total_candidates, "GC mark pass completed"
+            );
+        }
 
         // Sweep pass: check block report convergence before destructive actions
         let epoch = self.worker_manager.get_metadata_epoch();
