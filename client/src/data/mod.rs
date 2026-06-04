@@ -81,7 +81,7 @@ pub(crate) struct WorkerWriteBlock {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WorkerCommitResult {
     /// Effective block length published by the worker.
-    pub(crate) effective_block_len: u64,
+    pub(crate) effective_len: u64,
     /// Metadata-assigned block stamp persisted by the worker.
     pub(crate) block_stamp: u64,
     /// Contiguous byte prefix written into the staging block.
@@ -92,7 +92,7 @@ pub(crate) struct WorkerCommitResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WorkerBlockSyncResult {
     /// Effective block length validated by the worker.
-    pub(crate) effective_block_len: u64,
+    pub(crate) effective_len: u64,
     /// Metadata-assigned block stamp persisted by the worker.
     pub(crate) block_stamp: u64,
 }

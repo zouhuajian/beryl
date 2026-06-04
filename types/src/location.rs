@@ -23,8 +23,8 @@ pub struct WriteTarget {
     ///
     /// It is normally equal to `block_size` for full blocks and may be smaller
     /// for tail or bounded blocks. Workers publish this as
-    /// `BlockMeta.source.effective_block_len`.
-    pub effective_block_len: u64,
+    /// `BlockMeta.source.effective_len`.
+    pub effective_len: u64,
     pub worker_endpoints: Vec<WorkerEndpointInfo>,
     pub fencing_token: FencingToken,
     pub block_stamp: u64,
@@ -59,5 +59,5 @@ pub struct FileBlockLocation {
     /// Metadata-selected StorageChunk size for this block.
     pub chunk_size: u32,
     /// Block-local readable prefix expected by metadata.
-    pub effective_block_len: u64,
+    pub effective_len: u64,
 }

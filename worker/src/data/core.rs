@@ -65,8 +65,8 @@ pub struct StreamContext {
     /// Block-local valid length for reads, or the full write bound before commit.
     ///
     /// Write commits publish their final valid length through
-    /// `CommitWriteRequest.effective_block_len`.
-    pub effective_block_len: u64,
+    /// `CommitWriteRequest.effective_len`.
+    pub effective_len: u64,
     /// Fencing token bound during write open. Read streams do not carry one.
     pub fencing_token: Option<FencingToken>,
 }
@@ -86,7 +86,7 @@ pub struct ReadOpenRequest {
     pub block_format_id: BlockFormatId,
     pub block_size: u64,
     pub chunk_size: u32,
-    pub effective_block_len: u64,
+    pub effective_len: u64,
     /// Requested transport frame payload size, not the worker-local StorageChunk size.
     pub frame_size: u32,
 }
@@ -123,12 +123,12 @@ pub struct WriteOpenRequest {
     /// Full logical block size from the persisted FileLayout.
     ///
     /// The worker persists this value in BlockMeta.format.block_size. Tail or
-    /// bounded valid length is carried later by CommitWrite.effective_block_len.
+    /// bounded valid length is carried later by CommitWrite.effective_len.
     pub block_size: u64,
     /// Metadata-selected Vecton block data/meta interpretation format.
     pub block_format_id: BlockFormatId,
     pub chunk_size: u32,
-    pub effective_block_len: u64,
+    pub effective_len: u64,
     pub checksum_kind: ChecksumKind,
 }
 
@@ -186,7 +186,7 @@ pub struct CommitWriteRequest {
     pub token: FencingToken,
     pub commit_seq: u64,
     /// Complete effective block length to publish.
-    pub effective_block_len: u64,
+    pub effective_len: u64,
     /// Metadata-assigned logical block stamp to persist at publish time.
     pub block_stamp: u64,
     pub block_format_id: BlockFormatId,
@@ -199,7 +199,7 @@ pub struct CommitWriteRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitWriteResult {
     /// Complete effective block length published as Ready.
-    pub effective_block_len: u64,
+    pub effective_len: u64,
     /// Logical block stamp after commit.
     pub block_stamp: u64,
     /// Contiguous byte prefix written into the staging block.
@@ -225,7 +225,7 @@ pub struct SyncCommittedBlockRequest {
 /// Durable sync result for an already committed block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyncCommittedBlockResult {
-    pub effective_block_len: u64,
+    pub effective_len: u64,
     pub block_stamp: u64,
 }
 
@@ -392,8 +392,8 @@ impl WorkerCore {
             block_format_id: snapshot.block_format_id,
             block_size: snapshot.block_size,
             chunk_size: snapshot.chunk_size,
-            committed_length: snapshot.effective_block_len,
-            effective_block_len: snapshot.effective_block_len,
+            committed_length: snapshot.effective_len,
+            effective_len: snapshot.effective_len,
             fencing_token: None,
         };
         self.stream_manager.register(StreamState::new(context)).await;
@@ -403,7 +403,7 @@ impl WorkerCore {
             frame_size,
             window_bytes: self.window_bytes(),
             block_stamp: snapshot.block_stamp,
-            committed_length: snapshot.effective_block_len,
+            committed_length: snapshot.effective_len,
         })
     }
 
@@ -429,7 +429,7 @@ impl WorkerCore {
             mode: StreamMode::Write,
             worker_run_id: req.worker_run_id,
             start_offset: 0,
-            end_offset: req.effective_block_len,
+            end_offset: req.effective_len,
             frame_size,
             window_bytes: self.window_bytes(),
             block_stamp: req.block_stamp,
@@ -437,7 +437,7 @@ impl WorkerCore {
             block_size: req.block_size,
             chunk_size: req.chunk_size,
             committed_length: 0,
-            effective_block_len: req.effective_block_len,
+            effective_len: req.effective_len,
             fencing_token: Some(req.token),
         };
         self.stream_manager.register(StreamState::new(context)).await;
@@ -461,15 +461,15 @@ impl WorkerCore {
         let meta = self.block_store.publish_ready(PublishReadyRequest {
             group_name: req.group_name,
             block_id: req.block_id,
-            effective_block_len: req.effective_block_len,
+            effective_len: req.effective_len,
             block_stamp: req.block_stamp,
         })?;
         self.stream_manager.remove(req.stream_id).await;
 
         Ok(CommitWriteResult {
-            effective_block_len: meta.source.effective_block_len,
+            effective_len: meta.source.effective_len,
             block_stamp: meta.visibility.block_stamp,
-            written_through: meta.source.effective_block_len,
+            written_through: meta.source.effective_len,
         })
     }
 
@@ -496,7 +496,7 @@ impl WorkerCore {
         })?;
         validate_sync_committed_block_meta(&req, &synced)?;
         Ok(SyncCommittedBlockResult {
-            effective_block_len: synced.source.effective_block_len,
+            effective_len: synced.source.effective_len,
             block_stamp: synced.visibility.block_stamp,
         })
     }
@@ -676,14 +676,14 @@ fn validate_write_open_request(req: &WriteOpenRequest) -> WorkerCoreResult<()> {
         ));
     }
     validate_block_format(req.block_format_id, req.block_size, req.chunk_size, req.checksum_kind)?;
-    if req.effective_block_len == 0 {
+    if req.effective_len == 0 {
         return Err(WorkerError::InvalidArgument(
-            "effective_block_len must be greater than zero".to_string(),
+            "effective_len must be greater than zero".to_string(),
         ));
     }
-    if req.effective_block_len > req.block_size {
+    if req.effective_len > req.block_size {
         return Err(WorkerError::InvalidArgument(
-            "effective_block_len must not exceed block_size".to_string(),
+            "effective_len must not exceed block_size".to_string(),
         ));
     }
     Ok(())
@@ -788,7 +788,7 @@ fn validate_existing_block_shape(
     if meta.format.format_id != req.block_format_id
         || meta.format.block_size != req.block_size
         || meta.format.chunk_size != u64::from(req.chunk_size)
-        || meta.source.effective_block_len != req.effective_block_len
+        || meta.source.effective_len != req.effective_len
     {
         return Err(WorkerError::NeedRefresh {
             code: RpcErrorCode::StaleState,
@@ -811,21 +811,21 @@ fn validate_commit_request(state: &StreamState, req: &CommitWriteRequest) -> Wor
             req.commit_seq, state.last_acked_seq
         )));
     }
-    if req.effective_block_len == 0 {
+    if req.effective_len == 0 {
         return Err(WorkerError::InvalidArgument(
-            "effective_block_len must be greater than zero".to_string(),
+            "effective_len must be greater than zero".to_string(),
         ));
     }
-    if req.effective_block_len > state.context.end_offset {
+    if req.effective_len > state.context.end_offset {
         return Err(WorkerError::InvalidArgument(format!(
-            "effective_block_len exceeds block_size: requested={}, block_size={}",
-            req.effective_block_len, state.context.end_offset
+            "effective_len exceeds block_size: requested={}, block_size={}",
+            req.effective_len, state.context.end_offset
         )));
     }
-    if state.cursor != req.effective_block_len {
+    if state.cursor != req.effective_len {
         return Err(WorkerError::InvalidArgument(format!(
-            "write stream is incomplete: written_through={}, effective_block_len={}",
-            state.cursor, req.effective_block_len
+            "write stream is incomplete: written_through={}, effective_len={}",
+            state.cursor, req.effective_len
         )));
     }
     if req.block_stamp == 0 {
@@ -901,13 +901,13 @@ fn validate_sync_committed_block_meta(
             ),
         });
     }
-    if meta.source.effective_block_len != req.expected_block_len {
+    if meta.source.effective_len != req.expected_block_len {
         return Err(WorkerError::NeedRefresh {
             code: RpcErrorCode::StaleState,
             reason: RefreshReason::StaleState,
             message: format!(
                 "effective block length mismatch during durable sync: group_name={}, block_id={}, expected={}, local={}",
-                req.group_name, req.block_id, req.expected_block_len, meta.source.effective_block_len
+                req.group_name, req.block_id, req.expected_block_len, meta.source.effective_len
             ),
         });
     }

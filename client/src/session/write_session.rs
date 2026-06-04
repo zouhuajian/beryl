@@ -108,10 +108,10 @@ impl WriteSession {
                 self.cursor, target.file_offset
             )));
         }
-        if target.effective_block_len != expected_len {
+        if target.effective_len != expected_len {
             return Err(ClientError::InvalidLayout(format!(
-                "write target effective_block_len mismatch: expected {}, got {}",
-                expected_len, target.effective_block_len
+                "write target effective_len mismatch: expected {}, got {}",
+                expected_len, target.effective_len
             )));
         }
         if target.block_size == 0 {
@@ -119,9 +119,9 @@ impl WriteSession {
                 "write target block_size must be non-zero".to_string(),
             ));
         }
-        if target.effective_block_len > target.block_size {
+        if target.effective_len > target.block_size {
             return Err(ClientError::InvalidLayout(
-                "write target effective_block_len must not exceed block_size".to_string(),
+                "write target effective_len must not exceed block_size".to_string(),
             ));
         }
         let block = target.block_id;
@@ -925,7 +925,7 @@ fn append_worker_block_identity(detail: &mut String, worker_block: &WorkerWriteB
         block_id,
         worker_block.target.block_stamp,
         worker_block.target.file_offset,
-        worker_block.target.effective_block_len,
+        worker_block.target.effective_len,
         worker_block.stream_id.high,
         worker_block.stream_id.low,
         worker_block.next_seq
@@ -1408,7 +1408,7 @@ mod tests {
             block_id: BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(block_index)),
             file_offset,
             block_size: 1024,
-            effective_block_len: len,
+            effective_len: len,
             worker_endpoints: vec![worker_endpoint()],
             fencing_token: FencingToken {
                 block_id: BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(block_index)),
@@ -1461,7 +1461,7 @@ mod tests {
             proto::common::WorkerNetProtocolProto::from(block.worker.worker_net_protocol) as i32,
             block.worker.worker_run_id.to_string(),
             block.target.file_offset,
-            block.target.effective_block_len,
+            block.target.effective_len,
             block.target.block_stamp,
             block.target.block_id.index.as_raw(),
             block.target.block_id.data_handle_id.as_raw(),

@@ -472,11 +472,11 @@ impl TryFrom<proto_metadata::WriteTargetProto> for WriteTarget {
         if target.block_size == 0 {
             return Err("WriteTargetProto.block_size must be non-zero".to_string());
         }
-        if target.effective_block_len == 0 {
-            return Err("WriteTargetProto.effective_block_len must be non-zero".to_string());
+        if target.effective_len == 0 {
+            return Err("WriteTargetProto.effective_len must be non-zero".to_string());
         }
-        if target.effective_block_len > target.block_size {
-            return Err("WriteTargetProto.effective_block_len must not exceed block_size".to_string());
+        if target.effective_len > target.block_size {
+            return Err("WriteTargetProto.effective_len must not exceed block_size".to_string());
         }
         if target.worker_endpoints.is_empty() {
             return Err("WriteTargetProto.worker_endpoints must not be empty".to_string());
@@ -512,7 +512,7 @@ impl TryFrom<proto_metadata::WriteTargetProto> for WriteTarget {
             block_id,
             file_offset: target.file_offset,
             block_size: target.block_size,
-            effective_block_len: target.effective_block_len,
+            effective_len: target.effective_len,
             worker_endpoints,
             fencing_token,
             block_stamp: target.block_stamp,
@@ -527,7 +527,7 @@ impl From<&WriteTarget> for proto_metadata::WriteTargetProto {
         Self {
             block_id: Some(target.block_id.into()),
             file_offset: target.file_offset,
-            effective_block_len: target.effective_block_len,
+            effective_len: target.effective_len,
             worker_endpoints: target.worker_endpoints.iter().map(Into::into).collect(),
             fencing_token: Some(target.fencing_token.into()),
             block_stamp: target.block_stamp,
@@ -543,7 +543,7 @@ impl From<WriteTarget> for proto_metadata::WriteTargetProto {
         Self {
             block_id: Some(target.block_id.into()),
             file_offset: target.file_offset,
-            effective_block_len: target.effective_block_len,
+            effective_len: target.effective_len,
             worker_endpoints: target.worker_endpoints.into_iter().map(Into::into).collect(),
             fencing_token: Some(target.fencing_token.into()),
             block_stamp: target.block_stamp,
@@ -606,11 +606,11 @@ impl TryFrom<proto_metadata::FileBlockLocationProto> for FileBlockLocation {
         if location.block_size == 0 {
             return Err("FileBlockLocationProto.block_size must be non-zero".to_string());
         }
-        if location.effective_block_len == 0 {
-            return Err("FileBlockLocationProto.effective_block_len must be non-zero".to_string());
+        if location.effective_len == 0 {
+            return Err("FileBlockLocationProto.effective_len must be non-zero".to_string());
         }
-        if location.effective_block_len > location.block_size {
-            return Err("FileBlockLocationProto.effective_block_len must not exceed block_size".to_string());
+        if location.effective_len > location.block_size {
+            return Err("FileBlockLocationProto.effective_len must not exceed block_size".to_string());
         }
         if location.chunk_size == 0 {
             return Err("FileBlockLocationProto.chunk_size must be non-zero".to_string());
@@ -638,7 +638,7 @@ impl TryFrom<proto_metadata::FileBlockLocationProto> for FileBlockLocation {
             block_format_id,
             block_size: location.block_size,
             chunk_size: location.chunk_size,
-            effective_block_len: location.effective_block_len,
+            effective_len: location.effective_len,
         })
     }
 }
@@ -654,7 +654,7 @@ impl From<&FileBlockLocation> for proto_metadata::FileBlockLocationProto {
             block_format_id: location.block_format_id.as_raw(),
             block_size: location.block_size,
             chunk_size: location.chunk_size,
-            effective_block_len: location.effective_block_len,
+            effective_len: location.effective_len,
         }
     }
 }
@@ -670,7 +670,7 @@ impl From<FileBlockLocation> for proto_metadata::FileBlockLocationProto {
             block_format_id: location.block_format_id.as_raw(),
             block_size: location.block_size,
             chunk_size: location.chunk_size,
-            effective_block_len: location.effective_block_len,
+            effective_len: location.effective_len,
         }
     }
 }
@@ -1496,7 +1496,7 @@ mod tests {
                 ("uint64", "block_size", 4),
                 ("uint32", "chunk_size", 5),
                 ("uint64", "block_stamp", 6),
-                ("uint64", "effective_block_len", 7),
+                ("uint64", "effective_len", 7),
                 ("common.WorkerEndpointInfoProto", "worker_endpoints", 8),
                 ("common.FencingTokenProto", "fencing_token", 9),
             ]
@@ -1512,7 +1512,7 @@ mod tests {
                 ("uint32", "block_format_id", 6),
                 ("uint64", "block_size", 7),
                 ("uint32", "chunk_size", 8),
-                ("uint64", "effective_block_len", 9),
+                ("uint64", "effective_len", 9),
             ]
         );
         assert_eq!(
@@ -1622,7 +1622,7 @@ mod tests {
                 ("uint32", "block_format_id", 8),
                 ("uint64", "block_size", 9),
                 ("uint32", "chunk_size", 10),
-                ("uint64", "effective_block_len", 11),
+                ("uint64", "effective_len", 11),
                 ("string", "group_name", 12),
             ]
         );
@@ -1650,7 +1650,7 @@ mod tests {
                 ("common.FencingTokenProto", "token", 9),
                 ("uint32", "frame_size", 10),
                 ("string", "worker_run_id", 11),
-                ("uint64", "effective_block_len", 12),
+                ("uint64", "effective_len", 12),
                 ("string", "group_name", 13),
             ]
         );
@@ -1671,7 +1671,7 @@ mod tests {
                 ("worker.DataRequestHeaderProto", "header", 1),
                 ("common.BlockIdProto", "block_id", 3),
                 ("common.StreamIdProto", "stream_id", 4),
-                ("uint64", "effective_block_len", 5),
+                ("uint64", "effective_len", 5),
                 ("uint64", "block_stamp", 6),
                 ("common.FencingTokenProto", "token", 7),
                 ("uint64", "commit_seq", 8),
@@ -1687,7 +1687,7 @@ mod tests {
             proto_message_fields(worker_data_proto, "CommitWriteResponseProto"),
             vec![
                 ("worker.DataResponseHeaderProto", "header", 1),
-                ("uint64", "effective_block_len", 2),
+                ("uint64", "effective_len", 2),
                 ("uint64", "block_stamp", 3),
                 ("uint64", "written_through", 4),
             ]
@@ -1710,7 +1710,7 @@ mod tests {
             proto_message_fields(worker_data_proto, "SyncCommittedBlockResponseProto"),
             vec![
                 ("worker.DataResponseHeaderProto", "header", 1),
-                ("uint64", "effective_block_len", 2),
+                ("uint64", "effective_len", 2),
                 ("uint64", "block_stamp", 3),
             ]
         );
@@ -1740,7 +1740,7 @@ mod tests {
         );
         assert_eq!(
             proto_message_fields(block_meta_proto, "BlockSourceProto"),
-            vec![("uint64", "effective_block_len", 1)]
+            vec![("uint64", "effective_len", 1)]
         );
         assert_eq!(
             proto_message_fields(block_meta_proto, "BlockVisibilityProto"),
@@ -1960,7 +1960,7 @@ mod tests {
         let mut target = proto_metadata::WriteTargetProto {
             block_id: Some(block_id.into()),
             file_offset: 128,
-            effective_block_len: 4096,
+            effective_len: 4096,
             worker_endpoints: Vec::new(),
             fencing_token: Some(token.into()),
             block_stamp: 55,
@@ -1984,7 +1984,7 @@ mod tests {
             block_format_id: types::layout::BlockFormatId::FULL_EFFECTIVE.as_raw(),
             block_size: 4096,
             chunk_size: 1024,
-            effective_block_len: 4096,
+            effective_len: 4096,
         };
         let decoded_empty =
             types::FileBlockLocation::try_from(location.clone()).expect("empty read location workers are valid");
@@ -2013,7 +2013,7 @@ mod tests {
             block_id,
             file_offset: 128,
             block_size: 4096,
-            effective_block_len: 3072,
+            effective_len: 3072,
             worker_endpoints: vec![endpoint.clone()],
             fencing_token: token,
             block_stamp: 55,
@@ -2027,7 +2027,7 @@ mod tests {
         let missing_format = proto_metadata::WriteTargetProto {
             block_id: Some(block_id.into()),
             file_offset: 128,
-            effective_block_len: 4096,
+            effective_len: 4096,
             worker_endpoints: vec![endpoint.clone().into()],
             fencing_token: Some(token.into()),
             block_stamp: 55,
@@ -2058,7 +2058,7 @@ mod tests {
             block_format_id: types::layout::BlockFormatId::FULL_EFFECTIVE,
             block_size: 4096,
             chunk_size: 1024,
-            effective_block_len: 3072,
+            effective_len: 3072,
         };
         let decoded_location =
             types::FileBlockLocation::try_from(proto_metadata::FileBlockLocationProto::from(location.clone()))

@@ -68,7 +68,7 @@ pub fn read_open_request_to_proto(req: ReadOpenRequest, ctx: &RequestHeader) -> 
         block_format_id: req.block_format_id.as_raw(),
         block_size: req.block_size,
         chunk_size: req.chunk_size,
-        effective_block_len: req.effective_block_len,
+        effective_len: req.effective_len,
     }
 }
 
@@ -85,7 +85,7 @@ pub fn write_open_request_to_proto(req: WriteOpenRequest, ctx: &RequestHeader) -
         frame_size: req.frame_size,
         block_format_id: req.block_format_id.as_raw(),
         worker_run_id: req.worker_run_id.to_string(),
-        effective_block_len: req.effective_block_len,
+        effective_len: req.effective_len,
     }
 }
 
@@ -105,7 +105,7 @@ pub fn commit_write_request_to_proto(req: CommitWriteRequest, ctx: &RequestHeade
         group_name: req.group_name.to_string(),
         block_id: Some(block_id_to_proto(req.block_id)),
         stream_id: Some(stream_id_to_proto(req.stream_id)),
-        effective_block_len: req.effective_block_len,
+        effective_len: req.effective_len,
         block_stamp: req.block_stamp,
         token: Some(fencing_token_to_proto(req.token)),
         commit_seq: req.commit_seq,
@@ -180,7 +180,7 @@ pub fn proto_to_read_open_request(proto: OpenReadStreamRequestProto) -> WorkerCo
         block_format_id,
         block_size: proto.block_size,
         chunk_size: proto.chunk_size,
-        effective_block_len: proto.effective_block_len,
+        effective_len: proto.effective_len,
         frame_size: proto.frame_size,
     })
 }
@@ -204,7 +204,7 @@ pub fn proto_to_write_open_request(proto: OpenWriteStreamRequestProto) -> Worker
         block_size: proto.block_size,
         block_format_id,
         chunk_size: proto.chunk_size,
-        effective_block_len: proto.effective_block_len,
+        effective_len: proto.effective_len,
         checksum_kind,
     })
 }
@@ -237,7 +237,7 @@ pub fn proto_to_commit_write_request(proto: CommitWriteRequestProto) -> WorkerCo
         worker_run_id,
         token,
         commit_seq: proto.commit_seq,
-        effective_block_len: proto.effective_block_len,
+        effective_len: proto.effective_len,
         block_stamp: proto.block_stamp,
         block_format_id,
         block_size: proto.block_size,

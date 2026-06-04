@@ -307,7 +307,7 @@ impl WorkerDataService for WorkerDataServiceImpl {
         if let Err(error) = self.ensure_group_ready_for_run(&request.group_name, &request.worker_run_id) {
             return Ok(Response::new(CommitWriteResponseProto {
                 header: Some(Self::error_response_header(header, error)),
-                effective_block_len: 0,
+                effective_len: 0,
                 block_stamp: 0,
                 written_through: 0,
             }));
@@ -316,20 +316,20 @@ impl WorkerDataService for WorkerDataServiceImpl {
             Ok(domain) => match self.core.commit_write(domain).await {
                 Ok(result) => CommitWriteResponseProto {
                     header: Some(Self::ok_response_header(header)),
-                    effective_block_len: result.effective_block_len,
+                    effective_len: result.effective_len,
                     block_stamp: result.block_stamp,
                     written_through: result.written_through,
                 },
                 Err(error) => CommitWriteResponseProto {
                     header: Some(Self::error_response_header(header, error)),
-                    effective_block_len: 0,
+                    effective_len: 0,
                     block_stamp: 0,
                     written_through: 0,
                 },
             },
             Err(error) => CommitWriteResponseProto {
                 header: Some(Self::error_response_header(header, error)),
-                effective_block_len: 0,
+                effective_len: 0,
                 block_stamp: 0,
                 written_through: 0,
             },
@@ -347,7 +347,7 @@ impl WorkerDataService for WorkerDataServiceImpl {
         if let Err(error) = self.ensure_group_ready_for_run(&request.group_name, &request.worker_run_id) {
             return Ok(Response::new(SyncCommittedBlockResponseProto {
                 header: Some(Self::error_response_header(header, error)),
-                effective_block_len: 0,
+                effective_len: 0,
                 block_stamp: 0,
             }));
         }
@@ -355,18 +355,18 @@ impl WorkerDataService for WorkerDataServiceImpl {
             Ok(domain) => match self.core.sync_committed_block(domain).await {
                 Ok(result) => SyncCommittedBlockResponseProto {
                     header: Some(Self::ok_response_header(header)),
-                    effective_block_len: result.effective_block_len,
+                    effective_len: result.effective_len,
                     block_stamp: result.block_stamp,
                 },
                 Err(error) => SyncCommittedBlockResponseProto {
                     header: Some(Self::error_response_header(header, error)),
-                    effective_block_len: 0,
+                    effective_len: 0,
                     block_stamp: 0,
                 },
             },
             Err(error) => SyncCommittedBlockResponseProto {
                 header: Some(Self::error_response_header(header, error)),
-                effective_block_len: 0,
+                effective_len: 0,
                 block_stamp: 0,
             },
         };

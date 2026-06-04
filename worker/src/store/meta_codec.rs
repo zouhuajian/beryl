@@ -72,7 +72,7 @@ fn meta_to_proto_without_visibility(meta: &BlockMetaPayload) -> StoreResult<Bloc
             checksum_kind: checksum_kind_to_proto(meta.format.checksum_kind) as i32,
         }),
         source: Some(BlockSourceProto {
-            effective_block_len: meta.source.effective_block_len,
+            effective_len: meta.source.effective_len,
         }),
         visibility: None,
     })
@@ -156,7 +156,7 @@ fn meta_fields_from_proto(
             checksum_kind: checksum_kind_from_proto(format.checksum_kind)?,
         },
         source: BlockSource {
-            effective_block_len: source.effective_block_len,
+            effective_len: source.effective_len,
         },
     })
 }

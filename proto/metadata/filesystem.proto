@@ -61,8 +61,8 @@ message WriteTargetProto {
   uint64 block_stamp = 6;
   // Valid length for this block target. It is normally equal to block_size for
   // full blocks and may be smaller for tail or bounded blocks. Workers publish
-  // this as BlockMeta.source.effective_block_len.
-  uint64 effective_block_len = 7;
+  // this as BlockMeta.source.effective_len.
+  uint64 effective_len = 7;
   repeated common.WorkerEndpointInfoProto worker_endpoints = 8;
   common.FencingTokenProto fencing_token = 9;
 }
@@ -89,7 +89,7 @@ message FileBlockLocationProto {
   uint64 block_size = 7;
   uint32 chunk_size = 8;
   // Block-local readable prefix expected by metadata for this block.
-  uint64 effective_block_len = 9;
+  uint64 effective_len = 9;
 }
 
 // ============================================================================

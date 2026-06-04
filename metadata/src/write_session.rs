@@ -135,13 +135,13 @@ impl WriteSessionManager {
         let next_file_offset = session
             .issued_targets
             .last()
-            .and_then(|issued| issued.file_offset.checked_add(issued.effective_block_len))
+            .and_then(|issued| issued.file_offset.checked_add(issued.effective_len))
             .unwrap_or(session.base_size);
         target.file_offset = next_file_offset;
         if let Some(len) = desired_len {
-            target.effective_block_len = len.min(target.effective_block_len).max(1);
+            target.effective_len = len.min(target.effective_len).max(1);
         }
-        if target.effective_block_len == 0 || target.effective_block_len > target.block_size {
+        if target.effective_len == 0 || target.effective_len > target.block_size {
             return None;
         }
         session.next_target_index += 1;

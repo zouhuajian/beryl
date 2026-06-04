@@ -1516,7 +1516,7 @@ mod tests {
             block_size: BLOCK_SIZE,
             block_format_id: BlockFormatId::FULL_EFFECTIVE,
             chunk_size: CHUNK_SIZE,
-            effective_block_len: BLOCK_SIZE,
+            effective_len: BLOCK_SIZE,
             checksum_kind: ChecksumKind::None,
         }
     }
@@ -1529,7 +1529,7 @@ mod tests {
             worker_run_id: test_worker_run_id(),
             token: token(),
             commit_seq: 8,
-            effective_block_len: 4096,
+            effective_len: 4096,
             block_stamp: BLOCK_STAMP,
             block_format_id: BlockFormatId::FULL_EFFECTIVE,
             block_size: BLOCK_SIZE,
@@ -1575,7 +1575,7 @@ mod tests {
             block_size: BLOCK_SIZE,
             chunk_size: CHUNK_SIZE,
             committed_length: 4096,
-            effective_block_len: 4096,
+            effective_len: 4096,
             worker_run_id: test_worker_run_id(),
             fencing_token: None,
         }
@@ -1622,7 +1622,7 @@ mod tests {
             .publish_ready(PublishReadyRequest {
                 group_name: group_name(),
                 block_id: block_id(),
-                effective_block_len: data.len() as u64,
+                effective_len: data.len() as u64,
                 block_stamp,
             })
             .expect("publish ready block");
@@ -1652,7 +1652,7 @@ mod tests {
             .publish_ready(PublishReadyRequest {
                 group_name,
                 block_id,
-                effective_block_len: data.len() as u64,
+                effective_len: data.len() as u64,
                 block_stamp,
             })
             .expect("publish ready block");
@@ -1668,7 +1668,7 @@ mod tests {
             block_format_id: BlockFormatId::FULL_EFFECTIVE,
             block_size: BLOCK_SIZE,
             chunk_size: CHUNK_SIZE,
-            effective_block_len: BLOCK_SIZE,
+            effective_len: BLOCK_SIZE,
             frame_size,
         }
     }
@@ -1693,7 +1693,7 @@ mod tests {
             block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
             block_size: BLOCK_SIZE,
             chunk_size: CHUNK_SIZE,
-            effective_block_len: BLOCK_SIZE,
+            effective_len: BLOCK_SIZE,
         }
     }
 
@@ -1710,17 +1710,17 @@ mod tests {
             token: Some(test_token_proto()),
             frame_size,
             worker_run_id: test_worker_run_id().to_string(),
-            effective_block_len: BLOCK_SIZE,
+            effective_len: BLOCK_SIZE,
         }
     }
 
-    fn commit_write_proto(stream_id: StreamId, commit_seq: u64, effective_block_len: u64) -> CommitWriteRequestProto {
+    fn commit_write_proto(stream_id: StreamId, commit_seq: u64, effective_len: u64) -> CommitWriteRequestProto {
         CommitWriteRequestProto {
             header: Some(test_header()),
             group_name: "root".to_string(),
             block_id: Some(test_block_id_proto()),
             stream_id: Some(crate::data::convert::stream_id_to_proto(stream_id)),
-            effective_block_len,
+            effective_len,
             block_stamp: BLOCK_STAMP,
             token: Some(test_token_proto()),
             commit_seq,
@@ -1823,7 +1823,7 @@ mod tests {
         assert_eq!(domain.block_format_id, BlockFormatId::FULL_EFFECTIVE);
         assert_eq!(domain.block_size, BLOCK_SIZE);
         assert_eq!(domain.chunk_size, CHUNK_SIZE);
-        assert_eq!(domain.effective_block_len, BLOCK_SIZE);
+        assert_eq!(domain.effective_len, BLOCK_SIZE);
         assert_eq!(domain.frame_size, 8192);
     }
 
@@ -1843,7 +1843,7 @@ mod tests {
         assert_eq!(domain.frame_size, 8192);
         assert_eq!(domain.block_size, BLOCK_SIZE);
         assert_eq!(domain.chunk_size, CHUNK_SIZE);
-        assert_eq!(domain.effective_block_len, BLOCK_SIZE);
+        assert_eq!(domain.effective_len, BLOCK_SIZE);
         assert_eq!(domain.checksum_kind, ChecksumKind::None);
     }
 
@@ -1889,7 +1889,7 @@ mod tests {
         assert_eq!(commit.token.epoch, 11);
         assert_eq!(commit.worker_run_id, test_worker_run_id());
         assert_eq!(commit.commit_seq, 8);
-        assert_eq!(commit.effective_block_len, 4096);
+        assert_eq!(commit.effective_len, 4096);
         assert_eq!(commit.block_stamp, BLOCK_STAMP);
         assert_eq!(commit.block_format_id, BlockFormatId::FULL_EFFECTIVE);
         assert_eq!(commit.block_size, BLOCK_SIZE);
@@ -1938,7 +1938,7 @@ mod tests {
             block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
             block_size: BLOCK_SIZE,
             chunk_size: CHUNK_SIZE,
-            effective_block_len: BLOCK_SIZE,
+            effective_len: BLOCK_SIZE,
         })
         .unwrap_err();
         assert!(read_err.to_string().contains("missing block_id"));
@@ -1954,7 +1954,7 @@ mod tests {
             block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
             block_size: BLOCK_SIZE,
             chunk_size: CHUNK_SIZE,
-            effective_block_len: BLOCK_SIZE,
+            effective_len: BLOCK_SIZE,
         })
         .unwrap_err();
         assert!(read_err.to_string().contains("missing group_name"));
@@ -1970,7 +1970,7 @@ mod tests {
             block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
             block_size: BLOCK_SIZE,
             chunk_size: CHUNK_SIZE,
-            effective_block_len: BLOCK_SIZE,
+            effective_len: BLOCK_SIZE,
         })
         .unwrap_err();
         assert!(read_err.to_string().contains("group_name invalid"));
@@ -1997,7 +1997,7 @@ mod tests {
             group_name: "root".to_string(),
             block_id: Some(test_block_id_proto()),
             stream_id: None,
-            effective_block_len: 1,
+            effective_len: 1,
             block_stamp: BLOCK_STAMP,
             token: Some(test_token_proto()),
             commit_seq: 1,
@@ -2056,7 +2056,7 @@ mod tests {
         assert_invalid_argument(core.open_write(non_aligned).await);
 
         let mut over_len = write_open_request();
-        over_len.effective_block_len = BLOCK_SIZE + 1;
+        over_len.effective_len = BLOCK_SIZE + 1;
         assert_invalid_argument(core.open_write(over_len).await);
 
         assert!(!paths.staging_data_path.exists());
@@ -2244,13 +2244,13 @@ mod tests {
             .commit_write(CommitWriteRequest {
                 stream_id: open.stream_id,
                 commit_seq: 2,
-                effective_block_len: BLOCK_SIZE,
+                effective_len: BLOCK_SIZE,
                 ..commit_write_request()
             })
             .await
             .expect("commit write");
 
-        assert_eq!(result.effective_block_len, BLOCK_SIZE);
+        assert_eq!(result.effective_len, BLOCK_SIZE);
         assert_eq!(result.block_stamp, BLOCK_STAMP);
         assert_eq!(result.written_through, BLOCK_SIZE);
         let meta = store.load_meta(&group_name(), block_id()).expect("ready meta");
@@ -2278,17 +2278,17 @@ mod tests {
             .commit_write(CommitWriteRequest {
                 stream_id: open.stream_id,
                 commit_seq: 1,
-                effective_block_len: effective_len,
+                effective_len,
                 ..commit_write_request()
             })
             .await
             .expect("tail commit");
 
-        assert_eq!(result.effective_block_len, effective_len);
+        assert_eq!(result.effective_len, effective_len);
         assert_eq!(result.written_through, effective_len);
         let meta = store.load_meta(&group_name(), block_id()).expect("ready meta");
         assert_eq!(meta.format.block_size, BLOCK_SIZE);
-        assert_eq!(meta.source.effective_block_len, effective_len);
+        assert_eq!(meta.source.effective_len, effective_len);
     }
 
     #[tokio::test]
@@ -2300,7 +2300,7 @@ mod tests {
             core.commit_write(CommitWriteRequest {
                 stream_id: open.stream_id,
                 commit_seq: 0,
-                effective_block_len: BLOCK_SIZE + 1,
+                effective_len: BLOCK_SIZE + 1,
                 ..commit_write_request()
             })
             .await,
@@ -2311,7 +2311,7 @@ mod tests {
     async fn commit_write_rejects_layout_mismatch_against_open_request() {
         let (_temp, _store, core) = core_with_store(512, 2048, 4096);
         let mut open_req = write_open_request();
-        open_req.effective_block_len = 4;
+        open_req.effective_len = 4;
         let open = core.open_write(open_req).await.expect("open write");
         core.write_stream(WriteFrame {
             stream_id: open.stream_id,
@@ -2327,7 +2327,7 @@ mod tests {
             core.commit_write(CommitWriteRequest {
                 stream_id: open.stream_id,
                 commit_seq: 1,
-                effective_block_len: 4,
+                effective_len: 4,
                 chunk_size: CHUNK_SIZE * 2,
                 ..commit_write_request()
             })
@@ -2354,7 +2354,7 @@ mod tests {
             core.commit_write(CommitWriteRequest {
                 stream_id: open.stream_id,
                 commit_seq: 1,
-                effective_block_len: BLOCK_SIZE,
+                effective_len: BLOCK_SIZE,
                 ..commit_write_request()
             })
             .await,
@@ -2381,7 +2381,7 @@ mod tests {
                 stream_id: open.stream_id,
                 token: FencingToken::new(block_id(), ClientId::new(99), 11),
                 commit_seq: 1,
-                effective_block_len: BLOCK_SIZE,
+                effective_len: BLOCK_SIZE,
                 ..commit_write_request()
             })
             .await
@@ -2409,7 +2409,7 @@ mod tests {
         core.commit_write(CommitWriteRequest {
             stream_id: open.stream_id,
             commit_seq: 1,
-            effective_block_len: BLOCK_SIZE,
+            effective_len: BLOCK_SIZE,
             ..commit_write_request()
         })
         .await
@@ -2420,7 +2420,7 @@ mod tests {
             core.commit_write(CommitWriteRequest {
                 stream_id: open.stream_id,
                 commit_seq: 1,
-                effective_block_len: BLOCK_SIZE,
+                effective_len: BLOCK_SIZE,
                 ..commit_write_request()
             })
             .await,
@@ -2443,7 +2443,7 @@ mod tests {
         core.commit_write(CommitWriteRequest {
             stream_id: open.stream_id,
             commit_seq: 1,
-            effective_block_len: BLOCK_SIZE,
+            effective_len: BLOCK_SIZE,
             require_sync: false,
             ..commit_write_request()
         })
@@ -2456,7 +2456,7 @@ mod tests {
             .await
             .expect("sync committed block");
 
-        assert_eq!(result.effective_block_len, BLOCK_SIZE);
+        assert_eq!(result.effective_len, BLOCK_SIZE);
         assert_eq!(result.block_stamp, BLOCK_STAMP);
     }
 
@@ -2488,7 +2488,7 @@ mod tests {
         core.commit_write(CommitWriteRequest {
             stream_id: open.stream_id,
             commit_seq: 1,
-            effective_block_len: BLOCK_SIZE,
+            effective_len: BLOCK_SIZE,
             ..commit_write_request()
         })
         .await
@@ -2632,7 +2632,7 @@ mod tests {
         assert_eq!(state.context.start_offset, 128);
         assert_eq!(state.context.end_offset, 1152);
         assert_eq!(state.cursor, 128);
-        assert_eq!(state.context.effective_block_len, BLOCK_SIZE);
+        assert_eq!(state.context.effective_len, BLOCK_SIZE);
     }
 
     #[tokio::test]
@@ -2970,7 +2970,7 @@ mod tests {
             .into_inner();
 
         assert!(response.header.expect("header").error.is_none());
-        assert_eq!(response.effective_block_len, BLOCK_SIZE);
+        assert_eq!(response.effective_len, BLOCK_SIZE);
         assert_eq!(response.block_stamp, BLOCK_STAMP);
         assert_eq!(response.written_through, BLOCK_SIZE);
     }
@@ -2988,7 +2988,7 @@ mod tests {
             .into_inner();
 
         assert!(response.header.expect("header").error.is_none());
-        assert_eq!(response.effective_block_len, BLOCK_SIZE);
+        assert_eq!(response.effective_len, BLOCK_SIZE);
         assert_eq!(response.block_stamp, BLOCK_STAMP);
     }
 
@@ -3475,7 +3475,7 @@ mod tests {
                 ("common.FencingTokenProto", "token", 9),
                 ("uint32", "frame_size", 10),
                 ("string", "worker_run_id", 11),
-                ("uint64", "effective_block_len", 12),
+                ("uint64", "effective_len", 12),
                 ("string", "group_name", 13),
             ]
         );
@@ -3507,7 +3507,7 @@ mod tests {
                 ("worker.DataRequestHeaderProto", "header", 1),
                 ("common.BlockIdProto", "block_id", 3),
                 ("common.StreamIdProto", "stream_id", 4),
-                ("uint64", "effective_block_len", 5),
+                ("uint64", "effective_len", 5),
                 ("uint64", "block_stamp", 6),
                 ("common.FencingTokenProto", "token", 7),
                 ("uint64", "commit_seq", 8),
@@ -3523,7 +3523,7 @@ mod tests {
             proto_message_fields(proto, "CommitWriteResponseProto"),
             vec![
                 ("worker.DataResponseHeaderProto", "header", 1),
-                ("uint64", "effective_block_len", 2),
+                ("uint64", "effective_len", 2),
                 ("uint64", "block_stamp", 3),
                 ("uint64", "written_through", 4),
             ]
@@ -3546,7 +3546,7 @@ mod tests {
             proto_message_fields(proto, "SyncCommittedBlockResponseProto"),
             vec![
                 ("worker.DataResponseHeaderProto", "header", 1),
-                ("uint64", "effective_block_len", 2),
+                ("uint64", "effective_len", 2),
                 ("uint64", "block_stamp", 3),
             ]
         );

@@ -358,7 +358,7 @@ async fn get_file_layout_returns_reported_locations_using_read_placement() {
     assert_eq!(location.block_format_id, types::BlockFormatId::CURRENT_FOR_NEW_FILE);
     assert_eq!(location.block_size, 4096);
     assert_eq!(location.chunk_size, 4096);
-    assert_eq!(location.effective_block_len, 512);
+    assert_eq!(location.effective_len, 512);
     assert_eq!(location.workers[0].endpoint, "127.0.0.2:9102");
     assert_eq!(
         location.workers[0].worker_run_id,
@@ -1160,7 +1160,7 @@ fn install_write_session(fs_core: &FsCore, inode_id: InodeId, mount_id: MountId)
                 block_id: BlockId::new(data_handle_id, BlockIndex::new(0)),
                 file_offset: 0,
                 block_size: 64,
-                effective_block_len: 64,
+                effective_len: 64,
                 worker_endpoints: Vec::new(),
                 fencing_token: FencingToken {
                     block_id: BlockId::new(data_handle_id, BlockIndex::new(0)),
@@ -1795,7 +1795,7 @@ async fn open_write_targets_use_inode_current_data_handle() {
     for target in &success.payload.write_targets {
         assert_eq!(target.block_id.data_handle_id, data_handle_id);
         assert_eq!(target.block_size, 4096);
-        assert_eq!(target.effective_block_len, 4096);
+        assert_eq!(target.effective_len, 4096);
         assert_eq!(target.chunk_size, 4096);
         assert_eq!(target.block_format_id, types::BlockFormatId::CURRENT_FOR_NEW_FILE);
     }
@@ -2046,7 +2046,7 @@ async fn commit_worker_run_check_rejects_missing_authoritative_group() {
                     block_id,
                     file_offset: 0,
                     block_size: 64,
-                    effective_block_len: 64,
+                    effective_len: 64,
                     worker_endpoints: vec![WorkerEndpointInfo {
                         worker_id,
                         endpoint: "127.0.0.1:9001".to_string(),
@@ -2173,7 +2173,7 @@ async fn commit_advances_file_version() {
         vec![committed_block(
             target.block_id,
             target.file_offset,
-            target.effective_block_len,
+            target.effective_len,
         )],
         64,
     )
@@ -2210,8 +2210,8 @@ async fn create_then_add_block() {
     assert_eq!(target.block_id.data_handle_id, env.data_handle_id);
     assert_eq!(target.file_offset, 0);
     assert_eq!(target.block_size, 4096);
-    assert_eq!(target.effective_block_len, 512);
-    assert!(target.effective_block_len < target.block_size);
+    assert_eq!(target.effective_len, 512);
+    assert!(target.effective_len < target.block_size);
     assert_eq!(target.chunk_size, 4096);
     assert_eq!(target.block_format_id, types::BlockFormatId::CURRENT_FOR_NEW_FILE);
     assert!(target.worker_endpoints[0].endpoint.starts_with("127.0.0.1:900"));
@@ -2227,7 +2227,7 @@ async fn create_then_add_block() {
     assert_eq!(session_after_add.next_target_index, 1);
     assert_eq!(session_after_add.issued_targets.len(), 1);
 
-    let committed = committed_block(target.block_id, target.file_offset, target.effective_block_len);
+    let committed = committed_block(target.block_id, target.file_offset, target.effective_len);
     let success = commit_for_key(&env.fs_core, &key, vec![committed], 512)
         .await
         .expect("commit should succeed");
@@ -2260,7 +2260,7 @@ async fn open_write_target_uses_stored_file_layout_shape() {
     assert_eq!(target.block_format_id, layout.block_format_id);
     assert_eq!(target.block_size, u64::from(layout.block_size));
     assert_eq!(target.chunk_size, layout.chunk_size);
-    assert_eq!(target.effective_block_len, 2048);
+    assert_eq!(target.effective_len, 2048);
 }
 
 #[tokio::test]
@@ -2306,7 +2306,7 @@ async fn commit_worker_run_check_uses_session_group() {
         vec![committed_block(
             target.block_id,
             target.file_offset,
-            target.effective_block_len,
+            target.effective_len,
         )],
         64,
     )
@@ -2376,7 +2376,7 @@ async fn commit_worker_run_check_rejects_stale_live_registration() {
         vec![committed_block(
             target.block_id,
             target.file_offset,
-            target.effective_block_len,
+            target.effective_len,
         )],
         64,
     )
@@ -2414,7 +2414,7 @@ async fn create_new_commit_returns_initial_file_version() {
         vec![committed_block(
             target.block_id,
             target.file_offset,
-            target.effective_block_len,
+            target.effective_len,
         )],
         64,
     )
@@ -2466,7 +2466,7 @@ async fn append_advances_file_version() {
         vec![committed_block(
             first_target.block_id,
             first_target.file_offset,
-            first_target.effective_block_len,
+            first_target.effective_len,
         )],
         64,
     )
@@ -2492,7 +2492,7 @@ async fn append_advances_file_version() {
         vec![committed_block(
             second_target.block_id,
             second_target.file_offset,
-            second_target.effective_block_len,
+            second_target.effective_len,
         )],
         128,
     )
@@ -2546,7 +2546,7 @@ async fn worker_report_does_not_change_file_version() {
         vec![committed_block(
             target.block_id,
             target.file_offset,
-            target.effective_block_len,
+            target.effective_len,
         )],
         64,
     )
@@ -2612,7 +2612,7 @@ async fn get_locations_rejects_stale_state_watermark() {
         vec![committed_block(
             target.block_id,
             target.file_offset,
-            target.effective_block_len,
+            target.effective_len,
         )],
         64,
     )
@@ -2797,7 +2797,7 @@ async fn commit_rejects_duplicate_block() {
         .expect("open write should succeed");
     let key = open.payload.session_key;
     let target = add_block_for_key(&env.fs_core, &key, 256).await;
-    let block = committed_block(target.block_id, target.file_offset, target.effective_block_len);
+    let block = committed_block(target.block_id, target.file_offset, target.effective_len);
 
     let failure = commit_for_key(&env.fs_core, &key, vec![block.clone(), block], 256)
         .await
@@ -2826,7 +2826,7 @@ async fn commit_rejects_offset_mismatch() {
         .expect("open write should succeed");
     let key = open.payload.session_key;
     let target = add_block_for_key(&env.fs_core, &key, 256).await;
-    let committed = committed_block(target.block_id, target.file_offset + 1, target.effective_block_len);
+    let committed = committed_block(target.block_id, target.file_offset + 1, target.effective_len);
 
     let failure = commit_for_key(&env.fs_core, &key, vec![committed], 257)
         .await
@@ -2860,11 +2860,7 @@ async fn sync_write_visibility_publishes_prefix_and_keeps_session_open() {
     let synced = sync_for_key(
         &env.fs_core,
         &key,
-        vec![committed_block(
-            first.block_id,
-            first.file_offset,
-            first.effective_block_len,
-        )],
+        vec![committed_block(first.block_id, first.file_offset, first.effective_len)],
         64,
         SyncWriteMode::Visibility,
     )
@@ -2895,8 +2891,8 @@ async fn sync_write_visibility_publishes_prefix_and_keeps_session_open() {
         &env.fs_core,
         &key,
         vec![
-            committed_block(first.block_id, first.file_offset, first.effective_block_len),
-            committed_block(second.block_id, second.file_offset, second.effective_block_len),
+            committed_block(first.block_id, first.file_offset, first.effective_len),
+            committed_block(second.block_id, second.file_offset, second.effective_len),
         ],
         128,
     )
@@ -2929,7 +2925,7 @@ async fn sync_write_durability_uses_same_metadata_publish_path() {
         vec![committed_block(
             target.block_id,
             target.file_offset,
-            target.effective_block_len,
+            target.effective_len,
         )],
         64,
         SyncWriteMode::Durability,
@@ -2965,7 +2961,7 @@ async fn sync_write_rejects_target_beyond_committed_block_coverage() {
         vec![committed_block(
             target.block_id,
             target.file_offset,
-            target.effective_block_len,
+            target.effective_len,
         )],
         128,
         SyncWriteMode::Visibility,
@@ -3000,7 +2996,7 @@ async fn repeated_identical_sync_write_is_idempotent_without_file_version_advanc
     let blocks = vec![committed_block(
         target.block_id,
         target.file_offset,
-        target.effective_block_len,
+        target.effective_len,
     )];
 
     let first = sync_for_key(&env.fs_core, &key, blocks.clone(), 64, SyncWriteMode::Visibility)
@@ -3034,7 +3030,7 @@ async fn append_uses_base_size() {
     let target = add_block_for_key(&env.fs_core, &key, 64).await;
     assert_eq!(target.file_offset, 128);
 
-    let wrong_offset = committed_block(target.block_id, 0, target.effective_block_len);
+    let wrong_offset = committed_block(target.block_id, 0, target.effective_len);
     let failure = commit_for_key(&env.fs_core, &key, vec![wrong_offset], 64)
         .await
         .expect_err("append commit must start at base_size");
@@ -3168,7 +3164,7 @@ async fn replay_keeps_append_commit_mode() {
             committed_blocks: vec![committed_block(
                 target.block_id,
                 target.file_offset,
-                target.effective_block_len,
+                target.effective_len,
             )],
             final_size: 128,
         },

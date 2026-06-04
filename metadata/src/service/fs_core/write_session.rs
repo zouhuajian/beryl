@@ -85,7 +85,7 @@ struct PlannedWriteTarget {
     block_id: BlockId,
     file_offset: u64,
     block_size: u64,
-    effective_block_len: u64,
+    effective_len: u64,
     worker_endpoints: Vec<WorkerEndpointInfo>,
 }
 
@@ -755,7 +755,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             let block_index = BlockIndex::new(start_index + i as u32);
             let block_id = BlockId::new(data_handle_id, block_index);
             let file_offset = base_size + i * block_size;
-            let effective_block_len = desired_len.saturating_sub(i * block_size).min(block_size).max(1);
+            let effective_len = desired_len.saturating_sub(i * block_size).min(block_size).max(1);
             let placement = planner.plan(
                 &PlacementRequest {
                     group_name: placement_group_name.clone(),
@@ -811,7 +811,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 block_id,
                 file_offset,
                 block_size,
-                effective_block_len,
+                effective_len,
                 worker_endpoints,
             });
         }
@@ -862,19 +862,19 @@ impl<'a> WriteSessionCoordinator<'a> {
                 block_id,
                 file_offset: planned.file_offset,
                 block_size: planned.block_size,
-                effective_block_len: planned.effective_block_len,
+                effective_len: planned.effective_len,
                 worker_endpoints: planned.worker_endpoints,
                 fencing_token: target_token,
                 block_stamp,
                 chunk_size,
                 block_format_id: layout.block_format_id,
             };
-            if target.effective_block_len == 0 || target.effective_block_len > target.block_size {
+            if target.effective_len == 0 || target.effective_len > target.block_size {
                 return self.core.failure_from_error(
                     &req.ctx,
                     MetadataError::InvalidArgument(format!(
-                        "invalid write target length: effective_block_len={}, block_size={}",
-                        target.effective_block_len, target.block_size
+                        "invalid write target length: effective_len={}, block_size={}",
+                        target.effective_len, target.block_size
                     )),
                     group_name,
                     mount_epoch,
@@ -1129,7 +1129,7 @@ impl<'a> WriteSessionCoordinator<'a> {
     ) -> MetadataResult<Vec<Extent>> {
         let mut issued = HashMap::with_capacity(session.issued_targets.len());
         for target in &session.issued_targets {
-            issued.insert(target.block_id, (target.file_offset, target.effective_block_len));
+            issued.insert(target.block_id, (target.file_offset, target.effective_len));
         }
 
         let mut seen = HashSet::with_capacity(intent.committed_blocks.len());

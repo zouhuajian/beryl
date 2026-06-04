@@ -570,8 +570,8 @@ fn build_open_read_stream_request(
     }
     if segment.block_size == 0
         || segment.chunk_size == 0
-        || segment.effective_block_len == 0
-        || segment.effective_block_len > segment.block_size
+        || segment.effective_len == 0
+        || segment.effective_len > segment.block_size
     {
         return Err(ClientError::InvalidLayout(
             "planned read segment has invalid expected block shape".to_string(),
@@ -594,7 +594,7 @@ fn build_open_read_stream_request(
         block_format_id: segment.block_format_id.as_raw(),
         block_size: segment.block_size,
         chunk_size: segment.chunk_size,
-        effective_block_len: segment.effective_block_len,
+        effective_len: segment.effective_len,
     })
 }
 
@@ -610,14 +610,14 @@ fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> 
             "write target block_size must be non-zero".to_string(),
         ));
     }
-    if target.target.effective_block_len == 0 {
+    if target.target.effective_len == 0 {
         return Err(ClientError::InvalidLayout(
-            "write target effective_block_len must be non-zero".to_string(),
+            "write target effective_len must be non-zero".to_string(),
         ));
     }
-    if target.target.effective_block_len > target.target.block_size {
+    if target.target.effective_len > target.target.block_size {
         return Err(ClientError::InvalidLayout(
-            "write target effective_block_len must not exceed block_size".to_string(),
+            "write target effective_len must not exceed block_size".to_string(),
         ));
     }
     if target.target.worker_endpoints.is_empty() {
@@ -668,10 +668,10 @@ fn build_open_write_stream_request(
         chunk_size: target.target.chunk_size,
         checksum_kind: proto::worker::ChecksumKindProto::ChecksumKindNone as i32,
         token: Some(target.target.fencing_token.into()),
-        frame_size: default_frame_size(target.target.effective_block_len.min(u64::from(u32::MAX)) as u32),
+        frame_size: default_frame_size(target.target.effective_len.min(u64::from(u32::MAX)) as u32),
         block_format_id: target.target.block_format_id.as_raw(),
         worker_run_id: candidate.worker_run_id.to_string(),
-        effective_block_len: target.target.effective_block_len,
+        effective_len: target.target.effective_len,
     })
 }
 
@@ -714,7 +714,7 @@ fn build_commit_write_request(
         group_name: block.group_name.to_string(),
         block_id: Some(block.target.block_id.into()),
         stream_id: Some(block.stream_id),
-        effective_block_len: effective_len,
+        effective_len,
         block_stamp: block.target.block_stamp,
         token: Some(block.target.fencing_token.into()),
         commit_seq,
@@ -831,12 +831,12 @@ fn worker_commit_result_from_response(
     response: proto::worker::CommitWriteResponseProto,
 ) -> ClientResult<WorkerCommitResult> {
     parse_worker_control_header(ctx, response.header.as_ref())?;
-    if response.effective_block_len != effective_len {
+    if response.effective_len != effective_len {
         return Err(side_effect_response_body_mismatch(
             "CommitWrite",
             format!(
-                "effective_block_len expected {}, got {}",
-                effective_len, response.effective_block_len
+                "effective_len expected {}, got {}",
+                effective_len, response.effective_len
             ),
         ));
     }
@@ -859,7 +859,7 @@ fn worker_commit_result_from_response(
         ));
     }
     Ok(WorkerCommitResult {
-        effective_block_len: response.effective_block_len,
+        effective_len: response.effective_len,
         block_stamp: response.block_stamp,
         written_through: response.written_through,
     })
@@ -872,12 +872,12 @@ fn worker_block_sync_result_from_response(
     response: proto::worker::SyncCommittedBlockResponseProto,
 ) -> ClientResult<WorkerBlockSyncResult> {
     parse_worker_control_header(ctx, response.header.as_ref())?;
-    if response.effective_block_len != expected_len {
+    if response.effective_len != expected_len {
         return Err(side_effect_response_body_mismatch(
             "SyncCommittedBlock",
             format!(
-                "effective_block_len expected {}, got {}",
-                expected_len, response.effective_block_len
+                "effective_len expected {}, got {}",
+                expected_len, response.effective_len
             ),
         ));
     }
@@ -891,7 +891,7 @@ fn worker_block_sync_result_from_response(
         ));
     }
     Ok(WorkerBlockSyncResult {
-        effective_block_len: response.effective_block_len,
+        effective_len: response.effective_len,
         block_stamp: response.block_stamp,
     })
 }
@@ -1442,7 +1442,7 @@ mod tests {
         );
         assert_eq!(request.block_size, 4096);
         assert_eq!(request.chunk_size, 4096);
-        assert_eq!(request.effective_block_len, 5);
+        assert_eq!(request.effective_len, 5);
     }
 
     #[test]
@@ -1490,7 +1490,7 @@ mod tests {
             types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw()
         );
         assert_eq!(request.worker_run_id, test_worker_run_id().to_string());
-        assert_eq!(request.effective_block_len, 5);
+        assert_eq!(request.effective_len, 5);
         assert_eq!(
             request.token.as_ref().and_then(|token| token.owner),
             Some(ClientId::new(7).into())
@@ -1532,7 +1532,7 @@ mod tests {
 
         let request = build_commit_write_request(&ctx, &block, 5, 1, false).expect("commit write request");
 
-        assert_eq!(request.effective_block_len, 5);
+        assert_eq!(request.effective_len, 5);
         assert_eq!(request.block_stamp, 77);
         assert_eq!(request.worker_run_id, test_worker_run_id().to_string());
         assert_eq!(
@@ -1600,7 +1600,7 @@ mod tests {
         let ctx = write_attempt_context();
         let block = worker_write_block(1024);
         let response = proto::worker::CommitWriteResponseProto {
-            effective_block_len: 5,
+            effective_len: 5,
             block_stamp: block.target.block_stamp,
             written_through: 5,
             ..proto::worker::CommitWriteResponseProto::default()
@@ -1757,7 +1757,7 @@ mod tests {
         let block = worker_write_block(1024);
         let response = proto::worker::CommitWriteResponseProto {
             header: Some(proto::worker::DataResponseHeaderProto::default()),
-            effective_block_len: 5,
+            effective_len: 5,
             block_stamp: block.target.block_stamp,
             written_through: 5,
         };
@@ -1774,7 +1774,7 @@ mod tests {
         let block = worker_write_block(1024);
         let response = proto::worker::CommitWriteResponseProto {
             header: Some(ok_data_header(&ctx)),
-            effective_block_len: 4,
+            effective_len: 4,
             block_stamp: block.target.block_stamp,
             written_through: 5,
         };
@@ -1791,7 +1791,7 @@ mod tests {
         let block = worker_write_block(1024);
         let response = proto::worker::CommitWriteResponseProto {
             header: Some(ok_data_header(&ctx)),
-            effective_block_len: 5,
+            effective_len: 5,
             block_stamp: block.target.block_stamp,
             written_through: 4,
         };
@@ -1808,7 +1808,7 @@ mod tests {
         let block = worker_write_block(1024);
         let response = proto::worker::CommitWriteResponseProto {
             header: Some(ok_data_header(&ctx)),
-            effective_block_len: 5,
+            effective_len: 5,
             block_stamp: 0,
             written_through: 5,
         };
@@ -2101,7 +2101,7 @@ mod tests {
         ) -> ClientResult<WorkerCommitResult> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(WorkerCommitResult {
-                effective_block_len: effective_len,
+                effective_len,
                 block_stamp: block.target.block_stamp,
                 written_through: effective_len,
             })
@@ -2115,7 +2115,7 @@ mod tests {
         ) -> ClientResult<WorkerBlockSyncResult> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(WorkerBlockSyncResult {
-                effective_block_len: expected_len,
+                effective_len: expected_len,
                 block_stamp: block.target.block_stamp,
             })
         }
@@ -2162,7 +2162,7 @@ mod tests {
                 block_id: BlockId::new(DataHandleId::new(202), BlockIndex::new(0)),
                 file_offset: 0,
                 block_size: 4096,
-                effective_block_len: 5,
+                effective_len: 5,
                 worker_endpoints: vec![worker_endpoint()],
                 fencing_token: FencingToken {
                     block_id: BlockId::new(DataHandleId::new(202), BlockIndex::new(0)),
@@ -2212,7 +2212,7 @@ mod tests {
             block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
             block_size: 4096,
             chunk_size: 4096,
-            effective_block_len: 5,
+            effective_len: 5,
         }
     }
 

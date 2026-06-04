@@ -433,7 +433,7 @@ impl FsCore {
                     );
                 }
             };
-            let effective_block_len = match extent.block_offset.checked_add(extent.len) {
+            let effective_len = match extent.block_offset.checked_add(extent.len) {
                 Some(len) => len,
                 None => {
                     return self.failure_from_error_with_route_epoch(
@@ -490,7 +490,7 @@ impl FsCore {
                 block_format_id: layout.block_format_id,
                 block_size: u64::from(layout.block_size),
                 chunk_size: layout.chunk_size,
-                effective_block_len,
+                effective_len,
             });
         }
 

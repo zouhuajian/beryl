@@ -1617,7 +1617,7 @@ mod tests {
             block_id,
             file_offset: 0,
             block_size: 4096,
-            effective_block_len: 1,
+            effective_len: 1,
             worker_endpoints: vec![worker_endpoint()],
             fencing_token: FencingToken::new(block_id, ClientId::new(7), 1),
             block_stamp: 1,

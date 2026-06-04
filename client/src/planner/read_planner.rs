@@ -34,7 +34,7 @@ pub(crate) struct PlannedReadSegment {
     pub(crate) block_format_id: types::BlockFormatId,
     pub(crate) block_size: u64,
     pub(crate) chunk_size: u32,
-    pub(crate) effective_block_len: u64,
+    pub(crate) effective_len: u64,
     pub(crate) workers: Vec<WorkerEndpointInfo>,
 }
 
@@ -108,15 +108,15 @@ impl ReadPlanner {
                     block_id
                 )));
             }
-            if location.effective_block_len == 0 {
+            if location.effective_len == 0 {
                 return Err(ClientError::InvalidLayout(format!(
-                    "block location {} has zero effective_block_len",
+                    "block location {} has zero effective_len",
                     block_id
                 )));
             }
-            if location.effective_block_len > location.block_size {
+            if location.effective_len > location.block_size {
                 return Err(ClientError::InvalidLayout(format!(
-                    "block location {} effective_block_len exceeds block_size",
+                    "block location {} effective_len exceeds block_size",
                     block_id
                 )));
             }
@@ -173,7 +173,7 @@ impl ReadPlanner {
                 block_format_id: location.block_format_id,
                 block_size: location.block_size,
                 chunk_size: location.chunk_size,
-                effective_block_len: location.effective_block_len,
+                effective_len: location.effective_len,
                 workers: location.workers.clone(),
             });
             cursor = read_end;
@@ -270,7 +270,7 @@ mod tests {
         assert_eq!(segments[0].block_format_id, types::BlockFormatId::CURRENT_FOR_NEW_FILE);
         assert_eq!(segments[0].block_size, 4096);
         assert_eq!(segments[0].chunk_size, 1024);
-        assert_eq!(segments[0].effective_block_len, 8);
+        assert_eq!(segments[0].effective_len, 8);
         assert_eq!(segments[1].file_offset, 8);
         assert_eq!(segments[1].block_offset, 0);
         assert_eq!(segments[1].len, 6);
@@ -384,7 +384,7 @@ mod tests {
             block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
             block_size: 4096,
             chunk_size: 1024,
-            effective_block_len: len,
+            effective_len: len,
         }
     }
 }

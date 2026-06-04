@@ -140,7 +140,7 @@ pub struct BlockFormat {
     /// Full logical block size from the persisted FileLayout.
     ///
     /// Tail or bounded valid length is stored in
-    /// `BlockSource.effective_block_len`, not by shrinking this field.
+    /// `BlockSource.effective_len`, not by shrinking this field.
     pub block_size: u64,
     /// StorageChunk size used for local buffering and future data checksums.
     /// This is not a transport frame size.
@@ -158,10 +158,10 @@ pub enum ChecksumKind {
 /// Source-independent effective length of this block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockSource {
-    /// Valid logical length of this block in final metadata.
-    /// Ready `.blk` files must have exactly this length.
-    /// Staging metadata records the block-size write bound until publish.
-    pub effective_block_len: u64,
+    /// For final Ready/Corrupt metadata, this is the published valid logical length.
+    /// For Loading staging metadata, this is only a placeholder and must equal `format.block_size`.
+    /// Staging write bounds must use `format.block_size`, not this field.
+    pub effective_len: u64,
 }
 
 /// Local visibility state for final metadata and staging runtime paths.
@@ -214,8 +214,8 @@ pub struct ExpectedBlockShape {
     pub block_size: u64,
     pub chunk_size: u32,
     pub block_stamp: Option<u64>,
-    /// Optional expected valid block length persisted in BlockMeta.source.effective_block_len.
-    pub effective_block_len: Option<u64>,
+    /// Optional expected valid block length persisted in BlockMeta.source.effective_len.
+    pub effective_len: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -223,7 +223,7 @@ pub struct PublishReadyRequest {
     pub group_name: GroupName,
     pub block_id: BlockId,
     /// Complete effective block length to publish.
-    pub effective_block_len: u64,
+    pub effective_len: u64,
     /// Metadata-assigned logical block stamp.
     /// The local store persists this value at publish time and never generates it.
     pub block_stamp: u64,
@@ -312,7 +312,7 @@ impl FullBlockFileStore {
                 checksum_kind: req.checksum_kind,
             },
             source: BlockSource {
-                effective_block_len: req.block_size,
+                effective_len: req.block_size,
             },
             visibility: BlockVisibility {
                 block_state: BlockState::Loading,
@@ -345,9 +345,8 @@ impl FullBlockFileStore {
         }
 
         let meta = self.load_staging_meta(group_name, block_id)?;
-        ensure_loading(&meta)?;
         let len = u64::try_from(data.len()).map_err(|_| invalid_argument("write length does not fit in u64"))?;
-        validate_range(&meta, offset, len)?;
+        validate_staging_write_range(&meta, offset, len)?;
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -382,7 +381,7 @@ impl FullBlockFileStore {
         ensure_publishable(&meta)?;
 
         let mut ready = meta;
-        ready.source.effective_block_len = req.effective_block_len;
+        ready.source.effective_len = req.effective_len;
         ready.visibility.block_state = BlockState::Ready;
         ready.visibility.block_stamp = req.block_stamp;
         validate_final_meta_payload(&ready, &group_name, block_id)?;
@@ -404,8 +403,7 @@ impl FullBlockFileStore {
     /// Reads only from blocks whose metadata state is Ready.
     pub fn read_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, len: u64) -> StoreResult<Bytes> {
         let meta = self.load_meta(group_name, block_id)?;
-        ensure_readable(&meta)?;
-        validate_range(&meta, offset, len)?;
+        validate_published_read_range(&meta, offset, len)?;
 
         let paths = self.paths(group_name, block_id);
         validate_ready_data_file(&paths, &meta)?;
@@ -790,11 +788,13 @@ fn read_meta_payload(path: &Path) -> StoreResult<Vec<u8>> {
 }
 
 fn validate_final_meta_payload(meta: &BlockMetaPayload, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {
-    validate_meta_payload_shape(meta, group_name, block_id)?;
+    validate_common_meta_shape(meta, group_name, block_id)?;
     match meta.visibility.block_state {
         BlockState::Ready | BlockState::Corrupt => Ok(()),
         BlockState::Loading => Err(corrupt("loading block metadata is not valid final metadata")),
-    }
+    }?;
+    validate_final_effective_len(meta.source.effective_len, meta.format.block_size, corrupt)?;
+    Ok(())
 }
 
 fn validate_staging_meta_payload(
@@ -802,14 +802,18 @@ fn validate_staging_meta_payload(
     group_name: &GroupName,
     block_id: BlockId,
 ) -> StoreResult<()> {
-    validate_meta_payload_shape(meta, group_name, block_id)?;
+    validate_common_meta_shape(meta, group_name, block_id)?;
     match meta.visibility.block_state {
         BlockState::Loading => Ok(()),
         BlockState::Ready | BlockState::Corrupt => Err(corrupt("published block state is not valid staging metadata")),
+    }?;
+    if meta.source.effective_len != meta.format.block_size {
+        return Err(corrupt("staging effective length must equal block size"));
     }
+    Ok(())
 }
 
-fn validate_meta_payload_shape(meta: &BlockMetaPayload, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {
+fn validate_common_meta_shape(meta: &BlockMetaPayload, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {
     if &meta.identity.group_name != group_name {
         return Err(corrupt("block meta group name does not match path"));
     }
@@ -825,11 +829,7 @@ fn validate_meta_payload_shape(meta: &BlockMetaPayload, group_name: &GroupName, 
     if meta.format.checksum_kind != ChecksumKind::None {
         return Err(corrupt("unsupported checksum kind"));
     }
-    validate_meta_block_shape(
-        meta.format.block_size,
-        meta.format.chunk_size,
-        meta.source.effective_block_len,
-    )?;
+    validate_common_block_shape(meta.format.block_size, meta.format.chunk_size, corrupt)?;
     Ok(())
 }
 
@@ -854,9 +854,9 @@ pub fn validate_expected_block_shape(expected: &ExpectedBlockShape, actual: &Blo
             return Err(invalid_argument("block_stamp does not match expected shape"));
         }
     }
-    if let Some(effective_block_len) = expected.effective_block_len {
-        if effective_block_len != actual.source.effective_block_len {
-            return Err(invalid_argument("effective_block_len does not match expected shape"));
+    if let Some(effective_len) = expected.effective_len {
+        if effective_len != actual.source.effective_len {
+            return Err(invalid_argument("effective_len does not match expected shape"));
         }
     }
     Ok(())
@@ -869,19 +869,10 @@ fn validate_create_block_shape(block_format_id: BlockFormatId, block_size: u64, 
             block_format_id.as_raw()
         )));
     }
-    validate_block_shape(block_size, u64::from(chunk_size), block_size, invalid_argument)
+    validate_common_block_shape(block_size, u64::from(chunk_size), invalid_argument)
 }
 
-fn validate_meta_block_shape(block_size: u64, chunk_size: u64, effective_block_len: u64) -> StoreResult<()> {
-    validate_block_shape(block_size, chunk_size, effective_block_len, corrupt)
-}
-
-fn validate_block_shape(
-    block_size: u64,
-    chunk_size: u64,
-    effective_block_len: u64,
-    error: fn(String) -> WorkerError,
-) -> StoreResult<()> {
+fn validate_common_block_shape(block_size: u64, chunk_size: u64, error: fn(String) -> WorkerError) -> StoreResult<()> {
     if block_size == 0 {
         return Err(error("block size must be non-zero".to_string()));
     }
@@ -897,11 +888,19 @@ fn validate_block_shape(
     if !block_size.is_multiple_of(chunk_size) {
         return Err(error("block size must be a multiple of chunk size".to_string()));
     }
-    if effective_block_len == 0 {
-        return Err(error("effective block length must be non-zero".to_string()));
+    Ok(())
+}
+
+fn validate_final_effective_len(
+    effective_len: u64,
+    block_size: u64,
+    error: fn(String) -> WorkerError,
+) -> StoreResult<()> {
+    if effective_len == 0 {
+        return Err(error("effective length must be non-zero".to_string()));
     }
-    if effective_block_len > block_size {
-        return Err(error("effective block length exceeds block size".to_string()));
+    if effective_len > block_size {
+        return Err(error("effective length exceeds block size".to_string()));
     }
     Ok(())
 }
@@ -946,12 +945,32 @@ fn reject_publish_to_published(meta: &BlockMetaPayload) -> StoreResult<BlockMeta
     }
 }
 
-fn validate_range(meta: &BlockMetaPayload, offset: u64, len: u64) -> StoreResult<()> {
+fn validate_staging_write_range(meta: &BlockMetaPayload, offset: u64, len: u64) -> StoreResult<()> {
+    ensure_loading(meta)?;
+    validate_range_bound(
+        meta.format.block_size,
+        offset,
+        len,
+        "block-local range exceeds block size",
+    )
+}
+
+fn validate_published_read_range(meta: &BlockMetaPayload, offset: u64, len: u64) -> StoreResult<()> {
+    ensure_readable(meta)?;
+    validate_range_bound(
+        meta.source.effective_len,
+        offset,
+        len,
+        "block-local range exceeds effective length",
+    )
+}
+
+fn validate_range_bound(bound: u64, offset: u64, len: u64, message: &'static str) -> StoreResult<()> {
     let end = offset
         .checked_add(len)
         .ok_or_else(|| invalid_argument("block-local range overflows"))?;
-    if offset > meta.source.effective_block_len || end > meta.source.effective_block_len {
-        return Err(invalid_argument("block-local range exceeds effective block length"));
+    if offset > bound || end > bound {
+        return Err(invalid_argument(message));
     }
     Ok(())
 }
@@ -976,7 +995,7 @@ fn validate_ready_data_file(paths: &BlockPaths, meta: &BlockMetaPayload) -> Stor
 }
 
 fn validate_ready_data_len(actual_len: u64, meta: &BlockMetaPayload) -> StoreResult<()> {
-    let expected_len = meta.source.effective_block_len;
+    let expected_len = meta.source.effective_len;
     if actual_len != expected_len {
         return Err(corrupt(format!(
             "ready block data length {actual_len} does not match effective block length {expected_len}"
@@ -1083,7 +1102,7 @@ mod tests {
     use types::ids::{BlockId, BlockIndex, DataHandleId};
     use types::GroupName;
 
-    use crate::store::meta_codec::{decode_meta_payload, encode_meta_payload};
+    use crate::store::meta_codec::{decode_meta_payload, encode_meta_payload, encode_staging_meta_payload};
 
     use super::*;
 
@@ -1126,13 +1145,13 @@ mod tests {
     fn publish_request(
         group_name: &GroupName,
         block_id: BlockId,
-        effective_block_len: u64,
+        effective_len: u64,
         block_stamp: u64,
     ) -> PublishReadyRequest {
         PublishReadyRequest {
             group_name: group_name.to_owned(),
             block_id,
-            effective_block_len,
+            effective_len,
             block_stamp,
         }
     }
@@ -1213,6 +1232,15 @@ mod tests {
         persist_raw_payload(paths, &payload);
     }
 
+    fn persist_raw_staging_meta_payload(paths: &BlockPaths, meta: &BlockMetaPayload) {
+        let payload = encode_staging_meta_payload(meta).expect("encode staging payload");
+        let header = BlockMetaHeader::for_payload(payload.len()).expect("header");
+        let mut encoded = Vec::with_capacity(BlockMetaHeader::encoded_len() + payload.len());
+        encoded.extend_from_slice(&header.encode());
+        encoded.extend_from_slice(&payload);
+        fs::write(&paths.staging_meta_path, encoded).expect("write raw staging meta");
+    }
+
     fn persist_raw_payload(paths: &BlockPaths, payload: &[u8]) {
         let header = BlockMetaHeader::for_payload(payload.len()).expect("header");
         let mut encoded = Vec::with_capacity(BlockMetaHeader::encoded_len() + payload.len());
@@ -1262,9 +1290,7 @@ mod tests {
                 chunk_size: 1024,
                 checksum_kind: ChecksumKind::None,
             },
-            source: BlockSource {
-                effective_block_len: 3072,
-            },
+            source: BlockSource { effective_len: 3072 },
             visibility: BlockVisibility {
                 block_state: BlockState::Ready,
                 block_stamp: 99,
@@ -1280,7 +1306,7 @@ mod tests {
             block_size: 4096,
             chunk_size: 1024,
             block_stamp,
-            effective_block_len: None,
+            effective_len: None,
         }
     }
 
@@ -1308,7 +1334,7 @@ mod tests {
         let (group_name_value, block_id) = ids();
         let meta = ready_meta(group_name_value, block_id);
         let expected = ExpectedBlockShape {
-            effective_block_len: Some(3072),
+            effective_len: Some(3072),
             ..expected_shape(group_name_value, block_id, Some(99))
         };
 
@@ -1329,9 +1355,9 @@ mod tests {
                 },
             ),
             (
-                "effective_block_len",
+                "effective_len",
                 ExpectedBlockShape {
-                    effective_block_len: Some(2048),
+                    effective_len: Some(2048),
                     ..expected_shape(group_name_value, block_id, Some(99))
                 },
             ),
@@ -1557,7 +1583,17 @@ mod tests {
     }
 
     #[test]
-    fn create_staging_block_does_not_create_final_meta() {
+    fn final_loading_meta_is_rejected() {
+        let (group_name_value, block_id) = ids();
+        let mut meta = ready_meta(group_name_value, block_id);
+        meta.visibility.block_state = BlockState::Loading;
+        meta.source.effective_len = meta.format.block_size;
+
+        assert_corrupt(validate_final_meta_payload(&meta, group_name_value, block_id));
+    }
+
+    #[test]
+    fn create_staging_block_stores_block_size_as_loading_effective_len_placeholder() {
         let (_temp, store) = store();
         let (group_name_value, block_id) = ids();
 
@@ -1573,7 +1609,7 @@ mod tests {
         assert_not_found(store.read_at(group_name_value, block_id, 0, 1));
         assert_eq!(meta.visibility.block_state, BlockState::Loading);
         assert_eq!(meta.visibility.block_stamp, 0);
-        assert_eq!(meta.source.effective_block_len, 8 * MB);
+        assert_eq!(meta.source.effective_len, 8 * MB);
         assert_eq!(meta.format.format_id, BlockFormatId::FULL_EFFECTIVE);
         assert_eq!(meta.format.block_size, 8 * MB);
         assert_eq!(meta.format.chunk_size, MB);
@@ -1614,6 +1650,38 @@ mod tests {
 
         assert_not_found(store.read_at(group_name_value, block_id, 0, 8));
         assert!(store.load_meta(group_name_value, block_id).is_err());
+    }
+
+    #[test]
+    fn staging_write_can_append_before_final_effective_len_is_known() {
+        let (_temp, store) = store();
+        let (group_name_value, block_id) = ids();
+        create_default_block(&store, group_name_value, block_id);
+
+        store
+            .write_at(group_name_value, block_id, 0, Bytes::from(vec![1; 1024]))
+            .expect("write first staging bytes");
+        store
+            .write_at(group_name_value, block_id, 1024, Bytes::from(vec![2; 512]))
+            .expect("append staging bytes");
+        let meta = store
+            .publish_ready(publish_request(group_name_value, block_id, 1536, 11))
+            .expect("publish appended staging bytes");
+
+        assert_eq!(meta.source.effective_len, 1536);
+        assert_eq!(
+            store.read_at(group_name_value, block_id, 1024, 512).unwrap(),
+            Bytes::from(vec![2; 512])
+        );
+    }
+
+    #[test]
+    fn staging_write_rejects_offset_plus_len_beyond_block_size() {
+        let (_temp, store) = store();
+        let (group_name_value, block_id) = ids();
+        create_default_block(&store, group_name_value, block_id);
+
+        assert_invalid_argument(store.write_at(group_name_value, block_id, 0, Bytes::from(vec![1; 4097])));
     }
 
     #[test]
@@ -1670,7 +1738,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_ready_persists_metadata_assigned_block_stamp() {
+    fn publish_ready_writes_final_effective_len() {
         let (_temp, store) = store();
         let (group_name_value, block_id) = ids();
         store
@@ -1690,14 +1758,14 @@ mod tests {
             .publish_ready(PublishReadyRequest {
                 group_name: group_name_value.to_owned(),
                 block_id,
-                effective_block_len: 3072,
+                effective_len: 3072,
                 block_stamp: 0xfeed_cafe,
             })
             .expect("publish ready");
 
         let loaded = store.load_meta(group_name_value, block_id).expect("load meta");
         assert_eq!(loaded.format.block_size, 4096);
-        assert_eq!(loaded.source.effective_block_len, 3072);
+        assert_eq!(loaded.source.effective_len, 3072);
         assert_eq!(loaded.visibility.block_stamp, 0xfeed_cafe);
     }
 
@@ -1778,7 +1846,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_block_requires_exact_effective_len() {
+    fn recover_ready_requires_exact_effective_len() {
         let (_temp, store) = store();
         let (group_name_value, block_id) = ids();
         store
@@ -1822,7 +1890,7 @@ mod tests {
         let paths = store.paths(group_name_value, block_id);
         let loaded = store.load_meta(group_name_value, block_id).expect("load meta");
         assert_eq!(loaded.format.block_size, 32 * MB);
-        assert_eq!(loaded.source.effective_block_len, 4 * MB + 1);
+        assert_eq!(loaded.source.effective_len, 4 * MB + 1);
         assert_eq!(fs::metadata(paths.data_path).expect("data metadata").len(), 4 * MB + 1);
     }
 
@@ -1852,7 +1920,7 @@ mod tests {
     }
 
     #[test]
-    fn read_at_bounds_by_effective_len() {
+    fn read_at_rejects_range_beyond_final_effective_len() {
         let (_temp, store) = store();
         let (group_name_value, block_id) = ids();
         store
@@ -2056,7 +2124,7 @@ mod tests {
         let valid = store.load_meta(group_name_value, block_id).expect("load meta");
 
         let mut invalid = valid.clone();
-        invalid.source.effective_block_len = invalid.format.block_size + 1;
+        invalid.source.effective_len = invalid.format.block_size + 1;
         persist_raw_meta_payload(&paths, &invalid);
         assert_corrupt(store.load_meta(group_name_value, block_id));
     }
@@ -2097,9 +2165,9 @@ mod tests {
                 invalid.format.chunk_size = 0;
                 encode_meta_payload(&invalid).expect("encode zero chunk size")
             }),
-            ("zero effective_block_len", {
+            ("zero effective_len", {
                 let mut invalid = valid.clone();
-                invalid.source.effective_block_len = 0;
+                invalid.source.effective_len = 0;
                 encode_meta_payload(&invalid).expect("encode zero effective length")
             }),
             ("missing format", protobuf_payload_missing_format(&valid)),
@@ -2251,12 +2319,26 @@ mod tests {
     }
 
     #[test]
-    fn data_writes_reject_gap_before_current_end() {
+    fn staging_write_rejects_sparse_gap() {
         let (_temp, store) = store();
         let (group_name_value, block_id) = ids();
         create_default_block(&store, group_name_value, block_id);
 
         assert_invalid_argument(store.write_at(group_name_value, block_id, 1024, Bytes::from(vec![1; 1024])));
+    }
+
+    #[test]
+    fn staging_meta_with_effective_len_not_equal_to_block_size_is_rejected() {
+        let (_temp, store) = store();
+        let (group_name_value, block_id) = ids();
+        let mut meta = store
+            .create_staging_block(request(group_name_value, block_id, 4096, 1024))
+            .expect("create staging block");
+        let paths = store.paths(group_name_value, block_id);
+        meta.source.effective_len = 1024;
+        persist_raw_staging_meta_payload(&paths, &meta);
+
+        assert_corrupt(store.write_at(group_name_value, block_id, 0, Bytes::from_static(b"x")));
     }
 
     #[test]

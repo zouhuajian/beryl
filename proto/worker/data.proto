@@ -53,7 +53,7 @@ message OpenReadStreamRequestProto {
   uint32 block_format_id = 8;
   uint64 block_size = 9;
   uint32 chunk_size = 10;
-  uint64 effective_block_len = 11;
+  uint64 effective_len = 11;
 
   // Stable metadata group name for the local block-store lookup.
   string group_name = 12;
@@ -112,7 +112,7 @@ message OpenWriteStreamRequestProto {
 
   // Full logical block size for this block format, from the persisted
   // FileLayout. This value is persisted in worker BlockMeta.format.block_size.
-  // Tail length is carried separately through CommitWrite.effective_block_len.
+  // Tail length is carried separately through CommitWrite.effective_len.
   uint64 block_size = 5;
 
   // Metadata-issued StorageChunk size for this block format.
@@ -137,7 +137,7 @@ message OpenWriteStreamRequestProto {
   string worker_run_id = 11;
 
   // Metadata-issued valid length for this write target.
-  uint64 effective_block_len = 12;
+  uint64 effective_len = 12;
 
   // Stable metadata group name for the local block-store staging lookup.
   string group_name = 13;
@@ -189,7 +189,7 @@ message CommitWriteRequestProto {
   common.StreamIdProto stream_id = 4;
 
   // Publishes the complete effective block length for FullBlockFileStore.
-  uint64 effective_block_len = 5;
+  uint64 effective_len = 5;
 
   // Metadata-assigned logical block stamp to persist at publish time.
   uint64 block_stamp = 6;
@@ -212,7 +212,7 @@ message CommitWriteRequestProto {
 
 message CommitWriteResponseProto {
   worker.DataResponseHeaderProto header = 1;
-  uint64 effective_block_len = 2;
+  uint64 effective_len = 2;
 
   // Worker's current logical block stamp after commit.
   uint64 block_stamp = 3;
@@ -248,7 +248,7 @@ message SyncCommittedBlockRequestProto {
 
 message SyncCommittedBlockResponseProto {
   worker.DataResponseHeaderProto header = 1;
-  uint64 effective_block_len = 2;
+  uint64 effective_len = 2;
 
   // Worker's current logical block stamp after durable sync validation.
   uint64 block_stamp = 3;

@@ -17,7 +17,7 @@ use crate::store::block::{BlockState, LocalBlockStore};
 pub struct ReadBlockSnapshot {
     pub group_name: GroupName,
     pub block_id: BlockId,
-    pub effective_block_len: u64,
+    pub effective_len: u64,
     pub block_stamp: u64,
     pub block_format_id: BlockFormatId,
     pub block_size: u64,
@@ -90,14 +90,14 @@ impl BlockManager {
                 "block_size must be a multiple of chunk_size".to_string(),
             ));
         }
-        if req.effective_block_len == 0 {
+        if req.effective_len == 0 {
             return Err(WorkerError::InvalidArgument(
-                "effective_block_len must be greater than zero".to_string(),
+                "effective_len must be greater than zero".to_string(),
             ));
         }
-        if req.effective_block_len > req.block_size {
+        if req.effective_len > req.block_size {
             return Err(WorkerError::InvalidArgument(
-                "effective_block_len must not exceed block_size".to_string(),
+                "effective_len must not exceed block_size".to_string(),
             ));
         }
 
@@ -136,13 +136,13 @@ impl BlockManager {
         if req.block_format_id != meta.format.format_id
             || req.block_size != meta.format.block_size
             || u64::from(req.chunk_size) != meta.format.chunk_size
-            || req.effective_block_len != meta.source.effective_block_len
+            || req.effective_len != meta.source.effective_len
         {
             return Err(Self::need_refresh(
                 RpcErrorCode::StaleState,
                 RefreshReason::StaleState,
                 format!(
-                    "block layout mismatch: group_name={}, block_id={}, requested_format={}, local_format={}, requested_block_size={}, local_block_size={}, requested_chunk_size={}, local_chunk_size={}, requested_effective_block_len={}, local_effective_block_len={}",
+                    "block layout mismatch: group_name={}, block_id={}, requested_format={}, local_format={}, requested_block_size={}, local_block_size={}, requested_chunk_size={}, local_chunk_size={}, requested_effective_len={}, local_effective_len={}",
                     req.group_name,
                     req.block_id,
                     req.block_format_id.as_raw(),
@@ -151,8 +151,8 @@ impl BlockManager {
                     meta.format.block_size,
                     req.chunk_size,
                     meta.format.chunk_size,
-                    req.effective_block_len,
-                    meta.source.effective_block_len
+                    req.effective_len,
+                    meta.source.effective_len
                 ),
             ));
         }
@@ -162,17 +162,17 @@ impl BlockManager {
             .offset
             .checked_add(u64::from(req.byte_range.len))
             .ok_or_else(|| WorkerError::InvalidArgument("byte range offset overflow".to_string()))?;
-        if req.byte_range.offset > meta.source.effective_block_len || range_end > meta.source.effective_block_len {
+        if req.byte_range.offset > meta.source.effective_len || range_end > meta.source.effective_len {
             return Err(WorkerError::InvalidArgument(format!(
-                "byte range exceeds effective block length: group_name={}, block_id={}, offset={}, len={}, effective_block_len={}",
-                req.group_name, req.block_id, req.byte_range.offset, req.byte_range.len, meta.source.effective_block_len
+                "byte range exceeds effective block length: group_name={}, block_id={}, offset={}, len={}, effective_len={}",
+                req.group_name, req.block_id, req.byte_range.offset, req.byte_range.len, meta.source.effective_len
             )));
         }
 
         Ok(ReadBlockSnapshot {
             group_name: req.group_name.clone(),
             block_id: req.block_id,
-            effective_block_len: meta.source.effective_block_len,
+            effective_len: meta.source.effective_len,
             block_stamp: meta.visibility.block_stamp,
             block_format_id: meta.format.format_id,
             block_size: meta.format.block_size,

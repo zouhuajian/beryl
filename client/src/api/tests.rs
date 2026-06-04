@@ -1531,7 +1531,7 @@ impl WorkerDataClient for MockDataClient {
             .expect("commit sync flags")
             .push(require_sync);
         Ok(WorkerCommitResult {
-            effective_block_len: effective_len,
+            effective_len,
             block_stamp: block.target.block_stamp,
             written_through: effective_len,
         })
@@ -1546,7 +1546,7 @@ impl WorkerDataClient for MockDataClient {
         self.record_event("sync_committed_block");
         self.block_syncs.lock().expect("block syncs").push(expected_len);
         Ok(WorkerBlockSyncResult {
-            effective_block_len: expected_len,
+            effective_len: expected_len,
             block_stamp: block.target.block_stamp,
         })
     }
@@ -1637,7 +1637,7 @@ fn write_target_with_layout(
         block_id,
         file_offset,
         block_size: u64::from(layout.block_size),
-        effective_block_len: len,
+        effective_len: len,
         worker_endpoints: vec![worker_endpoint()],
         fencing_token: FencingToken::new(block_id, ClientId::new(7), 1),
         block_stamp: 1,
@@ -1667,7 +1667,7 @@ fn location(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -
         block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
         block_size: DEFAULT_BLOCK_SIZE as u64,
         chunk_size: DEFAULT_CHUNK_SIZE,
-        effective_block_len: len,
+        effective_len: len,
     }
 }
 

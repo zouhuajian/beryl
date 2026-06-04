@@ -1186,13 +1186,10 @@ fn committed_block_from_pending(pending: &PendingBlock) -> ClientResult<types::C
 
 fn validate_worker_commit_result(pending: &PendingBlock, result: WorkerCommitResult) -> ClientResult<()> {
     let expected_len = pending.written_len();
-    if result.effective_block_len != expected_len {
+    if result.effective_len != expected_len {
         return Err(side_effect_response_body_mismatch(
             "CommitWrite",
-            format!(
-                "effective_block_len expected {}, got {}",
-                expected_len, result.effective_block_len
-            ),
+            format!("effective_len expected {}, got {}", expected_len, result.effective_len),
         ));
     }
     if result.written_through != expected_len {
@@ -1216,13 +1213,10 @@ fn validate_worker_commit_result(pending: &PendingBlock, result: WorkerCommitRes
 
 fn validate_worker_block_sync_result(pending: &PendingBlock, result: WorkerBlockSyncResult) -> ClientResult<()> {
     let expected_len = pending.written_len();
-    if result.effective_block_len != expected_len {
+    if result.effective_len != expected_len {
         return Err(side_effect_response_body_mismatch(
             "SyncCommittedBlock",
-            format!(
-                "effective_block_len expected {}, got {}",
-                expected_len, result.effective_block_len
-            ),
+            format!("effective_len expected {}, got {}", expected_len, result.effective_len),
         ));
     }
     let expected_stamp = pending.target().block_stamp;

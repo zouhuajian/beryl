@@ -246,7 +246,7 @@ mod tests {
                     block_format_id: types::BlockFormatId::FULL_EFFECTIVE,
                     block_size: 4096,
                     chunk_size: 1024,
-                    effective_block_len: 4096,
+                    effective_len: 4096,
                     frame_size: 1024,
                 },
                 RequestHeader::new(ClientId::new(42)),

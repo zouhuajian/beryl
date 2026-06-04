@@ -531,8 +531,8 @@ fn meta_to_report_block(meta: BlockMetaPayload) -> Result<BlockReportBlockProto,
         data_handle_id: block_id.data_handle_id.as_raw(),
         block_index: block_id.index.as_raw(),
         block_stamp: meta.visibility.block_stamp,
-        effective_len: meta.source.effective_block_len,
-        committed_length: meta.source.effective_block_len,
+        effective_len: meta.source.effective_len,
+        committed_length: meta.source.effective_len,
         block_state: block_state as i32,
     })
 }
