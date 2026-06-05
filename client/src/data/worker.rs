@@ -672,6 +672,7 @@ fn build_open_write_stream_request(
         block_format_id: target.target.block_format_id.as_raw(),
         worker_run_id: candidate.worker_run_id.to_string(),
         effective_len: target.target.effective_len,
+        tier: proto::common::TierProto::from(target.target.tier) as i32,
     })
 }
 
@@ -2172,6 +2173,7 @@ mod tests {
                 block_stamp: 77,
                 chunk_size: 4096,
                 block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
+                tier: types::Tier::Hdd,
             },
         }
     }

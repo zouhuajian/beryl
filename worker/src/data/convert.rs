@@ -4,7 +4,7 @@
 //! Explicit conversion between worker wire messages and core domain types.
 
 use common::header::RequestHeader;
-use proto::common::{BlockIdProto, ByteRangeProto, FencingTokenProto, StreamIdProto};
+use proto::common::{BlockIdProto, ByteRangeProto, FencingTokenProto, StreamIdProto, TierProto};
 use proto::convert as proto_convert;
 use proto::worker::{
     AbortWriteRequestProto, ChecksumKindProto, CommitWriteRequestProto, DataRequestHeaderProto,
@@ -86,6 +86,7 @@ pub fn write_open_request_to_proto(req: WriteOpenRequest, ctx: &RequestHeader) -
         block_format_id: req.block_format_id.as_raw(),
         worker_run_id: req.worker_run_id.to_string(),
         effective_len: req.effective_len,
+        tier: TierProto::from(req.tier) as i32,
     }
 }
 
@@ -193,6 +194,8 @@ pub fn proto_to_write_open_request(proto: OpenWriteStreamRequestProto) -> Worker
     let block_format_id = BlockFormatId::from_raw(proto.block_format_id)
         .map_err(|err| WorkerError::InvalidArgument(format!("block_format_id invalid: {err}")))?;
     let worker_run_id = proto_to_worker_run_id(&proto.worker_run_id)?;
+    let tier = proto_convert::parse_known_tier(proto.tier)
+        .map_err(|err| WorkerError::InvalidArgument(format!("tier invalid: {err}")))?;
 
     Ok(WriteOpenRequest {
         group_name,
@@ -206,6 +209,7 @@ pub fn proto_to_write_open_request(proto: OpenWriteStreamRequestProto) -> Worker
         chunk_size: proto.chunk_size,
         effective_len: proto.effective_len,
         checksum_kind,
+        tier,
     })
 }
 

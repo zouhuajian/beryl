@@ -13,8 +13,9 @@ fn prepare_start_descriptor(config: &WorkerConfig) -> Result<(), String> {
 }
 
 fn write_config(dir: &TempDir, cluster_id: &str, group_name: &str) -> std::path::PathBuf {
-    let storage_root = dir.path().join("worker");
-    let identity_path = storage_root.join("worker.identity");
+    let worker_dir = dir.path().join("worker");
+    let store_dir = worker_dir.join("hdd0");
+    let identity_path = worker_dir.join("worker.identity");
     let config_path = dir.path().join("core-site.yaml");
     std::fs::write(
         &config_path,
@@ -22,14 +23,19 @@ fn write_config(dir: &TempDir, cluster_id: &str, group_name: &str) -> std::path:
             r#"
 vecton.cluster.id: "{cluster_id}"
 worker.identity.path: "{}"
-worker.storage.root: "{}"
+worker.store.dirs.hdd0.path: "{}"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.store.reserve_space: "1GB"
+worker.store.selection_policy: "round_robin"
+worker.store.check_interval_ms: 30000
 worker.rpc.bind: "127.0.0.1:0"
 worker.rpc.advertised_endpoint: "http://127.0.0.1:19090"
 worker.metadata.group.name: "{group_name}"
 worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#,
             identity_path.display(),
-            storage_root.display()
+            store_dir.display()
         ),
     )
     .unwrap();
@@ -37,7 +43,7 @@ worker.metadata.endpoints: "http://127.0.0.1:18080"
 }
 
 #[test]
-fn worker_start_on_missing_root_creates_identity_info_and_group_dir() {
+fn worker_start_on_missing_store_dirs_creates_identity_info() {
     let dir = TempDir::new().unwrap();
     let config_path = write_config(&dir, "cluster-a", "root");
     let config = WorkerConfig::load(&config_path).unwrap();
@@ -47,7 +53,6 @@ fn worker_start_on_missing_root_creates_identity_info_and_group_dir() {
     assert!(worker_id.as_raw() > 0);
     assert!(config.identity_path.exists());
     assert!(worker_storage_info_path(&config).exists());
-    assert!(config.storage_root.join("groups").join("root").exists());
 
     let info_json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(worker_storage_info_path(&config)).unwrap()).unwrap();
@@ -58,18 +63,17 @@ fn worker_start_on_missing_root_creates_identity_info_and_group_dir() {
 }
 
 #[test]
-fn worker_start_on_empty_root_creates_identity_info_and_group_dir() {
+fn worker_start_on_empty_store_dirs_creates_identity_info() {
     let dir = TempDir::new().unwrap();
     let config_path = write_config(&dir, "cluster-a", "root");
     let config = WorkerConfig::load(&config_path).unwrap();
-    std::fs::create_dir_all(&config.storage_root).unwrap();
+    std::fs::create_dir_all(&config.store.dirs["hdd0"].path).unwrap();
 
     let worker_id = prepare_worker_start(&config).unwrap();
 
     assert!(worker_id.as_raw() > 0);
     assert!(config.identity_path.exists());
     assert!(worker_storage_info_path(&config).exists());
-    assert!(config.storage_root.join("groups").join("root").exists());
 }
 
 #[test]
@@ -156,7 +160,12 @@ fn explicit_worker_id_cannot_bypass_missing_identity_for_existing_info() {
 vecton.cluster.id: "cluster-a"
 worker.id: {}
 worker.identity.path: "{}"
-worker.storage.root: "{}"
+worker.store.dirs.hdd0.path: "{}"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.store.reserve_space: "1GB"
+worker.store.selection_policy: "round_robin"
+worker.store.check_interval_ms: 30000
 worker.rpc.bind: "127.0.0.1:0"
 worker.rpc.advertised_endpoint: "http://127.0.0.1:19090"
 worker.metadata.group.name: "root"
@@ -164,7 +173,7 @@ worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#,
             worker_id.as_raw(),
             config.identity_path.display(),
-            config.storage_root.display()
+            config.store.dirs["hdd0"].path.display()
         ),
     )
     .unwrap();
@@ -211,18 +220,19 @@ fn worker_storage_info_rejects_legacy_group_id_and_unknown_fields() {
 }
 
 #[test]
-fn worker_start_refuses_non_empty_unknown_root_without_creating_identity() {
+fn worker_start_refuses_non_empty_unknown_store_dirs_without_creating_identity() {
     let dir = TempDir::new().unwrap();
     let config_path = write_config(&dir, "cluster-a", "root");
     let config = WorkerConfig::load(&config_path).unwrap();
-    std::fs::create_dir_all(&config.storage_root).unwrap();
-    std::fs::write(config.storage_root.join("old-block-file"), b"stale").unwrap();
+    let store_dir = &config.store.dirs["hdd0"].path;
+    std::fs::create_dir_all(store_dir).unwrap();
+    std::fs::write(store_dir.join("old-block-file"), b"stale").unwrap();
 
     let err = prepare_worker_start(&config).unwrap_err();
     let message = err.to_string();
 
-    assert!(message.contains("worker.storage.root"));
-    assert!(message.contains("WorkerStorageInfo missing"));
+    assert!(message.contains("worker.store.dirs"));
+    assert!(message.contains("WorkerStorageInfo is missing"));
     assert!(!worker_storage_info_path(&config).exists());
     assert!(!config.identity_path.exists());
 }

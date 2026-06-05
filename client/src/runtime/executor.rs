@@ -1623,6 +1623,7 @@ mod tests {
             block_stamp: 1,
             chunk_size: 4096,
             block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
+            tier: types::Tier::Hdd,
         }
     }
 

@@ -12,6 +12,8 @@ message BlockMetaPayloadProto {
   BlockFormatProto format = 2;
   BlockSourceProto source = 3;
   BlockVisibilityProto visibility = 4;
+  // Worker-local tier where this replica was materialized.
+  common.TierProto tier = 5;
 }
 
 message BlockIdentityProto {

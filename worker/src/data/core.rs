@@ -15,9 +15,8 @@ use types::chunk::ByteRange;
 use types::ids::{BlockId, ChunkIndex, StreamId};
 use types::layout::BlockFormatId;
 use types::lease::FencingToken;
-use types::{GroupName, WorkerRunId};
+use types::{GroupName, Tier, WorkerRunId};
 
-use crate::config::WorkerConfig;
 use crate::error::WorkerError;
 use crate::runtime::block::BlockManager;
 use crate::runtime::stream::{StreamManager, StreamState};
@@ -130,6 +129,7 @@ pub struct WriteOpenRequest {
     pub chunk_size: u32,
     pub effective_len: u64,
     pub checksum_kind: ChecksumKind,
+    pub tier: Tier,
 }
 
 /// Open-write result in worker core terms.
@@ -309,24 +309,14 @@ pub struct WorkerCore {
 }
 
 impl WorkerCore {
-    pub fn new() -> Self {
-        Self::with_options(
-            BlockManager::DEFAULT_FRAME_SIZE,
-            BlockManager::MAX_FRAME_SIZE,
-            BlockManager::DEFAULT_WINDOW_BYTES,
-            Duration::from_secs(60),
-            WorkerConfig::default().storage_root,
-        )
-    }
-
     pub fn with_options(
         default_frame_size: u32,
         max_frame_size: u32,
         window_bytes: u32,
         stream_idle_timeout: Duration,
-        storage_root: PathBuf,
+        store_dir: PathBuf,
     ) -> Self {
-        let block_store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(storage_root)));
+        let block_store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(store_dir)));
         Self::with_local_store(
             default_frame_size,
             max_frame_size,
@@ -411,6 +401,7 @@ impl WorkerCore {
         let frame_size = self.negotiate_frame_size(req.frame_size)?;
         validate_write_open_request(&req)?;
         reject_existing_final_block(self.block_store.as_ref(), &req)?;
+        let stream_id = self.next_stream_id()?;
 
         self.block_store.create_staging_block(CreateStagingBlockRequest {
             group_name: req.group_name.clone(),
@@ -419,9 +410,9 @@ impl WorkerCore {
             block_format_id: req.block_format_id,
             chunk_size: req.chunk_size,
             checksum_kind: req.checksum_kind,
+            tier: req.tier,
         })?;
 
-        let stream_id = self.next_stream_id()?;
         let context = StreamContext {
             stream_id,
             group_name: req.group_name,
@@ -507,6 +498,19 @@ impl WorkerCore {
         self.stream_manager.remove(req.stream_id).await;
         self.block_store.abort_staging_block(&req.group_name, req.block_id)?;
         Ok(AbortWriteResult { aborted: true })
+    }
+
+    pub(crate) async fn abort_write_stream_after_error(&self, stream_id: StreamId) -> WorkerCoreResult<()> {
+        let Some(state) = self.stream_manager.get(stream_id).await else {
+            return Ok(());
+        };
+        if state.context.mode != StreamMode::Write {
+            return Ok(());
+        }
+        self.stream_manager.remove(stream_id).await;
+        self.block_store
+            .abort_staging_block(&state.context.group_name, state.context.block_id)?;
+        Ok(())
     }
 
     pub async fn read_frame(&self, stream_id: StreamId, max_bytes: u32) -> WorkerCoreResult<Vec<ReadFrame>> {
@@ -662,12 +666,6 @@ impl WorkerCore {
     }
 }
 
-impl Default for WorkerCore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 fn validate_write_open_request(req: &WriteOpenRequest) -> WorkerCoreResult<()> {
     validate_fencing_token_shape(req.block_id, req.token)?;
     if req.block_stamp == 0 {
@@ -789,6 +787,7 @@ fn validate_existing_block_shape(
         || meta.format.block_size != req.block_size
         || meta.format.chunk_size != u64::from(req.chunk_size)
         || meta.source.effective_len != req.effective_len
+        || meta.tier != req.tier
     {
         return Err(WorkerError::NeedRefresh {
             code: RpcErrorCode::StaleState,

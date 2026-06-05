@@ -48,7 +48,14 @@ worker.default_frame_size: "1MB"
 worker.max_frame_size: "4MB"
 worker.window_bytes: "8MB"
 worker.stream.idle_timeout_ms: 60000
-worker.storage.root: "data/worker"
+
+# Worker local block store.
+worker.store.dirs.hdd0.path: "data/worker/hdd0"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.store.reserve_space: "1GB"
+worker.store.selection_policy: "round_robin"
+worker.store.check_interval_ms: 30000
 
 # Worker metadata registration, heartbeat, and block report.
 worker.metadata.group.name: "root"

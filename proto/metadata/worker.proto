@@ -92,6 +92,13 @@ message CapacityInfoProto {
   uint64 used_bytes = 2;
   /// Available capacity in bytes.
   uint64 available_bytes = 3;
+  /// Largest writable free bytes currently available for one new block on each tier.
+  repeated TierFreeProto tier_free = 4;
+}
+
+message TierFreeProto {
+  common.TierProto tier = 1;
+  uint64 free_bytes = 2;
 }
 
 message LoadInfoProto {

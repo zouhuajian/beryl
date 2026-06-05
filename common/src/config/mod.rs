@@ -131,7 +131,7 @@ mod tests {
             "metadata defaults belong to metadata::config"
         );
         assert!(
-            config.inner.get_str("worker.storage.root").is_none(),
+            config.inner.get_flat_map_sequence("worker.store.dirs").is_none(),
             "worker defaults belong to worker::config"
         );
     }

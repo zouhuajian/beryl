@@ -9,20 +9,23 @@ use worker::config::WorkerConfig;
 fn repository_core_site_parses_worker_storage_paths() {
     assert_worker_storage_paths(
         &repo_root().join("conf/core-site.yaml"),
-        Path::new("data/worker"),
+        Path::new("data/worker/hdd0"),
         Path::new("data/worker/worker.identity"),
     );
     assert_worker_storage_paths(
         &repo_root().join("conf/local/core-site.yaml"),
-        Path::new("./data/worker"),
+        Path::new("./data/worker/hdd0"),
         Path::new("./data/worker/worker.identity"),
     );
 }
 
-fn assert_worker_storage_paths(config_path: &Path, expected_root: &Path, expected_identity_path: &Path) {
+fn assert_worker_storage_paths(config_path: &Path, expected_store_dir: &Path, expected_identity_path: &Path) {
     let config = WorkerConfig::load(config_path).expect("worker config loads");
 
-    assert_eq!(config.storage_root, expected_root);
+    let hdd0 = config.store.dirs.get("hdd0").expect("hdd0 store dir");
+    assert_eq!(config.store.dirs.len(), 1);
+    assert_eq!(hdd0.path, expected_store_dir);
+    assert_eq!(hdd0.tier, types::Tier::Hdd);
     assert_eq!(config.identity_path, expected_identity_path);
 }
 

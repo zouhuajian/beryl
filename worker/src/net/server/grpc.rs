@@ -144,19 +144,38 @@ impl WorkerDataServiceImpl {
             last_acked_seq: 0,
             written_through: 0,
         };
+        let mut active_stream_id = None;
         while let Some(frame) = frames.next().await {
-            let domain = proto_to_write_frame(frame?).map_err(|error| error.to_status())?;
-            let result = self
-                .core
-                .write_stream(domain)
-                .await
-                .map_err(|error| error.to_status())?;
+            let frame = match frame {
+                Ok(frame) => frame,
+                Err(status) => {
+                    cleanup_write_stream_after_error(&self.core, active_stream_id).await?;
+                    return Err(status);
+                }
+            };
+            let frame_stream_id = proto_to_stream_id(frame.stream_id, "stream_id").ok();
+            let domain = match proto_to_write_frame(frame) {
+                Ok(domain) => domain,
+                Err(error) => {
+                    cleanup_write_stream_after_error(&self.core, frame_stream_id.or(active_stream_id)).await?;
+                    return Err(error.to_status());
+                }
+            };
+            active_stream_id = Some(domain.stream_id);
+            let result = match self.core.write_stream(domain).await {
+                Ok(result) => result,
+                Err(error) => {
+                    cleanup_write_stream_after_error(&self.core, active_stream_id).await?;
+                    return Err(error.to_status());
+                }
+            };
             response = WriteStreamResponseProto {
                 accepted: result.accepted,
                 last_acked_seq: result.last_acked_seq,
                 written_through: result.written_through,
             };
             if !response.accepted {
+                cleanup_write_stream_after_error(&self.core, active_stream_id).await?;
                 break;
             }
         }
@@ -405,6 +424,15 @@ impl WorkerDataService for WorkerDataServiceImpl {
 
         Ok(Response::new(response))
     }
+}
+
+async fn cleanup_write_stream_after_error(core: &WorkerCore, stream_id: Option<types::StreamId>) -> Result<(), Status> {
+    let Some(stream_id) = stream_id else {
+        return Ok(());
+    };
+    core.abort_write_stream_after_error(stream_id)
+        .await
+        .map_err(|error| error.to_status())
 }
 
 fn parse_group_name(value: &str) -> Result<GroupName, WorkerError> {

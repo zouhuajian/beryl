@@ -26,7 +26,7 @@ use types::layout::FileLayout;
 use types::lease::FencingToken;
 use types::{
     CallId, ClientId, CommittedBlock, FileAttrs, FileBlockLocation, GroupName, GroupStateWatermark, InodeKind,
-    RaftLogId, WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId, WriteTarget,
+    RaftLogId, Tier, WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId, WriteTarget,
 };
 
 // ============================================================================
@@ -399,6 +399,37 @@ impl TryFrom<proto_common::WorkerNetProtocolProto> for WorkerNetProtocol {
     }
 }
 
+impl From<Tier> for proto_common::TierProto {
+    fn from(tier: Tier) -> Self {
+        match tier {
+            Tier::Mem => proto_common::TierProto::TierMem,
+            Tier::Nvme => proto_common::TierProto::TierNvme,
+            Tier::Ssd => proto_common::TierProto::TierSsd,
+            Tier::Hdd => proto_common::TierProto::TierHdd,
+        }
+    }
+}
+
+impl TryFrom<proto_common::TierProto> for Tier {
+    type Error = String;
+
+    fn try_from(tier: proto_common::TierProto) -> Result<Self, Self::Error> {
+        match tier {
+            proto_common::TierProto::TierMem => Ok(Self::Mem),
+            proto_common::TierProto::TierNvme => Ok(Self::Nvme),
+            proto_common::TierProto::TierSsd => Ok(Self::Ssd),
+            proto_common::TierProto::TierHdd => Ok(Self::Hdd),
+            proto_common::TierProto::TierUnspecified => Err("tier must be specified".to_string()),
+        }
+    }
+}
+
+pub fn parse_known_tier(value: i32) -> Result<Tier, String> {
+    proto_common::TierProto::try_from(value)
+        .map_err(|_| format!("unknown tier value {value}"))?
+        .try_into()
+}
+
 impl TryFrom<proto_common::WorkerEndpointInfoProto> for WorkerEndpointInfo {
     type Error = String;
 
@@ -495,6 +526,7 @@ impl TryFrom<proto_metadata::WriteTargetProto> for WriteTarget {
         }
         let block_format_id = types::layout::BlockFormatId::from_raw(target.block_format_id)
             .map_err(|err| format!("WriteTargetProto.block_format_id invalid: {err}"))?;
+        let tier = parse_known_tier(target.tier).map_err(|err| format!("WriteTargetProto.tier invalid: {err}"))?;
         let block_id = required_block_id(target.block_id, "WriteTargetProto.block_id")?;
         let fencing_token = required_fencing_token(target.fencing_token, "WriteTargetProto.fencing_token")?;
         if fencing_token.block_id != block_id {
@@ -518,6 +550,7 @@ impl TryFrom<proto_metadata::WriteTargetProto> for WriteTarget {
             block_stamp: target.block_stamp,
             chunk_size: target.chunk_size,
             block_format_id,
+            tier,
         })
     }
 }
@@ -534,6 +567,7 @@ impl From<&WriteTarget> for proto_metadata::WriteTargetProto {
             chunk_size: target.chunk_size,
             block_format_id: target.block_format_id.as_raw(),
             block_size: target.block_size,
+            tier: proto_common::TierProto::from(target.tier) as i32,
         }
     }
 }
@@ -550,6 +584,7 @@ impl From<WriteTarget> for proto_metadata::WriteTargetProto {
             chunk_size: target.chunk_size,
             block_format_id: target.block_format_id.as_raw(),
             block_size: target.block_size,
+            tier: proto_common::TierProto::from(target.tier) as i32,
         }
     }
 }
@@ -1421,6 +1456,16 @@ mod tests {
                 ("uint32", "block_format_id", 4),
             ]
         );
+        assert_eq!(
+            proto_enum_values(common_proto, "TierProto"),
+            vec![
+                ("TIER_UNSPECIFIED", 0),
+                ("TIER_MEM", 1),
+                ("TIER_NVME", 2),
+                ("TIER_SSD", 3),
+                ("TIER_HDD", 4),
+            ]
+        );
 
         let errors_proto = include_str!("../common/errors.proto");
         assert_eq!(
@@ -1499,6 +1544,7 @@ mod tests {
                 ("uint64", "effective_len", 7),
                 ("common.WorkerEndpointInfoProto", "worker_endpoints", 8),
                 ("common.FencingTokenProto", "fencing_token", 9),
+                ("common.TierProto", "tier", 10),
             ]
         );
         assert_eq!(
@@ -1652,6 +1698,7 @@ mod tests {
                 ("string", "worker_run_id", 11),
                 ("uint64", "effective_len", 12),
                 ("string", "group_name", 13),
+                ("common.TierProto", "tier", 14),
             ]
         );
         assert_eq!(
@@ -1723,6 +1770,7 @@ mod tests {
                 ("BlockFormatProto", "format", 2),
                 ("BlockSourceProto", "source", 3),
                 ("BlockVisibilityProto", "visibility", 4),
+                ("common.TierProto", "tier", 5),
             ]
         );
         assert_eq!(
@@ -1967,6 +2015,7 @@ mod tests {
             chunk_size: 1024,
             block_format_id: types::layout::BlockFormatId::FULL_EFFECTIVE.as_raw(),
             block_size: 4096,
+            tier: proto_common::TierProto::TierHdd as i32,
         };
         let err = types::WriteTarget::try_from(target.clone()).expect_err("empty target workers must fail");
         assert!(err.contains("worker_endpoints"));
@@ -2019,6 +2068,7 @@ mod tests {
             block_stamp: 55,
             chunk_size: 1024,
             block_format_id: types::layout::BlockFormatId::FULL_EFFECTIVE,
+            tier: types::Tier::Hdd,
         };
         let decoded_target = types::WriteTarget::try_from(proto_metadata::WriteTargetProto::from(target.clone()))
             .expect("write target decodes");
@@ -2034,6 +2084,7 @@ mod tests {
             chunk_size: 1024,
             block_format_id: 0,
             block_size: 4096,
+            tier: proto_common::TierProto::TierHdd as i32,
         };
         let err = types::WriteTarget::try_from(missing_format).expect_err("missing format id must fail");
         assert!(err.contains("block_format_id"));

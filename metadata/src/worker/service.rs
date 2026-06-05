@@ -21,7 +21,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn, Span};
-use types::{BlockId, GroupName, WorkerId, WorkerRunId};
+use types::{BlockId, GroupName, TierFree, WorkerId, WorkerRunId};
 
 /// Worker service background task handles.
 pub struct WorkerBackgroundHandle {}
@@ -380,6 +380,20 @@ fn validate_advertised_endpoint(endpoint: proto::common::EndpointProto) -> Resul
     Ok(format!("{}:{}", endpoint.host, endpoint.port))
 }
 
+fn parse_tier_free(entries: &[TierFreeProto]) -> Result<Vec<TierFree>, String> {
+    entries
+        .iter()
+        .map(|entry| {
+            let tier = proto::convert::parse_known_tier(entry.tier)
+                .map_err(|err| format!("capacity.tier_free tier invalid: {err}"))?;
+            Ok(TierFree {
+                tier,
+                free_bytes: entry.free_bytes,
+            })
+        })
+        .collect()
+}
+
 fn check_header_group_name(
     req_header: &Option<proto::common::RequestHeaderProto>,
     body_group_name: &GroupName,
@@ -611,9 +625,13 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         };
         Span::current().record("worker_run_id", worker_run_id.to_string());
 
-        let capacity = match req.capacity {
+        let capacity = match req.capacity.as_ref() {
             Some(capacity) => capacity,
             None => return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, "Missing capacity"),
+        };
+        let tier_free = match parse_tier_free(&capacity.tier_free) {
+            Ok(tier_free) => tier_free,
+            Err(message) => return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, message),
         };
 
         let load = match req.load {
@@ -695,7 +713,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         use super::manager::HealthStatus;
         let health_status = HealthStatus::from(health_proto as i32);
 
-        let live_state = match self.worker_manager.record_heartbeat(
+        let live_state = match self.worker_manager.record_heartbeat_with_tier_free(
             &group_name,
             worker_id,
             worker_run_id,
@@ -705,6 +723,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             capacity.total_bytes,
             capacity.used_bytes,
             capacity.available_bytes,
+            tier_free,
             load.active_reads,
             load.active_writes,
             health_status,
@@ -1129,6 +1148,10 @@ mod tests {
                 total_bytes: 1_000,
                 used_bytes: 100,
                 available_bytes: 900,
+                tier_free: vec![TierFreeProto {
+                    tier: proto::common::TierProto::TierHdd as i32,
+                    free_bytes: 900,
+                }],
             }),
             load: Some(LoadInfoProto {
                 active_reads: 0,

@@ -168,6 +168,7 @@ mod tests {
                         chunk_size: 1024,
                         effective_len: 4096,
                         checksum_kind: ChecksumKind::None,
+                        tier: types::Tier::Hdd,
                     },
                     header.clone(),
                 )

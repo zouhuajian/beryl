@@ -27,7 +27,8 @@ use types::{BlockId, GroupName};
 use crate::config::WorkerRegistrationConfig;
 use crate::control::{ControlIdentity, ControlOp, Registration, RegistrationDescriptor, RegistrationSet};
 use crate::observe;
-use crate::store::block::{BlockMetaPayload, BlockState, FullBlockFileStore};
+use crate::store::block::{BlockMetaPayload, BlockState};
+use crate::store::dirs::StoreDirs;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockReportOptions {
@@ -77,7 +78,7 @@ pub struct MetadataBlockReportLoop {
     _descriptor: RegistrationDescriptor,
     state: Arc<RegistrationSet>,
     endpoints: Vec<Endpoint>,
-    store: Arc<FullBlockFileStore>,
+    store: Arc<StoreDirs>,
     options: BlockReportOptions,
     control_identity: ControlIdentity,
     baselines: Mutex<HashMap<GroupName, ReportBaseline>>,
@@ -88,7 +89,7 @@ impl MetadataBlockReportLoop {
         config: WorkerRegistrationConfig,
         descriptor: RegistrationDescriptor,
         state: Arc<RegistrationSet>,
-        store: Arc<FullBlockFileStore>,
+        store: Arc<StoreDirs>,
     ) -> Result<Self, BlockReportError> {
         Self::with_options(config, descriptor, state, store, BlockReportOptions::default())
     }
@@ -97,7 +98,7 @@ impl MetadataBlockReportLoop {
         config: WorkerRegistrationConfig,
         descriptor: RegistrationDescriptor,
         state: Arc<RegistrationSet>,
-        store: Arc<FullBlockFileStore>,
+        store: Arc<StoreDirs>,
         options: BlockReportOptions,
     ) -> Result<Self, BlockReportError> {
         config

@@ -15,7 +15,7 @@ use worker::{
         prepare_worker_start, MetadataBlockReportLoop, MetadataHeartbeatLoop, MetadataRegistrar, RegistrationSet,
     },
     net, observe,
-    store::block::{FullBlockFileStore, FullBlockFileStoreConfig},
+    store::dirs::StoreDirs,
     WorkerCore,
 };
 
@@ -52,7 +52,10 @@ async fn main() -> Result<()> {
         default_frame_size = config.default_frame_size,
         max_frame_size = config.max_frame_size,
         window_bytes = config.window_bytes,
-        storage_root = ?config.storage_root,
+        store_dirs = config.store.dirs.len(),
+        store_reserve_space_bytes = config.store.reserve_space_bytes,
+        store_selection_policy = %config.store.selection_policy,
+        store_check_interval_ms = config.store.check_interval_ms,
         net_listeners = config.net.listeners.len(),
         "Starting worker data service skeleton"
     );
@@ -82,9 +85,14 @@ async fn main() -> Result<()> {
             .context("Failed to create worker metadata registrar")?,
     );
 
-    let block_store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
-        config.storage_root.clone(),
-    )));
+    let block_store = Arc::new(
+        StoreDirs::open(
+            config.store.dirs.clone(),
+            config.store.reserve_space_bytes,
+            config.store.check_interval_ms,
+        )
+        .context("Failed to initialize worker store dirs")?,
+    );
     let core = Arc::new(WorkerCore::with_local_store(
         config.default_frame_size,
         config.max_frame_size,
@@ -99,7 +107,7 @@ async fn main() -> Result<()> {
         })
         .await
         .context("Worker metadata registration failed")?;
-    let _heartbeat_handle = heartbeat.spawn_with_registrar(Arc::clone(&registrar));
+    let _heartbeat_handle = heartbeat.spawn_with_registrar_and_store(Arc::clone(&registrar), Arc::clone(&block_store));
     let block_report = MetadataBlockReportLoop::new(
         config.metadata.clone(),
         block_report_descriptor,

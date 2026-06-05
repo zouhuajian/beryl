@@ -40,9 +40,9 @@ mod tests {
     use types::ids::{BlockId, BlockIndex, ChunkIndex, ClientId, DataHandleId, StreamId, WorkerId};
     use types::layout::BlockFormatId;
     use types::lease::FencingToken;
-    use types::{GroupName, WorkerRunId};
+    use types::{GroupName, Tier, TierFree, WorkerRunId};
 
-    use crate::config::{WorkerConfig, WorkerRegistrationConfig};
+    use crate::config::{StoreDirConfig, WorkerConfig, WorkerRegistrationConfig};
     use crate::control::identity::resolve_worker_id;
     use crate::control::{
         BlockReportOptions, HeartbeatSnapshot, MetadataBlockReportLoop, MetadataHeartbeatLoop, MetadataRegistrar,
@@ -62,8 +62,10 @@ mod tests {
     use crate::net::server::grpc::WorkerDataServiceImpl;
     use crate::runtime::stream::{StreamManager, StreamState};
     use crate::store::block::{
-        ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, PublishReadyRequest,
+        ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
+        PublishReadyRequest,
     };
+    use crate::store::dirs::{StoreDirs, StoreReport};
 
     const BLOCK_SIZE: u64 = 4096;
     const CHUNK_SIZE: u32 = 1024;
@@ -752,6 +754,10 @@ mod tests {
                 capacity_total_bytes: 10,
                 capacity_used_bytes: 3,
                 capacity_available_bytes: 7,
+                tier_free: vec![TierFree {
+                    tier: Tier::Ssd,
+                    free_bytes: 7,
+                }],
                 active_reads: 1,
                 active_writes: 2,
                 cpu_usage_percent: 4,
@@ -775,6 +781,11 @@ mod tests {
             assert_eq!(request.worker_run_id, worker_run_id.to_string());
             assert_eq!(request.heartbeat_seq, 1);
             assert_eq!(request.capacity.as_ref().unwrap().total_bytes, 10);
+            assert_eq!(request.capacity.as_ref().unwrap().tier_free.len(), 1);
+            assert_eq!(
+                request.capacity.as_ref().unwrap().tier_free[0].tier,
+                proto::common::TierProto::TierSsd as i32
+            );
             assert_eq!(
                 request.advertised_endpoint,
                 Some(EndpointProto {
@@ -787,6 +798,60 @@ mod tests {
         assert_eq!(identities[0], identities[1]);
         shutdown_a.send(()).ok();
         shutdown_b.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_sends_zero_capacity_when_store_report_has_failed_dir() {
+        let worker_run_id = test_worker_run_id();
+        let (endpoint, mock, shutdown) = start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::Ok {
+            worker_id: 42,
+            worker_run_id,
+            server_role: MetadataServerRoleProto::MetadataServerRoleLeader,
+            commands: Vec::new(),
+        }])
+        .await;
+        let state = Arc::new(RegistrationSet::new());
+        state.record_registered(Registration {
+            group_name: group_name(),
+            worker_id: WorkerId::new(42),
+            worker_run_id,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        });
+        let heartbeat = MetadataHeartbeatLoop::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+        )
+        .expect("heartbeat loop");
+        let temp = TempDir::new().expect("tempdir");
+        let failed_path = temp.path().join("hdd0");
+        let store = StoreDirs::open(
+            BTreeMap::from([(
+                "hdd0".to_string(),
+                StoreDirConfig {
+                    path: failed_path.clone(),
+                    tier: Tier::Hdd,
+                    capacity_bytes: 64 * 1024,
+                },
+            )]),
+            0,
+            1,
+        )
+        .expect("open store dirs");
+        std::fs::remove_dir_all(&failed_path).expect("remove failed store dir");
+        std::thread::sleep(Duration::from_millis(10));
+
+        let snapshot = HeartbeatSnapshot::from(store.report().expect("degraded store report"));
+        let round = heartbeat.send_once(snapshot).await.expect("heartbeat round");
+
+        assert_eq!(round.accepted_peers, 1);
+        let requests = mock.heartbeat_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let capacity = requests[0].capacity.as_ref().expect("heartbeat capacity");
+        assert_eq!(capacity.total_bytes, 64 * 1024);
+        assert_eq!(capacity.available_bytes, 0);
+        assert!(capacity.tier_free.is_empty());
+        shutdown.send(()).ok();
     }
 
     #[tokio::test]
@@ -961,9 +1026,7 @@ mod tests {
         )
         .expect("registrar");
         let temp = TempDir::new().expect("tempdir");
-        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
-            temp.path().to_path_buf(),
-        )));
+        let store = report_store(&temp);
         publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
         let reporter = MetadataBlockReportLoop::new(
             test_registration_config(endpoint),
@@ -1094,6 +1157,32 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_snapshot_uses_store_report_capacity() {
+        let snapshot = HeartbeatSnapshot::from(StoreReport {
+            total_bytes: 10_000,
+            used_bytes: 3_000,
+            pending_bytes: 1_000,
+            free_bytes: 6_000,
+            tier_free: vec![TierFree {
+                tier: Tier::Ssd,
+                free_bytes: 6_000,
+            }],
+            dirs: Vec::new(),
+        });
+
+        assert_eq!(snapshot.capacity_total_bytes, 10_000);
+        assert_eq!(snapshot.capacity_used_bytes, 3_000);
+        assert_eq!(snapshot.capacity_available_bytes, 6_000);
+        assert_eq!(
+            snapshot.tier_free,
+            vec![TierFree {
+                tier: Tier::Ssd,
+                free_bytes: 6_000,
+            }]
+        );
+    }
+
+    #[test]
     fn block_report_scans_local_blocks_by_group_directory() {
         let temp = TempDir::new().expect("tempdir");
         let store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(temp.path().to_path_buf()));
@@ -1117,9 +1206,7 @@ mod tests {
         let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(Vec::new()).await;
         let state = Arc::new(RegistrationSet::new());
         let temp = TempDir::new().expect("tempdir");
-        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
-            temp.path().to_path_buf(),
-        )));
+        let store = report_store(&temp);
         publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
         let reporter = MetadataBlockReportLoop::new(
             test_registration_config(endpoint),
@@ -1157,9 +1244,7 @@ mod tests {
         });
         state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
         let temp = TempDir::new().expect("tempdir");
-        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
-            temp.path().to_path_buf(),
-        )));
+        let store = report_store(&temp);
         publish_ready_block_for(
             store.as_ref(),
             group_name(),
@@ -1256,9 +1341,7 @@ mod tests {
             });
             state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
             let temp = TempDir::new().expect("tempdir");
-            let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
-                temp.path().to_path_buf(),
-            )));
+            let store = report_store(&temp);
             publish_ready_block_for(
                 store.as_ref(),
                 group_name(),
@@ -1322,9 +1405,7 @@ mod tests {
         });
         state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
         let temp = TempDir::new().expect("tempdir");
-        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
-            temp.path().to_path_buf(),
-        )));
+        let store = report_store(&temp);
         publish_ready_block_for(
             store.as_ref(),
             group_name(),
@@ -1382,9 +1463,7 @@ mod tests {
         });
         state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
         let temp = TempDir::new().expect("tempdir");
-        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
-            temp.path().to_path_buf(),
-        )));
+        let store = report_store(&temp);
         publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
         let reporter = MetadataBlockReportLoop::new(
             test_registration_config(endpoint),
@@ -1422,9 +1501,7 @@ mod tests {
         });
         state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
         let temp = TempDir::new().expect("tempdir");
-        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
-            temp.path().to_path_buf(),
-        )));
+        let store = report_store(&temp);
         publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
         let mut config = test_registration_config(first_endpoint);
         config.endpoints.push(second_endpoint);
@@ -1468,9 +1545,7 @@ mod tests {
         });
         state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
         let temp = TempDir::new().expect("tempdir");
-        let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
-            temp.path().to_path_buf(),
-        )));
+        let store = report_store(&temp);
         let first = BlockId::new(DataHandleId::new(7), BlockIndex::new(0));
         let second = BlockId::new(DataHandleId::new(7), BlockIndex::new(1));
         publish_ready_block_for(store.as_ref(), group_name(), first, payload(), 101);
@@ -1518,6 +1593,7 @@ mod tests {
             chunk_size: CHUNK_SIZE,
             effective_len: BLOCK_SIZE,
             checksum_kind: ChecksumKind::None,
+            tier: Tier::Hdd,
         }
     }
 
@@ -1604,6 +1680,24 @@ mod tests {
         (temp, store, core)
     }
 
+    fn report_store(temp: &TempDir) -> Arc<StoreDirs> {
+        Arc::new(
+            StoreDirs::open(
+                BTreeMap::from([(
+                    "hdd0".to_string(),
+                    StoreDirConfig {
+                        path: temp.path().join("hdd0"),
+                        tier: Tier::Hdd,
+                        capacity_bytes: 64 * 1024 * 1024,
+                    },
+                )]),
+                0,
+                30_000,
+            )
+            .expect("open report store"),
+        )
+    }
+
     fn publish_ready_block(store: &FullBlockFileStore, data: Bytes, block_stamp: u64) {
         store
             .create_staging_block(CreateStagingBlockRequest {
@@ -1613,6 +1707,7 @@ mod tests {
                 block_format_id: BlockFormatId::FULL_EFFECTIVE,
                 chunk_size: CHUNK_SIZE,
                 checksum_kind: ChecksumKind::None,
+                tier: Tier::Hdd,
             })
             .expect("create staging block");
         store
@@ -1629,7 +1724,7 @@ mod tests {
     }
 
     fn publish_ready_block_for(
-        store: &FullBlockFileStore,
+        store: &(impl LocalBlockStore + ?Sized),
         group_name: GroupName,
         block_id: BlockId,
         data: Bytes,
@@ -1643,6 +1738,7 @@ mod tests {
                 block_format_id: BlockFormatId::FULL_EFFECTIVE,
                 chunk_size: CHUNK_SIZE,
                 checksum_kind: ChecksumKind::None,
+                tier: Tier::Hdd,
             })
             .expect("create staging block");
         store
@@ -1711,6 +1807,7 @@ mod tests {
             frame_size,
             worker_run_id: test_worker_run_id().to_string(),
             effective_len: BLOCK_SIZE,
+            tier: proto::common::TierProto::TierHdd as i32,
         }
     }
 
@@ -1845,6 +1942,7 @@ mod tests {
         assert_eq!(domain.chunk_size, CHUNK_SIZE);
         assert_eq!(domain.effective_len, BLOCK_SIZE);
         assert_eq!(domain.checksum_kind, ChecksumKind::None);
+        assert_eq!(domain.tier, Tier::Hdd);
     }
 
     #[test]
@@ -2636,10 +2734,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_core_uses_configured_storage_root() {
-        let custom_root = TempDir::new().expect("custom root");
-        let other_root = TempDir::new().expect("other root");
-        let store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(custom_root.path().to_path_buf()));
+    async fn worker_core_uses_configured_store_dir() {
+        let custom_dir = TempDir::new().expect("custom store dir");
+        let other_dir = TempDir::new().expect("other store dir");
+        let store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(custom_dir.path().to_path_buf()));
         publish_ready_block(&store, payload(), BLOCK_STAMP);
 
         let core = WorkerCore::with_options(
@@ -2647,36 +2745,36 @@ mod tests {
             2048,
             4096,
             Duration::from_secs(60),
-            custom_root.path().to_path_buf(),
+            custom_dir.path().to_path_buf(),
         );
 
         let result = core
             .open_read(read_open_request_for(0, 8, BLOCK_STAMP, 512))
             .await
-            .expect("open read from configured root");
+            .expect("open read from configured store dir");
         assert!(core.stream_manager().get(result.stream_id).await.is_some());
 
         let paths = store.paths(&group_name(), block_id());
-        assert!(paths.data_path.starts_with(custom_root.path()));
-        assert!(paths.meta_path.starts_with(custom_root.path()));
+        assert!(paths.data_path.starts_with(custom_dir.path()));
+        assert!(paths.meta_path.starts_with(custom_dir.path()));
         assert!(
             paths.data_path.exists(),
-            "ready block data must exist under custom root"
+            "ready block data must exist under custom store dir"
         );
         assert!(
             paths.meta_path.exists(),
-            "ready block metadata must exist under custom root"
+            "ready block metadata must exist under custom store dir"
         );
 
-        let other_store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(other_root.path().to_path_buf()));
+        let other_store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(other_dir.path().to_path_buf()));
         let other_paths = other_store.paths(&group_name(), block_id());
         assert!(
             !other_paths.data_path.exists(),
-            "ready block data must not be created under other root"
+            "ready block data must not be created under other store dir"
         );
         assert!(
             !other_paths.meta_path.exists(),
-            "ready block metadata must not be created under other root"
+            "ready block metadata must not be created under other store dir"
         );
     }
 
@@ -2933,6 +3031,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_stream_error_releases_store_dir_pending_reservation() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = report_store(&temp);
+        let core = Arc::new(WorkerCore::with_local_store(
+            512,
+            2048,
+            4096,
+            Duration::from_secs(60),
+            store.clone(),
+        ));
+        let service = registered_data_service(Arc::clone(&core));
+        let open = service
+            .open_write_stream(tonic::Request::new(open_write_proto(0)))
+            .await
+            .expect("open write")
+            .into_inner();
+        let stream_id = crate::data::convert::proto_to_stream_id(open.stream_id, "stream_id").expect("stream id");
+
+        assert_eq!(store.report().expect("store report").pending_bytes, BLOCK_SIZE);
+
+        let response = service
+            .handle_write_frames(futures::stream::iter(vec![Ok(WriteStreamRequestProto {
+                stream_id: Some(crate::data::convert::stream_id_to_proto(stream_id)),
+                seq: 2,
+                offset_in_block: 0,
+                data: Bytes::from_static(b"abcd"),
+                checksum32: 0,
+            })]))
+            .await
+            .expect("write stream response");
+
+        assert!(!response.accepted);
+        assert_eq!(store.report().expect("store report").pending_bytes, 0);
+        assert!(core.stream_manager().get(stream_id).await.is_none());
+    }
+
+    #[tokio::test]
     async fn commit_write_returns_success_after_full_write() {
         let (_temp, _store, core) = core_with_store(512, 2048, 4096);
         let core = Arc::new(core);
@@ -3095,7 +3230,8 @@ mod tests {
 
     #[tokio::test]
     async fn service_read_stream_rejects_missing_stream() {
-        let service = registered_data_service(Arc::new(WorkerCore::new()));
+        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let service = registered_data_service(Arc::new(core));
 
         let read_status = match service
             .read_stream(tonic::Request::new(ReadStreamRequestProto {
@@ -3477,6 +3613,7 @@ mod tests {
                 ("string", "worker_run_id", 11),
                 ("uint64", "effective_len", 12),
                 ("string", "group_name", 13),
+                ("common.TierProto", "tier", 14),
             ]
         );
         assert_eq!(

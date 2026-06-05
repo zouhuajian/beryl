@@ -23,7 +23,7 @@ use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, LeaseId, MountId, 
 use types::layout::FileLayout;
 use types::lease::FencingToken;
 use types::worker::WorkerNetProtocol;
-use types::{CommittedBlock, GroupName, WorkerEndpointInfo, WorkerRunId, WriteTarget};
+use types::{CommittedBlock, GroupName, Tier, TierFree, WorkerEndpointInfo, WorkerRunId, WriteTarget};
 
 use super::freshness::{FreshnessValidator, StaleStateStatus};
 
@@ -119,6 +119,36 @@ fn record_worker_heartbeat(
     active_writes: u32,
     health: HealthStatus,
 ) {
+    record_worker_heartbeat_with_tiers(
+        manager,
+        group_name,
+        worker_id,
+        capacity_total,
+        capacity_used,
+        capacity_available,
+        vec![TierFree {
+            tier: Tier::Hdd,
+            free_bytes: capacity_available,
+        }],
+        active_reads,
+        active_writes,
+        health,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_worker_heartbeat_with_tiers(
+    manager: &WorkerManager,
+    group_name: &GroupName,
+    worker_id: WorkerId,
+    capacity_total: u64,
+    capacity_used: u64,
+    capacity_available: u64,
+    tier_free: Vec<TierFree>,
+    active_reads: u32,
+    active_writes: u32,
+    health: HealthStatus,
+) {
     let descriptor = manager
         .get_descriptor(group_name, worker_id)
         .expect("worker descriptor should be registered");
@@ -140,7 +170,7 @@ fn record_worker_heartbeat(
             run_id
         });
     manager
-        .record_heartbeat(
+        .record_heartbeat_with_tier_free(
             group_name,
             worker_id,
             run_id,
@@ -150,6 +180,7 @@ fn record_worker_heartbeat(
             capacity_total,
             capacity_used,
             capacity_available,
+            tier_free,
             active_reads,
             active_writes,
             health,
@@ -158,6 +189,27 @@ fn record_worker_heartbeat(
     manager
         .upsert_descriptor(descriptor)
         .expect("descriptor should be restored");
+}
+
+fn worker_manager_for_tier(group_name: &GroupName, tier: Tier, free_bytes: u64) -> Arc<WorkerManager> {
+    let manager = Arc::new(WorkerManager::new(60));
+    let worker_id = WorkerId::new(11);
+    manager
+        .register_worker(group_name, worker_id, "127.0.0.1:9111".to_string(), 1, None)
+        .unwrap();
+    record_worker_heartbeat_with_tiers(
+        &manager,
+        group_name,
+        worker_id,
+        free_bytes,
+        0,
+        free_bytes,
+        vec![TierFree { tier, free_bytes }],
+        0,
+        0,
+        HealthStatus::Healthy,
+    );
+    manager
 }
 
 fn report_block(block_id: BlockId) -> BlockReportBlock {
@@ -1170,6 +1222,7 @@ fn install_write_session(fs_core: &FsCore, inode_id: InodeId, mount_id: MountId)
                 block_stamp: 1,
                 chunk_size: 64,
                 block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
+                tier: types::Tier::Hdd,
             }],
             writer_identity: crate::write_session::WriterIdentity {
                 client_id: writer,
@@ -2061,6 +2114,7 @@ async fn commit_worker_run_check_rejects_missing_authoritative_group() {
                     block_stamp: 1,
                     chunk_size: 64,
                     block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
+                    tier: types::Tier::Hdd,
                 }],
                 writer_identity: crate::write_session::WriterIdentity {
                     client_id: writer,
@@ -2261,6 +2315,29 @@ async fn open_write_target_uses_stored_file_layout_shape() {
     assert_eq!(target.block_size, u64::from(layout.block_size));
     assert_eq!(target.chunk_size, layout.chunk_size);
     assert_eq!(target.effective_len, 2048);
+}
+
+#[tokio::test]
+async fn open_write_target_uses_metadata_selected_storage_tier() {
+    let mut env = write_flow_env(0).await;
+    env.fs_core
+        .set_worker_manager(worker_manager_for_tier(&env.group_name, Tier::Ssd, 4096));
+    let open = env
+        .fs_core
+        .execute_open_write(OpenWriteInput {
+            ctx: request_context(),
+            inode_id: env.inode_id,
+            desired_len: Some(2048),
+            mode: crate::inode_lease::WriteMode::Write,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("open write should select SSD worker");
+    let key = open.payload.session_key;
+
+    let target = add_block_for_key(&env.fs_core, &key, 2048).await;
+
+    assert_eq!(target.tier, Tier::Ssd);
 }
 
 #[tokio::test]

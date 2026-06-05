@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::info;
 use types::ids::{BlockId, WorkerId};
 use types::layout::BlockFormatId;
-use types::{GroupName, WorkerRunId};
+use types::{GroupName, TierFree, WorkerRunId};
 
 /// Worker descriptor (low-frequency, authoritative, persisted in Raft).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -36,6 +36,7 @@ pub struct WorkerRuntime {
     pub capacity_total: u64,
     pub capacity_used: u64,
     pub capacity_available: u64,
+    pub tier_free: Vec<TierFree>,
     pub active_reads: u32,
     pub active_writes: u32,
     pub health: HealthStatus,
@@ -794,6 +795,43 @@ impl WorkerManager {
         active_writes: u32,
         health: HealthStatus,
     ) -> MetadataResult<WorkerLiveState> {
+        self.record_heartbeat_with_tier_free(
+            group_name,
+            worker_id,
+            worker_run_id,
+            heartbeat_seq,
+            advertised_endpoint,
+            worker_net_protocol,
+            capacity_total,
+            capacity_used,
+            capacity_available,
+            vec![TierFree {
+                tier: types::Tier::Hdd,
+                free_bytes: capacity_available,
+            }],
+            active_reads,
+            active_writes,
+            health,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_heartbeat_with_tier_free(
+        &self,
+        group_name: &GroupName,
+        worker_id: WorkerId,
+        worker_run_id: WorkerRunId,
+        heartbeat_seq: u64,
+        advertised_endpoint: &str,
+        worker_net_protocol: i32,
+        capacity_total: u64,
+        capacity_used: u64,
+        capacity_available: u64,
+        tier_free: Vec<TierFree>,
+        active_reads: u32,
+        active_writes: u32,
+        health: HealthStatus,
+    ) -> MetadataResult<WorkerLiveState> {
         self.expire_liveness();
         let key = WorkerRegistrationKey::new(group_name, worker_id);
         let descriptor = {
@@ -857,6 +895,7 @@ impl WorkerManager {
                     capacity_total,
                     capacity_used,
                     capacity_available,
+                    tier_free,
                     active_reads,
                     active_writes,
                     health,
@@ -1018,6 +1057,7 @@ impl WorkerManager {
                 rack: descriptor.fault_domain.clone(),
                 region: None,
                 free_bytes: live.map(|runtime| runtime.capacity_available),
+                tier_free: live.map(|runtime| runtime.tier_free.clone()).unwrap_or_default(),
                 supported_block_formats: vec![BlockFormatId::CURRENT_FOR_NEW_FILE],
             });
         }

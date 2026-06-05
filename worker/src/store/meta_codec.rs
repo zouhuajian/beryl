@@ -4,6 +4,8 @@
 //! Protobuf payload codec for worker-local block metadata.
 
 use prost::Message;
+use proto::common::TierProto;
+use proto::convert::parse_known_tier;
 use proto::worker::{
     BlockFormatProto, BlockIdentityProto, BlockMetaPayloadProto, BlockSourceProto, BlockStateProto,
     BlockVisibilityProto, ChecksumKindProto,
@@ -75,6 +77,7 @@ fn meta_to_proto_without_visibility(meta: &BlockMetaPayload) -> StoreResult<Bloc
             effective_len: meta.source.effective_len,
         }),
         visibility: None,
+        tier: TierProto::from(meta.tier) as i32,
     })
 }
 
@@ -84,9 +87,11 @@ fn meta_from_proto(proto: BlockMetaPayloadProto) -> StoreResult<BlockMetaPayload
         format,
         source,
         visibility,
+        tier,
     } = proto;
     let fields = meta_fields_from_proto(identity, format, source)?;
     let visibility = visibility.ok_or_else(|| corrupt("block meta payload missing visibility"))?;
+    let tier = parse_known_tier(tier).map_err(|err| corrupt(format!("block meta payload invalid tier: {err}")))?;
 
     Ok(BlockMetaPayload {
         identity: fields.identity,
@@ -96,6 +101,7 @@ fn meta_from_proto(proto: BlockMetaPayloadProto) -> StoreResult<BlockMetaPayload
             block_state: block_state_from_proto(visibility.block_state)?,
             block_stamp: visibility.block_stamp,
         },
+        tier,
     })
 }
 
@@ -105,12 +111,14 @@ fn staging_meta_from_proto(proto: BlockMetaPayloadProto) -> StoreResult<BlockMet
         format,
         source,
         visibility,
+        tier,
     } = proto;
     if visibility.is_some() {
         return Err(corrupt("staging block metadata must not encode final visibility"));
     }
 
     let fields = meta_fields_from_proto(identity, format, source)?;
+    let tier = parse_known_tier(tier).map_err(|err| corrupt(format!("block meta payload invalid tier: {err}")))?;
     Ok(BlockMetaPayload {
         identity: fields.identity,
         format: fields.format,
@@ -119,6 +127,7 @@ fn staging_meta_from_proto(proto: BlockMetaPayloadProto) -> StoreResult<BlockMet
             block_state: BlockState::Loading,
             block_stamp: 0,
         },
+        tier,
     })
 }
 

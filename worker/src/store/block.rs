@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use bytes::Bytes;
 use types::ids::BlockId;
 use types::layout::BlockFormatId;
-use types::GroupName;
+use types::{GroupName, Tier};
 
 use super::meta_codec::{
     decode_meta_payload, decode_staging_meta_payload, encode_meta_payload, encode_staging_meta_payload,
@@ -23,7 +23,7 @@ pub type StoreResult<T> = Result<T, WorkerError>;
 
 const BLOCK_META_MAGIC: [u8; 8] = *b"VBLKMETA";
 const BLOCK_META_HEADER_LEN: usize = 24;
-const BLOCK_META_VERSION: u32 = 1;
+const BLOCK_META_VERSION: u32 = 2;
 const MAX_META_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 
 /// Fixed little-endian header for a block metadata file.
@@ -117,6 +117,8 @@ pub struct BlockMetaPayload {
     pub source: BlockSource,
     /// Local visibility state.
     pub visibility: BlockVisibility,
+    /// Worker-local tier where this replica was materialized.
+    pub tier: Tier,
 }
 
 /// Stable identity of the local block and owning metadata group.
@@ -203,6 +205,7 @@ pub struct CreateStagingBlockRequest {
     pub block_format_id: BlockFormatId,
     pub chunk_size: u32,
     pub checksum_kind: ChecksumKind,
+    pub tier: Tier,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -318,6 +321,7 @@ impl FullBlockFileStore {
                 block_state: BlockState::Loading,
                 block_stamp: 0,
             },
+            tier: req.tier,
         };
         validate_staging_meta_payload(&meta, &req.group_name, req.block_id)?;
         write_staging_meta_new(&paths, &meta)?;
@@ -1139,6 +1143,7 @@ mod tests {
             block_format_id: BlockFormatId::FULL_EFFECTIVE,
             chunk_size,
             checksum_kind: ChecksumKind::None,
+            tier: Tier::Hdd,
         }
     }
 
@@ -1295,6 +1300,7 @@ mod tests {
                 block_state: BlockState::Ready,
                 block_stamp: 99,
             },
+            tier: Tier::Hdd,
         }
     }
 
@@ -1506,7 +1512,7 @@ mod tests {
     }
 
     fn payload_has_generated_protobuf_shape(encoded: &[u8]) -> bool {
-        [1, 2, 3, 4]
+        [1, 2, 3, 4, 5]
             .into_iter()
             .all(|field_number| find_wire_field(encoded, field_number).is_some())
     }
@@ -1541,6 +1547,10 @@ mod tests {
 
     fn protobuf_payload_missing_visibility(meta: &BlockMetaPayload) -> Vec<u8> {
         remove_field(&valid_payload(meta), 4)
+    }
+
+    fn protobuf_payload_missing_tier(meta: &BlockMetaPayload) -> Vec<u8> {
+        remove_field(&valid_payload(meta), 5)
     }
 
     fn protobuf_payload_with_block_state(meta: &BlockMetaPayload, block_state: i32) -> Vec<u8> {
@@ -1614,6 +1624,7 @@ mod tests {
         assert_eq!(meta.format.block_size, 8 * MB);
         assert_eq!(meta.format.chunk_size, MB);
         assert_eq!(meta.format.checksum_kind, ChecksumKind::None);
+        assert_eq!(meta.tier, Tier::Hdd);
     }
 
     #[test]
@@ -1749,6 +1760,7 @@ mod tests {
                 block_format_id: BlockFormatId::FULL_EFFECTIVE,
                 chunk_size: 1024,
                 checksum_kind: ChecksumKind::None,
+                tier: Tier::Hdd,
             })
             .expect("create staging block");
         store
@@ -2173,6 +2185,7 @@ mod tests {
             ("missing format", protobuf_payload_missing_format(&valid)),
             ("missing source", protobuf_payload_missing_source(&valid)),
             ("missing visibility", protobuf_payload_missing_visibility(&valid)),
+            ("missing tier", protobuf_payload_missing_tier(&valid)),
         ];
 
         for (case, payload) in cases {

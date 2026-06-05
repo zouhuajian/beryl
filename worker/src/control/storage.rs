@@ -28,7 +28,12 @@ pub struct WorkerStorageInfo {
 }
 
 pub fn worker_storage_info_path(config: &WorkerConfig) -> PathBuf {
-    config.storage_root.join(WORKER_STORAGE_INFO_FILE)
+    config
+        .identity_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(WORKER_STORAGE_INFO_FILE)
 }
 
 pub fn prepare_worker_start(config: &WorkerConfig) -> Result<WorkerId, WorkerError> {
@@ -37,22 +42,14 @@ pub fn prepare_worker_start(config: &WorkerConfig) -> Result<WorkerId, WorkerErr
     if info_path.exists() {
         let info = read_info(&info_path)?;
         let worker_id = validate_info(config, &info)?;
-        init_group_dir(config)?;
         return Ok(worker_id);
     }
 
-    if storage_root_has_entries(&config.storage_root)? {
+    if store_dirs_have_entries(config)? {
         return Err(info_missing_error(config));
     }
 
-    std::fs::create_dir_all(&config.storage_root).map_err(|err| {
-        WorkerError::Internal(format!(
-            "failed to create worker.storage.root {}: {err}",
-            config.storage_root.display()
-        ))
-    })?;
     let worker_id = resolve_worker_id(config).map_err(|err| WorkerError::InvalidArgument(err.to_string()))?;
-    init_group_dir(config)?;
     let info = WorkerStorageInfo {
         cluster_id: config.cluster_id.clone(),
         worker_id: worker_id.as_raw(),
@@ -69,11 +66,6 @@ fn validate_start_config(config: &WorkerConfig) -> Result<(), WorkerError> {
     if config.cluster_id.trim().is_empty() {
         return Err(WorkerError::InvalidArgument(
             "vecton.cluster.id must not be empty".to_string(),
-        ));
-    }
-    if config.storage_root.as_os_str().is_empty() {
-        return Err(WorkerError::InvalidArgument(
-            "worker.storage.root must not be empty".to_string(),
         ));
     }
     Ok(())
@@ -100,43 +92,46 @@ fn validate_info(config: &WorkerConfig, info: &WorkerStorageInfo) -> Result<Work
     Ok(worker_id)
 }
 
-fn storage_root_has_entries(path: &Path) -> Result<bool, WorkerError> {
+fn store_dirs_have_entries(config: &WorkerConfig) -> Result<bool, WorkerError> {
+    for dir in config.store.dirs.values() {
+        if storage_dir_has_entries(&dir.path)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn storage_dir_has_entries(path: &Path) -> Result<bool, WorkerError> {
     if !path.exists() {
         return Ok(false);
     }
     if !path.is_dir() {
         return Err(WorkerError::InvalidArgument(format!(
-            "worker.storage.root {} exists but is not a directory",
+            "worker.store.dirs path {} exists but is not a directory",
             path.display()
         )));
     }
     let mut entries = std::fs::read_dir(path).map_err(|err| {
-        WorkerError::Internal(format!("failed to read worker.storage.root {}: {err}", path.display()))
+        WorkerError::Internal(format!(
+            "failed to read worker.store.dirs path {}: {err}",
+            path.display()
+        ))
     })?;
     Ok(entries
         .next()
         .transpose()
-        .map_err(|err| WorkerError::Internal(format!("failed to read worker.storage.root {}: {err}", path.display())))?
-        .is_some())
-}
-
-fn init_group_dir(config: &WorkerConfig) -> Result<(), WorkerError> {
-    let group_dir = config.group_storage_root();
-    for name in ["blocks", "tmp", "gc"] {
-        std::fs::create_dir_all(group_dir.join(name)).map_err(|err| {
+        .map_err(|err| {
             WorkerError::Internal(format!(
-                "failed to create worker block store directory {}: {err}",
-                group_dir.join(name).display()
+                "failed to read worker.store.dirs path {}: {err}",
+                path.display()
             ))
-        })?;
-    }
-    Ok(())
+        })?
+        .is_some())
 }
 
 fn info_missing_error(config: &WorkerConfig) -> WorkerError {
     WorkerError::InvalidArgument(format!(
-        "worker.storage.root {} is non-empty but WorkerStorageInfo missing at {}; refusing to take over unknown local data",
-        config.storage_root.display(),
+        "worker.store.dirs contains non-empty paths but WorkerStorageInfo is missing at {}; refusing to take over unknown local data",
         worker_storage_info_path(config).display()
     ))
 }

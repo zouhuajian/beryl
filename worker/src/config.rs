@@ -3,6 +3,7 @@
 
 //! Worker configuration for the current data service skeleton.
 
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -10,7 +11,7 @@ use common::config::CoreConfig;
 use common::error::{CommonError, CommonErrorCode};
 use tonic::transport::Endpoint;
 use tracing::info;
-use types::GroupName;
+use types::{GroupName, Tier};
 
 use crate::net::config::WorkerNetConfig;
 use crate::net::protocol::WorkerNetProtocol;
@@ -43,6 +44,41 @@ impl Default for WorkerRegistrationConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreDirConfig {
+    pub path: PathBuf,
+    pub tier: Tier,
+    pub capacity_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerStoreConfig {
+    pub dirs: BTreeMap<String, StoreDirConfig>,
+    pub reserve_space_bytes: u64,
+    pub selection_policy: String,
+    pub check_interval_ms: u64,
+}
+
+impl Default for WorkerStoreConfig {
+    fn default() -> Self {
+        let mut dirs = BTreeMap::new();
+        dirs.insert(
+            "hdd0".to_string(),
+            StoreDirConfig {
+                path: PathBuf::from("data/worker/hdd0"),
+                tier: Tier::Hdd,
+                capacity_bytes: 10 * 1024 * 1024 * 1024,
+            },
+        );
+        Self {
+            dirs,
+            reserve_space_bytes: 1024 * 1024 * 1024,
+            selection_policy: "round_robin".to_string(),
+            check_interval_ms: 30_000,
+        }
+    }
+}
+
 /// Worker configuration.
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
@@ -68,8 +104,8 @@ pub struct WorkerConfig {
     pub window_bytes: u32,
     /// Idle timeout for runtime stream state.
     pub stream_idle_timeout_ms: u64,
-    /// Root for worker-local block storage.
-    pub storage_root: PathBuf,
+    /// Worker-local block store configuration.
+    pub store: WorkerStoreConfig,
     /// Worker-owned service-specific network configuration.
     pub net: WorkerNetConfig,
     /// Worker metadata registration configuration.
@@ -89,7 +125,7 @@ impl Default for WorkerConfig {
             max_frame_size: 4 * 1024 * 1024,
             window_bytes: 8 * 1024 * 1024,
             stream_idle_timeout_ms: 60_000,
-            storage_root: PathBuf::from("data/worker"),
+            store: WorkerStoreConfig::default(),
             net: WorkerNetConfig::grpc_from_rpc("0.0.0.0:9090".to_string(), 100, 4 * 1024 * 1024),
             metadata: WorkerRegistrationConfig::default(),
         }
@@ -151,11 +187,7 @@ impl WorkerConfig {
             defaults.stream_idle_timeout_ms as usize,
             "worker.stream.idle_timeout_ms",
         )? as u64;
-        let storage_root = worker_sub
-            .get_str("storage.root")
-            .map(PathBuf::from)
-            .or_else(|| (!worker_sub.contains_key("storage.root")).then(|| defaults.storage_root.clone()))
-            .ok_or_else(|| invalid_config("worker.storage.root", "must be a string"))?;
+        let store = parse_store_config(&worker_sub, &defaults.store)?;
         let endpoints = metadata_endpoints(&worker_sub, &metadata_defaults)?;
         let group_name = Self::str_or(
             &worker_sub,
@@ -197,7 +229,7 @@ impl WorkerConfig {
             max_frame_size,
             window_bytes,
             stream_idle_timeout_ms,
-            storage_root,
+            store,
             net: WorkerNetConfig::grpc_from_rpc(rpc_bind, rpc_max_inflight, max_frame_size),
             metadata,
         };
@@ -213,7 +245,10 @@ impl WorkerConfig {
             default_frame_size = config.default_frame_size,
             max_frame_size = config.max_frame_size,
             window_bytes = config.window_bytes,
-            storage_root = ?config.storage_root,
+            store_dirs = config.store.dirs.len(),
+            store_reserve_space_bytes = config.store.reserve_space_bytes,
+            store_selection_policy = %config.store.selection_policy,
+            store_check_interval_ms = config.store.check_interval_ms,
             net_listeners = config.net.listeners.len(),
             metadata_endpoints = ?config.metadata.endpoints,
             metadata_group_name = %config.metadata.group_name,
@@ -303,12 +338,7 @@ impl WorkerConfig {
             ));
         }
 
-        if self.storage_root.as_os_str().is_empty() {
-            return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
-                "worker.storage.root must not be empty",
-            ));
-        }
+        validate_store_config(self)?;
 
         self.metadata.validate()?;
 
@@ -346,10 +376,6 @@ impl WorkerConfig {
     /// Return the host and port that registration advertises to metadata.
     pub fn rpc_advertised_endpoint_parts(&self) -> Result<(String, u32), CommonError> {
         parse_advertised_endpoint(&self.rpc_advertised_endpoint)
-    }
-
-    pub fn group_storage_root(&self) -> PathBuf {
-        self.storage_root.join("groups").join(self.metadata.group_name.as_str())
     }
 
     fn str_or(
@@ -423,9 +449,28 @@ impl WorkerConfig {
             None => Ok(fallback),
         }
     }
+
+    fn bytes_u64(
+        flat: &common::config::FlatConfig,
+        key: &str,
+        fallback: u64,
+        field_name: &'static str,
+    ) -> Result<u64, CommonError> {
+        match flat.get_bytes(key) {
+            Some(value) => u64::try_from(value).map_err(|_| invalid_config(field_name, "exceeds u64 byte size")),
+            None if flat.contains_key(key) => Err(invalid_config(field_name, "must be a byte size")),
+            None => Ok(fallback),
+        }
+    }
 }
 
 fn reject_removed_keys(flat: &common::config::FlatConfig) -> Result<(), CommonError> {
+    if let Some(key) = flat.keys_with_prefix("storage").into_iter().next() {
+        return Err(CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            format!("worker.{key} is unsupported: use worker.store.*"),
+        ));
+    }
     for (key, full_key, detail) in [
         (
             "id",
@@ -448,6 +493,21 @@ fn reject_removed_keys(flat: &common::config::FlatConfig) -> Result<(), CommonEr
             "worker.metadata.endpoint is unsupported; use worker.metadata.endpoints",
         ),
         (
+            "store.reserve",
+            "worker.store.reserve",
+            "worker.store.reserve is unsupported; use worker.store.reserve_space",
+        ),
+        (
+            "store.pick",
+            "worker.store.pick",
+            "worker.store.pick is unsupported; use worker.store.selection_policy",
+        ),
+        (
+            "store.check_ms",
+            "worker.store.check_ms",
+            "worker.store.check_ms is unsupported; use worker.store.check_interval_ms",
+        ),
+        (
             "bootstrap.auto_format",
             "worker.bootstrap.auto_format",
             "worker.bootstrap.auto_format is unsupported",
@@ -460,6 +520,217 @@ fn reject_removed_keys(flat: &common::config::FlatConfig) -> Result<(), CommonEr
                 format!("{full_key} is unsupported: {detail}"),
             ));
         }
+    }
+    Ok(())
+}
+
+fn parse_store_config(
+    flat: &common::config::FlatConfig,
+    defaults: &WorkerStoreConfig,
+) -> Result<WorkerStoreConfig, CommonError> {
+    Ok(WorkerStoreConfig {
+        dirs: parse_store_dirs(flat)?,
+        reserve_space_bytes: WorkerConfig::bytes_u64(
+            flat,
+            "store.reserve_space",
+            defaults.reserve_space_bytes,
+            "worker.store.reserve_space",
+        )?,
+        selection_policy: WorkerConfig::str_or(
+            flat,
+            "store.selection_policy",
+            &defaults.selection_policy,
+            "worker.store.selection_policy",
+        )?,
+        check_interval_ms: WorkerConfig::usize_or(
+            flat,
+            "store.check_interval_ms",
+            defaults.check_interval_ms as usize,
+            "worker.store.check_interval_ms",
+        )? as u64,
+    })
+}
+
+fn parse_store_dirs(flat: &common::config::FlatConfig) -> Result<BTreeMap<String, StoreDirConfig>, CommonError> {
+    if flat.contains_key("store.dirs") {
+        return Err(invalid_config(
+            "worker.store.dirs",
+            "must use worker.store.dirs.<dir_id>.path/tier/capacity",
+        ));
+    }
+
+    let keys = flat.keys_with_prefix("store.dirs");
+    if keys.is_empty() {
+        return Err(invalid_config("worker.store.dirs", "must be present and non-empty"));
+    }
+
+    let mut ids = BTreeSet::new();
+    for key in keys {
+        let rest = key.strip_prefix("store.dirs.").ok_or_else(|| {
+            CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!("worker.{key} must use worker.store.dirs.<dir_id>.<field>"),
+            )
+        })?;
+        let (id, field) = rest.split_once('.').ok_or_else(|| {
+            CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!("worker.{key} must use worker.store.dirs.<dir_id>.<field>"),
+            )
+        })?;
+        if id.is_empty() || id.trim() != id {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!("worker.{key} has an invalid store dir id"),
+            ));
+        }
+        if field.contains('.') {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!("worker.{key} has an unsupported nested store dir field"),
+            ));
+        }
+        match field {
+            "path" | "tier" | "capacity" => {}
+            "id" => {
+                return Err(CommonError::new(
+                    CommonErrorCode::InvalidArgument,
+                    format!("worker.{key} is unsupported; dir id must come from the key segment"),
+                ));
+            }
+            "cap" => {
+                return Err(CommonError::new(
+                    CommonErrorCode::InvalidArgument,
+                    format!("worker.{key} is unsupported; use worker.store.dirs.{id}.capacity"),
+                ));
+            }
+            _ => {
+                return Err(CommonError::new(
+                    CommonErrorCode::InvalidArgument,
+                    format!("worker.{key} is unsupported"),
+                ));
+            }
+        }
+        ids.insert(id.to_string());
+    }
+
+    if ids.is_empty() {
+        return Err(invalid_config("worker.store.dirs", "must be non-empty"));
+    }
+
+    let mut out = BTreeMap::new();
+    for id in ids {
+        let path_key = format!("store.dirs.{id}.path");
+        let tier_key = format!("store.dirs.{id}.tier");
+        let capacity_key = format!("store.dirs.{id}.capacity");
+        let path = required_store_str(flat, &path_key, format!("worker.{path_key}"))?;
+        let tier_raw = required_store_str(flat, &tier_key, format!("worker.{tier_key}"))?;
+        let tier = Tier::parse(&tier_raw).map_err(|err| {
+            CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!("worker.store.dirs.{id}.tier {err}"),
+            )
+        })?;
+        let capacity_bytes = required_store_bytes(flat, &capacity_key, format!("worker.{capacity_key}"))?;
+        if capacity_bytes == 0 {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!("worker.store.dirs.{id}.capacity must be greater than zero"),
+            ));
+        }
+        out.insert(
+            id,
+            StoreDirConfig {
+                path: PathBuf::from(path),
+                tier,
+                capacity_bytes,
+            },
+        );
+    }
+    Ok(out)
+}
+
+fn required_store_str(
+    flat: &common::config::FlatConfig,
+    field: &str,
+    display_key: String,
+) -> Result<String, CommonError> {
+    let value = flat.get_str(field).ok_or_else(|| {
+        CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            format!("{display_key} must be present"),
+        )
+    })?;
+    if value.trim().is_empty() {
+        return Err(CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            format!("{display_key} must not be empty"),
+        ));
+    }
+    Ok(value)
+}
+
+fn required_store_bytes(
+    flat: &common::config::FlatConfig,
+    field: &str,
+    display_key: String,
+) -> Result<u64, CommonError> {
+    let value = flat.get_bytes(field).ok_or_else(|| {
+        CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            format!("{display_key} must be a byte size"),
+        )
+    })?;
+    u64::try_from(value).map_err(|_| {
+        CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            format!("{display_key} exceeds u64 byte size"),
+        )
+    })
+}
+
+fn validate_store_config(config: &WorkerConfig) -> Result<(), CommonError> {
+    if config.store.dirs.is_empty() {
+        return Err(invalid_config("worker.store.dirs", "must be non-empty"));
+    }
+    let mut paths = HashSet::new();
+    for (id, dir) in &config.store.dirs {
+        if id.trim().is_empty() || id.trim() != id {
+            return Err(invalid_config(
+                "worker.store.dirs.<dir_id>",
+                "must be a non-empty segment",
+            ));
+        }
+        if dir.path.as_os_str().is_empty() {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!("worker.store.dirs.{id}.path must not be empty"),
+            ));
+        }
+        if !paths.insert(dir.path.clone()) {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!("worker.store.dirs duplicate path: {}", dir.path.display()),
+            ));
+        }
+        if dir.capacity_bytes == 0 {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!("worker.store.dirs.{id}.capacity must be greater than zero"),
+            ));
+        }
+    }
+    if config.store.selection_policy != "round_robin" {
+        return Err(CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            "worker.store.selection_policy must be round_robin; balanced is TODO(store)".to_string(),
+        ));
+    }
+    if config.store.check_interval_ms == 0 {
+        return Err(invalid_config(
+            "worker.store.check_interval_ms",
+            "must be greater than zero",
+        ));
     }
     Ok(())
 }
@@ -641,6 +912,15 @@ worker:
   rpc:
     bind: "127.0.0.1:9090"
     advertised_endpoint: "http://127.0.0.1:9090"
+  store:
+    dirs:
+      hdd0:
+        path: "/tmp/vecton-worker/hdd0"
+        tier: "HDD"
+        capacity: "10GB"
+    reserve_space: "1GB"
+    selection_policy: "round_robin"
+    check_interval_ms: 30000
   metadata:
     endpoints: "http://127.0.0.1:18080"
 "#,
@@ -656,7 +936,14 @@ worker:
         assert_eq!(config.max_frame_size, 4 * 1024 * 1024);
         assert_eq!(config.window_bytes, 8 * 1024 * 1024);
         assert_eq!(config.stream_idle_timeout_ms, 60_000);
-        assert_eq!(config.storage_root, PathBuf::from("data/worker"));
+        let hdd0 = config.store.dirs.get("hdd0").unwrap();
+        assert_eq!(config.store.dirs.len(), 1);
+        assert_eq!(hdd0.path, PathBuf::from("/tmp/vecton-worker/hdd0"));
+        assert_eq!(hdd0.tier, types::Tier::Hdd);
+        assert_eq!(hdd0.capacity_bytes, 10 * 1024 * 1024 * 1024);
+        assert_eq!(config.store.reserve_space_bytes, 1024 * 1024 * 1024);
+        assert_eq!(config.store.selection_policy, "round_robin");
+        assert_eq!(config.store.check_interval_ms, 30_000);
         assert_eq!(config.rpc_advertised_endpoint, "http://127.0.0.1:9090");
         assert_eq!(config.metadata.group_name.as_str(), "root");
         assert_eq!(config.metadata.endpoints, vec!["http://127.0.0.1:18080"]);
@@ -694,8 +981,19 @@ worker:
   window_bytes: 16384
   stream:
     idle_timeout_ms: 500
-  storage:
-    root: "/tmp/vecton-worker"
+  store:
+    dirs:
+      ssd0:
+        path: "/tmp/vecton-worker/ssd0"
+        tier: "SSD"
+        capacity: "12MB"
+      hdd0:
+        path: "/tmp/vecton-worker/hdd0"
+        tier: "HDD"
+        capacity: "34MB"
+    reserve_space: "2MB"
+    selection_policy: "round_robin"
+    check_interval_ms: 2500
   metadata:
     group:
       name: "analytics"
@@ -716,7 +1014,18 @@ worker:
         assert_eq!(config.max_frame_size, 8192);
         assert_eq!(config.window_bytes, 16_384);
         assert_eq!(config.stream_idle_timeout_ms, 500);
-        assert_eq!(config.storage_root, PathBuf::from("/tmp/vecton-worker"));
+        let ssd0 = config.store.dirs.get("ssd0").unwrap();
+        let hdd0 = config.store.dirs.get("hdd0").unwrap();
+        assert_eq!(config.store.dirs.len(), 2);
+        assert_eq!(ssd0.path, PathBuf::from("/tmp/vecton-worker/ssd0"));
+        assert_eq!(ssd0.tier, types::Tier::Ssd);
+        assert_eq!(ssd0.capacity_bytes, 12 * 1024 * 1024);
+        assert_eq!(hdd0.path, PathBuf::from("/tmp/vecton-worker/hdd0"));
+        assert_eq!(hdd0.tier, types::Tier::Hdd);
+        assert_eq!(hdd0.capacity_bytes, 34 * 1024 * 1024);
+        assert_eq!(config.store.reserve_space_bytes, 2 * 1024 * 1024);
+        assert_eq!(config.store.selection_policy, "round_robin");
+        assert_eq!(config.store.check_interval_ms, 2_500);
         assert_eq!(config.rpc_advertised_endpoint, "http://127.0.0.1:19091");
         assert_eq!(config.metadata.group_name.as_str(), "analytics");
         assert_eq!(
@@ -728,6 +1037,37 @@ worker:
         assert_eq!(config.metadata.register_retry_max_backoff_ms, 250);
         assert_eq!(config.net.listeners[0].bind, "127.0.0.1:9091");
         assert_eq!(config.net.listeners[0].max_inflight, 8);
+    }
+
+    #[test]
+    fn loads_id_keyed_store_dirs_from_dotted_keys() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("core-site.yaml");
+        fs::write(
+            &config_path,
+            r#"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.store.dirs.hdd0.path: "/tmp/vecton-worker/hdd0"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.store.reserve_space: "1GB"
+worker.store.selection_policy: "round_robin"
+worker.store.check_interval_ms: 30000
+worker.metadata.endpoints: "http://127.0.0.1:18080"
+"#,
+        )
+        .unwrap();
+
+        let config = WorkerConfig::load(&config_path).unwrap();
+
+        let hdd0 = config.store.dirs.get("hdd0").unwrap();
+        assert_eq!(config.store.dirs.len(), 1);
+        assert_eq!(hdd0.path, PathBuf::from("/tmp/vecton-worker/hdd0"));
+        assert_eq!(hdd0.tier, types::Tier::Hdd);
+        assert_eq!(hdd0.capacity_bytes, 10 * 1024 * 1024 * 1024);
+        assert_eq!(config.store.reserve_space_bytes, 1024 * 1024 * 1024);
+        assert_eq!(config.store.selection_policy, "round_robin");
+        assert_eq!(config.store.check_interval_ms, 30_000);
     }
 
     #[test]
@@ -770,6 +1110,12 @@ worker:
 worker:
   rpc:
     advertised_endpoint: "http://127.0.0.1:9090"
+  store:
+    dirs:
+      hdd0:
+        path: "/tmp/vecton-worker/hdd0"
+        tier: "HDD"
+        capacity: "10GB"
   transport:
     default_frame_size: 8388608
     max_frame_size: 16777216
@@ -806,6 +1152,12 @@ worker:
 worker:
   rpc:
     advertised_endpoint: "http://127.0.0.1:9090"
+  store:
+    dirs:
+      hdd0:
+        path: "/tmp/vecton-worker/hdd0"
+        tier: "HDD"
+        capacity: "10GB"
   default_frame_size: 8192
   max_frame_size: 4096
   metadata:
@@ -842,7 +1194,7 @@ worker:
     }
 
     #[test]
-    fn removed_storage_aliases_do_not_change_storage_root() {
+    fn worker_storage_root_is_rejected() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("core-site.yaml");
         fs::write(
@@ -852,17 +1204,293 @@ worker:
   rpc:
     advertised_endpoint: "http://127.0.0.1:9090"
   storage:
-    dir: "/data/a"
-    dirs: "/data/b,/data/c"
+    root: "/data/old"
+  store:
+    dirs:
+      hdd0:
+        path: "/tmp/vecton-worker/hdd0"
+        tier: "HDD"
+        capacity: "10GB"
   metadata:
     endpoints: "http://127.0.0.1:18080"
 "#,
         )
         .unwrap();
 
-        let config = WorkerConfig::load(&config_path).unwrap();
+        let err = WorkerConfig::load(&config_path).expect_err("old storage root must fail");
 
-        assert_eq!(config.storage_root, WorkerConfig::default().storage_root);
+        assert!(err.message.contains("worker.storage.root"));
+        assert!(err.message.contains("unsupported"));
+    }
+
+    #[test]
+    fn rejects_missing_or_empty_store_dirs() {
+        for store_config in ["", "store:\n    dirs: []\n"] {
+            let temp_dir = TempDir::new().unwrap();
+            let config_path = temp_dir.path().join("core-site.yaml");
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
+worker:
+  rpc:
+    advertised_endpoint: "http://127.0.0.1:9090"
+  {store_config}
+  metadata:
+    endpoints: "http://127.0.0.1:18080"
+"#
+                ),
+            )
+            .unwrap();
+
+            let err = WorkerConfig::load(&config_path).expect_err("missing or empty store dirs must fail");
+
+            assert!(err.message.contains("worker.store.dirs"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn rejects_old_list_based_store_dirs() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("core-site.yaml");
+        fs::write(
+            &config_path,
+            r#"
+worker:
+  rpc:
+    advertised_endpoint: "http://127.0.0.1:9090"
+  store:
+    dirs:
+      - id: "hdd0"
+        path: "/tmp/a"
+        tier: "HDD"
+        cap: "10GB"
+  metadata:
+    endpoints: "http://127.0.0.1:18080"
+"#,
+        )
+        .unwrap();
+
+        let err = WorkerConfig::load(&config_path).expect_err("old list-based store dirs must fail");
+
+        assert!(err.message.contains("worker.store.dirs"), "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_invalid_store_dir_entries() {
+        for (name, dirs_config, expected) in [
+            (
+                "missing path",
+                r#"hdd0:
+        tier: "HDD"
+        capacity: "10GB""#,
+                "path",
+            ),
+            (
+                "missing tier",
+                r#"hdd0:
+        path: "/tmp/a"
+        capacity: "10GB""#,
+                "tier",
+            ),
+            (
+                "missing capacity",
+                r#"hdd0:
+        path: "/tmp/a"
+        tier: "HDD""#,
+                "capacity",
+            ),
+            (
+                "old id field",
+                r#"hdd0:
+        id: "old"
+        path: "/tmp/a"
+        tier: "HDD"
+        capacity: "10GB""#,
+                "id",
+            ),
+            (
+                "old cap field",
+                r#"hdd0:
+        path: "/tmp/a"
+        tier: "HDD"
+        cap: "10GB""#,
+                "cap",
+            ),
+            (
+                "zero capacity",
+                r#"hdd0:
+        path: "/tmp/a"
+        tier: "HDD"
+        capacity: "0""#,
+                "capacity",
+            ),
+            (
+                "bad tier",
+                r#"hdd0:
+        path: "/tmp/a"
+        tier: "TAPE"
+        capacity: "10GB""#,
+                "tier",
+            ),
+        ] {
+            let temp_dir = TempDir::new().unwrap();
+            let config_path = temp_dir.path().join("core-site.yaml");
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
+worker:
+  rpc:
+    advertised_endpoint: "http://127.0.0.1:9090"
+  store:
+    dirs:
+      {dirs_config}
+  metadata:
+    endpoints: "http://127.0.0.1:18080"
+"#
+                ),
+            )
+            .unwrap();
+
+            let err = WorkerConfig::load(&config_path).unwrap_err();
+
+            assert!(
+                err.message.contains(expected),
+                "{name} expected {expected:?}, got {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_store_dir_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("core-site.yaml");
+        fs::write(
+            &config_path,
+            r#"
+worker:
+  rpc:
+    advertised_endpoint: "http://127.0.0.1:9090"
+  store:
+    dirs:
+      hdd0:
+        path: "/tmp/a"
+        tier: "HDD"
+        capacity: "10GB"
+      hdd1:
+        path: "/tmp/a"
+        tier: "HDD"
+        capacity: "10GB"
+  metadata:
+    endpoints: "http://127.0.0.1:18080"
+"#,
+        )
+        .unwrap();
+
+        let err = WorkerConfig::load(&config_path).unwrap_err();
+
+        assert!(err.message.contains("duplicate path"), "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_empty_store_dir_id_segment() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("core-site.yaml");
+        fs::write(
+            &config_path,
+            r#"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.store.dirs..path: "/tmp/a"
+worker.store.dirs..tier: "HDD"
+worker.store.dirs..capacity: "10GB"
+worker.metadata.endpoints: "http://127.0.0.1:18080"
+"#,
+        )
+        .unwrap();
+
+        let err = WorkerConfig::load(&config_path).unwrap_err();
+
+        assert!(err.message.contains("invalid store dir id"), "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_unsupported_store_selection_policy_or_zero_check_interval() {
+        for (store_tail, expected) in [
+            (
+                "selection_policy: \"balanced\"\n    check_interval_ms: 30000",
+                "worker.store.selection_policy",
+            ),
+            (
+                "selection_policy: \"round_robin\"\n    check_interval_ms: 0",
+                "worker.store.check_interval_ms",
+            ),
+        ] {
+            let temp_dir = TempDir::new().unwrap();
+            let config_path = temp_dir.path().join("core-site.yaml");
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
+worker:
+  rpc:
+    advertised_endpoint: "http://127.0.0.1:9090"
+  store:
+    dirs:
+      hdd0:
+        path: "/tmp/a"
+        tier: "HDD"
+        capacity: "10GB"
+    {store_tail}
+  metadata:
+    endpoints: "http://127.0.0.1:18080"
+"#
+                ),
+            )
+            .unwrap();
+
+            let err = WorkerConfig::load(&config_path).unwrap_err();
+
+            assert!(err.message.contains(expected), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn rejects_removed_store_keys() {
+        for (store_tail, expected) in [
+            ("reserve: \"1GB\"", "worker.store.reserve"),
+            ("pick: \"round_robin\"", "worker.store.pick"),
+            ("check_ms: 30000", "worker.store.check_ms"),
+        ] {
+            let temp_dir = TempDir::new().unwrap();
+            let config_path = temp_dir.path().join("core-site.yaml");
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
+worker:
+  rpc:
+    advertised_endpoint: "http://127.0.0.1:9090"
+  store:
+    dirs:
+      hdd0:
+        path: "/tmp/a"
+        tier: "HDD"
+        capacity: "10GB"
+    {store_tail}
+  metadata:
+    endpoints: "http://127.0.0.1:18080"
+"#
+                ),
+            )
+            .unwrap();
+
+            let err = WorkerConfig::load(&config_path).unwrap_err();
+
+            assert!(err.message.contains(expected), "{}", err.message);
+            assert!(err.message.contains("unsupported"), "{}", err.message);
+        }
     }
 
     #[test]
@@ -871,7 +1499,18 @@ worker:
         let config_path = temp_dir.path().join("core-site.yaml");
         fs::write(
             &config_path,
-            "worker:\n  rpc:\n    bind: \"127.0.0.1:9090\"\n    advertised_endpoint: \"http://127.0.0.1:9090\"\n",
+            r#"
+worker:
+  rpc:
+    bind: "127.0.0.1:9090"
+    advertised_endpoint: "http://127.0.0.1:9090"
+  store:
+    dirs:
+      hdd0:
+        path: "/tmp/vecton-worker/hdd0"
+        tier: "HDD"
+        capacity: "10GB"
+"#,
         )
         .unwrap();
 
@@ -912,6 +1551,12 @@ worker:
 worker:
   rpc:
     advertised_endpoint: "http://127.0.0.1:9090"
+  store:
+    dirs:
+      hdd0:
+        path: "/tmp/vecton-worker/hdd0"
+        tier: "HDD"
+        capacity: "10GB"
   metadata:
     endpoints: " , "
 "#,
@@ -959,6 +1604,12 @@ worker:
 worker:
   rpc:
     advertised_endpoint: "http://127.0.0.1:9090"
+  store:
+    dirs:
+      hdd0:
+        path: "/tmp/vecton-worker/hdd0"
+        tier: "HDD"
+        capacity: "10GB"
   metadata:
     endpoints: "127.0.0.1:18080"
 "#,
@@ -1004,6 +1655,12 @@ worker:
   rpc:
     bind: "0.0.0.0:9090"
     advertised_endpoint: "{advertised_endpoint}"
+  store:
+    dirs:
+      hdd0:
+        path: "/tmp/vecton-worker/hdd0"
+        tier: "HDD"
+        capacity: "10GB"
   metadata:
     endpoints: "http://127.0.0.1:18080"
 "#
@@ -1028,6 +1685,12 @@ worker:
 worker:
   rpc:
     advertised_endpoint: "http://127.0.0.1:9090"
+  store:
+    dirs:
+      hdd0:
+        path: "/tmp/vecton-worker/hdd0"
+        tier: "HDD"
+        capacity: "10GB"
   metadata:
     endpoints: "http://127.0.0.1:18080"
     register_timeout_ms: 0
@@ -1045,6 +1708,12 @@ worker:
 worker:
   rpc:
     advertised_endpoint: "http://127.0.0.1:9090"
+  store:
+    dirs:
+      hdd0:
+        path: "/tmp/vecton-worker/hdd0"
+        tier: "HDD"
+        capacity: "10GB"
   metadata:
     endpoints: "http://127.0.0.1:18080"
     register_retry_initial_backoff_ms: 0
@@ -1064,6 +1733,12 @@ worker:
 worker:
   rpc:
     advertised_endpoint: "http://127.0.0.1:9090"
+  store:
+    dirs:
+      hdd0:
+        path: "/tmp/vecton-worker/hdd0"
+        tier: "HDD"
+        capacity: "10GB"
   metadata:
     endpoints: "http://127.0.0.1:18080"
     register_retry_initial_backoff_ms: 500

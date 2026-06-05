@@ -36,6 +36,7 @@ prost = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+libc = { workspace = true }
 
 # RPC
 tonic = { workspace = true }

@@ -87,7 +87,12 @@ lock the root to one metadata group.
 | --- | --- | --- | --- |
 | `vecton.cluster.id` | `local-vecton` | non-empty string | Validated against `WorkerStorageInfo` on restart. |
 | `worker.identity.path` | `data/worker/worker.identity` | path string | Created only for missing or empty worker storage; loaded only for existing `WorkerStorageInfo`. |
-| `worker.storage.root` | `data/worker` | non-empty path string | Worker local storage root. Group data lives under `groups/<group_name>/`. |
+| `worker.store.dirs.<dir_id>.path` | required | non-empty path string; `<dir_id>` is a non-empty key segment | Worker local store directory path. Group data lives under each configured directory. |
+| `worker.store.dirs.<dir_id>.tier` | required | `MEM`, `NVME`, `SSD`, or `HDD` | Worker local store directory tier. |
+| `worker.store.dirs.<dir_id>.capacity` | required | positive byte size | Worker local store directory capacity limit. |
+| `worker.store.reserve_space` | `1GB` | non-negative byte size | Per-mount filesystem free-space reserve for local store admission. |
+| `worker.store.selection_policy` | `round_robin` | exactly `round_robin` | Worker-local store directory selection policy. `balanced` is future work only. |
+| `worker.store.check_interval_ms` | `30000` | positive integer | Filesystem capacity refresh interval. |
 | `worker.rpc.bind` | `0.0.0.0:9090` | valid socket address | Worker data-plane gRPC listener. |
 | `worker.rpc.advertised_endpoint` | required in file configs | valid URI with host and port | Endpoint registered with metadata and returned to clients. |
 | `worker.http.bind` | `0.0.0.0:19091` | valid socket address | Common Prometheus `/metrics` bind. |

@@ -22,6 +22,7 @@ pub mod layout;
 pub mod lease;
 pub mod location;
 pub mod raft_log_id;
+pub mod tier;
 pub mod worker;
 
 pub use acl::{
@@ -37,4 +38,5 @@ pub use ids::{
 pub use layout::{BlockFormatId, BlockFormatIdError, FileLayout, FileLayoutError};
 pub use location::{CommittedBlock, FileBlockLocation, WriteTarget};
 pub use raft_log_id::RaftLogId;
+pub use tier::{Tier, TierError, TierFree};
 pub use worker::{WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId};

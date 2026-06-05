@@ -11,7 +11,7 @@ use std::env;
 ///
 /// Converts environment variable names to dotted keys:
 /// - `METADATA_RPC_PORT` -> `metadata.rpc.port`
-/// - `WORKER_STORAGE_ROOT` -> `worker.storage.root`
+/// - `WORKER_STORE_DIRS_HDD0_TIER` -> `worker.store.dirs.hdd0.tier`
 pub fn load_from_env() -> FlatConfig {
     let mut config = FlatConfig::new();
 
@@ -46,7 +46,7 @@ pub fn load_from_env() -> FlatConfig {
 ///
 /// Examples:
 /// - `METADATA_RPC_PORT` -> `metadata.rpc.port`
-/// - `WORKER_STORAGE_ROOT` -> `worker.storage.root`
+/// - `WORKER_STORE_DIRS_HDD0_TIER` -> `worker.store.dirs.hdd0.tier`
 fn env_key_to_dotted(env_key: &str) -> String {
     env_key.to_lowercase().split('_').collect::<Vec<_>>().join(".")
 }
@@ -55,7 +55,7 @@ fn env_key_to_dotted(env_key: &str) -> String {
 ///
 /// Examples:
 /// - `metadata.rpc.port` -> `METADATA_RPC_PORT`
-/// - `worker.storage.root` -> `WORKER_STORAGE_ROOT`
+/// - `worker.store.dirs.hdd0.tier` -> `WORKER_STORE_DIRS_HDD0_TIER`
 pub fn dotted_to_env_key(dotted: &str) -> String {
     dotted
         .split('.')
@@ -71,12 +71,18 @@ mod tests {
     #[test]
     fn test_env_key_to_dotted() {
         assert_eq!(env_key_to_dotted("METADATA_RPC_PORT"), "metadata.rpc.port");
-        assert_eq!(env_key_to_dotted("WORKER_STORAGE_ROOT"), "worker.storage.root");
+        assert_eq!(
+            env_key_to_dotted("WORKER_STORE_DIRS_HDD0_TIER"),
+            "worker.store.dirs.hdd0.tier"
+        );
     }
 
     #[test]
     fn test_dotted_to_env_key() {
         assert_eq!(dotted_to_env_key("metadata.rpc.port"), "METADATA_RPC_PORT");
-        assert_eq!(dotted_to_env_key("worker.storage.root"), "WORKER_STORAGE_ROOT");
+        assert_eq!(
+            dotted_to_env_key("worker.store.dirs.hdd0.tier"),
+            "WORKER_STORE_DIRS_HDD0_TIER"
+        );
     }
 }

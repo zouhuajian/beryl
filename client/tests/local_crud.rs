@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use client::{AppendOptions, ClientConfig, CreateOptions, FsClient, ListOptions, OpenOptions};
+use tokio::time::{sleep, Duration, Instant};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "requires local metadata and worker"]
@@ -15,8 +16,8 @@ async fn local_client_crud_roundtrip() {
         .unwrap_or_else(|err| panic!("failed to load client config {config_path}: {err}"));
     let client = FsClient::try_new(config).expect("client config must be valid");
     let suffix = format!("codex-local-crud-{}", unique_suffix());
-    let path = format!("/{suffix}");
-    let renamed_path = format!("/{suffix}-renamed");
+    let path = format!("/local/{suffix}");
+    let renamed_path = format!("/local/{suffix}-renamed");
 
     let _ = client.delete(&path, false).await;
     let _ = client.delete(&renamed_path, false).await;
@@ -36,14 +37,7 @@ async fn local_client_crud_roundtrip() {
         .await
         .unwrap_or_else(|err| panic!("close requires running local metadata and worker: {err}"));
 
-    let reader = client
-        .open(&path, OpenOptions::default())
-        .await
-        .unwrap_or_else(|err| panic!("open requires running local metadata and worker: {err}"));
-    let read = reader
-        .read_at(0, first.len() as u32)
-        .await
-        .unwrap_or_else(|err| panic!("read requires running local metadata and worker: {err}"));
+    let read = read_after_block_report(&client, &path, first.len()).await;
     assert_eq!(read, first);
 
     let mut appender = client
@@ -64,30 +58,40 @@ async fn local_client_crud_roundtrip() {
         .await
         .unwrap_or_else(|err| panic!("rename requires running local metadata and worker: {err}"));
     let listing = client
-        .list("/", ListOptions::default())
+        .list("/local", ListOptions::default())
         .await
         .unwrap_or_else(|err| panic!("list requires running local metadata and worker: {err}"));
-    let renamed_name = renamed_path.trim_start_matches('/');
+    let renamed_name = renamed_path.trim_start_matches("/local/");
     assert!(
         listing.entries.iter().any(|entry| entry.name == renamed_name),
-        "root listing should include {renamed_name}"
+        "/local listing should include {renamed_name}"
     );
 
     let expected = [first.as_ref(), second.as_ref()].concat();
-    let reader = client
-        .open(&renamed_path, OpenOptions::default())
-        .await
-        .unwrap_or_else(|err| panic!("open renamed file requires running local metadata and worker: {err}"));
-    let read = reader
-        .read_at(0, expected.len() as u32)
-        .await
-        .unwrap_or_else(|err| panic!("read renamed file requires running local metadata and worker: {err}"));
+    let read = read_after_block_report(&client, &renamed_path, expected.len()).await;
     assert_eq!(read.as_ref(), expected.as_slice());
 
     client
         .delete(&renamed_path, false)
         .await
         .unwrap_or_else(|err| panic!("delete requires running local metadata and worker: {err}"));
+}
+
+async fn read_after_block_report(client: &FsClient, path: &str, len: usize) -> Bytes {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let reader = client
+            .open(path, OpenOptions::default())
+            .await
+            .unwrap_or_else(|err| panic!("open requires running local metadata and worker: {err}"));
+        match reader.read_at(0, len as u32).await {
+            Ok(bytes) => return bytes,
+            Err(err) if err.to_string().contains("no reachable worker candidates") && Instant::now() < deadline => {
+                sleep(Duration::from_millis(200)).await;
+            }
+            Err(err) => panic!("read requires running local metadata and worker: {err}"),
+        }
+    }
 }
 
 fn unique_suffix() -> u128 {

@@ -141,6 +141,9 @@ message OpenWriteStreamRequestProto {
 
   // Stable metadata group name for the local block-store staging lookup.
   string group_name = 13;
+
+  // Worker-local storage tier requested by metadata for this block replica.
+  common.TierProto tier = 14;
 }
 
 message OpenWriteStreamResponseProto {

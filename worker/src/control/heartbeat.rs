@@ -16,14 +16,14 @@ use proto::convert::error_detail_to_canonical;
 use proto::metadata::metadata_worker_service_proto_client::MetadataWorkerServiceProtoClient;
 use proto::metadata::{
     CapacityInfoProto, HealthStatusProto, HeartbeatRequestProto, HeartbeatResponseProto, LoadInfoProto,
-    MetadataServerRoleProto,
+    MetadataServerRoleProto, TierFreeProto,
 };
 use thiserror::Error;
 use tokio::time;
 use tonic::transport::Endpoint;
 use tonic::Code;
 use tracing::{debug, info, warn};
-use types::{GroupName, WorkerRunId};
+use types::{GroupName, TierFree, WorkerRunId};
 
 use crate::config::WorkerRegistrationConfig;
 use crate::control::{
@@ -31,6 +31,7 @@ use crate::control::{
 };
 use crate::net::protocol::WorkerNetProtocol;
 use crate::observe;
+use crate::store::dirs::{StoreDirs, StoreReport};
 
 /// Lightweight local resource snapshot sent on heartbeat.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -38,6 +39,7 @@ pub struct HeartbeatSnapshot {
     pub capacity_total_bytes: u64,
     pub capacity_used_bytes: u64,
     pub capacity_available_bytes: u64,
+    pub tier_free: Vec<TierFree>,
     pub active_reads: u32,
     pub active_writes: u32,
     pub cpu_usage_percent: u32,
@@ -99,7 +101,15 @@ impl MetadataHeartbeatLoop {
     }
 
     pub fn spawn_with_registrar(self, registrar: Arc<MetadataRegistrar>) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move { self.run(registrar).await })
+        tokio::spawn(async move { self.run(registrar, None).await })
+    }
+
+    pub fn spawn_with_registrar_and_store(
+        self,
+        registrar: Arc<MetadataRegistrar>,
+        store: Arc<StoreDirs>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move { self.run(registrar, Some(store)).await })
     }
 
     pub async fn send_once(&self, snapshot: HeartbeatSnapshot) -> Result<HeartbeatRound, HeartbeatError> {
@@ -167,6 +177,14 @@ impl MetadataHeartbeatLoop {
                 total_bytes: snapshot.capacity_total_bytes,
                 used_bytes: snapshot.capacity_used_bytes,
                 available_bytes: snapshot.capacity_available_bytes,
+                tier_free: snapshot
+                    .tier_free
+                    .iter()
+                    .map(|entry| TierFreeProto {
+                        tier: proto::common::TierProto::from(entry.tier) as i32,
+                        free_bytes: entry.free_bytes,
+                    })
+                    .collect(),
             }),
             load: Some(LoadInfoProto {
                 active_reads: snapshot.active_reads,
@@ -209,7 +227,7 @@ impl MetadataHeartbeatLoop {
         classify_heartbeat_response(&request, response)
     }
 
-    async fn run(self, registrar: Arc<MetadataRegistrar>) {
+    async fn run(self, registrar: Arc<MetadataRegistrar>, store: Option<Arc<StoreDirs>>) {
         let mut interval = time::interval(Duration::from_millis(1_000));
         loop {
             interval.tick().await;
@@ -230,7 +248,18 @@ impl MetadataHeartbeatLoop {
                 }
             }
 
-            match self.send_once(HeartbeatSnapshot::default()).await {
+            let snapshot = match store.as_ref() {
+                Some(store) => match store.report() {
+                    Ok(report) => HeartbeatSnapshot::from(report),
+                    Err(error) => {
+                        warn!(%error, "Worker store report failed before heartbeat");
+                        continue;
+                    }
+                },
+                None => HeartbeatSnapshot::default(),
+            };
+
+            match self.send_once(snapshot).await {
                 Ok(round) if round.needs_register => {
                     warn!("Metadata heartbeat requested worker registration");
                 }
@@ -240,6 +269,18 @@ impl MetadataHeartbeatLoop {
                 Ok(_) => {}
                 Err(error) => warn!(%error, "Worker heartbeat round failed"),
             }
+        }
+    }
+}
+
+impl From<StoreReport> for HeartbeatSnapshot {
+    fn from(report: StoreReport) -> Self {
+        Self {
+            capacity_total_bytes: report.total_bytes,
+            capacity_used_bytes: report.used_bytes,
+            capacity_available_bytes: report.free_bytes,
+            tier_free: report.tier_free,
+            ..Self::default()
         }
     }
 }

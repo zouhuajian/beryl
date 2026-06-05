@@ -25,7 +25,14 @@ metadata.repair.max_backoff_ms: 60000
 metadata.repair.worker_inflight_limit: 4
 
 worker.identity.path: "./data/worker/worker.identity"
-worker.storage.root: "./data/worker"
+
+# Worker local block store.
+worker.store.dirs.hdd0.path: "./data/worker/hdd0"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.store.reserve_space: "1GB"
+worker.store.selection_policy: "round_robin"
+worker.store.check_interval_ms: 30000
 worker.rpc.bind: "127.0.0.1:19090"
 worker.rpc.advertised_endpoint: "http://127.0.0.1:19090"
 worker.http.bind: "127.0.0.1:19091"

@@ -8,7 +8,7 @@ use metadata::lifecycle::{
 use metadata::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
 use metadata::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use metadata::readiness::{wait_for_root_ready, RootReadinessConfig, RootReadinessGate};
-use metadata::MountTable;
+use metadata::{ensure_root_mount_for_format, MountTable};
 use std::sync::Arc;
 use tempfile::TempDir;
 use types::ids::MountId;
@@ -322,6 +322,97 @@ async fn metadata_format_creates_root_namespace_through_raft_path() {
         .list_mounts()
         .into_iter()
         .any(|mount| mount.mount_prefix == metadata::mount::ROOT_MOUNT_PREFIX));
+    let local = mount_table
+        .list_mounts()
+        .into_iter()
+        .find(|mount| mount.mount_prefix == "/local")
+        .expect("local writable mount should exist after format");
+    assert_eq!(local.mount_kind, MountKind::Internal);
+    assert_eq!(local.data_io_policy, DataIoPolicy::Allow);
+    assert_eq!(local.namespace_owner_group_name, GroupName::parse("root").unwrap());
+    assert!(storage.get_inode(local.root_inode_id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn metadata_start_rejects_old_local_layout_without_local_mount() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "root", "single");
+    let config = MetadataConfig::load(&config_path).unwrap();
+    let storage = Arc::new(RocksDBStorage::create_for_format(&config.storage_dir).unwrap());
+    let mount_table = Arc::new(MountTable::load_from_storage(storage.as_ref()).unwrap());
+    let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
+    let raft_node = Arc::new(
+        AppRaftNode::new(config.raft.node_id, Arc::clone(&storage), state_machine, &config.raft)
+            .await
+            .unwrap(),
+    );
+    raft_node
+        .initialize_single_node(config.rpc_addr.to_string())
+        .await
+        .unwrap();
+    ensure_root_mount_for_format(
+        Arc::clone(&raft_node),
+        Arc::clone(&mount_table),
+        config.authority.group_name.clone(),
+    )
+    .await
+    .unwrap();
+    raft_node.shutdown().await.unwrap();
+    let marker = MetadataStorageMarker {
+        cluster_id: config.cluster_id.clone(),
+        group_name: config.authority.group_name.clone(),
+        node_id: config.raft.node_id,
+        storage_uuid: "old-root-only-storage".to_string(),
+        format_version: 1,
+        created_at_ms: 1,
+        software_version: "test".to_string(),
+    };
+    std::fs::write(
+        metadata_marker_path(&config),
+        serde_json::to_vec_pretty(&marker).unwrap(),
+    )
+    .unwrap();
+    drop(raft_node);
+    drop(mount_table);
+    drop(storage);
+
+    let err = prepare_metadata_start(&config)
+        .await
+        .expect_err("old local layout without /local must fail fast");
+    let message = err.to_string();
+
+    assert!(message.contains("missing required /local mount"), "{message}");
+    assert!(message.contains("older layout"), "{message}");
+    assert!(message.contains("Re-run metadata format"), "{message}");
+    let storage = RocksDBStorage::create_for_format(&config.storage_dir).unwrap();
+    let mounts = MountTable::load_from_storage(&storage).unwrap().list_mounts();
+    assert!(mounts.iter().all(|mount| mount.mount_prefix != "/local"));
+}
+
+#[tokio::test]
+async fn metadata_start_rejects_local_mount_without_data_io() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "root", "single");
+    let config = MetadataConfig::load(&config_path).unwrap();
+    format_metadata_storage(&config).await.unwrap();
+    let storage = RocksDBStorage::create_for_format(&config.storage_dir).unwrap();
+    let mut local = MountTable::load_from_storage(&storage)
+        .unwrap()
+        .list_mounts()
+        .into_iter()
+        .find(|mount| mount.mount_prefix == "/local")
+        .expect("/local mount after format");
+    local.data_io_policy = DataIoPolicy::Forbid;
+    storage.put_mount(&local).unwrap();
+    drop(storage);
+
+    let err = prepare_metadata_start(&config)
+        .await
+        .expect_err("/local must be writable for data IO on start");
+    let message = err.to_string();
+
+    assert!(message.contains("local writable mount"), "{message}");
+    assert!(message.contains("violates"), "{message}");
 }
 
 #[tokio::test]

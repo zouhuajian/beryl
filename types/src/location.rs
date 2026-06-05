@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::ids::BlockId;
 use crate::layout::BlockFormatId;
 use crate::lease::FencingToken;
+use crate::tier::Tier;
 use crate::worker::WorkerEndpointInfo;
 
 /// Metadata-issued target for writing one block to worker data-plane storage.
@@ -31,6 +32,8 @@ pub struct WriteTarget {
     pub chunk_size: u32,
     /// Metadata-selected Vecton block data/meta interpretation format.
     pub block_format_id: BlockFormatId,
+    /// Worker-local storage tier requested for this replica.
+    pub tier: Tier,
 }
 
 /// Metadata commit payload for one worker-published block.

@@ -21,7 +21,7 @@ use types::fs::{Extent, FsErrorCode};
 use types::ids::{BlockId, BlockIndex, DataHandleId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
-use types::{CommittedBlock, GroupName, WorkerEndpointInfo, WriteTarget};
+use types::{CommittedBlock, GroupName, Tier, WorkerEndpointInfo, WriteTarget};
 
 impl FsCore {
     pub(crate) fn write_session_for_handle(&self, file_handle: u64) -> Option<crate::write_session::WriteSession> {
@@ -87,6 +87,7 @@ struct PlannedWriteTarget {
     block_size: u64,
     effective_len: u64,
     worker_endpoints: Vec<WorkerEndpointInfo>,
+    tier: Tier,
 }
 
 struct WriteSessionCoordinator<'a> {
@@ -756,26 +757,24 @@ impl<'a> WriteSessionCoordinator<'a> {
             let block_id = BlockId::new(data_handle_id, block_index);
             let file_offset = base_size + i * block_size;
             let effective_len = desired_len.saturating_sub(i * block_size).min(block_size).max(1);
-            let placement = planner.plan(
-                &PlacementRequest {
-                    group_name: placement_group_name.clone(),
-                    op: PlacementOp::Write,
-                    block_id,
-                    block_stamp: Some(block_stamp),
-                    layout,
-                    caller: caller.clone(),
-                    existing: Vec::new(),
-                    exclude_workers: Vec::new(),
-                    target_replicas: layout.replication,
-                },
-                &placement_views,
-            );
+            let placement_req = PlacementRequest {
+                group_name: placement_group_name.clone(),
+                op: PlacementOp::Write,
+                block_id,
+                block_stamp: Some(block_stamp),
+                layout,
+                caller: caller.clone(),
+                existing: Vec::new(),
+                exclude_workers: Vec::new(),
+                target_replicas: layout.replication,
+            };
+            let placement = planner.plan(&placement_req, &placement_views);
             if placement.status != PlacementStatus::Ok {
                 return self.core.failure_from_error(
                     &req.ctx,
                     MetadataError::ServiceUnavailable(format!(
-                        "Failed to select write placement: {:?}",
-                        placement.status
+                        "Failed to select write placement: {}",
+                        placement.failure_message(&placement_req)
                     )),
                     group_name,
                     mount_epoch,
@@ -783,7 +782,9 @@ impl<'a> WriteSessionCoordinator<'a> {
             }
 
             let mut worker_endpoints = Vec::with_capacity(placement.workers.len());
+            let mut selected_tier = None;
             for worker in placement.workers {
+                selected_tier = selected_tier.or(worker.tier);
                 let endpoint = match worker_endpoint_from_parts(
                     worker.worker_id,
                     worker.endpoint,
@@ -797,6 +798,14 @@ impl<'a> WriteSessionCoordinator<'a> {
                 };
                 worker_endpoints.push(endpoint);
             }
+            let Some(tier) = selected_tier else {
+                return self.core.failure_from_error(
+                    &req.ctx,
+                    MetadataError::ServiceUnavailable("selected write placement is missing storage tier".to_string()),
+                    group_name,
+                    mount_epoch,
+                );
+            };
 
             if worker_endpoints.is_empty() {
                 return self.core.failure_from_error(
@@ -813,6 +822,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 block_size,
                 effective_len,
                 worker_endpoints,
+                tier,
             });
         }
 
@@ -868,6 +878,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                 block_stamp,
                 chunk_size,
                 block_format_id: layout.block_format_id,
+                tier: planned.tier,
             };
             if target.effective_len == 0 || target.effective_len > target.block_size {
                 return self.core.failure_from_error(
@@ -1671,28 +1682,26 @@ impl<'a> WriteSessionCoordinator<'a> {
         let planner = PlacementPlanner;
         for i in 0..num_blocks {
             let block_id = BlockId::new(DataHandleId::new(0), BlockIndex::new(i as u32));
-            let placement = planner.plan(
-                &PlacementRequest {
-                    group_name: placement_group_name.clone(),
-                    op: PlacementOp::Write,
-                    block_id,
-                    block_stamp: None,
-                    layout,
-                    caller: caller.clone(),
-                    existing: Vec::new(),
-                    exclude_workers: Vec::new(),
-                    target_replicas: layout.replication,
-                },
-                &placement_views,
-            );
+            let placement_req = PlacementRequest {
+                group_name: placement_group_name.clone(),
+                op: PlacementOp::Write,
+                block_id,
+                block_stamp: None,
+                layout,
+                caller: caller.clone(),
+                existing: Vec::new(),
+                exclude_workers: Vec::new(),
+                target_replicas: layout.replication,
+            };
+            let placement = planner.plan(&placement_req, &placement_views);
             if placement.status != PlacementStatus::Ok || placement.workers.is_empty() {
                 return self
                     .core
                     .failure_from_error::<()>(
                         req_ctx,
                         MetadataError::ServiceUnavailable(format!(
-                            "Failed to select write placement: {:?}",
-                            placement.status
+                            "Failed to select write placement: {}",
+                            placement.failure_message(&placement_req)
                         )),
                         group_name,
                         mount_epoch,

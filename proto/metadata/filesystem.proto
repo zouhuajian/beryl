@@ -65,6 +65,8 @@ message WriteTargetProto {
   uint64 effective_len = 7;
   repeated common.WorkerEndpointInfoProto worker_endpoints = 8;
   common.FencingTokenProto fencing_token = 9;
+  // Worker-local storage tier requested for this block replica.
+  common.TierProto tier = 10;
 }
 
 message CommittedBlockProto {

@@ -12,7 +12,9 @@ use std::collections::HashSet;
 use common::header::CallerContextFields;
 use types::ids::{BlockId, WorkerId};
 use types::layout::{BlockFormatId, FileLayout};
-use types::{GroupName, WorkerRunId};
+use types::{GroupName, Tier, TierFree, WorkerRunId};
+
+const WRITE_TIER_ORDER: [Tier; 3] = [Tier::Nvme, Tier::Ssd, Tier::Hdd];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlacementOp {
@@ -59,6 +61,7 @@ pub struct WorkerPlacementView {
     pub rack: Option<String>,
     pub region: Option<String>,
     pub free_bytes: Option<u64>,
+    pub tier_free: Vec<TierFree>,
     /// Metadata-visible block format capabilities. StoreBackend / IoEngine
     /// details remain worker-local and are not part of placement input.
     pub supported_block_formats: Vec<BlockFormatId>,
@@ -70,15 +73,32 @@ pub struct PlacementWorker {
     pub worker_run_id: WorkerRunId,
     pub endpoint: String,
     pub worker_net_protocol: i32,
+    pub tier: Option<Tier>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlacementStatus {
     Ok,
     NoLiveWorker,
+    NoEligibleWorker,
+    UnsupportedBlockFormat,
+    NoWritableTier,
+    InsufficientCapacity,
     NoLiveReplica,
     NotEnoughReplicas,
     Unsupported,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlacementStats {
+    pub live_count: usize,
+    pub group_count: usize,
+    pub format_count: usize,
+    pub tier_count: usize,
+    pub capacity_count: usize,
+    pub max_free_bytes: u64,
+    pub max_free_worker_id: Option<WorkerId>,
+    pub max_free_tier: Option<Tier>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,6 +107,38 @@ pub struct PlacementPlan {
     pub op: PlacementOp,
     pub workers: Vec<PlacementWorker>,
     pub status: PlacementStatus,
+    pub stats: PlacementStats,
+}
+
+impl PlacementPlan {
+    pub fn failure_message(&self, req: &PlacementRequest) -> String {
+        let max_worker = self
+            .stats
+            .max_free_worker_id
+            .map(|worker_id| worker_id.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let max_tier = self
+            .stats
+            .max_free_tier
+            .map(|tier| tier.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        format!(
+            "placement failed: status={:?} group={} format={} required={} policy=[{}] live={} group_ok={} format_ok={} tier_ok={} capacity_ok={} max_free={} max_worker={} max_tier={}",
+            self.status,
+            req.group_name,
+            req.layout.block_format_id.as_raw(),
+            req.layout.block_size,
+            write_tier_policy_label(),
+            self.stats.live_count,
+            self.stats.group_count,
+            self.stats.format_count,
+            self.stats.tier_count,
+            self.stats.capacity_count,
+            self.stats.max_free_bytes,
+            max_worker,
+            max_tier
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -145,19 +197,52 @@ fn choose_live_targets(
 ) -> PlacementPlan {
     let exclude: HashSet<WorkerId> = req.exclude_workers.iter().copied().collect();
     let required_len = u64::from(req.layout.block_size);
-    let mut candidates: Vec<_> = workers
+    let mut stats = PlacementStats::default();
+    let live_candidates: Vec<_> = workers
         .iter()
-        .filter(|worker| {
-            worker.group_name == req.group_name
-                && is_live(worker)
-                && !exclude.contains(&worker.worker_id)
-                && supports_block_format(worker, req.layout.block_format_id)
-                && has_capacity(worker, required_len)
-        })
+        .filter(|worker| worker.group_name == req.group_name && is_live(worker))
         .collect();
+    stats.live_count = live_candidates.len();
+    if live_candidates.is_empty() {
+        return plan_with_stats(req, Vec::new(), PlacementStatus::NoLiveWorker, stats);
+    }
+
+    let group_candidates: Vec<_> = live_candidates
+        .into_iter()
+        .filter(|worker| !exclude.contains(&worker.worker_id))
+        .collect();
+    stats.group_count = group_candidates.len();
+    if group_candidates.is_empty() {
+        return plan_with_stats(req, Vec::new(), PlacementStatus::NoEligibleWorker, stats);
+    }
+
+    let format_candidates: Vec<_> = group_candidates
+        .into_iter()
+        .filter(|worker| supports_block_format(worker, req.layout.block_format_id))
+        .collect();
+    stats.format_count = format_candidates.len();
+    if format_candidates.is_empty() {
+        return plan_with_stats(req, Vec::new(), PlacementStatus::UnsupportedBlockFormat, stats);
+    }
+
+    if req.op == PlacementOp::Write {
+        return choose_write_targets(req, format_candidates, target_replicas, use_locality, stats);
+    }
+
+    stats.tier_count = format_candidates.len();
+    for worker in &format_candidates {
+        if let Some(free_bytes) = worker.free_bytes {
+            record_max_free(&mut stats, worker.worker_id, None, free_bytes);
+        }
+    }
+    let mut candidates: Vec<_> = format_candidates
+        .into_iter()
+        .filter(|worker| has_capacity(worker, required_len))
+        .collect();
+    stats.capacity_count = candidates.len();
     sort_workers(req, &mut candidates, use_locality);
     if candidates.is_empty() {
-        return plan(req, Vec::new(), PlacementStatus::NoLiveWorker);
+        return plan_with_stats(req, Vec::new(), PlacementStatus::InsufficientCapacity, stats);
     }
 
     let target = usize::from(target_replicas.max(1));
@@ -167,7 +252,80 @@ fn choose_live_targets(
     } else {
         PlacementStatus::Ok
     };
-    plan(req, selected, status)
+    plan_with_stats(req, selected, status, stats)
+}
+
+fn choose_write_targets(
+    req: &PlacementRequest,
+    workers: Vec<&WorkerPlacementView>,
+    target_replicas: u8,
+    use_locality: bool,
+    mut stats: PlacementStats,
+) -> PlacementPlan {
+    let required_len = u64::from(req.layout.block_size);
+    for worker in &workers {
+        for tier in WRITE_TIER_ORDER {
+            if let Some(free_bytes) = tier_free_bytes(worker, tier) {
+                record_max_free(&mut stats, worker.worker_id, Some(tier), free_bytes);
+            }
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for worker in workers {
+        let mut has_persistent_tier = false;
+        for tier in WRITE_TIER_ORDER {
+            let Some(free_bytes) = tier_free_bytes(worker, tier) else {
+                continue;
+            };
+            has_persistent_tier = true;
+            if free_bytes >= required_len {
+                candidates.push((worker, tier));
+                break;
+            }
+        }
+        if has_persistent_tier {
+            stats.tier_count += 1;
+        }
+    }
+
+    if stats.tier_count == 0 {
+        return plan_with_stats(req, Vec::new(), PlacementStatus::NoWritableTier, stats);
+    }
+
+    stats.capacity_count = candidates.len();
+    sort_write_candidates(req, &mut candidates, use_locality);
+    if candidates.is_empty() {
+        return plan_with_stats(req, Vec::new(), PlacementStatus::InsufficientCapacity, stats);
+    }
+
+    let target = usize::from(target_replicas.max(1));
+    let mut seen = HashSet::new();
+    let mut selected = Vec::with_capacity(target);
+    for (worker, tier) in candidates {
+        if !seen.insert(worker.worker_id) {
+            continue;
+        }
+        if let Some(worker_run_id) = worker.worker_run_id {
+            selected.push(PlacementWorker {
+                worker_id: worker.worker_id,
+                worker_run_id,
+                endpoint: worker.endpoint.clone(),
+                worker_net_protocol: worker.worker_net_protocol,
+                tier: Some(tier),
+            });
+        }
+        if selected.len() == target {
+            break;
+        }
+    }
+
+    let status = if selected.len() < target {
+        PlacementStatus::NotEnoughReplicas
+    } else {
+        PlacementStatus::Ok
+    };
+    plan_with_stats(req, selected, status, stats)
 }
 
 fn is_live(worker: &WorkerPlacementView) -> bool {
@@ -179,6 +337,23 @@ fn has_capacity(worker: &WorkerPlacementView, required_len: u64) -> bool {
         .free_bytes
         .map(|free_bytes| free_bytes >= required_len)
         .unwrap_or(true)
+}
+
+fn tier_free_bytes(worker: &WorkerPlacementView, tier: Tier) -> Option<u64> {
+    worker
+        .tier_free
+        .iter()
+        .filter(|entry| entry.tier == tier)
+        .map(|entry| entry.free_bytes)
+        .max()
+}
+
+fn record_max_free(stats: &mut PlacementStats, worker_id: WorkerId, tier: Option<Tier>, free_bytes: u64) {
+    if free_bytes > stats.max_free_bytes || stats.max_free_worker_id.is_none() {
+        stats.max_free_bytes = free_bytes;
+        stats.max_free_worker_id = Some(worker_id);
+        stats.max_free_tier = tier;
+    }
 }
 
 fn supports_block_format(worker: &WorkerPlacementView, block_format_id: BlockFormatId) -> bool {
@@ -203,6 +378,29 @@ fn sort_workers(req: &PlacementRequest, workers: &mut Vec<&WorkerPlacementView>,
     });
 }
 
+fn sort_write_candidates(
+    req: &PlacementRequest,
+    candidates: &mut Vec<(&WorkerPlacementView, Tier)>,
+    use_locality: bool,
+) {
+    candidates.sort_by_key(|(worker, tier)| {
+        let locality = if use_locality {
+            req.caller
+                .as_ref()
+                .map(|caller| locality_rank(caller, worker))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        (
+            write_tier_rank(*tier),
+            locality,
+            stable_order(&req.group_name, req.block_id, worker.worker_id),
+            worker.worker_id.as_raw(),
+        )
+    });
+}
+
 fn workers_from_views(workers: Vec<&WorkerPlacementView>) -> Vec<PlacementWorker> {
     workers
         .into_iter()
@@ -212,17 +410,28 @@ fn workers_from_views(workers: Vec<&WorkerPlacementView>) -> Vec<PlacementWorker
                 worker_run_id,
                 endpoint: worker.endpoint.clone(),
                 worker_net_protocol: worker.worker_net_protocol,
+                tier: None,
             })
         })
         .collect()
 }
 
 fn plan(req: &PlacementRequest, workers: Vec<PlacementWorker>, status: PlacementStatus) -> PlacementPlan {
+    plan_with_stats(req, workers, status, PlacementStats::default())
+}
+
+fn plan_with_stats(
+    req: &PlacementRequest,
+    workers: Vec<PlacementWorker>,
+    status: PlacementStatus,
+    stats: PlacementStats,
+) -> PlacementPlan {
     PlacementPlan {
         group_name: req.group_name.clone(),
         op: req.op,
         workers,
         status,
+        stats,
     }
 }
 
@@ -263,4 +472,91 @@ fn stable_order(group_name: &GroupName, block_id: BlockId, worker_id: WorkerId) 
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+fn write_tier_rank(tier: Tier) -> u8 {
+    match tier {
+        Tier::Nvme => 0,
+        Tier::Ssd => 1,
+        Tier::Hdd => 2,
+        Tier::Mem => 3,
+    }
+}
+
+fn write_tier_policy_label() -> &'static str {
+    "NVME,SSD,HDD"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use types::ids::{BlockIndex, DataHandleId};
+
+    fn req(block_size: u32) -> PlacementRequest {
+        PlacementRequest {
+            group_name: GroupName::parse("root").unwrap(),
+            op: PlacementOp::Write,
+            block_id: BlockId::new(DataHandleId::new(1), BlockIndex::new(0)),
+            block_stamp: Some(7),
+            layout: FileLayout::new(block_size, 1024, 1),
+            caller: None,
+            existing: Vec::new(),
+            exclude_workers: Vec::new(),
+            target_replicas: 1,
+        }
+    }
+
+    fn worker(free_bytes: Option<u64>) -> WorkerPlacementView {
+        WorkerPlacementView {
+            group_name: GroupName::parse("root").unwrap(),
+            worker_id: WorkerId::new(11),
+            worker_run_id: Some(WorkerRunId::new()),
+            endpoint: "http://127.0.0.1:19090".to_string(),
+            worker_net_protocol: 1,
+            registered: true,
+            lease_valid: true,
+            ip: None,
+            host: None,
+            az: None,
+            rack: None,
+            region: None,
+            free_bytes,
+            tier_free: free_bytes
+                .map(|free_bytes| {
+                    vec![TierFree {
+                        tier: Tier::Hdd,
+                        free_bytes,
+                    }]
+                })
+                .unwrap_or_default(),
+            supported_block_formats: vec![BlockFormatId::CURRENT_FOR_NEW_FILE],
+        }
+    }
+
+    #[test]
+    fn live_worker_with_enough_free_bytes_is_eligible() {
+        let plan = PlacementPlanner.plan(&req(4096), &[worker(Some(4096))]);
+
+        assert_eq!(plan.status, PlacementStatus::Ok);
+        assert_eq!(plan.workers.len(), 1);
+    }
+
+    #[test]
+    fn live_worker_with_insufficient_free_bytes_is_capacity_failure() {
+        let plan = PlacementPlanner.plan(&req(4096), &[worker(Some(4095))]);
+
+        assert_eq!(plan.status, PlacementStatus::InsufficientCapacity);
+        assert!(plan.workers.is_empty());
+    }
+
+    #[test]
+    fn no_live_worker_remains_no_live_worker() {
+        let mut stale = worker(Some(4096));
+        stale.worker_run_id = None;
+
+        let plan = PlacementPlanner.plan(&req(4096), &[stale]);
+
+        assert_eq!(plan.status, PlacementStatus::NoLiveWorker);
+        assert!(plan.workers.is_empty());
+    }
 }

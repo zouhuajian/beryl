@@ -1418,6 +1418,7 @@ mod tests {
             block_stamp: 77,
             chunk_size: 1024,
             block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE,
+            tier: types::Tier::Hdd,
         }
     }
 

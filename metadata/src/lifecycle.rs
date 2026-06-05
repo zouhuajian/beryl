@@ -7,18 +7,20 @@ use crate::config::{MetadataConfig, RaftMode};
 use crate::ensure_root_mount_for_format;
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::{DataIoPolicy, MountKind, MountTable, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
-use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
+use crate::raft::{AppRaftNode, AppRaftStateMachine, Command, DedupKey, RocksDBStorage};
 use crate::readiness::{wait_for_root_ready_with_inputs, RootReadinessGate, RootReadinessLogFields, RootReadyInputs};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
-use types::GroupName;
+use types::{FileAttrs, GroupName, Inode};
 use uuid::Uuid;
 
 const METADATA_MARKER_FILE: &str = "metadata.marker.json";
 const FORMAT_VERSION: u32 = 1;
+const LOCAL_WRITABLE_MOUNT_PREFIX: &str = "/local";
+const OLD_LOCAL_LAYOUT_ERROR: &str = "local metadata store is missing required /local mount; this store was formatted by an older layout. Re-run metadata format or remove the local metadata directory.";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -59,6 +61,13 @@ pub async fn format_metadata_storage(config: &MetadataConfig) -> MetadataResult<
 
     let group_name = config.authority.group_name.clone();
     ensure_root_mount_for_format(Arc::clone(&raft_node), Arc::clone(&mount_table), group_name.clone()).await?;
+    ensure_local_writable_mount_for_format(
+        Arc::clone(&raft_node),
+        Arc::clone(&storage),
+        Arc::clone(&mount_table),
+        group_name.clone(),
+    )
+    .await?;
     wait_for_root_ready_with_inputs(RootReadyInputs {
         raft_node: Arc::clone(&raft_node),
         mount_table: Arc::clone(&mount_table),
@@ -76,6 +85,7 @@ pub async fn format_metadata_storage(config: &MetadataConfig) -> MetadataResult<
     })
     .await?;
     verify_root(&storage, &mount_table)?;
+    verify_local_writable_mount(&storage, &mount_table, &group_name)?;
 
     let marker = MetadataStorageMarker {
         cluster_id: config.cluster_id.clone(),
@@ -106,6 +116,7 @@ pub async fn prepare_metadata_start(config: &MetadataConfig) -> MetadataResult<(
     let storage = RocksDBStorage::open_existing_for_start(&config.storage_dir)?;
     let mount_table = MountTable::load_from_storage(&storage)?;
     verify_root(&storage, &mount_table)?;
+    verify_local_writable_mount_for_start(&storage, &mount_table, &config.authority.group_name)?;
     Ok(())
 }
 
@@ -229,6 +240,41 @@ fn write_marker(path: &std::path::Path, marker: &MetadataStorageMarker) -> Metad
     Ok(())
 }
 
+async fn ensure_local_writable_mount_for_format(
+    raft_node: Arc<AppRaftNode>,
+    storage: Arc<RocksDBStorage>,
+    mount_table: Arc<MountTable>,
+    group_name: GroupName,
+) -> MetadataResult<()> {
+    if mount_table
+        .list_mounts()
+        .into_iter()
+        .any(|entry| entry.mount_prefix == LOCAL_WRITABLE_MOUNT_PREFIX)
+    {
+        return verify_local_writable_mount(&storage, &mount_table, &group_name);
+    }
+
+    let mount_id = mount_table.allocate_mount_id();
+    let root_inode_id = storage.allocate_inode_id()?;
+    let mut attrs = FileAttrs::new();
+    attrs.update_timestamps(now_ms());
+    attrs.nlink = 1;
+    storage.put_inode(&Inode::new_dir(root_inode_id, attrs, mount_id))?;
+
+    let command = Command::CreateMount {
+        dedup: DedupKey::system(),
+        mount_id,
+        mount_prefix: LOCAL_WRITABLE_MOUNT_PREFIX.to_string(),
+        mount_kind: MountKind::Internal,
+        ufs_uri: None,
+        data_io_policy: DataIoPolicy::Allow,
+        namespace_owner_group_name: group_name.clone(),
+        root_inode_id,
+    };
+    raft_node.propose(command).await?;
+    verify_local_writable_mount(&storage, &mount_table, &group_name)
+}
+
 fn verify_root(storage: &RocksDBStorage, mount_table: &MountTable) -> MetadataResult<()> {
     let root = mount_table
         .list_mounts()
@@ -250,6 +296,57 @@ fn verify_root(storage: &RocksDBStorage, mount_table: &MountTable) -> MetadataRe
     if !inode.kind.is_dir() {
         return Err(MetadataError::InvalidArgument(
             "root inode exists but is not a directory".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_local_writable_mount(
+    storage: &RocksDBStorage,
+    mount_table: &MountTable,
+    group_name: &GroupName,
+) -> MetadataResult<()> {
+    verify_local_writable_mount_with_missing_error(storage, mount_table, group_name, || {
+        MetadataError::ServiceUnavailable("local writable mount missing after metadata format".to_string())
+    })
+}
+
+fn verify_local_writable_mount_for_start(
+    storage: &RocksDBStorage,
+    mount_table: &MountTable,
+    group_name: &GroupName,
+) -> MetadataResult<()> {
+    verify_local_writable_mount_with_missing_error(storage, mount_table, group_name, || {
+        MetadataError::InvalidArgument(OLD_LOCAL_LAYOUT_ERROR.to_string())
+    })
+}
+
+fn verify_local_writable_mount_with_missing_error(
+    storage: &RocksDBStorage,
+    mount_table: &MountTable,
+    group_name: &GroupName,
+    missing_error: impl FnOnce() -> MetadataError,
+) -> MetadataResult<()> {
+    let mount = mount_table
+        .list_mounts()
+        .into_iter()
+        .find(|entry| entry.mount_prefix == LOCAL_WRITABLE_MOUNT_PREFIX)
+        .ok_or_else(missing_error)?;
+    if mount.mount_kind != MountKind::Internal
+        || mount.ufs_uri.is_some()
+        || mount.data_io_policy != DataIoPolicy::Allow
+        || mount.namespace_owner_group_name != *group_name
+    {
+        return Err(MetadataError::InvalidArgument(
+            "local writable mount exists but violates internal/allow-data-io invariants".to_string(),
+        ));
+    }
+    let inode = storage
+        .get_inode(mount.root_inode_id)?
+        .ok_or_else(|| MetadataError::ServiceUnavailable("local writable mount root inode missing".to_string()))?;
+    if !inode.kind.is_dir() || inode.mount_id != mount.mount_id {
+        return Err(MetadataError::InvalidArgument(
+            "local writable mount root inode violates directory/mount invariants".to_string(),
         ));
     }
     Ok(())

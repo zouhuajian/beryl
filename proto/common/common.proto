@@ -180,6 +180,15 @@ enum WorkerNetProtocolProto {
   WORKER_NET_PROTOCOL_RDMA = 3;
 }
 
+/// Worker-local storage tier for a block replica or store directory.
+enum TierProto {
+  TIER_UNSPECIFIED = 0;
+  TIER_MEM = 1;
+  TIER_NVME = 2;
+  TIER_SSD = 3;
+  TIER_HDD = 4;
+}
+
 // ============================================================================
 // Consistency & Mode Enums
 // ============================================================================

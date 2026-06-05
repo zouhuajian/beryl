@@ -1643,6 +1643,7 @@ fn write_target_with_layout(
         block_stamp: 1,
         chunk_size: layout.chunk_size,
         block_format_id: types::BlockFormatId::from_raw(layout.block_format_id).expect("known test block format"),
+        tier: types::Tier::Hdd,
     }
 }
 
