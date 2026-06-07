@@ -555,8 +555,8 @@ fn fs_stats(path: &Path) -> StoreResult<(u64, u64)> {
     // SAFETY: statvfs returned success and initialized stat.
     let stat = unsafe { stat.assume_init() };
     let fragment_size = stat.f_frsize.max(1);
-    let total = (stat.f_blocks as u64).saturating_mul(fragment_size);
-    let free = (stat.f_bavail as u64).saturating_mul(fragment_size);
+    let total = Into::<u64>::into(stat.f_blocks).saturating_mul(fragment_size);
+    let free = Into::<u64>::into(stat.f_bavail).saturating_mul(fragment_size);
     Ok((total, free))
 }
 
