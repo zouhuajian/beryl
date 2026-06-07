@@ -28,9 +28,12 @@ use proto::metadata::{
     DeleteRequestProto, GetBlockLocationsRequestProto, GetStatusRequestProto, SyncWriteRequestProto, WriteHandleProto,
     WriteSyncModeProto,
 };
-use std::sync::{Arc, Mutex};
+use std::io;
+use std::sync::{Arc, Mutex, OnceLock};
 use tempfile::TempDir;
 use tonic::Request;
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::{fmt, layer::SubscriberExt, Registry};
 use types::fs::{Extent, FileAttrs, Inode, InodeId};
 use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
 use types::layout::FileLayout;
@@ -46,6 +49,81 @@ struct PathTestEnv {
     write_session_manager: Arc<metadata::write_session::WriteSessionManager>,
     mount_id: types::ids::MountId,
     root_inode_id: InodeId,
+}
+
+#[derive(Clone)]
+struct LogCaptureWriter {
+    output: Arc<Mutex<Vec<u8>>>,
+}
+
+impl LogCaptureWriter {
+    fn new(output: Arc<Mutex<Vec<u8>>>) -> Self {
+        Self { output }
+    }
+}
+
+impl io::Write for LogCaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.output
+            .lock()
+            .expect("log output must not be poisoned")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn captured_logs(output: &Arc<Mutex<Vec<u8>>>) -> Vec<serde_json::Value> {
+    let bytes = output.lock().expect("log output must not be poisoned").clone();
+    let text = String::from_utf8(bytes).expect("logs must be utf8");
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|err| panic!("invalid json log {line:?}: {err}")))
+        .collect()
+}
+
+fn captured_text(output: &Arc<Mutex<Vec<u8>>>) -> String {
+    let bytes = output.lock().expect("log output must not be poisoned").clone();
+    String::from_utf8(bytes).expect("logs must be utf8")
+}
+
+fn log_test_mutex() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn captured_json_subscriber(output: &Arc<Mutex<Vec<u8>>>) -> tracing::Dispatch {
+    let writer = LogCaptureWriter::new(Arc::clone(output));
+    let subscriber = Registry::default().with(
+        fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_ansi(false)
+            .with_target(true)
+            .with_file(false)
+            .with_line_number(false)
+            .with_writer(move || writer.clone()),
+    );
+    tracing::Dispatch::new(subscriber)
+}
+
+fn captured_text_subscriber(output: &Arc<Mutex<Vec<u8>>>) -> tracing::Dispatch {
+    let writer = LogCaptureWriter::new(Arc::clone(output));
+    let subscriber = Registry::default().with(
+        fmt::layer()
+            .compact()
+            .with_ansi(false)
+            .with_target(true)
+            .with_file(false)
+            .with_line_number(false)
+            .with_writer(move || writer.clone()),
+    );
+    tracing::Dispatch::new(subscriber)
 }
 
 #[derive(Clone)]
@@ -437,6 +515,438 @@ async fn open_write_session_with_committed_block(
     };
 
     (write_handle, data_handle_id, committed)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn create_file_success_emits_metadata_state_log() {
+    let _log_guard = log_test_mutex().lock().await;
+    let env = build_env_with_raft_and_workers(
+        "/mnt/test",
+        DataIoPolicy::Allow,
+        Some(worker_manager_for_write_targets()),
+        |_| Arc::new(NonePermissionChecker),
+    )
+    .await;
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writer = LogCaptureWriter::new(Arc::clone(&output));
+    let subscriber = Registry::default().with(
+        fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_ansi(false)
+            .with_target(true)
+            .with_file(false)
+            .with_line_number(false)
+            .with_writer(move || writer.clone()),
+    );
+
+    let dispatch = tracing::Dispatch::new(subscriber);
+    async {
+        let response = FileSystemServiceProto::create_file(
+            &env.service,
+            Request::new(CreateFileRequestProto {
+                header: header(700),
+                path: "/mnt/test/logged-create".to_string(),
+                attrs: Some(proto::fs::FileAttrsProto {
+                    mode: 0o644,
+                    uid: 1000,
+                    gid: 1000,
+                    ..Default::default()
+                }),
+                layout: Some(proto::common::FileLayoutProto {
+                    block_size: 4096,
+                    chunk_size: 4096,
+                    replication: 1,
+                    block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
+                }),
+                disposition: CreateDispositionProto::CreateNew as i32,
+                desired_len: Some(128),
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        assert_success_header(response.header);
+    }
+    .with_subscriber(dispatch.clone())
+    .await;
+
+    let logs = captured_logs(&output);
+    assert!(
+        logs.iter().any(|log| {
+            log["target"] == "metadata.state"
+                && log["op"] == "CreateFile"
+                && log["result"] == "committed"
+                && log["path"] == "/mnt/test/logged-create"
+                && log["inode_id"].as_u64().is_some()
+                && log["data_handle_id"].as_u64().is_some()
+                && log["layout_block_size"] == 4096
+                && log["layout_chunk_size"] == 4096
+                && log["replication"] == 1
+                && log["desired_len"] == 128
+        }),
+        "{logs:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn create_directory_failure_emits_metadata_state_warn_log() {
+    let _log_guard = log_test_mutex().lock().await;
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let first = FileSystemServiceProto::create_directory(
+        &env.service,
+        Request::new(CreateDirectoryRequestProto {
+            header: header(705),
+            path: "/mnt/test/duplicate-dir".to_string(),
+            attrs: Some(proto::fs::FileAttrsProto {
+                mode: 0o755,
+                uid: 1000,
+                gid: 1000,
+                ..Default::default()
+            }),
+            create_parents: false,
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+    assert_success_header(first.header);
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let dispatch = captured_json_subscriber(&output);
+    async {
+        let response = FileSystemServiceProto::create_directory(
+            &env.service,
+            Request::new(CreateDirectoryRequestProto {
+                header: header(706),
+                path: "/mnt/test/duplicate-dir".to_string(),
+                attrs: Some(proto::fs::FileAttrsProto {
+                    mode: 0o755,
+                    uid: 1000,
+                    gid: 1000,
+                    ..Default::default()
+                }),
+                create_parents: false,
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        let err = header_error(response.header);
+        assert_fs_errno(&err, FsErrnoProto::FsErrnoEexist);
+    }
+    .with_subscriber(dispatch)
+    .await;
+
+    let logs = captured_logs(&output);
+    assert!(
+        logs.iter().any(|log| {
+            log["target"] == "metadata.state"
+                && log["level"] == "WARN"
+                && log["op"] == "CreateDirectory"
+                && log["result"] == "rejected"
+                && log["error_code"] == "eexist"
+                && log["path"] == "/mnt/test/duplicate-dir"
+        }),
+        "{logs:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn create_file_early_create_failure_emits_metadata_state_warn_log() {
+    let _log_guard = log_test_mutex().lock().await;
+    let env = build_env_with_raft_and_workers(
+        "/mnt/test",
+        DataIoPolicy::Allow,
+        Some(worker_manager_for_write_targets()),
+        |_| Arc::new(NonePermissionChecker),
+    )
+    .await;
+    let request = |client_id, path: &str| CreateFileRequestProto {
+        header: header(client_id),
+        path: path.to_string(),
+        attrs: Some(proto::fs::FileAttrsProto {
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+            ..Default::default()
+        }),
+        layout: Some(proto::common::FileLayoutProto {
+            block_size: 4096,
+            chunk_size: 4096,
+            replication: 1,
+            block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
+        }),
+        disposition: CreateDispositionProto::CreateNew as i32,
+        desired_len: Some(128),
+    };
+    let first =
+        FileSystemServiceProto::create_file(&env.service, Request::new(request(707, "/mnt/test/duplicate-file")))
+            .await
+            .expect("transport status must remain OK")
+            .into_inner();
+    assert_success_header(first.header);
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let dispatch = captured_json_subscriber(&output);
+    async {
+        let response =
+            FileSystemServiceProto::create_file(&env.service, Request::new(request(708, "/mnt/test/duplicate-file")))
+                .await
+                .expect("transport status must remain OK")
+                .into_inner();
+        let err = header_error(response.header);
+        assert_fs_errno(&err, FsErrnoProto::FsErrnoEexist);
+    }
+    .with_subscriber(dispatch)
+    .await;
+
+    let logs = captured_logs(&output);
+    assert!(
+        logs.iter().any(|log| {
+            log["target"] == "metadata.state"
+                && log["level"] == "WARN"
+                && log["op"] == "CreateFile"
+                && log["result"] == "rejected"
+                && log["error_code"] == "eexist"
+                && log["path"] == "/mnt/test/duplicate-file"
+        }),
+        "{logs:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn add_block_success_emits_metadata_block_log_with_target_count() {
+    let _log_guard = log_test_mutex().lock().await;
+    let env = build_env_with_raft_and_workers(
+        "/mnt/test",
+        DataIoPolicy::Allow,
+        Some(worker_manager_for_write_targets()),
+        |_| Arc::new(NonePermissionChecker),
+    )
+    .await;
+    let create = FileSystemServiceProto::create_file(
+        &env.service,
+        Request::new(CreateFileRequestProto {
+            header: header(710),
+            path: "/mnt/test/logged-add-block".to_string(),
+            attrs: Some(proto::fs::FileAttrsProto {
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+                ..Default::default()
+            }),
+            layout: Some(proto::common::FileLayoutProto {
+                block_size: 4096,
+                chunk_size: 4096,
+                replication: 1,
+                block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
+            }),
+            disposition: CreateDispositionProto::CreateNew as i32,
+            desired_len: Some(128),
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+    assert_success_header(create.header);
+    let write_handle = create.write_handle.expect("write handle");
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writer = LogCaptureWriter::new(Arc::clone(&output));
+    let subscriber = Registry::default().with(
+        fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_ansi(false)
+            .with_target(true)
+            .with_file(false)
+            .with_line_number(false)
+            .with_writer(move || writer.clone()),
+    );
+
+    let dispatch = tracing::Dispatch::new(subscriber);
+    async {
+        let response = FileSystemServiceProto::add_block(
+            &env.service,
+            Request::new(AddBlockRequestProto {
+                header: header(711),
+                write_handle: Some(write_handle),
+                desired_len: Some(128),
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        assert_success_header(response.header);
+    }
+    .with_subscriber(dispatch.clone())
+    .await;
+
+    let logs = captured_logs(&output);
+    assert!(
+        logs.iter().any(|log| {
+            log["target"] == "metadata.block"
+                && log["op"] == "AddBlock"
+                && log["result"] == "allocated"
+                && log["block_id"].as_str().is_some()
+                && log["target_count"] == 1
+                && log["desired_len"] == 128
+        }),
+        "{logs:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn add_block_text_log_does_not_dump_request_or_duplicate_request_ids() {
+    let _log_guard = log_test_mutex().lock().await;
+    let env = build_env_with_raft_and_workers(
+        "/mnt/test",
+        DataIoPolicy::Allow,
+        Some(worker_manager_for_write_targets()),
+        |_| Arc::new(NonePermissionChecker),
+    )
+    .await;
+    let create = FileSystemServiceProto::create_file(
+        &env.service,
+        Request::new(CreateFileRequestProto {
+            header: header(712),
+            path: "/mnt/test/no-request-dump-add-block".to_string(),
+            attrs: Some(proto::fs::FileAttrsProto {
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+                ..Default::default()
+            }),
+            layout: Some(proto::common::FileLayoutProto {
+                block_size: 4096,
+                chunk_size: 4096,
+                replication: 1,
+                block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
+            }),
+            disposition: CreateDispositionProto::CreateNew as i32,
+            desired_len: Some(128),
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+    assert_success_header(create.header);
+    let write_handle = create.write_handle.expect("write handle");
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let dispatch = captured_text_subscriber(&output);
+    async {
+        let response = FileSystemServiceProto::add_block(
+            &env.service,
+            Request::new(AddBlockRequestProto {
+                header: header(713),
+                write_handle: Some(write_handle),
+                desired_len: Some(128),
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        assert_success_header(response.header);
+    }
+    .with_subscriber(dispatch)
+    .await;
+
+    let text = captured_text(&output);
+    assert!(!text.contains("request=Request"), "{text}");
+    assert_eq!(text.matches("client_id=").count(), 1, "{text}");
+    assert_eq!(text.matches("call_id=").count(), 1, "{text}");
+    assert!(text.contains("desired_len=128"), "{text}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn add_block_failure_emits_metadata_block_warn_log_with_error_code() {
+    let _log_guard = log_test_mutex().lock().await;
+    let env = build_env_with_raft_and_workers(
+        "/mnt/test",
+        DataIoPolicy::Allow,
+        Some(worker_manager_for_write_targets()),
+        |_| Arc::new(NonePermissionChecker),
+    )
+    .await;
+    let create = FileSystemServiceProto::create_file(
+        &env.service,
+        Request::new(CreateFileRequestProto {
+            header: header(720),
+            path: "/mnt/test/rejected-add-block".to_string(),
+            attrs: Some(proto::fs::FileAttrsProto {
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+                ..Default::default()
+            }),
+            layout: Some(proto::common::FileLayoutProto {
+                block_size: 4096,
+                chunk_size: 4096,
+                replication: 1,
+                block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
+            }),
+            disposition: CreateDispositionProto::CreateNew as i32,
+            desired_len: Some(128),
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+    assert_success_header(create.header);
+    let mut write_handle = create.write_handle.expect("write handle");
+    write_handle.lease_epoch += 1;
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writer = LogCaptureWriter::new(Arc::clone(&output));
+    let subscriber = Registry::default().with(
+        fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_ansi(false)
+            .with_target(true)
+            .with_file(false)
+            .with_line_number(false)
+            .with_writer(move || writer.clone()),
+    );
+
+    let dispatch = tracing::Dispatch::new(subscriber);
+    async {
+        let response = FileSystemServiceProto::add_block(
+            &env.service,
+            Request::new(AddBlockRequestProto {
+                header: header(721),
+                write_handle: Some(write_handle),
+                desired_len: Some(128),
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        let err = header_error(response.header);
+        assert_ne!(err.error_class, ErrorClassProto::ErrorClassOk as i32);
+    }
+    .with_subscriber(dispatch.clone())
+    .await;
+
+    let logs = captured_logs(&output);
+    assert!(
+        logs.iter().any(|log| {
+            log["target"] == "metadata.block"
+                && log["level"] == "WARN"
+                && log["op"] == "AddBlock"
+                && log["result"] == "rejected"
+                && log["error_code"] == "session_invalid"
+        }),
+        "{logs:?}"
+    );
 }
 
 fn put_dir(env: &PathTestEnv, parent_inode_id: InodeId, name: &str, inode_id: InodeId) {
@@ -1320,6 +1830,54 @@ async fn commit_file_public_replay_returns_persisted_result_and_rejects_fingerpr
         }
         other => panic!("expected file inode data, got {:?}", other),
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn commit_file_success_log_includes_explicit_commit_summary() {
+    let _log_guard = log_test_mutex().lock().await;
+    let env = build_env_with_raft_and_workers(
+        "/mnt/test",
+        DataIoPolicy::Allow,
+        Some(worker_manager_for_write_targets()),
+        |_| Arc::new(NonePermissionChecker),
+    )
+    .await;
+    let (write_handle, data_handle_id, committed) =
+        open_write_session_with_committed_block(&env, "/mnt/test/logged-commit", 730).await;
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let dispatch = captured_json_subscriber(&output);
+    async {
+        let response = FileSystemServiceProto::commit_file(
+            &env.service,
+            Request::new(CommitFileRequestProto {
+                header: header(731),
+                write_handle: Some(write_handle),
+                data_handle_id: Some(DataHandleIdProto { value: data_handle_id }),
+                committed_blocks: vec![committed],
+                final_size: 128,
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        assert_success_header(response.header);
+    }
+    .with_subscriber(dispatch)
+    .await;
+
+    let logs = captured_logs(&output);
+    assert!(
+        logs.iter().any(|log| {
+            log["target"] == "metadata.state"
+                && log["op"] == "CommitFile"
+                && log["result"] == "committed"
+                && log["final_size"] == 128
+                && log["committed_block_count"] == 1
+                && log["committed_bytes"] == 128
+        }),
+        "{logs:?}"
+    );
 }
 
 #[tokio::test]

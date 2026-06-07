@@ -25,6 +25,7 @@ use super::{
 use super::{FsCore, PermissionBits, PermissionChecker, SharedWorkerCommitHook};
 use crate::error::{to_canonical_fs, MetadataError};
 use crate::mount::MountTable;
+use crate::observe;
 use crate::path_resolver::{MountContext, PathResolver};
 use crate::raft::RocksDBStorage;
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
@@ -288,7 +289,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         Ok(Response::new(response))
     }
 
-    #[instrument(skip(self), fields(call_id, client_id))]
+    #[instrument(skip_all)]
     async fn get_status(
         &self,
         request: Request<GetStatusRequestProto>,
@@ -345,7 +346,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         }
     }
 
-    #[instrument(skip(self), fields(call_id, client_id))]
+    #[instrument(skip_all)]
     async fn create_directory(
         &self,
         request: Request<CreateDirectoryRequestProto>,
@@ -410,6 +411,20 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 let header = ok_header_from_core_success(&req_ctx, &success);
                 let payload = success.payload;
                 let attrs = payload.attrs.as_ref().map(file_attrs_to_proto);
+                tracing::info!(
+                    target: "metadata.state",
+                    op = "CreateDirectory",
+                    result = "committed",
+                    error_code = "none",
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    path = %req.path,
+                    inode_id = payload.inode_id.map(|id| id.as_raw()),
+                    parent_inode_id = parent_inode_id.as_raw(),
+                    mount_version = success.mount_epoch,
+                    route_epoch = success.route_epoch,
+                    "CreateDirectory committed"
+                );
                 response_with_header!(
                     CreateDirectoryResponseProto {
                         inode_id: payload.inode_id.map(Self::inode_proto),
@@ -419,14 +434,27 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     header
                 )
             }
-            Err(failure) => error_response!(
-                CreateDirectoryResponseProto,
-                header_from_core_failure(&req_ctx, &failure)
-            ),
+            Err(failure) => {
+                tracing::warn!(
+                    target: "metadata.state",
+                    op = "CreateDirectory",
+                    result = "rejected",
+                    error_code = observe::canonical_error_kind(&failure.error),
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    path = %req.path,
+                    parent_inode_id = parent_inode_id.as_raw(),
+                    "CreateDirectory rejected"
+                );
+                error_response!(
+                    CreateDirectoryResponseProto,
+                    header_from_core_failure(&req_ctx, &failure)
+                )
+            }
         }
     }
 
-    #[instrument(skip(self), fields(call_id, client_id))]
+    #[instrument(skip_all)]
     async fn delete(&self, request: Request<DeleteRequestProto>) -> Result<Response<DeleteResponseProto>, Status> {
         let req = request.into_inner();
         let req_ctx = request_context_or_error!(req, DeleteResponseProto);
@@ -534,12 +562,41 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 .map(|success| ok_header_from_core_success(&req_ctx, &success))
         };
         match result {
-            Ok(header) => response_with_header!(DeleteResponseProto::default(), header),
-            Err(failure) => error_response!(DeleteResponseProto, header_from_core_failure(&req_ctx, &failure)),
+            Ok(header) => {
+                tracing::info!(
+                    target: "metadata.state",
+                    op = "Delete",
+                    result = "committed",
+                    error_code = "none",
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    path = %req.path,
+                    inode_id = target_inode.as_ref().map(|inode| inode.inode_id.as_raw()),
+                    parent_inode_id = parent_inode_id.as_raw(),
+                    recursive = req.recursive,
+                    "Delete committed"
+                );
+                response_with_header!(DeleteResponseProto::default(), header)
+            }
+            Err(failure) => {
+                tracing::warn!(
+                    target: "metadata.state",
+                    op = "Delete",
+                    result = "rejected",
+                    error_code = observe::canonical_error_kind(&failure.error),
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    path = %req.path,
+                    parent_inode_id = parent_inode_id.as_raw(),
+                    recursive = req.recursive,
+                    "Delete rejected"
+                );
+                error_response!(DeleteResponseProto, header_from_core_failure(&req_ctx, &failure))
+            }
         }
     }
 
-    #[instrument(skip(self), fields(call_id, client_id))]
+    #[instrument(skip_all)]
     async fn rename(&self, request: Request<RenameRequestProto>) -> Result<Response<RenameResponseProto>, Status> {
         let req = request.into_inner();
         let req_ctx = request_context_or_error!(req, RenameResponseProto);
@@ -620,15 +677,45 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             })
             .await
         {
-            Ok(success) => response_with_header!(
-                RenameResponseProto::default(),
-                ok_header_from_core_success(&req_ctx, &success)
-            ),
-            Err(failure) => error_response!(RenameResponseProto, header_from_core_failure(&req_ctx, &failure)),
+            Ok(success) => {
+                tracing::info!(
+                    target: "metadata.state",
+                    op = "Rename",
+                    result = "committed",
+                    error_code = "none",
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    src = %req.src_path,
+                    dst = %req.dst_path,
+                    parent_inode_id = src_parent_inode_id.as_raw(),
+                    mount_version = success.mount_epoch,
+                    route_epoch = success.route_epoch,
+                    "Rename committed"
+                );
+                response_with_header!(
+                    RenameResponseProto::default(),
+                    ok_header_from_core_success(&req_ctx, &success)
+                )
+            }
+            Err(failure) => {
+                tracing::warn!(
+                    target: "metadata.state",
+                    op = "Rename",
+                    result = "rejected",
+                    error_code = observe::canonical_error_kind(&failure.error),
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    src = %req.src_path,
+                    dst = %req.dst_path,
+                    parent_inode_id = src_parent_inode_id.as_raw(),
+                    "Rename rejected"
+                );
+                error_response!(RenameResponseProto, header_from_core_failure(&req_ctx, &failure))
+            }
         }
     }
 
-    #[instrument(skip(self), fields(call_id, client_id))]
+    #[instrument(skip_all)]
     async fn list_status(
         &self,
         request: Request<ListStatusRequestProto>,
@@ -721,7 +808,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         }
     }
 
-    #[instrument(skip(self), fields(call_id, client_id))]
+    #[instrument(skip_all)]
     async fn open_file(
         &self,
         request: Request<OpenFileRequestProto>,
@@ -833,7 +920,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         }
     }
 
-    #[instrument(skip(self), fields(call_id, client_id))]
+    #[instrument(skip_all)]
     async fn get_block_locations(
         &self,
         request: Request<GetBlockLocationsRequestProto>,
@@ -1000,7 +1087,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         }
     }
 
-    #[instrument(skip(self), fields(call_id, client_id))]
+    #[instrument(skip_all)]
     async fn create_file(
         &self,
         request: Request<CreateFileRequestProto>,
@@ -1118,6 +1205,17 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         Some(resolved.mount_ctx.owner_group_name.clone()),
                         Some(resolved.mount_ctx.mount_epoch),
                     ) {
+                        tracing::warn!(
+                            target: "metadata.state",
+                            op = "CreateFile",
+                            result = "rejected",
+                            error_code = observe::canonical_error_kind(&failure.error),
+                            client_id = %req_ctx.caller.client.client_id,
+                            call_id = %req_ctx.caller.client.call_id,
+                            path = %req.path,
+                            parent_inode_id = parent_inode_id.as_raw(),
+                            "CreateFile rejected"
+                        );
                         return error_response!(CreateFileResponseProto, header_from_core_failure(&req_ctx, &failure));
                     }
                     let create = self
@@ -1146,10 +1244,21 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                             }
                         },
                         Err(failure) => {
+                            tracing::warn!(
+                                target: "metadata.state",
+                                op = "CreateFile",
+                                result = "rejected",
+                                error_code = observe::canonical_error_kind(&failure.error),
+                                client_id = %req_ctx.caller.client.client_id,
+                                call_id = %req_ctx.caller.client.call_id,
+                                path = %req.path,
+                                parent_inode_id = parent_inode_id.as_raw(),
+                                "CreateFile rejected"
+                            );
                             return error_response!(
                                 CreateFileResponseProto,
                                 header_from_core_failure(&req_ctx, &failure)
-                            )
+                            );
                         }
                     }
                 }
@@ -1220,6 +1329,17 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 Some(resolved.mount_ctx.owner_group_name.clone()),
                 Some(resolved.mount_ctx.mount_epoch),
             ) {
+                tracing::warn!(
+                    target: "metadata.state",
+                    op = "CreateFile",
+                    result = "rejected",
+                    error_code = observe::canonical_error_kind(&failure.error),
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    path = %req.path,
+                    parent_inode_id = parent_inode_id.as_raw(),
+                    "CreateFile rejected"
+                );
                 return error_response!(CreateFileResponseProto, header_from_core_failure(&req_ctx, &failure));
             }
             match self
@@ -1248,7 +1368,18 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     }
                 },
                 Err(failure) => {
-                    return error_response!(CreateFileResponseProto, header_from_core_failure(&req_ctx, &failure))
+                    tracing::warn!(
+                        target: "metadata.state",
+                        op = "CreateFile",
+                        result = "rejected",
+                        error_code = observe::canonical_error_kind(&failure.error),
+                        client_id = %req_ctx.caller.client.client_id,
+                        call_id = %req_ctx.caller.client.call_id,
+                        path = %req.path,
+                        parent_inode_id = parent_inode_id.as_raw(),
+                        "CreateFile rejected"
+                    );
+                    return error_response!(CreateFileResponseProto, header_from_core_failure(&req_ctx, &failure));
                 }
             }
         };
@@ -1267,6 +1398,27 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             Ok(success) => {
                 let header = ok_header_from_core_success(&req_ctx, &success);
                 let payload = success.payload;
+                tracing::info!(
+                    target: "metadata.state",
+                    op = "CreateFile",
+                    result = "committed",
+                    error_code = "none",
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    path = %req.path,
+                    inode_id = payload.inode_id.as_raw(),
+                    data_handle_id = payload.data_handle_id.as_raw(),
+                    file_handle = payload.session_key.file_handle,
+                    lease_id = payload.session_key.lease_id.as_raw(),
+                    lease_epoch = payload.session_key.lease_epoch,
+                    layout_block_size = payload.layout.block_size,
+                    layout_chunk_size = payload.layout.chunk_size,
+                    replication = payload.layout.replication,
+                    desired_len = req.desired_len,
+                    mount_version = success.mount_epoch,
+                    route_epoch = success.route_epoch,
+                    "CreateFile committed"
+                );
                 response_with_header!(
                     CreateFileResponseProto {
                         write_handle: Some(Self::write_handle_from_key(&payload.session_key)),
@@ -1281,11 +1433,24 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     header
                 )
             }
-            Err(failure) => error_response!(CreateFileResponseProto, header_from_core_failure(&req_ctx, &failure)),
+            Err(failure) => {
+                tracing::warn!(
+                    target: "metadata.state",
+                    op = "CreateFile",
+                    result = "rejected",
+                    error_code = observe::canonical_error_kind(&failure.error),
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    path = %req.path,
+                    inode_id = inode_id.as_raw(),
+                    "CreateFile rejected"
+                );
+                error_response!(CreateFileResponseProto, header_from_core_failure(&req_ctx, &failure))
+            }
         }
     }
 
-    #[instrument(skip(self), fields(call_id, client_id))]
+    #[instrument(skip_all)]
     async fn append_file(
         &self,
         request: Request<AppendFileRequestProto>,
@@ -1343,6 +1508,23 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             Ok(success) => {
                 let header = ok_header_from_core_success(&req_ctx, &success);
                 let payload = success.payload;
+                tracing::info!(
+                    target: "metadata.state",
+                    op = "AppendFile",
+                    result = "opened",
+                    error_code = "none",
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    path = %req.path,
+                    inode_id = payload.inode_id.as_raw(),
+                    data_handle_id = payload.data_handle_id.as_raw(),
+                    file_handle = payload.session_key.file_handle,
+                    lease_id = payload.session_key.lease_id.as_raw(),
+                    lease_epoch = payload.session_key.lease_epoch,
+                    mount_version = success.mount_epoch,
+                    route_epoch = success.route_epoch,
+                    "AppendFile opened"
+                );
                 response_with_header!(
                     AppendFileResponseProto {
                         write_handle: Some(Self::write_handle_from_key(&payload.session_key)),
@@ -1357,11 +1539,24 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     header
                 )
             }
-            Err(failure) => error_response!(AppendFileResponseProto, header_from_core_failure(&req_ctx, &failure)),
+            Err(failure) => {
+                tracing::warn!(
+                    target: "metadata.state",
+                    op = "AppendFile",
+                    result = "rejected",
+                    error_code = observe::canonical_error_kind(&failure.error),
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    path = %req.path,
+                    inode_id = inode_id.as_raw(),
+                    "AppendFile rejected"
+                );
+                error_response!(AppendFileResponseProto, header_from_core_failure(&req_ctx, &failure))
+            }
         }
     }
 
-    #[instrument(skip(self), fields(call_id, client_id))]
+    #[instrument(skip_all)]
     async fn add_block(
         &self,
         request: Request<AddBlockRequestProto>,
@@ -1401,18 +1596,56 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             })
             .await
         {
-            Ok(success) => response_with_header!(
-                AddBlockResponseProto {
-                    target: Some(write_target_to_proto(&success.payload.target)),
-                    ..Default::default()
-                },
-                ok_header_from_core_success(&req_ctx, &success)
-            ),
-            Err(failure) => error_response!(AddBlockResponseProto, header_from_core_failure(&req_ctx, &failure)),
+            Ok(success) => {
+                let target = &success.payload.target;
+                tracing::info!(
+                    target: "metadata.block",
+                    op = "AddBlock",
+                    result = "allocated",
+                    error_code = "none",
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    block_id = %target.block_id,
+                    block_index = target.block_id.index.as_raw(),
+                    group_id = success.group_name.as_ref().map(|group| group.as_str()),
+                    desired_len = req.desired_len,
+                    target_count = target.worker_endpoints.len(),
+                    targets_sample = ?target.worker_endpoints.iter().take(3).map(|endpoint| endpoint.worker_id.as_raw()).collect::<Vec<_>>(),
+                    data_handle_id = target.block_id.data_handle_id.as_raw(),
+                    file_handle = handle.handle_id,
+                    mount_version = success.mount_epoch,
+                    route_epoch = success.route_epoch,
+                    "AddBlock allocated"
+                );
+                response_with_header!(
+                    AddBlockResponseProto {
+                        target: Some(write_target_to_proto(&success.payload.target)),
+                        ..Default::default()
+                    },
+                    ok_header_from_core_success(&req_ctx, &success)
+                )
+            }
+            Err(failure) => {
+                tracing::warn!(
+                    target: "metadata.block",
+                    op = "AddBlock",
+                    result = "rejected",
+                    error_code = observe::canonical_error_kind(&failure.error),
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    desired_len = req.desired_len,
+                    file_handle = handle.handle_id,
+                    lease_epoch = handle.lease_epoch,
+                    mount_version = failure.mount_epoch,
+                    route_epoch = failure.route_epoch,
+                    "AddBlock rejected"
+                );
+                error_response!(AddBlockResponseProto, header_from_core_failure(&req_ctx, &failure))
+            }
         }
     }
 
-    #[instrument(skip(self), fields(call_id, client_id))]
+    #[instrument(skip_all)]
     async fn commit_file(
         &self,
         request: Request<CommitFileRequestProto>,
@@ -1475,36 +1708,82 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 }
             }
         }
+        let final_size = req.final_size;
+        let committed_block_count = committed_blocks.len();
+        let committed_bytes: u64 = committed_blocks.iter().map(|block| block.len).sum();
+        let lease_id = lease_id_from_proto(handle.lease_id);
+        let lease_id_value = lease_id.map(|lease_id| lease_id.as_raw());
         match self
             .fs_core
             .execute_close_write(CloseWriteInput {
                 ctx: req_ctx.clone(),
                 file_handle: handle.handle_id,
-                lease_id: lease_id_from_proto(handle.lease_id),
+                lease_id,
                 lease_epoch: handle.lease_epoch,
                 open_epoch: handle.open_epoch,
                 fencing_token: presented_fencing_from_proto(handle.fencing_token),
                 intent: CloseWriteIntent {
                     committed_blocks,
-                    final_size: req.final_size,
+                    final_size,
                 },
                 freshness: Self::freshness_from_header(&req.header),
             })
             .await
         {
-            Ok(success) => response_with_header!(
-                CommitFileResponseProto {
-                    committed_size: success.payload.committed_size,
-                    file_version: success.payload.file_version,
-                    ..Default::default()
-                },
-                ok_header_from_core_success(&req_ctx, &success)
-            ),
-            Err(failure) => error_response!(CommitFileResponseProto, header_from_core_failure(&req_ctx, &failure)),
+            Ok(success) => {
+                tracing::info!(
+                    target: "metadata.state",
+                    op = "CommitFile",
+                    result = "committed",
+                    error_code = "none",
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    data_handle_id,
+                    file_handle = handle.handle_id,
+                    final_size,
+                    committed_block_count,
+                    committed_bytes,
+                    lease_id = lease_id_value,
+                    lease_epoch = handle.lease_epoch,
+                    file_version = success.payload.file_version,
+                    mount_version = success.mount_epoch,
+                    route_epoch = success.route_epoch,
+                    "CommitFile committed"
+                );
+                response_with_header!(
+                    CommitFileResponseProto {
+                        committed_size: success.payload.committed_size,
+                        file_version: success.payload.file_version,
+                        ..Default::default()
+                    },
+                    ok_header_from_core_success(&req_ctx, &success)
+                )
+            }
+            Err(failure) => {
+                tracing::warn!(
+                    target: "metadata.state",
+                    op = "CommitFile",
+                    result = "rejected",
+                    error_code = observe::canonical_error_kind(&failure.error),
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    data_handle_id,
+                    file_handle = handle.handle_id,
+                    final_size,
+                    committed_block_count,
+                    committed_bytes,
+                    lease_id = lease_id_value,
+                    lease_epoch = handle.lease_epoch,
+                    mount_version = failure.mount_epoch,
+                    route_epoch = failure.route_epoch,
+                    "CommitFile rejected"
+                );
+                error_response!(CommitFileResponseProto, header_from_core_failure(&req_ctx, &failure))
+            }
         }
     }
 
-    #[instrument(skip(self), fields(call_id, client_id))]
+    #[instrument(skip_all)]
     async fn abort_file_write(
         &self,
         request: Request<AbortFileWriteRequestProto>,
@@ -1530,12 +1809,14 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 self.guard_chain.check_meta_write(&req_ctx)
             );
         }
+        let lease_id = lease_id_from_proto(handle.lease_id);
+        let lease_id_value = lease_id.map(|lease_id| lease_id.as_raw());
         match self
             .fs_core
             .execute_abort_write(AbortWriteInput {
                 ctx: req_ctx.clone(),
                 file_handle: handle.handle_id,
-                lease_id: lease_id_from_proto(handle.lease_id),
+                lease_id,
                 lease_epoch: handle.lease_epoch,
                 open_epoch: handle.open_epoch,
                 fencing_token: presented_fencing_from_proto(handle.fencing_token),
@@ -1543,18 +1824,50 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             })
             .await
         {
-            Ok(success) => response_with_header!(
-                AbortFileWriteResponseProto::default(),
-                ok_header_from_core_success(&req_ctx, &success)
-            ),
-            Err(failure) => response_with_header!(
-                AbortFileWriteResponseProto::default(),
-                header_from_core_failure(&req_ctx, &failure)
-            ),
+            Ok(success) => {
+                tracing::info!(
+                    target: "metadata.state",
+                    op = "AbortFileWrite",
+                    result = "completed",
+                    error_code = "none",
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    file_handle = handle.handle_id,
+                    lease_id = lease_id_value,
+                    lease_epoch = handle.lease_epoch,
+                    mount_version = success.mount_epoch,
+                    route_epoch = success.route_epoch,
+                    "AbortFileWrite completed"
+                );
+                response_with_header!(
+                    AbortFileWriteResponseProto::default(),
+                    ok_header_from_core_success(&req_ctx, &success)
+                )
+            }
+            Err(failure) => {
+                tracing::warn!(
+                    target: "metadata.state",
+                    op = "AbortFileWrite",
+                    result = "rejected",
+                    error_code = observe::canonical_error_kind(&failure.error),
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    file_handle = handle.handle_id,
+                    lease_id = lease_id_value,
+                    lease_epoch = handle.lease_epoch,
+                    mount_version = failure.mount_epoch,
+                    route_epoch = failure.route_epoch,
+                    "AbortFileWrite rejected"
+                );
+                response_with_header!(
+                    AbortFileWriteResponseProto::default(),
+                    header_from_core_failure(&req_ctx, &failure)
+                )
+            }
         }
     }
 
-    #[instrument(skip(self), fields(call_id, client_id))]
+    #[instrument(skip_all)]
     async fn renew_lease(
         &self,
         request: Request<RenewLeaseRequestProto>,
@@ -1580,12 +1893,14 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 self.guard_chain.check_meta_write(&req_ctx)
             );
         }
+        let lease_id = lease_id_from_proto(handle.lease_id);
+        let lease_id_value = lease_id.map(|lease_id| lease_id.as_raw());
         match self
             .fs_core
             .execute_renew_inode_lease(RenewLeaseInput {
                 ctx: req_ctx.clone(),
                 file_handle: handle.handle_id,
-                lease_id: lease_id_from_proto(handle.lease_id),
+                lease_id,
                 lease_epoch: handle.lease_epoch,
                 open_epoch: handle.open_epoch,
                 fencing_token: presented_fencing_from_proto(handle.fencing_token),
@@ -1593,18 +1908,50 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             })
             .await
         {
-            Ok(success) => response_with_header!(
-                RenewLeaseResponseProto {
-                    expires_at_ms: success.payload.expires_at_ms,
-                    ..Default::default()
-                },
-                ok_header_from_core_success(&req_ctx, &success)
-            ),
-            Err(failure) => error_response!(RenewLeaseResponseProto, header_from_core_failure(&req_ctx, &failure)),
+            Ok(success) => {
+                tracing::info!(
+                    target: "metadata.state",
+                    op = "RenewLease",
+                    result = "completed",
+                    error_code = "none",
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    file_handle = handle.handle_id,
+                    lease_id = lease_id_value,
+                    lease_epoch = handle.lease_epoch,
+                    mount_version = success.mount_epoch,
+                    route_epoch = success.route_epoch,
+                    "RenewLease completed"
+                );
+                response_with_header!(
+                    RenewLeaseResponseProto {
+                        expires_at_ms: success.payload.expires_at_ms,
+                        ..Default::default()
+                    },
+                    ok_header_from_core_success(&req_ctx, &success)
+                )
+            }
+            Err(failure) => {
+                tracing::warn!(
+                    target: "metadata.state",
+                    op = "RenewLease",
+                    result = "rejected",
+                    error_code = observe::canonical_error_kind(&failure.error),
+                    client_id = %req_ctx.caller.client.client_id,
+                    call_id = %req_ctx.caller.client.call_id,
+                    file_handle = handle.handle_id,
+                    lease_id = lease_id_value,
+                    lease_epoch = handle.lease_epoch,
+                    mount_version = failure.mount_epoch,
+                    route_epoch = failure.route_epoch,
+                    "RenewLease rejected"
+                );
+                error_response!(RenewLeaseResponseProto, header_from_core_failure(&req_ctx, &failure))
+            }
         }
     }
 
-    #[instrument(skip(self), fields(call_id, client_id))]
+    #[instrument(skip_all)]
     async fn sync_write(
         &self,
         request: Request<SyncWriteRequestProto>,

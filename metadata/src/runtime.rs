@@ -240,7 +240,7 @@ pub fn init_observability(config: &MetadataConfig) -> Result<Observability, DynE
         rpc_addr = %config.rpc_addr,
         http_bind = %config.http_bind,
         storage_dir = %config.storage_dir.display(),
-        authz_filesystem_mode = ?config.authz.filesystem.mode,
+        authz_mode = ?config.authz.filesystem.mode,
         node_id = config.raft.node_id,
         raft_mode = ?config.raft.mode,
         authority_group_name = %config.authority.group_name,

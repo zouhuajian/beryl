@@ -399,70 +399,208 @@ impl WorkerCore {
     }
 
     pub async fn open_write(&self, req: WriteOpenRequest) -> WorkerCoreResult<WriteOpenResult> {
-        let frame_size = self.negotiate_frame_size(req.frame_size)?;
-        validate_write_open_request(&req)?;
-        reject_existing_final_block(self.block_store.as_ref(), &req)?;
-        let stream_id = self.next_stream_id()?;
+        let group_name = req.group_name.clone();
+        let block_id = req.block_id;
+        let worker_run_id = req.worker_run_id;
+        let data_handle_id = req.block_id.data_handle_id;
+        let block_stamp = req.block_stamp;
+        let result = async {
+            let frame_size = self.negotiate_frame_size(req.frame_size)?;
+            validate_write_open_request(&req)?;
+            reject_existing_final_block(self.block_store.as_ref(), &req)?;
+            let stream_id = self.next_stream_id()?;
 
-        self.block_store.create_staging_block(CreateStagingBlockRequest {
-            group_name: req.group_name.clone(),
-            block_id: req.block_id,
-            block_size: req.block_size,
-            block_format_id: req.block_format_id,
-            chunk_size: req.chunk_size,
-            checksum_kind: req.checksum_kind,
-            tier: req.tier,
-        })?;
+            match self.block_store.create_staging_block(CreateStagingBlockRequest {
+                group_name: req.group_name.clone(),
+                block_id: req.block_id,
+                block_size: req.block_size,
+                block_format_id: req.block_format_id,
+                chunk_size: req.chunk_size,
+                checksum_kind: req.checksum_kind,
+                tier: req.tier,
+            }) {
+                Ok(_) => tracing::info!(
+                    target: "worker.block",
+                    op = "CreateBlock",
+                    result = "created",
+                    error_code = "none",
+                    group_id = %group_name,
+                    block_id = %block_id,
+                    data_handle_id = data_handle_id.as_raw(),
+                    worker_run_id = %worker_run_id,
+                    block_stamp,
+                    "Block created"
+                ),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "worker.block",
+                        op = "CreateBlock",
+                        result = "rejected",
+                        error_code = observe::worker_error_kind(&error),
+                        group_id = %group_name,
+                        block_id = %block_id,
+                        data_handle_id = data_handle_id.as_raw(),
+                        worker_run_id = %worker_run_id,
+                        block_stamp,
+                        "Block create rejected"
+                    );
+                    return Err(error);
+                }
+            }
 
-        let context = StreamContext {
-            stream_id,
-            group_name: req.group_name,
-            block_id: req.block_id,
-            mode: StreamMode::Write,
-            worker_run_id: req.worker_run_id,
-            start_offset: 0,
-            end_offset: req.effective_len,
-            frame_size,
-            window_bytes: self.window_bytes(),
-            block_stamp: req.block_stamp,
-            block_format_id: req.block_format_id,
-            block_size: req.block_size,
-            chunk_size: req.chunk_size,
-            committed_length: 0,
-            effective_len: req.effective_len,
-            fencing_token: Some(req.token),
-        };
-        self.stream_manager.register(StreamState::new(context)).await;
+            let context = StreamContext {
+                stream_id,
+                group_name: req.group_name,
+                block_id: req.block_id,
+                mode: StreamMode::Write,
+                worker_run_id: req.worker_run_id,
+                start_offset: 0,
+                end_offset: req.effective_len,
+                frame_size,
+                window_bytes: self.window_bytes(),
+                block_stamp: req.block_stamp,
+                block_format_id: req.block_format_id,
+                block_size: req.block_size,
+                chunk_size: req.chunk_size,
+                committed_length: 0,
+                effective_len: req.effective_len,
+                fencing_token: Some(req.token),
+            };
+            self.stream_manager.register(StreamState::new(context)).await;
 
-        Ok(WriteOpenResult {
-            stream_id,
-            frame_size,
-            window_bytes: self.window_bytes(),
-            block_stamp: req.block_stamp,
-            committed_length: 0,
-        })
+            Ok(WriteOpenResult {
+                stream_id,
+                frame_size,
+                window_bytes: self.window_bytes(),
+                block_stamp: req.block_stamp,
+                committed_length: 0,
+            })
+        }
+        .await;
+        match &result {
+            Ok(opened) => tracing::info!(
+                target: "worker.state",
+                op = "OpenWrite",
+                result = "accepted",
+                error_code = "none",
+                group_id = %group_name,
+                block_id = %block_id,
+                stream_id = %opened.stream_id,
+                data_handle_id = data_handle_id.as_raw(),
+                worker_run_id = %worker_run_id,
+                block_stamp,
+                committed_length = opened.committed_length,
+                "OpenWrite accepted"
+            ),
+            Err(error) => tracing::warn!(
+                target: "worker.state",
+                op = "OpenWrite",
+                result = "rejected",
+                error_code = observe::worker_error_kind(error),
+                group_id = %group_name,
+                block_id = %block_id,
+                data_handle_id = data_handle_id.as_raw(),
+                worker_run_id = %worker_run_id,
+                block_stamp,
+                "OpenWrite rejected"
+            ),
+        }
+        result
     }
 
     pub async fn commit_write(&self, req: CommitWriteRequest) -> WorkerCoreResult<CommitWriteResult> {
-        let state = self.write_state(req.stream_id).await?;
-        validate_commit_request(&state, &req)?;
+        let group_name = req.group_name.clone();
+        let block_id = req.block_id;
+        let stream_id = req.stream_id;
+        let worker_run_id = req.worker_run_id;
+        let data_handle_id = req.block_id.data_handle_id;
+        let result = async {
+            let state = self.write_state(req.stream_id).await?;
+            validate_commit_request(&state, &req)?;
 
-        // FullBlockFileStore publishes synchronously, so require_sync currently
-        // selects the same conservative path as the default commit.
-        let _require_sync = req.require_sync;
-        let meta = self.block_store.publish_ready(PublishReadyRequest {
-            group_name: req.group_name,
-            block_id: req.block_id,
-            effective_len: req.effective_len,
-            block_stamp: req.block_stamp,
-        })?;
-        self.stream_manager.remove(req.stream_id).await;
+            // FullBlockFileStore publishes synchronously, so require_sync currently
+            // selects the same conservative path as the default commit.
+            let _require_sync = req.require_sync;
+            let meta = match self.block_store.publish_ready(PublishReadyRequest {
+                group_name: req.group_name,
+                block_id: req.block_id,
+                effective_len: req.effective_len,
+                block_stamp: req.block_stamp,
+            }) {
+                Ok(meta) => {
+                    tracing::info!(
+                        target: "worker.block",
+                        op = "publish_ready",
+                        result = "completed",
+                        error_code = "none",
+                        group_id = %group_name,
+                        block_id = %block_id,
+                        stream_id = %stream_id,
+                        data_handle_id = data_handle_id.as_raw(),
+                        worker_run_id = %worker_run_id,
+                        committed_length = meta.source.effective_len,
+                        ready_chunks = 1_u64,
+                        corrupt_chunks = 0_u64,
+                        block_stamp = meta.visibility.block_stamp,
+                        "Block publish_ready completed"
+                    );
+                    meta
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "worker.block",
+                        op = "publish_ready",
+                        result = "rejected",
+                        error_code = observe::worker_error_kind(&error),
+                        group_id = %group_name,
+                        block_id = %block_id,
+                        stream_id = %stream_id,
+                        data_handle_id = data_handle_id.as_raw(),
+                        worker_run_id = %worker_run_id,
+                        "Block publish_ready rejected"
+                    );
+                    return Err(error);
+                }
+            };
+            tracing::info!(
+                target: "worker.state",
+                op = "CommitWrite",
+                result = "completed",
+                error_code = "none",
+                group_id = %group_name,
+                block_id = %block_id,
+                stream_id = %stream_id,
+                data_handle_id = data_handle_id.as_raw(),
+                worker_run_id = %worker_run_id,
+                committed_length = meta.source.effective_len,
+                bytes_written = meta.source.effective_len,
+                block_stamp = meta.visibility.block_stamp,
+                "CommitWrite completed"
+            );
+            self.stream_manager.remove(req.stream_id).await;
 
-        Ok(CommitWriteResult {
-            effective_len: meta.source.effective_len,
-            block_stamp: meta.visibility.block_stamp,
-            written_through: meta.source.effective_len,
-        })
+            Ok(CommitWriteResult {
+                effective_len: meta.source.effective_len,
+                block_stamp: meta.visibility.block_stamp,
+                written_through: meta.source.effective_len,
+            })
+        }
+        .await;
+        if let Err(error) = &result {
+            tracing::warn!(
+                target: "worker.state",
+                op = "CommitWrite",
+                result = "rejected",
+                error_code = observe::worker_error_kind(error),
+                group_id = %group_name,
+                block_id = %block_id,
+                stream_id = %stream_id,
+                data_handle_id = data_handle_id.as_raw(),
+                worker_run_id = %worker_run_id,
+                "CommitWrite rejected"
+            );
+        }
+        result
     }
 
     pub async fn sync_committed_block(

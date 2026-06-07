@@ -1763,6 +1763,7 @@ dependencies = [
  "tonic",
  "tonic-health",
  "tracing",
+ "tracing-subscriber",
  "types",
  "ufs",
  "uuid",
@@ -4032,6 +4033,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "tracing-subscriber",
  "types",
  "uuid",
 ]

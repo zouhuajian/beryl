@@ -22,7 +22,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tonic::{Request, Response, Status};
-use tracing::{info, instrument, warn, Span};
+use tracing::{info, instrument, warn};
 use types::{BlockId, GroupName, TierFree, WorkerId, WorkerRunId};
 
 /// Worker service background task handles.
@@ -354,25 +354,6 @@ impl MetadataWorkerServiceImpl {
         })
     }
 
-    fn map_report_error(
-        &self,
-        req_header: &Option<proto::common::RequestHeaderProto>,
-        error: MetadataError,
-    ) -> Result<Response<BlockReportResponseProto>, Status> {
-        match error {
-            MetadataError::NotFound(message) => {
-                self.need_register_response::<BlockReportResponseProto>(req_header, message)
-            }
-            MetadataError::StaleState(message) => {
-                self.worker_run_mismatch_response::<BlockReportResponseProto>(req_header, message)
-            }
-            MetadataError::FullReportRequired(message) => {
-                self.full_report_required_response::<BlockReportResponseProto>(req_header, message)
-            }
-            other => self.metadata_error_response::<BlockReportResponseProto>(req_header, other),
-        }
-    }
-
     fn record_worker_rpc_outcome<T>(
         method: &'static str,
         metric: MetadataWorkerMetric,
@@ -495,7 +476,6 @@ fn merge_request_header_transport_context(
     header: &mut Option<proto::common::RequestHeaderProto>,
     context: &ExtractedContext,
 ) {
-    record_transport_context(context);
     let Some(header) = header else {
         return;
     };
@@ -519,12 +499,6 @@ fn merge_request_header_transport_context(
 
 fn trace_context_proto_is_empty(context: &proto::common::TraceContextProto) -> bool {
     context.traceparent.is_none() && context.tracestate.is_none() && context.baggage.is_none()
-}
-
-fn record_transport_context(context: &ExtractedContext) {
-    if let Some(traceparent) = &context.traceparent {
-        Span::current().record("traceparent", traceparent);
-    }
 }
 
 fn validate_advertised_endpoint(endpoint: proto::common::EndpointProto) -> Result<String, String> {
@@ -593,19 +567,7 @@ fn parse_metadata_endpoint(address: &str) -> Option<proto::common::EndpointProto
 
 #[tonic::async_trait]
 impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
-    #[instrument(
-        skip(self, request),
-        fields(
-            call_id,
-            client_id,
-            group_name,
-            worker_id,
-            worker_run_id,
-            endpoint,
-            protocol,
-            traceparent
-        )
-    )]
+    #[instrument(skip_all)]
     async fn register_worker(
         &self,
         request: Request<RegisterWorkerRequestProto>,
@@ -638,7 +600,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     )
                 }
             };
-            Span::current().record("group_name", group_name.as_str());
             if let Err(message) = check_header_group_name(&req.header, &group_name) {
                 return self.invalid_request_response::<RegisterWorkerResponseProto>(&req.header, message);
             }
@@ -658,7 +619,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     "worker_id must be non-zero",
                 );
             }
-            Span::current().record("worker_id", worker_id.as_raw());
             let worker_run_id = match req.worker_run_id.parse::<WorkerRunId>() {
                 Ok(worker_run_id) => worker_run_id,
                 Err(error) => {
@@ -668,9 +628,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     )
                 }
             };
-            Span::current().record("worker_run_id", worker_run_id.to_string());
             let worker_net_protocol = req.worker_net_protocol;
-            Span::current().record("protocol", worker_net_protocol_label(worker_net_protocol));
             if req.worker_net_protocol() != proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc {
                 return self.invalid_request_response::<RegisterWorkerResponseProto>(
                     &req.header,
@@ -693,7 +651,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     return self.invalid_request_response::<RegisterWorkerResponseProto>(&req.header, message)
                 }
             };
-            Span::current().record("endpoint", address.as_str());
             if let Err(error) = self.worker_manager.validate_worker_registration_preflight(
                 &group_name,
                 worker_id,
@@ -736,6 +693,10 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             }
 
             info!(
+                target: "metadata.worker",
+                op = "RegisterWorker",
+                result = "accepted",
+                error_code = "none",
                 event = "worker_registered",
                 group_name = %group_name,
                 worker_id = accepted_worker_id.as_raw(),
@@ -757,19 +718,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         outcome
     }
 
-    #[instrument(
-        skip(self, request),
-        fields(
-            call_id,
-            client_id,
-            group_name,
-            worker_id,
-            worker_run_id,
-            endpoint,
-            protocol,
-            traceparent
-        )
-    )]
+    #[instrument(skip_all)]
     async fn heartbeat(
         &self,
         request: Request<HeartbeatRequestProto>,
@@ -793,7 +742,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     )
                 }
             };
-            Span::current().record("group_name", group_name.as_str());
             if let Err(message) = check_header_group_name(&req.header, &group_name) {
                 return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, message);
             }
@@ -811,7 +759,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 return self
                     .invalid_request_response::<HeartbeatResponseProto>(&req.header, "worker_id must be non-zero");
             }
-            Span::current().record("worker_id", worker_id.as_raw());
             let worker_run_id = match req.worker_run_id.parse::<WorkerRunId>() {
                 Ok(worker_run_id) => worker_run_id,
                 Err(error) => {
@@ -821,7 +768,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     )
                 }
             };
-            Span::current().record("worker_run_id", worker_run_id.to_string());
 
             let capacity = match req.capacity.as_ref() {
                 Some(capacity) => capacity,
@@ -841,7 +787,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
 
             let health_proto = req.health();
             let worker_net_protocol = req.worker_net_protocol;
-            Span::current().record("protocol", worker_net_protocol_label(worker_net_protocol));
             if req.worker_net_protocol() != proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc {
                 return self.invalid_request_response::<HeartbeatResponseProto>(
                     &req.header,
@@ -861,13 +806,27 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 Ok(address) => address,
                 Err(message) => return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, message),
             };
-            Span::current().record("endpoint", advertised_endpoint.as_str());
-
             self.worker_manager.expire_liveness();
 
             let descriptor = match self.worker_manager.get_descriptor(&group_name, worker_id) {
                 Some(descriptor) => descriptor,
                 None => {
+                    if self.worker_manager.mark_heartbeat_need_register_if_changed(
+                        &group_name,
+                        worker_id,
+                        worker_run_id,
+                    ) {
+                        warn!(
+                            target: "metadata.worker",
+                            op = "Heartbeat",
+                            result = "rejected",
+                            error_code = "need_register",
+                            group_name = %group_name,
+                            worker_id = worker_id.as_raw(),
+                            worker_run_id = %worker_run_id,
+                            "Heartbeat rejected"
+                        );
+                    }
                     return self.need_register_response::<HeartbeatResponseProto>(
                         &req.header,
                         format!(
@@ -881,6 +840,22 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             let registration = match self.worker_manager.get_registration(&group_name, worker_id) {
                 Some(registration) => registration,
                 None => {
+                    if self.worker_manager.mark_heartbeat_need_register_if_changed(
+                        &group_name,
+                        worker_id,
+                        worker_run_id,
+                    ) {
+                        warn!(
+                            target: "metadata.worker",
+                            op = "Heartbeat",
+                            result = "rejected",
+                            error_code = "need_register",
+                            group_name = %group_name,
+                            worker_id = worker_id.as_raw(),
+                            worker_run_id = %worker_run_id,
+                            "Heartbeat rejected"
+                        );
+                    }
                     return self.need_register_response::<HeartbeatResponseProto>(
                         &req.header,
                         format!(
@@ -892,6 +867,22 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 }
             };
             if registration.worker_run_id != worker_run_id {
+                if self
+                    .worker_manager
+                    .mark_heartbeat_run_mismatch_if_changed(&group_name, worker_id, worker_run_id)
+                {
+                    warn!(
+                        target: "metadata.worker",
+                        op = "Heartbeat",
+                        result = "rejected",
+                        error_code = "worker_run_mismatch",
+                        group_name = %group_name,
+                        worker_id = worker_id.as_raw(),
+                        worker_run_id = %worker_run_id,
+                        expected_worker_run_id = %registration.worker_run_id,
+                        "Heartbeat rejected"
+                    );
+                }
                 return self.worker_run_mismatch_response::<HeartbeatResponseProto>(
                     &req.header,
                     format!(
@@ -932,9 +923,40 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             ) {
                 Ok(live_state) => live_state,
                 Err(MetadataError::NotFound(message)) => {
+                    if self.worker_manager.mark_heartbeat_need_register_if_changed(
+                        &group_name,
+                        worker_id,
+                        worker_run_id,
+                    ) {
+                        warn!(
+                            target: "metadata.worker",
+                            op = "Heartbeat",
+                            result = "rejected",
+                            error_code = "need_register",
+                            group_name = %group_name,
+                            worker_id = worker_id.as_raw(),
+                            worker_run_id = %worker_run_id,
+                            "Heartbeat rejected"
+                        );
+                    }
                     return self.need_register_response::<HeartbeatResponseProto>(&req.header, message);
                 }
                 Err(MetadataError::StaleState(message)) => {
+                    if self
+                        .worker_manager
+                        .mark_heartbeat_run_mismatch_if_changed(&group_name, worker_id, worker_run_id)
+                    {
+                        warn!(
+                            target: "metadata.worker",
+                            op = "Heartbeat",
+                            result = "rejected",
+                            error_code = "worker_run_mismatch",
+                            group_name = %group_name,
+                            worker_id = worker_id.as_raw(),
+                            worker_run_id = %worker_run_id,
+                            "Heartbeat rejected"
+                        );
+                    }
                     return self.worker_run_mismatch_response::<HeartbeatResponseProto>(&req.header, message);
                 }
                 Err(MetadataError::InvalidArgument(message)) => {
@@ -978,24 +1000,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
         outcome
     }
 
-    #[instrument(
-        skip(self, request),
-        fields(
-            call_id,
-            client_id,
-            group_name,
-            worker_id,
-            worker_run_id,
-            report_kind,
-            report_seq,
-            batch_seq,
-            delta_seq,
-            final_batch,
-            added_blocks,
-            removed_blocks,
-            traceparent
-        )
-    )]
+    #[instrument(skip_all)]
     async fn block_report(
         &self,
         request: Request<BlockReportRequestProto>,
@@ -1020,7 +1025,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     )
                 }
             };
-            Span::current().record("group_name", group_name.as_str());
             if let Err(message) = check_header_group_name(&req.header, &group_name) {
                 return self.invalid_request_response::<BlockReportResponseProto>(&req.header, message);
             }
@@ -1038,7 +1042,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 return self
                     .invalid_request_response::<BlockReportResponseProto>(&req.header, "worker_id must be non-zero");
             }
-            Span::current().record("worker_id", worker_id.as_raw());
             let worker_run_id = match req.worker_run_id.parse::<WorkerRunId>() {
                 Ok(worker_run_id) => worker_run_id,
                 Err(error) => {
@@ -1048,9 +1051,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     )
                 }
             };
-            Span::current().record("worker_run_id", worker_run_id.to_string());
             let report_seq = req.report_seq;
-            Span::current().record("report_seq", report_seq);
             let Some(report) = req.report else {
                 return self.invalid_request_response::<BlockReportResponseProto>(
                     &req.header,
@@ -1058,13 +1059,10 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 );
             };
 
-            let (result, report_kind, batch_seq, final_batch) = match report {
+            let (result, report_kind, batch_seq, delta_seq, final_batch) = match report {
                 block_report_request_proto::Report::Full(full) => {
                     let batch_seq = full.batch_seq;
                     let final_batch = full.final_batch;
-                    Span::current().record("report_kind", "full");
-                    Span::current().record("batch_seq", batch_seq);
-                    Span::current().record("final_batch", final_batch);
                     let mut blocks = Vec::with_capacity(full.blocks.len());
                     for block in full.blocks {
                         match Self::proto_to_report_block(block) {
@@ -1084,13 +1082,66 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                         blocks,
                     ) {
                         Ok(result) => result,
-                        Err(error) => return self.map_report_error(&req.header, error),
+                        Err(MetadataError::NotFound(message)) => {
+                            warn!(
+                                target: "metadata.worker",
+                                op = "BlockReport",
+                                result = "rejected",
+                                error_code = "need_register",
+                                report_kind = "full",
+                                group_name = %group_name,
+                                worker_id = worker_id.as_raw(),
+                                worker_run_id = %worker_run_id,
+                                report_seq,
+                                batch_seq,
+                                final_batch,
+                                "Block report rejected"
+                            );
+                            return self.need_register_response::<BlockReportResponseProto>(&req.header, message);
+                        }
+                        Err(MetadataError::StaleState(message)) => {
+                            warn!(
+                                target: "metadata.worker",
+                                op = "BlockReport",
+                                result = "rejected",
+                                error_code = "worker_run_mismatch",
+                                report_kind = "full",
+                                group_name = %group_name,
+                                worker_id = worker_id.as_raw(),
+                                worker_run_id = %worker_run_id,
+                                report_seq,
+                                batch_seq,
+                                final_batch,
+                                "Block report rejected"
+                            );
+                            return self.worker_run_mismatch_response::<BlockReportResponseProto>(&req.header, message);
+                        }
+                        Err(MetadataError::FullReportRequired(message)) => {
+                            warn!(
+                                target: "metadata.worker",
+                                op = "BlockReport",
+                                result = "rejected",
+                                error_code = "full_report_required",
+                                report_kind = "full",
+                                group_name = %group_name,
+                                worker_id = worker_id.as_raw(),
+                                worker_run_id = %worker_run_id,
+                                report_seq,
+                                batch_seq,
+                                final_batch,
+                                "Block report rejected"
+                            );
+                            return self
+                                .full_report_required_response::<BlockReportResponseProto>(&req.header, message);
+                        }
+                        Err(error) => {
+                            return self.metadata_error_response::<BlockReportResponseProto>(&req.header, error)
+                        }
                     };
-                    (result, "full", Some(batch_seq), Some(final_batch))
+                    (result, "full", Some(batch_seq), None, Some(final_batch))
                 }
                 block_report_request_proto::Report::Delta(delta) => {
-                    Span::current().record("report_kind", "delta");
-                    Span::current().record("delta_seq", delta.delta_seq);
+                    let delta_seq = delta.delta_seq;
                     let mut deltas = Vec::with_capacity(delta.deltas.len());
                     for delta in delta.deltas {
                         match Self::proto_to_delta(delta) {
@@ -1105,17 +1156,66 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                         worker_id,
                         worker_run_id,
                         report_seq,
-                        delta.delta_seq,
+                        delta_seq,
                         deltas,
                     ) {
                         Ok(result) => result,
-                        Err(error) => return self.map_report_error(&req.header, error),
+                        Err(MetadataError::NotFound(message)) => {
+                            warn!(
+                                target: "metadata.worker",
+                                op = "BlockReport",
+                                result = "rejected",
+                                error_code = "need_register",
+                                report_kind = "delta",
+                                group_name = %group_name,
+                                worker_id = worker_id.as_raw(),
+                                worker_run_id = %worker_run_id,
+                                report_seq,
+                                delta_seq,
+                                "Block report rejected"
+                            );
+                            return self.need_register_response::<BlockReportResponseProto>(&req.header, message);
+                        }
+                        Err(MetadataError::StaleState(message)) => {
+                            warn!(
+                                target: "metadata.worker",
+                                op = "BlockReport",
+                                result = "rejected",
+                                error_code = "worker_run_mismatch",
+                                report_kind = "delta",
+                                group_name = %group_name,
+                                worker_id = worker_id.as_raw(),
+                                worker_run_id = %worker_run_id,
+                                report_seq,
+                                delta_seq,
+                                "Block report rejected"
+                            );
+                            return self.worker_run_mismatch_response::<BlockReportResponseProto>(&req.header, message);
+                        }
+                        Err(MetadataError::FullReportRequired(message)) => {
+                            warn!(
+                                target: "metadata.worker",
+                                op = "BlockReport",
+                                result = "rejected",
+                                error_code = "full_report_required",
+                                report_kind = "delta",
+                                group_name = %group_name,
+                                worker_id = worker_id.as_raw(),
+                                worker_run_id = %worker_run_id,
+                                report_seq,
+                                delta_seq,
+                                "Block report rejected"
+                            );
+                            return self
+                                .full_report_required_response::<BlockReportResponseProto>(&req.header, message);
+                        }
+                        Err(error) => {
+                            return self.metadata_error_response::<BlockReportResponseProto>(&req.header, error)
+                        }
                     };
-                    (result, "delta", None, None)
+                    (result, "delta", None, Some(delta_seq), None)
                 }
             };
-            Span::current().record("added_blocks", result.added_blocks.len() as u64);
-            Span::current().record("removed_blocks", result.removed_blocks.len() as u64);
 
             // In-memory worker state counters.
             let total_blocks = result.added_blocks.len() + result.removed_blocks.len();
@@ -1126,34 +1226,52 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             observe::record_worker_block_report_blocks("added", result.added_blocks.len());
             observe::record_worker_block_report_blocks("removed", result.removed_blocks.len());
 
-            if let (Some(batch_seq), Some(final_batch)) = (batch_seq, final_batch) {
-                info!(
-                    event = "metadata_worker_block_report_processed",
-                    group_name = %group_name,
-                    worker_id = worker_id.as_raw(),
-                    worker_run_id = %worker_run_id,
-                    report_kind,
-                    report_seq,
-                    batch_seq,
-                    final_batch,
-                    next_delta_seq = result.next_delta_seq,
-                    added_blocks = result.added_blocks.len(),
-                    removed_blocks = result.removed_blocks.len(),
-                    "Block report processed"
-                );
-            } else {
-                info!(
-                    event = "metadata_worker_block_report_processed",
-                    group_name = %group_name,
-                    worker_id = worker_id.as_raw(),
-                    worker_run_id = %worker_run_id,
-                    report_kind,
-                    report_seq,
-                    next_delta_seq = result.next_delta_seq,
-                    added_blocks = result.added_blocks.len(),
-                    removed_blocks = result.removed_blocks.len(),
-                    "Block report processed"
-                );
+            let changed_block_count = result.added_blocks.len() + result.removed_blocks.len();
+            let full_baseline_changed = matches!((batch_seq, final_batch), (Some(_), Some(true)))
+                && (result.baseline_established || result.baseline_replaced);
+            if changed_block_count > 0 || full_baseline_changed {
+                if let (Some(batch_seq), Some(final_batch)) = (batch_seq, final_batch) {
+                    info!(
+                        target: "metadata.block",
+                        op = "FullBlockReport",
+                        result = "processed",
+                        error_code = "none",
+                        report_kind,
+                        client_id = %_caller_ctx.client.client_id.as_raw(),
+                        call_id = %_caller_ctx.client.call_id,
+                        group_name = %group_name,
+                        worker_id = worker_id.as_raw(),
+                        worker_run_id = %worker_run_id,
+                        report_seq,
+                        batch_seq,
+                        final_batch,
+                        next_delta_seq = result.next_delta_seq,
+                        added_blocks = result.added_blocks.len(),
+                        removed_blocks = result.removed_blocks.len(),
+                        changed_block_count,
+                        "Full block report processed"
+                    );
+                } else if let Some(delta_seq) = delta_seq {
+                    info!(
+                        target: "metadata.block",
+                        op = "DeltaBlockReport",
+                        result = "processed",
+                        error_code = "none",
+                        report_kind,
+                        client_id = %_caller_ctx.client.client_id.as_raw(),
+                        call_id = %_caller_ctx.client.call_id,
+                        group_name = %group_name,
+                        worker_id = worker_id.as_raw(),
+                        worker_run_id = %worker_run_id,
+                        report_seq,
+                        delta_seq,
+                        next_delta_seq = result.next_delta_seq,
+                        added_blocks = result.added_blocks.len(),
+                        removed_blocks = result.removed_blocks.len(),
+                        changed_block_count,
+                        "Delta block report processed"
+                    );
+                }
             }
 
             Ok(Response::new(BlockReportResponseProto {
@@ -1184,9 +1302,93 @@ mod tests {
         Counter, CounterFn, Gauge, Histogram, HistogramFn, Key, KeyName, Metadata, Recorder, SharedString, Unit,
     };
     use proto::common::{error_detail_proto, ErrorClassProto, RefreshReasonProto, RpcErrorCodeProto};
-    use std::sync::Mutex;
+    use std::io;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::{fmt, layer::SubscriberExt, Registry};
     use types::ClientId;
+
+    #[derive(Clone)]
+    struct LogCaptureWriter {
+        output: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl LogCaptureWriter {
+        fn new(output: Arc<Mutex<Vec<u8>>>) -> Self {
+            Self { output }
+        }
+    }
+
+    impl io::Write for LogCaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.output
+                .lock()
+                .expect("log output must not be poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn captured_logs(output: &Arc<Mutex<Vec<u8>>>) -> Vec<serde_json::Value> {
+        let bytes = output.lock().expect("log output must not be poisoned").clone();
+        let text = String::from_utf8(bytes).expect("logs must be utf8");
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap_or_else(|err| panic!("invalid json log {line:?}: {err}")))
+            .collect()
+    }
+
+    fn captured_text(output: &Arc<Mutex<Vec<u8>>>) -> String {
+        let bytes = output.lock().expect("log output must not be poisoned").clone();
+        String::from_utf8(bytes).expect("logs must be utf8")
+    }
+
+    fn log_test_mutex() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    fn captured_json_subscriber(output: &Arc<Mutex<Vec<u8>>>) -> tracing::Dispatch {
+        let writer = LogCaptureWriter::new(Arc::clone(output));
+        let subscriber = Registry::default().with(
+            fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_span_list(false)
+                .with_ansi(false)
+                .with_target(true)
+                .with_file(false)
+                .with_line_number(false)
+                .with_writer(move || writer.clone()),
+        );
+        tracing::Dispatch::new(subscriber)
+    }
+
+    fn captured_text_subscriber(output: &Arc<Mutex<Vec<u8>>>) -> tracing::Dispatch {
+        let writer = LogCaptureWriter::new(Arc::clone(output));
+        let subscriber = Registry::default().with(
+            fmt::layer()
+                .compact()
+                .with_ansi(false)
+                .with_target(true)
+                .with_file(false)
+                .with_line_number(false)
+                .with_writer(move || writer.clone()),
+        );
+        tracing::Dispatch::new(subscriber)
+    }
+
+    fn header_client_identity(header: &proto::common::RequestHeaderProto) -> (String, String) {
+        let client = ::common::header::ClientInfo::try_from(header.client.clone().expect("client info"))
+            .expect("valid client info");
+        (client.client_id.as_raw().to_string(), client.call_id.to_string())
+    }
 
     fn group_name(raw: &str) -> GroupName {
         GroupName::parse(raw).unwrap()
@@ -1495,6 +1697,913 @@ mod tests {
             "message {:?} did not contain {:?}",
             error.message,
             expected_message
+        );
+    }
+
+    #[tokio::test]
+    async fn register_worker_accepted_emits_metadata_worker_log() {
+        let _log_guard = log_test_mutex().lock().await;
+        let dir = TempDir::new().unwrap();
+        let raft_node = leader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        raft_node.set_worker_manager(Arc::clone(&worker_manager)).unwrap();
+        let service = MetadataWorkerServiceImpl::new(
+            Arc::clone(&raft_node),
+            Arc::clone(&worker_manager),
+            Arc::new(MountTable::new()),
+            group_name("root"),
+        );
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = captured_json_subscriber(&output);
+
+        async {
+            let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
+                &service,
+                Request::new(register_request_with_header(
+                    Some(valid_request_header(&group_name("root"), ClientId::new(181))),
+                    WorkerId::new(181),
+                )),
+            )
+            .await
+            .expect("register worker response")
+            .into_inner();
+            assert!(response.header.expect("header").error.is_none());
+        }
+        .with_subscriber(dispatch)
+        .await;
+
+        let logs = captured_logs(&output);
+        assert!(
+            logs.iter().any(|log| {
+                log["target"] == "metadata.worker"
+                    && log["level"] == "INFO"
+                    && log["op"] == "RegisterWorker"
+                    && log["result"] == "accepted"
+                    && log["error_code"] == "none"
+                    && log["group_name"] == "root"
+                    && log.get("group_id").is_none()
+                    && log["worker_id"] == 181
+                    && log["worker_run_id"] == test_worker_run_id().to_string()
+            }),
+            "{logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_heartbeat_need_register_emits_one_metadata_worker_warn_log() {
+        let _log_guard = log_test_mutex().lock().await;
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_id = WorkerId::new(182);
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(MountTable::new()),
+            group_name("root"),
+        );
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = captured_json_subscriber(&output);
+
+        async {
+            for heartbeat_seq in [1, 2] {
+                let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+                    &service,
+                    Request::new(heartbeat_request(
+                        group_name("root"),
+                        worker_id,
+                        test_worker_run_id(),
+                        heartbeat_seq,
+                        9090,
+                    )),
+                )
+                .await
+                .expect("heartbeat business error uses gRPC OK")
+                .into_inner();
+                let error = response.header.expect("header").error.expect("header error");
+                assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+                assert!(matches!(
+                    error.code,
+                    Some(error_detail_proto::Code::RpcCode(code))
+                        if code == RpcErrorCodeProto::RpcErrCodeWorkerNotRegistered as i32
+                ));
+                assert_eq!(
+                    error.refresh_reason,
+                    RefreshReasonProto::RefreshReasonNeedRegister as i32
+                );
+            }
+        }
+        .with_subscriber(dispatch)
+        .await;
+
+        let logs = captured_logs(&output);
+        let warn_logs: Vec<_> = logs
+            .iter()
+            .filter(|log| {
+                log["target"] == "metadata.worker"
+                    && log["level"] == "WARN"
+                    && log["op"] == "Heartbeat"
+                    && log["result"] == "rejected"
+                    && log["error_code"] == "need_register"
+            })
+            .collect();
+        assert_eq!(warn_logs.len(), 1, "{logs:?}");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_need_register_with_new_worker_run_id_emits_new_metadata_worker_warn_log() {
+        let _log_guard = log_test_mutex().lock().await;
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_id = WorkerId::new(190);
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(MountTable::new()),
+            group_name("root"),
+        );
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = captured_json_subscriber(&output);
+
+        async {
+            for (heartbeat_seq, worker_run_id) in [(1, test_worker_run_id()), (2, second_worker_run_id())] {
+                let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+                    &service,
+                    Request::new(heartbeat_request(
+                        group_name("root"),
+                        worker_id,
+                        worker_run_id,
+                        heartbeat_seq,
+                        9090,
+                    )),
+                )
+                .await
+                .expect("heartbeat business error uses gRPC OK")
+                .into_inner();
+                let error = response.header.expect("header").error.expect("header error");
+                assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+                assert!(matches!(
+                    error.code,
+                    Some(error_detail_proto::Code::RpcCode(code))
+                        if code == RpcErrorCodeProto::RpcErrCodeWorkerNotRegistered as i32
+                ));
+                assert_eq!(
+                    error.refresh_reason,
+                    RefreshReasonProto::RefreshReasonNeedRegister as i32
+                );
+            }
+        }
+        .with_subscriber(dispatch)
+        .await;
+
+        let logs = captured_logs(&output);
+        let warn_logs: Vec<_> = logs
+            .iter()
+            .filter(|log| {
+                log["target"] == "metadata.worker"
+                    && log["level"] == "WARN"
+                    && log["op"] == "Heartbeat"
+                    && log["result"] == "rejected"
+                    && log["error_code"] == "need_register"
+            })
+            .collect();
+        assert_eq!(warn_logs.len(), 2, "{logs:?}");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejection_reason_change_emits_new_metadata_worker_warn_log() {
+        let _log_guard = log_test_mutex().lock().await;
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_id = WorkerId::new(191);
+        let worker_run_id = test_worker_run_id();
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            Arc::clone(&worker_manager),
+            Arc::new(MountTable::new()),
+            group_name("root"),
+        );
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = captured_json_subscriber(&output);
+
+        async {
+            let need_register = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+                &service,
+                Request::new(heartbeat_request(group_name("root"), worker_id, worker_run_id, 1, 9090)),
+            )
+            .await
+            .expect("need-register heartbeat returns gRPC OK")
+            .into_inner();
+            let need_register_error = need_register.header.expect("header").error.expect("header error");
+            assert_eq!(
+                need_register_error.refresh_reason,
+                RefreshReasonProto::RefreshReasonNeedRegister as i32
+            );
+
+            worker_manager
+                .register_worker_run(
+                    &group_name("root"),
+                    worker_id,
+                    "127.0.0.1:9090".to_string(),
+                    1,
+                    second_worker_run_id(),
+                    None,
+                )
+                .unwrap();
+
+            let run_mismatch = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+                &service,
+                Request::new(heartbeat_request(group_name("root"), worker_id, worker_run_id, 2, 9090)),
+            )
+            .await
+            .expect("run-mismatch heartbeat returns gRPC OK")
+            .into_inner();
+            let run_mismatch_error = run_mismatch.header.expect("header").error.expect("header error");
+            assert_eq!(
+                run_mismatch_error.refresh_reason,
+                RefreshReasonProto::RefreshReasonWorkerRunMismatch as i32
+            );
+        }
+        .with_subscriber(dispatch)
+        .await;
+
+        let logs = captured_logs(&output);
+        let warn_logs: Vec<_> = logs
+            .iter()
+            .filter(|log| log["target"] == "metadata.worker" && log["level"] == "WARN" && log["op"] == "Heartbeat")
+            .collect();
+        assert_eq!(warn_logs.len(), 2, "{logs:?}");
+        assert_eq!(warn_logs[0]["error_code"], "need_register");
+        assert_eq!(warn_logs[1]["error_code"], "worker_run_mismatch");
+    }
+
+    #[tokio::test]
+    async fn repeated_heartbeat_worker_run_mismatch_emits_one_metadata_worker_warn_log() {
+        let _log_guard = log_test_mutex().lock().await;
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_id = WorkerId::new(183);
+        worker_manager
+            .register_worker_run(
+                &group_name("root"),
+                worker_id,
+                "127.0.0.1:9090".to_string(),
+                1,
+                test_worker_run_id(),
+                None,
+            )
+            .unwrap();
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(MountTable::new()),
+            group_name("root"),
+        );
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = captured_json_subscriber(&output);
+
+        async {
+            for heartbeat_seq in [1, 2] {
+                let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+                    &service,
+                    Request::new(heartbeat_request(
+                        group_name("root"),
+                        worker_id,
+                        second_worker_run_id(),
+                        heartbeat_seq,
+                        9090,
+                    )),
+                )
+                .await
+                .expect("heartbeat business error uses gRPC OK")
+                .into_inner();
+                let error = response.header.expect("header").error.expect("header error");
+                assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+                assert!(matches!(
+                    error.code,
+                    Some(error_detail_proto::Code::RpcCode(code))
+                        if code == RpcErrorCodeProto::RpcErrCodeWorkerRunMismatch as i32
+                ));
+                assert_eq!(
+                    error.refresh_reason,
+                    RefreshReasonProto::RefreshReasonWorkerRunMismatch as i32
+                );
+            }
+        }
+        .with_subscriber(dispatch)
+        .await;
+
+        let logs = captured_logs(&output);
+        let warn_logs: Vec<_> = logs
+            .iter()
+            .filter(|log| {
+                log["target"] == "metadata.worker"
+                    && log["level"] == "WARN"
+                    && log["op"] == "Heartbeat"
+                    && log["result"] == "rejected"
+                    && log["error_code"] == "worker_run_mismatch"
+            })
+            .collect();
+        assert_eq!(warn_logs.len(), 1, "{logs:?}");
+    }
+
+    #[tokio::test]
+    async fn accepted_heartbeat_without_state_change_emits_no_metadata_worker_info_log() {
+        let _log_guard = log_test_mutex().lock().await;
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let group_name = group_name("root");
+        let worker_id = WorkerId::new(186);
+        let worker_run_id = test_worker_run_id();
+        worker_manager
+            .register_worker_run(
+                &group_name,
+                worker_id,
+                "127.0.0.1:9090".to_string(),
+                1,
+                worker_run_id,
+                None,
+            )
+            .unwrap();
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(MountTable::new()),
+            group_name.clone(),
+        );
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = captured_json_subscriber(&output);
+
+        async {
+            let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+                &service,
+                Request::new(heartbeat_request(group_name, worker_id, worker_run_id, 1, 9090)),
+            )
+            .await
+            .expect("heartbeat response")
+            .into_inner();
+            assert!(response.header.expect("header").error.is_none());
+        }
+        .with_subscriber(dispatch)
+        .await;
+
+        let logs = captured_logs(&output);
+        assert!(
+            logs.iter().all(|log| {
+                !(log["target"] == "metadata.worker" && log["level"] == "INFO" && log["op"] == "Heartbeat")
+            }),
+            "{logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_block_report_processed_emits_metadata_block_summary_log() {
+        let _log_guard = log_test_mutex().lock().await;
+        let dir = TempDir::new().unwrap();
+        let raft_node = leader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_id = WorkerId::new(184);
+        let block_id = BlockId::from_u64_u32(1840, 0);
+        worker_manager
+            .register_worker(&group_name("root"), worker_id, "127.0.0.1:9090".to_string(), 1, None)
+            .unwrap();
+        let worker_run_id = record_heartbeat(
+            &worker_manager,
+            &group_name("root"),
+            worker_id,
+            1_000,
+            100,
+            900,
+            0,
+            0,
+            HealthStatus::Healthy,
+        );
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(MountTable::new()),
+            group_name("root"),
+        );
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = captured_json_subscriber(&output);
+        let request = full_report_request(group_name("root"), worker_id, worker_run_id, 1, 0, true, vec![block_id]);
+        let (expected_client_id, expected_call_id) = header_client_identity(request.header.as_ref().expect("header"));
+
+        async {
+            let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+                &service,
+                Request::new(request),
+            )
+            .await
+            .expect("full block report response")
+            .into_inner();
+            assert!(response.header.expect("header").error.is_none());
+        }
+        .with_subscriber(dispatch)
+        .await;
+
+        let logs = captured_logs(&output);
+        assert!(
+            logs.iter().all(|log| {
+                log["level"] != "INFO" || matches!(log["target"].as_str(), Some("metadata.worker" | "metadata.block"))
+            }),
+            "{logs:?}"
+        );
+        assert!(
+            logs.iter().any(|log| {
+                log["target"] == "metadata.block"
+                    && log["level"] == "INFO"
+                    && log["op"] == "FullBlockReport"
+                    && log["result"] == "processed"
+                    && log["error_code"] == "none"
+                    && log["changed_block_count"] == 1
+                    && log["client_id"] == expected_client_id
+                    && log["call_id"] == expected_call_id
+            }),
+            "{logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_full_block_report_without_changes_emits_no_metadata_block_info_summary() {
+        let _log_guard = log_test_mutex().lock().await;
+        let dir = TempDir::new().unwrap();
+        let raft_node = leader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let group_name = group_name("root");
+        let worker_id = WorkerId::new(192);
+        let block_id = BlockId::from_u64_u32(1920, 0);
+        worker_manager
+            .register_worker(&group_name, worker_id, "127.0.0.1:9090".to_string(), 1, None)
+            .unwrap();
+        let worker_run_id = record_heartbeat(
+            &worker_manager,
+            &group_name,
+            worker_id,
+            1_000,
+            100,
+            900,
+            0,
+            0,
+            HealthStatus::Healthy,
+        );
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(MountTable::new()),
+            group_name.clone(),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+            &service,
+            Request::new(full_report_request(
+                group_name.clone(),
+                worker_id,
+                worker_run_id,
+                1,
+                0,
+                true,
+                vec![block_id],
+            )),
+        )
+        .await
+        .expect("initial full block report response")
+        .into_inner();
+        assert!(response.header.expect("header").error.is_none());
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = captured_json_subscriber(&output);
+        async {
+            let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+                &service,
+                Request::new(full_report_request(
+                    group_name,
+                    worker_id,
+                    worker_run_id,
+                    2,
+                    0,
+                    true,
+                    vec![block_id],
+                )),
+            )
+            .await
+            .expect("repeated full block report response")
+            .into_inner();
+            assert!(response.header.expect("header").error.is_none());
+        }
+        .with_subscriber(dispatch)
+        .await;
+
+        let logs = captured_logs(&output);
+        assert!(
+            logs.iter().all(|log| !(log["target"] == "metadata.block"
+                && log["level"] == "INFO"
+                && log["op"] == "FullBlockReport")),
+            "{logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_full_block_report_emits_one_metadata_block_info_summary() {
+        let _log_guard = log_test_mutex().lock().await;
+        let dir = TempDir::new().unwrap();
+        let raft_node = leader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let group_name = group_name("root");
+        let worker_id = WorkerId::new(193);
+        let initial_block = BlockId::from_u64_u32(1930, 0);
+        let replacement_block = BlockId::from_u64_u32(1931, 0);
+        worker_manager
+            .register_worker(&group_name, worker_id, "127.0.0.1:9090".to_string(), 1, None)
+            .unwrap();
+        let worker_run_id = record_heartbeat(
+            &worker_manager,
+            &group_name,
+            worker_id,
+            1_000,
+            100,
+            900,
+            0,
+            0,
+            HealthStatus::Healthy,
+        );
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(MountTable::new()),
+            group_name.clone(),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+            &service,
+            Request::new(full_report_request(
+                group_name.clone(),
+                worker_id,
+                worker_run_id,
+                1,
+                0,
+                true,
+                vec![initial_block],
+            )),
+        )
+        .await
+        .expect("initial full block report response")
+        .into_inner();
+        assert!(response.header.expect("header").error.is_none());
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = captured_json_subscriber(&output);
+        let request = full_report_request(
+            group_name.clone(),
+            worker_id,
+            worker_run_id,
+            2,
+            0,
+            true,
+            vec![replacement_block],
+        );
+        let (expected_client_id, expected_call_id) = header_client_identity(request.header.as_ref().expect("header"));
+        async {
+            let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+                &service,
+                Request::new(request),
+            )
+            .await
+            .expect("changed full block report response")
+            .into_inner();
+            assert!(response.header.expect("header").error.is_none());
+        }
+        .with_subscriber(dispatch)
+        .await;
+
+        let logs = captured_logs(&output);
+        let summaries: Vec<_> = logs
+            .iter()
+            .filter(|log| log["target"] == "metadata.block" && log["level"] == "INFO" && log["op"] == "FullBlockReport")
+            .collect();
+        assert_eq!(summaries.len(), 1, "{logs:?}");
+        let summary = summaries[0];
+        assert_eq!(summary["changed_block_count"], 2);
+        assert_eq!(summary["added_blocks"], 1);
+        assert_eq!(summary["removed_blocks"], 1);
+        assert_eq!(summary["client_id"], expected_client_id);
+        assert_eq!(summary["call_id"], expected_call_id);
+    }
+
+    #[tokio::test]
+    async fn zero_change_delta_block_report_emits_no_processed_info_summary() {
+        let _log_guard = log_test_mutex().lock().await;
+        let dir = TempDir::new().unwrap();
+        let raft_node = leader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let group_name = group_name("root");
+        let worker_id = WorkerId::new(187);
+        let block_id = BlockId::from_u64_u32(1870, 0);
+        worker_manager
+            .register_worker(&group_name, worker_id, "127.0.0.1:9090".to_string(), 1, None)
+            .unwrap();
+        let worker_run_id = record_heartbeat(
+            &worker_manager,
+            &group_name,
+            worker_id,
+            1_000,
+            100,
+            900,
+            0,
+            0,
+            HealthStatus::Healthy,
+        );
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(MountTable::new()),
+            group_name.clone(),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+            &service,
+            Request::new(full_report_request(
+                group_name.clone(),
+                worker_id,
+                worker_run_id,
+                1,
+                0,
+                true,
+                vec![block_id],
+            )),
+        )
+        .await
+        .expect("full block report response")
+        .into_inner();
+        assert!(response.header.expect("header").error.is_none());
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = captured_json_subscriber(&output);
+        async {
+            let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+                &service,
+                Request::new(delta_report_request(
+                    group_name,
+                    worker_id,
+                    worker_run_id,
+                    1,
+                    0,
+                    Vec::new(),
+                )),
+            )
+            .await
+            .expect("delta block report response")
+            .into_inner();
+            assert!(response.header.expect("header").error.is_none());
+        }
+        .with_subscriber(dispatch)
+        .await;
+
+        let logs = captured_logs(&output);
+        assert!(
+            logs.iter().all(|log| {
+                !(log["level"] == "INFO"
+                    && (log["target"] == "metadata.worker" || log["target"] == "metadata.block")
+                    && log["op"].as_str().is_some_and(|op| op.contains("BlockReport")))
+            }),
+            "{logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_delta_block_report_emits_one_metadata_block_info_summary() {
+        let _log_guard = log_test_mutex().lock().await;
+        let dir = TempDir::new().unwrap();
+        let raft_node = leader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let group_name = group_name("root");
+        let worker_id = WorkerId::new(188);
+        let baseline_block = BlockId::from_u64_u32(1880, 0);
+        let delta_block = BlockId::from_u64_u32(1881, 0);
+        worker_manager
+            .register_worker(&group_name, worker_id, "127.0.0.1:9090".to_string(), 1, None)
+            .unwrap();
+        let worker_run_id = record_heartbeat(
+            &worker_manager,
+            &group_name,
+            worker_id,
+            1_000,
+            100,
+            900,
+            0,
+            0,
+            HealthStatus::Healthy,
+        );
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(MountTable::new()),
+            group_name.clone(),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+            &service,
+            Request::new(full_report_request(
+                group_name.clone(),
+                worker_id,
+                worker_run_id,
+                1,
+                0,
+                true,
+                vec![baseline_block],
+            )),
+        )
+        .await
+        .expect("full block report response")
+        .into_inner();
+        assert!(response.header.expect("header").error.is_none());
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = captured_json_subscriber(&output);
+        let request = delta_report_request(
+            group_name.clone(),
+            worker_id,
+            worker_run_id,
+            1,
+            0,
+            vec![(BlockReportDeltaOpProto::BlockReportDeltaOpAddUpdate, delta_block)],
+        );
+        let (expected_client_id, expected_call_id) = header_client_identity(request.header.as_ref().expect("header"));
+        async {
+            let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+                &service,
+                Request::new(request),
+            )
+            .await
+            .expect("delta block report response")
+            .into_inner();
+            assert!(response.header.expect("header").error.is_none());
+        }
+        .with_subscriber(dispatch)
+        .await;
+
+        let logs = captured_logs(&output);
+        let summaries: Vec<_> = logs
+            .iter()
+            .filter(|log| {
+                log["level"] == "INFO"
+                    && (log["target"] == "metadata.worker" || log["target"] == "metadata.block")
+                    && log["op"].as_str().is_some_and(|op| op.contains("BlockReport"))
+            })
+            .collect();
+        assert_eq!(summaries.len(), 1, "{logs:?}");
+        let summary = summaries[0];
+        assert_eq!(summary["target"], "metadata.block");
+        assert_eq!(summary["op"], "DeltaBlockReport");
+        assert_eq!(summary["changed_block_count"], 1);
+        assert_eq!(summary["added_blocks"], 1);
+        assert_eq!(summary["removed_blocks"], 0);
+        assert_eq!(summary["report_seq"], 1);
+        assert_eq!(summary["delta_seq"], 0);
+        assert_eq!(summary["client_id"], expected_client_id);
+        assert_eq!(summary["call_id"], expected_call_id);
+        assert!(summary["next_delta_seq"].as_u64().is_some(), "{summary:?}");
+    }
+
+    #[tokio::test]
+    async fn changed_delta_block_report_text_log_does_not_dump_request_or_duplicate_request_ids() {
+        let _log_guard = log_test_mutex().lock().await;
+        let dir = TempDir::new().unwrap();
+        let raft_node = leader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let group_name = group_name("root");
+        let worker_id = WorkerId::new(189);
+        let baseline_block = BlockId::from_u64_u32(1890, 0);
+        let delta_block = BlockId::from_u64_u32(1891, 0);
+        worker_manager
+            .register_worker(&group_name, worker_id, "127.0.0.1:9090".to_string(), 1, None)
+            .unwrap();
+        let worker_run_id = record_heartbeat(
+            &worker_manager,
+            &group_name,
+            worker_id,
+            1_000,
+            100,
+            900,
+            0,
+            0,
+            HealthStatus::Healthy,
+        );
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(MountTable::new()),
+            group_name.clone(),
+        );
+
+        let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+            &service,
+            Request::new(full_report_request(
+                group_name.clone(),
+                worker_id,
+                worker_run_id,
+                1,
+                0,
+                true,
+                vec![baseline_block],
+            )),
+        )
+        .await
+        .expect("full block report response")
+        .into_inner();
+        assert!(response.header.expect("header").error.is_none());
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = captured_text_subscriber(&output);
+        async {
+            let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+                &service,
+                Request::new(delta_report_request(
+                    group_name,
+                    worker_id,
+                    worker_run_id,
+                    1,
+                    0,
+                    vec![(BlockReportDeltaOpProto::BlockReportDeltaOpAddUpdate, delta_block)],
+                )),
+            )
+            .await
+            .expect("delta block report response")
+            .into_inner();
+            assert!(response.header.expect("header").error.is_none());
+        }
+        .with_subscriber(dispatch)
+        .await;
+
+        let text = captured_text(&output);
+        assert!(!text.contains("request=Request"), "{text}");
+        assert_eq!(text.matches("client_id=").count(), 1, "{text}");
+        assert_eq!(text.matches("call_id=").count(), 1, "{text}");
+        assert!(text.contains("op=\"DeltaBlockReport\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn rejected_block_report_emits_metadata_worker_warn_log() {
+        let _log_guard = log_test_mutex().lock().await;
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_id = WorkerId::new(185);
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(MountTable::new()),
+            group_name("root"),
+        );
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = captured_json_subscriber(&output);
+
+        async {
+            let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+                &service,
+                Request::new(full_report_request(
+                    group_name("root"),
+                    worker_id,
+                    test_worker_run_id(),
+                    1,
+                    0,
+                    true,
+                    Vec::new(),
+                )),
+            )
+            .await
+            .expect("rejected block report response")
+            .into_inner();
+            let error = response.header.expect("header").error.expect("header error");
+            assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+            assert!(matches!(
+                error.code,
+                Some(error_detail_proto::Code::RpcCode(code))
+                    if code == RpcErrorCodeProto::RpcErrCodeWorkerNotRegistered as i32
+            ));
+            assert_eq!(
+                error.refresh_reason,
+                RefreshReasonProto::RefreshReasonNeedRegister as i32
+            );
+        }
+        .with_subscriber(dispatch)
+        .await;
+
+        let logs = captured_logs(&output);
+        assert!(
+            logs.iter().any(|log| {
+                log["target"] == "metadata.worker"
+                    && log["level"] == "WARN"
+                    && log["op"] == "BlockReport"
+                    && log["result"] == "rejected"
+                    && log["error_code"] == "need_register"
+                    && log["report_kind"] == "full"
+            }),
+            "{logs:?}"
         );
     }
 

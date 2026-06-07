@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::info;
 use types::ids::{BlockId, WorkerId};
 use types::layout::BlockFormatId;
 use types::{GroupName, TierFree, WorkerRunId};
@@ -173,6 +172,18 @@ pub struct WorkerLiveState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeartbeatRejectionReason {
+    NeedRegister,
+    WorkerRunMismatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HeartbeatRejectionState {
+    worker_run_id: WorkerRunId,
+    reason: HeartbeatRejectionReason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockReportBlockState {
     Ready,
     Partial,
@@ -212,6 +223,8 @@ pub struct BlockReportApplyResult {
     pub added_blocks: Vec<BlockId>,
     pub removed_blocks: Vec<BlockId>,
     pub next_delta_seq: u64,
+    pub baseline_established: bool,
+    pub baseline_replaced: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -231,6 +244,7 @@ struct WorkerBlockReportRuntime {
     /// Monotonic within one worker run and one group.
     report_seq: u64,
     next_batch_seq: u64,
+    full_report_had_baseline: bool,
     staging_blocks: HashMap<BlockId, BlockReportBlock>,
     published_blocks: HashMap<BlockId, BlockReportBlock>,
     /// Next delta sequence expected for the current published full baseline.
@@ -254,6 +268,8 @@ pub struct WorkerManager {
     registrations: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerRegistrationState>>>,
     /// Worker runtime (soft-state, memory-only, updated via fanout heartbeat).
     runtime: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerRuntime>>>,
+    /// Last heartbeat rejection state per worker, used only to suppress repeated unchanged warn logs.
+    heartbeat_rejections: Arc<RwLock<HashMap<WorkerRegistrationKey, HeartbeatRejectionState>>>,
     /// Block presence keyed by (group_name, block_id), memory-only.
     locations: Arc<RwLock<BlockLocations>>,
     /// Worker blocks: (group_name, worker_id) -> [block_ids] (soft-state, memory-only).
@@ -278,6 +294,7 @@ impl WorkerManager {
             descriptors: Arc::new(RwLock::new(HashMap::new())),
             registrations: Arc::new(RwLock::new(HashMap::new())),
             runtime: Arc::new(RwLock::new(HashMap::new())),
+            heartbeat_rejections: Arc::new(RwLock::new(HashMap::new())),
             locations: Arc::new(RwLock::new(HashMap::new())),
             worker_blocks: Arc::new(RwLock::new(HashMap::new())),
             block_reports: Arc::new(RwLock::new(HashMap::new())),
@@ -312,6 +329,7 @@ impl WorkerManager {
         // Metadata restart drops live registration and reconstructable report state.
         self.registrations.write().clear();
         self.runtime.write().clear();
+        self.heartbeat_rejections.write().clear();
         self.clear_all_block_reports();
     }
 
@@ -334,12 +352,14 @@ impl WorkerManager {
         let mut descriptors = self.descriptors.write();
         let mut registrations = self.registrations.write();
         let mut runtime = self.runtime.write();
+        let mut heartbeat_rejections = self.heartbeat_rejections.write();
         let mut locations = self.locations.write();
         let mut worker_blocks = self.worker_blocks.write();
         let mut block_reports = self.block_reports.write();
         descriptors.clear();
         registrations.clear();
         runtime.clear();
+        heartbeat_rejections.clear();
         locations.clear();
         worker_blocks.clear();
         block_reports.clear();
@@ -512,6 +532,7 @@ impl WorkerManager {
             },
         );
         drop(registrations);
+        self.heartbeat_rejections.write().remove(&key);
         if !same_registered_run {
             self.runtime.write().remove(&key);
             self.clear_block_report_for_worker(key);
@@ -540,6 +561,7 @@ impl WorkerManager {
         let mut reports = self.block_reports.write();
         let report = reports.entry(key.clone()).or_default();
         if batch_seq == 0 {
+            let full_report_had_baseline = report.state == BlockReportState::Ready;
             if report.worker_run_id == Some(worker_run_id) && report.report_seq > report_seq {
                 return Err(MetadataError::FullReportRequired(format!(
                     "full report required: stale report_seq {} for group_name={}, worker_id={}, current {}",
@@ -553,6 +575,7 @@ impl WorkerManager {
             report.state = BlockReportState::Receiving;
             report.report_seq = report_seq;
             report.next_batch_seq = 0;
+            report.full_report_had_baseline = full_report_had_baseline;
             report.staging_blocks.clear();
         }
 
@@ -581,8 +604,11 @@ impl WorkerManager {
             });
         }
 
-        let old_ready = ready_block_ids(report.published_blocks.values());
+        let old_published_blocks = report.published_blocks.clone();
+        let old_ready = ready_block_ids(old_published_blocks.values());
         let published_blocks = std::mem::take(&mut report.staging_blocks);
+        let baseline_established = !report.full_report_had_baseline;
+        let baseline_replaced = report.full_report_had_baseline && old_published_blocks != published_blocks;
         let new_ready = ready_block_ids(published_blocks.values());
         report.published_blocks = published_blocks;
         report.state = BlockReportState::Ready;
@@ -592,7 +618,7 @@ impl WorkerManager {
         drop(reports);
 
         self.rebuild_location_index_for_worker(key, &published_for_index);
-        info!(
+        tracing::debug!(
             group_name = %group_name,
             worker_id = worker_id.as_raw(),
             worker_run_id = %worker_run_id,
@@ -603,6 +629,8 @@ impl WorkerManager {
             added_blocks: new_ready.difference(&old_ready).copied().collect(),
             removed_blocks: old_ready.difference(&new_ready).copied().collect(),
             next_delta_seq,
+            baseline_established,
+            baseline_replaced,
         })
     }
 
@@ -681,6 +709,8 @@ impl WorkerManager {
             added_blocks: new_ready.difference(&old_ready).copied().collect(),
             removed_blocks: old_ready.difference(&new_ready).copied().collect(),
             next_delta_seq,
+            baseline_established: false,
+            baseline_replaced: false,
         })
     }
 
@@ -773,6 +803,53 @@ impl WorkerManager {
         self.block_reports.write().clear();
         self.worker_blocks.write().clear();
         self.locations.write().clear();
+    }
+
+    pub fn mark_heartbeat_need_register_if_changed(
+        &self,
+        group_name: &GroupName,
+        worker_id: WorkerId,
+        worker_run_id: WorkerRunId,
+    ) -> bool {
+        self.mark_heartbeat_rejection_if_changed(
+            group_name,
+            worker_id,
+            worker_run_id,
+            HeartbeatRejectionReason::NeedRegister,
+        )
+    }
+
+    pub fn mark_heartbeat_run_mismatch_if_changed(
+        &self,
+        group_name: &GroupName,
+        worker_id: WorkerId,
+        worker_run_id: WorkerRunId,
+    ) -> bool {
+        self.mark_heartbeat_rejection_if_changed(
+            group_name,
+            worker_id,
+            worker_run_id,
+            HeartbeatRejectionReason::WorkerRunMismatch,
+        )
+    }
+
+    fn mark_heartbeat_rejection_if_changed(
+        &self,
+        group_name: &GroupName,
+        worker_id: WorkerId,
+        worker_run_id: WorkerRunId,
+        reason: HeartbeatRejectionReason,
+    ) -> bool {
+        let current = HeartbeatRejectionState { worker_run_id, reason };
+        let previous = self
+            .heartbeat_rejections
+            .write()
+            .insert(WorkerRegistrationKey::new(group_name, worker_id), current);
+        previous != Some(current)
+    }
+
+    fn clear_heartbeat_rejection(&self, key: &WorkerRegistrationKey) {
+        self.heartbeat_rejections.write().remove(key);
     }
 
     /// Record a validated group-scoped heartbeat in volatile live state.
@@ -916,6 +993,7 @@ impl WorkerManager {
             }
         };
         drop(runtime);
+        self.clear_heartbeat_rejection(&key);
 
         Ok(live_state)
     }
