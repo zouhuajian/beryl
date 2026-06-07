@@ -9,6 +9,7 @@ use super::types::{
 };
 use crate::error::{MetadataError, MetadataResult};
 use crate::inflight_registry::{InflightKind, InflightRegistry};
+use crate::observe;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -241,6 +242,7 @@ impl RepairQueue {
             metrics.update_queue_pending(pending_count);
             metrics.update_queue_total(total_count);
         }
+        observe::set_repair_queue_depth(pending_count);
 
         info!(
             task_id = task_id.0,
@@ -569,6 +571,16 @@ impl RepairQueue {
             metrics.update_queue_inflight(metrics_update.inflight);
             metrics.update_queue_total(metrics_update.total);
         }
+        observe::set_repair_queue_depth(metrics_update.pending);
+        if metrics_update.acked {
+            observe::record_repair_attempt("ok", "none");
+        }
+        if metrics_update.failed {
+            observe::record_repair_attempt("error", "failed");
+        }
+        if metrics_update.retry {
+            observe::record_repair_attempt("error", "retryable");
+        }
 
         Ok(followup_task)
     }
@@ -682,6 +694,10 @@ impl RepairQueue {
                 metrics.update_queue_inflight(inflight_count);
                 metrics.update_queue_total(total_count);
             }
+            observe::set_repair_queue_depth(pending_count);
+            for _ in 0..timeout_count {
+                observe::record_repair_attempt("error", "timeout");
+            }
             info!(timeout_count, "Requeued timed-out tasks");
         }
 
@@ -731,5 +747,6 @@ impl RepairQueue {
         state.records.clear();
         state.dedup.clear();
         state.worker_inflight.clear();
+        observe::set_repair_queue_depth(0);
     }
 }

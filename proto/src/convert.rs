@@ -15,7 +15,9 @@ use ::common::{
         CanonicalError, ErrorClass as CanonicalErrorClass, ErrorCode as CanonicalErrorCode,
         RefreshHint as CanonicalRefreshHint, RefreshReason, WorkerEndpointHint,
     },
-    header::{AuthnType, CallerContext, ClientInfo, RequestHeader, ResponseHeader, RpcErrorCode, RpcStatus},
+    header::{
+        AuthnType, CallerContext, ClientInfo, RequestHeader, ResponseHeader, RpcErrorCode, RpcStatus, TraceContext,
+    },
 };
 use std::str::FromStr;
 use types::chunk::ByteRange;
@@ -801,17 +803,45 @@ impl From<&ClientInfo> for proto_common::ClientInfoProto {
     }
 }
 
+impl From<proto_common::TraceContextProto> for TraceContext {
+    fn from(proto: proto_common::TraceContextProto) -> Self {
+        Self {
+            traceparent: proto.traceparent.filter(|value| !value.is_empty()),
+            tracestate: proto.tracestate.filter(|value| !value.is_empty()),
+            baggage: proto.baggage.filter(|value| !value.is_empty()),
+        }
+    }
+}
+
+impl From<&TraceContext> for proto_common::TraceContextProto {
+    fn from(context: &TraceContext) -> Self {
+        Self {
+            traceparent: context.traceparent.clone(),
+            tracestate: context.tracestate.clone(),
+            baggage: context.baggage.clone(),
+        }
+    }
+}
+
+fn optional_trace_context(proto: Option<proto_common::TraceContextProto>) -> TraceContext {
+    proto.map(TraceContext::from).unwrap_or_default()
+}
+
+fn proto_trace_context(context: &TraceContext) -> Option<proto_common::TraceContextProto> {
+    if context.traceparent.is_none() && context.tracestate.is_none() && context.baggage.is_none() {
+        None
+    } else {
+        Some(context.into())
+    }
+}
+
 impl TryFrom<proto_common::RequestHeaderProto> for RequestHeader {
     type Error = String;
 
     fn try_from(proto: proto_common::RequestHeaderProto) -> Result<Self, Self::Error> {
         let client = proto.client.ok_or_else(|| "missing client".to_string())?.try_into()?;
         let deadline = Deadline::from_unix_ms(proto.deadline_ms);
-        let traceparent = if proto.traceparent.is_empty() {
-            None
-        } else {
-            Some(proto.traceparent)
-        };
+        let trace_context = optional_trace_context(proto.trace_context);
         let caller_context = proto.caller_context.map(|cc| CallerContext {
             context: cc.context,
             signature: if cc.signature.is_empty() {
@@ -845,22 +875,22 @@ impl TryFrom<proto_common::RequestHeaderProto> for RequestHeader {
 
         Ok(RequestHeader {
             client,
+            trace_context,
             group_name: if proto.group_name.is_empty() {
                 None
             } else {
                 Some(GroupName::parse(&proto.group_name).map_err(|err| format!("invalid header group_name: {err}"))?)
             },
             mount_epoch: proto.mount_epoch,
-            deadline,
-            traceparent,
-            caller_context,
             state,
-            retry_count: proto.retry_count,
             route_epoch: proto.route_epoch,
             principal,
             real_user,
             doas,
             authn_type,
+            deadline,
+            caller_context,
+            retry_count: proto.retry_count,
         })
     }
 }
@@ -869,23 +899,14 @@ impl From<&RequestHeader> for proto_common::RequestHeaderProto {
     fn from(header: &RequestHeader) -> Self {
         proto_common::RequestHeaderProto {
             client: Some((&header.client).into()),
-            deadline_ms: header.deadline.as_unix_ms(),
-            traceparent: header.traceparent.clone().unwrap_or_default(),
-            caller_context: header
-                .caller_context
-                .as_ref()
-                .map(|cc| proto_common::CallerContextProto {
-                    context: cc.context.clone(),
-                    signature: cc.signature.clone().unwrap_or_default(),
-                }),
+            trace_context: proto_trace_context(&header.trace_context),
+            group_name: header.group_name.as_ref().map(ToString::to_string).unwrap_or_default(),
+            mount_epoch: header.mount_epoch,
             state: header
                 .state
                 .iter()
                 .map(proto_common::GroupStateWatermarkProto::from)
                 .collect(),
-            retry_count: header.retry_count,
-            group_name: header.group_name.as_ref().map(ToString::to_string).unwrap_or_default(),
-            mount_epoch: header.mount_epoch,
             route_epoch: header.route_epoch,
             principal: header.principal.clone().unwrap_or_default(),
             real_user: header.real_user.clone().unwrap_or_default(),
@@ -896,6 +917,15 @@ impl From<&RequestHeader> for proto_common::RequestHeaderProto {
                 AuthnType::Kerberos => proto_common::AuthnTypeProto::Kerberos as i32,
                 AuthnType::Token => proto_common::AuthnTypeProto::Token as i32,
             },
+            deadline_ms: header.deadline.as_unix_ms(),
+            caller_context: header
+                .caller_context
+                .as_ref()
+                .map(|cc| proto_common::CallerContextProto {
+                    context: cc.context.clone(),
+                    signature: cc.signature.clone().unwrap_or_default(),
+                }),
+            retry_count: header.retry_count,
         }
     }
 }
@@ -943,13 +973,13 @@ impl TryFrom<proto_common::ResponseHeaderProto> for ResponseHeader {
             status,
             canonical_error,
             state,
+            mount_epoch: proto.mount_epoch,
+            route_epoch: proto.route_epoch,
             group_name: if proto.group_name.is_empty() {
                 None
             } else {
                 Some(GroupName::parse(&proto.group_name).map_err(|err| format!("invalid header group_name: {err}"))?)
             },
-            mount_epoch: proto.mount_epoch,
-            route_epoch: proto.route_epoch,
         })
     }
 }
@@ -990,9 +1020,9 @@ impl From<&ResponseHeader> for proto_common::ResponseHeaderProto {
                 .iter()
                 .map(proto_common::GroupStateWatermarkProto::from)
                 .collect(),
-            group_name: header.group_name.as_ref().map(ToString::to_string).unwrap_or_default(),
             mount_epoch: header.mount_epoch,
             route_epoch: header.route_epoch,
+            group_name: header.group_name.as_ref().map(ToString::to_string).unwrap_or_default(),
         }
     }
 }
@@ -1031,7 +1061,7 @@ impl From<&RequestHeader> for crate::worker::DataRequestHeaderProto {
     fn from(header: &RequestHeader) -> Self {
         crate::worker::DataRequestHeaderProto {
             client: Some((&header.client).into()),
-            traceparent: header.traceparent.clone().unwrap_or_default(),
+            trace_context: proto_trace_context(&header.trace_context),
         }
     }
 }
@@ -1437,6 +1467,85 @@ mod tests {
 
     #[test]
     fn block_contract_proto_fields_are_normalized() {
+        let header_proto = include_str!("../common/header.proto");
+        assert_eq!(
+            proto_message_fields(header_proto, "TraceContextProto"),
+            vec![
+                ("string", "traceparent", 1),
+                ("string", "tracestate", 2),
+                ("string", "baggage", 3),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(header_proto, "ClientInfoProto"),
+            vec![
+                ("string", "call_id", 1),
+                ("ClientIdProto", "client_id", 2),
+                ("string", "client_name", 3),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(header_proto, "RequestHeaderProto"),
+            vec![
+                ("ClientInfoProto", "client", 1),
+                ("TraceContextProto", "trace_context", 2),
+                ("string", "group_name", 3),
+                ("uint64", "mount_epoch", 4),
+                ("GroupStateWatermarkProto", "state", 5),
+                ("uint64", "route_epoch", 6),
+                ("string", "principal", 7),
+                ("string", "real_user", 8),
+                ("string", "doas", 9),
+                ("AuthnTypeProto", "authn_type", 10),
+                ("int64", "deadline_ms", 11),
+                ("CallerContextProto", "caller_context", 12),
+                ("int32", "retry_count", 13),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(header_proto, "ResponseHeaderProto"),
+            vec![
+                ("ClientInfoProto", "client", 1),
+                ("ErrorDetailProto", "error", 2),
+                ("GroupStateWatermarkProto", "state", 3),
+                ("uint64", "mount_epoch", 4),
+                ("uint64", "route_epoch", 5),
+                ("string", "group_name", 6),
+            ]
+        );
+        let request_header = proto_message_body(header_proto, "RequestHeaderProto");
+        assert!(!proto_message_has_reserved_statement(request_header));
+        assert!(!request_header.contains(concat!("request", "_id")));
+        assert!(!request_header.contains(concat!("trace", "_id")));
+        assert!(!request_header.contains("traceparent"));
+        assert!(!request_header.contains("tracestate"));
+        assert!(!request_header.contains("baggage"));
+        let response_header = proto_message_body(header_proto, "ResponseHeaderProto");
+        assert!(!proto_message_has_reserved_statement(response_header));
+
+        let data_header_proto = include_str!("../worker/data_header.proto");
+        assert_eq!(
+            proto_message_fields(data_header_proto, "DataRequestHeaderProto"),
+            vec![
+                ("common.ClientInfoProto", "client", 1),
+                ("common.TraceContextProto", "trace_context", 2),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(data_header_proto, "DataResponseHeaderProto"),
+            vec![
+                ("common.ClientInfoProto", "client", 1),
+                ("common.ErrorDetailProto", "error", 2),
+            ]
+        );
+        let data_request_header = proto_message_body(data_header_proto, "DataRequestHeaderProto");
+        assert!(!proto_message_has_reserved_statement(data_request_header));
+        assert!(!data_request_header.contains(concat!("request", "_id")));
+        assert!(!data_request_header.contains(concat!("trace", "_id")));
+        assert!(!data_request_header.contains("traceparent"));
+        assert!(!data_request_header.contains("tracestate"));
+        assert!(!data_request_header.contains("baggage"));
+
         let common_proto = include_str!("../common/common.proto");
         assert_eq!(
             proto_message_fields(common_proto, "WorkerEndpointInfoProto"),
@@ -1925,6 +2034,73 @@ mod tests {
     }
 
     #[test]
+    fn request_header_trace_context_roundtrip_preserves_w3c_fields() {
+        let request = RequestHeader::new(ClientId::new(42))
+            .with_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string())
+            .with_tracestate("vendor=state".to_string())
+            .with_baggage("tenant=local".to_string());
+        let call_id = request.client.call_id.to_string();
+
+        let proto_request: proto_common::RequestHeaderProto = (&request).into();
+        let trace = proto_request.trace_context.as_ref().expect("trace context");
+        assert_eq!(
+            trace.traceparent.as_deref(),
+            request.trace_context.traceparent.as_deref()
+        );
+        assert_eq!(trace.tracestate.as_deref(), request.trace_context.tracestate.as_deref());
+        assert_eq!(trace.baggage.as_deref(), request.trace_context.baggage.as_deref());
+        assert_ne!(trace.traceparent.as_deref(), Some(call_id.as_str()));
+
+        let decoded_request = RequestHeader::try_from(proto_request).expect("request header decode");
+        assert_eq!(decoded_request.trace_context, request.trace_context);
+        assert_eq!(decoded_request.client.call_id.to_string(), call_id);
+    }
+
+    #[test]
+    fn request_and_data_headers_omit_trace_context_without_source() {
+        let request = RequestHeader::new(ClientId::new(42));
+
+        let proto_request: proto_common::RequestHeaderProto = (&request).into();
+        let data_header: crate::worker::DataRequestHeaderProto = (&request).into();
+
+        assert!(proto_request.trace_context.is_none());
+        assert!(data_header.trace_context.is_none());
+    }
+
+    #[test]
+    fn empty_inbound_trace_context_reencodes_as_absent() {
+        let mut proto_request: proto_common::RequestHeaderProto = (&RequestHeader::new(ClientId::new(42))).into();
+        proto_request.trace_context = Some(proto_common::TraceContextProto {
+            traceparent: None,
+            tracestate: None,
+            baggage: None,
+        });
+
+        let decoded_request = RequestHeader::try_from(proto_request).expect("request header decode");
+        let reencoded_request: proto_common::RequestHeaderProto = (&decoded_request).into();
+
+        assert!(reencoded_request.trace_context.is_none());
+    }
+
+    #[test]
+    fn data_header_trace_context_roundtrip_preserves_w3c_fields() {
+        let request = RequestHeader::new(ClientId::new(42))
+            .with_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string())
+            .with_tracestate("vendor=state".to_string())
+            .with_baggage("tenant=local".to_string());
+
+        let data_header: crate::worker::DataRequestHeaderProto = (&request).into();
+        let trace = data_header.trace_context.expect("data trace context");
+
+        assert_eq!(
+            trace.traceparent.as_deref(),
+            request.trace_context.traceparent.as_deref()
+        );
+        assert_eq!(trace.tracestate.as_deref(), request.trace_context.tracestate.as_deref());
+        assert_eq!(trace.baggage.as_deref(), request.trace_context.baggage.as_deref());
+    }
+
+    #[test]
     fn required_fencing_token_requires_token_and_block_id() {
         let missing_token = required_fencing_token(None, "token").expect_err("missing token must fail");
         assert!(missing_token.contains("missing token"));
@@ -2149,6 +2325,16 @@ mod tests {
             .map(|offset| body_start + offset)
             .unwrap_or_else(|| panic!("unterminated proto message {message}"));
         &source[body_start..body_end]
+    }
+
+    fn proto_message_has_reserved_statement(body: &str) -> bool {
+        body.lines().any(|raw_line| {
+            raw_line
+                .split_once("//")
+                .map_or(raw_line, |(statement, _)| statement)
+                .trim_start()
+                .starts_with("reserved")
+        })
     }
 
     fn proto_enum_values<'a>(source: &'a str, enum_name: &str) -> Vec<(&'a str, u32)> {

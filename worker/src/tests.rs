@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Unit tests for the worker data-plane skeleton.
+//! Unit tests for the worker data-plane service.
 
 #[cfg(test)]
 #[allow(clippy::module_inception)]
@@ -14,6 +14,7 @@ mod tests {
     use common::error::canonical::{CanonicalError, RefreshReason};
     use common::header::RpcErrorCode;
     use futures::StreamExt;
+    use metrics::{Counter, Gauge, GaugeFn, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
     use proto::common::{
         BlockIdProto, ByteRangeProto, ClientInfoProto, EndpointProto, ErrorClassProto, FencingTokenProto,
         RefreshReasonProto, ResponseHeaderProto, StreamIdProto,
@@ -60,6 +61,7 @@ mod tests {
     use crate::net::config::WorkerNetConfig;
     use crate::net::protocol::WorkerNetProtocol;
     use crate::net::server::grpc::WorkerDataServiceImpl;
+    use crate::observe::WORKER_STREAM_INFLIGHT;
     use crate::runtime::stream::{StreamManager, StreamState};
     use crate::store::block::{
         ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
@@ -77,6 +79,38 @@ mod tests {
 
     fn group_name() -> GroupName {
         GroupName::parse("root").expect("test group name is valid")
+    }
+
+    fn test_worker_config() -> WorkerConfig {
+        WorkerConfig {
+            cluster_id: "local-vecton".to_string(),
+            identity_path: std::path::PathBuf::from("data/worker/worker.identity"),
+            rpc_bind: "0.0.0.0:9090".to_string(),
+            http_bind: "0.0.0.0:19091".to_string(),
+            rpc_advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+            rpc_max_inflight: 100,
+            default_frame_size: 1024 * 1024,
+            max_frame_size: 4 * 1024 * 1024,
+            window_bytes: 8 * 1024 * 1024,
+            stream_idle_timeout_ms: 60_000,
+            store: crate::config::WorkerStoreConfig::default(),
+            net: WorkerNetConfig::grpc_from_rpc("0.0.0.0:9090".to_string(), 100, 4 * 1024 * 1024),
+            metadata: WorkerRegistrationConfig::default(),
+            observability: test_observability_config(),
+        }
+    }
+
+    fn test_observability_config() -> common::observe::ObservabilityConfig {
+        let mut flat = common::config::FlatConfig::new();
+        flat.set("observe.log.format", "compact");
+        flat.set("observe.log.output", "stderr");
+        flat.set(
+            "observe.log.level",
+            "info,vecton=info,metadata=info,worker=info,common=info,openraft=warn,tonic=warn,tower=warn,h2=warn",
+        );
+        flat.set("observe.metrics.prometheus.bind", "127.0.0.1:19091");
+        flat.set("observe.metrics.prometheus.path", "/metrics");
+        common::observe::ObservabilityConfig::from_flat(&flat).expect("test observe config")
     }
 
     fn stream_id() -> StreamId {
@@ -113,7 +147,7 @@ mod tests {
                 client_id: Some(ClientId::new(9).into()),
                 client_name: "worker-test".to_string(),
             }),
-            traceparent: String::new(),
+            trace_context: None,
         }
     }
 
@@ -362,7 +396,7 @@ mod tests {
         }
     }
 
-    fn control_request_identity(header: &proto::common::RequestHeaderProto) -> (ClientId, String) {
+    fn control_call_identity(header: &proto::common::RequestHeaderProto) -> (ClientId, String) {
         let client = header.client.as_ref().expect("client info");
         let client_id = proto::convert::required_client_id(client.client_id, "client_id").expect("client_id");
         assert!(!client_id.is_zero());
@@ -476,7 +510,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let config = WorkerConfig {
             identity_path: temp.path().join("worker.identity"),
-            ..WorkerConfig::default()
+            ..test_worker_config()
         };
 
         let first = resolve_worker_id(&config).expect("generated worker id");
@@ -594,7 +628,7 @@ mod tests {
 
     #[test]
     fn descriptor_from_config_uses_advertised_endpoint_not_bind() {
-        let mut config = WorkerConfig::default();
+        let mut config = test_worker_config();
         config.rpc_bind = "0.0.0.0:9090".to_string();
         config.rpc_advertised_endpoint = "http://127.0.0.1:19090".to_string();
         config.net =
@@ -776,7 +810,7 @@ mod tests {
             let request = &requests[0];
             assert_eq!(request.group_name, group_name().as_str());
             assert_eq!(request.header.as_ref().expect("header").group_name, request.group_name);
-            identities.push(control_request_identity(request.header.as_ref().expect("header")));
+            identities.push(control_call_identity(request.header.as_ref().expect("header")));
             assert_eq!(request.worker_id, 42);
             assert_eq!(request.worker_run_id, worker_run_id.to_string());
             assert_eq!(request.heartbeat_seq, 1);
@@ -884,9 +918,9 @@ mod tests {
         let requests = mock.heartbeat_requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         let (first_client_id, first_call_id) =
-            control_request_identity(requests[0].header.as_ref().expect("first header"));
+            control_call_identity(requests[0].header.as_ref().expect("first header"));
         let (second_client_id, second_call_id) =
-            control_request_identity(requests[1].header.as_ref().expect("second header"));
+            control_call_identity(requests[1].header.as_ref().expect("second header"));
         assert_eq!(first_client_id, second_client_id);
         assert_ne!(first_call_id, second_call_id);
         assert_eq!(requests[0].heartbeat_seq, 1);
@@ -1283,9 +1317,9 @@ mod tests {
             requests[0].group_name
         );
         let (first_client_id, first_call_id) =
-            control_request_identity(requests[0].header.as_ref().expect("first header"));
+            control_call_identity(requests[0].header.as_ref().expect("first header"));
         let (second_client_id, second_call_id) =
-            control_request_identity(requests[1].header.as_ref().expect("second header"));
+            control_call_identity(requests[1].header.as_ref().expect("second header"));
         assert_eq!(first_client_id, second_client_id);
         assert_ne!(first_call_id, second_call_id);
         assert_eq!(requests[0].worker_id, 42);
@@ -1566,10 +1600,9 @@ mod tests {
         assert!(delta.full_report_required);
         assert!(!reporter.has_delta_baseline(&group_name()));
         let requests = mock.block_report_requests.lock().unwrap();
-        let (full_client_id, full_call_id) =
-            control_request_identity(requests[0].header.as_ref().expect("full header"));
+        let (full_client_id, full_call_id) = control_call_identity(requests[0].header.as_ref().expect("full header"));
         let request = requests.last().expect("delta report request");
-        let (delta_client_id, delta_call_id) = control_request_identity(request.header.as_ref().expect("delta header"));
+        let (delta_client_id, delta_call_id) = control_call_identity(request.header.as_ref().expect("delta header"));
         assert_eq!(full_client_id, delta_client_id);
         assert_ne!(full_call_id, delta_call_id);
         assert_eq!(request.header.as_ref().expect("header").group_name, request.group_name);
@@ -3068,6 +3101,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_stream_frame_error_decrements_inflight_once() {
+        let recorder = StreamGaugeRecorder::default();
+
+        metrics::with_local_recorder(&recorder, || {
+            futures::executor::block_on(async {
+                let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+                let core = Arc::new(core);
+                let service = registered_data_service(Arc::clone(&core));
+                let open = service
+                    .open_write_stream(tonic::Request::new(open_write_proto(0)))
+                    .await
+                    .expect("open write")
+                    .into_inner();
+                let stream_id =
+                    crate::data::convert::proto_to_stream_id(open.stream_id, "stream_id").expect("stream id");
+
+                let response = service
+                    .handle_write_frames(futures::stream::iter(vec![Ok(WriteStreamRequestProto {
+                        stream_id: Some(crate::data::convert::stream_id_to_proto(stream_id)),
+                        seq: 2,
+                        offset_in_block: 0,
+                        data: Bytes::from_static(b"abcd"),
+                        checksum32: 0,
+                    })]))
+                    .await
+                    .expect("write stream response");
+
+                assert!(!response.accepted);
+                assert!(core.stream_manager().get(stream_id).await.is_none());
+            });
+        });
+
+        assert_eq!(
+            recorder.stream_values(),
+            vec![("write".to_string(), 1.0), ("write".to_string(), -1.0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_write_success_decrements_inflight_once() {
+        let recorder = StreamGaugeRecorder::default();
+
+        metrics::with_local_recorder(&recorder, || {
+            futures::executor::block_on(async {
+                let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+                let service = registered_data_service(Arc::new(core));
+                let open = service
+                    .open_write_stream(tonic::Request::new(open_write_proto(2048)))
+                    .await
+                    .expect("open write")
+                    .into_inner();
+                let stream_id =
+                    crate::data::convert::proto_to_stream_id(open.stream_id, "stream_id").expect("stream id");
+                let data = payload();
+
+                service
+                    .handle_write_frames(futures::stream::iter(vec![
+                        Ok(WriteStreamRequestProto {
+                            stream_id: Some(crate::data::convert::stream_id_to_proto(stream_id)),
+                            seq: 1,
+                            offset_in_block: 0,
+                            data: data.slice(0..2048),
+                            checksum32: 0,
+                        }),
+                        Ok(WriteStreamRequestProto {
+                            stream_id: Some(crate::data::convert::stream_id_to_proto(stream_id)),
+                            seq: 2,
+                            offset_in_block: 2048,
+                            data: data.slice(2048..4096),
+                            checksum32: 0,
+                        }),
+                    ]))
+                    .await
+                    .expect("write frames");
+
+                let response = service
+                    .commit_write(tonic::Request::new(commit_write_proto(stream_id, 2, BLOCK_SIZE)))
+                    .await
+                    .expect("commit write")
+                    .into_inner();
+
+                assert!(response.header.expect("header").error.is_none());
+            });
+        });
+
+        assert_eq!(
+            recorder.stream_values(),
+            vec![("write".to_string(), 1.0), ("write".to_string(), -1.0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_write_error_decrements_inflight_once() {
+        let recorder = StreamGaugeRecorder::default();
+
+        metrics::with_local_recorder(&recorder, || {
+            futures::executor::block_on(async {
+                let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+                let core = Arc::new(core);
+                let service = registered_data_service(Arc::clone(&core));
+                let open = service
+                    .open_write_stream(tonic::Request::new(open_write_proto(2048)))
+                    .await
+                    .expect("open write")
+                    .into_inner();
+                let stream_id =
+                    crate::data::convert::proto_to_stream_id(open.stream_id, "stream_id").expect("stream id");
+
+                let response = service
+                    .commit_write(tonic::Request::new(commit_write_proto(stream_id, 1, BLOCK_SIZE)))
+                    .await
+                    .expect("commit error response")
+                    .into_inner();
+
+                assert!(response.header.expect("header").error.is_some());
+                assert!(core.stream_manager().get(stream_id).await.is_none());
+            });
+        });
+
+        assert_eq!(
+            recorder.stream_values(),
+            vec![("write".to_string(), 1.0), ("write".to_string(), -1.0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_write_success_decrements_inflight_once() {
+        let recorder = StreamGaugeRecorder::default();
+
+        metrics::with_local_recorder(&recorder, || {
+            futures::executor::block_on(async {
+                let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+                let service = registered_data_service(Arc::new(core));
+                let open = service
+                    .open_write_stream(tonic::Request::new(open_write_proto(2048)))
+                    .await
+                    .expect("open write")
+                    .into_inner();
+                let stream_id =
+                    crate::data::convert::proto_to_stream_id(open.stream_id, "stream_id").expect("stream id");
+
+                let response = service
+                    .abort_write(tonic::Request::new(AbortWriteRequestProto {
+                        header: Some(test_header()),
+                        group_name: "root".to_string(),
+                        block_id: Some(test_block_id_proto()),
+                        stream_id: Some(crate::data::convert::stream_id_to_proto(stream_id)),
+                        token: Some(test_token_proto()),
+                    }))
+                    .await
+                    .expect("abort write")
+                    .into_inner();
+
+                assert!(response.header.expect("header").error.is_none());
+                assert!(response.aborted);
+            });
+        });
+
+        assert_eq!(
+            recorder.stream_values(),
+            vec![("write".to_string(), 1.0), ("write".to_string(), -1.0)]
+        );
+    }
+
+    #[tokio::test]
     async fn commit_write_returns_success_after_full_write() {
         let (_temp, _store, core) = core_with_store(512, 2048, 4096);
         let core = Arc::new(core);
@@ -3226,6 +3424,139 @@ mod tests {
         assert_eq!(frames[0].offset_in_block, 4);
         assert_eq!(frames[0].data, data.slice(4..10));
         assert!(frames[0].eos);
+    }
+
+    #[tokio::test]
+    async fn read_stream_service_completion_decrements_inflight_once() {
+        let recorder = StreamGaugeRecorder::default();
+
+        metrics::with_local_recorder(&recorder, || {
+            futures::executor::block_on(async {
+                let (_temp, store, core) = core_with_store(512, 2048, 4096);
+                publish_ready_block(&store, payload(), BLOCK_STAMP);
+                let core = Arc::new(core);
+                let service = registered_data_service(Arc::clone(&core));
+
+                let open = service
+                    .open_read_stream(tonic::Request::new(open_read_proto(
+                        0,
+                        BLOCK_SIZE as u32,
+                        BLOCK_STAMP,
+                        512,
+                    )))
+                    .await
+                    .expect("open read")
+                    .into_inner();
+                let stream_id =
+                    crate::data::convert::proto_to_stream_id(open.stream_id, "stream_id").expect("stream id");
+                let response_stream = service
+                    .read_stream(tonic::Request::new(ReadStreamRequestProto {
+                        stream_id: Some(crate::data::convert::stream_id_to_proto(stream_id)),
+                        max_bytes: 512,
+                    }))
+                    .await
+                    .expect("read stream response")
+                    .into_inner();
+                let frames = response_stream
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("read frames");
+
+                assert!(frames.last().expect("last frame").eos);
+                assert_eq!(core.stream_manager().active_count().await, 0);
+            });
+        });
+
+        assert_eq!(
+            recorder.stream_values(),
+            vec![("read".to_string(), 1.0), ("read".to_string(), -1.0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_stream_response_drop_decrements_inflight_once() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        publish_ready_block(&store, payload(), BLOCK_STAMP);
+        let core = Arc::new(core);
+        let service = registered_data_service(Arc::clone(&core));
+
+        let open = service
+            .open_read_stream(tonic::Request::new(open_read_proto(
+                0,
+                BLOCK_SIZE as u32,
+                BLOCK_STAMP,
+                512,
+            )))
+            .await
+            .expect("open read")
+            .into_inner();
+        let stream_id = crate::data::convert::proto_to_stream_id(open.stream_id, "stream_id").expect("stream id");
+        let response_stream = service
+            .read_stream(tonic::Request::new(ReadStreamRequestProto {
+                stream_id: Some(crate::data::convert::stream_id_to_proto(stream_id)),
+                max_bytes: 512,
+            }))
+            .await
+            .expect("read stream response")
+            .into_inner();
+
+        drop(response_stream);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert_eq!(core.stream_manager().active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn read_stream_store_error_decrements_inflight_once() {
+        let recorder = StreamGaugeRecorder::default();
+
+        metrics::with_local_recorder(&recorder, || {
+            futures::executor::block_on(async {
+                let (_temp, store, core) = core_with_store(512, 2048, 4096);
+                publish_ready_block(&store, payload(), BLOCK_STAMP);
+                let paths = store.paths(&group_name(), block_id());
+                let core = Arc::new(core);
+                let service = registered_data_service(Arc::clone(&core));
+
+                let open = service
+                    .open_read_stream(tonic::Request::new(open_read_proto(
+                        0,
+                        BLOCK_SIZE as u32,
+                        BLOCK_STAMP,
+                        512,
+                    )))
+                    .await
+                    .expect("open read")
+                    .into_inner();
+                let stream_id =
+                    crate::data::convert::proto_to_stream_id(open.stream_id, "stream_id").expect("stream id");
+                std::fs::remove_file(paths.data_path).expect("remove ready data file");
+
+                let response_stream = service
+                    .read_stream(tonic::Request::new(ReadStreamRequestProto {
+                        stream_id: Some(crate::data::convert::stream_id_to_proto(stream_id)),
+                        max_bytes: 512,
+                    }))
+                    .await
+                    .expect("read stream response")
+                    .into_inner();
+                let result = response_stream
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>();
+
+                assert!(result.is_err());
+                assert_eq!(core.stream_manager().active_count().await, 0);
+            });
+        });
+
+        assert_eq!(
+            recorder.stream_values(),
+            vec![("read".to_string(), 1.0), ("read".to_string(), -1.0)]
+        );
     }
 
     #[tokio::test]
@@ -3589,7 +3920,7 @@ mod tests {
         ] {
             assert!(
                 sources.iter().all(|source| !source.contains(old_name)),
-                "{old_name} must stay out of the worker data-plane skeleton"
+                "{old_name} must stay out of the worker data-plane service"
             );
         }
     }
@@ -3741,6 +4072,76 @@ mod tests {
                 sources.iter().all(|source| !source.contains(forbidden)),
                 "{forbidden} must stay out of active worker source text"
             );
+        }
+    }
+
+    #[derive(Default)]
+    struct StreamGaugeRecorder {
+        stream_values: Arc<Mutex<Vec<(String, f64)>>>,
+    }
+
+    impl StreamGaugeRecorder {
+        fn stream_values(&self) -> Vec<(String, f64)> {
+            self.stream_values.lock().expect("stream gauge values poisoned").clone()
+        }
+    }
+
+    impl Recorder for StreamGaugeRecorder {
+        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn register_counter(&self, _key: &Key, _metadata: &Metadata<'_>) -> Counter {
+            Counter::noop()
+        }
+
+        fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+            if key.name() != WORKER_STREAM_INFLIGHT {
+                return Gauge::noop();
+            }
+            let mode = key
+                .labels()
+                .find(|label| label.key() == "mode")
+                .map(|label| label.value().to_string())
+                .unwrap_or_default();
+            Gauge::from_arc(Arc::new(StreamGauge {
+                mode,
+                values: Arc::clone(&self.stream_values),
+            }))
+        }
+
+        fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+            Histogram::noop()
+        }
+    }
+
+    struct StreamGauge {
+        mode: String,
+        values: Arc<Mutex<Vec<(String, f64)>>>,
+    }
+
+    impl GaugeFn for StreamGauge {
+        fn increment(&self, value: f64) {
+            self.values
+                .lock()
+                .expect("stream gauge values poisoned")
+                .push((self.mode.clone(), value));
+        }
+
+        fn decrement(&self, value: f64) {
+            self.values
+                .lock()
+                .expect("stream gauge values poisoned")
+                .push((self.mode.clone(), -value));
+        }
+
+        fn set(&self, value: f64) {
+            self.values
+                .lock()
+                .expect("stream gauge values poisoned")
+                .push((self.mode.clone(), value));
         }
     }
 

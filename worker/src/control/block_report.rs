@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode, RefreshReason};
 use common::header::{RequestHeader, RpcErrorCode};
@@ -25,7 +25,9 @@ use tracing::{debug, warn};
 use types::{BlockId, GroupName};
 
 use crate::config::WorkerRegistrationConfig;
-use crate::control::{ControlIdentity, ControlOp, Registration, RegistrationDescriptor, RegistrationSet};
+use crate::control::{
+    metadata_tonic_request, ControlIdentity, ControlOp, Registration, RegistrationDescriptor, RegistrationSet,
+};
 use crate::observe;
 use crate::store::block::{BlockMetaPayload, BlockState};
 use crate::store::dirs::StoreDirs;
@@ -162,29 +164,58 @@ impl MetadataBlockReportLoop {
         let mut accepted_next_delta_seq = 0;
 
         for endpoint in &self.endpoints {
+            let started = Instant::now();
             match self
                 .send_full_to_peer(endpoint.clone(), &registration, report_seq, &blocks)
                 .await
             {
                 Ok(BlockReportPeerOutcome::Accepted { next_delta_seq }) => {
+                    let duration = started.elapsed().as_secs_f64();
+                    observe::record_metadata_rpc("block_report", "ok", "none", duration);
+                    observe::record_block_report_sent("full", "ok", "none", duration);
                     round.accepted_peers += 1;
                     accepted_next_delta_seq = next_delta_seq;
-                    observe::record_block_report_sent();
                 }
-                Ok(BlockReportPeerOutcome::FullReportRequired) => round.full_report_required = true,
+                Ok(BlockReportPeerOutcome::FullReportRequired) => {
+                    observe::record_metadata_rpc(
+                        "block_report",
+                        "error",
+                        "full_report_required",
+                        started.elapsed().as_secs_f64(),
+                    );
+                    round.full_report_required = true;
+                }
                 Ok(BlockReportPeerOutcome::NeedRegister) => {
+                    observe::record_metadata_rpc(
+                        "block_report",
+                        "error",
+                        "need_register",
+                        started.elapsed().as_secs_f64(),
+                    );
                     round.needs_register = true;
                     self.state.mark_needs_register(&registration.group_name);
                     self.reset_baseline(&registration.group_name);
                     break;
                 }
                 Ok(BlockReportPeerOutcome::WorkerRunMismatch) => {
+                    observe::record_metadata_rpc(
+                        "block_report",
+                        "error",
+                        "worker_run_mismatch",
+                        started.elapsed().as_secs_f64(),
+                    );
                     round.worker_run_mismatch = true;
                     self.state.mark_needs_register(&registration.group_name);
                     self.reset_baseline(&registration.group_name);
                     break;
                 }
                 Err(error) => {
+                    observe::record_metadata_rpc(
+                        "block_report",
+                        "error",
+                        block_report_error_kind(&error),
+                        started.elapsed().as_secs_f64(),
+                    );
                     debug!(%error, "Worker full block report peer attempt failed");
                     last_error = Some(error);
                 }
@@ -222,32 +253,59 @@ impl MetadataBlockReportLoop {
         let mut accepted_next_delta_seq = delta_seq;
 
         for endpoint in &self.endpoints {
+            let started = Instant::now();
             match self
                 .send_delta_to_peer(endpoint.clone(), &registration, report_seq, delta_seq, &deltas)
                 .await
             {
                 Ok(BlockReportPeerOutcome::Accepted { next_delta_seq }) => {
+                    let duration = started.elapsed().as_secs_f64();
+                    observe::record_metadata_rpc("block_report", "ok", "none", duration);
+                    observe::record_block_report_sent("delta", "ok", "none", duration);
                     round.accepted_peers += 1;
                     accepted_next_delta_seq = next_delta_seq;
-                    observe::record_block_report_sent();
                 }
                 Ok(BlockReportPeerOutcome::FullReportRequired) => {
+                    observe::record_metadata_rpc(
+                        "block_report",
+                        "error",
+                        "full_report_required",
+                        started.elapsed().as_secs_f64(),
+                    );
                     round.full_report_required = true;
                     self.reset_baseline(&registration.group_name);
                 }
                 Ok(BlockReportPeerOutcome::NeedRegister) => {
+                    observe::record_metadata_rpc(
+                        "block_report",
+                        "error",
+                        "need_register",
+                        started.elapsed().as_secs_f64(),
+                    );
                     round.needs_register = true;
                     self.state.mark_needs_register(&registration.group_name);
                     self.reset_baseline(&registration.group_name);
                     break;
                 }
                 Ok(BlockReportPeerOutcome::WorkerRunMismatch) => {
+                    observe::record_metadata_rpc(
+                        "block_report",
+                        "error",
+                        "worker_run_mismatch",
+                        started.elapsed().as_secs_f64(),
+                    );
                     round.worker_run_mismatch = true;
                     self.state.mark_needs_register(&registration.group_name);
                     self.reset_baseline(&registration.group_name);
                     break;
                 }
                 Err(error) => {
+                    observe::record_metadata_rpc(
+                        "block_report",
+                        "error",
+                        block_report_error_kind(&error),
+                        started.elapsed().as_secs_f64(),
+                    );
                     debug!(%error, "Worker delta block report peer attempt failed");
                     last_error = Some(error);
                 }
@@ -434,7 +492,8 @@ impl MetadataBlockReportLoop {
                 })),
                 group_name: registration.group_name.to_string(),
             };
-            let response = time::timeout(timeout, client.block_report(tonic::Request::new(request.clone())))
+            let tonic_request = metadata_tonic_request(request.clone(), request.header.as_ref());
+            let response = time::timeout(timeout, client.block_report(tonic_request))
                 .await
                 .map_err(|_| BlockReportError::Retryable("metadata full block report timed out".to_string()))?
                 .map_err(classify_status)?
@@ -475,7 +534,8 @@ impl MetadataBlockReportLoop {
             })),
             group_name: registration.group_name.to_string(),
         };
-        let response = time::timeout(timeout, client.block_report(tonic::Request::new(request.clone())))
+        let tonic_request = metadata_tonic_request(request.clone(), request.header.as_ref());
+        let response = time::timeout(timeout, client.block_report(tonic_request))
             .await
             .map_err(|_| BlockReportError::Retryable("metadata delta block report timed out".to_string()))?
             .map_err(classify_status)?
@@ -542,6 +602,14 @@ fn block_id(block: &BlockReportBlockProto) -> Option<BlockId> {
     block.block_id.map(|block_id| {
         BlockId::try_from(block_id).unwrap_or_else(|()| unreachable!("BlockIdProto conversion is infallible"))
     })
+}
+
+fn block_report_error_kind(error: &BlockReportError) -> &'static str {
+    match error {
+        BlockReportError::InvalidConfig(_) => "invalid_config",
+        BlockReportError::Retryable(_) => "retryable",
+        BlockReportError::Fatal(_) => "fatal",
+    }
 }
 
 fn classify_block_report_response(

@@ -422,10 +422,10 @@ impl AttemptContext {
         }
         Ok(RequestHeaderProto {
             client: Some(self.client_info()),
+            trace_context: None,
             group_name: group_name.to_string(),
             mount_epoch: self.mount_epoch,
             deadline_ms: self.deadline_ms(),
-            traceparent: self.call_id_text.clone(),
             caller_context: None,
             state: self.state.clone(),
             retry_count: self.attempt_number as i32,
@@ -441,7 +441,7 @@ impl AttemptContext {
     pub fn data_header(&self) -> DataRequestHeaderProto {
         DataRequestHeaderProto {
             client: Some(self.client_info()),
-            traceparent: self.call_id_text.clone(),
+            trace_context: None,
         }
     }
 }
@@ -562,6 +562,24 @@ mod tests {
         assert_eq!(first.call_id(), replay.call_id());
         assert_eq!(first.metadata_header().expect("first header").group_name, "root");
         assert_eq!(replay.metadata_header().expect("replay header").group_name, "analytics");
+    }
+
+    #[test]
+    fn attempt_headers_do_not_use_call_id_as_traceparent() {
+        let operation = metadata_operation();
+        let ctx =
+            AttemptContext::for_metadata(&operation, GroupName::parse("root").unwrap(), 0).expect("metadata attempt");
+
+        let metadata_header = ctx.metadata_header().expect("metadata header");
+        let data_header = ctx.data_header();
+
+        assert_eq!(
+            metadata_header.client.as_ref().expect("metadata client").call_id,
+            ctx.call_id()
+        );
+        assert_eq!(data_header.client.as_ref().expect("data client").call_id, ctx.call_id());
+        assert!(metadata_header.trace_context.is_none());
+        assert!(data_header.trace_context.is_none());
     }
 
     #[test]

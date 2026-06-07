@@ -4,6 +4,7 @@
 //! RocksDB-backed Raft state machine store (openraft `RaftStateMachine` + snapshot I/O).
 
 use crate::error::{MetadataError, MetadataResult};
+use crate::observe;
 use crate::raft::snapshot::SnapshotFile;
 use crate::raft::storage::{RocksDBStorage, STATE_CFS};
 use crate::raft::types::{AppDataResponse, AppMetadataRaftState, MetadataNode, MetadataRaftTypeConfig};
@@ -88,42 +89,65 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
 
         for entry in &entries {
             let log_id = *entry.get_log_id();
+            let apply_started = Instant::now();
 
             match entry.payload {
                 EntryPayload::Normal(ref cmd) => {
-                    let result = self.state_machine.apply(cmd.clone()).map_err(|e| StorageError::IO {
-                        source: StorageIOError::<u64>::apply(log_id, AnyError::new(&e)),
-                    })?;
+                    let result = match self.state_machine.apply(cmd.clone()) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            observe::record_raft_apply(
+                                "error",
+                                observe::metadata_error_kind(&e),
+                                apply_started.elapsed().as_secs_f64(),
+                            );
+                            return Err(StorageError::IO {
+                                source: StorageIOError::<u64>::apply(log_id, AnyError::new(&e)),
+                            });
+                        }
+                    };
 
                     // Update last_applied_log_id
                     let mut state = self.state.write();
                     state.last_applied_log_id = Some(log_id);
-                    self.storage.persist_raft_state(&state).map_err(|e| StorageError::IO {
-                        source: StorageIOError::<u64>::apply(log_id, AnyError::new(&e)),
-                    })?;
+                    if let Err(e) = self.storage.persist_raft_state(&state) {
+                        observe::record_raft_apply("error", "storage", apply_started.elapsed().as_secs_f64());
+                        return Err(StorageError::IO {
+                            source: StorageIOError::<u64>::apply(log_id, AnyError::new(&e)),
+                        });
+                    }
 
                     results.push(result);
+                    observe::record_raft_apply("ok", "none", apply_started.elapsed().as_secs_f64());
                 }
                 EntryPayload::Membership(ref membership) => {
                     // Update membership
                     let mut state = self.state.write();
                     state.membership = membership.clone();
                     state.last_applied_log_id = Some(log_id);
-                    self.storage.persist_raft_state(&state).map_err(|e| StorageError::IO {
-                        source: StorageIOError::<u64>::apply(log_id, AnyError::new(&e)),
-                    })?;
+                    if let Err(e) = self.storage.persist_raft_state(&state) {
+                        observe::record_raft_apply("error", "storage", apply_started.elapsed().as_secs_f64());
+                        return Err(StorageError::IO {
+                            source: StorageIOError::<u64>::apply(log_id, AnyError::new(&e)),
+                        });
+                    }
 
                     results.push(AppDataResponse::None);
+                    observe::record_raft_apply("ok", "none", apply_started.elapsed().as_secs_f64());
                 }
                 EntryPayload::Blank => {
                     // Blank entry, just update last_applied_log_id
                     let mut state = self.state.write();
                     state.last_applied_log_id = Some(log_id);
-                    self.storage.persist_raft_state(&state).map_err(|e| StorageError::IO {
-                        source: StorageIOError::<u64>::apply(log_id, AnyError::new(&e)),
-                    })?;
+                    if let Err(e) = self.storage.persist_raft_state(&state) {
+                        observe::record_raft_apply("error", "storage", apply_started.elapsed().as_secs_f64());
+                        return Err(StorageError::IO {
+                            source: StorageIOError::<u64>::apply(log_id, AnyError::new(&e)),
+                        });
+                    }
 
                     results.push(AppDataResponse::None);
+                    observe::record_raft_apply("ok", "none", apply_started.elapsed().as_secs_f64());
                 }
             }
         }

@@ -22,7 +22,7 @@ use tracing::{info, warn};
 use types::{GroupName, WorkerId, WorkerRunId};
 
 use crate::config::{WorkerConfig, WorkerRegistrationConfig};
-use crate::control::{ControlIdentity, ControlOp, Registration, RegistrationSet};
+use crate::control::{metadata_tonic_request, ControlIdentity, ControlOp, Registration, RegistrationSet};
 use crate::net::protocol::WorkerNetProtocol;
 
 /// Worker descriptor sent to metadata during startup registration.
@@ -126,7 +126,8 @@ impl MetadataRegistrar {
         let channel = self.connect(timeout).await?;
         let mut client = MetadataWorkerServiceProtoClient::new(channel);
         let request = self.build_request(op, retry_count);
-        let response = time::timeout(timeout, client.register_worker(tonic::Request::new(request)))
+        let tonic_request = metadata_tonic_request(request.clone(), request.header.as_ref());
+        let response = time::timeout(timeout, client.register_worker(tonic_request))
             .await
             .map_err(|_| RegistrationError::Retryable("metadata register request timed out".to_string()))?
             .map_err(classify_status)?

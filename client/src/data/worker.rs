@@ -255,7 +255,7 @@ impl WorkerDataClient for TonicWorkerDataClient {
                 max_bytes,
             };
             let mut stream = client
-                .read_stream(tonic::Request::new(stream_request))
+                .read_stream(tonic_request(&ctx, stream_request))
                 .await
                 .map_err(ClientError::from)?
                 .into_inner();

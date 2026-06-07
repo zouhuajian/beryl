@@ -9,7 +9,7 @@
 - 清理仓库基线：确认 `client/src/api/` 当前布局为 `fs_client.rs`、`handle.rs`、`options.rs`、`status.rs`、`tests.rs`，不恢复已删除的 split API 文件。
 - 文档追踪显式化：`docs/` 不再被整目录忽略，架构边界、审计材料、行动计划和配置矩阵可正常提交。
 - 工具链基线：固定 Rust 1.95.0，新增 `rust-toolchain.toml`、`Makefile` 验证入口和 GitHub Actions CI。
-- 配置收敛：`conf/core-site.yaml` 和 `conf/client-site.yaml` 只保留当前 runtime 实际消费并校验的键。
+- 配置收敛：`conf/metadata.yaml`、`conf/worker.yaml` 和 `conf/client-site.yaml` 只保留当前 runtime 实际消费并校验的键。
 - 删除无当前消费方的配置入口：移除 metadata 存储目录环境覆盖、worker 配置别名、client 单数 metadata group 配置入口，以及默认配置中的未接线 worker/client/observability 项。
 - 文档一致性：README 只描述当前可运行基线和明确延期项，不把未实现功能写成可部署能力。
 

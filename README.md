@@ -34,7 +34,8 @@ Currently supported:
 - Worker startup registration with MetadataWorkerService using stable `WorkerId` plus per-process `WorkerRunId`, followed by heartbeat and block-report loops and a gRPC data service for local block/chunk/stream read and write execution.
 - MetadataWorkerService structured application-error response contract for worker registration.
 - Client facade with metadata gateway, retry/refresh classification, read planning, worker endpoint validation, and sequential write handles.
-- Default `conf/core-site.yaml` and `conf/client-site.yaml` containing only keys consumed by current runtime code.
+- Default `conf/metadata.yaml`, `conf/worker.yaml`, and `conf/client-site.yaml` containing only keys consumed by current runtime code.
+- Local runnable configs for one metadata process and one worker process: `conf/local/metadata.yaml` and `conf/local/worker.yaml`.
 - Owner-crate config and contract tests. Default workspace tests do not start metadata or worker services.
 
 Intentionally not yet implemented in this baseline:
@@ -65,9 +66,27 @@ Dependency direction is one-way from product crates to shared crates. `types` mu
 
 Default configuration files are active baselines, not roadmaps:
 
-- `conf/core-site.yaml` contains current metadata and worker runtime keys only.
+- `conf/metadata.yaml` contains current metadata runtime keys only.
+- `conf/worker.yaml` contains current worker runtime keys only.
 - `conf/client-site.yaml` contains current client runtime keys only.
+- `conf/local/metadata.yaml` and `conf/local/worker.yaml` are the runnable local metadata/worker pair.
 - Planned capabilities may be described in docs, but they must not appear as deployable defaults until code consumes and validates them.
+
+Default one-metadata, one-worker startup:
+
+```bash
+metadata format --config conf/metadata.yaml
+metadata start --config conf/metadata.yaml
+worker start --config conf/worker.yaml
+```
+
+Local one-metadata, one-worker startup:
+
+```bash
+metadata format --config conf/local/metadata.yaml
+metadata start --config conf/local/metadata.yaml
+worker start --config conf/local/worker.yaml
+```
 
 See `docs/CONFIG_MATRIX_ZH.md` for the current key ownership and status matrix.
 
@@ -79,12 +98,15 @@ tracing/logging subscriber. Product crates own their own signal names and emissi
 worker, and client code should emit through the `metrics` crate and `tracing`; common must not
 contain metadata/worker/client/UFS business metric definitions.
 
-The default metrics exporter is Prometheus. Metadata start binds it from `metadata.http.bind`,
-worker start binds it from `worker.http.bind`, and both expose the common recorder output at
-`/metrics`. `metadata format` does not initialize observability. Trace/log output defaults to the
-local tracing subscriber; OTLP integration is optional/feature-gated where present, and
-OpenTelemetry logs are not part of the current runtime. Client observability is still partial and
-does not set up its own exporter.
+The supported metrics exporter is Prometheus. `observe.metrics.prometheus.bind`
+controls the `/metrics` listener bind address and `observe.metrics.prometheus.path`
+controls the HTTP path. `metadata.http.bind` and `worker.http.bind` are parsed and
+logged as reserved HTTP/admin bind fields, but no current listener uses them and
+they do not control `/metrics`. `metadata format` does not initialize observability.
+Trace/log output uses the local tracing subscriber. OTLP export and OpenTelemetry
+SDK export pipelines are unsupported now. Client observability is still partial and
+does not set up its own exporter. See `docs/observability.md` for the current
+observability contract.
 
 ## License
 

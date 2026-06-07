@@ -14,6 +14,7 @@ use crate::error::MetadataResult;
 use crate::inflight_registry::{InflightKind, InflightRegistry};
 use crate::metrics::MetadataMetrics;
 use crate::mount::MountTable;
+use crate::observe;
 use crate::raft::{AppRaftNode, Command, DedupKey, RocksDBStorage};
 use crate::state::{DeleteIntent, DeleteIntentReason, DeleteIntentStatus};
 use crate::worker::WorkerManager;
@@ -173,6 +174,7 @@ impl DeleteExecutor {
         let pending_intents = self
             .storage
             .list_pending_delete_intents(self.max_intents_per_poll, now_ms)?;
+        observe::set_delete_queue_depth(pending_intents.len());
 
         if pending_intents.is_empty() {
             return Ok(());
@@ -477,6 +479,9 @@ impl DeleteExecutor {
             self.metrics
                 .delete_executor_requests_total
                 .fetch_add(blocks.len() as u64, Ordering::Relaxed);
+            for _ in &blocks {
+                observe::record_delete_task("ok", "none");
+            }
 
             debug!(
                 worker_id = worker_id.as_raw(),
@@ -621,6 +626,7 @@ impl DeleteExecutor {
                 .propose_delete_intent_status(intent_id, DeleteIntentStatus::Completed, Some(now_ms), None)
                 .await
             {
+                observe::record_delete_task("error", observe::metadata_error_kind(&e));
                 warn!(
                     intent_id,
                     error = %e,
@@ -642,6 +648,7 @@ impl DeleteExecutor {
             self.metrics
                 .delete_intents_completed_total
                 .fetch_add(1, Ordering::Relaxed);
+            observe::record_delete_task("ok", "none");
             if reconciled {
                 self.metrics
                     .delete_intents_completed_by_reconcile_total

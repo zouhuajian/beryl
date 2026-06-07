@@ -16,7 +16,7 @@ fn write_config(dir: &TempDir, cluster_id: &str, group_name: &str) -> std::path:
     let worker_dir = dir.path().join("worker");
     let store_dir = worker_dir.join("hdd0");
     let identity_path = worker_dir.join("worker.identity");
-    let config_path = dir.path().join("core-site.yaml");
+    let config_path = dir.path().join("worker.yaml");
     std::fs::write(
         &config_path,
         format!(
@@ -33,6 +33,11 @@ worker.rpc.bind: "127.0.0.1:0"
 worker.rpc.advertised_endpoint: "http://127.0.0.1:19090"
 worker.metadata.group.name: "{group_name}"
 worker.metadata.endpoints: "http://127.0.0.1:18080"
+observe.log.format: compact
+observe.log.output: stderr
+observe.log.level: "info,vecton=info,metadata=info,worker=info,common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
+observe.metrics.prometheus.bind: "127.0.0.1:19091"
+observe.metrics.prometheus.path: "/metrics"
 "#,
             identity_path.display(),
             store_dir.display()
@@ -170,6 +175,11 @@ worker.rpc.bind: "127.0.0.1:0"
 worker.rpc.advertised_endpoint: "http://127.0.0.1:19090"
 worker.metadata.group.name: "root"
 worker.metadata.endpoints: "http://127.0.0.1:18080"
+observe.log.format: compact
+observe.log.output: stderr
+observe.log.level: "info,vecton=info,metadata=info,worker=info,common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
+observe.metrics.prometheus.bind: "127.0.0.1:19091"
+observe.metrics.prometheus.path: "/metrics"
 "#,
             worker_id.as_raw(),
             config.identity_path.display(),

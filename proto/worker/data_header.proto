@@ -23,8 +23,8 @@ message DataRequestHeaderProto {
   /// Client information (call_id, client_id, client_name).
   common.ClientInfoProto client = 1;
 
-  /// W3C Trace Context: traceparent header value.
-  string traceparent = 2;
+  /// W3C trace propagation context.
+  common.TraceContextProto trace_context = 2;
 }
 
 /// Response header for data-plane operations.

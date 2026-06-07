@@ -120,8 +120,10 @@ impl OrphanBlockCleaner {
         // Check if we're leader and state is stable
         let is_leader = self.raft_node.is_leader();
         if !is_leader {
+            observe::set_orphan_queue_depth(self.orphan_queue.len());
             return Ok(()); // Only run on leader
         }
+        observe::set_orphan_queue_depth(self.orphan_queue.len());
 
         let (is_ready, reason_opt) = match &gate_check {
             GateCheckResult::Ready => (true, None),
@@ -133,7 +135,7 @@ impl OrphanBlockCleaner {
             self.metrics
                 .orphan_cleanup_skipped_total
                 .fetch_add(1, Ordering::Relaxed);
-            observe::record_orphan_cleanup_skipped();
+            observe::record_orphan_cleanup("skipped", "gate_not_ready");
             self.metrics.orphan_gate_state.store(0, Ordering::Relaxed);
 
             const LOG_INTERVAL_MS: u64 = 5 * 60 * 1000;
@@ -188,7 +190,7 @@ impl OrphanBlockCleaner {
             self.metrics
                 .orphan_cleanup_skipped_total
                 .fetch_add(1, Ordering::Relaxed);
-            observe::record_orphan_cleanup_skipped();
+            observe::record_orphan_cleanup("skipped", "block_report_not_converged");
             self.metrics.orphan_gate_state.store(0, Ordering::Relaxed);
 
             const LOG_INTERVAL_MS: u64 = 5 * 60 * 1000;
@@ -227,6 +229,7 @@ impl OrphanBlockCleaner {
 
         // Process orphan blocks with grace period
         self.process_orphan_blocks(now_ms).await?;
+        observe::set_orphan_queue_depth(self.orphan_queue.len() + self.orphan_pending.read().len());
 
         Ok(())
     }
@@ -264,7 +267,7 @@ impl OrphanBlockCleaner {
                     self.metrics
                         .orphan_cleanup_skipped_total
                         .fetch_add(1, Ordering::Relaxed);
-                    observe::record_orphan_cleanup_skipped();
+                    observe::record_orphan_cleanup("skipped", "block_read_failed");
                     warn!(
                         task = "orphan_cleanup",
                         block_id = %block_id,
@@ -289,6 +292,7 @@ impl OrphanBlockCleaner {
                         false // Not eligible yet
                     }
                 };
+                observe::set_orphan_queue_depth(self.orphan_queue.len() + self.orphan_pending.read().len());
 
                 if should_evict {
                     // Eligible for evict - create DeleteIntent instead of direct evict
@@ -368,8 +372,12 @@ impl OrphanBlockCleaner {
                                     self.metrics
                                         .delete_intents_created_total
                                         .fetch_add(1, Ordering::Relaxed);
+                                    observe::record_orphan_cleanup("ok", "delete_intent_created");
                                     // Remove from pending
                                     self.orphan_pending.write().remove(&block_id);
+                                    observe::set_orphan_queue_depth(
+                                        self.orphan_queue.len() + self.orphan_pending.read().len(),
+                                    );
                                 }
                                 Err(e) => {
                                     warn!(
@@ -395,7 +403,7 @@ impl OrphanBlockCleaner {
                             self.metrics
                                 .orphan_cleanup_skipped_total
                                 .fetch_add(1, Ordering::Relaxed);
-                            observe::record_orphan_cleanup_skipped();
+                            observe::record_orphan_cleanup("skipped", "intent_build_failed");
                             continue;
                         }
                     }

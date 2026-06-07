@@ -3,132 +3,187 @@
 
 //! Tracing setup and configuration.
 
+use std::io::IsTerminal;
+
+use crate::observe::config::ObservabilityConfig;
 use tracing_subscriber::{
     EnvFilter, Layer, Registry,
     fmt::{self},
-    layer::SubscriberExt,
+    layer::{Layered, SubscriberExt},
     util::SubscriberInitExt,
 };
 
-/// Initialize tracing subscriber with JSON output to stdout.
-pub fn init_tracing_subscriber(
-    level: &str,
-    format: &str,
-    targets: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let filter = if let Some(targets) = targets {
-        EnvFilter::try_new(targets)?
-    } else {
-        EnvFilter::try_new(level)?
-    };
+/// Initialize tracing subscriber once with the configured logging layer.
+pub fn init_tracing_subscriber(config: &ObservabilityConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let log = &config.log;
+    match (log.format.as_str(), log.output.as_str()) {
+        ("json", "stdout") => init_with_log_layer(
+            config,
+            fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_span_list(false)
+                .with_ansi(false)
+                .with_target(true)
+                .with_file(false)
+                .with_line_number(false)
+                .with_writer(std::io::stdout),
+        ),
+        ("json", "stderr") => init_with_log_layer(
+            config,
+            fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_span_list(false)
+                .with_ansi(false)
+                .with_target(true)
+                .with_file(false)
+                .with_line_number(false)
+                .with_writer(std::io::stderr),
+        ),
+        ("compact", "stdout") => init_with_log_layer(
+            config,
+            fmt::layer()
+                .compact()
+                .with_ansi(ansi_enabled(log.output.as_str()))
+                .with_target(true)
+                .with_file(false)
+                .with_line_number(false)
+                .with_writer(std::io::stdout),
+        ),
+        ("compact", "stderr") => init_with_log_layer(
+            config,
+            fmt::layer()
+                .compact()
+                .with_ansi(ansi_enabled(log.output.as_str()))
+                .with_target(true)
+                .with_file(false)
+                .with_line_number(false)
+                .with_writer(std::io::stderr),
+        ),
+        _ => Err(format!(
+            "unsupported log format/output: format={}, output={}",
+            log.format, log.output
+        )
+        .into()),
+    }
+}
 
-    let fmt_layer = if format == "json" {
-        fmt::layer().json().with_writer(std::io::stdout).boxed()
-    } else {
-        fmt::layer().pretty().with_writer(std::io::stdout).boxed()
-    };
-
-    Registry::default().with(filter).with(fmt_layer).try_init()?;
-
+fn init_with_log_layer<L>(config: &ObservabilityConfig, log_layer: L) -> Result<(), Box<dyn std::error::Error>>
+where
+    L: Layer<Registry> + Send + Sync + 'static,
+    EnvFilter: Layer<Layered<L, Registry>>,
+{
+    let filter = EnvFilter::try_new(&config.log.level)?;
+    Registry::default().with(log_layer).with(filter).try_init()?;
     Ok(())
 }
 
-/// Add OpenTelemetry layer to existing subscriber.
-#[cfg(feature = "otel")]
-pub fn add_otel_layer_to_subscriber(
-    provider: opentelemetry_sdk::trace::TracerProvider,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
-
-    let otel_layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("vecton"));
-
-    tracing_subscriber::registry().with(otel_layer).try_init()?;
-
-    Ok(())
+fn ansi_enabled(output: &str) -> bool {
+    match output {
+        "stdout" => std::io::stdout().is_terminal(),
+        "stderr" => std::io::stderr().is_terminal(),
+        _ => false,
+    }
 }
 
-#[cfg(feature = "otel")]
-pub mod otel {
-    use opentelemetry::trace::TraceError;
-    use opentelemetry_sdk::{
-        Resource,
-        trace::{self, TracerProvider},
-    };
-    use opentelemetry_semantic_conventions::resource::{SERVICE_NAME, SERVICE_VERSION};
-    use std::time::Duration;
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::{Arc, Mutex};
 
-    /// Initialize OpenTelemetry tracing with OTLP exporter.
-    pub fn init_otel_tracing(
-        endpoint: &str,
-        _protocol: &str,
-        _headers: Option<&str>,
-        timeout_ms: u64,
-        sampling_ratio: f64,
-        parent_based: bool,
-        resource: &crate::observe::config::ResourceConfig,
-        service_info: &crate::observe::config::ServiceInfo,
-    ) -> Result<TracerProvider, TraceError> {
-        use opentelemetry_otlp::WithExportConfig;
+    use tracing_subscriber::{Registry, layer::SubscriberExt};
 
-        let mut resource_builder = Resource::default();
+    use super::*;
 
-        // Set service name from service_info or config
-        let service_name = resource.service_name.as_ref().unwrap_or(&service_info.name);
-        resource_builder = resource_builder.with_attributes(vec![SERVICE_NAME.string(service_name.clone())]);
+    #[test]
+    fn json_formatter_flattens_event_and_omits_span_wrappers() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = TestWriter::new(Arc::clone(&output));
+        let subscriber = Registry::default().with(
+            fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_span_list(false)
+                .with_ansi(false)
+                .with_target(true)
+                .with_file(false)
+                .with_line_number(false)
+                .with_writer(move || writer.clone()),
+        );
 
-        if let Some(version) = resource
-            .service_version
-            .as_ref()
-            .or_else(|| Some(&service_info.version))
-        {
-            resource_builder = resource_builder.with_attributes(vec![SERVICE_VERSION.string(version.clone())]);
-        }
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                event = "metadata_epoch_initialized",
+                metadata_epoch = 7_u64,
+                "metadata epoch initialized"
+            );
+        });
 
-        if let Some(env) = &resource.environment {
-            resource_builder = resource_builder.with_attributes(vec![opentelemetry::KeyValue::new(
-                "deployment.environment",
-                env.clone(),
-            )]);
-        }
-
-        if let Some(instance_id) = &resource.instance_id {
-            resource_builder = resource_builder.with_attributes(vec![opentelemetry::KeyValue::new(
-                "service.instance.id",
-                instance_id.clone(),
-            )]);
-        }
-
-        let exporter = opentelemetry_otlp::new_exporter()
-            .tonic()
-            .with_endpoint(endpoint)
-            .with_timeout(Duration::from_millis(timeout_ms));
-
-        let provider = opentelemetry_otlp::new_pipeline()
-            .tracing()
-            .with_exporter(exporter)
-            .with_trace_config(
-                trace::config()
-                    .with_resource(resource_builder)
-                    .with_sampler(if parent_based {
-                        trace::Sampler::ParentBased(Box::new(trace::Sampler::TraceIdRatioBased(sampling_ratio)))
-                    } else {
-                        trace::Sampler::TraceIdRatioBased(sampling_ratio)
-                    }),
-            )
-            .install_batch(opentelemetry_sdk::runtime::Tokio)?;
-
-        Ok(provider)
+        let line = String::from_utf8(output.lock().expect("test log output poisoned").clone()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(json["event"], "metadata_epoch_initialized");
+        assert_eq!(json["metadata_epoch"], 7);
+        assert!(json.get("fields").is_none(), "{line}");
+        assert!(json.get("span").is_none(), "{line}");
+        assert!(json.get("spans").is_none(), "{line}");
     }
 
-    /// Add OpenTelemetry layer to existing subscriber.
-    pub fn add_otel_layer(provider: TracerProvider) -> Result<(), Box<dyn std::error::Error>> {
-        let otel_layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("vecton"));
+    #[test]
+    fn compact_formatter_is_not_json() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = TestWriter::new(Arc::clone(&output));
+        let subscriber = Registry::default().with(
+            fmt::layer()
+                .compact()
+                .with_ansi(false)
+                .with_target(true)
+                .with_file(false)
+                .with_line_number(false)
+                .with_writer(move || writer.clone()),
+        );
 
-        tracing_subscriber::registry().with(otel_layer).try_init()?;
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(event = "worker_registered", worker_id = 1_u64, "worker registered");
+        });
 
-        Ok(())
+        let line = String::from_utf8(output.lock().expect("test log output poisoned").clone()).unwrap();
+        assert!(!line.trim_start().starts_with('{'), "{line}");
+        assert!(line.contains("worker registered"), "{line}");
+    }
+
+    #[test]
+    fn subscriber_initialization_has_no_second_global_try_init_path() {
+        let source = include_str!("tracing.rs");
+        let production_source = source.split("\n#[cfg(test)]").next().expect("production source");
+        assert_eq!(production_source.matches("try_init()").count(), 1);
+    }
+
+    #[derive(Clone)]
+    struct TestWriter {
+        output: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl TestWriter {
+        fn new(output: Arc<Mutex<Vec<u8>>>) -> Self {
+            Self { output }
+        }
+    }
+
+    impl io::Write for TestWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.output
+                .lock()
+                .expect("test log output poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 }

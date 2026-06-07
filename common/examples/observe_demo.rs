@@ -4,60 +4,39 @@
 //! Observability demo example.
 //!
 //! This example demonstrates:
-//! - Initializing observability with stdout JSON logging
+//! - Initializing observability with production-style flat JSON logging
 //! - Prometheus metrics endpoint
 //! - Tracing spans
 //! - Mock transport and UFS operations
 
-use common::observe::{ObservabilityConfig, ServiceInfo, init_observability};
+use common::observe::config::{
+    LogConfig, MetricsConfig, ObservabilityConfig, PrometheusConfig, ResourceConfig, ServiceInfo,
+};
+use common::observe::init_observability;
 use std::time::Duration;
 use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Configure observability
     let config = ObservabilityConfig {
-        logging: common::observe::config::LoggingConfig {
-            level: "info".to_string(),
+        log: LogConfig {
+            level: "info,vecton=info,common=info,tonic=warn,tower=warn,h2=warn".to_string(),
             format: "json".to_string(),
-            targets: None,
-            stdout: true,
+            output: "stdout".to_string(),
         },
-        tracing: common::observe::config::TracingConfig {
-            enabled: true,
-            sampling: common::observe::config::SamplingConfig {
-                ratio: 1.0,
-                parent_based: true,
-            },
-            otlp: common::observe::config::OtlpConfig {
-                enabled: false, // Set to true if you have an OTLP collector running
-                endpoint: "http://localhost:4317".to_string(),
-                protocol: "grpc".to_string(),
-                headers: None,
-                timeout_ms: 10000,
-            },
-        },
-        metrics: common::observe::config::MetricsConfig {
-            enabled: true,
-            prometheus: common::observe::config::PrometheusConfig {
-                enabled: true,
+        metrics: MetricsConfig {
+            prometheus: PrometheusConfig {
                 bind: "0.0.0.0:9090".to_string(),
                 path: "/metrics".to_string(),
             },
-            otlp: common::observe::config::OtlpMetricsConfig {
-                enabled: false, // Set to true if you have an OTLP collector running
-                endpoint: "http://localhost:4317".to_string(),
-                protocol: "grpc".to_string(),
-                interval_ms: 60000,
-            },
         },
-        resource: common::observe::config::ResourceConfig {
+        resource: ResourceConfig {
             service_name: Some("observability-demo".to_string()),
             service_version: Some("0.1.0".to_string()),
             environment: Some("development".to_string()),
             instance_id: Some("demo-1".to_string()),
             node_name: Some("demo-node".to_string()),
-            cluster: None,
+            ..Default::default()
         },
     };
 

@@ -5,7 +5,9 @@
 
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use futures::{stream, Stream, StreamExt};
@@ -25,10 +27,13 @@ use crate::data::convert::{
     proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_open_request, proto_to_stream_id,
     proto_to_sync_committed_block_request, proto_to_write_frame, proto_to_write_open_request, stream_id_to_proto,
 };
-use crate::data::core::WorkerCore;
+use crate::data::core::{StreamMode, WorkerCore};
 use crate::error::WorkerError;
+use crate::observe;
 use common::error::canonical::RefreshReason;
 use common::header::RpcErrorCode;
+use common::observe::propagation::{extract_trace_context, ExtractedContext};
+use tracing::Span;
 use types::{GroupName, WorkerRunId};
 
 /// Worker data service implementation.
@@ -149,14 +154,17 @@ impl WorkerDataServiceImpl {
             let frame = match frame {
                 Ok(frame) => frame,
                 Err(status) => {
+                    observe::record_stream_frame("write", "error", status_error_kind(&status), 0);
                     cleanup_write_stream_after_error(&self.core, active_stream_id).await?;
                     return Err(status);
                 }
             };
+            let frame_bytes = frame.data.len() as u64;
             let frame_stream_id = proto_to_stream_id(frame.stream_id, "stream_id").ok();
             let domain = match proto_to_write_frame(frame) {
                 Ok(domain) => domain,
                 Err(error) => {
+                    observe::record_stream_frame("write", "error", observe::worker_error_kind(&error), frame_bytes);
                     cleanup_write_stream_after_error(&self.core, frame_stream_id.or(active_stream_id)).await?;
                     return Err(error.to_status());
                 }
@@ -165,10 +173,12 @@ impl WorkerDataServiceImpl {
             let result = match self.core.write_stream(domain).await {
                 Ok(result) => result,
                 Err(error) => {
+                    observe::record_stream_frame("write", "error", observe::worker_error_kind(&error), frame_bytes);
                     cleanup_write_stream_after_error(&self.core, active_stream_id).await?;
                     return Err(error.to_status());
                 }
             };
+            observe::record_stream_frame("write", "ok", "none", frame_bytes);
             response = WriteStreamResponseProto {
                 accepted: result.accepted,
                 last_acked_seq: result.last_acked_seq,
@@ -183,6 +193,69 @@ impl WorkerDataServiceImpl {
     }
 }
 
+struct ReadStreamState {
+    core: Arc<WorkerCore>,
+    stream_id: types::StreamId,
+    max_bytes: u32,
+    done: Arc<AtomicBool>,
+    _cleanup: ReadStreamCleanup,
+}
+
+impl ReadStreamState {
+    async fn next(self) -> Option<(Result<ReadStreamResponseProto, Status>, Self)> {
+        if self.done.load(Ordering::Acquire) {
+            return None;
+        }
+
+        match self.core.read_stream(self.stream_id, self.max_bytes).await {
+            Ok(mut frames) => {
+                let Some(frame) = frames.pop() else {
+                    self.done.store(true, Ordering::Release);
+                    return None;
+                };
+                if frame.eos {
+                    self.done.store(true, Ordering::Release);
+                }
+                observe::record_stream_frame("read", "ok", "none", frame.data.len() as u64);
+                Some((
+                    Ok(ReadStreamResponseProto {
+                        offset_in_block: frame.offset_in_block,
+                        data: frame.data,
+                        checksum32: frame.checksum32,
+                        eos: frame.eos,
+                    }),
+                    self,
+                ))
+            }
+            Err(error) => {
+                self.done.store(true, Ordering::Release);
+                observe::record_stream_frame("read", "error", observe::worker_error_kind(&error), 0);
+                Some((Err(error.to_status()), self))
+            }
+        }
+    }
+}
+
+struct ReadStreamCleanup {
+    core: Arc<WorkerCore>,
+    stream_id: types::StreamId,
+    done: Arc<AtomicBool>,
+}
+
+impl Drop for ReadStreamCleanup {
+    fn drop(&mut self) {
+        if self.done.load(Ordering::Acquire) {
+            return;
+        }
+        let core = Arc::clone(&self.core);
+        let stream_id = self.stream_id;
+        self.done.store(true, Ordering::Release);
+        tokio::spawn(async move {
+            core.stream_manager().remove(stream_id).await;
+        });
+    }
+}
+
 #[tonic::async_trait]
 impl WorkerDataService for WorkerDataServiceImpl {
     type ReadStreamStream = Pin<Box<dyn futures::Stream<Item = Result<ReadStreamResponseProto, Status>> + Send>>;
@@ -191,9 +264,16 @@ impl WorkerDataService for WorkerDataServiceImpl {
         &self,
         request: Request<OpenReadStreamRequestProto>,
     ) -> Result<Response<OpenReadStreamResponseProto>, Status> {
-        let request = request.into_inner();
+        let started = Instant::now();
+        let transport_context = extract_trace_context(request.metadata());
+        let mut request = request.into_inner();
+        merge_data_header_transport_context(&mut request.header, &transport_context);
         let header = request.header.clone();
         if let Err(error) = self.ensure_group_ready_for_run(&request.group_name, &request.worker_run_id) {
+            let error_kind = observe::worker_error_kind(&error);
+            let duration = started.elapsed().as_secs_f64();
+            observe::record_data_rpc("open_read_stream", "error", error_kind, duration);
+            observe::record_stream_open("read", "error", error_kind);
             return Ok(Response::new(OpenReadStreamResponseProto {
                 header: Some(Self::error_response_header(header, error)),
                 stream_id: None,
@@ -231,6 +311,10 @@ impl WorkerDataService for WorkerDataServiceImpl {
                 committed_length: 0,
             },
         };
+        let (status, error_kind) = response_status_error_kind(response.header.as_ref());
+        let duration = started.elapsed().as_secs_f64();
+        observe::record_data_rpc("open_read_stream", status, error_kind, duration);
+        observe::record_stream_open("read", status, error_kind);
 
         Ok(Response::new(response))
     }
@@ -239,34 +323,83 @@ impl WorkerDataService for WorkerDataServiceImpl {
         &self,
         request: Request<ReadStreamRequestProto>,
     ) -> Result<Response<Self::ReadStreamStream>, Status> {
-        self.ensure_any_ready().map_err(|error| error.to_status())?;
+        let started = Instant::now();
+        record_transport_context(&extract_trace_context(request.metadata()));
+        if let Err(error) = self.ensure_any_ready() {
+            observe::record_data_rpc(
+                "read_stream",
+                "error",
+                observe::worker_error_kind(&error),
+                started.elapsed().as_secs_f64(),
+            );
+            return Err(error.to_status());
+        }
         let request = request.into_inner();
-        let stream_id = proto_to_stream_id(request.stream_id, "stream_id").map_err(|error| error.to_status())?;
-        let frames = self
-            .core
-            .read_stream(stream_id, request.max_bytes)
-            .await
-            .map_err(|error| error.to_status())?;
-        let responses = frames.into_iter().map(|frame| {
-            Ok(ReadStreamResponseProto {
-                offset_in_block: frame.offset_in_block,
-                data: frame.data,
-                checksum32: frame.checksum32,
-                eos: frame.eos,
-            })
-        });
-        Ok(Response::new(
-            Box::pin(stream::iter(responses)) as Self::ReadStreamStream
-        ))
+        let stream_id = match proto_to_stream_id(request.stream_id, "stream_id") {
+            Ok(stream_id) => stream_id,
+            Err(error) => {
+                observe::record_data_rpc(
+                    "read_stream",
+                    "error",
+                    observe::worker_error_kind(&error),
+                    started.elapsed().as_secs_f64(),
+                );
+                return Err(error.to_status());
+            }
+        };
+        let Some(state) = self.core.stream_manager().get(stream_id).await else {
+            let error = WorkerError::NotFound(format!("read stream not found: stream_id={stream_id}"));
+            observe::record_data_rpc(
+                "read_stream",
+                "error",
+                observe::worker_error_kind(&error),
+                started.elapsed().as_secs_f64(),
+            );
+            return Err(error.to_status());
+        };
+        if state.context.mode != StreamMode::Read {
+            let error = WorkerError::InvalidArgument(format!("stream is not a read stream: stream_id={stream_id}"));
+            observe::record_data_rpc(
+                "read_stream",
+                "error",
+                observe::worker_error_kind(&error),
+                started.elapsed().as_secs_f64(),
+            );
+            return Err(error.to_status());
+        }
+        observe::record_data_rpc("read_stream", "ok", "none", started.elapsed().as_secs_f64());
+
+        let done = Arc::new(AtomicBool::new(false));
+        let cleanup = ReadStreamCleanup {
+            core: Arc::clone(&self.core),
+            stream_id,
+            done: Arc::clone(&done),
+        };
+        let state = ReadStreamState {
+            core: Arc::clone(&self.core),
+            stream_id,
+            max_bytes: request.max_bytes,
+            done,
+            _cleanup: cleanup,
+        };
+        let responses = stream::unfold(state, |state| async move { state.next().await });
+        Ok(Response::new(Box::pin(responses) as Self::ReadStreamStream))
     }
 
     async fn open_write_stream(
         &self,
         request: Request<OpenWriteStreamRequestProto>,
     ) -> Result<Response<OpenWriteStreamResponseProto>, Status> {
-        let request = request.into_inner();
+        let started = Instant::now();
+        let transport_context = extract_trace_context(request.metadata());
+        let mut request = request.into_inner();
+        merge_data_header_transport_context(&mut request.header, &transport_context);
         let header = request.header.clone();
         if let Err(error) = self.ensure_group_ready_for_run(&request.group_name, &request.worker_run_id) {
+            let error_kind = observe::worker_error_kind(&error);
+            let duration = started.elapsed().as_secs_f64();
+            observe::record_data_rpc("open_write_stream", "error", error_kind, duration);
+            observe::record_stream_open("write", "error", error_kind);
             return Ok(Response::new(OpenWriteStreamResponseProto {
                 header: Some(Self::error_response_header(header, error)),
                 stream_id: None,
@@ -304,6 +437,10 @@ impl WorkerDataService for WorkerDataServiceImpl {
                 committed_length: 0,
             },
         };
+        let (status, error_kind) = response_status_error_kind(response.header.as_ref());
+        let duration = started.elapsed().as_secs_f64();
+        observe::record_data_rpc("open_write_stream", status, error_kind, duration);
+        observe::record_stream_open("write", status, error_kind);
 
         Ok(Response::new(response))
     }
@@ -312,8 +449,30 @@ impl WorkerDataService for WorkerDataServiceImpl {
         &self,
         request: Request<tonic::Streaming<WriteStreamRequestProto>>,
     ) -> Result<Response<WriteStreamResponseProto>, Status> {
-        self.ensure_any_ready().map_err(|error| error.to_status())?;
-        let response = self.handle_write_frames(request.into_inner()).await?;
+        let started = Instant::now();
+        record_transport_context(&extract_trace_context(request.metadata()));
+        if let Err(error) = self.ensure_any_ready() {
+            observe::record_data_rpc(
+                "write_stream",
+                "error",
+                observe::worker_error_kind(&error),
+                started.elapsed().as_secs_f64(),
+            );
+            return Err(error.to_status());
+        }
+        let response = match self.handle_write_frames(request.into_inner()).await {
+            Ok(response) => response,
+            Err(status) => {
+                observe::record_data_rpc(
+                    "write_stream",
+                    "error",
+                    status_error_kind(&status),
+                    started.elapsed().as_secs_f64(),
+                );
+                return Err(status);
+            }
+        };
+        observe::record_data_rpc("write_stream", "ok", "none", started.elapsed().as_secs_f64());
         Ok(Response::new(response))
     }
 
@@ -321,9 +480,15 @@ impl WorkerDataService for WorkerDataServiceImpl {
         &self,
         request: Request<CommitWriteRequestProto>,
     ) -> Result<Response<CommitWriteResponseProto>, Status> {
-        let request = request.into_inner();
+        let started = Instant::now();
+        let transport_context = extract_trace_context(request.metadata());
+        let mut request = request.into_inner();
+        merge_data_header_transport_context(&mut request.header, &transport_context);
         let header = request.header.clone();
         if let Err(error) = self.ensure_group_ready_for_run(&request.group_name, &request.worker_run_id) {
+            let error_kind = observe::worker_error_kind(&error);
+            observe::record_data_rpc("commit_write", "error", error_kind, started.elapsed().as_secs_f64());
+            observe::record_stream_commit("error", error_kind);
             return Ok(Response::new(CommitWriteResponseProto {
                 header: Some(Self::error_response_header(header, error)),
                 effective_len: 0,
@@ -332,20 +497,26 @@ impl WorkerDataService for WorkerDataServiceImpl {
             }));
         }
         let response = match proto_to_commit_write_request(request) {
-            Ok(domain) => match self.core.commit_write(domain).await {
-                Ok(result) => CommitWriteResponseProto {
-                    header: Some(Self::ok_response_header(header)),
-                    effective_len: result.effective_len,
-                    block_stamp: result.block_stamp,
-                    written_through: result.written_through,
-                },
-                Err(error) => CommitWriteResponseProto {
-                    header: Some(Self::error_response_header(header, error)),
-                    effective_len: 0,
-                    block_stamp: 0,
-                    written_through: 0,
-                },
-            },
+            Ok(domain) => {
+                let stream_id = domain.stream_id;
+                match self.core.commit_write(domain).await {
+                    Ok(result) => CommitWriteResponseProto {
+                        header: Some(Self::ok_response_header(header)),
+                        effective_len: result.effective_len,
+                        block_stamp: result.block_stamp,
+                        written_through: result.written_through,
+                    },
+                    Err(error) => {
+                        let _ = self.core.abort_write_stream_after_error(stream_id).await;
+                        CommitWriteResponseProto {
+                            header: Some(Self::error_response_header(header, error)),
+                            effective_len: 0,
+                            block_stamp: 0,
+                            written_through: 0,
+                        }
+                    }
+                }
+            }
             Err(error) => CommitWriteResponseProto {
                 header: Some(Self::error_response_header(header, error)),
                 effective_len: 0,
@@ -353,6 +524,9 @@ impl WorkerDataService for WorkerDataServiceImpl {
                 written_through: 0,
             },
         };
+        let (status, error_kind) = response_status_error_kind(response.header.as_ref());
+        observe::record_data_rpc("commit_write", status, error_kind, started.elapsed().as_secs_f64());
+        observe::record_stream_commit(status, error_kind);
 
         Ok(Response::new(response))
     }
@@ -361,9 +535,18 @@ impl WorkerDataService for WorkerDataServiceImpl {
         &self,
         request: Request<SyncCommittedBlockRequestProto>,
     ) -> Result<Response<SyncCommittedBlockResponseProto>, Status> {
-        let request = request.into_inner();
+        let started = Instant::now();
+        let transport_context = extract_trace_context(request.metadata());
+        let mut request = request.into_inner();
+        merge_data_header_transport_context(&mut request.header, &transport_context);
         let header = request.header.clone();
         if let Err(error) = self.ensure_group_ready_for_run(&request.group_name, &request.worker_run_id) {
+            observe::record_data_rpc(
+                "sync_committed_block",
+                "error",
+                observe::worker_error_kind(&error),
+                started.elapsed().as_secs_f64(),
+            );
             return Ok(Response::new(SyncCommittedBlockResponseProto {
                 header: Some(Self::error_response_header(header, error)),
                 effective_len: 0,
@@ -389,6 +572,13 @@ impl WorkerDataService for WorkerDataServiceImpl {
                 block_stamp: 0,
             },
         };
+        let (status, error_kind) = response_status_error_kind(response.header.as_ref());
+        observe::record_data_rpc(
+            "sync_committed_block",
+            status,
+            error_kind,
+            started.elapsed().as_secs_f64(),
+        );
 
         Ok(Response::new(response))
     }
@@ -397,9 +587,15 @@ impl WorkerDataService for WorkerDataServiceImpl {
         &self,
         request: Request<AbortWriteRequestProto>,
     ) -> Result<Response<AbortWriteResponseProto>, Status> {
-        let request = request.into_inner();
+        let started = Instant::now();
+        let transport_context = extract_trace_context(request.metadata());
+        let mut request = request.into_inner();
+        merge_data_header_transport_context(&mut request.header, &transport_context);
         let header = request.header.clone();
         if let Err(error) = self.ensure_group_ready(&request.group_name) {
+            let error_kind = observe::worker_error_kind(&error);
+            observe::record_data_rpc("abort_write", "error", error_kind, started.elapsed().as_secs_f64());
+            observe::record_stream_abort("error", error_kind);
             return Ok(Response::new(AbortWriteResponseProto {
                 header: Some(Self::error_response_header(header, error)),
                 aborted: false,
@@ -421,8 +617,68 @@ impl WorkerDataService for WorkerDataServiceImpl {
                 aborted: false,
             },
         };
+        let (status, error_kind) = response_status_error_kind(response.header.as_ref());
+        observe::record_data_rpc("abort_write", status, error_kind, started.elapsed().as_secs_f64());
+        observe::record_stream_abort(status, error_kind);
 
         Ok(Response::new(response))
+    }
+}
+
+fn merge_data_header_transport_context(header: &mut Option<DataRequestHeaderProto>, context: &ExtractedContext) {
+    record_transport_context(context);
+    let Some(header) = header else {
+        return;
+    };
+    if header.trace_context.as_ref().is_some_and(trace_context_proto_is_empty) {
+        header.trace_context = None;
+    }
+    if context.is_empty() {
+        return;
+    }
+    let trace_context = header.trace_context.get_or_insert_with(Default::default);
+    if trace_context.traceparent.is_none() {
+        trace_context.traceparent = context.traceparent.clone();
+    }
+    if trace_context.tracestate.is_none() {
+        trace_context.tracestate = context.tracestate.clone();
+    }
+    if trace_context.baggage.is_none() {
+        trace_context.baggage = context.baggage.clone();
+    }
+}
+
+fn trace_context_proto_is_empty(context: &proto::common::TraceContextProto) -> bool {
+    context.traceparent.is_none() && context.tracestate.is_none() && context.baggage.is_none()
+}
+
+fn record_transport_context(context: &ExtractedContext) {
+    if let Some(traceparent) = &context.traceparent {
+        Span::current().record("traceparent", traceparent);
+    }
+}
+
+fn response_status_error_kind(header: Option<&DataResponseHeaderProto>) -> (&'static str, &'static str) {
+    match header.and_then(|header| header.error.as_ref()) {
+        Some(_) => ("error", "canonical_error"),
+        None => ("ok", "none"),
+    }
+}
+
+fn status_error_kind(status: &Status) -> &'static str {
+    match status.code() {
+        tonic::Code::Ok => "none",
+        tonic::Code::InvalidArgument => "invalid_argument",
+        tonic::Code::NotFound => "not_found",
+        tonic::Code::FailedPrecondition => "failed_precondition",
+        tonic::Code::PermissionDenied => "permission_denied",
+        tonic::Code::ResourceExhausted => "resource_exhausted",
+        tonic::Code::Unavailable => "unavailable",
+        tonic::Code::DeadlineExceeded => "timeout",
+        tonic::Code::Unimplemented => "unimplemented",
+        tonic::Code::Cancelled => "cancelled",
+        tonic::Code::Internal => "internal",
+        _ => "rpc_status",
     }
 }
 
@@ -460,4 +716,32 @@ async fn serve_grpc_worker_data_with_service(
         .serve(bind)
         .await
         .context("worker gRPC data server failed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_empty_transport_context_keeps_trace_context_absent() {
+        let mut header = Some(DataRequestHeaderProto {
+            client: Some(ClientInfoProto {
+                call_id: types::CallId::new().to_string(),
+                client_id: Some(types::ClientId::new(7).into()),
+                client_name: "test".to_string(),
+            }),
+            trace_context: None,
+        });
+
+        merge_data_header_transport_context(
+            &mut header,
+            &ExtractedContext {
+                traceparent: None,
+                tracestate: None,
+                baggage: None,
+            },
+        );
+
+        assert!(header.expect("header").trace_context.is_none());
+    }
 }

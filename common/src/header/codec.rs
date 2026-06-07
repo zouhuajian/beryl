@@ -17,6 +17,8 @@ pub const HEADER_CLIENT_ID: &str = "x-client-id";
 pub const HEADER_STATE_ID: &str = "x-state-id";
 pub const HEADER_MOUNT_EPOCH: &str = "x-mount-epoch";
 pub const HEADER_TRACEPARENT: &str = "traceparent";
+pub const HEADER_TRACESTATE: &str = "tracestate";
+pub const HEADER_BAGGAGE: &str = "baggage";
 pub const HEADER_DEADLINE_MS: &str = "x-deadline-ms";
 pub const HEADER_GRPC_TIMEOUT: &str = "grpc-timeout";
 pub const HEADER_PRINCIPAL: &str = "x-principal";
@@ -68,8 +70,14 @@ impl RequestHeaderCodec {
         }
 
         // traceparent (if present)
-        if let Some(ref tp) = header.traceparent {
+        if let Some(ref tp) = header.trace_context.traceparent {
             headers.push((HEADER_TRACEPARENT.to_string(), tp.clone()));
+        }
+        if let Some(ref tracestate) = header.trace_context.tracestate {
+            headers.push((HEADER_TRACESTATE.to_string(), tracestate.clone()));
+        }
+        if let Some(ref baggage) = header.trace_context.baggage {
+            headers.push((HEADER_BAGGAGE.to_string(), baggage.clone()));
         }
 
         if let Some(ref principal) = header.principal {
@@ -128,6 +136,8 @@ impl RequestHeaderCodec {
         let mut saw_client_id = false;
         let mut state = Vec::new();
         let mut traceparent = None;
+        let mut tracestate = None;
+        let mut baggage = None;
         let mut deadline_ms = None;
         let mut mount_epoch = None;
         let mut principal = None;
@@ -164,6 +174,12 @@ impl RequestHeaderCodec {
                 }
                 k if k.eq_ignore_ascii_case(HEADER_TRACEPARENT) => {
                     traceparent = Some(value);
+                }
+                k if k.eq_ignore_ascii_case(HEADER_TRACESTATE) => {
+                    tracestate = Some(value);
+                }
+                k if k.eq_ignore_ascii_case(HEADER_BAGGAGE) => {
+                    baggage = Some(value);
                 }
                 k if k.eq_ignore_ascii_case(HEADER_PRINCIPAL) && !value.is_empty() => {
                     principal = Some(value);
@@ -229,20 +245,24 @@ impl RequestHeaderCodec {
                 client_id,
                 client_name: None,
             },
-            deadline: deadline_ms
-                .map(Deadline::from_unix_ms)
-                .unwrap_or_else(|| Deadline::from_now(std::time::Duration::from_secs(30))),
-            traceparent,
-            caller_context: None,
-            state,
-            retry_count: 0,
+            trace_context: crate::header::TraceContext {
+                traceparent,
+                tracestate,
+                baggage,
+            },
             group_name: None,
             mount_epoch,
+            state,
             route_epoch: None,
             principal,
             real_user,
             doas,
             authn_type,
+            deadline: deadline_ms
+                .map(Deadline::from_unix_ms)
+                .unwrap_or_else(|| Deadline::from_now(std::time::Duration::from_secs(30))),
+            caller_context: None,
+            retry_count: 0,
         })
     }
 }
@@ -328,6 +348,8 @@ mod tests {
         let client_id = ClientId::new(12345);
         let deadline = Deadline::from_now(std::time::Duration::from_secs(60));
         let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string();
+        let tracestate = "vendor=state".to_string();
+        let baggage = "tenant=local".to_string();
         let state = vec![GroupStateWatermark::new(
             GroupName::parse("root").unwrap(),
             RaftLogId::new(1, 2, 100),
@@ -339,22 +361,40 @@ mod tests {
                 client_id,
                 client_name: None,
             },
-            deadline,
-            traceparent: Some(traceparent.clone()),
-            caller_context: None,
-            state: state.clone(),
-            retry_count: 0,
+            trace_context: crate::header::TraceContext {
+                traceparent: Some(traceparent.clone()),
+                tracestate: Some(tracestate.clone()),
+                baggage: Some(baggage.clone()),
+            },
             group_name: None,
             mount_epoch: None,
+            state: state.clone(),
             route_epoch: None,
             principal: None,
             real_user: None,
             doas: None,
             authn_type: AuthnType::Unspecified,
+            deadline,
+            caller_context: None,
+            retry_count: 0,
         };
 
         // Encode
         let headers = RequestHeaderCodec::encode_to_headers(&header);
+        let legacy_request_key = concat!("request", "_id");
+        assert!(
+            headers.iter().all(|(key, _)| {
+                !key.eq_ignore_ascii_case(legacy_request_key) && !key.eq_ignore_ascii_case("x-request-id")
+            }),
+            "legacy request id must not be serialized"
+        );
+        assert!(
+            headers
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case(HEADER_TRACEPARENT))
+                .all(|(_, value)| value != &header.client.call_id.to_string()),
+            "call_id must not be serialized as traceparent"
+        );
 
         // Decode
         let decoded = RequestHeaderCodec::decode_from_headers(headers.into_iter()).expect("decode header");
@@ -363,7 +403,7 @@ mod tests {
         assert_eq!(decoded.client.call_id, header.client.call_id);
         assert_eq!(decoded.client.client_id, header.client.client_id);
         assert_eq!(decoded.deadline.as_unix_ms(), header.deadline.as_unix_ms());
-        assert_eq!(decoded.traceparent, header.traceparent);
+        assert_eq!(decoded.trace_context, header.trace_context);
         assert_eq!(decoded.state, header.state);
     }
 

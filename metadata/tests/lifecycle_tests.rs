@@ -16,7 +16,7 @@ use types::GroupName;
 
 fn write_config(dir: &TempDir, group_name: &str, raft_mode: &str) -> std::path::PathBuf {
     let storage_dir = dir.path().join("metadata");
-    let config_path = dir.path().join(format!("{group_name}-{raft_mode}-core-site.yaml"));
+    let config_path = dir.path().join(format!("{group_name}-{raft_mode}-metadata.yaml"));
     std::fs::write(
         &config_path,
         format!(
@@ -31,6 +31,11 @@ metadata.rpc.port: 18080
 metadata.bootstrap.ready.timeout_ms: 2000
 metadata.bootstrap.ready.warn_after_ms: 10
 metadata.bootstrap.ready.fail_fast: true
+observe.log.format: compact
+observe.log.output: stderr
+observe.log.level: "info,vecton=info,metadata=info,worker=info,common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
+observe.metrics.prometheus.bind: "127.0.0.1:18081"
+observe.metrics.prometheus.path: "/metrics"
 "#,
             storage_dir.display()
         ),

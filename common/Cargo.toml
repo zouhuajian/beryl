@@ -23,23 +23,17 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json"
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 
-# OpenTelemetry (optional, via feature)
-opentelemetry = { workspace = true, optional = true, features = ["trace", "metrics"] }
-opentelemetry_sdk = { workspace = true, optional = true, features = ["trace", "metrics", "rt-tokio"] }
-opentelemetry-otlp = { workspace = true, optional = true, features = ["trace", "metrics", "grpc-tonic", "http-proto"] }
-tracing-opentelemetry = { workspace = true, optional = true }
-
 # HTTP server for Prometheus endpoint
 tokio = { workspace = true, features = ["rt", "net", "sync", "fs", "io-util"] }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 http = { workspace = true }
+tonic = { workspace = true }
 
 [features]
 default = ["prometheus"]
 prometheus = []
-otel = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -31,6 +31,7 @@ pub struct StoreDirReport {
     pub capacity_bytes: u64,
     pub used_bytes: u64,
     pub pending_bytes: u64,
+    pub block_count: u64,
     pub fs_total_bytes: u64,
     pub fs_free_bytes: u64,
     pub free_bytes: u64,
@@ -75,6 +76,7 @@ struct StoreDirState {
     last_check: Instant,
     used_bytes: u64,
     pending_bytes: u64,
+    block_count: u64,
     pending_blocks: HashMap<(GroupName, BlockId), u64>,
     writable: bool,
 }
@@ -102,7 +104,7 @@ impl StoreDirs {
             let (fs_total_bytes, fs_free_bytes) = fs_stats(&config.path)?;
             let mount_key = mount_key(&config.path)?;
             let store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(config.path.clone()));
-            let used_bytes = scan_used_bytes(&store, &config.path)?;
+            let (used_bytes, block_count) = scan_store_usage(&store, &config.path)?;
             dirs.push(StoreDirState {
                 id,
                 path: config.path,
@@ -116,6 +118,7 @@ impl StoreDirs {
                 last_check: Instant::now(),
                 used_bytes,
                 pending_bytes: 0,
+                block_count,
                 pending_blocks: HashMap::new(),
                 writable: true,
             });
@@ -299,6 +302,7 @@ impl LocalBlockStore for StoreDirs {
         inner.dirs[dir_index].used_bytes = inner.dirs[dir_index]
             .used_bytes
             .saturating_add(meta.source.effective_len);
+        inner.dirs[dir_index].block_count = inner.dirs[dir_index].block_count.saturating_add(1);
         Ok(meta)
     }
 
@@ -354,7 +358,8 @@ impl LocalBlockStore for StoreDirs {
             .collect();
         for (idx, store) in stores {
             let paths = store.paths(group_name, block_id);
-            let used_len = if paths.meta_path.exists() {
+            let ready_exists = paths.meta_path.exists();
+            let used_len = if ready_exists {
                 store
                     .load_meta(group_name, block_id)
                     .map(|meta| meta.source.effective_len)
@@ -371,6 +376,9 @@ impl LocalBlockStore for StoreDirs {
                 let mut inner = self.inner.lock().expect("store dir state poisoned");
                 release_pending_locked(&mut inner.dirs[idx], group_name, block_id);
                 inner.dirs[idx].used_bytes = inner.dirs[idx].used_bytes.saturating_sub(used_len);
+                if ready_exists {
+                    inner.dirs[idx].block_count = inner.dirs[idx].block_count.saturating_sub(1);
+                }
             }
         }
         Ok(())
@@ -433,6 +441,7 @@ fn build_report(inner: &StoreDirsState, reserve_bytes: u64) -> StoreReport {
             capacity_bytes: dir.capacity_bytes,
             used_bytes: dir.used_bytes,
             pending_bytes: dir.pending_bytes,
+            block_count: dir.block_count,
             fs_total_bytes: dir.fs_total_bytes,
             fs_free_bytes: dir.fs_free_bytes,
             free_bytes,
@@ -507,12 +516,13 @@ fn probe_store_path(path: &Path) -> StoreResult<()> {
     Ok(())
 }
 
-fn scan_used_bytes(store: &FullBlockFileStore, path: &Path) -> StoreResult<u64> {
+fn scan_store_usage(store: &FullBlockFileStore, path: &Path) -> StoreResult<(u64, u64)> {
     let groups = path.join("groups");
     if !groups.exists() {
-        return Ok(0);
+        return Ok((0, 0));
     }
     let mut used = 0u64;
+    let mut block_count = 0u64;
     for entry in fs::read_dir(groups)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
@@ -523,9 +533,10 @@ fn scan_used_bytes(store: &FullBlockFileStore, path: &Path) -> StoreResult<u64> 
         };
         for meta in store.scan_group_blocks(&name)? {
             used = used.saturating_add(meta.source.effective_len);
+            block_count = block_count.saturating_add(1);
         }
     }
-    Ok(used)
+    Ok((used, block_count))
 }
 
 #[cfg(unix)]

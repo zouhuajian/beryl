@@ -3,18 +3,20 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use common::{CoreConfig, FlatConfig};
+use common::{FlatConfig, ServerConfig};
 
 #[test]
-fn repository_core_site_store_dirs_do_not_overlap() {
+fn repository_split_config_store_dirs_do_not_overlap() {
     assert_store_dirs_do_not_overlap(
-        &repo_root().join("conf/core-site.yaml"),
+        &repo_root().join("conf/metadata.yaml"),
+        &repo_root().join("conf/worker.yaml"),
         Path::new("data/metadata"),
         Path::new("data/worker/hdd0"),
         Path::new("data/worker/worker.identity"),
     );
     assert_store_dirs_do_not_overlap(
-        &repo_root().join("conf/local/core-site.yaml"),
+        &repo_root().join("conf/local/metadata.yaml"),
+        &repo_root().join("conf/local/worker.yaml"),
         Path::new("./data/metadata"),
         Path::new("./data/worker/hdd0"),
         Path::new("./data/worker/worker.identity"),
@@ -22,16 +24,17 @@ fn repository_core_site_store_dirs_do_not_overlap() {
 }
 
 fn assert_store_dirs_do_not_overlap(
-    config_path: &Path,
+    metadata_config_path: &Path,
+    worker_config_path: &Path,
     expected_metadata_dir: &Path,
     expected_worker_root: &Path,
     expected_identity_path: &Path,
 ) {
-    let config = CoreConfig::load(config_path).expect("core config loads");
-    let flat = config.as_flat();
-    let metadata_dir = required_path(flat, "metadata.storage.dir");
-    let worker_root = required_store_dir(flat);
-    let identity_path = required_path(flat, "worker.identity.path");
+    let metadata_config = ServerConfig::load(metadata_config_path).expect("metadata config loads");
+    let worker_config = ServerConfig::load(worker_config_path).expect("worker config loads");
+    let metadata_dir = required_path(metadata_config.as_flat(), "metadata.storage.dir");
+    let worker_root = required_store_dir(worker_config.as_flat());
+    let identity_path = required_path(worker_config.as_flat(), "worker.identity.path");
 
     assert_eq!(metadata_dir, expected_metadata_dir);
     assert_eq!(worker_root, expected_worker_root);

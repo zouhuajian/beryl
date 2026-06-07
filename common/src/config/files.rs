@@ -12,12 +12,6 @@ use std::path::Path;
 use tracing::{info, warn};
 
 /// Load configuration from a YAML file with flat dotted keys.
-///
-/// The YAML file can contain either:
-/// 1. Flat keys with dots: `metadata.rpc.port: 8080`
-/// 2. Nested structure: `metadata: { rpc: { port: 8080 } }`
-///
-/// Both will be flattened to dotted keys.
 pub fn load_from_yaml_file<P: AsRef<Path>>(path: P) -> Result<FlatConfig, CommonError> {
     let path = path.as_ref();
     info!(path = %path.display(), "loading config from YAML file");
@@ -36,67 +30,60 @@ pub fn load_from_yaml_file<P: AsRef<Path>>(path: P) -> Result<FlatConfig, Common
         )
     })?;
 
-    let flat = flatten_value(value, String::new());
+    let flat = flat_mapping(value)?;
     info!(keys = flat.keys().count(), "loaded config from YAML file");
     Ok(FlatConfig::from_map(flat))
 }
 
-/// Flatten a YAML Value into dotted keys.
-fn flatten_value(value: Value, prefix: String) -> BTreeMap<String, Value> {
+fn flat_mapping(value: Value) -> Result<BTreeMap<String, Value>, CommonError> {
     let mut result = BTreeMap::new();
 
-    match value {
-        Value::Mapping(map) => {
-            for (key, val) in map {
-                let key_str = match key {
-                    Value::String(s) => s,
-                    Value::Number(n) => n.to_string(),
-                    _ => continue,
-                };
+    let Value::Mapping(map) = value else {
+        return Err(CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            "config file must be a YAML mapping with flat keys",
+        ));
+    };
 
-                let new_prefix = if prefix.is_empty() {
-                    key_str
-                } else {
-                    format!("{}.{}", prefix, key_str)
-                };
+    for (key, val) in map {
+        let key_str = match key {
+            Value::String(s) => s,
+            Value::Number(n) => n.to_string(),
+            _ => continue,
+        };
 
-                match val {
-                    Value::Mapping(_) | Value::Sequence(_) => {
-                        // Recursively flatten nested structures
-                        let nested = flatten_value(val, new_prefix.clone());
-                        result.extend(nested);
-                    }
-                    _ => {
-                        // Leaf value
-                        result.insert(new_prefix, val);
-                    }
-                }
-            }
+        if matches!(val, Value::Mapping(_)) {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!(
+                    "nested YAML config is not supported; use flat keys such as observe.log.format instead of {key_str}"
+                ),
+            ));
         }
-        Value::Sequence(_) => {
-            // Sequences are kept as-is (could be enhanced to support indexed access)
-            if !prefix.is_empty() {
-                result.insert(prefix, value);
-            }
+
+        if let Value::Sequence(entries) = &val
+            && entries.iter().any(|entry| matches!(entry, Value::Mapping(_)))
+        {
+            return Err(CommonError::new(
+                CommonErrorCode::InvalidArgument,
+                format!(
+                    "nested YAML config is not supported; use flat keys such as observe.log.format instead of {key_str}"
+                ),
+            ));
         }
-        _ => {
-            // Scalar value
-            if !prefix.is_empty() {
-                result.insert(prefix, value);
-            }
-        }
+
+        result.insert(key_str, val);
     }
 
-    result
+    Ok(result)
 }
 
-/// Load configuration from multiple sources and merge them.
+/// Load configuration from defaults and an optional YAML file.
 ///
 /// Sources are merged in order (later sources override earlier ones):
 /// 1. Default values
 /// 2. YAML file (if provided)
-/// 3. Environment variables
-pub fn load_merged(default: FlatConfig, yaml_path: Option<&Path>, use_env: bool) -> Result<FlatConfig, CommonError> {
+pub fn load_merged(default: FlatConfig, yaml_path: Option<&Path>) -> Result<FlatConfig, CommonError> {
     let mut config = default;
 
     // Load from YAML file
@@ -107,12 +94,6 @@ pub fn load_merged(default: FlatConfig, yaml_path: Option<&Path>, use_env: bool)
         } else {
             warn!(path = %path.display(), "config file does not exist, skipping");
         }
-    }
-
-    // Load from environment variables (highest priority)
-    if use_env {
-        let env_config = crate::config::env::load_from_env();
-        config.merge(env_config);
     }
 
     Ok(config)
@@ -131,26 +112,48 @@ mod tests {
         let mut file = File::create(&path).unwrap();
         writeln!(file, "metadata.rpc.port: 8080").unwrap();
         writeln!(file, "worker.rpc.max_inflight: 100").unwrap();
+        writeln!(file, "observe.log.format: compact").unwrap();
+        writeln!(file, "observe.metrics.prometheus.path: /metrics").unwrap();
         drop(file);
 
         let config = load_from_yaml_file(&path).unwrap();
         assert_eq!(config.get_i64("metadata.rpc.port"), Some(8080));
         assert_eq!(config.get_i64("worker.rpc.max_inflight"), Some(100));
+        assert_eq!(config.get_str("observe.log.format"), Some("compact".to_string()));
+        assert_eq!(
+            config.get_str("observe.metrics.prometheus.path"),
+            Some("/metrics".to_string())
+        );
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn test_load_nested_yaml() {
+    fn test_reject_nested_observe_yaml() {
         let dir = std::env::temp_dir();
-        let path = dir.join("test_config_nested.yaml");
+        let path = dir.join("test_config_nested_observe.yaml");
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, "observe:").unwrap();
+        writeln!(file, "  log:").unwrap();
+        writeln!(file, "    format: compact").unwrap();
+        drop(file);
+
+        let err = load_from_yaml_file(&path).unwrap_err();
+        assert!(err.message.contains("flat keys"), "{err:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_reject_nested_non_observe_yaml() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_config_nested_metadata.yaml");
         let mut file = File::create(&path).unwrap();
         writeln!(file, "metadata:").unwrap();
         writeln!(file, "  rpc:").unwrap();
         writeln!(file, "    port: 8080").unwrap();
         drop(file);
 
-        let config = load_from_yaml_file(&path).unwrap();
-        assert_eq!(config.get_i64("metadata.rpc.port"), Some(8080));
+        let err = load_from_yaml_file(&path).unwrap_err();
+        assert!(err.message.contains("flat keys"), "{err:?}");
         let _ = std::fs::remove_file(&path);
     }
 }

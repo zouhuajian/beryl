@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use common::observe::{init_observability, ObservabilityConfig, ServiceInfo};
+use common::observe::{init_observability, ServiceInfo};
 use tracing::{error, info};
 use worker::{
     config::WorkerConfig,
@@ -25,14 +25,13 @@ async fn main() -> Result<()> {
     let config_path = command
         .config_path
         .clone()
-        .unwrap_or_else(|| "conf/core-site.yaml".to_string());
+        .unwrap_or_else(|| "conf/worker.yaml".to_string());
 
     let config = WorkerConfig::load(&config_path).context("Failed to load worker configuration")?;
 
     let worker_id = prepare_worker_start(&config).context("Worker storage start validation failed")?;
 
-    let mut obs_config = ObservabilityConfig::default();
-    obs_config.metrics.prometheus.bind = config.http_bind.clone();
+    let obs_config = config.observability.clone();
     let service_info = ServiceInfo {
         name: "vecton-worker".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -42,10 +41,11 @@ async fn main() -> Result<()> {
     };
     let _obs_guard = init_observability(&obs_config, service_info)
         .map_err(|e| anyhow::anyhow!("Failed to initialize observability: {}", e))?;
-    observe::record_worker_started();
+    observe::record_worker_started("worker", env!("CARGO_PKG_VERSION"));
     observe::set_worker_registered(false);
 
     info!(
+        event = "worker_data_service_starting",
         rpc_bind = %config.rpc_bind,
         rpc_advertised_endpoint = %config.rpc_advertised_endpoint,
         rpc_max_inflight = config.rpc_max_inflight,
@@ -57,10 +57,11 @@ async fn main() -> Result<()> {
         store_selection_policy = %config.store.selection_policy,
         store_check_interval_ms = config.store.check_interval_ms,
         net_listeners = config.net.listeners.len(),
-        "Starting worker data service skeleton"
+        "starting worker data service"
     );
     for listener in &config.net.listeners {
         info!(
+            event = "worker_net_listener_configured",
             protocol = %listener.protocol,
             bind = %listener.bind,
             max_inflight = listener.max_inflight,
@@ -176,6 +177,8 @@ fn looks_like_path(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
     fn parse(args: &[&str]) -> Result<WorkerCommand> {
         WorkerCommand::parse(args.iter().map(|arg| arg.to_string()))
@@ -183,11 +186,64 @@ mod tests {
 
     #[test]
     fn valid_worker_start_command_parses() {
-        let start = parse(&["start", "--config", "conf/local/core-site.yaml"]).unwrap();
-        assert_eq!(start.config_path.as_deref(), Some("conf/local/core-site.yaml"));
+        let start = parse(&["start", "--config", "conf/local/worker.yaml"]).unwrap();
+        assert_eq!(start.config_path.as_deref(), Some("conf/local/worker.yaml"));
 
         let default_start = parse(&[]).unwrap();
         assert!(default_start.config_path.is_none());
+    }
+
+    #[test]
+    fn worker_observe_cli_overrides_are_rejected() {
+        for flag in [
+            "--observe-profile",
+            "--log-level",
+            "--log-format",
+            "--log-output",
+            "--metrics-bind",
+            "--metrics-path",
+            "--trace-enabled",
+        ] {
+            let err = parse(&["start", flag, "value"])
+                .err()
+                .expect("observe CLI override must fail");
+            assert!(err.to_string().contains("unknown worker argument"), "{flag}: {err}");
+        }
+    }
+
+    #[test]
+    fn worker_startup_load_uses_file_observe_values() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("worker.yaml");
+        let store_path = temp_dir.path().join("hdd0");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+worker.rpc.bind: "127.0.0.1:9090"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.store.dirs.hdd0.path: "{}"
+worker.store.dirs.hdd0.tier: HDD
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.metadata.endpoints: "http://127.0.0.1:18080"
+observe.log.format: json
+observe.log.output: stdout
+observe.log.level: "warn"
+observe.metrics.prometheus.bind: "127.0.0.1:19091"
+observe.metrics.prometheus.path: "/metrics"
+"#,
+                store_path.display()
+            ),
+        )
+        .unwrap();
+
+        let command = parse(&["start", "--config", config_path.to_str().unwrap()]).unwrap();
+        let config_path = command.config_path.as_deref().expect("config path");
+        let config = WorkerConfig::load(config_path).unwrap();
+
+        assert_eq!(config.observability.log.format, "json");
+        assert_eq!(config.observability.log.output, "stdout");
+        assert_eq!(config.observability.metrics.prometheus.bind, "127.0.0.1:19091");
     }
 
     #[test]
@@ -196,7 +252,7 @@ mod tests {
             &["format"][..],
             &["bootstrap"][..],
             &["auto-format"][..],
-            &["format", "--config", "conf/core-site.yaml"][..],
+            &["format", "--config", "conf/worker.yaml"][..],
         ] {
             let err = parse(args).err().expect("removed worker command must fail");
             assert!(err.to_string().contains("unsupported worker command"));
@@ -205,7 +261,7 @@ mod tests {
 
     #[test]
     fn worker_config_path_requires_explicit_config_flag() {
-        let err = parse(&["conf/local/core-site.yaml"])
+        let err = parse(&["conf/local/worker.yaml"])
             .err()
             .expect("positional worker config path must fail");
         assert!(err.to_string().contains("--config"));

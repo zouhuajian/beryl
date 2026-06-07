@@ -329,7 +329,7 @@ mod tests {
         let caller = RequestHeader::new(types::ClientId::new(client_id));
         RequestContext {
             caller: caller.clone(),
-            traceparent: caller.traceparent.clone(),
+            traceparent: caller.trace_context.traceparent.clone(),
             route_epoch: None,
             principal: caller.principal.clone(),
             real_user: caller.real_user.clone(),

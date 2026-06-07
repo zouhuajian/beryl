@@ -11,7 +11,7 @@ pub mod retry;
 pub mod time;
 
 pub use audit::{AuditLogger, AuditRecord};
-pub use config::{ClientConfig, CoreConfig, FlatConfig, load_client_site, load_core_site};
+pub use config::{ClientConfig, FlatConfig, ServerConfig, load_client_site, load_server_config};
 pub use error::{CommonError, CommonErrorCode, ErrorMeta, ResultExt};
 pub use header::{
     AuthnType, CallerContext, CallerContextFields, RequestHeader, RequestHeaderCodec, ResponseHeader, RpcError,

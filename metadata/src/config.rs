@@ -3,11 +3,12 @@
 
 //! Metadata service configuration.
 //!
-//! Reads configuration from core-site.yaml / client-site.yaml.
+//! Reads metadata configuration from server YAML files.
 
 use crate::readiness::RootReadinessConfig;
-use common::config::CoreConfig;
+use common::config::ServerConfig;
 use common::error::{CommonError, CommonErrorCode};
+use common::observe::ObservabilityConfig;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use types::GroupName;
@@ -49,7 +50,7 @@ pub struct MetadataConfig {
     pub cluster_id: String,
     /// RPC server address.
     pub rpc_addr: SocketAddr,
-    /// HTTP/admin/metrics bind address.
+    /// Reserved HTTP/admin bind address. Prometheus metrics use observability config.
     pub http_bind: SocketAddr,
     /// Local directory for metadata persistent state.
     pub storage_dir: PathBuf,
@@ -63,6 +64,8 @@ pub struct MetadataConfig {
     pub worker: WorkerConfig,
     /// Readiness configuration.
     pub bootstrap: BootstrapConfig,
+    /// Shared observability configuration.
+    pub observability: ObservabilityConfig,
 }
 
 /// Bootstrap/readiness configuration.
@@ -197,15 +200,15 @@ impl Default for RepairConfig {
 }
 
 impl MetadataConfig {
-    /// Load configuration from core-site.yaml.
+    /// Load metadata configuration from a YAML file.
     pub fn load<P: AsRef<Path>>(config_path: P) -> Result<Self, CommonError> {
-        let core_config = CoreConfig::load(config_path)?;
-        Self::from_core_config(core_config)
+        let server_config = ServerConfig::load(config_path)?;
+        Self::from_server_config(server_config)
     }
 
-    /// Create from CoreConfig.
-    pub fn from_core_config(core_config: CoreConfig) -> Result<Self, CommonError> {
-        let flat = core_config.as_flat();
+    /// Create from ServerConfig.
+    pub fn from_server_config(server_config: ServerConfig) -> Result<Self, CommonError> {
+        let flat = server_config.as_flat();
 
         reject_removed_keys(flat)?;
 
@@ -216,6 +219,7 @@ impl MetadataConfig {
 
         let rpc_addr = rpc_addr_from_config(flat)?;
         let http_bind = socket_addr_or(flat, METADATA_HTTP_BIND, "0.0.0.0:18081")?;
+        let observability = ObservabilityConfig::from_flat(flat)?;
         let storage_dir = PathBuf::from(get_str_or(flat, METADATA_STORAGE_DIR, "data/metadata")?);
 
         let filesystem_mode_raw = get_str_or(flat, METADATA_AUTHZ_FILESYSTEM_MODE, "NONE")?;
@@ -281,6 +285,7 @@ impl MetadataConfig {
             authority,
             worker,
             bootstrap,
+            observability,
         })
     }
 }
@@ -423,28 +428,59 @@ fn invalid_config(key: &'static str, detail: &'static str) -> CommonError {
     CommonError::new(CommonErrorCode::InvalidArgument, format!("{key} {detail}"))
 }
 
-impl Default for MetadataConfig {
-    fn default() -> Self {
-        Self {
-            cluster_id: "local-vecton".to_string(),
-            rpc_addr: "0.0.0.0:18080".parse().unwrap(),
-            http_bind: "0.0.0.0:18081".parse().unwrap(),
-            storage_dir: PathBuf::from("data/metadata"),
-            authz: MetadataAuthzConfig::default(),
-            raft: RaftConfig::default(),
-            authority: MetadataAuthorityConfig::default(),
-            worker: WorkerConfig::default(),
-            bootstrap: BootstrapConfig {
-                root_readiness: RootReadinessConfig::default(),
-            },
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::config::CoreConfig;
+    use common::config::ServerConfig;
+
+    impl Default for MetadataConfig {
+        fn default() -> Self {
+            Self {
+                cluster_id: "local-vecton".to_string(),
+                rpc_addr: "0.0.0.0:18080".parse().unwrap(),
+                http_bind: "0.0.0.0:18081".parse().unwrap(),
+                storage_dir: PathBuf::from("data/metadata"),
+                authz: MetadataAuthzConfig::default(),
+                raft: RaftConfig::default(),
+                authority: MetadataAuthorityConfig::default(),
+                worker: WorkerConfig::default(),
+                bootstrap: BootstrapConfig {
+                    root_readiness: RootReadinessConfig::default(),
+                },
+                observability: test_observability_config(),
+            }
+        }
+    }
+
+    fn test_observability_config() -> ObservabilityConfig {
+        let mut flat = common::config::FlatConfig::new();
+        flat.set("observe.log.format", "compact");
+        flat.set("observe.log.output", "stderr");
+        flat.set(
+            "observe.log.level",
+            "info,vecton=info,metadata=info,worker=info,common=info,openraft=warn,tonic=warn,tower=warn,h2=warn",
+        );
+        flat.set("observe.metrics.prometheus.bind", "127.0.0.1:18081");
+        flat.set("observe.metrics.prometheus.path", "/metrics");
+        ObservabilityConfig::from_flat(&flat).expect("test observe config")
+    }
+
+    fn add_observe_config(flat: &mut common::config::FlatConfig) {
+        flat.set("observe.log.format", "compact");
+        flat.set("observe.log.output", "stderr");
+        flat.set(
+            "observe.log.level",
+            "info,vecton=info,metadata=info,worker=info,common=info,openraft=warn,tonic=warn,tower=warn,h2=warn",
+        );
+        flat.set("observe.metrics.prometheus.bind", "127.0.0.1:18081");
+        flat.set("observe.metrics.prometheus.path", "/metrics");
+    }
+
+    fn test_flat() -> common::config::FlatConfig {
+        let mut flat = ServerConfig::default().as_flat().clone();
+        add_observe_config(&mut flat);
+        flat
+    }
 
     #[test]
     fn authz_mode_defaults_to_none() {
@@ -456,20 +492,34 @@ mod tests {
 
     #[test]
     fn authz_mode_parses_valid_values() {
-        let mut flat = CoreConfig::default().as_flat().clone();
+        let mut flat = test_flat();
         flat.set("metadata.authz.filesystem.mode", "acl");
 
-        let config = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap();
+        let config = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap();
         assert_eq!(config.authz.filesystem.mode, FileSystemAuthzMode::Acl);
     }
 
     #[test]
     fn canonical_group_name_loads_from_metadata_group_name() {
-        let mut flat = CoreConfig::default().as_flat().clone();
+        let mut flat = test_flat();
         flat.set("metadata.group.name", "root-prod");
 
-        let config = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap();
+        let config = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap();
         assert_eq!(config.authority.group_name.as_str(), "root-prod");
+    }
+
+    #[test]
+    fn observability_loads_from_flat_config_only() {
+        let mut flat = test_flat();
+        flat.set("observe.log.format", "json");
+        flat.set("observe.log.output", "stdout");
+        flat.set("observe.metrics.prometheus.bind", "127.0.0.1:19081");
+
+        let config = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap();
+
+        assert_eq!(config.observability.log.format, "json");
+        assert_eq!(config.observability.log.output, "stdout");
+        assert_eq!(config.observability.metrics.prometheus.bind, "127.0.0.1:19081");
     }
 
     #[test]
@@ -482,10 +532,10 @@ mod tests {
             "metadata.bootstrap.auto_format",
             "metadata.auto_format",
         ] {
-            let mut flat = CoreConfig::default().as_flat().clone();
+            let mut flat = test_flat();
             flat.set(key, "legacy");
 
-            let err = MetadataConfig::from_core_config(CoreConfig::from_flat(flat))
+            let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat))
                 .expect_err("removed metadata key must fail");
 
             assert!(
@@ -498,48 +548,48 @@ mod tests {
     #[test]
     fn invalid_group_name_is_rejected() {
         for group_name in ["", "Root", "root/prod", "root prod", "-root"] {
-            let mut flat = CoreConfig::default().as_flat().clone();
+            let mut flat = test_flat();
             flat.set("metadata.group.name", group_name);
 
-            let err = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap_err();
+            let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
             assert!(err.message.contains("metadata.group.name"));
         }
     }
 
     #[test]
     fn storage_dir_parses_from_metadata_storage_key() {
-        let mut flat = CoreConfig::default().as_flat().clone();
+        let mut flat = test_flat();
         flat.set("metadata.storage.dir", "/var/lib/vecton/metadata");
 
-        let config = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap();
+        let config = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap();
         assert_eq!(config.storage_dir, std::path::PathBuf::from("/var/lib/vecton/metadata"));
     }
 
     #[test]
     fn rpc_port_rejects_out_of_range_value() {
-        let mut flat = CoreConfig::default().as_flat().clone();
+        let mut flat = test_flat();
         flat.set("metadata.rpc.port", 70000i64);
 
-        let err = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap_err();
+        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
         assert!(err.message.contains("metadata.rpc.port"));
     }
 
     #[test]
     fn rpc_port_rejects_present_non_integer_value() {
-        let mut flat = CoreConfig::default().as_flat().clone();
+        let mut flat = test_flat();
         flat.set("metadata.rpc.port", true);
 
-        let err = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap_err();
+        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
         assert!(err.message.contains("metadata.rpc.port"));
     }
 
     #[test]
     fn string_keys_reject_present_wrong_type_values() {
         for key in [METADATA_RPC_ADDR, METADATA_STORAGE_DIR, METADATA_AUTHZ_FILESYSTEM_MODE] {
-            let mut flat = CoreConfig::default().as_flat().clone();
+            let mut flat = test_flat();
             flat.set(key, true);
 
-            let err = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap_err();
+            let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
 
             assert!(
                 err.message.contains(key),
@@ -552,22 +602,22 @@ mod tests {
     #[test]
     fn raft_mode_parses_single_and_cluster_only() {
         for (raw, expected) in [("single", RaftMode::Single), ("cluster", RaftMode::Cluster)] {
-            let mut flat = CoreConfig::default().as_flat().clone();
+            let mut flat = test_flat();
             flat.set("metadata.raft.mode", raw);
 
-            let config = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap();
+            let config = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap();
             assert_eq!(config.raft.mode, expected);
         }
 
-        let mut flat = CoreConfig::default().as_flat().clone();
+        let mut flat = test_flat();
         flat.set("metadata.raft.mode", "single_node");
-        let err = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap_err();
+        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
         assert!(err.message.contains("metadata.raft.mode"));
     }
 
     #[test]
     fn absent_numeric_keys_use_metadata_defaults() {
-        let config = MetadataConfig::from_core_config(CoreConfig::default()).unwrap();
+        let config = MetadataConfig::from_server_config(ServerConfig::from_flat(test_flat())).unwrap();
 
         assert_eq!(config.raft.node_id, 1);
         assert_eq!(config.worker.repair.max_queue_size, 10000);
@@ -595,10 +645,10 @@ mod tests {
             METADATA_BOOTSTRAP_ROOT_READY_MAX_BACKOFF_MS,
             METADATA_BOOTSTRAP_ROOT_READY_WARN_AFTER_MS,
         ] {
-            let mut flat = CoreConfig::default().as_flat().clone();
+            let mut flat = test_flat();
             flat.set(key, -1i64);
 
-            let err = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap_err();
+            let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
 
             assert!(
                 err.message.contains(key),
@@ -622,10 +672,10 @@ mod tests {
             METADATA_BOOTSTRAP_ROOT_READY_MAX_BACKOFF_MS,
             METADATA_BOOTSTRAP_ROOT_READY_WARN_AFTER_MS,
         ] {
-            let mut flat = CoreConfig::default().as_flat().clone();
+            let mut flat = test_flat();
             flat.set(key, 0i64);
 
-            let err = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap_err();
+            let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
 
             assert!(
                 err.message.contains(key),
@@ -637,10 +687,10 @@ mod tests {
 
     #[test]
     fn metadata_repair_max_attempts_rejects_u32_overflow() {
-        let mut flat = CoreConfig::default().as_flat().clone();
+        let mut flat = test_flat();
         flat.set(METADATA_REPAIR_MAX_ATTEMPTS, i64::from(u32::MAX) + 1);
 
-        let err = MetadataConfig::from_core_config(CoreConfig::from_flat(flat)).unwrap_err();
+        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap_err();
 
         assert!(err.message.contains(METADATA_REPAIR_MAX_ATTEMPTS));
     }

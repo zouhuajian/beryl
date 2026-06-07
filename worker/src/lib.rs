@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Vecton worker data-plane skeleton.
+//! Vecton worker data-plane service.
 
 pub mod config;
 pub mod control;

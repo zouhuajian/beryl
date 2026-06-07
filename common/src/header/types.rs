@@ -20,30 +20,35 @@ pub struct ClientInfo {
     pub client_name: Option<String>,
 }
 
+/// W3C trace propagation context.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TraceContext {
+    /// W3C Trace Context: traceparent header value.
+    pub traceparent: Option<String>,
+    /// W3C Trace Context: tracestate header value.
+    pub tracestate: Option<String>,
+    /// W3C baggage header value. Do not put secrets or credentials here.
+    pub baggage: Option<String>,
+}
+
 /// Request header carried with every RPC request.
 #[derive(Clone, Debug)]
 pub struct RequestHeader {
     /// Client information (call_id, client_id, client_name).
     pub client: ClientInfo,
+    /// W3C trace propagation context.
+    pub trace_context: TraceContext,
     /// Metadata group name for this request.
     pub group_name: Option<GroupName>,
     /// Mount epoch for FS write operations.
     /// Client should provide the mount_epoch it knows for the mount being accessed.
     /// Server validates this against current mount.mount_epoch and returns NEED_REFRESH if mismatch.
     pub mount_epoch: Option<u64>,
-    /// Absolute deadline (Unix epoch milliseconds).
-    pub deadline: Deadline,
-    /// W3C Trace Context: traceparent header value.
-    pub traceparent: Option<String>,
-    /// Optional caller context for auditing/diagnostics.
-    pub caller_context: Option<CallerContext>,
     /// Client-required state-machine applied watermarks.
     ///
     /// Each watermark is scoped by metadata group name. Empty means the
     /// request has no state freshness requirement.
     pub state: Vec<GroupStateWatermark>,
-    /// Optional retry count from client perspective (0 = first attempt).
-    pub retry_count: i32,
     /// Optional route epoch observed by client.
     pub route_epoch: Option<u64>,
     /// Authenticated principal/user identity.
@@ -56,6 +61,12 @@ pub struct RequestHeader {
     pub doas: Option<String>,
     /// Authentication type marker for the request.
     pub authn_type: AuthnType,
+    /// Absolute deadline (Unix epoch milliseconds).
+    pub deadline: Deadline,
+    /// Optional caller context for auditing/diagnostics.
+    pub caller_context: Option<CallerContext>,
+    /// Optional retry count from client perspective (0 = first attempt).
+    pub retry_count: i32,
 }
 
 /// Human-oriented context for auditing and lightweight diagnostics.
@@ -159,13 +170,13 @@ pub struct ResponseHeader {
     /// Leaders and msync may return non-empty state. Follower successful
     /// responses must leave this empty. Empty means no cache update, not stale.
     pub state: Vec<GroupStateWatermark>,
-    /// Metadata group name that this response applies to.
-    pub group_name: Option<GroupName>,
     /// Mount epoch returned by server (for FS operations).
     /// Server fills this with the current mount.mount_epoch so client can update its cache.
     pub mount_epoch: Option<u64>,
     /// Route epoch returned by server (for FS route/layout operations).
     pub route_epoch: Option<u64>,
+    /// Metadata group name that this response applies to.
+    pub group_name: Option<GroupName>,
 }
 
 /// High-level status for the RPC outcome.
@@ -252,18 +263,18 @@ impl RequestHeader {
     pub fn with_deadline(client_id: impl Into<ClientId>, deadline: Deadline) -> Self {
         Self {
             client: ClientInfo::new(client_id),
-            deadline,
-            traceparent: None,
-            caller_context: None,
-            state: Vec::new(),
-            retry_count: 0,
+            trace_context: TraceContext::default(),
             group_name: None,
             mount_epoch: None,
+            state: Vec::new(),
             route_epoch: None,
             principal: None,
             real_user: None,
             doas: None,
             authn_type: AuthnType::Unspecified,
+            deadline,
+            caller_context: None,
+            retry_count: 0,
         }
     }
 
@@ -281,7 +292,19 @@ impl RequestHeader {
 
     /// Set the traceparent.
     pub fn with_traceparent(mut self, traceparent: String) -> Self {
-        self.traceparent = Some(traceparent);
+        self.trace_context.traceparent = Some(traceparent);
+        self
+    }
+
+    /// Set the tracestate header value.
+    pub fn with_tracestate(mut self, tracestate: String) -> Self {
+        self.trace_context.tracestate = Some(tracestate);
+        self
+    }
+
+    /// Set the baggage header value.
+    pub fn with_baggage(mut self, baggage: String) -> Self {
+        self.trace_context.baggage = Some(baggage);
         self
     }
 
@@ -323,7 +346,7 @@ impl RequestHeader {
 
     /// Create a child header (for nested calls).
     ///
-    /// Inherits client_id, deadline, traceparent, state watermarks, and group name.
+    /// Inherits client_id, deadline, trace context, state watermarks, and group name.
     /// Generates a new call_id by default.
     pub fn child(&self) -> Self {
         Self {
@@ -332,18 +355,18 @@ impl RequestHeader {
                 client_id: self.client.client_id,
                 client_name: self.client.client_name.clone(),
             },
-            deadline: self.deadline,
-            traceparent: self.traceparent.clone(),
-            caller_context: self.caller_context.clone(),
-            state: self.state.clone(),
-            retry_count: 0,
+            trace_context: self.trace_context.clone(),
             group_name: self.group_name.clone(),
             mount_epoch: self.mount_epoch,
+            state: self.state.clone(),
             route_epoch: self.route_epoch,
             principal: self.principal.clone(),
             real_user: self.real_user.clone(),
             doas: self.doas.clone(),
             authn_type: self.authn_type,
+            deadline: self.deadline,
+            caller_context: self.caller_context.clone(),
+            retry_count: 0,
         }
     }
 
@@ -355,18 +378,18 @@ impl RequestHeader {
                 client_id: self.client.client_id,
                 client_name: self.client.client_name.clone(),
             },
-            deadline: self.deadline,
-            traceparent: self.traceparent.clone(),
-            caller_context: self.caller_context.clone(),
-            state: self.state.clone(),
-            retry_count: self.retry_count + 1,
+            trace_context: self.trace_context.clone(),
             group_name: self.group_name.clone(),
             mount_epoch: self.mount_epoch,
+            state: self.state.clone(),
             route_epoch: self.route_epoch,
             principal: self.principal.clone(),
             real_user: self.real_user.clone(),
             doas: self.doas.clone(),
             authn_type: self.authn_type,
+            deadline: self.deadline,
+            caller_context: self.caller_context.clone(),
+            retry_count: self.retry_count + 1,
         }
     }
 
@@ -376,7 +399,7 @@ impl RequestHeader {
     /// - x-call-id: Call ID (UUID string)
     /// - x-client-id: Client ID (u128 as string)
     /// - x-state-id: Group state watermarks as group:term:leader_node_id:index entries
-    /// - traceparent: W3C Trace Context (if present)
+    /// - traceparent/tracestate/baggage: W3C Trace Context (if present)
     /// - grpc-timeout: Deadline as gRPC timeout format (e.g., "30S")
     ///
     /// Returns a vector of (key, value) pairs suitable for use with tonic::metadata::MetadataMap.
@@ -391,7 +414,7 @@ impl RequestHeader {
     /// - x-call-id: Call ID
     /// - x-client-id: Client ID
     /// - x-state-id: Group state watermarks as group:term:leader_node_id:index entries
-    /// - traceparent: W3C Trace Context
+    /// - traceparent/tracestate/baggage: W3C Trace Context
     /// - grpc-timeout: Deadline (converted from timeout to absolute deadline)
     ///
     pub fn from_grpc_metadata<I>(iter: I) -> Result<Self, String>
@@ -411,9 +434,9 @@ impl ResponseHeader {
             status: RpcStatus::Ok,
             canonical_error: None,
             state: Vec::new(),
-            group_name: None,
             mount_epoch: None,
             route_epoch: None,
+            group_name: None,
         }
     }
 
@@ -442,9 +465,9 @@ impl ResponseHeader {
             status,
             canonical_error: Some(canonical_error),
             state: Vec::new(),
-            group_name: None,
             mount_epoch: None,
             route_epoch: None,
+            group_name: None,
         }
     }
 

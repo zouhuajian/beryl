@@ -4,10 +4,10 @@
 //! Unified observability infrastructure for Vecton.
 //!
 //! This module provides:
-//! - Logging (stdout JSON, production default)
-//! - Tracing subscriber setup, with optional OTLP tracing when enabled
+//! - Logging with compact or flat JSON output
+//! - Tracing subscriber setup
 //! - Metrics recorder setup and Prometheus export
-//! - Context propagation (W3C traceparent + request_id)
+//! - Context propagation (W3C traceparent/tracestate/baggage)
 //! - Generic error classification for low-cardinality labels
 
 pub mod config;

@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Vecton Contributors
+
+# Vecton worker baseline. Run with:
+# worker start --config conf/worker.yaml
+
+vecton.cluster.id: "local-vecton"
+
+# Worker data service.
+worker.identity.path: "data/worker/worker.identity"
+worker.rpc.bind: "0.0.0.0:9090"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.http.bind: "0.0.0.0:19091"
+worker.rpc.max_inflight: 100
+worker.default_frame_size: "1MB"
+worker.max_frame_size: "4MB"
+worker.window_bytes: "8MB"
+worker.stream.idle_timeout_ms: 60000
+
+# Worker local block store.
+worker.store.dirs.hdd0.path: "data/worker/hdd0"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.store.reserve_space: "1GB"
+worker.store.selection_policy: "round_robin"
+worker.store.check_interval_ms: 30000
+
+# Worker metadata registration, heartbeat, and block report.
+worker.metadata.group.name: "root"
+worker.metadata.endpoints: "http://127.0.0.1:18080"
+worker.metadata.register_timeout_ms: 5000
+worker.metadata.register_retry_initial_backoff_ms: 200
+worker.metadata.register_retry_max_backoff_ms: 5000
+
+observe.log.format: compact
+observe.log.output: stderr
+observe.log.level: "info,vecton=info,metadata=info,worker=info,common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
+observe.metrics.prometheus.bind: "127.0.0.1:19091"
+observe.metrics.prometheus.path: "/metrics"

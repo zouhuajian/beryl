@@ -7,6 +7,7 @@
 
 use crate::config::RaftConfig;
 use crate::error::{MetadataError, MetadataResult};
+use crate::observe;
 use crate::raft::command::Command;
 use crate::raft::log_store::AppLogStorage;
 use crate::raft::network::NetworkFactory;
@@ -20,6 +21,7 @@ use openraft::{Config, Raft, RaftMetrics, RaftTypeConfig, ServerState, SnapshotP
 use parking_lot::RwLock;
 use serde_json;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::info;
 use types::RaftLogId;
 
@@ -66,7 +68,7 @@ impl AppRaftNode {
         // Create NetworkFactory
         let network_factory = NetworkFactory::new();
 
-        // TODO: Set config from core-site.yaml
+        // TODO: Set Raft timing from metadata configuration.
         // Create Raft Config
         let config = Config {
             heartbeat_interval: 1000,    // 1 second
@@ -95,12 +97,14 @@ impl AppRaftNode {
             info!(node_id = node_id, "Raft cluster already initialized");
         }
 
-        Ok(Self {
+        let node = Self {
             node_id,
             raft: Arc::new(raft),
             state_machine,
             _storage: storage,
-        })
+        };
+        node.record_current_raft_metrics();
+        Ok(node)
     }
 
     /// Initializes single-node membership for explicit metadata format.
@@ -133,31 +137,40 @@ impl AppRaftNode {
 
     /// Propose a command to Raft.
     pub async fn propose(&self, command: Command) -> MetadataResult<AppDataResponse> {
-        // Use openraft client_write API
-        let result = self.raft.client_write(command).await.map_err(|e| {
-            // Map openraft errors to MetadataError
-            // e is RaftError<u64, ClientWriteError<u64, MetadataNode>>
-            match e {
-                openraft::error::RaftError::APIError(api_err) => match api_err {
-                    openraft::error::ClientWriteError::ForwardToLeader(forward) => {
-                        if let Some(leader_id) = forward.leader_id {
-                            MetadataError::LeaderChanged(format!("Leader is node {}", leader_id))
-                        } else {
-                            MetadataError::LeaderChanged("Leader unknown".to_string())
-                        }
-                    }
-                    openraft::error::ClientWriteError::ChangeMembershipError(change_err) => {
-                        MetadataError::Internal(format!("Membership change error: {}", change_err))
-                    }
-                },
-                openraft::error::RaftError::Fatal(fatal) => {
-                    MetadataError::Internal(format!("Fatal Raft error: {}", fatal))
-                }
+        let started = Instant::now();
+        match self.raft.client_write(command).await {
+            Ok(result) => {
+                observe::record_raft_proposal("ok", "none", started.elapsed().as_secs_f64());
+                self.record_current_raft_metrics();
+                Ok(result.data)
             }
-        })?;
-
-        // Extract response from ClientWriteResponse
-        Ok(result.data)
+            Err(e) => {
+                let error = match e {
+                    openraft::error::RaftError::APIError(api_err) => match api_err {
+                        openraft::error::ClientWriteError::ForwardToLeader(forward) => {
+                            if let Some(leader_id) = forward.leader_id {
+                                MetadataError::LeaderChanged(format!("Leader is node {}", leader_id))
+                            } else {
+                                MetadataError::LeaderChanged("Leader unknown".to_string())
+                            }
+                        }
+                        openraft::error::ClientWriteError::ChangeMembershipError(change_err) => {
+                            MetadataError::Internal(format!("Membership change error: {}", change_err))
+                        }
+                    },
+                    openraft::error::RaftError::Fatal(fatal) => {
+                        MetadataError::Internal(format!("Fatal Raft error: {}", fatal))
+                    }
+                };
+                observe::record_raft_proposal(
+                    "error",
+                    observe::metadata_error_kind(&error),
+                    started.elapsed().as_secs_f64(),
+                );
+                self.record_current_raft_metrics();
+                Err(error)
+            }
+        }
     }
 
     /// Attach worker live-state observer used by the Raft apply/replay path.
@@ -281,5 +294,31 @@ impl AppRaftNode {
             }
         }
         None
+    }
+
+    fn record_current_raft_metrics(&self) {
+        let metrics = self.metrics();
+        observe::record_raft_role(server_state_label(metrics.state));
+        observe::record_raft_term(metrics.current_term);
+        observe::record_raft_indexes(metrics.last_applied.map(|log_id| log_id.index), self.committed_index());
+    }
+
+    fn committed_index(&self) -> Option<u64> {
+        self._storage
+            .get_raft_state()
+            .ok()
+            .flatten()
+            .and_then(|state_data| serde_json::from_slice::<AppMetadataRaftState>(&state_data).ok())
+            .and_then(|raft_state| raft_state.committed.map(|log_id| log_id.index))
+    }
+}
+
+fn server_state_label(state: ServerState) -> &'static str {
+    match state {
+        ServerState::Leader => "leader",
+        ServerState::Follower => "follower",
+        ServerState::Candidate => "candidate",
+        ServerState::Learner => "learner",
+        ServerState::Shutdown => "shutdown",
     }
 }

@@ -10,28 +10,9 @@ use crate::observe::config::{ObservabilityConfig, ServiceInfo};
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// Guard that ensures observability is properly shut down on drop.
+/// Guard that keeps process observability resources alive.
 pub struct ObservabilityGuard {
-    #[cfg(feature = "otel")]
-    tracer_provider: Option<opentelemetry_sdk::trace::TracerProvider>,
-    #[cfg(feature = "otel")]
-    meter_provider: Option<opentelemetry_sdk::metrics::MeterProvider>,
-    prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
-}
-
-impl Drop for ObservabilityGuard {
-    fn drop(&mut self) {
-        // Flush OTLP exporters
-        #[cfg(feature = "otel")]
-        {
-            if let Some(provider) = self.tracer_provider.take() {
-                opentelemetry_sdk::trace::TracerProvider::shutdown(&provider);
-            }
-            if let Some(provider) = self.meter_provider.take() {
-                opentelemetry_sdk::metrics::MeterProvider::shutdown(&provider);
-            }
-        }
-    }
+    _prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
 }
 
 /// Initialize observability infrastructure.
@@ -42,7 +23,6 @@ pub fn init_observability(
     config: &ObservabilityConfig,
     service_info: ServiceInfo,
 ) -> Result<ObservabilityGuard, Box<dyn std::error::Error>> {
-    // Check if already initialized
     if INITIALIZED.swap(true, Ordering::SeqCst) {
         return Err("Observability already initialized".into());
     }
@@ -60,95 +40,20 @@ fn init_observability_once(
     config: &ObservabilityConfig,
     service_info: ServiceInfo,
 ) -> Result<ObservabilityGuard, Box<dyn std::error::Error>> {
-    // Initialize logging (stdout JSON)
-    if config.logging.stdout {
-        crate::observe::tracing::init_tracing_subscriber(
-            &config.logging.level,
-            &config.logging.format,
-            config.logging.targets.as_deref(),
-        )?;
-    }
-
-    let mut guard = ObservabilityGuard {
-        #[cfg(feature = "otel")]
-        tracer_provider: None,
-        #[cfg(feature = "otel")]
-        meter_provider: None,
-        prometheus_handle: None,
-    };
-
-    // Initialize tracing with OTLP if enabled
-    #[cfg(feature = "otel")]
-    if config.tracing.enabled && config.tracing.otlp.enabled {
-        match crate::observe::tracing::otel::init_otel_tracing(
-            &config.tracing.otlp.endpoint,
-            &config.tracing.otlp.protocol,
-            config.tracing.otlp.headers.as_deref(),
-            config.tracing.otlp.timeout_ms,
-            config.tracing.sampling.ratio,
-            config.tracing.sampling.parent_based,
-            &config.resource,
-            &service_info,
-        ) {
-            Ok(provider) => {
-                // Add OTLP layer to existing subscriber
-                if let Err(e) = crate::observe::tracing::otel::add_otel_layer(provider.clone()) {
-                    tracing::warn!(
-                        error = %e,
-                        "Failed to add OTLP layer to subscriber, continuing without it"
-                    );
-                } else {
-                    guard.tracer_provider = Some(provider);
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to initialize OTLP tracing, continuing without it"
-                );
-            }
-        }
-    }
-
-    // Initialize metrics
-    if config.metrics.enabled {
-        // Initialize Prometheus exporter if enabled
-        if config.metrics.prometheus.enabled {
-            let handle = init_prometheus_metrics(&config.metrics.prometheus.bind, &config.metrics.prometheus.path)?;
-            guard.prometheus_handle = Some(handle);
-        }
-
-        // Initialize OTLP metrics if enabled
-        #[cfg(feature = "otel")]
-        if config.metrics.otlp.enabled {
-            match init_otlp_metrics(
-                &config.metrics.otlp.endpoint,
-                &config.metrics.otlp.protocol,
-                Duration::from_millis(config.metrics.otlp.interval_ms),
-                &config.resource,
-                &service_info,
-            ) {
-                Ok(provider) => {
-                    guard.meter_provider = Some(provider);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "Failed to initialize OTLP metrics, continuing without it"
-                    );
-                }
-            }
-        }
-    }
+    crate::observe::tracing::init_tracing_subscriber(config)?;
+    let handle = init_prometheus_metrics(&config.metrics.prometheus.bind, &config.metrics.prometheus.path)?;
 
     tracing::info!(
+        event = "observability_initialized",
         service_name = %service_info.name,
         service_version = %service_info.version,
         environment = %service_info.environment,
         "Observability initialized"
     );
 
-    Ok(guard)
+    Ok(ObservabilityGuard {
+        _prometheus_handle: Some(handle),
+    })
 }
 
 fn bind_prometheus_listener(bind: &str) -> Result<(SocketAddr, tokio::net::TcpListener), Box<dyn std::error::Error>> {
@@ -170,7 +75,6 @@ fn init_prometheus_metrics(
     let (bind_addr, listener) = bind_prometheus_listener(bind)?;
     let handle = PrometheusBuilder::new().install_recorder()?;
 
-    // Start HTTP server for /metrics endpoint
     let path = path.to_string();
     let path_clone = path.clone();
     let handle_clone = handle.clone();
@@ -227,56 +131,10 @@ fn init_prometheus_metrics(
     Ok(handle)
 }
 
-#[cfg(feature = "otel")]
-fn init_otlp_metrics(
-    endpoint: &str,
-    _protocol: &str,
-    interval: Duration,
-    resource: &crate::observe::config::ResourceConfig,
-    service_info: &ServiceInfo,
-) -> Result<opentelemetry_sdk::metrics::MeterProvider, Box<dyn std::error::Error>> {
-    use opentelemetry::KeyValue;
-    use opentelemetry_sdk::Resource;
-    use opentelemetry_sdk::metrics::MeterProvider;
-    use opentelemetry_semantic_conventions::resource::{SERVICE_NAME, SERVICE_VERSION};
-
-    let mut resource_builder = Resource::default();
-
-    let service_name = resource.service_name.as_ref().unwrap_or(&service_info.name);
-    resource_builder = resource_builder.with_attributes(vec![SERVICE_NAME.string(service_name.clone())]);
-
-    if let Some(version) = resource
-        .service_version
-        .as_ref()
-        .or_else(|| Some(&service_info.version))
-    {
-        resource_builder = resource_builder.with_attributes(vec![SERVICE_VERSION.string(version.clone())]);
-    }
-
-    if let Some(env) = &resource.environment {
-        resource_builder = resource_builder.with_attributes(vec![KeyValue::new("deployment.environment", env.clone())]);
-    }
-
-    let exporter = opentelemetry_otlp::new_exporter().tonic().with_endpoint(endpoint);
-
-    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter, opentelemetry_sdk::runtime::Tokio)
-        .with_interval(interval)
-        .build();
-
-    let provider = MeterProvider::builder()
-        .with_resource(resource_builder)
-        .with_reader(reader)
-        .build();
-
-    Ok(provider)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observe::config::{
-        LoggingConfig, MetricsConfig, OtlpConfig, OtlpMetricsConfig, PrometheusConfig, ResourceConfig, TracingConfig,
-    };
+    use crate::observe::config::{LogConfig, MetricsConfig, PrometheusConfig, ResourceConfig};
 
     #[test]
     fn prometheus_bind_conflict_returns_error_and_resets_initialized() {
@@ -285,23 +143,16 @@ mod tests {
         let bind = listener.local_addr().expect("test listener local addr").to_string();
 
         let config = ObservabilityConfig {
-            logging: LoggingConfig {
-                stdout: false,
-                ..LoggingConfig::default()
-            },
-            tracing: TracingConfig {
-                enabled: false,
-                sampling: Default::default(),
-                otlp: OtlpConfig::default(),
+            log: LogConfig {
+                format: "compact".to_string(),
+                output: "stderr".to_string(),
+                level: "warn".to_string(),
             },
             metrics: MetricsConfig {
-                enabled: true,
                 prometheus: PrometheusConfig {
-                    enabled: true,
                     bind,
                     path: "/metrics".to_string(),
                 },
-                otlp: OtlpMetricsConfig::default(),
             },
             resource: ResourceConfig::default(),
         };

@@ -183,12 +183,14 @@ fn publish_and_abort_release_pending_reservations() {
     let after_publish = store.report().unwrap();
     assert_eq!(after_publish.pending_bytes, 0);
     assert_eq!(after_publish.used_bytes, BLOCK_SIZE);
+    assert_eq!(after_publish.dirs[0].block_count, 1);
 
     store.create_staging_block(staging_req(1)).unwrap();
     store.abort_staging_block(&group_name(), block_id(1)).unwrap();
     let after_abort = store.report().unwrap();
     assert_eq!(after_abort.pending_bytes, 0);
     assert_eq!(after_abort.used_bytes, BLOCK_SIZE);
+    assert_eq!(after_abort.dirs[0].block_count, 1);
 }
 
 #[test]

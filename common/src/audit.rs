@@ -16,8 +16,8 @@ use tracing::{error, info, warn};
 pub struct AuditRecord {
     /// Timestamp (ISO 8601).
     pub timestamp: String,
-    /// Request ID (UUID).
-    pub request_id: String,
+    /// Vecton application call correlation ID.
+    pub call_id: String,
     /// Client ID.
     pub client_id: u128,
     /// Operation name.
@@ -230,7 +230,7 @@ mod tests {
 
         let record = AuditRecord {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
-            request_id: "test-request-id".to_string(),
+            call_id: "test-call-id".to_string(),
             client_id: 12345,
             operation: "OpenReadStream".to_string(),
             path: Some("/test/path".to_string()),

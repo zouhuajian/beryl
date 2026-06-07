@@ -58,7 +58,7 @@ The regular data path is metadata issued: client create/open/append/add-block/re
 
 #### Owns
 
-- Generic infrastructure used across modules: error framework, request/response header domain types, config file loading and flattening, env-key mapping, retry/time/path utilities, and observability primitives.
+- Generic infrastructure used across modules: error framework, request/response header domain types, flat config file loading, retry/time/path utilities, and observability primitives.
 - Canonical recoverable error categories that are independent of one service implementation.
 - Generic validation helpers only when the rule is independent of metadata, worker, client, UFS, or test policy.
 
@@ -192,7 +192,7 @@ The regular data path is metadata issued: client create/open/append/add-block/re
 
 ## Config Ownership Rules
 
-- `common` owns generic config loading, flattening, environment key mapping, and shared low-level config primitives.
+- `common` owns generic flat config file loading and shared low-level config primitives.
 - A module owns its typed config structs, defaults, validation, and module-specific key semantics.
 - Shared config constants belong in `common` only when the key is stable, cross-module, and not tied to one module runtime.
 - Do not centralize every module key in `common` by default.

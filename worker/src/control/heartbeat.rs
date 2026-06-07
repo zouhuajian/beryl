@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::future;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode, RefreshReason};
 use common::header::RequestHeader;
@@ -27,7 +27,8 @@ use types::{GroupName, TierFree, WorkerRunId};
 
 use crate::config::WorkerRegistrationConfig;
 use crate::control::{
-    ControlIdentity, ControlOp, MetadataRegistrar, Registration, RegistrationDescriptor, RegistrationSet,
+    metadata_tonic_request, ControlIdentity, ControlOp, MetadataRegistrar, Registration, RegistrationDescriptor,
+    RegistrationSet,
 };
 use crate::net::protocol::WorkerNetProtocol;
 use crate::observe;
@@ -126,22 +127,43 @@ impl MetadataHeartbeatLoop {
         let mut last_error = None;
 
         for endpoint in &self.endpoints {
+            let started = Instant::now();
             match self.send_to_peer(endpoint.clone(), request.clone()).await {
                 Ok(HeartbeatPeerOutcome::Accepted { liveness_timeout }) => {
+                    let duration = started.elapsed().as_secs_f64();
+                    observe::record_metadata_rpc("heartbeat", "ok", "none", duration);
+                    observe::record_heartbeat_sent("ok", "none");
                     round.accepted_peers += 1;
                     self.state
                         .record_heartbeat_success(&registration.group_name, liveness_timeout);
-                    observe::record_heartbeat_sent();
                 }
                 Ok(HeartbeatPeerOutcome::NeedRegister) => {
+                    observe::record_metadata_rpc(
+                        "heartbeat",
+                        "error",
+                        "need_register",
+                        started.elapsed().as_secs_f64(),
+                    );
                     round.needs_register = true;
                     self.state.mark_needs_register(&registration.group_name);
                 }
                 Ok(HeartbeatPeerOutcome::WorkerRunMismatch) => {
+                    observe::record_metadata_rpc(
+                        "heartbeat",
+                        "error",
+                        "worker_run_mismatch",
+                        started.elapsed().as_secs_f64(),
+                    );
                     round.worker_run_mismatch = true;
                     self.state.mark_needs_register(&registration.group_name);
                 }
                 Err(error) => {
+                    observe::record_metadata_rpc(
+                        "heartbeat",
+                        "error",
+                        heartbeat_error_kind(&error),
+                        started.elapsed().as_secs_f64(),
+                    );
                     debug!(%error, "Worker heartbeat peer attempt failed");
                     last_error = Some(error);
                 }
@@ -219,7 +241,8 @@ impl MetadataHeartbeatLoop {
             .map_err(|_| HeartbeatError::Retryable("metadata heartbeat connect timed out".to_string()))?
             .map_err(|err| HeartbeatError::Retryable(format!("metadata heartbeat endpoint unavailable: {err}")))?;
         let mut client = MetadataWorkerServiceProtoClient::new(channel);
-        let response = time::timeout(timeout, client.heartbeat(tonic::Request::new(request.clone())))
+        let tonic_request = metadata_tonic_request(request.clone(), request.header.as_ref());
+        let response = time::timeout(timeout, client.heartbeat(tonic_request))
             .await
             .map_err(|_| HeartbeatError::Retryable("metadata heartbeat request timed out".to_string()))?
             .map_err(classify_status)?
@@ -250,7 +273,10 @@ impl MetadataHeartbeatLoop {
 
             let snapshot = match store.as_ref() {
                 Some(store) => match store.report() {
-                    Ok(report) => HeartbeatSnapshot::from(report),
+                    Ok(report) => {
+                        observe::record_store_report(&report);
+                        HeartbeatSnapshot::from(report)
+                    }
                     Err(error) => {
                         warn!(%error, "Worker store report failed before heartbeat");
                         continue;
@@ -289,6 +315,14 @@ enum HeartbeatPeerOutcome {
     Accepted { liveness_timeout: Duration },
     NeedRegister,
     WorkerRunMismatch,
+}
+
+fn heartbeat_error_kind(error: &HeartbeatError) -> &'static str {
+    match error {
+        HeartbeatError::InvalidConfig(_) => "invalid_config",
+        HeartbeatError::Retryable(_) => "retryable",
+        HeartbeatError::Fatal(_) => "fatal",
+    }
 }
 
 fn classify_heartbeat_response(

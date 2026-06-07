@@ -3,6 +3,7 @@
 
 use super::{FsCore, StaleStateStatus};
 use crate::error::MetadataError;
+use crate::observe;
 use crate::placement::{PlacementOp, PlacementPlanner, PlacementRequest, WorkerPlacementView};
 use crate::service::core_util::{need_refresh_core_failure, worker_endpoint_from_parts};
 use crate::service::domain::{
@@ -12,6 +13,7 @@ use crate::service::domain::{
 use common::error::canonical::RefreshReason;
 use common::header::CallerContextFields;
 use common::header::RpcErrorCode;
+use std::time::Instant;
 use types::fs::{Extent, InodeId};
 use types::ids::DataHandleId;
 use types::{FileBlockLocation, GroupName};
@@ -111,43 +113,49 @@ impl FsCore {
     }
 
     pub(crate) async fn execute_get_attr(&self, req: GetAttrInput) -> CoreResult<GetAttrOutput> {
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-            }
-        };
+        let started = Instant::now();
+        let result = async {
+            let storage = match self.storage.as_ref() {
+                Some(storage) => storage,
+                None => {
+                    return self.failure_from_error(
+                        &req.ctx,
+                        MetadataError::Internal("Storage not available".to_string()),
+                        None,
+                        None,
+                    );
+                }
+            };
 
-        let inode = match storage.get_inode(req.inode_id) {
-            Ok(Some(inode)) => inode,
-            Ok(None) => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::NotFound(format!("Inode not found: {}", req.inode_id)),
-                    None,
-                    None,
-                );
-            }
-            Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
-        };
+            let inode = match storage.get_inode(req.inode_id) {
+                Ok(Some(inode)) => inode,
+                Ok(None) => {
+                    return self.failure_from_error(
+                        &req.ctx,
+                        MetadataError::NotFound(format!("Inode not found: {}", req.inode_id)),
+                        None,
+                        None,
+                    );
+                }
+                Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
+            };
 
-        let (group_name, mount_epoch, route_epoch) = self
-            .validate_read_freshness_for_mount(&req.ctx, req.freshness, inode.mount_id, "GetStatus")
-            .await?;
-        self.success_with_route_epoch(
-            &req.ctx,
-            GetAttrOutput {
-                attrs: inode.attrs.clone(),
-            },
-            group_name,
-            mount_epoch,
-            route_epoch,
-        )
+            let (group_name, mount_epoch, route_epoch) = self
+                .validate_read_freshness_for_mount(&req.ctx, req.freshness, inode.mount_id, "GetStatus")
+                .await?;
+            self.success_with_route_epoch(
+                &req.ctx,
+                GetAttrOutput {
+                    attrs: inode.attrs.clone(),
+                },
+                group_name,
+                mount_epoch,
+                route_epoch,
+            )
+        }
+        .await;
+        record_fs_read_result("get_status", started, &result);
+        result
     }
 
     pub(crate) async fn inode_for_data_handle(
@@ -182,75 +190,83 @@ impl FsCore {
     }
 
     pub(crate) async fn execute_read_dir(&self, req: ReadDirInput) -> CoreResult<ReadDirOutput> {
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-            }
-        };
-
-        let parent_inode = match storage.get_inode(req.parent_inode_id) {
-            Ok(Some(parent_inode)) => parent_inode,
-            Ok(None) => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::NotFound(format!("Parent inode not found: {}", req.parent_inode_id)),
-                    None,
-                    None,
-                );
-            }
-            Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
-        };
-        if !parent_inode.kind.is_dir() {
-            return self.failure_from_error(
-                &req.ctx,
-                MetadataError::InvalidArgument(format!("Parent is not a directory: {}", req.parent_inode_id)),
-                None,
-                None,
-            );
-        }
-
-        let (group_name, mount_epoch, route_epoch) = self
-            .validate_read_freshness_for_mount(&req.ctx, req.freshness, parent_inode.mount_id, "ListStatus")
-            .await?;
-
-        let cursor_key = req.cursor_key.as_deref();
-        let (entries, next_cursor_key, eof) =
-            match storage.list_dentries_with_cursor(req.parent_inode_id, cursor_key, req.max_entries) {
-                Ok(result) => result,
-                Err(err) => return self.failure_from_error(&req.ctx, err, group_name, mount_epoch),
+        let started = Instant::now();
+        let result = async {
+            let storage = match self.storage.as_ref() {
+                Some(storage) => storage,
+                None => {
+                    return self.failure_from_error(
+                        &req.ctx,
+                        MetadataError::Internal("Storage not available".to_string()),
+                        None,
+                        None,
+                    );
+                }
             };
 
-        let mut dir_entries = Vec::with_capacity(entries.len());
-        for (name, child_inode_id) in entries {
-            let child_inode = storage.get_inode(child_inode_id).ok().flatten();
-            dir_entries.push(ReadDirEntry {
-                name,
-                inode_id: child_inode_id,
-                kind: child_inode.as_ref().map(|i| i.kind),
-                attrs: child_inode.as_ref().map(|i| i.attrs.clone()),
-            });
-        }
+            let parent_inode = match storage.get_inode(req.parent_inode_id) {
+                Ok(Some(parent_inode)) => parent_inode,
+                Ok(None) => {
+                    return self.failure_from_error(
+                        &req.ctx,
+                        MetadataError::NotFound(format!("Parent inode not found: {}", req.parent_inode_id)),
+                        None,
+                        None,
+                    );
+                }
+                Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
+            };
+            if !parent_inode.kind.is_dir() {
+                return self.failure_from_error(
+                    &req.ctx,
+                    MetadataError::InvalidArgument(format!("Parent is not a directory: {}", req.parent_inode_id)),
+                    None,
+                    None,
+                );
+            }
 
-        self.success_with_route_epoch(
-            &req.ctx,
-            ReadDirOutput {
-                entries: dir_entries,
-                next_cursor_key: next_cursor_key.unwrap_or_default(),
-                eof,
-            },
-            group_name,
-            mount_epoch,
-            route_epoch,
-        )
+            let (group_name, mount_epoch, route_epoch) = self
+                .validate_read_freshness_for_mount(&req.ctx, req.freshness, parent_inode.mount_id, "ListStatus")
+                .await?;
+
+            let cursor_key = req.cursor_key.as_deref();
+            let (entries, next_cursor_key, eof) =
+                match storage.list_dentries_with_cursor(req.parent_inode_id, cursor_key, req.max_entries) {
+                    Ok(result) => result,
+                    Err(err) => return self.failure_from_error(&req.ctx, err, group_name, mount_epoch),
+                };
+
+            let mut dir_entries = Vec::with_capacity(entries.len());
+            for (name, child_inode_id) in entries {
+                let child_inode = storage.get_inode(child_inode_id).ok().flatten();
+                dir_entries.push(ReadDirEntry {
+                    name,
+                    inode_id: child_inode_id,
+                    kind: child_inode.as_ref().map(|i| i.kind),
+                    attrs: child_inode.as_ref().map(|i| i.attrs.clone()),
+                });
+            }
+
+            self.success_with_route_epoch(
+                &req.ctx,
+                ReadDirOutput {
+                    entries: dir_entries,
+                    next_cursor_key: next_cursor_key.unwrap_or_default(),
+                    eof,
+                },
+                group_name,
+                mount_epoch,
+                route_epoch,
+            )
+        }
+        .await;
+        record_fs_read_result("list_status", started, &result);
+        result
     }
 
     pub(crate) async fn execute_get_file_layout(&self, req: GetFileLayoutInput) -> CoreResult<GetFileLayoutOutput> {
+        let started = Instant::now();
+        let result = async {
         let storage = match self.storage.as_ref() {
             Some(storage) => storage,
             None => {
@@ -506,5 +522,21 @@ impl FsCore {
             mount_epoch,
             route_epoch,
         )
+        }
+        .await;
+        record_fs_read_result("get_file_layout", started, &result);
+        result
+    }
+}
+
+fn record_fs_read_result<T>(operation: &str, started: Instant, result: &CoreResult<T>) {
+    match result {
+        Ok(_) => observe::record_fs_op(operation, "ok", "none", started.elapsed().as_secs_f64()),
+        Err(failure) => observe::record_fs_op(
+            operation,
+            "error",
+            observe::canonical_error_kind(&failure.error),
+            started.elapsed().as_secs_f64(),
+        ),
     }
 }

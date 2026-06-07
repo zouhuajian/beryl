@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Worker configuration for the current data service skeleton.
+//! Worker configuration for the current data service.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use common::config::CoreConfig;
+use common::config::ServerConfig;
 use common::error::{CommonError, CommonErrorCode};
+use common::observe::ObservabilityConfig;
 use tonic::transport::Endpoint;
 use tracing::info;
 use types::{GroupName, Tier};
@@ -88,7 +89,7 @@ pub struct WorkerConfig {
     pub identity_path: PathBuf,
     /// RPC server bind address.
     pub rpc_bind: String,
-    /// HTTP/admin/metrics bind address.
+    /// Reserved HTTP/admin bind address. Prometheus metrics use observability config.
     pub http_bind: String,
     /// Routable gRPC data endpoint registered with metadata.
     pub rpc_advertised_endpoint: String,
@@ -110,47 +111,39 @@ pub struct WorkerConfig {
     pub net: WorkerNetConfig,
     /// Worker metadata registration configuration.
     pub metadata: WorkerRegistrationConfig,
-}
-
-impl Default for WorkerConfig {
-    fn default() -> Self {
-        Self {
-            cluster_id: "local-vecton".to_string(),
-            identity_path: PathBuf::from("data/worker/worker.identity"),
-            rpc_bind: "0.0.0.0:9090".to_string(),
-            http_bind: "0.0.0.0:19091".to_string(),
-            rpc_advertised_endpoint: "http://127.0.0.1:9090".to_string(),
-            rpc_max_inflight: 100,
-            default_frame_size: 1024 * 1024,
-            max_frame_size: 4 * 1024 * 1024,
-            window_bytes: 8 * 1024 * 1024,
-            stream_idle_timeout_ms: 60_000,
-            store: WorkerStoreConfig::default(),
-            net: WorkerNetConfig::grpc_from_rpc("0.0.0.0:9090".to_string(), 100, 4 * 1024 * 1024),
-            metadata: WorkerRegistrationConfig::default(),
-        }
-    }
+    /// Shared observability configuration.
+    pub observability: ObservabilityConfig,
 }
 
 impl WorkerConfig {
-    /// Load worker configuration from a core-site YAML file.
+    /// Load worker configuration from a YAML file.
     pub fn load<P: AsRef<Path>>(config_path: P) -> Result<Self, CommonError> {
-        let core_config = CoreConfig::load(config_path)?;
-        Self::from_core_config(&core_config)
+        let server_config = ServerConfig::load(config_path)?;
+        Self::from_server_config(&server_config)
     }
 
     /// Create worker configuration from the repository-wide config shape.
-    pub fn from_core_config(core_config: &CoreConfig) -> Result<Self, CommonError> {
-        let worker_sub = core_config.as_flat().sub("worker");
-        let flat = core_config.as_flat();
-        let defaults = Self::default();
+    pub fn from_server_config(server_config: &ServerConfig) -> Result<Self, CommonError> {
+        let worker_sub = server_config.as_flat().sub("worker");
+        let flat = server_config.as_flat();
+        let default_cluster_id = "local-vecton".to_string();
+        let default_identity_path = PathBuf::from("data/worker/worker.identity");
+        let default_rpc_bind = "0.0.0.0:9090".to_string();
+        let default_http_bind = "0.0.0.0:19091".to_string();
+        let default_rpc_max_inflight = 100usize;
+        let default_frame_size = 1024 * 1024;
+        let default_max_frame_size = 4 * 1024 * 1024;
+        let default_window_bytes = 8 * 1024 * 1024;
+        let default_stream_idle_timeout_ms = 60_000u64;
+        let default_store = WorkerStoreConfig::default();
         let metadata_defaults = WorkerRegistrationConfig::default();
 
-        let cluster_id = Self::root_str_or(flat, "vecton.cluster.id", &defaults.cluster_id)?;
+        let cluster_id = Self::root_str_or(flat, "vecton.cluster.id", &default_cluster_id)?;
         reject_removed_keys(&worker_sub)?;
-        let identity_path = Self::path_or(&worker_sub, "identity.path", defaults.identity_path.clone())?;
-        let rpc_bind = Self::str_or(&worker_sub, "rpc.bind", &defaults.rpc_bind, "worker.rpc.bind")?;
-        let http_bind = Self::str_or(&worker_sub, "http.bind", &defaults.http_bind, "worker.http.bind")?;
+        let identity_path = Self::path_or(&worker_sub, "identity.path", default_identity_path)?;
+        let rpc_bind = Self::str_or(&worker_sub, "rpc.bind", &default_rpc_bind, "worker.rpc.bind")?;
+        let http_bind = Self::str_or(&worker_sub, "http.bind", &default_http_bind, "worker.http.bind")?;
+        let observability = ObservabilityConfig::from_flat(flat)?;
         let rpc_advertised_endpoint = worker_sub
             .get_str("rpc.advertised_endpoint")
             .ok_or_else(|| invalid_config("worker.rpc.advertised_endpoint", "must be present and be a string"))?;
@@ -160,34 +153,29 @@ impl WorkerConfig {
         let rpc_max_inflight = Self::usize_or(
             &worker_sub,
             "rpc.max_inflight",
-            defaults.rpc_max_inflight,
+            default_rpc_max_inflight,
             "worker.rpc.max_inflight",
         )?;
         let default_frame_size = Self::bytes_u32(
             &worker_sub,
             "default_frame_size",
-            defaults.default_frame_size,
+            default_frame_size,
             "worker.default_frame_size",
         )?;
         let max_frame_size = Self::bytes_u32(
             &worker_sub,
             "max_frame_size",
-            defaults.max_frame_size,
+            default_max_frame_size,
             "worker.max_frame_size",
         )?;
-        let window_bytes = Self::bytes_u32(
-            &worker_sub,
-            "window_bytes",
-            defaults.window_bytes,
-            "worker.window_bytes",
-        )?;
+        let window_bytes = Self::bytes_u32(&worker_sub, "window_bytes", default_window_bytes, "worker.window_bytes")?;
         let stream_idle_timeout_ms = Self::usize_or(
             &worker_sub,
             "stream.idle_timeout_ms",
-            defaults.stream_idle_timeout_ms as usize,
+            default_stream_idle_timeout_ms as usize,
             "worker.stream.idle_timeout_ms",
         )? as u64;
-        let store = parse_store_config(&worker_sub, &defaults.store)?;
+        let store = parse_store_config(&worker_sub, &default_store)?;
         let endpoints = metadata_endpoints(&worker_sub, &metadata_defaults)?;
         let group_name = Self::str_or(
             &worker_sub,
@@ -232,6 +220,7 @@ impl WorkerConfig {
             store,
             net: WorkerNetConfig::grpc_from_rpc(rpc_bind, rpc_max_inflight, max_frame_size),
             metadata,
+            observability,
         };
 
         config.validate()?;
@@ -901,29 +890,91 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    fn test_worker_config() -> WorkerConfig {
+        WorkerConfig {
+            cluster_id: "local-vecton".to_string(),
+            identity_path: PathBuf::from("data/worker/worker.identity"),
+            rpc_bind: "0.0.0.0:9090".to_string(),
+            http_bind: "0.0.0.0:19091".to_string(),
+            rpc_advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+            rpc_max_inflight: 100,
+            default_frame_size: 1024 * 1024,
+            max_frame_size: 4 * 1024 * 1024,
+            window_bytes: 8 * 1024 * 1024,
+            stream_idle_timeout_ms: 60_000,
+            store: WorkerStoreConfig::default(),
+            net: WorkerNetConfig::grpc_from_rpc("0.0.0.0:9090".to_string(), 100, 4 * 1024 * 1024),
+            metadata: WorkerRegistrationConfig::default(),
+            observability: test_observability_config(),
+        }
+    }
+
+    fn test_observability_config() -> ObservabilityConfig {
+        let mut flat = common::config::FlatConfig::new();
+        flat.set("observe.log.format", "compact");
+        flat.set("observe.log.output", "stderr");
+        flat.set(
+            "observe.log.level",
+            "info,vecton=info,metadata=info,worker=info,common=info,openraft=warn,tonic=warn,tower=warn,h2=warn",
+        );
+        flat.set("observe.metrics.prometheus.bind", "127.0.0.1:19091");
+        flat.set("observe.metrics.prometheus.path", "/metrics");
+        ObservabilityConfig::from_flat(&flat).expect("test observe config")
+    }
+
+    fn with_test_observe_yaml(config: impl AsRef<str>) -> String {
+        format!(
+            "{}\n{}",
+            config.as_ref().trim_end(),
+            r#"
+observe.log.format: compact
+observe.log.output: stderr
+observe.log.level: "info,vecton=info,metadata=info,worker=info,common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
+observe.metrics.prometheus.bind: "127.0.0.1:19091"
+observe.metrics.prometheus.path: "/metrics"
+"#
+            .trim_start()
+        )
+    }
+
+    #[test]
+    fn test_load_real_worker_config() {
+        let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("worker lives under workspace root")
+            .join("conf/worker.yaml");
+
+        let config = WorkerConfig::load(&config_path)
+            .unwrap_or_else(|err| panic!("Failed to load {}: {err:?}", config_path.display()));
+
+        let hdd0 = config.store.dirs.get("hdd0").expect("hdd0 store dir");
+        assert_eq!(hdd0.path, PathBuf::from("data/worker/hdd0"));
+        assert_eq!(hdd0.tier, types::Tier::Hdd);
+        assert_eq!(config.identity_path, PathBuf::from("data/worker/worker.identity"));
+        assert_eq!(config.rpc_bind, "0.0.0.0:9090");
+        assert_eq!(config.rpc_advertised_endpoint, "http://127.0.0.1:9090");
+        assert_eq!(config.observability.metrics.prometheus.bind, "127.0.0.1:19091");
+    }
+
     #[test]
     fn loads_default_config() {
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("core-site.yaml");
+        let config_path = temp_dir.path().join("worker.yaml");
         fs::write(
             &config_path,
-            r#"
-worker:
-  rpc:
-    bind: "127.0.0.1:9090"
-    advertised_endpoint: "http://127.0.0.1:9090"
-  store:
-    dirs:
-      hdd0:
-        path: "/tmp/vecton-worker/hdd0"
-        tier: "HDD"
-        capacity: "10GB"
-    reserve_space: "1GB"
-    selection_policy: "round_robin"
-    check_interval_ms: 30000
-  metadata:
-    endpoints: "http://127.0.0.1:18080"
+            with_test_observe_yaml(
+                r#"
+worker.rpc.bind: "127.0.0.1:9090"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.store.dirs.hdd0.path: "/tmp/vecton-worker/hdd0"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.store.reserve_space: "1GB"
+worker.store.selection_policy: "round_robin"
+worker.store.check_interval_ms: 30000
+worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#,
+            ),
         )
         .unwrap();
 
@@ -963,45 +1014,57 @@ worker:
     }
 
     #[test]
+    fn observability_loads_from_flat_config_only() {
+        let mut flat = ServerConfig::default().as_flat().clone();
+        flat.set("worker.rpc.advertised_endpoint", "http://127.0.0.1:9090");
+        flat.set("worker.store.dirs.hdd0.path", "/tmp/vecton-worker/hdd0");
+        flat.set("worker.store.dirs.hdd0.tier", "HDD");
+        flat.set("worker.store.dirs.hdd0.capacity", "10GB");
+        flat.set("observe.log.format", "json");
+        flat.set("observe.log.output", "stdout");
+        flat.set("observe.log.level", "warn");
+        flat.set("observe.metrics.prometheus.bind", "127.0.0.1:19091");
+        flat.set("observe.metrics.prometheus.path", "/metrics");
+
+        let config = WorkerConfig::from_server_config(&ServerConfig::from_flat(flat)).unwrap();
+
+        assert_eq!(config.observability.log.format, "json");
+        assert_eq!(config.observability.log.output, "stdout");
+        assert_eq!(config.observability.metrics.prometheus.bind, "127.0.0.1:19091");
+    }
+
+    #[test]
     fn loads_current_worker_knobs() {
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("core-site.yaml");
+        let config_path = temp_dir.path().join("worker.yaml");
         fs::write(
             &config_path,
-            r#"
-worker:
-  identity:
-    path: "/tmp/vecton-worker.identity"
-  rpc:
-    bind: "127.0.0.1:9091"
-    advertised_endpoint: "http://127.0.0.1:19091"
-    max_inflight: 8
-  default_frame_size: 4096
-  max_frame_size: 8192
-  window_bytes: 16384
-  stream:
-    idle_timeout_ms: 500
-  store:
-    dirs:
-      ssd0:
-        path: "/tmp/vecton-worker/ssd0"
-        tier: "SSD"
-        capacity: "12MB"
-      hdd0:
-        path: "/tmp/vecton-worker/hdd0"
-        tier: "HDD"
-        capacity: "34MB"
-    reserve_space: "2MB"
-    selection_policy: "round_robin"
-    check_interval_ms: 2500
-  metadata:
-    group:
-      name: "analytics"
-    endpoints: "http://127.0.0.1:18080,http://127.0.0.1:18081"
-    register_timeout_ms: 2500
-    register_retry_initial_backoff_ms: 25
-    register_retry_max_backoff_ms: 250
+            with_test_observe_yaml(
+                r#"
+worker.identity.path: "/tmp/vecton-worker.identity"
+worker.rpc.bind: "127.0.0.1:9091"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:19091"
+worker.rpc.max_inflight: 8
+worker.default_frame_size: 4096
+worker.max_frame_size: 8192
+worker.window_bytes: 16384
+worker.stream.idle_timeout_ms: 500
+worker.store.dirs.ssd0.path: "/tmp/vecton-worker/ssd0"
+worker.store.dirs.ssd0.tier: "SSD"
+worker.store.dirs.ssd0.capacity: "12MB"
+worker.store.dirs.hdd0.path: "/tmp/vecton-worker/hdd0"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "34MB"
+worker.store.reserve_space: "2MB"
+worker.store.selection_policy: "round_robin"
+worker.store.check_interval_ms: 2500
+worker.metadata.group.name: "analytics"
+worker.metadata.endpoints: "http://127.0.0.1:18080,http://127.0.0.1:18081"
+worker.metadata.register_timeout_ms: 2500
+worker.metadata.register_retry_initial_backoff_ms: 25
+worker.metadata.register_retry_max_backoff_ms: 250
 "#,
+            ),
         )
         .unwrap();
 
@@ -1042,10 +1105,11 @@ worker:
     #[test]
     fn loads_id_keyed_store_dirs_from_dotted_keys() {
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("core-site.yaml");
+        let config_path = temp_dir.path().join("worker.yaml");
         fs::write(
             &config_path,
-            r#"
+            with_test_observe_yaml(
+                r#"
 worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
 worker.store.dirs.hdd0.path: "/tmp/vecton-worker/hdd0"
 worker.store.dirs.hdd0.tier: "HDD"
@@ -1055,6 +1119,7 @@ worker.store.selection_policy: "round_robin"
 worker.store.check_interval_ms: 30000
 worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#,
+            ),
         )
         .unwrap();
 
@@ -1073,22 +1138,20 @@ worker.metadata.endpoints: "http://127.0.0.1:18080"
     #[test]
     fn removed_worker_identity_and_group_keys_are_rejected() {
         for removed_key in [
-            "id: 91",
-            "metadata:\n    group_id: 7\n    endpoints: \"http://127.0.0.1:18080\"",
-            "metadata:\n    group:\n      id: 7\n    endpoints: \"http://127.0.0.1:18080\"",
-            "bootstrap:\n    auto_format: true\n  metadata:\n    endpoints: \"http://127.0.0.1:18080\"",
-            "auto_format: true\n  metadata:\n    endpoints: \"http://127.0.0.1:18080\"",
+            "worker.id: 91",
+            "worker.metadata.group_id: 7\nworker.metadata.endpoints: \"http://127.0.0.1:18080\"",
+            "worker.metadata.group.id: 7\nworker.metadata.endpoints: \"http://127.0.0.1:18080\"",
+            "worker.bootstrap.auto_format: true\nworker.metadata.endpoints: \"http://127.0.0.1:18080\"",
+            "worker.auto_format: true\nworker.metadata.endpoints: \"http://127.0.0.1:18080\"",
         ] {
             let temp_dir = TempDir::new().unwrap();
-            let config_path = temp_dir.path().join("core-site.yaml");
+            let config_path = temp_dir.path().join("worker.yaml");
             fs::write(
                 &config_path,
                 format!(
                     r#"
-worker:
-  {removed_key}
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
+{removed_key}
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
 "#
                 ),
             )
@@ -1103,30 +1166,25 @@ worker:
     #[test]
     fn ignores_removed_worker_transport_frame_size_keys() {
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("core-site.yaml");
+        let config_path = temp_dir.path().join("worker.yaml");
         fs::write(
             &config_path,
-            r#"
-worker:
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
-  store:
-    dirs:
-      hdd0:
-        path: "/tmp/vecton-worker/hdd0"
-        tier: "HDD"
-        capacity: "10GB"
-  transport:
-    default_frame_size: 8388608
-    max_frame_size: 16777216
-  metadata:
-    endpoints: "http://127.0.0.1:18080"
+            with_test_observe_yaml(
+                r#"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.store.dirs.hdd0.path: "/tmp/vecton-worker/hdd0"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.transport.default_frame_size: 8388608
+worker.transport.max_frame_size: 16777216
+worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#,
+            ),
         )
         .unwrap();
 
         let config = WorkerConfig::load(&config_path).unwrap();
-        let defaults = WorkerConfig::default();
+        let defaults = test_worker_config();
 
         assert_eq!(config.default_frame_size, defaults.default_frame_size);
         assert_eq!(config.max_frame_size, defaults.max_frame_size);
@@ -1134,7 +1192,7 @@ worker:
 
     #[test]
     fn rejects_empty_worker_net_listeners() {
-        let mut config = WorkerConfig::default();
+        let mut config = test_worker_config();
         config.net.listeners.clear();
 
         let error = config.validate().unwrap_err();
@@ -1145,24 +1203,20 @@ worker:
     #[test]
     fn rejects_invalid_frame_size_order() {
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("core-site.yaml");
+        let config_path = temp_dir.path().join("worker.yaml");
         fs::write(
             &config_path,
-            r#"
-worker:
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
-  store:
-    dirs:
-      hdd0:
-        path: "/tmp/vecton-worker/hdd0"
-        tier: "HDD"
-        capacity: "10GB"
-  default_frame_size: 8192
-  max_frame_size: 4096
-  metadata:
-    endpoints: "http://127.0.0.1:18080"
+            with_test_observe_yaml(
+                r#"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.store.dirs.hdd0.path: "/tmp/vecton-worker/hdd0"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.default_frame_size: 8192
+worker.max_frame_size: 4096
+worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#,
+            ),
         )
         .unwrap();
 
@@ -1174,17 +1228,16 @@ worker:
     #[test]
     fn rejects_wrong_type_current_worker_knobs() {
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("core-site.yaml");
+        let config_path = temp_dir.path().join("worker.yaml");
         fs::write(
             &config_path,
-            r#"
-worker:
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
-    max_inflight: false
-  metadata:
-    endpoints: "http://127.0.0.1:18080"
+            with_test_observe_yaml(
+                r#"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.rpc.max_inflight: false
+worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#,
+            ),
         )
         .unwrap();
 
@@ -1196,23 +1249,16 @@ worker:
     #[test]
     fn worker_storage_root_is_rejected() {
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("core-site.yaml");
+        let config_path = temp_dir.path().join("worker.yaml");
         fs::write(
             &config_path,
             r#"
-worker:
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
-  storage:
-    root: "/data/old"
-  store:
-    dirs:
-      hdd0:
-        path: "/tmp/vecton-worker/hdd0"
-        tier: "HDD"
-        capacity: "10GB"
-  metadata:
-    endpoints: "http://127.0.0.1:18080"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.storage.root: "/data/old"
+worker.store.dirs.hdd0.path: "/tmp/vecton-worker/hdd0"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#,
         )
         .unwrap();
@@ -1225,21 +1271,17 @@ worker:
 
     #[test]
     fn rejects_missing_or_empty_store_dirs() {
-        for store_config in ["", "store:\n    dirs: []\n"] {
+        for store_config in ["", "worker.store.dirs: []\n"] {
             let temp_dir = TempDir::new().unwrap();
-            let config_path = temp_dir.path().join("core-site.yaml");
+            let config_path = temp_dir.path().join("worker.yaml");
             fs::write(
                 &config_path,
-                format!(
+                with_test_observe_yaml(format!(
                     r#"
-worker:
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
-  {store_config}
-  metadata:
-    endpoints: "http://127.0.0.1:18080"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+{store_config}worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#
-                ),
+                )),
             )
             .unwrap();
 
@@ -1252,22 +1294,20 @@ worker:
     #[test]
     fn rejects_old_list_based_store_dirs() {
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("core-site.yaml");
+        let config_path = temp_dir.path().join("worker.yaml");
         fs::write(
             &config_path,
-            r#"
-worker:
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
-  store:
-    dirs:
-      - id: "hdd0"
-        path: "/tmp/a"
-        tier: "HDD"
-        cap: "10GB"
-  metadata:
-    endpoints: "http://127.0.0.1:18080"
+            with_test_observe_yaml(
+                r#"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.store.dirs:
+  - id: "hdd0"
+    path: "/tmp/a"
+    tier: "HDD"
+    cap: "10GB"
+worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#,
+            ),
         )
         .unwrap();
 
@@ -1281,75 +1321,63 @@ worker:
         for (name, dirs_config, expected) in [
             (
                 "missing path",
-                r#"hdd0:
-        tier: "HDD"
-        capacity: "10GB""#,
+                r#"worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB""#,
                 "path",
             ),
             (
                 "missing tier",
-                r#"hdd0:
-        path: "/tmp/a"
-        capacity: "10GB""#,
+                r#"worker.store.dirs.hdd0.path: "/tmp/a"
+worker.store.dirs.hdd0.capacity: "10GB""#,
                 "tier",
             ),
             (
                 "missing capacity",
-                r#"hdd0:
-        path: "/tmp/a"
-        tier: "HDD""#,
+                r#"worker.store.dirs.hdd0.path: "/tmp/a"
+worker.store.dirs.hdd0.tier: "HDD""#,
                 "capacity",
             ),
             (
                 "old id field",
-                r#"hdd0:
-        id: "old"
-        path: "/tmp/a"
-        tier: "HDD"
-        capacity: "10GB""#,
+                r#"worker.store.dirs.hdd0.id: "old"
+worker.store.dirs.hdd0.path: "/tmp/a"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB""#,
                 "id",
             ),
             (
                 "old cap field",
-                r#"hdd0:
-        path: "/tmp/a"
-        tier: "HDD"
-        cap: "10GB""#,
+                r#"worker.store.dirs.hdd0.path: "/tmp/a"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.cap: "10GB""#,
                 "cap",
             ),
             (
                 "zero capacity",
-                r#"hdd0:
-        path: "/tmp/a"
-        tier: "HDD"
-        capacity: "0""#,
+                r#"worker.store.dirs.hdd0.path: "/tmp/a"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "0""#,
                 "capacity",
             ),
             (
                 "bad tier",
-                r#"hdd0:
-        path: "/tmp/a"
-        tier: "TAPE"
-        capacity: "10GB""#,
+                r#"worker.store.dirs.hdd0.path: "/tmp/a"
+worker.store.dirs.hdd0.tier: "TAPE"
+worker.store.dirs.hdd0.capacity: "10GB""#,
                 "tier",
             ),
         ] {
             let temp_dir = TempDir::new().unwrap();
-            let config_path = temp_dir.path().join("core-site.yaml");
+            let config_path = temp_dir.path().join("worker.yaml");
             fs::write(
                 &config_path,
-                format!(
+                with_test_observe_yaml(format!(
                     r#"
-worker:
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
-  store:
-    dirs:
-      {dirs_config}
-  metadata:
-    endpoints: "http://127.0.0.1:18080"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+{dirs_config}
+worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#
-                ),
+                )),
             )
             .unwrap();
 
@@ -1366,26 +1394,21 @@ worker:
     #[test]
     fn rejects_duplicate_store_dir_path() {
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("core-site.yaml");
+        let config_path = temp_dir.path().join("worker.yaml");
         fs::write(
             &config_path,
-            r#"
-worker:
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
-  store:
-    dirs:
-      hdd0:
-        path: "/tmp/a"
-        tier: "HDD"
-        capacity: "10GB"
-      hdd1:
-        path: "/tmp/a"
-        tier: "HDD"
-        capacity: "10GB"
-  metadata:
-    endpoints: "http://127.0.0.1:18080"
+            with_test_observe_yaml(
+                r#"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.store.dirs.hdd0.path: "/tmp/a"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.store.dirs.hdd1.path: "/tmp/a"
+worker.store.dirs.hdd1.tier: "HDD"
+worker.store.dirs.hdd1.capacity: "10GB"
+worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#,
+            ),
         )
         .unwrap();
 
@@ -1397,16 +1420,18 @@ worker:
     #[test]
     fn rejects_empty_store_dir_id_segment() {
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("core-site.yaml");
+        let config_path = temp_dir.path().join("worker.yaml");
         fs::write(
             &config_path,
-            r#"
+            with_test_observe_yaml(
+                r#"
 worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
 worker.store.dirs..path: "/tmp/a"
 worker.store.dirs..tier: "HDD"
 worker.store.dirs..capacity: "10GB"
 worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#,
+            ),
         )
         .unwrap();
 
@@ -1419,34 +1444,28 @@ worker.metadata.endpoints: "http://127.0.0.1:18080"
     fn rejects_unsupported_store_selection_policy_or_zero_check_interval() {
         for (store_tail, expected) in [
             (
-                "selection_policy: \"balanced\"\n    check_interval_ms: 30000",
+                "worker.store.selection_policy: \"balanced\"\nworker.store.check_interval_ms: 30000",
                 "worker.store.selection_policy",
             ),
             (
-                "selection_policy: \"round_robin\"\n    check_interval_ms: 0",
+                "worker.store.selection_policy: \"round_robin\"\nworker.store.check_interval_ms: 0",
                 "worker.store.check_interval_ms",
             ),
         ] {
             let temp_dir = TempDir::new().unwrap();
-            let config_path = temp_dir.path().join("core-site.yaml");
+            let config_path = temp_dir.path().join("worker.yaml");
             fs::write(
                 &config_path,
-                format!(
+                with_test_observe_yaml(format!(
                     r#"
-worker:
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
-  store:
-    dirs:
-      hdd0:
-        path: "/tmp/a"
-        tier: "HDD"
-        capacity: "10GB"
-    {store_tail}
-  metadata:
-    endpoints: "http://127.0.0.1:18080"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.store.dirs.hdd0.path: "/tmp/a"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+{store_tail}
+worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#
-                ),
+                )),
             )
             .unwrap();
 
@@ -1459,28 +1478,22 @@ worker:
     #[test]
     fn rejects_removed_store_keys() {
         for (store_tail, expected) in [
-            ("reserve: \"1GB\"", "worker.store.reserve"),
-            ("pick: \"round_robin\"", "worker.store.pick"),
-            ("check_ms: 30000", "worker.store.check_ms"),
+            ("worker.store.reserve: \"1GB\"", "worker.store.reserve"),
+            ("worker.store.pick: \"round_robin\"", "worker.store.pick"),
+            ("worker.store.check_ms: 30000", "worker.store.check_ms"),
         ] {
             let temp_dir = TempDir::new().unwrap();
-            let config_path = temp_dir.path().join("core-site.yaml");
+            let config_path = temp_dir.path().join("worker.yaml");
             fs::write(
                 &config_path,
                 format!(
                     r#"
-worker:
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
-  store:
-    dirs:
-      hdd0:
-        path: "/tmp/a"
-        tier: "HDD"
-        capacity: "10GB"
-    {store_tail}
-  metadata:
-    endpoints: "http://127.0.0.1:18080"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.store.dirs.hdd0.path: "/tmp/a"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+{store_tail}
+worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#
                 ),
             )
@@ -1496,21 +1509,18 @@ worker:
     #[test]
     fn uses_default_worker_metadata_endpoints_when_absent() {
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("core-site.yaml");
+        let config_path = temp_dir.path().join("worker.yaml");
         fs::write(
             &config_path,
-            r#"
-worker:
-  rpc:
-    bind: "127.0.0.1:9090"
-    advertised_endpoint: "http://127.0.0.1:9090"
-  store:
-    dirs:
-      hdd0:
-        path: "/tmp/vecton-worker/hdd0"
-        tier: "HDD"
-        capacity: "10GB"
+            with_test_observe_yaml(
+                r#"
+worker.rpc.bind: "127.0.0.1:9090"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.store.dirs.hdd0.path: "/tmp/vecton-worker/hdd0"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
 "#,
+            ),
         )
         .unwrap();
 
@@ -1522,16 +1532,15 @@ worker:
     #[test]
     fn worker_metadata_endpoint_key_is_rejected() {
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("core-site.yaml");
+        let config_path = temp_dir.path().join("worker.yaml");
         fs::write(
             &config_path,
-            r#"
-worker:
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
-  metadata:
-    endpoint: "http://127.0.0.1:19080"
+            with_test_observe_yaml(
+                r#"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.metadata.endpoint: "http://127.0.0.1:19080"
 "#,
+            ),
         )
         .unwrap();
 
@@ -1544,22 +1553,18 @@ worker:
     #[test]
     fn rejects_empty_worker_metadata_endpoints() {
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("core-site.yaml");
+        let config_path = temp_dir.path().join("worker.yaml");
         fs::write(
             &config_path,
-            r#"
-worker:
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
-  store:
-    dirs:
-      hdd0:
-        path: "/tmp/vecton-worker/hdd0"
-        tier: "HDD"
-        capacity: "10GB"
-  metadata:
-    endpoints: " , "
+            with_test_observe_yaml(
+                r#"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.store.dirs.hdd0.path: "/tmp/vecton-worker/hdd0"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.metadata.endpoints: " , "
 "#,
+            ),
         )
         .unwrap();
 
@@ -1572,17 +1577,14 @@ worker:
     fn rejects_invalid_explicit_worker_id() {
         for worker_id in ["0", "not-a-number", ""] {
             let temp_dir = TempDir::new().unwrap();
-            let config_path = temp_dir.path().join("core-site.yaml");
+            let config_path = temp_dir.path().join("worker.yaml");
             fs::write(
                 &config_path,
                 format!(
                     r#"
-worker:
-  id: "{worker_id}"
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
-  metadata:
-    endpoints: "http://127.0.0.1:18080"
+worker.id: "{worker_id}"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#
                 ),
             )
@@ -1597,22 +1599,18 @@ worker:
     #[test]
     fn rejects_invalid_worker_metadata_endpoints() {
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("core-site.yaml");
+        let config_path = temp_dir.path().join("worker.yaml");
         fs::write(
             &config_path,
-            r#"
-worker:
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
-  store:
-    dirs:
-      hdd0:
-        path: "/tmp/vecton-worker/hdd0"
-        tier: "HDD"
-        capacity: "10GB"
-  metadata:
-    endpoints: "127.0.0.1:18080"
+            with_test_observe_yaml(
+                r#"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.store.dirs.hdd0.path: "/tmp/vecton-worker/hdd0"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.metadata.endpoints: "127.0.0.1:18080"
 "#,
+            ),
         )
         .unwrap();
 
@@ -1624,16 +1622,15 @@ worker:
     #[test]
     fn rejects_missing_worker_rpc_advertised_endpoint() {
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("core-site.yaml");
+        let config_path = temp_dir.path().join("worker.yaml");
         fs::write(
             &config_path,
-            r#"
-worker:
-  rpc:
-    bind: "0.0.0.0:9090"
-  metadata:
-    endpoints: "http://127.0.0.1:18080"
+            with_test_observe_yaml(
+                r#"
+worker.rpc.bind: "0.0.0.0:9090"
+worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#,
+            ),
         )
         .unwrap();
 
@@ -1646,25 +1643,19 @@ worker:
     fn rejects_wildcard_worker_rpc_advertised_endpoint() {
         for advertised_endpoint in ["http://0.0.0.0:9090", "http://[::]:9090"] {
             let temp_dir = TempDir::new().unwrap();
-            let config_path = temp_dir.path().join("core-site.yaml");
+            let config_path = temp_dir.path().join("worker.yaml");
             fs::write(
                 &config_path,
-                format!(
+                with_test_observe_yaml(format!(
                     r#"
-worker:
-  rpc:
-    bind: "0.0.0.0:9090"
-    advertised_endpoint: "{advertised_endpoint}"
-  store:
-    dirs:
-      hdd0:
-        path: "/tmp/vecton-worker/hdd0"
-        tier: "HDD"
-        capacity: "10GB"
-  metadata:
-    endpoints: "http://127.0.0.1:18080"
+worker.rpc.bind: "0.0.0.0:9090"
+worker.rpc.advertised_endpoint: "{advertised_endpoint}"
+worker.store.dirs.hdd0.path: "/tmp/vecton-worker/hdd0"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.metadata.endpoints: "http://127.0.0.1:18080"
 "#
-                ),
+                )),
             )
             .unwrap();
 
@@ -1678,23 +1669,19 @@ worker:
     #[test]
     fn rejects_invalid_worker_metadata_register_timing() {
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("core-site.yaml");
+        let config_path = temp_dir.path().join("worker.yaml");
         fs::write(
             &config_path,
-            r#"
-worker:
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
-  store:
-    dirs:
-      hdd0:
-        path: "/tmp/vecton-worker/hdd0"
-        tier: "HDD"
-        capacity: "10GB"
-  metadata:
-    endpoints: "http://127.0.0.1:18080"
-    register_timeout_ms: 0
+            with_test_observe_yaml(
+                r#"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.store.dirs.hdd0.path: "/tmp/vecton-worker/hdd0"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.metadata.endpoints: "http://127.0.0.1:18080"
+worker.metadata.register_timeout_ms: 0
 "#,
+            ),
         )
         .unwrap();
 
@@ -1704,20 +1691,16 @@ worker:
 
         fs::write(
             &config_path,
-            r#"
-worker:
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
-  store:
-    dirs:
-      hdd0:
-        path: "/tmp/vecton-worker/hdd0"
-        tier: "HDD"
-        capacity: "10GB"
-  metadata:
-    endpoints: "http://127.0.0.1:18080"
-    register_retry_initial_backoff_ms: 0
+            with_test_observe_yaml(
+                r#"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.store.dirs.hdd0.path: "/tmp/vecton-worker/hdd0"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.metadata.endpoints: "http://127.0.0.1:18080"
+worker.metadata.register_retry_initial_backoff_ms: 0
 "#,
+            ),
         )
         .unwrap();
 
@@ -1729,21 +1712,17 @@ worker:
 
         fs::write(
             &config_path,
-            r#"
-worker:
-  rpc:
-    advertised_endpoint: "http://127.0.0.1:9090"
-  store:
-    dirs:
-      hdd0:
-        path: "/tmp/vecton-worker/hdd0"
-        tier: "HDD"
-        capacity: "10GB"
-  metadata:
-    endpoints: "http://127.0.0.1:18080"
-    register_retry_initial_backoff_ms: 500
-    register_retry_max_backoff_ms: 100
+            with_test_observe_yaml(
+                r#"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.store.dirs.hdd0.path: "/tmp/vecton-worker/hdd0"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.metadata.endpoints: "http://127.0.0.1:18080"
+worker.metadata.register_retry_initial_backoff_ms: 500
+worker.metadata.register_retry_max_backoff_ms: 100
 "#,
+            ),
         )
         .unwrap();
 

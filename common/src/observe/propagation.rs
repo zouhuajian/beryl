@@ -4,6 +4,7 @@
 //! Context propagation for distributed tracing.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 
 /// Trait for setting trace context in a carrier (e.g., gRPC metadata).
 pub trait CarrierSet {
@@ -18,14 +19,20 @@ pub trait CarrierGet {
 }
 
 /// Extracted trace context.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ExtractedContext {
     /// Trace parent (W3C traceparent header).
     pub traceparent: Option<String>,
+    /// Trace state (W3C tracestate header).
+    pub tracestate: Option<String>,
     /// Baggage (W3C baggage header).
     pub baggage: Option<String>,
-    /// Request ID.
-    pub request_id: Option<String>,
+}
+
+impl ExtractedContext {
+    pub fn is_empty(&self) -> bool {
+        self.traceparent.is_none() && self.tracestate.is_none() && self.baggage.is_none()
+    }
 }
 
 /// Inject trace context into a carrier.
@@ -33,11 +40,11 @@ pub fn inject_trace_context(carrier: &mut dyn CarrierSet, context: &ExtractedCon
     if let Some(ref traceparent) = context.traceparent {
         carrier.set("traceparent", traceparent);
     }
+    if let Some(ref tracestate) = context.tracestate {
+        carrier.set("tracestate", tracestate);
+    }
     if let Some(ref baggage) = context.baggage {
         carrier.set("baggage", baggage);
-    }
-    if let Some(ref request_id) = context.request_id {
-        carrier.set("request-id", request_id);
     }
 }
 
@@ -45,11 +52,27 @@ pub fn inject_trace_context(carrier: &mut dyn CarrierSet, context: &ExtractedCon
 pub fn extract_trace_context(carrier: &dyn CarrierGet) -> ExtractedContext {
     ExtractedContext {
         traceparent: carrier.get("traceparent").map(|s| s.to_string()),
+        tracestate: carrier.get("tracestate").map(|s| s.to_string()),
         baggage: carrier.get("baggage").map(|s| s.to_string()),
-        request_id: carrier
-            .get("request-id")
-            .or_else(|| carrier.get("x-request-id"))
-            .map(|s| s.to_string()),
+    }
+}
+
+impl CarrierSet for tonic::metadata::MetadataMap {
+    fn set(&mut self, key: &str, value: &str) {
+        let Ok(key) = tonic::metadata::MetadataKey::from_bytes(key.as_bytes()) else {
+            return;
+        };
+        let Ok(value) = tonic::metadata::MetadataValue::from_str(value) else {
+            return;
+        };
+        self.insert(key, value);
+    }
+}
+
+impl CarrierGet for tonic::metadata::MetadataMap {
+    fn get(&self, key: &str) -> Option<&str> {
+        let key = tonic::metadata::MetadataKey::from_bytes(key.as_bytes()).ok()?;
+        self.get(key)?.to_str().ok()
     }
 }
 
@@ -134,5 +157,42 @@ impl CarrierGet for HashMapCarrier {
 impl Default for HashMapCarrier {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::metadata::MetadataMap;
+
+    #[test]
+    fn metadata_map_inject_extracts_trace_context() {
+        let mut metadata = MetadataMap::new();
+        let context = ExtractedContext {
+            traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string()),
+            tracestate: Some("vendor=state".to_string()),
+            baggage: Some("tenant=local".to_string()),
+        };
+
+        inject_trace_context(&mut metadata, &context);
+        let extracted = extract_trace_context(&metadata);
+
+        assert_eq!(extracted.traceparent, context.traceparent);
+        assert_eq!(extracted.tracestate, context.tracestate);
+        assert_eq!(extracted.baggage, context.baggage);
+    }
+
+    #[test]
+    fn metadata_map_injection_ignores_invalid_metadata_value() {
+        let mut metadata = MetadataMap::new();
+        let context = ExtractedContext {
+            traceparent: Some("bad\ntraceparent".to_string()),
+            tracestate: None,
+            baggage: None,
+        };
+
+        inject_trace_context(&mut metadata, &context);
+
+        assert!(metadata.get("traceparent").is_none());
     }
 }

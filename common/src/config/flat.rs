@@ -171,24 +171,6 @@ impl FlatConfig {
         FlatConfig::from_map(sub_data)
     }
 
-    /// Get a YAML sequence of mapping entries as flat configs.
-    pub fn get_flat_map_sequence(&self, key: &str) -> Option<Vec<FlatConfig>> {
-        let Value::Sequence(entries) = self.data.get(key)? else {
-            return None;
-        };
-
-        let mut configs = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let Value::Mapping(map) = entry else {
-                return None;
-            };
-            let mut flat = BTreeMap::new();
-            flatten_mapping_into(map, String::new(), &mut flat);
-            configs.push(FlatConfig::from_map(flat));
-        }
-        Some(configs)
-    }
-
     /// Get all keys with the given prefix.
     pub fn keys_with_prefix(&self, prefix: &str) -> Vec<String> {
         let prefix_with_dot = if prefix.is_empty() {
@@ -240,27 +222,6 @@ impl FlatConfig {
     /// Check if a key exists.
     pub fn contains_key(&self, key: &str) -> bool {
         self.data.contains_key(key)
-    }
-}
-
-fn flatten_mapping_into(map: &serde_yaml::Mapping, prefix: String, out: &mut BTreeMap<String, Value>) {
-    for (key, value) in map {
-        let key = match key {
-            Value::String(value) => value.clone(),
-            Value::Number(value) => value.to_string(),
-            _ => continue,
-        };
-        let next = if prefix.is_empty() {
-            key
-        } else {
-            format!("{prefix}.{key}")
-        };
-        match value {
-            Value::Mapping(nested) => flatten_mapping_into(nested, next, out),
-            _ => {
-                out.insert(next, value.clone());
-            }
-        }
     }
 }
 

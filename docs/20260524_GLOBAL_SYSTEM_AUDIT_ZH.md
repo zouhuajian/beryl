@@ -7,7 +7,7 @@
 - 审计重点：功能完整性、模块边界、依赖方向、核心读写链路、配置与部署可信度、错误语义、测试覆盖、文档一致性。
 - 审计基线：当前分支 `dev`，`HEAD=ba813d89c48d66cf775c89bd1d32689bbfb5f215`。
 - 审计时工作区状态：`git status --porcelain -uall` 曾显示旧 client API split 文件为 `AD`，即已暂存新增但工作区删除；本轮稳定化重新检查后未发现这些 stale index entries。
-- 稳定化后基线：Rust development baseline 固定为 Rust 1.95.0；根目录 `rust-toolchain.toml` pin `1.95.0` 并安装 `rustfmt`/`clippy`；workspace `rust-version` 为 `1.95.0`；根目录 `Makefile` 提供本地 verify 入口；`.github/workflows/ci.yml` 提供最小 CI；`conf/core-site.yaml` 和 `conf/client-site.yaml` 只保留当前 runtime 实际消费的 active 默认 key。
+- 稳定化后基线：Rust development baseline 固定为 Rust 1.95.0；根目录 `rust-toolchain.toml` pin `1.95.0` 并安装 `rustfmt`/`clippy`；workspace `rust-version` 为 `1.95.0`；根目录 `Makefile` 提供本地 verify 入口；`.github/workflows/ci.yml` 提供最小 CI；`conf/metadata.yaml`、`conf/worker.yaml` 和 `conf/client-site.yaml` 只保留当前 runtime 实际消费的 active 默认 key。
 - PR-5 更新：worker startup register 已由 worker 二进制接入；注册模型为稳定 `WorkerId` + 每进程启动 UUID `WorkerRunId`，按 metadata group 注册 advertised endpoint。leader 通过 Raft apply 持久化稳定 worker descriptor，`WorkerRunId` 只进入 live registration state；metadata restart / snapshot reload 后必须重新 register。heartbeat、block report、command ack 和真实 metadata+worker+client E2E 仍未完成。
 - 总体结论：Vecton 的分层方向基本清晰，`common`、`types`、`proto`、`client`、`metadata`、`worker` 的主要职责经过近期重构后比旧版更收敛；`types` 以纯领域值为主，`proto` 承担结构转换，`client` 侧读写、刷新、重试与缓存边界较完整，`metadata` 侧 inode/dentry/attrs、写会话、Raft apply、freshness 语义覆盖较强，`worker` 的本地块存储和 gRPC 数据面已形成可测闭环。系统仍未达到完整生产闭环，主要风险集中在 worker 到 metadata 的生命周期闭合、MetadataWorkerService 错误返回语义、未落地的 proto/API surface、以及端到端集成测试不足。
 - 最高优先级问题摘要：
@@ -30,7 +30,7 @@
 | `client/` | SDK facade、metadata gateway、worker endpoint resolution/cache、channel pooling、retry/refresh orchestration、read planner、worker data adapter | 已完成 | `client/src/lib.rs`、`client/src/api/fs_client.rs`、`client/src/data/worker.rs`、`client/src/runtime/executor.rs` | 公共 facade 收敛；普通读路径从 metadata 获取 authoritative layout/locations，经 `ReadPlanner` 校验后访问 worker；当前架构不保留 client 侧读 layout 缓存；默认 client 配置已收敛到当前 active key。 |
 | `ufs/` | 外部后端抽象、OpenDAL adapter、UFS registry/spec/capability | 需要优化 | `ufs/src/lib.rs`、`ufs/src/opendal_impl.rs`、`ufs/Cargo.toml` | 边界清晰；部分后端能力依赖 feature 或运行环境，测试有 ignored。 |
 | owner-crate tests | 跨 crate contract tests、repo config contracts | 需要优化 | `client/tests/`、`metadata/tests/`、`worker/tests/`、`common/tests/` | 能验证 client/config contract，但不是完整真实 metadata+worker E2E。 |
-| `conf/` | 示例/默认配置 | 已完成 | `conf/core-site.yaml`、`conf/client-site.yaml`、`docs/CONFIG_MATRIX_ZH.md` | 默认配置文件仅包含当前 runtime 实际消费的 active key；planned/unimplemented 能力只在文档中列为 deferred，不作为 deployable default。 |
+| `conf/` | 示例/默认配置 | 已完成 | `conf/metadata.yaml`、`conf/worker.yaml`、`conf/client-site.yaml`、`docs/CONFIG_MATRIX_ZH.md` | 默认配置文件仅包含当前 runtime 实际消费的 active key；planned/unimplemented 能力只在文档中列为 deferred，不作为 deployable default。 |
 | `docs/` | 架构边界与审计材料 | 已完成 | `docs/ARCHITECTURE_BOUNDARIES.md`、`docs/20260524_GLOBAL_SYSTEM_AUDIT_ZH.md`、`.gitignore` | `docs/` 不再被整目录忽略，重要 Markdown 文档默认可被 git 发现。 |
 | `.github/workflows` / `Makefile` / `rust-toolchain.toml` | CI、统一验证入口、工具链 baseline | 已完成 | `.github/workflows/ci.yml`、`Makefile`、`rust-toolchain.toml` | CI 和本地 verify 均运行 Rust 1.95.0 下的 fmt-check、metadata、check、clippy、test。 |
 
@@ -193,7 +193,7 @@
 | 公开 WorkerDataService 读的 block_stamp 防线 | 已完成 | worker validation 拒绝零 stamp，并对 stale/mismatched stamp 返回 structured refresh。 | `worker/src/runtime/block.rs`、`worker/src/tests.rs` | N/A |
 | worker metadata startup register | 已实现 | worker 二进制启动时解析 WorkerId、生成 WorkerRunId，并调用 MetadataWorkerService register。 | `worker/src/bin/main.rs`、`worker/src/control/registrar.rs`、`proto/metadata/worker.proto` | heartbeat/block report/command ack 仍未实现 |
 | io_uring/SPDK/RDMA/QUIC | TODO / 未完成 | 代码为 placeholder 或 explicit unimplemented；默认配置不再把这些能力列为 deployable default。 | `worker/src/store/io/io_uring.rs`、`worker/src/store/io/spdk.rs`、`worker/src/net/peer/quic.rs`、`worker/src/net/peer/rdma.rs` | P2 |
-| worker config | 已完成 | 默认配置只保留当前 worker data service/runtime 实际消费的 active key；metadata lifecycle、replication、多协议等仍为 deferred work。 | `worker/src/config.rs`、`conf/core-site.yaml`、`docs/CONFIG_MATRIX_ZH.md` | N/A |
+| worker config | 已完成 | 默认配置只保留当前 worker data service/runtime 实际消费的 active key；metadata lifecycle、replication、多协议等仍为 deferred work。 | `worker/src/config.rs`、`conf/worker.yaml`、`docs/CONFIG_MATRIX_ZH.md` | N/A |
 
 #### 3.5.3 架构评价
 
@@ -319,7 +319,7 @@ owner-crate tests 更符合行为归属。当前不足是 repo config / owner co
 | 功能点 | 状态 | 说明 | 证据 | 优先级 |
 |---|---|---|---|---|
 | 架构边界文档 | 已完成 | 明确 common/types/proto/product crate 边界和反模式。 | `docs/ARCHITECTURE_BOUNDARIES.md` | N/A |
-| 示例配置 | 已完成 | 默认配置文件只包含当前 runtime active consumed keys；planned/unimplemented 能力不作为 deployable default。 | `conf/core-site.yaml`、`conf/client-site.yaml`、`docs/CONFIG_MATRIX_ZH.md` | N/A |
+| 示例配置 | 已完成 | 默认配置文件只包含当前 runtime active consumed keys；planned/unimplemented 能力不作为 deployable default。 | `conf/metadata.yaml`、`conf/worker.yaml`、`conf/client-site.yaml`、`docs/CONFIG_MATRIX_ZH.md` | N/A |
 | CI / local verify / toolchain | 已完成 | CI 和本地 verify 均执行 fmt-check、metadata、check、clippy、test；toolchain pin Rust 1.95.0。 | `.github/workflows/ci.yml`、`Makefile`、`rust-toolchain.toml` | N/A |
 | docs 跟踪状态 | 已完成 | `docs/` 不再被整目录忽略，重要 Markdown 文档可被普通 status 发现。 | `.gitignore`、`git status --porcelain -uall docs` | N/A |
 
@@ -331,7 +331,7 @@ owner-crate tests 更符合行为归属。当前不足是 repo config / owner co
 
 | 问题 | 类型 | 影响 | 建议 | 优先级 | 证据 |
 |---|---|---|---|---|---|
-| deferred features 不能回流到默认配置 | 配置风险 | 后续实现前若把 worker lifecycle、多协议、replication 等 key 放回默认配置，会重新制造部署误判。 | 保持 CONFIG_MATRIX 的 active/planned/removed 分类；新增 active key 必须先证明 runtime consumer。 | P2 | `docs/CONFIG_MATRIX_ZH.md`、`conf/core-site.yaml` |
+| deferred features 不能回流到默认配置 | 配置风险 | 后续实现前若把 worker lifecycle、多协议、replication 等 key 放回默认配置，会重新制造部署误判。 | 保持 CONFIG_MATRIX 的 active/planned/removed 分类；新增 active key 必须先证明 runtime consumer。 | P2 | `docs/CONFIG_MATRIX_ZH.md`、`conf/metadata.yaml`、`conf/worker.yaml` |
 
 #### 3.9.5 建议后续动作
 
@@ -439,7 +439,7 @@ owner-crate tests 更符合行为归属。当前不足是 repo config / owner co
 | `common/AGENTS.md` 等子目录 agent 文件 | 已完成 | 本次审计已按触达模块读取；规则与根文档一致。 | 保持本地规则优先级。 |
 | `docs/ARCHITECTURE_BOUNDARIES.md` | 已完成 | 内容与当前边界基本一致。 | 后续只在边界真实变化时更新。 |
 | `docs/20260524_GLOBAL_SYSTEM_AUDIT_ZH.md` | 已完成 | 本报告已更新为 post-stabilization-aware audit record，不再把已解决的 baseline 问题列为当前风险。 | 后续审计需区分 historical finding 和 current state。 |
-| `conf/core-site.yaml` | 已完成 | 仅保留 metadata/worker 当前 runtime active consumed keys。 | deferred features 不进入默认配置。 |
+| `conf/metadata.yaml` / `conf/worker.yaml` | 已完成 | 分别保留 metadata 和 worker 当前 runtime active consumed keys。 | deferred features 不进入默认配置。 |
 | `conf/client-site.yaml` | 已完成 | 仅保留 client 当前 runtime active consumed keys。 | deferred client modes 不进入默认配置。 |
 | `metadata/README_ZH.md`、`metadata/ARCHITECTURE_ZH.md` | 需要优化 | metadata 局部文档存在，但需与当前 worker service、maintenance、single-group 语义保持同步。 | 对照 `metadata/src/runtime.rs` 和 FsCore 当前行为刷新。 |
 | CI/local verify/toolchain | 已完成 | `.github/workflows/ci.yml`、`Makefile`、`rust-toolchain.toml` 已建立最小 baseline。 | 后续如新增验证 profile，不应让 default verify 依赖外部服务。 |

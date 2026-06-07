@@ -31,7 +31,7 @@ pub fn request_context_from_proto(
     if let Some(ref client_name) = caller.client.client_name {
         Span::current().record("client_name", client_name);
     }
-    if let Some(traceparent) = &caller.traceparent {
+    if let Some(traceparent) = &caller.trace_context.traceparent {
         Span::current().record("traceparent", traceparent);
     }
     if !caller.state.is_empty() {
@@ -42,7 +42,7 @@ pub fn request_context_from_proto(
     }
 
     Ok(RequestContext {
-        traceparent: caller.traceparent.clone(),
+        traceparent: caller.trace_context.traceparent.clone(),
         route_epoch: req_header.as_ref().and_then(|h| h.route_epoch),
         principal: caller.principal.clone(),
         real_user: caller.real_user.clone(),

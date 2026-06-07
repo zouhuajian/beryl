@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use metadata::lifecycle::format_metadata_storage;
-use metadata::runtime::{init_observability, load_config, DynError, MetadataServer};
+use metadata::runtime::{init_observability, DynError, MetadataServer};
 use metadata::MetadataConfig;
 
 #[tokio::main]
@@ -86,10 +86,12 @@ impl MetadataCommand {
     }
 
     fn load_config(&self) -> Result<Arc<MetadataConfig>, DynError> {
-        if let Some(path) = &self.config_path {
-            return Ok(Arc::new(MetadataConfig::load(path)?));
-        }
-        load_config()
+        let config_path = self
+            .config_path
+            .clone()
+            .or_else(|| std::env::var("VECTON_CONFIG").ok())
+            .unwrap_or_else(|| "conf/metadata.yaml".to_string());
+        Ok(Arc::new(MetadataConfig::load(config_path)?))
     }
 }
 
@@ -100,6 +102,8 @@ fn looks_like_path(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
     fn parse(args: &[&str]) -> Result<MetadataCommand, DynError> {
         MetadataCommand::parse(args.iter().map(|arg| arg.to_string()))
@@ -107,17 +111,59 @@ mod tests {
 
     #[test]
     fn valid_metadata_commands_parse() {
-        let format = parse(&["format", "--config", "conf/local/core-site.yaml"]).unwrap();
+        let format = parse(&["format", "--config", "conf/local/metadata.yaml"]).unwrap();
         assert!(matches!(format.action, MetadataAction::Format));
-        assert_eq!(format.config_path.as_deref(), Some("conf/local/core-site.yaml"));
+        assert_eq!(format.config_path.as_deref(), Some("conf/local/metadata.yaml"));
 
-        let start = parse(&["start", "--config", "conf/local/core-site.yaml"]).unwrap();
+        let start = parse(&["start", "--config", "conf/local/metadata.yaml"]).unwrap();
         assert!(matches!(start.action, MetadataAction::Start));
-        assert_eq!(start.config_path.as_deref(), Some("conf/local/core-site.yaml"));
+        assert_eq!(start.config_path.as_deref(), Some("conf/local/metadata.yaml"));
 
         let default_start = parse(&[]).unwrap();
         assert!(matches!(default_start.action, MetadataAction::Start));
         assert!(default_start.config_path.is_none());
+    }
+
+    #[test]
+    fn metadata_observe_cli_overrides_are_rejected() {
+        for flag in [
+            "--observe-profile",
+            "--log-level",
+            "--log-format",
+            "--log-output",
+            "--metrics-bind",
+            "--metrics-path",
+            "--trace-enabled",
+        ] {
+            let err = parse(&["start", flag, "value"])
+                .err()
+                .expect("observe CLI override must fail");
+            assert!(err.to_string().contains("unknown metadata argument"), "{flag}: {err}");
+        }
+    }
+
+    #[test]
+    fn metadata_startup_load_uses_file_observe_values() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("metadata.yaml");
+        fs::write(
+            &config_path,
+            r#"
+observe.log.format: json
+observe.log.output: stdout
+observe.log.level: "warn"
+observe.metrics.prometheus.bind: "127.0.0.1:19081"
+observe.metrics.prometheus.path: "/metrics"
+"#,
+        )
+        .unwrap();
+
+        let command = parse(&["start", "--config", config_path.to_str().unwrap()]).unwrap();
+        let config = command.load_config().unwrap();
+
+        assert_eq!(config.observability.log.format, "json");
+        assert_eq!(config.observability.log.output, "stdout");
+        assert_eq!(config.observability.metrics.prometheus.bind, "127.0.0.1:19081");
     }
 
     #[test]
@@ -126,7 +172,7 @@ mod tests {
             &["bootstrap"][..],
             &["auto-format"][..],
             &["worker"][..],
-            &["bootstrap", "--config", "conf/core-site.yaml"][..],
+            &["bootstrap", "--config", "conf/metadata.yaml"][..],
         ] {
             let err = parse(args).err().expect("removed metadata command must fail");
             assert!(err.to_string().contains("unsupported metadata command"));
@@ -135,7 +181,7 @@ mod tests {
 
     #[test]
     fn metadata_config_path_requires_explicit_config_flag() {
-        let err = parse(&["conf/local/core-site.yaml"])
+        let err = parse(&["conf/local/metadata.yaml"])
             .err()
             .expect("positional metadata config path must fail");
         assert!(err.to_string().contains("--config"));

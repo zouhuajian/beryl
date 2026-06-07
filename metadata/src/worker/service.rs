@@ -15,10 +15,12 @@ use crate::raft::{AppDataResponse, AppRaftNode, WorkerCommandResult};
 use crate::service::extract_and_inject_context;
 use ::common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshReason};
 use ::common::header::{ResponseHeader, RpcErrorCode};
+use ::common::observe::propagation::{extract_trace_context, ExtractedContext};
 use proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProto;
 use proto::metadata::*;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn, Span};
 use types::{BlockId, GroupName, TierFree, WorkerId, WorkerRunId};
@@ -34,6 +36,7 @@ impl WorkerBackgroundHandle {
 
 trait WorkerServiceResponse {
     fn set_header(&mut self, header: proto::common::ResponseHeaderProto);
+    fn header(&self) -> Option<&proto::common::ResponseHeaderProto>;
 }
 
 macro_rules! impl_worker_service_response {
@@ -42,6 +45,10 @@ macro_rules! impl_worker_service_response {
             impl WorkerServiceResponse for $resp_ty {
                 fn set_header(&mut self, header: proto::common::ResponseHeaderProto) {
                     self.header = Some(header);
+                }
+
+                fn header(&self) -> Option<&proto::common::ResponseHeaderProto> {
+                    self.header.as_ref()
                 }
             }
         )+
@@ -53,6 +60,13 @@ impl_worker_service_response!(
     HeartbeatResponseProto,
     BlockReportResponseProto,
 );
+
+#[derive(Clone, Copy)]
+enum MetadataWorkerMetric {
+    Registration,
+    Heartbeat,
+    BlockReport(&'static str),
+}
 
 /// MetadataWorkerService implementation.
 pub struct MetadataWorkerServiceImpl {
@@ -358,6 +372,159 @@ impl MetadataWorkerServiceImpl {
             other => self.metadata_error_response::<BlockReportResponseProto>(req_header, other),
         }
     }
+
+    fn record_worker_rpc_outcome<T>(
+        method: &'static str,
+        metric: MetadataWorkerMetric,
+        started: Instant,
+        outcome: &Result<Response<T>, Status>,
+    ) where
+        T: WorkerServiceResponse,
+    {
+        let duration = started.elapsed().as_secs_f64();
+        let (status, error_kind) = metadata_worker_outcome_labels(outcome);
+
+        observe::record_rpc_request("metadata_worker", method, status, error_kind, duration);
+        match metric {
+            MetadataWorkerMetric::Registration => observe::record_worker_registration(status, error_kind, duration),
+            MetadataWorkerMetric::Heartbeat => observe::record_worker_heartbeat(status, error_kind, duration),
+            MetadataWorkerMetric::BlockReport(kind) => {
+                observe::record_worker_block_report(kind, status, error_kind, duration)
+            }
+        }
+    }
+}
+
+fn metadata_worker_outcome_labels<T>(outcome: &Result<Response<T>, Status>) -> (&'static str, &'static str)
+where
+    T: WorkerServiceResponse,
+{
+    match outcome {
+        Ok(response) => match response.get_ref().header().and_then(|header| header.error.as_ref()) {
+            Some(error) => ("error", metadata_worker_error_detail_kind(error)),
+            None => ("ok", "none"),
+        },
+        Err(status) => ("error", tonic_status_error_kind(status)),
+    }
+}
+
+fn metadata_worker_error_detail_kind(error: &proto::common::ErrorDetailProto) -> &'static str {
+    let canonical = proto::convert::error_detail_to_canonical(error);
+    if let Some(reason) = canonical.reason.filter(|reason| *reason != RefreshReason::Unknown) {
+        return metadata_worker_refresh_reason_kind(reason);
+    }
+    match canonical.code.as_ref() {
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::InvalidArgument)) => "invalid_argument",
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)) => {
+            metadata_worker_application_error_kind(&canonical.message)
+        }
+        _ => observe::canonical_error_kind(&canonical),
+    }
+}
+
+fn metadata_worker_refresh_reason_kind(reason: RefreshReason) -> &'static str {
+    match reason {
+        RefreshReason::Unknown => "unknown_refresh",
+        RefreshReason::NotLeader => "not_leader",
+        RefreshReason::OwnerGroupMismatch => "owner_group_mismatch",
+        RefreshReason::Moved => "moved",
+        RefreshReason::StaleState => "stale_state",
+        RefreshReason::MountEpochMismatch => "mount_epoch_mismatch",
+        RefreshReason::RouteEpochMismatch => "route_epoch_mismatch",
+        RefreshReason::GroupMismatch => "group_mismatch",
+        RefreshReason::NeedRegister => "need_register",
+        RefreshReason::WorkerRunMismatch => "worker_run_mismatch",
+        RefreshReason::FullReportRequired => "full_report_required",
+        RefreshReason::BlockStampMismatch => "block_stamp_mismatch",
+        RefreshReason::Fencing => "fencing",
+        RefreshReason::EpochMismatch => "epoch_mismatch",
+        RefreshReason::SessionInvalid => "session_invalid",
+        RefreshReason::SessionExpired => "session_expired",
+    }
+}
+
+fn metadata_worker_application_error_kind(message: &str) -> &'static str {
+    let message = message.to_ascii_lowercase();
+    if message.starts_with("invalid argument:") {
+        "invalid_argument"
+    } else if message.starts_with("not found:") {
+        "not_found"
+    } else if message.starts_with("already exists:") {
+        "already_exists"
+    } else if message.starts_with("permission denied:") {
+        "permission_denied"
+    } else if message.starts_with("operation not supported:") {
+        "not_supported"
+    } else if message.starts_with("resource busy:") {
+        "busy"
+    } else if message.starts_with("active worker conflict:") {
+        "active_worker_conflict"
+    } else if message.starts_with("internal error:") {
+        "internal"
+    } else {
+        "application"
+    }
+}
+
+fn tonic_status_error_kind(status: &Status) -> &'static str {
+    match status.code() {
+        tonic::Code::Ok => "none",
+        tonic::Code::InvalidArgument => "invalid_argument",
+        tonic::Code::NotFound => "not_found",
+        tonic::Code::FailedPrecondition => "failed_precondition",
+        tonic::Code::PermissionDenied => "permission_denied",
+        tonic::Code::ResourceExhausted => "resource_exhausted",
+        tonic::Code::Unavailable => "unavailable",
+        tonic::Code::DeadlineExceeded => "timeout",
+        tonic::Code::Unimplemented => "unimplemented",
+        tonic::Code::Cancelled => "cancelled",
+        tonic::Code::Internal => "internal",
+        _ => "rpc_status",
+    }
+}
+
+fn block_report_kind(req: &BlockReportRequestProto) -> &'static str {
+    match &req.report {
+        Some(block_report_request_proto::Report::Full(_)) => "full",
+        Some(block_report_request_proto::Report::Delta(_)) => "delta",
+        None => "unknown",
+    }
+}
+
+fn merge_request_header_transport_context(
+    header: &mut Option<proto::common::RequestHeaderProto>,
+    context: &ExtractedContext,
+) {
+    record_transport_context(context);
+    let Some(header) = header else {
+        return;
+    };
+    if header.trace_context.as_ref().is_some_and(trace_context_proto_is_empty) {
+        header.trace_context = None;
+    }
+    if context.is_empty() {
+        return;
+    }
+    let trace_context = header.trace_context.get_or_insert_with(Default::default);
+    if trace_context.traceparent.is_none() {
+        trace_context.traceparent = context.traceparent.clone();
+    }
+    if trace_context.tracestate.is_none() {
+        trace_context.tracestate = context.tracestate.clone();
+    }
+    if trace_context.baggage.is_none() {
+        trace_context.baggage = context.baggage.clone();
+    }
+}
+
+fn trace_context_proto_is_empty(context: &proto::common::TraceContextProto) -> bool {
+    context.traceparent.is_none() && context.tracestate.is_none() && context.baggage.is_none()
+}
+
+fn record_transport_context(context: &ExtractedContext) {
+    if let Some(traceparent) = &context.traceparent {
+        Span::current().record("traceparent", traceparent);
+    }
 }
 
 fn validate_advertised_endpoint(endpoint: proto::common::EndpointProto) -> Result<String, String> {
@@ -424,346 +591,391 @@ fn parse_metadata_endpoint(address: &str) -> Option<proto::common::EndpointProto
     })
 }
 
-async fn persist_worker_descriptor(
-    persist_descriptor: impl std::future::Future<Output = MetadataResult<AppDataResponse>>,
-) -> MetadataResult<WorkerId> {
-    match persist_descriptor.await? {
-        AppDataResponse::Worker(WorkerCommandResult::Upserted(worker_id)) => Ok(worker_id),
-        other => Err(MetadataError::Internal(format!(
-            "RegisterWorker returned unexpected Raft response: {:?}",
-            other
-        ))),
-    }
-}
-
 #[tonic::async_trait]
 impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
     #[instrument(
         skip(self, request),
-        fields(call_id, client_id, group_name, worker_id, worker_run_id, endpoint, protocol)
+        fields(
+            call_id,
+            client_id,
+            group_name,
+            worker_id,
+            worker_run_id,
+            endpoint,
+            protocol,
+            traceparent
+        )
     )]
     async fn register_worker(
         &self,
         request: Request<RegisterWorkerRequestProto>,
     ) -> Result<Response<RegisterWorkerResponseProto>, Status> {
-        let req = request.into_inner();
-        let _caller_ctx = match extract_and_inject_context(&req.header) {
-            Ok(ctx) => ctx,
-            Err(error) => return self.response_with_error::<RegisterWorkerResponseProto>(&req.header, error),
-        };
+        let started = Instant::now();
+        let transport_context = extract_trace_context(request.metadata());
+        let outcome = async {
+            let mut req = request.into_inner();
+            merge_request_header_transport_context(&mut req.header, &transport_context);
+            let _caller_ctx = match extract_and_inject_context(&req.header) {
+                Ok(ctx) => ctx,
+                Err(error) => return self.response_with_error::<RegisterWorkerResponseProto>(&req.header, error),
+            };
 
-        if !self.raft_node.is_leader() {
-            return self.metadata_error_response::<RegisterWorkerResponseProto>(
-                &req.header,
-                MetadataError::LeaderChanged("worker registration must be sent to the metadata group leader".into()),
-            );
-        }
-
-        let group_name = match GroupName::parse(&req.group_name) {
-            Ok(group_name) => group_name,
-            Err(error) => {
-                return self.invalid_request_response::<RegisterWorkerResponseProto>(
+            if !self.raft_node.is_leader() {
+                return self.metadata_error_response::<RegisterWorkerResponseProto>(
                     &req.header,
-                    format!("group_name is invalid: {error}"),
-                )
-            }
-        };
-        Span::current().record("group_name", group_name.as_str());
-        if let Err(message) = check_header_group_name(&req.header, &group_name) {
-            return self.invalid_request_response::<RegisterWorkerResponseProto>(&req.header, message);
-        }
-        if group_name != self.served_group_name {
-            return self.invalid_request_response::<RegisterWorkerResponseProto>(
-                &req.header,
-                format!(
-                    "register group_name {} does not match served metadata group {}",
-                    group_name, self.served_group_name
-                ),
-            );
-        }
-        let worker_id = WorkerId::new(req.worker_id);
-        if worker_id.as_raw() == 0 {
-            return self
-                .invalid_request_response::<RegisterWorkerResponseProto>(&req.header, "worker_id must be non-zero");
-        }
-        Span::current().record("worker_id", worker_id.as_raw());
-        let worker_run_id = match req.worker_run_id.parse::<WorkerRunId>() {
-            Ok(worker_run_id) => worker_run_id,
-            Err(error) => {
-                return self.invalid_request_response::<RegisterWorkerResponseProto>(
-                    &req.header,
-                    format!("worker_run_id must be a UUID: {error}"),
-                )
-            }
-        };
-        Span::current().record("worker_run_id", worker_run_id.to_string());
-        let worker_net_protocol = req.worker_net_protocol;
-        Span::current().record("protocol", worker_net_protocol_label(worker_net_protocol));
-        if req.worker_net_protocol() != proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc {
-            return self.invalid_request_response::<RegisterWorkerResponseProto>(
-                &req.header,
-                "worker_net_protocol must be gRPC for startup registration",
-            );
-        }
-        let _labels = req.labels;
-        let endpoint = match req.advertised_endpoint {
-            Some(endpoint) => endpoint,
-            None => {
-                return self.invalid_request_response::<RegisterWorkerResponseProto>(
-                    &req.header,
-                    "Missing advertised_endpoint",
+                    MetadataError::LeaderChanged(
+                        "worker registration must be sent to the metadata group leader".into(),
+                    ),
                 );
             }
-        };
-        let address = match validate_advertised_endpoint(endpoint) {
-            Ok(address) => address,
-            Err(message) => return self.invalid_request_response::<RegisterWorkerResponseProto>(&req.header, message),
-        };
-        Span::current().record("endpoint", address.as_str());
-        if let Err(error) = self.worker_manager.validate_worker_registration_preflight(
-            &group_name,
-            worker_id,
-            worker_run_id,
-            &address,
-            worker_net_protocol,
-        ) {
-            return self.metadata_error_response::<RegisterWorkerResponseProto>(&req.header, error);
-        }
 
-        let command = Command::RegisterWorker {
-            dedup: crate::raft::DedupKey::new(_caller_ctx.client.client_id, _caller_ctx.client.call_id),
-            group_name: group_name.clone(),
-            worker_id,
-            worker_run_id,
-            address: address.clone(),
-            worker_net_protocol,
-            fault_domain: None, // TODO: Extract fault_domain from labels
-        };
+            let group_name = match GroupName::parse(&req.group_name) {
+                Ok(group_name) => group_name,
+                Err(error) => {
+                    return self.invalid_request_response::<RegisterWorkerResponseProto>(
+                        &req.header,
+                        format!("group_name is invalid: {error}"),
+                    )
+                }
+            };
+            Span::current().record("group_name", group_name.as_str());
+            if let Err(message) = check_header_group_name(&req.header, &group_name) {
+                return self.invalid_request_response::<RegisterWorkerResponseProto>(&req.header, message);
+            }
+            if group_name != self.served_group_name {
+                return self.invalid_request_response::<RegisterWorkerResponseProto>(
+                    &req.header,
+                    format!(
+                        "register group_name {} does not match served metadata group {}",
+                        group_name, self.served_group_name
+                    ),
+                );
+            }
+            let worker_id = WorkerId::new(req.worker_id);
+            if worker_id.as_raw() == 0 {
+                return self.invalid_request_response::<RegisterWorkerResponseProto>(
+                    &req.header,
+                    "worker_id must be non-zero",
+                );
+            }
+            Span::current().record("worker_id", worker_id.as_raw());
+            let worker_run_id = match req.worker_run_id.parse::<WorkerRunId>() {
+                Ok(worker_run_id) => worker_run_id,
+                Err(error) => {
+                    return self.invalid_request_response::<RegisterWorkerResponseProto>(
+                        &req.header,
+                        format!("worker_run_id must be a UUID: {error}"),
+                    )
+                }
+            };
+            Span::current().record("worker_run_id", worker_run_id.to_string());
+            let worker_net_protocol = req.worker_net_protocol;
+            Span::current().record("protocol", worker_net_protocol_label(worker_net_protocol));
+            if req.worker_net_protocol() != proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc {
+                return self.invalid_request_response::<RegisterWorkerResponseProto>(
+                    &req.header,
+                    "worker_net_protocol must be gRPC for startup registration",
+                );
+            }
+            let _labels = req.labels;
+            let endpoint = match req.advertised_endpoint {
+                Some(endpoint) => endpoint,
+                None => {
+                    return self.invalid_request_response::<RegisterWorkerResponseProto>(
+                        &req.header,
+                        "Missing advertised_endpoint",
+                    );
+                }
+            };
+            let address = match validate_advertised_endpoint(endpoint) {
+                Ok(address) => address,
+                Err(message) => {
+                    return self.invalid_request_response::<RegisterWorkerResponseProto>(&req.header, message)
+                }
+            };
+            Span::current().record("endpoint", address.as_str());
+            if let Err(error) = self.worker_manager.validate_worker_registration_preflight(
+                &group_name,
+                worker_id,
+                worker_run_id,
+                &address,
+                worker_net_protocol,
+            ) {
+                return self.metadata_error_response::<RegisterWorkerResponseProto>(&req.header, error);
+            }
 
-        let accepted_worker_id = match persist_worker_descriptor(self.raft_node.propose(command)).await {
-            Ok(worker_id) => worker_id,
-            Err(error) => return self.metadata_error_response::<RegisterWorkerResponseProto>(&req.header, error),
-        };
-        if accepted_worker_id != worker_id {
-            return self.metadata_error_response::<RegisterWorkerResponseProto>(
-                &req.header,
-                MetadataError::Internal(format!(
-                    "RegisterWorker returned worker_id {}, expected {}",
-                    accepted_worker_id.as_raw(),
-                    worker_id.as_raw()
-                )),
+            let command = Command::RegisterWorker {
+                dedup: crate::raft::DedupKey::new(_caller_ctx.client.client_id, _caller_ctx.client.call_id),
+                group_name: group_name.clone(),
+                worker_id,
+                worker_run_id,
+                address: address.clone(),
+                worker_net_protocol,
+                fault_domain: None, // TODO: Extract fault_domain from labels
+            };
+
+            let accepted_worker_id = match self.raft_node.propose(command).await {
+                Ok(AppDataResponse::Worker(WorkerCommandResult::Upserted(worker_id))) => worker_id,
+                Ok(other) => {
+                    return self.metadata_error_response::<RegisterWorkerResponseProto>(
+                        &req.header,
+                        MetadataError::Internal(format!("RegisterWorker returned unexpected Raft response: {other:?}")),
+                    );
+                }
+                Err(error) => return self.metadata_error_response::<RegisterWorkerResponseProto>(&req.header, error),
+            };
+            if accepted_worker_id != worker_id {
+                return self.metadata_error_response::<RegisterWorkerResponseProto>(
+                    &req.header,
+                    MetadataError::Internal(format!(
+                        "RegisterWorker returned worker_id {}, expected {}",
+                        accepted_worker_id.as_raw(),
+                        worker_id.as_raw()
+                    )),
+                );
+            }
+
+            info!(
+                event = "worker_registered",
+                group_name = %group_name,
+                worker_id = accepted_worker_id.as_raw(),
+                worker_run_id = %worker_run_id,
+                endpoint = %address,
+                protocol = worker_net_protocol_label(worker_net_protocol),
+                "Worker registered"
             );
+
+            Ok(Response::new(RegisterWorkerResponseProto {
+                header: Some(self.create_response_header_from_request(&req.header, Some(&group_name))),
+                worker_id: accepted_worker_id.as_raw(),
+                accepted_worker_run_id: worker_run_id.to_string(),
+                group_name: group_name.to_string(),
+            }))
         }
-
-        info!(
-            group_name = %group_name,
-            worker_id = accepted_worker_id.as_raw(),
-            worker_run_id = %worker_run_id,
-            endpoint = %address,
-            protocol = worker_net_protocol_label(worker_net_protocol),
-            "Worker registered"
-        );
-        observe::record_worker_registered();
-
-        Ok(Response::new(RegisterWorkerResponseProto {
-            header: Some(self.create_response_header_from_request(&req.header, Some(&group_name))),
-            worker_id: accepted_worker_id.as_raw(),
-            accepted_worker_run_id: worker_run_id.to_string(),
-            group_name: group_name.to_string(),
-        }))
+        .await;
+        Self::record_worker_rpc_outcome("register_worker", MetadataWorkerMetric::Registration, started, &outcome);
+        outcome
     }
 
     #[instrument(
         skip(self, request),
-        fields(call_id, client_id, group_name, worker_id, worker_run_id, endpoint, protocol)
+        fields(
+            call_id,
+            client_id,
+            group_name,
+            worker_id,
+            worker_run_id,
+            endpoint,
+            protocol,
+            traceparent
+        )
     )]
     async fn heartbeat(
         &self,
         request: Request<HeartbeatRequestProto>,
     ) -> Result<Response<HeartbeatResponseProto>, Status> {
-        let req = request.into_inner();
-        let _caller_ctx = match extract_and_inject_context(&req.header) {
-            Ok(ctx) => ctx,
-            Err(error) => return self.response_with_error::<HeartbeatResponseProto>(&req.header, error),
-        };
+        let started = Instant::now();
+        let transport_context = extract_trace_context(request.metadata());
+        let outcome = async {
+            let mut req = request.into_inner();
+            merge_request_header_transport_context(&mut req.header, &transport_context);
+            let _caller_ctx = match extract_and_inject_context(&req.header) {
+                Ok(ctx) => ctx,
+                Err(error) => return self.response_with_error::<HeartbeatResponseProto>(&req.header, error),
+            };
 
-        let group_name = match GroupName::parse(&req.group_name) {
-            Ok(group_name) => group_name,
-            Err(error) => {
-                return self.invalid_request_response::<HeartbeatResponseProto>(
-                    &req.header,
-                    format!("group_name is invalid: {error}"),
-                )
+            let group_name = match GroupName::parse(&req.group_name) {
+                Ok(group_name) => group_name,
+                Err(error) => {
+                    return self.invalid_request_response::<HeartbeatResponseProto>(
+                        &req.header,
+                        format!("group_name is invalid: {error}"),
+                    )
+                }
+            };
+            Span::current().record("group_name", group_name.as_str());
+            if let Err(message) = check_header_group_name(&req.header, &group_name) {
+                return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, message);
             }
-        };
-        Span::current().record("group_name", group_name.as_str());
-        if let Err(message) = check_header_group_name(&req.header, &group_name) {
-            return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, message);
-        }
-        if group_name != self.served_group_name {
-            return self.group_mismatch_response::<HeartbeatResponseProto>(
-                &req.header,
-                format!(
-                    "heartbeat group_name {} does not match served metadata group {}",
-                    group_name, self.served_group_name
-                ),
-            );
-        }
-        let worker_id = WorkerId::new(req.worker_id);
-        if worker_id.as_raw() == 0 {
-            return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, "worker_id must be non-zero");
-        }
-        Span::current().record("worker_id", worker_id.as_raw());
-        let worker_run_id = match req.worker_run_id.parse::<WorkerRunId>() {
-            Ok(worker_run_id) => worker_run_id,
-            Err(error) => {
-                return self.invalid_request_response::<HeartbeatResponseProto>(
+            if group_name != self.served_group_name {
+                return self.group_mismatch_response::<HeartbeatResponseProto>(
                     &req.header,
-                    format!("worker_run_id must be a UUID: {error}"),
-                )
+                    format!(
+                        "heartbeat group_name {} does not match served metadata group {}",
+                        group_name, self.served_group_name
+                    ),
+                );
             }
-        };
-        Span::current().record("worker_run_id", worker_run_id.to_string());
-
-        let capacity = match req.capacity.as_ref() {
-            Some(capacity) => capacity,
-            None => return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, "Missing capacity"),
-        };
-        let tier_free = match parse_tier_free(&capacity.tier_free) {
-            Ok(tier_free) => tier_free,
-            Err(message) => return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, message),
-        };
-
-        let load = match req.load {
-            Some(load) => load,
-            None => return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, "Missing load"),
-        };
-
-        let health_proto = req.health();
-        let worker_net_protocol = req.worker_net_protocol;
-        Span::current().record("protocol", worker_net_protocol_label(worker_net_protocol));
-        if req.worker_net_protocol() != proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc {
-            return self.invalid_request_response::<HeartbeatResponseProto>(
-                &req.header,
-                "worker_net_protocol must be gRPC for heartbeat",
-            );
-        }
-        let endpoint = match req.advertised_endpoint {
-            Some(endpoint) => endpoint,
-            None => {
+            let worker_id = WorkerId::new(req.worker_id);
+            if worker_id.as_raw() == 0 {
                 return self
-                    .invalid_request_response::<HeartbeatResponseProto>(&req.header, "Missing advertised_endpoint");
+                    .invalid_request_response::<HeartbeatResponseProto>(&req.header, "worker_id must be non-zero");
             }
-        };
-        let advertised_endpoint = match validate_advertised_endpoint(endpoint) {
-            Ok(address) => address,
-            Err(message) => return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, message),
-        };
-        Span::current().record("endpoint", advertised_endpoint.as_str());
+            Span::current().record("worker_id", worker_id.as_raw());
+            let worker_run_id = match req.worker_run_id.parse::<WorkerRunId>() {
+                Ok(worker_run_id) => worker_run_id,
+                Err(error) => {
+                    return self.invalid_request_response::<HeartbeatResponseProto>(
+                        &req.header,
+                        format!("worker_run_id must be a UUID: {error}"),
+                    )
+                }
+            };
+            Span::current().record("worker_run_id", worker_run_id.to_string());
 
-        self.worker_manager.expire_liveness();
+            let capacity = match req.capacity.as_ref() {
+                Some(capacity) => capacity,
+                None => {
+                    return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, "Missing capacity")
+                }
+            };
+            let tier_free = match parse_tier_free(&capacity.tier_free) {
+                Ok(tier_free) => tier_free,
+                Err(message) => return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, message),
+            };
 
-        let descriptor = match self.worker_manager.get_descriptor(&group_name, worker_id) {
-            Some(descriptor) => descriptor,
-            None => {
-                return self.need_register_response::<HeartbeatResponseProto>(
+            let load = match req.load {
+                Some(load) => load,
+                None => return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, "Missing load"),
+            };
+
+            let health_proto = req.health();
+            let worker_net_protocol = req.worker_net_protocol;
+            Span::current().record("protocol", worker_net_protocol_label(worker_net_protocol));
+            if req.worker_net_protocol() != proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc {
+                return self.invalid_request_response::<HeartbeatResponseProto>(
+                    &req.header,
+                    "worker_net_protocol must be gRPC for heartbeat",
+                );
+            }
+            let endpoint = match req.advertised_endpoint {
+                Some(endpoint) => endpoint,
+                None => {
+                    return self.invalid_request_response::<HeartbeatResponseProto>(
+                        &req.header,
+                        "Missing advertised_endpoint",
+                    );
+                }
+            };
+            let advertised_endpoint = match validate_advertised_endpoint(endpoint) {
+                Ok(address) => address,
+                Err(message) => return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, message),
+            };
+            Span::current().record("endpoint", advertised_endpoint.as_str());
+
+            self.worker_manager.expire_liveness();
+
+            let descriptor = match self.worker_manager.get_descriptor(&group_name, worker_id) {
+                Some(descriptor) => descriptor,
+                None => {
+                    return self.need_register_response::<HeartbeatResponseProto>(
+                        &req.header,
+                        format!(
+                            "worker descriptor not found for group_name={}, worker_id={}",
+                            group_name,
+                            worker_id.as_raw()
+                        ),
+                    );
+                }
+            };
+            let registration = match self.worker_manager.get_registration(&group_name, worker_id) {
+                Some(registration) => registration,
+                None => {
+                    return self.need_register_response::<HeartbeatResponseProto>(
+                        &req.header,
+                        format!(
+                            "live worker registration not found for group_name={}, worker_id={}",
+                            group_name,
+                            worker_id.as_raw()
+                        ),
+                    );
+                }
+            };
+            if registration.worker_run_id != worker_run_id {
+                return self.worker_run_mismatch_response::<HeartbeatResponseProto>(
                     &req.header,
                     format!(
-                        "worker descriptor not found for group_name={}, worker_id={}",
+                        "worker_run_id mismatch for group_name={}, worker_id={}",
                         group_name,
                         worker_id.as_raw()
                     ),
                 );
             }
-        };
-        let registration = match self.worker_manager.get_registration(&group_name, worker_id) {
-            Some(registration) => registration,
-            None => {
-                return self.need_register_response::<HeartbeatResponseProto>(
+            if descriptor.address != advertised_endpoint || descriptor.worker_net_protocol != worker_net_protocol {
+                return self.worker_descriptor_mismatch_response::<HeartbeatResponseProto>(
                     &req.header,
                     format!(
-                        "live worker registration not found for group_name={}, worker_id={}",
+                        "advertised endpoint or protocol does not match registration for group_name={}, worker_id={}",
                         group_name,
                         worker_id.as_raw()
                     ),
                 );
             }
-        };
-        if registration.worker_run_id != worker_run_id {
-            return self.worker_run_mismatch_response::<HeartbeatResponseProto>(
-                &req.header,
-                format!(
-                    "worker_run_id mismatch for group_name={}, worker_id={}",
-                    group_name,
-                    worker_id.as_raw()
-                ),
-            );
-        }
-        if descriptor.address != advertised_endpoint || descriptor.worker_net_protocol != worker_net_protocol {
-            return self.worker_descriptor_mismatch_response::<HeartbeatResponseProto>(
-                &req.header,
-                format!(
-                    "advertised endpoint or protocol does not match registration for group_name={}, worker_id={}",
-                    group_name,
-                    worker_id.as_raw()
-                ),
-            );
-        }
 
-        use super::manager::HealthStatus;
-        let health_status = HealthStatus::from(health_proto as i32);
+            use super::manager::HealthStatus;
+            let health_status = HealthStatus::from(health_proto as i32);
 
-        let live_state = match self.worker_manager.record_heartbeat_with_tier_free(
-            &group_name,
-            worker_id,
-            worker_run_id,
-            req.heartbeat_seq,
-            &advertised_endpoint,
-            worker_net_protocol,
-            capacity.total_bytes,
-            capacity.used_bytes,
-            capacity.available_bytes,
-            tier_free,
-            load.active_reads,
-            load.active_writes,
-            health_status,
-        ) {
-            Ok(live_state) => live_state,
-            Err(MetadataError::NotFound(message)) => {
-                return self.need_register_response::<HeartbeatResponseProto>(&req.header, message);
+            let live_state = match self.worker_manager.record_heartbeat_with_tier_free(
+                &group_name,
+                worker_id,
+                worker_run_id,
+                req.heartbeat_seq,
+                &advertised_endpoint,
+                worker_net_protocol,
+                capacity.total_bytes,
+                capacity.used_bytes,
+                capacity.available_bytes,
+                tier_free,
+                load.active_reads,
+                load.active_writes,
+                health_status,
+            ) {
+                Ok(live_state) => live_state,
+                Err(MetadataError::NotFound(message)) => {
+                    return self.need_register_response::<HeartbeatResponseProto>(&req.header, message);
+                }
+                Err(MetadataError::StaleState(message)) => {
+                    return self.worker_run_mismatch_response::<HeartbeatResponseProto>(&req.header, message);
+                }
+                Err(MetadataError::InvalidArgument(message)) => {
+                    return self.worker_descriptor_mismatch_response::<HeartbeatResponseProto>(&req.header, message);
+                }
+                Err(error) => return self.metadata_error_response::<HeartbeatResponseProto>(&req.header, error),
+            };
+
+            // Update metrics (all nodes)
+            let live_count = self.worker_manager.list_live_workers().len();
+            self.metrics.update_worker_live(live_count);
+            observe::set_worker_live(live_count);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(live_state.last_seen_ms);
+            observe::record_worker_heartbeat_lag(now_ms.saturating_sub(live_state.last_seen_ms) as f64 / 1000.0);
+
+            if !req.acks.is_empty() {
+                warn!(
+                    worker_id = worker_id.as_raw(),
+                    ack_count = req.acks.len(),
+                    "Ignoring worker command acks because command ack handling is not enabled"
+                );
             }
-            Err(MetadataError::StaleState(message)) => {
-                return self.worker_run_mismatch_response::<HeartbeatResponseProto>(&req.header, message);
-            }
-            Err(MetadataError::InvalidArgument(message)) => {
-                return self.worker_descriptor_mismatch_response::<HeartbeatResponseProto>(&req.header, message);
-            }
-            Err(error) => return self.metadata_error_response::<HeartbeatResponseProto>(&req.header, error),
-        };
 
-        // Update metrics (all nodes)
-        let live_count = self.worker_manager.list_live_workers().len();
-        self.metrics.update_worker_live(live_count);
-
-        if !req.acks.is_empty() {
-            warn!(
-                worker_id = worker_id.as_raw(),
-                ack_count = req.acks.len(),
-                "Ignoring worker command acks because command ack handling is not enabled"
-            );
+            Ok(Response::new(HeartbeatResponseProto {
+                header: Some(self.create_response_header_from_request(&req.header, Some(&group_name))),
+                commands: Vec::new(),
+                worker_id: live_state.worker_id.as_raw(),
+                accepted_worker_run_id: live_state.worker_run_id.to_string(),
+                heartbeat_interval_ms: self.heartbeat_interval_ms(),
+                liveness_timeout_ms: self.liveness_timeout_ms(),
+                server_role: self.server_role() as i32,
+                leader_hint: self.leader_hint(),
+                group_name: group_name.to_string(),
+            }))
         }
-
-        Ok(Response::new(HeartbeatResponseProto {
-            header: Some(self.create_response_header_from_request(&req.header, Some(&group_name))),
-            commands: Vec::new(),
-            worker_id: live_state.worker_id.as_raw(),
-            accepted_worker_run_id: live_state.worker_run_id.to_string(),
-            heartbeat_interval_ms: self.heartbeat_interval_ms(),
-            liveness_timeout_ms: self.liveness_timeout_ms(),
-            server_role: self.server_role() as i32,
-            leader_hint: self.leader_hint(),
-            group_name: group_name.to_string(),
-        }))
+        .await;
+        Self::record_worker_rpc_outcome("heartbeat", MetadataWorkerMetric::Heartbeat, started, &outcome);
+        outcome
     }
 
     #[instrument(
@@ -780,163 +992,199 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             delta_seq,
             final_batch,
             added_blocks,
-            removed_blocks
+            removed_blocks,
+            traceparent
         )
     )]
     async fn block_report(
         &self,
         request: Request<BlockReportRequestProto>,
     ) -> Result<Response<BlockReportResponseProto>, Status> {
-        let req = request.into_inner();
-        let _caller_ctx = match extract_and_inject_context(&req.header) {
-            Ok(ctx) => ctx,
-            Err(error) => return self.response_with_error::<BlockReportResponseProto>(&req.header, error),
-        };
+        let started = Instant::now();
+        let metric_kind = block_report_kind(request.get_ref());
+        let transport_context = extract_trace_context(request.metadata());
+        let outcome = async {
+            let mut req = request.into_inner();
+            merge_request_header_transport_context(&mut req.header, &transport_context);
+            let _caller_ctx = match extract_and_inject_context(&req.header) {
+                Ok(ctx) => ctx,
+                Err(error) => return self.response_with_error::<BlockReportResponseProto>(&req.header, error),
+            };
 
-        let group_name = match GroupName::parse(&req.group_name) {
-            Ok(group_name) => group_name,
-            Err(error) => {
+            let group_name = match GroupName::parse(&req.group_name) {
+                Ok(group_name) => group_name,
+                Err(error) => {
+                    return self.invalid_request_response::<BlockReportResponseProto>(
+                        &req.header,
+                        format!("group_name is invalid: {error}"),
+                    )
+                }
+            };
+            Span::current().record("group_name", group_name.as_str());
+            if let Err(message) = check_header_group_name(&req.header, &group_name) {
+                return self.invalid_request_response::<BlockReportResponseProto>(&req.header, message);
+            }
+            if group_name != self.served_group_name {
+                return self.group_mismatch_response::<BlockReportResponseProto>(
+                    &req.header,
+                    format!(
+                        "block report group_name {} does not match served metadata group {}",
+                        group_name, self.served_group_name
+                    ),
+                );
+            }
+            let worker_id = WorkerId::new(req.worker_id);
+            if worker_id.as_raw() == 0 {
+                return self
+                    .invalid_request_response::<BlockReportResponseProto>(&req.header, "worker_id must be non-zero");
+            }
+            Span::current().record("worker_id", worker_id.as_raw());
+            let worker_run_id = match req.worker_run_id.parse::<WorkerRunId>() {
+                Ok(worker_run_id) => worker_run_id,
+                Err(error) => {
+                    return self.invalid_request_response::<BlockReportResponseProto>(
+                        &req.header,
+                        format!("worker_run_id must be a UUID: {error}"),
+                    )
+                }
+            };
+            Span::current().record("worker_run_id", worker_run_id.to_string());
+            let report_seq = req.report_seq;
+            Span::current().record("report_seq", report_seq);
+            let Some(report) = req.report else {
                 return self.invalid_request_response::<BlockReportResponseProto>(
                     &req.header,
-                    format!("group_name is invalid: {error}"),
-                )
-            }
-        };
-        Span::current().record("group_name", group_name.as_str());
-        if let Err(message) = check_header_group_name(&req.header, &group_name) {
-            return self.invalid_request_response::<BlockReportResponseProto>(&req.header, message);
-        }
-        if group_name != self.served_group_name {
-            return self.group_mismatch_response::<BlockReportResponseProto>(
-                &req.header,
-                format!(
-                    "block report group_name {} does not match served metadata group {}",
-                    group_name, self.served_group_name
-                ),
-            );
-        }
-        let worker_id = WorkerId::new(req.worker_id);
-        if worker_id.as_raw() == 0 {
-            return self
-                .invalid_request_response::<BlockReportResponseProto>(&req.header, "worker_id must be non-zero");
-        }
-        Span::current().record("worker_id", worker_id.as_raw());
-        let worker_run_id = match req.worker_run_id.parse::<WorkerRunId>() {
-            Ok(worker_run_id) => worker_run_id,
-            Err(error) => {
-                return self.invalid_request_response::<BlockReportResponseProto>(
-                    &req.header,
-                    format!("worker_run_id must be a UUID: {error}"),
-                )
-            }
-        };
-        Span::current().record("worker_run_id", worker_run_id.to_string());
-        let report_seq = req.report_seq;
-        Span::current().record("report_seq", report_seq);
-        let Some(report) = req.report else {
-            return self
-                .invalid_request_response::<BlockReportResponseProto>(&req.header, "block report body is required");
-        };
+                    "block report body is required",
+                );
+            };
 
-        let (result, report_kind, batch_seq, final_batch) = match report {
-            block_report_request_proto::Report::Full(full) => {
-                let batch_seq = full.batch_seq;
-                let final_batch = full.final_batch;
-                Span::current().record("report_kind", "full");
-                Span::current().record("batch_seq", batch_seq);
-                Span::current().record("final_batch", final_batch);
-                let mut blocks = Vec::with_capacity(full.blocks.len());
-                for block in full.blocks {
-                    match Self::proto_to_report_block(block) {
-                        Ok(block) => blocks.push(block),
-                        Err(error) => {
-                            return self.metadata_error_response::<BlockReportResponseProto>(&req.header, error);
+            let (result, report_kind, batch_seq, final_batch) = match report {
+                block_report_request_proto::Report::Full(full) => {
+                    let batch_seq = full.batch_seq;
+                    let final_batch = full.final_batch;
+                    Span::current().record("report_kind", "full");
+                    Span::current().record("batch_seq", batch_seq);
+                    Span::current().record("final_batch", final_batch);
+                    let mut blocks = Vec::with_capacity(full.blocks.len());
+                    for block in full.blocks {
+                        match Self::proto_to_report_block(block) {
+                            Ok(block) => blocks.push(block),
+                            Err(error) => {
+                                return self.metadata_error_response::<BlockReportResponseProto>(&req.header, error);
+                            }
                         }
                     }
+                    let result = match self.worker_manager.receive_full_block_report(
+                        &group_name,
+                        worker_id,
+                        worker_run_id,
+                        report_seq,
+                        full.batch_seq,
+                        full.final_batch,
+                        blocks,
+                    ) {
+                        Ok(result) => result,
+                        Err(error) => return self.map_report_error(&req.header, error),
+                    };
+                    (result, "full", Some(batch_seq), Some(final_batch))
                 }
-                let result = match self.worker_manager.receive_full_block_report(
-                    &group_name,
-                    worker_id,
-                    worker_run_id,
-                    report_seq,
-                    full.batch_seq,
-                    full.final_batch,
-                    blocks,
-                ) {
-                    Ok(result) => result,
-                    Err(error) => return self.map_report_error(&req.header, error),
-                };
-                (result, "full", Some(batch_seq), Some(final_batch))
-            }
-            block_report_request_proto::Report::Delta(delta) => {
-                Span::current().record("report_kind", "delta");
-                Span::current().record("delta_seq", delta.delta_seq);
-                let mut deltas = Vec::with_capacity(delta.deltas.len());
-                for delta in delta.deltas {
-                    match Self::proto_to_delta(delta) {
-                        Ok(delta) => deltas.push(delta),
-                        Err(error) => {
-                            return self.metadata_error_response::<BlockReportResponseProto>(&req.header, error);
+                block_report_request_proto::Report::Delta(delta) => {
+                    Span::current().record("report_kind", "delta");
+                    Span::current().record("delta_seq", delta.delta_seq);
+                    let mut deltas = Vec::with_capacity(delta.deltas.len());
+                    for delta in delta.deltas {
+                        match Self::proto_to_delta(delta) {
+                            Ok(delta) => deltas.push(delta),
+                            Err(error) => {
+                                return self.metadata_error_response::<BlockReportResponseProto>(&req.header, error);
+                            }
                         }
                     }
+                    let result = match self.worker_manager.apply_delta_block_report(
+                        &group_name,
+                        worker_id,
+                        worker_run_id,
+                        report_seq,
+                        delta.delta_seq,
+                        deltas,
+                    ) {
+                        Ok(result) => result,
+                        Err(error) => return self.map_report_error(&req.header, error),
+                    };
+                    (result, "delta", None, None)
                 }
-                let result = match self.worker_manager.apply_delta_block_report(
-                    &group_name,
-                    worker_id,
-                    worker_run_id,
+            };
+            Span::current().record("added_blocks", result.added_blocks.len() as u64);
+            Span::current().record("removed_blocks", result.removed_blocks.len() as u64);
+
+            // In-memory worker state counters.
+            let total_blocks = result.added_blocks.len() + result.removed_blocks.len();
+            self.metrics.record_blockreport_blocks(total_blocks as u64);
+            let locations_size = self.worker_manager.get_all_locations_count();
+            self.metrics.update_locations_size(locations_size);
+
+            observe::record_worker_block_report_blocks("added", result.added_blocks.len());
+            observe::record_worker_block_report_blocks("removed", result.removed_blocks.len());
+
+            if let (Some(batch_seq), Some(final_batch)) = (batch_seq, final_batch) {
+                info!(
+                    event = "metadata_worker_block_report_processed",
+                    group_name = %group_name,
+                    worker_id = worker_id.as_raw(),
+                    worker_run_id = %worker_run_id,
+                    report_kind,
                     report_seq,
-                    delta.delta_seq,
-                    deltas,
-                ) {
-                    Ok(result) => result,
-                    Err(error) => return self.map_report_error(&req.header, error),
-                };
-                (result, "delta", None, None)
+                    batch_seq,
+                    final_batch,
+                    next_delta_seq = result.next_delta_seq,
+                    added_blocks = result.added_blocks.len(),
+                    removed_blocks = result.removed_blocks.len(),
+                    "Block report processed"
+                );
+            } else {
+                info!(
+                    event = "metadata_worker_block_report_processed",
+                    group_name = %group_name,
+                    worker_id = worker_id.as_raw(),
+                    worker_run_id = %worker_run_id,
+                    report_kind,
+                    report_seq,
+                    next_delta_seq = result.next_delta_seq,
+                    added_blocks = result.added_blocks.len(),
+                    removed_blocks = result.removed_blocks.len(),
+                    "Block report processed"
+                );
             }
-        };
-        Span::current().record("added_blocks", result.added_blocks.len() as u64);
-        Span::current().record("removed_blocks", result.removed_blocks.len() as u64);
 
-        // In-memory worker state counters.
-        let total_blocks = result.added_blocks.len() + result.removed_blocks.len();
-        self.metrics.record_blockreport_blocks(total_blocks as u64);
-        let locations_size = self.worker_manager.get_all_locations_count();
-        self.metrics.update_locations_size(locations_size);
-
-        // Exported metric via the shared recorder.
-        observe::record_worker_block_report_processed();
-
-        info!(
-            group_name = %group_name,
-            worker_id = worker_id.as_raw(),
-            worker_run_id = %worker_run_id,
-            report_kind,
-            report_seq,
-            batch_seq = ?batch_seq,
-            final_batch = ?final_batch,
-            next_delta_seq = result.next_delta_seq,
-            added_blocks = result.added_blocks.len(),
-            removed_blocks = result.removed_blocks.len(),
-            "Block report processed"
+            Ok(Response::new(BlockReportResponseProto {
+                header: Some(self.create_response_header_from_request(&req.header, Some(&group_name))),
+                report_seq,
+                next_delta_seq: result.next_delta_seq,
+                retry_after_ms: 0,
+            }))
+        }
+        .await;
+        Self::record_worker_rpc_outcome(
+            "block_report",
+            MetadataWorkerMetric::BlockReport(metric_kind),
+            started,
+            &outcome,
         );
-
-        Ok(Response::new(BlockReportResponseProto {
-            header: Some(self.create_response_header_from_request(&req.header, Some(&group_name))),
-            report_seq,
-            next_delta_seq: result.next_delta_seq,
-            retry_after_ms: 0,
-        }))
+        outcome
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::MetadataError;
     use crate::raft::{AppRaftStateMachine, RocksDBStorage};
     use crate::worker::HealthStatus;
     use crate::MountTable;
+    use metrics::{
+        Counter, CounterFn, Gauge, Histogram, HistogramFn, Key, KeyName, Metadata, Recorder, SharedString, Unit,
+    };
     use proto::common::{error_detail_proto, ErrorClassProto, RefreshReasonProto, RpcErrorCodeProto};
+    use std::sync::Mutex;
     use tempfile::TempDir;
     use types::ClientId;
 
@@ -1170,6 +1418,50 @@ mod tests {
         (&::common::header::RequestHeader::new(client_id).with_group_name(group_name.clone())).into()
     }
 
+    #[test]
+    fn merge_transport_context_preserves_call_id_and_trace_context_boundary() {
+        let mut header = Some(valid_request_header(&group_name("root"), ClientId::new(90)));
+        let original_call_id = header
+            .as_ref()
+            .and_then(|header| header.client.as_ref())
+            .expect("client info")
+            .call_id
+            .clone();
+        let context = ExtractedContext {
+            traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string()),
+            tracestate: Some("vendor=state".to_string()),
+            baggage: Some("tenant=local".to_string()),
+        };
+
+        merge_request_header_transport_context(&mut header, &context);
+
+        let header = header.expect("merged header");
+        let trace_context = header.trace_context.expect("trace context");
+        assert_eq!(
+            trace_context.traceparent.as_deref(),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        );
+        assert_eq!(trace_context.tracestate.as_deref(), Some("vendor=state"));
+        assert_eq!(trace_context.baggage.as_deref(), Some("tenant=local"));
+        assert_eq!(header.client.expect("client info").call_id, original_call_id);
+    }
+
+    #[test]
+    fn merge_empty_transport_context_keeps_trace_context_absent() {
+        let mut header = Some(valid_request_header(&group_name("root"), ClientId::new(90)));
+
+        merge_request_header_transport_context(
+            &mut header,
+            &ExtractedContext {
+                traceparent: None,
+                tracestate: None,
+                baggage: None,
+            },
+        );
+
+        assert!(header.expect("header").trace_context.is_none());
+    }
+
     fn register_request_with_header(
         header: Option<proto::common::RequestHeaderProto>,
         worker_id: WorkerId,
@@ -1204,34 +1496,6 @@ mod tests {
             error.message,
             expected_message
         );
-    }
-
-    #[tokio::test]
-    async fn register_worker_persist_helper_propagates_propose_failure() {
-        let result =
-            persist_worker_descriptor(async { Err(MetadataError::Internal("propose failed".to_string())) }).await;
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("propose failed"));
-    }
-
-    #[tokio::test]
-    async fn register_worker_persist_helper_returns_accepted_worker_id() {
-        let worker_id = WorkerId::new(7);
-
-        let returned_worker_id =
-            persist_worker_descriptor(async { Ok(AppDataResponse::Worker(WorkerCommandResult::Upserted(worker_id))) })
-                .await
-                .unwrap();
-        assert_eq!(returned_worker_id, worker_id);
-    }
-
-    #[tokio::test]
-    async fn register_worker_persist_helper_rejects_unexpected_response() {
-        let result = persist_worker_descriptor(async { Ok(AppDataResponse::None) }).await;
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unexpected Raft response"));
     }
 
     #[tokio::test]
@@ -1445,6 +1709,359 @@ mod tests {
         let error = response.header.expect("header").error.expect("header error");
         assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
         assert!(error.message.contains("Missing advertised_endpoint"));
+    }
+
+    #[tokio::test]
+    async fn register_worker_invalid_request_records_error_metrics() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = leader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(MountTable::new()),
+            group_name("root"),
+        );
+        let recorder = MetadataWorkerMetricsRecorder::default();
+
+        metrics::with_local_recorder(&recorder, || {
+            futures::executor::block_on(async {
+                let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
+                    &service,
+                    Request::new(RegisterWorkerRequestProto {
+                        header: Some(valid_request_header(&group_name("root"), ClientId::new(180))),
+                        worker_id: 9,
+                        worker_run_id: test_worker_run_id().to_string(),
+                        advertised_endpoint: None,
+                        capabilities: 0,
+                        version: String::new(),
+                        labels: Default::default(),
+                        worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+                        group_name: "root".to_string(),
+                    }),
+                )
+                .await
+                .expect("business validation must return gRPC OK")
+                .into_inner();
+
+                assert!(response.header.expect("header").error.is_some());
+            });
+        });
+
+        assert!(recorder.has_counter(
+            observe::METADATA_RPC_REQUESTS_TOTAL,
+            &[
+                ("service", "metadata_worker"),
+                ("method", "register_worker"),
+                ("status", "error"),
+                ("error_kind", "invalid_argument"),
+            ],
+        ));
+        assert!(recorder.has_counter(
+            observe::METADATA_WORKER_REGISTERED_TOTAL,
+            &[("status", "error"), ("error_kind", "invalid_argument")],
+        ));
+        assert!(recorder.has_histogram(
+            observe::METADATA_RPC_REQUEST_DURATION_SECONDS,
+            &[
+                ("service", "metadata_worker"),
+                ("method", "register_worker"),
+                ("status", "error"),
+                ("error_kind", "invalid_argument"),
+            ],
+        ));
+        assert!(recorder.has_histogram(
+            observe::METADATA_WORKER_REGISTRATION_DURATION_SECONDS,
+            &[("status", "error"), ("error_kind", "invalid_argument")],
+        ));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_success_records_worker_metrics() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_id = WorkerId::new(17);
+        worker_manager
+            .register_worker_run(
+                &group_name("root"),
+                worker_id,
+                "127.0.0.1:9090".to_string(),
+                proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+                test_worker_run_id(),
+                None,
+            )
+            .unwrap();
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(MountTable::new()),
+            group_name("root"),
+        );
+        let recorder = MetadataWorkerMetricsRecorder::default();
+
+        metrics::with_local_recorder(&recorder, || {
+            futures::executor::block_on(async {
+                let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+                    &service,
+                    Request::new(heartbeat_request(
+                        group_name("root"),
+                        worker_id,
+                        test_worker_run_id(),
+                        1,
+                        9090,
+                    )),
+                )
+                .await
+                .expect("heartbeat succeeds")
+                .into_inner();
+
+                assert!(response.header.expect("header").error.is_none());
+            });
+        });
+
+        assert!(recorder.has_counter(
+            observe::METADATA_RPC_REQUESTS_TOTAL,
+            &[
+                ("service", "metadata_worker"),
+                ("method", "heartbeat"),
+                ("status", "ok"),
+                ("error_kind", "none"),
+            ],
+        ));
+        assert!(recorder.has_counter(
+            observe::METADATA_WORKER_HEARTBEAT_TOTAL,
+            &[("status", "ok"), ("error_kind", "none")],
+        ));
+        assert!(recorder.has_histogram(
+            observe::METADATA_RPC_REQUEST_DURATION_SECONDS,
+            &[
+                ("service", "metadata_worker"),
+                ("method", "heartbeat"),
+                ("status", "ok"),
+                ("error_kind", "none"),
+            ],
+        ));
+        assert!(recorder.has_histogram(
+            observe::METADATA_WORKER_HEARTBEAT_DURATION_SECONDS,
+            &[("status", "ok"), ("error_kind", "none")],
+        ));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_error_records_worker_metrics() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(MountTable::new()),
+            group_name("root"),
+        );
+        let recorder = MetadataWorkerMetricsRecorder::default();
+
+        metrics::with_local_recorder(&recorder, || {
+            futures::executor::block_on(async {
+                let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
+                    &service,
+                    Request::new(heartbeat_request(
+                        group_name("root"),
+                        WorkerId::new(18),
+                        test_worker_run_id(),
+                        1,
+                        9090,
+                    )),
+                )
+                .await
+                .expect("heartbeat header error returns gRPC OK")
+                .into_inner();
+
+                assert!(response.header.expect("header").error.is_some());
+            });
+        });
+
+        assert!(recorder.has_counter(
+            observe::METADATA_RPC_REQUESTS_TOTAL,
+            &[
+                ("service", "metadata_worker"),
+                ("method", "heartbeat"),
+                ("status", "error"),
+                ("error_kind", "need_register"),
+            ],
+        ));
+        assert!(recorder.has_counter(
+            observe::METADATA_WORKER_HEARTBEAT_TOTAL,
+            &[("status", "error"), ("error_kind", "need_register")],
+        ));
+        assert!(recorder.has_histogram(
+            observe::METADATA_RPC_REQUEST_DURATION_SECONDS,
+            &[
+                ("service", "metadata_worker"),
+                ("method", "heartbeat"),
+                ("status", "error"),
+                ("error_kind", "need_register"),
+            ],
+        ));
+        assert!(recorder.has_histogram(
+            observe::METADATA_WORKER_HEARTBEAT_DURATION_SECONDS,
+            &[("status", "error"), ("error_kind", "need_register")],
+        ));
+    }
+
+    #[tokio::test]
+    async fn block_report_success_records_worker_metrics_and_accepted_blocks() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let worker_id = WorkerId::new(19);
+        worker_manager
+            .register_worker(
+                &group_name("root"),
+                worker_id,
+                "127.0.0.1:9090".to_string(),
+                proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+                None,
+            )
+            .unwrap();
+        let worker_run_id = record_heartbeat(
+            &worker_manager,
+            &group_name("root"),
+            worker_id,
+            1_000,
+            100,
+            900,
+            0,
+            0,
+            HealthStatus::Healthy,
+        );
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(MountTable::new()),
+            group_name("root"),
+        );
+        let recorder = MetadataWorkerMetricsRecorder::default();
+
+        metrics::with_local_recorder(&recorder, || {
+            futures::executor::block_on(async {
+                let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+                    &service,
+                    Request::new(full_report_request(
+                        group_name("root"),
+                        worker_id,
+                        worker_run_id,
+                        1,
+                        0,
+                        true,
+                        vec![BlockId::from_u64_u32(1_900, 0)],
+                    )),
+                )
+                .await
+                .expect("block report succeeds")
+                .into_inner();
+
+                assert!(response.header.expect("header").error.is_none());
+            });
+        });
+
+        assert!(recorder.has_counter(
+            observe::METADATA_RPC_REQUESTS_TOTAL,
+            &[
+                ("service", "metadata_worker"),
+                ("method", "block_report"),
+                ("status", "ok"),
+                ("error_kind", "none"),
+            ],
+        ));
+        assert!(recorder.has_counter(
+            observe::METADATA_WORKER_BLOCK_REPORT_TOTAL,
+            &[("kind", "full"), ("status", "ok"), ("error_kind", "none")],
+        ));
+        assert!(recorder.has_counter(
+            observe::METADATA_WORKER_BLOCK_REPORT_BLOCKS_TOTAL,
+            &[("change", "added")],
+        ));
+        assert!(recorder.has_histogram(
+            observe::METADATA_RPC_REQUEST_DURATION_SECONDS,
+            &[
+                ("service", "metadata_worker"),
+                ("method", "block_report"),
+                ("status", "ok"),
+                ("error_kind", "none"),
+            ],
+        ));
+        assert!(recorder.has_histogram(
+            observe::METADATA_WORKER_BLOCK_REPORT_DURATION_SECONDS,
+            &[("kind", "full"), ("status", "ok"), ("error_kind", "none")],
+        ));
+    }
+
+    #[tokio::test]
+    async fn block_report_error_records_worker_metrics_without_block_counter() {
+        let dir = TempDir::new().unwrap();
+        let raft_node = nonleader_raft(&dir).await;
+        let worker_manager = Arc::new(WorkerManager::new(60));
+        let service = MetadataWorkerServiceImpl::new(
+            raft_node,
+            worker_manager,
+            Arc::new(MountTable::new()),
+            group_name("root"),
+        );
+        let recorder = MetadataWorkerMetricsRecorder::default();
+
+        metrics::with_local_recorder(&recorder, || {
+            futures::executor::block_on(async {
+                let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::block_report(
+                    &service,
+                    Request::new(full_report_request(
+                        group_name("root"),
+                        WorkerId::new(20),
+                        test_worker_run_id(),
+                        1,
+                        0,
+                        true,
+                        vec![BlockId::from_u64_u32(2_000, 0)],
+                    )),
+                )
+                .await
+                .expect("block report header error returns gRPC OK")
+                .into_inner();
+
+                assert!(response.header.expect("header").error.is_some());
+            });
+        });
+
+        assert!(recorder.has_counter(
+            observe::METADATA_RPC_REQUESTS_TOTAL,
+            &[
+                ("service", "metadata_worker"),
+                ("method", "block_report"),
+                ("status", "error"),
+                ("error_kind", "need_register"),
+            ],
+        ));
+        assert!(recorder.has_counter(
+            observe::METADATA_WORKER_BLOCK_REPORT_TOTAL,
+            &[("kind", "full"), ("status", "error"), ("error_kind", "need_register")],
+        ));
+        assert!(!recorder.has_counter(
+            observe::METADATA_WORKER_BLOCK_REPORT_BLOCKS_TOTAL,
+            &[("change", "added")],
+        ));
+        assert!(recorder.has_histogram(
+            observe::METADATA_RPC_REQUEST_DURATION_SECONDS,
+            &[
+                ("service", "metadata_worker"),
+                ("method", "block_report"),
+                ("status", "error"),
+                ("error_kind", "need_register"),
+            ],
+        ));
+        assert!(recorder.has_histogram(
+            observe::METADATA_WORKER_BLOCK_REPORT_DURATION_SECONDS,
+            &[("kind", "full"), ("status", "error"), ("error_kind", "need_register")],
+        ));
     }
 
     #[tokio::test]
@@ -2439,5 +3056,114 @@ mod tests {
         let error = response.header.expect("header").error.expect("header error");
         assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
         assert!(error.message.contains("missing block"));
+    }
+
+    #[derive(Default)]
+    struct MetadataWorkerMetricsRecorder {
+        counters: Arc<Mutex<Vec<RecordedMetric>>>,
+        histograms: Arc<Mutex<Vec<RecordedMetric>>>,
+    }
+
+    impl MetadataWorkerMetricsRecorder {
+        fn has_counter(&self, name: &str, labels: &[(&str, &str)]) -> bool {
+            self.counters
+                .lock()
+                .expect("counter metrics poisoned")
+                .iter()
+                .any(|metric| metric.matches(name, labels))
+        }
+
+        fn has_histogram(&self, name: &str, labels: &[(&str, &str)]) -> bool {
+            self.histograms
+                .lock()
+                .expect("histogram metrics poisoned")
+                .iter()
+                .any(|metric| metric.matches(name, labels))
+        }
+    }
+
+    impl Recorder for MetadataWorkerMetricsRecorder {
+        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
+            Counter::from_arc(Arc::new(MetricCounter {
+                metric: RecordedMetric::from_key(key),
+                recorder: Arc::clone(&self.counters),
+            }))
+        }
+
+        fn register_gauge(&self, _key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+            Gauge::noop()
+        }
+
+        fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+            Histogram::from_arc(Arc::new(MetricHistogram {
+                metric: RecordedMetric::from_key(key),
+                recorder: Arc::clone(&self.histograms),
+            }))
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordedMetric {
+        name: String,
+        labels: Vec<(String, String)>,
+    }
+
+    impl RecordedMetric {
+        fn from_key(key: &Key) -> Self {
+            Self {
+                name: key.name().to_string(),
+                labels: key
+                    .labels()
+                    .map(|label| (label.key().to_string(), label.value().to_string()))
+                    .collect(),
+            }
+        }
+
+        fn matches(&self, name: &str, labels: &[(&str, &str)]) -> bool {
+            self.name == name
+                && labels.iter().all(|(key, value)| {
+                    self.labels
+                        .iter()
+                        .any(|(actual_key, actual_value)| actual_key == key && actual_value == value)
+                })
+        }
+    }
+
+    struct MetricCounter {
+        metric: RecordedMetric,
+        recorder: Arc<Mutex<Vec<RecordedMetric>>>,
+    }
+
+    impl CounterFn for MetricCounter {
+        fn increment(&self, _value: u64) {
+            self.recorder
+                .lock()
+                .expect("counter metrics poisoned")
+                .push(self.metric.clone());
+        }
+
+        fn absolute(&self, value: u64) {
+            self.increment(value);
+        }
+    }
+
+    struct MetricHistogram {
+        metric: RecordedMetric,
+        recorder: Arc<Mutex<Vec<RecordedMetric>>>,
+    }
+
+    impl HistogramFn for MetricHistogram {
+        fn record(&self, _value: f64) {
+            self.recorder
+                .lock()
+                .expect("histogram metrics poisoned")
+                .push(self.metric.clone());
+        }
     }
 }

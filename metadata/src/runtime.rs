@@ -17,9 +17,7 @@ use crate::service::{
 use crate::state::RaftStateStore;
 use crate::worker::{MetadataWorkerServiceImpl, WorkerBackgroundHandle, WorkerManager};
 use crate::{observe, MetadataConfig, MountTable};
-use common::observe::{
-    init_observability as init_common_observability, ObservabilityConfig, ObservabilityGuard, ServiceInfo,
-};
+use common::observe::{init_observability as init_common_observability, ObservabilityGuard, ServiceInfo};
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProtoServer;
 use proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProtoServer;
 use std::sync::{Arc, Mutex};
@@ -140,7 +138,11 @@ impl WorkerRuntime {
     fn new() -> Self {
         let manager = Arc::new(WorkerManager::new(60));
         manager.increment_metadata_epoch();
-        info!("Metadata epoch initialized: {}", manager.get_metadata_epoch());
+        info!(
+            event = "metadata_epoch_initialized",
+            metadata_epoch = manager.get_metadata_epoch(),
+            "metadata epoch initialized"
+        );
 
         Self { manager }
     }
@@ -214,7 +216,7 @@ impl MetadataServer {
 
 /// Loads metadata configuration from the configured path.
 pub fn load_config() -> Result<Arc<MetadataConfig>, DynError> {
-    let config_path = std::env::var("VECTON_CONFIG").unwrap_or_else(|_| "conf/core-site.yaml".to_string());
+    let config_path = std::env::var("VECTON_CONFIG").unwrap_or_else(|_| "conf/metadata.yaml".to_string());
     let config = Arc::new(MetadataConfig::load(&config_path)?);
 
     Ok(config)
@@ -222,8 +224,7 @@ pub fn load_config() -> Result<Arc<MetadataConfig>, DynError> {
 
 /// Initializes process-wide observability after configuration has been loaded.
 pub fn init_observability(config: &MetadataConfig) -> Result<Observability, DynError> {
-    let mut obs_config = ObservabilityConfig::default();
-    obs_config.metrics.prometheus.bind = config.http_bind.to_string();
+    let obs_config = config.observability.clone();
     let service_info = ServiceInfo {
         name: "metadata".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -232,9 +233,10 @@ pub fn init_observability(config: &MetadataConfig) -> Result<Observability, DynE
         node_name: None,
     };
     let observability_guard = init_common_observability(&obs_config, service_info)?;
-    observe::record_metadata_started();
+    observe::record_metadata_started("metadata", env!("CARGO_PKG_VERSION"));
 
     info!(
+        event = "metadata_configuration_loaded",
         rpc_addr = %config.rpc_addr,
         http_bind = %config.http_bind,
         storage_dir = %config.storage_dir.display(),
@@ -655,7 +657,21 @@ mod tests {
             bootstrap: BootstrapConfig {
                 root_readiness: crate::readiness::RootReadinessConfig::default(),
             },
+            observability: test_observability_config(),
         }
+    }
+
+    fn test_observability_config() -> common::observe::ObservabilityConfig {
+        let mut flat = common::config::FlatConfig::new();
+        flat.set("observe.log.format", "compact");
+        flat.set("observe.log.output", "stderr");
+        flat.set(
+            "observe.log.level",
+            "info,vecton=info,metadata=info,worker=info,common=info,openraft=warn,tonic=warn,tower=warn,h2=warn",
+        );
+        flat.set("observe.metrics.prometheus.bind", "127.0.0.1:18081");
+        flat.set("observe.metrics.prometheus.path", "/metrics");
+        common::observe::ObservabilityConfig::from_flat(&flat).expect("test observe config")
     }
 
     #[tokio::test]

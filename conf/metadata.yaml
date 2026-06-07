@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-# Vecton core-site baseline.
-# This file intentionally contains only keys consumed by the current metadata
-# and worker runtimes.
+# Vecton metadata baseline. Run with:
+# metadata format --config conf/metadata.yaml
+# metadata start --config conf/metadata.yaml
 
 vecton.cluster.id: "local-vecton"
 
 # Metadata RPC service.
 metadata.rpc.addr: "0.0.0.0"
 metadata.rpc.port: 18080
+metadata.http.bind: "0.0.0.0:18081"
 
 # Metadata persistent state root. RocksDB state, Raft log/state, and snapshot
 # metadata live under this directory.
@@ -39,27 +40,8 @@ metadata.repair.initial_backoff_ms: 1000
 metadata.repair.max_backoff_ms: 60000
 metadata.repair.worker_inflight_limit: 4
 
-# Worker data service.
-worker.identity.path: "data/worker/worker.identity"
-worker.rpc.bind: "0.0.0.0:9090"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:19090"
-worker.rpc.max_inflight: 100
-worker.default_frame_size: "1MB"
-worker.max_frame_size: "4MB"
-worker.window_bytes: "8MB"
-worker.stream.idle_timeout_ms: 60000
-
-# Worker local block store.
-worker.store.dirs.hdd0.path: "data/worker/hdd0"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.store.reserve_space: "1GB"
-worker.store.selection_policy: "round_robin"
-worker.store.check_interval_ms: 30000
-
-# Worker metadata registration, heartbeat, and block report.
-worker.metadata.group.name: "root"
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-worker.metadata.register_timeout_ms: 5000
-worker.metadata.register_retry_initial_backoff_ms: 200
-worker.metadata.register_retry_max_backoff_ms: 5000
+observe.log.format: compact
+observe.log.output: stderr
+observe.log.level: "info,vecton=info,metadata=info,worker=info,common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
+observe.metrics.prometheus.bind: "127.0.0.1:18081"
+observe.metrics.prometheus.path: "/metrics"

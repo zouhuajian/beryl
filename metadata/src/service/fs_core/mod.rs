@@ -14,6 +14,7 @@ use super::core_util::{
 use super::domain::{CoreFailure, CoreResult, CoreSuccess, Freshness, PresentedFencingToken, RequestContext};
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::MountTable;
+use crate::observe;
 use crate::raft::{AppDataResponse, AppRaftNode, Command, DedupKey, FsCommandResult, RocksDBStorage};
 use crate::state::StateStore;
 use common::error::canonical::{RefreshHint, RefreshReason};
@@ -21,6 +22,7 @@ use common::header::{RequestHeader, RpcErrorCode};
 use proto::worker::CommitWriteRequestProto;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tracing::debug;
 use types::fs::{FsErrorCode, InodeId};
 use types::ids::MountId;
@@ -48,6 +50,20 @@ enum CoreWriteOp {
     DeleteTree,
     Rename,
     SetAttr,
+}
+
+impl CoreWriteOp {
+    fn metric_label(self) -> &'static str {
+        match self {
+            CoreWriteOp::Create => "create_file",
+            CoreWriteOp::Mkdir => "create_directory",
+            CoreWriteOp::Unlink => "delete_file",
+            CoreWriteOp::DeleteEmptyDir => "delete_empty_dir",
+            CoreWriteOp::DeleteTree => "delete_tree",
+            CoreWriteOp::Rename => "rename",
+            CoreWriteOp::SetAttr => "set_attr",
+        }
+    }
 }
 
 pub(crate) struct FsCore {
@@ -431,26 +447,49 @@ impl FsCore {
     }
 
     async fn propose_fs_write_command(&self, op: CoreWriteOp, command: Command) -> MetadataResult<FsCommandResult> {
-        let raft_node = self
-            .raft_node
-            .as_ref()
-            .ok_or_else(|| MetadataError::Internal("Raft node not available".to_string()))?;
+        let started = Instant::now();
+        let raft_node = self.raft_node.as_ref().ok_or_else(|| {
+            let error = MetadataError::Internal("Raft node not available".to_string());
+            observe::record_fs_op(
+                op.metric_label(),
+                "error",
+                observe::metadata_error_kind(&error),
+                started.elapsed().as_secs_f64(),
+            );
+            error
+        })?;
 
         let dedup_key = command.dedup_key().clone();
         let fingerprint = command.fingerprint();
 
         if let Some(storage) = &self.storage {
-            if let Some(existing) = storage.get_applied_result(&dedup_key)? {
+            if let Some(existing) = storage.get_applied_result(&dedup_key).inspect_err(|error| {
+                observe::record_fs_op(
+                    op.metric_label(),
+                    "error",
+                    observe::metadata_error_kind(error),
+                    started.elapsed().as_secs_f64(),
+                );
+            })? {
                 if existing.fingerprint != fingerprint {
-                    return Err(MetadataError::InvalidArgument(format!(
+                    let error = MetadataError::InvalidArgument(format!(
                         "call_id {} reused with different command payload",
                         dedup_key.call_id
-                    )));
+                    ));
+                    observe::record_fs_op(
+                        op.metric_label(),
+                        "error",
+                        observe::metadata_error_kind(&error),
+                        started.elapsed().as_secs_f64(),
+                    );
+                    return Err(error);
                 }
-                return Ok(match existing.result {
+                let result = match existing.result {
                     AppDataResponse::Fs(res) => res,
                     _ => FsCommandResult::ok(),
-                });
+                };
+                record_fs_write_result(op, started, &result);
+                return Ok(result);
             }
         }
 
@@ -481,17 +520,43 @@ impl FsCore {
             }
         }
 
-        let response = raft_node
-            .propose(command)
-            .await
-            .map_err(|e| MetadataError::Internal(format!("Failed to propose command: {}", e)))?;
+        let response = match raft_node.propose(command).await {
+            Ok(response) => response,
+            Err(e) => {
+                let error = MetadataError::Internal(format!("Failed to propose command: {}", e));
+                observe::record_fs_op(
+                    op.metric_label(),
+                    "error",
+                    observe::metadata_error_kind(&error),
+                    started.elapsed().as_secs_f64(),
+                );
+                return Err(error);
+            }
+        };
 
         let fs_result = match response {
             AppDataResponse::Fs(res) => res,
             _ => FsCommandResult::ok(),
         };
 
+        record_fs_write_result(op, started, &fs_result);
         Ok(fs_result)
+    }
+}
+
+fn record_fs_write_result(op: CoreWriteOp, started: Instant, result: &FsCommandResult) {
+    match result {
+        FsCommandResult::Ok(_) => {
+            observe::record_fs_op(op.metric_label(), "ok", "none", started.elapsed().as_secs_f64());
+        }
+        FsCommandResult::Err(err) => {
+            observe::record_fs_op(
+                op.metric_label(),
+                "error",
+                observe::fs_errno_kind(err.errno),
+                started.elapsed().as_secs_f64(),
+            );
+        }
     }
 }
 

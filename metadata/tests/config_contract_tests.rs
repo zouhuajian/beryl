@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use metadata::MetadataConfig;
 
 #[test]
-fn repository_core_site_parses_metadata_storage_dir() {
-    assert_metadata_storage_dir(&repo_root().join("conf/core-site.yaml"), Path::new("data/metadata"));
+fn repository_metadata_config_parses_metadata_storage_dir() {
+    assert_metadata_storage_dir(&repo_root().join("conf/metadata.yaml"), Path::new("data/metadata"));
     assert_metadata_storage_dir(
-        &repo_root().join("conf/local/core-site.yaml"),
+        &repo_root().join("conf/local/metadata.yaml"),
         Path::new("./data/metadata"),
     );
 }

@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::error::canonical::RefreshReason;
@@ -18,6 +18,7 @@ use types::lease::FencingToken;
 use types::{GroupName, Tier, WorkerRunId};
 
 use crate::error::WorkerError;
+use crate::observe;
 use crate::runtime::block::BlockManager;
 use crate::runtime::stream::{StreamManager, StreamState};
 use crate::store::block::{
@@ -546,12 +547,35 @@ impl WorkerCore {
 
         let remaining = state.context.end_offset - state.cursor;
         let read_len = remaining.min(u64::from(frame_budget));
-        let data = self.block_store.read_at(
+        let store_started = Instant::now();
+        let data = match self.block_store.read_at(
             &state.context.group_name,
             state.context.block_id,
             state.cursor,
             read_len,
-        )?;
+        ) {
+            Ok(data) => {
+                observe::record_store_io(
+                    "read",
+                    "ok",
+                    "none",
+                    data.len() as u64,
+                    store_started.elapsed().as_secs_f64(),
+                );
+                data
+            }
+            Err(error) => {
+                observe::record_store_io(
+                    "read",
+                    "error",
+                    observe::worker_error_kind(&error),
+                    0,
+                    store_started.elapsed().as_secs_f64(),
+                );
+                self.stream_manager.remove(stream_id).await;
+                return Err(error);
+            }
+        };
         let next_cursor = state
             .cursor
             .checked_add(
@@ -603,12 +627,25 @@ impl WorkerCore {
             return Ok(rejected_write_frame(&state));
         }
 
-        self.block_store.write_at(
+        let store_started = Instant::now();
+        match self.block_store.write_at(
             &state.context.group_name,
             state.context.block_id,
             frame.offset_in_block,
             frame.data,
-        )?;
+        ) {
+            Ok(()) => observe::record_store_io("write", "ok", "none", len, store_started.elapsed().as_secs_f64()),
+            Err(error) => {
+                observe::record_store_io(
+                    "write",
+                    "error",
+                    observe::worker_error_kind(&error),
+                    0,
+                    store_started.elapsed().as_secs_f64(),
+                );
+                return Err(error);
+            }
+        }
         if !self
             .stream_manager
             .advance_write_progress(frame.stream_id, frame.seq, written_through)
