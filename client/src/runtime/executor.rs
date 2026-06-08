@@ -512,11 +512,12 @@ impl OperationExecutor {
 
     fn retry_budget_for_operation(&self, kind: OperationKind) -> usize {
         match kind {
-            OperationKind::MetadataSessionBarrier => self.retry.session_barrier_retry_budget(),
-            OperationKind::MetadataRead | OperationKind::MetadataMutation | OperationKind::CleanupBestEffort => {
-                self.retry.metadata_retry_budget()
-            }
-            OperationKind::WorkerReadData | OperationKind::WorkerWriteData => self.retry.worker_retry_budget(),
+            OperationKind::MetadataSessionBarrier => 0,
+            OperationKind::MetadataRead
+            | OperationKind::MetadataMutation
+            | OperationKind::CleanupBestEffort
+            | OperationKind::WorkerReadData
+            | OperationKind::WorkerWriteData => self.retry.max_retry_attempts(),
         }
     }
 
@@ -1770,13 +1771,9 @@ mod tests {
         .expect("executor")
     }
 
-    fn retry_config(max_retries: usize) -> RetryConfig {
+    fn retry_config(max_retry_attempts: usize) -> RetryConfig {
         RetryConfig {
-            max_retries,
-            max_retry_attempts: max_retries,
-            metadata_retry_budget: max_retries,
-            worker_retry_budget: max_retries,
-            session_barrier_retry_budget: max_retries,
+            max_retry_attempts,
             operation_timeout_ms: None,
         }
     }

@@ -860,13 +860,10 @@ fn test_config(group_name: &str) -> ClientConfig {
     }
 }
 
-fn test_config_with_retries(group_name: &str, max_retries: usize) -> ClientConfig {
+fn test_config_with_retries(group_name: &str, max_retry_attempts: usize) -> ClientConfig {
     let mut config = test_config(group_name);
-    config.retry.max_retries = max_retries;
-    config.retry.max_retry_attempts = max_retries;
-    config.retry.metadata_retry_budget = max_retries;
-    config.retry.worker_retry_budget = max_retries;
-    config.refresh.max_refresh_attempts = max_retries;
+    config.retry.max_retry_attempts = max_retry_attempts;
+    config.refresh.max_refresh_attempts = max_retry_attempts;
     config
 }
 

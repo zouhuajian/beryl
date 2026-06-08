@@ -66,16 +66,8 @@ pub struct ChannelPoolConfig {
 /// Retry configuration.
 #[derive(Clone, Debug)]
 pub struct RetryConfig {
-    /// Maximum configured retry cap.
-    pub max_retries: usize,
     /// Maximum retry attempts per logical operation.
     pub max_retry_attempts: usize,
-    /// Metadata retry budget per logical operation.
-    pub metadata_retry_budget: usize,
-    /// Worker retry budget per logical operation.
-    pub worker_retry_budget: usize,
-    /// Session barrier retry budget per logical operation.
-    pub session_barrier_retry_budget: usize,
     /// Optional per-operation timeout in milliseconds.
     pub operation_timeout_ms: Option<u64>,
 }
@@ -101,33 +93,14 @@ pub struct BackoffConfig {
 impl RetryConfig {
     /// Return the effective maximum retry attempt cap.
     pub fn max_retry_attempts(&self) -> usize {
-        self.max_retry_attempts.min(self.max_retries)
-    }
-
-    /// Return the effective metadata retry budget.
-    pub fn metadata_retry_budget(&self) -> usize {
-        self.metadata_retry_budget.min(self.max_retry_attempts())
-    }
-
-    /// Return the effective worker retry budget.
-    pub fn worker_retry_budget(&self) -> usize {
-        self.worker_retry_budget.min(self.max_retry_attempts())
-    }
-
-    /// Return the effective session barrier retry budget.
-    pub fn session_barrier_retry_budget(&self) -> usize {
-        self.session_barrier_retry_budget.min(self.max_retry_attempts())
+        self.max_retry_attempts
     }
 }
 
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_retries: 3,
             max_retry_attempts: 3,
-            metadata_retry_budget: 3,
-            worker_retry_budget: 3,
-            session_barrier_retry_budget: 0,
             operation_timeout_ms: None,
         }
     }
@@ -353,20 +326,9 @@ fn parse_metadata_group_names(flat: &FlatConfig) -> Result<Vec<GroupName>, Commo
 fn retry_config_from_flat(flat: &FlatConfig) -> Result<RetryConfig, CommonError> {
     let defaults = RetryConfig::default();
     let max_retry_attempts = get_usize_or_strict(flat, "client.retry.max_retry_attempts", defaults.max_retry_attempts)?;
-    let metadata_retry_budget = get_usize_or_strict(flat, "client.retry.metadata_budget", max_retry_attempts)?;
-    let worker_retry_budget = get_usize_or_strict(flat, "client.retry.worker_budget", max_retry_attempts)?;
-    let session_barrier_retry_budget = get_usize_or_strict(
-        flat,
-        "client.retry.session_barrier_budget",
-        defaults.session_barrier_retry_budget.min(max_retry_attempts),
-    )?;
     let operation_timeout_ms = get_optional_u64(flat, "client.operation.timeout_ms")?;
     Ok(RetryConfig {
-        max_retries: max_retry_attempts,
         max_retry_attempts,
-        metadata_retry_budget,
-        worker_retry_budget,
-        session_barrier_retry_budget,
         operation_timeout_ms,
     })
 }
@@ -472,9 +434,6 @@ mod tests {
         let config = ClientConfig::default();
 
         assert_eq!(config.retry.max_retry_attempts(), 3);
-        assert_eq!(config.retry.metadata_retry_budget(), 3);
-        assert_eq!(config.retry.worker_retry_budget(), 3);
-        assert_eq!(config.retry.session_barrier_retry_budget(), 0);
         assert_eq!(config.refresh.max_refresh_attempts, 3);
         assert_eq!(config.backoff.initial_backoff_ms, 100);
         assert_eq!(config.backoff.max_backoff_ms, 5000);
@@ -597,28 +556,19 @@ mod tests {
     }
 
     #[test]
-    fn zero_retry_is_valid_and_disables_effective_retry_budgets() {
+    fn zero_retry_is_valid_and_disables_retry_attempts() {
         let mut flat = FlatConfig::new();
         flat.set("client.retry.max_retry_attempts", 0i64);
-        flat.set("client.retry.metadata_budget", 0i64);
-        flat.set("client.retry.worker_budget", 0i64);
-        flat.set("client.retry.session_barrier_budget", 0i64);
 
         let config = ClientConfig::from_flat(flat).expect("zero retry config is valid");
 
         assert_eq!(config.retry.max_retry_attempts(), 0);
-        assert_eq!(config.retry.metadata_retry_budget(), 0);
-        assert_eq!(config.retry.worker_retry_budget(), 0);
-        assert_eq!(config.retry.session_barrier_retry_budget(), 0);
     }
 
     #[test]
     fn current_retry_refresh_and_backoff_keys_are_loaded_from_flat_config() {
         let mut flat = FlatConfig::new();
         flat.set("client.retry.max_retry_attempts", 5i64);
-        flat.set("client.retry.metadata_budget", 4i64);
-        flat.set("client.retry.worker_budget", 3i64);
-        flat.set("client.retry.session_barrier_budget", 2i64);
         flat.set("client.refresh.max_attempts", 6i64);
         flat.set("client.operation.timeout_ms", 7000i64);
         flat.set("client.backoff.initial_ms", 25i64);
@@ -627,11 +577,7 @@ mod tests {
 
         let config = ClientConfig::from_flat(flat).expect("current retry and backoff config");
 
-        assert_eq!(config.retry.max_retries, 5);
         assert_eq!(config.retry.max_retry_attempts(), 5);
-        assert_eq!(config.retry.metadata_retry_budget(), 4);
-        assert_eq!(config.retry.worker_retry_budget(), 3);
-        assert_eq!(config.retry.session_barrier_retry_budget(), 2);
         assert_eq!(config.retry.operation_timeout_ms, Some(7000));
         assert_eq!(config.refresh.max_refresh_attempts, 6);
         assert_eq!(config.backoff.initial_backoff_ms, 25);
@@ -660,9 +606,6 @@ mod tests {
     fn invalid_retry_and_backoff_config_is_rejected() {
         for (key, value) in [
             ("client.retry.max_retry_attempts", -1i64),
-            ("client.retry.metadata_budget", -1i64),
-            ("client.retry.worker_budget", -1i64),
-            ("client.retry.session_barrier_budget", -1i64),
             ("client.refresh.max_attempts", -1i64),
             ("client.backoff.initial_ms", -1i64),
             ("client.backoff.max_ms", -1i64),
@@ -693,10 +636,5 @@ mod tests {
         flat.set("client.backoff.multiplier", "not-a-number");
         let err = ClientConfig::from_flat(flat).expect_err("non-numeric backoff multiplier must be rejected");
         assert!(err.to_string().contains("client.backoff.multiplier"));
-
-        let mut flat = FlatConfig::new();
-        flat.set("client.retry.metadata_budget", "three");
-        let err = ClientConfig::from_flat(flat).expect_err("wrong-type retry budget must be rejected");
-        assert!(err.to_string().contains("client.retry.metadata_budget"));
     }
 }

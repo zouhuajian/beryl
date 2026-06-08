@@ -132,10 +132,7 @@ lock the root to one metadata group.
 | `client.name` | `default_client` | non-blank string | Low-cardinality client display identity for diagnostics and audit. |
 | `client.metadata.endpoints` | `127.0.0.1:18080` | at least one endpoint | Comma-separated metadata endpoint list. |
 | `client.metadata.group.names` | `root` | one or more valid `GroupName` values | Paired with metadata endpoints by position. |
-| `client.retry.max_retry_attempts` | `3` | non-negative integer | Logical operation retry limit. |
-| `client.retry.metadata_budget` | `3` | non-negative integer | Metadata retry budget, capped by max attempts. |
-| `client.retry.worker_budget` | `3` | non-negative integer | Worker retry budget, capped by max attempts. |
-| `client.retry.session_barrier_budget` | `0` | non-negative integer | Write-session barrier retry budget. |
+| `client.retry.max_retry_attempts` | `3` | non-negative integer | Logical operation retry limit for ordinary metadata and worker operations; metadata session barriers do not retry. |
 | `client.refresh.max_attempts` | `3` | non-negative integer | Refresh attempt limit. |
 | `client.operation.timeout_ms` | `null` | null or non-negative integer | Per-operation deadline; null disables it. |
 | `client.backoff.initial_ms` | `100` | non-negative integer | Retry initial backoff. |

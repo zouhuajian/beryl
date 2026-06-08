@@ -8,9 +8,6 @@ client.metadata.endpoints: "127.0.0.1:18080"
 client.metadata.group.names: "root"
 
 client.retry.max_retry_attempts: 3
-client.retry.metadata_budget: 3
-client.retry.worker_budget: 3
-client.retry.session_barrier_budget: 0
 client.refresh.max_attempts: 3
 client.operation.timeout_ms: null
 client.backoff.initial_ms: 100

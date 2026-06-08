@@ -284,6 +284,7 @@ impl FsClient {
         };
         Ok(FileWriter::new(self.clone(), handle_from_write_seed(path, seed)?))
     }
+
     pub(crate) async fn read_handle(&self, handle: &ReadHandle, offset: u64, len: u32) -> ClientResult<Bytes> {
         let Some(span) = ReadPlanner::plan_requested_range(offset, len, handle.size_hint())? else {
             return Ok(Bytes::new());
@@ -300,7 +301,7 @@ impl FsClient {
         )?;
         let mut retry_used = 0usize;
         let mut refresh_used = 0usize;
-        let retry_budget = self.config.retry.worker_retry_budget();
+        let retry_budget = self.config.retry.max_retry_attempts();
         let refresh_budget = self.config.refresh.max_refresh_attempts;
         let mut attempt = 0u32;
         loop {
