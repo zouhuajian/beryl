@@ -23,7 +23,7 @@ use super::{
 };
 use crate::canonical::{ClientAction, RefreshHint};
 use crate::config::ClientConfig;
-use crate::data::{DataPlaneBoundary, WorkerBlockSyncResult, WorkerCommitResult};
+use crate::data::{WorkerBlockSyncResult, WorkerCommitResult, WorkerDataPlane};
 use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult};
 use crate::metadata::{MetadataGateway, TonicMetadataGateway, WriteSessionSeed};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics, NoopClientMetrics};
@@ -45,7 +45,7 @@ pub(super) const MAX_PREALLOCATED_WRITE_BLOCKS: u64 = 10;
 pub struct FsClient {
     pub(super) config: ClientConfig,
     pub(super) executor: OperationExecutor,
-    pub(super) data_boundary: DataPlaneBoundary,
+    pub(super) data_plane: WorkerDataPlane,
     pub(super) backoff: BackoffPolicy,
     pub(super) sleeper: Arc<dyn BackoffSleeper>,
     pub(super) metrics: Arc<dyn ClientMetrics>,
@@ -76,19 +76,19 @@ impl FsClient {
     /// Create a filesystem client with an injected metadata gateway.
     pub(crate) fn with_metadata_gateway(config: ClientConfig, gateway: Arc<dyn MetadataGateway>) -> ClientResult<Self> {
         let metrics: Arc<dyn ClientMetrics> = Arc::new(NoopClientMetrics);
-        let data_boundary = DataPlaneBoundary::from_config(&config, metrics);
-        Self::with_data_boundary(config, gateway, data_boundary)
+        let data_plane = WorkerDataPlane::from_config(&config, metrics);
+        Self::with_data_plane(config, gateway, data_plane)
     }
 
-    pub(crate) fn with_data_boundary(
+    pub(crate) fn with_data_plane(
         config: ClientConfig,
         gateway: Arc<dyn MetadataGateway>,
-        data_boundary: DataPlaneBoundary,
+        data_plane: WorkerDataPlane,
     ) -> ClientResult<Self> {
         Self::with_runtime_hooks(
             config,
             gateway,
-            data_boundary,
+            data_plane,
             Arc::new(TokioBackoffSleeper),
             Arc::new(NoopClientMetrics),
         )
@@ -97,13 +97,13 @@ impl FsClient {
     pub(crate) fn with_runtime_hooks(
         config: ClientConfig,
         gateway: Arc<dyn MetadataGateway>,
-        data_boundary: DataPlaneBoundary,
+        data_plane: WorkerDataPlane,
         sleeper: Arc<dyn BackoffSleeper>,
         metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
         let identity = ClientIdentity::generate(config.client_name.clone())?;
         let refresh_manager = RefreshManager::from_config(&config.metadata_group_names, &config.metadata_endpoints)?
-            .with_worker_endpoint_cache(data_boundary.worker_endpoint_cache());
+            .with_worker_endpoint_cache(data_plane.worker_endpoint_cache());
         let executor = OperationExecutor::with_runtime(
             identity,
             gateway,
@@ -120,7 +120,7 @@ impl FsClient {
         Ok(Self {
             config,
             executor,
-            data_boundary,
+            data_plane,
             backoff,
             sleeper,
             metrics,
@@ -316,7 +316,7 @@ impl FsClient {
                 .worker_rpc_with_timeout(
                     "Read",
                     OperationKind::WorkerReadData,
-                    self.data_boundary.read_all(ctx, group_name, &segments),
+                    self.data_plane.read_all(ctx, group_name, &segments),
                 )
                 .await
             {
@@ -556,7 +556,7 @@ impl FsClient {
                 .worker_rpc_with_timeout(
                     "AbortWrite",
                     OperationKind::CleanupBestEffort,
-                    self.data_boundary.abort_write(ctx, cleanup.worker_block()),
+                    self.data_plane.abort_write(ctx, cleanup.worker_block()),
                 )
                 .await
             {
@@ -645,7 +645,7 @@ impl FsClient {
             .worker_rpc_with_timeout(
                 "OpenWriteStream",
                 OperationKind::WorkerWriteData,
-                self.data_boundary
+                self.data_plane
                     .open_write(ctx, add_block.group_name.clone(), add_block.target.clone()),
             )
             .await
@@ -660,7 +660,7 @@ impl FsClient {
             .worker_rpc_with_timeout(
                 "WriteStream",
                 OperationKind::WorkerWriteData,
-                self.data_boundary.write_all(&worker_block, data),
+                self.data_plane.write_all(&worker_block, data),
             )
             .await
         {
@@ -768,7 +768,7 @@ impl FsClient {
                         .worker_rpc_with_timeout(
                             "CommitWrite",
                             OperationKind::WorkerWriteData,
-                            self.data_boundary.commit_write(
+                            self.data_plane.commit_write(
                                 ctx,
                                 pending.worker_block(),
                                 pending.written_len(),
@@ -815,8 +815,11 @@ impl FsClient {
                         .worker_rpc_with_timeout(
                             "SyncCommittedBlock",
                             OperationKind::WorkerWriteData,
-                            self.data_boundary
-                                .sync_committed_block(ctx, pending.worker_block(), pending.written_len()),
+                            self.data_plane.sync_committed_block(
+                                ctx,
+                                pending.worker_block(),
+                                pending.written_len(),
+                            ),
                         )
                         .await
                     {
@@ -972,7 +975,7 @@ impl fmt::Debug for FsClient {
         f.debug_struct("FsClient")
             .field("config", &self.config)
             .field("executor", &self.executor)
-            .field("data_boundary", &self.data_boundary)
+            .field("data_plane", &self.data_plane)
             .finish_non_exhaustive()
     }
 }

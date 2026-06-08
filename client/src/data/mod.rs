@@ -97,4 +97,4 @@ pub(crate) struct WorkerBlockSyncResult {
     pub(crate) block_stamp: u64,
 }
 
-pub(crate) use worker::DataPlaneBoundary;
+pub(crate) use worker::WorkerDataPlane;

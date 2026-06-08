@@ -407,21 +407,21 @@ impl WorkerDataClient for TonicWorkerDataClient {
     }
 }
 
-/// Internal data-plane boundary holder used by the public facade.
+/// Internal worker data-plane holder used by the public facade.
 #[derive(Clone)]
-pub(crate) struct DataPlaneBoundary {
+pub(crate) struct WorkerDataPlane {
     client: Arc<dyn WorkerDataClient>,
     worker_endpoint_cache: Option<WorkerEndpointCache>,
     grpc_protocol: WorkerNetProtocol,
 }
 
-impl DataPlaneBoundary {
-    /// Create a data-plane boundary.
+impl WorkerDataPlane {
+    /// Create a worker data-plane.
     pub(crate) fn new() -> Self {
         Self::with_tonic_client(Arc::new(TonicWorkerDataClient::new()))
     }
 
-    /// Create a data-plane boundary from client config.
+    /// Create a worker data-plane from client config.
     pub(crate) fn from_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> Self {
         Self::with_tonic_client(Arc::new(TonicWorkerDataClient::from_config(config, metrics)))
     }
@@ -429,12 +429,12 @@ impl DataPlaneBoundary {
     fn with_tonic_client(client: Arc<TonicWorkerDataClient>) -> Self {
         let worker_endpoint_cache = client.endpoint_cache();
         let client: Arc<dyn WorkerDataClient> = client;
-        let mut boundary = Self::with_client(client);
-        boundary.worker_endpoint_cache = Some(worker_endpoint_cache);
-        boundary
+        let mut data_plane = Self::with_client(client);
+        data_plane.worker_endpoint_cache = Some(worker_endpoint_cache);
+        data_plane
     }
 
-    /// Create a data-plane boundary around an already selected worker client implementation.
+    /// Create a worker data-plane around an already selected worker client implementation.
     pub(crate) fn with_client(client: Arc<dyn WorkerDataClient>) -> Self {
         let grpc_protocol = WorkerNetProtocol::Grpc;
         ensure_supported_worker_protocol(grpc_protocol).expect("gRPC must be supported");
@@ -534,15 +534,15 @@ impl DataPlaneBoundary {
     }
 }
 
-impl fmt::Debug for DataPlaneBoundary {
+impl fmt::Debug for WorkerDataPlane {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DataPlaneBoundary")
+        f.debug_struct("WorkerDataPlane")
             .field("grpc_protocol", &self.grpc_protocol)
             .finish_non_exhaustive()
     }
 }
 
-impl Default for DataPlaneBoundary {
+impl Default for WorkerDataPlane {
     fn default() -> Self {
         Self::new()
     }
@@ -1131,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_data_boundary_accepts_grpc_protocol() {
+    fn data_plane_accepts_grpc_protocol() {
         assert!(ensure_supported_worker_protocol(WorkerNetProtocol::Grpc).is_ok());
     }
 
@@ -1348,7 +1348,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_data_boundary_returns_unsupported_for_quic_and_rdma() {
+    fn data_plane_returns_unsupported_for_quic_and_rdma() {
         for protocol in [WorkerNetProtocol::Quic, WorkerNetProtocol::Rdma] {
             let err = ensure_supported_worker_protocol(protocol).expect_err("known non-GRPC protocol is unsupported");
 
@@ -1957,12 +1957,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn data_boundary_rejects_zero_block_stamp_before_worker_io() {
+    async fn data_plane_rejects_zero_block_stamp_before_worker_io() {
         let worker = Arc::new(CountingWorkerDataClient::default());
-        let boundary = DataPlaneBoundary::with_client(worker.clone());
+        let data_plane = WorkerDataPlane::with_client(worker.clone());
         let segment = planned_segment(0);
 
-        let err = boundary
+        let err = data_plane
             .read_all(data_attempt_context(), test_group_name(), &[segment])
             .await
             .expect_err("zero stamp must fail before worker IO");

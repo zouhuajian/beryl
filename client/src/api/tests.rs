@@ -9,7 +9,7 @@ use super::*;
 use crate::canonical::{ClientAction, RefreshHint};
 use crate::config::ClientConfig;
 use crate::data::{
-    DataPlaneBoundary, WorkerBlockSyncResult, WorkerCommitResult, WorkerDataClient, WorkerWriteBlock, WorkerWriteTarget,
+    WorkerBlockSyncResult, WorkerCommitResult, WorkerDataClient, WorkerDataPlane, WorkerWriteBlock, WorkerWriteTarget,
 };
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::{
@@ -336,8 +336,8 @@ async fn list_options_map_to_metadata_request() {
 async fn reader_empty_ranges_do_not_use_worker_io() {
     let gateway = Arc::new(MockGateway::default());
     let worker = Arc::new(MockDataClient::default());
-    let client =
-        FsClient::with_data_boundary(test_config("root"), gateway, data_boundary(worker.clone())).expect("client");
+    let client = FsClient::with_data_plane(test_config("root"), gateway, data_plane(worker.clone()))
+        .expect("client");
     let reader = read_reader(&client, 10);
 
     assert!(reader.read_at(0, 0).await.expect("zero read").is_empty());
@@ -356,8 +356,8 @@ async fn reader_reads_normal_range_through_planner_and_worker() {
         vec![location(202, 0, 0, 16)],
     )));
     let worker = Arc::new(MockDataClient::from_file(b"abcdefghijklmnop"));
-    let client =
-        FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker)).expect("client");
+    let client = FsClient::with_data_plane(test_config("root"), gateway.clone(), data_plane(worker))
+        .expect("client");
     let reader = read_reader(&client, 16);
 
     let bytes = reader.read_at(2, 5).await.expect("read succeeds");
@@ -383,8 +383,8 @@ async fn reader_repeated_reads_fetch_current_metadata_locations() {
         vec![location(202, 0, 0, 16)],
     )));
     let worker = Arc::new(MockDataClient::from_file(b"abcdefghijklmnop"));
-    let client =
-        FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker)).expect("client");
+    let client = FsClient::with_data_plane(test_config("root"), gateway.clone(), data_plane(worker))
+        .expect("client");
     let reader = read_reader(&client, 16);
 
     let first = reader.read_at(2, 5).await.expect("first read succeeds");
@@ -406,8 +406,8 @@ async fn concurrent_reader_reads_fetch_layout_per_call() {
         vec![location(202, 0, 0, 16)],
     )));
     let worker = Arc::new(MockDataClient::from_file(b"abcdefghijklmnop"));
-    let client =
-        FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker)).expect("client");
+    let client = FsClient::with_data_plane(test_config("root"), gateway.clone(), data_plane(worker))
+        .expect("client");
     let reader = read_reader(&client, 16);
 
     let first = {
@@ -441,8 +441,8 @@ async fn reader_replans_after_worker_refresh() {
         b"abcdefghijklmnop",
         RefreshReason::WorkerRunMismatch,
     ));
-    let client =
-        FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker)).expect("client");
+    let client = FsClient::with_data_plane(test_config("root"), gateway.clone(), data_plane(worker))
+        .expect("client");
     let reader = read_reader(&client, 16);
 
     let bytes = reader.read_at(1, 3).await.expect("read succeeds after refresh");
@@ -485,8 +485,9 @@ async fn writer_debug_redacts_write_session_identity_names() {
 async fn writer_write_all_and_close_commit_final_size() {
     let gateway = Arc::new(MockGateway::default());
     let worker = Arc::new(MockDataClient::default());
-    let client = FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker.clone()))
-        .expect("client");
+    let client =
+        FsClient::with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
+            .expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
         .await
@@ -510,8 +511,9 @@ async fn writer_create_uses_metadata_layout_block_size_for_chunking() {
     let layout = recorded_layout_values(8, 4);
     let gateway = Arc::new(MockGateway::default());
     let worker = Arc::new(MockDataClient::default());
-    let client = FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker.clone()))
-        .expect("client");
+    let client =
+        FsClient::with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
+            .expect("client");
     let mut writer = client
         .create(
             "/created",
@@ -545,8 +547,9 @@ async fn writer_append_uses_metadata_layout_block_size_for_chunking() {
     let layout = recorded_layout_values(6, 3);
     let gateway = Arc::new(MockGateway::with_append_write_layout(layout));
     let worker = Arc::new(MockDataClient::default());
-    let client = FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker.clone()))
-        .expect("client");
+    let client =
+        FsClient::with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
+            .expect("client");
     let mut writer = client
         .append("/append", AppendOptions::default())
         .await
@@ -579,8 +582,9 @@ async fn writer_append_uses_metadata_layout_block_size_for_chunking() {
 async fn writer_default_create_layout_uses_default_block_size_for_chunking() {
     let gateway = Arc::new(MockGateway::default());
     let worker = Arc::new(MockDataClient::without_recorded_body());
-    let client = FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker.clone()))
-        .expect("client");
+    let client =
+        FsClient::with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
+            .expect("client");
     let mut writer = client
         .create("/created", CreateOptions::default())
         .await
@@ -608,8 +612,9 @@ async fn writer_default_create_layout_uses_default_block_size_for_chunking() {
 async fn writer_multiple_sequential_writes_preserve_cursor_and_final_size() {
     let gateway = Arc::new(MockGateway::default());
     let worker = Arc::new(MockDataClient::default());
-    let client = FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker.clone()))
-        .expect("client");
+    let client =
+        FsClient::with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
+            .expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
         .await
@@ -635,8 +640,9 @@ async fn writer_multiple_sequential_writes_preserve_cursor_and_final_size() {
 async fn writer_visibility_sync_publishes_prefix_and_keeps_writer_usable() {
     let gateway = Arc::new(MockGateway::default());
     let worker = Arc::new(MockDataClient::default());
-    let client = FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker.clone()))
-        .expect("client");
+    let client =
+        FsClient::with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
+            .expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
         .await
@@ -668,8 +674,9 @@ async fn writer_visibility_sync_publishes_prefix_and_keeps_writer_usable() {
 async fn writer_durability_sync_publishes_prefix_and_keeps_writer_usable() {
     let gateway = Arc::new(MockGateway::default());
     let worker = Arc::new(MockDataClient::default());
-    let client = FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker.clone()))
-        .expect("client");
+    let client =
+        FsClient::with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
+            .expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
         .await
@@ -701,8 +708,9 @@ async fn writer_durability_sync_publishes_prefix_and_keeps_writer_usable() {
 async fn writer_durability_after_visibility_uses_sync_committed_block() {
     let gateway = Arc::new(MockGateway::default());
     let worker = Arc::new(MockDataClient::default());
-    let client = FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker.clone()))
-        .expect("client");
+    let client =
+        FsClient::with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
+            .expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
         .await
@@ -733,7 +741,8 @@ async fn writer_durability_after_visibility_uses_sync_committed_block() {
 async fn writer_renew_lease_updates_session_state() {
     let gateway = Arc::new(MockGateway::default());
     let worker = Arc::new(MockDataClient::default());
-    let client = FsClient::with_data_boundary(test_config("root"), gateway, data_boundary(worker)).expect("client");
+    let client =
+        FsClient::with_data_plane(test_config("root"), gateway, data_plane(worker)).expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
         .await
@@ -751,8 +760,9 @@ async fn writer_abort_cleans_worker_then_metadata_and_blocks_session() {
     let events = event_log();
     let gateway = Arc::new(MockGateway::with_events(events.clone()));
     let worker = Arc::new(MockDataClient::with_events(events.clone()));
-    let client = FsClient::with_data_boundary(test_config("root"), gateway.clone(), data_boundary(worker.clone()))
-        .expect("client");
+    let client =
+        FsClient::with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
+            .expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
         .await
@@ -776,10 +786,10 @@ async fn writer_unknown_add_block_blocks_followup_writes() {
         AddBlockOutcome::TransportUnknown,
     ]));
     let worker = Arc::new(MockDataClient::default());
-    let client = FsClient::with_data_boundary(
+    let client = FsClient::with_data_plane(
         test_config_with_retries("root", 0),
         gateway.clone(),
-        data_boundary(worker),
+        data_plane(worker),
     )
     .expect("client");
     let mut writer = client
@@ -805,7 +815,8 @@ async fn writer_unknown_add_block_blocks_followup_writes() {
 async fn writer_session_expiry_blocks_followup_writes() {
     let gateway = Arc::new(MockGateway::with_renew_outcomes(vec![RenewOutcome::SessionExpired]));
     let worker = Arc::new(MockDataClient::default());
-    let client = FsClient::with_data_boundary(test_config("root"), gateway, data_boundary(worker)).expect("client");
+    let client =
+        FsClient::with_data_plane(test_config("root"), gateway, data_plane(worker)).expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
         .await
@@ -1554,8 +1565,8 @@ impl WorkerDataClient for MockDataClient {
     }
 }
 
-fn data_boundary(client: Arc<MockDataClient>) -> DataPlaneBoundary {
-    DataPlaneBoundary::with_client(client)
+fn data_plane(client: Arc<MockDataClient>) -> WorkerDataPlane {
+    WorkerDataPlane::with_client(client)
 }
 
 fn read_reader(client: &FsClient, file_size: u64) -> FileReader {
