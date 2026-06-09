@@ -138,12 +138,6 @@ lock the root to one metadata group.
 | `client.backoff.initial_ms` | `100` | non-negative integer | Retry initial backoff. |
 | `client.backoff.max_ms` | `5000` | non-negative integer >= initial | Retry maximum backoff. |
 | `client.backoff.multiplier` | `2.0` | finite number >= 1.0 | Retry backoff multiplier. |
-| `client.cache.worker_endpoint.enabled` | `false` | boolean | Metadata-authoritative worker endpoint cache. |
-| `client.cache.worker_endpoint.ttl_secs` | `0` | non-negative integer | Cache TTL; zero means immediate expiry. |
-| `client.cache.worker_endpoint.max_entries` | `1024` | positive when cache enabled | Worker endpoint cache capacity. |
-| `client.cache.worker_endpoint.health.enabled` | `true` | boolean | Temporary endpoint penalty switch. |
-| `client.cache.worker_endpoint.health.failure_threshold` | `2` | positive when health enabled | Consecutive failure threshold. |
-| `client.cache.worker_endpoint.health.ttl_secs` | `5` | non-negative integer | Endpoint penalty TTL. |
 | `client.channel_pool.metadata.enabled` | `true` | boolean | Metadata channel pool switch. |
 | `client.channel_pool.metadata.max_per_group` | `1` | positive integer | Max metadata channels per group. |
 | `client.channel_pool.worker.enabled` | `true` | boolean | Worker channel pool switch. |

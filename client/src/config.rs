@@ -5,7 +5,6 @@
 
 use common::{ClientConfig as CommonClientConfig, CommonError, FlatConfig};
 use std::path::Path;
-use std::time::Duration;
 use types::GroupName;
 
 pub const DEFAULT_CLIENT_NAME: &str = "default_client";
@@ -17,8 +16,6 @@ pub struct ClientConfig {
     pub inner: CommonClientConfig,
     /// Low-cardinality display identity carried in request headers.
     pub client_name: String,
-    /// Cache configuration.
-    pub cache: CacheConfig,
     /// Retry configuration.
     pub retry: RetryConfig,
     /// Refresh configuration.
@@ -31,23 +28,6 @@ pub struct ClientConfig {
     pub metadata_endpoints: Vec<String>,
     /// Configured metadata owner groups used as bootstrap targets.
     pub metadata_group_names: Vec<GroupName>,
-}
-
-/// Cache configuration.
-#[derive(Clone, Debug)]
-pub struct CacheConfig {
-    /// Enable metadata-authoritative worker endpoint cache reuse.
-    pub worker_endpoint_cache_enabled: bool,
-    /// TTL for worker endpoint cache entries.
-    pub worker_endpoint_cache_ttl: Duration,
-    /// Maximum number of worker endpoint cache entries.
-    pub worker_endpoint_cache_max_entries: usize,
-    /// Enable temporary endpoint health penalties after repeated failures.
-    pub endpoint_health_enabled: bool,
-    /// Consecutive failure threshold before an endpoint is temporarily unhealthy.
-    pub endpoint_health_failure_threshold: usize,
-    /// Temporary endpoint health penalty TTL.
-    pub endpoint_health_ttl: Duration,
 }
 
 /// Channel/client pool configuration.
@@ -157,7 +137,6 @@ impl ClientConfig {
     /// Create from FlatConfig.
     pub fn from_flat(flat: FlatConfig) -> Result<Self, CommonError> {
         let client_name = client_name_from_flat(&flat)?;
-        let cache = cache_config_from_flat(&flat)?;
 
         let retry = retry_config_from_flat(&flat)?;
         let refresh = refresh_config_from_flat(&flat)?;
@@ -180,7 +159,6 @@ impl ClientConfig {
         Ok(Self {
             inner: CommonClientConfig::from_flat(flat),
             client_name,
-            cache,
             retry,
             refresh,
             backoff,
@@ -212,44 +190,6 @@ fn client_name_from_flat(flat: &FlatConfig) -> Result<String, CommonError> {
         return Err(invalid_config("client.name", "must not be blank"));
     }
     Ok(name)
-}
-
-fn cache_config_from_flat(flat: &FlatConfig) -> Result<CacheConfig, CommonError> {
-    let worker_endpoint_cache_enabled = get_bool_or(flat, "client.cache.worker_endpoint.enabled", false)?;
-    let worker_endpoint_cache_ttl =
-        Duration::from_secs(get_u64_or_strict(flat, "client.cache.worker_endpoint.ttl_secs", 0)?);
-    let worker_endpoint_cache_max_entries =
-        get_usize_or_strict(flat, "client.cache.worker_endpoint.max_entries", 1024)?;
-    let endpoint_health_enabled = get_bool_or(flat, "client.cache.worker_endpoint.health.enabled", true)?;
-    let endpoint_health_failure_threshold =
-        get_usize_or_strict(flat, "client.cache.worker_endpoint.health.failure_threshold", 2)?;
-    let endpoint_health_ttl = Duration::from_secs(get_u64_or_strict(
-        flat,
-        "client.cache.worker_endpoint.health.ttl_secs",
-        5,
-    )?);
-
-    if worker_endpoint_cache_enabled && worker_endpoint_cache_max_entries == 0 {
-        return Err(invalid_config(
-            "client.cache.worker_endpoint.max_entries",
-            "must be greater than zero when worker endpoint cache is enabled",
-        ));
-    }
-    if endpoint_health_enabled && endpoint_health_failure_threshold == 0 {
-        return Err(invalid_config(
-            "client.cache.worker_endpoint.health.failure_threshold",
-            "must be greater than zero when endpoint health is enabled",
-        ));
-    }
-
-    Ok(CacheConfig {
-        worker_endpoint_cache_enabled,
-        worker_endpoint_cache_ttl,
-        worker_endpoint_cache_max_entries,
-        endpoint_health_enabled,
-        endpoint_health_failure_threshold,
-        endpoint_health_ttl,
-    })
 }
 
 fn channel_pool_config_from_flat(flat: &FlatConfig) -> Result<ChannelPoolConfig, CommonError> {
@@ -441,15 +381,9 @@ mod tests {
     }
 
     #[test]
-    fn default_config_has_bounded_cache_and_pool_settings() {
+    fn default_config_has_bounded_pool_settings() {
         let config = ClientConfig::default();
 
-        assert!(!config.cache.worker_endpoint_cache_enabled);
-        assert_eq!(config.cache.worker_endpoint_cache_max_entries, 1024);
-        assert!(config.cache.worker_endpoint_cache_ttl.is_zero());
-        assert!(config.cache.endpoint_health_enabled);
-        assert_eq!(config.cache.endpoint_health_failure_threshold, 2);
-        assert_eq!(config.cache.endpoint_health_ttl, std::time::Duration::from_secs(5));
         assert!(config.channel_pool.metadata_channel_pool_enabled);
         assert_eq!(config.channel_pool.metadata_channel_pool_max_per_group, 1);
         assert!(config.channel_pool.worker_channel_pool_enabled);
@@ -482,30 +416,15 @@ mod tests {
     }
 
     #[test]
-    fn cache_and_pool_config_is_loaded_from_flat_config() {
+    fn channel_pool_config_is_loaded_from_flat_config() {
         let mut flat = FlatConfig::new();
-        flat.set("client.cache.worker_endpoint.enabled", true);
-        flat.set("client.cache.worker_endpoint.ttl_secs", 45i64);
-        flat.set("client.cache.worker_endpoint.max_entries", 9i64);
-        flat.set("client.cache.worker_endpoint.health.enabled", false);
-        flat.set("client.cache.worker_endpoint.health.failure_threshold", 4i64);
-        flat.set("client.cache.worker_endpoint.health.ttl_secs", 12i64);
         flat.set("client.channel_pool.metadata.enabled", false);
         flat.set("client.channel_pool.metadata.max_per_group", 2i64);
         flat.set("client.channel_pool.worker.enabled", false);
         flat.set("client.channel_pool.worker.max_per_worker", 3i64);
 
-        let config = ClientConfig::from_flat(flat).expect("cache and pool config");
+        let config = ClientConfig::from_flat(flat).expect("channel pool config");
 
-        assert!(config.cache.worker_endpoint_cache_enabled);
-        assert_eq!(
-            config.cache.worker_endpoint_cache_ttl,
-            std::time::Duration::from_secs(45)
-        );
-        assert_eq!(config.cache.worker_endpoint_cache_max_entries, 9);
-        assert!(!config.cache.endpoint_health_enabled);
-        assert_eq!(config.cache.endpoint_health_failure_threshold, 4);
-        assert_eq!(config.cache.endpoint_health_ttl, std::time::Duration::from_secs(12));
         assert!(!config.channel_pool.metadata_channel_pool_enabled);
         assert_eq!(config.channel_pool.metadata_channel_pool_max_per_group, 2);
         assert!(!config.channel_pool.worker_channel_pool_enabled);
@@ -513,46 +432,18 @@ mod tests {
     }
 
     #[test]
-    fn zero_worker_endpoint_cache_ttl_is_explicit_and_forces_miss_behavior() {
-        let mut flat = FlatConfig::new();
-        flat.set("client.cache.worker_endpoint.enabled", true);
-        flat.set("client.cache.worker_endpoint.ttl_secs", 0i64);
-        flat.set("client.cache.worker_endpoint.max_entries", 4i64);
-
-        let config = ClientConfig::from_flat(flat).expect("zero ttl is valid");
-
-        assert!(config.cache.worker_endpoint_cache_enabled);
-        assert!(config.cache.worker_endpoint_cache_ttl.is_zero());
-        assert_eq!(config.cache.worker_endpoint_cache_max_entries, 4);
-    }
-
-    #[test]
-    fn invalid_cache_and_pool_config_is_rejected() {
+    fn invalid_channel_pool_config_is_rejected() {
         for (key, value) in [
-            ("client.cache.worker_endpoint.ttl_secs", -1i64),
             ("client.channel_pool.metadata.max_per_group", 0i64),
             ("client.channel_pool.worker.max_per_worker", 0i64),
         ] {
             let mut flat = FlatConfig::new();
             flat.set(key, value);
 
-            let err = ClientConfig::from_flat(flat).expect_err("invalid cache or pool config must fail");
+            let err = ClientConfig::from_flat(flat).expect_err("invalid pool config must fail");
 
             assert!(format!("{err}").contains(key));
         }
-
-        let mut flat = FlatConfig::new();
-        flat.set("client.cache.worker_endpoint.enabled", true);
-        flat.set("client.cache.worker_endpoint.max_entries", 0i64);
-
-        let err = ClientConfig::from_flat(flat).expect_err("enabled cache must be bounded");
-
-        assert!(format!("{err}").contains("client.cache.worker_endpoint.max_entries"));
-
-        let mut flat = FlatConfig::new();
-        flat.set("client.cache.worker_endpoint.enabled", "sometimes");
-        let err = ClientConfig::from_flat(flat).expect_err("invalid bool must fail");
-        assert!(format!("{err}").contains("client.cache.worker_endpoint.enabled"));
     }
 
     #[test]

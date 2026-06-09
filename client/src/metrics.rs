@@ -56,22 +56,6 @@ pub(crate) enum ClientMetric {
     UnsafeReplayDenied,
     /// Backoff delay selected.
     BackoffDelay,
-    /// Worker endpoint cache lookup attempted.
-    WorkerEndpointCacheLookup,
-    /// Worker endpoint cache hit.
-    WorkerEndpointCacheHit,
-    /// Worker endpoint cache miss.
-    WorkerEndpointCacheMiss,
-    /// Worker endpoint cache entry expired.
-    WorkerEndpointCacheExpired,
-    /// Worker endpoint cache entry invalidated.
-    WorkerEndpointCacheInvalidate,
-    /// Worker endpoint cache entry evicted.
-    WorkerEndpointCacheEvict,
-    /// Worker endpoint health recorded a failure threshold event.
-    WorkerEndpointHealthFailure,
-    /// Worker endpoint health recovered after TTL.
-    WorkerEndpointHealthRecovery,
     /// Metadata channel pool hit.
     MetadataChannelPoolHit,
     /// Metadata channel pool miss.
@@ -84,8 +68,6 @@ pub(crate) enum ClientMetric {
     ChannelPoolConnectError,
     /// Precise cache invalidation was used.
     CachePreciseInvalidation,
-    /// Broad invalidation fallback was used.
-    CacheBroadInvalidationFallback,
     /// Client-side RPC timeout fired.
     RpcTimeout,
 }
@@ -154,12 +136,6 @@ impl ClientMetricLabels {
     /// Attach a cache label.
     pub(crate) fn with_cache(mut self, cache: &'static str) -> Self {
         self.cache = Some(cache);
-        self
-    }
-
-    /// Attach a reason label.
-    pub(crate) fn with_reason(mut self, reason: &'static str) -> Self {
-        self.reason = Some(reason);
         self
     }
 

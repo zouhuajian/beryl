@@ -40,9 +40,6 @@ tracing = { workspace = true }
 # Metrics
 metrics = { workspace = true }
 
-# LRU cache
-lru = { workspace = true }
-
 [dev-dependencies]
 tokio-test = { workspace = true }
 assert_fs = { workspace = true }

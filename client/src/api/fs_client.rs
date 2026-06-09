@@ -102,8 +102,7 @@ impl FsClient {
         metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
         let identity = ClientIdentity::generate(config.client_name.clone())?;
-        let refresh_manager = RefreshManager::from_config(&config.metadata_group_names, &config.metadata_endpoints)?
-            .with_worker_endpoint_cache(data_plane.worker_endpoint_cache());
+        let refresh_manager = RefreshManager::from_config(&config.metadata_group_names, &config.metadata_endpoints)?;
         let executor = OperationExecutor::with_runtime(
             identity,
             gateway,
@@ -815,11 +814,8 @@ impl FsClient {
                         .worker_rpc_with_timeout(
                             "SyncCommittedBlock",
                             OperationKind::WorkerWriteData,
-                            self.data_plane.sync_committed_block(
-                                ctx,
-                                pending.worker_block(),
-                                pending.written_len(),
-                            ),
+                            self.data_plane
+                                .sync_committed_block(ctx, pending.worker_block(), pending.written_len()),
                         )
                         .await
                     {

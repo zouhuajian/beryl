@@ -17,7 +17,7 @@ use types::chunk::ByteRange;
 use types::{GroupName, WorkerEndpointInfo, WorkerNetProtocol, WriteTarget};
 
 use super::{WorkerBlockSyncResult, WorkerCommitResult, WorkerDataClient, WorkerWriteBlock, WorkerWriteTarget};
-use crate::cache::{CacheInvalidationReason, WorkerEndpointCache};
+use crate::cache::CacheInvalidationReason;
 use crate::canonical::{invalid_header_action, validate_data_header_or_action};
 use crate::config::ClientConfig;
 use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult};
@@ -28,7 +28,6 @@ use crate::runtime::{AttemptContext, ErrorClass, ErrorClassifier, RefreshReason}
 #[derive(Debug)]
 struct TonicWorkerDataClient {
     channels: RwLock<std::collections::HashMap<WorkerChannelKey, tonic_net::Channel>>,
-    endpoint_cache: WorkerEndpointCache,
     channel_pool_enabled: bool,
     max_channels_per_worker: usize,
     metrics: Arc<dyn ClientMetrics>,
@@ -36,35 +35,24 @@ struct TonicWorkerDataClient {
 
 impl TonicWorkerDataClient {
     fn new() -> Self {
-        Self::with_parts(WorkerEndpointCache::disabled(), true, 1, Arc::new(NoopClientMetrics))
+        Self::with_parts(true, 1, Arc::new(NoopClientMetrics))
     }
 
     fn from_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> Self {
         Self::with_parts(
-            WorkerEndpointCache::from_config(&config.cache, Arc::clone(&metrics)),
             config.channel_pool.worker_channel_pool_enabled,
             config.channel_pool.worker_channel_pool_max_per_worker,
             metrics,
         )
     }
 
-    fn with_parts(
-        endpoint_cache: WorkerEndpointCache,
-        channel_pool_enabled: bool,
-        max_channels_per_worker: usize,
-        metrics: Arc<dyn ClientMetrics>,
-    ) -> Self {
+    fn with_parts(channel_pool_enabled: bool, max_channels_per_worker: usize, metrics: Arc<dyn ClientMetrics>) -> Self {
         Self {
             channels: RwLock::new(std::collections::HashMap::new()),
-            endpoint_cache,
             channel_pool_enabled,
             max_channels_per_worker: max_channels_per_worker.max(1),
             metrics,
         }
-    }
-
-    fn endpoint_cache(&self) -> WorkerEndpointCache {
-        self.endpoint_cache.clone()
     }
 
     async fn client(
@@ -72,7 +60,7 @@ impl TonicWorkerDataClient {
         candidate: &WorkerEndpointInfo,
         operation: &'static str,
     ) -> ClientResult<WorkerDataServiceClient<tonic_net::Channel>> {
-        let candidate = self.endpoint_cache.get_or_resolve_authoritative(candidate).await?;
+        ensure_supported_worker_protocol(candidate.worker_net_protocol)?;
         let endpoint = normalize_endpoint(&candidate.endpoint)?;
         let key = WorkerChannelKey {
             worker_id: candidate.worker_id.as_raw(),
@@ -130,14 +118,6 @@ impl TonicWorkerDataClient {
         channel
     }
 
-    fn invalidate_endpoint(&self, candidate: &WorkerEndpointInfo, reason: CacheInvalidationReason) {
-        self.endpoint_cache.invalidate_candidate(candidate, reason);
-    }
-
-    fn record_endpoint_failure(&self, candidate: &WorkerEndpointInfo, reason: CacheInvalidationReason) {
-        self.endpoint_cache.record_candidate_failure(candidate, reason);
-    }
-
     fn invalidate_channel(&self, candidate: &WorkerEndpointInfo, reason: CacheInvalidationReason) {
         if let Ok(endpoint) = normalize_endpoint(&candidate.endpoint) {
             let key = WorkerChannelKey {
@@ -160,7 +140,6 @@ impl TonicWorkerDataClient {
         let Some(reason) = worker_identity_mismatch_invalidation_reason(err) else {
             return;
         };
-        self.invalidate_endpoint(candidate, reason);
         self.invalidate_channel(candidate, reason);
     }
 
@@ -218,20 +197,15 @@ impl WorkerDataClient for TonicWorkerDataClient {
     ) -> ClientResult<Bytes> {
         let mut last_transport_error = None;
         for candidate in &segment.workers {
-            ensure_supported_worker_protocol(candidate.worker_net_protocol)?;
             let mut client = match self.client(candidate, "read").await {
                 Ok(client) => client,
-                Err(err) if is_endpoint_health_error(&err) => {
-                    last_transport_error = Some(err);
-                    continue;
-                }
                 Err(err) => return Err(err),
             };
             let request = build_open_read_stream_request(&ctx, &group_name, segment, candidate)?;
             let open_response = match client.open_read_stream(tonic_request(&ctx, request)).await {
                 Ok(response) => response.into_inner(),
                 Err(status) if is_retryable_worker_status(&status) => {
-                    self.record_endpoint_failure(candidate, CacheInvalidationReason::Unavailable);
+                    self.invalidate_channel(candidate, CacheInvalidationReason::Unavailable);
                     last_transport_error = Some(ClientError::from(status));
                     continue;
                 }
@@ -269,20 +243,15 @@ impl WorkerDataClient for TonicWorkerDataClient {
         validate_worker_write_target(&target)?;
         let mut last_transport_error = None;
         for candidate in &target.target.worker_endpoints {
-            ensure_supported_worker_protocol(candidate.worker_net_protocol)?;
             let mut client = match self.client(candidate, "write").await {
                 Ok(client) => client,
-                Err(err) if is_endpoint_health_error(&err) => {
-                    last_transport_error = Some(err);
-                    continue;
-                }
                 Err(err) => return Err(err),
             };
             let request = build_open_write_stream_request(&ctx, &target, candidate)?;
             let response = match client.open_write_stream(tonic_request(&ctx, request)).await {
                 Ok(response) => response.into_inner(),
                 Err(status) if is_retryable_worker_status(&status) => {
-                    self.record_endpoint_failure(candidate, CacheInvalidationReason::Unavailable);
+                    self.invalidate_channel(candidate, CacheInvalidationReason::Unavailable);
                     last_transport_error = Some(ClientError::UnknownOutcome(format!(
                         "worker OpenWriteStream outcome is unknown after transport status {}: {}",
                         status.code(),
@@ -411,43 +380,25 @@ impl WorkerDataClient for TonicWorkerDataClient {
 #[derive(Clone)]
 pub(crate) struct WorkerDataPlane {
     client: Arc<dyn WorkerDataClient>,
-    worker_endpoint_cache: Option<WorkerEndpointCache>,
     grpc_protocol: WorkerNetProtocol,
 }
 
 impl WorkerDataPlane {
     /// Create a worker data-plane.
     pub(crate) fn new() -> Self {
-        Self::with_tonic_client(Arc::new(TonicWorkerDataClient::new()))
+        Self::with_client(Arc::new(TonicWorkerDataClient::new()))
     }
 
     /// Create a worker data-plane from client config.
     pub(crate) fn from_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> Self {
-        Self::with_tonic_client(Arc::new(TonicWorkerDataClient::from_config(config, metrics)))
-    }
-
-    fn with_tonic_client(client: Arc<TonicWorkerDataClient>) -> Self {
-        let worker_endpoint_cache = client.endpoint_cache();
-        let client: Arc<dyn WorkerDataClient> = client;
-        let mut data_plane = Self::with_client(client);
-        data_plane.worker_endpoint_cache = Some(worker_endpoint_cache);
-        data_plane
+        Self::with_client(Arc::new(TonicWorkerDataClient::from_config(config, metrics)))
     }
 
     /// Create a worker data-plane around an already selected worker client implementation.
     pub(crate) fn with_client(client: Arc<dyn WorkerDataClient>) -> Self {
         let grpc_protocol = WorkerNetProtocol::Grpc;
         ensure_supported_worker_protocol(grpc_protocol).expect("gRPC must be supported");
-        Self {
-            client,
-            worker_endpoint_cache: None,
-            grpc_protocol,
-        }
-    }
-
-    /// Return the worker endpoint cache when the tonic client owns one.
-    pub(crate) fn worker_endpoint_cache(&self) -> Option<WorkerEndpointCache> {
-        self.worker_endpoint_cache.clone()
+        Self { client, grpc_protocol }
     }
 
     pub(crate) async fn read_all(
@@ -1049,10 +1000,6 @@ fn worker_identity_mismatch_invalidation_reason(err: &ClientError) -> Option<Cac
     }
 }
 
-fn is_endpoint_health_error(err: &ClientError) -> bool {
-    matches!(err, ClientError::Worker(message) if message.contains("temporarily unavailable"))
-}
-
 fn default_frame_size(len: u32) -> u32 {
     len.clamp(1, 1024 * 1024)
 }
@@ -1096,14 +1043,12 @@ mod tests {
     use proto::convert::canonical_to_error_detail;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
-    use std::time::Duration;
     use types::lease::FencingToken;
     use types::{
         BlockId, BlockIndex, ClientId, DataHandleId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol, WriteTarget,
     };
 
     use crate::canonical::ClientAction;
-    use crate::metrics::NoopClientMetrics;
     use crate::planner::read_planner::PlannedReadSegment;
     use crate::runtime::{ErrorClass, ErrorClassifier, OperationContext, OperationIdentity, OperationKind};
 
@@ -1138,12 +1083,7 @@ mod tests {
     #[tokio::test]
     async fn worker_channel_pool_reuses_channel_for_same_worker_endpoint() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let client = TonicWorkerDataClient::with_parts(
-            WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone()),
-            true,
-            1,
-            metrics.clone(),
-        );
+        let client = TonicWorkerDataClient::with_parts(true, 1, metrics.clone());
         let candidate = worker_endpoint();
 
         let _first = client.client(&candidate, "read").await.expect("first client");
@@ -1158,12 +1098,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_worker_channel_requests_same_key_reuse_inserted_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let client = Arc::new(TonicWorkerDataClient::with_parts(
-            WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone()),
-            true,
-            8,
-            metrics.clone(),
-        ));
+        let client = Arc::new(TonicWorkerDataClient::with_parts(true, 8, metrics.clone()));
         let candidate = worker_endpoint();
 
         let mut tasks = Vec::with_capacity(8);
@@ -1184,12 +1119,7 @@ mod tests {
     #[tokio::test]
     async fn worker_channel_different_run_does_not_share_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let client = Arc::new(TonicWorkerDataClient::with_parts(
-            WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone()),
-            true,
-            8,
-            metrics,
-        ));
+        let client = Arc::new(TonicWorkerDataClient::with_parts(true, 8, metrics));
         let mut first = worker_endpoint();
         first.worker_run_id = "550e8400-e29b-41d4-a716-446655440007"
             .parse()
@@ -1214,14 +1144,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_identity_mismatch_invalidates_target_endpoint_and_channel() {
+    async fn worker_identity_mismatch_invalidates_target_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let client = TonicWorkerDataClient::with_parts(
-            WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone()),
-            true,
-            1,
-            metrics.clone(),
-        );
+        let client = TonicWorkerDataClient::with_parts(true, 1, metrics.clone());
         let candidate = worker_endpoint();
         let ctx = data_attempt_context();
 
@@ -1231,7 +1156,6 @@ mod tests {
             "worker run mismatch",
         )] {
             let _worker_client = client.client(&candidate, "read").await.expect("worker client");
-            assert_eq!(client.endpoint_cache().len(), 1);
             assert_eq!(client.channels.read().len(), 1);
 
             let err = parse_worker_control_header(
@@ -1245,7 +1169,6 @@ mod tests {
 
             client.invalidate_worker_identity_mismatch(&candidate, &err);
 
-            assert_eq!(client.endpoint_cache().len(), 0);
             assert_eq!(client.channels.read().len(), 0);
         }
         assert_metric(&metrics.events(), ClientMetric::CachePreciseInvalidation);
@@ -1254,12 +1177,7 @@ mod tests {
     #[tokio::test]
     async fn failed_worker_channel_creation_does_not_insert() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let client = Arc::new(TonicWorkerDataClient::with_parts(
-            WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone()),
-            true,
-            8,
-            metrics.clone(),
-        ));
+        let client = Arc::new(TonicWorkerDataClient::with_parts(true, 8, metrics.clone()));
         let mut candidate = worker_endpoint();
         candidate.endpoint = "http://[invalid".to_string();
 
@@ -1281,12 +1199,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_worker_channel_pool_does_not_reuse_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let client = TonicWorkerDataClient::with_parts(
-            WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone()),
-            false,
-            1,
-            metrics.clone(),
-        );
+        let client = TonicWorkerDataClient::with_parts(false, 1, metrics.clone());
         let candidate = worker_endpoint();
 
         let _first = client.client(&candidate, "read").await.expect("first client");
@@ -1308,12 +1221,7 @@ mod tests {
     #[tokio::test]
     async fn unsupported_worker_protocol_does_not_create_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let client = TonicWorkerDataClient::with_parts(
-            WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics),
-            true,
-            1,
-            Arc::new(NoopClientMetrics),
-        );
+        let client = TonicWorkerDataClient::with_parts(true, 1, metrics);
         let mut candidate = worker_endpoint();
         candidate.worker_net_protocol = WorkerNetProtocol::Quic;
 
@@ -1329,12 +1237,7 @@ mod tests {
     #[tokio::test]
     async fn worker_channel_pool_connection_error_is_reported() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let client = TonicWorkerDataClient::with_parts(
-            WorkerEndpointCache::new(true, Duration::from_secs(60), 8, metrics.clone()),
-            true,
-            1,
-            metrics.clone(),
-        );
+        let client = TonicWorkerDataClient::with_parts(true, 1, metrics.clone());
         let mut candidate = worker_endpoint();
         candidate.endpoint = "http://[invalid".to_string();
 

@@ -10,7 +10,6 @@ use parking_lot::RwLock;
 use types::{GroupName, GroupStateWatermark};
 
 use crate::cache::StateIdCache;
-use crate::cache::{CacheInvalidationReason, WorkerEndpointCache};
 use crate::canonical::RefreshHint;
 use crate::error::{ClientError, ClientResult};
 use crate::runtime::classify::RefreshReason;
@@ -39,7 +38,6 @@ struct RefreshState {
 pub struct RefreshManager {
     state: Arc<RwLock<RefreshState>>,
     watermarks: StateIdCache,
-    worker_endpoint_cache: Option<WorkerEndpointCache>,
 }
 
 impl RefreshManager {
@@ -59,14 +57,7 @@ impl RefreshManager {
                 route_epoch_cache: HashMap::new(),
             })),
             watermarks: StateIdCache::new(300),
-            worker_endpoint_cache: None,
         })
-    }
-
-    /// Attach the worker endpoint cache owned by the client runtime.
-    pub(crate) fn with_worker_endpoint_cache(mut self, worker_endpoint_cache: Option<WorkerEndpointCache>) -> Self {
-        self.worker_endpoint_cache = worker_endpoint_cache;
-        self
     }
 
     /// Build configured groups from parallel group name and endpoint lists.
@@ -188,8 +179,6 @@ impl RefreshManager {
             | RefreshReason::BlockStampMismatch
             | RefreshReason::Unknown => {}
         }
-        drop(state);
-        self.invalidate_caches_after_refresh(reason);
         Ok(())
     }
 
@@ -218,30 +207,6 @@ impl RefreshManager {
     /// Return cached watermark as proto for a group.
     pub fn state_watermark_proto(&self, group_name: &GroupName) -> Option<proto::common::GroupStateWatermarkProto> {
         self.watermarks.get(group_name).map(|watermark| (&watermark).into())
-    }
-}
-
-impl RefreshManager {
-    fn invalidate_caches_after_refresh(&self, reason: RefreshReason) {
-        match reason {
-            RefreshReason::RouteEpochMismatch => {
-                self.invalidate_worker_endpoints(CacheInvalidationReason::RouteEpoch);
-            }
-            RefreshReason::OwnerGroupMismatch | RefreshReason::MountEpochMismatch => {
-                self.invalidate_worker_endpoints(CacheInvalidationReason::Owner);
-            }
-            RefreshReason::BlockStampMismatch
-            | RefreshReason::WorkerRunMismatch
-            | RefreshReason::StaleState
-            | RefreshReason::Unknown
-            | RefreshReason::NotLeader => {}
-        }
-    }
-
-    fn invalidate_worker_endpoints(&self, reason: CacheInvalidationReason) {
-        if let Some(cache) = &self.worker_endpoint_cache {
-            cache.invalidate_all(reason);
-        }
     }
 }
 
@@ -292,16 +257,12 @@ impl Default for RefreshManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::WorkerEndpointCache;
     use crate::canonical::RefreshHint;
-    use crate::metrics::NoopClientMetrics;
     use crate::runtime::classify::RefreshReason;
     use crate::runtime::policy::OperationKind;
     use crate::runtime::{OperationContext, OperationIdentity};
     use proto::common::{GroupStateWatermarkProto, RaftLogIdProto};
-    use std::sync::Arc;
-    use std::time::Duration;
-    use types::{ClientId, GroupName, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
+    use types::{ClientId, GroupName};
 
     fn manager() -> RefreshManager {
         RefreshManager::new(vec![ConfiguredMetadataGroup {
@@ -485,39 +446,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn route_epoch_refresh_invalidates_attached_worker_endpoint_cache() {
-        let endpoint_cache = seeded_worker_endpoint_cache();
-        let manager = manager().with_worker_endpoint_cache(Some(endpoint_cache.clone()));
-        let op = path_operation();
-
-        manager
-            .record_refresh(
-                &op,
-                RefreshReason::RouteEpochMismatch,
-                &RefreshHint {
-                    route_epoch: Some(23),
-                    ..RefreshHint::default()
-                },
-            )
-            .expect("refresh recorded");
-
-        assert_eq!(endpoint_cache.len(), 0);
-    }
-
-    #[test]
-    fn block_stamp_refresh_does_not_drop_worker_endpoint_cache() {
-        let endpoint_cache = seeded_worker_endpoint_cache();
-        let manager = manager().with_worker_endpoint_cache(Some(endpoint_cache.clone()));
-        let op = path_operation();
-
-        manager
-            .record_refresh(&op, RefreshReason::BlockStampMismatch, &RefreshHint::default())
-            .expect("refresh recorded");
-
-        assert_eq!(endpoint_cache.len(), 1);
-    }
-
     fn watermark_proto(group_name: &str, index: u64) -> GroupStateWatermarkProto {
         GroupStateWatermarkProto {
             group_name: group_name.to_string(),
@@ -531,24 +459,5 @@ mod tests {
 
     fn group_name(raw: &str) -> GroupName {
         GroupName::parse(raw).unwrap()
-    }
-
-    fn seeded_worker_endpoint_cache() -> WorkerEndpointCache {
-        let cache = WorkerEndpointCache::new(true, Duration::from_secs(60), 8, Arc::new(NoopClientMetrics));
-        cache
-            .get_or_insert_authoritative(&worker_endpoint())
-            .expect("seed worker endpoint cache");
-        cache
-    }
-
-    fn worker_endpoint() -> WorkerEndpointInfo {
-        WorkerEndpointInfo {
-            worker_id: WorkerId::new(1),
-            endpoint: "127.0.0.1:19101".to_string(),
-            worker_net_protocol: WorkerNetProtocol::Grpc,
-            worker_run_id: "550e8400-e29b-41d4-a716-446655440000"
-                .parse()
-                .expect("valid test WorkerRunId"),
-        }
     }
 }

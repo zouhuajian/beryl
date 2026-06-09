@@ -264,7 +264,6 @@ fn client_source_tree_has_no_orphan_rust_files() {
         "api/tests.rs",
         "cache/mod.rs",
         "cache/state_id.rs",
-        "cache/worker_endpoint.rs",
         "canonical.rs",
         "config.rs",
         "consistency.rs",

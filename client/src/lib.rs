@@ -39,7 +39,7 @@ pub use api::{AppendOptions, CreateDisposition, CreateOptions, FileReader, FileW
 pub use api::{BlockFormatId, DirectoryEntry, DirectoryListing, FileAttrs, FileStatus, InodeKind};
 pub use api::{ListOptions, OpenOptions};
 pub use config::ClientConfig;
-pub use config::{BackoffConfig, CacheConfig, ChannelPoolConfig, RefreshConfig, RetryConfig};
+pub use config::{BackoffConfig, ChannelPoolConfig, RefreshConfig, RetryConfig};
 pub use consistency::ConsistencyLevel;
 pub use error::{ClientActionError, ClientError, ClientResult};
 pub use modes::{ReadMode, WriteMode};
