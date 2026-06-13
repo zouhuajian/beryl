@@ -9,11 +9,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::sync::Mutex;
-use types::fs::InodeId;
-use types::ids::DataHandleId;
+use types::{DataHandleId, FileLayout, InodeId};
 
 use super::fs_client::FsClient;
-use crate::error::ClientResult;
+use crate::error::{ClientError, ClientResult};
 use crate::session::write_session::WriteSession;
 
 /// A reader for an immutable file snapshot opened through [`FsClient::open`].
@@ -163,6 +162,35 @@ impl ReadHandle {
         }
     }
 
+    pub(crate) fn from_open_response(
+        path: &str,
+        response: proto::metadata::OpenFileResponseProto,
+    ) -> ClientResult<Self> {
+        let Some(inode_id) = response.inode_id else {
+            return Err(ClientError::Metadata(
+                "OpenFileResponseProto.inode_id missing".to_string(),
+            ));
+        };
+        let Some(data_handle_id) = response.data_handle_id else {
+            return Err(ClientError::Metadata(
+                "OpenFileResponseProto.data_handle_id missing".to_string(),
+            ));
+        };
+        let Some(file_version) = response.file_version else {
+            return Err(ClientError::Metadata(
+                "OpenFileResponseProto.file_version missing".to_string(),
+            ));
+        };
+
+        Ok(Self::new(
+            path.to_string(),
+            InodeId::new(inode_id.value),
+            DataHandleId::new(data_handle_id.value),
+            file_version,
+            response.file_size,
+        ))
+    }
+
     pub(crate) fn inode_id(&self) -> InodeId {
         self.inode_id
     }
@@ -210,6 +238,98 @@ impl WriteHandle {
         }
     }
 
+    pub(crate) fn from_create_response(
+        path: &str,
+        response: proto::metadata::CreateFileResponseProto,
+    ) -> ClientResult<Self> {
+        let Some(inode_id) = response.inode_id else {
+            return Err(ClientError::Metadata(
+                "CreateFileResponseProto.inode_id missing".to_string(),
+            ));
+        };
+        let Some(data_handle_id) = response.data_handle_id else {
+            return Err(ClientError::Metadata(
+                "CreateFileResponseProto.data_handle_id missing".to_string(),
+            ));
+        };
+        let Some(layout) = response.layout else {
+            return Err(ClientError::Metadata(
+                "CreateFileResponseProto.layout missing".to_string(),
+            ));
+        };
+        let layout = FileLayout::try_from(layout)
+            .map_err(|err| ClientError::InvalidLayout(format!("CreateFileResponseProto.layout invalid: {err}")))?;
+        let Some(write_handle) = response.write_handle else {
+            return Err(ClientError::Metadata(
+                "CreateFileResponseProto.write_handle missing".to_string(),
+            ));
+        };
+
+        let inode_id = InodeId::new(inode_id.value);
+        let data_handle_id = DataHandleId::new(data_handle_id.value);
+        let session = WriteSession::new(
+            path.to_string(),
+            inode_id,
+            data_handle_id,
+            layout,
+            write_handle,
+            response.base_size,
+        )?;
+        Ok(Self::new(
+            path.to_string(),
+            inode_id,
+            data_handle_id,
+            response.base_size,
+            session,
+        ))
+    }
+
+    pub(crate) fn from_append_response(
+        path: &str,
+        response: proto::metadata::AppendFileResponseProto,
+    ) -> ClientResult<Self> {
+        let Some(inode_id) = response.inode_id else {
+            return Err(ClientError::Metadata(
+                "AppendFileResponseProto.inode_id missing".to_string(),
+            ));
+        };
+        let Some(data_handle_id) = response.data_handle_id else {
+            return Err(ClientError::Metadata(
+                "AppendFileResponseProto.data_handle_id missing".to_string(),
+            ));
+        };
+        let Some(layout) = response.layout else {
+            return Err(ClientError::Metadata(
+                "AppendFileResponseProto.layout missing".to_string(),
+            ));
+        };
+        let layout = FileLayout::try_from(layout)
+            .map_err(|err| ClientError::InvalidLayout(format!("AppendFileResponseProto.layout invalid: {err}")))?;
+        let Some(write_handle) = response.write_handle else {
+            return Err(ClientError::Metadata(
+                "AppendFileResponseProto.write_handle missing".to_string(),
+            ));
+        };
+
+        let inode_id = InodeId::new(inode_id.value);
+        let data_handle_id = DataHandleId::new(data_handle_id.value);
+        let session = WriteSession::new(
+            path.to_string(),
+            inode_id,
+            data_handle_id,
+            layout,
+            write_handle,
+            response.base_size,
+        )?;
+        Ok(Self::new(
+            path.to_string(),
+            inode_id,
+            data_handle_id,
+            response.base_size,
+            session,
+        ))
+    }
+
     pub(crate) fn path(&self) -> &str {
         &self.path
     }
@@ -244,6 +364,10 @@ impl fmt::Debug for WriteHandle {
 mod tests {
     use super::*;
     use crate::config::ClientConfig;
+    use crate::error::ClientError;
+    use proto::common::{DataHandleIdProto, FileLayoutProto};
+    use proto::fs::InodeIdProto;
+    use proto::metadata::{CreateFileResponseProto, OpenFileResponseProto, WriteHandleProto};
 
     #[tokio::test]
     async fn file_reader_debug_redacts_identity_names() {
@@ -263,6 +387,46 @@ mod tests {
         assert_debug_redacts_internal_identity_names(&debug);
     }
 
+    #[test]
+    fn read_handle_from_open_response_requires_inode_id() {
+        let err = ReadHandle::from_open_response(
+            "/alpha",
+            OpenFileResponseProto {
+                inode_id: None,
+                data_handle_id: Some(DataHandleIdProto { value: 202 }),
+                file_version: Some(3),
+                file_size: 10,
+                ..OpenFileResponseProto::default()
+            },
+        )
+        .expect_err("missing inode_id must fail");
+
+        assert!(
+            matches!(&err, ClientError::Metadata(msg) if msg.contains("OpenFileResponseProto.inode_id missing")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn write_handle_from_create_response_builds_session() {
+        let handle = WriteHandle::from_create_response(
+            "/created",
+            CreateFileResponseProto {
+                inode_id: Some(InodeIdProto { value: 301 }),
+                data_handle_id: Some(DataHandleIdProto { value: 302 }),
+                write_handle: Some(write_handle_proto(1, 302)),
+                base_size: 8,
+                layout: Some(layout_proto()),
+                ..CreateFileResponseProto::default()
+            },
+        )
+        .expect("write handle");
+
+        assert_eq!(handle.path(), "/created");
+        assert_eq!(handle.data_handle_id(), DataHandleId::new(302));
+        assert_eq!(handle.write_cursor(), 8);
+    }
+
     fn assert_debug_redacts_internal_identity_names(debug: &str) {
         for needle in [
             concat!("inode", "_id"),
@@ -280,6 +444,35 @@ mod tests {
                 !debug.contains(needle),
                 "reader or writer Debug output must redact {needle}: {debug}"
             );
+        }
+    }
+
+    fn write_handle_proto(handle_id: u64, data_handle_id: u64) -> WriteHandleProto {
+        WriteHandleProto {
+            handle_id,
+            lease_id: Some(proto::common::LeaseIdProto {
+                high: 0,
+                low: handle_id,
+            }),
+            lease_epoch: 1,
+            open_epoch: 1,
+            fencing_token: Some(proto::common::FencingTokenProto {
+                block_id: Some(proto::common::BlockIdProto {
+                    data_handle_id,
+                    block_index: 0,
+                }),
+                owner: Some(types::ClientId::new(7).into()),
+                epoch: 1,
+            }),
+        }
+    }
+
+    fn layout_proto() -> FileLayoutProto {
+        FileLayoutProto {
+            block_size: 64 * 1024 * 1024,
+            chunk_size: 4 * 1024 * 1024,
+            replication: 1,
+            block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
         }
     }
 }

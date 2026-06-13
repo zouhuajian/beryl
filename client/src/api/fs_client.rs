@@ -14,7 +14,6 @@ use proto::metadata::{
     GetStatusRequestProto, ListStatusRequestProto, OpenFileRequestProto, RenameRequestProto, RenewLeaseRequestProto,
     SyncWriteRequestProto, WriteSyncModeProto,
 };
-use types::{DataHandleId, FileLayout, InodeId};
 
 use super::handle::{ReadHandle, WriteHandle};
 use super::{
@@ -199,13 +198,7 @@ impl FsClient {
                 },
             )
             .await?;
-        let handle = ReadHandle::new(
-            path.to_string(),
-            inode_id_from_proto(response.inode_id, "OpenFileResponseProto.inode_id")?,
-            data_handle_id_from_proto(response.data_handle_id, "OpenFileResponseProto.data_handle_id")?,
-            file_version_from_proto(response.file_version, "OpenFileResponseProto.file_version")?,
-            response.file_size,
-        );
+        let handle = ReadHandle::from_open_response(path, response)?;
         Ok(FileReader::new(self.clone(), handle))
     }
 
@@ -239,7 +232,10 @@ impl FsClient {
                 return Err(self.normalize_unknown_outcome("CreateFile", OperationKind::MetadataMutation, err));
             }
         };
-        Ok(FileWriter::new(self.clone(), write_handle_from_create(path, response)?))
+        Ok(FileWriter::new(
+            self.clone(),
+            WriteHandle::from_create_response(path, response)?,
+        ))
     }
 
     /// Opens an append write session for an existing file.
@@ -265,7 +261,10 @@ impl FsClient {
                 return Err(self.normalize_unknown_outcome("AppendFile", OperationKind::MetadataMutation, err));
             }
         };
-        Ok(FileWriter::new(self.clone(), write_handle_from_append(path, response)?))
+        Ok(FileWriter::new(
+            self.clone(),
+            WriteHandle::from_append_response(path, response)?,
+        ))
     }
 
     pub(crate) async fn read_handle(&self, handle: &ReadHandle, offset: u64, len: u32) -> ClientResult<Bytes> {
@@ -999,85 +998,6 @@ fn normalize_unknown_outcome(operation: &str, err: ClientError) -> ClientError {
         )),
         _ => err,
     }
-}
-
-fn write_handle_from_create(
-    path: &str,
-    response: proto::metadata::CreateFileResponseProto,
-) -> ClientResult<WriteHandle> {
-    let inode_id = inode_id_from_proto(response.inode_id, "CreateFileResponseProto.inode_id")?;
-    let data_handle_id = data_handle_id_from_proto(response.data_handle_id, "CreateFileResponseProto.data_handle_id")?;
-    let layout = write_layout_from_proto(response.layout, "CreateFileResponseProto.layout")?;
-    let write_handle = response
-        .write_handle
-        .ok_or_else(|| ClientError::Metadata("CreateFileResponseProto.write_handle missing".to_string()))?;
-    let session = WriteSession::new(
-        path.to_string(),
-        inode_id,
-        data_handle_id,
-        layout,
-        write_handle,
-        response.base_size,
-    )?;
-    Ok(WriteHandle::new(
-        path.to_string(),
-        inode_id,
-        data_handle_id,
-        response.base_size,
-        session,
-    ))
-}
-
-fn write_handle_from_append(
-    path: &str,
-    response: proto::metadata::AppendFileResponseProto,
-) -> ClientResult<WriteHandle> {
-    let inode_id = inode_id_from_proto(response.inode_id, "AppendFileResponseProto.inode_id")?;
-    let data_handle_id = data_handle_id_from_proto(response.data_handle_id, "AppendFileResponseProto.data_handle_id")?;
-    let layout = write_layout_from_proto(response.layout, "AppendFileResponseProto.layout")?;
-    let write_handle = response
-        .write_handle
-        .ok_or_else(|| ClientError::Metadata("AppendFileResponseProto.write_handle missing".to_string()))?;
-    let session = WriteSession::new(
-        path.to_string(),
-        inode_id,
-        data_handle_id,
-        layout,
-        write_handle,
-        response.base_size,
-    )?;
-    Ok(WriteHandle::new(
-        path.to_string(),
-        inode_id,
-        data_handle_id,
-        response.base_size,
-        session,
-    ))
-}
-
-fn inode_id_from_proto(value: Option<proto::fs::InodeIdProto>, field: &str) -> ClientResult<InodeId> {
-    value
-        .map(|id| InodeId::new(id.value))
-        .ok_or_else(|| ClientError::Metadata(format!("{field} missing")))
-}
-
-fn data_handle_id_from_proto(
-    value: Option<proto::common::DataHandleIdProto>,
-    field: &str,
-) -> ClientResult<DataHandleId> {
-    value
-        .ok_or_else(|| ClientError::Metadata(format!("{field} missing")))?
-        .try_into()
-        .map_err(|_| ClientError::Metadata(format!("{field} invalid")))
-}
-
-fn file_version_from_proto(value: Option<u64>, field: &str) -> ClientResult<u64> {
-    value.ok_or_else(|| ClientError::Metadata(format!("{field} missing")))
-}
-
-fn write_layout_from_proto(value: Option<proto::common::FileLayoutProto>, field: &str) -> ClientResult<FileLayout> {
-    let layout = value.ok_or_else(|| ClientError::Metadata(format!("{field} missing")))?;
-    FileLayout::try_from(layout).map_err(|err| ClientError::InvalidLayout(format!("{field} invalid: {err}")))
 }
 
 fn default_write_preallocation_len() -> u64 {
