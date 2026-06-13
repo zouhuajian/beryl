@@ -16,14 +16,7 @@ use crate::canonical::{invalid_header_action, validate_header_or_action};
 use crate::config::ClientConfig;
 use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult};
 use crate::metadata::header::ensure_metadata_header;
-use crate::metadata::ops::{
-    AbortFileWriteOp, AddBlockOp, AppendFileOp, CommitFileOp, CreateFileOp, DeleteOp, GetBlockLocationsOp, GetStatusOp,
-    ListStatusOp, MsyncOp, OpenFileOp, RenameOp, RenewLeaseOp, SyncWriteOp,
-};
-use crate::metadata::snapshot::{
-    AbortFileWriteResult, AddBlockResult, CommitFileResult, DeleteResult, FileSnapshot, LayoutSnapshot, ListSnapshot,
-    RenameResult, RenewLeaseResult, StateWatermark, StatusSnapshot, SyncWriteResult, WriteSessionSeed,
-};
+use crate::metadata::model::{AddBlockResult, ReadLayout};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
 use crate::runtime::AttemptContext;
 
@@ -31,46 +24,102 @@ use crate::runtime::AttemptContext;
 #[async_trait]
 pub(crate) trait MetadataGateway: Send + Sync {
     /// Get file or directory status.
-    async fn get_status(&self, ctx: AttemptContext, req: GetStatusOp) -> ClientResult<StatusSnapshot>;
+    async fn get_status(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::GetStatusRequestProto,
+    ) -> ClientResult<proto::metadata::GetStatusResponseProto>;
 
     /// List directory status.
-    async fn list_status(&self, ctx: AttemptContext, req: ListStatusOp) -> ClientResult<ListSnapshot>;
+    async fn list_status(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::ListStatusRequestProto,
+    ) -> ClientResult<proto::metadata::ListStatusResponseProto>;
 
     /// Delete a namespace entry.
-    async fn delete(&self, ctx: AttemptContext, req: DeleteOp) -> ClientResult<DeleteResult>;
+    async fn delete(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::DeleteRequestProto,
+    ) -> ClientResult<proto::metadata::DeleteResponseProto>;
 
     /// Rename a namespace entry.
-    async fn rename(&self, ctx: AttemptContext, req: RenameOp) -> ClientResult<RenameResult>;
+    async fn rename(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::RenameRequestProto,
+    ) -> ClientResult<proto::metadata::RenameResponseProto>;
 
     /// Open a file for read planning.
-    async fn open_file(&self, ctx: AttemptContext, req: OpenFileOp) -> ClientResult<FileSnapshot>;
+    async fn open_file(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::OpenFileRequestProto,
+    ) -> ClientResult<proto::metadata::OpenFileResponseProto>;
 
     /// Get the file data layout for a public read.
-    async fn read_layout(&self, ctx: AttemptContext, req: GetBlockLocationsOp) -> ClientResult<LayoutSnapshot>;
+    async fn read_layout(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::GetBlockLocationsRequestProto,
+    ) -> ClientResult<ReadLayout>;
 
     /// Create a file and seed a write session.
-    async fn create_file(&self, ctx: AttemptContext, req: CreateFileOp) -> ClientResult<WriteSessionSeed>;
+    async fn create_file(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::CreateFileRequestProto,
+    ) -> ClientResult<proto::metadata::CreateFileResponseProto>;
 
     /// Append to an existing file and seed a write session.
-    async fn append_file(&self, ctx: AttemptContext, req: AppendFileOp) -> ClientResult<WriteSessionSeed>;
+    async fn append_file(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::AppendFileRequestProto,
+    ) -> ClientResult<proto::metadata::AppendFileResponseProto>;
 
     /// Allocate a worker write target for a write session.
-    async fn add_block(&self, ctx: AttemptContext, req: AddBlockOp) -> ClientResult<AddBlockResult>;
+    async fn add_block(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::AddBlockRequestProto,
+    ) -> ClientResult<AddBlockResult>;
 
     /// Commit a write session after worker data commit succeeds.
-    async fn commit_file(&self, ctx: AttemptContext, req: CommitFileOp) -> ClientResult<CommitFileResult>;
+    async fn commit_file(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::CommitFileRequestProto,
+    ) -> ClientResult<proto::metadata::CommitFileResponseProto>;
 
     /// Abort a write session best effort.
-    async fn abort_file_write(&self, ctx: AttemptContext, req: AbortFileWriteOp) -> ClientResult<AbortFileWriteResult>;
+    async fn abort_file_write(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::AbortFileWriteRequestProto,
+    ) -> ClientResult<proto::metadata::AbortFileWriteResponseProto>;
 
     /// Renew an active write session lease.
-    async fn renew_lease(&self, ctx: AttemptContext, req: RenewLeaseOp) -> ClientResult<RenewLeaseResult>;
+    async fn renew_lease(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::RenewLeaseRequestProto,
+    ) -> ClientResult<proto::metadata::RenewLeaseResponseProto>;
 
     /// Apply a write-session visibility or durability barrier.
-    async fn sync_write(&self, ctx: AttemptContext, req: SyncWriteOp) -> ClientResult<SyncWriteResult>;
+    async fn sync_write(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::SyncWriteRequestProto,
+    ) -> ClientResult<proto::metadata::SyncWriteResponseProto>;
 
     /// Synchronize metadata state freshness.
-    async fn msync(&self, ctx: AttemptContext, req: MsyncOp) -> ClientResult<StateWatermark>;
+    async fn msync(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::MsyncRequestProto,
+    ) -> ClientResult<proto::common::GroupStateWatermarkProto>;
 }
 
 /// Tonic-backed metadata gateway.
@@ -242,7 +291,11 @@ fn evict_metadata_channel_if_needed(
 
 #[async_trait]
 impl MetadataGateway for TonicMetadataGateway {
-    async fn get_status(&self, ctx: AttemptContext, mut req: GetStatusOp) -> ClientResult<StatusSnapshot> {
+    async fn get_status(
+        &self,
+        ctx: AttemptContext,
+        mut req: proto::metadata::GetStatusRequestProto,
+    ) -> ClientResult<proto::metadata::GetStatusResponseProto> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
             .client(&ctx, "read")
@@ -255,7 +308,11 @@ impl MetadataGateway for TonicMetadataGateway {
         Ok(response)
     }
 
-    async fn list_status(&self, ctx: AttemptContext, mut req: ListStatusOp) -> ClientResult<ListSnapshot> {
+    async fn list_status(
+        &self,
+        ctx: AttemptContext,
+        mut req: proto::metadata::ListStatusRequestProto,
+    ) -> ClientResult<proto::metadata::ListStatusResponseProto> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
             .client(&ctx, "read")
@@ -268,7 +325,11 @@ impl MetadataGateway for TonicMetadataGateway {
         Ok(response)
     }
 
-    async fn delete(&self, ctx: AttemptContext, mut req: DeleteOp) -> ClientResult<DeleteResult> {
+    async fn delete(
+        &self,
+        ctx: AttemptContext,
+        mut req: proto::metadata::DeleteRequestProto,
+    ) -> ClientResult<proto::metadata::DeleteResponseProto> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
             .client(&ctx, "write")
@@ -281,7 +342,11 @@ impl MetadataGateway for TonicMetadataGateway {
         Ok(response)
     }
 
-    async fn rename(&self, ctx: AttemptContext, mut req: RenameOp) -> ClientResult<RenameResult> {
+    async fn rename(
+        &self,
+        ctx: AttemptContext,
+        mut req: proto::metadata::RenameRequestProto,
+    ) -> ClientResult<proto::metadata::RenameResponseProto> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
             .client(&ctx, "write")
@@ -294,7 +359,11 @@ impl MetadataGateway for TonicMetadataGateway {
         Ok(response)
     }
 
-    async fn open_file(&self, ctx: AttemptContext, mut req: OpenFileOp) -> ClientResult<FileSnapshot> {
+    async fn open_file(
+        &self,
+        ctx: AttemptContext,
+        mut req: proto::metadata::OpenFileRequestProto,
+    ) -> ClientResult<proto::metadata::OpenFileResponseProto> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
             .client(&ctx, "read")
@@ -307,7 +376,11 @@ impl MetadataGateway for TonicMetadataGateway {
         Ok(response)
     }
 
-    async fn read_layout(&self, ctx: AttemptContext, mut req: GetBlockLocationsOp) -> ClientResult<LayoutSnapshot> {
+    async fn read_layout(
+        &self,
+        ctx: AttemptContext,
+        mut req: proto::metadata::GetBlockLocationsRequestProto,
+    ) -> ClientResult<ReadLayout> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
             .client(&ctx, "read")
@@ -317,10 +390,14 @@ impl MetadataGateway for TonicMetadataGateway {
             .map_err(ClientError::from)?
             .into_inner();
         let group_name = parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        LayoutSnapshot::from_proto(group_name, response)
+        ReadLayout::from_get_block_locations_response(group_name, response)
     }
 
-    async fn create_file(&self, ctx: AttemptContext, mut req: CreateFileOp) -> ClientResult<WriteSessionSeed> {
+    async fn create_file(
+        &self,
+        ctx: AttemptContext,
+        mut req: proto::metadata::CreateFileRequestProto,
+    ) -> ClientResult<proto::metadata::CreateFileResponseProto> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
             .client(&ctx, "write")
@@ -330,10 +407,14 @@ impl MetadataGateway for TonicMetadataGateway {
             .map_err(ClientError::from)?
             .into_inner();
         parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        Ok(WriteSessionSeed::Create(response))
+        Ok(response)
     }
 
-    async fn append_file(&self, ctx: AttemptContext, mut req: AppendFileOp) -> ClientResult<WriteSessionSeed> {
+    async fn append_file(
+        &self,
+        ctx: AttemptContext,
+        mut req: proto::metadata::AppendFileRequestProto,
+    ) -> ClientResult<proto::metadata::AppendFileResponseProto> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
             .client(&ctx, "write")
@@ -343,10 +424,14 @@ impl MetadataGateway for TonicMetadataGateway {
             .map_err(ClientError::from)?
             .into_inner();
         parse_metadata_response_header(&ctx, response.header.as_ref())?;
-        Ok(WriteSessionSeed::Append(response))
+        Ok(response)
     }
 
-    async fn add_block(&self, ctx: AttemptContext, mut req: AddBlockOp) -> ClientResult<AddBlockResult> {
+    async fn add_block(
+        &self,
+        ctx: AttemptContext,
+        mut req: proto::metadata::AddBlockRequestProto,
+    ) -> ClientResult<AddBlockResult> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
             .client(&ctx, "write")
@@ -365,7 +450,11 @@ impl MetadataGateway for TonicMetadataGateway {
         Ok(AddBlockResult { group_name, target })
     }
 
-    async fn commit_file(&self, ctx: AttemptContext, mut req: CommitFileOp) -> ClientResult<CommitFileResult> {
+    async fn commit_file(
+        &self,
+        ctx: AttemptContext,
+        mut req: proto::metadata::CommitFileRequestProto,
+    ) -> ClientResult<proto::metadata::CommitFileResponseProto> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
             .client(&ctx, "write")
@@ -381,8 +470,8 @@ impl MetadataGateway for TonicMetadataGateway {
     async fn abort_file_write(
         &self,
         ctx: AttemptContext,
-        mut req: AbortFileWriteOp,
-    ) -> ClientResult<AbortFileWriteResult> {
+        mut req: proto::metadata::AbortFileWriteRequestProto,
+    ) -> ClientResult<proto::metadata::AbortFileWriteResponseProto> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
             .client(&ctx, "write")
@@ -395,7 +484,11 @@ impl MetadataGateway for TonicMetadataGateway {
         Ok(response)
     }
 
-    async fn renew_lease(&self, ctx: AttemptContext, mut req: RenewLeaseOp) -> ClientResult<RenewLeaseResult> {
+    async fn renew_lease(
+        &self,
+        ctx: AttemptContext,
+        mut req: proto::metadata::RenewLeaseRequestProto,
+    ) -> ClientResult<proto::metadata::RenewLeaseResponseProto> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
             .client(&ctx, "write")
@@ -408,7 +501,11 @@ impl MetadataGateway for TonicMetadataGateway {
         Ok(response)
     }
 
-    async fn sync_write(&self, ctx: AttemptContext, mut req: SyncWriteOp) -> ClientResult<SyncWriteResult> {
+    async fn sync_write(
+        &self,
+        ctx: AttemptContext,
+        mut req: proto::metadata::SyncWriteRequestProto,
+    ) -> ClientResult<proto::metadata::SyncWriteResponseProto> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
             .client(&ctx, "write")
@@ -421,7 +518,11 @@ impl MetadataGateway for TonicMetadataGateway {
         Ok(response)
     }
 
-    async fn msync(&self, ctx: AttemptContext, mut req: MsyncOp) -> ClientResult<StateWatermark> {
+    async fn msync(
+        &self,
+        ctx: AttemptContext,
+        mut req: proto::metadata::MsyncRequestProto,
+    ) -> ClientResult<proto::common::GroupStateWatermarkProto> {
         ensure_metadata_header(&mut req.header, &ctx)?;
         let response = self
             .client(&ctx, "refresh")

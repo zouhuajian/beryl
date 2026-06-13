@@ -198,7 +198,7 @@ fn public_facade_does_not_export_metadata_layout_or_worker_route_details() {
     let api = std::fs::read_to_string(src.join("api").join("mod.rs")).expect("read client/src/api/mod.rs");
 
     for name in [
-        "LayoutSnapshot",
+        "ReadLayout",
         "WriteTarget",
         "WorkerEndpoint",
         "WorkerEndpointInfoProto",
@@ -273,9 +273,8 @@ fn client_source_tree_has_no_orphan_rust_files() {
         "lib.rs",
         "metadata/gateway.rs",
         "metadata/header.rs",
+        "metadata/model.rs",
         "metadata/mod.rs",
-        "metadata/ops.rs",
-        "metadata/snapshot.rs",
         "metrics.rs",
         "modes.rs",
         "planner/mod.rs",

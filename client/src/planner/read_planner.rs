@@ -4,7 +4,7 @@
 //! Read planner.
 
 use crate::error::{ClientError, ClientResult};
-use crate::metadata::LayoutSnapshot;
+use crate::metadata::ReadLayout;
 use types::{BlockId, DataHandleId, FileBlockLocation, GroupName, InodeId, WorkerEndpointInfo};
 
 /// Splits public read ranges into block-local worker reads.
@@ -195,7 +195,7 @@ impl ReadPlanner {
         expected_data_handle_id: DataHandleId,
         expected_file_version: Option<u64>,
         span: PlannedReadRange,
-        response: &LayoutSnapshot,
+        response: &ReadLayout,
     ) -> ClientResult<(GroupName, Vec<PlannedReadSegment>)> {
         let group_name = response.group_name.clone();
         let inode_id = response.inode_id;
@@ -218,7 +218,7 @@ impl ReadPlanner {
             });
         }
         let actual_version =
-            file_version_from_snapshot(response.file_version, "GetBlockLocationsResponseProto.file_version")?;
+            file_version_from_response(response.file_version, "GetBlockLocationsResponseProto.file_version")?;
         let expected_version = expected_file_version.ok_or_else(|| ClientError::StaleHandle {
             reason: "read handle missing file_version".to_string(),
         })?;
@@ -233,7 +233,7 @@ impl ReadPlanner {
     }
 }
 
-fn file_version_from_snapshot(value: Option<u64>, field: &str) -> ClientResult<u64> {
+fn file_version_from_response(value: Option<u64>, field: &str) -> ClientResult<u64> {
     value.ok_or_else(|| ClientError::InvalidLayout(format!("{field} missing")))
 }
 

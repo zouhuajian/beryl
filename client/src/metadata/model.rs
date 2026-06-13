@@ -1,29 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Metadata operation result types.
+//! Client-domain metadata result types.
 
 use crate::error::{ClientError, ClientResult};
 use types::{DataHandleId, FileBlockLocation, GroupName, InodeId, WriteTarget};
 
-/// File status snapshot returned by metadata.
-pub type StatusSnapshot = proto::metadata::GetStatusResponseProto;
-
-/// Directory listing snapshot returned by metadata.
-pub type ListSnapshot = proto::metadata::ListStatusResponseProto;
-
-/// Delete result returned by metadata.
-pub type DeleteResult = proto::metadata::DeleteResponseProto;
-
-/// Rename result returned by metadata.
-pub type RenameResult = proto::metadata::RenameResponseProto;
-
-/// Read-open file snapshot returned by metadata.
-pub type FileSnapshot = proto::metadata::OpenFileResponseProto;
-
-/// File block layout snapshot returned by metadata.
+/// Validated read layout returned by metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LayoutSnapshot {
+pub(crate) struct ReadLayout {
     /// Metadata owner group from the validated response header.
     pub group_name: GroupName,
     /// Inode identity this layout belongs to.
@@ -38,9 +23,9 @@ pub struct LayoutSnapshot {
     pub locations: Vec<FileBlockLocation>,
 }
 
-impl LayoutSnapshot {
+impl ReadLayout {
     /// Convert a metadata wire response into the client read-layout domain view.
-    pub(crate) fn from_proto(
+    pub(crate) fn from_get_block_locations_response(
         group_name: GroupName,
         response: proto::metadata::GetBlockLocationsResponseProto,
     ) -> ClientResult<Self> {
@@ -74,35 +59,11 @@ impl LayoutSnapshot {
     }
 }
 
-/// Write-session seed returned by create or append.
-#[derive(Clone, Debug)]
-pub enum WriteSessionSeed {
-    /// CreateFile response.
-    Create(proto::metadata::CreateFileResponseProto),
-    /// AppendFile response.
-    Append(proto::metadata::AppendFileResponseProto),
-}
-
 /// Write target returned by AddBlock with its owner group.
 #[derive(Clone, Debug)]
-pub struct AddBlockResult {
+pub(crate) struct AddBlockResult {
     /// Metadata owner group for the block target.
     pub group_name: GroupName,
     /// Worker target for this block.
     pub target: WriteTarget,
 }
-
-/// CommitFile result returned by metadata.
-pub type CommitFileResult = proto::metadata::CommitFileResponseProto;
-
-/// AbortFileWrite result returned by metadata.
-pub type AbortFileWriteResult = proto::metadata::AbortFileWriteResponseProto;
-
-/// RenewLease result returned by metadata.
-pub type RenewLeaseResult = proto::metadata::RenewLeaseResponseProto;
-
-/// SyncWrite result returned by metadata.
-pub type SyncWriteResult = proto::metadata::SyncWriteResponseProto;
-
-/// Metadata state watermark returned by Msync.
-pub type StateWatermark = proto::common::GroupStateWatermarkProto;

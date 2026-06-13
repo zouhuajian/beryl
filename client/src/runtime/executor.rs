@@ -11,12 +11,7 @@ use std::time::Duration;
 use crate::canonical::ClientAction;
 use crate::config::{BackoffConfig, RefreshConfig, RetryConfig};
 use crate::error::{ClientError, ClientResult};
-use crate::metadata::{
-    AbortFileWriteOp, AbortFileWriteResult, AddBlockOp, AddBlockResult, AppendFileOp, CommitFileOp, CommitFileResult,
-    CreateFileOp, DeleteOp, DeleteResult, GetBlockLocationsOp, GetStatusOp, LayoutSnapshot, ListStatusOp,
-    MetadataGateway, MsyncOp, OpenFileOp, RenameOp, RenameResult, RenewLeaseOp, RenewLeaseResult, StatusSnapshot,
-    SyncWriteOp, SyncWriteResult, WriteSessionSeed,
-};
+use crate::metadata::{AddBlockResult, MetadataGateway, ReadLayout};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
 use crate::runtime::classify::{ErrorClass, ErrorClassifier, RefreshReason};
 pub use crate::runtime::context::{AttemptContext, OperationContext, OperationIdentity};
@@ -74,7 +69,11 @@ impl OperationExecutor {
     }
 
     /// Execute OpenFile.
-    pub(crate) async fn open_file(&self, path: &str, req: OpenFileOp) -> ClientResult<crate::metadata::FileSnapshot> {
+    pub(crate) async fn open_file(
+        &self,
+        path: &str,
+        req: proto::metadata::OpenFileRequestProto,
+    ) -> ClientResult<proto::metadata::OpenFileResponseProto> {
         let operation = OperationContext::new_with_identity(
             &self.identity,
             OperationKind::MetadataRead,
@@ -88,7 +87,11 @@ impl OperationExecutor {
     }
 
     /// Execute a metadata layout read.
-    pub(crate) async fn read_layout(&self, path: &str, req: GetBlockLocationsOp) -> ClientResult<LayoutSnapshot> {
+    pub(crate) async fn read_layout(
+        &self,
+        path: &str,
+        req: proto::metadata::GetBlockLocationsRequestProto,
+    ) -> ClientResult<ReadLayout> {
         let operation = OperationContext::new_with_identity(
             &self.identity,
             OperationKind::MetadataRead,
@@ -108,7 +111,7 @@ impl OperationExecutor {
         data_handle_id: DataHandleId,
         offset: u64,
         len: u32,
-    ) -> ClientResult<LayoutSnapshot> {
+    ) -> ClientResult<ReadLayout> {
         self.read_layout(
             path,
             proto::metadata::GetBlockLocationsRequestProto {
@@ -146,7 +149,11 @@ impl OperationExecutor {
     }
 
     /// Execute GetStatus.
-    pub(crate) async fn get_status(&self, path: &str, req: GetStatusOp) -> ClientResult<StatusSnapshot> {
+    pub(crate) async fn get_status(
+        &self,
+        path: &str,
+        req: proto::metadata::GetStatusRequestProto,
+    ) -> ClientResult<proto::metadata::GetStatusResponseProto> {
         let operation = OperationContext::new_with_identity(
             &self.identity,
             OperationKind::MetadataRead,
@@ -163,8 +170,8 @@ impl OperationExecutor {
     pub(crate) async fn list_status(
         &self,
         path: &str,
-        req: ListStatusOp,
-    ) -> ClientResult<crate::metadata::ListSnapshot> {
+        req: proto::metadata::ListStatusRequestProto,
+    ) -> ClientResult<proto::metadata::ListStatusResponseProto> {
         let operation = OperationContext::new_with_identity(
             &self.identity,
             OperationKind::MetadataRead,
@@ -178,7 +185,11 @@ impl OperationExecutor {
     }
 
     /// Execute CreateFile.
-    pub(crate) async fn create_file(&self, path: &str, req: CreateFileOp) -> ClientResult<WriteSessionSeed> {
+    pub(crate) async fn create_file(
+        &self,
+        path: &str,
+        req: proto::metadata::CreateFileRequestProto,
+    ) -> ClientResult<proto::metadata::CreateFileResponseProto> {
         let detail = format!("disposition={}", req.disposition);
         let operation = OperationContext::new_with_identity(
             &self.identity,
@@ -193,7 +204,11 @@ impl OperationExecutor {
     }
 
     /// Execute AppendFile.
-    pub(crate) async fn append_file(&self, path: &str, req: AppendFileOp) -> ClientResult<WriteSessionSeed> {
+    pub(crate) async fn append_file(
+        &self,
+        path: &str,
+        req: proto::metadata::AppendFileRequestProto,
+    ) -> ClientResult<proto::metadata::AppendFileResponseProto> {
         let operation = OperationContext::new_with_identity(
             &self.identity,
             OperationKind::MetadataMutation,
@@ -211,7 +226,7 @@ impl OperationExecutor {
         &self,
         path: &str,
         session_identity: String,
-        req: AddBlockOp,
+        req: proto::metadata::AddBlockRequestProto,
     ) -> ClientResult<AddBlockResult> {
         let detail = format!("desired_len={:?}", req.desired_len);
         let operation = OperationContext::new_with_identity(
@@ -230,8 +245,8 @@ impl OperationExecutor {
     pub(crate) async fn commit_file(
         &self,
         operation: OperationContext,
-        req: CommitFileOp,
-    ) -> ClientResult<CommitFileResult> {
+        req: proto::metadata::CommitFileRequestProto,
+    ) -> ClientResult<proto::metadata::CommitFileResponseProto> {
         self.execute_metadata(operation, req, |gateway, ctx, req| async move {
             gateway.commit_file(ctx, req).await
         })
@@ -242,8 +257,8 @@ impl OperationExecutor {
     pub(crate) async fn abort_file_write(
         &self,
         operation: OperationContext,
-        req: AbortFileWriteOp,
-    ) -> ClientResult<AbortFileWriteResult> {
+        req: proto::metadata::AbortFileWriteRequestProto,
+    ) -> ClientResult<proto::metadata::AbortFileWriteResponseProto> {
         self.execute_metadata(operation, req, |gateway, ctx, req| async move {
             gateway.abort_file_write(ctx, req).await
         })
@@ -255,8 +270,8 @@ impl OperationExecutor {
         &self,
         path: &str,
         session_identity: String,
-        req: RenewLeaseOp,
-    ) -> ClientResult<RenewLeaseResult> {
+        req: proto::metadata::RenewLeaseRequestProto,
+    ) -> ClientResult<proto::metadata::RenewLeaseResponseProto> {
         let operation = OperationContext::new_with_identity(
             &self.identity,
             OperationKind::MetadataSessionBarrier,
@@ -274,8 +289,8 @@ impl OperationExecutor {
         &self,
         path: &str,
         session_identity: String,
-        req: SyncWriteOp,
-    ) -> ClientResult<SyncWriteResult> {
+        req: proto::metadata::SyncWriteRequestProto,
+    ) -> ClientResult<proto::metadata::SyncWriteResponseProto> {
         let detail = format!("mode={} target_size={}", req.mode, req.target_size);
         let operation = OperationContext::new_with_identity(
             &self.identity,
@@ -290,7 +305,11 @@ impl OperationExecutor {
     }
 
     /// Execute Delete.
-    pub(crate) async fn delete(&self, path: &str, req: DeleteOp) -> ClientResult<DeleteResult> {
+    pub(crate) async fn delete(
+        &self,
+        path: &str,
+        req: proto::metadata::DeleteRequestProto,
+    ) -> ClientResult<proto::metadata::DeleteResponseProto> {
         let operation = OperationContext::new_with_identity(
             &self.identity,
             OperationKind::MetadataMutation,
@@ -304,7 +323,12 @@ impl OperationExecutor {
     }
 
     /// Execute Rename.
-    pub(crate) async fn rename(&self, src: &str, dst: &str, req: RenameOp) -> ClientResult<RenameResult> {
+    pub(crate) async fn rename(
+        &self,
+        src: &str,
+        dst: &str,
+        req: proto::metadata::RenameRequestProto,
+    ) -> ClientResult<proto::metadata::RenameResponseProto> {
         let operation = OperationContext::new_with_identity(
             &self.identity,
             OperationKind::MetadataMutation,
@@ -484,7 +508,11 @@ impl OperationExecutor {
             .with_operation_timeout_ms(self.retry.operation_timeout_ms)
             .with_metadata_endpoint(endpoint);
         let watermark = self
-            .metadata_rpc_with_timeout(operation, self.gateway.msync(ctx, MsyncOp { header: None }))
+            .metadata_rpc_with_timeout(
+                operation,
+                self.gateway
+                    .msync(ctx, proto::metadata::MsyncRequestProto { header: None }),
+            )
             .await?;
         self.refresh_manager.record_state_watermark(watermark)
     }
@@ -654,7 +682,6 @@ fn refresh_hint_from_error(err: &ClientError) -> crate::canonical::RefreshHint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::ListSnapshot;
     use crate::runtime::policy::{OperationKind, ReplaySafety};
     use crate::runtime::refresh::ConfiguredMetadataGroup;
     use async_trait::async_trait;
@@ -1590,8 +1617,8 @@ mod tests {
         }
     }
 
-    fn layout_snapshot(group_name: GroupName) -> LayoutSnapshot {
-        LayoutSnapshot {
+    fn read_layout_response(group_name: GroupName) -> ReadLayout {
+        ReadLayout {
             group_name,
             inode_id: InodeId::new(101),
             data_handle_id: DataHandleId::new(202),
@@ -1630,53 +1657,85 @@ mod tests {
 
     #[async_trait]
     impl MetadataGateway for ScriptedGateway {
-        async fn get_status(&self, ctx: AttemptContext, _req: GetStatusOp) -> ClientResult<StatusSnapshot> {
+        async fn get_status(
+            &self,
+            ctx: AttemptContext,
+            _req: proto::metadata::GetStatusRequestProto,
+        ) -> ClientResult<proto::metadata::GetStatusResponseProto> {
             self.next_result("get_status", &ctx).await?;
             Ok(GetStatusResponseProto::default())
         }
 
-        async fn list_status(&self, ctx: AttemptContext, _req: ListStatusOp) -> ClientResult<ListSnapshot> {
+        async fn list_status(
+            &self,
+            ctx: AttemptContext,
+            _req: proto::metadata::ListStatusRequestProto,
+        ) -> ClientResult<proto::metadata::ListStatusResponseProto> {
             self.next_result("list_status", &ctx).await?;
-            Ok(ListSnapshot::default())
+            Ok(proto::metadata::ListStatusResponseProto::default())
         }
 
-        async fn delete(&self, ctx: AttemptContext, _req: DeleteOp) -> ClientResult<DeleteResult> {
+        async fn delete(
+            &self,
+            ctx: AttemptContext,
+            _req: proto::metadata::DeleteRequestProto,
+        ) -> ClientResult<proto::metadata::DeleteResponseProto> {
             self.next_result("delete", &ctx).await?;
             Ok(DeleteResponseProto::default())
         }
 
-        async fn rename(&self, ctx: AttemptContext, _req: RenameOp) -> ClientResult<RenameResult> {
+        async fn rename(
+            &self,
+            ctx: AttemptContext,
+            _req: proto::metadata::RenameRequestProto,
+        ) -> ClientResult<proto::metadata::RenameResponseProto> {
             self.next_result("rename", &ctx).await?;
-            Ok(RenameResult::default())
+            Ok(proto::metadata::RenameResponseProto::default())
         }
 
         async fn open_file(
             &self,
             ctx: AttemptContext,
-            _req: OpenFileOp,
-        ) -> ClientResult<crate::metadata::FileSnapshot> {
+            _req: proto::metadata::OpenFileRequestProto,
+        ) -> ClientResult<proto::metadata::OpenFileResponseProto> {
             self.next_result("open_file", &ctx).await?;
-            Ok(crate::metadata::FileSnapshot::default())
+            Ok(proto::metadata::OpenFileResponseProto::default())
         }
 
-        async fn read_layout(&self, ctx: AttemptContext, _req: GetBlockLocationsOp) -> ClientResult<LayoutSnapshot> {
+        async fn read_layout(
+            &self,
+            ctx: AttemptContext,
+            _req: proto::metadata::GetBlockLocationsRequestProto,
+        ) -> ClientResult<ReadLayout> {
             self.next_result("read_layout", &ctx).await?;
-            Ok(layout_snapshot(
+            Ok(read_layout_response(
                 GroupName::parse(&ctx.metadata_header()?.group_name).unwrap(),
             ))
         }
 
-        async fn create_file(&self, ctx: AttemptContext, _req: CreateFileOp) -> ClientResult<WriteSessionSeed> {
+        async fn create_file(
+            &self,
+            ctx: AttemptContext,
+            _req: proto::metadata::CreateFileRequestProto,
+        ) -> ClientResult<proto::metadata::CreateFileResponseProto> {
             self.next_result("create_file", &ctx).await?;
-            Ok(WriteSessionSeed::Create(CreateFileResponseProto::default()))
+            Ok(CreateFileResponseProto::default())
         }
 
-        async fn append_file(&self, ctx: AttemptContext, _req: AppendFileOp) -> ClientResult<WriteSessionSeed> {
+        async fn append_file(
+            &self,
+            ctx: AttemptContext,
+            _req: proto::metadata::AppendFileRequestProto,
+        ) -> ClientResult<proto::metadata::AppendFileResponseProto> {
             self.next_result("append_file", &ctx).await?;
-            Ok(WriteSessionSeed::Append(AppendFileResponseProto::default()))
+            Ok(AppendFileResponseProto::default())
         }
 
-        async fn add_block(&self, ctx: AttemptContext, _req: AddBlockOp) -> ClientResult<AddBlockResult> {
+        async fn add_block(
+            &self,
+            ctx: AttemptContext,
+            _req: proto::metadata::AddBlockRequestProto,
+        ) -> ClientResult<AddBlockResult> {
             self.next_result("add_block", &ctx).await?;
             Ok(AddBlockResult {
                 group_name: GroupName::parse(&ctx.metadata_header()?.group_name).unwrap(),
@@ -1684,7 +1743,11 @@ mod tests {
             })
         }
 
-        async fn commit_file(&self, ctx: AttemptContext, _req: CommitFileOp) -> ClientResult<CommitFileResult> {
+        async fn commit_file(
+            &self,
+            ctx: AttemptContext,
+            _req: proto::metadata::CommitFileRequestProto,
+        ) -> ClientResult<proto::metadata::CommitFileResponseProto> {
             self.next_result("commit_file", &ctx).await?;
             Ok(CommitFileResponseProto::default())
         }
@@ -1692,26 +1755,34 @@ mod tests {
         async fn abort_file_write(
             &self,
             ctx: AttemptContext,
-            _req: AbortFileWriteOp,
-        ) -> ClientResult<AbortFileWriteResult> {
+            _req: proto::metadata::AbortFileWriteRequestProto,
+        ) -> ClientResult<proto::metadata::AbortFileWriteResponseProto> {
             self.next_result("abort_file_write", &ctx).await?;
             Ok(AbortFileWriteResponseProto::default())
         }
 
-        async fn renew_lease(&self, ctx: AttemptContext, _req: RenewLeaseOp) -> ClientResult<RenewLeaseResult> {
+        async fn renew_lease(
+            &self,
+            ctx: AttemptContext,
+            _req: proto::metadata::RenewLeaseRequestProto,
+        ) -> ClientResult<proto::metadata::RenewLeaseResponseProto> {
             self.next_result("renew_lease", &ctx).await?;
             Ok(RenewLeaseResponseProto::default())
         }
 
-        async fn sync_write(&self, ctx: AttemptContext, _req: SyncWriteOp) -> ClientResult<SyncWriteResult> {
+        async fn sync_write(
+            &self,
+            ctx: AttemptContext,
+            _req: proto::metadata::SyncWriteRequestProto,
+        ) -> ClientResult<proto::metadata::SyncWriteResponseProto> {
             self.next_result("sync_write", &ctx).await?;
-            Ok(SyncWriteResult::default())
+            Ok(proto::metadata::SyncWriteResponseProto::default())
         }
 
         async fn msync(
             &self,
             ctx: AttemptContext,
-            _req: MsyncOp,
+            _req: proto::metadata::MsyncRequestProto,
         ) -> ClientResult<proto::common::GroupStateWatermarkProto> {
             self.record("msync", &ctx);
             Ok(self.msync_watermark.clone())

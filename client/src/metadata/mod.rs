@@ -9,17 +9,9 @@
 //! decisions. Worker data reads stay behind the internal data boundary.
 
 pub(crate) mod gateway;
-pub(crate) mod ops;
-pub(crate) mod snapshot;
+pub(crate) mod model;
 
 mod header;
 
 pub(crate) use gateway::{MetadataGateway, TonicMetadataGateway};
-pub(crate) use ops::{
-    AbortFileWriteOp, AddBlockOp, AppendFileOp, CommitFileOp, CreateFileOp, DeleteOp, GetBlockLocationsOp, GetStatusOp,
-    ListStatusOp, MsyncOp, OpenFileOp, RenameOp, RenewLeaseOp, SyncWriteOp,
-};
-pub(crate) use snapshot::{
-    AbortFileWriteResult, AddBlockResult, CommitFileResult, DeleteResult, FileSnapshot, LayoutSnapshot, ListSnapshot,
-    RenameResult, RenewLeaseResult, StatusSnapshot, SyncWriteResult, WriteSessionSeed,
-};
+pub(crate) use model::{AddBlockResult, ReadLayout};

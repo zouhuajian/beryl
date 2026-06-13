@@ -12,11 +12,7 @@ use crate::data::{
     WorkerBlockSyncResult, WorkerCommitResult, WorkerDataClient, WorkerDataPlane, WorkerWriteBlock, WorkerWriteTarget,
 };
 use crate::error::{ClientError, ClientResult};
-use crate::metadata::{
-    AbortFileWriteOp, AbortFileWriteResult, AddBlockOp, AddBlockResult, AppendFileOp, CommitFileOp, CommitFileResult,
-    CreateFileOp, DeleteOp, GetBlockLocationsOp, GetStatusOp, LayoutSnapshot, ListStatusOp, MetadataGateway, MsyncOp,
-    OpenFileOp, RenameOp, RenewLeaseOp, RenewLeaseResult, WriteSessionSeed,
-};
+use crate::metadata::{AddBlockResult, MetadataGateway, ReadLayout};
 use crate::planner::read_planner::PlannedReadSegment;
 use crate::runtime::{AttemptContext, ErrorClass, ErrorClassifier};
 use async_trait::async_trait;
@@ -56,7 +52,7 @@ fn independent_fs_clients_generate_distinct_nonzero_client_ids() {
 }
 
 #[tokio::test]
-async fn open_returns_reader_from_metadata_snapshot() {
+async fn open_returns_reader_from_metadata_response() {
     let gateway = Arc::new(MockGateway::default());
     let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
 
@@ -943,8 +939,8 @@ fn add_block_lens(calls: &[RecordedCall]) -> Vec<u64> {
 #[derive(Debug, Default)]
 struct MockGateway {
     calls: Mutex<Vec<RecordedCall>>,
-    layouts: Mutex<VecDeque<LayoutSnapshot>>,
-    list_requests: Mutex<Vec<ListStatusOp>>,
+    layouts: Mutex<VecDeque<ReadLayout>>,
+    list_requests: Mutex<Vec<proto::metadata::ListStatusRequestProto>>,
     next_offsets: Mutex<HashMap<u64, u64>>,
     next_block_indexes: Mutex<HashMap<u64, u32>>,
     write_layouts: Mutex<HashMap<u64, RecordedLayout>>,
@@ -961,7 +957,7 @@ impl MockGateway {
         self.calls.lock().expect("calls").clone()
     }
 
-    fn list_requests(&self) -> Vec<ListStatusOp> {
+    fn list_requests(&self) -> Vec<proto::metadata::ListStatusRequestProto> {
         self.list_requests.lock().expect("list requests").clone()
     }
 
@@ -972,7 +968,7 @@ impl MockGateway {
         }
     }
 
-    fn with_layout(layout: LayoutSnapshot) -> Self {
+    fn with_layout(layout: ReadLayout) -> Self {
         let mut layouts = VecDeque::new();
         layouts.push_back(layout);
         Self {
@@ -1051,7 +1047,7 @@ impl MockGateway {
         });
     }
 
-    fn record_create_file(&self, ctx: &AttemptContext, req: &CreateFileOp) {
+    fn record_create_file(&self, ctx: &AttemptContext, req: &proto::metadata::CreateFileRequestProto) {
         let header = ctx.metadata_header().expect("metadata header");
         self.calls.lock().expect("calls").push(RecordedCall {
             method: "create_file",
@@ -1070,7 +1066,7 @@ impl MockGateway {
         });
     }
 
-    fn record_read_layout(&self, ctx: &AttemptContext, req: &GetBlockLocationsOp) {
+    fn record_read_layout(&self, ctx: &AttemptContext, req: &proto::metadata::GetBlockLocationsRequestProto) {
         let header = ctx.metadata_header().expect("metadata header");
         let target_data_handle_id = match req.target.as_ref() {
             Some(proto::metadata::get_block_locations_request_proto::Target::DataHandleId(id)) => Some(id.value),
@@ -1094,7 +1090,7 @@ impl MockGateway {
         });
     }
 
-    fn record_commit_file(&self, ctx: &AttemptContext, req: &CommitFileOp) {
+    fn record_commit_file(&self, ctx: &AttemptContext, req: &proto::metadata::CommitFileRequestProto) {
         self.record_event("commit_file");
         let header = ctx.metadata_header().expect("metadata header");
         self.calls.lock().expect("calls").push(RecordedCall {
@@ -1114,7 +1110,7 @@ impl MockGateway {
         });
     }
 
-    fn record_sync_write(&self, ctx: &AttemptContext, req: &crate::metadata::SyncWriteOp) {
+    fn record_sync_write(&self, ctx: &AttemptContext, req: &proto::metadata::SyncWriteRequestProto) {
         let header = ctx.metadata_header().expect("metadata header");
         self.calls.lock().expect("calls").push(RecordedCall {
             method: "sync_write",
@@ -1133,7 +1129,7 @@ impl MockGateway {
         });
     }
 
-    fn record_add_block(&self, ctx: &AttemptContext, req: &AddBlockOp) {
+    fn record_add_block(&self, ctx: &AttemptContext, req: &proto::metadata::AddBlockRequestProto) {
         let header = ctx.metadata_header().expect("metadata header");
         self.calls.lock().expect("calls").push(RecordedCall {
             method: "add_block",
@@ -1161,7 +1157,11 @@ impl MockGateway {
 
 #[async_trait]
 impl MetadataGateway for MockGateway {
-    async fn get_status(&self, ctx: AttemptContext, _req: GetStatusOp) -> ClientResult<GetStatusResponseProto> {
+    async fn get_status(
+        &self,
+        ctx: AttemptContext,
+        _req: proto::metadata::GetStatusRequestProto,
+    ) -> ClientResult<GetStatusResponseProto> {
         self.record("get_status", &ctx);
         Ok(GetStatusResponseProto {
             inode_id: Some(proto::fs::InodeIdProto { value: 101 }),
@@ -1170,7 +1170,11 @@ impl MetadataGateway for MockGateway {
         })
     }
 
-    async fn list_status(&self, ctx: AttemptContext, req: ListStatusOp) -> ClientResult<ListStatusResponseProto> {
+    async fn list_status(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::ListStatusRequestProto,
+    ) -> ClientResult<ListStatusResponseProto> {
         self.record("list_status", &ctx);
         self.list_requests.lock().expect("list requests").push(req);
         Ok(ListStatusResponseProto {
@@ -1185,17 +1189,29 @@ impl MetadataGateway for MockGateway {
         })
     }
 
-    async fn delete(&self, ctx: AttemptContext, _req: DeleteOp) -> ClientResult<DeleteResponseProto> {
+    async fn delete(
+        &self,
+        ctx: AttemptContext,
+        _req: proto::metadata::DeleteRequestProto,
+    ) -> ClientResult<DeleteResponseProto> {
         self.record("delete", &ctx);
         Ok(DeleteResponseProto::default())
     }
 
-    async fn rename(&self, ctx: AttemptContext, _req: RenameOp) -> ClientResult<RenameResponseProto> {
+    async fn rename(
+        &self,
+        ctx: AttemptContext,
+        _req: proto::metadata::RenameRequestProto,
+    ) -> ClientResult<RenameResponseProto> {
         self.record("rename", &ctx);
         Ok(RenameResponseProto::default())
     }
 
-    async fn open_file(&self, ctx: AttemptContext, _req: OpenFileOp) -> ClientResult<OpenFileResponseProto> {
+    async fn open_file(
+        &self,
+        ctx: AttemptContext,
+        _req: proto::metadata::OpenFileRequestProto,
+    ) -> ClientResult<OpenFileResponseProto> {
         self.record("open_file", &ctx);
         Ok(OpenFileResponseProto {
             inode_id: Some(proto::fs::InodeIdProto { value: 101 }),
@@ -1206,7 +1222,11 @@ impl MetadataGateway for MockGateway {
         })
     }
 
-    async fn read_layout(&self, ctx: AttemptContext, req: GetBlockLocationsOp) -> ClientResult<LayoutSnapshot> {
+    async fn read_layout(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::GetBlockLocationsRequestProto,
+    ) -> ClientResult<ReadLayout> {
         self.record_read_layout(&ctx, &req);
         let layouts = self.layouts.lock().expect("layouts");
         Ok(layouts
@@ -1215,7 +1235,11 @@ impl MetadataGateway for MockGateway {
             .unwrap_or_else(|| layout_response("root", 101, 202, Some(3), 10, Vec::new())))
     }
 
-    async fn create_file(&self, ctx: AttemptContext, req: CreateFileOp) -> ClientResult<WriteSessionSeed> {
+    async fn create_file(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::CreateFileRequestProto,
+    ) -> ClientResult<CreateFileResponseProto> {
         self.record_create_file(&ctx, &req);
         self.next_offsets.lock().expect("offsets").insert(1, 0);
         let layout = req.layout.as_ref().map(recorded_layout).unwrap_or_else(default_layout);
@@ -1225,17 +1249,21 @@ impl MetadataGateway for MockGateway {
             .lock()
             .expect("create response layout")
             .unwrap_or(Some(layout));
-        Ok(WriteSessionSeed::Create(CreateFileResponseProto {
+        Ok(CreateFileResponseProto {
             write_handle: Some(write_handle_proto(1, 302)),
             inode_id: Some(proto::fs::InodeIdProto { value: 301 }),
             data_handle_id: Some(proto::common::DataHandleIdProto { value: 302 }),
             base_size: 0,
             layout: response_layout.map(layout_proto),
             ..CreateFileResponseProto::default()
-        }))
+        })
     }
 
-    async fn append_file(&self, ctx: AttemptContext, _req: AppendFileOp) -> ClientResult<WriteSessionSeed> {
+    async fn append_file(
+        &self,
+        ctx: AttemptContext,
+        _req: proto::metadata::AppendFileRequestProto,
+    ) -> ClientResult<AppendFileResponseProto> {
         self.record("append_file", &ctx);
         self.next_offsets.lock().expect("offsets").insert(2, 10);
         let layout = self
@@ -1249,17 +1277,21 @@ impl MetadataGateway for MockGateway {
             .lock()
             .expect("append response layout")
             .unwrap_or(Some(layout));
-        Ok(WriteSessionSeed::Append(AppendFileResponseProto {
+        Ok(AppendFileResponseProto {
             write_handle: Some(write_handle_proto(2, 402)),
             inode_id: Some(proto::fs::InodeIdProto { value: 401 }),
             data_handle_id: Some(proto::common::DataHandleIdProto { value: 402 }),
             base_size: 10,
             layout: response_layout.map(layout_proto),
             ..AppendFileResponseProto::default()
-        }))
+        })
     }
 
-    async fn add_block(&self, ctx: AttemptContext, req: AddBlockOp) -> ClientResult<AddBlockResult> {
+    async fn add_block(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::AddBlockRequestProto,
+    ) -> ClientResult<AddBlockResult> {
         self.record_add_block(&ctx, &req);
         if matches!(self.next_add_block_outcome(), AddBlockOutcome::TransportUnknown) {
             return Err(ClientError::from(tonic::Status::unavailable(
@@ -1301,7 +1333,11 @@ impl MetadataGateway for MockGateway {
         })
     }
 
-    async fn commit_file(&self, ctx: AttemptContext, req: CommitFileOp) -> ClientResult<CommitFileResult> {
+    async fn commit_file(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::CommitFileRequestProto,
+    ) -> ClientResult<proto::metadata::CommitFileResponseProto> {
         self.record_commit_file(&ctx, &req);
         Ok(CommitFileResponseProto {
             committed_size: req.final_size,
@@ -1313,14 +1349,18 @@ impl MetadataGateway for MockGateway {
     async fn abort_file_write(
         &self,
         ctx: AttemptContext,
-        _req: AbortFileWriteOp,
-    ) -> ClientResult<AbortFileWriteResult> {
+        _req: proto::metadata::AbortFileWriteRequestProto,
+    ) -> ClientResult<proto::metadata::AbortFileWriteResponseProto> {
         self.record_event("abort_file_write");
         self.record("abort_file_write", &ctx);
         Ok(AbortFileWriteResponseProto::default())
     }
 
-    async fn renew_lease(&self, ctx: AttemptContext, _req: RenewLeaseOp) -> ClientResult<RenewLeaseResult> {
+    async fn renew_lease(
+        &self,
+        ctx: AttemptContext,
+        _req: proto::metadata::RenewLeaseRequestProto,
+    ) -> ClientResult<proto::metadata::RenewLeaseResponseProto> {
         self.record("renew_lease", &ctx);
         match self.next_renew_outcome() {
             RenewOutcome::Ok => Ok(RenewLeaseResponseProto {
@@ -1334,7 +1374,7 @@ impl MetadataGateway for MockGateway {
     async fn sync_write(
         &self,
         ctx: AttemptContext,
-        req: crate::metadata::SyncWriteOp,
+        req: proto::metadata::SyncWriteRequestProto,
     ) -> ClientResult<SyncWriteResponseProto> {
         self.record_sync_write(&ctx, &req);
         Ok(SyncWriteResponseProto {
@@ -1344,7 +1384,11 @@ impl MetadataGateway for MockGateway {
         })
     }
 
-    async fn msync(&self, ctx: AttemptContext, _req: MsyncOp) -> ClientResult<proto::common::GroupStateWatermarkProto> {
+    async fn msync(
+        &self,
+        ctx: AttemptContext,
+        _req: proto::metadata::MsyncRequestProto,
+    ) -> ClientResult<proto::common::GroupStateWatermarkProto> {
         self.record("msync", &ctx);
         Ok(proto::common::GroupStateWatermarkProto::default())
     }
@@ -1587,8 +1631,8 @@ fn layout_response(
     file_version: Option<u64>,
     file_size: u64,
     locations: Vec<FileBlockLocation>,
-) -> LayoutSnapshot {
-    LayoutSnapshot {
+) -> ReadLayout {
+    ReadLayout {
         group_name: group_name_from(group_name),
         inode_id: InodeId::new(inode_id),
         data_handle_id: DataHandleId::new(data_handle_id),

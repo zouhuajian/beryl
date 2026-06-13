@@ -25,7 +25,7 @@ use crate::canonical::{ClientAction, RefreshHint};
 use crate::config::ClientConfig;
 use crate::data::{WorkerBlockSyncResult, WorkerCommitResult, WorkerDataPlane};
 use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult};
-use crate::metadata::{MetadataGateway, TonicMetadataGateway, WriteSessionSeed};
+use crate::metadata::{MetadataGateway, TonicMetadataGateway};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics, NoopClientMetrics};
 use crate::planner::read_planner::ReadPlanner;
 use crate::runtime::{
@@ -187,7 +187,7 @@ impl FsClient {
     /// override layout shape.
     pub async fn open(&self, path: &str, _options: OpenOptions) -> ClientResult<FileReader> {
         validate_path(path)?;
-        let snapshot = self
+        let response = self
             .executor
             .open_file(
                 path,
@@ -201,10 +201,10 @@ impl FsClient {
             .await?;
         let handle = ReadHandle::new(
             path.to_string(),
-            inode_id_from_proto(snapshot.inode_id, "OpenFileResponseProto.inode_id")?,
-            data_handle_id_from_proto(snapshot.data_handle_id, "OpenFileResponseProto.data_handle_id")?,
-            file_version_from_proto(snapshot.file_version, "OpenFileResponseProto.file_version")?,
-            snapshot.file_size,
+            inode_id_from_proto(response.inode_id, "OpenFileResponseProto.inode_id")?,
+            data_handle_id_from_proto(response.data_handle_id, "OpenFileResponseProto.data_handle_id")?,
+            file_version_from_proto(response.file_version, "OpenFileResponseProto.file_version")?,
+            response.file_size,
         );
         Ok(FileReader::new(self.clone(), handle))
     }
@@ -219,7 +219,7 @@ impl FsClient {
             CreateDisposition::Create => CreateDispositionProto::CreateNew,
             CreateDisposition::Overwrite => CreateDispositionProto::Overwrite,
         };
-        let seed = match self
+        let response = match self
             .executor
             .create_file(
                 path,
@@ -234,12 +234,12 @@ impl FsClient {
             )
             .await
         {
-            Ok(seed) => seed,
+            Ok(response) => response,
             Err(err) => {
                 return Err(self.normalize_unknown_outcome("CreateFile", OperationKind::MetadataMutation, err));
             }
         };
-        Ok(FileWriter::new(self.clone(), handle_from_write_seed(path, seed)?))
+        Ok(FileWriter::new(self.clone(), write_handle_from_create(path, response)?))
     }
 
     /// Opens an append write session for an existing file.
@@ -248,7 +248,7 @@ impl FsClient {
     /// layout override.
     pub async fn append(&self, path: &str, _options: AppendOptions) -> ClientResult<FileWriter> {
         validate_path(path)?;
-        let seed = match self
+        let response = match self
             .executor
             .append_file(
                 path,
@@ -260,12 +260,12 @@ impl FsClient {
             )
             .await
         {
-            Ok(seed) => seed,
+            Ok(response) => response,
             Err(err) => {
                 return Err(self.normalize_unknown_outcome("AppendFile", OperationKind::MetadataMutation, err));
             }
         };
-        Ok(FileWriter::new(self.clone(), handle_from_write_seed(path, seed)?))
+        Ok(FileWriter::new(self.clone(), write_handle_from_append(path, response)?))
     }
 
     pub(crate) async fn read_handle(&self, handle: &ReadHandle, offset: u64, len: u32) -> ClientResult<Bytes> {
@@ -998,13 +998,6 @@ fn normalize_unknown_outcome(operation: &str, err: ClientError) -> ClientError {
             "{operation} outcome is unknown after malformed OK response: {err}"
         )),
         _ => err,
-    }
-}
-
-fn handle_from_write_seed(path: &str, seed: WriteSessionSeed) -> ClientResult<WriteHandle> {
-    match seed {
-        WriteSessionSeed::Create(response) => write_handle_from_create(path, response),
-        WriteSessionSeed::Append(response) => write_handle_from_append(path, response),
     }
 }
 
