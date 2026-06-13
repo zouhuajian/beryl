@@ -70,28 +70,8 @@ impl FsClient {
             &config,
             Arc::clone(&metrics),
         )?);
-        Self::with_metadata_gateway(config, gateway)
-    }
-
-    /// Create a filesystem client with an injected metadata gateway.
-    pub(crate) fn with_metadata_gateway(config: ClientConfig, gateway: Arc<dyn MetadataGateway>) -> ClientResult<Self> {
-        let metrics: Arc<dyn ClientMetrics> = Arc::new(NoopClientMetrics);
-        let data_plane = WorkerDataPlane::from_config(&config, metrics);
-        Self::with_data_plane(config, gateway, data_plane)
-    }
-
-    pub(crate) fn with_data_plane(
-        config: ClientConfig,
-        gateway: Arc<dyn MetadataGateway>,
-        data_plane: WorkerDataPlane,
-    ) -> ClientResult<Self> {
-        Self::with_runtime_hooks(
-            config,
-            gateway,
-            data_plane,
-            Arc::new(TokioBackoffSleeper),
-            Arc::new(NoopClientMetrics),
-        )
+        let data_plane = WorkerDataPlane::from_config(&config, Arc::clone(&metrics));
+        Self::with_runtime_hooks(config, gateway, data_plane, Arc::new(TokioBackoffSleeper), metrics)
     }
 
     pub(crate) fn with_runtime_hooks(
@@ -219,10 +199,14 @@ impl FsClient {
                 },
             )
             .await?;
-        Ok(FileReader::new(
-            self.clone(),
-            handle_from_open_snapshot(path, snapshot)?,
-        ))
+        let handle = ReadHandle::new(
+            path.to_string(),
+            inode_id_from_proto(snapshot.inode_id, "OpenFileResponseProto.inode_id")?,
+            data_handle_id_from_proto(snapshot.data_handle_id, "OpenFileResponseProto.data_handle_id")?,
+            file_version_from_proto(snapshot.file_version, "OpenFileResponseProto.file_version")?,
+            snapshot.file_size,
+        );
+        Ok(FileReader::new(self.clone(), handle))
     }
 
     /// Creates a file write session according to the supplied creation options.
@@ -1015,16 +999,6 @@ fn normalize_unknown_outcome(operation: &str, err: ClientError) -> ClientError {
         )),
         _ => err,
     }
-}
-
-fn handle_from_open_snapshot(path: &str, snapshot: proto::metadata::OpenFileResponseProto) -> ClientResult<ReadHandle> {
-    Ok(ReadHandle::new(
-        path.to_string(),
-        inode_id_from_proto(snapshot.inode_id, "OpenFileResponseProto.inode_id")?,
-        data_handle_id_from_proto(snapshot.data_handle_id, "OpenFileResponseProto.data_handle_id")?,
-        file_version_from_proto(snapshot.file_version, "OpenFileResponseProto.file_version")?,
-        snapshot.file_size,
-    ))
 }
 
 fn handle_from_write_seed(path: &str, seed: WriteSessionSeed) -> ClientResult<WriteHandle> {
