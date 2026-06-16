@@ -3,7 +3,7 @@
 
 //! Public namespace status snapshots.
 
-use types::{FileAttrs, InodeKind};
+use types::{FileAttrs, InodeId, InodeKind};
 
 use crate::error::{ClientError, ClientResult};
 
@@ -15,6 +15,8 @@ fn inode_kind_from_proto(kind: i32) -> Option<InodeKind> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileStatus {
     path: String,
+    /// Stable metadata inode identity for the namespace entry.
+    pub inode_id: InodeId,
     /// User-visible attributes for the namespace entry.
     pub attrs: FileAttrs,
 }
@@ -29,8 +31,12 @@ impl FileStatus {
         let attrs = response
             .attrs
             .ok_or_else(|| ClientError::Metadata("GetStatusResponseProto.attrs missing".to_string()))?;
+        let inode_id = response
+            .inode_id
+            .ok_or_else(|| ClientError::Metadata("GetStatusResponseProto.inode_id missing".to_string()))?;
         Ok(Self {
             path: path.to_string(),
+            inode_id: InodeId::new(inode_id.value),
             attrs: attrs.into(),
         })
     }

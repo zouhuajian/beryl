@@ -6,8 +6,7 @@
 use crate::canonical::ClientAction;
 use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshReason};
 use common::header::RpcErrorCode;
-use common::{CommonError, CommonErrorCode};
-use proto::common::RpcErrorCodeProto as ProtoErrorCode;
+use common::CommonError;
 use thiserror::Error;
 
 /// Opaque structured action error derived from RPC header validation.
@@ -26,6 +25,63 @@ impl ClientActionError {
     pub(crate) fn into_action(self) -> ClientAction {
         *self.action
     }
+
+    /// Return the canonical error carried by this action, when one exists.
+    pub fn canonical(&self) -> Option<&CanonicalError> {
+        self.action.canonical()
+    }
+
+    /// Return the canonical error class, when this action carries a canonical error.
+    pub fn class(&self) -> Option<ErrorClass> {
+        self.canonical().map(|canonical| canonical.class)
+    }
+
+    /// Return the canonical error code, when this action carries one.
+    pub fn code(&self) -> Option<&CanonicalErrorCode> {
+        self.canonical().and_then(|canonical| canonical.code.as_ref())
+    }
+
+    /// Return the canonical refresh reason, when this action carries one.
+    pub fn reason(&self) -> Option<RefreshReason> {
+        self.canonical().and_then(|canonical| canonical.reason)
+    }
+
+    /// Return the canonical error message, when this action carries one.
+    pub fn message(&self) -> Option<&str> {
+        self.canonical().map(|canonical| canonical.message.as_str())
+    }
+
+    /// Return the retry-after delay in milliseconds, when this action carries one.
+    pub fn retry_after_ms(&self) -> Option<u64> {
+        self.canonical().and_then(|canonical| canonical.retry_after_ms)
+    }
+
+    /// Return whether the action is retryable under client retry policy.
+    pub fn is_retryable(&self) -> bool {
+        match self.action.as_ref() {
+            ClientAction::Refresh {
+                reason:
+                    RefreshReason::Fencing
+                    | RefreshReason::EpochMismatch
+                    | RefreshReason::SessionInvalid
+                    | RefreshReason::SessionExpired,
+                ..
+            } => false,
+            ClientAction::Retry { .. } | ClientAction::Refresh { .. } => true,
+            ClientAction::TransportFail { status } => {
+                matches!(
+                    status.code(),
+                    tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::ResourceExhausted
+                )
+            }
+            ClientAction::Fail { .. } | ClientAction::Ok => false,
+        }
+    }
+
+    /// Return whether the action requires refreshing client metadata state.
+    pub fn is_refresh_required(&self) -> bool {
+        matches!(self.action.as_ref(), ClientAction::Refresh { .. })
+    }
 }
 
 impl AsRef<ClientAction> for ClientActionError {
@@ -37,6 +93,35 @@ impl AsRef<ClientAction> for ClientActionError {
 impl std::fmt::Debug for ClientActionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ClientActionError")
+    }
+}
+
+impl std::fmt::Display for ClientActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.action.as_ref() {
+            ClientAction::Refresh { reason, canonical, .. } => write!(
+                f,
+                "Client action error: class={:?}, code={:?}, reason={:?}, message={}",
+                canonical.class, canonical.code, reason, canonical.message
+            ),
+            ClientAction::Retry { after_ms, canonical } => write!(
+                f,
+                "Client action error: class={:?}, code={:?}, retry_after_ms={:?}, message={}",
+                canonical.class, canonical.code, after_ms, canonical.message
+            ),
+            ClientAction::Fail { canonical } => write!(
+                f,
+                "Client action error: class={:?}, code={:?}, reason={:?}, message={}",
+                canonical.class, canonical.code, canonical.reason, canonical.message
+            ),
+            ClientAction::TransportFail { status } => write!(
+                f,
+                "Client action error: transport code={:?}, message={}",
+                status.code(),
+                status.message()
+            ),
+            ClientAction::Ok => f.write_str("Client action error: ok action"),
+        }
     }
 }
 
@@ -69,6 +154,15 @@ pub enum ClientError {
     /// Invalid metadata layout returned for a read.
     #[error("Invalid layout: {0}")]
     InvalidLayout(String),
+
+    /// Protocol-violating success response from metadata or worker.
+    #[error("Invalid response from {operation}: {reason}")]
+    InvalidResponse {
+        /// Operation that returned the invalid response.
+        operation: &'static str,
+        /// Machine-readable enough reason for rejecting the response.
+        reason: String,
+    },
 
     /// Worker service error.
     #[error("Worker error: {0}")]
@@ -129,7 +223,7 @@ pub enum ClientError {
     NotSupported(String),
 
     /// Structured action error derived from canonical/header validation.
-    #[error("Client action error")]
+    #[error("{0}")]
     Action(ClientActionError),
 }
 
@@ -138,6 +232,13 @@ pub type ClientResult<T> = Result<T, ClientError>;
 
 pub(crate) fn side_effect_response_body_mismatch(operation: &str, detail: impl std::fmt::Display) -> ClientError {
     ClientError::UnknownOutcome(format!("{operation} response body mismatch after OK header: {detail}"))
+}
+
+pub(crate) fn invalid_response(operation: &'static str, reason: impl Into<String>) -> ClientError {
+    ClientError::InvalidResponse {
+        operation,
+        reason: reason.into(),
+    }
 }
 
 impl ClientError {
@@ -178,6 +279,7 @@ impl ClientError {
             ClientError::NotSupported(_) => false,
             ClientError::Config(_) => false,
             ClientError::InvalidArgument(_) => false,
+            ClientError::InvalidResponse { .. } => false,
             ClientError::StaleHandle { .. } => false,
             ClientError::InvalidLayout(_) => false,
         }
@@ -202,45 +304,6 @@ impl ClientError {
         match self {
             ClientError::NotLeader(id) => *id,
             _ => None,
-        }
-    }
-}
-
-/// Convert proto ErrorCode to ClientError.
-/// Note: This is a placeholder - actual proto ErrorCode enum variants may differ.
-/// TODO: Update after proto code generation to match actual variant names.
-impl From<ProtoErrorCode> for ClientError {
-    fn from(code: ProtoErrorCode) -> Self {
-        // Use i32 value for matching since variant names may differ
-        let code_value = code as i32;
-        match code_value {
-            11 => ClientError::NotLeader(None),
-            12 => ClientError::RouteEpochMismatch { expected: 0, actual: 0 },
-            13 => ClientError::StaleMeta("Stale metadata".to_string()),
-            14 => ClientError::VersionMismatch { expected: 0, actual: 0 },
-            15 => ClientError::Moved("Resource moved".to_string()),
-            16 => ClientError::Unimplemented("Feature not implemented".to_string()),
-            17 => ClientError::from(ClientAction::Refresh {
-                reason: RefreshReason::StaleState,
-                hint: Box::default(),
-                canonical: Box::new(CanonicalError::need_refresh(
-                    RpcErrorCode::StaleState,
-                    RefreshReason::StaleState,
-                    "Need refresh",
-                )),
-            }),
-            1 => ClientError::Common(CommonError::new(CommonErrorCode::Timeout, "Timeout")),
-            2 => ClientError::Common(CommonError::new(CommonErrorCode::Unavailable, "Unavailable")),
-            3 => ClientError::Common(CommonError::new(CommonErrorCode::Throttled, "Throttled")),
-            4 => ClientError::Common(CommonError::new(CommonErrorCode::NotFound, "Not found")),
-            5 => ClientError::Common(CommonError::new(CommonErrorCode::PermissionDenied, "Permission denied")),
-            6 => ClientError::Common(CommonError::new(CommonErrorCode::InvalidArgument, "Invalid argument")),
-            7 => ClientError::Common(CommonError::new(CommonErrorCode::Io, "IO error")),
-            8 => ClientError::Common(CommonError::new(CommonErrorCode::Internal, "Internal error")),
-            _ => ClientError::Common(CommonError::new(
-                CommonErrorCode::Internal,
-                format!("Unknown error code: {}", code_value),
-            )),
         }
     }
 }
@@ -327,6 +390,14 @@ impl From<ClientError> for CanonicalError {
                 message: msg,
                 refresh_hint: None,
             },
+            ClientError::InvalidResponse { operation, reason } => CanonicalError {
+                class: ErrorClass::Fatal,
+                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
+                reason: None,
+                retry_after_ms: None,
+                message: format!("invalid response from {operation}: {reason}"),
+                refresh_hint: None,
+            },
             ClientError::StaleHandle { reason } => CanonicalError {
                 class: ErrorClass::Fatal,
                 code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
@@ -336,5 +407,40 @@ impl From<ClientError> for CanonicalError {
                 refresh_hint: None,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canonical::{ClientAction, RefreshHint};
+
+    #[test]
+    fn action_error_exposes_canonical_diagnostics() {
+        let canonical = CanonicalError::need_refresh(
+            RpcErrorCode::ShardMoved,
+            RefreshReason::RouteEpochMismatch,
+            "route epoch is stale",
+        );
+        let err = ClientActionError::new(ClientAction::Refresh {
+            reason: RefreshReason::RouteEpochMismatch,
+            hint: Box::new(RefreshHint::default()),
+            canonical: Box::new(canonical.clone()),
+        });
+
+        assert_eq!(err.canonical().unwrap().message, canonical.message);
+        assert_eq!(err.class(), Some(ErrorClass::NeedRefresh));
+        assert_eq!(err.code(), canonical.code.as_ref());
+        assert_eq!(err.reason(), Some(RefreshReason::RouteEpochMismatch));
+        assert_eq!(err.message(), Some("route epoch is stale"));
+        assert_eq!(err.retry_after_ms(), None);
+        assert!(err.is_retryable());
+        assert!(err.is_refresh_required());
+
+        let displayed = ClientError::Action(err).to_string();
+        assert!(displayed.contains("NeedRefresh"));
+        assert!(displayed.contains("ShardMoved"));
+        assert!(displayed.contains("RouteEpochMismatch"));
+        assert!(displayed.contains("route epoch is stale"));
     }
 }

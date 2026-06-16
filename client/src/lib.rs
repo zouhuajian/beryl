@@ -4,7 +4,7 @@
 //! Vecton filesystem client.
 //!
 //! The public facade is centered on [`FsClient`], [`FileReader`],
-//! [`FileWriter`], operation option types, and small namespace snapshot types.
+//! [`FileWriter`], creation/list options, and small namespace snapshot types.
 //! Metadata-facing operations are executed through the internal operation
 //! executor and metadata gateway, with hardened refresh, replay header, and
 //! invalid response-header handling. Public reads return one complete buffer
@@ -23,11 +23,10 @@ mod api;
 mod cache;
 mod canonical;
 mod config;
-mod consistency;
 mod error;
 mod metrics;
-mod modes;
 mod planner;
+mod protocol;
 mod runtime;
 mod session;
 
@@ -35,11 +34,9 @@ mod data;
 pub(crate) mod metadata;
 
 // Re-export commonly used types
-pub use api::{AppendOptions, CreateDisposition, CreateOptions, FileReader, FileWriter, FsClient};
+pub use api::ListOptions;
 pub use api::{BlockFormatId, DirectoryEntry, DirectoryListing, FileAttrs, FileStatus, InodeKind};
-pub use api::{ListOptions, OpenOptions};
+pub use api::{CreateDisposition, CreateOptions, FileReader, FileWriter, FsClient};
 pub use config::ClientConfig;
 pub use config::{BackoffConfig, ChannelPoolConfig, RefreshConfig, RetryConfig};
-pub use consistency::ConsistencyLevel;
 pub use error::{ClientActionError, ClientError, ClientResult};
-pub use modes::{ReadMode, WriteMode};

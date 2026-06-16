@@ -219,7 +219,7 @@ message CreateFileResponseProto {
   fs.InodeIdProto inode_id = 3;
   common.DataHandleIdProto data_handle_id = 4;
   uint64 base_size = 5;
-  // P0 contract: CreateFile does not issue write targets; callers must use AddBlock.
+  // CreateFile does not issue write targets; callers must use AddBlock.
   repeated WriteTargetProto initial_targets = 6;
   uint64 expires_at_ms = 7;
   // Metadata-stored FileLayout accepted for this write session.
@@ -238,7 +238,7 @@ message AppendFileResponseProto {
   fs.InodeIdProto inode_id = 3;
   common.DataHandleIdProto data_handle_id = 4;
   uint64 base_size = 5;
-  // P0 contract: AppendFile does not issue write targets; callers must use AddBlock.
+  // AppendFile does not issue write targets; callers must use AddBlock.
   repeated WriteTargetProto initial_targets = 6;
   uint64 expires_at_ms = 7;
   // Metadata-stored FileLayout for the existing file.

@@ -99,6 +99,7 @@ impl ErrorClassifier {
     pub fn classify_error(&self, err: &ClientError) -> ErrorClass {
         match err {
             ClientError::InvalidArgument(_) | ClientError::InvalidLayout(_) => ErrorClass::InvalidArgument,
+            ClientError::InvalidResponse { .. } => ErrorClass::Fatal,
             ClientError::Unsupported(_) | ClientError::NotSupported(_) | ClientError::Unimplemented(_) => {
                 ErrorClass::Unsupported
             }
@@ -301,6 +302,18 @@ mod tests {
         let classified = ErrorClassifier.classify_error(&err);
 
         assert_eq!(classified, ErrorClass::RetryableTransport);
+    }
+
+    #[test]
+    fn invalid_response_classifies_as_fatal_protocol_failure() {
+        let err = ClientError::InvalidResponse {
+            operation: "GetStatus",
+            reason: "missing attrs".to_string(),
+        };
+
+        let classified = ErrorClassifier.classify_error(&err);
+
+        assert_eq!(classified, ErrorClass::Fatal);
     }
 
     #[test]

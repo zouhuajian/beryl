@@ -16,11 +16,13 @@ use tonic::transport as tonic_net;
 use types::chunk::ByteRange;
 use types::{GroupName, WorkerEndpointInfo, WorkerNetProtocol, WriteTarget};
 
-use super::{WorkerBlockSyncResult, WorkerCommitResult, WorkerDataClient, WorkerWriteBlock, WorkerWriteTarget};
+use super::{
+    WorkerBlockSyncResult, WorkerCommitResult, WorkerDataClient, WorkerReadResult, WorkerWriteBlock, WorkerWriteTarget,
+};
 use crate::cache::CacheInvalidationReason;
 use crate::canonical::{invalid_header_action, validate_data_header_or_action};
 use crate::config::ClientConfig;
-use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult};
+use crate::error::{invalid_response, side_effect_response_body_mismatch, ClientError, ClientResult};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics, NoopClientMetrics};
 use crate::planner::read_planner::PlannedReadSegment;
 use crate::runtime::{AttemptContext, ErrorClass, ErrorClassifier, RefreshReason};
@@ -194,7 +196,7 @@ impl WorkerDataClient for TonicWorkerDataClient {
         ctx: AttemptContext,
         group_name: GroupName,
         segment: &PlannedReadSegment,
-    ) -> ClientResult<Bytes> {
+    ) -> ClientResult<WorkerReadResult> {
         let mut last_transport_error = None;
         for candidate in &segment.workers {
             let mut client = match self.client(candidate, "read").await {
@@ -215,6 +217,7 @@ impl WorkerDataClient for TonicWorkerDataClient {
                 self.invalidate_worker_identity_mismatch(candidate, &err);
                 return Err(err);
             }
+            validate_open_read_stream_response(segment, &open_response)?;
             let stream_id = open_response
                 .stream_id
                 .ok_or_else(|| invalid_worker_header("worker OK response missing stream_id"))?;
@@ -233,7 +236,12 @@ impl WorkerDataClient for TonicWorkerDataClient {
                 .await
                 .map_err(ClientError::from)?
                 .into_inner();
-            return read_stream_to_bytes(&mut stream, segment).await;
+            let bytes = read_stream_to_bytes(&mut stream, segment).await?;
+            return Ok(WorkerReadResult {
+                bytes,
+                block_stamp: open_response.block_stamp,
+                committed_length: open_response.committed_length,
+            });
         }
         Err(last_transport_error
             .unwrap_or_else(|| ClientError::Worker("worker read has no reachable worker candidates".to_string())))
@@ -424,18 +432,19 @@ impl WorkerDataPlane {
                     "planned read segment coverage is inconsistent".to_string(),
                 ));
             }
-            let bytes = self
+            let result = self
                 .client
                 .read_segment(ctx.clone(), group_name.clone(), segment)
                 .await?;
-            if bytes.len() != segment.len as usize {
+            validate_worker_read_result(segment, &result)?;
+            if result.bytes.len() != segment.len as usize {
                 return Err(ClientError::Worker(format!(
                     "worker read returned {} bytes for {} byte segment",
-                    bytes.len(),
+                    result.bytes.len(),
                     segment.len
                 )));
             }
-            output.extend_from_slice(&bytes);
+            output.extend_from_slice(&result.bytes);
         }
         Ok(output.freeze())
     }
@@ -547,6 +556,46 @@ fn build_open_read_stream_request(
         chunk_size: segment.chunk_size,
         effective_len: segment.effective_len,
     })
+}
+
+fn validate_open_read_stream_response(
+    segment: &PlannedReadSegment,
+    response: &proto::worker::OpenReadStreamResponseProto,
+) -> ClientResult<()> {
+    validate_worker_read_result(
+        segment,
+        &WorkerReadResult {
+            bytes: Bytes::new(),
+            block_stamp: response.block_stamp,
+            committed_length: response.committed_length,
+        },
+    )
+}
+
+fn validate_worker_read_result(segment: &PlannedReadSegment, result: &WorkerReadResult) -> ClientResult<()> {
+    if result.block_stamp != segment.block_stamp {
+        return Err(invalid_response(
+            "OpenReadStream",
+            format!(
+                "block_stamp expected {}, got {}",
+                segment.block_stamp, result.block_stamp
+            ),
+        ));
+    }
+    let required_committed_length = segment
+        .block_offset
+        .checked_add(u64::from(segment.len))
+        .ok_or_else(|| ClientError::InvalidLayout("planned read segment block range overflow".to_string()))?;
+    if result.committed_length < required_committed_length {
+        return Err(invalid_response(
+            "OpenReadStream",
+            format!(
+                "committed_length {} does not cover requested block range ending at {}",
+                result.committed_length, required_committed_length
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> {
@@ -1965,9 +2014,13 @@ mod tests {
             _ctx: AttemptContext,
             _group_name: GroupName,
             segment: &PlannedReadSegment,
-        ) -> ClientResult<Bytes> {
+        ) -> ClientResult<WorkerReadResult> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            Ok(Bytes::from(vec![0; segment.len as usize]))
+            Ok(WorkerReadResult {
+                bytes: Bytes::from(vec![0; segment.len as usize]),
+                block_stamp: segment.block_stamp,
+                committed_length: segment.block_offset + u64::from(segment.len),
+            })
         }
 
         async fn open_write(&self, _ctx: AttemptContext, target: WorkerWriteTarget) -> ClientResult<WorkerWriteBlock> {

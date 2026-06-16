@@ -6,6 +6,7 @@
 use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::{Bytes, BytesMut};
 use proto::metadata::{AbortFileWriteRequestProto, CommitFileRequestProto, WriteHandleProto};
 use types::{CallId, ClientId, CommittedBlock, DataHandleId, FileLayout, InodeId, WriteTarget};
 
@@ -26,7 +27,9 @@ pub(crate) struct WriteSession {
     file_version: Option<u64>,
     write_handle: WriteHandleProto,
     cursor: u64,
+    flush_cursor: u64,
     base_size: u64,
+    buffered: BytesMut,
     expires_at_ms: Option<u64>,
     pending_blocks: Vec<PendingBlock>,
     state: WriteSessionState,
@@ -43,8 +46,14 @@ impl WriteSession {
         layout: FileLayout,
         write_handle: WriteHandleProto,
         base_size: u64,
+        expires_at_ms: u64,
     ) -> ClientResult<Self> {
         validate_write_handle(&write_handle)?;
+        if expires_at_ms == 0 {
+            return Err(ClientError::InvalidArgument(
+                "write session expires_at_ms must be non-zero".to_string(),
+            ));
+        }
         layout
             .validate()
             .map_err(|err| ClientError::InvalidLayout(format!("write session layout invalid: {err}")))?;
@@ -56,8 +65,10 @@ impl WriteSession {
             file_version: None,
             write_handle,
             cursor: base_size,
+            flush_cursor: base_size,
             base_size,
-            expires_at_ms: None,
+            buffered: BytesMut::new(),
+            expires_at_ms: Some(expires_at_ms),
             pending_blocks: Vec::new(),
             state: WriteSessionState::Open,
             commit: None,
@@ -75,9 +86,53 @@ impl WriteSession {
         self.cursor
     }
 
-    /// Authoritative metadata block size for splitting public writes.
-    pub(crate) fn block_size(&self) -> u32 {
-        self.layout.block_size
+    /// Number of locally buffered bytes not yet assigned to a worker block.
+    pub(crate) fn buffered_len(&self) -> usize {
+        self.buffered.len()
+    }
+
+    /// Metadata-confirmed block size as a usize for local buffering decisions.
+    pub(crate) fn block_size_usize(&self) -> usize {
+        self.layout.block_size as usize
+    }
+
+    /// Accept bytes into the SDK-visible write cursor.
+    pub(crate) fn advance_cursor(&mut self, len: usize) -> ClientResult<()> {
+        self.cursor = self
+            .cursor
+            .checked_add(len as u64)
+            .ok_or_else(|| ClientError::InvalidArgument("write cursor overflow".to_string()))?;
+        Ok(())
+    }
+
+    /// Append bytes to the current local block buffer.
+    pub(crate) fn buffer_bytes(&mut self, data: &[u8]) -> ClientResult<()> {
+        self.advance_cursor(data.len())?;
+        self.buffered.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// Take a full buffered block when the metadata-confirmed boundary is reached.
+    pub(crate) fn take_full_buffered_block(&mut self) -> Option<Bytes> {
+        let block_size = self.block_size_usize();
+        if self.buffered.len() < block_size {
+            return None;
+        }
+        Some(self.buffered.split_to(block_size).freeze())
+    }
+
+    /// Take any remaining buffered tail for a barrier or close.
+    pub(crate) fn take_buffered_tail(&mut self) -> Option<Bytes> {
+        if self.buffered.is_empty() {
+            return None;
+        }
+        let len = self.buffered.len();
+        Some(self.buffered.split_to(len).freeze())
+    }
+
+    /// Discard local bytes that never reached metadata or a worker.
+    pub(crate) fn discard_buffered_bytes(&mut self) {
+        self.buffered.clear();
     }
 
     /// Metadata write handle.
@@ -102,10 +157,10 @@ impl WriteSession {
     /// Validate a metadata write target before opening the worker stream.
     pub(crate) fn validate_target(&mut self, target: &WriteTarget, expected_len: u64) -> ClientResult<()> {
         self.ensure_open_for_write()?;
-        if target.file_offset != self.cursor {
+        if target.file_offset != self.flush_cursor {
             return Err(ClientError::InvalidLayout(format!(
                 "write target file_offset mismatch: expected {}, got {}",
-                self.cursor, target.file_offset
+                self.flush_cursor, target.file_offset
             )));
         }
         if target.effective_len != expected_len {
@@ -171,9 +226,9 @@ impl WriteSession {
             ));
         }
         let final_offset = self
-            .cursor
+            .flush_cursor
             .checked_add(written_len)
-            .ok_or_else(|| ClientError::InvalidArgument("write cursor overflow".to_string()))?;
+            .ok_or_else(|| ClientError::InvalidArgument("write flush cursor overflow".to_string()))?;
         self.pending_blocks.push(PendingBlock {
             target,
             worker_block,
@@ -181,7 +236,7 @@ impl WriteSession {
             commit_seq,
             worker_commit_level: WorkerCommitLevel::Uncommitted,
         });
-        self.cursor = final_offset;
+        self.flush_cursor = final_offset;
         Ok(())
     }
 
@@ -1029,6 +1084,7 @@ mod tests {
             test_layout(),
             write_handle_proto(1, 302),
             0,
+            1_000,
         )
         .expect("session");
         let blocks = vec![committed_block(302, 0, 0, 5)];
@@ -1061,6 +1117,7 @@ mod tests {
             test_layout(),
             write_handle_proto(1, 302),
             0,
+            1_000,
         )
         .expect("session");
 
@@ -1083,6 +1140,7 @@ mod tests {
             test_layout(),
             write_handle_proto(1, 302),
             0,
+            1_000,
         )
         .expect("session");
         let blocks = vec![committed_block(302, 0, 0, 5)];
@@ -1128,6 +1186,7 @@ mod tests {
             test_layout(),
             write_handle_proto(1, 302),
             0,
+            1_000,
         )
         .expect("session");
         session
@@ -1182,6 +1241,7 @@ mod tests {
             test_layout(),
             write_handle_proto(1, 302),
             0,
+            1_000,
         )
         .expect("session");
 
@@ -1220,6 +1280,7 @@ mod tests {
             test_layout(),
             write_handle_proto(1, 302),
             0,
+            1_000,
         )
         .expect("session");
         session
@@ -1251,6 +1312,7 @@ mod tests {
             test_layout(),
             write_handle_proto(1, 302),
             0,
+            1_000,
         )
         .expect("session");
 
@@ -1338,6 +1400,7 @@ mod tests {
                 test_layout(),
                 write_handle_proto(1, 302),
                 0,
+                10_000,
             )
             .expect("session");
             session.state = state;

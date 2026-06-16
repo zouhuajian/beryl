@@ -8,23 +8,35 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use proto::metadata::{RenewLeaseRequestProto, SyncWriteRequestProto, WriteSyncModeProto};
 use tokio::sync::Mutex;
 use types::{DataHandleId, FileLayout, InodeId};
 
-use super::fs_client::FsClient;
-use crate::error::{ClientError, ClientResult};
-use crate::session::write_session::WriteSession;
+use super::runtime::{
+    is_unknown_session_barrier_outcome, mark_session_after_session_error, metric_labels, refresh_hint_from_error,
+    ClientRuntime,
+};
+use crate::error::{invalid_response, ClientError, ClientResult};
+use crate::metrics::ClientMetric;
+use crate::planner::read_planner::ReadPlanner;
+use crate::protocol::validate::{validate_commit_file_size, validate_sync_write_size};
+use crate::runtime::{
+    ErrorClass, ErrorClassifier, OperationContext, OperationIdentity, OperationKind, RefreshReason, RetryDecision,
+    RetryDecisionInput,
+};
+use crate::session::write_session::{WorkerCommitLevel, WriteSession};
 
-/// A reader for an immutable file snapshot opened through [`FsClient::open`].
+/// A reader for an immutable file snapshot opened through the filesystem client.
 #[derive(Clone)]
 pub struct FileReader {
-    client: FsClient,
+    /// Shared runtime used to refresh metadata and access workers for this handle.
+    runtime: Arc<ClientRuntime>,
     inner: ReadHandle,
 }
 
 impl FileReader {
-    pub(crate) fn new(client: FsClient, inner: ReadHandle) -> Self {
-        Self { client, inner }
+    pub(crate) fn new(runtime: Arc<ClientRuntime>, inner: ReadHandle) -> Self {
+        Self { runtime, inner }
     }
 
     /// Returns the namespace path used to open this file snapshot.
@@ -37,19 +49,154 @@ impl FileReader {
         self.inner.size_hint()
     }
 
-    /// Reads a range from the file snapshot opened by [`FsClient::open`].
+    /// Reads a range from the opened file snapshot.
     pub async fn read_at(&self, offset: u64, len: u32) -> ClientResult<Bytes> {
-        self.client.read_handle(&self.inner, offset, len).await
-    }
-
-    #[cfg(test)]
-    pub(crate) fn inode_id(&self) -> InodeId {
-        self.inner.inode_id()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn data_handle_id(&self) -> DataHandleId {
-        self.inner.data_handle_id()
+        let Some(span) = ReadPlanner::plan_requested_range(offset, len, self.inner.size_hint())? else {
+            return Ok(Bytes::new());
+        };
+        let file_version = self.inner.file_version();
+        let inode_id = self.inner.inode_id();
+        let data_handle_id = self.inner.data_handle_id();
+        let operation = OperationContext::new_named(
+            self.runtime.executor.client_id(),
+            self.runtime.executor.client_name(),
+            OperationKind::WorkerReadData,
+            "Read",
+            OperationIdentity::path(self.inner.path().to_string()),
+        )?;
+        let mut retry_used = 0usize;
+        let mut refresh_used = 0usize;
+        let retry_budget = self.runtime.config.retry.max_retry_attempts();
+        let refresh_budget = self.runtime.config.refresh.max_refresh_attempts;
+        let mut attempt = 0u32;
+        loop {
+            let layout = self
+                .runtime
+                .executor
+                .read_layout_for_data_handle(self.inner.path(), data_handle_id, span.file_offset, span.len)
+                .await?;
+            let (group_name, segments) =
+                ReadPlanner::resolve_response(inode_id, data_handle_id, Some(file_version), span, &layout)?;
+            let ctx = self.runtime.data_attempt_context(&operation, attempt);
+            match self
+                .runtime
+                .worker_rpc_with_timeout(
+                    "Read",
+                    OperationKind::WorkerReadData,
+                    self.runtime.data_plane.read_all(ctx, group_name, &segments),
+                )
+                .await
+            {
+                Ok(bytes) => return Ok(bytes),
+                Err(err) => {
+                    let class = ErrorClassifier.classify_error(&err);
+                    self.runtime
+                        .record_error_metric("Read", OperationKind::WorkerReadData, &class);
+                    let refresh_reason = match class {
+                        ErrorClass::NeedRefresh(reason) => Some(reason),
+                        _ => None,
+                    };
+                    let decision = RetryDecision::from_input(RetryDecisionInput {
+                        operation_kind: OperationKind::WorkerReadData,
+                        operation_name: "Read",
+                        attempt_number: attempt,
+                        retry_budget_remaining: retry_budget.saturating_sub(retry_used),
+                        refresh_budget_remaining: refresh_budget.saturating_sub(refresh_used),
+                        error_class: class.clone(),
+                        refresh_reason,
+                        replay_safety: operation.replay_safety(),
+                        side_effects_may_have_occurred: false,
+                        has_stable_call_id_and_fingerprint: true,
+                        has_stable_session_identity: true,
+                        public_bytes_returned: false,
+                        outcome_unknown: matches!(err, ClientError::UnknownOutcome(_)),
+                    });
+                    self.runtime.record_retry_decision(
+                        "Read",
+                        OperationKind::WorkerReadData,
+                        &class,
+                        refresh_reason,
+                        decision,
+                    );
+                    match decision {
+                        RetryDecision::RefreshThenRetry if should_replan_after_worker_error(&err) => {
+                            let reason = refresh_reason.expect("refresh decision requires reason");
+                            self.runtime.executor.record_data_refresh(
+                                &operation,
+                                reason,
+                                &refresh_hint_from_error(&err),
+                            )?;
+                            self.runtime.record_refresh_metric(
+                                "Read",
+                                OperationKind::WorkerReadData,
+                                reason,
+                                "refresh",
+                            );
+                            retry_used += 1;
+                            refresh_used += 1;
+                            attempt = attempt.saturating_add(1);
+                        }
+                        RetryDecision::Retry => {
+                            let retry_index = retry_used;
+                            retry_used += 1;
+                            self.runtime.record_metric(
+                                ClientMetric::RetryAttempt,
+                                metric_labels("Read", OperationKind::WorkerReadData).with_error_class(class.label()),
+                            );
+                            self.runtime
+                                .sleep_before_retry(retry_index, "Read", OperationKind::WorkerReadData)
+                                .await;
+                            attempt = attempt.saturating_add(1);
+                        }
+                        RetryDecision::ReturnError => {
+                            if matches!(class, ErrorClass::RetryableTransport)
+                                && retry_budget.saturating_sub(retry_used) == 0
+                            {
+                                self.runtime.record_metric(
+                                    ClientMetric::RetryExhausted,
+                                    metric_labels("Read", OperationKind::WorkerReadData)
+                                        .with_error_class(class.label()),
+                                );
+                            }
+                            if let Some(reason) = refresh_reason {
+                                if reason != RefreshReason::Unknown && refresh_budget.saturating_sub(refresh_used) == 0
+                                {
+                                    self.runtime.record_metric(
+                                        ClientMetric::RefreshExhausted,
+                                        metric_labels("Read", OperationKind::WorkerReadData)
+                                            .with_refresh_reason(reason.label()),
+                                    );
+                                    return Err(ClientError::Worker(format!(
+                                        "read refresh budget exhausted for {}",
+                                        reason.label()
+                                    )));
+                                }
+                            }
+                            return Err(err);
+                        }
+                        RetryDecision::UnknownOutcome => {
+                            self.runtime.record_metric(
+                                ClientMetric::UnknownOutcome,
+                                metric_labels("Read", OperationKind::WorkerReadData)
+                                    .with_error_class(class.label())
+                                    .with_outcome("unknown"),
+                            );
+                            return Err(err);
+                        }
+                        RetryDecision::DenyUnsafeReplay => {
+                            self.runtime.record_metric(
+                                ClientMetric::UnsafeReplayDenied,
+                                metric_labels("Read", OperationKind::WorkerReadData).with_outcome("denied"),
+                            );
+                            return Err(ClientError::Unsupported(
+                                "Read replay denied by retry policy".to_string(),
+                            ));
+                        }
+                        RetryDecision::RefreshThenRetry => return Err(err),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -62,15 +209,26 @@ impl fmt::Debug for FileReader {
     }
 }
 
-/// A writer for a sequential write session created through [`FsClient::create`] or [`FsClient::append`].
+/// Returns true when a worker read failure requires a fresh metadata layout.
+fn should_replan_after_worker_error(err: &ClientError) -> bool {
+    matches!(
+        ErrorClassifier.classify_error(err),
+        ErrorClass::NeedRefresh(
+            RefreshReason::RouteEpochMismatch | RefreshReason::WorkerRunMismatch | RefreshReason::BlockStampMismatch
+        )
+    )
+}
+
+/// A writer for a sequential write session created through the filesystem client.
 pub struct FileWriter {
-    client: FsClient,
+    /// Shared runtime used to publish metadata barriers and access workers.
+    runtime: Arc<ClientRuntime>,
     inner: WriteHandle,
 }
 
 impl FileWriter {
-    pub(crate) fn new(client: FsClient, inner: WriteHandle) -> Self {
-        Self { client, inner }
+    pub(crate) fn new(runtime: Arc<ClientRuntime>, inner: WriteHandle) -> Self {
+        Self { runtime, inner }
     }
 
     /// Returns the namespace path associated with this write session.
@@ -85,37 +243,262 @@ impl FileWriter {
 
     /// Writes all supplied bytes at the current sequential cursor.
     pub async fn write_all(&mut self, data: Bytes) -> ClientResult<()> {
-        self.client.write_handle_all(&self.inner, data).await.map(|_| ())
+        let session_ref = self.inner.write_session();
+        let mut session = session_ref.lock().await;
+        session.ensure_open_for_write()?;
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let blocks = buffer_write(&mut session, data)?;
+        for block in blocks {
+            self.runtime.write_one_block(&mut session, block).await?;
+        }
+        self.inner.store_write_cursor(session.cursor());
+        Ok(())
     }
 
     /// Publishes the written prefix for visibility while keeping the writer open.
     pub async fn sync_write_visibility(&mut self) -> ClientResult<()> {
-        self.client.sync_write_visibility_handle(&self.inner).await
+        self.sync_write_barrier(WriteSyncModeProto::WriteSyncModeVisibility)
+            .await
     }
 
     /// Publishes the written prefix for durability while keeping the writer open.
     pub async fn sync_write_durability(&mut self) -> ClientResult<()> {
-        self.client.sync_write_durability_handle(&self.inner).await
+        self.sync_write_barrier(WriteSyncModeProto::WriteSyncModeDurability)
+            .await
     }
 
     /// Renews the writer lease while keeping the write session open.
     pub async fn renew_lease(&mut self) -> ClientResult<()> {
-        self.client.renew_lease_handle(&self.inner).await
+        let session_ref = self.inner.write_session();
+        let mut session = session_ref.lock().await;
+        session.ensure_open_for_renew()?;
+        let path = session.path().to_string();
+        let session_identity = session.session_identity();
+        let write_handle = session.write_handle();
+        self.runtime.record_metric(
+            ClientMetric::LeaseRenewAttempt,
+            metric_labels("RenewLease", OperationKind::MetadataSessionBarrier).with_outcome("attempt"),
+        );
+        match self
+            .runtime
+            .executor
+            .renew_lease(
+                &path,
+                session_identity,
+                RenewLeaseRequestProto {
+                    header: None,
+                    write_handle: Some(write_handle),
+                },
+            )
+            .await
+        {
+            Ok(response) => {
+                let expires_at_ms = valid_write_session_expiry("RenewLease", response.expires_at_ms)?;
+                session.update_expires_at_ms(expires_at_ms);
+                self.runtime.record_metric(
+                    ClientMetric::LeaseRenewSuccess,
+                    metric_labels("RenewLease", OperationKind::MetadataSessionBarrier).with_outcome("success"),
+                );
+                Ok(())
+            }
+            Err(err) => {
+                mark_session_after_session_error(&mut session, &err);
+                let class = ErrorClassifier.classify_error(&err);
+                self.runtime
+                    .record_error_metric("RenewLease", OperationKind::MetadataSessionBarrier, &class);
+                self.runtime.record_metric(
+                    ClientMetric::LeaseRenewFailure,
+                    metric_labels("RenewLease", OperationKind::MetadataSessionBarrier)
+                        .with_error_class(class.label())
+                        .with_outcome("failure"),
+                );
+                Err(err)
+            }
+        }
     }
 
     /// Closes the writer and commits the final file metadata.
     pub async fn close(&mut self) -> ClientResult<()> {
-        self.client.close_handle(&self.inner).await
+        let session_ref = self.inner.write_session();
+        let mut session = session_ref.lock().await;
+        session.ensure_close_allowed()?;
+        let path = session.path().to_string();
+        self.flush_pending_bytes(&mut session).await?;
+        let final_size = session.cursor();
+        let committed_blocks = self
+            .runtime
+            .ensure_pending_worker_blocks_at_level(&mut session, WorkerCommitLevel::CLOSE_REQUIRED)
+            .await?;
+
+        let retrying_unknown_commit = session.is_commit_unknown();
+        let (operation, request) = session.prepare_commit_file(
+            self.runtime.executor.client_id(),
+            self.runtime.executor.client_name(),
+            committed_blocks,
+            final_size,
+        )?;
+        if retrying_unknown_commit {
+            self.runtime.record_metric(
+                ClientMetric::CommitUnknownRetry,
+                metric_labels("CommitFile", OperationKind::MetadataSessionBarrier).with_outcome("retry"),
+            );
+        }
+        match self.runtime.executor.commit_file(operation, request).await {
+            Ok(response) => {
+                validate_commit_file_size(response.committed_size, final_size)?;
+                session.mark_closed(response.file_version);
+                Ok(())
+            }
+            Err(err) if is_unknown_session_barrier_outcome(&err) => {
+                session.mark_commit_unknown();
+                self.runtime.record_metric(
+                    ClientMetric::UnknownOutcome,
+                    metric_labels("CommitFile", OperationKind::MetadataSessionBarrier).with_outcome("unknown"),
+                );
+                Err(ClientError::UnknownOutcome(format!(
+                    "CommitFile outcome is unknown for path {}: {}",
+                    path, err
+                )))
+            }
+            Err(err) => {
+                mark_session_after_session_error(&mut session, &err);
+                let class = ErrorClassifier.classify_error(&err);
+                self.runtime
+                    .record_error_metric("CommitFile", OperationKind::MetadataSessionBarrier, &class);
+                Err(err)
+            }
+        }
     }
 
     /// Aborts this writer's open write session and reports cleanup failures.
     pub async fn abort(&mut self) -> ClientResult<()> {
-        self.client.abort_handle(&self.inner).await
+        let session_ref = self.inner.write_session();
+        let mut session = session_ref.lock().await;
+        session.ensure_open_for_abort()?;
+        session.discard_buffered_bytes();
+        let plan =
+            session.prepare_abort_cleanup(self.runtime.executor.client_id(), self.runtime.executor.client_name())?;
+        let mut abort_error = None;
+        self.runtime.record_metric(
+            ClientMetric::AbortAttempt,
+            metric_labels("AbortFileWrite", OperationKind::CleanupBestEffort).with_outcome("attempt"),
+        );
+        for cleanup in plan.worker_cleanups() {
+            let operation = cleanup.operation();
+            let ctx = self.runtime.data_attempt_context(&operation, 0);
+            if let Err(err) = self
+                .runtime
+                .worker_rpc_with_timeout(
+                    "AbortWrite",
+                    OperationKind::CleanupBestEffort,
+                    self.runtime.data_plane.abort_write(ctx, cleanup.worker_block()),
+                )
+                .await
+            {
+                abort_error.get_or_insert(err);
+            }
+        }
+        if let Err(err) = self
+            .runtime
+            .executor
+            .abort_file_write(plan.metadata_operation(), plan.metadata_request())
+            .await
+        {
+            abort_error.get_or_insert(self.runtime.normalize_unknown_outcome(
+                "AbortFileWrite",
+                OperationKind::CleanupBestEffort,
+                err,
+            ));
+        }
+        match abort_error {
+            Some(err) => {
+                session.mark_abort_unknown();
+                let normalized =
+                    self.runtime
+                        .normalize_unknown_outcome("AbortWrite", OperationKind::CleanupBestEffort, err);
+                let metric = if matches!(normalized, ClientError::UnknownOutcome(_)) {
+                    ClientMetric::AbortUnknown
+                } else {
+                    ClientMetric::AbortFailure
+                };
+                self.runtime.record_metric(
+                    metric,
+                    metric_labels("AbortWrite", OperationKind::CleanupBestEffort).with_outcome("unknown"),
+                );
+                Err(normalized)
+            }
+            None => {
+                session.mark_aborted();
+                self.runtime.record_metric(
+                    ClientMetric::AbortSuccess,
+                    metric_labels("AbortFileWrite", OperationKind::CleanupBestEffort).with_outcome("success"),
+                );
+                Ok(())
+            }
+        }
     }
 
-    #[cfg(test)]
-    pub(crate) fn write_session(&self) -> Option<Arc<Mutex<WriteSession>>> {
-        Some(self.inner.write_session())
+    /// Flushes worker data to the requested level and publishes the metadata sync barrier.
+    async fn sync_write_barrier(&mut self, mode: WriteSyncModeProto) -> ClientResult<()> {
+        let session_ref = self.inner.write_session();
+        let mut session = session_ref.lock().await;
+        session.ensure_open_for_barrier()?;
+        let path = session.path().to_string();
+        let session_identity = session.session_identity();
+        self.flush_pending_bytes(&mut session).await?;
+        let target_size = session.cursor();
+        let required_level = sync_write_required_commit_level(mode)?;
+        let committed_blocks = self
+            .runtime
+            .ensure_pending_worker_blocks_at_level(&mut session, required_level)
+            .await?;
+        let request = SyncWriteRequestProto {
+            header: None,
+            write_handle: Some(session.write_handle()),
+            data_handle_id: Some(proto::common::DataHandleIdProto {
+                value: self.inner.data_handle_id().as_raw(),
+            }),
+            committed_blocks: committed_blocks.iter().map(Into::into).collect(),
+            target_size,
+            mode: mode as i32,
+            flags: 0,
+        };
+        match self.runtime.executor.sync_write(&path, session_identity, request).await {
+            Ok(response) => {
+                validate_sync_write_size(response.synced_size, target_size)?;
+                self.inner.store_write_cursor(session.cursor());
+                Ok(())
+            }
+            Err(err) => {
+                let class = ErrorClassifier.classify_error(&err);
+                if is_unknown_session_barrier_outcome(&err) {
+                    session.mark_unknown_outcome();
+                    self.runtime.record_metric(
+                        ClientMetric::UnknownOutcome,
+                        metric_labels("SyncWrite", OperationKind::MetadataSessionBarrier).with_outcome("unknown"),
+                    );
+                    return Err(ClientError::UnknownOutcome(format!(
+                        "SyncWrite outcome is unknown for path {}: {}",
+                        path, err
+                    )));
+                }
+                mark_session_after_session_error(&mut session, &err);
+                self.runtime
+                    .record_error_metric("SyncWrite", OperationKind::MetadataSessionBarrier, &class);
+                Err(err)
+            }
+        }
+    }
+
+    /// Writes the buffered tail block, if the session currently has one.
+    async fn flush_pending_bytes(&self, session: &mut WriteSession) -> ClientResult<()> {
+        if let Some(block) = session.take_buffered_tail() {
+            self.runtime.write_one_block(session, block).await?;
+        }
+        Ok(())
     }
 }
 
@@ -125,6 +508,42 @@ impl fmt::Debug for FileWriter {
             .field("path", &self.path())
             .field("cursor", &self.cursor())
             .finish()
+    }
+}
+
+/// Buffers incoming bytes and returns complete blocks ready for worker writes.
+fn buffer_write(session: &mut WriteSession, data: Bytes) -> ClientResult<Vec<Bytes>> {
+    let mut blocks = Vec::new();
+    let mut offset = 0usize;
+    let block_size = session.block_size_usize();
+    while offset < data.len() {
+        if session.buffered_len() == 0 && data.len() - offset >= block_size {
+            let end = offset + block_size;
+            session.advance_cursor(block_size)?;
+            blocks.push(data.slice(offset..end));
+            offset = end;
+            continue;
+        }
+
+        let needed = block_size - session.buffered_len();
+        let len = needed.min(data.len() - offset);
+        session.buffer_bytes(&data[offset..offset + len])?;
+        offset += len;
+        if let Some(block) = session.take_full_buffered_block() {
+            blocks.push(block);
+        }
+    }
+    Ok(blocks)
+}
+
+/// Maps a public sync mode to the worker commit level required before metadata publication.
+fn sync_write_required_commit_level(mode: WriteSyncModeProto) -> ClientResult<WorkerCommitLevel> {
+    match mode {
+        WriteSyncModeProto::WriteSyncModeDurability => Ok(WorkerCommitLevel::Durable),
+        WriteSyncModeProto::WriteSyncModeVisibility => Ok(WorkerCommitLevel::Visible),
+        WriteSyncModeProto::WriteSyncModeUnspecified => Err(ClientError::InvalidArgument(
+            "SyncWrite mode must be visibility or durability".to_string(),
+        )),
     }
 }
 
@@ -265,6 +684,7 @@ impl WriteHandle {
             ));
         };
 
+        let expires_at_ms = valid_write_session_expiry("CreateFile", response.expires_at_ms)?;
         let inode_id = InodeId::new(inode_id.value);
         let data_handle_id = DataHandleId::new(data_handle_id.value);
         let session = WriteSession::new(
@@ -274,6 +694,7 @@ impl WriteHandle {
             layout,
             write_handle,
             response.base_size,
+            expires_at_ms,
         )?;
         Ok(Self::new(
             path.to_string(),
@@ -311,6 +732,7 @@ impl WriteHandle {
             ));
         };
 
+        let expires_at_ms = valid_write_session_expiry("AppendFile", response.expires_at_ms)?;
         let inode_id = InodeId::new(inode_id.value);
         let data_handle_id = DataHandleId::new(data_handle_id.value);
         let session = WriteSession::new(
@@ -320,6 +742,7 @@ impl WriteHandle {
             layout,
             write_handle,
             response.base_size,
+            expires_at_ms,
         )?;
         Ok(Self::new(
             path.to_string(),
@@ -351,128 +774,18 @@ impl WriteHandle {
     }
 }
 
+pub(crate) fn valid_write_session_expiry(operation: &'static str, expires_at_ms: u64) -> ClientResult<u64> {
+    if expires_at_ms == 0 {
+        return Err(invalid_response(operation, "expires_at_ms must be non-zero"));
+    }
+    Ok(expires_at_ms)
+}
+
 impl fmt::Debug for WriteHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WriteHandle")
             .field("path", &self.path())
             .field("cursor", &self.write_cursor())
             .finish()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::ClientConfig;
-    use crate::error::ClientError;
-    use proto::common::{DataHandleIdProto, FileLayoutProto};
-    use proto::fs::InodeIdProto;
-    use proto::metadata::{CreateFileResponseProto, OpenFileResponseProto, WriteHandleProto};
-
-    #[tokio::test]
-    async fn file_reader_debug_redacts_identity_names() {
-        let config = ClientConfig {
-            metadata_endpoints: vec!["http://127.0.0.1:18080".to_string()],
-            ..ClientConfig::default()
-        };
-        let client = FsClient::try_new(config).expect("client");
-        let read = FileReader::new(
-            client,
-            ReadHandle::new("/alpha".to_string(), InodeId::new(101), DataHandleId::new(202), 3, 10),
-        );
-        let debug = format!("{read:?}");
-
-        assert!(debug.contains("FileReader"));
-        assert!(debug.contains("size_hint"));
-        assert_debug_redacts_internal_identity_names(&debug);
-    }
-
-    #[test]
-    fn read_handle_from_open_response_requires_inode_id() {
-        let err = ReadHandle::from_open_response(
-            "/alpha",
-            OpenFileResponseProto {
-                inode_id: None,
-                data_handle_id: Some(DataHandleIdProto { value: 202 }),
-                file_version: Some(3),
-                file_size: 10,
-                ..OpenFileResponseProto::default()
-            },
-        )
-        .expect_err("missing inode_id must fail");
-
-        assert!(
-            matches!(&err, ClientError::Metadata(msg) if msg.contains("OpenFileResponseProto.inode_id missing")),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn write_handle_from_create_response_builds_session() {
-        let handle = WriteHandle::from_create_response(
-            "/created",
-            CreateFileResponseProto {
-                inode_id: Some(InodeIdProto { value: 301 }),
-                data_handle_id: Some(DataHandleIdProto { value: 302 }),
-                write_handle: Some(write_handle_proto(1, 302)),
-                base_size: 8,
-                layout: Some(layout_proto()),
-                ..CreateFileResponseProto::default()
-            },
-        )
-        .expect("write handle");
-
-        assert_eq!(handle.path(), "/created");
-        assert_eq!(handle.data_handle_id(), DataHandleId::new(302));
-        assert_eq!(handle.write_cursor(), 8);
-    }
-
-    fn assert_debug_redacts_internal_identity_names(debug: &str) {
-        for needle in [
-            concat!("inode", "_id"),
-            concat!("data", "_handle_id"),
-            concat!("file", "_version"),
-            concat!("write", "_handle"),
-            concat!("fen", "cing"),
-            concat!("route", "_epoch"),
-            concat!("worker", "_run_id"),
-            concat!("block", "_stamp"),
-            concat!("call", "_id"),
-            concat!("stream", "_id"),
-        ] {
-            assert!(
-                !debug.contains(needle),
-                "reader or writer Debug output must redact {needle}: {debug}"
-            );
-        }
-    }
-
-    fn write_handle_proto(handle_id: u64, data_handle_id: u64) -> WriteHandleProto {
-        WriteHandleProto {
-            handle_id,
-            lease_id: Some(proto::common::LeaseIdProto {
-                high: 0,
-                low: handle_id,
-            }),
-            lease_epoch: 1,
-            open_epoch: 1,
-            fencing_token: Some(proto::common::FencingTokenProto {
-                block_id: Some(proto::common::BlockIdProto {
-                    data_handle_id,
-                    block_index: 0,
-                }),
-                owner: Some(types::ClientId::new(7).into()),
-                epoch: 1,
-            }),
-        }
-    }
-
-    fn layout_proto() -> FileLayoutProto {
-        FileLayoutProto {
-            block_size: 64 * 1024 * 1024,
-            chunk_size: 4 * 1024 * 1024,
-            replication: 1,
-            block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
-        }
     }
 }

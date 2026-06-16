@@ -4,7 +4,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use client::{AppendOptions, ClientConfig, CreateOptions, FsClient, ListOptions, OpenOptions};
+use client::{ClientConfig, CreateOptions, FsClient, ListOptions};
 use tokio::time::{sleep, Duration, Instant};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -41,7 +41,7 @@ async fn local_client_crud_roundtrip() {
     assert_eq!(read, first);
 
     let mut appender = client
-        .append(&path, AppendOptions::default())
+        .append(&path)
         .await
         .unwrap_or_else(|err| panic!("append requires running local metadata and worker: {err}"));
     appender
@@ -81,7 +81,7 @@ async fn read_after_block_report(client: &FsClient, path: &str, len: usize) -> B
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let reader = client
-            .open(path, OpenOptions::default())
+            .open(path)
             .await
             .unwrap_or_else(|err| panic!("open requires running local metadata and worker: {err}"));
         match reader.read_at(0, len as u32).await {

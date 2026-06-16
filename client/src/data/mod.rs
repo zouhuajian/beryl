@@ -26,7 +26,7 @@ pub(crate) trait WorkerDataClient: Send + Sync {
         ctx: AttemptContext,
         group_name: GroupName,
         segment: &PlannedReadSegment,
-    ) -> ClientResult<Bytes>;
+    ) -> ClientResult<WorkerReadResult>;
 
     async fn open_write(&self, ctx: AttemptContext, target: WorkerWriteTarget) -> ClientResult<WorkerWriteBlock>;
 
@@ -58,6 +58,17 @@ pub(crate) struct WorkerWriteTarget {
     pub(crate) group_name: GroupName,
     /// Metadata AddBlock target.
     pub(crate) target: WriteTarget,
+}
+
+/// Worker OpenReadStream evidence plus the bytes read from that stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkerReadResult {
+    /// Bytes returned for the planned segment.
+    pub(crate) bytes: Bytes,
+    /// Worker-observed block stamp from OpenReadStream.
+    pub(crate) block_stamp: u64,
+    /// Worker-observed readable committed prefix from OpenReadStream.
+    pub(crate) committed_length: u64,
 }
 
 /// Internal worker write stream state.

@@ -6,14 +6,6 @@
 use super::fs_client::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE};
 use types::BlockFormatId;
 
-/// Options for opening an existing file for reads.
-///
-/// This type is intentionally empty until the client supports stable read-open
-/// options. Existing files use the metadata-stored `FileLayout`; read-open
-/// options do not carry create-time layout overrides.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct OpenOptions {}
-
 /// Options for creating a file write session and, for new files only, proposing a `FileLayout`.
 ///
 /// Metadata validates and persists the accepted layout. Existing files opened
@@ -78,14 +70,6 @@ impl CreateOptions {
         self
     }
 }
-
-/// Options for opening an append write session.
-///
-/// This type is intentionally empty until append has stable public options.
-/// Append uses the metadata-stored `FileLayout` for the existing file and does
-/// not carry create-time layout overrides.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AppendOptions {}
 
 /// Options for listing a directory through [`FsClient::list`](crate::FsClient::list).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

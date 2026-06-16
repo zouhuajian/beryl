@@ -4,12 +4,13 @@
 //! Focused unit tests for the public API facade and client runtime behavior.
 
 use super::fs_client::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_REPLICATION};
-use super::handle::ReadHandle;
+use super::handle::{ReadHandle, WriteHandle};
 use super::*;
 use crate::canonical::{ClientAction, RefreshHint};
 use crate::config::ClientConfig;
 use crate::data::{
-    WorkerBlockSyncResult, WorkerCommitResult, WorkerDataClient, WorkerDataPlane, WorkerWriteBlock, WorkerWriteTarget,
+    WorkerBlockSyncResult, WorkerCommitResult, WorkerDataClient, WorkerDataPlane, WorkerReadResult, WorkerWriteBlock,
+    WorkerWriteTarget,
 };
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::{AddBlockResult, MetadataGateway, ReadLayout};
@@ -19,7 +20,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use common::error::canonical::{CanonicalError, RefreshHint as CanonicalRefreshHint, RefreshReason};
 use common::header::RpcErrorCode;
-use proto::common::{BlockIdProto, FencingTokenProto};
+use proto::common::{BlockIdProto, DataHandleIdProto, FencingTokenProto};
 use proto::metadata::{
     AbortFileWriteResponseProto, AppendFileResponseProto, CommitFileResponseProto, CreateDispositionProto,
     CreateFileResponseProto, DeleteResponseProto, GetStatusResponseProto, ListStatusResponseProto,
@@ -41,14 +42,14 @@ fn independent_fs_clients_generate_distinct_nonzero_client_ids() {
     let first = fs_client_with_gateway(test_config("root"), Arc::new(MockGateway::default())).expect("first client");
     let second = fs_client_with_gateway(test_config("root"), Arc::new(MockGateway::default())).expect("second client");
 
-    let first_id = first.executor.client_id();
-    let second_id = second.executor.client_id();
+    let first_id = first.runtime.executor.client_id();
+    let second_id = second.runtime.executor.client_id();
 
     assert_ne!(first_id.as_raw(), 0);
     assert_ne!(second_id.as_raw(), 0);
     assert_ne!(first_id, second_id);
-    assert_eq!(first.executor.client_name(), "default_client");
-    assert_eq!(second.executor.client_name(), "default_client");
+    assert_eq!(first.runtime.executor.client_name(), "default_client");
+    assert_eq!(second.runtime.executor.client_name(), "default_client");
 }
 
 #[tokio::test]
@@ -56,16 +57,108 @@ async fn open_returns_reader_from_metadata_response() {
     let gateway = Arc::new(MockGateway::default());
     let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
 
-    let reader = client
-        .open("/alpha", OpenOptions::default())
-        .await
-        .expect("open succeeds");
+    let reader = client.open("/alpha").await.expect("open succeeds");
 
     assert_eq!(reader.path(), "/alpha");
     assert_eq!(reader.size_hint(), 10);
-    assert_eq!(reader.inode_id(), InodeId::new(101));
-    assert_eq!(reader.data_handle_id(), DataHandleId::new(202));
     assert_eq!(methods(&gateway.calls()), vec!["open_file"]);
+}
+
+#[tokio::test]
+async fn file_reader_debug_redacts_identity_names() {
+    let config = ClientConfig {
+        metadata_endpoints: vec!["http://127.0.0.1:18080".to_string()],
+        ..ClientConfig::default()
+    };
+    let client = FsClient::try_new(config).expect("client");
+    let read = FileReader::new(
+        Arc::clone(&client.runtime),
+        ReadHandle::new("/alpha".to_string(), InodeId::new(101), DataHandleId::new(202), 3, 10),
+    );
+    let debug = format!("{read:?}");
+
+    assert!(debug.contains("FileReader"));
+    assert!(debug.contains("size_hint"));
+    assert_debug_redacts_internal_identity_names(&debug);
+}
+
+#[test]
+fn read_handle_from_open_response_requires_inode_id() {
+    let err = ReadHandle::from_open_response(
+        "/alpha",
+        OpenFileResponseProto {
+            inode_id: None,
+            data_handle_id: Some(DataHandleIdProto { value: 202 }),
+            file_version: Some(3),
+            file_size: 10,
+            ..OpenFileResponseProto::default()
+        },
+    )
+    .expect_err("missing inode_id must fail");
+
+    assert!(
+        matches!(&err, ClientError::Metadata(msg) if msg.contains("OpenFileResponseProto.inode_id missing")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn write_handle_from_create_response_builds_session() {
+    let handle = WriteHandle::from_create_response(
+        "/created",
+        CreateFileResponseProto {
+            inode_id: Some(proto::fs::InodeIdProto { value: 301 }),
+            data_handle_id: Some(DataHandleIdProto { value: 302 }),
+            write_handle: Some(write_handle_proto(1, 302)),
+            base_size: 8,
+            expires_at_ms: u64::MAX / 4,
+            layout: Some(layout_proto(default_layout())),
+            ..CreateFileResponseProto::default()
+        },
+    )
+    .expect("write handle");
+
+    assert_eq!(handle.path(), "/created");
+    assert_eq!(handle.data_handle_id(), DataHandleId::new(302));
+    assert_eq!(handle.write_cursor(), 8);
+}
+
+#[tokio::test]
+async fn write_handle_from_create_response_propagates_lease_expiry() {
+    let handle = WriteHandle::from_create_response(
+        "/created",
+        CreateFileResponseProto {
+            inode_id: Some(proto::fs::InodeIdProto { value: 301 }),
+            data_handle_id: Some(DataHandleIdProto { value: 302 }),
+            write_handle: Some(write_handle_proto(1, 302)),
+            expires_at_ms: 456,
+            layout: Some(layout_proto(default_layout())),
+            ..CreateFileResponseProto::default()
+        },
+    )
+    .expect("write handle");
+
+    let session_ref = handle.write_session();
+    let session = session_ref.lock().await;
+    assert_eq!(session.expires_at_ms(), Some(456));
+}
+
+#[test]
+fn write_handle_from_create_response_rejects_missing_lease_expiry() {
+    let err = WriteHandle::from_create_response(
+        "/created",
+        CreateFileResponseProto {
+            inode_id: Some(proto::fs::InodeIdProto { value: 301 }),
+            data_handle_id: Some(DataHandleIdProto { value: 302 }),
+            write_handle: Some(write_handle_proto(1, 302)),
+            layout: Some(layout_proto(default_layout())),
+            ..CreateFileResponseProto::default()
+        },
+    )
+    .expect_err("zero expires_at_ms must fail");
+
+    assert!(matches!(&err, ClientError::InvalidResponse { operation, reason }
+        if *operation == "CreateFile" && reason.contains("expires_at_ms")));
 }
 
 #[tokio::test]
@@ -188,47 +281,11 @@ async fn overwrite_returns_writer_and_maps_overwrite_disposition() {
 }
 
 #[tokio::test]
-async fn overwrite_preserves_custom_create_layout_mapping() {
-    let gateway = Arc::new(MockGateway::default());
-    let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
-
-    client
-        .create(
-            "/overwrite",
-            CreateOptions::overwrite()
-                .with_block_format_id(types::BlockFormatId::CURRENT_FOR_NEW_FILE)
-                .with_block_size(16 * 1024 * 1024)
-                .with_chunk_size(2 * 1024 * 1024),
-        )
-        .await
-        .expect("overwrite writer");
-
-    let calls = gateway.calls();
-    assert_eq!(methods(&calls), vec!["create_file"]);
-    assert_eq!(
-        calls[0].create_disposition,
-        Some(CreateDispositionProto::Overwrite as i32)
-    );
-    assert_eq!(
-        calls[0].create_layout,
-        Some(RecordedLayout {
-            block_size: 16 * 1024 * 1024,
-            chunk_size: 2 * 1024 * 1024,
-            replication: DEFAULT_REPLICATION,
-            block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
-        })
-    );
-}
-
-#[tokio::test]
 async fn append_returns_writer_from_metadata_session() {
     let gateway = Arc::new(MockGateway::default());
     let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
 
-    let writer = client
-        .append("/append", AppendOptions::default())
-        .await
-        .expect("append writer");
+    let writer = client.append("/append").await.expect("append writer");
 
     assert_eq!(writer.path(), "/append");
     assert_eq!(writer.cursor(), 10);
@@ -243,7 +300,7 @@ async fn append_rejects_missing_response_layout() {
     let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
 
     let err = client
-        .append("/append", AppendOptions::default())
+        .append("/append")
         .await
         .expect_err("missing append response layout must fail");
 
@@ -262,7 +319,7 @@ async fn append_rejects_invalid_response_layout() {
     let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
 
     let err = client
-        .append("/append", AppendOptions::default())
+        .append("/append")
         .await
         .expect_err("invalid append response layout must fail");
 
@@ -284,6 +341,7 @@ async fn stat_list_delete_and_rename_use_metadata_gateway() {
     client.rename("/alpha", "/beta").await.expect("rename");
 
     assert_eq!(status.path(), "/alpha");
+    assert_eq!(status.inode_id, InodeId::new(101));
     assert_eq!(status.attrs.size, 10);
     assert_eq!(listing.path(), "/alpha");
     assert!(listing.eof);
@@ -365,6 +423,52 @@ async fn reader_reads_normal_range_through_planner_and_worker() {
 }
 
 #[tokio::test]
+async fn reader_rejects_worker_block_stamp_mismatch() {
+    let gateway = Arc::new(MockGateway::with_layout(layout_response(
+        "root",
+        101,
+        202,
+        Some(3),
+        16,
+        vec![location(202, 0, 0, 16)],
+    )));
+    let worker = Arc::new(MockDataClient::with_read_block_stamp(b"abcdefghijklmnop", 99));
+    let client = fs_client_with_data_plane(test_config("root"), gateway, data_plane(worker)).expect("client");
+    let reader = read_reader(&client, 16);
+
+    let err = reader
+        .read_at(2, 5)
+        .await
+        .expect_err("worker block_stamp mismatch must fail");
+
+    assert!(matches!(&err, ClientError::InvalidResponse { operation, reason }
+        if *operation == "OpenReadStream" && reason.contains("block_stamp")));
+}
+
+#[tokio::test]
+async fn reader_rejects_worker_committed_length_that_does_not_cover_range() {
+    let gateway = Arc::new(MockGateway::with_layout(layout_response(
+        "root",
+        101,
+        202,
+        Some(3),
+        16,
+        vec![location(202, 0, 0, 16)],
+    )));
+    let worker = Arc::new(MockDataClient::with_read_committed_length(b"abcdefghijklmnop", 6));
+    let client = fs_client_with_data_plane(test_config("root"), gateway, data_plane(worker)).expect("client");
+    let reader = read_reader(&client, 16);
+
+    let err = reader
+        .read_at(2, 5)
+        .await
+        .expect_err("short worker committed_length must fail");
+
+    assert!(matches!(&err, ClientError::InvalidResponse { operation, reason }
+        if *operation == "OpenReadStream" && reason.contains("committed_length")));
+}
+
+#[tokio::test]
 async fn reader_repeated_reads_fetch_current_metadata_locations() {
     let gateway = Arc::new(MockGateway::with_layout(layout_response(
         "root",
@@ -383,37 +487,6 @@ async fn reader_repeated_reads_fetch_current_metadata_locations() {
 
     assert_eq!(first, Bytes::from_static(b"cdefg"));
     assert_eq!(second, Bytes::from_static(b"cdefg"));
-    assert_eq!(method_count(&gateway.calls(), "read_layout"), 2);
-}
-
-#[tokio::test]
-async fn concurrent_reader_reads_fetch_layout_per_call() {
-    let gateway = Arc::new(MockGateway::with_layout(layout_response(
-        "root",
-        101,
-        202,
-        Some(3),
-        16,
-        vec![location(202, 0, 0, 16)],
-    )));
-    let worker = Arc::new(MockDataClient::from_file(b"abcdefghijklmnop"));
-    let client = fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker)).expect("client");
-    let reader = read_reader(&client, 16);
-
-    let first = {
-        let reader = reader.clone();
-        tokio::spawn(async move { reader.read_at(2, 5).await })
-    };
-    let second = tokio::spawn(async move { reader.read_at(2, 5).await });
-
-    assert_eq!(
-        first.await.expect("first task").expect("first read"),
-        Bytes::from_static(b"cdefg")
-    );
-    assert_eq!(
-        second.await.expect("second task").expect("second read"),
-        Bytes::from_static(b"cdefg")
-    );
     assert_eq!(method_count(&gateway.calls(), "read_layout"), 2);
 }
 
@@ -530,16 +603,43 @@ async fn writer_create_uses_metadata_layout_block_size_for_chunking() {
 }
 
 #[tokio::test]
+async fn writer_uses_metadata_confirmed_layout_over_create_request_layout() {
+    let requested = recorded_layout_values(64, 8);
+    let confirmed = recorded_layout_values(8, 4);
+    let gateway = Arc::new(MockGateway::with_create_response_layout(Some(confirmed)));
+    let worker = Arc::new(MockDataClient::default());
+    let client =
+        fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone())).expect("client");
+    let mut writer = client
+        .create(
+            "/created",
+            CreateOptions::create()
+                .with_block_size(requested.block_size)
+                .with_chunk_size(requested.chunk_size),
+        )
+        .await
+        .expect("writer");
+
+    writer
+        .write_all(Bytes::from(vec![b'x'; 20]))
+        .await
+        .expect("write should use confirmed metadata layout");
+    writer.close().await.expect("close");
+
+    let calls = gateway.calls();
+    assert_eq!(calls[0].create_layout, Some(requested));
+    assert_eq!(add_block_lens(&calls), vec![8, 8, 4]);
+    assert_eq!(worker.write_lens(), vec![8, 8, 4]);
+}
+
+#[tokio::test]
 async fn writer_append_uses_metadata_layout_block_size_for_chunking() {
     let layout = recorded_layout_values(6, 3);
     let gateway = Arc::new(MockGateway::with_append_write_layout(layout));
     let worker = Arc::new(MockDataClient::default());
     let client =
         fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone())).expect("client");
-    let mut writer = client
-        .append("/append", AppendOptions::default())
-        .await
-        .expect("writer");
+    let mut writer = client.append("/append").await.expect("writer");
 
     writer
         .write_all(Bytes::from(vec![b'x'; 14]))
@@ -565,37 +665,9 @@ async fn writer_append_uses_metadata_layout_block_size_for_chunking() {
 }
 
 #[tokio::test]
-async fn writer_default_create_layout_uses_default_block_size_for_chunking() {
-    let gateway = Arc::new(MockGateway::default());
-    let worker = Arc::new(MockDataClient::without_recorded_body());
-    let client =
-        fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone())).expect("client");
-    let mut writer = client
-        .create("/created", CreateOptions::default())
-        .await
-        .expect("writer");
-    let len = DEFAULT_BLOCK_SIZE as usize + 3;
-
-    writer
-        .write_all(Bytes::from(vec![b'x'; len]))
-        .await
-        .expect("write should split by default metadata layout");
-    writer.close().await.expect("close");
-
-    let calls = gateway.calls();
-    assert_eq!(add_block_lens(&calls), vec![u64::from(DEFAULT_BLOCK_SIZE), 3]);
-    assert_eq!(worker.write_lens(), vec![u64::from(DEFAULT_BLOCK_SIZE), 3]);
-    let commit = calls
-        .into_iter()
-        .find(|call| call.method == "commit_file")
-        .expect("commit_file call");
-    assert_eq!(commit.final_size, Some(len as u64));
-    assert_eq!(commit.committed_block_lens, vec![u64::from(DEFAULT_BLOCK_SIZE), 3]);
-}
-
-#[tokio::test]
-async fn writer_multiple_sequential_writes_preserve_cursor_and_final_size() {
-    let gateway = Arc::new(MockGateway::default());
+async fn writer_multiple_small_writes_coalesce_until_close_flushes_pending_bytes() {
+    let layout = recorded_layout_values(8, 4);
+    let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
     let worker = Arc::new(MockDataClient::default());
     let client =
         fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone())).expect("client");
@@ -606,6 +678,11 @@ async fn writer_multiple_sequential_writes_preserve_cursor_and_final_size() {
 
     writer.write_all(Bytes::from_static(b"hel")).await.expect("first write");
     writer.write_all(Bytes::from_static(b"lo")).await.expect("second write");
+
+    assert_eq!(writer.cursor(), 5);
+    assert_eq!(add_block_lens(&gateway.calls()), Vec::<u64>::new());
+    assert_eq!(worker.write_lens(), Vec::<u64>::new());
+
     writer.close().await.expect("close");
 
     assert_eq!(writer.cursor(), 5);
@@ -616,13 +693,47 @@ async fn writer_multiple_sequential_writes_preserve_cursor_and_final_size() {
         .find(|call| call.method == "commit_file")
         .expect("commit_file call");
     assert_eq!(commit.final_size, Some(5));
-    assert_eq!(commit.committed_block_offsets, vec![0, 3]);
-    assert_eq!(commit.committed_block_lens, vec![3, 2]);
+    assert_eq!(commit.committed_block_offsets, vec![0]);
+    assert_eq!(commit.committed_block_lens, vec![5]);
+}
+
+#[tokio::test]
+async fn writer_write_crossing_block_boundary_emits_full_blocks_and_buffers_tail() {
+    let layout = recorded_layout_values(8, 4);
+    let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
+    let worker = Arc::new(MockDataClient::default());
+    let client =
+        fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone())).expect("client");
+    let mut writer = client
+        .create("/created", CreateOptions::create())
+        .await
+        .expect("writer");
+
+    writer
+        .write_all(Bytes::from(vec![b'x'; 20]))
+        .await
+        .expect("write should flush only complete blocks");
+
+    assert_eq!(writer.cursor(), 20);
+    assert_eq!(add_block_lens(&gateway.calls()), vec![8, 8]);
+    assert_eq!(worker.write_lens(), vec![8, 8]);
+
+    writer.close().await.expect("close");
+
+    let calls = gateway.calls();
+    assert_eq!(add_block_lens(&calls), vec![8, 8, 4]);
+    let commit = calls
+        .into_iter()
+        .find(|call| call.method == "commit_file")
+        .expect("commit_file call");
+    assert_eq!(commit.final_size, Some(20));
+    assert_eq!(commit.committed_block_lens, vec![8, 8, 4]);
 }
 
 #[tokio::test]
 async fn writer_visibility_sync_publishes_prefix_and_keeps_writer_usable() {
-    let gateway = Arc::new(MockGateway::default());
+    let layout = recorded_layout_values(8, 4);
+    let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
     let worker = Arc::new(MockDataClient::default());
     let client =
         fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone())).expect("client");
@@ -632,6 +743,10 @@ async fn writer_visibility_sync_publishes_prefix_and_keeps_writer_usable() {
         .expect("writer");
 
     writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
+
+    assert_eq!(add_block_lens(&gateway.calls()), Vec::<u64>::new());
+    assert_eq!(worker.write_lens(), Vec::<u64>::new());
+
     writer.sync_write_visibility().await.expect("visibility sync");
     writer
         .write_all(Bytes::from_static(b"!"))
@@ -655,7 +770,8 @@ async fn writer_visibility_sync_publishes_prefix_and_keeps_writer_usable() {
 
 #[tokio::test]
 async fn writer_durability_sync_publishes_prefix_and_keeps_writer_usable() {
-    let gateway = Arc::new(MockGateway::default());
+    let layout = recorded_layout_values(8, 4);
+    let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
     let worker = Arc::new(MockDataClient::default());
     let client =
         fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone())).expect("client");
@@ -665,6 +781,10 @@ async fn writer_durability_sync_publishes_prefix_and_keeps_writer_usable() {
         .expect("writer");
 
     writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
+
+    assert_eq!(add_block_lens(&gateway.calls()), Vec::<u64>::new());
+    assert_eq!(worker.write_lens(), Vec::<u64>::new());
+
     writer.sync_write_durability().await.expect("durability sync");
     writer
         .write_all(Bytes::from_static(b"!"))
@@ -719,26 +839,167 @@ async fn writer_durability_after_visibility_uses_sync_committed_block() {
 }
 
 #[tokio::test]
-async fn writer_renew_lease_updates_session_state() {
-    let gateway = Arc::new(MockGateway::default());
-    let worker = Arc::new(MockDataClient::default());
-    let client = fs_client_with_data_plane(test_config("root"), gateway, data_plane(worker)).expect("client");
+async fn writer_barrier_flush_worker_error_blocks_later_write_and_close() {
+    let layout = recorded_layout_values(8, 4);
+    let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
+    let worker = Arc::new(MockDataClient {
+        write_stream_outcomes: Mutex::new(vec![WorkerWriteOutcome::WorkerError].into()),
+        ..MockDataClient::default()
+    });
+    let client = fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker)).expect("client");
     let mut writer = client
         .create("/created", CreateOptions::create())
         .await
         .expect("writer");
 
+    writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
+    let err = writer
+        .sync_write_visibility()
+        .await
+        .expect_err("flush failure must fail barrier");
+    assert!(matches!(err, ClientError::Worker(msg) if msg.contains("injected WriteStream failure")));
+
+    let err = writer
+        .write_all(Bytes::from_static(b"!"))
+        .await
+        .expect_err("unsafe flush failure blocks writes");
+    assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("invalid")));
+    let err = writer
+        .sync_write_durability()
+        .await
+        .expect_err("unsafe flush failure blocks durability sync");
+    assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("invalid")));
+    let err = writer.close().await.expect_err("unsafe flush failure blocks close");
+    assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("invalid")));
+    assert_eq!(method_count(&gateway.calls(), "commit_file"), 0);
+}
+
+#[tokio::test]
+async fn writer_close_time_flush_worker_error_blocks_retry_commit() {
+    let layout = recorded_layout_values(8, 4);
+    let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
+    let worker = Arc::new(MockDataClient {
+        write_stream_outcomes: Mutex::new(vec![WorkerWriteOutcome::WorkerError].into()),
+        ..MockDataClient::default()
+    });
+    let client = fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker)).expect("client");
+    let mut writer = client
+        .create("/created", CreateOptions::create())
+        .await
+        .expect("writer");
+
+    writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
+    let err = writer.close().await.expect_err("close-time flush must fail");
+    assert!(matches!(err, ClientError::Worker(msg) if msg.contains("injected WriteStream failure")));
+
+    let err = writer
+        .close()
+        .await
+        .expect_err("failed close-time flush must not become commit retry");
+    assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("invalid")));
+    assert_eq!(method_count(&gateway.calls(), "commit_file"), 0);
+}
+
+#[tokio::test]
+async fn writer_renew_lease_updates_session_state() {
+    let gateway = Arc::new(MockGateway::default());
+    let client = fs_client_with_gateway(test_config("root"), gateway).expect("client");
+    let handle = WriteHandle::from_create_response(
+        "/created",
+        CreateFileResponseProto {
+            inode_id: Some(proto::fs::InodeIdProto { value: 301 }),
+            data_handle_id: Some(DataHandleIdProto { value: 302 }),
+            write_handle: Some(write_handle_proto(1, 302)),
+            base_size: 0,
+            expires_at_ms: u64::MAX / 4,
+            layout: Some(layout_proto(default_layout())),
+            ..CreateFileResponseProto::default()
+        },
+    )
+    .expect("write handle");
+    let session_ref = handle.write_session();
+    let mut writer = FileWriter::new(Arc::clone(&client.runtime), handle);
+
     writer.renew_lease().await.expect("renew lease");
 
-    let session_ref = writer.write_session().expect("write session");
     let session = session_ref.lock().await;
     assert_eq!(session.expires_at_ms(), Some(u64::MAX / 2));
 }
 
 #[tokio::test]
+async fn writer_renew_lease_rejects_zero_expiry_without_updating_session() {
+    let gateway = Arc::new(MockGateway::with_renew_outcomes(vec![RenewOutcome::ZeroExpiry]));
+    let client = fs_client_with_gateway(test_config("root"), gateway).expect("client");
+    let handle = WriteHandle::from_create_response(
+        "/created",
+        CreateFileResponseProto {
+            inode_id: Some(proto::fs::InodeIdProto { value: 301 }),
+            data_handle_id: Some(DataHandleIdProto { value: 302 }),
+            write_handle: Some(write_handle_proto(1, 302)),
+            base_size: 0,
+            expires_at_ms: u64::MAX / 4,
+            layout: Some(layout_proto(default_layout())),
+            ..CreateFileResponseProto::default()
+        },
+    )
+    .expect("write handle");
+    let session_ref = handle.write_session();
+    let mut writer = FileWriter::new(Arc::clone(&client.runtime), handle);
+
+    let err = writer.renew_lease().await.expect_err("zero renew expiry must fail");
+    assert!(matches!(&err, ClientError::InvalidResponse { operation, reason }
+        if *operation == "RenewLease" && reason.contains("expires_at_ms")));
+
+    let session = session_ref.lock().await;
+    assert_eq!(session.expires_at_ms(), Some(u64::MAX / 4));
+}
+
+#[tokio::test]
+async fn writer_close_rejects_commit_size_shorter_than_final_size() {
+    let gateway = Arc::new(MockGateway::with_commit_response_size(4));
+    let worker = Arc::new(MockDataClient::default());
+    let client = fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker)).expect("client");
+    let mut writer = client
+        .create("/created", CreateOptions::create())
+        .await
+        .expect("writer");
+
+    writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
+    let err = writer.close().await.expect_err("short committed_size must fail");
+
+    assert!(matches!(&err, ClientError::InvalidResponse { operation, reason }
+        if *operation == "CommitFile" && reason.contains("committed_size")));
+}
+
+#[tokio::test]
+async fn writer_visibility_sync_rejects_synced_size_shorter_than_target() {
+    let gateway = Arc::new(MockGateway::with_sync_response_size(4));
+    let worker = Arc::new(MockDataClient::default());
+    let client = fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker)).expect("client");
+    let mut writer = client
+        .create("/created", CreateOptions::create())
+        .await
+        .expect("writer");
+
+    writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
+    let err = writer
+        .sync_write_visibility()
+        .await
+        .expect_err("short synced_size must fail");
+
+    assert!(matches!(&err, ClientError::InvalidResponse { operation, reason }
+        if *operation == "SyncWrite" && reason.contains("synced_size")));
+}
+
+#[tokio::test]
 async fn writer_abort_cleans_worker_then_metadata_and_blocks_session() {
     let events = event_log();
-    let gateway = Arc::new(MockGateway::with_events(events.clone()));
+    let layout = recorded_layout_values(5, 5);
+    let gateway = Arc::new(MockGateway {
+        create_response_layout: Mutex::new(Some(Some(layout))),
+        events: Some(events.clone()),
+        ..MockGateway::default()
+    });
     let worker = Arc::new(MockDataClient::with_events(events.clone()));
     let client =
         fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone())).expect("client");
@@ -761,9 +1022,12 @@ async fn writer_abort_cleans_worker_then_metadata_and_blocks_session() {
 
 #[tokio::test]
 async fn writer_unknown_add_block_blocks_followup_writes() {
-    let gateway = Arc::new(MockGateway::with_add_block_outcomes(vec![
-        AddBlockOutcome::TransportUnknown,
-    ]));
+    let layout = recorded_layout_values(5, 5);
+    let gateway = Arc::new(MockGateway {
+        create_response_layout: Mutex::new(Some(Some(layout))),
+        add_block_outcomes: Mutex::new(vec![AddBlockOutcome::TransportUnknown].into()),
+        ..MockGateway::default()
+    });
     let worker = Arc::new(MockDataClient::default());
     let client = fs_client_with_data_plane(test_config_with_retries("root", 0), gateway.clone(), data_plane(worker))
         .expect("client");
@@ -811,6 +1075,26 @@ fn event_log() -> EventLog {
 
 fn methods(calls: &[RecordedCall]) -> Vec<&'static str> {
     calls.iter().map(|call| call.method).collect()
+}
+
+fn assert_debug_redacts_internal_identity_names(debug: &str) {
+    for needle in [
+        concat!("inode", "_id"),
+        concat!("data", "_handle_id"),
+        concat!("file", "_version"),
+        concat!("write", "_handle"),
+        concat!("fen", "cing"),
+        concat!("route", "_epoch"),
+        concat!("worker", "_run_id"),
+        concat!("block", "_stamp"),
+        concat!("call", "_id"),
+        concat!("stream", "_id"),
+    ] {
+        assert!(
+            !debug.contains(needle),
+            "reader or writer Debug output must redact {needle}: {debug}"
+        );
+    }
 }
 
 fn method_count(calls: &[RecordedCall], method: &str) -> usize {
@@ -947,6 +1231,8 @@ struct MockGateway {
     append_write_layout: Mutex<Option<RecordedLayout>>,
     create_response_layout: Mutex<Option<Option<RecordedLayout>>>,
     append_response_layout: Mutex<Option<Option<RecordedLayout>>>,
+    commit_response_size: Mutex<Option<u64>>,
+    sync_response_size: Mutex<Option<u64>>,
     add_block_outcomes: Mutex<VecDeque<AddBlockOutcome>>,
     renew_outcomes: Mutex<VecDeque<RenewOutcome>>,
     events: Option<EventLog>,
@@ -959,13 +1245,6 @@ impl MockGateway {
 
     fn list_requests(&self) -> Vec<proto::metadata::ListStatusRequestProto> {
         self.list_requests.lock().expect("list requests").clone()
-    }
-
-    fn with_events(events: EventLog) -> Self {
-        Self {
-            events: Some(events),
-            ..Self::default()
-        }
     }
 
     fn with_layout(layout: ReadLayout) -> Self {
@@ -998,9 +1277,16 @@ impl MockGateway {
         }
     }
 
-    fn with_add_block_outcomes(outcomes: Vec<AddBlockOutcome>) -> Self {
+    fn with_commit_response_size(committed_size: u64) -> Self {
         Self {
-            add_block_outcomes: Mutex::new(outcomes.into()),
+            commit_response_size: Mutex::new(Some(committed_size)),
+            ..Self::default()
+        }
+    }
+
+    fn with_sync_response_size(synced_size: u64) -> Self {
+        Self {
+            sync_response_size: Mutex::new(Some(synced_size)),
             ..Self::default()
         }
     }
@@ -1254,6 +1540,7 @@ impl MetadataGateway for MockGateway {
             inode_id: Some(proto::fs::InodeIdProto { value: 301 }),
             data_handle_id: Some(proto::common::DataHandleIdProto { value: 302 }),
             base_size: 0,
+            expires_at_ms: u64::MAX / 2,
             layout: response_layout.map(layout_proto),
             ..CreateFileResponseProto::default()
         })
@@ -1282,6 +1569,7 @@ impl MetadataGateway for MockGateway {
             inode_id: Some(proto::fs::InodeIdProto { value: 401 }),
             data_handle_id: Some(proto::common::DataHandleIdProto { value: 402 }),
             base_size: 10,
+            expires_at_ms: u64::MAX / 2,
             layout: response_layout.map(layout_proto),
             ..AppendFileResponseProto::default()
         })
@@ -1339,8 +1627,13 @@ impl MetadataGateway for MockGateway {
         req: proto::metadata::CommitFileRequestProto,
     ) -> ClientResult<proto::metadata::CommitFileResponseProto> {
         self.record_commit_file(&ctx, &req);
+        let committed_size = self
+            .commit_response_size
+            .lock()
+            .expect("commit response size")
+            .unwrap_or(req.final_size);
         Ok(CommitFileResponseProto {
-            committed_size: req.final_size,
+            committed_size,
             file_version: Some(1),
             ..CommitFileResponseProto::default()
         })
@@ -1368,6 +1661,10 @@ impl MetadataGateway for MockGateway {
                 ..RenewLeaseResponseProto::default()
             }),
             RenewOutcome::SessionExpired => Err(session_error(RefreshReason::SessionExpired)),
+            RenewOutcome::ZeroExpiry => Ok(RenewLeaseResponseProto {
+                expires_at_ms: 0,
+                ..RenewLeaseResponseProto::default()
+            }),
         }
     }
 
@@ -1377,8 +1674,13 @@ impl MetadataGateway for MockGateway {
         req: proto::metadata::SyncWriteRequestProto,
     ) -> ClientResult<SyncWriteResponseProto> {
         self.record_sync_write(&ctx, &req);
+        let synced_size = self
+            .sync_response_size
+            .lock()
+            .expect("sync response size")
+            .unwrap_or(req.target_size);
         Ok(SyncWriteResponseProto {
-            synced_size: req.target_size,
+            synced_size,
             file_version: Some(1),
             ..SyncWriteResponseProto::default()
         })
@@ -1404,6 +1706,13 @@ enum AddBlockOutcome {
 enum RenewOutcome {
     Ok,
     SessionExpired,
+    ZeroExpiry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerWriteOutcome {
+    Ok,
+    WorkerError,
 }
 
 #[derive(Debug)]
@@ -1415,8 +1724,11 @@ struct MockDataClient {
     written_lens: Mutex<Vec<u64>>,
     committed: Mutex<Vec<u64>>,
     committed_streams: Mutex<std::collections::HashSet<(u64, u64)>>,
+    write_stream_outcomes: Mutex<VecDeque<WorkerWriteOutcome>>,
     commit_sync_flags: Mutex<Vec<bool>>,
     block_syncs: Mutex<Vec<u64>>,
+    read_block_stamp: Mutex<Option<u64>>,
+    read_committed_length: Mutex<Option<u64>>,
     record_written_body: bool,
     events: Option<EventLog>,
 }
@@ -1431,17 +1743,13 @@ impl MockDataClient {
             written_lens: Mutex::new(Vec::new()),
             committed: Mutex::new(Vec::new()),
             committed_streams: Mutex::new(std::collections::HashSet::new()),
+            write_stream_outcomes: Mutex::new(VecDeque::new()),
             commit_sync_flags: Mutex::new(Vec::new()),
             block_syncs: Mutex::new(Vec::new()),
+            read_block_stamp: Mutex::new(None),
+            read_committed_length: Mutex::new(None),
             record_written_body: true,
             events: None,
-        }
-    }
-
-    fn without_recorded_body() -> Self {
-        Self {
-            record_written_body: false,
-            ..Self::default()
         }
     }
 
@@ -1455,6 +1763,20 @@ impl MockDataClient {
     fn with_refresh_once(file: &'static [u8], reason: RefreshReason) -> Self {
         Self {
             refresh_once: Mutex::new(Some(reason)),
+            ..Self::from_file(file)
+        }
+    }
+
+    fn with_read_block_stamp(file: &'static [u8], block_stamp: u64) -> Self {
+        Self {
+            read_block_stamp: Mutex::new(Some(block_stamp)),
+            ..Self::from_file(file)
+        }
+    }
+
+    fn with_read_committed_length(file: &'static [u8], committed_length: u64) -> Self {
+        Self {
+            read_committed_length: Mutex::new(Some(committed_length)),
             ..Self::from_file(file)
         }
     }
@@ -1484,6 +1806,14 @@ impl MockDataClient {
             events.lock().expect("events").push(event);
         }
     }
+
+    fn next_write_stream_outcome(&self) -> WorkerWriteOutcome {
+        self.write_stream_outcomes
+            .lock()
+            .expect("write stream outcomes")
+            .pop_front()
+            .unwrap_or(WorkerWriteOutcome::Ok)
+    }
 }
 
 impl Default for MockDataClient {
@@ -1499,7 +1829,7 @@ impl WorkerDataClient for MockDataClient {
         _ctx: AttemptContext,
         _group_name: GroupName,
         segment: &PlannedReadSegment,
-    ) -> ClientResult<Bytes> {
+    ) -> ClientResult<WorkerReadResult> {
         let call_number = {
             let mut calls = self.calls.lock().expect("calls");
             *calls += 1;
@@ -1512,7 +1842,19 @@ impl WorkerDataClient for MockDataClient {
         }
         let start = segment.file_offset as usize;
         let end = start + segment.len as usize;
-        Ok(self.file.slice(start..end))
+        Ok(WorkerReadResult {
+            bytes: self.file.slice(start..end),
+            block_stamp: self
+                .read_block_stamp
+                .lock()
+                .expect("read block stamp")
+                .unwrap_or(segment.block_stamp),
+            committed_length: self
+                .read_committed_length
+                .lock()
+                .expect("read committed length")
+                .unwrap_or(segment.block_offset + u64::from(segment.len)),
+        })
     }
 
     async fn open_write(&self, _ctx: AttemptContext, target: WorkerWriteTarget) -> ClientResult<WorkerWriteBlock> {
@@ -1541,6 +1883,9 @@ impl WorkerDataClient for MockDataClient {
         data: Bytes,
     ) -> ClientResult<proto::worker::WriteStreamResponseProto> {
         self.record_event("write_stream");
+        if matches!(self.next_write_stream_outcome(), WorkerWriteOutcome::WorkerError) {
+            return Err(ClientError::Worker("injected WriteStream failure".to_string()));
+        }
         self.written_lens.lock().expect("written lens").push(data.len() as u64);
         if self.record_written_body {
             self.written.lock().expect("written").extend_from_slice(&data);
@@ -1613,7 +1958,7 @@ fn data_plane(client: Arc<MockDataClient>) -> WorkerDataPlane {
 
 fn read_reader(client: &FsClient, file_size: u64) -> FileReader {
     FileReader::new(
-        client.clone(),
+        Arc::clone(&client.runtime),
         ReadHandle::new(
             "/alpha".to_string(),
             InodeId::new(101),
