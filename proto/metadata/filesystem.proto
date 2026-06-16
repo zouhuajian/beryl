@@ -39,10 +39,10 @@ message WriteHandleProto {
   common.FencingTokenProto fencing_token = 5;
 }
 
-enum CreateDispositionProto {
-  CREATE_DISPOSITION_UNSPECIFIED = 0;
+enum CreateModeProto {
+  CREATE_MODE_UNSPECIFIED = 0;
   CREATE_NEW = 1;
-  OVERWRITE = 2;
+  CREATE_OR_OVERWRITE = 2;
 }
 
 message WriteTargetProto {
@@ -209,7 +209,7 @@ message CreateFileRequestProto {
   string path = 2;
   fs.FileAttrsProto attrs = 3;
   common.FileLayoutProto layout = 4;
-  CreateDispositionProto disposition = 5;
+  CreateModeProto create_mode = 5;
   optional uint64 desired_len = 6;
 }
 

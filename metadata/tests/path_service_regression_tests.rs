@@ -24,9 +24,8 @@ use proto::common::{
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::{
     get_block_locations_request_proto, AddBlockRequestProto, AppendFileRequestProto, CommitFileRequestProto,
-    CommittedBlockProto, CreateDirectoryRequestProto, CreateDispositionProto, CreateFileRequestProto,
-    DeleteRequestProto, GetBlockLocationsRequestProto, GetStatusRequestProto, SyncWriteRequestProto, WriteHandleProto,
-    WriteSyncModeProto,
+    CommittedBlockProto, CreateDirectoryRequestProto, CreateFileRequestProto, CreateModeProto, DeleteRequestProto,
+    GetBlockLocationsRequestProto, GetStatusRequestProto, SyncWriteRequestProto, WriteHandleProto, WriteSyncModeProto,
 };
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -483,7 +482,7 @@ async fn open_write_session_with_committed_block(
                 replication: 1,
                 block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
             }),
-            disposition: CreateDispositionProto::CreateNew as i32,
+            create_mode: CreateModeProto::CreateNew as i32,
             desired_len: Some(128),
         }),
     )
@@ -561,7 +560,7 @@ async fn create_file_success_emits_metadata_state_log() {
                     replication: 1,
                     block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
                 }),
-                disposition: CreateDispositionProto::CreateNew as i32,
+                create_mode: CreateModeProto::CreateNew as i32,
                 desired_len: Some(128),
             }),
         )
@@ -679,7 +678,7 @@ async fn create_file_early_create_failure_emits_metadata_state_warn_log() {
             replication: 1,
             block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
         }),
-        disposition: CreateDispositionProto::CreateNew as i32,
+        create_mode: CreateModeProto::CreateNew as i32,
         desired_len: Some(128),
     };
     let first =
@@ -744,7 +743,7 @@ async fn add_block_success_emits_metadata_block_log_with_target_count() {
                 replication: 1,
                 block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
             }),
-            disposition: CreateDispositionProto::CreateNew as i32,
+            create_mode: CreateModeProto::CreateNew as i32,
             desired_len: Some(128),
         }),
     )
@@ -828,7 +827,7 @@ async fn add_block_text_log_does_not_dump_request_or_duplicate_request_ids() {
                 replication: 1,
                 block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
             }),
-            disposition: CreateDispositionProto::CreateNew as i32,
+            create_mode: CreateModeProto::CreateNew as i32,
             desired_len: Some(128),
         }),
     )
@@ -891,7 +890,7 @@ async fn add_block_failure_emits_metadata_block_warn_log_with_error_code() {
                 replication: 1,
                 block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
             }),
-            disposition: CreateDispositionProto::CreateNew as i32,
+            create_mode: CreateModeProto::CreateNew as i32,
             desired_len: Some(128),
         }),
     )
@@ -1646,7 +1645,7 @@ async fn create_file_failure_leaves_no_inode() {
                 replication: 1,
                 block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
             }),
-            disposition: CreateDispositionProto::CreateNew as i32,
+            create_mode: CreateModeProto::CreateNew as i32,
             desired_len: Some(4096),
         }),
     )
@@ -1686,7 +1685,7 @@ async fn commit_file_public_replay_returns_persisted_result_and_rejects_fingerpr
                 replication: 1,
                 block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
             }),
-            disposition: CreateDispositionProto::CreateNew as i32,
+            create_mode: CreateModeProto::CreateNew as i32,
             desired_len: Some(128),
         }),
     )
@@ -2034,7 +2033,7 @@ async fn recursive_delete_rejects_active_write_session_without_half_delete() {
                 replication: 1,
                 block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
             }),
-            disposition: CreateDispositionProto::CreateNew as i32,
+            create_mode: CreateModeProto::CreateNew as i32,
             desired_len: Some(128),
         }),
     )

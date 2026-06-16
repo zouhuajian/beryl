@@ -13,7 +13,7 @@ use types::BlockFormatId;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CreateOptions {
     /// Creation behavior for the target path.
-    pub disposition: CreateDisposition,
+    pub create_mode: CreateMode,
 
     /// Block data/meta interpretation format for newly created files.
     pub block_format_id: BlockFormatId,
@@ -35,7 +35,7 @@ impl CreateOptions {
     /// Return options that create a new file and fail if it already exists.
     pub fn create() -> Self {
         Self {
-            disposition: CreateDisposition::Create,
+            create_mode: CreateMode::CreateNew,
             block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
             block_size: DEFAULT_BLOCK_SIZE,
             chunk_size: DEFAULT_CHUNK_SIZE,
@@ -45,7 +45,7 @@ impl CreateOptions {
     /// Return options that replace the file contents or create it if absent.
     pub fn overwrite() -> Self {
         Self {
-            disposition: CreateDisposition::Overwrite,
+            create_mode: CreateMode::CreateOrOverwrite,
             block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
             block_size: DEFAULT_BLOCK_SIZE,
             chunk_size: DEFAULT_CHUNK_SIZE,
@@ -85,11 +85,12 @@ pub struct ListOptions {
 }
 
 /// Creation behavior for [`CreateOptions`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CreateDisposition {
-    /// Create a new file and fail if the path already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CreateMode {
+    /// Create a new file and fail if the target path already exists.
     #[default]
-    Create,
-    /// Replace the existing file contents or create the file if it does not exist.
-    Overwrite,
+    CreateNew,
+
+    /// Create the file if it does not exist, or replace the existing file contents.
+    CreateOrOverwrite,
 }

@@ -10,7 +10,7 @@ use proto::metadata::{
     DeleteRequestProto, GetStatusRequestProto, ListStatusRequestProto, OpenFileRequestProto, RenameRequestProto,
 };
 
-use super::{CreateDisposition, CreateOptions, DirectoryListing, FileReader, FileStatus, FileWriter, ListOptions};
+use super::{CreateMode, CreateOptions, DirectoryListing, FileReader, FileStatus, FileWriter, ListOptions};
 use crate::api::handle::{ReadHandle, WriteHandle};
 use crate::api::runtime::ClientRuntime;
 use crate::config::ClientConfig;
@@ -179,9 +179,9 @@ impl FsClient {
     /// creation. Metadata validates and persists the accepted `FileLayout`.
     pub async fn create(&self, path: &str, options: CreateOptions) -> ClientResult<FileWriter> {
         validate_path(path)?;
-        let disposition = match options.disposition {
-            CreateDisposition::Create => proto::metadata::CreateDispositionProto::CreateNew,
-            CreateDisposition::Overwrite => proto::metadata::CreateDispositionProto::Overwrite,
+        let create_mode = match options.create_mode {
+            CreateMode::CreateNew => proto::metadata::CreateModeProto::CreateNew,
+            CreateMode::CreateOrOverwrite => proto::metadata::CreateModeProto::CreateOrOverwrite,
         };
         let response = match self
             .runtime
@@ -193,7 +193,7 @@ impl FsClient {
                     path: path.to_string(),
                     attrs: Some(default_file_attrs()),
                     layout: Some(layout_for_new_file(&options)),
-                    disposition: disposition as i32,
+                    create_mode: create_mode as i32,
                     desired_len: Some(default_write_preallocation_len()),
                 },
             )

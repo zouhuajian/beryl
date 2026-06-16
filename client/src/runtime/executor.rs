@@ -190,7 +190,7 @@ impl OperationExecutor {
         path: &str,
         req: proto::metadata::CreateFileRequestProto,
     ) -> ClientResult<proto::metadata::CreateFileResponseProto> {
-        let detail = format!("disposition={}", req.disposition);
+        let detail = format!("create_mode={}", req.create_mode);
         let operation = OperationContext::new_with_identity(
             &self.identity,
             OperationKind::MetadataMutation,

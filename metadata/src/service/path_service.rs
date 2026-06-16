@@ -1100,20 +1100,19 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             CreateFileResponseProto,
             self.guard_chain.check_meta_write(&req_ctx)
         );
-        let disposition = CreateDispositionProto::try_from(req.disposition)
-            .unwrap_or(CreateDispositionProto::CreateDispositionUnspecified);
-        if disposition == CreateDispositionProto::CreateDispositionUnspecified {
+        let create_mode = CreateModeProto::try_from(req.create_mode).unwrap_or(CreateModeProto::CreateModeUnspecified);
+        if create_mode == CreateModeProto::CreateModeUnspecified {
             return error_response!(
                 CreateFileResponseProto,
                 self.header_from_path_error(
                     &req.header,
-                    MetadataError::InvalidArgument("create disposition is required".to_string()),
+                    MetadataError::InvalidArgument("create mode is required".to_string()),
                     None,
                 )
             );
         }
 
-        let inode_id = if disposition == CreateDispositionProto::Overwrite {
+        let inode_id = if create_mode == CreateModeProto::CreateOrOverwrite {
             match self.path_resolver.resolve_inode(&req.path) {
                 Ok(resolved) => {
                     guard_or_error!(

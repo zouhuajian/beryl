@@ -11,7 +11,7 @@ mod status;
 
 pub use fs_client::FsClient;
 pub use handle::{FileReader, FileWriter};
-pub use options::{CreateDisposition, CreateOptions, ListOptions};
+pub use options::{CreateMode, CreateOptions, ListOptions};
 pub use status::{DirectoryEntry, DirectoryListing, FileStatus};
 pub use types::{BlockFormatId, FileAttrs, InodeKind};
 

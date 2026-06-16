@@ -22,10 +22,9 @@ use common::error::canonical::{CanonicalError, RefreshHint as CanonicalRefreshHi
 use common::header::RpcErrorCode;
 use proto::common::{BlockIdProto, DataHandleIdProto, FencingTokenProto};
 use proto::metadata::{
-    AbortFileWriteResponseProto, AppendFileResponseProto, CommitFileResponseProto, CreateDispositionProto,
-    CreateFileResponseProto, DeleteResponseProto, GetStatusResponseProto, ListStatusResponseProto,
-    OpenFileResponseProto, RenameResponseProto, RenewLeaseResponseProto, SyncWriteResponseProto, WriteHandleProto,
-    WriteSyncModeProto,
+    AbortFileWriteResponseProto, AppendFileResponseProto, CommitFileResponseProto, CreateFileResponseProto,
+    CreateModeProto, DeleteResponseProto, GetStatusResponseProto, ListStatusResponseProto, OpenFileResponseProto,
+    RenameResponseProto, RenewLeaseResponseProto, SyncWriteResponseProto, WriteHandleProto, WriteSyncModeProto,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -162,9 +161,11 @@ fn write_handle_from_create_response_rejects_missing_lease_expiry() {
 }
 
 #[tokio::test]
-async fn create_returns_writer_and_maps_create_disposition() {
+async fn create_returns_writer_and_maps_create_new_mode() {
     let gateway = Arc::new(MockGateway::default());
     let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
+
+    assert_eq!(CreateOptions::create().create_mode, CreateMode::CreateNew);
 
     let writer = client
         .create("/created", CreateOptions::create())
@@ -174,16 +175,15 @@ async fn create_returns_writer_and_maps_create_disposition() {
     assert_eq!(writer.path(), "/created");
     let calls = gateway.calls();
     assert_eq!(methods(&calls), vec!["create_file"]);
-    assert_eq!(
-        calls[0].create_disposition,
-        Some(CreateDispositionProto::CreateNew as i32)
-    );
+    assert_eq!(calls[0].create_mode, Some(CreateModeProto::CreateNew as i32));
 }
 
 #[tokio::test]
 async fn create_options_default_maps_current_layout_defaults() {
     let gateway = Arc::new(MockGateway::default());
     let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
+
+    assert_eq!(CreateOptions::default().create_mode, CreateMode::CreateNew);
 
     client
         .create("/created", CreateOptions::default())
@@ -262,9 +262,11 @@ async fn create_rejects_invalid_response_layout() {
 }
 
 #[tokio::test]
-async fn overwrite_returns_writer_and_maps_overwrite_disposition() {
+async fn overwrite_returns_writer_and_maps_create_or_overwrite_mode() {
     let gateway = Arc::new(MockGateway::default());
     let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
+
+    assert_eq!(CreateOptions::overwrite().create_mode, CreateMode::CreateOrOverwrite);
 
     let writer = client
         .create("/overwrite", CreateOptions::overwrite())
@@ -274,10 +276,7 @@ async fn overwrite_returns_writer_and_maps_overwrite_disposition() {
     assert_eq!(writer.path(), "/overwrite");
     let calls = gateway.calls();
     assert_eq!(methods(&calls), vec!["create_file"]);
-    assert_eq!(
-        calls[0].create_disposition,
-        Some(CreateDispositionProto::Overwrite as i32)
-    );
+    assert_eq!(calls[0].create_mode, Some(CreateModeProto::CreateOrOverwrite as i32));
 }
 
 #[tokio::test]
@@ -1168,7 +1167,7 @@ struct RecordedCall {
     committed_block_offsets: Vec<u64>,
     committed_block_lens: Vec<u64>,
     sync_mode: Option<i32>,
-    create_disposition: Option<i32>,
+    create_mode: Option<i32>,
     create_layout: Option<RecordedLayout>,
     add_block_desired_len: Option<u64>,
 }
@@ -1327,7 +1326,7 @@ impl MockGateway {
             committed_block_offsets: Vec::new(),
             committed_block_lens: Vec::new(),
             sync_mode: None,
-            create_disposition: None,
+            create_mode: None,
             create_layout: None,
             add_block_desired_len: None,
         });
@@ -1346,7 +1345,7 @@ impl MockGateway {
             committed_block_offsets: Vec::new(),
             committed_block_lens: Vec::new(),
             sync_mode: None,
-            create_disposition: Some(req.disposition),
+            create_mode: Some(req.create_mode),
             create_layout: req.layout.as_ref().map(recorded_layout),
             add_block_desired_len: None,
         });
@@ -1370,7 +1369,7 @@ impl MockGateway {
             committed_block_offsets: Vec::new(),
             committed_block_lens: Vec::new(),
             sync_mode: None,
-            create_disposition: None,
+            create_mode: None,
             create_layout: None,
             add_block_desired_len: None,
         });
@@ -1390,7 +1389,7 @@ impl MockGateway {
             committed_block_offsets: req.committed_blocks.iter().map(|block| block.file_offset).collect(),
             committed_block_lens: req.committed_blocks.iter().map(|block| block.len).collect(),
             sync_mode: None,
-            create_disposition: None,
+            create_mode: None,
             create_layout: None,
             add_block_desired_len: None,
         });
@@ -1409,7 +1408,7 @@ impl MockGateway {
             committed_block_offsets: req.committed_blocks.iter().map(|block| block.file_offset).collect(),
             committed_block_lens: req.committed_blocks.iter().map(|block| block.len).collect(),
             sync_mode: Some(req.mode),
-            create_disposition: None,
+            create_mode: None,
             create_layout: None,
             add_block_desired_len: None,
         });
@@ -1428,7 +1427,7 @@ impl MockGateway {
             committed_block_offsets: Vec::new(),
             committed_block_lens: Vec::new(),
             sync_mode: None,
-            create_disposition: None,
+            create_mode: None,
             create_layout: None,
             add_block_desired_len: req.desired_len,
         });

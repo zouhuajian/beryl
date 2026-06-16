@@ -36,7 +36,7 @@ pub(crate) mod metadata;
 // Re-export commonly used types
 pub use api::ListOptions;
 pub use api::{BlockFormatId, DirectoryEntry, DirectoryListing, FileAttrs, FileStatus, InodeKind};
-pub use api::{CreateDisposition, CreateOptions, FileReader, FileWriter, FsClient};
+pub use api::{CreateMode, CreateOptions, FileReader, FileWriter, FsClient};
 pub use config::ClientConfig;
 pub use config::{BackoffConfig, ChannelPoolConfig, RefreshConfig, RetryConfig};
 pub use error::{ClientActionError, ClientError, ClientResult};
