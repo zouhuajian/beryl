@@ -3,7 +3,7 @@
 
 //! Public filesystem operation options.
 
-use super::fs_client::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE};
+use super::client::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE};
 use types::BlockFormatId;
 
 /// Options for creating a file write session and, for new files only, proposing a `FileLayout`.

@@ -3,13 +3,13 @@
 
 //! High-level API modules.
 
-pub(crate) mod fs_client;
+pub(crate) mod client;
 pub(crate) mod handle;
 mod options;
 pub(crate) mod runtime;
 mod status;
 
-pub use fs_client::FsClient;
+pub use client::FsClient;
 pub use handle::{FileReader, FileWriter};
 pub use options::{CreateMode, CreateOptions, ListOptions};
 pub use status::{DirectoryEntry, DirectoryListing, FileStatus};

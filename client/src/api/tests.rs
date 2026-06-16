@@ -3,7 +3,7 @@
 
 //! Focused unit tests for the public API facade and client runtime behavior.
 
-use super::fs_client::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_REPLICATION};
+use super::client::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_REPLICATION};
 use super::handle::{ReadHandle, WriteHandle};
 use super::*;
 use crate::canonical::{ClientAction, RefreshHint};
