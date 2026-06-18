@@ -15,7 +15,6 @@ use types::GroupName;
 use crate::canonical::{invalid_header_action, validate_header_or_action};
 use crate::config::ClientConfig;
 use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult};
-use crate::metadata::header::ensure_metadata_header;
 use crate::metadata::model::{AddBlockResult, ReadLayout};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
 use crate::runtime::AttemptContext;
@@ -125,7 +124,6 @@ pub(crate) trait MetadataGateway: Send + Sync {
 /// Tonic-backed metadata gateway.
 #[derive(Clone, Debug)]
 pub(crate) struct TonicMetadataGateway {
-    default_endpoint: String,
     channels: Arc<parking_lot::RwLock<HashMap<MetadataChannelKey, tonic_net::Channel>>>,
     channel_pool_enabled: bool,
     max_channels_per_group: usize,
@@ -134,13 +132,8 @@ pub(crate) struct TonicMetadataGateway {
 
 impl TonicMetadataGateway {
     /// Create a lazily connecting metadata gateway from client config.
-    pub(crate) fn new_lazy_with_config(
-        endpoint: impl Into<String>,
-        config: &ClientConfig,
-        metrics: Arc<dyn ClientMetrics>,
-    ) -> ClientResult<Self> {
+    pub(crate) fn new_lazy_with_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> ClientResult<Self> {
         Self::new_lazy_with_pool_options(
-            endpoint,
             config.channel_pool.metadata_channel_pool_enabled,
             config.channel_pool.metadata_channel_pool_max_per_group,
             metrics,
@@ -149,33 +142,20 @@ impl TonicMetadataGateway {
 
     #[cfg(test)]
     fn new_lazy_with_pool(
-        endpoint: impl Into<String>,
         channel_pool_enabled: bool,
         max_channels_per_group: usize,
         metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
-        Self::new_lazy_with_pool_options(endpoint, channel_pool_enabled, max_channels_per_group, metrics)
+        Self::new_lazy_with_pool_options(channel_pool_enabled, max_channels_per_group, metrics)
     }
 
     fn new_lazy_with_pool_options(
-        endpoint: impl Into<String>,
         channel_pool_enabled: bool,
         max_channels_per_group: usize,
         metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
-        let endpoint = normalize_endpoint(&endpoint.into());
-        let channel = lazy_channel(&endpoint)?;
-        let mut channels = HashMap::new();
-        channels.insert(
-            MetadataChannelKey {
-                group_name: GroupName::parse("root").expect("default group name is valid"),
-                endpoint: endpoint.clone(),
-            },
-            channel,
-        );
         Ok(Self {
-            default_endpoint: endpoint,
-            channels: Arc::new(parking_lot::RwLock::new(channels)),
+            channels: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             channel_pool_enabled,
             max_channels_per_group: max_channels_per_group.max(1),
             metrics,
@@ -187,10 +167,9 @@ impl TonicMetadataGateway {
         ctx: &AttemptContext,
         operation: &'static str,
     ) -> ClientResult<FileSystemServiceProtoClient<tonic_net::Channel>> {
-        let endpoint = ctx
-            .metadata_endpoint()
-            .map(normalize_endpoint)
-            .unwrap_or_else(|| self.default_endpoint.clone());
+        let endpoint = ctx.metadata_endpoint().map(normalize_endpoint).ok_or_else(|| {
+            ClientError::InvalidArgument("metadata AttemptContext missing metadata_endpoint".to_string())
+        })?;
         let group_name = ctx
             .group_name()
             .cloned()
@@ -296,7 +275,7 @@ impl MetadataGateway for TonicMetadataGateway {
         ctx: AttemptContext,
         mut req: proto::metadata::GetStatusRequestProto,
     ) -> ClientResult<proto::metadata::GetStatusResponseProto> {
-        ensure_metadata_header(&mut req.header, &ctx)?;
+        req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "read")
             .await?
@@ -313,7 +292,7 @@ impl MetadataGateway for TonicMetadataGateway {
         ctx: AttemptContext,
         mut req: proto::metadata::ListStatusRequestProto,
     ) -> ClientResult<proto::metadata::ListStatusResponseProto> {
-        ensure_metadata_header(&mut req.header, &ctx)?;
+        req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "read")
             .await?
@@ -330,7 +309,7 @@ impl MetadataGateway for TonicMetadataGateway {
         ctx: AttemptContext,
         mut req: proto::metadata::DeleteRequestProto,
     ) -> ClientResult<proto::metadata::DeleteResponseProto> {
-        ensure_metadata_header(&mut req.header, &ctx)?;
+        req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
             .await?
@@ -347,7 +326,7 @@ impl MetadataGateway for TonicMetadataGateway {
         ctx: AttemptContext,
         mut req: proto::metadata::RenameRequestProto,
     ) -> ClientResult<proto::metadata::RenameResponseProto> {
-        ensure_metadata_header(&mut req.header, &ctx)?;
+        req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
             .await?
@@ -364,7 +343,7 @@ impl MetadataGateway for TonicMetadataGateway {
         ctx: AttemptContext,
         mut req: proto::metadata::OpenFileRequestProto,
     ) -> ClientResult<proto::metadata::OpenFileResponseProto> {
-        ensure_metadata_header(&mut req.header, &ctx)?;
+        req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "read")
             .await?
@@ -381,7 +360,7 @@ impl MetadataGateway for TonicMetadataGateway {
         ctx: AttemptContext,
         mut req: proto::metadata::GetBlockLocationsRequestProto,
     ) -> ClientResult<ReadLayout> {
-        ensure_metadata_header(&mut req.header, &ctx)?;
+        req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "read")
             .await?
@@ -398,7 +377,7 @@ impl MetadataGateway for TonicMetadataGateway {
         ctx: AttemptContext,
         mut req: proto::metadata::CreateFileRequestProto,
     ) -> ClientResult<proto::metadata::CreateFileResponseProto> {
-        ensure_metadata_header(&mut req.header, &ctx)?;
+        req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
             .await?
@@ -415,7 +394,7 @@ impl MetadataGateway for TonicMetadataGateway {
         ctx: AttemptContext,
         mut req: proto::metadata::AppendFileRequestProto,
     ) -> ClientResult<proto::metadata::AppendFileResponseProto> {
-        ensure_metadata_header(&mut req.header, &ctx)?;
+        req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
             .await?
@@ -432,7 +411,7 @@ impl MetadataGateway for TonicMetadataGateway {
         ctx: AttemptContext,
         mut req: proto::metadata::AddBlockRequestProto,
     ) -> ClientResult<AddBlockResult> {
-        ensure_metadata_header(&mut req.header, &ctx)?;
+        req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
             .await?
@@ -455,7 +434,7 @@ impl MetadataGateway for TonicMetadataGateway {
         ctx: AttemptContext,
         mut req: proto::metadata::CommitFileRequestProto,
     ) -> ClientResult<proto::metadata::CommitFileResponseProto> {
-        ensure_metadata_header(&mut req.header, &ctx)?;
+        req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
             .await?
@@ -472,7 +451,7 @@ impl MetadataGateway for TonicMetadataGateway {
         ctx: AttemptContext,
         mut req: proto::metadata::AbortFileWriteRequestProto,
     ) -> ClientResult<proto::metadata::AbortFileWriteResponseProto> {
-        ensure_metadata_header(&mut req.header, &ctx)?;
+        req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
             .await?
@@ -489,7 +468,7 @@ impl MetadataGateway for TonicMetadataGateway {
         ctx: AttemptContext,
         mut req: proto::metadata::RenewLeaseRequestProto,
     ) -> ClientResult<proto::metadata::RenewLeaseResponseProto> {
-        ensure_metadata_header(&mut req.header, &ctx)?;
+        req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
             .await?
@@ -506,7 +485,7 @@ impl MetadataGateway for TonicMetadataGateway {
         ctx: AttemptContext,
         mut req: proto::metadata::SyncWriteRequestProto,
     ) -> ClientResult<proto::metadata::SyncWriteResponseProto> {
-        ensure_metadata_header(&mut req.header, &ctx)?;
+        req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "write")
             .await?
@@ -523,7 +502,7 @@ impl MetadataGateway for TonicMetadataGateway {
         ctx: AttemptContext,
         mut req: proto::metadata::MsyncRequestProto,
     ) -> ClientResult<proto::common::GroupStateWatermarkProto> {
-        ensure_metadata_header(&mut req.header, &ctx)?;
+        req.header = Some(build_metadata_header(&ctx)?);
         let response = self
             .client(&ctx, "refresh")
             .await?
@@ -536,6 +515,10 @@ impl MetadataGateway for TonicMetadataGateway {
             .state
             .ok_or_else(|| ClientError::Metadata("MsyncResponseProto missing state".to_string()))
     }
+}
+
+fn build_metadata_header(ctx: &AttemptContext) -> ClientResult<proto::common::RequestHeaderProto> {
+    ctx.metadata_header()
 }
 
 fn parse_metadata_response_header(
@@ -664,28 +647,23 @@ mod tests {
     #[tokio::test]
     async fn metadata_channel_pool_reuses_channel_for_same_group_endpoint() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let gateway =
-            TonicMetadataGateway::new_lazy_with_pool("127.0.0.1:18080", true, 1, metrics.clone()).expect("gateway");
-        let ctx = metadata_attempt("root", None);
+        let gateway = TonicMetadataGateway::new_lazy_with_pool(true, 1, metrics.clone()).expect("gateway");
+        let ctx = metadata_attempt("root", Some("127.0.0.1:18080"));
 
         let _first = gateway.client(&ctx, "read").await.expect("first client");
         let _second = gateway.client(&ctx, "read").await.expect("second client");
 
         let events = metrics.events();
         assert_metric(&events, ClientMetric::MetadataChannelPoolHit);
-        assert!(events
-            .iter()
-            .all(|event| event.metric != ClientMetric::MetadataChannelPoolMiss));
+        assert_metric(&events, ClientMetric::MetadataChannelPoolMiss);
         assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
     }
 
     #[tokio::test]
     async fn concurrent_metadata_channel_requests_same_key_reuse_inserted_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let gateway = Arc::new(
-            TonicMetadataGateway::new_lazy_with_pool("127.0.0.1:18080", true, 8, metrics.clone()).expect("gateway"),
-        );
-        let ctx = metadata_attempt("root", None);
+        let gateway = Arc::new(TonicMetadataGateway::new_lazy_with_pool(true, 8, metrics.clone()).expect("gateway"));
+        let ctx = metadata_attempt("root", Some("127.0.0.1:18080"));
 
         let mut tasks = Vec::with_capacity(8);
         for _ in 0..8 {
@@ -705,9 +683,7 @@ mod tests {
     #[tokio::test]
     async fn failed_metadata_channel_creation_does_not_insert() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let gateway = Arc::new(
-            TonicMetadataGateway::new_lazy_with_pool("127.0.0.1:18080", true, 8, metrics.clone()).expect("gateway"),
-        );
+        let gateway = Arc::new(TonicMetadataGateway::new_lazy_with_pool(true, 8, metrics.clone()).expect("gateway"));
         let ctx = metadata_attempt("root", Some("http://[invalid"));
 
         let mut tasks = Vec::with_capacity(4);
@@ -721,16 +697,15 @@ mod tests {
             let err = task.await.expect("task").expect_err("invalid endpoint");
             assert!(matches!(err, ClientError::Metadata(msg) if msg.contains("invalid metadata endpoint")));
         }
-        assert_eq!(gateway.channels.read().len(), 1);
+        assert_eq!(gateway.channels.read().len(), 0);
         assert_metric(&metrics.events(), ClientMetric::ChannelPoolConnectError);
     }
 
     #[tokio::test]
     async fn disabled_metadata_channel_pool_does_not_reuse_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let gateway =
-            TonicMetadataGateway::new_lazy_with_pool("127.0.0.1:18080", false, 1, metrics.clone()).expect("gateway");
-        let ctx = metadata_attempt("root", None);
+        let gateway = TonicMetadataGateway::new_lazy_with_pool(false, 1, metrics.clone()).expect("gateway");
+        let ctx = metadata_attempt("root", Some("127.0.0.1:18080"));
 
         let _first = gateway.client(&ctx, "read").await.expect("first client");
         let _second = gateway.client(&ctx, "read").await.expect("second client");
@@ -751,8 +726,7 @@ mod tests {
     #[tokio::test]
     async fn metadata_channel_pool_connection_error_is_reported() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let gateway =
-            TonicMetadataGateway::new_lazy_with_pool("127.0.0.1:18080", true, 1, metrics.clone()).expect("gateway");
+        let gateway = TonicMetadataGateway::new_lazy_with_pool(true, 1, metrics.clone()).expect("gateway");
         let ctx = metadata_attempt("root", Some("http://[invalid"));
 
         let err = gateway.client(&ctx, "read").await.expect_err("invalid endpoint fails");

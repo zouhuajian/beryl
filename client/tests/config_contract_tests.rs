@@ -16,13 +16,15 @@ fn assert_client_bootstrap_contract(config_path: &Path) {
     let config = ClientConfig::load(config_path).expect("client config loads");
 
     assert_eq!(config.client_name(), "default_client");
-    assert_eq!(config.metadata_endpoints, vec!["127.0.0.1:18080".to_string()]);
-    assert_eq!(config.metadata_group_names, vec![GroupName::parse("root").unwrap()]);
+    assert_eq!(config.metadata_groups.len(), 1);
+    assert_eq!(config.metadata_groups[0].group_name, GroupName::parse("root").unwrap());
+    assert_eq!(config.metadata_groups[0].endpoints, vec!["127.0.0.1:18080".to_string()]);
 
     let client = FsClient::try_new(config).expect("FsClient construction must stay lazy");
+    assert_eq!(client.config().metadata_groups.len(), 1);
     assert_eq!(
-        client.config().metadata_group_names,
-        vec![GroupName::parse("root").unwrap()]
+        client.config().metadata_groups[0].group_name,
+        GroupName::parse("root").unwrap()
     );
 }
 

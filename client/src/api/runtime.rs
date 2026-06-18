@@ -7,9 +7,6 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
-use proto::metadata::AddBlockRequestProto;
-
 use crate::canonical::{ClientAction, RefreshHint};
 use crate::config::ClientConfig;
 use crate::data::WorkerDataPlane;
@@ -18,12 +15,14 @@ use crate::error::{ClientError, ClientResult};
 use crate::metadata::MetadataGateway;
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
 use crate::protocol::validate::{validate_worker_block_sync_result, validate_worker_commit_result};
+use crate::runtime::MetadataTargets;
 use crate::runtime::OperationExecutor;
 use crate::runtime::{
     AttemptContext, BackoffPolicy, BackoffSleeper, ClientIdentity, ErrorClass, ErrorClassifier, OperationContext,
-    OperationIdentity, OperationKind, OperationRuntime, RefreshManager, RefreshReason, RetryDecision,
+    OperationIdentity, OperationKind, OperationRuntime, RefreshReason,
 };
 use crate::session::write_session::{PendingBlock, WorkerCommitLevel, WriteSession};
+use bytes::Bytes;
 
 /// Shared concrete runtime state for the filesystem facade and open file handles.
 pub(crate) struct ClientRuntime {
@@ -46,16 +45,16 @@ impl ClientRuntime {
     pub(crate) fn with_hooks(
         config: ClientConfig,
         gateway: Arc<dyn MetadataGateway>,
+        metadata_targets: MetadataTargets,
         data_plane: WorkerDataPlane,
         sleeper: Arc<dyn BackoffSleeper>,
         metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
         let identity = ClientIdentity::generate(config.client_name.clone())?;
-        let refresh_manager = RefreshManager::from_config(&config.metadata_group_names, &config.metadata_endpoints)?;
         let executor = OperationExecutor::with_runtime(
             identity,
             gateway,
-            refresh_manager,
+            metadata_targets,
             OperationRuntime {
                 retry: config.retry.clone(),
                 refresh: config.refresh.clone(),
@@ -83,11 +82,8 @@ impl ClientRuntime {
             .add_block(
                 session.path(),
                 session.session_identity(),
-                AddBlockRequestProto {
-                    header: None,
-                    write_handle: Some(session.write_handle()),
-                    desired_len: Some(block_len),
-                },
+                session.write_handle(),
+                block_len,
             )
             .await
         {
@@ -329,24 +325,6 @@ impl ClientRuntime {
             metric_labels(operation, kind).with_outcome("scheduled"),
         );
         self.sleeper.sleep(self.backoff.delay_for_retry(retry_index)).await;
-    }
-
-    /// Records the retry decision chosen for a client-side operation.
-    pub(crate) fn record_retry_decision(
-        &self,
-        operation: &'static str,
-        kind: OperationKind,
-        class: &ErrorClass,
-        reason: Option<RefreshReason>,
-        decision: RetryDecision,
-    ) {
-        let mut labels = metric_labels(operation, kind)
-            .with_error_class(class.label())
-            .with_retry_decision(decision.label());
-        if let Some(reason) = reason {
-            labels = labels.with_refresh_reason(reason.label());
-        }
-        self.record_metric(ClientMetric::RetryDecision, labels);
     }
 
     /// Records refresh decision and refresh reason metrics with a shared label shape.

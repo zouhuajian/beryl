@@ -7,8 +7,8 @@
 
 # Client display identity and metadata bootstrap targets.
 client.name: "default_client"
-client.metadata.endpoints: "127.0.0.1:18080"
 client.metadata.group.names: "root"
+client.metadata.group.root.endpoints: "127.0.0.1:18080"
 
 # Logical operation retry, refresh, timeout, and backoff.
 client.retry.max_retry_attempts: 3

@@ -130,8 +130,8 @@ lock the root to one metadata group.
 | key | default | validation | notes |
 | --- | --- | --- | --- |
 | `client.name` | `default_client` | non-blank string | Low-cardinality client display identity for diagnostics and audit. |
-| `client.metadata.endpoints` | `127.0.0.1:18080` | at least one endpoint | Comma-separated metadata endpoint list. |
-| `client.metadata.group.names` | `root` | one or more valid `GroupName` values | Paired with metadata endpoints by position. |
+| `client.metadata.group.names` | `root` | one or more valid `GroupName` values | Metadata groups configured as bootstrap targets. |
+| `client.metadata.group.<group>.endpoints` | `127.0.0.1:18080` for default `root` | at least one endpoint for every listed group | Comma-separated metadata endpoints scoped to one metadata group. |
 | `client.retry.max_retry_attempts` | `3` | non-negative integer | Logical operation retry limit for ordinary metadata and worker operations; metadata session barriers do not retry. |
 | `client.refresh.max_attempts` | `3` | non-negative integer | Refresh attempt limit. |
 | `client.operation.timeout_ms` | `null` | null or non-negative integer | Per-operation deadline; null disables it. |

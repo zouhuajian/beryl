@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
-use proto::metadata::{AbortFileWriteRequestProto, CommitFileRequestProto, WriteHandleProto};
+use proto::metadata::WriteHandleProto;
 use types::{CallId, ClientId, CommittedBlock, DataHandleId, FileLayout, InodeId, WriteTarget};
 
 use crate::data::WorkerWriteBlock;
@@ -252,7 +252,7 @@ impl WriteSession {
         client_name: &str,
         committed_blocks: Vec<CommittedBlock>,
         final_size: u64,
-    ) -> ClientResult<(OperationContext, CommitFileRequestProto)> {
+    ) -> ClientResult<CommitFilePlan> {
         match self.state {
             WriteSessionState::Open => {
                 let session_identity = self.session_identity();
@@ -347,18 +347,13 @@ impl WriteSession {
                 .with_detail(commit.detail.clone()),
             commit.commit_fingerprint,
         )?;
-        Ok((
+        Ok(CommitFilePlan {
             operation,
-            CommitFileRequestProto {
-                header: None,
-                write_handle: Some(commit.commit_write_handle),
-                data_handle_id: Some(proto::common::DataHandleIdProto {
-                    value: self.data_handle_id.as_raw(),
-                }),
-                committed_blocks: commit.commit_committed_blocks_snapshot.iter().map(Into::into).collect(),
-                final_size: commit.commit_final_size,
-            },
-        ))
+            write_handle: commit.commit_write_handle,
+            data_handle_id: self.data_handle_id,
+            committed_blocks: commit.commit_committed_blocks_snapshot.clone(),
+            final_size: commit.commit_final_size,
+        })
     }
 
     /// Freeze and return the abort cleanup plan for this write session.
@@ -441,10 +436,6 @@ impl WriteSession {
                 .with_detail(abort.detail.clone()),
             abort.metadata_fingerprint,
         )?;
-        let metadata_request = AbortFileWriteRequestProto {
-            header: None,
-            write_handle: Some(abort.metadata_write_handle),
-        };
         let mut worker_cleanups = Vec::with_capacity(abort.worker_cleanups.len());
         for cleanup in &abort.worker_cleanups {
             let operation = OperationContext::with_call_id_named_and_fingerprint(
@@ -464,7 +455,7 @@ impl WriteSession {
         }
         Ok(AbortCleanupPlan {
             metadata_operation,
-            metadata_request,
+            metadata_write_handle: abort.metadata_write_handle,
             worker_cleanups,
         })
     }
@@ -831,11 +822,21 @@ impl std::fmt::Debug for AbortWorkerCleanupState {
     }
 }
 
+/// Frozen metadata CommitFile operation and request payload.
+#[derive(Clone, Debug)]
+pub(crate) struct CommitFilePlan {
+    pub(crate) operation: OperationContext,
+    pub(crate) write_handle: WriteHandleProto,
+    pub(crate) data_handle_id: DataHandleId,
+    pub(crate) committed_blocks: Vec<CommittedBlock>,
+    pub(crate) final_size: u64,
+}
+
 /// Frozen side-effecting abort cleanup plan.
 #[derive(Clone)]
 pub(crate) struct AbortCleanupPlan {
     metadata_operation: OperationContext,
-    metadata_request: AbortFileWriteRequestProto,
+    metadata_write_handle: WriteHandleProto,
     worker_cleanups: Vec<AbortWorkerCleanupPlan>,
 }
 
@@ -845,9 +846,9 @@ impl AbortCleanupPlan {
         self.metadata_operation.clone()
     }
 
-    /// Metadata AbortFileWrite request frozen before cleanup starts.
-    pub(crate) fn metadata_request(&self) -> AbortFileWriteRequestProto {
-        self.metadata_request.clone()
+    /// Metadata write handle payload frozen before cleanup starts.
+    pub(crate) fn metadata_write_handle(&self) -> WriteHandleProto {
+        self.metadata_write_handle
     }
 
     /// Per-worker cleanup operations frozen before cleanup starts.
@@ -1089,23 +1090,23 @@ mod tests {
         .expect("session");
         let blocks = vec![committed_block(302, 0, 0, 5)];
 
-        let (first_operation, first_request) = session
+        let first = session
             .prepare_commit_file(ClientId::new(7), "test-client", blocks.clone(), 5)
             .expect("first commit plan");
         session.mark_commit_unknown();
-        let (second_operation, second_request) = session
+        let second = session
             .prepare_commit_file(ClientId::new(7), "test-client", blocks, 5)
             .expect("retry commit plan");
 
-        let first_ctx = AttemptContext::for_metadata(&first_operation, test_group_name(), 0).expect("first context");
-        let second_ctx = AttemptContext::for_metadata(&second_operation, test_group_name(), 0).expect("second context");
+        let first_ctx = AttemptContext::for_metadata(&first.operation, test_group_name(), 0).expect("first context");
+        let second_ctx = AttemptContext::for_metadata(&second.operation, test_group_name(), 0).expect("second context");
         assert_eq!(first_ctx.call_id(), second_ctx.call_id());
         assert_eq!(
-            first_operation.operation_fingerprint(),
-            second_operation.operation_fingerprint()
+            first.operation.operation_fingerprint(),
+            second.operation.operation_fingerprint()
         );
-        assert_eq!(first_request.committed_blocks, second_request.committed_blocks);
-        assert_eq!(first_request.final_size, second_request.final_size);
+        assert_eq!(first.committed_blocks, second.committed_blocks);
+        assert_eq!(first.final_size, second.final_size);
     }
 
     #[test]
@@ -1145,10 +1146,10 @@ mod tests {
         .expect("session");
         let blocks = vec![committed_block(302, 0, 0, 5)];
 
-        let (first_operation, _) = session
+        let first = session
             .prepare_commit_file(ClientId::new(7), "test-client", blocks.clone(), 5)
             .expect("first commit plan");
-        let first_ctx = AttemptContext::for_metadata(&first_operation, test_group_name(), 0).expect("first context");
+        let first_ctx = AttemptContext::for_metadata(&first.operation, test_group_name(), 0).expect("first context");
         session.mark_commit_unknown();
 
         session.write_handle.lease_epoch = 2;
@@ -1158,23 +1159,18 @@ mod tests {
         assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("identity changed")));
 
         session.write_handle.lease_epoch = 1;
-        let (retry_operation, retry_request) = session
+        let retry = session
             .prepare_commit_file(ClientId::new(7), "test-client", blocks, 5)
             .expect("retry commit plan");
-        let retry_ctx = AttemptContext::for_metadata(&retry_operation, test_group_name(), 0).expect("retry context");
+        let retry_ctx = AttemptContext::for_metadata(&retry.operation, test_group_name(), 0).expect("retry context");
 
         assert_eq!(first_ctx.call_id(), retry_ctx.call_id());
         assert_eq!(
-            first_operation.operation_fingerprint(),
-            retry_operation.operation_fingerprint()
+            first.operation.operation_fingerprint(),
+            retry.operation.operation_fingerprint()
         );
-        assert_eq!(retry_request.final_size, 5);
-        assert_eq!(
-            retry_request.committed_blocks,
-            vec![proto::metadata::CommittedBlockProto::from(committed_block(
-                302, 0, 0, 5
-            ))]
-        );
+        assert_eq!(retry.final_size, 5);
+        assert_eq!(retry.committed_blocks, vec![committed_block(302, 0, 0, 5)]);
     }
 
     #[test]
@@ -1216,10 +1212,7 @@ mod tests {
             first.metadata_operation().operation_fingerprint(),
             second.metadata_operation().operation_fingerprint()
         );
-        assert_eq!(
-            first.metadata_request().write_handle,
-            second.metadata_request().write_handle
-        );
+        assert_eq!(first.metadata_write_handle(), second.metadata_write_handle());
         assert_eq!(second.worker_cleanups().len(), 1);
         assert_eq!(first_worker_ctx.call_id(), second_worker_ctx.call_id());
         assert_eq!(

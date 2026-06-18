@@ -11,7 +11,5 @@
 pub(crate) mod gateway;
 pub(crate) mod model;
 
-mod header;
-
 pub(crate) use gateway::{MetadataGateway, TonicMetadataGateway};
 pub(crate) use model::{AddBlockResult, ReadLayout};

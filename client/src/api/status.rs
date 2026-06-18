@@ -5,12 +5,6 @@
 
 use types::{FileAttrs, InodeId, InodeKind};
 
-use crate::error::{ClientError, ClientResult};
-
-fn inode_kind_from_proto(kind: i32) -> Option<InodeKind> {
-    proto::fs::InodeKindProto::try_from(kind).ok()?.try_into().ok()
-}
-
 /// Public file or directory status returned by [`crate::FsClient::stat`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileStatus {
@@ -22,23 +16,17 @@ pub struct FileStatus {
 }
 
 impl FileStatus {
+    pub(crate) fn new(path: impl Into<String>, inode_id: InodeId, attrs: FileAttrs) -> Self {
+        Self {
+            path: path.into(),
+            inode_id,
+            attrs,
+        }
+    }
+
     /// Return the namespace path that was queried.
     pub fn path(&self) -> &str {
         &self.path
-    }
-
-    pub(crate) fn from_proto(path: &str, response: proto::metadata::GetStatusResponseProto) -> ClientResult<Self> {
-        let attrs = response
-            .attrs
-            .ok_or_else(|| ClientError::Metadata("GetStatusResponseProto.attrs missing".to_string()))?;
-        let inode_id = response
-            .inode_id
-            .ok_or_else(|| ClientError::Metadata("GetStatusResponseProto.inode_id missing".to_string()))?;
-        Ok(Self {
-            path: path.to_string(),
-            inode_id: InodeId::new(inode_id.value),
-            attrs: attrs.into(),
-        })
     }
 }
 
@@ -54,11 +42,11 @@ pub struct DirectoryEntry {
 }
 
 impl DirectoryEntry {
-    fn from_proto(entry: proto::fs::DirEntryProto) -> Self {
+    pub(crate) fn new(name: impl Into<String>, kind: Option<InodeKind>, attrs: Option<FileAttrs>) -> Self {
         Self {
-            name: entry.name,
-            kind: inode_kind_from_proto(entry.kind),
-            attrs: entry.attrs.map(Into::into),
+            name: name.into(),
+            kind,
+            attrs,
         }
     }
 }
@@ -76,63 +64,22 @@ pub struct DirectoryListing {
 }
 
 impl DirectoryListing {
+    pub(crate) fn new(
+        path: impl Into<String>,
+        entries: Vec<DirectoryEntry>,
+        next_cursor: Option<Vec<u8>>,
+        eof: bool,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            entries,
+            next_cursor,
+            eof,
+        }
+    }
+
     /// Return the namespace path that was listed.
     pub fn path(&self) -> &str {
         &self.path
-    }
-
-    pub(crate) fn from_proto(path: &str, response: proto::metadata::ListStatusResponseProto) -> Self {
-        let next_cursor = if response.next_cursor.is_empty() {
-            None
-        } else {
-            Some(response.next_cursor)
-        };
-        Self {
-            path: path.to_string(),
-            entries: response.entries.into_iter().map(DirectoryEntry::from_proto).collect(),
-            next_cursor,
-            eof: response.eof,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use types::InodeKind;
-
-    fn dir_entry(name: &str, kind: i32) -> proto::fs::DirEntryProto {
-        proto::fs::DirEntryProto {
-            name: name.to_string(),
-            inode_id: None,
-            kind,
-            attrs: None,
-        }
-    }
-
-    #[test]
-    fn directory_entry_unspecified_and_unknown_kind_map_to_none() {
-        let unspecified = DirectoryEntry::from_proto(dir_entry(
-            "unspecified",
-            proto::fs::InodeKindProto::InodeKindUnspecified as i32,
-        ));
-        let unknown = DirectoryEntry::from_proto(dir_entry("unknown", 99));
-
-        assert_eq!(unspecified.kind, None);
-        assert_eq!(unknown.kind, None);
-    }
-
-    #[test]
-    fn directory_entry_known_kinds_map_to_domain_inode_kind() {
-        let cases = [
-            (proto::fs::InodeKindProto::InodeKindFile, Some(InodeKind::File)),
-            (proto::fs::InodeKindProto::InodeKindDir, Some(InodeKind::Dir)),
-            (proto::fs::InodeKindProto::InodeKindSymlink, Some(InodeKind::Symlink)),
-        ];
-
-        for (proto_kind, expected_kind) in cases {
-            let entry = DirectoryEntry::from_proto(dir_entry("entry", proto_kind as i32));
-            assert_eq!(entry.kind, expected_kind);
-        }
     }
 }

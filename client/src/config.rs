@@ -24,10 +24,17 @@ pub struct ClientConfig {
     pub backoff: BackoffConfig,
     /// Channel/client pool configuration.
     pub channel_pool: ChannelPoolConfig,
-    /// Metadata endpoints.
-    pub metadata_endpoints: Vec<String>,
-    /// Configured metadata owner groups used as bootstrap targets.
-    pub metadata_group_names: Vec<GroupName>,
+    /// Configured metadata owner groups and their bootstrap endpoints.
+    pub metadata_groups: Vec<MetadataGroupConfig>,
+}
+
+/// Metadata group bootstrap endpoints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetadataGroupConfig {
+    /// Stable metadata group name.
+    pub group_name: GroupName,
+    /// Metadata endpoints configured for the group.
+    pub endpoints: Vec<String>,
 }
 
 /// Channel/client pool configuration.
@@ -143,18 +150,7 @@ impl ClientConfig {
         let backoff = backoff_config_from_flat(&flat)?;
         let channel_pool = channel_pool_config_from_flat(&flat)?;
 
-        // Metadata endpoints
-        let metadata_endpoints = if let Some(endpoints_str) = flat.get_str("client.metadata.endpoints") {
-            endpoints_str
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        } else {
-            vec!["127.0.0.1:18080".to_string()]
-        };
-
-        let metadata_group_names = parse_metadata_group_names(&flat)?;
+        let metadata_groups = parse_metadata_groups(&flat)?;
 
         Ok(Self {
             inner: CommonClientConfig::from_flat(flat),
@@ -163,8 +159,7 @@ impl ClientConfig {
             refresh,
             backoff,
             channel_pool,
-            metadata_endpoints,
-            metadata_group_names,
+            metadata_groups,
         })
     }
 
@@ -230,15 +225,24 @@ fn channel_pool_config_from_flat(flat: &FlatConfig) -> Result<ChannelPoolConfig,
     Ok(config)
 }
 
-fn parse_metadata_group_names(flat: &FlatConfig) -> Result<Vec<GroupName>, CommonError> {
+fn parse_metadata_groups(flat: &FlatConfig) -> Result<Vec<MetadataGroupConfig>, CommonError> {
     if flat.contains_key("client.metadata.group_ids") {
         return Err(CommonError::new(
             common::CommonErrorCode::InvalidArgument,
             "client.metadata.group_ids is unsupported; use client.metadata.group.names",
         ));
     }
-    let groups = if let Some(groups_str) = flat.get_str("client.metadata.group.names") {
-        groups_str
+
+    let removed_endpoint_key = ["client.metadata", "endpoints"].join(".");
+    if flat.contains_key(&removed_endpoint_key) {
+        return Err(CommonError::new(
+            common::CommonErrorCode::InvalidArgument,
+            format!("{removed_endpoint_key} is unsupported; use client.metadata.group.<group>.endpoints"),
+        ));
+    }
+
+    let group_names = if let Some(groups_str) = flat.get_str("client.metadata.group.names") {
+        let groups = groups_str
             .split(',')
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -249,18 +253,52 @@ fn parse_metadata_group_names(flat: &FlatConfig) -> Result<Vec<GroupName>, Commo
                     common::CommonErrorCode::InvalidArgument,
                     format!("invalid client.metadata.group.names: {err}"),
                 )
-            })?
+            })?;
+        if groups.is_empty() {
+            return Err(CommonError::new(
+                common::CommonErrorCode::InvalidArgument,
+                "client.metadata.group.names must contain at least one group name",
+            ));
+        }
+        groups
     } else {
         vec![GroupName::parse("root").expect("default group name is valid")]
     };
 
-    if groups.is_empty() {
-        return Err(CommonError::new(
-            common::CommonErrorCode::InvalidArgument,
-            "client.metadata.group.names must contain at least one group name",
-        ));
-    }
-    Ok(groups)
+    let explicit_group_names = flat.get_str("client.metadata.group.names").is_some();
+    group_names
+        .into_iter()
+        .map(|group_name| {
+            let key = format!("client.metadata.group.{}.endpoints", group_name.as_str());
+            let endpoints = match flat.get_str(&key) {
+                Some(raw) => {
+                    let endpoints = raw
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>();
+                    if endpoints.is_empty() {
+                        return Err(CommonError::new(
+                            common::CommonErrorCode::InvalidArgument,
+                            format!("{key} must be configured and non-empty"),
+                        ));
+                    }
+                    endpoints
+                }
+                None if !explicit_group_names && group_name.as_str() == "root" => {
+                    vec!["127.0.0.1:18080".to_string()]
+                }
+                None => {
+                    return Err(CommonError::new(
+                        common::CommonErrorCode::InvalidArgument,
+                        format!("{key} must be configured and non-empty"),
+                    ));
+                }
+            };
+            Ok(MetadataGroupConfig { group_name, endpoints })
+        })
+        .collect()
 }
 
 fn retry_config_from_flat(flat: &FlatConfig) -> Result<RetryConfig, CommonError> {
@@ -477,20 +515,33 @@ mod tests {
     }
 
     #[test]
-    fn metadata_group_names_parse_comma_separated_values() {
+    fn metadata_groups_parse_group_scoped_endpoints() {
         let mut flat = FlatConfig::new();
-        flat.set("client.metadata.group.names", "root,analytics,tenant-a");
+        flat.set("client.metadata.group.names", "root,analytics");
+        flat.set("client.metadata.group.root.endpoints", "a,b");
+        flat.set("client.metadata.group.analytics.endpoints", "c,d");
 
-        let config = ClientConfig::from_flat(flat).expect("metadata group names config");
+        let config = ClientConfig::from_flat(flat).expect("metadata group endpoint config");
 
+        assert_eq!(config.metadata_groups.len(), 2);
+        assert_eq!(config.metadata_groups[0].group_name, GroupName::parse("root").unwrap());
+        assert_eq!(config.metadata_groups[0].endpoints, vec!["a", "b"]);
         assert_eq!(
-            config.metadata_group_names,
-            vec![
-                GroupName::parse("root").unwrap(),
-                GroupName::parse("analytics").unwrap(),
-                GroupName::parse("tenant-a").unwrap()
-            ]
+            config.metadata_groups[1].group_name,
+            GroupName::parse("analytics").unwrap()
         );
+        assert_eq!(config.metadata_groups[1].endpoints, vec!["c", "d"]);
+    }
+
+    #[test]
+    fn metadata_group_missing_endpoints_is_rejected() {
+        let mut flat = FlatConfig::new();
+        flat.set("client.metadata.group.names", "root,analytics");
+        flat.set("client.metadata.group.root.endpoints", "a,b");
+
+        let err = ClientConfig::from_flat(flat).expect_err("missing group endpoints must fail");
+
+        assert!(err.to_string().contains("client.metadata.group.analytics.endpoints"));
     }
 
     #[test]

@@ -10,7 +10,6 @@
 pub(crate) mod backoff;
 pub mod classify;
 pub mod context;
-pub mod decision;
 pub mod executor;
 pub mod policy;
 pub mod refresh;
@@ -19,7 +18,6 @@ pub(crate) use backoff::{BackoffPolicy, BackoffSleeper, TokioBackoffSleeper};
 pub use classify::{ErrorClass, ErrorClassifier, RefreshReason};
 pub(crate) use context::ClientIdentity;
 pub use context::{AttemptContext, OperationContext, OperationIdentity};
-pub(crate) use decision::{RetryDecision, RetryDecisionInput};
 pub(crate) use executor::{OperationExecutor, OperationRuntime};
 pub use policy::OperationKind;
-pub use refresh::RefreshManager;
+pub use refresh::MetadataTargets;

@@ -8,8 +8,6 @@ use std::fmt;
 /// Client runtime metric event kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClientMetric {
-    /// Retry decision selected for a classified error.
-    RetryDecision,
     /// Retry attempt started.
     RetryAttempt,
     /// Retry budget exhausted.
@@ -83,8 +81,6 @@ pub(crate) struct ClientMetricLabels {
     pub(crate) error_class: Option<&'static str>,
     /// Refresh reason.
     pub(crate) refresh_reason: Option<&'static str>,
-    /// Retry decision.
-    pub(crate) retry_decision: Option<&'static str>,
     /// Target plane.
     pub(crate) target_plane: Option<&'static str>,
     /// Cache or pool name.
@@ -121,12 +117,6 @@ impl ClientMetricLabels {
         self
     }
 
-    /// Attach retry decision label.
-    pub(crate) fn with_retry_decision(mut self, retry_decision: &'static str) -> Self {
-        self.retry_decision = Some(retry_decision);
-        self
-    }
-
     /// Attach outcome label.
     pub(crate) fn with_outcome(mut self, outcome: &'static str) -> Self {
         self.outcome = Some(outcome);
@@ -158,7 +148,6 @@ impl ClientMetricLabels {
             self.operation_kind,
             self.error_class,
             self.refresh_reason,
-            self.retry_decision,
             self.target_plane,
             self.cache,
             self.reason,

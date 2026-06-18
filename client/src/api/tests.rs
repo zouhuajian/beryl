@@ -7,7 +7,7 @@ use super::client::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_REPLICATION}
 use super::handle::{ReadHandle, WriteHandle};
 use super::*;
 use crate::canonical::{ClientAction, RefreshHint};
-use crate::config::ClientConfig;
+use crate::config::{ClientConfig, MetadataGroupConfig};
 use crate::data::{
     WorkerBlockSyncResult, WorkerCommitResult, WorkerDataClient, WorkerDataPlane, WorkerReadResult, WorkerWriteBlock,
     WorkerWriteTarget,
@@ -15,12 +15,13 @@ use crate::data::{
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::{AddBlockResult, MetadataGateway, ReadLayout};
 use crate::planner::read_planner::PlannedReadSegment;
-use crate::runtime::{AttemptContext, ErrorClass, ErrorClassifier};
+use crate::runtime::{AttemptContext, ErrorClass, ErrorClassifier, MetadataTargets};
+use crate::session::write_session::WriteSession;
 use async_trait::async_trait;
 use bytes::Bytes;
 use common::error::canonical::{CanonicalError, RefreshHint as CanonicalRefreshHint, RefreshReason};
 use common::header::RpcErrorCode;
-use proto::common::{BlockIdProto, DataHandleIdProto, FencingTokenProto};
+use proto::common::{BlockIdProto, FencingTokenProto};
 use proto::metadata::{
     AbortFileWriteResponseProto, AppendFileResponseProto, CommitFileResponseProto, CreateFileResponseProto,
     CreateModeProto, DeleteResponseProto, GetStatusResponseProto, ListStatusResponseProto, OpenFileResponseProto,
@@ -66,7 +67,7 @@ async fn open_returns_reader_from_metadata_response() {
 #[tokio::test]
 async fn file_reader_debug_redacts_identity_names() {
     let config = ClientConfig {
-        metadata_endpoints: vec!["http://127.0.0.1:18080".to_string()],
+        metadata_groups: vec![metadata_group_config("root")],
         ..ClientConfig::default()
     };
     let client = FsClient::try_new(config).expect("client");
@@ -79,85 +80,6 @@ async fn file_reader_debug_redacts_identity_names() {
     assert!(debug.contains("FileReader"));
     assert!(debug.contains("size_hint"));
     assert_debug_redacts_internal_identity_names(&debug);
-}
-
-#[test]
-fn read_handle_from_open_response_requires_inode_id() {
-    let err = ReadHandle::from_open_response(
-        "/alpha",
-        OpenFileResponseProto {
-            inode_id: None,
-            data_handle_id: Some(DataHandleIdProto { value: 202 }),
-            file_version: Some(3),
-            file_size: 10,
-            ..OpenFileResponseProto::default()
-        },
-    )
-    .expect_err("missing inode_id must fail");
-
-    assert!(
-        matches!(&err, ClientError::Metadata(msg) if msg.contains("OpenFileResponseProto.inode_id missing")),
-        "unexpected error: {err:?}"
-    );
-}
-
-#[test]
-fn write_handle_from_create_response_builds_session() {
-    let handle = WriteHandle::from_create_response(
-        "/created",
-        CreateFileResponseProto {
-            inode_id: Some(proto::fs::InodeIdProto { value: 301 }),
-            data_handle_id: Some(DataHandleIdProto { value: 302 }),
-            write_handle: Some(write_handle_proto(1, 302)),
-            base_size: 8,
-            expires_at_ms: u64::MAX / 4,
-            layout: Some(layout_proto(default_layout())),
-            ..CreateFileResponseProto::default()
-        },
-    )
-    .expect("write handle");
-
-    assert_eq!(handle.path(), "/created");
-    assert_eq!(handle.data_handle_id(), DataHandleId::new(302));
-    assert_eq!(handle.write_cursor(), 8);
-}
-
-#[tokio::test]
-async fn write_handle_from_create_response_propagates_lease_expiry() {
-    let handle = WriteHandle::from_create_response(
-        "/created",
-        CreateFileResponseProto {
-            inode_id: Some(proto::fs::InodeIdProto { value: 301 }),
-            data_handle_id: Some(DataHandleIdProto { value: 302 }),
-            write_handle: Some(write_handle_proto(1, 302)),
-            expires_at_ms: 456,
-            layout: Some(layout_proto(default_layout())),
-            ..CreateFileResponseProto::default()
-        },
-    )
-    .expect("write handle");
-
-    let session_ref = handle.write_session();
-    let session = session_ref.lock().await;
-    assert_eq!(session.expires_at_ms(), Some(456));
-}
-
-#[test]
-fn write_handle_from_create_response_rejects_missing_lease_expiry() {
-    let err = WriteHandle::from_create_response(
-        "/created",
-        CreateFileResponseProto {
-            inode_id: Some(proto::fs::InodeIdProto { value: 301 }),
-            data_handle_id: Some(DataHandleIdProto { value: 302 }),
-            write_handle: Some(write_handle_proto(1, 302)),
-            layout: Some(layout_proto(default_layout())),
-            ..CreateFileResponseProto::default()
-        },
-    )
-    .expect_err("zero expires_at_ms must fail");
-
-    assert!(matches!(&err, ClientError::InvalidResponse { operation, reason }
-        if *operation == "CreateFile" && reason.contains("expires_at_ms")));
 }
 
 #[tokio::test]
@@ -903,19 +825,7 @@ async fn writer_close_time_flush_worker_error_blocks_retry_commit() {
 async fn writer_renew_lease_updates_session_state() {
     let gateway = Arc::new(MockGateway::default());
     let client = fs_client_with_gateway(test_config("root"), gateway).expect("client");
-    let handle = WriteHandle::from_create_response(
-        "/created",
-        CreateFileResponseProto {
-            inode_id: Some(proto::fs::InodeIdProto { value: 301 }),
-            data_handle_id: Some(DataHandleIdProto { value: 302 }),
-            write_handle: Some(write_handle_proto(1, 302)),
-            base_size: 0,
-            expires_at_ms: u64::MAX / 4,
-            layout: Some(layout_proto(default_layout())),
-            ..CreateFileResponseProto::default()
-        },
-    )
-    .expect("write handle");
+    let handle = write_handle_for_tests("/created", 0, u64::MAX / 4).expect("write handle");
     let session_ref = handle.write_session();
     let mut writer = FileWriter::new(Arc::clone(&client.runtime), handle);
 
@@ -929,19 +839,7 @@ async fn writer_renew_lease_updates_session_state() {
 async fn writer_renew_lease_rejects_zero_expiry_without_updating_session() {
     let gateway = Arc::new(MockGateway::with_renew_outcomes(vec![RenewOutcome::ZeroExpiry]));
     let client = fs_client_with_gateway(test_config("root"), gateway).expect("client");
-    let handle = WriteHandle::from_create_response(
-        "/created",
-        CreateFileResponseProto {
-            inode_id: Some(proto::fs::InodeIdProto { value: 301 }),
-            data_handle_id: Some(DataHandleIdProto { value: 302 }),
-            write_handle: Some(write_handle_proto(1, 302)),
-            base_size: 0,
-            expires_at_ms: u64::MAX / 4,
-            layout: Some(layout_proto(default_layout())),
-            ..CreateFileResponseProto::default()
-        },
-    )
-    .expect("write handle");
+    let handle = write_handle_for_tests("/created", 0, u64::MAX / 4).expect("write handle");
     let session_ref = handle.write_session();
     let mut writer = FileWriter::new(Arc::clone(&client.runtime), handle);
 
@@ -1122,9 +1020,15 @@ fn assert_event_order(events: &EventLog, before: &'static str, after: &'static s
 
 fn test_config(group_name: &str) -> ClientConfig {
     ClientConfig {
-        metadata_endpoints: vec!["http://127.0.0.1:18080".to_string()],
-        metadata_group_names: vec![group_name_from(group_name)],
+        metadata_groups: vec![metadata_group_config(group_name)],
         ..ClientConfig::default()
+    }
+}
+
+fn metadata_group_config(group_name: &str) -> MetadataGroupConfig {
+    MetadataGroupConfig {
+        group_name: group_name_from(group_name),
+        endpoints: vec!["http://127.0.0.1:18080".to_string()],
     }
 }
 
@@ -1146,9 +1050,11 @@ fn fs_client_with_data_plane(
     gateway: Arc<dyn MetadataGateway>,
     data_plane: WorkerDataPlane,
 ) -> ClientResult<FsClient> {
+    let metadata_targets = MetadataTargets::from_config(&config)?;
     FsClient::with_runtime_hooks(
         config,
         gateway,
+        metadata_targets,
         data_plane,
         Arc::new(crate::runtime::TokioBackoffSleeper),
         Arc::new(crate::metrics::NoopClientMetrics),
@@ -2017,6 +1923,29 @@ fn write_handle_proto(handle_id: u64, data_handle_id: u64) -> WriteHandleProto {
             epoch: 1,
         }),
     }
+}
+
+fn write_handle_for_tests(path: &str, base_size: u64, expires_at_ms: u64) -> ClientResult<WriteHandle> {
+    let inode_id = InodeId::new(301);
+    let data_handle_id = DataHandleId::new(302);
+    let layout = types::FileLayout::try_from(layout_proto(default_layout()))
+        .map_err(|err| ClientError::InvalidLayout(err.to_string()))?;
+    let session = WriteSession::new(
+        path.to_string(),
+        inode_id,
+        data_handle_id,
+        layout,
+        write_handle_proto(1, data_handle_id.as_raw()),
+        base_size,
+        expires_at_ms,
+    )?;
+    Ok(WriteHandle::new(
+        path.to_string(),
+        inode_id,
+        data_handle_id,
+        base_size,
+        session,
+    ))
 }
 
 fn write_target_with_layout(

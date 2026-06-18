@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Refresh manager entry point.
+//! Metadata target selection and refresh cache updates.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,48 +11,55 @@ use types::{GroupName, GroupStateWatermark};
 
 use crate::cache::StateIdCache;
 use crate::canonical::RefreshHint;
+use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
 use crate::runtime::classify::RefreshReason;
 use crate::runtime::context::{AttemptContext, OperationContext};
 
 /// Configured metadata group bootstrap target.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConfiguredMetadataGroup {
+pub struct MetadataGroupTargets {
     /// Stable metadata group name.
     pub group_name: GroupName,
-    /// Metadata endpoint for this group.
-    pub endpoint: String,
+    /// Metadata endpoints for this group.
+    pub endpoints: Vec<String>,
 }
 
 #[derive(Debug)]
-struct RefreshState {
-    configured_groups: Vec<ConfiguredMetadataGroup>,
+struct MetadataTargetState {
+    groups: Vec<MetadataGroupTargets>,
     leader_cache: HashMap<GroupName, String>,
-    mount_route_cache: HashMap<String, GroupName>,
+    route_cache: HashMap<String, GroupName>,
     mount_epoch_cache: HashMap<String, u64>,
     route_epoch_cache: HashMap<String, u64>,
 }
 
-/// Owns correctness cache updates after structured refresh signals.
+/// Owns metadata target selection and correctness cache updates after refresh signals.
 #[derive(Clone, Debug)]
-pub struct RefreshManager {
-    state: Arc<RwLock<RefreshState>>,
+pub struct MetadataTargets {
+    state: Arc<RwLock<MetadataTargetState>>,
     watermarks: StateIdCache,
 }
 
-impl RefreshManager {
-    /// Create a refresh manager from configured metadata groups.
-    pub fn new(configured_groups: Vec<ConfiguredMetadataGroup>) -> ClientResult<Self> {
-        if configured_groups.is_empty() {
+impl MetadataTargets {
+    /// Create metadata targets from configured metadata groups.
+    pub fn new(groups: Vec<MetadataGroupTargets>) -> ClientResult<Self> {
+        if groups.is_empty() {
             return Err(ClientError::InvalidArgument(
-                "RefreshManager requires at least one metadata group".to_string(),
+                "MetadataTargets requires at least one metadata group".to_string(),
             ));
         }
+        if let Some(group) = groups.iter().find(|group| group.endpoints.is_empty()) {
+            return Err(ClientError::InvalidArgument(format!(
+                "MetadataTargets group {} requires at least one endpoint",
+                group.group_name
+            )));
+        }
         Ok(Self {
-            state: Arc::new(RwLock::new(RefreshState {
-                configured_groups,
+            state: Arc::new(RwLock::new(MetadataTargetState {
+                groups,
                 leader_cache: HashMap::new(),
-                mount_route_cache: HashMap::new(),
+                route_cache: HashMap::new(),
                 mount_epoch_cache: HashMap::new(),
                 route_epoch_cache: HashMap::new(),
             })),
@@ -60,45 +67,38 @@ impl RefreshManager {
         })
     }
 
-    /// Build configured groups from parallel group name and endpoint lists.
-    pub fn from_config(metadata_group_names: &[GroupName], metadata_endpoints: &[String]) -> ClientResult<Self> {
-        let fallback_endpoint = metadata_endpoints
-            .first()
-            .cloned()
-            .ok_or_else(|| ClientError::Config("client.metadata.endpoints must not be empty".to_string()))?;
-        let groups = metadata_group_names
+    /// Build metadata targets from client config.
+    pub fn from_config(config: &ClientConfig) -> ClientResult<Self> {
+        let groups = config
+            .metadata_groups
             .iter()
-            .enumerate()
-            .map(|(index, group_name)| ConfiguredMetadataGroup {
-                group_name: group_name.clone(),
-                endpoint: metadata_endpoints
-                    .get(index)
-                    .cloned()
-                    .unwrap_or_else(|| fallback_endpoint.clone()),
+            .map(|group| MetadataGroupTargets {
+                group_name: group.group_name.clone(),
+                endpoints: group.endpoints.clone(),
             })
             .collect();
         Self::new(groups)
     }
 
     /// Choose the owner group for a path, using owner cache before bootstrap config.
-    pub fn choose_group_for_path(&self, path: &str) -> ClientResult<GroupName> {
+    pub fn group_for_path(&self, path: &str) -> ClientResult<GroupName> {
         let state = self.state.read();
-        if let Some(group_name) = state.mount_route_cache.get(path) {
+        if let Some(group_name) = state.route_cache.get(path) {
             return Ok(group_name.clone());
         }
         state
-            .configured_groups
+            .groups
             .first()
             .map(|group| group.group_name.clone())
             .ok_or_else(|| ClientError::Config("metadata group configuration is empty".to_string()))
     }
 
     /// Choose the owner group for an operation.
-    pub fn choose_group_for_operation(&self, operation: &OperationContext) -> ClientResult<GroupName> {
+    pub fn group_for_operation(&self, operation: &OperationContext) -> ClientResult<GroupName> {
         if let Some(path) = operation.original_target_path() {
-            self.choose_group_for_path(path)
+            self.group_for_path(path)
         } else {
-            self.choose_group_for_path("")
+            self.group_for_path("")
         }
     }
 
@@ -113,18 +113,32 @@ impl RefreshManager {
     }
 
     /// Select endpoint for the next attempt.
-    pub fn endpoint_for_group(&self, group_name: &GroupName) -> ClientResult<String> {
+    pub fn endpoint_for_group(&self, group_name: &GroupName, attempt: u32) -> ClientResult<String> {
         let state = self.state.read();
         if let Some(endpoint) = state.leader_cache.get(group_name) {
             return Ok(endpoint.clone());
         }
         state
-            .configured_groups
+            .groups
             .iter()
             .find(|group| &group.group_name == group_name)
-            .or_else(|| state.configured_groups.first())
-            .map(|group| group.endpoint.clone())
-            .ok_or_else(|| ClientError::Config("metadata endpoint configuration is empty".to_string()))
+            .map(|group| {
+                let index = attempt as usize % group.endpoints.len();
+                group.endpoints[index].clone()
+            })
+            .ok_or_else(|| ClientError::Config(format!("metadata group {} is not configured", group_name)))
+    }
+
+    /// Clear a cached leader when transport failed against that exact endpoint.
+    pub fn record_transport_failure(&self, group_name: &GroupName, endpoint: &str) {
+        let mut state = self.state.write();
+        if state
+            .leader_cache
+            .get(group_name)
+            .is_some_and(|cached| cached == endpoint)
+        {
+            state.leader_cache.remove(group_name);
+        }
     }
 
     /// Record a structured refresh decision and update correctness caches.
@@ -148,7 +162,7 @@ impl RefreshManager {
                     ));
                 };
                 if let Some(path) = operation.original_target_path() {
-                    state.mount_route_cache.insert(path.to_string(), group_name.clone());
+                    state.route_cache.insert(path.to_string(), group_name.clone());
                 }
                 if let Some(endpoint) = hint.leader_endpoint.as_ref() {
                     state.leader_cache.insert(group_name.clone(), endpoint.clone());
@@ -244,11 +258,11 @@ fn path_matches_prefix(path: &str, prefix: &str) -> bool {
             .is_some_and(|remaining| remaining.starts_with('/'))
 }
 
-impl Default for RefreshManager {
+impl Default for MetadataTargets {
     fn default() -> Self {
-        Self::new(vec![ConfiguredMetadataGroup {
+        Self::new(vec![MetadataGroupTargets {
             group_name: GroupName::parse("root").expect("default group name is valid"),
-            endpoint: "http://127.0.0.1:18080".to_string(),
+            endpoints: vec!["127.0.0.1:18080".to_string()],
         }])
         .expect("default metadata group must be valid")
     }
@@ -264,10 +278,10 @@ mod tests {
     use proto::common::{GroupStateWatermarkProto, RaftLogIdProto};
     use types::{ClientId, GroupName};
 
-    fn manager() -> RefreshManager {
-        RefreshManager::new(vec![ConfiguredMetadataGroup {
+    fn manager() -> MetadataTargets {
+        MetadataTargets::new(vec![MetadataGroupTargets {
             group_name: group_name("root"),
-            endpoint: "http://127.0.0.1:18080".to_string(),
+            endpoints: vec!["http://127.0.0.1:18080".to_string()],
         }])
         .expect("refresh manager")
     }
@@ -290,10 +304,7 @@ mod tests {
     fn path_operation_initially_uses_configured_default_group() {
         let manager = manager();
 
-        assert_eq!(
-            manager.choose_group_for_path("/alpha").expect("group"),
-            group_name("root")
-        );
+        assert_eq!(manager.group_for_path("/alpha").expect("group"), group_name("root"));
     }
 
     #[test]
@@ -313,7 +324,7 @@ mod tests {
             .expect("refresh recorded");
 
         assert_eq!(
-            manager.choose_group_for_path("/alpha/file").expect("group"),
+            manager.group_for_path("/alpha/file").expect("group"),
             group_name("analytics")
         );
     }
@@ -336,12 +347,12 @@ mod tests {
             .expect("refresh recorded");
 
         assert_eq!(
-            manager.choose_group_for_path("/alpha/file").expect("group"),
+            manager.group_for_path("/alpha/file").expect("group"),
             group_name("analytics")
         );
         assert_eq!(
             manager
-                .endpoint_for_group(&group_name("analytics"))
+                .endpoint_for_group(&group_name("analytics"), 0)
                 .expect("owner endpoint"),
             "http://127.0.0.1:18082"
         );
@@ -366,10 +377,51 @@ mod tests {
 
         assert_eq!(
             manager
-                .endpoint_for_group(&group_name("root"))
+                .endpoint_for_group(&group_name("root"), 0)
                 .expect("leader endpoint"),
             "http://127.0.0.1:18081"
         );
+    }
+
+    #[test]
+    fn metadata_targets_rotate_configured_endpoints_without_cached_leader() {
+        let targets = MetadataTargets::new(vec![MetadataGroupTargets {
+            group_name: group_name("root"),
+            endpoints: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        }])
+        .expect("metadata targets");
+
+        assert_eq!(targets.endpoint_for_group(&group_name("root"), 0).unwrap(), "a");
+        assert_eq!(targets.endpoint_for_group(&group_name("root"), 1).unwrap(), "b");
+        assert_eq!(targets.endpoint_for_group(&group_name("root"), 2).unwrap(), "c");
+        assert_eq!(targets.endpoint_for_group(&group_name("root"), 3).unwrap(), "a");
+    }
+
+    #[test]
+    fn transport_failure_clears_failed_cached_leader() {
+        let targets = MetadataTargets::new(vec![MetadataGroupTargets {
+            group_name: group_name("root"),
+            endpoints: vec!["a".to_string(), "b".to_string()],
+        }])
+        .expect("metadata targets");
+        let op = path_operation();
+
+        targets
+            .record_refresh(
+                &op,
+                RefreshReason::NotLeader,
+                &RefreshHint {
+                    group_name: Some(group_name("root")),
+                    leader_endpoint: Some("leader".to_string()),
+                    ..RefreshHint::default()
+                },
+            )
+            .expect("refresh recorded");
+        assert_eq!(targets.endpoint_for_group(&group_name("root"), 0).unwrap(), "leader");
+
+        targets.record_transport_failure(&group_name("root"), "leader");
+
+        assert_eq!(targets.endpoint_for_group(&group_name("root"), 1).unwrap(), "b");
     }
 
     #[test]

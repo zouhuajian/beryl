@@ -8,6 +8,10 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::api::client::{DEFAULT_BLOCK_SIZE, DEFAULT_REPLICATION, MAX_PREALLOCATED_WRITE_BLOCKS};
+use crate::api::handle::{ReadHandle, WriteHandle};
+use crate::api::path::NamespacePathBuf;
+use crate::api::{CreateMode, CreateOptions, DirectoryEntry, DirectoryListing, FileStatus, ListOptions};
 use crate::canonical::ClientAction;
 use crate::config::{BackoffConfig, RefreshConfig, RetryConfig};
 use crate::error::{ClientError, ClientResult};
@@ -15,19 +19,19 @@ use crate::metadata::{AddBlockResult, MetadataGateway, ReadLayout};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
 use crate::runtime::classify::{ErrorClass, ErrorClassifier, RefreshReason};
 pub use crate::runtime::context::{AttemptContext, OperationContext, OperationIdentity};
-use crate::runtime::decision::{RetryDecision, RetryDecisionInput};
 use crate::runtime::policy::{OperationKind, ReplayPolicyTable};
-use crate::runtime::refresh::RefreshManager;
+use crate::runtime::refresh::MetadataTargets;
 use crate::runtime::ClientIdentity;
 use crate::runtime::{BackoffPolicy, BackoffSleeper};
-use types::DataHandleId;
+use crate::session::write_session::{CommitFilePlan, WriteSession};
+use types::{CommittedBlock, DataHandleId, FileLayout, InodeId};
 
 /// Executes public operations through policy, classification, refresh, and replay gates.
 #[derive(Clone)]
 pub struct OperationExecutor {
     identity: ClientIdentity,
     gateway: Arc<dyn MetadataGateway>,
-    refresh_manager: RefreshManager,
+    metadata_targets: MetadataTargets,
     replay_policy: ReplayPolicyTable,
     classifier: ErrorClassifier,
     retry: RetryConfig,
@@ -51,13 +55,13 @@ impl OperationExecutor {
     pub(crate) fn with_runtime(
         identity: ClientIdentity,
         gateway: Arc<dyn MetadataGateway>,
-        refresh_manager: RefreshManager,
+        metadata_targets: MetadataTargets,
         runtime: OperationRuntime,
     ) -> ClientResult<Self> {
         Ok(Self {
             identity,
             gateway,
-            refresh_manager,
+            metadata_targets,
             replay_policy: ReplayPolicyTable::new(),
             classifier: ErrorClassifier,
             retry: runtime.retry,
@@ -68,8 +72,90 @@ impl OperationExecutor {
         })
     }
 
-    /// Execute OpenFile.
-    pub(crate) async fn open_file(
+    /// Execute GetStatus and return a public status snapshot.
+    pub(crate) async fn stat(&self, path: NamespacePathBuf) -> ClientResult<FileStatus> {
+        let path_text = path.as_str().to_string();
+        let response = self
+            .get_status_request(
+                &path_text,
+                proto::metadata::GetStatusRequestProto {
+                    header: None,
+                    path: path_text.clone(),
+                },
+            )
+            .await?;
+        file_status_from_response(path_text, response)
+    }
+
+    /// Execute ListStatus and return a public directory listing.
+    pub(crate) async fn list(&self, path: NamespacePathBuf, options: ListOptions) -> ClientResult<DirectoryListing> {
+        let path_text = path.into_string();
+        let response = self
+            .list_status_request(
+                &path_text,
+                proto::metadata::ListStatusRequestProto {
+                    header: None,
+                    path: path_text.clone(),
+                    recursive: options.recursive,
+                    cursor: options.cursor.unwrap_or_default(),
+                    limit: options.limit.unwrap_or(0),
+                },
+            )
+            .await?;
+        Ok(directory_listing_from_response(path_text, response))
+    }
+
+    /// Execute Delete.
+    pub(crate) async fn delete(&self, path: NamespacePathBuf, recursive: bool) -> ClientResult<()> {
+        let path_text = path.into_string();
+        self.delete_request(
+            &path_text,
+            proto::metadata::DeleteRequestProto {
+                header: None,
+                path: path_text.clone(),
+                recursive,
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Execute Rename.
+    pub(crate) async fn rename(&self, src: NamespacePathBuf, dst: NamespacePathBuf) -> ClientResult<()> {
+        let src_text = src.into_string();
+        let dst_text = dst.into_string();
+        self.rename_request(
+            &src_text,
+            &dst_text,
+            proto::metadata::RenameRequestProto {
+                header: None,
+                src_path: src_text.clone(),
+                dst_path: dst_text.clone(),
+                flags: 0,
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Execute OpenFile and return a read handle.
+    pub(crate) async fn open_file(&self, path: NamespacePathBuf) -> ClientResult<ReadHandle> {
+        let path_text = path.into_string();
+        let response = self
+            .open_file_request(
+                &path_text,
+                proto::metadata::OpenFileRequestProto {
+                    header: None,
+                    path: path_text.clone(),
+                    range: None,
+                    include_locations: false,
+                },
+            )
+            .await?;
+        read_handle_from_open_response(path_text, response)
+    }
+
+    async fn open_file_request(
         &self,
         path: &str,
         req: proto::metadata::OpenFileRequestProto,
@@ -145,11 +231,11 @@ impl OperationExecutor {
         reason: RefreshReason,
         hint: &crate::canonical::RefreshHint,
     ) -> ClientResult<()> {
-        self.refresh_manager.record_refresh(operation, reason, hint)
+        self.metadata_targets.record_refresh(operation, reason, hint)
     }
 
     /// Execute GetStatus.
-    pub(crate) async fn get_status(
+    async fn get_status_request(
         &self,
         path: &str,
         req: proto::metadata::GetStatusRequestProto,
@@ -167,7 +253,7 @@ impl OperationExecutor {
     }
 
     /// Execute ListStatus.
-    pub(crate) async fn list_status(
+    async fn list_status_request(
         &self,
         path: &str,
         req: proto::metadata::ListStatusRequestProto,
@@ -185,7 +271,34 @@ impl OperationExecutor {
     }
 
     /// Execute CreateFile.
+    /// Execute CreateFile and return a write handle.
     pub(crate) async fn create_file(
+        &self,
+        path: NamespacePathBuf,
+        options: CreateOptions,
+    ) -> ClientResult<WriteHandle> {
+        let path_text = path.into_string();
+        let create_mode = match options.create_mode {
+            CreateMode::CreateNew => proto::metadata::CreateModeProto::CreateNew,
+            CreateMode::CreateOrOverwrite => proto::metadata::CreateModeProto::CreateOrOverwrite,
+        };
+        let response = self
+            .create_file_request(
+                &path_text,
+                proto::metadata::CreateFileRequestProto {
+                    header: None,
+                    path: path_text.clone(),
+                    attrs: Some(default_file_attrs()),
+                    layout: Some(layout_for_new_file(&options)),
+                    create_mode: create_mode as i32,
+                    desired_len: Some(default_write_preallocation_len()),
+                },
+            )
+            .await?;
+        write_handle_from_create_response(path_text, response)
+    }
+
+    async fn create_file_request(
         &self,
         path: &str,
         req: proto::metadata::CreateFileRequestProto,
@@ -204,7 +317,23 @@ impl OperationExecutor {
     }
 
     /// Execute AppendFile.
-    pub(crate) async fn append_file(
+    /// Execute AppendFile and return a write handle.
+    pub(crate) async fn append_file(&self, path: NamespacePathBuf) -> ClientResult<WriteHandle> {
+        let path_text = path.into_string();
+        let response = self
+            .append_file_request(
+                &path_text,
+                proto::metadata::AppendFileRequestProto {
+                    header: None,
+                    path: path_text.clone(),
+                    desired_len: Some(default_write_preallocation_len()),
+                },
+            )
+            .await?;
+        write_handle_from_append_response(path_text, response)
+    }
+
+    async fn append_file_request(
         &self,
         path: &str,
         req: proto::metadata::AppendFileRequestProto,
@@ -226,15 +355,21 @@ impl OperationExecutor {
         &self,
         path: &str,
         session_identity: String,
-        req: proto::metadata::AddBlockRequestProto,
+        write_handle: proto::metadata::WriteHandleProto,
+        desired_len: u64,
     ) -> ClientResult<AddBlockResult> {
-        let detail = format!("desired_len={:?}", req.desired_len);
+        let detail = format!("desired_len={desired_len}");
         let operation = OperationContext::new_with_identity(
             &self.identity,
             OperationKind::MetadataMutation,
             "AddBlock",
             OperationIdentity::session(path, session_identity).with_detail(detail),
         )?;
+        let req = proto::metadata::AddBlockRequestProto {
+            header: None,
+            write_handle: Some(write_handle),
+            desired_len: Some(desired_len),
+        };
         self.execute_metadata(operation, req, |gateway, ctx, req| async move {
             gateway.add_block(ctx, req).await
         })
@@ -244,10 +379,18 @@ impl OperationExecutor {
     /// Execute CommitFile.
     pub(crate) async fn commit_file(
         &self,
-        operation: OperationContext,
-        req: proto::metadata::CommitFileRequestProto,
+        plan: CommitFilePlan,
     ) -> ClientResult<proto::metadata::CommitFileResponseProto> {
-        self.execute_metadata(operation, req, |gateway, ctx, req| async move {
+        let req = proto::metadata::CommitFileRequestProto {
+            header: None,
+            write_handle: Some(plan.write_handle),
+            data_handle_id: Some(proto::common::DataHandleIdProto {
+                value: plan.data_handle_id.as_raw(),
+            }),
+            committed_blocks: plan.committed_blocks.iter().map(Into::into).collect(),
+            final_size: plan.final_size,
+        };
+        self.execute_metadata(plan.operation, req, |gateway, ctx, req| async move {
             gateway.commit_file(ctx, req).await
         })
         .await
@@ -257,8 +400,12 @@ impl OperationExecutor {
     pub(crate) async fn abort_file_write(
         &self,
         operation: OperationContext,
-        req: proto::metadata::AbortFileWriteRequestProto,
+        write_handle: proto::metadata::WriteHandleProto,
     ) -> ClientResult<proto::metadata::AbortFileWriteResponseProto> {
+        let req = proto::metadata::AbortFileWriteRequestProto {
+            header: None,
+            write_handle: Some(write_handle),
+        };
         self.execute_metadata(operation, req, |gateway, ctx, req| async move {
             gateway.abort_file_write(ctx, req).await
         })
@@ -270,7 +417,7 @@ impl OperationExecutor {
         &self,
         path: &str,
         session_identity: String,
-        req: proto::metadata::RenewLeaseRequestProto,
+        write_handle: proto::metadata::WriteHandleProto,
     ) -> ClientResult<proto::metadata::RenewLeaseResponseProto> {
         let operation = OperationContext::new_with_identity(
             &self.identity,
@@ -278,6 +425,10 @@ impl OperationExecutor {
             "RenewLease",
             OperationIdentity::session(path, session_identity),
         )?;
+        let req = proto::metadata::RenewLeaseRequestProto {
+            header: None,
+            write_handle: Some(write_handle),
+        };
         self.execute_metadata(operation, req, |gateway, ctx, req| async move {
             gateway.renew_lease(ctx, req).await
         })
@@ -287,17 +438,30 @@ impl OperationExecutor {
     /// Execute SyncWrite.
     pub(crate) async fn sync_write(
         &self,
-        path: &str,
-        session_identity: String,
-        req: proto::metadata::SyncWriteRequestProto,
+        session: &WriteSession,
+        data_handle_id: DataHandleId,
+        committed_blocks: Vec<CommittedBlock>,
+        target_size: u64,
+        mode: proto::metadata::WriteSyncModeProto,
     ) -> ClientResult<proto::metadata::SyncWriteResponseProto> {
-        let detail = format!("mode={} target_size={}", req.mode, req.target_size);
+        let detail = format!("mode={} target_size={}", mode as i32, target_size);
         let operation = OperationContext::new_with_identity(
             &self.identity,
             OperationKind::MetadataSessionBarrier,
             "SyncWrite",
-            OperationIdentity::session(path, session_identity).with_detail(detail),
+            OperationIdentity::session(session.path(), session.session_identity()).with_detail(detail),
         )?;
+        let req = proto::metadata::SyncWriteRequestProto {
+            header: None,
+            write_handle: Some(session.write_handle()),
+            data_handle_id: Some(proto::common::DataHandleIdProto {
+                value: data_handle_id.as_raw(),
+            }),
+            committed_blocks: committed_blocks.iter().map(Into::into).collect(),
+            target_size,
+            mode: mode as i32,
+            flags: 0,
+        };
         self.execute_metadata(operation, req, |gateway, ctx, req| async move {
             gateway.sync_write(ctx, req).await
         })
@@ -305,7 +469,7 @@ impl OperationExecutor {
     }
 
     /// Execute Delete.
-    pub(crate) async fn delete(
+    async fn delete_request(
         &self,
         path: &str,
         req: proto::metadata::DeleteRequestProto,
@@ -323,7 +487,7 @@ impl OperationExecutor {
     }
 
     /// Execute Rename.
-    pub(crate) async fn rename(
+    async fn rename_request(
         &self,
         src: &str,
         dst: &str,
@@ -352,7 +516,7 @@ impl OperationExecutor {
         F: FnMut(Arc<dyn MetadataGateway>, AttemptContext, Req) -> Fut,
         Fut: Future<Output = ClientResult<T>>,
     {
-        let mut target_group = self.refresh_manager.choose_group_for_operation(&operation)?;
+        let mut target_group = self.metadata_targets.group_for_operation(&operation)?;
         let mut retry_used = 0usize;
         let mut refresh_used = 0usize;
         let retry_budget = self.retry_budget_for_operation(operation.kind());
@@ -360,12 +524,12 @@ impl OperationExecutor {
         let mut attempt = 0u32;
 
         loop {
-            let endpoint = self.refresh_manager.endpoint_for_group(&target_group)?;
+            let endpoint = self.metadata_targets.endpoint_for_group(&target_group, attempt)?;
             let mut ctx = AttemptContext::for_metadata(&operation, target_group.clone(), attempt)?
                 .with_operation_timeout_ms(self.retry.operation_timeout_ms);
-            ctx = ctx.with_metadata_endpoint(endpoint);
-            ctx = self.refresh_manager.enrich_attempt_context(&operation, ctx);
-            if let Some(watermark) = self.refresh_manager.state_watermark_proto(&target_group) {
+            ctx = ctx.with_metadata_endpoint(&endpoint);
+            ctx = self.metadata_targets.enrich_attempt_context(&operation, ctx);
+            if let Some(watermark) = self.metadata_targets.state_watermark_proto(&target_group) {
                 ctx = ctx.with_state(vec![watermark]);
             }
             let observed_fingerprint = ctx.operation_fingerprint();
@@ -378,76 +542,8 @@ impl OperationExecutor {
                 Err(err) => {
                     let class = self.classifier.classify_error(&err);
                     self.record_error_metric(&operation, &class);
-                    let refresh_reason = match class {
-                        ErrorClass::NeedRefresh(reason) => Some(reason),
-                        _ => None,
-                    };
-                    let decision = RetryDecision::from_input(RetryDecisionInput {
-                        operation_kind: operation.kind(),
-                        operation_name: "metadata",
-                        attempt_number: attempt,
-                        retry_budget_remaining: retry_budget.saturating_sub(retry_used),
-                        refresh_budget_remaining: refresh_budget.saturating_sub(refresh_used),
-                        error_class: class.clone(),
-                        refresh_reason,
-                        replay_safety: operation.replay_safety(),
-                        side_effects_may_have_occurred: metadata_operation_may_have_side_effects(operation.kind()),
-                        has_stable_call_id_and_fingerprint: observed_fingerprint == operation.operation_fingerprint(),
-                        has_stable_session_identity: operation.has_session_identity(),
-                        public_bytes_returned: false,
-                        outcome_unknown: matches!(err, ClientError::UnknownOutcome(_)),
-                    });
-                    self.record_retry_decision(&operation, &class, refresh_reason, decision);
-                    match decision {
-                        RetryDecision::Retry => {
-                            if let Err(policy_err) = self
-                                .replay_policy
-                                .ensure_replay_allowed(&operation, Some(observed_fingerprint))
-                            {
-                                self.record_replay_denied(&operation);
-                                return Err(policy_err);
-                            }
-                            let retry_index = retry_used;
-                            retry_used += 1;
-                            self.record_metric(
-                                ClientMetric::RetryAttempt,
-                                operation_labels(&operation).with_error_class(class.label()),
-                            );
-                            self.sleep_before_retry(retry_index, &operation).await;
-                            attempt = attempt.saturating_add(1);
-                        }
-                        RetryDecision::RefreshThenRetry => {
-                            if let Err(policy_err) = self
-                                .replay_policy
-                                .ensure_replay_allowed(&operation, Some(observed_fingerprint))
-                            {
-                                self.record_replay_denied(&operation);
-                                return Err(policy_err);
-                            }
-                            let reason = refresh_reason.expect("refresh decision requires reason");
-                            let hint = refresh_hint_from_error(&err);
-                            self.record_metric(
-                                ClientMetric::RefreshDecision,
-                                operation_labels(&operation)
-                                    .with_error_class(class.label())
-                                    .with_refresh_reason(reason.label())
-                                    .with_outcome("refresh"),
-                            );
-                            self.record_metric(
-                                ClientMetric::RefreshReason,
-                                operation_labels(&operation).with_refresh_reason(reason.label()),
-                            );
-                            self.refresh_manager.record_refresh(&operation, reason, &hint)?;
-                            if reason == RefreshReason::StaleState {
-                                self.refresh_state(&operation, target_group.clone(), attempt.saturating_add(1))
-                                    .await?;
-                            }
-                            target_group = self.refresh_manager.choose_group_for_operation(&operation)?;
-                            refresh_used += 1;
-                            retry_used += 1;
-                            attempt = attempt.saturating_add(1);
-                        }
-                        RetryDecision::UnknownOutcome => {
+                    match class.clone() {
+                        ErrorClass::UnknownOutcome => {
                             self.record_metric(
                                 ClientMetric::UnknownOutcome,
                                 operation_labels(&operation)
@@ -463,32 +559,93 @@ impl OperationExecutor {
                                 )),
                             });
                         }
-                        RetryDecision::DenyUnsafeReplay => {
-                            self.record_replay_denied(&operation);
-                            self.replay_policy
-                                .ensure_replay_allowed(&operation, Some(observed_fingerprint))?;
-                            return Err(ClientError::Unsupported(format!(
-                                "{} replay denied by retry policy",
-                                operation.operation_name()
-                            )));
+                        ErrorClass::NeedRefresh(RefreshReason::Unknown) => return Err(err),
+                        ErrorClass::NeedRefresh(reason) => {
+                            if refresh_budget.saturating_sub(refresh_used) == 0 {
+                                self.record_exhausted_if_needed(
+                                    &operation,
+                                    &class,
+                                    retry_budget.saturating_sub(retry_used),
+                                    refresh_budget.saturating_sub(refresh_used),
+                                );
+                                return Err(ClientError::Metadata(format!(
+                                    "{} refresh budget exhausted for {}",
+                                    operation.operation_name(),
+                                    reason.label()
+                                )));
+                            }
+                            if retry_budget.saturating_sub(retry_used) == 0 {
+                                self.record_exhausted_if_needed(
+                                    &operation,
+                                    &class,
+                                    retry_budget.saturating_sub(retry_used),
+                                    refresh_budget.saturating_sub(refresh_used),
+                                );
+                                return Err(err);
+                            }
+                            if let Err(policy_err) = self
+                                .replay_policy
+                                .ensure_replay_allowed(&operation, Some(observed_fingerprint))
+                            {
+                                self.record_replay_denied(&operation);
+                                return Err(policy_err);
+                            }
+                            let hint = refresh_hint_from_error(&err);
+                            self.record_metric(
+                                ClientMetric::RefreshDecision,
+                                operation_labels(&operation)
+                                    .with_error_class(class.label())
+                                    .with_refresh_reason(reason.label())
+                                    .with_outcome("refresh"),
+                            );
+                            self.record_metric(
+                                ClientMetric::RefreshReason,
+                                operation_labels(&operation).with_refresh_reason(reason.label()),
+                            );
+                            self.metadata_targets.record_refresh(&operation, reason, &hint)?;
+                            if reason == RefreshReason::StaleState {
+                                self.refresh_state(&operation, target_group.clone(), attempt.saturating_add(1))
+                                    .await?;
+                            }
+                            target_group = self.metadata_targets.group_for_operation(&operation)?;
+                            refresh_used += 1;
+                            retry_used += 1;
+                            attempt = attempt.saturating_add(1);
                         }
-                        RetryDecision::ReturnError => {
+                        ErrorClass::RetryableTransport => {
+                            if retry_budget.saturating_sub(retry_used) == 0 {
+                                self.record_exhausted_if_needed(
+                                    &operation,
+                                    &class,
+                                    retry_budget.saturating_sub(retry_used),
+                                    refresh_budget.saturating_sub(refresh_used),
+                                );
+                                return Err(err);
+                            }
+                            if let Err(policy_err) = self
+                                .replay_policy
+                                .ensure_replay_allowed(&operation, Some(observed_fingerprint))
+                            {
+                                self.record_replay_denied(&operation);
+                                return Err(policy_err);
+                            }
+                            self.metadata_targets.record_transport_failure(&target_group, &endpoint);
+                            let retry_index = retry_used;
+                            retry_used += 1;
+                            self.record_metric(
+                                ClientMetric::RetryAttempt,
+                                operation_labels(&operation).with_error_class(class.label()),
+                            );
+                            self.sleep_before_retry(retry_index, &operation).await;
+                            attempt = attempt.saturating_add(1);
+                        }
+                        _ => {
                             self.record_exhausted_if_needed(
                                 &operation,
                                 &class,
                                 retry_budget.saturating_sub(retry_used),
                                 refresh_budget.saturating_sub(refresh_used),
                             );
-                            if let Some(reason) = refresh_reason {
-                                if reason != RefreshReason::Unknown && refresh_budget.saturating_sub(refresh_used) == 0
-                                {
-                                    return Err(ClientError::Metadata(format!(
-                                        "{} refresh budget exhausted for {}",
-                                        operation.operation_name(),
-                                        reason.label()
-                                    )));
-                                }
-                            }
                             return Err(err);
                         }
                     }
@@ -503,7 +660,9 @@ impl OperationExecutor {
         target_group: types::GroupName,
         attempt_number: u32,
     ) -> ClientResult<()> {
-        let endpoint = self.refresh_manager.endpoint_for_group(&target_group)?;
+        let endpoint = self
+            .metadata_targets
+            .endpoint_for_group(&target_group, attempt_number)?;
         let ctx = AttemptContext::for_metadata(operation, target_group, attempt_number)?
             .with_operation_timeout_ms(self.retry.operation_timeout_ms)
             .with_metadata_endpoint(endpoint);
@@ -514,7 +673,7 @@ impl OperationExecutor {
                     .msync(ctx, proto::metadata::MsyncRequestProto { header: None }),
             )
             .await?;
-        self.refresh_manager.record_state_watermark(watermark)
+        self.metadata_targets.record_state_watermark(watermark)
     }
 
     async fn metadata_rpc_with_timeout<T, Fut>(&self, operation: &OperationContext, future: Fut) -> ClientResult<T>
@@ -556,22 +715,6 @@ impl OperationExecutor {
             operation_labels(operation).with_outcome("scheduled"),
         );
         self.sleeper.sleep(delay).await;
-    }
-
-    fn record_retry_decision(
-        &self,
-        operation: &OperationContext,
-        class: &ErrorClass,
-        reason: Option<RefreshReason>,
-        decision: RetryDecision,
-    ) {
-        let mut labels = operation_labels(operation)
-            .with_error_class(class.label())
-            .with_retry_decision(decision.label());
-        if let Some(reason) = reason {
-            labels = labels.with_refresh_reason(reason.label());
-        }
-        self.record_metric(ClientMetric::RetryDecision, labels);
     }
 
     fn record_exhausted_if_needed(
@@ -635,6 +778,192 @@ fn operation_timeout_duration(timeout_ms: Option<u64>) -> Option<Duration> {
     timeout_ms.map(Duration::from_millis)
 }
 
+fn default_write_preallocation_len() -> u64 {
+    u64::from(DEFAULT_BLOCK_SIZE) * MAX_PREALLOCATED_WRITE_BLOCKS
+}
+
+fn default_file_attrs() -> proto::fs::FileAttrsProto {
+    proto::fs::FileAttrsProto {
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        size: 0,
+        atime_ms: 0,
+        mtime_ms: 0,
+        ctime_ms: 0,
+        nlink: 1,
+    }
+}
+
+fn layout_for_new_file(options: &CreateOptions) -> proto::common::FileLayoutProto {
+    proto::common::FileLayoutProto {
+        block_size: options.block_size,
+        chunk_size: options.chunk_size,
+        replication: DEFAULT_REPLICATION,
+        block_format_id: options.block_format_id.as_raw(),
+    }
+}
+
+fn file_status_from_response(
+    path: String,
+    response: proto::metadata::GetStatusResponseProto,
+) -> ClientResult<FileStatus> {
+    let attrs = response
+        .attrs
+        .ok_or_else(|| ClientError::Metadata("GetStatusResponseProto.attrs missing".to_string()))?;
+    let inode_id = response
+        .inode_id
+        .ok_or_else(|| ClientError::Metadata("GetStatusResponseProto.inode_id missing".to_string()))?;
+    Ok(FileStatus::new(path, InodeId::new(inode_id.value), attrs.into()))
+}
+
+fn directory_listing_from_response(
+    path: String,
+    response: proto::metadata::ListStatusResponseProto,
+) -> DirectoryListing {
+    let next_cursor = if response.next_cursor.is_empty() {
+        None
+    } else {
+        Some(response.next_cursor)
+    };
+    let entries = response
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let kind = proto::fs::InodeKindProto::try_from(entry.kind)
+                .ok()
+                .and_then(|kind| kind.try_into().ok());
+            DirectoryEntry::new(entry.name, kind, entry.attrs.map(Into::into))
+        })
+        .collect();
+    DirectoryListing::new(path, entries, next_cursor, response.eof)
+}
+
+fn read_handle_from_open_response(
+    path: String,
+    response: proto::metadata::OpenFileResponseProto,
+) -> ClientResult<ReadHandle> {
+    let Some(inode_id) = response.inode_id else {
+        return Err(ClientError::Metadata(
+            "OpenFileResponseProto.inode_id missing".to_string(),
+        ));
+    };
+    let Some(data_handle_id) = response.data_handle_id else {
+        return Err(ClientError::Metadata(
+            "OpenFileResponseProto.data_handle_id missing".to_string(),
+        ));
+    };
+    let Some(file_version) = response.file_version else {
+        return Err(ClientError::Metadata(
+            "OpenFileResponseProto.file_version missing".to_string(),
+        ));
+    };
+
+    Ok(ReadHandle::new(
+        path,
+        InodeId::new(inode_id.value),
+        DataHandleId::new(data_handle_id.value),
+        file_version,
+        response.file_size,
+    ))
+}
+
+fn write_handle_from_create_response(
+    path: String,
+    response: proto::metadata::CreateFileResponseProto,
+) -> ClientResult<WriteHandle> {
+    let Some(inode_id) = response.inode_id else {
+        return Err(ClientError::Metadata(
+            "CreateFileResponseProto.inode_id missing".to_string(),
+        ));
+    };
+    let Some(data_handle_id) = response.data_handle_id else {
+        return Err(ClientError::Metadata(
+            "CreateFileResponseProto.data_handle_id missing".to_string(),
+        ));
+    };
+    let Some(layout) = response.layout else {
+        return Err(ClientError::Metadata(
+            "CreateFileResponseProto.layout missing".to_string(),
+        ));
+    };
+    let layout = FileLayout::try_from(layout)
+        .map_err(|err| ClientError::InvalidLayout(format!("CreateFileResponseProto.layout invalid: {err}")))?;
+    let Some(write_handle) = response.write_handle else {
+        return Err(ClientError::Metadata(
+            "CreateFileResponseProto.write_handle missing".to_string(),
+        ));
+    };
+
+    let expires_at_ms = crate::api::handle::valid_write_session_expiry("CreateFile", response.expires_at_ms)?;
+    let inode_id = InodeId::new(inode_id.value);
+    let data_handle_id = DataHandleId::new(data_handle_id.value);
+    let session = WriteSession::new(
+        path.clone(),
+        inode_id,
+        data_handle_id,
+        layout,
+        write_handle,
+        response.base_size,
+        expires_at_ms,
+    )?;
+    Ok(WriteHandle::new(
+        path,
+        inode_id,
+        data_handle_id,
+        response.base_size,
+        session,
+    ))
+}
+
+fn write_handle_from_append_response(
+    path: String,
+    response: proto::metadata::AppendFileResponseProto,
+) -> ClientResult<WriteHandle> {
+    let Some(inode_id) = response.inode_id else {
+        return Err(ClientError::Metadata(
+            "AppendFileResponseProto.inode_id missing".to_string(),
+        ));
+    };
+    let Some(data_handle_id) = response.data_handle_id else {
+        return Err(ClientError::Metadata(
+            "AppendFileResponseProto.data_handle_id missing".to_string(),
+        ));
+    };
+    let Some(layout) = response.layout else {
+        return Err(ClientError::Metadata(
+            "AppendFileResponseProto.layout missing".to_string(),
+        ));
+    };
+    let layout = FileLayout::try_from(layout)
+        .map_err(|err| ClientError::InvalidLayout(format!("AppendFileResponseProto.layout invalid: {err}")))?;
+    let Some(write_handle) = response.write_handle else {
+        return Err(ClientError::Metadata(
+            "AppendFileResponseProto.write_handle missing".to_string(),
+        ));
+    };
+
+    let expires_at_ms = crate::api::handle::valid_write_session_expiry("AppendFile", response.expires_at_ms)?;
+    let inode_id = InodeId::new(inode_id.value);
+    let data_handle_id = DataHandleId::new(data_handle_id.value);
+    let session = WriteSession::new(
+        path.clone(),
+        inode_id,
+        data_handle_id,
+        layout,
+        write_handle,
+        response.base_size,
+        expires_at_ms,
+    )?;
+    Ok(WriteHandle::new(
+        path,
+        inode_id,
+        data_handle_id,
+        response.base_size,
+        session,
+    ))
+}
+
 fn timeout_error(target_plane: &str, operation: &str, timeout: Duration) -> ClientError {
     ClientError::from(tonic::Status::deadline_exceeded(format!(
         "{target_plane} {operation} timed out after {}ms",
@@ -647,18 +976,11 @@ impl fmt::Debug for OperationExecutor {
         f.debug_struct("OperationExecutor")
             .field("client_id", &self.identity.client_id())
             .field("client_name", &self.identity.client_name())
-            .field("refresh_manager", &self.refresh_manager)
+            .field("metadata_targets", &self.metadata_targets)
             .field("retry", &self.retry)
             .field("refresh", &self.refresh)
             .finish_non_exhaustive()
     }
-}
-
-fn metadata_operation_may_have_side_effects(kind: OperationKind) -> bool {
-    matches!(
-        kind,
-        OperationKind::MetadataMutation | OperationKind::MetadataSessionBarrier | OperationKind::CleanupBestEffort
-    )
 }
 
 fn operation_labels(operation: &OperationContext) -> ClientMetricLabels {
@@ -683,7 +1005,7 @@ fn refresh_hint_from_error(err: &ClientError) -> crate::canonical::RefreshHint {
 mod tests {
     use super::*;
     use crate::runtime::policy::{OperationKind, ReplaySafety};
-    use crate::runtime::refresh::ConfiguredMetadataGroup;
+    use crate::runtime::refresh::MetadataGroupTargets;
     use async_trait::async_trait;
     use common::error::canonical::{
         CanonicalError, ErrorClass as CanonicalErrorClass, ErrorCode as CanonicalErrorCode,
@@ -807,7 +1129,7 @@ mod tests {
         let executor = test_executor(gateway.clone());
 
         executor
-            .get_status(
+            .get_status_request(
                 "/alpha",
                 GetStatusRequestProto {
                     header: None,
@@ -840,7 +1162,7 @@ mod tests {
         let executor = test_executor(gateway.clone());
 
         executor
-            .get_status(
+            .get_status_request(
                 "/alpha",
                 GetStatusRequestProto {
                     header: None,
@@ -874,7 +1196,7 @@ mod tests {
         let executor = test_executor(gateway.clone());
 
         executor
-            .get_status(
+            .get_status_request(
                 "/alpha",
                 GetStatusRequestProto {
                     header: None,
@@ -908,7 +1230,7 @@ mod tests {
         let executor = test_executor(gateway.clone());
 
         executor
-            .delete(
+            .delete_request(
                 "/alpha",
                 DeleteRequestProto {
                     header: None,
@@ -946,7 +1268,7 @@ mod tests {
         let executor = test_executor(gateway.clone());
 
         executor
-            .get_status(
+            .get_status_request(
                 "/alpha",
                 GetStatusRequestProto {
                     header: None,
@@ -982,7 +1304,7 @@ mod tests {
         let executor = test_executor(gateway.clone());
 
         executor
-            .get_status(
+            .get_status_request(
                 "/alpha",
                 GetStatusRequestProto {
                     header: None,
@@ -1015,7 +1337,7 @@ mod tests {
         let executor = test_executor(gateway.clone());
 
         executor
-            .get_status(
+            .get_status_request(
                 "/alpha",
                 GetStatusRequestProto {
                     header: None,
@@ -1045,7 +1367,7 @@ mod tests {
         let executor = test_executor(gateway.clone());
 
         executor
-            .get_status(
+            .get_status_request(
                 "/alpha",
                 GetStatusRequestProto {
                     header: None,
@@ -1062,13 +1384,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_barrier_without_session_identity_denies_refresh_replay() {
+    async fn session_barrier_need_refresh_honors_retry_budget_before_replay_gate() {
         let gateway = Arc::new(ScriptedGateway::new(vec![refresh_outcome(
             RpcErrorCode::StaleState,
             CanonicalRefreshReason::StaleState,
             CanonicalRefreshHint::default(),
         )]));
-        let executor = test_executor(gateway.clone());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let executor = test_executor_with_budgets(gateway.clone(), 1, 1, Arc::clone(&metrics));
         let operation = OperationContext::new(
             ClientId::new(7),
             OperationKind::MetadataSessionBarrier,
@@ -1087,10 +1410,17 @@ mod tests {
                 |gateway, ctx, req| async move { gateway.get_status(ctx, req).await },
             )
             .await
-            .expect_err("session barrier replay must be denied");
+            .expect_err("session barrier must not replay after retry budget is exhausted");
 
-        assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("StableSession")));
+        assert_eq!(
+            ErrorClassifier.classify_error(&err),
+            ErrorClass::NeedRefresh(RefreshReason::StaleState)
+        );
         assert_eq!(gateway.calls().len(), 1);
+        assert!(metrics
+            .events()
+            .iter()
+            .all(|event| event.metric != ClientMetric::UnsafeReplayDenied));
     }
 
     #[test]
@@ -1128,7 +1458,7 @@ mod tests {
         let executor = test_executor(gateway.clone());
 
         let err = executor
-            .delete(
+            .delete_request(
                 "/alpha",
                 DeleteRequestProto {
                     header: None,
@@ -1149,7 +1479,7 @@ mod tests {
         let executor = test_executor(gateway.clone());
 
         let err = executor
-            .delete(
+            .delete_request(
                 "/alpha",
                 DeleteRequestProto {
                     header: None,
@@ -1226,7 +1556,7 @@ mod tests {
         let executor = test_executor(gateway.clone());
 
         let err = executor
-            .get_status(
+            .get_status_request(
                 "/alpha",
                 GetStatusRequestProto {
                     header: None,
@@ -1246,7 +1576,7 @@ mod tests {
         let executor = test_executor(gateway.clone());
 
         let err = executor
-            .get_status(
+            .get_status_request(
                 "/alpha",
                 GetStatusRequestProto {
                     header: None,
@@ -1270,7 +1600,7 @@ mod tests {
         let executor = test_executor(gateway.clone());
 
         let err = executor
-            .get_status(
+            .get_status_request(
                 "/alpha",
                 GetStatusRequestProto {
                     header: None,
@@ -1294,7 +1624,7 @@ mod tests {
         let executor = test_executor_with_budgets(gateway.clone(), 0, 1, Arc::clone(&metrics));
 
         let err = executor
-            .get_status(
+            .get_status_request(
                 "/alpha",
                 GetStatusRequestProto {
                     header: None,
@@ -1324,7 +1654,7 @@ mod tests {
         let executor = test_executor_with_budgets(gateway.clone(), 1, 0, Arc::clone(&metrics));
 
         let err = executor
-            .get_status(
+            .get_status_request(
                 "/alpha",
                 GetStatusRequestProto {
                     header: None,
@@ -1360,7 +1690,7 @@ mod tests {
         );
 
         executor
-            .get_status(
+            .get_status_request(
                 "/alpha",
                 GetStatusRequestProto {
                     header: None,
@@ -1394,11 +1724,8 @@ mod tests {
             .add_block(
                 "/alpha",
                 "handle=1".to_string(),
-                proto::metadata::AddBlockRequestProto {
-                    header: None,
-                    write_handle: None,
-                    desired_len: Some(5),
-                },
+                proto::metadata::WriteHandleProto::default(),
+                5,
             )
             .await
             .expect_err("expired session must fail without replay");
@@ -1422,9 +1749,16 @@ mod tests {
             OperationIdentity::session("/alpha", "handle=1"),
         )
         .expect("operation context");
+        let plan = CommitFilePlan {
+            operation,
+            write_handle: proto::metadata::WriteHandleProto::default(),
+            data_handle_id: DataHandleId::new(302),
+            committed_blocks: Vec::new(),
+            final_size: 0,
+        };
 
         let err = executor
-            .commit_file(operation, proto::metadata::CommitFileRequestProto::default())
+            .commit_file(plan)
             .await
             .expect_err("fencing mismatch must fail without replay");
 
@@ -1442,7 +1776,7 @@ mod tests {
         let executor = test_executor(gateway.clone());
 
         let err = executor
-            .get_status(
+            .get_status_request(
                 "/alpha",
                 GetStatusRequestProto {
                     header: None,
@@ -1476,7 +1810,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(200),
-            executor.get_status(
+            executor.get_status_request(
                 "/alpha",
                 GetStatusRequestProto {
                     header: None,
@@ -1510,7 +1844,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_millis(200),
-            executor.get_status(
+            executor.get_status_request(
                 "/alpha",
                 GetStatusRequestProto {
                     header: None,
@@ -1820,15 +2154,21 @@ mod tests {
         sleeper: Arc<dyn BackoffSleeper>,
     ) -> OperationExecutor {
         let gateway: Arc<dyn MetadataGateway> = gateway;
-        let refresh_manager = RefreshManager::new(vec![ConfiguredMetadataGroup {
-            group_name: group_name("root"),
-            endpoint: "http://127.0.0.1:18080".to_string(),
-        }])
-        .expect("refresh manager");
+        let metadata_targets = MetadataTargets::new(vec![
+            MetadataGroupTargets {
+                group_name: group_name("root"),
+                endpoints: vec!["http://127.0.0.1:18080".to_string()],
+            },
+            MetadataGroupTargets {
+                group_name: group_name("analytics"),
+                endpoints: vec!["http://127.0.0.1:18082".to_string()],
+            },
+        ])
+        .expect("metadata targets");
         OperationExecutor::with_runtime(
             ClientIdentity::from_parts(ClientId::new(7), "test-client").expect("client identity"),
             gateway,
-            refresh_manager,
+            metadata_targets,
             OperationRuntime {
                 retry,
                 refresh: RefreshConfig {

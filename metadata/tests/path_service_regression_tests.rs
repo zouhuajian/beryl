@@ -1846,24 +1846,21 @@ async fn commit_file_success_log_includes_explicit_commit_summary() {
 
     let output = Arc::new(Mutex::new(Vec::new()));
     let dispatch = captured_json_subscriber(&output);
-    async {
-        let response = FileSystemServiceProto::commit_file(
-            &env.service,
-            Request::new(CommitFileRequestProto {
-                header: header(731),
-                write_handle: Some(write_handle),
-                data_handle_id: Some(DataHandleIdProto { value: data_handle_id }),
-                committed_blocks: vec![committed],
-                final_size: 128,
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
-        assert_success_header(response.header);
-    }
-    .with_subscriber(dispatch)
-    .await;
+    let _dispatch_guard = tracing::dispatcher::set_default(&dispatch);
+    let response = FileSystemServiceProto::commit_file(
+        &env.service,
+        Request::new(CommitFileRequestProto {
+            header: header(731),
+            write_handle: Some(write_handle),
+            data_handle_id: Some(DataHandleIdProto { value: data_handle_id }),
+            committed_blocks: vec![committed],
+            final_size: 128,
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+    assert_success_header(response.header);
 
     let logs = captured_logs(&output);
     assert!(

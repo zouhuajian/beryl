@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use proto::metadata::{RenewLeaseRequestProto, SyncWriteRequestProto, WriteSyncModeProto};
+use proto::metadata::WriteSyncModeProto;
 use tokio::sync::Mutex;
-use types::{DataHandleId, FileLayout, InodeId};
+use types::{DataHandleId, InodeId};
 
 use super::runtime::{
     is_unknown_session_barrier_outcome, mark_session_after_session_error, metric_labels, refresh_hint_from_error,
@@ -20,10 +20,7 @@ use crate::error::{invalid_response, ClientError, ClientResult};
 use crate::metrics::ClientMetric;
 use crate::planner::read_planner::ReadPlanner;
 use crate::protocol::validate::{validate_commit_file_size, validate_sync_write_size};
-use crate::runtime::{
-    ErrorClass, ErrorClassifier, OperationContext, OperationIdentity, OperationKind, RefreshReason, RetryDecision,
-    RetryDecisionInput,
-};
+use crate::runtime::{ErrorClass, ErrorClassifier, OperationContext, OperationIdentity, OperationKind, RefreshReason};
 use crate::session::write_session::{WorkerCommitLevel, WriteSession};
 
 /// A reader for an immutable file snapshot opened through the filesystem client.
@@ -92,35 +89,28 @@ impl FileReader {
                     let class = ErrorClassifier.classify_error(&err);
                     self.runtime
                         .record_error_metric("Read", OperationKind::WorkerReadData, &class);
-                    let refresh_reason = match class {
-                        ErrorClass::NeedRefresh(reason) => Some(reason),
-                        _ => None,
-                    };
-                    let decision = RetryDecision::from_input(RetryDecisionInput {
-                        operation_kind: OperationKind::WorkerReadData,
-                        operation_name: "Read",
-                        attempt_number: attempt,
-                        retry_budget_remaining: retry_budget.saturating_sub(retry_used),
-                        refresh_budget_remaining: refresh_budget.saturating_sub(refresh_used),
-                        error_class: class.clone(),
-                        refresh_reason,
-                        replay_safety: operation.replay_safety(),
-                        side_effects_may_have_occurred: false,
-                        has_stable_call_id_and_fingerprint: true,
-                        has_stable_session_identity: true,
-                        public_bytes_returned: false,
-                        outcome_unknown: matches!(err, ClientError::UnknownOutcome(_)),
-                    });
-                    self.runtime.record_retry_decision(
-                        "Read",
-                        OperationKind::WorkerReadData,
-                        &class,
-                        refresh_reason,
-                        decision,
-                    );
-                    match decision {
-                        RetryDecision::RefreshThenRetry if should_replan_after_worker_error(&err) => {
-                            let reason = refresh_reason.expect("refresh decision requires reason");
+                    match class.clone() {
+                        ErrorClass::NeedRefresh(RefreshReason::Unknown) => return Err(err),
+                        ErrorClass::NeedRefresh(reason) if should_replan_after_worker_error(&err) => {
+                            if refresh_budget.saturating_sub(refresh_used) == 0 {
+                                self.runtime.record_metric(
+                                    ClientMetric::RefreshExhausted,
+                                    metric_labels("Read", OperationKind::WorkerReadData)
+                                        .with_refresh_reason(reason.label()),
+                                );
+                                return Err(ClientError::Worker(format!(
+                                    "read refresh budget exhausted for {}",
+                                    reason.label()
+                                )));
+                            }
+                            if retry_budget.saturating_sub(retry_used) == 0 {
+                                self.runtime.record_metric(
+                                    ClientMetric::RetryExhausted,
+                                    metric_labels("Read", OperationKind::WorkerReadData)
+                                        .with_error_class(class.label()),
+                                );
+                                return Err(err);
+                            }
                             self.runtime.executor.record_data_refresh(
                                 &operation,
                                 reason,
@@ -136,7 +126,16 @@ impl FileReader {
                             refresh_used += 1;
                             attempt = attempt.saturating_add(1);
                         }
-                        RetryDecision::Retry => {
+                        ErrorClass::NeedRefresh(_) => return Err(err),
+                        ErrorClass::RetryableTransport => {
+                            if retry_budget.saturating_sub(retry_used) == 0 {
+                                self.runtime.record_metric(
+                                    ClientMetric::RetryExhausted,
+                                    metric_labels("Read", OperationKind::WorkerReadData)
+                                        .with_error_class(class.label()),
+                                );
+                                return Err(err);
+                            }
                             let retry_index = retry_used;
                             retry_used += 1;
                             self.runtime.record_metric(
@@ -148,33 +147,7 @@ impl FileReader {
                                 .await;
                             attempt = attempt.saturating_add(1);
                         }
-                        RetryDecision::ReturnError => {
-                            if matches!(class, ErrorClass::RetryableTransport)
-                                && retry_budget.saturating_sub(retry_used) == 0
-                            {
-                                self.runtime.record_metric(
-                                    ClientMetric::RetryExhausted,
-                                    metric_labels("Read", OperationKind::WorkerReadData)
-                                        .with_error_class(class.label()),
-                                );
-                            }
-                            if let Some(reason) = refresh_reason {
-                                if reason != RefreshReason::Unknown && refresh_budget.saturating_sub(refresh_used) == 0
-                                {
-                                    self.runtime.record_metric(
-                                        ClientMetric::RefreshExhausted,
-                                        metric_labels("Read", OperationKind::WorkerReadData)
-                                            .with_refresh_reason(reason.label()),
-                                    );
-                                    return Err(ClientError::Worker(format!(
-                                        "read refresh budget exhausted for {}",
-                                        reason.label()
-                                    )));
-                                }
-                            }
-                            return Err(err);
-                        }
-                        RetryDecision::UnknownOutcome => {
+                        ErrorClass::UnknownOutcome => {
                             self.runtime.record_metric(
                                 ClientMetric::UnknownOutcome,
                                 metric_labels("Read", OperationKind::WorkerReadData)
@@ -183,16 +156,7 @@ impl FileReader {
                             );
                             return Err(err);
                         }
-                        RetryDecision::DenyUnsafeReplay => {
-                            self.runtime.record_metric(
-                                ClientMetric::UnsafeReplayDenied,
-                                metric_labels("Read", OperationKind::WorkerReadData).with_outcome("denied"),
-                            );
-                            return Err(ClientError::Unsupported(
-                                "Read replay denied by retry policy".to_string(),
-                            ));
-                        }
-                        RetryDecision::RefreshThenRetry => return Err(err),
+                        _ => return Err(err),
                     }
                 }
             }
@@ -285,14 +249,7 @@ impl FileWriter {
         match self
             .runtime
             .executor
-            .renew_lease(
-                &path,
-                session_identity,
-                RenewLeaseRequestProto {
-                    header: None,
-                    write_handle: Some(write_handle),
-                },
-            )
+            .renew_lease(&path, session_identity, write_handle)
             .await
         {
             Ok(response) => {
@@ -334,7 +291,7 @@ impl FileWriter {
             .await?;
 
         let retrying_unknown_commit = session.is_commit_unknown();
-        let (operation, request) = session.prepare_commit_file(
+        let plan = session.prepare_commit_file(
             self.runtime.executor.client_id(),
             self.runtime.executor.client_name(),
             committed_blocks,
@@ -346,7 +303,7 @@ impl FileWriter {
                 metric_labels("CommitFile", OperationKind::MetadataSessionBarrier).with_outcome("retry"),
             );
         }
-        match self.runtime.executor.commit_file(operation, request).await {
+        match self.runtime.executor.commit_file(plan).await {
             Ok(response) => {
                 validate_commit_file_size(response.committed_size, final_size)?;
                 session.mark_closed(response.file_version);
@@ -404,7 +361,7 @@ impl FileWriter {
         if let Err(err) = self
             .runtime
             .executor
-            .abort_file_write(plan.metadata_operation(), plan.metadata_request())
+            .abort_file_write(plan.metadata_operation(), plan.metadata_write_handle())
             .await
         {
             abort_error.get_or_insert(self.runtime.normalize_unknown_outcome(
@@ -447,7 +404,6 @@ impl FileWriter {
         let mut session = session_ref.lock().await;
         session.ensure_open_for_barrier()?;
         let path = session.path().to_string();
-        let session_identity = session.session_identity();
         self.flush_pending_bytes(&mut session).await?;
         let target_size = session.cursor();
         let required_level = sync_write_required_commit_level(mode)?;
@@ -455,18 +411,18 @@ impl FileWriter {
             .runtime
             .ensure_pending_worker_blocks_at_level(&mut session, required_level)
             .await?;
-        let request = SyncWriteRequestProto {
-            header: None,
-            write_handle: Some(session.write_handle()),
-            data_handle_id: Some(proto::common::DataHandleIdProto {
-                value: self.inner.data_handle_id().as_raw(),
-            }),
-            committed_blocks: committed_blocks.iter().map(Into::into).collect(),
-            target_size,
-            mode: mode as i32,
-            flags: 0,
-        };
-        match self.runtime.executor.sync_write(&path, session_identity, request).await {
+        match self
+            .runtime
+            .executor
+            .sync_write(
+                &session,
+                self.inner.data_handle_id(),
+                committed_blocks,
+                target_size,
+                mode,
+            )
+            .await
+        {
             Ok(response) => {
                 validate_sync_write_size(response.synced_size, target_size)?;
                 self.inner.store_write_cursor(session.cursor());
@@ -581,35 +537,6 @@ impl ReadHandle {
         }
     }
 
-    pub(crate) fn from_open_response(
-        path: &str,
-        response: proto::metadata::OpenFileResponseProto,
-    ) -> ClientResult<Self> {
-        let Some(inode_id) = response.inode_id else {
-            return Err(ClientError::Metadata(
-                "OpenFileResponseProto.inode_id missing".to_string(),
-            ));
-        };
-        let Some(data_handle_id) = response.data_handle_id else {
-            return Err(ClientError::Metadata(
-                "OpenFileResponseProto.data_handle_id missing".to_string(),
-            ));
-        };
-        let Some(file_version) = response.file_version else {
-            return Err(ClientError::Metadata(
-                "OpenFileResponseProto.file_version missing".to_string(),
-            ));
-        };
-
-        Ok(Self::new(
-            path.to_string(),
-            InodeId::new(inode_id.value),
-            DataHandleId::new(data_handle_id.value),
-            file_version,
-            response.file_size,
-        ))
-    }
-
     pub(crate) fn inode_id(&self) -> InodeId {
         self.inode_id
     }
@@ -655,102 +582,6 @@ impl WriteHandle {
             write_session: Arc::new(Mutex::new(session)),
             write_cursor: Arc::new(AtomicU64::new(base_size)),
         }
-    }
-
-    pub(crate) fn from_create_response(
-        path: &str,
-        response: proto::metadata::CreateFileResponseProto,
-    ) -> ClientResult<Self> {
-        let Some(inode_id) = response.inode_id else {
-            return Err(ClientError::Metadata(
-                "CreateFileResponseProto.inode_id missing".to_string(),
-            ));
-        };
-        let Some(data_handle_id) = response.data_handle_id else {
-            return Err(ClientError::Metadata(
-                "CreateFileResponseProto.data_handle_id missing".to_string(),
-            ));
-        };
-        let Some(layout) = response.layout else {
-            return Err(ClientError::Metadata(
-                "CreateFileResponseProto.layout missing".to_string(),
-            ));
-        };
-        let layout = FileLayout::try_from(layout)
-            .map_err(|err| ClientError::InvalidLayout(format!("CreateFileResponseProto.layout invalid: {err}")))?;
-        let Some(write_handle) = response.write_handle else {
-            return Err(ClientError::Metadata(
-                "CreateFileResponseProto.write_handle missing".to_string(),
-            ));
-        };
-
-        let expires_at_ms = valid_write_session_expiry("CreateFile", response.expires_at_ms)?;
-        let inode_id = InodeId::new(inode_id.value);
-        let data_handle_id = DataHandleId::new(data_handle_id.value);
-        let session = WriteSession::new(
-            path.to_string(),
-            inode_id,
-            data_handle_id,
-            layout,
-            write_handle,
-            response.base_size,
-            expires_at_ms,
-        )?;
-        Ok(Self::new(
-            path.to_string(),
-            inode_id,
-            data_handle_id,
-            response.base_size,
-            session,
-        ))
-    }
-
-    pub(crate) fn from_append_response(
-        path: &str,
-        response: proto::metadata::AppendFileResponseProto,
-    ) -> ClientResult<Self> {
-        let Some(inode_id) = response.inode_id else {
-            return Err(ClientError::Metadata(
-                "AppendFileResponseProto.inode_id missing".to_string(),
-            ));
-        };
-        let Some(data_handle_id) = response.data_handle_id else {
-            return Err(ClientError::Metadata(
-                "AppendFileResponseProto.data_handle_id missing".to_string(),
-            ));
-        };
-        let Some(layout) = response.layout else {
-            return Err(ClientError::Metadata(
-                "AppendFileResponseProto.layout missing".to_string(),
-            ));
-        };
-        let layout = FileLayout::try_from(layout)
-            .map_err(|err| ClientError::InvalidLayout(format!("AppendFileResponseProto.layout invalid: {err}")))?;
-        let Some(write_handle) = response.write_handle else {
-            return Err(ClientError::Metadata(
-                "AppendFileResponseProto.write_handle missing".to_string(),
-            ));
-        };
-
-        let expires_at_ms = valid_write_session_expiry("AppendFile", response.expires_at_ms)?;
-        let inode_id = InodeId::new(inode_id.value);
-        let data_handle_id = DataHandleId::new(data_handle_id.value);
-        let session = WriteSession::new(
-            path.to_string(),
-            inode_id,
-            data_handle_id,
-            layout,
-            write_handle,
-            response.base_size,
-            expires_at_ms,
-        )?;
-        Ok(Self::new(
-            path.to_string(),
-            inode_id,
-            data_handle_id,
-            response.base_size,
-            session,
-        ))
     }
 
     pub(crate) fn path(&self) -> &str {
