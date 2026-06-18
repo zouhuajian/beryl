@@ -7,24 +7,26 @@ use crate::error::{ClientError, ClientResult};
 use crate::metadata::ReadLayout;
 use types::{BlockId, DataHandleId, FileBlockLocation, GroupName, InodeId, WorkerEndpointInfo};
 
-/// Splits public read ranges into block-local worker reads.
+/// Splits a requested file byte range into block-local worker reads.
 #[derive(Clone, Debug, Default)]
 pub struct ReadPlanner;
 
+/// File byte range requested by a reader after EOF truncation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PlannedReadRange {
+pub(crate) struct RequestedReadRange {
     pub(crate) file_offset: u64,
     pub(crate) len: u32,
 }
 
-impl PlannedReadRange {
+impl RequestedReadRange {
     pub(crate) fn end_file_offset(self) -> u64 {
         self.file_offset + self.len as u64
     }
 }
 
+/// A block-local worker read planned from metadata block locations.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PlannedReadSegment {
+pub(crate) struct PlannedBlockRead {
     pub(crate) file_offset: u64,
     pub(crate) len: u32,
     pub(crate) end_file_offset: u64,
@@ -39,11 +41,7 @@ pub(crate) struct PlannedReadSegment {
 }
 
 impl ReadPlanner {
-    pub(crate) fn plan_requested_range(
-        offset: u64,
-        len: u32,
-        file_size: u64,
-    ) -> ClientResult<Option<PlannedReadRange>> {
+    pub(crate) fn requested_range(offset: u64, len: u32, file_size: u64) -> ClientResult<Option<RequestedReadRange>> {
         if len == 0 || offset >= file_size {
             return Ok(None);
         }
@@ -59,23 +57,21 @@ impl ReadPlanner {
         if effective_len == 0 {
             return Ok(None);
         }
-        Ok(Some(PlannedReadRange {
+        Ok(Some(RequestedReadRange {
             file_offset: offset,
             len: effective_len,
         }))
     }
 
-    pub(crate) fn resolve_locations(
+    pub(crate) fn plan_block_reads(
         expected_data_handle_id: DataHandleId,
-        span: PlannedReadRange,
+        requested_range: RequestedReadRange,
         locations: &[FileBlockLocation],
-    ) -> ClientResult<Vec<PlannedReadSegment>> {
+    ) -> ClientResult<Vec<PlannedBlockRead>> {
         let mut normalized = Vec::with_capacity(locations.len());
         for location in locations {
             if location.len == 0 {
-                return Err(ClientError::InvalidLayout(
-                    "zero-length block location segment".to_string(),
-                ));
+                return Err(ClientError::InvalidLayout("zero-length block location".to_string()));
             }
             let end = location
                 .file_offset
@@ -120,16 +116,16 @@ impl ReadPlanner {
                     block_id
                 )));
             }
-            if end <= span.file_offset || location.file_offset >= span.end_file_offset() {
+            if end <= requested_range.file_offset || location.file_offset >= requested_range.end_file_offset() {
                 continue;
             }
             normalized.push((location.file_offset, end, block_id, block_stamp, location));
         }
         normalized.sort_by_key(|(start, _, block_id, _, _)| (*start, block_id.index.as_raw()));
 
-        let mut segments = Vec::with_capacity(normalized.len());
-        let mut cursor = span.file_offset;
-        let requested_end = span.end_file_offset();
+        let mut block_reads = Vec::with_capacity(normalized.len());
+        let mut cursor = requested_range.file_offset;
+        let requested_end = requested_range.end_file_offset();
         let mut previous_end = None;
 
         for (start, end, block_id, block_stamp, location) in normalized {
@@ -157,13 +153,11 @@ impl ReadPlanner {
                 continue;
             }
             let len = u32::try_from(read_end - read_start)
-                .map_err(|_| ClientError::InvalidLayout("planned segment length exceeds u32".to_string()))?;
+                .map_err(|_| ClientError::InvalidLayout("planned block read length exceeds u32".to_string()))?;
             if len == 0 {
-                return Err(ClientError::InvalidLayout(
-                    "zero-length planned read segment".to_string(),
-                ));
+                return Err(ClientError::InvalidLayout("zero-length planned block read".to_string()));
             }
-            segments.push(PlannedReadSegment {
+            block_reads.push(PlannedBlockRead {
                 file_offset: read_start,
                 len,
                 end_file_offset: read_end,
@@ -187,16 +181,16 @@ impl ReadPlanner {
                 "layout gap at file offset {cursor}"
             )));
         }
-        Ok(segments)
+        Ok(block_reads)
     }
 
-    pub(crate) fn resolve_response(
+    pub(crate) fn plan_block_reads_from_layout(
         expected_inode_id: InodeId,
         expected_data_handle_id: DataHandleId,
         expected_file_version: Option<u64>,
-        span: PlannedReadRange,
+        requested_range: RequestedReadRange,
         response: &ReadLayout,
-    ) -> ClientResult<(GroupName, Vec<PlannedReadSegment>)> {
+    ) -> ClientResult<(GroupName, Vec<PlannedBlockRead>)> {
         let group_name = response.group_name.clone();
         let inode_id = response.inode_id;
         if inode_id != expected_inode_id {
@@ -228,8 +222,8 @@ impl ReadPlanner {
                 actual: actual_version,
             });
         }
-        let segments = Self::resolve_locations(expected_data_handle_id, span, &response.locations)?;
-        Ok((group_name, segments))
+        let block_reads = Self::plan_block_reads(expected_data_handle_id, requested_range, &response.locations)?;
+        Ok((group_name, block_reads))
     }
 }
 
@@ -244,92 +238,102 @@ mod tests {
 
     #[test]
     fn requested_range_is_truncated_at_eof() {
-        let span = ReadPlanner::plan_requested_range(8, 10, 12)
+        let requested_range = ReadPlanner::requested_range(8, 10, 12)
             .expect("range planning succeeds")
-            .expect("non-empty span");
+            .expect("non-empty requested range");
 
-        assert_eq!(span.file_offset, 8);
-        assert_eq!(span.len, 4);
+        assert_eq!(requested_range.file_offset, 8);
+        assert_eq!(requested_range.len, 4);
     }
 
     #[test]
     fn planner_supports_multi_block_reads() {
-        let span = ReadPlanner::plan_requested_range(2, 12, 20)
+        let requested_range = ReadPlanner::requested_range(2, 12, 20)
             .expect("range planning succeeds")
-            .expect("non-empty span");
+            .expect("non-empty requested range");
         let locations = vec![location(10, 0, 0, 8, 101), location(10, 1, 8, 8, 202)];
 
-        let segments =
-            ReadPlanner::resolve_locations(DataHandleId::new(10), span, &locations).expect("locations cover range");
+        let block_reads = ReadPlanner::plan_block_reads(DataHandleId::new(10), requested_range, &locations)
+            .expect("locations cover range");
 
-        assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].file_offset, 2);
-        assert_eq!(segments[0].block_offset, 2);
-        assert_eq!(segments[0].len, 6);
-        assert_eq!(segments[0].block_stamp, 101);
-        assert_eq!(segments[0].block_format_id, types::BlockFormatId::CURRENT_FOR_NEW_FILE);
-        assert_eq!(segments[0].block_size, 4096);
-        assert_eq!(segments[0].chunk_size, 1024);
-        assert_eq!(segments[0].effective_len, 8);
-        assert_eq!(segments[1].file_offset, 8);
-        assert_eq!(segments[1].block_offset, 0);
-        assert_eq!(segments[1].len, 6);
-        assert_eq!(segments[1].block_stamp, 202);
+        assert_eq!(block_reads.len(), 2);
+        assert_eq!(block_reads[0].file_offset, 2);
+        assert_eq!(block_reads[0].block_offset, 2);
+        assert_eq!(block_reads[0].len, 6);
+        assert_eq!(block_reads[0].block_stamp, 101);
+        assert_eq!(
+            block_reads[0].block_format_id,
+            types::BlockFormatId::CURRENT_FOR_NEW_FILE
+        );
+        assert_eq!(block_reads[0].block_size, 4096);
+        assert_eq!(block_reads[0].chunk_size, 1024);
+        assert_eq!(block_reads[0].effective_len, 8);
+        assert_eq!(block_reads[1].file_offset, 8);
+        assert_eq!(block_reads[1].block_offset, 0);
+        assert_eq!(block_reads[1].len, 6);
+        assert_eq!(block_reads[1].block_stamp, 202);
     }
 
     #[test]
     fn planner_normalizes_unordered_locations() {
-        let span = ReadPlanner::plan_requested_range(0, 12, 20)
+        let requested_range = ReadPlanner::requested_range(0, 12, 20)
             .expect("range planning succeeds")
-            .expect("non-empty span");
+            .expect("non-empty requested range");
         let locations = vec![location(10, 1, 8, 8, 202), location(10, 0, 0, 8, 101)];
 
-        let segments = ReadPlanner::resolve_locations(DataHandleId::new(10), span, &locations)
+        let block_reads = ReadPlanner::plan_block_reads(DataHandleId::new(10), requested_range, &locations)
             .expect("unordered locations are sorted");
 
         assert_eq!(
-            segments.iter().map(|segment| segment.file_offset).collect::<Vec<_>>(),
+            block_reads
+                .iter()
+                .map(|block_read| block_read.file_offset)
+                .collect::<Vec<_>>(),
             vec![0, 8]
         );
         assert_eq!(
-            segments.iter().map(|segment| segment.block_stamp).collect::<Vec<_>>(),
+            block_reads
+                .iter()
+                .map(|block_read| block_read.block_stamp)
+                .collect::<Vec<_>>(),
             vec![101, 202]
         );
     }
 
     #[test]
     fn planner_rejects_missing_coverage() {
-        let span = ReadPlanner::plan_requested_range(0, 12, 20)
+        let requested_range = ReadPlanner::requested_range(0, 12, 20)
             .expect("range planning succeeds")
-            .expect("non-empty span");
+            .expect("non-empty requested range");
         let locations = vec![location(10, 0, 0, 4, 101), location(10, 1, 8, 8, 202)];
 
-        let err = ReadPlanner::resolve_locations(DataHandleId::new(10), span, &locations).expect_err("gap must fail");
+        let err = ReadPlanner::plan_block_reads(DataHandleId::new(10), requested_range, &locations)
+            .expect_err("gap must fail");
 
         assert!(format!("{err}").contains("layout gap"));
     }
 
     #[test]
     fn planner_rejects_overlapping_coverage() {
-        let span = ReadPlanner::plan_requested_range(0, 12, 20)
+        let requested_range = ReadPlanner::requested_range(0, 12, 20)
             .expect("range planning succeeds")
-            .expect("non-empty span");
+            .expect("non-empty requested range");
         let locations = vec![location(10, 0, 0, 8, 101), location(10, 1, 4, 8, 202)];
 
-        let err =
-            ReadPlanner::resolve_locations(DataHandleId::new(10), span, &locations).expect_err("overlap must fail");
+        let err = ReadPlanner::plan_block_reads(DataHandleId::new(10), requested_range, &locations)
+            .expect_err("overlap must fail");
 
         assert!(format!("{err}").contains("layout overlap"));
     }
 
     #[test]
-    fn planner_rejects_zero_length_location_segments() {
-        let span = ReadPlanner::plan_requested_range(0, 4, 20)
+    fn planner_rejects_zero_length_block_locations() {
+        let requested_range = ReadPlanner::requested_range(0, 4, 20)
             .expect("range planning succeeds")
-            .expect("non-empty span");
+            .expect("non-empty requested range");
         let locations = vec![location(10, 0, 0, 0, 101)];
 
-        let err = ReadPlanner::resolve_locations(DataHandleId::new(10), span, &locations)
+        let err = ReadPlanner::plan_block_reads(DataHandleId::new(10), requested_range, &locations)
             .expect_err("zero-length location must fail");
 
         assert!(format!("{err}").contains("zero-length"));
@@ -337,12 +341,12 @@ mod tests {
 
     #[test]
     fn planner_rejects_zero_block_stamp() {
-        let span = ReadPlanner::plan_requested_range(0, 4, 20)
+        let requested_range = ReadPlanner::requested_range(0, 4, 20)
             .expect("range planning succeeds")
-            .expect("non-empty span");
+            .expect("non-empty requested range");
         let locations = vec![location(10, 0, 0, 4, 0)];
 
-        let err = ReadPlanner::resolve_locations(DataHandleId::new(10), span, &locations)
+        let err = ReadPlanner::plan_block_reads(DataHandleId::new(10), requested_range, &locations)
             .expect_err("zero block stamp must fail");
 
         assert!(format!("{err}").contains("block_stamp"));
@@ -350,17 +354,17 @@ mod tests {
 
     #[test]
     fn planner_accepts_empty_worker_candidates_from_metadata() {
-        let span = ReadPlanner::plan_requested_range(0, 4, 20)
+        let requested_range = ReadPlanner::requested_range(0, 4, 20)
             .expect("range planning succeeds")
-            .expect("non-empty span");
+            .expect("non-empty requested range");
         let mut location = location(10, 0, 0, 4, 101);
         location.workers.clear();
 
-        let segments =
-            ReadPlanner::resolve_locations(DataHandleId::new(10), span, &[location]).expect("location covers range");
+        let block_reads = ReadPlanner::plan_block_reads(DataHandleId::new(10), requested_range, &[location])
+            .expect("location covers range");
 
-        assert_eq!(segments.len(), 1);
-        assert!(segments[0].workers.is_empty());
+        assert_eq!(block_reads.len(), 1);
+        assert!(block_reads[0].workers.is_empty());
     }
 
     fn location(

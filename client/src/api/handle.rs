@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use types::{DataHandleId, InodeId};
 
 use super::runtime::{
-    is_unknown_session_barrier_outcome, mark_session_after_session_error, metric_labels, refresh_hint_from_error,
+    is_unknown_session_barrier_outcome, mark_session_after_metadata_error, metric_labels, refresh_hint_from_error,
     ClientRuntime,
 };
 use crate::error::{invalid_response, ClientError, ClientResult};
@@ -48,7 +48,7 @@ impl FileReader {
 
     /// Reads a range from the opened file snapshot.
     pub async fn read_at(&self, offset: u64, len: u32) -> ClientResult<Bytes> {
-        let Some(span) = ReadPlanner::plan_requested_range(offset, len, self.inner.size_hint())? else {
+        let Some(requested_range) = ReadPlanner::requested_range(offset, len, self.inner.size_hint())? else {
             return Ok(Bytes::new());
         };
         let file_version = self.inner.file_version();
@@ -70,17 +70,27 @@ impl FileReader {
             let layout = self
                 .runtime
                 .executor
-                .read_layout_for_data_handle(self.inner.path(), data_handle_id, span.file_offset, span.len)
+                .read_layout_for_data_handle(
+                    self.inner.path(),
+                    data_handle_id,
+                    requested_range.file_offset,
+                    requested_range.len,
+                )
                 .await?;
-            let (group_name, segments) =
-                ReadPlanner::resolve_response(inode_id, data_handle_id, Some(file_version), span, &layout)?;
-            let ctx = self.runtime.data_attempt_context(&operation, attempt);
+            let (group_name, block_reads) = ReadPlanner::plan_block_reads_from_layout(
+                inode_id,
+                data_handle_id,
+                Some(file_version),
+                requested_range,
+                &layout,
+            )?;
+            let ctx = self.runtime.data_context(&operation, attempt);
             match self
                 .runtime
                 .worker_rpc_with_timeout(
                     "Read",
                     OperationKind::WorkerReadData,
-                    self.runtime.data_plane.read_all(ctx, group_name, &segments),
+                    self.runtime.data_plane.read_block_ranges(ctx, group_name, &block_reads),
                 )
                 .await
             {
@@ -216,7 +226,7 @@ impl FileWriter {
 
         let blocks = buffer_write(&mut session, data)?;
         for block in blocks {
-            self.runtime.write_one_block(&mut session, block).await?;
+            self.runtime.write_block(&mut session, block).await?;
         }
         self.inner.store_write_cursor(session.cursor());
         Ok(())
@@ -262,7 +272,7 @@ impl FileWriter {
                 Ok(())
             }
             Err(err) => {
-                mark_session_after_session_error(&mut session, &err);
+                mark_session_after_metadata_error(&mut session, &err);
                 let class = ErrorClassifier.classify_error(&err);
                 self.runtime
                     .record_error_metric("RenewLease", OperationKind::MetadataSessionBarrier, &class);
@@ -287,7 +297,7 @@ impl FileWriter {
         let final_size = session.cursor();
         let committed_blocks = self
             .runtime
-            .ensure_pending_worker_blocks_at_level(&mut session, WorkerCommitLevel::CLOSE_REQUIRED)
+            .commit_pending_blocks_for_barrier(&mut session, WorkerCommitLevel::CLOSE_REQUIRED)
             .await?;
 
         let retrying_unknown_commit = session.is_commit_unknown();
@@ -321,7 +331,7 @@ impl FileWriter {
                 )))
             }
             Err(err) => {
-                mark_session_after_session_error(&mut session, &err);
+                mark_session_after_metadata_error(&mut session, &err);
                 let class = ErrorClassifier.classify_error(&err);
                 self.runtime
                     .record_error_metric("CommitFile", OperationKind::MetadataSessionBarrier, &class);
@@ -345,13 +355,15 @@ impl FileWriter {
         );
         for cleanup in plan.worker_cleanups() {
             let operation = cleanup.operation();
-            let ctx = self.runtime.data_attempt_context(&operation, 0);
+            let ctx = self.runtime.data_context(&operation, 0);
             if let Err(err) = self
                 .runtime
                 .worker_rpc_with_timeout(
                     "AbortWrite",
                     OperationKind::CleanupBestEffort,
-                    self.runtime.data_plane.abort_write(ctx, cleanup.worker_block()),
+                    self.runtime
+                        .data_plane
+                        .abort_block_write(ctx, cleanup.block_write_handle()),
                 )
                 .await
             {
@@ -364,7 +376,7 @@ impl FileWriter {
             .abort_file_write(plan.metadata_operation(), plan.metadata_write_handle())
             .await
         {
-            abort_error.get_or_insert(self.runtime.normalize_unknown_outcome(
+            abort_error.get_or_insert(self.runtime.normalize_outcome_error(
                 "AbortFileWrite",
                 OperationKind::CleanupBestEffort,
                 err,
@@ -375,7 +387,7 @@ impl FileWriter {
                 session.mark_abort_unknown();
                 let normalized =
                     self.runtime
-                        .normalize_unknown_outcome("AbortWrite", OperationKind::CleanupBestEffort, err);
+                        .normalize_outcome_error("AbortWrite", OperationKind::CleanupBestEffort, err);
                 let metric = if matches!(normalized, ClientError::UnknownOutcome(_)) {
                     ClientMetric::AbortUnknown
                 } else {
@@ -409,7 +421,7 @@ impl FileWriter {
         let required_level = sync_write_required_commit_level(mode)?;
         let committed_blocks = self
             .runtime
-            .ensure_pending_worker_blocks_at_level(&mut session, required_level)
+            .commit_pending_blocks_for_barrier(&mut session, required_level)
             .await?;
         match self
             .runtime
@@ -441,7 +453,7 @@ impl FileWriter {
                         path, err
                     )));
                 }
-                mark_session_after_session_error(&mut session, &err);
+                mark_session_after_metadata_error(&mut session, &err);
                 self.runtime
                     .record_error_metric("SyncWrite", OperationKind::MetadataSessionBarrier, &class);
                 Err(err)
@@ -452,7 +464,7 @@ impl FileWriter {
     /// Writes the buffered tail block, if the session currently has one.
     async fn flush_pending_bytes(&self, session: &mut WriteSession) -> ClientResult<()> {
         if let Some(block) = session.take_buffered_tail() {
-            self.runtime.write_one_block(session, block).await?;
+            self.runtime.write_block(session, block).await?;
         }
         Ok(())
     }

@@ -64,7 +64,7 @@ impl FsClient {
         metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
         Ok(Self {
-            runtime: Arc::new(ClientRuntime::with_hooks(
+            runtime: Arc::new(ClientRuntime::new(
                 config,
                 gateway,
                 metadata_targets,
@@ -126,7 +126,7 @@ impl FsClient {
             Err(err) => {
                 return Err(self
                     .runtime
-                    .normalize_unknown_outcome("CreateFile", OperationKind::MetadataMutation, err));
+                    .normalize_outcome_error("CreateFile", OperationKind::MetadataMutation, err));
             }
         };
         Ok(FileWriter::new(Arc::clone(&self.runtime), response))
@@ -143,7 +143,7 @@ impl FsClient {
             Err(err) => {
                 return Err(self
                     .runtime
-                    .normalize_unknown_outcome("AppendFile", OperationKind::MetadataMutation, err));
+                    .normalize_outcome_error("AppendFile", OperationKind::MetadataMutation, err));
             }
         };
         Ok(FileWriter::new(Arc::clone(&self.runtime), response))

@@ -9,12 +9,12 @@ use super::*;
 use crate::canonical::{ClientAction, RefreshHint};
 use crate::config::{ClientConfig, MetadataGroupConfig};
 use crate::data::{
-    WorkerBlockSyncResult, WorkerCommitResult, WorkerDataClient, WorkerDataPlane, WorkerReadResult, WorkerWriteBlock,
-    WorkerWriteTarget,
+    WorkerBlockSyncResult, WorkerBlockWriteHandle, WorkerCommitResult, WorkerDataClient, WorkerDataPlane,
+    WorkerReadResult, WorkerWriteTarget,
 };
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::{AddBlockResult, MetadataGateway, ReadLayout};
-use crate::planner::read_planner::PlannedReadSegment;
+use crate::planner::read_planner::PlannedBlockRead;
 use crate::runtime::{AttemptContext, ErrorClass, ErrorClassifier, MetadataTargets};
 use crate::session::write_session::WriteSession;
 use async_trait::async_trait;
@@ -909,7 +909,7 @@ async fn writer_abort_cleans_worker_then_metadata_and_blocks_session() {
     writer.abort().await.expect("abort");
 
     assert_eq!(method_count(&gateway.calls(), "abort_file_write"), 1);
-    assert_event_order(&events, "abort_write", "abort_file_write");
+    assert_event_order(&events, "abort_block_write", "abort_file_write");
     let err = writer
         .write_all(Bytes::from_static(b"!"))
         .await
@@ -1729,11 +1729,11 @@ impl Default for MockDataClient {
 
 #[async_trait]
 impl WorkerDataClient for MockDataClient {
-    async fn read_segment(
+    async fn read_block_range(
         &self,
         _ctx: AttemptContext,
         _group_name: GroupName,
-        segment: &PlannedReadSegment,
+        block_read: &PlannedBlockRead,
     ) -> ClientResult<WorkerReadResult> {
         let call_number = {
             let mut calls = self.calls.lock().expect("calls");
@@ -1745,31 +1745,35 @@ impl WorkerDataClient for MockDataClient {
                 return Err(refresh_action_error(reason));
             }
         }
-        let start = segment.file_offset as usize;
-        let end = start + segment.len as usize;
+        let start = block_read.file_offset as usize;
+        let end = start + block_read.len as usize;
         Ok(WorkerReadResult {
             bytes: self.file.slice(start..end),
             block_stamp: self
                 .read_block_stamp
                 .lock()
                 .expect("read block stamp")
-                .unwrap_or(segment.block_stamp),
+                .unwrap_or(block_read.block_stamp),
             committed_length: self
                 .read_committed_length
                 .lock()
                 .expect("read committed length")
-                .unwrap_or(segment.block_offset + u64::from(segment.len)),
+                .unwrap_or(block_read.block_offset + u64::from(block_read.len)),
         })
     }
 
-    async fn open_write(&self, _ctx: AttemptContext, target: WorkerWriteTarget) -> ClientResult<WorkerWriteBlock> {
-        self.record_event("open_write");
+    async fn open_block_write(
+        &self,
+        _ctx: AttemptContext,
+        target: WorkerWriteTarget,
+    ) -> ClientResult<WorkerBlockWriteHandle> {
+        self.record_event("open_block_write");
         let call_number = {
             let mut calls = self.calls.lock().expect("calls");
             *calls += 1;
             *calls
         };
-        Ok(WorkerWriteBlock {
+        Ok(WorkerBlockWriteHandle {
             group_name: target.group_name,
             worker: worker_endpoint(),
             target: target.target,
@@ -1782,12 +1786,12 @@ impl WorkerDataClient for MockDataClient {
         })
     }
 
-    async fn write_stream(
+    async fn write_block_bytes(
         &self,
-        block: &WorkerWriteBlock,
+        block: &WorkerBlockWriteHandle,
         data: Bytes,
     ) -> ClientResult<proto::worker::WriteStreamResponseProto> {
-        self.record_event("write_stream");
+        self.record_event("write_block_bytes");
         if matches!(self.next_write_stream_outcome(), WorkerWriteOutcome::WorkerError) {
             return Err(ClientError::Worker("injected WriteStream failure".to_string()));
         }
@@ -1804,15 +1808,15 @@ impl WorkerDataClient for MockDataClient {
         })
     }
 
-    async fn commit_write(
+    async fn commit_block_write(
         &self,
         _ctx: AttemptContext,
-        block: &WorkerWriteBlock,
+        block: &WorkerBlockWriteHandle,
         effective_len: u64,
         _commit_seq: u64,
         require_sync: bool,
     ) -> ClientResult<WorkerCommitResult> {
-        self.record_event("commit_write");
+        self.record_event("commit_block_write");
         let stream_key = (block.stream_id.high, block.stream_id.low);
         if !self
             .committed_streams
@@ -1840,7 +1844,7 @@ impl WorkerDataClient for MockDataClient {
     async fn sync_committed_block(
         &self,
         _ctx: AttemptContext,
-        block: &WorkerWriteBlock,
+        block: &WorkerBlockWriteHandle,
         expected_len: u64,
     ) -> ClientResult<WorkerBlockSyncResult> {
         self.record_event("sync_committed_block");
@@ -1851,8 +1855,8 @@ impl WorkerDataClient for MockDataClient {
         })
     }
 
-    async fn abort_write(&self, _ctx: AttemptContext, _block: &WorkerWriteBlock) -> ClientResult<()> {
-        self.record_event("abort_write");
+    async fn abort_block_write(&self, _ctx: AttemptContext, _block: &WorkerBlockWriteHandle) -> ClientResult<()> {
+        self.record_event("abort_block_write");
         Ok(())
     }
 }

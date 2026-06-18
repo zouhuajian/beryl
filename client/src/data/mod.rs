@@ -6,6 +6,8 @@
 //! This module stays private to the crate, so stream handles and block-local
 //! worker operations do not appear in the public API.
 
+mod channel_pool;
+mod protocol;
 mod worker;
 
 use async_trait::async_trait;
@@ -14,28 +16,36 @@ use proto::worker::WriteStreamResponseProto;
 use types::{GroupName, WorkerEndpointInfo, WriteTarget};
 
 use crate::error::ClientResult;
-use crate::planner::read_planner::PlannedReadSegment;
+use crate::planner::read_planner::PlannedBlockRead;
 use crate::runtime::AttemptContext;
 
 /// Internal worker data client boundary.
 /// Stream identifiers and endpoint details stay inside the implementation.
 #[async_trait]
 pub(crate) trait WorkerDataClient: Send + Sync {
-    async fn read_segment(
+    async fn read_block_range(
         &self,
-        ctx: AttemptContext,
+        attempt: AttemptContext,
         group_name: GroupName,
-        segment: &PlannedReadSegment,
+        block_read: &PlannedBlockRead,
     ) -> ClientResult<WorkerReadResult>;
 
-    async fn open_write(&self, ctx: AttemptContext, target: WorkerWriteTarget) -> ClientResult<WorkerWriteBlock>;
-
-    async fn write_stream(&self, block: &WorkerWriteBlock, data: Bytes) -> ClientResult<WriteStreamResponseProto>;
-
-    async fn commit_write(
+    async fn open_block_write(
         &self,
-        ctx: AttemptContext,
-        block: &WorkerWriteBlock,
+        attempt: AttemptContext,
+        target: WorkerWriteTarget,
+    ) -> ClientResult<WorkerBlockWriteHandle>;
+
+    async fn write_block_bytes(
+        &self,
+        handle: &WorkerBlockWriteHandle,
+        data: Bytes,
+    ) -> ClientResult<WriteStreamResponseProto>;
+
+    async fn commit_block_write(
+        &self,
+        attempt: AttemptContext,
+        handle: &WorkerBlockWriteHandle,
         effective_len: u64,
         commit_seq: u64,
         require_sync: bool,
@@ -43,12 +53,12 @@ pub(crate) trait WorkerDataClient: Send + Sync {
 
     async fn sync_committed_block(
         &self,
-        ctx: AttemptContext,
-        block: &WorkerWriteBlock,
+        attempt: AttemptContext,
+        handle: &WorkerBlockWriteHandle,
         expected_len: u64,
     ) -> ClientResult<WorkerBlockSyncResult>;
 
-    async fn abort_write(&self, ctx: AttemptContext, block: &WorkerWriteBlock) -> ClientResult<()>;
+    async fn abort_block_write(&self, attempt: AttemptContext, handle: &WorkerBlockWriteHandle) -> ClientResult<()>;
 }
 
 /// Internal worker write target derived from metadata AddBlock.
@@ -63,7 +73,7 @@ pub(crate) struct WorkerWriteTarget {
 /// Worker OpenReadStream evidence plus the bytes read from that stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WorkerReadResult {
-    /// Bytes returned for the planned segment.
+    /// Bytes returned for the planned block read.
     pub(crate) bytes: Bytes,
     /// Worker-observed block stamp from OpenReadStream.
     pub(crate) block_stamp: u64,
@@ -71,9 +81,9 @@ pub(crate) struct WorkerReadResult {
     pub(crate) committed_length: u64,
 }
 
-/// Internal worker write stream state.
+/// Worker block write handle returned by OpenWriteStream.
 #[derive(Clone, Debug)]
-pub(crate) struct WorkerWriteBlock {
+pub(crate) struct WorkerBlockWriteHandle {
     /// Metadata owner group for the block.
     pub(crate) group_name: GroupName,
     /// Stable worker identity selected by metadata.

@@ -10,7 +10,7 @@ use bytes::{Bytes, BytesMut};
 use proto::metadata::WriteHandleProto;
 use types::{CallId, ClientId, CommittedBlock, DataHandleId, FileLayout, InodeId, WriteTarget};
 
-use crate::data::WorkerWriteBlock;
+use crate::data::WorkerBlockWriteHandle;
 use crate::error::{ClientError, ClientResult};
 use crate::runtime::context::{OperationContext, OperationFingerprint, OperationIdentity};
 use crate::runtime::policy::OperationKind;
@@ -216,7 +216,7 @@ impl WriteSession {
     pub(crate) fn push_pending_block(
         &mut self,
         target: WriteTarget,
-        worker_block: WorkerWriteBlock,
+        block_write_handle: WorkerBlockWriteHandle,
         written_len: u64,
         commit_seq: u64,
     ) -> ClientResult<()> {
@@ -231,7 +231,7 @@ impl WriteSession {
             .ok_or_else(|| ClientError::InvalidArgument("write flush cursor overflow".to_string()))?;
         self.pending_blocks.push(PendingBlock {
             target,
-            worker_block,
+            block_write_handle,
             written_len,
             commit_seq,
             worker_commit_level: WorkerCommitLevel::Uncommitted,
@@ -375,15 +375,15 @@ impl WriteSession {
                     .pending_blocks
                     .iter()
                     .map(|pending| {
-                        let worker_block = pending.worker_block().clone();
-                        let detail = abort_worker_fingerprint_detail(&worker_block);
+                        let block_write_handle = pending.block_write_handle().clone();
+                        let detail = abort_block_write_handle_fingerprint_detail(&block_write_handle);
                         let identity = OperationIdentity::session(self.path.clone(), session_identity.clone())
                             .with_detail(detail.clone());
                         let abort_fingerprint = identity.fingerprint(OperationKind::WorkerWriteData, "AbortWrite");
                         AbortWorkerCleanupState {
                             abort_call_id: CallId::new(),
                             abort_fingerprint,
-                            worker_block,
+                            block_write_handle,
                             detail,
                         }
                     })
@@ -450,7 +450,7 @@ impl WriteSession {
             )?;
             worker_cleanups.push(AbortWorkerCleanupPlan {
                 operation,
-                worker_block: cleanup.worker_block.clone(),
+                block_write_handle: cleanup.block_write_handle.clone(),
             });
         }
         Ok(AbortCleanupPlan {
@@ -682,7 +682,7 @@ impl WriteSession {
 #[derive(Clone, Debug)]
 pub(crate) struct PendingBlock {
     target: WriteTarget,
-    worker_block: WorkerWriteBlock,
+    block_write_handle: WorkerBlockWriteHandle,
     written_len: u64,
     commit_seq: u64,
     worker_commit_level: WorkerCommitLevel,
@@ -694,9 +694,9 @@ impl PendingBlock {
         &self.target
     }
 
-    /// Worker stream state for this block.
-    pub(crate) fn worker_block(&self) -> &WorkerWriteBlock {
-        &self.worker_block
+    /// Worker block write handle for this pending block.
+    pub(crate) fn block_write_handle(&self) -> &WorkerBlockWriteHandle {
+        &self.block_write_handle
     }
 
     /// Length accepted by the worker write path.
@@ -812,7 +812,7 @@ impl std::fmt::Debug for AbortCleanupState {
 struct AbortWorkerCleanupState {
     abort_call_id: CallId,
     abort_fingerprint: OperationFingerprint,
-    worker_block: WorkerWriteBlock,
+    block_write_handle: WorkerBlockWriteHandle,
     detail: String,
 }
 
@@ -861,7 +861,7 @@ impl AbortCleanupPlan {
 #[derive(Clone)]
 pub(crate) struct AbortWorkerCleanupPlan {
     operation: OperationContext,
-    worker_block: WorkerWriteBlock,
+    block_write_handle: WorkerBlockWriteHandle,
 }
 
 impl AbortWorkerCleanupPlan {
@@ -870,9 +870,9 @@ impl AbortWorkerCleanupPlan {
         self.operation.clone()
     }
 
-    /// Worker write block snapshot to abort.
-    pub(crate) fn worker_block(&self) -> &WorkerWriteBlock {
-        &self.worker_block
+    /// Worker block write handle snapshot to abort.
+    pub(crate) fn block_write_handle(&self) -> &WorkerBlockWriteHandle {
+        &self.block_write_handle
     }
 }
 
@@ -956,35 +956,35 @@ fn abort_file_fingerprint_detail(
     );
     detail.push_str(" worker_cleanups=[");
     for cleanup in worker_cleanups {
-        append_worker_block_identity(&mut detail, &cleanup.worker_block);
+        append_block_write_handle_identity(&mut detail, &cleanup.block_write_handle);
         detail.push(';');
     }
     detail.push(']');
     detail
 }
 
-fn abort_worker_fingerprint_detail(worker_block: &WorkerWriteBlock) -> String {
+fn abort_block_write_handle_fingerprint_detail(block_write_handle: &WorkerBlockWriteHandle) -> String {
     let mut detail = String::new();
-    append_worker_block_identity(&mut detail, worker_block);
+    append_block_write_handle_identity(&mut detail, block_write_handle);
     detail
 }
 
-fn append_worker_block_identity(detail: &mut String, worker_block: &WorkerWriteBlock) {
-    let block_id = worker_block.target.block_id;
+fn append_block_write_handle_identity(detail: &mut String, block_write_handle: &WorkerBlockWriteHandle) {
+    let block_id = block_write_handle.target.block_id;
     let _ = write!(
         detail,
         "group={} worker={} protocol={} worker_run_id={} block={} stamp={} offset={} effective_len={} stream={}:{} next_seq={}",
-        worker_block.group_name,
-        worker_block.worker.worker_id,
-        proto::common::WorkerNetProtocolProto::from(worker_block.worker.worker_net_protocol) as i32,
-        worker_block.worker.worker_run_id,
+        block_write_handle.group_name,
+        block_write_handle.worker.worker_id,
+        proto::common::WorkerNetProtocolProto::from(block_write_handle.worker.worker_net_protocol) as i32,
+        block_write_handle.worker.worker_run_id,
         block_id,
-        worker_block.target.block_stamp,
-        worker_block.target.file_offset,
-        worker_block.target.effective_len,
-        worker_block.stream_id.high,
-        worker_block.stream_id.low,
-        worker_block.next_seq
+        block_write_handle.target.block_stamp,
+        block_write_handle.target.file_offset,
+        block_write_handle.target.effective_len,
+        block_write_handle.stream_id.high,
+        block_write_handle.stream_id.low,
+        block_write_handle.next_seq
     );
 }
 
@@ -1027,7 +1027,7 @@ mod tests {
         WorkerNetProtocol, WriteTarget,
     };
 
-    use crate::data::WorkerWriteBlock;
+    use crate::data::WorkerBlockWriteHandle;
     use crate::runtime::AttemptContext;
 
     #[test]
@@ -1186,7 +1186,7 @@ mod tests {
         )
         .expect("session");
         session
-            .push_pending_block(write_target(302, 0, 0, 5), worker_block(302, 0, 0, 5, 9), 5, 1)
+            .push_pending_block(write_target(302, 0, 0, 5), block_write_handle(302, 0, 0, 5, 9), 5, 1)
             .expect("pending block");
 
         let first = session
@@ -1196,7 +1196,7 @@ mod tests {
             .expect("first metadata context");
         let first_worker = first.worker_cleanups()[0].operation();
         let first_worker_ctx = AttemptContext::for_data(&first_worker, 0);
-        let first_worker_snapshot = worker_block_signature(first.worker_cleanups()[0].worker_block());
+        let first_worker_snapshot = block_write_handle_signature(first.worker_cleanups()[0].block_write_handle());
         session.pending_blocks.clear();
 
         let second = session
@@ -1221,7 +1221,7 @@ mod tests {
         );
         assert_eq!(
             first_worker_snapshot,
-            worker_block_signature(second.worker_cleanups()[0].worker_block())
+            block_write_handle_signature(second.worker_cleanups()[0].block_write_handle())
         );
     }
 
@@ -1277,7 +1277,7 @@ mod tests {
         )
         .expect("session");
         session
-            .push_pending_block(write_target(302, 0, 0, 5), worker_block(302, 0, 0, 5, 9), 5, 1)
+            .push_pending_block(write_target(302, 0, 0, 5), block_write_handle(302, 0, 0, 5, 9), 5, 1)
             .expect("pending block");
         session.pending_blocks[0].mark_worker_committed(false);
 
@@ -1489,14 +1489,14 @@ mod tests {
         }
     }
 
-    fn worker_block(
+    fn block_write_handle(
         data_handle_id: u64,
         block_index: u32,
         file_offset: u64,
         len: u64,
         stream_low: u64,
-    ) -> WorkerWriteBlock {
-        WorkerWriteBlock {
+    ) -> WorkerBlockWriteHandle {
+        WorkerBlockWriteHandle {
             group_name: test_group_name(),
             worker: worker_endpoint(),
             target: write_target(data_handle_id, block_index, file_offset, len),
@@ -1509,8 +1509,8 @@ mod tests {
         }
     }
 
-    fn worker_block_signature(
-        block: &WorkerWriteBlock,
+    fn block_write_handle_signature(
+        block: &WorkerBlockWriteHandle,
     ) -> (String, u64, i32, String, u64, u64, u64, u32, u64, u64, u64) {
         (
             block.group_name.to_string(),

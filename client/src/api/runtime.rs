@@ -42,7 +42,7 @@ pub(crate) struct ClientRuntime {
 
 impl ClientRuntime {
     /// Builds the shared runtime from injected metadata, worker, sleep, and metrics dependencies.
-    pub(crate) fn with_hooks(
+    pub(crate) fn new(
         config: ClientConfig,
         gateway: Arc<dyn MetadataGateway>,
         metadata_targets: MetadataTargets,
@@ -75,7 +75,7 @@ impl ClientRuntime {
     }
 
     /// Allocates one metadata block and writes its payload to the selected worker.
-    pub(crate) async fn write_one_block(&self, session: &mut WriteSession, data: Bytes) -> ClientResult<()> {
+    pub(crate) async fn write_block(&self, session: &mut WriteSession, data: Bytes) -> ClientResult<()> {
         let block_len = data.len() as u64;
         let add_block = match self
             .executor
@@ -90,7 +90,7 @@ impl ClientRuntime {
             Ok(add_block) => add_block,
             Err(err) => {
                 mark_session_after_write_error(session, &err);
-                return Err(self.normalize_unknown_outcome("AddBlock", OperationKind::MetadataMutation, err));
+                return Err(self.normalize_outcome_error("AddBlock", OperationKind::MetadataMutation, err));
             }
         };
         if let Err(err) = session.validate_target(&add_block.target, block_len) {
@@ -105,41 +105,41 @@ impl ClientRuntime {
             );
             return Err(side_effect_response_body_mismatch("AddBlock", err));
         }
-        let operation = worker_write_operation(
+        let operation = worker_write_context(
             self.executor.client_id(),
             self.executor.client_name(),
             "OpenWriteStream",
             session.path(),
             &session.session_identity(),
         )?;
-        let ctx = self.data_attempt_context(&operation, 0);
-        let worker_block = match self
+        let ctx = self.data_context(&operation, 0);
+        let block_write_handle = match self
             .worker_rpc_with_timeout(
                 "OpenWriteStream",
                 OperationKind::WorkerWriteData,
                 self.data_plane
-                    .open_write(ctx, add_block.group_name.clone(), add_block.target.clone()),
+                    .open_block_write(ctx, add_block.group_name.clone(), add_block.target.clone()),
             )
             .await
         {
-            Ok(worker_block) => worker_block,
+            Ok(block_write_handle) => block_write_handle,
             Err(err) => {
                 mark_session_after_write_error(session, &err);
-                return Err(self.normalize_unknown_outcome("OpenWriteStream", OperationKind::WorkerWriteData, err));
+                return Err(self.normalize_outcome_error("OpenWriteStream", OperationKind::WorkerWriteData, err));
             }
         };
         let response = match self
             .worker_rpc_with_timeout(
                 "WriteStream",
                 OperationKind::WorkerWriteData,
-                self.data_plane.write_all(&worker_block, data),
+                self.data_plane.write_block_bytes(&block_write_handle, data),
             )
             .await
         {
             Ok(response) => response,
             Err(err) => {
                 mark_session_after_write_error(session, &err);
-                return Err(self.normalize_unknown_outcome("WriteStream", OperationKind::WorkerWriteData, err));
+                return Err(self.normalize_outcome_error("WriteStream", OperationKind::WorkerWriteData, err));
             }
         };
         if response.written_through != block_len {
@@ -157,7 +157,8 @@ impl ClientRuntime {
                 block_len, response.written_through
             )));
         }
-        if let Err(err) = session.push_pending_block(add_block.target, worker_block, block_len, response.last_acked_seq)
+        if let Err(err) =
+            session.push_pending_block(add_block.target, block_write_handle, block_len, response.last_acked_seq)
         {
             session.mark_session_invalid();
             return Err(err);
@@ -165,8 +166,8 @@ impl ClientRuntime {
         Ok(())
     }
 
-    /// Move worker blocks to the required level and return the metadata block list for the open session.
-    pub(crate) async fn ensure_pending_worker_blocks_at_level(
+    /// Commit pending worker blocks to the level required by the next metadata barrier.
+    pub(crate) async fn commit_pending_blocks_for_barrier(
         &self,
         session: &mut WriteSession,
         required_level: WorkerCommitLevel,
@@ -183,21 +184,21 @@ impl ClientRuntime {
             match (pending.worker_commit_level(), required_level) {
                 (WorkerCommitLevel::Uncommitted, WorkerCommitLevel::Visible | WorkerCommitLevel::Durable) => {
                     let require_sync = required_level.requires_sync();
-                    let operation = worker_write_operation(
+                    let operation = worker_write_context(
                         self.executor.client_id(),
                         self.executor.client_name(),
                         "CommitWrite",
                         &worker_path,
                         &worker_session_identity,
                     )?;
-                    let ctx = self.data_attempt_context(&operation, 0);
+                    let ctx = self.data_context(&operation, 0);
                     let commit_result = match self
                         .worker_rpc_with_timeout(
                             "CommitWrite",
                             OperationKind::WorkerWriteData,
-                            self.data_plane.commit_write(
+                            self.data_plane.commit_block_write(
                                 ctx,
-                                pending.worker_block(),
+                                pending.block_write_handle(),
                                 pending.written_len(),
                                 pending.commit_seq(),
                                 require_sync,
@@ -208,7 +209,7 @@ impl ClientRuntime {
                         Ok(result) => result,
                         Err(err) => {
                             mark_session_after_write_error(session, &err);
-                            return Err(self.normalize_unknown_outcome(
+                            return Err(self.normalize_outcome_error(
                                 "CommitWrite",
                                 OperationKind::WorkerWriteData,
                                 err,
@@ -230,27 +231,30 @@ impl ClientRuntime {
                     pending.mark_worker_committed(require_sync);
                 }
                 (WorkerCommitLevel::Visible, WorkerCommitLevel::Durable) => {
-                    let operation = worker_write_operation(
+                    let operation = worker_write_context(
                         self.executor.client_id(),
                         self.executor.client_name(),
                         "SyncCommittedBlock",
                         &worker_path,
                         &worker_session_identity,
                     )?;
-                    let ctx = self.data_attempt_context(&operation, 0);
+                    let ctx = self.data_context(&operation, 0);
                     let sync_result = match self
                         .worker_rpc_with_timeout(
                             "SyncCommittedBlock",
                             OperationKind::WorkerWriteData,
-                            self.data_plane
-                                .sync_committed_block(ctx, pending.worker_block(), pending.written_len()),
+                            self.data_plane.sync_committed_block(
+                                ctx,
+                                pending.block_write_handle(),
+                                pending.written_len(),
+                            ),
                         )
                         .await
                     {
                         Ok(result) => result,
                         Err(err) => {
                             mark_session_after_block_sync_error(session, &err);
-                            return Err(self.normalize_unknown_outcome(
+                            return Err(self.normalize_outcome_error(
                                 "SyncCommittedBlock",
                                 OperationKind::WorkerWriteData,
                                 err,
@@ -282,7 +286,7 @@ impl ClientRuntime {
     }
 
     /// Builds a data-plane attempt context with the configured operation timeout.
-    pub(crate) fn data_attempt_context(&self, operation: &OperationContext, attempt: u32) -> AttemptContext {
+    pub(crate) fn data_context(&self, operation: &OperationContext, attempt: u32) -> AttemptContext {
         AttemptContext::for_data(operation, attempt).with_operation_timeout_ms(self.config.retry.operation_timeout_ms)
     }
 
@@ -359,7 +363,7 @@ impl ClientRuntime {
     }
 
     /// Maps transport or malformed-response uncertainty into an unknown-outcome client error.
-    pub(crate) fn normalize_unknown_outcome(
+    pub(crate) fn normalize_outcome_error(
         &self,
         operation: &'static str,
         kind: OperationKind,
@@ -367,7 +371,7 @@ impl ClientRuntime {
     ) -> ClientError {
         let class = ErrorClassifier.classify_error(&err);
         self.record_error_metric(operation, kind, &class);
-        let normalized = normalize_unknown_outcome(operation, err);
+        let normalized = map_outcome_error(operation, err);
         if matches!(normalized, ClientError::UnknownOutcome(_)) {
             self.record_metric(
                 ClientMetric::UnknownOutcome,
@@ -408,7 +412,7 @@ pub(crate) fn is_unknown_session_barrier_outcome(err: &ClientError) -> bool {
 }
 
 /// Marks a write session after a metadata session-level failure.
-pub(crate) fn mark_session_after_session_error(session: &mut WriteSession, err: &ClientError) {
+pub(crate) fn mark_session_after_metadata_error(session: &mut WriteSession, err: &ClientError) {
     match ErrorClassifier.classify_error(err) {
         ErrorClass::SessionExpired => session.mark_session_expired(),
         ErrorClass::Fencing | ErrorClass::SessionInvalid | ErrorClass::NeedRefresh(_) => session.mark_session_invalid(),
@@ -425,7 +429,7 @@ fn timeout_error(target_plane: &str, operation: &str, timeout: Duration) -> Clie
 }
 
 /// Creates the stable operation identity used for worker write attempts.
-fn worker_write_operation(
+fn worker_write_context(
     client_id: types::ClientId,
     client_name: &str,
     operation_name: &str,
@@ -454,10 +458,10 @@ fn committed_block_from_pending(pending: &PendingBlock) -> types::CommittedBlock
 
 /// Marks a write session after a worker write or add-block failure.
 fn mark_session_after_write_error(session: &mut WriteSession, err: &ClientError) {
-    if is_conservative_unknown_outcome_error(err) {
+    if has_uncertain_write_effect(err) {
         session.mark_unknown_outcome();
     } else if is_session_or_fencing_error(err) || is_write_refresh_error(err) {
-        mark_session_after_session_error(session, err);
+        mark_session_after_metadata_error(session, err);
     } else {
         session.mark_session_invalid();
     }
@@ -466,14 +470,14 @@ fn mark_session_after_write_error(session: &mut WriteSession, err: &ClientError)
 /// Marks a write session after a durable block-sync failure.
 fn mark_session_after_block_sync_error(session: &mut WriteSession, err: &ClientError) {
     if is_session_or_fencing_error(err) || is_write_refresh_error(err) {
-        mark_session_after_session_error(session, err);
+        mark_session_after_metadata_error(session, err);
     } else {
         session.mark_unknown_outcome();
     }
 }
 
 /// Returns true when a failure leaves worker write side effects uncertain.
-fn is_conservative_unknown_outcome_error(err: &ClientError) -> bool {
+fn has_uncertain_write_effect(err: &ClientError) -> bool {
     matches!(err, ClientError::UnknownOutcome(_))
         || matches!(
             ErrorClassifier.classify_error(err),
@@ -503,7 +507,7 @@ fn is_write_refresh_error(err: &ClientError) -> bool {
 }
 
 /// Normalizes uncertain transport and header failures into unknown outcomes.
-fn normalize_unknown_outcome(operation: &str, err: ClientError) -> ClientError {
+fn map_outcome_error(operation: &str, err: ClientError) -> ClientError {
     match ErrorClassifier.classify_error(&err) {
         ErrorClass::RetryableTransport => {
             ClientError::UnknownOutcome(format!("{operation} outcome is unknown after transport failure: {err}"))

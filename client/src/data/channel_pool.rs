@@ -1,0 +1,477 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Vecton Contributors
+
+//! gRPC worker channel cache for the client data plane.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use parking_lot::RwLock;
+use proto::worker::worker_data_service_client::WorkerDataServiceClient;
+use tonic::transport as tonic_net;
+use types::{WorkerEndpointInfo, WorkerNetProtocol};
+
+use crate::cache::CacheInvalidationReason;
+use crate::config::ClientConfig;
+use crate::error::{ClientError, ClientResult};
+use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
+use crate::runtime::{ErrorClass, ErrorClassifier, RefreshReason};
+
+#[derive(Debug)]
+pub(super) struct GrpcWorkerChannelPool {
+    channels: RwLock<HashMap<WorkerChannelKey, tonic_net::Channel>>,
+    enabled: bool,
+    max_cached_keys_per_worker: usize,
+    metrics: Arc<dyn ClientMetrics>,
+}
+
+impl GrpcWorkerChannelPool {
+    pub(super) fn new(enabled: bool, max_cached_keys_per_worker: usize, metrics: Arc<dyn ClientMetrics>) -> Self {
+        Self {
+            channels: RwLock::new(HashMap::new()),
+            enabled,
+            max_cached_keys_per_worker: max_cached_keys_per_worker.max(1),
+            metrics,
+        }
+    }
+
+    pub(super) fn from_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> Self {
+        Self::new(
+            config.channel_pool.worker_channel_pool_enabled,
+            config.channel_pool.worker_channel_pool_max_per_worker,
+            metrics,
+        )
+    }
+
+    pub(super) async fn worker_data_service_client(
+        &self,
+        worker: &WorkerEndpointInfo,
+        operation: &'static str,
+    ) -> ClientResult<WorkerDataServiceClient<tonic_net::Channel>> {
+        let key = Self::channel_key(worker)?;
+        if !self.enabled {
+            self.record_pool_metric(ClientMetric::WorkerChannelPoolMiss, operation, "miss");
+            return build_lazy_worker_channel(&key.endpoint)
+                .map(WorkerDataServiceClient::new)
+                .inspect_err(|_err| {
+                    self.record_pool_metric(ClientMetric::ChannelPoolConnectError, operation, "error");
+                });
+        }
+        let channel = self.channel_for_key(key, operation).await?;
+        Ok(WorkerDataServiceClient::new(channel))
+    }
+
+    pub(super) fn invalidate_worker_channel(&self, worker: &WorkerEndpointInfo, reason: CacheInvalidationReason) {
+        if let Ok(key) = Self::channel_key(worker) {
+            if self.channels.write().remove(&key).is_some() {
+                self.record_pool_metric(
+                    ClientMetric::CachePreciseInvalidation,
+                    "channel_invalidate",
+                    reason.label(),
+                );
+            }
+        }
+    }
+
+    pub(super) fn invalidate_on_worker_run_mismatch(&self, worker: &WorkerEndpointInfo, error: &ClientError) {
+        let Some(reason) = worker_run_mismatch_invalidation_reason(error) else {
+            return;
+        };
+        self.invalidate_worker_channel(worker, reason);
+    }
+
+    fn channel_key(worker: &WorkerEndpointInfo) -> ClientResult<WorkerChannelKey> {
+        ensure_supported_worker_protocol(worker.worker_net_protocol)?;
+        Ok(WorkerChannelKey {
+            worker_id: worker.worker_id.as_raw(),
+            endpoint: normalize_endpoint(&worker.endpoint)?,
+            protocol: worker.worker_net_protocol,
+            worker_run_id: worker.worker_run_id,
+        })
+    }
+
+    async fn channel_for_key(
+        &self,
+        key: WorkerChannelKey,
+        operation: &'static str,
+    ) -> ClientResult<tonic_net::Channel> {
+        if let Some(channel) = self.get_cached_channel(&key) {
+            self.record_pool_metric(ClientMetric::WorkerChannelPoolHit, operation, "hit");
+            return Ok(channel);
+        }
+        self.record_pool_metric(ClientMetric::WorkerChannelPoolMiss, operation, "miss");
+
+        if let Some(channel) = self.get_cached_channel(&key) {
+            self.record_pool_metric(ClientMetric::WorkerChannelPoolHit, operation, "hit");
+            return Ok(channel);
+        }
+        let channel = build_lazy_worker_channel(&key.endpoint).inspect_err(|_err| {
+            self.record_pool_metric(ClientMetric::ChannelPoolConnectError, operation, "error");
+        })?;
+        Ok(self.insert_or_get_existing(key, channel))
+    }
+
+    fn get_cached_channel(&self, key: &WorkerChannelKey) -> Option<tonic_net::Channel> {
+        self.channels.read().get(key).cloned()
+    }
+
+    fn insert_or_get_existing(&self, key: WorkerChannelKey, channel: tonic_net::Channel) -> tonic_net::Channel {
+        let mut channels = self.channels.write();
+        if let Some(existing) = channels.get(&key).cloned() {
+            return existing;
+        }
+        evict_worker_channel_if_needed(&mut channels, &key, self.max_cached_keys_per_worker);
+        channels.insert(key, channel.clone());
+        channel
+    }
+
+    fn record_pool_metric(&self, metric: ClientMetric, operation: &'static str, outcome: &'static str) {
+        self.metrics.record(ClientMetricEvent::new(
+            metric,
+            ClientMetricLabels::default()
+                .with_cache("channel_pool")
+                .with_target_plane("worker")
+                .with_operation_name(operation)
+                .with_outcome(outcome),
+        ));
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct WorkerChannelKey {
+    worker_id: u64,
+    endpoint: String,
+    protocol: WorkerNetProtocol,
+    worker_run_id: types::WorkerRunId,
+}
+
+pub(super) fn ensure_supported_worker_protocol(protocol: WorkerNetProtocol) -> ClientResult<()> {
+    match protocol {
+        WorkerNetProtocol::Grpc => Ok(()),
+        WorkerNetProtocol::Quic | WorkerNetProtocol::Rdma => Err(ClientError::Unsupported(format!(
+            "unsupported worker net protocol {protocol:?}"
+        ))),
+    }
+}
+
+fn normalize_endpoint(endpoint: &str) -> ClientResult<String> {
+    if endpoint.is_empty() {
+        return Err(ClientError::InvalidArgument(
+            "worker endpoint must not be empty".to_string(),
+        ));
+    }
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        Ok(endpoint.to_string())
+    } else {
+        Ok(format!("http://{endpoint}"))
+    }
+}
+
+fn build_lazy_worker_channel(endpoint: &str) -> ClientResult<tonic_net::Channel> {
+    tonic_net::Endpoint::from_shared(endpoint.to_string())
+        .map_err(|err| ClientError::Worker(format!("invalid worker endpoint {endpoint}: {err}")))
+        .map(|endpoint| endpoint.connect_lazy())
+}
+
+fn evict_worker_channel_if_needed(
+    channels: &mut HashMap<WorkerChannelKey, tonic_net::Channel>,
+    key: &WorkerChannelKey,
+    max_cached_keys_per_worker: usize,
+) {
+    if channels.contains_key(key) {
+        return;
+    }
+    let count = channels
+        .keys()
+        .filter(|existing| existing.worker_id == key.worker_id)
+        .count();
+    if count < max_cached_keys_per_worker {
+        return;
+    }
+    if let Some(evicted) = channels
+        .keys()
+        .find(|existing| existing.worker_id == key.worker_id)
+        .cloned()
+    {
+        channels.remove(&evicted);
+    }
+}
+
+fn worker_run_mismatch_invalidation_reason(err: &ClientError) -> Option<CacheInvalidationReason> {
+    match ErrorClassifier.classify_error(err) {
+        ErrorClass::NeedRefresh(RefreshReason::WorkerRunMismatch) => Some(CacheInvalidationReason::WorkerRun),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use common::error::canonical::CanonicalError;
+    use common::header::RpcErrorCode;
+    use proto::convert::canonical_to_error_detail;
+    use std::sync::Mutex;
+    use types::{ClientId, WorkerEndpointInfo, WorkerId};
+
+    use crate::data::protocol::parse_worker_control_header;
+    use crate::metrics::NoopClientMetrics;
+    use crate::runtime::{AttemptContext, OperationContext, OperationIdentity, OperationKind};
+
+    #[derive(Debug, Default)]
+    struct RecordingMetrics {
+        events: Mutex<Vec<ClientMetricEvent>>,
+    }
+
+    impl ClientMetrics for RecordingMetrics {
+        fn record(&self, event: ClientMetricEvent) {
+            self.events.lock().expect("events").push(event);
+        }
+    }
+
+    impl RecordingMetrics {
+        fn events(&self) -> Vec<ClientMetricEvent> {
+            self.events.lock().expect("events").clone()
+        }
+    }
+
+    #[test]
+    fn data_plane_accepts_grpc_protocol() {
+        assert!(ensure_supported_worker_protocol(WorkerNetProtocol::Grpc).is_ok());
+    }
+
+    #[tokio::test]
+    async fn worker_channel_pool_reuses_channel_for_same_worker_endpoint() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let pool = GrpcWorkerChannelPool::new(true, 1, metrics.clone());
+        let worker = worker_endpoint();
+
+        let _first = pool
+            .worker_data_service_client(&worker, "read")
+            .await
+            .expect("first client");
+        let _second = pool
+            .worker_data_service_client(&worker, "read")
+            .await
+            .expect("second client");
+
+        let events = metrics.events();
+        assert_metric(&events, ClientMetric::WorkerChannelPoolMiss);
+        assert_metric(&events, ClientMetric::WorkerChannelPoolHit);
+        assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
+    }
+
+    #[tokio::test]
+    async fn concurrent_worker_channel_requests_same_key_reuse_inserted_channel() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let pool = Arc::new(GrpcWorkerChannelPool::new(true, 8, metrics.clone()));
+        let worker = worker_endpoint();
+
+        let mut tasks = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let pool = Arc::clone(&pool);
+            let worker = worker.clone();
+            tasks.push(tokio::spawn(async move {
+                pool.worker_data_service_client(&worker, "read").await
+            }));
+        }
+
+        for task in tasks {
+            let _client = task.await.expect("task").expect("worker client");
+        }
+        assert_eq!(pool.channels.read().len(), 1);
+        let events = metrics.events();
+        assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
+    }
+
+    #[tokio::test]
+    async fn worker_channel_different_run_does_not_share_channel() {
+        let metrics = Arc::new(NoopClientMetrics);
+        let pool = Arc::new(GrpcWorkerChannelPool::new(true, 8, metrics));
+        let mut first = worker_endpoint();
+        first.worker_run_id = "550e8400-e29b-41d4-a716-446655440007"
+            .parse()
+            .expect("valid first WorkerRunId");
+        let mut second = worker_endpoint();
+        second.worker_run_id = "550e8400-e29b-41d4-a716-446655440008"
+            .parse()
+            .expect("valid second WorkerRunId");
+
+        let first_task = {
+            let pool = Arc::clone(&pool);
+            tokio::spawn(async move { pool.worker_data_service_client(&first, "read").await })
+        };
+        let second_task = {
+            let pool = Arc::clone(&pool);
+            tokio::spawn(async move { pool.worker_data_service_client(&second, "read").await })
+        };
+
+        first_task.await.expect("first").expect("first client");
+        second_task.await.expect("second").expect("second client");
+        assert_eq!(pool.channels.read().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn worker_run_mismatch_invalidates_target_channel() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let pool = GrpcWorkerChannelPool::new(true, 1, metrics.clone());
+        let worker = worker_endpoint();
+        let attempt = data_attempt_context();
+
+        let _worker_client = pool
+            .worker_data_service_client(&worker, "read")
+            .await
+            .expect("worker client");
+        assert_eq!(pool.channels.read().len(), 1);
+
+        let err = parse_worker_control_header(
+            &attempt,
+            Some(&data_header_with_error(
+                &attempt,
+                CanonicalError::need_refresh(
+                    RpcErrorCode::WorkerRunMismatch,
+                    common::error::canonical::RefreshReason::WorkerRunMismatch,
+                    "worker run mismatch",
+                ),
+            )),
+        )
+        .expect_err("worker run mismatch must fail");
+
+        pool.invalidate_on_worker_run_mismatch(&worker, &err);
+
+        assert_eq!(pool.channels.read().len(), 0);
+        assert_metric(&metrics.events(), ClientMetric::CachePreciseInvalidation);
+    }
+
+    #[tokio::test]
+    async fn failed_worker_channel_creation_does_not_insert() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let pool = Arc::new(GrpcWorkerChannelPool::new(true, 8, metrics.clone()));
+        let mut worker = worker_endpoint();
+        worker.endpoint = "http://[invalid".to_string();
+
+        let mut tasks = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let pool = Arc::clone(&pool);
+            let worker = worker.clone();
+            tasks.push(tokio::spawn(async move {
+                pool.worker_data_service_client(&worker, "read").await
+            }));
+        }
+
+        for task in tasks {
+            let err = task.await.expect("task").expect_err("invalid endpoint");
+            assert!(matches!(err, ClientError::Worker(msg) if msg.contains("invalid worker endpoint")));
+        }
+        assert!(pool.channels.read().is_empty());
+        assert_metric(&metrics.events(), ClientMetric::ChannelPoolConnectError);
+    }
+
+    #[tokio::test]
+    async fn disabled_worker_channel_pool_does_not_reuse_channel() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let pool = GrpcWorkerChannelPool::new(false, 1, metrics.clone());
+        let worker = worker_endpoint();
+
+        let _first = pool
+            .worker_data_service_client(&worker, "read")
+            .await
+            .expect("first client");
+        let _second = pool
+            .worker_data_service_client(&worker, "read")
+            .await
+            .expect("second client");
+
+        let events = metrics.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.metric == ClientMetric::WorkerChannelPoolMiss)
+                .count(),
+            2
+        );
+        assert!(events
+            .iter()
+            .all(|event| event.metric != ClientMetric::WorkerChannelPoolHit));
+    }
+
+    #[tokio::test]
+    async fn unsupported_worker_protocol_does_not_create_channel() {
+        let metrics = Arc::new(NoopClientMetrics);
+        let pool = GrpcWorkerChannelPool::new(true, 1, metrics);
+        let mut worker = worker_endpoint();
+        worker.worker_net_protocol = WorkerNetProtocol::Quic;
+
+        let err = pool
+            .worker_data_service_client(&worker, "read")
+            .await
+            .expect_err("unsupported protocol rejected");
+
+        assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("unsupported worker net protocol")));
+        assert!(pool.channels.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_channel_pool_connection_error_is_reported() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let pool = GrpcWorkerChannelPool::new(true, 1, metrics.clone());
+        let mut worker = worker_endpoint();
+        worker.endpoint = "http://[invalid".to_string();
+
+        let err = pool
+            .worker_data_service_client(&worker, "read")
+            .await
+            .expect_err("invalid endpoint fails");
+
+        assert!(matches!(err, ClientError::Worker(msg) if msg.contains("invalid worker endpoint")));
+        assert_metric(&metrics.events(), ClientMetric::ChannelPoolConnectError);
+    }
+
+    #[test]
+    fn data_plane_returns_unsupported_for_quic_and_rdma() {
+        for protocol in [WorkerNetProtocol::Quic, WorkerNetProtocol::Rdma] {
+            let err = ensure_supported_worker_protocol(protocol).expect_err("known non-GRPC protocol is unsupported");
+
+            assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("unsupported worker net protocol")));
+        }
+    }
+
+    fn worker_endpoint() -> WorkerEndpointInfo {
+        WorkerEndpointInfo {
+            worker_id: WorkerId::new(1),
+            endpoint: "127.0.0.1:19101".to_string(),
+            worker_net_protocol: WorkerNetProtocol::Grpc,
+            worker_run_id: "550e8400-e29b-41d4-a716-446655440000"
+                .parse()
+                .expect("valid test WorkerRunId"),
+        }
+    }
+
+    fn data_attempt_context() -> AttemptContext {
+        let operation = OperationContext::new(
+            ClientId::new(7),
+            OperationKind::WorkerReadData,
+            "OpenReadStream",
+            OperationIdentity::path("/alpha"),
+        )
+        .expect("operation context");
+        AttemptContext::for_data(&operation, 0)
+    }
+
+    fn data_header_with_error(
+        attempt: &AttemptContext,
+        canonical: CanonicalError,
+    ) -> proto::worker::DataResponseHeaderProto {
+        proto::worker::DataResponseHeaderProto {
+            client: Some(attempt.client_info()),
+            error: Some(canonical_to_error_detail(&canonical)),
+        }
+    }
+
+    fn assert_metric(events: &[ClientMetricEvent], metric: ClientMetric) {
+        assert!(
+            events.iter().any(|event| event.metric == metric),
+            "missing metric {metric:?}: {events:?}"
+        );
+    }
+}
