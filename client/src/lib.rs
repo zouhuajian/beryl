@@ -26,7 +26,6 @@ mod config;
 mod error;
 mod metrics;
 mod planner;
-mod protocol;
 mod runtime;
 mod session;
 

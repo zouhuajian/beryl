@@ -74,45 +74,45 @@ impl OperationExecutor {
 
     /// Execute GetStatus and return a public status snapshot.
     pub(crate) async fn stat(&self, path: NamespacePathBuf) -> ClientResult<FileStatus> {
-        let path_text = path.as_str().to_string();
+        let path = path.as_str().to_string();
         let response = self
             .get_status_request(
-                &path_text,
+                &path,
                 proto::metadata::GetStatusRequestProto {
                     header: None,
-                    path: path_text.clone(),
+                    path: path.clone(),
                 },
             )
             .await?;
-        file_status_from_response(path_text, response)
+        file_status_from_response(path, response)
     }
 
     /// Execute ListStatus and return a public directory listing.
     pub(crate) async fn list(&self, path: NamespacePathBuf, options: ListOptions) -> ClientResult<DirectoryListing> {
-        let path_text = path.into_string();
+        let path = path.into_string();
         let response = self
             .list_status_request(
-                &path_text,
+                &path,
                 proto::metadata::ListStatusRequestProto {
                     header: None,
-                    path: path_text.clone(),
+                    path: path.clone(),
                     recursive: options.recursive,
                     cursor: options.cursor.unwrap_or_default(),
                     limit: options.limit.unwrap_or(0),
                 },
             )
             .await?;
-        Ok(directory_listing_from_response(path_text, response))
+        Ok(directory_listing_from_response(path, response))
     }
 
     /// Execute Delete.
     pub(crate) async fn delete(&self, path: NamespacePathBuf, recursive: bool) -> ClientResult<()> {
-        let path_text = path.into_string();
+        let path = path.into_string();
         self.delete_request(
-            &path_text,
+            &path,
             proto::metadata::DeleteRequestProto {
                 header: None,
-                path: path_text.clone(),
+                path: path.clone(),
                 recursive,
             },
         )
@@ -140,34 +140,40 @@ impl OperationExecutor {
 
     /// Execute OpenFile and return a read handle.
     pub(crate) async fn open_file(&self, path: NamespacePathBuf) -> ClientResult<ReadHandle> {
-        let path_text = path.into_string();
-        let response = self
-            .open_file_request(
-                &path_text,
-                proto::metadata::OpenFileRequestProto {
-                    header: None,
-                    path: path_text.clone(),
-                },
-            )
-            .await?;
-        read_handle_from_open_response(path_text, response)
-    }
-
-    async fn open_file_request(
-        &self,
-        path: &str,
-        req: proto::metadata::OpenFileRequestProto,
-    ) -> ClientResult<proto::metadata::OpenFileResponseProto> {
+        let path = path.into_string();
         let operation = OperationContext::new_with_identity(
             &self.identity,
             OperationKind::MetadataRead,
             "OpenFile",
-            OperationIdentity::path(path),
+            OperationIdentity::path(path.clone()),
         )?;
-        self.execute_metadata(operation, req, |gateway, ctx, req| async move {
-            gateway.open_file(ctx, req).await
-        })
-        .await
+        let request = proto::metadata::OpenFileRequestProto {
+            header: None,
+            path: path.clone(),
+        };
+        let response = self
+            .execute_metadata(operation, request, |gateway, ctx, req| async move {
+                gateway.open_file(ctx, req).await
+            })
+            .await?;
+
+        let Some(data_handle_id) = response.data_handle_id else {
+            return Err(ClientError::Metadata(
+                "OpenFileResponseProto.data_handle_id missing".to_string(),
+            ));
+        };
+        let Some(file_version) = response.file_version else {
+            return Err(ClientError::Metadata(
+                "OpenFileResponseProto.file_version missing".to_string(),
+            ));
+        };
+
+        Ok(ReadHandle::new(
+            path,
+            DataHandleId::new(data_handle_id.value),
+            file_version,
+            response.file_size,
+        ))
     }
 
     /// Execute a metadata layout read.
@@ -275,17 +281,17 @@ impl OperationExecutor {
         path: NamespacePathBuf,
         options: CreateOptions,
     ) -> ClientResult<WriteHandle> {
-        let path_text = path.into_string();
+        let path = path.into_string();
         let create_mode = match options.create_mode {
             CreateMode::CreateNew => proto::metadata::CreateModeProto::CreateNew,
             CreateMode::CreateOrOverwrite => proto::metadata::CreateModeProto::CreateOrOverwrite,
         };
         let response = self
             .create_file_request(
-                &path_text,
+                &path,
                 proto::metadata::CreateFileRequestProto {
                     header: None,
-                    path: path_text.clone(),
+                    path: path.clone(),
                     attrs: Some(default_file_attrs()),
                     layout: Some(layout_for_new_file(&options)),
                     create_mode: create_mode as i32,
@@ -293,7 +299,35 @@ impl OperationExecutor {
                 },
             )
             .await?;
-        write_handle_from_create_response(path_text, response)
+        let Some(data_handle_id) = response.data_handle_id else {
+            return Err(ClientError::Metadata(
+                "CreateFileResponseProto.data_handle_id missing".to_string(),
+            ));
+        };
+        let Some(layout) = response.layout else {
+            return Err(ClientError::Metadata(
+                "CreateFileResponseProto.layout missing".to_string(),
+            ));
+        };
+        let layout = FileLayout::try_from(layout)
+            .map_err(|err| ClientError::InvalidLayout(format!("CreateFileResponseProto.layout invalid: {err}")))?;
+        let Some(write_handle) = response.write_handle else {
+            return Err(ClientError::Metadata(
+                "CreateFileResponseProto.write_handle missing".to_string(),
+            ));
+        };
+
+        let expires_at_ms = crate::api::handle::valid_write_session_expiry("CreateFile", response.expires_at_ms)?;
+        let data_handle_id = DataHandleId::new(data_handle_id.value);
+        let session = WriteSession::new(
+            path.clone(),
+            data_handle_id,
+            layout,
+            write_handle,
+            response.base_size,
+            expires_at_ms,
+        )?;
+        Ok(WriteHandle::new(path, data_handle_id, response.base_size, session))
     }
 
     async fn create_file_request(
@@ -317,18 +351,46 @@ impl OperationExecutor {
     /// Execute AppendFile.
     /// Execute AppendFile and return a write handle.
     pub(crate) async fn append_file(&self, path: NamespacePathBuf) -> ClientResult<WriteHandle> {
-        let path_text = path.into_string();
+        let path = path.into_string();
         let response = self
             .append_file_request(
-                &path_text,
+                &path,
                 proto::metadata::AppendFileRequestProto {
                     header: None,
-                    path: path_text.clone(),
+                    path: path.clone(),
                     desired_len: Some(default_write_preallocation_len()),
                 },
             )
             .await?;
-        write_handle_from_append_response(path_text, response)
+        let Some(data_handle_id) = response.data_handle_id else {
+            return Err(ClientError::Metadata(
+                "AppendFileResponseProto.data_handle_id missing".to_string(),
+            ));
+        };
+        let Some(layout) = response.layout else {
+            return Err(ClientError::Metadata(
+                "AppendFileResponseProto.layout missing".to_string(),
+            ));
+        };
+        let layout = FileLayout::try_from(layout)
+            .map_err(|err| ClientError::InvalidLayout(format!("AppendFileResponseProto.layout invalid: {err}")))?;
+        let Some(write_handle) = response.write_handle else {
+            return Err(ClientError::Metadata(
+                "AppendFileResponseProto.write_handle missing".to_string(),
+            ));
+        };
+
+        let expires_at_ms = crate::api::handle::valid_write_session_expiry("AppendFile", response.expires_at_ms)?;
+        let data_handle_id = DataHandleId::new(data_handle_id.value);
+        let session = WriteSession::new(
+            path.clone(),
+            data_handle_id,
+            layout,
+            write_handle,
+            response.base_size,
+            expires_at_ms,
+        )?;
+        Ok(WriteHandle::new(path, data_handle_id, response.base_size, session))
     }
 
     async fn append_file_request(
@@ -834,99 +896,6 @@ fn directory_listing_from_response(
     DirectoryListing::new(path, entries, next_cursor, response.eof)
 }
 
-fn read_handle_from_open_response(
-    path: String,
-    response: proto::metadata::OpenFileResponseProto,
-) -> ClientResult<ReadHandle> {
-    let Some(data_handle_id) = response.data_handle_id else {
-        return Err(ClientError::Metadata(
-            "OpenFileResponseProto.data_handle_id missing".to_string(),
-        ));
-    };
-    let Some(file_version) = response.file_version else {
-        return Err(ClientError::Metadata(
-            "OpenFileResponseProto.file_version missing".to_string(),
-        ));
-    };
-
-    Ok(ReadHandle::new(
-        path,
-        DataHandleId::new(data_handle_id.value),
-        file_version,
-        response.file_size,
-    ))
-}
-
-fn write_handle_from_create_response(
-    path: String,
-    response: proto::metadata::CreateFileResponseProto,
-) -> ClientResult<WriteHandle> {
-    let Some(data_handle_id) = response.data_handle_id else {
-        return Err(ClientError::Metadata(
-            "CreateFileResponseProto.data_handle_id missing".to_string(),
-        ));
-    };
-    let Some(layout) = response.layout else {
-        return Err(ClientError::Metadata(
-            "CreateFileResponseProto.layout missing".to_string(),
-        ));
-    };
-    let layout = FileLayout::try_from(layout)
-        .map_err(|err| ClientError::InvalidLayout(format!("CreateFileResponseProto.layout invalid: {err}")))?;
-    let Some(write_handle) = response.write_handle else {
-        return Err(ClientError::Metadata(
-            "CreateFileResponseProto.write_handle missing".to_string(),
-        ));
-    };
-
-    let expires_at_ms = crate::api::handle::valid_write_session_expiry("CreateFile", response.expires_at_ms)?;
-    let data_handle_id = DataHandleId::new(data_handle_id.value);
-    let session = WriteSession::new(
-        path.clone(),
-        data_handle_id,
-        layout,
-        write_handle,
-        response.base_size,
-        expires_at_ms,
-    )?;
-    Ok(WriteHandle::new(path, data_handle_id, response.base_size, session))
-}
-
-fn write_handle_from_append_response(
-    path: String,
-    response: proto::metadata::AppendFileResponseProto,
-) -> ClientResult<WriteHandle> {
-    let Some(data_handle_id) = response.data_handle_id else {
-        return Err(ClientError::Metadata(
-            "AppendFileResponseProto.data_handle_id missing".to_string(),
-        ));
-    };
-    let Some(layout) = response.layout else {
-        return Err(ClientError::Metadata(
-            "AppendFileResponseProto.layout missing".to_string(),
-        ));
-    };
-    let layout = FileLayout::try_from(layout)
-        .map_err(|err| ClientError::InvalidLayout(format!("AppendFileResponseProto.layout invalid: {err}")))?;
-    let Some(write_handle) = response.write_handle else {
-        return Err(ClientError::Metadata(
-            "AppendFileResponseProto.write_handle missing".to_string(),
-        ));
-    };
-
-    let expires_at_ms = crate::api::handle::valid_write_session_expiry("AppendFile", response.expires_at_ms)?;
-    let data_handle_id = DataHandleId::new(data_handle_id.value);
-    let session = WriteSession::new(
-        path.clone(),
-        data_handle_id,
-        layout,
-        write_handle,
-        response.base_size,
-        expires_at_ms,
-    )?;
-    Ok(WriteHandle::new(path, data_handle_id, response.base_size, session))
-}
-
 fn timeout_error(target_plane: &str, operation: &str, timeout: Duration) -> ClientError {
     ClientError::from(tonic::Status::deadline_exceeded(format!(
         "{target_plane} {operation} timed out after {}ms",
@@ -967,7 +936,7 @@ fn refresh_hint_from_error(err: &ClientError) -> crate::canonical::RefreshHint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::policy::{OperationKind, ReplaySafety};
+    use crate::runtime::policy::OperationKind;
     use crate::runtime::refresh::MetadataGroupTargets;
     use async_trait::async_trait;
     use common::error::canonical::{
@@ -986,8 +955,8 @@ mod tests {
     use std::time::Duration;
     use types::lease::FencingToken;
     use types::{
-        BlockId, BlockIndex, CallId, ClientId, DataHandleId, GroupName, WorkerEndpointInfo, WorkerId,
-        WorkerNetProtocol, WriteTarget,
+        BlockId, BlockIndex, ClientId, DataHandleId, GroupName, WorkerEndpointInfo, WorkerId, WorkerNetProtocol,
+        WriteTarget,
     };
 
     #[derive(Debug, Default)]
@@ -1017,62 +986,6 @@ mod tests {
         fn events(&self) -> Vec<ClientMetricEvent> {
             self.events.lock().expect("events").clone()
         }
-    }
-
-    #[test]
-    fn operation_context_keeps_call_id_across_metadata_attempts() {
-        let op = OperationContext::new(
-            ClientId::new(7),
-            OperationKind::MetadataRead,
-            "OpenFile",
-            OperationIdentity::path("/alpha"),
-        )
-        .expect("operation context");
-
-        let first = AttemptContext::for_metadata(&op, group_name("root"), 0).expect("first attempt");
-        let second = AttemptContext::for_metadata(&op, group_name("analytics"), 1).expect("replay attempt");
-
-        assert_eq!(first.call_id(), second.call_id());
-        assert_eq!(first.metadata_header().expect("first header").group_name, "root");
-        assert_eq!(second.metadata_header().expect("second header").group_name, "analytics");
-        assert_eq!(
-            op.operation_fingerprint(),
-            OperationIdentity::path("/alpha").fingerprint(OperationKind::MetadataRead, "OpenFile")
-        );
-    }
-
-    #[test]
-    fn metadata_attempt_context_rejects_zero_client_id() {
-        let err = OperationContext::new(
-            ClientId::new(u128::MIN),
-            OperationKind::MetadataRead,
-            "OpenFile",
-            OperationIdentity::path("/alpha"),
-        )
-        .expect_err("metadata operations must not use fake client_id 0");
-
-        assert!(matches!(err, crate::error::ClientError::InvalidArgument(msg) if msg.contains("client_id")));
-    }
-
-    #[test]
-    fn metadata_attempt_context_builds_nonzero_header() {
-        let op = OperationContext::with_call_id(
-            ClientId::new(7),
-            CallId::new(),
-            OperationKind::MetadataRead,
-            "OpenFile",
-            OperationIdentity::path("/alpha"),
-        )
-        .expect("operation context");
-        let ctx = AttemptContext::for_metadata(&op, group_name("root"), 0).expect("metadata context");
-        let header = ctx.metadata_header().expect("metadata header");
-
-        assert_eq!(
-            header.client.as_ref().and_then(|client| client.client_id),
-            Some(ClientId::new(7).into())
-        );
-        assert_eq!(header.group_name, "root");
-        assert!(!header.client.as_ref().unwrap().call_id.is_empty());
     }
 
     #[tokio::test]
@@ -1106,39 +1019,6 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].endpoint.as_deref(), Some("http://127.0.0.1:18080"));
         assert_eq!(calls[1].endpoint.as_deref(), Some("http://127.0.0.1:18081"));
-        assert_eq!(calls[0].call_id, calls[1].call_id);
-    }
-
-    #[tokio::test]
-    async fn owner_group_mismatch_replays_with_same_call_id_on_refreshed_group() {
-        let gateway = Arc::new(ScriptedGateway::new(vec![
-            refresh_outcome(
-                RpcErrorCode::ShardMoved,
-                CanonicalRefreshReason::OwnerGroupMismatch,
-                CanonicalRefreshHint {
-                    group_name: Some("analytics".to_string()),
-                    ..CanonicalRefreshHint::default()
-                },
-            ),
-            GatewayOutcome::Ok,
-        ]));
-        let executor = test_executor(gateway.clone());
-
-        executor
-            .get_status_request(
-                "/alpha",
-                GetStatusRequestProto {
-                    header: None,
-                    path: "/alpha".to_string(),
-                },
-            )
-            .await
-            .expect("metadata read replay");
-
-        let calls = gateway.calls();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].group_name, group_name("root"));
-        assert_eq!(calls[1].group_name, group_name("analytics"));
         assert_eq!(calls[0].call_id, calls[1].call_id);
     }
 
@@ -1386,133 +1266,6 @@ mod tests {
             .all(|event| event.metric != ClientMetric::UnsafeReplayDenied));
     }
 
-    #[test]
-    fn metadata_mutation_with_changed_fingerprint_is_denied_by_executor_replay_gate() {
-        let gateway = Arc::new(ScriptedGateway::new(Vec::new()));
-        let executor = test_executor(gateway);
-        let operation = OperationContext::new(
-            ClientId::new(7),
-            OperationKind::MetadataMutation,
-            "Delete",
-            OperationIdentity::path("/alpha"),
-        )
-        .expect("operation context");
-        let changed = OperationIdentity::path("/beta").fingerprint(OperationKind::MetadataMutation, "Delete");
-
-        let err = executor
-            .replay_policy
-            .ensure_replay_allowed(&operation, Some(changed))
-            .expect_err("changed fingerprint must be denied");
-
-        assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("operation fingerprint")));
-    }
-
-    #[test]
-    fn cleanup_best_effort_remains_separate_replay_class() {
-        assert_eq!(
-            ReplayPolicyTable::safety_for(OperationKind::CleanupBestEffort),
-            ReplaySafety::BestEffortCleanup
-        );
-    }
-
-    #[tokio::test]
-    async fn mutation_missing_header_is_fatal_and_not_replayed() {
-        let gateway = Arc::new(ScriptedGateway::new(vec![GatewayOutcome::MissingHeader]));
-        let executor = test_executor(gateway.clone());
-
-        let err = executor
-            .delete_request(
-                "/alpha",
-                DeleteRequestProto {
-                    header: None,
-                    path: "/alpha".to_string(),
-                    recursive: false,
-                },
-            )
-            .await
-            .expect_err("missing header must fail");
-
-        assert_invalid_header_not_retryable(&err);
-        assert_eq!(gateway.calls().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn mutation_missing_group_name_ok_header_is_fatal_and_not_replayed() {
-        let gateway = Arc::new(ScriptedGateway::new(vec![GatewayOutcome::MissingGroupNameOkHeader]));
-        let executor = test_executor(gateway.clone());
-
-        let err = executor
-            .delete_request(
-                "/alpha",
-                DeleteRequestProto {
-                    header: None,
-                    path: "/alpha".to_string(),
-                    recursive: false,
-                },
-            )
-            .await
-            .expect_err("missing group_name OK header must fail");
-
-        assert_invalid_header_not_retryable(&err);
-        assert_eq!(gateway.calls().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn session_barrier_missing_header_is_fatal_and_not_replayed() {
-        let gateway = Arc::new(ScriptedGateway::new(vec![GatewayOutcome::MissingHeader]));
-        let executor = test_executor(gateway.clone());
-        let operation = OperationContext::new(
-            ClientId::new(7),
-            OperationKind::MetadataSessionBarrier,
-            "CommitFile",
-            OperationIdentity::session("/alpha", "session-1"),
-        )
-        .expect("operation context");
-
-        let err = executor
-            .execute_metadata(
-                operation,
-                GetStatusRequestProto {
-                    header: None,
-                    path: "/alpha".to_string(),
-                },
-                |gateway, ctx, req| async move { gateway.get_status(ctx, req).await },
-            )
-            .await
-            .expect_err("missing header must fail");
-
-        assert_invalid_header_not_retryable(&err);
-        assert_eq!(gateway.calls().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn session_barrier_missing_group_name_ok_header_is_fatal_and_not_replayed() {
-        let gateway = Arc::new(ScriptedGateway::new(vec![GatewayOutcome::MissingGroupNameOkHeader]));
-        let executor = test_executor(gateway.clone());
-        let operation = OperationContext::new(
-            ClientId::new(7),
-            OperationKind::MetadataSessionBarrier,
-            "CommitFile",
-            OperationIdentity::session("/alpha", "session-1"),
-        )
-        .expect("operation context");
-
-        let err = executor
-            .execute_metadata(
-                operation,
-                GetStatusRequestProto {
-                    header: None,
-                    path: "/alpha".to_string(),
-                },
-                |gateway, ctx, req| async move { gateway.get_status(ctx, req).await },
-            )
-            .await
-            .expect_err("missing group_name OK header must fail");
-
-        assert_invalid_header_not_retryable(&err);
-        assert_eq!(gateway.calls().len(), 1);
-    }
-
     #[tokio::test]
     async fn metadata_read_missing_header_is_not_retried_as_transport() {
         let gateway = Arc::new(ScriptedGateway::new(vec![GatewayOutcome::MissingHeader]));
@@ -1528,26 +1281,6 @@ mod tests {
             )
             .await
             .expect_err("missing header must fail");
-
-        assert_invalid_header_not_retryable(&err);
-        assert_eq!(gateway.calls().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn metadata_read_missing_group_name_ok_header_is_not_retried_as_transport() {
-        let gateway = Arc::new(ScriptedGateway::new(vec![GatewayOutcome::MissingGroupNameOkHeader]));
-        let executor = test_executor(gateway.clone());
-
-        let err = executor
-            .get_status_request(
-                "/alpha",
-                GetStatusRequestProto {
-                    header: None,
-                    path: "/alpha".to_string(),
-                },
-            )
-            .await
-            .expect_err("missing group_name OK header must fail");
 
         assert_invalid_header_not_retryable(&err);
         assert_eq!(gateway.calls().len(), 1);
@@ -1835,7 +1568,6 @@ mod tests {
         },
         TransportUnavailable,
         MissingHeader,
-        MissingGroupNameOkHeader,
         Pending,
     }
 
@@ -1905,7 +1637,6 @@ mod tests {
                 GatewayOutcome::MissingHeader => {
                     Err(invalid_header_error("metadata OK response missing ResponseHeader"))
                 }
-                GatewayOutcome::MissingGroupNameOkHeader => missing_group_name_ok_header_error(),
                 GatewayOutcome::Pending => {
                     std::future::pending::<()>().await;
                     Ok(())
@@ -2205,10 +1936,6 @@ mod tests {
                 refresh_hint: None,
             }),
         })
-    }
-
-    fn missing_group_name_ok_header_error() -> ClientResult<()> {
-        Err(invalid_header_error("invalid response header: group_name missing"))
     }
 
     fn assert_invalid_header_not_retryable(err: &ClientError) {

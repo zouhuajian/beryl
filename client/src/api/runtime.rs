@@ -9,12 +9,11 @@ use std::time::Duration;
 
 use crate::canonical::{ClientAction, RefreshHint};
 use crate::config::ClientConfig;
-use crate::data::WorkerDataPlane;
+use crate::data::{WorkerBlockSyncResult, WorkerCommitResult, WorkerDataPlane};
 use crate::error::side_effect_response_body_mismatch;
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::MetadataGateway;
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
-use crate::protocol::validate::{validate_worker_block_sync_result, validate_worker_commit_result};
 use crate::runtime::MetadataTargets;
 use crate::runtime::OperationExecutor;
 use crate::runtime::{
@@ -454,6 +453,51 @@ fn committed_block_from_pending(pending: &PendingBlock) -> types::CommittedBlock
         len: pending.written_len(),
         checksum: None,
     }
+}
+
+fn validate_worker_commit_result(pending: &PendingBlock, result: WorkerCommitResult) -> ClientResult<()> {
+    let expected_len = pending.written_len();
+    if result.effective_len != expected_len {
+        return Err(side_effect_response_body_mismatch(
+            "CommitWrite",
+            format!("effective_len expected {}, got {}", expected_len, result.effective_len),
+        ));
+    }
+    if result.written_through != expected_len {
+        return Err(side_effect_response_body_mismatch(
+            "CommitWrite",
+            format!(
+                "written_through expected {}, got {}",
+                expected_len, result.written_through
+            ),
+        ));
+    }
+    let expected_stamp = pending.target().block_stamp;
+    if result.block_stamp != expected_stamp {
+        return Err(side_effect_response_body_mismatch(
+            "CommitWrite",
+            format!("block_stamp expected {}, got {}", expected_stamp, result.block_stamp),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_worker_block_sync_result(pending: &PendingBlock, result: WorkerBlockSyncResult) -> ClientResult<()> {
+    let expected_len = pending.written_len();
+    if result.effective_len != expected_len {
+        return Err(side_effect_response_body_mismatch(
+            "SyncCommittedBlock",
+            format!("effective_len expected {}, got {}", expected_len, result.effective_len),
+        ));
+    }
+    let expected_stamp = pending.target().block_stamp;
+    if result.block_stamp != expected_stamp {
+        return Err(side_effect_response_body_mismatch(
+            "SyncCommittedBlock",
+            format!("block_stamp expected {}, got {}", expected_stamp, result.block_stamp),
+        ));
+    }
+    Ok(())
 }
 
 /// Marks a write session after a worker write or add-block failure.

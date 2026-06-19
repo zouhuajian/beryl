@@ -18,8 +18,7 @@ use super::runtime::{
 };
 use crate::error::{invalid_response, ClientError, ClientResult};
 use crate::metrics::ClientMetric;
-use crate::planner::read_planner::ReadPlanner;
-use crate::protocol::validate::{validate_commit_file_size, validate_sync_write_size};
+use crate::planner;
 use crate::runtime::{ErrorClass, ErrorClassifier, OperationContext, OperationIdentity, OperationKind, RefreshReason};
 use crate::session::write_session::{WorkerCommitLevel, WriteSession};
 
@@ -48,7 +47,7 @@ impl FileReader {
 
     /// Reads a range from the opened file snapshot.
     pub async fn read_at(&self, offset: u64, len: u32) -> ClientResult<Bytes> {
-        let Some(requested_range) = ReadPlanner::requested_range(offset, len, self.inner.size_hint())? else {
+        let Some(requested_range) = planner::requested_range(offset, len, self.inner.size_hint())? else {
             return Ok(Bytes::new());
         };
         let file_version = self.inner.file_version();
@@ -76,12 +75,8 @@ impl FileReader {
                     requested_range.len,
                 )
                 .await?;
-            let (group_name, block_reads) = ReadPlanner::plan_block_reads_from_layout(
-                data_handle_id,
-                Some(file_version),
-                requested_range,
-                &layout,
-            )?;
+            let (group_name, block_reads) =
+                planner::plan_block_reads_from_layout(data_handle_id, Some(file_version), requested_range, &layout)?;
             let ctx = self.runtime.data_context(&operation, attempt);
             match self
                 .runtime
@@ -511,6 +506,32 @@ fn sync_write_required_commit_level(mode: WriteSyncModeProto) -> ClientResult<Wo
             "SyncWrite mode must be visibility or durability".to_string(),
         )),
     }
+}
+
+fn validate_commit_file_size(committed_size: u64, final_size: u64) -> ClientResult<()> {
+    if committed_size < final_size {
+        return Err(invalid_response(
+            "CommitFile",
+            format!(
+                "committed_size {} is smaller than final_size {}",
+                committed_size, final_size
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sync_write_size(synced_size: u64, target_size: u64) -> ClientResult<()> {
+    if synced_size < target_size {
+        return Err(invalid_response(
+            "SyncWrite",
+            format!(
+                "synced_size {} is smaller than target_size {}",
+                synced_size, target_size
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone)]

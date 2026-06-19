@@ -8,6 +8,8 @@
 
 mod channel_pool;
 mod protocol;
+#[cfg(test)]
+mod tests;
 mod worker;
 
 use async_trait::async_trait;
@@ -16,7 +18,7 @@ use proto::worker::WriteStreamResponseProto;
 use types::{GroupName, WorkerEndpointInfo, WriteTarget};
 
 use crate::error::ClientResult;
-use crate::planner::read_planner::PlannedBlockRead;
+use crate::planner::PlannedBlockRead;
 use crate::runtime::AttemptContext;
 
 /// Internal worker data client boundary.

@@ -12,7 +12,7 @@ use crate::api::runtime::ClientRuntime;
 use crate::config::ClientConfig;
 use crate::data::WorkerDataPlane;
 use crate::error::ClientResult;
-use crate::metadata::{MetadataGateway, TonicMetadataGateway};
+use crate::metadata::{GrpcMetadataGateway, MetadataGateway};
 use crate::metrics::{ClientMetrics, NoopClientMetrics};
 use crate::runtime::{BackoffSleeper, MetadataTargets, OperationKind, TokioBackoffSleeper};
 
@@ -38,7 +38,7 @@ impl FsClient {
     pub fn try_new(config: ClientConfig) -> ClientResult<Self> {
         let metrics: Arc<dyn ClientMetrics> = Arc::new(NoopClientMetrics);
         let metadata_targets = MetadataTargets::from_config(&config)?;
-        let gateway = Arc::new(TonicMetadataGateway::new_lazy_with_config(
+        let gateway = Arc::new(GrpcMetadataGateway::new_lazy_with_config(
             &config,
             Arc::clone(&metrics),
         )?);

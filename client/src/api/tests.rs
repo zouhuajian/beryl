@@ -14,7 +14,7 @@ use crate::data::{
 };
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::{AddBlockResult, MetadataGateway, ReadLayout};
-use crate::planner::read_planner::PlannedBlockRead;
+use crate::planner::PlannedBlockRead;
 use crate::runtime::{AttemptContext, ErrorClass, ErrorClassifier, MetadataTargets};
 use crate::session::write_session::WriteSession;
 use async_trait::async_trait;

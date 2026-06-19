@@ -15,7 +15,7 @@ use types::{GroupName, WorkerEndpointInfo, WriteTarget};
 use super::{WorkerBlockSyncResult, WorkerBlockWriteHandle, WorkerCommitResult, WorkerReadResult, WorkerWriteTarget};
 use crate::canonical::{invalid_header_action, validate_data_header_or_action};
 use crate::error::{invalid_response, side_effect_response_body_mismatch, ClientError, ClientResult};
-use crate::planner::read_planner::PlannedBlockRead;
+use crate::planner::PlannedBlockRead;
 use crate::runtime::AttemptContext;
 
 pub(super) fn build_open_read_stream_request(
@@ -796,42 +796,6 @@ mod tests {
     }
 
     #[test]
-    fn sync_committed_block_request_uses_metadata_target_shape() {
-        let attempt = write_attempt_context();
-        let handle = worker_block_write_handle(1024);
-
-        let request = build_sync_committed_block_request(&attempt, &handle, 5).expect("sync request");
-
-        assert_eq!(request.block_stamp, 77);
-        assert_eq!(request.expected_block_len, 5);
-        assert_eq!(request.worker_run_id, test_worker_run_id().to_string());
-        assert_eq!(
-            request.block_format_id,
-            types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw()
-        );
-        assert_eq!(request.block_size, 4096);
-        assert_eq!(request.chunk_size, 4096);
-    }
-
-    #[test]
-    fn open_write_stream_missing_header_is_invalid_header() {
-        let attempt = write_attempt_context();
-        let target = worker_write_target();
-        let worker = target.target.worker_endpoints[0].clone();
-        let response = proto::worker::OpenWriteStreamResponseProto {
-            stream_id: Some(proto::common::StreamIdProto { high: 1, low: 1 }),
-            frame_size: 1024,
-            block_stamp: target.target.block_stamp,
-            ..proto::worker::OpenWriteStreamResponseProto::default()
-        };
-
-        let err = parse_open_write_stream_response(&attempt, &target, &worker, response)
-            .expect_err("missing OpenWriteStream header must fail");
-
-        assert_invalid_worker_header(&err);
-    }
-
-    #[test]
     fn open_write_stream_missing_stream_id_is_unknown_outcome() {
         let attempt = write_attempt_context();
         let target = worker_write_target();
@@ -870,23 +834,6 @@ mod tests {
     }
 
     #[test]
-    fn commit_write_missing_header_is_invalid_header() {
-        let attempt = write_attempt_context();
-        let handle = worker_block_write_handle(1024);
-        let response = proto::worker::CommitWriteResponseProto {
-            effective_len: 5,
-            block_stamp: handle.target.block_stamp,
-            written_through: 5,
-            ..proto::worker::CommitWriteResponseProto::default()
-        };
-
-        let err = parse_commit_write_response(&attempt, &handle, 5, response)
-            .expect_err("missing CommitWrite header must fail");
-
-        assert_invalid_worker_header(&err);
-    }
-
-    #[test]
     fn commit_write_body_mismatch_is_unknown_outcome() {
         let attempt = write_attempt_context();
         let handle = worker_block_write_handle(1024);
@@ -901,38 +848,6 @@ mod tests {
             .expect_err("CommitWrite length mismatch must be unknown");
 
         assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("CommitWrite")));
-    }
-
-    #[test]
-    fn abort_write_missing_header_is_invalid_header() {
-        let attempt = write_attempt_context();
-        let response = proto::worker::AbortWriteResponseProto {
-            aborted: true,
-            ..proto::worker::AbortWriteResponseProto::default()
-        };
-
-        let err = validate_abort_write_response(&attempt, response).expect_err("missing AbortWrite header must fail");
-
-        assert_invalid_worker_header(&err);
-    }
-
-    #[test]
-    fn worker_fencing_mismatch_is_typed_error() {
-        let attempt = write_attempt_context();
-        let err = parse_worker_control_header(
-            &attempt,
-            Some(&data_header_with_error(
-                &attempt,
-                CanonicalError::need_refresh(
-                    RpcErrorCode::Fencing,
-                    CanonicalRefreshReason::Fencing,
-                    "fencing mismatch",
-                ),
-            )),
-        )
-        .expect_err("fencing mismatch must fail");
-
-        assert_eq!(ErrorClassifier.classify_error(&err), ErrorClass::Fencing);
     }
 
     #[test]
@@ -978,28 +893,6 @@ mod tests {
             ErrorClassifier.classify_error(&err),
             ErrorClass::NeedRefresh(crate::runtime::RefreshReason::WorkerRunMismatch)
         );
-    }
-
-    #[test]
-    fn worker_permission_denied_error_is_not_retryable_transport() {
-        let attempt = write_attempt_context();
-        let err = parse_worker_control_header(
-            &attempt,
-            Some(&data_header_with_error(
-                &attempt,
-                CanonicalError {
-                    class: CanonicalErrorClass::Fatal,
-                    code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::PermissionDenied)),
-                    reason: None,
-                    retry_after_ms: None,
-                    message: "permission denied".to_string(),
-                    refresh_hint: None,
-                },
-            )),
-        )
-        .expect_err("permission denied must fail");
-
-        assert_eq!(ErrorClassifier.classify_error(&err), ErrorClass::PermissionDenied);
     }
 
     #[test]

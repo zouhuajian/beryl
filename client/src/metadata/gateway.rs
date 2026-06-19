@@ -123,14 +123,14 @@ pub(crate) trait MetadataGateway: Send + Sync {
 
 /// Tonic-backed metadata gateway.
 #[derive(Clone, Debug)]
-pub(crate) struct TonicMetadataGateway {
+pub(crate) struct GrpcMetadataGateway {
     channels: Arc<parking_lot::RwLock<HashMap<MetadataChannelKey, tonic_net::Channel>>>,
     channel_pool_enabled: bool,
     max_channels_per_group: usize,
     metrics: Arc<dyn ClientMetrics>,
 }
 
-impl TonicMetadataGateway {
+impl GrpcMetadataGateway {
     /// Create a lazily connecting metadata gateway from client config.
     pub(crate) fn new_lazy_with_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> ClientResult<Self> {
         Self::new_lazy_with_pool_options(
@@ -269,7 +269,7 @@ fn evict_metadata_channel_if_needed(
 }
 
 #[async_trait]
-impl MetadataGateway for TonicMetadataGateway {
+impl MetadataGateway for GrpcMetadataGateway {
     async fn get_status(
         &self,
         ctx: AttemptContext,
@@ -647,7 +647,7 @@ mod tests {
     #[tokio::test]
     async fn metadata_channel_pool_reuses_channel_for_same_group_endpoint() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let gateway = TonicMetadataGateway::new_lazy_with_pool(true, 1, metrics.clone()).expect("gateway");
+        let gateway = GrpcMetadataGateway::new_lazy_with_pool(true, 1, metrics.clone()).expect("gateway");
         let ctx = metadata_attempt("root", Some("127.0.0.1:18080"));
 
         let _first = gateway.client(&ctx, "read").await.expect("first client");
@@ -662,7 +662,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_metadata_channel_requests_same_key_reuse_inserted_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let gateway = Arc::new(TonicMetadataGateway::new_lazy_with_pool(true, 8, metrics.clone()).expect("gateway"));
+        let gateway = Arc::new(GrpcMetadataGateway::new_lazy_with_pool(true, 8, metrics.clone()).expect("gateway"));
         let ctx = metadata_attempt("root", Some("127.0.0.1:18080"));
 
         let mut tasks = Vec::with_capacity(8);
@@ -683,7 +683,7 @@ mod tests {
     #[tokio::test]
     async fn failed_metadata_channel_creation_does_not_insert() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let gateway = Arc::new(TonicMetadataGateway::new_lazy_with_pool(true, 8, metrics.clone()).expect("gateway"));
+        let gateway = Arc::new(GrpcMetadataGateway::new_lazy_with_pool(true, 8, metrics.clone()).expect("gateway"));
         let ctx = metadata_attempt("root", Some("http://[invalid"));
 
         let mut tasks = Vec::with_capacity(4);
@@ -704,7 +704,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_metadata_channel_pool_does_not_reuse_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let gateway = TonicMetadataGateway::new_lazy_with_pool(false, 1, metrics.clone()).expect("gateway");
+        let gateway = GrpcMetadataGateway::new_lazy_with_pool(false, 1, metrics.clone()).expect("gateway");
         let ctx = metadata_attempt("root", Some("127.0.0.1:18080"));
 
         let _first = gateway.client(&ctx, "read").await.expect("first client");
@@ -726,7 +726,7 @@ mod tests {
     #[tokio::test]
     async fn metadata_channel_pool_connection_error_is_reported() {
         let metrics = Arc::new(RecordingMetrics::default());
-        let gateway = TonicMetadataGateway::new_lazy_with_pool(true, 1, metrics.clone()).expect("gateway");
+        let gateway = GrpcMetadataGateway::new_lazy_with_pool(true, 1, metrics.clone()).expect("gateway");
         let ctx = metadata_attempt("root", Some("http://[invalid"));
 
         let err = gateway.client(&ctx, "read").await.expect_err("invalid endpoint fails");
