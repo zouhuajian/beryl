@@ -48,7 +48,7 @@ A new `BlockFormat` is not needed for:
 
 If a future "package block" or "packed small file block" design means multiple logical blocks share a physical pack file and require a pack index, it is a future `BlockFormat`, not merely an `IoEngine`.
 
-Production reads remain `FileLayout` and file-extent authoritative. `GetBlockLocations` and `OpenFile(include_locations=true)` resolve candidates from in-memory reported block locations, filter them through live group-scoped worker registration and heartbeat state, and order eligible replicas with `PlacementPlanner(Read)`. Reported locations are soft state: they do not mutate `FileLayout`, and an existing block range may be returned with an empty worker list when no live reported replica is eligible.
+Production reads remain `FileLayout` and file-extent authoritative. `GetBlockLocations` resolves candidates from in-memory reported block locations, filters them through live group-scoped worker registration and heartbeat state, and orders eligible replicas with `PlacementPlanner(Read)`. Reported locations are soft state: they do not mutate `FileLayout`, and an existing block range may be returned with an empty worker list when no live reported replica is eligible.
 
 The regular data path is metadata issued: client create/open/append/add-block/read-location/delete decisions go through metadata before the client contacts workers. Client cache-only, metadata-less worker access is not part of the current contract. Metadata delete removes logical namespace and layout visibility; physical worker block cleanup is deferred to explicit worker-command and cleanup flows.
 

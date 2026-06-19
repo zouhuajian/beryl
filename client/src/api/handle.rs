@@ -10,7 +10,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use proto::metadata::WriteSyncModeProto;
 use tokio::sync::Mutex;
-use types::{DataHandleId, InodeId};
+use types::DataHandleId;
 
 use super::runtime::{
     is_unknown_session_barrier_outcome, mark_session_after_metadata_error, metric_labels, refresh_hint_from_error,
@@ -52,7 +52,6 @@ impl FileReader {
             return Ok(Bytes::new());
         };
         let file_version = self.inner.file_version();
-        let inode_id = self.inner.inode_id();
         let data_handle_id = self.inner.data_handle_id();
         let operation = OperationContext::new_named(
             self.runtime.executor.client_id(),
@@ -78,7 +77,6 @@ impl FileReader {
                 )
                 .await?;
             let (group_name, block_reads) = ReadPlanner::plan_block_reads_from_layout(
-                inode_id,
                 data_handle_id,
                 Some(file_version),
                 requested_range,
@@ -518,7 +516,6 @@ fn sync_write_required_commit_level(mode: WriteSyncModeProto) -> ClientResult<Wo
 #[derive(Clone)]
 pub(crate) struct ReadHandle {
     path: String,
-    inode_id: InodeId,
     data_handle_id: DataHandleId,
     file_version: u64,
     file_size: u64,
@@ -533,24 +530,13 @@ impl ReadHandle {
         self.file_size
     }
 
-    pub(crate) fn new(
-        path: String,
-        inode_id: InodeId,
-        data_handle_id: DataHandleId,
-        file_version: u64,
-        file_size: u64,
-    ) -> Self {
+    pub(crate) fn new(path: String, data_handle_id: DataHandleId, file_version: u64, file_size: u64) -> Self {
         Self {
             path,
-            inode_id,
             data_handle_id,
             file_version,
             file_size,
         }
-    }
-
-    pub(crate) fn inode_id(&self) -> InodeId {
-        self.inode_id
     }
 
     pub(crate) fn data_handle_id(&self) -> DataHandleId {
@@ -573,23 +559,15 @@ impl fmt::Debug for ReadHandle {
 
 pub(crate) struct WriteHandle {
     path: String,
-    _inode_id: InodeId,
     data_handle_id: DataHandleId,
     write_session: Arc<Mutex<WriteSession>>,
     write_cursor: Arc<AtomicU64>,
 }
 
 impl WriteHandle {
-    pub(crate) fn new(
-        path: String,
-        inode_id: InodeId,
-        data_handle_id: DataHandleId,
-        base_size: u64,
-        session: WriteSession,
-    ) -> Self {
+    pub(crate) fn new(path: String, data_handle_id: DataHandleId, base_size: u64, session: WriteSession) -> Self {
         Self {
             path,
-            _inode_id: inode_id,
             data_handle_id,
             write_session: Arc::new(Mutex::new(session)),
             write_cursor: Arc::new(AtomicU64::new(base_size)),

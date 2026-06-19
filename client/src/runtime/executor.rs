@@ -24,7 +24,7 @@ use crate::runtime::refresh::MetadataTargets;
 use crate::runtime::ClientIdentity;
 use crate::runtime::{BackoffPolicy, BackoffSleeper};
 use crate::session::write_session::{CommitFilePlan, WriteSession};
-use types::{CommittedBlock, DataHandleId, FileLayout, InodeId};
+use types::{CommittedBlock, DataHandleId, FileLayout};
 
 /// Executes public operations through policy, classification, refresh, and replay gates.
 #[derive(Clone)]
@@ -147,8 +147,6 @@ impl OperationExecutor {
                 proto::metadata::OpenFileRequestProto {
                     header: None,
                     path: path_text.clone(),
-                    range: None,
-                    include_locations: false,
                 },
             )
             .await?;
@@ -811,10 +809,7 @@ fn file_status_from_response(
     let attrs = response
         .attrs
         .ok_or_else(|| ClientError::Metadata("GetStatusResponseProto.attrs missing".to_string()))?;
-    let inode_id = response
-        .inode_id
-        .ok_or_else(|| ClientError::Metadata("GetStatusResponseProto.inode_id missing".to_string()))?;
-    Ok(FileStatus::new(path, InodeId::new(inode_id.value), attrs.into()))
+    Ok(FileStatus::new(path, attrs.into()))
 }
 
 fn directory_listing_from_response(
@@ -843,11 +838,6 @@ fn read_handle_from_open_response(
     path: String,
     response: proto::metadata::OpenFileResponseProto,
 ) -> ClientResult<ReadHandle> {
-    let Some(inode_id) = response.inode_id else {
-        return Err(ClientError::Metadata(
-            "OpenFileResponseProto.inode_id missing".to_string(),
-        ));
-    };
     let Some(data_handle_id) = response.data_handle_id else {
         return Err(ClientError::Metadata(
             "OpenFileResponseProto.data_handle_id missing".to_string(),
@@ -861,7 +851,6 @@ fn read_handle_from_open_response(
 
     Ok(ReadHandle::new(
         path,
-        InodeId::new(inode_id.value),
         DataHandleId::new(data_handle_id.value),
         file_version,
         response.file_size,
@@ -872,11 +861,6 @@ fn write_handle_from_create_response(
     path: String,
     response: proto::metadata::CreateFileResponseProto,
 ) -> ClientResult<WriteHandle> {
-    let Some(inode_id) = response.inode_id else {
-        return Err(ClientError::Metadata(
-            "CreateFileResponseProto.inode_id missing".to_string(),
-        ));
-    };
     let Some(data_handle_id) = response.data_handle_id else {
         return Err(ClientError::Metadata(
             "CreateFileResponseProto.data_handle_id missing".to_string(),
@@ -896,35 +880,22 @@ fn write_handle_from_create_response(
     };
 
     let expires_at_ms = crate::api::handle::valid_write_session_expiry("CreateFile", response.expires_at_ms)?;
-    let inode_id = InodeId::new(inode_id.value);
     let data_handle_id = DataHandleId::new(data_handle_id.value);
     let session = WriteSession::new(
         path.clone(),
-        inode_id,
         data_handle_id,
         layout,
         write_handle,
         response.base_size,
         expires_at_ms,
     )?;
-    Ok(WriteHandle::new(
-        path,
-        inode_id,
-        data_handle_id,
-        response.base_size,
-        session,
-    ))
+    Ok(WriteHandle::new(path, data_handle_id, response.base_size, session))
 }
 
 fn write_handle_from_append_response(
     path: String,
     response: proto::metadata::AppendFileResponseProto,
 ) -> ClientResult<WriteHandle> {
-    let Some(inode_id) = response.inode_id else {
-        return Err(ClientError::Metadata(
-            "AppendFileResponseProto.inode_id missing".to_string(),
-        ));
-    };
     let Some(data_handle_id) = response.data_handle_id else {
         return Err(ClientError::Metadata(
             "AppendFileResponseProto.data_handle_id missing".to_string(),
@@ -944,24 +915,16 @@ fn write_handle_from_append_response(
     };
 
     let expires_at_ms = crate::api::handle::valid_write_session_expiry("AppendFile", response.expires_at_ms)?;
-    let inode_id = InodeId::new(inode_id.value);
     let data_handle_id = DataHandleId::new(data_handle_id.value);
     let session = WriteSession::new(
         path.clone(),
-        inode_id,
         data_handle_id,
         layout,
         write_handle,
         response.base_size,
         expires_at_ms,
     )?;
-    Ok(WriteHandle::new(
-        path,
-        inode_id,
-        data_handle_id,
-        response.base_size,
-        session,
-    ))
+    Ok(WriteHandle::new(path, data_handle_id, response.base_size, session))
 }
 
 fn timeout_error(target_plane: &str, operation: &str, timeout: Duration) -> ClientError {
@@ -1023,7 +986,7 @@ mod tests {
     use std::time::Duration;
     use types::lease::FencingToken;
     use types::{
-        BlockId, BlockIndex, CallId, ClientId, DataHandleId, GroupName, InodeId, WorkerEndpointInfo, WorkerId,
+        BlockId, BlockIndex, CallId, ClientId, DataHandleId, GroupName, WorkerEndpointInfo, WorkerId,
         WorkerNetProtocol, WriteTarget,
     };
 
@@ -1954,7 +1917,6 @@ mod tests {
     fn read_layout_response(group_name: GroupName) -> ReadLayout {
         ReadLayout {
             group_name,
-            inode_id: InodeId::new(101),
             data_handle_id: DataHandleId::new(202),
             file_size: 0,
             file_version: Some(1),

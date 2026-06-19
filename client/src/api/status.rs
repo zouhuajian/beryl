@@ -3,23 +3,20 @@
 
 //! Public namespace status snapshots.
 
-use types::{FileAttrs, InodeId, InodeKind};
+use types::{FileAttrs, InodeKind};
 
 /// Public file or directory status returned by [`crate::FsClient::stat`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileStatus {
     path: String,
-    /// Stable metadata inode identity for the namespace entry.
-    pub inode_id: InodeId,
     /// User-visible attributes for the namespace entry.
     pub attrs: FileAttrs,
 }
 
 impl FileStatus {
-    pub(crate) fn new(path: impl Into<String>, inode_id: InodeId, attrs: FileAttrs) -> Self {
+    pub(crate) fn new(path: impl Into<String>, attrs: FileAttrs) -> Self {
         Self {
             path: path.into(),
-            inode_id,
             attrs,
         }
     }

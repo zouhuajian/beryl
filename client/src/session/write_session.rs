@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
 use proto::metadata::WriteHandleProto;
-use types::{CallId, ClientId, CommittedBlock, DataHandleId, FileLayout, InodeId, WriteTarget};
+use types::{CallId, ClientId, CommittedBlock, DataHandleId, FileLayout, WriteTarget};
 
 use crate::data::WorkerBlockWriteHandle;
 use crate::error::{ClientError, ClientResult};
@@ -21,7 +21,6 @@ const LEASE_EXPIRY_SAFETY_WINDOW_MS: u64 = 1_000;
 #[derive(Clone, Debug)]
 pub(crate) struct WriteSession {
     path: String,
-    inode_id: InodeId,
     data_handle_id: DataHandleId,
     layout: FileLayout,
     file_version: Option<u64>,
@@ -41,7 +40,6 @@ impl WriteSession {
     /// Create a new client-side write session from metadata open-write state.
     pub(crate) fn new(
         path: String,
-        inode_id: InodeId,
         data_handle_id: DataHandleId,
         layout: FileLayout,
         write_handle: WriteHandleProto,
@@ -59,7 +57,6 @@ impl WriteSession {
             .map_err(|err| ClientError::InvalidLayout(format!("write session layout invalid: {err}")))?;
         Ok(Self {
             path,
-            inode_id,
             data_handle_id,
             layout,
             file_version: None,
@@ -143,9 +140,8 @@ impl WriteSession {
     /// Stable identity used by replay gates for session-scoped operations.
     pub(crate) fn session_identity(&self) -> String {
         format!(
-            "handle={} inode={} data_handle={} base_size={} lease_epoch={} open_epoch={} fencing={}",
+            "handle={} data_handle={} base_size={} lease_epoch={} open_epoch={} fencing={}",
             self.write_handle.handle_id,
-            self.inode_id.as_raw(),
             self.data_handle_id.as_raw(),
             self.base_size,
             self.write_handle.lease_epoch,
@@ -256,13 +252,8 @@ impl WriteSession {
         match self.state {
             WriteSessionState::Open => {
                 let session_identity = self.session_identity();
-                let detail = commit_fingerprint_detail(
-                    &self.write_handle,
-                    self.inode_id,
-                    self.data_handle_id,
-                    final_size,
-                    &committed_blocks,
-                );
+                let detail =
+                    commit_fingerprint_detail(&self.write_handle, self.data_handle_id, final_size, &committed_blocks);
                 let identity =
                     OperationIdentity::session(self.path.clone(), session_identity.clone()).with_detail(detail.clone());
                 let commit_fingerprint = identity.fingerprint(OperationKind::MetadataSessionBarrier, "CommitFile");
@@ -288,13 +279,8 @@ impl WriteSession {
                     ));
                 }
                 let session_identity = self.session_identity();
-                let detail = commit_fingerprint_detail(
-                    &self.write_handle,
-                    self.inode_id,
-                    self.data_handle_id,
-                    final_size,
-                    &committed_blocks,
-                );
+                let detail =
+                    commit_fingerprint_detail(&self.write_handle, self.data_handle_id, final_size, &committed_blocks);
                 if commit.session_identity != session_identity || commit.detail != detail {
                     return Err(ClientError::InvalidArgument(
                         "CommitFile replay identity changed after commit started".to_string(),
@@ -388,12 +374,7 @@ impl WriteSession {
                         }
                     })
                     .collect::<Vec<_>>();
-                let detail = abort_file_fingerprint_detail(
-                    &self.write_handle,
-                    self.inode_id,
-                    self.data_handle_id,
-                    &worker_cleanups,
-                );
+                let detail = abort_file_fingerprint_detail(&self.write_handle, self.data_handle_id, &worker_cleanups);
                 let metadata_identity =
                     OperationIdentity::session(self.path.clone(), session_identity.clone()).with_detail(detail.clone());
                 let metadata_fingerprint =
@@ -903,7 +884,6 @@ fn validate_write_handle(handle: &WriteHandleProto) -> ClientResult<()> {
 
 fn commit_fingerprint_detail(
     write_handle: &WriteHandleProto,
-    inode_id: InodeId,
     data_handle_id: DataHandleId,
     final_size: u64,
     committed_blocks: &[CommittedBlock],
@@ -911,8 +891,7 @@ fn commit_fingerprint_detail(
     let mut detail = String::new();
     let _ = write!(
         &mut detail,
-        "inode={} write_handle={} data_handle={} lease={} lease_epoch={} open_epoch={} final_size={} fencing={}",
-        inode_id.as_raw(),
+        "write_handle={} data_handle={} lease={} lease_epoch={} open_epoch={} final_size={} fencing={}",
         write_handle.handle_id,
         data_handle_id.as_raw(),
         lease_identity(write_handle),
@@ -938,15 +917,13 @@ fn commit_fingerprint_detail(
 
 fn abort_file_fingerprint_detail(
     write_handle: &WriteHandleProto,
-    inode_id: InodeId,
     data_handle_id: DataHandleId,
     worker_cleanups: &[AbortWorkerCleanupState],
 ) -> String {
     let mut detail = String::new();
     let _ = write!(
         &mut detail,
-        "inode={} write_handle={} data_handle={} lease={} lease_epoch={} open_epoch={} fencing={}",
-        inode_id.as_raw(),
+        "write_handle={} data_handle={} lease={} lease_epoch={} open_epoch={} fencing={}",
         write_handle.handle_id,
         data_handle_id.as_raw(),
         lease_identity(write_handle),
@@ -1080,7 +1057,6 @@ mod tests {
     fn prepare_commit_file_reuses_call_id_fingerprint_and_frozen_payload() {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
-            InodeId::new(301),
             DataHandleId::new(302),
             test_layout(),
             write_handle_proto(1, 302),
@@ -1113,7 +1089,6 @@ mod tests {
     fn prepare_commit_file_rejects_changed_payload_after_commit_started() {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
-            InodeId::new(301),
             DataHandleId::new(302),
             test_layout(),
             write_handle_proto(1, 302),
@@ -1136,7 +1111,6 @@ mod tests {
     fn prepare_commit_file_rejects_session_identity_change_after_unknown_without_replacing_call_id() {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
-            InodeId::new(301),
             DataHandleId::new(302),
             test_layout(),
             write_handle_proto(1, 302),
@@ -1177,7 +1151,6 @@ mod tests {
     fn prepare_abort_cleanup_reuses_call_id_fingerprint_and_frozen_payload() {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
-            InodeId::new(301),
             DataHandleId::new(302),
             test_layout(),
             write_handle_proto(1, 302),
@@ -1229,7 +1202,6 @@ mod tests {
     fn prepare_abort_cleanup_rejects_session_identity_drift_after_unknown_without_replacing_call_id() {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
-            InodeId::new(301),
             DataHandleId::new(302),
             test_layout(),
             write_handle_proto(1, 302),
@@ -1268,7 +1240,6 @@ mod tests {
     fn prepare_abort_cleanup_after_worker_committed_block_is_conservative() {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
-            InodeId::new(301),
             DataHandleId::new(302),
             test_layout(),
             write_handle_proto(1, 302),
@@ -1300,7 +1271,6 @@ mod tests {
     fn lease_expiry_guard_marks_session_expired_and_blocks_side_effects() {
         let mut session = WriteSession::new(
             "/alpha".to_string(),
-            InodeId::new(301),
             DataHandleId::new(302),
             test_layout(),
             write_handle_proto(1, 302),
@@ -1388,7 +1358,6 @@ mod tests {
         for (state, operation, allowed) in cases {
             let mut session = WriteSession::new(
                 "/alpha".to_string(),
-                InodeId::new(301),
                 DataHandleId::new(302),
                 test_layout(),
                 write_handle_proto(1, 302),
@@ -1414,13 +1383,7 @@ mod tests {
         final_size: u64,
         committed_blocks: &[CommittedBlock],
     ) -> OperationFingerprint {
-        let detail = commit_fingerprint_detail(
-            write_handle,
-            InodeId::new(301),
-            DataHandleId::new(302),
-            final_size,
-            committed_blocks,
-        );
+        let detail = commit_fingerprint_detail(write_handle, DataHandleId::new(302), final_size, committed_blocks);
         OperationIdentity::session("/alpha", "session-1")
             .with_detail(detail)
             .fingerprint(OperationKind::MetadataSessionBarrier, "CommitFile")

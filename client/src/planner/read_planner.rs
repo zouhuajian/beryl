@@ -5,7 +5,7 @@
 
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::ReadLayout;
-use types::{BlockId, DataHandleId, FileBlockLocation, GroupName, InodeId, WorkerEndpointInfo};
+use types::{BlockId, DataHandleId, FileBlockLocation, GroupName, WorkerEndpointInfo};
 
 /// Splits a requested file byte range into block-local worker reads.
 #[derive(Clone, Debug, Default)]
@@ -185,22 +185,12 @@ impl ReadPlanner {
     }
 
     pub(crate) fn plan_block_reads_from_layout(
-        expected_inode_id: InodeId,
         expected_data_handle_id: DataHandleId,
         expected_file_version: Option<u64>,
         requested_range: RequestedReadRange,
         response: &ReadLayout,
     ) -> ClientResult<(GroupName, Vec<PlannedBlockRead>)> {
         let group_name = response.group_name.clone();
-        let inode_id = response.inode_id;
-        if inode_id != expected_inode_id {
-            return Err(ClientError::StaleHandle {
-                reason: format!(
-                    "layout inode_id {} does not match handle {}",
-                    inode_id.0, expected_inode_id.0
-                ),
-            });
-        }
         let data_handle_id = response.data_handle_id;
         if data_handle_id != expected_data_handle_id {
             return Err(ClientError::StaleHandle {

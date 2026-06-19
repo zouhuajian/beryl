@@ -31,7 +31,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use types::lease::FencingToken;
 use types::{
-    BlockId, BlockIndex, ClientId, DataHandleId, FileBlockLocation, GroupName, InodeId, WorkerEndpointInfo, WorkerId,
+    BlockId, BlockIndex, ClientId, DataHandleId, FileBlockLocation, GroupName, WorkerEndpointInfo, WorkerId,
     WorkerNetProtocol, WriteTarget,
 };
 
@@ -73,7 +73,7 @@ async fn file_reader_debug_redacts_identity_names() {
     let client = FsClient::try_new(config).expect("client");
     let read = FileReader::new(
         Arc::clone(&client.runtime),
-        ReadHandle::new("/alpha".to_string(), InodeId::new(101), DataHandleId::new(202), 3, 10),
+        ReadHandle::new("/alpha".to_string(), DataHandleId::new(202), 3, 10),
     );
     let debug = format!("{read:?}");
 
@@ -262,7 +262,6 @@ async fn stat_list_delete_and_rename_use_metadata_gateway() {
     client.rename("/alpha", "/beta").await.expect("rename");
 
     assert_eq!(status.path(), "/alpha");
-    assert_eq!(status.inode_id, InodeId::new(101));
     assert_eq!(status.attrs.size, 10);
     assert_eq!(listing.path(), "/alpha");
     assert!(listing.eof);
@@ -321,7 +320,6 @@ async fn reader_empty_ranges_do_not_use_worker_io() {
 async fn reader_reads_normal_range_through_planner_and_worker() {
     let gateway = Arc::new(MockGateway::with_layout(layout_response(
         "root",
-        101,
         202,
         Some(3),
         16,
@@ -347,7 +345,6 @@ async fn reader_reads_normal_range_through_planner_and_worker() {
 async fn reader_rejects_worker_block_stamp_mismatch() {
     let gateway = Arc::new(MockGateway::with_layout(layout_response(
         "root",
-        101,
         202,
         Some(3),
         16,
@@ -370,7 +367,6 @@ async fn reader_rejects_worker_block_stamp_mismatch() {
 async fn reader_rejects_worker_committed_length_that_does_not_cover_range() {
     let gateway = Arc::new(MockGateway::with_layout(layout_response(
         "root",
-        101,
         202,
         Some(3),
         16,
@@ -393,7 +389,6 @@ async fn reader_rejects_worker_committed_length_that_does_not_cover_range() {
 async fn reader_repeated_reads_fetch_current_metadata_locations() {
     let gateway = Arc::new(MockGateway::with_layout(layout_response(
         "root",
-        101,
         202,
         Some(3),
         16,
@@ -415,7 +410,6 @@ async fn reader_repeated_reads_fetch_current_metadata_locations() {
 async fn reader_replans_after_worker_refresh() {
     let gateway = Arc::new(MockGateway::with_layout(layout_response(
         "root",
-        101,
         202,
         Some(3),
         16,
@@ -1355,7 +1349,6 @@ impl MetadataGateway for MockGateway {
     ) -> ClientResult<GetStatusResponseProto> {
         self.record("get_status", &ctx);
         Ok(GetStatusResponseProto {
-            inode_id: Some(proto::fs::InodeIdProto { value: 101 }),
             attrs: Some(file_attrs_proto(10)),
             ..GetStatusResponseProto::default()
         })
@@ -1371,7 +1364,6 @@ impl MetadataGateway for MockGateway {
         Ok(ListStatusResponseProto {
             entries: vec![proto::fs::DirEntryProto {
                 name: "child".to_string(),
-                inode_id: Some(proto::fs::InodeIdProto { value: 102 }),
                 kind: proto::fs::InodeKindProto::InodeKindFile as i32,
                 attrs: Some(file_attrs_proto(4)),
             }],
@@ -1405,7 +1397,6 @@ impl MetadataGateway for MockGateway {
     ) -> ClientResult<OpenFileResponseProto> {
         self.record("open_file", &ctx);
         Ok(OpenFileResponseProto {
-            inode_id: Some(proto::fs::InodeIdProto { value: 101 }),
             data_handle_id: Some(proto::common::DataHandleIdProto { value: 202 }),
             file_size: 10,
             file_version: Some(3),
@@ -1423,7 +1414,7 @@ impl MetadataGateway for MockGateway {
         Ok(layouts
             .front()
             .cloned()
-            .unwrap_or_else(|| layout_response("root", 101, 202, Some(3), 10, Vec::new())))
+            .unwrap_or_else(|| layout_response("root", 202, Some(3), 10, Vec::new())))
     }
 
     async fn create_file(
@@ -1442,7 +1433,6 @@ impl MetadataGateway for MockGateway {
             .unwrap_or(Some(layout));
         Ok(CreateFileResponseProto {
             write_handle: Some(write_handle_proto(1, 302)),
-            inode_id: Some(proto::fs::InodeIdProto { value: 301 }),
             data_handle_id: Some(proto::common::DataHandleIdProto { value: 302 }),
             base_size: 0,
             expires_at_ms: u64::MAX / 2,
@@ -1471,7 +1461,6 @@ impl MetadataGateway for MockGateway {
             .unwrap_or(Some(layout));
         Ok(AppendFileResponseProto {
             write_handle: Some(write_handle_proto(2, 402)),
-            inode_id: Some(proto::fs::InodeIdProto { value: 401 }),
             data_handle_id: Some(proto::common::DataHandleIdProto { value: 402 }),
             base_size: 10,
             expires_at_ms: u64::MAX / 2,
@@ -1868,19 +1857,12 @@ fn data_plane(client: Arc<MockDataClient>) -> WorkerDataPlane {
 fn read_reader(client: &FsClient, file_size: u64) -> FileReader {
     FileReader::new(
         Arc::clone(&client.runtime),
-        ReadHandle::new(
-            "/alpha".to_string(),
-            InodeId::new(101),
-            DataHandleId::new(202),
-            3,
-            file_size,
-        ),
+        ReadHandle::new("/alpha".to_string(), DataHandleId::new(202), 3, file_size),
     )
 }
 
 fn layout_response(
     group_name: &str,
-    inode_id: u64,
     data_handle_id: u64,
     file_version: Option<u64>,
     file_size: u64,
@@ -1888,7 +1870,6 @@ fn layout_response(
 ) -> ReadLayout {
     ReadLayout {
         group_name: group_name_from(group_name),
-        inode_id: InodeId::new(inode_id),
         data_handle_id: DataHandleId::new(data_handle_id),
         file_size,
         file_version,
@@ -1930,26 +1911,18 @@ fn write_handle_proto(handle_id: u64, data_handle_id: u64) -> WriteHandleProto {
 }
 
 fn write_handle_for_tests(path: &str, base_size: u64, expires_at_ms: u64) -> ClientResult<WriteHandle> {
-    let inode_id = InodeId::new(301);
     let data_handle_id = DataHandleId::new(302);
     let layout = types::FileLayout::try_from(layout_proto(default_layout()))
         .map_err(|err| ClientError::InvalidLayout(err.to_string()))?;
     let session = WriteSession::new(
         path.to_string(),
-        inode_id,
         data_handle_id,
         layout,
         write_handle_proto(1, data_handle_id.as_raw()),
         base_size,
         expires_at_ms,
     )?;
-    Ok(WriteHandle::new(
-        path.to_string(),
-        inode_id,
-        data_handle_id,
-        base_size,
-        session,
-    ))
+    Ok(WriteHandle::new(path.to_string(), data_handle_id, base_size, session))
 }
 
 fn write_target_with_layout(

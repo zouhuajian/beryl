@@ -1696,7 +1696,11 @@ async fn commit_file_public_replay_returns_persisted_result_and_rejects_fingerpr
 
     let write_handle = create.write_handle.expect("write handle");
     let data_handle_id = create.data_handle_id.expect("data handle").value;
-    let inode_id = create.inode_id.expect("inode id").value;
+    let file_inode_id = env
+        .storage
+        .get_inode_by_data_handle(DataHandleId::new(data_handle_id))
+        .unwrap()
+        .expect("created inode owner");
     assert!(env.write_session_manager.get_session(write_handle.handle_id).is_some());
 
     let target = FileSystemServiceProto::add_block(
@@ -1781,11 +1785,7 @@ async fn commit_file_public_replay_returns_persisted_result_and_rejects_fingerpr
     assert_eq!(second.file_version, Some(first_file_version));
     assert_eq!(env.storage.get_block_ref_count(typed_block_id).unwrap(), Some(1));
 
-    let inode = env
-        .storage
-        .get_inode(InodeId::new(inode_id))
-        .unwrap()
-        .expect("committed inode");
+    let inode = env.storage.get_inode(file_inode_id).unwrap().expect("committed inode");
     assert_eq!(inode.attrs.size, 128);
     match inode.data {
         types::fs::InodeData::File {
@@ -1819,7 +1819,7 @@ async fn commit_file_public_replay_returns_persisted_result_and_rejects_fingerpr
     assert_eq!(env.storage.get_block_ref_count(typed_block_id).unwrap(), Some(1));
     let after_mismatch = env
         .storage
-        .get_inode(InodeId::new(inode_id))
+        .get_inode(file_inode_id)
         .unwrap()
         .expect("inode after mismatch");
     assert_eq!(after_mismatch.attrs.size, 128);
@@ -2039,8 +2039,12 @@ async fn recursive_delete_rejects_active_write_session_without_half_delete() {
     .into_inner();
     assert_success_header(create.header);
     let write_handle = create.write_handle.expect("write handle");
-    let file_inode_id = InodeId::new(create.inode_id.expect("inode id").value);
     let data_handle_id = DataHandleId::new(create.data_handle_id.expect("data handle").value);
+    let file_inode_id = env
+        .storage
+        .get_inode_by_data_handle(data_handle_id)
+        .unwrap()
+        .expect("created inode owner");
     assert!(env.write_session_manager.get_session(write_handle.handle_id).is_some());
 
     let response = FileSystemServiceProto::delete(

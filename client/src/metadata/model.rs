@@ -4,15 +4,13 @@
 //! Client-domain metadata result types.
 
 use crate::error::{ClientError, ClientResult};
-use types::{DataHandleId, FileBlockLocation, GroupName, InodeId, WriteTarget};
+use types::{DataHandleId, FileBlockLocation, GroupName, WriteTarget};
 
 /// Validated read layout returned by metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReadLayout {
     /// Metadata owner group from the validated response header.
     pub group_name: GroupName,
-    /// Inode identity this layout belongs to.
-    pub inode_id: InodeId,
     /// Data handle identity this layout belongs to.
     pub data_handle_id: DataHandleId,
     /// Authoritative file size at this layout version.
@@ -29,10 +27,6 @@ impl ReadLayout {
         group_name: GroupName,
         response: proto::metadata::GetBlockLocationsResponseProto,
     ) -> ClientResult<Self> {
-        let inode_id = response
-            .inode_id
-            .map(|id| InodeId::new(id.value))
-            .ok_or_else(|| ClientError::InvalidLayout("GetBlockLocationsResponseProto.inode_id missing".to_string()))?;
         let data_handle_id = response
             .data_handle_id
             .ok_or_else(|| {
@@ -50,7 +44,6 @@ impl ReadLayout {
             .map_err(ClientError::InvalidLayout)?;
         Ok(Self {
             group_name,
-            inode_id,
             data_handle_id,
             file_size: response.file_size,
             file_version: response.file_version,

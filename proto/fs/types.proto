@@ -44,14 +44,12 @@ message FileAttrsProto {
   uint32 nlink = 8;
 }
 
-/// Directory entry (name + inode reference).
+/// Directory entry metadata visible through listing APIs.
 message DirEntryProto {
   /// Entry name (UTF-8).
   string name = 1;
-  /// Referenced inode ID.
-  InodeIdProto inode_id = 2;
   /// Inode kind (for quick filtering).
-  InodeKindProto kind = 3;
+  InodeKindProto kind = 2;
   /// Optional attributes (for optimization, to avoid extra Lookup calls).
-  optional FileAttrsProto attrs = 4;
+  optional FileAttrsProto attrs = 3;
 }

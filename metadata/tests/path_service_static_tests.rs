@@ -70,6 +70,10 @@ fn status_hides_inode() {
         !body.contains("InodeProto"),
         "GetStatusResponseProto must not expose internal fs.InodeProto"
     );
+    assert!(
+        !body.contains("InodeIdProto"),
+        "GetStatusResponseProto must not expose metadata inode identity"
+    );
 }
 
 #[test]
@@ -87,17 +91,31 @@ fn create_directory_hides_inode() {
         "CreateDirectoryResponseProto must not expose internal fs.InodeProto"
     );
     assert!(
-        body.contains("fs.InodeIdProto inode_id = 2"),
-        "CreateDirectoryResponseProto must expose only inode_id"
+        !body.contains("InodeIdProto"),
+        "CreateDirectoryResponseProto must not expose metadata inode identity"
     );
     assert!(
-        body.contains("fs.FileAttrsProto attrs = 3"),
+        body.contains("fs.FileAttrsProto attrs = 2"),
         "CreateDirectoryResponseProto must expose attrs"
     );
 }
 
 #[test]
-fn block_locations_hide_extents() {
+fn list_entries_hide_inode_identity() {
+    let proto = include_str!("../../proto/fs/types.proto");
+    let start = proto.find("message DirEntryProto").expect("DirEntryProto must exist");
+    let tail = &proto[start..];
+    let end = tail.find("\n}\n").expect("DirEntryProto must close");
+    let body = &tail[..end];
+
+    assert!(
+        !body.contains("InodeIdProto"),
+        "DirEntryProto must not expose metadata inode identity"
+    );
+}
+
+#[test]
+fn block_locations_hide_extents_and_inode_identity() {
     let proto = include_str!("../../proto/metadata/filesystem.proto");
     let start = proto
         .find("message GetBlockLocationsResponseProto")
@@ -109,6 +127,32 @@ fn block_locations_hide_extents() {
     assert!(
         !body.contains("ExtentProto"),
         "GetBlockLocationsResponseProto must use external block locations, not fs.ExtentProto"
+    );
+    assert!(
+        !body.contains("InodeIdProto"),
+        "GetBlockLocationsResponseProto must not expose metadata inode identity"
+    );
+}
+
+#[test]
+fn block_location_requests_use_path_or_data_handle_targets_only() {
+    let proto = include_str!("../../proto/metadata/filesystem.proto");
+
+    assert!(
+        proto.contains("string path = 2;"),
+        "GetBlockLocationsRequestProto must keep path target at field 2"
+    );
+    assert!(
+        proto.contains("common.DataHandleIdProto data_handle_id = 3;"),
+        "GetBlockLocationsRequestProto must keep data_handle_id target at field 3"
+    );
+    assert!(
+        proto.contains("optional common.ByteRangeProto range = 4;"),
+        "GetBlockLocationsRequestProto must keep range at field 4"
+    );
+    assert!(
+        !proto.contains("fs.InodeIdProto inode_id"),
+        "filesystem proto must not expose metadata inode identity"
     );
 }
 

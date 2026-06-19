@@ -166,7 +166,7 @@ root mount 格式化与 readiness：
 | --- | --- | --- |
 | metadata read | `GetStatus`, `ListStatus` | 已实现；recursive listing 返回 structured `NotSupported`。 |
 | namespace mutation | `CreateDirectory`, `Delete`, `Rename` | 已实现主链路；`Delete(recursive=true)` 对目录未实现；rename overwrite cleanup 已实现。 |
-| read plan | `OpenFile`, `GetBlockLocations` | 已实现 read-plan API；返回 external `FileBlockLocation`，worker locations 是 soft route hints。 |
+| read plan | `OpenFile`, `GetBlockLocations` | 已实现 read-plan API；`OpenFile` 返回读快照身份和版本，`GetBlockLocations` 返回 external `FileBlockLocation`，worker locations 是 soft route hints。 |
 | write lifecycle | `CreateFile`, `AppendFile`, `AddBlock`, `CommitFile`, `AbortFileWrite`, `RenewLease` | 已实现主链路；`WriteSession` 是内部 runtime concept，不是 public RPC 命名。 |
 | write barrier | `SyncWrite` | 已实现 visibility/durability barrier；成功时发布 `target_size` 前缀并保持 write session 打开。 |
 | freshness sync | `Msync` | 已实现 production single-group local authoritative state 返回；multi-group msync 未实现。 |
@@ -208,13 +208,12 @@ commit/version 当前事实：
 
 ## 8. Read plan / freshness 当前状态
 
-`OpenFile` / `GetBlockLocations` 当前返回：
+`OpenFile` / `GetBlockLocations` 当前返回 client read-plan 所需的外部身份和布局信息：
 
-- `inode_id`
 - current `data_handle_id`
 - `file_size`
 - `file_version`
-- external `FileBlockLocationProto` 列表
+- `GetBlockLocations` 的 external `FileBlockLocationProto` 列表
 - `ResponseHeader` 中的 group/mount/route/state hints
 
 read-plan 校验：

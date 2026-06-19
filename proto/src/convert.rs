@@ -1671,16 +1671,52 @@ mod tests {
             ]
         );
         assert_eq!(
+            proto_message_fields(metadata_proto, "OpenFileRequestProto"),
+            vec![("common.RequestHeaderProto", "header", 1), ("string", "path", 2),]
+        );
+        assert_eq!(
+            proto_message_fields(metadata_proto, "GetStatusResponseProto"),
+            vec![
+                ("common.ResponseHeaderProto", "header", 1),
+                ("fs.FileAttrsProto", "attrs", 2),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(metadata_proto, "CreateDirectoryResponseProto"),
+            vec![
+                ("common.ResponseHeaderProto", "header", 1),
+                ("fs.FileAttrsProto", "attrs", 2),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(metadata_proto, "OpenFileResponseProto"),
+            vec![
+                ("common.ResponseHeaderProto", "header", 1),
+                ("common.DataHandleIdProto", "data_handle_id", 2),
+                ("uint64", "file_size", 3),
+                ("uint64", "file_version", 4),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(metadata_proto, "GetBlockLocationsResponseProto"),
+            vec![
+                ("common.ResponseHeaderProto", "header", 1),
+                ("common.DataHandleIdProto", "data_handle_id", 2),
+                ("uint64", "file_size", 3),
+                ("FileBlockLocationProto", "locations", 4),
+                ("uint64", "file_version", 5),
+            ]
+        );
+        assert_eq!(
             proto_message_fields(metadata_proto, "CreateFileResponseProto"),
             vec![
                 ("common.ResponseHeaderProto", "header", 1),
                 ("WriteHandleProto", "write_handle", 2),
-                ("fs.InodeIdProto", "inode_id", 3),
-                ("common.DataHandleIdProto", "data_handle_id", 4),
-                ("uint64", "base_size", 5),
-                ("WriteTargetProto", "initial_targets", 6),
-                ("uint64", "expires_at_ms", 7),
-                ("common.FileLayoutProto", "layout", 8),
+                ("common.DataHandleIdProto", "data_handle_id", 3),
+                ("uint64", "base_size", 4),
+                ("WriteTargetProto", "initial_targets", 5),
+                ("uint64", "expires_at_ms", 6),
+                ("common.FileLayoutProto", "layout", 7),
             ]
         );
         assert_eq!(
@@ -1688,12 +1724,11 @@ mod tests {
             vec![
                 ("common.ResponseHeaderProto", "header", 1),
                 ("WriteHandleProto", "write_handle", 2),
-                ("fs.InodeIdProto", "inode_id", 3),
-                ("common.DataHandleIdProto", "data_handle_id", 4),
-                ("uint64", "base_size", 5),
-                ("WriteTargetProto", "initial_targets", 6),
-                ("uint64", "expires_at_ms", 7),
-                ("common.FileLayoutProto", "layout", 8),
+                ("common.DataHandleIdProto", "data_handle_id", 3),
+                ("uint64", "base_size", 4),
+                ("WriteTargetProto", "initial_targets", 5),
+                ("uint64", "expires_at_ms", 6),
+                ("common.FileLayoutProto", "layout", 7),
             ]
         );
 

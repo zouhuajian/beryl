@@ -33,7 +33,6 @@ use proto::metadata::*;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::instrument;
-use types::fs::InodeId;
 use types::ids::DataHandleId;
 use types::CommittedBlock;
 
@@ -270,12 +269,6 @@ impl MetadataFileSystemServiceImpl {
     fn data_handle_proto(data_handle_id: DataHandleId) -> proto::common::DataHandleIdProto {
         data_handle_id.into()
     }
-
-    fn inode_proto(inode_id: InodeId) -> proto::fs::InodeIdProto {
-        proto::fs::InodeIdProto {
-            value: inode_id.as_raw(),
-        }
-    }
 }
 
 #[tonic::async_trait]
@@ -336,7 +329,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         {
             Ok(success) => response_with_header!(
                 GetStatusResponseProto {
-                    inode_id: Some(Self::inode_proto(inode_id)),
                     attrs: Some(file_attrs_to_proto(&success.payload.attrs)),
                     ..Default::default()
                 },
@@ -427,7 +419,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 );
                 response_with_header!(
                     CreateDirectoryResponseProto {
-                        inode_id: payload.inode_id.map(Self::inode_proto),
                         attrs,
                         ..Default::default()
                     },
@@ -784,7 +775,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     .into_iter()
                     .map(|entry| proto::fs::DirEntryProto {
                         name: entry.name,
-                        inode_id: Some(Self::inode_proto(entry.inode_id)),
                         kind: match entry.kind {
                             Some(types::fs::InodeKind::File) => proto::fs::InodeKindProto::InodeKindFile as i32,
                             Some(types::fs::InodeKind::Dir) => proto::fs::InodeKindProto::InodeKindDir as i32,
@@ -882,16 +872,12 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             );
         }
-        let range = req.range.map(|r| FileRange {
-            offset: r.offset,
-            len: r.len as u64,
-        });
         match self
             .fs_core
             .execute_get_file_layout(GetFileLayoutInput {
                 ctx: req_ctx.clone(),
                 inode_id,
-                range,
+                range: None,
                 requested_data_handle_id: None,
                 freshness: Self::freshness_from_header(&req.header),
             })
@@ -902,15 +888,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 let payload = success.payload;
                 response_with_header!(
                     OpenFileResponseProto {
-                        inode_id: Some(Self::inode_proto(inode_id)),
                         data_handle_id: Some(Self::data_handle_proto(inode.current_data_handle_id)),
                         file_size: payload.file_size,
                         file_version: payload.file_version,
-                        locations: if req.include_locations {
-                            payload.locations.iter().map(location_to_proto).collect()
-                        } else {
-                            Vec::new()
-                        },
                         ..Default::default()
                     },
                     header
@@ -965,26 +945,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         return error_response!(
                             GetBlockLocationsResponseProto,
                             self.header_from_path_error(&req.header, err, Some(&resolved.mount_ctx))
-                        )
-                    }
-                }
-            }
-            Some(get_block_locations_request_proto::Target::InodeId(inode)) => {
-                let inode_id = InodeId::new(inode.value);
-                match self.fs_core.plan_inode_mount(&req_ctx, inode_id).await {
-                    Ok(success) => {
-                        guard_or_error!(
-                            self,
-                            req,
-                            GetBlockLocationsResponseProto,
-                            self.guard_chain.check_data_read(&req_ctx, success.payload.mount_id)
-                        );
-                        inode_id
-                    }
-                    Err(failure) => {
-                        return error_response!(
-                            GetBlockLocationsResponseProto,
-                            header_from_core_failure(&req_ctx, &failure)
                         )
                     }
                 }
@@ -1070,7 +1030,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 let payload = success.payload;
                 response_with_header!(
                     GetBlockLocationsResponseProto {
-                        inode_id: Some(Self::inode_proto(inode_id)),
                         data_handle_id: Some(Self::data_handle_proto(inode.current_data_handle_id)),
                         file_size: payload.file_size,
                         file_version: payload.file_version,
@@ -1421,7 +1380,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 response_with_header!(
                     CreateFileResponseProto {
                         write_handle: Some(Self::write_handle_from_key(&payload.session_key)),
-                        inode_id: Some(Self::inode_proto(payload.inode_id)),
                         data_handle_id: Some(Self::data_handle_proto(payload.data_handle_id)),
                         base_size: payload.base_size,
                         initial_targets: Vec::new(),
@@ -1527,7 +1485,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 response_with_header!(
                     AppendFileResponseProto {
                         write_handle: Some(Self::write_handle_from_key(&payload.session_key)),
-                        inode_id: Some(Self::inode_proto(payload.inode_id)),
                         data_handle_id: Some(Self::data_handle_proto(payload.data_handle_id)),
                         base_size: payload.base_size,
                         initial_targets: Vec::new(),
