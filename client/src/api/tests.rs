@@ -1777,6 +1777,7 @@ impl WorkerDataClient for MockDataClient {
 
     async fn write_block_bytes(
         &self,
+        _ctx: AttemptContext,
         block: &WorkerBlockWriteHandle,
         data: Bytes,
     ) -> ClientResult<proto::worker::WriteStreamResponseProto> {

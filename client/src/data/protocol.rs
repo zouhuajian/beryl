@@ -896,6 +896,24 @@ mod tests {
     }
 
     #[test]
+    fn tonic_request_uses_attempt_timeout_when_present() {
+        let attempt = write_attempt_context().with_operation_timeout_ms(Some(5_000));
+
+        let request = build_tonic_request(&attempt, ());
+
+        assert!(request.metadata().get("grpc-timeout").is_some());
+    }
+
+    #[test]
+    fn tonic_request_has_no_timeout_without_attempt_deadline() {
+        let attempt = write_attempt_context().with_operation_timeout_ms(None);
+
+        let request = build_tonic_request(&attempt, ());
+
+        assert!(request.metadata().get("grpc-timeout").is_none());
+    }
+
+    #[test]
     fn write_stream_partial_ack_is_unknown_outcome() {
         let response = proto::worker::WriteStreamResponseProto {
             accepted: true,

@@ -40,6 +40,7 @@ pub(crate) trait WorkerDataClient: Send + Sync {
 
     async fn write_block_bytes(
         &self,
+        attempt: AttemptContext,
         handle: &WorkerBlockWriteHandle,
         data: Bytes,
     ) -> ClientResult<WriteStreamResponseProto>;

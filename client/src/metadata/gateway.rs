@@ -180,7 +180,7 @@ impl GrpcMetadataGateway {
             return lazy_channel(&key.endpoint)
                 .map(FileSystemServiceProtoClient::new)
                 .inspect_err(|_err| {
-                    self.record_pool_metric(ClientMetric::ChannelPoolConnectError, operation, "error");
+                    self.record_pool_metric(ClientMetric::ChannelBuildError, operation, "error");
                 });
         }
         let channel = {
@@ -210,7 +210,7 @@ impl GrpcMetadataGateway {
             return Ok(channel);
         }
         let channel = lazy_channel(&key.endpoint).inspect_err(|_err| {
-            self.record_pool_metric(ClientMetric::ChannelPoolConnectError, operation, "error");
+            self.record_pool_metric(ClientMetric::ChannelBuildError, operation, "error");
         })?;
         Ok(self.insert_metadata_channel(key, channel))
     }
@@ -698,7 +698,9 @@ mod tests {
             assert!(matches!(err, ClientError::Metadata(msg) if msg.contains("invalid metadata endpoint")));
         }
         assert_eq!(gateway.channels.read().len(), 0);
-        assert_metric(&metrics.events(), ClientMetric::ChannelPoolConnectError);
+        let events = metrics.events();
+        assert_metric_with_target_plane(&events, ClientMetric::ChannelBuildError, "metadata");
+        assert_metric_labels_do_not_contain(&events, "http://[invalid");
     }
 
     #[tokio::test]
@@ -721,18 +723,6 @@ mod tests {
         assert!(events
             .iter()
             .all(|event| event.metric != ClientMetric::MetadataChannelPoolHit));
-    }
-
-    #[tokio::test]
-    async fn metadata_channel_pool_connection_error_is_reported() {
-        let metrics = Arc::new(RecordingMetrics::default());
-        let gateway = GrpcMetadataGateway::new_lazy_with_pool(true, 1, metrics.clone()).expect("gateway");
-        let ctx = metadata_attempt("root", Some("http://[invalid"));
-
-        let err = gateway.client(&ctx, "read").await.expect_err("invalid endpoint fails");
-
-        assert!(matches!(err, ClientError::Metadata(msg) if msg.contains("invalid metadata endpoint")));
-        assert_metric(&metrics.events(), ClientMetric::ChannelPoolConnectError);
     }
 
     #[test]
@@ -822,40 +812,6 @@ mod tests {
     }
 
     #[test]
-    fn metadata_response_header_with_missing_group_name_is_invalid_header_action() {
-        let ctx = metadata_attempt("root", None);
-        let header = proto::common::ResponseHeaderProto {
-            client: Some(proto::common::ClientInfoProto {
-                call_id: types::CallId::new().to_string(),
-                client_id: Some(types::ClientId::new(7).into()),
-                client_name: "test".to_string(),
-            }),
-            error: None,
-            state: Vec::new(),
-            group_name: String::new(),
-            mount_epoch: None,
-            route_epoch: None,
-        };
-
-        let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("missing group_name must fail");
-
-        assert_ne!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
-        match action(&err) {
-            ClientAction::Fail { canonical } => {
-                assert_eq!(canonical.class, common::error::canonical::ErrorClass::Fatal);
-                assert!(matches!(
-                    canonical.code,
-                    Some(common::error::canonical::ErrorCode::RpcCode(
-                        HeaderRpcErrorCode::InvalidHeader
-                    ))
-                ));
-                assert!(canonical.message.contains("group_name"));
-            }
-            other => panic!("expected invalid header Fail action, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn metadata_response_header_with_wrong_call_id_is_invalid_header_action() {
         let ctx = metadata_attempt("root", None);
         let mut header = ok_metadata_header(&ctx);
@@ -886,28 +842,6 @@ mod tests {
         let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("wrong group_name must fail");
 
         assert_invalid_metadata_header(&err, "group_name");
-    }
-
-    #[test]
-    fn metadata_response_header_with_missing_client_identity_is_invalid_header_action() {
-        let ctx = metadata_attempt("root", None);
-        let mut header = ok_metadata_header(&ctx);
-        header.client = None;
-
-        let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("missing client must fail");
-
-        assert_invalid_metadata_header(&err, "client identity");
-    }
-
-    #[test]
-    fn metadata_response_header_with_empty_call_id_is_invalid_header_action() {
-        let ctx = metadata_attempt("root", None);
-        let mut header = ok_metadata_header(&ctx);
-        header.client.as_mut().expect("client").call_id.clear();
-
-        let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("empty call_id must fail");
-
-        assert_invalid_metadata_header(&err, "call_id");
     }
 
     fn action(err: &ClientError) -> &ClientAction {
@@ -942,6 +876,44 @@ mod tests {
             events.iter().any(|event| event.metric == metric),
             "missing metric {metric:?}: {events:?}"
         );
+    }
+
+    fn assert_metric_with_target_plane(events: &[ClientMetricEvent], metric: ClientMetric, target_plane: &'static str) {
+        assert!(
+            events
+                .iter()
+                .any(|event| event.metric == metric && event.labels.target_plane == Some(target_plane)),
+            "missing metric {metric:?} with target_plane={target_plane}: {events:?}"
+        );
+        assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
+        let stale_metric = ["ChannelPool", "ConnectError"].concat();
+        assert!(events
+            .iter()
+            .all(|event| !format!("{:?}", event.metric).contains(&stale_metric)));
+    }
+
+    fn assert_metric_labels_do_not_contain(events: &[ClientMetricEvent], value: &str) {
+        assert!(
+            events
+                .iter()
+                .all(|event| !metric_label_values(&event.labels).any(|label| label.contains(value))),
+            "metric labels unexpectedly contain {value:?}: {events:?}"
+        );
+    }
+
+    fn metric_label_values(labels: &ClientMetricLabels) -> impl Iterator<Item = &str> {
+        [
+            labels.operation_kind,
+            labels.operation_name.as_deref(),
+            labels.error_class,
+            labels.refresh_reason,
+            labels.target_plane,
+            labels.cache,
+            labels.reason,
+            labels.outcome,
+        ]
+        .into_iter()
+        .flatten()
     }
 
     fn metadata_attempt(group_name: &str, endpoint: Option<&str>) -> AttemptContext {

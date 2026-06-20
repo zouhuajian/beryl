@@ -62,8 +62,8 @@ pub(crate) enum ClientMetric {
     WorkerChannelPoolHit,
     /// Worker channel pool miss.
     WorkerChannelPoolMiss,
-    /// Channel pool connection setup failed.
-    ChannelPoolConnectError,
+    /// Channel construction failed before lazy connection establishment.
+    ChannelBuildError,
     /// Precise cache invalidation was used.
     CachePreciseInvalidation,
     /// Client-side RPC timeout fired.

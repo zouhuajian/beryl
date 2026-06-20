@@ -127,11 +127,19 @@ impl ClientRuntime {
                 return Err(self.normalize_outcome_error("OpenWriteStream", OperationKind::WorkerWriteData, err));
             }
         };
+        let operation = worker_write_context(
+            self.executor.client_id(),
+            self.executor.client_name(),
+            "WriteStream",
+            session.path(),
+            &session.session_identity(),
+        )?;
+        let ctx = self.data_context(&operation, 0);
         let response = match self
             .worker_rpc_with_timeout(
                 "WriteStream",
                 OperationKind::WorkerWriteData,
-                self.data_plane.write_block_bytes(&block_write_handle, data),
+                self.data_plane.write_block_bytes(ctx, &block_write_handle, data),
             )
             .await
         {

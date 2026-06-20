@@ -43,7 +43,7 @@ impl GrpcWorkerChannelPool {
         )
     }
 
-    pub(super) async fn worker_data_service_client(
+    pub(super) fn worker_data_service_client(
         &self,
         worker: &WorkerEndpointInfo,
         operation: &'static str,
@@ -54,10 +54,10 @@ impl GrpcWorkerChannelPool {
             return build_lazy_worker_channel(&key.endpoint)
                 .map(WorkerDataServiceClient::new)
                 .inspect_err(|_err| {
-                    self.record_pool_metric(ClientMetric::ChannelPoolConnectError, operation, "error");
+                    self.record_pool_metric(ClientMetric::ChannelBuildError, operation, "error");
                 });
         }
-        let channel = self.channel_for_key(key, operation).await?;
+        let channel = self.channel_for_key(key, operation)?;
         Ok(WorkerDataServiceClient::new(channel))
     }
 
@@ -90,23 +90,15 @@ impl GrpcWorkerChannelPool {
         })
     }
 
-    async fn channel_for_key(
-        &self,
-        key: WorkerChannelKey,
-        operation: &'static str,
-    ) -> ClientResult<tonic_net::Channel> {
+    fn channel_for_key(&self, key: WorkerChannelKey, operation: &'static str) -> ClientResult<tonic_net::Channel> {
         if let Some(channel) = self.get_cached_channel(&key) {
             self.record_pool_metric(ClientMetric::WorkerChannelPoolHit, operation, "hit");
             return Ok(channel);
         }
         self.record_pool_metric(ClientMetric::WorkerChannelPoolMiss, operation, "miss");
 
-        if let Some(channel) = self.get_cached_channel(&key) {
-            self.record_pool_metric(ClientMetric::WorkerChannelPoolHit, operation, "hit");
-            return Ok(channel);
-        }
         let channel = build_lazy_worker_channel(&key.endpoint).inspect_err(|_err| {
-            self.record_pool_metric(ClientMetric::ChannelPoolConnectError, operation, "error");
+            self.record_pool_metric(ClientMetric::ChannelBuildError, operation, "error");
         })?;
         Ok(self.insert_or_get_existing(key, channel))
     }
@@ -240,20 +232,15 @@ mod tests {
         assert!(ensure_supported_worker_protocol(WorkerNetProtocol::Grpc).is_ok());
     }
 
+    // connect_lazy touches Hyper's Tokio executor even though acquisition is synchronous.
     #[tokio::test]
     async fn worker_channel_pool_reuses_channel_for_same_worker_endpoint() {
         let metrics = Arc::new(RecordingMetrics::default());
         let pool = GrpcWorkerChannelPool::new(true, 1, metrics.clone());
         let worker = worker_endpoint();
 
-        let _first = pool
-            .worker_data_service_client(&worker, "read")
-            .await
-            .expect("first client");
-        let _second = pool
-            .worker_data_service_client(&worker, "read")
-            .await
-            .expect("second client");
+        let _first = pool.worker_data_service_client(&worker, "read").expect("first client");
+        let _second = pool.worker_data_service_client(&worker, "read").expect("second client");
 
         let events = metrics.events();
         assert_metric(&events, ClientMetric::WorkerChannelPoolMiss);
@@ -263,17 +250,18 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_worker_channel_requests_same_key_reuse_inserted_channel() {
+        let task_count = 8;
         let metrics = Arc::new(RecordingMetrics::default());
         let pool = Arc::new(GrpcWorkerChannelPool::new(true, 8, metrics.clone()));
         let worker = worker_endpoint();
 
-        let mut tasks = Vec::with_capacity(8);
-        for _ in 0..8 {
+        let mut tasks = Vec::with_capacity(task_count);
+        for _ in 0..task_count {
             let pool = Arc::clone(&pool);
             let worker = worker.clone();
-            tasks.push(tokio::spawn(async move {
-                pool.worker_data_service_client(&worker, "read").await
-            }));
+            tasks.push(tokio::spawn(
+                async move { pool.worker_data_service_client(&worker, "read") },
+            ));
         }
 
         for task in tasks {
@@ -281,13 +269,20 @@ mod tests {
         }
         assert_eq!(pool.channels.read().len(), 1);
         let events = metrics.events();
-        assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
+        let miss_count = count_metric(&events, ClientMetric::WorkerChannelPoolMiss);
+        assert!(
+            (1..=task_count).contains(&miss_count),
+            "miss count {miss_count} outside expected race-visible bounds: {events:?}"
+        );
+        assert_eq!(count_metric(&events, ClientMetric::ChannelBuildError), 0);
+        assert_safe_metric_labels(&events);
     }
 
+    // connect_lazy touches Hyper's Tokio executor even though acquisition is synchronous.
     #[tokio::test]
     async fn worker_channel_different_run_does_not_share_channel() {
         let metrics = Arc::new(NoopClientMetrics);
-        let pool = Arc::new(GrpcWorkerChannelPool::new(true, 8, metrics));
+        let pool = GrpcWorkerChannelPool::new(true, 8, metrics);
         let mut first = worker_endpoint();
         first.worker_run_id = "550e8400-e29b-41d4-a716-446655440007"
             .parse()
@@ -297,20 +292,12 @@ mod tests {
             .parse()
             .expect("valid second WorkerRunId");
 
-        let first_task = {
-            let pool = Arc::clone(&pool);
-            tokio::spawn(async move { pool.worker_data_service_client(&first, "read").await })
-        };
-        let second_task = {
-            let pool = Arc::clone(&pool);
-            tokio::spawn(async move { pool.worker_data_service_client(&second, "read").await })
-        };
-
-        first_task.await.expect("first").expect("first client");
-        second_task.await.expect("second").expect("second client");
+        pool.worker_data_service_client(&first, "read").expect("first client");
+        pool.worker_data_service_client(&second, "read").expect("second client");
         assert_eq!(pool.channels.read().len(), 2);
     }
 
+    // connect_lazy touches Hyper's Tokio executor even though acquisition is synchronous.
     #[tokio::test]
     async fn worker_run_mismatch_invalidates_target_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
@@ -318,10 +305,7 @@ mod tests {
         let worker = worker_endpoint();
         let attempt = data_attempt_context();
 
-        let _worker_client = pool
-            .worker_data_service_client(&worker, "read")
-            .await
-            .expect("worker client");
+        let _worker_client = pool.worker_data_service_client(&worker, "read").expect("worker client");
         assert_eq!(pool.channels.read().len(), 1);
 
         let err = parse_worker_control_header(
@@ -343,8 +327,8 @@ mod tests {
         assert_metric(&metrics.events(), ClientMetric::CachePreciseInvalidation);
     }
 
-    #[tokio::test]
-    async fn failed_worker_channel_creation_does_not_insert() {
+    #[test]
+    fn failed_worker_channel_creation_does_not_insert() {
         let metrics = Arc::new(RecordingMetrics::default());
         let pool = Arc::new(GrpcWorkerChannelPool::new(true, 8, metrics.clone()));
         let mut worker = worker_endpoint();
@@ -354,33 +338,30 @@ mod tests {
         for _ in 0..4 {
             let pool = Arc::clone(&pool);
             let worker = worker.clone();
-            tasks.push(tokio::spawn(async move {
-                pool.worker_data_service_client(&worker, "read").await
+            tasks.push(std::thread::spawn(move || {
+                pool.worker_data_service_client(&worker, "read")
             }));
         }
 
         for task in tasks {
-            let err = task.await.expect("task").expect_err("invalid endpoint");
+            let err = task.join().expect("task").expect_err("invalid endpoint");
             assert!(matches!(err, ClientError::Worker(msg) if msg.contains("invalid worker endpoint")));
         }
         assert!(pool.channels.read().is_empty());
-        assert_metric(&metrics.events(), ClientMetric::ChannelPoolConnectError);
+        let events = metrics.events();
+        assert_metric_with_target_plane(&events, ClientMetric::ChannelBuildError, "worker");
+        assert_metric_labels_do_not_contain(&events, "http://[invalid");
     }
 
+    // connect_lazy touches Hyper's Tokio executor even though acquisition is synchronous.
     #[tokio::test]
     async fn disabled_worker_channel_pool_does_not_reuse_channel() {
         let metrics = Arc::new(RecordingMetrics::default());
         let pool = GrpcWorkerChannelPool::new(false, 1, metrics.clone());
         let worker = worker_endpoint();
 
-        let _first = pool
-            .worker_data_service_client(&worker, "read")
-            .await
-            .expect("first client");
-        let _second = pool
-            .worker_data_service_client(&worker, "read")
-            .await
-            .expect("second client");
+        let _first = pool.worker_data_service_client(&worker, "read").expect("first client");
+        let _second = pool.worker_data_service_client(&worker, "read").expect("second client");
 
         let events = metrics.events();
         assert_eq!(
@@ -395,8 +376,8 @@ mod tests {
             .all(|event| event.metric != ClientMetric::WorkerChannelPoolHit));
     }
 
-    #[tokio::test]
-    async fn unsupported_worker_protocol_does_not_create_channel() {
+    #[test]
+    fn unsupported_worker_protocol_does_not_create_channel() {
         let metrics = Arc::new(NoopClientMetrics);
         let pool = GrpcWorkerChannelPool::new(true, 1, metrics);
         let mut worker = worker_endpoint();
@@ -404,15 +385,14 @@ mod tests {
 
         let err = pool
             .worker_data_service_client(&worker, "read")
-            .await
             .expect_err("unsupported protocol rejected");
 
         assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("unsupported worker net protocol")));
         assert!(pool.channels.read().is_empty());
     }
 
-    #[tokio::test]
-    async fn worker_channel_pool_connection_error_is_reported() {
+    #[test]
+    fn worker_channel_build_error_is_reported_with_safe_labels() {
         let metrics = Arc::new(RecordingMetrics::default());
         let pool = GrpcWorkerChannelPool::new(true, 1, metrics.clone());
         let mut worker = worker_endpoint();
@@ -420,11 +400,12 @@ mod tests {
 
         let err = pool
             .worker_data_service_client(&worker, "read")
-            .await
             .expect_err("invalid endpoint fails");
 
         assert!(matches!(err, ClientError::Worker(msg) if msg.contains("invalid worker endpoint")));
-        assert_metric(&metrics.events(), ClientMetric::ChannelPoolConnectError);
+        let events = metrics.events();
+        assert_metric_with_target_plane(&events, ClientMetric::ChannelBuildError, "worker");
+        assert_metric_labels_do_not_contain(&events, "http://[invalid");
     }
 
     #[test]
@@ -473,5 +454,54 @@ mod tests {
             events.iter().any(|event| event.metric == metric),
             "missing metric {metric:?}: {events:?}"
         );
+    }
+
+    fn assert_metric_with_target_plane(events: &[ClientMetricEvent], metric: ClientMetric, target_plane: &'static str) {
+        assert!(
+            events
+                .iter()
+                .any(|event| event.metric == metric && event.labels.target_plane == Some(target_plane)),
+            "missing metric {metric:?} with target_plane={target_plane}: {events:?}"
+        );
+        assert!(events.iter().all(|event| event.labels.has_only_safe_values()));
+        let stale_metric = ["ChannelPool", "ConnectError"].concat();
+        assert!(events
+            .iter()
+            .all(|event| !format!("{:?}", event.metric).contains(&stale_metric)));
+    }
+
+    fn assert_safe_metric_labels(events: &[ClientMetricEvent]) {
+        assert!(
+            events.iter().all(|event| event.labels.has_only_safe_values()),
+            "unsafe metric labels: {events:?}"
+        );
+    }
+
+    fn assert_metric_labels_do_not_contain(events: &[ClientMetricEvent], value: &str) {
+        assert!(
+            events
+                .iter()
+                .all(|event| !metric_label_values(&event.labels).any(|label| label.contains(value))),
+            "metric labels unexpectedly contain {value:?}: {events:?}"
+        );
+    }
+
+    fn metric_label_values(labels: &ClientMetricLabels) -> impl Iterator<Item = &str> {
+        [
+            labels.operation_kind,
+            labels.operation_name.as_deref(),
+            labels.error_class,
+            labels.refresh_reason,
+            labels.target_plane,
+            labels.cache,
+            labels.reason,
+            labels.outcome,
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    fn count_metric(events: &[ClientMetricEvent], metric: ClientMetric) -> usize {
+        events.iter().filter(|event| event.metric == metric).count()
     }
 }

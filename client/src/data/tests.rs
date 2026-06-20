@@ -51,6 +51,7 @@ impl WorkerDataClient for NoWorkerIo {
 
     async fn write_block_bytes(
         &self,
+        _attempt: AttemptContext,
         _handle: &WorkerBlockWriteHandle,
         _data: Bytes,
     ) -> ClientResult<proto::worker::WriteStreamResponseProto> {
