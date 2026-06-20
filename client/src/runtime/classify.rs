@@ -9,7 +9,7 @@ use common::error::canonical::RefreshReason as CanonicalRefreshReason;
 
 /// Refresh reason used by the runtime executor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RefreshReason {
+pub(crate) enum RefreshReason {
     /// Metadata leader changed or the target is not leader.
     NotLeader,
     /// Path or mount owner group changed.
@@ -46,7 +46,7 @@ impl RefreshReason {
 
 /// Runtime error classification used by [`crate::runtime::OperationExecutor`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ErrorClass {
+pub(crate) enum ErrorClass {
     /// Unrecoverable error.
     Fatal,
     /// Retryable transport/framework failure.
@@ -92,11 +92,11 @@ impl ErrorClass {
 
 /// Classifies transport, metadata canonical, and worker canonical errors.
 #[derive(Clone, Debug, Default)]
-pub struct ErrorClassifier;
+pub(crate) struct ErrorClassifier;
 
 impl ErrorClassifier {
     /// Classify a client error without string matching.
-    pub fn classify_error(&self, err: &ClientError) -> ErrorClass {
+    pub(crate) fn classify_error(&self, err: &ClientError) -> ErrorClass {
         match err {
             ClientError::InvalidArgument(_) | ClientError::InvalidLayout(_) => ErrorClass::InvalidArgument,
             ClientError::InvalidResponse { .. } => ErrorClass::Fatal,

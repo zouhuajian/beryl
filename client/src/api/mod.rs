@@ -5,9 +5,8 @@
 
 pub(crate) mod client;
 pub(crate) mod handle;
-mod options;
+pub(crate) mod options;
 pub(crate) mod path;
-pub(crate) mod runtime;
 mod status;
 
 pub use client::FsClient;

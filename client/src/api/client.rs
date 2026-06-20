@@ -8,18 +8,12 @@ use std::sync::Arc;
 
 use super::{CreateOptions, DirectoryListing, FileReader, FileStatus, FileWriter, ListOptions};
 use crate::api::path::NamespacePathBuf;
-use crate::api::runtime::ClientRuntime;
 use crate::config::ClientConfig;
 use crate::data::WorkerDataPlane;
 use crate::error::ClientResult;
 use crate::metadata::{GrpcMetadataGateway, MetadataGateway};
 use crate::metrics::{ClientMetrics, NoopClientMetrics};
-use crate::runtime::{BackoffSleeper, MetadataTargets, OperationKind, TokioBackoffSleeper};
-
-pub(crate) const DEFAULT_BLOCK_SIZE: u32 = 64 * 1024 * 1024;
-pub(super) const DEFAULT_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
-pub(crate) const DEFAULT_REPLICATION: u32 = 1;
-pub(crate) const MAX_PREALLOCATED_WRITE_BLOCKS: u64 = 10;
+use crate::runtime::{BackoffSleeper, ClientRuntime, MetadataTargets, OperationKind, TokioBackoffSleeper};
 
 /// Public filesystem-facing client facade.
 #[derive(Clone)]

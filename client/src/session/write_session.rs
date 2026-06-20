@@ -485,12 +485,6 @@ impl WriteSession {
         self.expires_at_ms = Some(expires_at_ms);
     }
 
-    /// Return the latest known lease expiration.
-    #[cfg(test)]
-    pub(crate) fn expires_at_ms(&self) -> Option<u64> {
-        self.expires_at_ms
-    }
-
     /// Return whether CommitFile outcome is unresolved and retryable.
     pub(crate) fn is_commit_unknown(&self) -> bool {
         matches!(self.state, WriteSessionState::CommitUnknown)
@@ -526,28 +520,11 @@ impl WriteSession {
         self.ensure_open_for_barrier_at_ms(unix_now_ms())
     }
 
-    #[cfg(test)]
-    pub(crate) fn ensure_open_for_write_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
-        self.ensure_state_allows_write()?;
-        self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS)
-    }
-
-    #[cfg(not(test))]
     fn ensure_open_for_write_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
         self.ensure_state_allows_write()?;
         self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS)
     }
 
-    #[cfg(test)]
-    pub(crate) fn ensure_open_for_close_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
-        match self.state {
-            WriteSessionState::Open => self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS),
-            WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown => Ok(()),
-            _ => self.state_error(),
-        }
-    }
-
-    #[cfg(not(test))]
     fn ensure_open_for_close_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
         match self.state {
             WriteSessionState::Open => self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS),
@@ -556,16 +533,6 @@ impl WriteSession {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn ensure_open_for_abort_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
-        match self.state {
-            WriteSessionState::Open => self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS),
-            WriteSessionState::AbortUnknown => Ok(()),
-            _ => self.state_error(),
-        }
-    }
-
-    #[cfg(not(test))]
     fn ensure_open_for_abort_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
         match self.state {
             WriteSessionState::Open => self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS),
@@ -574,25 +541,11 @@ impl WriteSession {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn ensure_open_for_renew_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
-        self.ensure_state_allows_write()?;
-        self.ensure_lease_valid_at_ms(now_ms, 0)
-    }
-
-    #[cfg(not(test))]
     fn ensure_open_for_renew_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
         self.ensure_state_allows_write()?;
         self.ensure_lease_valid_at_ms(now_ms, 0)
     }
 
-    #[cfg(test)]
-    pub(crate) fn ensure_open_for_barrier_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
-        self.ensure_state_allows_write()?;
-        self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS)
-    }
-
-    #[cfg(not(test))]
     fn ensure_open_for_barrier_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
         self.ensure_state_allows_write()?;
         self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS)
@@ -1008,49 +961,28 @@ mod tests {
     use crate::runtime::AttemptContext;
 
     #[test]
-    fn commit_file_fingerprint_is_stable_for_same_payload() {
+    fn commit_file_fingerprint_is_stable_and_changes_with_commit_identity() {
         let handle = write_handle_proto(1, 302);
         let blocks = vec![committed_block(302, 0, 0, 5)];
+        let base = commit_fingerprint(&handle, 5, &blocks);
 
-        let first = commit_fingerprint(&handle, 5, &blocks);
-        let second = commit_fingerprint(&handle, 5, &blocks);
+        assert_eq!(base, commit_fingerprint(&handle, 5, &blocks));
 
-        assert_eq!(first, second);
-    }
+        let cases = [
+            ("final_size", commit_fingerprint(&handle, 6, &blocks)),
+            (
+                "committed_blocks",
+                commit_fingerprint(&handle, 5, &[committed_block(302, 0, 0, 4)]),
+            ),
+            (
+                "write_handle",
+                commit_fingerprint(&write_handle_proto(2, 302), 5, &blocks),
+            ),
+        ];
 
-    #[test]
-    fn commit_file_fingerprint_changes_when_final_size_changes() {
-        let handle = write_handle_proto(1, 302);
-        let blocks = vec![committed_block(302, 0, 0, 5)];
-
-        assert_ne!(
-            commit_fingerprint(&handle, 5, &blocks),
-            commit_fingerprint(&handle, 6, &blocks)
-        );
-    }
-
-    #[test]
-    fn commit_file_fingerprint_changes_when_committed_blocks_change() {
-        let handle = write_handle_proto(1, 302);
-        let first_blocks = vec![committed_block(302, 0, 0, 5)];
-        let changed_blocks = vec![committed_block(302, 0, 0, 4)];
-
-        assert_ne!(
-            commit_fingerprint(&handle, 5, &first_blocks),
-            commit_fingerprint(&handle, 5, &changed_blocks)
-        );
-    }
-
-    #[test]
-    fn commit_file_fingerprint_changes_when_write_handle_changes() {
-        let first_handle = write_handle_proto(1, 302);
-        let changed_handle = write_handle_proto(2, 302);
-        let blocks = vec![committed_block(302, 0, 0, 5)];
-
-        assert_ne!(
-            commit_fingerprint(&first_handle, 5, &blocks),
-            commit_fingerprint(&changed_handle, 5, &blocks)
-        );
+        for (field, changed) in cases {
+            assert_ne!(base, changed, "{field} must contribute to commit fingerprint");
+        }
     }
 
     #[test]

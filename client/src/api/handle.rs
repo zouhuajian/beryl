@@ -12,14 +12,13 @@ use proto::metadata::WriteSyncModeProto;
 use tokio::sync::Mutex;
 use types::DataHandleId;
 
-use super::runtime::{
-    is_unknown_session_barrier_outcome, mark_session_after_metadata_error, metric_labels, refresh_hint_from_error,
-    ClientRuntime,
-};
 use crate::error::{invalid_response, ClientError, ClientResult};
 use crate::metrics::ClientMetric;
 use crate::planner;
-use crate::runtime::{ErrorClass, ErrorClassifier, OperationContext, OperationIdentity, OperationKind, RefreshReason};
+use crate::runtime::{
+    is_unknown_session_barrier_outcome, mark_session_after_metadata_error, metric_labels, refresh_hint_from_error,
+    ClientRuntime, ErrorClass, ErrorClassifier, OperationContext, OperationIdentity, OperationKind, RefreshReason,
+};
 use crate::session::write_session::{WorkerCommitLevel, WriteSession};
 
 /// A reader for an immutable file snapshot opened through the filesystem client.

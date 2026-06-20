@@ -3,8 +3,8 @@
 
 //! Focused unit tests for the public API facade and client runtime behavior.
 
-use super::client::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_REPLICATION};
 use super::handle::{ReadHandle, WriteHandle};
+use super::options::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_REPLICATION};
 use super::*;
 use crate::canonical::{ClientAction, RefreshHint};
 use crate::config::{ClientConfig, MetadataGroupConfig};
@@ -646,79 +646,51 @@ async fn writer_write_crossing_block_boundary_emits_full_blocks_and_buffers_tail
 }
 
 #[tokio::test]
-async fn writer_visibility_sync_publishes_prefix_and_keeps_writer_usable() {
-    let layout = recorded_layout_values(8, 4);
-    let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
-    let worker = Arc::new(MockDataClient::default());
-    let client =
-        fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone())).expect("client");
-    let mut writer = client
-        .create("/created", CreateOptions::create())
-        .await
-        .expect("writer");
+async fn writer_sync_publishes_prefix_and_keeps_writer_usable() {
+    for (sync_mode, expected_sync_flags) in [
+        (WriteSyncModeProto::WriteSyncModeVisibility, vec![false, false]),
+        (WriteSyncModeProto::WriteSyncModeDurability, vec![true, false]),
+    ] {
+        let layout = recorded_layout_values(8, 4);
+        let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
+        let worker = Arc::new(MockDataClient::default());
+        let client = fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone()))
+            .expect("client");
+        let mut writer = client
+            .create("/created", CreateOptions::create())
+            .await
+            .expect("writer");
 
-    writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
+        writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
 
-    assert_eq!(add_block_lens(&gateway.calls()), Vec::<u64>::new());
-    assert_eq!(worker.write_lens(), Vec::<u64>::new());
+        assert_eq!(add_block_lens(&gateway.calls()), Vec::<u64>::new());
+        assert_eq!(worker.write_lens(), Vec::<u64>::new());
 
-    writer.sync_write_visibility().await.expect("visibility sync");
-    writer
-        .write_all(Bytes::from_static(b"!"))
-        .await
-        .expect("writer remains usable");
-    writer.close().await.expect("close");
+        match sync_mode {
+            WriteSyncModeProto::WriteSyncModeVisibility => {
+                writer.sync_write_visibility().await.expect("visibility sync")
+            }
+            WriteSyncModeProto::WriteSyncModeDurability => {
+                writer.sync_write_durability().await.expect("durability sync")
+            }
+            WriteSyncModeProto::WriteSyncModeUnspecified => unreachable!("sync test cases use explicit modes"),
+        }
+        writer
+            .write_all(Bytes::from_static(b"!"))
+            .await
+            .expect("writer remains usable");
+        writer.close().await.expect("close");
 
-    let sync_call = gateway
-        .calls()
-        .into_iter()
-        .find(|call| call.method == "sync_write")
-        .expect("sync_write call");
-    assert_eq!(
-        sync_call.sync_mode,
-        Some(WriteSyncModeProto::WriteSyncModeVisibility as i32)
-    );
-    assert_eq!(sync_call.target_size, Some(5));
-    assert_eq!(sync_call.committed_block_lens, vec![5]);
-    assert_eq!(worker.commit_sync_flags(), vec![false, false]);
-}
-
-#[tokio::test]
-async fn writer_durability_sync_publishes_prefix_and_keeps_writer_usable() {
-    let layout = recorded_layout_values(8, 4);
-    let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
-    let worker = Arc::new(MockDataClient::default());
-    let client =
-        fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker.clone())).expect("client");
-    let mut writer = client
-        .create("/created", CreateOptions::create())
-        .await
-        .expect("writer");
-
-    writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
-
-    assert_eq!(add_block_lens(&gateway.calls()), Vec::<u64>::new());
-    assert_eq!(worker.write_lens(), Vec::<u64>::new());
-
-    writer.sync_write_durability().await.expect("durability sync");
-    writer
-        .write_all(Bytes::from_static(b"!"))
-        .await
-        .expect("writer remains usable");
-    writer.close().await.expect("close");
-
-    let sync_call = gateway
-        .calls()
-        .into_iter()
-        .find(|call| call.method == "sync_write")
-        .expect("sync_write call");
-    assert_eq!(
-        sync_call.sync_mode,
-        Some(WriteSyncModeProto::WriteSyncModeDurability as i32)
-    );
-    assert_eq!(sync_call.target_size, Some(5));
-    assert_eq!(sync_call.committed_block_lens, vec![5]);
-    assert_eq!(worker.commit_sync_flags(), vec![true, false]);
+        let sync_call = gateway
+            .calls()
+            .into_iter()
+            .find(|call| call.method == "sync_write")
+            .expect("sync_write call");
+        assert_eq!(sync_call.sync_mode, Some(sync_mode as i32));
+        assert_eq!(sync_call.target_size, Some(5));
+        assert_eq!(sync_call.committed_block_lens, vec![5]);
+        assert_eq!(worker.commit_sync_flags(), expected_sync_flags);
+    }
 }
 
 #[tokio::test]
@@ -816,33 +788,34 @@ async fn writer_close_time_flush_worker_error_blocks_retry_commit() {
 }
 
 #[tokio::test]
-async fn writer_renew_lease_updates_session_state() {
+async fn writer_renew_lease_keeps_writer_usable() {
     let gateway = Arc::new(MockGateway::default());
-    let client = fs_client_with_gateway(test_config("root"), gateway).expect("client");
+    let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
     let handle = write_handle_for_tests("/created", 0, u64::MAX / 4).expect("write handle");
-    let session_ref = handle.write_session();
     let mut writer = FileWriter::new(Arc::clone(&client.runtime), handle);
 
     writer.renew_lease().await.expect("renew lease");
+    writer.abort().await.expect("renewed writer can still abort");
 
-    let session = session_ref.lock().await;
-    assert_eq!(session.expires_at_ms(), Some(u64::MAX / 2));
+    assert_eq!(methods(&gateway.calls()), vec!["renew_lease", "abort_file_write"]);
 }
 
 #[tokio::test]
 async fn writer_renew_lease_rejects_zero_expiry_without_updating_session() {
     let gateway = Arc::new(MockGateway::with_renew_outcomes(vec![RenewOutcome::ZeroExpiry]));
-    let client = fs_client_with_gateway(test_config("root"), gateway).expect("client");
+    let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
     let handle = write_handle_for_tests("/created", 0, u64::MAX / 4).expect("write handle");
-    let session_ref = handle.write_session();
     let mut writer = FileWriter::new(Arc::clone(&client.runtime), handle);
 
     let err = writer.renew_lease().await.expect_err("zero renew expiry must fail");
     assert!(matches!(&err, ClientError::InvalidResponse { operation, reason }
         if *operation == "RenewLease" && reason.contains("expires_at_ms")));
 
-    let session = session_ref.lock().await;
-    assert_eq!(session.expires_at_ms(), Some(u64::MAX / 4));
+    writer
+        .abort()
+        .await
+        .expect("zero expiry response must not poison session");
+    assert_eq!(methods(&gateway.calls()), vec!["renew_lease", "abort_file_write"]);
 }
 
 #[tokio::test]

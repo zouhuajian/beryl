@@ -18,7 +18,7 @@ use crate::runtime::policy::{OperationKind, ReplaySafety};
 
 /// Stable operation fingerprint used to guard replay of mutations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct OperationFingerprint(u64);
+pub(crate) struct OperationFingerprint(u64);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClientIdentity {
@@ -66,7 +66,7 @@ impl ClientIdentity {
 
 /// Stable identity fields that define one logical public operation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct OperationIdentity {
+pub(crate) struct OperationIdentity {
     original_target_path: Option<String>,
     secondary_target_path: Option<String>,
     detail: Option<String>,
@@ -75,7 +75,7 @@ pub struct OperationIdentity {
 
 impl OperationIdentity {
     /// Identity for a path-targeted operation.
-    pub fn path(path: impl Into<String>) -> Self {
+    pub(crate) fn path(path: impl Into<String>) -> Self {
         Self {
             original_target_path: Some(path.into()),
             secondary_target_path: None,
@@ -85,7 +85,7 @@ impl OperationIdentity {
     }
 
     /// Identity for a two-path operation such as rename.
-    pub fn path_pair(src: impl Into<String>, dst: impl Into<String>) -> Self {
+    pub(crate) fn path_pair(src: impl Into<String>, dst: impl Into<String>) -> Self {
         Self {
             original_target_path: Some(src.into()),
             secondary_target_path: Some(dst.into()),
@@ -105,13 +105,13 @@ impl OperationIdentity {
     }
 
     /// Attach an operation-specific stable detail.
-    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+    pub(crate) fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
         self
     }
 
     /// Compute the replay fingerprint for this identity.
-    pub fn fingerprint(&self, kind: OperationKind, operation_name: &str) -> OperationFingerprint {
+    pub(crate) fn fingerprint(&self, kind: OperationKind, operation_name: &str) -> OperationFingerprint {
         let mut hasher = DefaultHasher::new();
         kind.hash(&mut hasher);
         operation_name.hash(&mut hasher);
@@ -120,7 +120,7 @@ impl OperationIdentity {
     }
 
     /// Original path used by this operation, if any.
-    pub fn original_target_path(&self) -> Option<&str> {
+    pub(crate) fn original_target_path(&self) -> Option<&str> {
         self.original_target_path.as_deref()
     }
 
@@ -132,7 +132,7 @@ impl OperationIdentity {
 
 /// Stable context for one logical public operation.
 #[derive(Clone, Debug)]
-pub struct OperationContext {
+pub(crate) struct OperationContext {
     client_id: ClientId,
     client_name: String,
     call_id: CallId,
@@ -245,27 +245,27 @@ impl OperationContext {
     }
 
     /// Logical operation kind.
-    pub fn kind(&self) -> OperationKind {
+    pub(crate) fn kind(&self) -> OperationKind {
         self.kind
     }
 
     /// Human readable operation name.
-    pub fn operation_name(&self) -> &str {
+    pub(crate) fn operation_name(&self) -> &str {
         &self.operation_name
     }
 
     /// Replay safety required for this operation.
-    pub fn replay_safety(&self) -> ReplaySafety {
+    pub(crate) fn replay_safety(&self) -> ReplaySafety {
         self.replay_safety
     }
 
     /// Stable operation fingerprint.
-    pub fn operation_fingerprint(&self) -> OperationFingerprint {
+    pub(crate) fn operation_fingerprint(&self) -> OperationFingerprint {
         self.operation_fingerprint
     }
 
     /// Original target path, if present.
-    pub fn original_target_path(&self) -> Option<&str> {
+    pub(crate) fn original_target_path(&self) -> Option<&str> {
         self.identity.original_target_path()
     }
 
@@ -277,7 +277,7 @@ impl OperationContext {
 
 /// Per-attempt context shared by metadata and worker adapters.
 #[derive(Clone, Debug)]
-pub struct AttemptContext {
+pub(crate) struct AttemptContext {
     operation: OperationContext,
     call_id_text: String,
     group_name: Option<GroupName>,
@@ -291,7 +291,7 @@ pub struct AttemptContext {
 
 impl AttemptContext {
     /// Create a metadata context and require an explicit group name.
-    pub fn for_metadata(
+    pub(crate) fn for_metadata(
         operation: &OperationContext,
         group_name: GroupName,
         attempt_number: u32,
@@ -311,7 +311,7 @@ impl AttemptContext {
     }
 
     /// Create a data-plane context. Data RPCs carry block ownership in their operation payload.
-    pub fn for_data(operation: &OperationContext, attempt_number: u32) -> Self {
+    pub(crate) fn for_data(operation: &OperationContext, attempt_number: u32) -> Self {
         Self {
             call_id_text: operation.call_id.to_string(),
             operation: operation.clone(),
@@ -326,31 +326,31 @@ impl AttemptContext {
     }
 
     /// Attach selected metadata endpoint for this attempt.
-    pub fn with_metadata_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+    pub(crate) fn with_metadata_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.metadata_endpoint = Some(endpoint.into());
         self
     }
 
     /// Attach known mount epoch.
-    pub fn with_mount_epoch(mut self, mount_epoch: u64) -> Self {
+    pub(crate) fn with_mount_epoch(mut self, mount_epoch: u64) -> Self {
         self.mount_epoch = Some(mount_epoch);
         self
     }
 
     /// Attach known route epoch.
-    pub fn with_route_epoch(mut self, route_epoch: u64) -> Self {
+    pub(crate) fn with_route_epoch(mut self, route_epoch: u64) -> Self {
         self.route_epoch = Some(route_epoch);
         self
     }
 
     /// Attach group-scoped state watermarks.
-    pub fn with_state(mut self, state: Vec<proto::common::GroupStateWatermarkProto>) -> Self {
+    pub(crate) fn with_state(mut self, state: Vec<proto::common::GroupStateWatermarkProto>) -> Self {
         self.state = state;
         self
     }
 
     /// Attach an absolute per-attempt deadline derived from the operation timeout.
-    pub fn with_operation_timeout_ms(mut self, timeout_ms: Option<u64>) -> Self {
+    pub(crate) fn with_operation_timeout_ms(mut self, timeout_ms: Option<u64>) -> Self {
         if let Some(timeout_ms) = timeout_ms {
             self.deadline_ms = unix_now_ms().saturating_add(timeout_ms.min(i64::MAX as u64) as i64);
         }
@@ -358,12 +358,12 @@ impl AttemptContext {
     }
 
     /// Return the stable logical call id.
-    pub fn call_id(&self) -> &str {
+    pub(crate) fn call_id(&self) -> &str {
         &self.call_id_text
     }
 
     /// Return the stable client identity for this attempt.
-    pub fn client_id(&self) -> ClientId {
+    pub(crate) fn client_id(&self) -> ClientId {
         self.operation.client_id
     }
 
@@ -373,7 +373,7 @@ impl AttemptContext {
     }
 
     /// Return the absolute deadline in Unix epoch milliseconds, or zero when unset.
-    pub fn deadline_ms(&self) -> i64 {
+    pub(crate) fn deadline_ms(&self) -> i64 {
         self.deadline_ms
     }
 
@@ -396,12 +396,12 @@ impl AttemptContext {
     }
 
     /// Return the selected metadata endpoint for this attempt.
-    pub fn metadata_endpoint(&self) -> Option<&str> {
+    pub(crate) fn metadata_endpoint(&self) -> Option<&str> {
         self.metadata_endpoint.as_deref()
     }
 
     /// Build common client info for request headers.
-    pub fn client_info(&self) -> ClientInfoProto {
+    pub(crate) fn client_info(&self) -> ClientInfoProto {
         ClientInfoProto {
             call_id: self.call_id_text.clone(),
             client_id: Some(self.operation.client_id.into()),
@@ -410,7 +410,7 @@ impl AttemptContext {
     }
 
     /// Build a metadata request header for this attempt.
-    pub fn metadata_header(&self) -> ClientResult<RequestHeaderProto> {
+    pub(crate) fn metadata_header(&self) -> ClientResult<RequestHeaderProto> {
         let group_name = self
             .group_name
             .as_ref()
@@ -438,7 +438,7 @@ impl AttemptContext {
     }
 
     /// Build a worker data-plane request header for this attempt.
-    pub fn data_header(&self) -> DataRequestHeaderProto {
+    pub(crate) fn data_header(&self) -> DataRequestHeaderProto {
         DataRequestHeaderProto {
             client: Some(self.client_info()),
             trace_context: None,

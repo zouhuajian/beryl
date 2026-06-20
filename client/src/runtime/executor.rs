@@ -8,17 +8,17 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::api::client::{DEFAULT_BLOCK_SIZE, DEFAULT_REPLICATION, MAX_PREALLOCATED_WRITE_BLOCKS};
 use crate::api::handle::{ReadHandle, WriteHandle};
+use crate::api::options::{DEFAULT_BLOCK_SIZE, DEFAULT_REPLICATION, MAX_PREALLOCATED_WRITE_BLOCKS};
 use crate::api::path::NamespacePathBuf;
 use crate::api::{CreateMode, CreateOptions, DirectoryEntry, DirectoryListing, FileStatus, ListOptions};
 use crate::canonical::ClientAction;
-use crate::config::{BackoffConfig, RefreshConfig, RetryConfig};
+use crate::config::{ClientConfig, RefreshConfig, RetryConfig};
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::{AddBlockResult, MetadataGateway, ReadLayout};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
 use crate::runtime::classify::{ErrorClass, ErrorClassifier, RefreshReason};
-pub use crate::runtime::context::{AttemptContext, OperationContext, OperationIdentity};
+pub(crate) use crate::runtime::context::{AttemptContext, OperationContext, OperationIdentity};
 use crate::runtime::policy::{OperationKind, ReplayPolicyTable};
 use crate::runtime::refresh::MetadataTargets;
 use crate::runtime::ClientIdentity;
@@ -28,7 +28,7 @@ use types::{CommittedBlock, DataHandleId, FileLayout};
 
 /// Executes public operations through policy, classification, refresh, and replay gates.
 #[derive(Clone)]
-pub struct OperationExecutor {
+pub(crate) struct OperationExecutor {
     identity: ClientIdentity,
     gateway: Arc<dyn MetadataGateway>,
     metadata_targets: MetadataTargets,
@@ -41,22 +41,15 @@ pub struct OperationExecutor {
     metrics: Arc<dyn ClientMetrics>,
 }
 
-/// Runtime policy and hooks used by the operation executor.
-pub(crate) struct OperationRuntime {
-    pub(crate) retry: RetryConfig,
-    pub(crate) refresh: RefreshConfig,
-    pub(crate) backoff: BackoffConfig,
-    pub(crate) sleeper: Arc<dyn BackoffSleeper>,
-    pub(crate) metrics: Arc<dyn ClientMetrics>,
-}
-
 impl OperationExecutor {
     /// Create a metadata executor with explicit runtime policy and hooks.
-    pub(crate) fn with_runtime(
+    pub(crate) fn new(
         identity: ClientIdentity,
         gateway: Arc<dyn MetadataGateway>,
         metadata_targets: MetadataTargets,
-        runtime: OperationRuntime,
+        config: &ClientConfig,
+        sleeper: Arc<dyn BackoffSleeper>,
+        metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
         Ok(Self {
             identity,
@@ -64,11 +57,11 @@ impl OperationExecutor {
             metadata_targets,
             replay_policy: ReplayPolicyTable::new(),
             classifier: ErrorClassifier,
-            retry: runtime.retry,
-            refresh: runtime.refresh,
-            backoff: BackoffPolicy::from_config(&runtime.backoff),
-            sleeper: runtime.sleeper,
-            metrics: runtime.metrics,
+            retry: config.retry.clone(),
+            refresh: config.refresh.clone(),
+            backoff: BackoffPolicy::from_config(&config.backoff),
+            sleeper,
+            metrics,
         })
     }
 
@@ -274,7 +267,6 @@ impl OperationExecutor {
         .await
     }
 
-    /// Execute CreateFile.
     /// Execute CreateFile and return a write handle.
     pub(crate) async fn create_file(
         &self,
@@ -348,7 +340,6 @@ impl OperationExecutor {
         .await
     }
 
-    /// Execute AppendFile.
     /// Execute AppendFile and return a write handle.
     pub(crate) async fn append_file(&self, path: NamespacePathBuf) -> ClientResult<WriteHandle> {
         let path = path.into_string();
@@ -936,6 +927,7 @@ fn refresh_hint_from_error(err: &ClientError) -> crate::canonical::RefreshHint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::BackoffConfig;
     use crate::runtime::policy::OperationKind;
     use crate::runtime::refresh::MetadataGroupTargets;
     use async_trait::async_trait;
@@ -1858,19 +1850,21 @@ mod tests {
             },
         ])
         .expect("metadata targets");
-        OperationExecutor::with_runtime(
+        let config = ClientConfig {
+            retry,
+            refresh: RefreshConfig {
+                max_refresh_attempts: refresh.max_refresh_attempts,
+            },
+            backoff: BackoffConfig::default(),
+            ..ClientConfig::default()
+        };
+        OperationExecutor::new(
             ClientIdentity::from_parts(ClientId::new(7), "test-client").expect("client identity"),
             gateway,
             metadata_targets,
-            OperationRuntime {
-                retry,
-                refresh: RefreshConfig {
-                    max_refresh_attempts: refresh.max_refresh_attempts,
-                },
-                backoff: BackoffConfig::default(),
-                sleeper,
-                metrics,
-            },
+            &config,
+            sleeper,
+            metrics,
         )
         .expect("executor")
     }

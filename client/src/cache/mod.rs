@@ -3,9 +3,9 @@
 
 //! Client-side caching for metadata freshness.
 
-pub mod state_id;
+pub(crate) mod state_id;
 
-pub use state_id::StateIdCache;
+pub(crate) use state_id::StateIdCache;
 
 /// Low-cardinality cache invalidation reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

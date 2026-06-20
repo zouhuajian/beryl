@@ -3,4 +3,4 @@
 
 //! Client-side read/write session state.
 
-pub mod write_session;
+pub(crate) mod write_session;

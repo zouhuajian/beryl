@@ -8,7 +8,7 @@ use crate::runtime::context::{OperationContext, OperationFingerprint, OperationI
 
 /// Logical operation category used by replay policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum OperationKind {
+pub(crate) enum OperationKind {
     /// Idempotent metadata read.
     MetadataRead,
     /// Metadata mutation guarded by stable call id and server-side dedup.
@@ -48,7 +48,7 @@ impl OperationKind {
 
 /// Evidence required before replaying an operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReplaySafety {
+pub(crate) enum ReplaySafety {
     /// Replay is safe because the operation is an idempotent read.
     Idempotent,
     /// Replay requires a stable logical call id.
@@ -61,7 +61,7 @@ pub enum ReplaySafety {
 
 /// Explicit replay policy table.
 #[derive(Clone, Debug)]
-pub struct ReplayPolicyTable;
+pub(crate) struct ReplayPolicyTable;
 
 impl Default for ReplayPolicyTable {
     fn default() -> Self {
@@ -71,7 +71,7 @@ impl Default for ReplayPolicyTable {
 
 impl ReplayPolicyTable {
     /// Create a replay policy table and verify the explicit policy classes are covered.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::assert_contract_complete();
         Self
     }
@@ -89,7 +89,7 @@ impl ReplayPolicyTable {
     }
 
     /// Return the replay safety requirement for an operation kind.
-    pub fn safety_for(kind: OperationKind) -> ReplaySafety {
+    pub(crate) fn safety_for(kind: OperationKind) -> ReplaySafety {
         match kind {
             OperationKind::MetadataRead | OperationKind::WorkerReadData => ReplaySafety::Idempotent,
             OperationKind::MetadataMutation => ReplaySafety::StableCallId,
@@ -99,7 +99,7 @@ impl ReplayPolicyTable {
     }
 
     /// Reject unsafe mutation or session replay before an executor retries.
-    pub fn ensure_replay_allowed(
+    pub(crate) fn ensure_replay_allowed(
         &self,
         operation: &OperationContext,
         observed_fingerprint: Option<OperationFingerprint>,

@@ -7,23 +7,22 @@
 //! Watermarks must be compared only within the same group name.
 
 use dashmap::DashMap;
-use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use types::{GroupName, GroupStateWatermark};
 
 /// Cached watermark entry.
 #[derive(Clone, Debug)]
-pub struct CachedWatermark {
+pub(crate) struct CachedWatermark {
     /// The group watermark.
-    pub watermark: GroupStateWatermark,
+    watermark: GroupStateWatermark,
     /// When this entry was cached.
-    pub cached_at: Instant,
+    cached_at: Instant,
 }
 
 impl CachedWatermark {
     /// Create a new cached watermark entry.
-    pub fn new(watermark: GroupStateWatermark) -> Self {
+    fn new(watermark: GroupStateWatermark) -> Self {
         Self {
             watermark,
             cached_at: Instant::now(),
@@ -31,34 +30,33 @@ impl CachedWatermark {
     }
 
     /// Check if this entry is still fresh (within TTL).
-    pub fn is_fresh(&self, ttl: Duration) -> bool {
+    fn is_fresh(&self, ttl: Duration) -> bool {
         self.cached_at.elapsed() < ttl
     }
 }
 
 /// State ID cache per group.
 #[derive(Clone, Debug)]
-pub struct StateIdCache {
+pub(crate) struct StateIdCache {
     /// Watermark map: group name -> CachedWatermark.
-    cache: Arc<RwLock<DashMap<GroupName, CachedWatermark>>>,
+    cache: Arc<DashMap<GroupName, CachedWatermark>>,
     /// TTL for cache entries.
     ttl: Duration,
 }
 
 impl StateIdCache {
     /// Create a new state ID cache.
-    pub fn new(ttl_secs: u64) -> Self {
+    pub(crate) fn new(ttl_secs: u64) -> Self {
         Self {
-            cache: Arc::new(RwLock::new(DashMap::new())),
+            cache: Arc::new(DashMap::new()),
             ttl: Duration::from_secs(ttl_secs),
         }
     }
 
     /// Get the cached watermark for a group.
     /// Returns None if not cached or expired.
-    pub fn get(&self, group_name: &GroupName) -> Option<GroupStateWatermark> {
-        let cache = self.cache.read();
-        cache.get(group_name).and_then(|entry| {
+    pub(crate) fn get(&self, group_name: &GroupName) -> Option<GroupStateWatermark> {
+        self.cache.get(group_name).and_then(|entry| {
             if entry.is_fresh(self.ttl) {
                 Some(entry.watermark.clone())
             } else {
@@ -69,19 +67,22 @@ impl StateIdCache {
 
     /// Update the cached watermark for a group if the new watermark is ahead.
     /// This ensures we only advance the watermark, never go backwards.
-    pub fn update_if_ahead(&self, new_watermark: GroupStateWatermark) {
-        let cache = self.cache.write();
-        let should_update = cache
-            .get(&new_watermark.group_name)
-            .and_then(|entry| {
-                new_watermark
-                    .cmp_same_group(&entry.watermark)
-                    .map(|ord| ord == std::cmp::Ordering::Greater)
-            })
-            .unwrap_or(true);
+    pub(crate) fn update_if_ahead(&self, new_watermark: GroupStateWatermark) {
+        use dashmap::mapref::entry::Entry;
 
-        if should_update {
-            cache.insert(new_watermark.group_name.clone(), CachedWatermark::new(new_watermark));
+        match self.cache.entry(new_watermark.group_name.clone()) {
+            Entry::Occupied(mut entry) => {
+                let should_update = new_watermark
+                    .cmp_same_group(&entry.get().watermark)
+                    .map(|ord| ord == std::cmp::Ordering::Greater)
+                    .unwrap_or(false);
+                if should_update {
+                    entry.insert(CachedWatermark::new(new_watermark));
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(CachedWatermark::new(new_watermark));
+            }
         }
     }
 }

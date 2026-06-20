@@ -14,11 +14,9 @@ use crate::error::side_effect_response_body_mismatch;
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::MetadataGateway;
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
-use crate::runtime::MetadataTargets;
-use crate::runtime::OperationExecutor;
 use crate::runtime::{
-    AttemptContext, BackoffPolicy, BackoffSleeper, ClientIdentity, ErrorClass, ErrorClassifier, OperationContext,
-    OperationIdentity, OperationKind, OperationRuntime, RefreshReason,
+    AttemptContext, BackoffPolicy, BackoffSleeper, ClientIdentity, ErrorClass, ErrorClassifier, MetadataTargets,
+    OperationContext, OperationExecutor, OperationIdentity, OperationKind, RefreshReason,
 };
 use crate::session::write_session::{PendingBlock, WorkerCommitLevel, WriteSession};
 use bytes::Bytes;
@@ -50,17 +48,13 @@ impl ClientRuntime {
         metrics: Arc<dyn ClientMetrics>,
     ) -> ClientResult<Self> {
         let identity = ClientIdentity::generate(config.client_name.clone())?;
-        let executor = OperationExecutor::with_runtime(
+        let executor = OperationExecutor::new(
             identity,
             gateway,
             metadata_targets,
-            OperationRuntime {
-                retry: config.retry.clone(),
-                refresh: config.refresh.clone(),
-                backoff: config.backoff.clone(),
-                sleeper: Arc::clone(&sleeper),
-                metrics: Arc::clone(&metrics),
-            },
+            &config,
+            Arc::clone(&sleeper),
+            Arc::clone(&metrics),
         )?;
         let backoff = BackoffPolicy::from_config(&config.backoff);
         Ok(Self {

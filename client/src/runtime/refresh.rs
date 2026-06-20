@@ -18,11 +18,11 @@ use crate::runtime::context::{AttemptContext, OperationContext};
 
 /// Configured metadata group bootstrap target.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MetadataGroupTargets {
+pub(crate) struct MetadataGroupTargets {
     /// Stable metadata group name.
-    pub group_name: GroupName,
+    pub(crate) group_name: GroupName,
     /// Metadata endpoints for this group.
-    pub endpoints: Vec<String>,
+    pub(crate) endpoints: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -36,14 +36,14 @@ struct MetadataTargetState {
 
 /// Owns metadata target selection and correctness cache updates after refresh signals.
 #[derive(Clone, Debug)]
-pub struct MetadataTargets {
+pub(crate) struct MetadataTargets {
     state: Arc<RwLock<MetadataTargetState>>,
     watermarks: StateIdCache,
 }
 
 impl MetadataTargets {
     /// Create metadata targets from configured metadata groups.
-    pub fn new(groups: Vec<MetadataGroupTargets>) -> ClientResult<Self> {
+    pub(crate) fn new(groups: Vec<MetadataGroupTargets>) -> ClientResult<Self> {
         if groups.is_empty() {
             return Err(ClientError::InvalidArgument(
                 "MetadataTargets requires at least one metadata group".to_string(),
@@ -68,7 +68,7 @@ impl MetadataTargets {
     }
 
     /// Build metadata targets from client config.
-    pub fn from_config(config: &ClientConfig) -> ClientResult<Self> {
+    pub(crate) fn from_config(config: &ClientConfig) -> ClientResult<Self> {
         let groups = config
             .metadata_groups
             .iter()
@@ -81,7 +81,7 @@ impl MetadataTargets {
     }
 
     /// Choose the owner group for a path, using owner cache before bootstrap config.
-    pub fn group_for_path(&self, path: &str) -> ClientResult<GroupName> {
+    pub(crate) fn group_for_path(&self, path: &str) -> ClientResult<GroupName> {
         let state = self.state.read();
         if let Some(group_name) = state.route_cache.get(path) {
             return Ok(group_name.clone());
@@ -94,7 +94,7 @@ impl MetadataTargets {
     }
 
     /// Choose the owner group for an operation.
-    pub fn group_for_operation(&self, operation: &OperationContext) -> ClientResult<GroupName> {
+    pub(crate) fn group_for_operation(&self, operation: &OperationContext) -> ClientResult<GroupName> {
         if let Some(path) = operation.original_target_path() {
             self.group_for_path(path)
         } else {
@@ -103,17 +103,17 @@ impl MetadataTargets {
     }
 
     /// Return cached mount epoch for a path or its best matching mount prefix.
-    pub fn cached_mount_epoch(&self, path: &str) -> Option<u64> {
+    pub(crate) fn cached_mount_epoch(&self, path: &str) -> Option<u64> {
         cached_epoch_for_path(&self.state.read().mount_epoch_cache, path)
     }
 
     /// Return cached route epoch for a path or its best matching mount prefix.
-    pub fn cached_route_epoch(&self, path: &str) -> Option<u64> {
+    pub(crate) fn cached_route_epoch(&self, path: &str) -> Option<u64> {
         cached_epoch_for_path(&self.state.read().route_epoch_cache, path)
     }
 
     /// Select endpoint for the next attempt.
-    pub fn endpoint_for_group(&self, group_name: &GroupName, attempt: u32) -> ClientResult<String> {
+    pub(crate) fn endpoint_for_group(&self, group_name: &GroupName, attempt: u32) -> ClientResult<String> {
         let state = self.state.read();
         if let Some(endpoint) = state.leader_cache.get(group_name) {
             return Ok(endpoint.clone());
@@ -130,7 +130,7 @@ impl MetadataTargets {
     }
 
     /// Clear a cached leader when transport failed against that exact endpoint.
-    pub fn record_transport_failure(&self, group_name: &GroupName, endpoint: &str) {
+    pub(crate) fn record_transport_failure(&self, group_name: &GroupName, endpoint: &str) {
         let mut state = self.state.write();
         if state
             .leader_cache
@@ -142,7 +142,7 @@ impl MetadataTargets {
     }
 
     /// Record a structured refresh decision and update correctness caches.
-    pub fn record_refresh(
+    pub(crate) fn record_refresh(
         &self,
         operation: &OperationContext,
         reason: RefreshReason,
@@ -197,7 +197,11 @@ impl MetadataTargets {
     }
 
     /// Add cached freshness hints to an attempt context without inventing defaults.
-    pub fn enrich_attempt_context(&self, operation: &OperationContext, mut ctx: AttemptContext) -> AttemptContext {
+    pub(crate) fn enrich_attempt_context(
+        &self,
+        operation: &OperationContext,
+        mut ctx: AttemptContext,
+    ) -> AttemptContext {
         let Some(path) = operation.original_target_path() else {
             return ctx;
         };
@@ -211,7 +215,10 @@ impl MetadataTargets {
     }
 
     /// Record an msync state watermark.
-    pub fn record_state_watermark(&self, watermark: proto::common::GroupStateWatermarkProto) -> ClientResult<()> {
+    pub(crate) fn record_state_watermark(
+        &self,
+        watermark: proto::common::GroupStateWatermarkProto,
+    ) -> ClientResult<()> {
         let watermark = GroupStateWatermark::try_from(watermark)
             .map_err(|err| ClientError::Metadata(format!("invalid state watermark: {err}")))?;
         self.watermarks.update_if_ahead(watermark);
@@ -219,7 +226,10 @@ impl MetadataTargets {
     }
 
     /// Return cached watermark as proto for a group.
-    pub fn state_watermark_proto(&self, group_name: &GroupName) -> Option<proto::common::GroupStateWatermarkProto> {
+    pub(crate) fn state_watermark_proto(
+        &self,
+        group_name: &GroupName,
+    ) -> Option<proto::common::GroupStateWatermarkProto> {
         self.watermarks.get(group_name).map(|watermark| (&watermark).into())
     }
 }
