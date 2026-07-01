@@ -31,6 +31,11 @@ impl FsClient {
     /// Create a new filesystem client facade and return configuration errors.
     pub fn try_new(config: ClientConfig) -> ClientResult<Self> {
         let metrics: Arc<dyn ClientMetrics> = Arc::new(NoopClientMetrics);
+        Self::try_new_with_metrics(config, metrics)
+    }
+
+    /// Create a new filesystem client facade with an injected metrics recorder.
+    pub fn try_new_with_metrics(config: ClientConfig, metrics: Arc<dyn ClientMetrics>) -> ClientResult<Self> {
         let metadata_targets = MetadataTargets::from_config(&config)?;
         let gateway = Arc::new(GrpcMetadataGateway::new_lazy_with_config(
             &config,
@@ -84,6 +89,13 @@ impl FsClient {
     pub async fn list(&self, path: &str, options: ListOptions) -> ClientResult<DirectoryListing> {
         let path = NamespacePathBuf::parse(path)?;
         self.runtime.executor.list(path, options).await
+    }
+
+    /// Create a directory through the metadata runtime.
+    /// When `recursive` is true, missing parent directories are created.
+    pub async fn mkdirs(&self, path: &str, recursive: bool) -> ClientResult<FileStatus> {
+        let path = NamespacePathBuf::parse(path)?;
+        self.runtime.executor.create_directory(path, recursive).await
     }
 
     /// Delete a file, symlink, or directory through the metadata runtime.

@@ -57,13 +57,34 @@ impl GrpcWorkerDataClient {
     ) -> ClientError {
         if is_transient_worker_transport_status(&status) {
             self.channel_pool
-                .invalidate_worker_channel(worker, CacheInvalidationReason::Unavailable);
+                .mark_worker_unavailable(worker, CacheInvalidationReason::Unavailable);
         }
         ClientError::UnknownOutcome(format!(
             "worker {operation} outcome is unknown after transport status {}: {}",
             status.code(),
             status.message()
         ))
+    }
+
+    fn worker_candidates<'a>(&self, workers: &'a [types::WorkerEndpointInfo]) -> Vec<&'a types::WorkerEndpointInfo> {
+        let mut active = Vec::with_capacity(workers.len());
+        let mut cooling = Vec::new();
+        for worker in workers {
+            if self.channel_pool.is_worker_cooling_down(worker) {
+                cooling.push(worker);
+            } else {
+                active.push(worker);
+            }
+        }
+        if !active.is_empty() {
+            return active;
+        }
+        // Cooldown is an avoidance preference, not availability authority. If
+        // metadata gives no uncool alternatives, try the cooled candidates.
+        for worker in &cooling {
+            self.channel_pool.clear_worker_cooldown(worker);
+        }
+        cooling
     }
 }
 
@@ -76,14 +97,14 @@ impl WorkerDataClient for GrpcWorkerDataClient {
         block_read: &PlannedBlockRead,
     ) -> ClientResult<WorkerReadResult> {
         let mut last_transport_error = None;
-        for worker in &block_read.workers {
+        for worker in self.worker_candidates(&block_read.workers) {
             let mut client = self.channel_pool.worker_data_service_client(worker, "OpenReadStream")?;
             let request = build_open_read_stream_request(&attempt, &group_name, block_read, worker)?;
             let open_response = match client.open_read_stream(build_tonic_request(&attempt, request)).await {
                 Ok(response) => response.into_inner(),
                 Err(status) if is_transient_worker_transport_status(&status) => {
                     self.channel_pool
-                        .invalidate_worker_channel(worker, CacheInvalidationReason::Unavailable);
+                        .mark_worker_unavailable(worker, CacheInvalidationReason::Unavailable);
                     last_transport_error = Some(ClientError::from(status));
                     continue;
                 }
@@ -110,7 +131,7 @@ impl WorkerDataClient for GrpcWorkerDataClient {
                 Ok(response) => response.into_inner(),
                 Err(status) if is_transient_worker_transport_status(&status) => {
                     self.channel_pool
-                        .invalidate_worker_channel(worker, CacheInvalidationReason::Unavailable);
+                        .mark_worker_unavailable(worker, CacheInvalidationReason::Unavailable);
                     last_transport_error = Some(ClientError::from(status));
                     continue;
                 }
@@ -120,7 +141,7 @@ impl WorkerDataClient for GrpcWorkerDataClient {
                 Ok(bytes) => bytes,
                 Err(err) if ErrorClassifier.classify_error(&err) == ErrorClass::RetryableTransport => {
                     self.channel_pool
-                        .invalidate_worker_channel(worker, CacheInvalidationReason::Unavailable);
+                        .mark_worker_unavailable(worker, CacheInvalidationReason::Unavailable);
                     last_transport_error = Some(err);
                     continue;
                 }
@@ -142,7 +163,7 @@ impl WorkerDataClient for GrpcWorkerDataClient {
         target: WorkerWriteTarget,
     ) -> ClientResult<WorkerBlockWriteHandle> {
         let mut last_transport_error = None;
-        for worker in &target.target.worker_endpoints {
+        for worker in self.worker_candidates(&target.target.worker_endpoints) {
             let mut client = self
                 .channel_pool
                 .worker_data_service_client(worker, "OpenWriteStream")?;
@@ -151,7 +172,7 @@ impl WorkerDataClient for GrpcWorkerDataClient {
                 Ok(response) => response.into_inner(),
                 Err(status) if is_transient_worker_transport_status(&status) => {
                     self.channel_pool
-                        .invalidate_worker_channel(worker, CacheInvalidationReason::Unavailable);
+                        .mark_worker_unavailable(worker, CacheInvalidationReason::Unavailable);
                     last_transport_error = Some(ClientError::UnknownOutcome(format!(
                         "worker OpenWriteStream outcome is unknown after transport status {}: {}",
                         status.code(),
@@ -444,13 +465,14 @@ mod tests {
             let err = client.map_side_effect_status(&worker, "WriteStream", Status::new(code, "transport down"));
 
             assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("WriteStream")));
-            client
+            let err = client
                 .channel_pool
                 .worker_data_service_client(&worker, "WriteStream")
-                .expect("channel can be rebuilt after invalidation");
+                .expect_err("worker endpoint should cool down after transient failure");
+            assert!(matches!(err, ClientError::Worker(msg) if msg.contains("cooling down")));
             let events = metrics.events();
             assert_metric(&events, ClientMetric::CachePreciseInvalidation);
-            assert_eq!(count_metric(&events, ClientMetric::WorkerChannelPoolMiss), 2);
+            assert_eq!(count_metric(&events, ClientMetric::WorkerChannelPoolMiss), 1);
         }
     }
 
@@ -506,6 +528,89 @@ mod tests {
         assert_metric(&metrics.events(), ClientMetric::CachePreciseInvalidation);
         let _ = first_shutdown.send(());
         let _ = second_shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn transient_read_failure_cools_down_worker_for_followup_read() {
+        let first_state = Arc::new(MockWorkerDataState {
+            read_stream_status: Some(tonic::Code::Unavailable),
+            read_payload: Bytes::new(),
+            ..MockWorkerDataState::default()
+        });
+        let second_state = Arc::new(MockWorkerDataState {
+            read_payload: Bytes::from_static(b"data"),
+            ..MockWorkerDataState::default()
+        });
+        let (first_worker, first_shutdown) = start_mock_worker(Arc::clone(&first_state), 1).await;
+        let (second_worker, second_shutdown) = start_mock_worker(Arc::clone(&second_state), 2).await;
+        let metrics = Arc::new(RecordingMetrics::default());
+        let client = grpc_client_with_metrics(metrics);
+        let block_read = planned_block_read(vec![first_worker, second_worker]);
+
+        client
+            .read_block_range(data_attempt_context("OpenReadStream"), test_group_name(), &block_read)
+            .await
+            .expect("second worker should satisfy first read");
+        client
+            .read_block_range(data_attempt_context("OpenReadStream"), test_group_name(), &block_read)
+            .await
+            .expect("cooled down first worker should be skipped");
+
+        assert_eq!(first_state.open_read_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first_state.read_stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_state.open_read_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(second_state.read_stream_calls.load(Ordering::SeqCst), 2);
+        let _ = first_shutdown.send(());
+        let _ = second_shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn all_cooling_read_candidates_are_tried_when_no_alternative() {
+        let state = Arc::new(MockWorkerDataState {
+            read_payload: Bytes::from_static(b"data"),
+            ..MockWorkerDataState::default()
+        });
+        let (worker, shutdown) = start_mock_worker(Arc::clone(&state), 1).await;
+        let metrics = Arc::new(RecordingMetrics::default());
+        let client = grpc_client_with_metrics(metrics);
+        client
+            .channel_pool
+            .mark_worker_unavailable(&worker, CacheInvalidationReason::Unavailable);
+        let block_read = planned_block_read(vec![worker]);
+
+        let result = client
+            .read_block_range(data_attempt_context("OpenReadStream"), test_group_name(), &block_read)
+            .await
+            .expect("single cooled read candidate should still be tried");
+
+        assert_eq!(result.bytes, Bytes::from_static(b"data"));
+        assert_eq!(state.open_read_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.read_stream_calls.load(Ordering::SeqCst), 1);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn all_cooling_write_candidates_are_tried_when_no_alternative() {
+        let state = Arc::new(MockWorkerDataState::default());
+        let (worker, shutdown) = start_mock_worker(Arc::clone(&state), 1).await;
+        let metrics = Arc::new(RecordingMetrics::default());
+        let client = grpc_client_with_metrics(metrics);
+        client
+            .channel_pool
+            .mark_worker_unavailable(&worker, CacheInvalidationReason::Unavailable);
+        let target = WorkerWriteTarget {
+            group_name: test_group_name(),
+            target: write_target(worker.clone()),
+        };
+
+        let handle = client
+            .open_block_write(data_attempt_context("OpenWriteStream"), target)
+            .await
+            .expect("single cooled write candidate should still be tried");
+
+        assert_eq!(handle.worker.endpoint, worker.endpoint);
+        assert_eq!(state.open_write_calls.load(Ordering::SeqCst), 1);
+        let _ = shutdown.send(());
     }
 
     #[tokio::test]
@@ -662,6 +767,7 @@ mod tests {
     #[derive(Default)]
     struct MockWorkerDataState {
         open_read_calls: AtomicUsize,
+        open_write_calls: AtomicUsize,
         read_stream_calls: AtomicUsize,
         commit_calls: AtomicUsize,
         abort_calls: AtomicUsize,
@@ -719,9 +825,18 @@ mod tests {
 
         async fn open_write_stream(
             &self,
-            _request: Request<OpenWriteStreamRequestProto>,
+            request: Request<OpenWriteStreamRequestProto>,
         ) -> Result<Response<OpenWriteStreamResponseProto>, Status> {
-            Err(Status::unimplemented("open write unused in test"))
+            self.state.open_write_calls.fetch_add(1, Ordering::SeqCst);
+            let request = request.into_inner();
+            Ok(Response::new(OpenWriteStreamResponseProto {
+                header: Some(ok_data_header(request.header.as_ref())),
+                stream_id: Some(proto::common::StreamIdProto { high: 1, low: 1 }),
+                frame_size: request.frame_size.max(1),
+                window_bytes: 0,
+                block_stamp: request.block_stamp,
+                committed_length: 0,
+            }))
         }
 
         async fn write_stream(
@@ -931,10 +1046,14 @@ mod tests {
         let hits = count_metric(&before, ClientMetric::WorkerChannelPoolHit);
         let misses = count_metric(&before, ClientMetric::WorkerChannelPoolMiss);
 
-        client
-            .channel_pool
-            .worker_data_service_client(worker, "CacheProbe")
-            .expect("cache probe channel");
+        let result = client.channel_pool.worker_data_service_client(worker, "CacheProbe");
+        if !expected_cached {
+            if let Err(ClientError::Worker(msg)) = &result {
+                assert!(msg.contains("cooling down"), "unexpected worker error: {msg}");
+                return;
+            }
+        }
+        result.expect("cache probe channel");
 
         let after = metrics.events();
         let hit_delta = count_metric(&after, ClientMetric::WorkerChannelPoolHit) - hits;

@@ -485,6 +485,11 @@ impl WriteSession {
         self.expires_at_ms = Some(expires_at_ms);
     }
 
+    /// Return whether the open session should renew before another side-effecting operation.
+    pub(crate) fn should_renew_lease(&mut self, renew_before_expiry_ms: u64) -> ClientResult<bool> {
+        self.should_renew_lease_at_ms(unix_now_ms(), renew_before_expiry_ms)
+    }
+
     /// Return whether CommitFile outcome is unresolved and retryable.
     pub(crate) fn is_commit_unknown(&self) -> bool {
         matches!(self.state, WriteSessionState::CommitUnknown)
@@ -549,6 +554,22 @@ impl WriteSession {
     fn ensure_open_for_barrier_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
         self.ensure_state_allows_write()?;
         self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS)
+    }
+
+    fn should_renew_lease_at_ms(&mut self, now_ms: u64, renew_before_expiry_ms: u64) -> ClientResult<bool> {
+        if !matches!(self.state, WriteSessionState::Open) {
+            return Ok(false);
+        }
+        let Some(expires_at_ms) = self.expires_at_ms else {
+            return Ok(false);
+        };
+        if expires_at_ms <= now_ms {
+            self.mark_session_expired();
+            return Err(ClientError::StaleHandle {
+                reason: "write session lease expired".to_string(),
+            });
+        }
+        Ok(expires_at_ms.saturating_sub(now_ms) <= renew_before_expiry_ms)
     }
 
     fn ensure_state_allows_write(&self) -> ClientResult<()> {

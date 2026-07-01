@@ -138,10 +138,13 @@ lock the root to one metadata group.
 | `client.backoff.initial_ms` | `100` | non-negative integer | Retry initial backoff. |
 | `client.backoff.max_ms` | `5000` | non-negative integer >= initial | Retry maximum backoff. |
 | `client.backoff.multiplier` | `2.0` | finite number >= 1.0 | Retry backoff multiplier. |
+| `client.write_lease.auto_renew` | `true` | boolean | Automatically renew near-expiry write leases before side-effecting writer operations. |
+| `client.write_lease.renew_before_expiry_ms` | `30000` | positive integer | Renew write leases when the current metadata lease expires within this window. |
 | `client.channel_pool.metadata.enabled` | `true` | boolean | Metadata channel pool switch. |
 | `client.channel_pool.metadata.max_per_group` | `1` | positive integer | Max metadata channels per group. |
 | `client.channel_pool.worker.enabled` | `true` | boolean | Worker channel pool switch. |
 | `client.channel_pool.worker.max_per_worker` | `1` | positive integer | Max worker channels per worker. |
+| `client.channel_pool.worker.endpoint_cooldown_ms` | `1000` | non-negative integer | Cooldown after transient worker endpoint failures; zero disables cooldown. |
 
 ## Unsupported Behavior
 

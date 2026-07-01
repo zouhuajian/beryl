@@ -23,12 +23,14 @@ use common::error::canonical::{CanonicalError, RefreshHint as CanonicalRefreshHi
 use common::header::RpcErrorCode;
 use proto::common::{BlockIdProto, FencingTokenProto};
 use proto::metadata::{
-    AbortFileWriteResponseProto, AppendFileResponseProto, CommitFileResponseProto, CreateFileResponseProto,
-    CreateModeProto, DeleteResponseProto, GetStatusResponseProto, ListStatusResponseProto, OpenFileResponseProto,
-    RenameResponseProto, RenewLeaseResponseProto, SyncWriteResponseProto, WriteHandleProto, WriteSyncModeProto,
+    AbortFileWriteResponseProto, AppendFileResponseProto, CommitFileResponseProto, CreateDirectoryResponseProto,
+    CreateFileResponseProto, CreateModeProto, DeleteResponseProto, GetStatusResponseProto, ListStatusResponseProto,
+    OpenFileResponseProto, RenameResponseProto, RenewLeaseResponseProto, SyncWriteResponseProto, WriteHandleProto,
+    WriteSyncModeProto,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use types::lease::FencingToken;
 use types::{
     BlockId, BlockIndex, ClientId, DataHandleId, FileBlockLocation, GroupName, WorkerEndpointInfo, WorkerId,
@@ -281,6 +283,26 @@ async fn stat_list_delete_and_rename_use_metadata_gateway() {
 }
 
 #[tokio::test]
+async fn mkdirs_uses_metadata_gateway_and_recursive_flag() {
+    let gateway = Arc::new(MockGateway::default());
+    let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
+
+    let dir = client.mkdirs("/alpha", false).await.expect("mkdirs");
+    let nested = client.mkdirs("/alpha/beta", true).await.expect("recursive mkdirs");
+
+    assert_eq!(dir.path(), "/alpha");
+    assert_eq!(dir.attrs.size, 0);
+    assert_eq!(nested.path(), "/alpha/beta");
+    assert_eq!(nested.attrs.size, 0);
+    let requests = gateway.create_directory_requests();
+    assert_eq!(
+        requests,
+        vec![("/alpha".to_string(), false), ("/alpha/beta".to_string(), true)]
+    );
+    assert_eq!(methods(&gateway.calls()), vec!["create_directory", "create_directory"]);
+}
+
+#[tokio::test]
 async fn list_options_map_to_metadata_request() {
     let gateway = Arc::new(MockGateway::default());
     let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
@@ -339,6 +361,40 @@ async fn reader_reads_normal_range_through_planner_and_worker() {
         .expect("read layout call");
     assert_eq!(read_layout.target_data_handle_id, Some(202));
     assert_eq!(read_layout.range, Some((2, 5)));
+}
+
+#[tokio::test]
+async fn reader_read_all_reads_full_opened_file() {
+    let gateway = Arc::new(MockGateway::with_layout(layout_response(
+        "root",
+        202,
+        Some(3),
+        10,
+        vec![location(202, 0, 0, 10)],
+    )));
+    let worker = Arc::new(MockDataClient::from_file(b"abcdefghijklmnop"));
+    let client = fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker)).expect("client");
+
+    let reader = client.open("/alpha").await.expect("open succeeds");
+    let bytes = reader.read_all().await.expect("read all");
+
+    assert_eq!(bytes, Bytes::from_static(b"abcdefghij"));
+    assert_eq!(methods(&gateway.calls()), vec!["open_file", "read_layout"]);
+}
+
+#[tokio::test]
+async fn reader_read_exact_at_rejects_short_eof_read() {
+    let gateway = Arc::new(MockGateway::default());
+    let client = fs_client_with_gateway(test_config("root"), gateway).expect("client");
+    let reader = read_reader(&client, 10);
+
+    let err = reader
+        .read_exact_at(10, 4)
+        .await
+        .expect_err("short EOF read must fail exact read");
+
+    assert!(matches!(err, ClientError::InvalidArgument(msg)
+        if msg.contains("read_exact_at") && msg.contains("requested 4 bytes")));
 }
 
 #[tokio::test]
@@ -819,6 +875,22 @@ async fn writer_renew_lease_rejects_zero_expiry_without_updating_session() {
 }
 
 #[tokio::test]
+async fn writer_auto_renews_near_expiry_before_write() {
+    let gateway = Arc::new(MockGateway::default());
+    let worker = Arc::new(MockDataClient::default());
+    let mut config = test_config("root");
+    config.write_lease.auto_renew = true;
+    config.write_lease.renew_before_expiry_ms = 120_000;
+    let client = fs_client_with_data_plane(config, gateway.clone(), data_plane(worker)).expect("client");
+    let handle = write_handle_for_tests("/created", 0, unix_now_ms() + 60_000).expect("write handle");
+    let mut writer = FileWriter::new(Arc::clone(&client.runtime), handle);
+
+    writer.write_all(Bytes::from_static(b"hello")).await.expect("write");
+
+    assert_eq!(methods(&gateway.calls()), vec!["renew_lease"]);
+}
+
+#[tokio::test]
 async fn writer_close_rejects_commit_size_shorter_than_final_size() {
     let gateway = Arc::new(MockGateway::with_commit_response_size(4));
     let worker = Arc::new(MockDataClient::default());
@@ -1092,11 +1164,19 @@ fn add_block_lens(calls: &[RecordedCall]) -> Vec<u64> {
         .collect()
 }
 
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after Unix epoch")
+        .as_millis() as u64
+}
+
 #[derive(Debug, Default)]
 struct MockGateway {
     calls: Mutex<Vec<RecordedCall>>,
     layouts: Mutex<VecDeque<ReadLayout>>,
     list_requests: Mutex<Vec<proto::metadata::ListStatusRequestProto>>,
+    create_directory_requests: Mutex<Vec<(String, bool)>>,
     next_offsets: Mutex<HashMap<u64, u64>>,
     next_block_indexes: Mutex<HashMap<u64, u32>>,
     write_layouts: Mutex<HashMap<u64, RecordedLayout>>,
@@ -1117,6 +1197,13 @@ impl MockGateway {
 
     fn list_requests(&self) -> Vec<proto::metadata::ListStatusRequestProto> {
         self.list_requests.lock().expect("list requests").clone()
+    }
+
+    fn create_directory_requests(&self) -> Vec<(String, bool)> {
+        self.create_directory_requests
+            .lock()
+            .expect("create directory requests")
+            .clone()
     }
 
     fn with_layout(layout: ReadLayout) -> Self {
@@ -1342,6 +1429,22 @@ impl MetadataGateway for MockGateway {
             }],
             eof: true,
             ..ListStatusResponseProto::default()
+        })
+    }
+
+    async fn create_directory(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::CreateDirectoryRequestProto,
+    ) -> ClientResult<CreateDirectoryResponseProto> {
+        self.record("create_directory", &ctx);
+        self.create_directory_requests
+            .lock()
+            .expect("create directory requests")
+            .push((req.path, req.recursive));
+        Ok(CreateDirectoryResponseProto {
+            attrs: Some(file_attrs_proto(0)),
+            ..CreateDirectoryResponseProto::default()
         })
     }
 

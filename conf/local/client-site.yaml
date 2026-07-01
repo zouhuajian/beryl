@@ -14,7 +14,11 @@ client.backoff.initial_ms: 100
 client.backoff.max_ms: 5000
 client.backoff.multiplier: "2.0"
 
+client.write_lease.auto_renew: true
+client.write_lease.renew_before_expiry_ms: 30000
+
 client.channel_pool.metadata.enabled: true
 client.channel_pool.metadata.max_per_group: 1
 client.channel_pool.worker.enabled: true
 client.channel_pool.worker.max_per_worker: 1
+client.channel_pool.worker.endpoint_cooldown_ms: 1000

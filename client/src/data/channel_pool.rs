@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use proto::worker::worker_data_service_client::WorkerDataServiceClient;
@@ -17,30 +18,88 @@ use crate::error::{ClientError, ClientResult};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
 use crate::runtime::{ErrorClass, ErrorClassifier, RefreshReason};
 
+const WORKER_ENDPOINT_COOLDOWN_CACHE_LIMIT: usize = 1_024;
+
 #[derive(Debug)]
 pub(super) struct GrpcWorkerChannelPool {
     channels: RwLock<HashMap<WorkerChannelKey, tonic_net::Channel>>,
+    cooldowns: RwLock<HashMap<WorkerChannelKey, Instant>>,
     enabled: bool,
     max_cached_keys_per_worker: usize,
+    endpoint_cooldown: Duration,
     metrics: Arc<dyn ClientMetrics>,
 }
 
 impl GrpcWorkerChannelPool {
     pub(super) fn new(enabled: bool, max_cached_keys_per_worker: usize, metrics: Arc<dyn ClientMetrics>) -> Self {
+        Self::new_with_cooldown_ms(
+            enabled,
+            max_cached_keys_per_worker,
+            crate::config::DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS,
+            metrics,
+        )
+    }
+
+    pub(super) fn new_with_cooldown_ms(
+        enabled: bool,
+        max_cached_keys_per_worker: usize,
+        endpoint_cooldown_ms: u64,
+        metrics: Arc<dyn ClientMetrics>,
+    ) -> Self {
         Self {
             channels: RwLock::new(HashMap::new()),
+            cooldowns: RwLock::new(HashMap::new()),
             enabled,
             max_cached_keys_per_worker: max_cached_keys_per_worker.max(1),
+            endpoint_cooldown: Duration::from_millis(endpoint_cooldown_ms),
             metrics,
         }
     }
 
     pub(super) fn from_config(config: &ClientConfig, metrics: Arc<dyn ClientMetrics>) -> Self {
-        Self::new(
+        Self::new_with_cooldown_ms(
             config.channel_pool.worker_channel_pool_enabled,
             config.channel_pool.worker_channel_pool_max_per_worker,
+            config.channel_pool.worker_endpoint_cooldown_ms,
             metrics,
         )
+    }
+
+    pub(super) fn is_worker_cooling_down(&self, worker: &WorkerEndpointInfo) -> bool {
+        let Ok(key) = Self::channel_key(worker) else {
+            return false;
+        };
+        self.is_key_cooling_down(&key)
+    }
+
+    pub(super) fn mark_worker_unavailable(&self, worker: &WorkerEndpointInfo, reason: CacheInvalidationReason) {
+        let Ok(key) = Self::channel_key(worker) else {
+            return;
+        };
+        self.invalidate_key(&key, reason);
+        if !self.endpoint_cooldown.is_zero() {
+            let now = Instant::now();
+            let mut cooldowns = self.cooldowns.write();
+            prune_expired_cooldowns(&mut cooldowns, now);
+            evict_worker_cooldown_if_needed(&mut cooldowns, &key);
+            cooldowns.insert(key, now + self.endpoint_cooldown);
+        }
+    }
+
+    pub(super) fn clear_worker_cooldown(&self, worker: &WorkerEndpointInfo) {
+        if let Ok(key) = Self::channel_key(worker) {
+            self.cooldowns.write().remove(&key);
+        }
+    }
+
+    fn is_key_cooling_down(&self, key: &WorkerChannelKey) -> bool {
+        if self.endpoint_cooldown.is_zero() {
+            return false;
+        }
+        let now = Instant::now();
+        let mut cooldowns = self.cooldowns.write();
+        prune_expired_cooldowns(&mut cooldowns, now);
+        cooldowns.get(key).is_some_and(|until| *until > now)
     }
 
     pub(super) fn worker_data_service_client(
@@ -49,6 +108,9 @@ impl GrpcWorkerChannelPool {
         operation: &'static str,
     ) -> ClientResult<WorkerDataServiceClient<tonic_net::Channel>> {
         let key = Self::channel_key(worker)?;
+        if self.is_key_cooling_down(&key) {
+            return Err(ClientError::Worker("worker endpoint is cooling down".to_string()));
+        }
         if !self.enabled {
             self.record_pool_metric(ClientMetric::WorkerChannelPoolMiss, operation, "miss");
             return build_lazy_worker_channel(&key.endpoint)
@@ -63,13 +125,17 @@ impl GrpcWorkerChannelPool {
 
     pub(super) fn invalidate_worker_channel(&self, worker: &WorkerEndpointInfo, reason: CacheInvalidationReason) {
         if let Ok(key) = Self::channel_key(worker) {
-            if self.channels.write().remove(&key).is_some() {
-                self.record_pool_metric(
-                    ClientMetric::CachePreciseInvalidation,
-                    "channel_invalidate",
-                    reason.label(),
-                );
-            }
+            self.invalidate_key(&key, reason);
+        }
+    }
+
+    fn invalidate_key(&self, key: &WorkerChannelKey, reason: CacheInvalidationReason) {
+        if self.channels.write().remove(key).is_some() {
+            self.record_pool_metric(
+                ClientMetric::CachePreciseInvalidation,
+                "channel_invalidate",
+                reason.label(),
+            );
         }
     }
 
@@ -186,6 +252,19 @@ fn evict_worker_channel_if_needed(
         .cloned()
     {
         channels.remove(&evicted);
+    }
+}
+
+fn prune_expired_cooldowns(cooldowns: &mut HashMap<WorkerChannelKey, Instant>, now: Instant) {
+    cooldowns.retain(|_, until| *until > now);
+}
+
+fn evict_worker_cooldown_if_needed(cooldowns: &mut HashMap<WorkerChannelKey, Instant>, key: &WorkerChannelKey) {
+    if cooldowns.contains_key(key) || cooldowns.len() < WORKER_ENDPOINT_COOLDOWN_CACHE_LIMIT {
+        return;
+    }
+    if let Some(evicted) = cooldowns.keys().next().cloned() {
+        cooldowns.remove(&evicted);
     }
 }
 
@@ -415,6 +494,26 @@ mod tests {
 
             assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("unsupported worker net protocol")));
         }
+    }
+
+    #[test]
+    fn worker_endpoint_cooldowns_are_bounded() {
+        let metrics = Arc::new(NoopClientMetrics);
+        let pool = GrpcWorkerChannelPool::new_with_cooldown_ms(true, 1, 60_000, metrics);
+
+        for index in 0..1_100 {
+            let mut worker = worker_endpoint();
+            worker.worker_id = WorkerId::new(index + 1);
+            worker.endpoint = format!("127.0.0.1:{}", 20_000 + index);
+
+            pool.mark_worker_unavailable(&worker, CacheInvalidationReason::Unavailable);
+        }
+
+        assert!(
+            pool.cooldowns.read().len() <= WORKER_ENDPOINT_COOLDOWN_CACHE_LIMIT,
+            "cooldown map must stay bounded, got {} entries",
+            pool.cooldowns.read().len()
+        );
     }
 
     fn worker_endpoint() -> WorkerEndpointInfo {

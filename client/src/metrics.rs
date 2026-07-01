@@ -7,7 +7,7 @@ use std::fmt;
 
 /// Client runtime metric event kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ClientMetric {
+pub enum ClientMetric {
     /// Retry attempt started.
     RetryAttempt,
     /// Retry budget exhausted.
@@ -72,7 +72,7 @@ pub(crate) enum ClientMetric {
 
 /// Low-cardinality labels for client metric events.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ClientMetricLabels {
+pub struct ClientMetricLabels {
     /// Logical operation kind.
     pub(crate) operation_kind: Option<&'static str>,
     /// Stable operation name.
@@ -92,6 +92,46 @@ pub(crate) struct ClientMetricLabels {
 }
 
 impl ClientMetricLabels {
+    /// Return the logical operation kind label.
+    pub fn operation_kind(&self) -> Option<&'static str> {
+        self.operation_kind
+    }
+
+    /// Return the stable operation name label.
+    pub fn operation_name(&self) -> Option<&str> {
+        self.operation_name.as_deref()
+    }
+
+    /// Return the classified error class label.
+    pub fn error_class(&self) -> Option<&'static str> {
+        self.error_class
+    }
+
+    /// Return the refresh reason label.
+    pub fn refresh_reason(&self) -> Option<&'static str> {
+        self.refresh_reason
+    }
+
+    /// Return the target plane label.
+    pub fn target_plane(&self) -> Option<&'static str> {
+        self.target_plane
+    }
+
+    /// Return the cache or pool label.
+    pub fn cache(&self) -> Option<&'static str> {
+        self.cache
+    }
+
+    /// Return the cache or pool reason label.
+    pub fn reason(&self) -> Option<&'static str> {
+        self.reason
+    }
+
+    /// Return the outcome label.
+    pub fn outcome(&self) -> Option<&'static str> {
+        self.outcome
+    }
+
     /// Attach operation identity labels.
     pub(crate) fn with_operation(
         mut self,
@@ -142,7 +182,7 @@ impl ClientMetricLabels {
     }
 
     /// Return true if no label value contains a sensitive or high-cardinality marker.
-    pub(crate) fn has_only_safe_values(&self) -> bool {
+    pub fn has_only_safe_values(&self) -> bool {
         let values = [
             self.operation_name.as_deref(),
             self.operation_kind,
@@ -165,7 +205,7 @@ impl ClientMetricLabels {
 
 /// One client metric event.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ClientMetricEvent {
+pub struct ClientMetricEvent {
     /// Metric kind.
     pub(crate) metric: ClientMetric,
     /// Low-cardinality labels.
@@ -178,17 +218,27 @@ impl ClientMetricEvent {
         debug_assert!(labels.has_only_safe_values());
         Self { metric, labels }
     }
+
+    /// Return the metric kind.
+    pub fn metric(&self) -> ClientMetric {
+        self.metric
+    }
+
+    /// Return the low-cardinality labels.
+    pub fn labels(&self) -> &ClientMetricLabels {
+        &self.labels
+    }
 }
 
 /// Client metrics recorder.
-pub(crate) trait ClientMetrics: Send + Sync + fmt::Debug {
+pub trait ClientMetrics: Send + Sync + fmt::Debug {
     /// Record one client metric event.
     fn record(&self, event: ClientMetricEvent);
 }
 
 /// No-op client metrics recorder.
 #[derive(Debug, Default)]
-pub(crate) struct NoopClientMetrics;
+pub struct NoopClientMetrics;
 
 impl ClientMetrics for NoopClientMetrics {
     fn record(&self, _event: ClientMetricEvent) {}

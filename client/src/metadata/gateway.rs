@@ -36,6 +36,13 @@ pub(crate) trait MetadataGateway: Send + Sync {
         req: proto::metadata::ListStatusRequestProto,
     ) -> ClientResult<proto::metadata::ListStatusResponseProto>;
 
+    /// Create a directory.
+    async fn create_directory(
+        &self,
+        ctx: AttemptContext,
+        req: proto::metadata::CreateDirectoryRequestProto,
+    ) -> ClientResult<proto::metadata::CreateDirectoryResponseProto>;
+
     /// Delete a namespace entry.
     async fn delete(
         &self,
@@ -314,6 +321,23 @@ impl MetadataGateway for GrpcMetadataGateway {
             .client(&ctx, "write")
             .await?
             .delete(tonic_request(&ctx, req))
+            .await
+            .map_err(ClientError::from)?
+            .into_inner();
+        parse_metadata_response_header(&ctx, response.header.as_ref())?;
+        Ok(response)
+    }
+
+    async fn create_directory(
+        &self,
+        ctx: AttemptContext,
+        mut req: proto::metadata::CreateDirectoryRequestProto,
+    ) -> ClientResult<proto::metadata::CreateDirectoryResponseProto> {
+        req.header = Some(build_metadata_header(&ctx)?);
+        let response = self
+            .client(&ctx, "write")
+            .await?
+            .create_directory(tonic_request(&ctx, req))
             .await
             .map_err(ClientError::from)?
             .into_inner();

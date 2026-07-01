@@ -8,6 +8,8 @@ use std::path::Path;
 use types::GroupName;
 
 pub const DEFAULT_CLIENT_NAME: &str = "default_client";
+pub const DEFAULT_WRITE_LEASE_RENEW_BEFORE_EXPIRY_MS: u64 = 30_000;
+pub const DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS: u64 = 1_000;
 
 /// Client-specific configuration.
 #[derive(Clone, Debug)]
@@ -22,6 +24,8 @@ pub struct ClientConfig {
     pub refresh: RefreshConfig,
     /// Backoff configuration.
     pub backoff: BackoffConfig,
+    /// Client-side write lease renewal policy.
+    pub write_lease: WriteLeaseConfig,
     /// Channel/client pool configuration.
     pub channel_pool: ChannelPoolConfig,
     /// Configured metadata owner groups and their bootstrap endpoints.
@@ -48,6 +52,8 @@ pub struct ChannelPoolConfig {
     pub worker_channel_pool_enabled: bool,
     /// Maximum cached worker channels per worker identity.
     pub worker_channel_pool_max_per_worker: usize,
+    /// Cooldown duration after transient worker endpoint failures.
+    pub worker_endpoint_cooldown_ms: u64,
 }
 
 /// Retry configuration.
@@ -64,6 +70,15 @@ pub struct RetryConfig {
 pub struct RefreshConfig {
     /// Maximum refresh attempts per logical operation.
     pub max_refresh_attempts: usize,
+}
+
+/// Write lease renewal configuration.
+#[derive(Clone, Debug)]
+pub struct WriteLeaseConfig {
+    /// Renew write leases automatically before side-effecting writer operations.
+    pub auto_renew: bool,
+    /// Renew when the current metadata lease expires within this many milliseconds.
+    pub renew_before_expiry_ms: u64,
 }
 
 /// Backoff configuration.
@@ -111,6 +126,15 @@ impl Default for BackoffConfig {
     }
 }
 
+impl Default for WriteLeaseConfig {
+    fn default() -> Self {
+        Self {
+            auto_renew: true,
+            renew_before_expiry_ms: DEFAULT_WRITE_LEASE_RENEW_BEFORE_EXPIRY_MS,
+        }
+    }
+}
+
 impl Default for ChannelPoolConfig {
     fn default() -> Self {
         Self {
@@ -118,6 +142,7 @@ impl Default for ChannelPoolConfig {
             metadata_channel_pool_max_per_group: 1,
             worker_channel_pool_enabled: true,
             worker_channel_pool_max_per_worker: 1,
+            worker_endpoint_cooldown_ms: DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS,
         }
     }
 }
@@ -148,6 +173,7 @@ impl ClientConfig {
         let retry = retry_config_from_flat(&flat)?;
         let refresh = refresh_config_from_flat(&flat)?;
         let backoff = backoff_config_from_flat(&flat)?;
+        let write_lease = write_lease_config_from_flat(&flat)?;
         let channel_pool = channel_pool_config_from_flat(&flat)?;
 
         let metadata_groups = parse_metadata_groups(&flat)?;
@@ -158,6 +184,7 @@ impl ClientConfig {
             retry,
             refresh,
             backoff,
+            write_lease,
             channel_pool,
             metadata_groups,
         })
@@ -208,6 +235,11 @@ fn channel_pool_config_from_flat(flat: &FlatConfig) -> Result<ChannelPoolConfig,
             flat,
             "client.channel_pool.worker.max_per_worker",
             ChannelPoolConfig::default().worker_channel_pool_max_per_worker,
+        )?,
+        worker_endpoint_cooldown_ms: get_u64_or_strict(
+            flat,
+            "client.channel_pool.worker.endpoint_cooldown_ms",
+            ChannelPoolConfig::default().worker_endpoint_cooldown_ms,
         )?,
     };
     if config.metadata_channel_pool_max_per_group == 0 {
@@ -321,6 +353,25 @@ fn refresh_config_from_flat(flat: &FlatConfig) -> Result<RefreshConfig, CommonEr
     })
 }
 
+fn write_lease_config_from_flat(flat: &FlatConfig) -> Result<WriteLeaseConfig, CommonError> {
+    let defaults = WriteLeaseConfig::default();
+    let config = WriteLeaseConfig {
+        auto_renew: get_bool_or(flat, "client.write_lease.auto_renew", defaults.auto_renew)?,
+        renew_before_expiry_ms: get_u64_or_strict(
+            flat,
+            "client.write_lease.renew_before_expiry_ms",
+            defaults.renew_before_expiry_ms,
+        )?,
+    };
+    if config.renew_before_expiry_ms == 0 {
+        return Err(invalid_config(
+            "client.write_lease.renew_before_expiry_ms",
+            "must be greater than zero",
+        ));
+    }
+    Ok(config)
+}
+
 fn backoff_config_from_flat(flat: &FlatConfig) -> Result<BackoffConfig, CommonError> {
     let defaults = BackoffConfig::default();
     let backoff = BackoffConfig {
@@ -416,6 +467,11 @@ mod tests {
         assert_eq!(config.backoff.initial_backoff_ms, 100);
         assert_eq!(config.backoff.max_backoff_ms, 5000);
         assert!(config.backoff.backoff_multiplier >= 1.0);
+        assert!(config.write_lease.auto_renew);
+        assert_eq!(
+            config.write_lease.renew_before_expiry_ms,
+            DEFAULT_WRITE_LEASE_RENEW_BEFORE_EXPIRY_MS
+        );
     }
 
     #[test]
@@ -426,6 +482,10 @@ mod tests {
         assert_eq!(config.channel_pool.metadata_channel_pool_max_per_group, 1);
         assert!(config.channel_pool.worker_channel_pool_enabled);
         assert_eq!(config.channel_pool.worker_channel_pool_max_per_worker, 1);
+        assert_eq!(
+            config.channel_pool.worker_endpoint_cooldown_ms,
+            DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS
+        );
     }
 
     #[test]
@@ -460,6 +520,7 @@ mod tests {
         flat.set("client.channel_pool.metadata.max_per_group", 2i64);
         flat.set("client.channel_pool.worker.enabled", false);
         flat.set("client.channel_pool.worker.max_per_worker", 3i64);
+        flat.set("client.channel_pool.worker.endpoint_cooldown_ms", 4_000i64);
 
         let config = ClientConfig::from_flat(flat).expect("channel pool config");
 
@@ -467,6 +528,7 @@ mod tests {
         assert_eq!(config.channel_pool.metadata_channel_pool_max_per_group, 2);
         assert!(!config.channel_pool.worker_channel_pool_enabled);
         assert_eq!(config.channel_pool.worker_channel_pool_max_per_worker, 3);
+        assert_eq!(config.channel_pool.worker_endpoint_cooldown_ms, 4_000);
     }
 
     #[test]
@@ -503,6 +565,8 @@ mod tests {
         flat.set("client.backoff.initial_ms", 25i64);
         flat.set("client.backoff.max_ms", 400i64);
         flat.set("client.backoff.multiplier", "1.5");
+        flat.set("client.write_lease.auto_renew", false);
+        flat.set("client.write_lease.renew_before_expiry_ms", 60_000i64);
 
         let config = ClientConfig::from_flat(flat).expect("current retry and backoff config");
 
@@ -512,6 +576,8 @@ mod tests {
         assert_eq!(config.backoff.initial_backoff_ms, 25);
         assert_eq!(config.backoff.max_backoff_ms, 400);
         assert_eq!(config.backoff.backoff_multiplier, 1.5);
+        assert!(!config.write_lease.auto_renew);
+        assert_eq!(config.write_lease.renew_before_expiry_ms, 60_000);
     }
 
     #[test]
@@ -551,6 +617,8 @@ mod tests {
             ("client.refresh.max_attempts", -1i64),
             ("client.backoff.initial_ms", -1i64),
             ("client.backoff.max_ms", -1i64),
+            ("client.write_lease.renew_before_expiry_ms", -1i64),
+            ("client.channel_pool.worker.endpoint_cooldown_ms", -1i64),
         ] {
             let mut flat = FlatConfig::new();
             flat.set(key, value);
@@ -562,6 +630,11 @@ mod tests {
                 "error for {key} should mention the offending key: {err}"
             );
         }
+
+        let mut flat = FlatConfig::new();
+        flat.set("client.write_lease.renew_before_expiry_ms", 0i64);
+        let err = ClientConfig::from_flat(flat).expect_err("zero lease renewal threshold must be rejected");
+        assert!(err.to_string().contains("client.write_lease.renew_before_expiry_ms"));
 
         let mut flat = FlatConfig::new();
         flat.set("client.backoff.initial_ms", 1000i64);

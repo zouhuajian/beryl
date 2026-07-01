@@ -7,7 +7,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use proto::metadata::WriteSyncModeProto;
 use tokio::sync::Mutex;
 use types::DataHandleId;
@@ -21,42 +21,44 @@ use crate::runtime::{
 };
 use crate::session::write_session::{WorkerCommitLevel, WriteSession};
 
+const MAX_CONVENIENCE_READ_CHUNK: u32 = 8 * 1024 * 1024;
+
 /// A reader for an immutable file snapshot opened through the filesystem client.
 #[derive(Clone)]
 pub struct FileReader {
     /// Shared runtime used to refresh metadata and access workers for this handle.
     runtime: Arc<ClientRuntime>,
-    inner: ReadHandle,
+    handle: ReadHandle,
 }
 
 impl FileReader {
-    pub(crate) fn new(runtime: Arc<ClientRuntime>, inner: ReadHandle) -> Self {
-        Self { runtime, inner }
+    pub(crate) fn new(runtime: Arc<ClientRuntime>, handle: ReadHandle) -> Self {
+        Self { runtime, handle }
     }
 
     /// Returns the namespace path used to open this file snapshot.
     pub fn path(&self) -> &str {
-        self.inner.path()
+        self.handle.path()
     }
 
     /// Returns the file size observed when this reader was opened.
     pub fn size_hint(&self) -> u64 {
-        self.inner.size_hint()
+        self.handle.size_hint()
     }
 
     /// Reads a range from the opened file snapshot.
     pub async fn read_at(&self, offset: u64, len: u32) -> ClientResult<Bytes> {
-        let Some(requested_range) = planner::requested_range(offset, len, self.inner.size_hint())? else {
+        let Some(requested_range) = planner::requested_range(offset, len, self.handle.size_hint())? else {
             return Ok(Bytes::new());
         };
-        let file_version = self.inner.file_version();
-        let data_handle_id = self.inner.data_handle_id();
+        let file_version = self.handle.file_version();
+        let data_handle_id = self.handle.data_handle_id();
         let operation = OperationContext::new_named(
             self.runtime.executor.client_id(),
             self.runtime.executor.client_name(),
             OperationKind::WorkerReadData,
             "Read",
-            OperationIdentity::path(self.inner.path().to_string()),
+            OperationIdentity::path(self.handle.path().to_string()),
         )?;
         let mut retry_used = 0usize;
         let mut refresh_used = 0usize;
@@ -68,7 +70,7 @@ impl FileReader {
                 .runtime
                 .executor
                 .read_layout_for_data_handle(
-                    self.inner.path(),
+                    self.handle.path(),
                     data_handle_id,
                     requested_range.file_offset,
                     requested_range.len,
@@ -164,6 +166,39 @@ impl FileReader {
             }
         }
     }
+
+    /// Reads the entire opened file snapshot into one buffer.
+    pub async fn read_all(&self) -> ClientResult<Bytes> {
+        let size = self.handle.size_hint();
+        if size == 0 {
+            return Ok(Bytes::new());
+        }
+        let capacity = usize::try_from(size)
+            .map_err(|_| ClientError::InvalidArgument("file is too large to read into one buffer".to_string()))?;
+        let mut output = BytesMut::with_capacity(capacity);
+        let mut offset = 0u64;
+        while offset < size {
+            let len = (size - offset).min(u64::from(MAX_CONVENIENCE_READ_CHUNK)) as u32;
+            let bytes = self.read_exact_at(offset, len).await?;
+            output.extend_from_slice(&bytes);
+            offset += u64::from(len);
+        }
+        Ok(output.freeze())
+    }
+
+    /// Reads exactly `len` bytes from `offset`, failing if the file snapshot ends first.
+    pub async fn read_exact_at(&self, offset: u64, len: u32) -> ClientResult<Bytes> {
+        let bytes = self.read_at(offset, len).await?;
+        if bytes.len() != len as usize {
+            return Err(ClientError::InvalidArgument(format!(
+                "read_exact_at requested {} bytes at offset {} but read {} bytes",
+                len,
+                offset,
+                bytes.len()
+            )));
+        }
+        Ok(bytes)
+    }
 }
 
 impl fmt::Debug for FileReader {
@@ -189,28 +224,29 @@ fn should_replan_after_worker_error(err: &ClientError) -> bool {
 pub struct FileWriter {
     /// Shared runtime used to publish metadata barriers and access workers.
     runtime: Arc<ClientRuntime>,
-    inner: WriteHandle,
+    handle: WriteHandle,
 }
 
 impl FileWriter {
-    pub(crate) fn new(runtime: Arc<ClientRuntime>, inner: WriteHandle) -> Self {
-        Self { runtime, inner }
+    pub(crate) fn new(runtime: Arc<ClientRuntime>, handle: WriteHandle) -> Self {
+        Self { runtime, handle }
     }
 
     /// Returns the namespace path associated with this write session.
     pub fn path(&self) -> &str {
-        self.inner.path()
+        self.handle.path()
     }
 
     /// Returns the next sequential write offset for this writer.
     pub fn cursor(&self) -> u64 {
-        self.inner.write_cursor()
+        self.handle.write_cursor()
     }
 
     /// Writes all supplied bytes at the current sequential cursor.
     pub async fn write_all(&mut self, data: Bytes) -> ClientResult<()> {
-        let session_ref = self.inner.write_session();
+        let session_ref = self.handle.write_session();
         let mut session = session_ref.lock().await;
+        self.renew_lease_if_needed(&mut session).await?;
         session.ensure_open_for_write()?;
         if data.is_empty() {
             return Ok(());
@@ -220,7 +256,7 @@ impl FileWriter {
         for block in blocks {
             self.runtime.write_block(&mut session, block).await?;
         }
-        self.inner.store_write_cursor(session.cursor());
+        self.handle.store_write_cursor(session.cursor());
         Ok(())
     }
 
@@ -238,8 +274,20 @@ impl FileWriter {
 
     /// Renews the writer lease while keeping the write session open.
     pub async fn renew_lease(&mut self) -> ClientResult<()> {
-        let session_ref = self.inner.write_session();
+        let session_ref = self.handle.write_session();
         let mut session = session_ref.lock().await;
+        self.renew_lease_locked(&mut session).await
+    }
+
+    async fn renew_lease_if_needed(&self, session: &mut WriteSession) -> ClientResult<()> {
+        let config = &self.runtime.config.write_lease;
+        if !config.auto_renew || !session.should_renew_lease(config.renew_before_expiry_ms)? {
+            return Ok(());
+        }
+        self.renew_lease_locked(session).await
+    }
+
+    async fn renew_lease_locked(&self, session: &mut WriteSession) -> ClientResult<()> {
         session.ensure_open_for_renew()?;
         let path = session.path().to_string();
         let session_identity = session.session_identity();
@@ -264,7 +312,7 @@ impl FileWriter {
                 Ok(())
             }
             Err(err) => {
-                mark_session_after_metadata_error(&mut session, &err);
+                mark_session_after_metadata_error(session, &err);
                 let class = ErrorClassifier.classify_error(&err);
                 self.runtime
                     .record_error_metric("RenewLease", OperationKind::MetadataSessionBarrier, &class);
@@ -281,8 +329,9 @@ impl FileWriter {
 
     /// Closes the writer and commits the final file metadata.
     pub async fn close(&mut self) -> ClientResult<()> {
-        let session_ref = self.inner.write_session();
+        let session_ref = self.handle.write_session();
         let mut session = session_ref.lock().await;
+        self.renew_lease_if_needed(&mut session).await?;
         session.ensure_close_allowed()?;
         let path = session.path().to_string();
         self.flush_pending_bytes(&mut session).await?;
@@ -334,7 +383,7 @@ impl FileWriter {
 
     /// Aborts this writer's open write session and reports cleanup failures.
     pub async fn abort(&mut self) -> ClientResult<()> {
-        let session_ref = self.inner.write_session();
+        let session_ref = self.handle.write_session();
         let mut session = session_ref.lock().await;
         session.ensure_open_for_abort()?;
         session.discard_buffered_bytes();
@@ -404,8 +453,9 @@ impl FileWriter {
 
     /// Flushes worker data to the requested level and publishes the metadata sync barrier.
     async fn sync_write_barrier(&mut self, mode: WriteSyncModeProto) -> ClientResult<()> {
-        let session_ref = self.inner.write_session();
+        let session_ref = self.handle.write_session();
         let mut session = session_ref.lock().await;
+        self.renew_lease_if_needed(&mut session).await?;
         session.ensure_open_for_barrier()?;
         let path = session.path().to_string();
         self.flush_pending_bytes(&mut session).await?;
@@ -420,7 +470,7 @@ impl FileWriter {
             .executor
             .sync_write(
                 &session,
-                self.inner.data_handle_id(),
+                self.handle.data_handle_id(),
                 committed_blocks,
                 target_size,
                 mode,
@@ -429,7 +479,7 @@ impl FileWriter {
         {
             Ok(response) => {
                 validate_sync_write_size(response.synced_size, target_size)?;
-                self.inner.store_write_cursor(session.cursor());
+                self.handle.store_write_cursor(session.cursor());
                 Ok(())
             }
             Err(err) => {

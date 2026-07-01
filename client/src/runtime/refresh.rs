@@ -3,7 +3,8 @@
 
 //! Metadata target selection and refresh cache updates.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -15,6 +16,8 @@ use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
 use crate::runtime::classify::RefreshReason;
 use crate::runtime::context::{AttemptContext, OperationContext};
+
+const METADATA_TARGET_CACHE_LIMIT: usize = 300;
 
 /// Configured metadata group bootstrap target.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,8 +33,52 @@ struct MetadataTargetState {
     groups: Vec<MetadataGroupTargets>,
     leader_cache: HashMap<GroupName, String>,
     route_cache: HashMap<String, GroupName>,
+    route_cache_order: VecDeque<String>,
     mount_epoch_cache: HashMap<String, u64>,
+    mount_epoch_cache_order: VecDeque<String>,
     route_epoch_cache: HashMap<String, u64>,
+    route_epoch_cache_order: VecDeque<String>,
+}
+
+impl MetadataTargetState {
+    fn insert_route(&mut self, path: String, group_name: GroupName) {
+        let MetadataTargetState {
+            route_cache,
+            route_cache_order,
+            ..
+        } = self;
+        insert_bounded(route_cache, route_cache_order, path, group_name);
+    }
+
+    fn record_mount_epoch_hint(&mut self, operation_path: Option<&str>, mount_prefix: Option<&str>, epoch: u64) {
+        let MetadataTargetState {
+            mount_epoch_cache,
+            mount_epoch_cache_order,
+            ..
+        } = self;
+        record_epoch_hint(
+            mount_epoch_cache,
+            mount_epoch_cache_order,
+            operation_path,
+            mount_prefix,
+            epoch,
+        );
+    }
+
+    fn record_route_epoch_hint(&mut self, operation_path: Option<&str>, mount_prefix: Option<&str>, epoch: u64) {
+        let MetadataTargetState {
+            route_epoch_cache,
+            route_epoch_cache_order,
+            ..
+        } = self;
+        record_epoch_hint(
+            route_epoch_cache,
+            route_epoch_cache_order,
+            operation_path,
+            mount_prefix,
+            epoch,
+        );
+    }
 }
 
 /// Owns metadata target selection and correctness cache updates after refresh signals.
@@ -60,8 +107,11 @@ impl MetadataTargets {
                 groups,
                 leader_cache: HashMap::new(),
                 route_cache: HashMap::new(),
+                route_cache_order: VecDeque::new(),
                 mount_epoch_cache: HashMap::new(),
+                mount_epoch_cache_order: VecDeque::new(),
                 route_epoch_cache: HashMap::new(),
+                route_epoch_cache_order: VecDeque::new(),
             })),
             watermarks: StateIdCache::new(300),
         })
@@ -162,7 +212,7 @@ impl MetadataTargets {
                     ));
                 };
                 if let Some(path) = operation.original_target_path() {
-                    state.route_cache.insert(path.to_string(), group_name.clone());
+                    state.insert_route(path.to_string(), group_name.clone());
                 }
                 if let Some(endpoint) = hint.leader_endpoint.as_ref() {
                     state.leader_cache.insert(group_name.clone(), endpoint.clone());
@@ -170,8 +220,7 @@ impl MetadataTargets {
             }
             RefreshReason::MountEpochMismatch => {
                 if let Some(mount_epoch) = hint.mount_epoch {
-                    record_epoch_hint(
-                        &mut state.mount_epoch_cache,
+                    state.record_mount_epoch_hint(
                         operation.original_target_path(),
                         hint.mount_prefix.as_deref(),
                         mount_epoch,
@@ -180,8 +229,7 @@ impl MetadataTargets {
             }
             RefreshReason::RouteEpochMismatch => {
                 if let Some(route_epoch) = hint.route_epoch {
-                    record_epoch_hint(
-                        &mut state.route_epoch_cache,
+                    state.record_route_epoch_hint(
                         operation.original_target_path(),
                         hint.mount_prefix.as_deref(),
                         route_epoch,
@@ -236,16 +284,37 @@ impl MetadataTargets {
 
 fn record_epoch_hint(
     cache: &mut HashMap<String, u64>,
+    order: &mut VecDeque<String>,
     operation_path: Option<&str>,
     mount_prefix: Option<&str>,
     epoch: u64,
 ) {
     if let Some(path) = operation_path {
-        cache.insert(path.to_string(), epoch);
+        insert_bounded(cache, order, path.to_string(), epoch);
     }
     if let Some(prefix) = mount_prefix {
-        cache.insert(prefix.to_string(), epoch);
+        insert_bounded(cache, order, prefix.to_string(), epoch);
     }
+}
+
+fn insert_bounded<K, V>(cache: &mut HashMap<K, V>, order: &mut VecDeque<K>, key: K, value: V)
+where
+    K: Clone + Eq + Hash,
+{
+    if let Some(existing) = cache.get_mut(&key) {
+        *existing = value;
+        return;
+    }
+    while cache.len() >= METADATA_TARGET_CACHE_LIMIT {
+        let Some(evicted) = order.pop_front() else {
+            break;
+        };
+        if cache.remove(&evicted).is_some() {
+            break;
+        }
+    }
+    cache.insert(key.clone(), value);
+    order.push_back(key);
 }
 
 fn cached_epoch_for_path(cache: &HashMap<String, u64>, path: &str) -> Option<u64> {
@@ -478,6 +547,58 @@ mod tests {
         let header = enriched.metadata_header().expect("metadata header");
 
         assert_eq!(header.route_epoch, Some(23));
+    }
+
+    #[test]
+    fn refresh_hint_caches_are_bounded() {
+        let manager = manager();
+
+        for index in 0..(METADATA_TARGET_CACHE_LIMIT + 50) {
+            let operation = OperationContext::new(
+                ClientId::new(7),
+                OperationKind::MetadataRead,
+                "OpenFile",
+                OperationIdentity::path(format!("/tenant/{index}/file")),
+            )
+            .expect("operation context");
+            manager
+                .record_refresh(
+                    &operation,
+                    RefreshReason::OwnerGroupMismatch,
+                    &RefreshHint {
+                        group_name: Some(group_name("analytics")),
+                        ..RefreshHint::default()
+                    },
+                )
+                .expect("owner refresh");
+            manager
+                .record_refresh(
+                    &operation,
+                    RefreshReason::MountEpochMismatch,
+                    &RefreshHint {
+                        mount_epoch: Some(index as u64),
+                        mount_prefix: Some(format!("/tenant/{index}")),
+                        ..RefreshHint::default()
+                    },
+                )
+                .expect("mount refresh");
+            manager
+                .record_refresh(
+                    &operation,
+                    RefreshReason::RouteEpochMismatch,
+                    &RefreshHint {
+                        route_epoch: Some(index as u64),
+                        mount_prefix: Some(format!("/tenant/{index}")),
+                        ..RefreshHint::default()
+                    },
+                )
+                .expect("route refresh");
+        }
+
+        let state = manager.state.read();
+        assert!(state.route_cache.len() <= METADATA_TARGET_CACHE_LIMIT);
+        assert!(state.mount_epoch_cache.len() <= METADATA_TARGET_CACHE_LIMIT);
+        assert!(state.route_epoch_cache.len() <= METADATA_TARGET_CACHE_LIMIT);
     }
 
     #[test]

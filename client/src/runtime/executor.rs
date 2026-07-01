@@ -98,6 +98,23 @@ impl OperationExecutor {
         Ok(directory_listing_from_response(path, response))
     }
 
+    /// Execute CreateDirectory and return a public status snapshot.
+    pub(crate) async fn create_directory(&self, path: NamespacePathBuf, recursive: bool) -> ClientResult<FileStatus> {
+        let path = path.into_string();
+        let response = self
+            .create_directory_request(
+                &path,
+                proto::metadata::CreateDirectoryRequestProto {
+                    header: None,
+                    path: path.clone(),
+                    attrs: Some(default_dir_attrs()),
+                    recursive,
+                },
+            )
+            .await?;
+        directory_status_from_response(path, response)
+    }
+
     /// Execute Delete.
     pub(crate) async fn delete(&self, path: NamespacePathBuf, recursive: bool) -> ClientResult<()> {
         let path = path.into_string();
@@ -263,6 +280,24 @@ impl OperationExecutor {
         )?;
         self.execute_metadata(operation, req, |gateway, ctx, req| async move {
             gateway.list_status(ctx, req).await
+        })
+        .await
+    }
+
+    /// Execute CreateDirectory.
+    async fn create_directory_request(
+        &self,
+        path: &str,
+        req: proto::metadata::CreateDirectoryRequestProto,
+    ) -> ClientResult<proto::metadata::CreateDirectoryResponseProto> {
+        let operation = OperationContext::new_with_identity(
+            &self.identity,
+            OperationKind::MetadataMutation,
+            "CreateDirectory",
+            OperationIdentity::path(path).with_detail(format!("recursive={}", req.recursive)),
+        )?;
+        self.execute_metadata(operation, req, |gateway, ctx, req| async move {
+            gateway.create_directory(ctx, req).await
         })
         .await
     }
@@ -846,6 +881,19 @@ fn default_file_attrs() -> proto::fs::FileAttrsProto {
     }
 }
 
+fn default_dir_attrs() -> proto::fs::FileAttrsProto {
+    proto::fs::FileAttrsProto {
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+        size: 0,
+        atime_ms: 0,
+        mtime_ms: 0,
+        ctime_ms: 0,
+        nlink: 2,
+    }
+}
+
 fn layout_for_new_file(options: &CreateOptions) -> proto::common::FileLayoutProto {
     proto::common::FileLayoutProto {
         block_size: options.block_size,
@@ -862,6 +910,16 @@ fn file_status_from_response(
     let attrs = response
         .attrs
         .ok_or_else(|| ClientError::Metadata("GetStatusResponseProto.attrs missing".to_string()))?;
+    Ok(FileStatus::new(path, attrs.into()))
+}
+
+fn directory_status_from_response(
+    path: String,
+    response: proto::metadata::CreateDirectoryResponseProto,
+) -> ClientResult<FileStatus> {
+    let attrs = response
+        .attrs
+        .ok_or_else(|| ClientError::Metadata("CreateDirectoryResponseProto.attrs missing".to_string()))?;
     Ok(FileStatus::new(path, attrs.into()))
 }
 
@@ -1692,6 +1750,15 @@ mod tests {
         ) -> ClientResult<proto::metadata::ListStatusResponseProto> {
             self.next_result("list_status", &ctx).await?;
             Ok(proto::metadata::ListStatusResponseProto::default())
+        }
+
+        async fn create_directory(
+            &self,
+            ctx: AttemptContext,
+            _req: proto::metadata::CreateDirectoryRequestProto,
+        ) -> ClientResult<proto::metadata::CreateDirectoryResponseProto> {
+            self.next_result("create_directory", &ctx).await?;
+            Ok(proto::metadata::CreateDirectoryResponseProto::default())
         }
 
         async fn delete(
