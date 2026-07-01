@@ -605,7 +605,7 @@ async fn create_directory_failure_emits_metadata_state_warn_log() {
                 gid: 1000,
                 ..Default::default()
             }),
-            create_parents: false,
+            recursive: false,
         }),
     )
     .await
@@ -627,7 +627,7 @@ async fn create_directory_failure_emits_metadata_state_warn_log() {
                     gid: 1000,
                     ..Default::default()
                 }),
-                create_parents: false,
+                recursive: false,
             }),
         )
         .await
@@ -651,6 +651,150 @@ async fn create_directory_failure_emits_metadata_state_warn_log() {
         }),
         "{logs:?}"
     );
+}
+
+#[tokio::test]
+async fn recursive_create_directory_creates_missing_parent_directories() {
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+
+    let response = FileSystemServiceProto::create_directory(
+        &env.service,
+        Request::new(CreateDirectoryRequestProto {
+            header: header(707),
+            path: "/mnt/test/a/b/c".to_string(),
+            attrs: Some(proto::fs::FileAttrsProto {
+                mode: 0o755,
+                uid: 1000,
+                gid: 1000,
+                ..Default::default()
+            }),
+            recursive: true,
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+
+    assert_success_header(response.header);
+    let a = env
+        .storage
+        .get_dentry(env.root_inode_id, "a")
+        .expect("lookup /a")
+        .expect("/a created");
+    let b = env
+        .storage
+        .get_dentry(a, "b")
+        .expect("lookup /a/b")
+        .expect("/a/b created");
+    let c = env
+        .storage
+        .get_dentry(b, "c")
+        .expect("lookup /a/b/c")
+        .expect("/a/b/c created");
+    assert!(env
+        .storage
+        .get_inode(a)
+        .expect("load /a")
+        .expect("/a inode")
+        .kind
+        .is_dir());
+    assert!(env
+        .storage
+        .get_inode(b)
+        .expect("load /a/b")
+        .expect("/a/b inode")
+        .kind
+        .is_dir());
+    assert!(env
+        .storage
+        .get_inode(c)
+        .expect("load /a/b/c")
+        .expect("/a/b/c inode")
+        .kind
+        .is_dir());
+}
+
+#[tokio::test]
+async fn recursive_create_directory_fails_when_parent_component_is_file() {
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let file_inode_id = InodeId::new(5001);
+    env.storage
+        .put_inode(&Inode::new_file(
+            file_inode_id,
+            FileAttrs::new(),
+            env.mount_id,
+            DataHandleId::new(5001),
+        ))
+        .expect("put file inode");
+    env.storage
+        .put_dentry(env.root_inode_id, "file", file_inode_id)
+        .expect("put file dentry");
+
+    let response = FileSystemServiceProto::create_directory(
+        &env.service,
+        Request::new(CreateDirectoryRequestProto {
+            header: header(708),
+            path: "/mnt/test/file/child".to_string(),
+            attrs: Some(proto::fs::FileAttrsProto {
+                mode: 0o755,
+                uid: 1000,
+                gid: 1000,
+                ..Default::default()
+            }),
+            recursive: true,
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+
+    let err = header_error(response.header);
+    assert_fs_errno(&err, FsErrnoProto::FsErrnoEnotdir);
+    assert_eq!(env.storage.get_dentry(file_inode_id, "child").unwrap(), None);
+}
+
+#[tokio::test]
+async fn recursive_create_directory_succeeds_when_target_directory_exists() {
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+
+    let first = FileSystemServiceProto::create_directory(
+        &env.service,
+        Request::new(CreateDirectoryRequestProto {
+            header: header(709),
+            path: "/mnt/test/existing".to_string(),
+            attrs: Some(proto::fs::FileAttrsProto {
+                mode: 0o755,
+                uid: 1000,
+                gid: 1000,
+                ..Default::default()
+            }),
+            recursive: false,
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+    assert_success_header(first.header);
+
+    let second = FileSystemServiceProto::create_directory(
+        &env.service,
+        Request::new(CreateDirectoryRequestProto {
+            header: header(710),
+            path: "/mnt/test/existing".to_string(),
+            attrs: Some(proto::fs::FileAttrsProto {
+                mode: 0o755,
+                uid: 1000,
+                gid: 1000,
+                ..Default::default()
+            }),
+            recursive: true,
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+
+    assert_success_header(second.header);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1233,7 +1377,7 @@ async fn leadership_precedence_write_returns_not_leader_before_not_found() {
             header: header(2),
             path: "/mnt/test/missing/child".to_string(),
             attrs: None,
-            create_parents: false,
+            recursive: false,
         }),
     )
     .await

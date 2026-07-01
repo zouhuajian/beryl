@@ -13,7 +13,7 @@
 use super::domain::{
     AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CreateInput, DeleteEmptyDirInput,
     DeleteTreeInput, FileRange, Freshness, GetAttrInput, GetFileLayoutInput, MkdirInput, OpenWriteInput, ReadDirInput,
-    RenameInput, RenewLeaseInput, SyncWriteInput, SyncWriteMode, UnlinkInput,
+    RenameInput, RenewLeaseInput, RequestContext, SyncWriteInput, SyncWriteMode, UnlinkInput,
 };
 use super::guard::{GuardChain, GuardFailure, LeadershipChecker};
 use super::MsyncHandler;
@@ -26,7 +26,7 @@ use super::{FsCore, PermissionBits, PermissionChecker, SharedWorkerCommitHook};
 use crate::error::{to_canonical_fs, MetadataError};
 use crate::mount::MountTable;
 use crate::observe;
-use crate::path_resolver::{MountContext, PathResolver};
+use crate::path_resolver::{MountContext, PathResolver, ResolvedPath};
 use crate::raft::RocksDBStorage;
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::*;
@@ -269,6 +269,191 @@ impl MetadataFileSystemServiceImpl {
     fn data_handle_proto(data_handle_id: DataHandleId) -> proto::common::DataHandleIdProto {
         data_handle_id.into()
     }
+
+    async fn create_directory_recursive(
+        &self,
+        req: CreateDirectoryRequestProto,
+        req_ctx: RequestContext,
+    ) -> Result<Response<CreateDirectoryResponseProto>, Status> {
+        let (mount_ctx, components) = match self.path_resolver.resolve_mount_components(&req.path) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let header = self.header_from_path_error(&req.header, err, None);
+                return error_response!(CreateDirectoryResponseProto, header);
+            }
+        };
+        if components.is_empty() {
+            let header = self.header_from_path_error(
+                &req.header,
+                MetadataError::InvalidArgument("Cannot operate on mount root".to_string()),
+                Some(&mount_ctx),
+            );
+            return error_response!(CreateDirectoryResponseProto, header);
+        }
+        let attrs = match file_attrs_from_proto(req.attrs) {
+            Ok(attrs) => attrs,
+            Err(err) => {
+                let header = self.header_from_path_error(&req.header, err, Some(&mount_ctx));
+                return error_response!(CreateDirectoryResponseProto, header);
+            }
+        };
+
+        let mut parent_inode_id = mount_ctx.root_inode_id;
+        let mut traverse_dir_inode_ids = Vec::with_capacity(components.len());
+        let mut last_create_success = None;
+        let mut last_created_parent_inode_id = None;
+        let freshness = Self::freshness_from_header(&req.header);
+
+        for name in components {
+            traverse_dir_inode_ids.push(parent_inode_id);
+            match self.path_resolver.get_dentry(parent_inode_id, &name) {
+                Ok(Some(child_inode_id)) => {
+                    let inode = match self.path_resolver.get_inode(child_inode_id) {
+                        Ok(Some(inode)) => inode,
+                        Ok(None) => {
+                            let header = self.header_from_path_error(
+                                &req.header,
+                                MetadataError::NotFound(format!("Target inode not found: {}", child_inode_id)),
+                                Some(&mount_ctx),
+                            );
+                            return error_response!(CreateDirectoryResponseProto, header);
+                        }
+                        Err(err) => {
+                            let header = self.header_from_path_error(&req.header, err, Some(&mount_ctx));
+                            return error_response!(CreateDirectoryResponseProto, header);
+                        }
+                    };
+                    if !inode.kind.is_dir() {
+                        let header = self.header_from_path_error(
+                            &req.header,
+                            MetadataError::NotDir(format!("Path component is not a directory: {}", name)),
+                            Some(&mount_ctx),
+                        );
+                        return error_response!(CreateDirectoryResponseProto, header);
+                    }
+                    parent_inode_id = child_inode_id;
+                }
+                Ok(None) => {
+                    let create_parent_inode_id = parent_inode_id;
+                    let resolved_parent = ResolvedPath {
+                        mount_ctx: mount_ctx.clone(),
+                        parent_inode_id: Some(create_parent_inode_id),
+                        name: Some(name.clone()),
+                        inode_id: None,
+                        traverse_dir_inode_ids: traverse_dir_inode_ids.clone(),
+                    };
+                    guard_or_error!(
+                        self,
+                        req,
+                        CreateDirectoryResponseProto,
+                        self.guard_chain.check_parent_perm(
+                            &req_ctx,
+                            PermissionBits::WRITE,
+                            &req.path,
+                            &resolved_parent,
+                        )
+                    );
+
+                    let mut child_ctx = req_ctx.clone();
+                    child_ctx.caller = req_ctx.caller.child();
+                    match self
+                        .fs_core
+                        .execute_mkdir(MkdirInput {
+                            ctx: child_ctx,
+                            parent_inode_id: create_parent_inode_id,
+                            name,
+                            attrs: attrs.clone(),
+                            freshness,
+                        })
+                        .await
+                    {
+                        Ok(success) => {
+                            let Some(created_inode_id) = success.payload.inode_id else {
+                                let header = self.header_from_path_error(
+                                    &req.header,
+                                    MetadataError::Internal("CreateDirectory succeeded without inode_id".to_string()),
+                                    Some(&mount_ctx),
+                                );
+                                return error_response!(CreateDirectoryResponseProto, header);
+                            };
+                            parent_inode_id = created_inode_id;
+                            last_created_parent_inode_id = Some(create_parent_inode_id);
+                            last_create_success = Some(success);
+                        }
+                        Err(failure) => {
+                            tracing::warn!(
+                                target: "metadata.state",
+                                op = "CreateDirectory",
+                                result = "rejected",
+                                error_code = observe::canonical_error_kind(&failure.error),
+                                client_id = %req_ctx.caller.client.client_id,
+                                call_id = %req_ctx.caller.client.call_id,
+                                path = %req.path,
+                                parent_inode_id = create_parent_inode_id.as_raw(),
+                                "CreateDirectory rejected"
+                            );
+                            return error_response!(
+                                CreateDirectoryResponseProto,
+                                header_from_core_failure(&req_ctx, &failure)
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    let header = self.header_from_path_error(&req.header, err, Some(&mount_ctx));
+                    return error_response!(CreateDirectoryResponseProto, header);
+                }
+            }
+        }
+
+        if let Some(success) = last_create_success {
+            let header = ok_header_from_core_success(&req_ctx, &success);
+            let attrs = success.payload.attrs.as_ref().map(file_attrs_to_proto);
+            tracing::info!(
+                target: "metadata.state",
+                op = "CreateDirectory",
+                result = "committed",
+                error_code = "none",
+                client_id = %req_ctx.caller.client.client_id,
+                call_id = %req_ctx.caller.client.call_id,
+                path = %req.path,
+                inode_id = success.payload.inode_id.map(|id| id.as_raw()),
+                parent_inode_id = last_created_parent_inode_id.map(|id| id.as_raw()),
+                mount_version = success.mount_epoch,
+                route_epoch = success.route_epoch,
+                "CreateDirectory committed"
+            );
+            return response_with_header!(
+                CreateDirectoryResponseProto {
+                    attrs,
+                    ..Default::default()
+                },
+                header
+            );
+        }
+
+        match self
+            .fs_core
+            .execute_get_attr(GetAttrInput {
+                ctx: req_ctx.clone(),
+                inode_id: parent_inode_id,
+                freshness,
+            })
+            .await
+        {
+            Ok(success) => response_with_header!(
+                CreateDirectoryResponseProto {
+                    attrs: Some(file_attrs_to_proto(&success.payload.attrs)),
+                    ..Default::default()
+                },
+                ok_header_from_core_success(&req_ctx, &success)
+            ),
+            Err(failure) => error_response!(
+                CreateDirectoryResponseProto,
+                header_from_core_failure(&req_ctx, &failure)
+            ),
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -351,6 +536,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             CreateDirectoryResponseProto,
             self.guard_chain.check_meta_write(&req_ctx)
         );
+        if req.recursive {
+            return self.create_directory_recursive(req, req_ctx).await;
+        }
 
         let resolved = match self.path_resolver.resolve_path(&req.path) {
             Ok(resolved) => resolved,

@@ -127,7 +127,7 @@ message CreateDirectoryRequestProto {
   common.RequestHeaderProto header = 1;
   string path = 2;
   fs.FileAttrsProto attrs = 3;
-  bool create_parents = 4;
+  bool recursive = 4;
 }
 
 message CreateDirectoryResponseProto {

@@ -152,6 +152,21 @@ impl PathResolver {
         best_match.ok_or_else(|| MetadataError::NotFound(format!("No mount found for path: {}", normalized)))
     }
 
+    /// Resolve path to its owning mount and mount-relative components without
+    /// requiring the namespace entries to exist.
+    pub(crate) fn resolve_mount_components(&self, path: &str) -> MetadataResult<(MountContext, Vec<String>)> {
+        let (mount_entry, components) = self.resolve_mount(path)?;
+        Ok((
+            MountContext {
+                mount_id: mount_entry.mount_id,
+                mount_epoch: mount_entry.mount_version,
+                owner_group_name: mount_entry.namespace_owner_group_name,
+                root_inode_id: mount_entry.root_inode_id,
+            },
+            components,
+        ))
+    }
+
     /// Walk dentry tree and return:
     /// - final inode id after following all components
     /// - ordered directory inode list that must pass traverse/search checks
@@ -286,6 +301,10 @@ impl PathResolver {
 
     pub(crate) fn get_inode(&self, inode_id: InodeId) -> MetadataResult<Option<Inode>> {
         self.storage.get_inode(inode_id)
+    }
+
+    pub(crate) fn get_dentry(&self, parent_inode_id: InodeId, name: &str) -> MetadataResult<Option<InodeId>> {
+        self.storage.get_dentry(parent_inode_id, name)
     }
 }
 
