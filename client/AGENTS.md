@@ -1,50 +1,33 @@
-# `client` Agent Instructions
+# client Agent Instructions
 
-This file applies to `client/`. Follow the root `AGENTS.md` first; this crate owns the public API and client-side orchestration.
+## Crate Boundary
 
-## Scope
+`client` owns the Rust native API and metadata/worker RPC orchestration. It coordinates authority decisions from metadata with data execution on workers.
 
-`client` owns:
+## Allowed Changes
 
-- SDK facade and public API shape
-- metadata RPC orchestration and response validation
-- worker data-plane orchestration after metadata-issued layout, route, source, lease/fencing, and freshness context
-- freshness, route epoch, mount epoch, worker run identity, block stamp, fencing, retry, refresh, replay, and unknown-outcome behavior
-- worker endpoint cache, channel pooling, endpoint health, attempt scheduling, and client typed config
-- session-scoped open/write/flush/sync/close state
+- Improve `FsClient`, reader/writer handles, operation options, and status/listing types.
+- Improve metadata RPC orchestration, worker RPC orchestration, and response validation.
+- Tighten client identity, call ID, retry, refresh, replay, unknown-outcome handling, endpoint cache, and write-session behavior.
+- Add focused coverage for public API behavior and retry/freshness contracts when code changes require it.
 
-`client` must not own metadata authority, server-side filesystem rules, worker internals, worker store/runtime behavior, generic schema ownership, or shared retry/cache policy in `common`, `types`, or `proto`.
+## Do Not Do
 
-## Local Rules
+- Do not production-depend on `metadata` or `worker` crates.
+- Do not bypass metadata for direct worker access.
+- Do not add POSIX, FUSE, or Hadoop compatibility claims unless implemented.
+- Do not leak future-only metadata-group concepts into public APIs unless current code requires them.
+- Do not add blind retry loops or silent fallback for consistency failures.
+- Do not add test-only seeding, injection, force, or fake APIs to production modules.
 
-- Current focus is the normal client -> metadata -> worker data path, not metadata-free cached direct access.
-- Do not bypass metadata for cached direct read/write unless an explicit design requests it.
-- Keep route/cache state subordinate to metadata authority and freshness validation.
-- Keep API modules simple. Do not split operations into tiny modules when `FsClient` remains the clearer public surface.
-- Convert raw proto near metadata and worker service boundaries; use domain objects after boundaries where one exists.
-- Avoid blind retry loops; classify retry, refresh, replay, endpoint invalidation, and unknown outcome explicitly.
-- Do not add test-only cache seeding, injection, force, or fake APIs to production modules.
+## Cross-Crate Rules
 
-## Public API Contract
+- Use `types`, `common`, and `proto` for shared contracts.
+- Convert raw proto near service boundaries and use domain objects after boundaries where available.
+- Keep route/cache state subordinate to metadata authority.
+- Keep UFS integration out of the current client interface unless explicitly implemented.
 
-- Create-time layout options apply only to new file creation.
-- Existing files use metadata-stored `FileLayout`; `OpenOptions` and `AppendOptions` must not carry layout overrides.
-- Rust native writer sync APIs are only sync_write_visibility and sync_write_durability.
-- Public reads must not add a read layout cache.
-- Public reads and writes must not add metadata-less direct worker access.
+## Validation Notes
 
-## Tests
-
-- Test route refresh, not-leader refresh/replay, stale route/mount/worker-run/block-stamp behavior, follower-read watermark gating, group-scoped watermark comparison, write-session invalidation, fencing/session-expired behavior, transport-vs-business failure classification, and stale direct-path fallback-to-refresh where relevant.
-- Assert explicit client actions and policies, not only eventual success.
-- Use integration tests for end-to-end metadata/worker/client contracts.
-
-## Local Self-Review
-
-Apply the root self-review checklist, then check:
-
-- Did client policy stay local and production dependencies avoid `metadata` and `worker`?
-- Did worker access remain metadata-issued and validated?
-- Did raw proto stay near service/adapter boundaries?
-- Did retry/refresh/replay avoid blind fallback behavior?
-- Did API shape stay simple without tiny operation modules or test-only production hooks?
+- Root workspace validation applies.
+- For focused checks, use `cargo test -p client`.

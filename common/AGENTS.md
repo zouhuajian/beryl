@@ -1,39 +1,31 @@
-# `common` Agent Instructions
+# common Agent Instructions
 
-This file applies to `common/`. Follow the root `AGENTS.md` first; keep this crate limited to shared infrastructure.
+## Crate Boundary
 
-## Scope
+`common` owns shared infrastructure: canonical errors, headers, config mechanics, retry/time helpers, observability utilities, and small crate-independent helpers.
 
-`common` owns infrastructure that is generic across product crates:
+## Allowed Changes
 
-- canonical recoverable error primitives and service-independent error helpers
-- request/response header domain types
-- config loading, flattening, environment-key mapping, and low-level config mechanics
-- observability, retry/time/path utilities, and other module-independent helpers
-- generic validation only when it does not choose product policy
+- Improve canonical error and header structures without losing machine-readable detail.
+- Add config, retry, time, or observability helpers that are genuinely crate-independent.
+- Tighten validation mechanics that do not choose service policy.
+- Keep operational failures explicit and structured.
 
-`common` must not own metadata authority, worker execution, client retry/cache policy, UFS backend policy, generated proto types, schema-local codecs, gRPC adapters, product runtime state, or typed module config semantics. Stable domain values belong in `types`, not here.
+## Do Not Do
 
-## Local Rules
+- Do not put service-specific metadata, worker, client, or UFS behavior here.
+- Do not hide operational failures behind generic string-only errors.
+- Do not move product config semantics into common config mechanics.
+- Do not create a second error vocabulary that competes with canonical errors.
+- Do not use `common` as a dumping ground for unrelated helpers.
 
-- Do not use `common` as a dumping ground for code that lacks a clear owner.
-- Keep helpers small and infrastructure-shaped; if correctness depends on metadata, worker, client, UFS, route, lease, repair, cache, or retry policy, keep the code in that product crate.
-- Config utilities may parse and flatten inputs, but each module owns its typed config structs, defaults, validation, and key meaning.
-- Shared error/header code may define structured domain shapes; structural proto conversion belongs in `proto`.
-- Avoid broad dependencies for narrow convenience.
+## Cross-Crate Rules
 
-## Tests
+- Owning crates keep policy; `common` supplies mechanics.
+- Shared errors and headers must remain usable by metadata, worker, client, proto, and UFS paths.
+- Avoid dependencies that would pull runtime crates into `common`.
 
-- Test error classification, config mechanics, and generic validation with structured assertions.
-- Include negative tests for invalid config or validation inputs when behavior is not obvious.
-- Do not add integration-style tests here for product-crate policy.
+## Validation Notes
 
-## Local Self-Review
-
-Apply the root self-review checklist, then check:
-
-- Is the new code truly generic, stable, and cross-module?
-- Should the value or validation live in `types` instead?
-- Did typed config semantics stay in the owning module?
-- Did this create a second error vocabulary or duplicate proto conversion?
-- Did dependency direction remain `common` -> `types` only when needed?
+- Root workspace validation applies.
+- For focused checks, use `cargo test -p common`.

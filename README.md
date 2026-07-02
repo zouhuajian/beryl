@@ -1,76 +1,113 @@
 # Vecton
 
-Vecton is an inode-centric distributed storage and cache system with filesystem-facing semantics. Metadata owns inode, dentry, attrs, mount, lease, route, and state freshness. Workers own local block/chunk/stream execution. Clients orchestrate metadata and worker calls without owning metadata or worker runtime policy.
+## Overview
 
-> Status: active development. Internal APIs, config keys, and on-disk formats may change.
+Vecton is a Rust-based distributed storage/cache layer for big data and AI workloads. It uses a metadata control plane to manage namespace, file layout, data visibility, and worker-resident data. Clients coordinate metadata RPCs with worker data RPCs so visible data is served through metadata-authorized workers.
 
-## Development Baseline
+## Why Vecton?
 
-Vecton is developed and verified with Rust 1.95.0. The repository pins that baseline in `rust-toolchain.toml`; keep `rustfmt` and `clippy` installed for this toolchain.
+- Large data systems need metadata paths that can scale with file count, namespace activity, and data-plane parallelism.
+- Centralized metadata can become a bottleneck when all namespace, layout, and visibility decisions converge on one authority.
+- Vecton explores a metadata-authorized architecture where metadata owns visibility and workers execute the data plane.
+- The long-term direction is mount-level metadata sharding.
 
-Local verification entrypoints:
+## Core Semantics
+
+- Metadata is the authority for namespace, file layout, and data visibility.
+- Workers store and serve blocks authorized by metadata.
+- Data made visible by metadata is Vecton resident data.
+- Vecton should keep resident data durable until explicit delete/free or a documented recovery state.
+- External storage integration is future work unless it is wired into the current read/write path.
+
+## Architecture
+
+- Client
+  - Exposes the Rust native API.
+  - Orchestrates metadata RPCs and worker data RPCs.
+- Metadata
+  - Owns namespace, layout, visibility, leases, worker registry, block locations, freshness, and Raft/RocksDB-backed authority.
+  - Issues the context required before workers serve data.
+- Worker
+  - Stores local blocks and executes read/write streams.
+  - Handles block commit, abort, sync, heartbeat, and block reports.
+- External storage / UFS boundary
+  - Provides the adapter boundary for external backends.
+  - Current reads and writes do not use it.
+- Shared crates
+  - `types`, `common`, and `proto` provide stable domain values, shared infrastructure, and wire contracts.
+
+## Current Status
+
+- The current runtime is focused on one metadata group.
+- The current metadata runtime uses one leader.
+- The Rust native client is the client interface used today.
+- Reads and writes currently go through metadata-authorized worker storage.
+- UFS is present as an adapter boundary, but current reads and writes do not use it.
+- Multi-group metadata is future work.
+- `/local` is the current local development namespace.
+
+## What Works Today
+
+- Metadata format/start lifecycle and gRPC filesystem service.
+- Worker registration, heartbeat, and block reports.
+- Rust client APIs for core file operations including status, list, mkdirs, delete, rename, open, create, append, read, write, sync, close, and abort.
+- Metadata-authorized worker reads and writes.
+- Structured error and proto contracts for current metadata and worker paths.
+- Default and local development configuration.
+
+## Known Gaps
+
+- Non-ignored metadata + worker + client E2E coverage.
+- Worker stream correctness hardening.
+- Worker block publish/recovery hardening.
+- Metadata restart behavior for in-flight writes.
+- Worker restart/full-report convergence.
+- Precise no-replica and block-location-unavailable behavior.
+- UFS integration for reads and writes.
+
+## Roadmap
+
+- P0: stabilize the single-group core path.
+- P1: mount-level metadata sharding.
+- P2: UFS read-through/write-through integration.
+- P3: replication, repair, and ecosystem integration.
+
+## Crates
+
+- `types`
+  - Stable domain and value types shared by crates used in the current runtime.
+  - Includes IDs, layout values, block values, epochs, and watermarks at the domain level.
+- `common`
+  - Shared infrastructure for errors, headers, config loading, retry/time helpers, and observability.
+  - Does not own product behavior.
+- `proto`
+  - Protobuf/gRPC contracts and generated Rust bindings.
+  - Covers the current metadata filesystem, metadata-worker control, and worker data services.
+- `metadata`
+  - Namespace, layout, visibility, lease, worker registry, block location, freshness, and Raft/RocksDB authority.
+  - Multi-group metadata remains future work.
+- `worker`
+  - Local block storage and metadata-authorized data-plane execution.
+  - Does not own namespace visibility or file layout decisions.
+- `client`
+  - Rust native API and orchestration for metadata and worker RPCs.
+  - Does not provide POSIX, FUSE, or Hadoop compatibility today.
+- `ufs`
+  - External backend adapter boundary.
+  - Current reads and writes do not use it.
+
+## Quick Start
+
+Vecton requires local metadata and worker configuration. The repository provides default and local debug profiles.
+
+Development checks:
 
 ```bash
 make fmt
 make verify
 ```
 
-`make verify` runs the non-mutating baseline gates:
-
-```bash
-cargo fmt --all --check
-cargo metadata --format-version 1 --no-deps
-cargo check --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-```
-
-## Current Baseline
-
-Currently supported:
-
-- Rust workspace build, metadata generation, lint, and unit/contract test gates.
-- Single-group metadata runtime with inode/dentry/attrs authority, explicit root mount formatting, Raft-backed state, write sessions, leases, and route/state freshness.
-- Worker startup registration with MetadataWorkerService using stable `WorkerId` plus per-process `WorkerRunId`, followed by heartbeat and block-report loops and a gRPC data service for local block/chunk/stream read and write execution.
-- MetadataWorkerService structured application-error response contract for worker registration.
-- Client facade with metadata gateway, retry/refresh classification, read planning, worker endpoint validation, and sequential write handles.
-- Default `conf/metadata.yaml`, `conf/worker.yaml`, and `conf/client-site.yaml` containing only keys consumed by current runtime code.
-- Local runnable configs for one metadata process and one worker process: `conf/local/metadata.yaml` and `conf/local/worker.yaml`.
-- Owner-crate config and contract tests. Default workspace tests do not start metadata or worker services.
-
-Intentionally not yet implemented in this baseline:
-
-- WorkerDataService public `block_stamp=0` hardening.
-- Raft network implementation for production multi-node metadata.
-- QUIC, RDMA, io_uring, or SPDK production data paths.
-- Expanded maintenance repair/delete features.
-- Default-on real metadata + worker + client end-to-end system tests. The local client CRUD smoke lives in `client/tests/local_crud.rs` and is ignored by default.
-
-Worker startup registration is group-scoped. The worker resolves a stable `WorkerId` from the persisted `worker.identity.path`, generates a UUID `WorkerRunId` once per process start, registers the advertised gRPC endpoint with the configured metadata group leader, and serves data-plane requests for a group only after that group accepts the registration. Metadata persists only the stable worker descriptor; `WorkerRunId` is live registration state and is not restored from metadata restart or snapshot reload. `WorkerRunId` is not an epoch and is not comparable. Client-to-worker reads, writes, commits, and syncs use `WorkerRunId` for worker process-run freshness and `block_stamp` for block generation freshness.
-
-## Workspace Crates
-
-| Crate | Role | Owns |
-| --- | --- | --- |
-| `types` | Pure Rust domain model | Stable IDs and shared value objects such as worker endpoints, block locations, write targets, committed blocks, fencing tokens, block stamps, epochs, and watermarks. |
-| `common` | Generic shared infrastructure | Canonical errors, request/response headers, config loading mechanics, observability primitives, and module-independent utilities. |
-| `proto` | Wire schema and structural conversion | Protobuf files, generated Rust modules, gRPC service contracts, wire enum values, and proto/domain conversion. |
-| `metadata` | Metadata authority runtime | Inode/dentry/attrs, mounts, leases, write sessions, Raft state, worker membership service, maintenance routing, and metadata config. |
-| `worker` | Data-plane runtime | Local block store, chunk IO, stream runtime, data service adapters, worker networking, and worker config. |
-| `client` | SDK and orchestration runtime | Public facade, metadata gateway, worker endpoint resolution/cache, channel pooling, retry/refresh orchestration, read planning, worker data-plane access, and client config. The client obtains authoritative layout, write targets, and read locations from metadata, validates read locations with `ReadPlanner`, and then accesses workers on the normal data path. Client-side read layout caching has been removed from the current architecture. |
-| `ufs` | External backend adapter | Backend integration, OpenDAL setup, backend-specific config, UFS path behavior, and backend capability decisions. |
-
-Dependency direction is one-way from product crates to shared crates. `types` must not depend on workspace crates; `common` may depend on `types` but not `proto` or product crates; `proto` may depend on `types` and `common`; production `metadata`, `worker`, `client`, and `ufs` must not depend on each other in production code.
-
-## Configuration
-
-Default configuration files are active baselines, not roadmaps:
-
-- `conf/metadata.yaml` contains current metadata runtime keys only.
-- `conf/worker.yaml` contains current worker runtime keys only.
-- `conf/client-site.yaml` contains current client runtime keys only.
-- `conf/local/metadata.yaml` and `conf/local/worker.yaml` are the runnable local metadata/worker pair.
-- Planned capabilities may be described in docs, but they must not appear as deployable defaults until code consumes and validates them.
+`make verify` runs the workspace format check, metadata check, compile check, clippy, and tests.
 
 Default one-metadata, one-worker startup:
 
@@ -88,22 +125,17 @@ metadata start --config conf/local/metadata.yaml
 worker start --config conf/local/worker.yaml
 ```
 
-## Observability
+The client reads `conf/client-site.yaml` or `conf/local/client-site.yaml` depending on caller configuration.
 
-`common/src/observe` owns process-wide observability infrastructure: configuration structs,
-initialization, the metrics recorder/exporter, the Prometheus `/metrics` endpoint, and the
-tracing/logging subscriber. Product crates own their own signal names and emission. Metadata,
-worker, and client code should emit through the `metrics` crate and `tracing`; common must not
-contain metadata/worker/client/UFS business metric definitions.
+## Non-goals for Current Scope
 
-The supported metrics exporter is Prometheus. `observe.metrics.prometheus.bind`
-controls the `/metrics` listener bind address and `observe.metrics.prometheus.path`
-controls the HTTP path. `metadata.http.bind` and `worker.http.bind` are parsed and
-logged as reserved HTTP/admin bind fields, but no current listener uses them and
-they do not control `/metrics`. `metadata format` does not initialize observability.
-Trace/log output uses the local tracing subscriber. OTLP export and OpenTelemetry
-SDK export pipelines are unsupported now. Client observability is still partial and
-does not set up its own exporter.
+- Alluxio full feature parity.
+- Production-ready multi-group metadata.
+- POSIX compatibility.
+- FUSE.
+- UFS-backed cache read/write path.
+- Replication, repair, or rebalancing as completed user-facing behavior.
+- Alternate transports such as QUIC or RDMA.
 
 ## License
 

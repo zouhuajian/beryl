@@ -1,40 +1,31 @@
-# `ufs` Agent Instructions
+# ufs Agent Instructions
 
-This file applies to `ufs/`. Follow the root `AGENTS.md` first; this crate owns backend integration and adapter behavior.
+## Crate Boundary
 
-## Scope
+`ufs` owns the external backend and adapter boundary. Current Vecton file IO does not use UFS for reads or writes.
 
-`ufs` owns:
+## Allowed Changes
 
-- external backend adapters such as local FS, HDFS, S3, OSS, and object stores
-- backend-specific config, defaults, validation, and construction
-- OpenDAL adapter setup
-- UFS path/object mapping and backend operation mapping
-- backend capability discovery and explicit capability decisions
-- backend error normalization when it preserves Vecton semantics
+- Improve backend specs, backend-specific config, defaults, validation, and construction.
+- Improve OpenDAL adapter setup and backend capability mapping.
+- Clarify unsupported backend behavior explicitly.
+- Prepare future integration only when it preserves unified Vecton resident data semantics.
 
-`ufs` must not own metadata authority, inode/dentry/mount policy, namespace ownership, worker store/runtime behavior, client retry/replay/cache policy, shared production helpers for unrelated crates, or dependencies on `metadata`, `worker`, or `client`.
+## Do Not Do
 
-## Local Rules
-
-- Backend behavior must not redefine filesystem metadata truth.
-- Keep backend-specific dependencies and policy isolated behind adapter boundaries.
-- Do not promote backend-specific behavior into `common` as generic policy.
-- Preserve Block, StorageChunk, TransportFrame, Stream, route, epoch, and fencing semantics at adapter boundaries.
+- Do not document UFS read-through or write-through as implemented unless code proves it.
+- Do not own metadata authority, namespace policy, worker runtime behavior, or client retry/replay/cache policy.
+- Do not depend on `metadata`, `worker`, or `client`.
 - Do not silently fake unsupported backend semantics such as rename, append, truncate, consistency, or directory behavior.
+- Do not introduce separate cache-mode semantics in current docs.
 
-## Tests
+## Cross-Crate Rules
 
-- Test backend capability mapping, config validation, error normalization, LocalUFS interpretation, range/object translation, unsupported semantic rejection, and restart/reopen behavior where relevant.
-- Tests should prove semantic preservation, not only successful backend IO.
-- Use integration tests when backend behavior affects cross-crate contracts.
+- Keep backend-specific policy isolated behind adapter boundaries.
+- Surface backend limitations through explicit capability and error contracts.
+- Future UFS integration must preserve metadata-owned visibility and unified Vecton resident data semantics.
 
-## Local Self-Review
+## Validation Notes
 
-Apply the root self-review checklist, then check:
-
-- Did metadata authority stay outside `ufs`?
-- Did backend-specific policy stay local and explicit?
-- Did unsupported backend semantics fail clearly?
-- Did dependency direction avoid `metadata`, `worker`, and `client`?
-- Did docs explain backend capability gaps only where relevant?
+- Root workspace validation applies.
+- For focused checks, use `cargo test -p ufs`.

@@ -1,41 +1,32 @@
-# `proto` Agent Instructions
+# proto Agent Instructions
 
-This file applies to `proto/`. Follow the root `AGENTS.md` first; keep this crate focused on wire contracts and structural conversion.
+## Crate Boundary
 
-## Scope
+`proto` owns protobuf/gRPC schema, generated modules, and structural conversion helpers. Schema changes are compatibility-sensitive.
 
-`proto` owns:
+## Allowed Changes
 
-- `.proto` files, generated Rust modules, and exports
-- gRPC service contracts, wire messages, field numbers, and enum numeric values
-- structural conversion between generated proto types and `types`/`common` domain types
-- schema-local codecs when the persisted or transported payload is protobuf
-- explicit compatibility notes when an external contract requires them
+- Update wire contracts when a current caller or handler requires the change.
+- Add or adjust structural conversion between generated proto values and `types`/`common` values.
+- Clarify wire comments for current behavior, freshness, fencing, stream semantics, and compatibility.
+- Add conversion or error-mapping tests when schema/conversion behavior changes.
 
-`proto` must not own business policy, authority decisions, retry/replay/cache behavior, endpoint-health policy, route refresh decisions, metadata routing, worker store/runtime behavior, UFS behavior, client SDK policy, or duplicated shadow models that compete with `types`.
+## Do Not Do
 
-## Local Rules
+- Do not change schema casually.
+- Do not reuse or silently change field numbers or enum values.
+- Do not add future service contracts unless explicitly requested.
+- Do not put business policy, authority decisions, retry/cache policy, or worker execution here.
+- Do not add compatibility aliases or decode fallbacks without a real external requirement.
 
-- `proto` may depend on `types` and `common`; it must not depend on product crates.
-- Do not introduce proto messages only because two Rust structs look similar.
-- Do not add compatibility aliases or decode fallbacks unless explicitly requested or required by an external consumer.
-- Never silently change or reuse numeric field or enum values.
-- Keep proto comments about wire-level behavior: required/advisory status, error contract, epoch/fencing fields, freshness, stream semantics, and compatibility implications.
-- Avoid duplicating domain semantics in comments when the Rust domain type already owns the meaning.
-- Raw proto values should stay near service or adapter boundaries; product runtime code should use domain models where one exists.
+## Cross-Crate Rules
 
-## Tests
+- Current services are metadata filesystem, metadata-worker control, and worker data.
+- Keep generated proto values at service boundaries and convert to domain types where available.
+- Treat admin, peer, or shard-style proto contracts as future/experimental unless runtime code used today proves otherwise.
 
-- Schema changes require generated-code rebuild and compilation of active Rust callers.
-- Add tests for conversion behavior, structured error mapping, identity/epoch propagation, and stream framing semantics where relevant.
-- Do not stop at "proto compiles" when the wire contract changed.
+## Validation Notes
 
-## Local Self-Review
-
-Apply the root self-review checklist, then check:
-
-- Are active consumers, generated Rust references, and wire numeric values accounted for?
-- Is the change schema or structural conversion only, with policy kept local to product crates?
-- Did it avoid duplicate headers, duplicate error paths, and shadow domain models?
-- Is every compatibility shim backed by a real external requirement?
-- Do comments describe current wire contract rather than migration history?
+- Root workspace validation applies.
+- For focused checks, use `cargo test -p proto`.
+- Schema changes require generated-code rebuild and current caller compilation.
