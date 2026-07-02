@@ -2,7 +2,7 @@
 
 Vecton is a data access acceleration layer with metadata-controlled routing and client-to-worker data-plane access. The project is still in active design and stabilization: correctness, freshness, epoch/fencing validation, and clear module boundaries matter more than feature breadth.
 
-`AGENTS.md` files are normative execution rules. `docs/` records architecture, audits, and design context; keep those docs consistent with code, but do not treat stale docs as stronger than current code plus these instructions. If a subtree has a stricter `AGENTS.md`, follow it for that subtree.
+`AGENTS.md` files are normative execution rules. If a subtree has a stricter `AGENTS.md`, follow it for that subtree.
 
 ## Required Reading
 
@@ -10,7 +10,6 @@ Before architectural, dependency-boundary, schema, config, shared-module, or cro
 
 - this file
 - the local `AGENTS.md` for every touched subtree
-- `docs/ARCHITECTURE_BOUNDARIES.md`
 - task-specific design or audit documents named by the user
 
 Keep changes inside the requested scope. Do not introduce architecture direction through opportunistic cleanup.
@@ -26,7 +25,6 @@ Keep changes inside the requested scope. Do not introduce architecture direction
 | `metadata` | Namespace and control-plane truth: inode, dentry, attrs, layout, leases, route ownership, mount routing, guard pipeline, Raft/RocksDB apply semantics. | Worker data execution, client policy, UFS backend behavior. |
 | `worker` | Data-plane execution, block store, local IO, stream handling, block reports, heartbeats. | File-level namespace authority, UFS path derivation from data handles, client retry/cache policy. |
 | `ufs` | Backend integration, backend config, OpenDAL setup, UFS path behavior, backend capability decisions. | Metadata authority, worker runtime, client policy. |
-| `docs` | Architecture, audit, and design records. | Normative rules that conflict with `AGENTS.md` or claims that planned features already exist. |
 
 Shared crates must not depend on product crates. `metadata`, `worker`, and `client` must not depend on each other in production code. `ufs` is a backend adapter crate and must not depend on `metadata`, `worker`, or `client`; `metadata` may depend on `ufs` only at mount/backend adapter boundaries. Test-only dependencies must stay explicit and narrow.
 

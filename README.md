@@ -88,8 +88,6 @@ metadata start --config conf/local/metadata.yaml
 worker start --config conf/local/worker.yaml
 ```
 
-See `docs/CONFIG_MATRIX_ZH.md` for the current key ownership and status matrix.
-
 ## Observability
 
 `common/src/observe` owns process-wide observability infrastructure: configuration structs,
@@ -105,8 +103,7 @@ logged as reserved HTTP/admin bind fields, but no current listener uses them and
 they do not control `/metrics`. `metadata format` does not initialize observability.
 Trace/log output uses the local tracing subscriber. OTLP export and OpenTelemetry
 SDK export pipelines are unsupported now. Client observability is still partial and
-does not set up its own exporter. See `docs/observability.md` for the current
-observability contract.
+does not set up its own exporter.
 
 ## License
 

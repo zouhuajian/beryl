@@ -423,7 +423,6 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 
 - `metadata/src/lib.rs` crate docs 已改为当前 `MetadataServer` runtime、`MetadataFileSystemServiceImpl`、`MetadataWorkerServiceImpl` 和 FileSystemService external API 事实；不再引用当前 checkout 缺失的 metadata docs path，也不再描述旧 client service 名称。
 - `metadata/src/service/mod.rs` module docs 已改为当前 FileSystemService adapter / GuardChain / FsCore / msync / auth extension point 事实。
-- 当前 checkout 未包含 `docs/architecture` 目录；README 不把该目录写成当前可读实现文档。
 - 旧 `report_presence` proto RPC 和服务实现已删除；当前 block presence authoritative input 是 `block_report`。
 - `metadata/src/worker/command_sender.rs` 已删除；当前没有 push queue 或 push transport hook。
 - `Command::UpdateCommittedLength` stale command path 已删除；scan 未发现当前 public caller。
@@ -465,7 +464,6 @@ client 配合不是本轮 metadata 完成度核心，但当前事实是：
 | 文件/模块 | 当前引用情况 | 为什么可疑 | 建议 | 风险 |
 | --- | --- | --- | --- | --- |
 | `metadata/src/state/memory.rs` / `MemoryStateStore` | regression/FsCore tests 使用；保留在 `metadata::state` 下 | 生产 runtime 使用 `RaftStateStore`，但 integration tests 仍需构造 route-epoch store | 已收窄为 route-epoch helper；后续如有测试辅助 crate 可继续取消 public state exposure | 直接删除会破坏现有 tests |
-| `docs/architecture/*` | 本轮扫描未发现 `docs/architecture` 目录 | 用户指定的背景目录当前不存在 | 无需处理；后续若新增再审 | 无 |
 
 ## 18. Metadata 瘦身建议
 
