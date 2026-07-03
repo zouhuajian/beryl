@@ -1787,6 +1787,16 @@ mod tests {
     }
 
     fn read_open_request_for(offset: u64, len: u32, block_stamp: u64, frame_size: u32) -> ReadOpenRequest {
+        read_open_request_for_len(offset, len, block_stamp, BLOCK_SIZE, frame_size)
+    }
+
+    fn read_open_request_for_len(
+        offset: u64,
+        len: u32,
+        block_stamp: u64,
+        effective_len: u64,
+        frame_size: u32,
+    ) -> ReadOpenRequest {
         ReadOpenRequest {
             group_name: group_name(),
             block_id: block_id(),
@@ -1796,8 +1806,39 @@ mod tests {
             block_format_id: BlockFormatId::FULL_EFFECTIVE,
             block_size: BLOCK_SIZE,
             chunk_size: CHUNK_SIZE,
-            effective_len: BLOCK_SIZE,
+            effective_len,
             frame_size,
+        }
+    }
+
+    async fn collect_core_read(core: &WorkerCore, stream_id: StreamId, max_bytes: u32) -> Bytes {
+        let mut out = Vec::new();
+        loop {
+            let frames = core.read_stream(stream_id, max_bytes).await.expect("read stream");
+            let Some(frame) = frames.into_iter().next() else {
+                break;
+            };
+            let eos = frame.eos;
+            out.extend_from_slice(&frame.data);
+            if eos {
+                break;
+            }
+        }
+        Bytes::from(out)
+    }
+
+    async fn wait_for_active_stream_count(core: &WorkerCore, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let active = core.stream_manager().active_count().await;
+            if active == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "active stream count stayed at {active}, expected {expected}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -2390,6 +2431,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multichunk_write_commit_and_read_returns_exact_effective_bytes() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let effective_len = 3073;
+        let data = payload().slice(0..effective_len as usize);
+        let mut open_req = write_open_request();
+        open_req.effective_len = effective_len;
+        let open = core.open_write(open_req).await.expect("open write");
+
+        let chunks = [
+            data.slice(0..700),
+            data.slice(700..1536),
+            data.slice(1536..2500),
+            data.slice(2500..effective_len as usize),
+        ];
+        let mut offset = 0u64;
+        for (idx, chunk) in chunks.into_iter().enumerate() {
+            core.write_stream(WriteFrame {
+                stream_id: open.stream_id,
+                seq: (idx + 1) as u64,
+                offset_in_block: offset,
+                data: chunk.clone(),
+                checksum32: 0,
+            })
+            .await
+            .expect("write chunk");
+            offset += chunk.len() as u64;
+        }
+
+        let result = core
+            .commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                commit_seq: 4,
+                effective_len,
+                ..commit_write_request()
+            })
+            .await
+            .expect("commit write");
+
+        assert_eq!(result.effective_len, effective_len);
+        assert_eq!(result.written_through, effective_len);
+        let meta = store.load_meta(&group_name(), block_id()).expect("ready meta");
+        assert_eq!(meta.source.effective_len, effective_len);
+        assert_eq!(
+            store.read_at(&group_name(), block_id(), 0, effective_len).unwrap(),
+            data
+        );
+
+        let open_read = core
+            .open_read(read_open_request_for_len(
+                0,
+                effective_len as u32,
+                BLOCK_STAMP,
+                effective_len,
+                600,
+            ))
+            .await
+            .expect("open read");
+        assert_eq!(collect_core_read(&core, open_read.stream_id, 600).await, data);
+
+        let eof_read = core
+            .open_read(read_open_request_for_len(
+                effective_len,
+                0,
+                BLOCK_STAMP,
+                effective_len,
+                600,
+            ))
+            .await
+            .expect("open eof read");
+        assert!(collect_core_read(&core, eof_read.stream_id, 600).await.is_empty());
+        assert_invalid_argument(
+            core.open_read(read_open_request_for_len(
+                effective_len,
+                1,
+                BLOCK_STAMP,
+                effective_len,
+                600,
+            ))
+            .await,
+        );
+    }
+
+    #[tokio::test]
     async fn commit_write_accepts_non_chunk_aligned_tail_and_persists_full_block_shape() {
         let (_temp, store, core) = core_with_store(512, 2048, 4096);
         let open = core.open_write(write_open_request()).await.expect("open write");
@@ -2558,6 +2682,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_commit_fails_without_republishing_or_corrupting_ready_block() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        let data = payload();
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: data.clone(),
+            checksum32: 0,
+        })
+        .await
+        .expect("write frame");
+
+        core.commit_write(CommitWriteRequest {
+            stream_id: open.stream_id,
+            commit_seq: 1,
+            effective_len: BLOCK_SIZE,
+            ..commit_write_request()
+        })
+        .await
+        .expect("first commit");
+        assert_not_found(
+            core.commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                commit_seq: 1,
+                effective_len: BLOCK_SIZE,
+                ..commit_write_request()
+            })
+            .await,
+        );
+
+        let scanned = store.scan_group_blocks(&group_name()).expect("scan group");
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(
+            scanned[0].visibility.block_state,
+            crate::store::block::BlockState::Ready
+        );
+        assert_eq!(store.read_at(&group_name(), block_id(), 0, BLOCK_SIZE).unwrap(), data);
+    }
+
+    #[tokio::test]
     async fn sync_committed_block_succeeds_after_terminal_commit_without_stream() {
         let (_temp, _store, core) = core_with_store(512, 2048, 4096);
         let open = core.open_write(write_open_request()).await.expect("open write");
@@ -2718,6 +2884,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_write_then_abort_is_not_ready_or_reportable() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: Bytes::from_static(b"partial"),
+            checksum32: 0,
+        })
+        .await
+        .expect("partial frame");
+
+        core.abort_write(AbortWriteRequest {
+            stream_id: open.stream_id,
+            ..abort_write_request()
+        })
+        .await
+        .expect("abort write");
+
+        assert!(core.stream_manager().get(open.stream_id).await.is_none());
+        assert!(!store.paths(&group_name(), block_id()).meta_path.exists());
+        assert_not_found(store.read_at(&group_name(), block_id(), 0, 1));
+        assert_need_refresh(
+            core.open_read(read_open_request_for(0, 1, BLOCK_STAMP, 512)).await,
+            RefreshReason::Moved,
+        );
+        assert!(store.scan_group_blocks(&group_name()).expect("scan group").is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_after_abort_fails_without_publishing_ready_block() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: Bytes::from_static(b"partial"),
+            checksum32: 0,
+        })
+        .await
+        .expect("partial frame");
+        core.abort_write(AbortWriteRequest {
+            stream_id: open.stream_id,
+            ..abort_write_request()
+        })
+        .await
+        .expect("abort write");
+
+        assert_not_found(
+            core.commit_write(CommitWriteRequest {
+                stream_id: open.stream_id,
+                commit_seq: 1,
+                effective_len: 7,
+                ..commit_write_request()
+            })
+            .await,
+        );
+        assert!(store.scan_group_blocks(&group_name()).expect("scan group").is_empty());
+        assert_not_found(store.read_at(&group_name(), block_id(), 0, 1));
+    }
+
+    #[tokio::test]
+    async fn duplicate_abort_fails_without_publishing_ready_block() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+
+        core.abort_write(AbortWriteRequest {
+            stream_id: open.stream_id,
+            ..abort_write_request()
+        })
+        .await
+        .expect("first abort");
+        assert_not_found(
+            core.abort_write(AbortWriteRequest {
+                stream_id: open.stream_id,
+                ..abort_write_request()
+            })
+            .await,
+        );
+
+        assert!(store.scan_group_blocks(&group_name()).expect("scan group").is_empty());
+        assert_not_found(store.read_at(&group_name(), block_id(), 0, 1));
+    }
+
+    #[tokio::test]
+    async fn abort_after_successful_commit_does_not_damage_ready_block() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        let data = payload();
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: data.clone(),
+            checksum32: 0,
+        })
+        .await
+        .expect("write frame");
+        core.commit_write(CommitWriteRequest {
+            stream_id: open.stream_id,
+            commit_seq: 1,
+            effective_len: BLOCK_SIZE,
+            ..commit_write_request()
+        })
+        .await
+        .expect("commit write");
+
+        assert_not_found(
+            core.abort_write(AbortWriteRequest {
+                stream_id: open.stream_id,
+                ..abort_write_request()
+            })
+            .await,
+        );
+
+        let scanned = store.scan_group_blocks(&group_name()).expect("scan group");
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(store.read_at(&group_name(), block_id(), 0, BLOCK_SIZE).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn write_stream_cancellation_discards_partial_staging_state() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let core = Arc::new(core);
+        let service = registered_data_service(Arc::clone(&core));
+        let open = service
+            .open_write_stream(tonic::Request::new(open_write_proto(0)))
+            .await
+            .expect("open write")
+            .into_inner();
+        let stream_id = crate::data::convert::proto_to_stream_id(open.stream_id, "stream_id").expect("stream id");
+        let cancelled = Status::cancelled("client cancelled write stream");
+
+        let status = service
+            .handle_write_frames(futures::stream::iter(vec![
+                Ok(WriteStreamRequestProto {
+                    stream_id: Some(crate::data::convert::stream_id_to_proto(stream_id)),
+                    seq: 1,
+                    offset_in_block: 0,
+                    data: Bytes::from_static(b"partial"),
+                    checksum32: 0,
+                }),
+                Err(cancelled),
+            ]))
+            .await
+            .expect_err("cancelled write stream must fail");
+
+        assert_eq!(status.code(), tonic::Code::Cancelled);
+        assert!(core.stream_manager().get(stream_id).await.is_none());
+        assert!(!store.paths(&group_name(), block_id()).meta_path.exists());
+        assert_not_found(store.read_at(&group_name(), block_id(), 0, 1));
+        assert!(store.scan_group_blocks(&group_name()).expect("scan group").is_empty());
+    }
+
+    #[tokio::test]
     async fn recover_after_uncommitted_write_is_not_readable() {
         let (temp, _store, core) = core_with_store(512, 2048, 4096);
         let open = core.open_write(write_open_request()).await.expect("open write");
@@ -2734,6 +3057,27 @@ mod tests {
         let recovered_store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(temp.path().to_path_buf()));
         assert_not_found(recovered_store.recover_block(&group_name(), block_id()));
         assert_not_found(recovered_store.read_at(&group_name(), block_id(), 0, 1));
+    }
+
+    #[tokio::test]
+    async fn incomplete_staging_write_is_ignored_by_ready_block_scan() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let open = core.open_write(write_open_request()).await.expect("open write");
+        core.write_stream(WriteFrame {
+            stream_id: open.stream_id,
+            seq: 1,
+            offset_in_block: 0,
+            data: Bytes::from_static(b"partial"),
+            checksum32: 0,
+        })
+        .await
+        .expect("partial frame");
+
+        let paths = store.paths(&group_name(), block_id());
+        assert!(paths.staging_data_path.exists());
+        assert!(paths.staging_meta_path.exists());
+        assert!(!paths.meta_path.exists());
+        assert!(store.scan_group_blocks(&group_name()).expect("scan group").is_empty());
     }
 
     #[tokio::test]
@@ -2934,6 +3278,93 @@ mod tests {
         assert_eq!(frames[0].data.len(), 3);
         assert_eq!(frames[0].data, data.slice(0..3));
         assert!(!frames[0].eos);
+    }
+
+    #[tokio::test]
+    async fn read_stream_offset_length_and_eof_boundaries_are_exact() {
+        let (_temp, store, core) = core_with_store(513, 2048, 4096);
+        let effective_len = u64::from(CHUNK_SIZE) * 2 + 17;
+        let data = payload().slice(0..effective_len as usize);
+        publish_ready_block(&store, data.clone(), BLOCK_STAMP);
+
+        let full = core
+            .open_read(read_open_request_for_len(
+                0,
+                effective_len as u32,
+                BLOCK_STAMP,
+                effective_len,
+                513,
+            ))
+            .await
+            .expect("open full read");
+        assert_eq!(collect_core_read(&core, full.stream_id, 513).await, data);
+
+        let nonzero = core
+            .open_read(read_open_request_for_len(17, 100, BLOCK_STAMP, effective_len, 64))
+            .await
+            .expect("open nonzero read");
+        assert_eq!(
+            collect_core_read(&core, nonzero.stream_id, 64).await,
+            data.slice(17..117)
+        );
+
+        let short = core
+            .open_read(read_open_request_for_len(100, 3, BLOCK_STAMP, effective_len, 64))
+            .await
+            .expect("open short read");
+        assert_eq!(
+            collect_core_read(&core, short.stream_id, 64).await,
+            data.slice(100..103)
+        );
+
+        let boundary_offset = u64::from(CHUNK_SIZE) - 3;
+        let across_chunk = core
+            .open_read(read_open_request_for_len(
+                boundary_offset,
+                10,
+                BLOCK_STAMP,
+                effective_len,
+                4,
+            ))
+            .await
+            .expect("open chunk boundary read");
+        assert_eq!(
+            collect_core_read(&core, across_chunk.stream_id, 4).await,
+            data.slice(boundary_offset as usize..boundary_offset as usize + 10)
+        );
+
+        let eof = core
+            .open_read(read_open_request_for_len(
+                effective_len,
+                0,
+                BLOCK_STAMP,
+                effective_len,
+                64,
+            ))
+            .await
+            .expect("open eof read");
+        assert!(collect_core_read(&core, eof.stream_id, 64).await.is_empty());
+
+        assert_invalid_argument(
+            core.open_read(read_open_request_for_len(
+                effective_len,
+                1,
+                BLOCK_STAMP,
+                effective_len,
+                64,
+            ))
+            .await,
+        );
+        assert_invalid_argument(
+            core.open_read(read_open_request_for_len(
+                effective_len - 1,
+                2,
+                BLOCK_STAMP,
+                effective_len,
+                64,
+            ))
+            .await,
+        );
     }
 
     #[tokio::test]
@@ -3502,8 +3933,79 @@ mod tests {
             .into_inner();
 
         drop(response_stream);
-        tokio::time::sleep(Duration::from_millis(20)).await;
 
+        wait_for_active_stream_count(&core, 0).await;
+    }
+
+    #[tokio::test]
+    async fn read_stream_early_drop_does_not_affect_later_read() {
+        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let data = payload();
+        publish_ready_block(&store, data.clone(), BLOCK_STAMP);
+        let core = Arc::new(core);
+        let service = registered_data_service(Arc::clone(&core));
+
+        let open = service
+            .open_read_stream(tonic::Request::new(open_read_proto(
+                0,
+                BLOCK_SIZE as u32,
+                BLOCK_STAMP,
+                512,
+            )))
+            .await
+            .expect("open first read")
+            .into_inner();
+        let stream_id = open.stream_id.expect("stream id");
+        let mut response_stream = service
+            .read_stream(tonic::Request::new(ReadStreamRequestProto {
+                stream_id: Some(stream_id),
+                max_bytes: 512,
+            }))
+            .await
+            .expect("read stream response")
+            .into_inner();
+        let first = response_stream
+            .next()
+            .await
+            .expect("first frame")
+            .expect("first frame ok");
+        assert_eq!(first.data, data.slice(0..512));
+        assert!(!first.eos);
+
+        drop(response_stream);
+        wait_for_active_stream_count(&core, 0).await;
+
+        let second_open = service
+            .open_read_stream(tonic::Request::new(open_read_proto(
+                0,
+                BLOCK_SIZE as u32,
+                BLOCK_STAMP,
+                512,
+            )))
+            .await
+            .expect("open second read")
+            .into_inner();
+        let second_stream = service
+            .read_stream(tonic::Request::new(ReadStreamRequestProto {
+                stream_id: second_open.stream_id,
+                max_bytes: 512,
+            }))
+            .await
+            .expect("second read stream")
+            .into_inner();
+        let frames = second_stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("second read frames");
+        let mut reread = Vec::new();
+        for frame in &frames {
+            reread.extend_from_slice(&frame.data);
+        }
+
+        assert_eq!(Bytes::from(reread), data);
+        assert!(frames.last().expect("last frame").eos);
         assert_eq!(core.stream_manager().active_count().await, 0);
     }
 
