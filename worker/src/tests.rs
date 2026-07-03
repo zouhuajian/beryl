@@ -3696,20 +3696,15 @@ mod tests {
     }
 
     #[test]
-    fn worker_net_public_surface_excludes_inactive_peer_and_transport_modules() {
+    fn worker_net_active_surface_is_grpc_only_with_explicit_unsupported_protocol_rejection() {
         let net_mod = include_str!("net/mod.rs");
         let server_mod = include_str!("net/server/mod.rs");
 
-        assert!(
-            !net_mod.contains("mod peer"),
-            "worker peer clients must stay out of the current worker net surface"
-        );
-        for inactive_module in ["mod quic", "mod rdma"] {
-            assert!(
-                !server_mod.contains(inactive_module),
-                "{inactive_module} must stay out of the current worker server surface"
-            );
-        }
+        assert!(net_mod.contains("pub mod config;"));
+        assert!(net_mod.contains("pub mod protocol;"));
+        assert!(net_mod.contains("pub mod server;"));
+        assert!(server_mod.contains("pub mod grpc;"));
+        assert!(server_mod.contains("grpc::serve_grpc_worker_data_with_registration"));
         assert!(
             server_mod.contains("WorkerNetProtocol::Quic => bail!"),
             "QUIC listener values must remain explicitly rejected"
