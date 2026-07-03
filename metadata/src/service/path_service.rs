@@ -223,6 +223,20 @@ impl MetadataFileSystemServiceImpl {
         header_from_canonical_error(req_header, group_name, mount_epoch, &canonical)
     }
 
+    fn header_from_resolution_error(
+        &self,
+        req_header: &Option<proto::common::RequestHeaderProto>,
+        path: &str,
+        err: MetadataError,
+    ) -> proto::common::ResponseHeaderProto {
+        let mount_ctx = self
+            .path_resolver
+            .resolve_mount_components(path)
+            .ok()
+            .map(|(mount_ctx, _)| mount_ctx);
+        self.header_from_path_error(req_header, err, mount_ctx.as_ref())
+    }
+
     fn header_from_guard_failure(
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
@@ -484,7 +498,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         let resolved = match self.path_resolver.resolve_inode(&req.path) {
             Ok(resolved) => resolved,
             Err(err) => {
-                let header = self.header_from_path_error(&req.header, err, None);
+                let header = self.header_from_resolution_error(&req.header, &req.path, err);
                 return error_response!(GetStatusResponseProto, header);
             }
         };
@@ -1005,7 +1019,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             Err(err) => {
                 return error_response!(
                     OpenFileResponseProto,
-                    self.header_from_path_error(&req.header, err, None)
+                    self.header_from_resolution_error(&req.header, &req.path, err)
                 )
             }
         };
@@ -1110,7 +1124,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     Err(err) => {
                         return error_response!(
                             GetBlockLocationsResponseProto,
-                            self.header_from_path_error(&req.header, err, None)
+                            self.header_from_resolution_error(&req.header, &path, err)
                         )
                     }
                 };
@@ -1613,7 +1627,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             Err(err) => {
                 return error_response!(
                     AppendFileResponseProto,
-                    self.header_from_path_error(&req.header, err, None)
+                    self.header_from_resolution_error(&req.header, &req.path, err)
                 )
             }
         };
