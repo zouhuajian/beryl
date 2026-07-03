@@ -3838,7 +3838,7 @@ mod tests {
         for forbidden in [
             "ReplicationClient",
             "replicate",
-            "read_chunk",
+            concat!("read_", "chunk"),
             "write_chunk",
             "delete_block",
         ] {
@@ -3859,7 +3859,7 @@ mod tests {
             "ReadChunk",
             "WriteChunk",
             "ReadRange",
-            "read_chunk",
+            concat!("read_", "chunk"),
             "write_chunk",
             "ufs",
             "replication",
@@ -3881,7 +3881,7 @@ mod tests {
             "ReadChunk",
             "WriteChunk",
             "ReadRange",
-            "read_chunk",
+            concat!("read_", "chunk"),
             "write_chunk",
             "ufs",
             "replication",

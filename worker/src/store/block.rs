@@ -661,38 +661,6 @@ impl LocalBlockStore for FullBlockFileStore {
     }
 }
 
-/// Placeholder for higher worker data path wiring.
-///
-/// The concrete local format lives in FullBlockFileStore and remains
-/// detached from upper worker services until wired explicitly.
-#[derive(Clone, Debug, Default)]
-pub struct BlockStore;
-
-impl BlockStore {
-    pub const fn new() -> Self {
-        Self
-    }
-
-    /// Read at a block-local offset.
-    pub async fn read_at(&self, _block_id: BlockId, _offset: u64, _len: u32) -> StoreResult<Bytes> {
-        Err(Self::not_implemented("BlockStore::read_at"))
-    }
-
-    /// Write at a block-local offset.
-    pub async fn write_at(&self, _block_id: BlockId, _offset: u64, _data: Bytes) -> StoreResult<()> {
-        Err(Self::not_implemented("BlockStore::write_at"))
-    }
-
-    /// Persist pending local data for a block.
-    pub async fn sync_block(&self, _block_id: BlockId) -> StoreResult<u64> {
-        Err(Self::not_implemented("BlockStore::sync_block"))
-    }
-
-    fn not_implemented(operation: &'static str) -> WorkerError {
-        WorkerError::Unimplemented(format!("{operation} is not implemented"))
-    }
-}
-
 fn write_meta_new(paths: &BlockPaths, meta: &BlockMetaPayload) -> StoreResult<()> {
     validate_final_meta_payload(meta, &meta.identity.group_name, meta.identity.block_id)?;
     let parent = paths.parent_dir()?;
