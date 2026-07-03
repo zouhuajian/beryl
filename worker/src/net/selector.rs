@@ -39,12 +39,6 @@ impl WorkerPeerSelector {
                 find_enabled_protocol(endpoints, enabled_protocols, WorkerNetProtocol::Grpc)
                     .or_else(|| first_enabled(endpoints, enabled_protocols))
             }
-            PeerProtocolSelectionPolicy::PreferRdmaThenQuicThenGrpc => {
-                find_enabled_protocol(endpoints, enabled_protocols, WorkerNetProtocol::Rdma)
-                    .or_else(|| find_enabled_protocol(endpoints, enabled_protocols, WorkerNetProtocol::Quic))
-                    .or_else(|| find_enabled_protocol(endpoints, enabled_protocols, WorkerNetProtocol::Grpc))
-                    .or_else(|| first_enabled(endpoints, enabled_protocols))
-            }
         }
     }
 }

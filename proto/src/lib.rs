@@ -3,13 +3,13 @@
 
 //! Vecton Protocol Buffers definitions and generated code.
 //!
-//! This crate provides gRPC service definitions and message types for:
-//! - client → metadata: MetadataClientService
+//! Active runtime services:
 //! - client → metadata (filesystem): FileSystemServiceProto
-//! - client → worker: WorkerDataService
 //! - worker → metadata: MetadataWorkerService
-//! - metadata ↔ metadata: MetadataPeerService
-//! - admin (shard management): ShardAdminService
+//! - client → worker: WorkerDataService
+//!
+//! Admin and metadata-peer proto schemas are generated for future compatibility work,
+//! but they are not active runtime services in the current single-leader metadata path.
 //!
 //! Module organization: Each proto package maps to a Rust module with the same name.
 //! All types from a package are included once to avoid duplicate type definitions.
@@ -36,9 +36,8 @@ pub mod metadata {
     tonic::include_proto!("metadata");
 }
 
-// Metadata ↔ metadata RPC
-// Package: metapeer (from metadata/peer.proto)
-pub mod metapeer {
+// Generated inactive/future metadata-peer RPC package (from metadata/peer.proto).
+pub(crate) mod metapeer {
     tonic::include_proto!("metapeer");
 }
 
@@ -48,9 +47,8 @@ pub mod worker {
     tonic::include_proto!("worker");
 }
 
-// Admin (shard management) RPC
-// Package: admin
-pub mod admin {
+// Generated inactive/future admin RPC package.
+pub(crate) mod admin {
     tonic::include_proto!("admin");
 }
 

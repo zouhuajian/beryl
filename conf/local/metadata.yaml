@@ -11,7 +11,6 @@ metadata.group.name: "root"
 metadata.storage.dir: "./data/metadata"
 metadata.rpc.addr: "127.0.0.1"
 metadata.rpc.port: 18080
-metadata.http.bind: "127.0.0.1:18081"
 metadata.raft.mode: "single"
 metadata.raft.node_id: 1
 metadata.bootstrap.ready.timeout_ms: 10000

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! UFS client trait for reading chunks by DataHandleId/BlockId/ChunkIndex.
+//! Inactive logical-ID UFS client placeholder.
+//!
+//! This file is not declared by the current UFS crate root. Current Vecton file
+//! IO uses metadata-authorized worker block storage, not UFS logical-ID reads.
 
 use anyhow::Result;
 use async_trait::async_trait;

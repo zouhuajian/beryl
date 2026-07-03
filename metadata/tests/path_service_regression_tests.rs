@@ -27,11 +27,11 @@ use proto::metadata::{
     CommittedBlockProto, CreateDirectoryRequestProto, CreateFileRequestProto, CreateModeProto, DeleteRequestProto,
     GetBlockLocationsRequestProto, GetStatusRequestProto, SyncWriteRequestProto, WriteHandleProto, WriteSyncModeProto,
 };
+use std::future::Future;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 use tempfile::TempDir;
 use tonic::Request;
-use tracing::instrument::WithSubscriber;
 use tracing_subscriber::{fmt, layer::SubscriberExt, Registry};
 use types::fs::{Extent, FileAttrs, Inode, InodeId};
 use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
@@ -123,6 +123,11 @@ fn captured_text_subscriber(output: &Arc<Mutex<Vec<u8>>>) -> tracing::Dispatch {
             .with_writer(move || writer.clone()),
     );
     tracing::Dispatch::new(subscriber)
+}
+
+async fn run_with_log_dispatch<T>(dispatch: &tracing::Dispatch, future: impl Future<Output = T>) -> T {
+    let _dispatch_guard = tracing::dispatcher::set_default(dispatch);
+    future.await
 }
 
 #[derive(Clone)]
@@ -542,7 +547,7 @@ async fn create_file_success_emits_metadata_state_log() {
     );
 
     let dispatch = tracing::Dispatch::new(subscriber);
-    async {
+    run_with_log_dispatch(&dispatch, async {
         let response = FileSystemServiceProto::create_file(
             &env.service,
             Request::new(CreateFileRequestProto {
@@ -568,8 +573,7 @@ async fn create_file_success_emits_metadata_state_log() {
         .expect("transport status must remain OK")
         .into_inner();
         assert_success_header(response.header);
-    }
-    .with_subscriber(dispatch.clone())
+    })
     .await;
 
     let logs = captured_logs(&output);
@@ -615,7 +619,7 @@ async fn create_directory_failure_emits_metadata_state_warn_log() {
 
     let output = Arc::new(Mutex::new(Vec::new()));
     let dispatch = captured_json_subscriber(&output);
-    async {
+    run_with_log_dispatch(&dispatch, async {
         let response = FileSystemServiceProto::create_directory(
             &env.service,
             Request::new(CreateDirectoryRequestProto {
@@ -635,8 +639,7 @@ async fn create_directory_failure_emits_metadata_state_warn_log() {
         .into_inner();
         let err = header_error(response.header);
         assert_fs_errno(&err, FsErrnoProto::FsErrnoEexist);
-    }
-    .with_subscriber(dispatch)
+    })
     .await;
 
     let logs = captured_logs(&output);
@@ -834,7 +837,7 @@ async fn create_file_early_create_failure_emits_metadata_state_warn_log() {
 
     let output = Arc::new(Mutex::new(Vec::new()));
     let dispatch = captured_json_subscriber(&output);
-    async {
+    run_with_log_dispatch(&dispatch, async {
         let response =
             FileSystemServiceProto::create_file(&env.service, Request::new(request(708, "/mnt/test/duplicate-file")))
                 .await
@@ -842,8 +845,7 @@ async fn create_file_early_create_failure_emits_metadata_state_warn_log() {
                 .into_inner();
         let err = header_error(response.header);
         assert_fs_errno(&err, FsErrnoProto::FsErrnoEexist);
-    }
-    .with_subscriber(dispatch)
+    })
     .await;
 
     let logs = captured_logs(&output);
@@ -913,7 +915,7 @@ async fn add_block_success_emits_metadata_block_log_with_target_count() {
     );
 
     let dispatch = tracing::Dispatch::new(subscriber);
-    async {
+    run_with_log_dispatch(&dispatch, async {
         let response = FileSystemServiceProto::add_block(
             &env.service,
             Request::new(AddBlockRequestProto {
@@ -926,8 +928,7 @@ async fn add_block_success_emits_metadata_block_log_with_target_count() {
         .expect("transport status must remain OK")
         .into_inner();
         assert_success_header(response.header);
-    }
-    .with_subscriber(dispatch.clone())
+    })
     .await;
 
     let logs = captured_logs(&output);
@@ -983,7 +984,7 @@ async fn add_block_text_log_does_not_dump_request_or_duplicate_request_ids() {
 
     let output = Arc::new(Mutex::new(Vec::new()));
     let dispatch = captured_text_subscriber(&output);
-    async {
+    run_with_log_dispatch(&dispatch, async {
         let response = FileSystemServiceProto::add_block(
             &env.service,
             Request::new(AddBlockRequestProto {
@@ -996,8 +997,7 @@ async fn add_block_text_log_does_not_dump_request_or_duplicate_request_ids() {
         .expect("transport status must remain OK")
         .into_inner();
         assert_success_header(response.header);
-    }
-    .with_subscriber(dispatch)
+    })
     .await;
 
     let text = captured_text(&output);
@@ -1061,7 +1061,7 @@ async fn add_block_failure_emits_metadata_block_warn_log_with_error_code() {
     );
 
     let dispatch = tracing::Dispatch::new(subscriber);
-    async {
+    run_with_log_dispatch(&dispatch, async {
         let response = FileSystemServiceProto::add_block(
             &env.service,
             Request::new(AddBlockRequestProto {
@@ -1075,8 +1075,7 @@ async fn add_block_failure_emits_metadata_block_warn_log_with_error_code() {
         .into_inner();
         let err = header_error(response.header);
         assert_ne!(err.error_class, ErrorClassProto::ErrorClassOk as i32);
-    }
-    .with_subscriber(dispatch.clone())
+    })
     .await;
 
     let logs = captured_logs(&output);
@@ -1990,21 +1989,23 @@ async fn commit_file_success_log_includes_explicit_commit_summary() {
 
     let output = Arc::new(Mutex::new(Vec::new()));
     let dispatch = captured_json_subscriber(&output);
-    let _dispatch_guard = tracing::dispatcher::set_default(&dispatch);
-    let response = FileSystemServiceProto::commit_file(
-        &env.service,
-        Request::new(CommitFileRequestProto {
-            header: header(731),
-            write_handle: Some(write_handle),
-            data_handle_id: Some(DataHandleIdProto { value: data_handle_id }),
-            committed_blocks: vec![committed],
-            final_size: 128,
-        }),
-    )
-    .await
-    .expect("transport status must remain OK")
-    .into_inner();
-    assert_success_header(response.header);
+    run_with_log_dispatch(&dispatch, async {
+        let response = FileSystemServiceProto::commit_file(
+            &env.service,
+            Request::new(CommitFileRequestProto {
+                header: header(731),
+                write_handle: Some(write_handle),
+                data_handle_id: Some(DataHandleIdProto { value: data_handle_id }),
+                committed_blocks: vec![committed],
+                final_size: 128,
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        assert_success_header(response.header);
+    })
+    .await;
 
     let logs = captured_logs(&output);
     assert!(

@@ -10,7 +10,6 @@ vecton.cluster.id: "local-vecton"
 # Metadata RPC service.
 metadata.rpc.addr: "0.0.0.0"
 metadata.rpc.port: 18080
-metadata.http.bind: "0.0.0.0:18081"
 
 # Metadata persistent state root. RocksDB state, Raft log/state, and snapshot
 # metadata live under this directory.

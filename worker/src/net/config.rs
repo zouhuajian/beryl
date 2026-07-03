@@ -3,7 +3,6 @@
 
 //! Worker-owned net configuration.
 
-use crate::net::endpoint::WorkerEndpointRole;
 use crate::net::protocol::WorkerNetProtocol;
 use crate::runtime::block::BlockManager;
 
@@ -11,7 +10,6 @@ use crate::runtime::block::BlockManager;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkerNetConfig {
     pub listeners: Vec<WorkerListenerConfig>,
-    pub peer: WorkerPeerNetConfig,
 }
 
 /// Worker listener configuration.
@@ -19,31 +17,15 @@ pub struct WorkerNetConfig {
 pub struct WorkerListenerConfig {
     pub protocol: WorkerNetProtocol,
     pub bind: String,
-    pub role: Vec<WorkerEndpointRole>,
     /// Per-connection gRPC concurrency limit for listener protocols that support it.
     pub max_inflight: usize,
     pub max_frame_size: u32,
-}
-
-/// Worker peer-client net configuration.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkerPeerNetConfig {
-    pub enabled_protocols: Vec<WorkerNetProtocol>,
-    pub selection_policy: PeerProtocolSelectionPolicy,
-}
-
-/// Protocol selection policy for worker-to-worker peers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PeerProtocolSelectionPolicy {
-    PreferRdmaThenQuicThenGrpc,
-    PreferGrpc,
 }
 
 impl WorkerNetConfig {
     pub fn grpc_from_rpc(bind: String, max_inflight: usize, max_frame_size: u32) -> Self {
         Self {
             listeners: vec![WorkerListenerConfig::grpc(bind, max_inflight, max_frame_size)],
-            peer: WorkerPeerNetConfig::default(),
         }
     }
 }
@@ -59,18 +41,8 @@ impl WorkerListenerConfig {
         Self {
             protocol: WorkerNetProtocol::Grpc,
             bind,
-            role: vec![WorkerEndpointRole::ClientData],
             max_inflight,
             max_frame_size,
-        }
-    }
-}
-
-impl Default for WorkerPeerNetConfig {
-    fn default() -> Self {
-        Self {
-            enabled_protocols: vec![WorkerNetProtocol::Grpc],
-            selection_policy: PeerProtocolSelectionPolicy::PreferGrpc,
         }
     }
 }

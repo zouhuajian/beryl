@@ -86,7 +86,6 @@ mod tests {
             cluster_id: "local-vecton".to_string(),
             identity_path: std::path::PathBuf::from("data/worker/worker.identity"),
             rpc_bind: "0.0.0.0:9090".to_string(),
-            http_bind: "0.0.0.0:19091".to_string(),
             rpc_advertised_endpoint: "http://127.0.0.1:9090".to_string(),
             rpc_max_inflight: 100,
             default_frame_size: 1024 * 1024,
@@ -3694,6 +3693,31 @@ mod tests {
                 "remove inactive worker source file: {removed}"
             );
         }
+    }
+
+    #[test]
+    fn worker_net_public_surface_excludes_inactive_peer_and_transport_modules() {
+        let net_mod = include_str!("net/mod.rs");
+        let server_mod = include_str!("net/server/mod.rs");
+
+        assert!(
+            !net_mod.contains("mod peer"),
+            "worker peer clients must stay out of the current worker net surface"
+        );
+        for inactive_module in ["mod quic", "mod rdma"] {
+            assert!(
+                !server_mod.contains(inactive_module),
+                "{inactive_module} must stay out of the current worker server surface"
+            );
+        }
+        assert!(
+            server_mod.contains("WorkerNetProtocol::Quic => bail!"),
+            "QUIC listener values must remain explicitly rejected"
+        );
+        assert!(
+            server_mod.contains("WorkerNetProtocol::Rdma => bail!"),
+            "RDMA listener values must remain explicitly rejected"
+        );
     }
 
     #[test]

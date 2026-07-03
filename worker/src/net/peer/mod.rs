@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Worker-internal peer client boundaries.
+//! Inactive worker peer client placeholders.
+//!
+//! This module is not declared by the current worker net surface. Current worker
+//! data access uses the gRPC data server only.
 
-pub mod client;
-pub mod grpc;
-pub mod quic;
-pub mod rdma;
-pub mod router;
+mod client;
+mod grpc;
+mod quic;
+mod rdma;
+mod router;

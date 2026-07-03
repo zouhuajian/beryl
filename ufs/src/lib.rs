@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! UFS (Underlying File System) abstraction for Vecton.
+//! UFS (Underlying File System) adapter boundary for Vecton.
 //!
-//! This module provides a unified interface for accessing various underlying file systems
-//! (HDFS, S3, OSS, local filesystem, etc.) with support for dynamic instance management.
+//! This crate isolates external backend configuration, capability description, and
+//! path-based adapter construction. Current Vecton file reads and writes do not use UFS;
+//! they go through metadata-authorized worker block storage.
 //!
 //! # Architecture
 //!
@@ -13,7 +14,7 @@
 //! - **Traits**: `UfsMeta` and `UfsData` provide unified operations across backends
 //! - **Implementation**: `OpendalUfs` implements the traits using OpenDAL
 //!
-//! # Usage
+//! # Adapter usage
 //!
 //! ```ignore
 //! use ufs::{UfsRegistry, UfsSpec, BackendKind, BackendConfig, FsConfig};
@@ -31,7 +32,7 @@
 //! );
 //! registry.upsert(spec)?;
 //!
-//! // Use the UFS instance
+//! // Use the UFS instance as an external adapter boundary.
 //! if let Some(ufs) = registry.get(&ufs::UfsId::new("local-fs")) {
 //!     let data = ufs.read_all("path/to/file").await?;
 //!     let status = ufs.stat("path/to/file").await?;
@@ -47,7 +48,6 @@
 #![forbid(unsafe_code)]
 
 pub mod capability;
-pub mod client;
 pub mod error;
 pub mod opendal_impl;
 pub mod registry;
@@ -56,7 +56,6 @@ pub mod traits;
 
 // Re-export commonly used types
 pub use capability::Capability;
-pub use client::{MockUfsClient, UfsClient, UfsClientAdapter};
 pub use error::UfsError;
 pub use opendal_impl::OpendalUfs;
 pub use registry::UfsRegistry;

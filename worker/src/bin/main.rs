@@ -66,7 +66,6 @@ async fn main() -> Result<()> {
             bind = %listener.bind,
             max_inflight = listener.max_inflight,
             max_frame_size = listener.max_frame_size,
-            roles = ?listener.role,
             "Configured worker net listener"
         );
     }

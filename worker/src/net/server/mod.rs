@@ -13,8 +13,6 @@ use crate::net::config::WorkerNetConfig;
 use crate::net::protocol::WorkerNetProtocol;
 
 pub mod grpc;
-pub mod quic;
-pub mod rdma;
 
 /// Serve worker data-plane RPCs after metadata registration, with an active readiness guard.
 pub async fn serve_worker_data_with_registration(

@@ -238,7 +238,7 @@ pub fn init_observability(config: &MetadataConfig) -> Result<Observability, DynE
     info!(
         event = "metadata_configuration_loaded",
         rpc_addr = %config.rpc_addr,
-        http_bind = %config.http_bind,
+        metrics_bind = %config.observability.metrics.prometheus.bind,
         storage_dir = %config.storage_dir.display(),
         authz_mode = ?config.authz.filesystem.mode,
         node_id = config.raft.node_id,
@@ -646,7 +646,6 @@ mod tests {
         MetadataConfig {
             cluster_id: "local".to_string(),
             rpc_addr: "127.0.0.1:18080".parse().unwrap(),
-            http_bind: "127.0.0.1:18081".parse().unwrap(),
             storage_dir: std::path::PathBuf::from("data/metadata"),
             authz: MetadataAuthzConfig::default(),
             raft: RaftConfig::default(),

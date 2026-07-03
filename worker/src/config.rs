@@ -89,8 +89,6 @@ pub struct WorkerConfig {
     pub identity_path: PathBuf,
     /// RPC server bind address.
     pub rpc_bind: String,
-    /// Reserved HTTP/admin bind address. Prometheus metrics use observability config.
-    pub http_bind: String,
     /// Routable gRPC data endpoint registered with metadata.
     pub rpc_advertised_endpoint: String,
     /// Maximum concurrent RPC requests per gRPC connection.
@@ -129,7 +127,6 @@ impl WorkerConfig {
         let default_cluster_id = "local-vecton".to_string();
         let default_identity_path = PathBuf::from("data/worker/worker.identity");
         let default_rpc_bind = "0.0.0.0:9090".to_string();
-        let default_http_bind = "0.0.0.0:19091".to_string();
         let default_rpc_max_inflight = 100usize;
         let default_frame_size = 1024 * 1024;
         let default_max_frame_size = 4 * 1024 * 1024;
@@ -142,7 +139,6 @@ impl WorkerConfig {
         reject_removed_keys(&worker_sub)?;
         let identity_path = Self::path_or(&worker_sub, "identity.path", default_identity_path)?;
         let rpc_bind = Self::str_or(&worker_sub, "rpc.bind", &default_rpc_bind, "worker.rpc.bind")?;
-        let http_bind = Self::str_or(&worker_sub, "http.bind", &default_http_bind, "worker.http.bind")?;
         let observability = ObservabilityConfig::from_flat(flat)?;
         let rpc_advertised_endpoint = worker_sub
             .get_str("rpc.advertised_endpoint")
@@ -210,7 +206,6 @@ impl WorkerConfig {
             cluster_id,
             identity_path,
             rpc_bind: rpc_bind.clone(),
-            http_bind,
             rpc_advertised_endpoint,
             rpc_max_inflight,
             default_frame_size,
@@ -228,7 +223,7 @@ impl WorkerConfig {
         info!(
             identity_path = ?config.identity_path,
             rpc_bind = %config.rpc_bind,
-            http_bind = %config.http_bind,
+            metrics_bind = %config.observability.metrics.prometheus.bind,
             rpc_advertised_endpoint = %config.rpc_advertised_endpoint,
             rpc_max_inflight = config.rpc_max_inflight,
             default_frame_size = config.default_frame_size,
@@ -270,13 +265,6 @@ impl WorkerConfig {
             return Err(CommonError::new(
                 CommonErrorCode::InvalidArgument,
                 format!("invalid worker.rpc.bind address: {}", self.rpc_bind),
-            ));
-        }
-
-        if self.http_bind.parse::<std::net::SocketAddr>().is_err() {
-            return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
-                format!("invalid worker.http.bind address: {}", self.http_bind),
             ));
         }
 
@@ -460,7 +448,18 @@ fn reject_removed_keys(flat: &common::config::FlatConfig) -> Result<(), CommonEr
             format!("worker.{key} is unsupported: use worker.store.*"),
         ));
     }
+    if let Some(key) = flat.keys_with_prefix("transport").into_iter().next() {
+        return Err(CommonError::new(
+            CommonErrorCode::InvalidArgument,
+            format!("worker.{key} is unsupported: use worker.default_frame_size and worker.max_frame_size"),
+        ));
+    }
     for (key, full_key, detail) in [
+        (
+            "http.bind",
+            "worker.http.bind",
+            "worker.http.bind is unsupported; use observe.metrics.prometheus.bind for metrics",
+        ),
         (
             "id",
             "worker.id",
@@ -884,8 +883,6 @@ fn parse_advertised_endpoint(value: &str) -> Result<(String, u32), CommonError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::config::PeerProtocolSelectionPolicy;
-    use crate::net::endpoint::WorkerEndpointRole;
     use crate::net::protocol::WorkerNetProtocol;
     use std::fs;
     use tempfile::TempDir;
@@ -895,7 +892,6 @@ mod tests {
             cluster_id: "local-vecton".to_string(),
             identity_path: PathBuf::from("data/worker/worker.identity"),
             rpc_bind: "0.0.0.0:9090".to_string(),
-            http_bind: "0.0.0.0:19091".to_string(),
             rpc_advertised_endpoint: "http://127.0.0.1:9090".to_string(),
             rpc_max_inflight: 100,
             default_frame_size: 1024 * 1024,
@@ -1004,13 +1000,7 @@ worker.metadata.endpoints: "http://127.0.0.1:18080"
         assert_eq!(config.net.listeners.len(), 1);
         assert_eq!(config.net.listeners[0].protocol, WorkerNetProtocol::Grpc);
         assert_eq!(config.net.listeners[0].bind, "127.0.0.1:9090");
-        assert_eq!(config.net.listeners[0].role, vec![WorkerEndpointRole::ClientData]);
         assert_eq!(config.net.listeners[0].max_inflight, 100);
-        assert_eq!(config.net.peer.enabled_protocols, vec![WorkerNetProtocol::Grpc]);
-        assert_eq!(
-            config.net.peer.selection_policy,
-            PeerProtocolSelectionPolicy::PreferGrpc
-        );
     }
 
     #[test]
@@ -1031,6 +1021,32 @@ worker.metadata.endpoints: "http://127.0.0.1:18080"
         assert_eq!(config.observability.log.format, "json");
         assert_eq!(config.observability.log.output, "stdout");
         assert_eq!(config.observability.metrics.prometheus.bind, "127.0.0.1:19091");
+    }
+
+    #[test]
+    fn worker_http_bind_is_rejected_without_disabling_metrics_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("worker.yaml");
+        fs::write(
+            &config_path,
+            with_test_observe_yaml(
+                r#"
+worker.http.bind: "127.0.0.1:19091"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.store.dirs.hdd0.path: "/tmp/vecton-worker/hdd0"
+worker.store.dirs.hdd0.tier: "HDD"
+worker.store.dirs.hdd0.capacity: "10GB"
+worker.metadata.endpoints: "http://127.0.0.1:18080"
+"#,
+            ),
+        )
+        .unwrap();
+
+        let err = WorkerConfig::load(&config_path)
+            .expect_err("worker.http.bind must not imply an active worker HTTP/admin service");
+
+        assert!(err.message.contains("worker.http.bind"));
+        assert!(err.message.contains("unsupported"));
     }
 
     #[test]
@@ -1164,7 +1180,7 @@ worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
     }
 
     #[test]
-    fn ignores_removed_worker_transport_frame_size_keys() {
+    fn rejects_unsupported_worker_transport_frame_size_keys() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("worker.yaml");
         fs::write(
@@ -1183,11 +1199,11 @@ worker.metadata.endpoints: "http://127.0.0.1:18080"
         )
         .unwrap();
 
-        let config = WorkerConfig::load(&config_path).unwrap();
-        let defaults = test_worker_config();
+        let err = WorkerConfig::load(&config_path)
+            .expect_err("worker.transport.* must not imply alternate transport support");
 
-        assert_eq!(config.default_frame_size, defaults.default_frame_size);
-        assert_eq!(config.max_frame_size, defaults.max_frame_size);
+        assert!(err.message.contains("worker.transport."));
+        assert!(err.message.contains("unsupported"));
     }
 
     #[test]

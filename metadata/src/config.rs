@@ -38,6 +38,7 @@ const REMOVED_METADATA_KEYS: &[&str] = &[
     "metadata.authority.group_id",
     "metadata.group.id",
     "metadata.group_id",
+    METADATA_HTTP_BIND,
     "metadata.raft.peers",
     "metadata.bootstrap.auto_format",
     "metadata.auto_format",
@@ -50,8 +51,6 @@ pub struct MetadataConfig {
     pub cluster_id: String,
     /// RPC server address.
     pub rpc_addr: SocketAddr,
-    /// Reserved HTTP/admin bind address. Prometheus metrics use observability config.
-    pub http_bind: SocketAddr,
     /// Local directory for metadata persistent state.
     pub storage_dir: PathBuf,
     /// Authz mode configuration.
@@ -218,7 +217,6 @@ impl MetadataConfig {
         }
 
         let rpc_addr = rpc_addr_from_config(flat)?;
-        let http_bind = socket_addr_or(flat, METADATA_HTTP_BIND, "0.0.0.0:18081")?;
         let observability = ObservabilityConfig::from_flat(flat)?;
         let storage_dir = PathBuf::from(get_str_or(flat, METADATA_STORAGE_DIR, "data/metadata")?);
 
@@ -278,7 +276,6 @@ impl MetadataConfig {
         Ok(Self {
             cluster_id,
             rpc_addr,
-            http_bind,
             storage_dir,
             authz,
             raft,
@@ -301,16 +298,6 @@ fn reject_removed_keys(flat: &common::config::FlatConfig) -> Result<(), CommonEr
 
 fn parse_group_name(key: &'static str, raw: String) -> Result<GroupName, CommonError> {
     GroupName::parse(raw).map_err(|err| CommonError::new(CommonErrorCode::InvalidArgument, format!("{key} {err}")))
-}
-
-fn socket_addr_or(
-    flat: &common::config::FlatConfig,
-    key: &'static str,
-    default: &'static str,
-) -> Result<SocketAddr, CommonError> {
-    let raw = get_str_or(flat, key, default)?;
-    raw.parse()
-        .map_err(|e| CommonError::new(CommonErrorCode::InvalidArgument, format!("Invalid {key}: {e}")))
 }
 
 fn get_i64_if_present(flat: &common::config::FlatConfig, key: &'static str) -> Result<Option<i64>, CommonError> {
@@ -438,7 +425,6 @@ mod tests {
             Self {
                 cluster_id: "local-vecton".to_string(),
                 rpc_addr: "0.0.0.0:18080".parse().unwrap(),
-                http_bind: "0.0.0.0:18081".parse().unwrap(),
                 storage_dir: PathBuf::from("data/metadata"),
                 authz: MetadataAuthzConfig::default(),
                 raft: RaftConfig::default(),
@@ -520,6 +506,18 @@ mod tests {
         assert_eq!(config.observability.log.format, "json");
         assert_eq!(config.observability.log.output, "stdout");
         assert_eq!(config.observability.metrics.prometheus.bind, "127.0.0.1:19081");
+    }
+
+    #[test]
+    fn metadata_http_bind_is_rejected_without_disabling_metrics_config() {
+        let mut flat = test_flat();
+        flat.set(METADATA_HTTP_BIND, "127.0.0.1:18081");
+
+        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat))
+            .expect_err("metadata.http.bind must not imply an active HTTP/admin service");
+
+        assert!(err.message.contains(METADATA_HTTP_BIND));
+        assert!(err.message.contains("unsupported"));
     }
 
     #[test]

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! QUIC worker data-plane server placeholder.
+//! Inactive QUIC worker data-plane server placeholder.
+//!
+//! This file is not declared by the current worker server surface. QUIC listener
+//! values are rejected explicitly by the active gRPC-only server entry point.
 
 use std::sync::Arc;
 

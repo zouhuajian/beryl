@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! RDMA worker data-plane server placeholder.
+//! Inactive RDMA worker data-plane server placeholder.
+//!
+//! This file is not declared by the current worker server surface. RDMA listener
+//! values are rejected explicitly by the active gRPC-only server entry point.
 
 use std::sync::Arc;
 
