@@ -23,13 +23,9 @@ message RegisterWorkerRequestProto {
   string worker_run_id = 4;
   /// Routable worker data endpoint advertised to metadata and clients.
   common.EndpointProto advertised_endpoint = 5;
-  /// Optional: worker capabilities/features.
-  uint64 capabilities = 6;
-  /// Optional: version string.
-  string version = 7;
-  /// Optional: labels/tags for placement.
-  map<string, string> labels = 8;
-  /// Worker network protocol (grpc/quic/rdma).
+  reserved 6, 7, 8;
+  reserved "capabilities", "version", "labels";
+  /// Worker network protocol. Current runtime accepts gRPC only.
   common.WorkerNetProtocolProto worker_net_protocol = 9;
   /// Stable metadata group name this registration targets.
   string group_name = 10;
@@ -69,7 +65,7 @@ message HeartbeatRequestProto {
   uint64 heartbeat_seq = 5;
   /// Current advertised data endpoint; must match the registered descriptor.
   common.EndpointProto advertised_endpoint = 6;
-  /// Worker network protocol (grpc/quic/rdma).
+  /// Worker network protocol. Current runtime accepts gRPC only.
   common.WorkerNetProtocolProto worker_net_protocol = 7;
   /// Capacity information.
   CapacityInfoProto capacity = 8;

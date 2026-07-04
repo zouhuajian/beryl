@@ -3,7 +3,6 @@
 
 //! MetadataWorkerService registrar used during worker startup.
 
-use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,9 +34,6 @@ pub struct RegistrationDescriptor {
     pub endpoint_port: u32,
     pub advertised_endpoint: String,
     pub worker_net_protocol: WorkerNetProtocol,
-    pub version: String,
-    pub capabilities: u64,
-    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Error)]
@@ -110,9 +106,6 @@ impl MetadataRegistrar {
             endpoint_port,
             advertised_endpoint: config.rpc_advertised_endpoint.clone(),
             worker_net_protocol: listener.protocol,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            capabilities: 0,
-            labels: BTreeMap::new(),
         })
     }
 
@@ -198,9 +191,6 @@ impl MetadataRegistrar {
                 port: self.descriptor.endpoint_port,
                 protocol: self.descriptor.worker_net_protocol.to_string(),
             }),
-            capabilities: self.descriptor.capabilities,
-            version: self.descriptor.version.clone(),
-            labels: self.descriptor.labels.clone().into_iter().collect::<HashMap<_, _>>(),
             worker_net_protocol: worker_protocol_to_proto(self.descriptor.worker_net_protocol) as i32,
             group_name: self.descriptor.group_name.to_string(),
         }
@@ -253,8 +243,6 @@ fn registration_request_header(group_name: &GroupName, op: &ControlOp, retry_cou
 fn worker_protocol_to_proto(protocol: WorkerNetProtocol) -> WorkerNetProtocolProto {
     match protocol {
         WorkerNetProtocol::Grpc => WorkerNetProtocolProto::WorkerNetProtocolGrpc,
-        WorkerNetProtocol::Quic => WorkerNetProtocolProto::WorkerNetProtocolQuic,
-        WorkerNetProtocol::Rdma => WorkerNetProtocolProto::WorkerNetProtocolRdma,
     }
 }
 

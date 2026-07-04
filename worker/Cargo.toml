@@ -5,8 +5,6 @@ edition = "2021"
 
 [features]
 default = []
-io_uring = []
-spdk = []
 
 [[bin]]
 name = "worker"

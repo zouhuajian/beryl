@@ -231,7 +231,7 @@ message SyncCommittedBlockRequestProto {
   worker.DataRequestHeaderProto header = 1;
   common.BlockIdProto block_id = 3;
 
-  // Metadata-authoritative logical block stamp for the committed generation.
+  // Metadata-authoritative logical block_stamp for the committed block version.
   uint64 block_stamp = 4;
 
   // Complete committed block length expected by the metadata-visible prefix.

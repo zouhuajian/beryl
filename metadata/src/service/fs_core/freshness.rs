@@ -39,7 +39,7 @@ impl FreshnessValidator {
         match self.mount_table.get_mount(mount_id) {
             Ok(Some(mount_entry)) => (
                 Some(mount_entry.namespace_owner_group_name),
-                Some(mount_entry.mount_version),
+                Some(mount_entry.mount_epoch),
             ),
             _ => (None, None),
         }

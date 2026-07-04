@@ -18,7 +18,7 @@ message MountEntryProto {
   /// Configuration hash/version for change detection.
   string config_hash = 4;
   /// Per-mount entry version exposed as mount_epoch for client freshness validation.
-  uint64 mount_version = 5;
+  uint64 mount_epoch = 5;
   /// Optional: mount-specific parameters.
   map<string, string> params = 6;
   reserved 7;

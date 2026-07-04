@@ -88,7 +88,7 @@ fn fs_core_with_mount(mount_id: MountId, mount_epoch: u64, group_name: &GroupNam
             mount_kind: MountKind::Internal,
             ufs_uri: None,
             data_io_policy: DataIoPolicy::Allow,
-            mount_version: mount_epoch,
+            mount_epoch: mount_epoch,
             namespace_owner_group_name: group_name.clone(),
             root_inode_id: ROOT_INODE_ID,
         })
@@ -1622,7 +1622,7 @@ fn freshness_validator_rejects_routed_write_mount_epoch_with_replay_hint() {
             mount_kind: MountKind::Internal,
             ufs_uri: None,
             data_io_policy: DataIoPolicy::Allow,
-            mount_version: 9,
+            mount_epoch: 9,
             namespace_owner_group_name: group_name_value.clone(),
             root_inode_id: ROOT_INODE_ID,
         })

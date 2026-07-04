@@ -14,8 +14,6 @@ use crate::ids::WorkerId;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum WorkerNetProtocol {
     Grpc,
-    Quic,
-    Rdma,
 }
 
 /// Metadata-authoritative worker endpoint advertised for data-plane access.

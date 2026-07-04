@@ -160,12 +160,10 @@ impl OrphanBlockCleaner {
         }
 
         // Check block report convergence before evict actions
-        let epoch = self.worker_manager.get_metadata_epoch();
         let active_ttl_ms = self.worker_manager.heartbeat_timeout_sec() * 1000;
         let snapshot = self.worker_manager.blockreport_convergence_snapshot(
             now_ms,
             active_ttl_ms,
-            epoch,
             BLOCKREPORT_CONVERGENCE_THRESHOLD,
         );
 
@@ -215,7 +213,6 @@ impl OrphanBlockCleaner {
                         full_reported_workers = snapshot.full_reported_workers,
                         ratio = snapshot.ratio,
                         threshold = BLOCKREPORT_CONVERGENCE_THRESHOLD,
-                        epoch = epoch,
                         "Skipping orphan evict: activation prerequisites are not satisfied"
                     );
                     *last_log = now_ms;
@@ -308,12 +305,10 @@ impl OrphanBlockCleaner {
                     }
 
                     // Check block report convergence
-                    let epoch = self.worker_manager.get_metadata_epoch();
                     let active_ttl_ms = self.worker_manager.heartbeat_timeout_sec() * 1000;
                     let snapshot = self.worker_manager.blockreport_convergence_snapshot(
                         now_ms,
                         active_ttl_ms,
-                        epoch,
                         BLOCKREPORT_CONVERGENCE_THRESHOLD,
                     );
 

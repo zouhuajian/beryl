@@ -153,7 +153,7 @@ message PathProto {
 message EndpointProto {
   string host = 1;
   uint32 port = 2;
-  /// Optional: protocol hint (e.g., "grpc", "quic").
+  /// Optional: protocol hint. Current runtime supports "grpc".
   string protocol = 3;
 }
 
@@ -173,6 +173,7 @@ message NodeInfoProto {
 // ============================================================================
 
 /// Worker network protocol for worker communication.
+/// Current Rust runtime supports gRPC only. QUIC/RDMA remain wire values, not active runtime paths.
 enum WorkerNetProtocolProto {
   WORKER_NET_PROTOCOL_UNSPECIFIED = 0;
   WORKER_NET_PROTOCOL_GRPC = 1;

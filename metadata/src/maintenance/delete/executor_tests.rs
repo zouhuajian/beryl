@@ -55,7 +55,7 @@ mod tests {
         wait_for_test_leader(&raft_node).await;
 
         let worker_manager = Arc::new(WorkerManager::new(60));
-        worker_manager.increment_metadata_epoch();
+        worker_manager.reset_worker_soft_state();
         let inflight_registry = Arc::new(InflightRegistry::new(5 * 60 * 1000));
         let metrics = Arc::new(MetadataMetrics::new());
         let executor = DeleteExecutor::new(
@@ -361,7 +361,7 @@ mod tests {
         assert!(raft_node.is_leader());
 
         let worker_manager = Arc::new(WorkerManager::new(60));
-        worker_manager.increment_metadata_epoch();
+        worker_manager.reset_worker_soft_state();
         let worker_id = WorkerId::new(1);
         let address = "127.0.0.1:8080".to_string();
         let run_id = worker_run_id(worker_id);
@@ -444,7 +444,6 @@ mod tests {
         let snapshot = worker_manager.blockreport_convergence_snapshot(
             now_ms,
             worker_manager.heartbeat_timeout_sec() * 1000,
-            worker_manager.get_metadata_epoch(),
             0.80,
         );
         assert!(snapshot.converged);
@@ -514,6 +513,32 @@ mod tests {
             env.storage.get_delete_intent(150)?.unwrap().status,
             DeleteIntentStatus::Pending
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reset_worker_soft_state_prevents_delete_from_using_old_report_locations() -> MetadataResult<()> {
+        let env = new_delete_executor_test_env().await?;
+        let worker_id = WorkerId::new(1);
+        let block_id = BlockId::new(DataHandleId::new(81), BlockIndex::new(0));
+        put_sealed_block(&env.storage, block_id, worker_id)?;
+        add_live_worker_with_blocks(&env.worker_manager, worker_id, vec![block_id])?;
+        put_pending_delete_intent(&env.storage, 151, block_id)?;
+
+        assert_eq!(
+            env.worker_manager.get_block_locations(&group_name("root"), block_id),
+            vec![worker_id]
+        );
+        env.worker_manager.reset_worker_soft_state();
+        assert!(env
+            .worker_manager
+            .get_block_locations(&group_name("root"), block_id)
+            .is_empty());
+
+        env.executor.run_once().await?;
+
+        assert_eq!(env.metrics.delete_executor_requests_total.load(Ordering::Relaxed), 0);
 
         Ok(())
     }

@@ -137,12 +137,8 @@ impl WorkerRuntime {
     /// Builds required worker soft state before worker RPC registration.
     fn new() -> Self {
         let manager = Arc::new(WorkerManager::new(60));
-        manager.increment_metadata_epoch();
-        info!(
-            event = "metadata_epoch_initialized",
-            metadata_epoch = manager.get_metadata_epoch(),
-            "metadata epoch initialized"
-        );
+        manager.reset_worker_soft_state();
+        info!(event = "worker_soft_state_reset", "worker soft state reset");
 
         Self { manager }
     }
@@ -881,7 +877,7 @@ mod tests {
             .list_mounts()
             .iter()
             .any(|entry| entry.mount_prefix == "/"));
-        assert!(server.worker.manager.get_metadata_epoch() > 0);
+        assert!(server.worker.manager.is_blockreport_converged(0).converged);
         assert_eq!(server.handles._worker_background._handle.task_count(), 0);
         assert_eq!(server.handles._maintenance._maintenance_handle.task_count(), 8);
         assert!(Arc::strong_count(&server.handles._readiness.gate) >= 1);

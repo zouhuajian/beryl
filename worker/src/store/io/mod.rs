@@ -1,23 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Worker-local I/O engine abstraction for file and device I/O.
+//! Worker-local filesystem I/O engine abstraction.
 //!
-//! An I/O engine controls how bytes are read and written locally. It does not
+//! The I/O engine controls how bytes are read and written locally. It does not
 //! define Vecton block interpretation, wire schema, placement policy, or
-//! `BlockFormatId`. The same persistent block format can be executed through
-//! filesystem I/O, io_uring, SPDK, or another worker-local engine as long as
-//! the stored `BlockMeta` and block payload interpretation are unchanged.
+//! `BlockFormatId`.
 
-mod config;
 mod fs;
-mod io_uring;
-mod spdk;
 
-pub use config::{build_local_io, LocalIoConfig, LocalIoKind};
 pub use fs::FsIoEngine;
-pub use io_uring::IoUringIoEngine;
-pub use spdk::SpdkIoEngine;
 
 use std::path::Path;
 
@@ -32,9 +24,6 @@ pub type IoResult<T> = Result<T, IoError>;
 pub enum IoError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("not implemented: {0}")]
-    NotImplemented(String),
 
     #[error("not supported: {0}")]
     NotSupported(String),

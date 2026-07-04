@@ -63,7 +63,7 @@ impl TestCluster {
             .await
             .map_err(|err| io::Error::other(err.to_string()))?;
         let worker_manager = Arc::new(WorkerManager::new(60));
-        worker_manager.increment_metadata_epoch();
+        worker_manager.reset_worker_soft_state();
         authority.raft_node.set_worker_manager(Arc::clone(&worker_manager))?;
         let readiness_state = build_readiness(&metadata_config, &authority).await;
         let filesystem = build_filesystem_service(

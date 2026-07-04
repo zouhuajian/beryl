@@ -429,7 +429,7 @@ impl FsCore {
             op = ?op,
             mount_id = %mount_id.as_raw(),
             owner_group_name = %mount_entry.namespace_owner_group_name,
-            mount_epoch = mount_entry.mount_version,
+            mount_epoch = mount_entry.mount_epoch,
             "FS write routed to mount namespace owner group"
         );
 
@@ -442,7 +442,7 @@ impl FsCore {
         Ok(RoutedFsWriteCtx {
             mount_id,
             namespace_owner_group_name: mount_entry.namespace_owner_group_name,
-            mount_epoch: mount_entry.mount_version,
+            mount_epoch: mount_entry.mount_epoch,
         })
     }
 

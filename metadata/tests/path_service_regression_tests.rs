@@ -977,7 +977,7 @@ async fn add_block_success_emits_metadata_block_log_with_target_count() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn add_block_text_log_does_not_dump_request_or_duplicate_request_ids() {
+async fn add_block_text_log_does_not_dump_request_or_duplicate_client_call_identity() {
     let _log_guard = log_test_mutex().lock().await;
     let env = build_env_with_raft_and_workers(
         "/mnt/test",

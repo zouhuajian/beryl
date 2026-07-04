@@ -416,7 +416,5 @@ fn heartbeat_request_header(group_name: &GroupName, op: &ControlOp) -> RequestHe
 fn worker_protocol_to_proto(protocol: WorkerNetProtocol) -> proto::common::WorkerNetProtocolProto {
     match protocol {
         WorkerNetProtocol::Grpc => proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc,
-        WorkerNetProtocol::Quic => proto::common::WorkerNetProtocolProto::WorkerNetProtocolQuic,
-        WorkerNetProtocol::Rdma => proto::common::WorkerNetProtocolProto::WorkerNetProtocolRdma,
     }
 }

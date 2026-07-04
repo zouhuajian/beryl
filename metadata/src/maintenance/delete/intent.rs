@@ -47,8 +47,8 @@ impl DeleteIntentBuilder {
         // Build guard_watermark
         let guard_watermark = GroupStateWatermark::new(group_name.clone(), guard_state_id);
 
-        // Get mount_epoch from mount_table
-        let mount_epoch = MountEpoch::new(self.mount_table.version());
+        // Get mount_epoch from mount_table.
+        let mount_epoch = MountEpoch::new(self.mount_table.epoch());
 
         Ok(DeleteIntent {
             intent_id,

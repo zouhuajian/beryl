@@ -251,20 +251,6 @@ impl fmt::Display for LeaseId {
     }
 }
 
-id_new_uint!(
-    /// Request correlation ID for tracing across services.
-    ///
-    /// Optional but useful. If you already have one in `common` tracing context,
-    /// you can remove it here.
-    RequestId(u128)
-);
-
-impl fmt::Display for RequestId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "0x{:032x}", self.0)
-    }
-}
-
 /// Internal client runtime identity.
 ///
 /// This is generated when a client runtime is created. Display names belong in

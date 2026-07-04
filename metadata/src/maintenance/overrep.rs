@@ -398,7 +398,7 @@ impl OverReplicaCleanupService {
             ctx = ctx.with_group_name(group_name.clone());
             let guard_watermark = types::group_watermark::GroupStateWatermark::new(group_name, guard_state_id);
             ctx = ctx.with_guard_watermark(guard_watermark);
-            let mount_epoch = types::group_watermark::MountEpoch::new(self.mount_table.version());
+            let mount_epoch = types::group_watermark::MountEpoch::new(self.mount_table.epoch());
             ctx = ctx.with_mount_epoch(mount_epoch);
 
             match self.destructive_gate.check_destructive_allowed(&ctx)? {

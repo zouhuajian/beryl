@@ -244,7 +244,7 @@ impl DataIoPolicyGuard {
         );
         Err(GuardFailure::new(err).with_mount(
             Some(mount_entry.namespace_owner_group_name),
-            Some(mount_entry.mount_version),
+            Some(mount_entry.mount_epoch),
         ))
     }
 }
@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(err.err.code, Some(ErrorCode::FsErrno(FsErrorCode::ENotsup)));
         assert!(err.err.message.contains("RootDataIoForbidden"));
         assert_eq!(err.group_name, Some(root_entry.namespace_owner_group_name.clone()));
-        assert_eq!(err.mount_epoch, Some(root_entry.mount_version));
+        assert_eq!(err.mount_epoch, Some(root_entry.mount_epoch));
     }
 
     #[tokio::test]

@@ -482,9 +482,6 @@ mod tests {
             endpoint_port: 9090,
             advertised_endpoint: "http://127.0.0.1:9090".to_string(),
             worker_net_protocol: WorkerNetProtocol::Grpc,
-            version: "worker-test".to_string(),
-            capabilities: 0,
-            labels: BTreeMap::new(),
         }
     }
 
@@ -567,7 +564,6 @@ mod tests {
             request.worker_net_protocol,
             proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32
         );
-        assert_eq!(request.version, "worker-test");
         shutdown.send(()).ok();
     }
 
@@ -4222,7 +4218,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_net_active_surface_is_grpc_only_with_explicit_unsupported_protocol_rejection() {
+    fn worker_net_active_surface_is_grpc_only_without_alternate_transport_branches() {
         let net_mod = include_str!("net/mod.rs");
         let server_mod = include_str!("net/server/mod.rs");
 
@@ -4232,12 +4228,12 @@ mod tests {
         assert!(server_mod.contains("pub mod grpc;"));
         assert!(server_mod.contains("grpc::serve_grpc_worker_data_with_registration"));
         assert!(
-            server_mod.contains("WorkerNetProtocol::Quic => bail!"),
-            "QUIC listener values must remain explicitly rejected"
+            !server_mod.contains("WorkerNetProtocol::Quic"),
+            "worker data server must not keep a QUIC active runtime branch"
         );
         assert!(
-            server_mod.contains("WorkerNetProtocol::Rdma => bail!"),
-            "RDMA listener values must remain explicitly rejected"
+            !server_mod.contains("WorkerNetProtocol::Rdma"),
+            "worker data server must not keep an RDMA active runtime branch"
         );
     }
 

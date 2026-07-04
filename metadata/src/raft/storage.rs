@@ -11,7 +11,7 @@
 //! - shard_groups/{group_name} -> ShardGroupInfo (serialized)
 //! - shard_routing/{shard_id} -> group_name (validated string)
 //! - route_epoch -> u64
-//! - mount_version -> u64
+//! - mount_epoch -> u64
 //!
 //! FS schema:
 //! - inodes/{inode_id_be_fixed_width} -> Inode (serialized)
@@ -58,7 +58,7 @@ const CF_WORKERS: &str = "workers";
 const CF_BLOCK_REF_COUNTS: &str = "block_ref_counts"; // block_id -> u64 (global refcount)
 const CF_DELETE_INTENTS: &str = "delete_intents"; // intent_id -> DeleteIntent
 /// Raft column families
-const CF_META: &str = "meta"; // route_epoch, mount_version, file layouts, etc.
+const CF_META: &str = "meta"; // route_epoch, mount_epoch, file layouts, etc.
 const CF_RAFT_LOG: &str = "raft_log"; // Raft log entries
 const CF_RAFT_STATE: &str = "raft_state"; // Raft state (hard_state, membership)
 const CF_RAFT_SNAPSHOT: &str = "raft_snapshot"; // Raft snapshots
@@ -802,28 +802,28 @@ impl RocksDBStorage {
         Ok(())
     }
 
-    fn batch_put_mount_version(batch: &mut WriteBatch, cf: &ColumnFamily, version: u64) -> MetadataResult<()> {
-        let value = encode_to_vec(version, standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to serialize mount_version: {}", e)))?;
-        batch.put_cf(cf, b"mount_version", value);
+    fn batch_put_mount_epoch(batch: &mut WriteBatch, cf: &ColumnFamily, epoch: u64) -> MetadataResult<()> {
+        let value = encode_to_vec(epoch, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize mount_epoch: {}", e)))?;
+        batch.put_cf(cf, b"mount_epoch", value);
         Ok(())
     }
 
-    /// Get mount version.
-    pub fn get_mount_version(&self) -> MetadataResult<u64> {
+    /// Get mount epoch.
+    pub fn get_mount_epoch(&self) -> MetadataResult<u64> {
         let cf = self
             .db
             .cf_handle(CF_META)
             .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
 
-        match self.db.get_cf(cf, b"mount_version") {
+        match self.db.get_cf(cf, b"mount_epoch") {
             Ok(Some(value)) => {
-                let version: u64 = decode_from_slice(&value, standard())
-                    .map_err(|e| MetadataError::Internal(format!("Failed to deserialize mount_version: {}", e)))?
+                let epoch: u64 = decode_from_slice(&value, standard())
+                    .map_err(|e| MetadataError::Internal(format!("Failed to deserialize mount_epoch: {}", e)))?
                     .0;
-                Ok(version)
+                Ok(epoch)
             }
-            Ok(None) => Ok(1), // Default version
+            Ok(None) => Ok(1), // Default epoch
             Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
         }
     }
@@ -986,17 +986,17 @@ impl RocksDBStorage {
         Ok(inode_id)
     }
 
-    /// Put mount version.
-    pub fn put_mount_version(&self, version: u64) -> MetadataResult<()> {
+    /// Put mount epoch.
+    pub fn put_mount_epoch(&self, epoch: u64) -> MetadataResult<()> {
         let cf = self
             .db
             .cf_handle(CF_META)
             .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
-        let value = encode_to_vec(version, standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to serialize mount_version: {}", e)))?;
+        let value = encode_to_vec(epoch, standard())
+            .map_err(|e| MetadataError::Internal(format!("Failed to serialize mount_epoch: {}", e)))?;
 
         self.db
-            .put_cf(cf, b"mount_version", value)
+            .put_cf(cf, b"mount_epoch", value)
             .map_err(|e| MetadataError::Internal(format!("RocksDB error: {}", e)))?;
         Ok(())
     }
@@ -1812,7 +1812,7 @@ impl RocksDBStorage {
         &self,
         entry: &MountEntry,
         root_inode_to_create: Option<&Inode>,
-        mount_version: u64,
+        mount_epoch: u64,
         route_epoch: RouteEpoch,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
@@ -1825,7 +1825,7 @@ impl RocksDBStorage {
             Self::batch_put_inode(&mut batch, cf_inodes, inode)?;
         }
         Self::batch_put_mount(&mut batch, cf_mounts, entry)?;
-        Self::batch_put_mount_version(&mut batch, cf_meta, mount_version)?;
+        Self::batch_put_mount_epoch(&mut batch, cf_meta, mount_epoch)?;
         Self::batch_put_route_epoch(&mut batch, cf_meta, route_epoch)?;
         self.commit_apply_batch(batch, dedup_key, applied_result)
     }
@@ -1834,7 +1834,7 @@ impl RocksDBStorage {
     pub fn delete_mount_with_apply_result_atomic(
         &self,
         mount_id: MountId,
-        mount_version: u64,
+        mount_epoch: u64,
         route_epoch: RouteEpoch,
         dedup_key: &DedupKey,
         applied_result: AppliedResult,
@@ -1844,7 +1844,7 @@ impl RocksDBStorage {
         let mut batch = WriteBatch::default();
         let key = format!("{}", mount_id.as_raw());
         batch.delete_cf(cf_mounts, key.as_bytes());
-        Self::batch_put_mount_version(&mut batch, cf_meta, mount_version)?;
+        Self::batch_put_mount_epoch(&mut batch, cf_meta, mount_epoch)?;
         Self::batch_put_route_epoch(&mut batch, cf_meta, route_epoch)?;
         self.commit_apply_batch(batch, dedup_key, applied_result)
     }

@@ -471,58 +471,6 @@ async fn test_worker_placement_selection() {
 }
 
 #[tokio::test]
-async fn test_worker_identity_stability() {
-    // Test that same endpoint + labels generate same identity
-    use sha2::{Digest, Sha256};
-
-    let address = "127.0.0.1:8080";
-    let labels1 = std::collections::HashMap::from([
-        ("zone".to_string(), "us-west-1".to_string()),
-        ("rack".to_string(), "rack-1".to_string()),
-    ]);
-    let labels2 = std::collections::HashMap::from([
-        ("rack".to_string(), "rack-1".to_string()),
-        ("zone".to_string(), "us-west-1".to_string()),
-    ]); // Same labels, different order
-
-    // Generate identity for labels1
-    let identity1 = {
-        let mut hasher = Sha256::new();
-        hasher.update(address.as_bytes());
-        let mut sorted_labels: Vec<_> = labels1.iter().collect();
-        sorted_labels.sort_by_key(|(k, _)| *k);
-        for (k, v) in sorted_labels {
-            hasher.update(k.as_bytes());
-            hasher.update(b":");
-            hasher.update(v.as_bytes());
-            hasher.update(b";");
-        }
-        format!("{:x}", hasher.finalize())
-    };
-
-    // Generate identity for labels2 (different order)
-    let identity2 = {
-        let mut hasher = Sha256::new();
-        hasher.update(address.as_bytes());
-        let mut sorted_labels: Vec<_> = labels2.iter().collect();
-        sorted_labels.sort_by_key(|(k, _)| *k);
-        for (k, v) in sorted_labels {
-            hasher.update(k.as_bytes());
-            hasher.update(b":");
-            hasher.update(v.as_bytes());
-            hasher.update(b";");
-        }
-        format!("{:x}", hasher.finalize())
-    };
-
-    // Identities should be the same (stable hash with sorted labels)
-    assert_eq!(
-        identity1, identity2,
-        "Same endpoint + labels should generate same identity regardless of label order"
-    );
-}
-
-#[tokio::test]
 async fn test_replication_check_triggers_repair() {
     let manager = Arc::new(WorkerManager::new(60));
     let repair_queue = Arc::new(RepairQueue::new(100));

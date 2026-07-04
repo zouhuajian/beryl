@@ -266,7 +266,7 @@ async fn metadata_readiness_rejects_root_mount_with_wrong_owner_group() {
             mount_kind: MountKind::Internal,
             ufs_uri: None,
             data_io_policy: DataIoPolicy::Forbid,
-            mount_version: 1,
+            mount_epoch: 1,
             namespace_owner_group_name: GroupName::parse("other").unwrap(),
             root_inode_id: ROOT_INODE_ID,
         })

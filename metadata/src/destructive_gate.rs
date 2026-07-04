@@ -40,8 +40,8 @@ pub struct DestructiveCheckContext {
     pub block_id: Option<BlockId>,
     /// Shard group ID (required for cross-group gate control).
     pub group_name: Option<GroupName>,
-    /// Mount epoch (for route consistency checking).
-    /// If provided, must match current mount_table.version().
+    /// Mount epoch for freshness checking.
+    /// If provided, must match the current mount table epoch.
     pub mount_epoch: Option<MountEpoch>,
     /// Guard watermark (group_name + state_id).
     /// If provided, the target shard group must have applied at least up to this state_id.
@@ -137,7 +137,7 @@ impl DestructiveGate {
 
         // Check mount_epoch consistency (if provided)
         if let Some(expected_mount_epoch) = ctx.mount_epoch {
-            let current_mount_epoch = MountEpoch::new(self.mount_table.version());
+            let current_mount_epoch = MountEpoch::new(self.mount_table.epoch());
             if expected_mount_epoch.as_u64() != current_mount_epoch.as_u64() {
                 // Mount epoch mismatch: route changed, need refresh
                 warn!(
@@ -164,12 +164,10 @@ impl DestructiveGate {
         // Invariant 2: blockreport_converged==true
         // Note: We still check global convergence.
         // Per-group convergence can be added later if needed.
-        let epoch = self.worker_manager.get_metadata_epoch();
         let active_ttl_ms = self.worker_manager.heartbeat_timeout_sec() * 1000;
         let snapshot = self.worker_manager.blockreport_convergence_snapshot(
             now_ms,
             active_ttl_ms,
-            epoch,
             0.80, // 80% threshold
         );
 

@@ -433,7 +433,7 @@ impl MetadataFileSystemServiceImpl {
                 path = %req.path,
                 inode_id = success.payload.inode_id.map(|id| id.as_raw()),
                 parent_inode_id = last_created_parent_inode_id.map(|id| id.as_raw()),
-                mount_version = success.mount_epoch,
+                mount_epoch = success.mount_epoch,
                 route_epoch = success.route_epoch,
                 "CreateDirectory committed"
             );
@@ -615,7 +615,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     path = %req.path,
                     inode_id = payload.inode_id.map(|id| id.as_raw()),
                     parent_inode_id = parent_inode_id.as_raw(),
-                    mount_version = success.mount_epoch,
+                    mount_epoch = success.mount_epoch,
                     route_epoch = success.route_epoch,
                     "CreateDirectory committed"
                 );
@@ -881,7 +881,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     src = %req.src_path,
                     dst = %req.dst_path,
                     parent_inode_id = src_parent_inode_id.as_raw(),
-                    mount_version = success.mount_epoch,
+                    mount_epoch = success.mount_epoch,
                     route_epoch = success.route_epoch,
                     "Rename committed"
                 );
@@ -1575,7 +1575,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     layout_chunk_size = payload.layout.chunk_size,
                     replication = payload.layout.replication,
                     desired_len = req.desired_len,
-                    mount_version = success.mount_epoch,
+                    mount_epoch = success.mount_epoch,
                     route_epoch = success.route_epoch,
                     "CreateFile committed"
                 );
@@ -1680,7 +1680,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     file_handle = payload.session_key.file_handle,
                     lease_id = payload.session_key.lease_id.as_raw(),
                     lease_epoch = payload.session_key.lease_epoch,
-                    mount_version = success.mount_epoch,
+                    mount_epoch = success.mount_epoch,
                     route_epoch = success.route_epoch,
                     "AppendFile opened"
                 );
@@ -1771,7 +1771,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     targets_sample = ?target.worker_endpoints.iter().take(3).map(|endpoint| endpoint.worker_id.as_raw()).collect::<Vec<_>>(),
                     data_handle_id = target.block_id.data_handle_id.as_raw(),
                     file_handle = handle.handle_id,
-                    mount_version = success.mount_epoch,
+                    mount_epoch = success.mount_epoch,
                     route_epoch = success.route_epoch,
                     "AddBlock allocated"
                 );
@@ -1794,7 +1794,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     desired_len = req.desired_len,
                     file_handle = handle.handle_id,
                     lease_epoch = handle.lease_epoch,
-                    mount_version = failure.mount_epoch,
+                    mount_epoch = failure.mount_epoch,
                     route_epoch = failure.route_epoch,
                     "AddBlock rejected"
                 );
@@ -1904,7 +1904,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     lease_id = lease_id_value,
                     lease_epoch = handle.lease_epoch,
                     file_version = success.payload.file_version,
-                    mount_version = success.mount_epoch,
+                    mount_epoch = success.mount_epoch,
                     route_epoch = success.route_epoch,
                     "CommitFile committed"
                 );
@@ -1932,7 +1932,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     committed_bytes,
                     lease_id = lease_id_value,
                     lease_epoch = handle.lease_epoch,
-                    mount_version = failure.mount_epoch,
+                    mount_epoch = failure.mount_epoch,
                     route_epoch = failure.route_epoch,
                     "CommitFile rejected"
                 );
@@ -1993,7 +1993,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     file_handle = handle.handle_id,
                     lease_id = lease_id_value,
                     lease_epoch = handle.lease_epoch,
-                    mount_version = success.mount_epoch,
+                    mount_epoch = success.mount_epoch,
                     route_epoch = success.route_epoch,
                     "AbortFileWrite completed"
                 );
@@ -2013,7 +2013,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     file_handle = handle.handle_id,
                     lease_id = lease_id_value,
                     lease_epoch = handle.lease_epoch,
-                    mount_version = failure.mount_epoch,
+                    mount_epoch = failure.mount_epoch,
                     route_epoch = failure.route_epoch,
                     "AbortFileWrite rejected"
                 );
@@ -2077,7 +2077,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     file_handle = handle.handle_id,
                     lease_id = lease_id_value,
                     lease_epoch = handle.lease_epoch,
-                    mount_version = success.mount_epoch,
+                    mount_epoch = success.mount_epoch,
                     route_epoch = success.route_epoch,
                     "RenewLease completed"
                 );
@@ -2100,7 +2100,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     file_handle = handle.handle_id,
                     lease_id = lease_id_value,
                     lease_epoch = handle.lease_epoch,
-                    mount_version = failure.mount_epoch,
+                    mount_epoch = failure.mount_epoch,
                     route_epoch = failure.route_epoch,
                     "RenewLease rejected"
                 );

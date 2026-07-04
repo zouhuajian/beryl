@@ -10,7 +10,6 @@ use anyhow::{bail, Context};
 use crate::control::RegistrationSet;
 use crate::data::core::WorkerCore;
 use crate::net::config::WorkerNetConfig;
-use crate::net::protocol::WorkerNetProtocol;
 
 pub mod grpc;
 
@@ -36,15 +35,9 @@ async fn serve_worker_data_inner(
     }
 
     let listener = &config.listeners[0];
-    match listener.protocol {
-        WorkerNetProtocol::Grpc => {
-            let bind = listener
-                .bind
-                .parse()
-                .with_context(|| format!("invalid worker gRPC listener bind address: {}", listener.bind))?;
-            grpc::serve_grpc_worker_data_with_registration(bind, listener.max_inflight, core, registration_state).await
-        }
-        WorkerNetProtocol::Quic => bail!("QUIC worker data service requires a registration readiness guard"),
-        WorkerNetProtocol::Rdma => bail!("RDMA worker data service requires a registration readiness guard"),
-    }
+    let bind = listener
+        .bind
+        .parse()
+        .with_context(|| format!("invalid worker gRPC listener bind address: {}", listener.bind))?;
+    grpc::serve_grpc_worker_data_with_registration(bind, listener.max_inflight, core, registration_state).await
 }

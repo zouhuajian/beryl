@@ -53,7 +53,7 @@ pub struct MountEntry {
     pub mount_kind: MountKind,
     pub ufs_uri: Option<String>, // e.g., "s3://bucket/path"
     pub data_io_policy: DataIoPolicy,
-    pub mount_version: u64,
+    pub mount_epoch: u64,
     /// Namespace owner group name: all FS write operations within this mount
     /// must route to this single Raft group for atomic rename within mount.
     pub namespace_owner_group_name: GroupName,
@@ -67,7 +67,7 @@ pub struct MountTable {
     entries: Arc<RwLock<HashMap<MountId, MountEntry>>>,
     prefix_index: Arc<RwLock<HashMap<String, MountId>>>, // mount_prefix -> mount_id
     next_mount_id: Arc<RwLock<u64>>,
-    version: Arc<RwLock<u64>>,
+    epoch: Arc<RwLock<u64>>,
 }
 
 impl MountTable {
@@ -76,7 +76,7 @@ impl MountTable {
             entries: Arc::new(RwLock::new(HashMap::new())),
             prefix_index: Arc::new(RwLock::new(HashMap::new())),
             next_mount_id: Arc::new(RwLock::new(1)),
-            version: Arc::new(RwLock::new(1)),
+            epoch: Arc::new(RwLock::new(1)),
         }
     }
 
@@ -91,13 +91,13 @@ impl MountTable {
         let mut entries = HashMap::new();
         let mut prefix_index = HashMap::new();
         let mut max_mount_id = 0u64;
-        let mut max_version = 0u64;
+        let mut max_epoch = 0u64;
 
         // Build entries and prefix_index from loaded mounts
         for entry in mounts {
             let mount_id_raw = entry.mount_id.as_raw();
             max_mount_id = max_mount_id.max(mount_id_raw);
-            max_version = max_version.max(entry.mount_version);
+            max_epoch = max_epoch.max(entry.mount_epoch);
 
             // Check for duplicate prefix (data corruption)
             if prefix_index.contains_key(&entry.mount_prefix) {
@@ -116,7 +116,7 @@ impl MountTable {
             entries: Arc::new(RwLock::new(entries)),
             prefix_index: Arc::new(RwLock::new(prefix_index)),
             next_mount_id: Arc::new(RwLock::new(max_mount_id + 1)),
-            version: Arc::new(RwLock::new(max_version + 1)),
+            epoch: Arc::new(RwLock::new(max_epoch + 1)),
         })
     }
 
@@ -134,7 +134,7 @@ impl MountTable {
     ) -> MetadataResult<MountEntry> {
         let mut entries = self.entries.write();
         let mut prefix_index = self.prefix_index.write();
-        let mut version = self.version.write();
+        let mut epoch = self.epoch.write();
 
         // Check if prefix already exists
         if prefix_index.contains_key(&mount_prefix) {
@@ -154,14 +154,14 @@ impl MountTable {
             mount_kind,
             ufs_uri,
             data_io_policy,
-            mount_version: *version,
+            mount_epoch: *epoch,
             namespace_owner_group_name,
             root_inode_id,
         };
 
         entries.insert(mount_id, entry.clone());
         prefix_index.insert(mount_prefix, mount_id);
-        *version += 1;
+        *epoch += 1;
 
         Ok(entry)
     }
@@ -170,11 +170,11 @@ impl MountTable {
     pub fn delete_mount(&self, mount_id: MountId) -> MetadataResult<()> {
         let mut entries = self.entries.write();
         let mut prefix_index = self.prefix_index.write();
-        let mut version = self.version.write();
+        let mut epoch = self.epoch.write();
 
         if let Some(entry) = entries.remove(&mount_id) {
             prefix_index.remove(&entry.mount_prefix);
-            *version += 1;
+            *epoch += 1;
             Ok(())
         } else {
             Err(MetadataError::NotFound(format!("Mount not found: {:?}", mount_id)))
@@ -188,7 +188,7 @@ impl MountTable {
     pub fn upsert(&self, entry: MountEntry) -> MetadataResult<()> {
         let mut entries = self.entries.write();
         let mut prefix_index = self.prefix_index.write();
-        let mut version = self.version.write();
+        let mut epoch = self.epoch.write();
 
         // Remove old prefix mapping if updating existing mount
         if let Some(old_entry) = entries.get(&entry.mount_id) {
@@ -211,8 +211,8 @@ impl MountTable {
         entries.insert(entry.mount_id, entry.clone());
         prefix_index.insert(entry.mount_prefix, entry.mount_id);
 
-        // Update version to match entry's mount_version (from RocksDB)
-        *version = entry.mount_version.max(*version);
+        // Update epoch to match entry's mount_epoch from RocksDB.
+        *epoch = entry.mount_epoch.max(*epoch);
 
         Ok(())
     }
@@ -273,9 +273,9 @@ impl MountTable {
         Ok(best_match)
     }
 
-    /// Get current version.
-    pub fn version(&self) -> u64 {
-        *self.version.read()
+    /// Get current mount epoch.
+    pub fn epoch(&self) -> u64 {
+        *self.epoch.read()
     }
 
     /// Allocate a new mount ID (in-memory only).
@@ -446,7 +446,7 @@ mod tests {
             mount_kind: MountKind::External,
             ufs_uri: Some("s3://bucket1/path".to_string()),
             data_io_policy: DataIoPolicy::Allow,
-            mount_version: 1,
+            mount_epoch: 1,
             namespace_owner_group_name: GroupName::parse("g1").unwrap(),
             root_inode_id: InodeId::new(1),
         };
@@ -456,14 +456,14 @@ mod tests {
             mount_kind: MountKind::External,
             ufs_uri: Some("oss://bucket2/path".to_string()),
             data_io_policy: DataIoPolicy::Allow,
-            mount_version: 2,
+            mount_epoch: 2,
             namespace_owner_group_name: GroupName::parse("g2").unwrap(),
             root_inode_id: InodeId::new(2),
         };
 
         storage.put_mount(&entry1).unwrap();
         storage.put_mount(&entry2).unwrap();
-        storage.put_mount_version(2).unwrap();
+        storage.put_mount_epoch(2).unwrap();
 
         // Load mount table from storage (simulating service restart)
         let mount_table = MountTable::load_from_storage(&storage).unwrap();
@@ -487,7 +487,7 @@ mod tests {
 
         // Delete one mount via storage (simulating Raft apply_delete_mount)
         storage.delete_mount(MountId::new(1)).unwrap();
-        storage.put_mount_version(3).unwrap();
+        storage.put_mount_epoch(3).unwrap();
 
         // Synchronize MountTable (simulating apply_delete_mount calling remove)
         mount_table.remove(MountId::new(1)).unwrap();

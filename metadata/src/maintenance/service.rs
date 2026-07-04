@@ -303,12 +303,10 @@ impl MaintenanceService {
                             let gate = orphan_gate.read();
                             gate.check("orphan_cleanup", now_ms)
                         };
-                        let epoch = worker_manager.get_metadata_epoch();
                         let active_ttl_ms = worker_manager.heartbeat_timeout_sec() * 1000;
                         let snapshot = worker_manager.blockreport_convergence_snapshot(
                             now_ms,
                             active_ttl_ms,
-                            epoch,
                             BLOCKREPORT_CONVERGENCE_THRESHOLD,
                         );
                         metrics
@@ -341,7 +339,6 @@ impl MaintenanceService {
                                         full_reported_workers = snapshot.full_reported_workers,
                                         ratio = snapshot.ratio,
                                         threshold = BLOCKREPORT_CONVERGENCE_THRESHOLD,
-                                        epoch,
                                         "Orphan cleanup evict paused"
                                     );
                                     paused_logged = true;
@@ -355,7 +352,6 @@ impl MaintenanceService {
                                     full_reported_workers = snapshot.full_reported_workers,
                                     ratio = snapshot.ratio,
                                     threshold = BLOCKREPORT_CONVERGENCE_THRESHOLD,
-                                    epoch,
                                     "Orphan cleanup evict pending block report convergence"
                                 );
                                 pending_logged = true;
@@ -370,7 +366,6 @@ impl MaintenanceService {
                                 full_reported_workers = snapshot.full_reported_workers,
                                 ratio = snapshot.ratio,
                                 threshold = BLOCKREPORT_CONVERGENCE_THRESHOLD,
-                                epoch,
                                 "Orphan cleanup evict activated"
                             );
                             activated = true;
@@ -383,7 +378,6 @@ impl MaintenanceService {
                                 full_reported_workers = snapshot.full_reported_workers,
                                 ratio = snapshot.ratio,
                                 threshold = BLOCKREPORT_CONVERGENCE_THRESHOLD,
-                                epoch,
                                 "Orphan cleanup evict resumed"
                             );
                             paused_logged = false;

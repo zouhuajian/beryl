@@ -324,12 +324,10 @@ impl DeleteExecutor {
     /// Check safety gates.
     async fn check_safety_gates(&self, now_ms: u64) -> MetadataResult<bool> {
         // Check block report convergence
-        let epoch = self.worker_manager.get_metadata_epoch();
         let active_ttl_ms = self.worker_manager.heartbeat_timeout_sec() * 1000;
         let snapshot = self.worker_manager.blockreport_convergence_snapshot(
             now_ms,
             active_ttl_ms,
-            epoch,
             0.80, // 80% threshold
         );
 

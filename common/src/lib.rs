@@ -14,8 +14,8 @@ pub use audit::{AuditLogger, AuditRecord};
 pub use config::{ClientConfig, FlatConfig, ServerConfig, load_client_site, load_server_config};
 pub use error::{CommonError, CommonErrorCode, ErrorMeta, ResultExt};
 pub use header::{
-    AuthnType, CallerContext, CallerContextFields, RequestHeader, RequestHeaderCodec, ResponseHeader, RpcError,
-    RpcErrorCode, RpcStatus,
+    AuthnType, CallerContext, CallerContextFields, RequestHeader, RequestHeaderCodec, ResponseHeader, RpcErrorCode,
+    RpcStatus,
 };
 pub use limit::{ConcurrencyLimiter, Permit};
 pub use retry::{RetryPolicy, retry_async};

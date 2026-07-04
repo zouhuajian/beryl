@@ -83,7 +83,7 @@ message FileBlockLocationProto {
   // Metadata-issued read candidates. Empty means FileLayout has this block
   // range but no live reported replica is currently eligible.
   repeated common.WorkerEndpointInfoProto workers = 4;
-  // Metadata-authoritative logical stamp for this block generation.
+  // Metadata-authoritative logical block_stamp for this block version.
   // Normal readable locations must carry a non-zero value.
   optional uint64 block_stamp = 5;
   // FileLayout-derived block format facts that workers validate before reads.

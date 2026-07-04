@@ -34,32 +34,40 @@ impl WorkerBackgroundHandle {
     }
 }
 
-trait WorkerServiceResponse {
-    fn set_header(&mut self, header: proto::common::ResponseHeaderProto);
-    fn header(&self) -> Option<&proto::common::ResponseHeaderProto>;
+fn register_worker_response_with_header(header: proto::common::ResponseHeaderProto) -> RegisterWorkerResponseProto {
+    RegisterWorkerResponseProto {
+        header: Some(header),
+        ..Default::default()
+    }
 }
 
-macro_rules! impl_worker_service_response {
-    ($($resp_ty:ty),+ $(,)?) => {
-        $(
-            impl WorkerServiceResponse for $resp_ty {
-                fn set_header(&mut self, header: proto::common::ResponseHeaderProto) {
-                    self.header = Some(header);
-                }
-
-                fn header(&self) -> Option<&proto::common::ResponseHeaderProto> {
-                    self.header.as_ref()
-                }
-            }
-        )+
-    };
+fn heartbeat_response_with_header(header: proto::common::ResponseHeaderProto) -> HeartbeatResponseProto {
+    HeartbeatResponseProto {
+        header: Some(header),
+        ..Default::default()
+    }
 }
 
-impl_worker_service_response!(
-    RegisterWorkerResponseProto,
-    HeartbeatResponseProto,
-    BlockReportResponseProto,
-);
+fn block_report_response_with_header(header: proto::common::ResponseHeaderProto) -> BlockReportResponseProto {
+    BlockReportResponseProto {
+        header: Some(header),
+        ..Default::default()
+    }
+}
+
+fn register_worker_response_header(
+    response: &RegisterWorkerResponseProto,
+) -> Option<&proto::common::ResponseHeaderProto> {
+    response.header.as_ref()
+}
+
+fn heartbeat_response_header(response: &HeartbeatResponseProto) -> Option<&proto::common::ResponseHeaderProto> {
+    response.header.as_ref()
+}
+
+fn block_report_response_header(response: &BlockReportResponseProto) -> Option<&proto::common::ResponseHeaderProto> {
+    response.header.as_ref()
+}
 
 #[derive(Clone, Copy)]
 enum MetadataWorkerMetric {
@@ -152,48 +160,41 @@ impl MetadataWorkerServiceImpl {
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
         error: CanonicalError,
-    ) -> Result<Response<T>, Status>
-    where
-        T: Default + WorkerServiceResponse,
-    {
-        let mut response = T::default();
-        response.set_header(self.error_response_header_from_request(req_header, error));
-        Ok(Response::new(response))
+        make_response: fn(proto::common::ResponseHeaderProto) -> T,
+    ) -> Result<Response<T>, Status> {
+        Ok(Response::new(make_response(
+            self.error_response_header_from_request(req_header, error),
+        )))
     }
 
     fn invalid_request_response<T>(
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
+        make_response: fn(proto::common::ResponseHeaderProto) -> T,
         message: impl Into<String>,
-    ) -> Result<Response<T>, Status>
-    where
-        T: Default + WorkerServiceResponse,
-    {
+    ) -> Result<Response<T>, Status> {
         self.response_with_error(
             req_header,
             to_canonical_rpc(MetadataError::InvalidArgument(message.into())),
+            make_response,
         )
     }
 
     fn metadata_error_response<T>(
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
+        make_response: fn(proto::common::ResponseHeaderProto) -> T,
         error: MetadataError,
-    ) -> Result<Response<T>, Status>
-    where
-        T: Default + WorkerServiceResponse,
-    {
-        self.response_with_error(req_header, to_canonical_rpc(error))
+    ) -> Result<Response<T>, Status> {
+        self.response_with_error(req_header, to_canonical_rpc(error), make_response)
     }
 
     fn group_mismatch_response<T>(
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
+        make_response: fn(proto::common::ResponseHeaderProto) -> T,
         message: impl Into<String>,
-    ) -> Result<Response<T>, Status>
-    where
-        T: Default + WorkerServiceResponse,
-    {
+    ) -> Result<Response<T>, Status> {
         self.response_with_error(
             req_header,
             CanonicalError {
@@ -204,31 +205,29 @@ impl MetadataWorkerServiceImpl {
                 message: message.into(),
                 refresh_hint: None,
             },
+            make_response,
         )
     }
 
     fn need_register_response<T>(
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
+        make_response: fn(proto::common::ResponseHeaderProto) -> T,
         message: impl Into<String>,
-    ) -> Result<Response<T>, Status>
-    where
-        T: Default + WorkerServiceResponse,
-    {
+    ) -> Result<Response<T>, Status> {
         self.response_with_error(
             req_header,
             CanonicalError::need_refresh(RpcErrorCode::WorkerNotRegistered, RefreshReason::NeedRegister, message),
+            make_response,
         )
     }
 
     fn worker_run_mismatch_response<T>(
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
+        make_response: fn(proto::common::ResponseHeaderProto) -> T,
         message: impl Into<String>,
-    ) -> Result<Response<T>, Status>
-    where
-        T: Default + WorkerServiceResponse,
-    {
+    ) -> Result<Response<T>, Status> {
         self.response_with_error(
             req_header,
             CanonicalError::need_refresh(
@@ -236,17 +235,16 @@ impl MetadataWorkerServiceImpl {
                 RefreshReason::WorkerRunMismatch,
                 message,
             ),
+            make_response,
         )
     }
 
     fn worker_descriptor_mismatch_response<T>(
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
+        make_response: fn(proto::common::ResponseHeaderProto) -> T,
         message: impl Into<String>,
-    ) -> Result<Response<T>, Status>
-    where
-        T: Default + WorkerServiceResponse,
-    {
+    ) -> Result<Response<T>, Status> {
         self.response_with_error(
             req_header,
             CanonicalError::need_refresh(
@@ -254,6 +252,7 @@ impl MetadataWorkerServiceImpl {
                 RefreshReason::NeedRegister,
                 message,
             ),
+            make_response,
         )
     }
 
@@ -292,11 +291,9 @@ impl MetadataWorkerServiceImpl {
     fn full_report_required_response<T>(
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
+        make_response: fn(proto::common::ResponseHeaderProto) -> T,
         message: impl Into<String>,
-    ) -> Result<Response<T>, Status>
-    where
-        T: Default + WorkerServiceResponse,
-    {
+    ) -> Result<Response<T>, Status> {
         self.response_with_error(
             req_header,
             CanonicalError::need_refresh(
@@ -304,6 +301,7 @@ impl MetadataWorkerServiceImpl {
                 RefreshReason::FullReportRequired,
                 message,
             ),
+            make_response,
         )
     }
 
@@ -359,11 +357,10 @@ impl MetadataWorkerServiceImpl {
         metric: MetadataWorkerMetric,
         started: Instant,
         outcome: &Result<Response<T>, Status>,
-    ) where
-        T: WorkerServiceResponse,
-    {
+        response_header: fn(&T) -> Option<&proto::common::ResponseHeaderProto>,
+    ) {
         let duration = started.elapsed().as_secs_f64();
-        let (status, error_kind) = metadata_worker_outcome_labels(outcome);
+        let (status, error_kind) = metadata_worker_outcome_labels(outcome, response_header);
 
         observe::record_rpc_request("metadata_worker", method, status, error_kind, duration);
         match metric {
@@ -376,12 +373,12 @@ impl MetadataWorkerServiceImpl {
     }
 }
 
-fn metadata_worker_outcome_labels<T>(outcome: &Result<Response<T>, Status>) -> (&'static str, &'static str)
-where
-    T: WorkerServiceResponse,
-{
+fn metadata_worker_outcome_labels<T>(
+    outcome: &Result<Response<T>, Status>,
+    response_header: fn(&T) -> Option<&proto::common::ResponseHeaderProto>,
+) -> (&'static str, &'static str) {
     match outcome {
-        Ok(response) => match response.get_ref().header().and_then(|header| header.error.as_ref()) {
+        Ok(response) => match response_header(response.get_ref()).and_then(|header| header.error.as_ref()) {
             Some(error) => ("error", metadata_worker_error_detail_kind(error)),
             None => ("ok", "none"),
         },
@@ -580,12 +577,15 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             merge_request_header_transport_context(&mut req.header, &transport_context);
             let _caller_ctx = match extract_and_inject_context(&req.header) {
                 Ok(ctx) => ctx,
-                Err(error) => return self.response_with_error::<RegisterWorkerResponseProto>(&req.header, error),
+                Err(error) => {
+                    return self.response_with_error(&req.header, error, register_worker_response_with_header)
+                }
             };
 
             if !self.raft_node.is_leader() {
-                return self.metadata_error_response::<RegisterWorkerResponseProto>(
+                return self.metadata_error_response(
                     &req.header,
+                    register_worker_response_with_header,
                     MetadataError::LeaderChanged(
                         "worker registration must be sent to the metadata group leader".into(),
                     ),
@@ -595,18 +595,20 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             let group_name = match GroupName::parse(&req.group_name) {
                 Ok(group_name) => group_name,
                 Err(error) => {
-                    return self.invalid_request_response::<RegisterWorkerResponseProto>(
+                    return self.invalid_request_response(
                         &req.header,
+                        register_worker_response_with_header,
                         format!("group_name is invalid: {error}"),
                     )
                 }
             };
             if let Err(message) = check_header_group_name(&req.header, &group_name) {
-                return self.invalid_request_response::<RegisterWorkerResponseProto>(&req.header, message);
+                return self.invalid_request_response(&req.header, register_worker_response_with_header, message);
             }
             if group_name != self.served_group_name {
-                return self.invalid_request_response::<RegisterWorkerResponseProto>(
+                return self.invalid_request_response(
                     &req.header,
+                    register_worker_response_with_header,
                     format!(
                         "register group_name {} does not match served metadata group {}",
                         group_name, self.served_group_name
@@ -615,33 +617,36 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             }
             let worker_id = WorkerId::new(req.worker_id);
             if worker_id.as_raw() == 0 {
-                return self.invalid_request_response::<RegisterWorkerResponseProto>(
+                return self.invalid_request_response(
                     &req.header,
+                    register_worker_response_with_header,
                     "worker_id must be non-zero",
                 );
             }
             let worker_run_id = match req.worker_run_id.parse::<WorkerRunId>() {
                 Ok(worker_run_id) => worker_run_id,
                 Err(error) => {
-                    return self.invalid_request_response::<RegisterWorkerResponseProto>(
+                    return self.invalid_request_response(
                         &req.header,
+                        register_worker_response_with_header,
                         format!("worker_run_id must be a UUID: {error}"),
                     )
                 }
             };
             let worker_net_protocol = req.worker_net_protocol;
             if req.worker_net_protocol() != proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc {
-                return self.invalid_request_response::<RegisterWorkerResponseProto>(
+                return self.invalid_request_response(
                     &req.header,
+                    register_worker_response_with_header,
                     "worker_net_protocol must be gRPC for startup registration",
                 );
             }
-            let _labels = req.labels;
             let endpoint = match req.advertised_endpoint {
                 Some(endpoint) => endpoint,
                 None => {
-                    return self.invalid_request_response::<RegisterWorkerResponseProto>(
+                    return self.invalid_request_response(
                         &req.header,
+                        register_worker_response_with_header,
                         "Missing advertised_endpoint",
                     );
                 }
@@ -649,7 +654,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             let address = match validate_advertised_endpoint(endpoint) {
                 Ok(address) => address,
                 Err(message) => {
-                    return self.invalid_request_response::<RegisterWorkerResponseProto>(&req.header, message)
+                    return self.invalid_request_response(&req.header, register_worker_response_with_header, message)
                 }
             };
             if let Err(error) = self.worker_manager.validate_worker_registration_preflight(
@@ -659,7 +664,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 &address,
                 worker_net_protocol,
             ) {
-                return self.metadata_error_response::<RegisterWorkerResponseProto>(&req.header, error);
+                return self.metadata_error_response(&req.header, register_worker_response_with_header, error);
             }
 
             let command = Command::RegisterWorker {
@@ -669,22 +674,26 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 worker_run_id,
                 address: address.clone(),
                 worker_net_protocol,
-                fault_domain: None, // TODO: Extract fault_domain from labels
+                fault_domain: None,
             };
 
             let accepted_worker_id = match self.raft_node.propose(command).await {
                 Ok(AppDataResponse::Worker(WorkerCommandResult::Upserted(worker_id))) => worker_id,
                 Ok(other) => {
-                    return self.metadata_error_response::<RegisterWorkerResponseProto>(
+                    return self.metadata_error_response(
                         &req.header,
+                        register_worker_response_with_header,
                         MetadataError::Internal(format!("RegisterWorker returned unexpected Raft response: {other:?}")),
                     );
                 }
-                Err(error) => return self.metadata_error_response::<RegisterWorkerResponseProto>(&req.header, error),
+                Err(error) => {
+                    return self.metadata_error_response(&req.header, register_worker_response_with_header, error)
+                }
             };
             if accepted_worker_id != worker_id {
-                return self.metadata_error_response::<RegisterWorkerResponseProto>(
+                return self.metadata_error_response(
                     &req.header,
+                    register_worker_response_with_header,
                     MetadataError::Internal(format!(
                         "RegisterWorker returned worker_id {}, expected {}",
                         accepted_worker_id.as_raw(),
@@ -715,7 +724,13 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             }))
         }
         .await;
-        Self::record_worker_rpc_outcome("register_worker", MetadataWorkerMetric::Registration, started, &outcome);
+        Self::record_worker_rpc_outcome(
+            "register_worker",
+            MetadataWorkerMetric::Registration,
+            started,
+            &outcome,
+            register_worker_response_header,
+        );
         outcome
     }
 
@@ -731,24 +746,26 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             merge_request_header_transport_context(&mut req.header, &transport_context);
             let _caller_ctx = match extract_and_inject_context(&req.header) {
                 Ok(ctx) => ctx,
-                Err(error) => return self.response_with_error::<HeartbeatResponseProto>(&req.header, error),
+                Err(error) => return self.response_with_error(&req.header, error, heartbeat_response_with_header),
             };
 
             let group_name = match GroupName::parse(&req.group_name) {
                 Ok(group_name) => group_name,
                 Err(error) => {
-                    return self.invalid_request_response::<HeartbeatResponseProto>(
+                    return self.invalid_request_response(
                         &req.header,
+                        heartbeat_response_with_header,
                         format!("group_name is invalid: {error}"),
                     )
                 }
             };
             if let Err(message) = check_header_group_name(&req.header, &group_name) {
-                return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, message);
+                return self.invalid_request_response(&req.header, heartbeat_response_with_header, message);
             }
             if group_name != self.served_group_name {
-                return self.group_mismatch_response::<HeartbeatResponseProto>(
+                return self.group_mismatch_response(
                     &req.header,
+                    heartbeat_response_with_header,
                     format!(
                         "heartbeat group_name {} does not match served metadata group {}",
                         group_name, self.served_group_name
@@ -757,14 +774,18 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             }
             let worker_id = WorkerId::new(req.worker_id);
             if worker_id.as_raw() == 0 {
-                return self
-                    .invalid_request_response::<HeartbeatResponseProto>(&req.header, "worker_id must be non-zero");
+                return self.invalid_request_response(
+                    &req.header,
+                    heartbeat_response_with_header,
+                    "worker_id must be non-zero",
+                );
             }
             let worker_run_id = match req.worker_run_id.parse::<WorkerRunId>() {
                 Ok(worker_run_id) => worker_run_id,
                 Err(error) => {
-                    return self.invalid_request_response::<HeartbeatResponseProto>(
+                    return self.invalid_request_response(
                         &req.header,
+                        heartbeat_response_with_header,
                         format!("worker_run_id must be a UUID: {error}"),
                     )
                 }
@@ -773,39 +794,51 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             let capacity = match req.capacity.as_ref() {
                 Some(capacity) => capacity,
                 None => {
-                    return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, "Missing capacity")
+                    return self.invalid_request_response(
+                        &req.header,
+                        heartbeat_response_with_header,
+                        "Missing capacity",
+                    )
                 }
             };
             let tier_free = match parse_tier_free(&capacity.tier_free) {
                 Ok(tier_free) => tier_free,
-                Err(message) => return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, message),
+                Err(message) => {
+                    return self.invalid_request_response(&req.header, heartbeat_response_with_header, message)
+                }
             };
 
             let load = match req.load {
                 Some(load) => load,
-                None => return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, "Missing load"),
+                None => {
+                    return self.invalid_request_response(&req.header, heartbeat_response_with_header, "Missing load")
+                }
             };
 
             let health_proto = req.health();
             let worker_net_protocol = req.worker_net_protocol;
             if req.worker_net_protocol() != proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc {
-                return self.invalid_request_response::<HeartbeatResponseProto>(
+                return self.invalid_request_response(
                     &req.header,
+                    heartbeat_response_with_header,
                     "worker_net_protocol must be gRPC for heartbeat",
                 );
             }
             let endpoint = match req.advertised_endpoint {
                 Some(endpoint) => endpoint,
                 None => {
-                    return self.invalid_request_response::<HeartbeatResponseProto>(
+                    return self.invalid_request_response(
                         &req.header,
+                        heartbeat_response_with_header,
                         "Missing advertised_endpoint",
                     );
                 }
             };
             let advertised_endpoint = match validate_advertised_endpoint(endpoint) {
                 Ok(address) => address,
-                Err(message) => return self.invalid_request_response::<HeartbeatResponseProto>(&req.header, message),
+                Err(message) => {
+                    return self.invalid_request_response(&req.header, heartbeat_response_with_header, message)
+                }
             };
             self.worker_manager.expire_liveness();
 
@@ -828,8 +861,9 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                             "Heartbeat rejected"
                         );
                     }
-                    return self.need_register_response::<HeartbeatResponseProto>(
+                    return self.need_register_response(
                         &req.header,
+                        heartbeat_response_with_header,
                         format!(
                             "worker descriptor not found for group_name={}, worker_id={}",
                             group_name,
@@ -857,8 +891,9 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                             "Heartbeat rejected"
                         );
                     }
-                    return self.need_register_response::<HeartbeatResponseProto>(
+                    return self.need_register_response(
                         &req.header,
+                        heartbeat_response_with_header,
                         format!(
                             "live worker registration not found for group_name={}, worker_id={}",
                             group_name,
@@ -884,8 +919,9 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                         "Heartbeat rejected"
                     );
                 }
-                return self.worker_run_mismatch_response::<HeartbeatResponseProto>(
+                return self.worker_run_mismatch_response(
                     &req.header,
+                    heartbeat_response_with_header,
                     format!(
                         "worker_run_id mismatch for group_name={}, worker_id={}",
                         group_name,
@@ -894,8 +930,9 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 );
             }
             if descriptor.address != advertised_endpoint || descriptor.worker_net_protocol != worker_net_protocol {
-                return self.worker_descriptor_mismatch_response::<HeartbeatResponseProto>(
+                return self.worker_descriptor_mismatch_response(
                     &req.header,
+                    heartbeat_response_with_header,
                     format!(
                         "advertised endpoint or protocol does not match registration for group_name={}, worker_id={}",
                         group_name,
@@ -940,7 +977,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                             "Heartbeat rejected"
                         );
                     }
-                    return self.need_register_response::<HeartbeatResponseProto>(&req.header, message);
+                    return self.need_register_response(&req.header, heartbeat_response_with_header, message);
                 }
                 Err(MetadataError::StaleState(message)) => {
                     if self
@@ -958,12 +995,16 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                             "Heartbeat rejected"
                         );
                     }
-                    return self.worker_run_mismatch_response::<HeartbeatResponseProto>(&req.header, message);
+                    return self.worker_run_mismatch_response(&req.header, heartbeat_response_with_header, message);
                 }
                 Err(MetadataError::InvalidArgument(message)) => {
-                    return self.worker_descriptor_mismatch_response::<HeartbeatResponseProto>(&req.header, message);
+                    return self.worker_descriptor_mismatch_response(
+                        &req.header,
+                        heartbeat_response_with_header,
+                        message,
+                    );
                 }
-                Err(error) => return self.metadata_error_response::<HeartbeatResponseProto>(&req.header, error),
+                Err(error) => return self.metadata_error_response(&req.header, heartbeat_response_with_header, error),
             };
 
             // Update metrics (all nodes)
@@ -997,7 +1038,13 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             }))
         }
         .await;
-        Self::record_worker_rpc_outcome("heartbeat", MetadataWorkerMetric::Heartbeat, started, &outcome);
+        Self::record_worker_rpc_outcome(
+            "heartbeat",
+            MetadataWorkerMetric::Heartbeat,
+            started,
+            &outcome,
+            heartbeat_response_header,
+        );
         outcome
     }
 
@@ -1014,24 +1061,26 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             merge_request_header_transport_context(&mut req.header, &transport_context);
             let _caller_ctx = match extract_and_inject_context(&req.header) {
                 Ok(ctx) => ctx,
-                Err(error) => return self.response_with_error::<BlockReportResponseProto>(&req.header, error),
+                Err(error) => return self.response_with_error(&req.header, error, block_report_response_with_header),
             };
 
             let group_name = match GroupName::parse(&req.group_name) {
                 Ok(group_name) => group_name,
                 Err(error) => {
-                    return self.invalid_request_response::<BlockReportResponseProto>(
+                    return self.invalid_request_response(
                         &req.header,
+                        block_report_response_with_header,
                         format!("group_name is invalid: {error}"),
                     )
                 }
             };
             if let Err(message) = check_header_group_name(&req.header, &group_name) {
-                return self.invalid_request_response::<BlockReportResponseProto>(&req.header, message);
+                return self.invalid_request_response(&req.header, block_report_response_with_header, message);
             }
             if group_name != self.served_group_name {
-                return self.group_mismatch_response::<BlockReportResponseProto>(
+                return self.group_mismatch_response(
                     &req.header,
+                    block_report_response_with_header,
                     format!(
                         "block report group_name {} does not match served metadata group {}",
                         group_name, self.served_group_name
@@ -1040,22 +1089,27 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             }
             let worker_id = WorkerId::new(req.worker_id);
             if worker_id.as_raw() == 0 {
-                return self
-                    .invalid_request_response::<BlockReportResponseProto>(&req.header, "worker_id must be non-zero");
+                return self.invalid_request_response(
+                    &req.header,
+                    block_report_response_with_header,
+                    "worker_id must be non-zero",
+                );
             }
             let worker_run_id = match req.worker_run_id.parse::<WorkerRunId>() {
                 Ok(worker_run_id) => worker_run_id,
                 Err(error) => {
-                    return self.invalid_request_response::<BlockReportResponseProto>(
+                    return self.invalid_request_response(
                         &req.header,
+                        block_report_response_with_header,
                         format!("worker_run_id must be a UUID: {error}"),
                     )
                 }
             };
             let report_seq = req.report_seq;
             let Some(report) = req.report else {
-                return self.invalid_request_response::<BlockReportResponseProto>(
+                return self.invalid_request_response(
                     &req.header,
+                    block_report_response_with_header,
                     "block report body is required",
                 );
             };
@@ -1069,7 +1123,11 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                         match Self::proto_to_report_block(block) {
                             Ok(block) => blocks.push(block),
                             Err(error) => {
-                                return self.metadata_error_response::<BlockReportResponseProto>(&req.header, error);
+                                return self.metadata_error_response(
+                                    &req.header,
+                                    block_report_response_with_header,
+                                    error,
+                                );
                             }
                         }
                     }
@@ -1098,7 +1156,11 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                                 final_batch,
                                 "Block report rejected"
                             );
-                            return self.need_register_response::<BlockReportResponseProto>(&req.header, message);
+                            return self.need_register_response(
+                                &req.header,
+                                block_report_response_with_header,
+                                message,
+                            );
                         }
                         Err(MetadataError::StaleState(message)) => {
                             warn!(
@@ -1115,7 +1177,11 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                                 final_batch,
                                 "Block report rejected"
                             );
-                            return self.worker_run_mismatch_response::<BlockReportResponseProto>(&req.header, message);
+                            return self.worker_run_mismatch_response(
+                                &req.header,
+                                block_report_response_with_header,
+                                message,
+                            );
                         }
                         Err(MetadataError::FullReportRequired(message)) => {
                             warn!(
@@ -1132,11 +1198,14 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                                 final_batch,
                                 "Block report rejected"
                             );
-                            return self
-                                .full_report_required_response::<BlockReportResponseProto>(&req.header, message);
+                            return self.full_report_required_response(
+                                &req.header,
+                                block_report_response_with_header,
+                                message,
+                            );
                         }
                         Err(error) => {
-                            return self.metadata_error_response::<BlockReportResponseProto>(&req.header, error)
+                            return self.metadata_error_response(&req.header, block_report_response_with_header, error)
                         }
                     };
                     (result, "full", Some(batch_seq), None, Some(final_batch))
@@ -1148,7 +1217,11 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                         match Self::proto_to_delta(delta) {
                             Ok(delta) => deltas.push(delta),
                             Err(error) => {
-                                return self.metadata_error_response::<BlockReportResponseProto>(&req.header, error);
+                                return self.metadata_error_response(
+                                    &req.header,
+                                    block_report_response_with_header,
+                                    error,
+                                );
                             }
                         }
                     }
@@ -1175,7 +1248,11 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                                 delta_seq,
                                 "Block report rejected"
                             );
-                            return self.need_register_response::<BlockReportResponseProto>(&req.header, message);
+                            return self.need_register_response(
+                                &req.header,
+                                block_report_response_with_header,
+                                message,
+                            );
                         }
                         Err(MetadataError::StaleState(message)) => {
                             warn!(
@@ -1191,7 +1268,11 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                                 delta_seq,
                                 "Block report rejected"
                             );
-                            return self.worker_run_mismatch_response::<BlockReportResponseProto>(&req.header, message);
+                            return self.worker_run_mismatch_response(
+                                &req.header,
+                                block_report_response_with_header,
+                                message,
+                            );
                         }
                         Err(MetadataError::FullReportRequired(message)) => {
                             warn!(
@@ -1207,11 +1288,14 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                                 delta_seq,
                                 "Block report rejected"
                             );
-                            return self
-                                .full_report_required_response::<BlockReportResponseProto>(&req.header, message);
+                            return self.full_report_required_response(
+                                &req.header,
+                                block_report_response_with_header,
+                                message,
+                            );
                         }
                         Err(error) => {
-                            return self.metadata_error_response::<BlockReportResponseProto>(&req.header, error)
+                            return self.metadata_error_response(&req.header, block_report_response_with_header, error)
                         }
                     };
                     (result, "delta", None, Some(delta_seq), None)
@@ -1288,6 +1372,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             MetadataWorkerMetric::BlockReport(metric_kind),
             started,
             &outcome,
+            block_report_response_header,
         );
         outcome
     }
@@ -1678,9 +1763,6 @@ mod tests {
                 port: 9090 + worker_id.as_raw() as u32,
                 protocol: "grpc".to_string(),
             }),
-            capabilities: 0,
-            version: "0.1.0".to_string(),
-            labels: Default::default(),
             worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
             group_name: "root".to_string(),
         }
@@ -2471,7 +2553,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_delta_block_report_text_log_does_not_dump_request_or_duplicate_request_ids() {
+    async fn changed_delta_block_report_text_log_does_not_dump_request_or_duplicate_client_call_identity() {
         let _log_guard = log_test_mutex().lock().await;
         let dir = TempDir::new().unwrap();
         let raft_node = leader_raft(&dir).await;
@@ -2805,9 +2887,6 @@ mod tests {
                 worker_id: 9,
                 worker_run_id: test_worker_run_id().to_string(),
                 advertised_endpoint: None,
-                capabilities: 0,
-                version: String::new(),
-                labels: Default::default(),
                 worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
                 group_name: "root".to_string(),
             }),
@@ -2843,9 +2922,6 @@ mod tests {
                         worker_id: 9,
                         worker_run_id: test_worker_run_id().to_string(),
                         advertised_endpoint: None,
-                        capabilities: 0,
-                        version: String::new(),
-                        labels: Default::default(),
                         worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
                         group_name: "root".to_string(),
                     }),
@@ -3197,9 +3273,6 @@ mod tests {
                     port: 9090,
                     protocol: "grpc".to_string(),
                 }),
-                capabilities: 0,
-                version: "0.1.0".to_string(),
-                labels: Default::default(),
                 worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
                 group_name: "root".to_string(),
             }),
@@ -3281,9 +3354,6 @@ mod tests {
                     port: 9090,
                     protocol: "grpc".to_string(),
                 }),
-                capabilities: 0,
-                version: "0.1.0".to_string(),
-                labels: Default::default(),
                 worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
                 group_name: "root".to_string(),
             }),
@@ -3322,9 +3392,6 @@ mod tests {
                     port: 9090,
                     protocol: "grpc".to_string(),
                 }),
-                capabilities: 0,
-                version: "0.1.0".to_string(),
-                labels: Default::default(),
                 worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
                 group_name: "root".to_string(),
             }),
@@ -3374,9 +3441,6 @@ mod tests {
                     port: 9091,
                     protocol: "grpc".to_string(),
                 }),
-                capabilities: 0,
-                version: "0.1.0".to_string(),
-                labels: Default::default(),
                 worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
                 group_name: "root".to_string(),
             }),
@@ -3415,9 +3479,6 @@ mod tests {
                 port: 9090,
                 protocol: "grpc".to_string(),
             }),
-            capabilities: 0,
-            version: "0.1.0".to_string(),
-            labels: Default::default(),
             worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
             group_name: "root".to_string(),
         };
@@ -3540,9 +3601,6 @@ mod tests {
                 port,
                 protocol: "grpc".to_string(),
             }),
-            capabilities: 0,
-            version: "0.1.0".to_string(),
-            labels: Default::default(),
             worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
             group_name: "root".to_string(),
         };
@@ -3610,9 +3668,6 @@ mod tests {
                 port,
                 protocol: "grpc".to_string(),
             }),
-            capabilities: 0,
-            version: "0.1.0".to_string(),
-            labels: Default::default(),
             worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
             group_name: "root".to_string(),
         };
@@ -3709,9 +3764,6 @@ mod tests {
                     port: 9090,
                     protocol: "grpc".to_string(),
                 }),
-                capabilities: 0,
-                version: "0.1.0".to_string(),
-                labels: Default::default(),
                 worker_net_protocol: proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
                 group_name: "other".to_string(),
             }),

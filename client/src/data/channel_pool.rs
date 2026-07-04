@@ -147,7 +147,6 @@ impl GrpcWorkerChannelPool {
     }
 
     fn channel_key(worker: &WorkerEndpointInfo) -> ClientResult<WorkerChannelKey> {
-        ensure_supported_worker_protocol(worker.worker_net_protocol)?;
         Ok(WorkerChannelKey {
             worker_id: worker.worker_id.as_raw(),
             endpoint: normalize_endpoint(&worker.endpoint)?,
@@ -201,15 +200,6 @@ struct WorkerChannelKey {
     endpoint: String,
     protocol: WorkerNetProtocol,
     worker_run_id: types::WorkerRunId,
-}
-
-pub(super) fn ensure_supported_worker_protocol(protocol: WorkerNetProtocol) -> ClientResult<()> {
-    match protocol {
-        WorkerNetProtocol::Grpc => Ok(()),
-        WorkerNetProtocol::Quic | WorkerNetProtocol::Rdma => Err(ClientError::Unsupported(format!(
-            "unsupported worker net protocol {protocol:?}"
-        ))),
-    }
 }
 
 fn normalize_endpoint(endpoint: &str) -> ClientResult<String> {
@@ -304,11 +294,6 @@ mod tests {
         fn events(&self) -> Vec<ClientMetricEvent> {
             self.events.lock().expect("events").clone()
         }
-    }
-
-    #[test]
-    fn data_plane_accepts_grpc_protocol() {
-        assert!(ensure_supported_worker_protocol(WorkerNetProtocol::Grpc).is_ok());
     }
 
     // connect_lazy touches Hyper's Tokio executor even though acquisition is synchronous.
@@ -456,21 +441,6 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_worker_protocol_does_not_create_channel() {
-        let metrics = Arc::new(NoopClientMetrics);
-        let pool = GrpcWorkerChannelPool::new(true, 1, metrics);
-        let mut worker = worker_endpoint();
-        worker.worker_net_protocol = WorkerNetProtocol::Quic;
-
-        let err = pool
-            .worker_data_service_client(&worker, "read")
-            .expect_err("unsupported protocol rejected");
-
-        assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("unsupported worker net protocol")));
-        assert!(pool.channels.read().is_empty());
-    }
-
-    #[test]
     fn worker_channel_build_error_is_reported_with_safe_labels() {
         let metrics = Arc::new(RecordingMetrics::default());
         let pool = GrpcWorkerChannelPool::new(true, 1, metrics.clone());
@@ -485,15 +455,6 @@ mod tests {
         let events = metrics.events();
         assert_metric_with_target_plane(&events, ClientMetric::ChannelBuildError, "worker");
         assert_metric_labels_do_not_contain(&events, "http://[invalid");
-    }
-
-    #[test]
-    fn data_plane_returns_unsupported_for_quic_and_rdma() {
-        for protocol in [WorkerNetProtocol::Quic, WorkerNetProtocol::Rdma] {
-            let err = ensure_supported_worker_protocol(protocol).expect_err("known non-GRPC protocol is unsupported");
-
-            assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("unsupported worker net protocol")));
-        }
     }
 
     #[test]

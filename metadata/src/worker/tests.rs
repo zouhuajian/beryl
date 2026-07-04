@@ -148,7 +148,7 @@ fn final_full_report_marks_active_worker_converged() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    let before = manager.blockreport_convergence_snapshot(now_ms, 60_000, manager.get_metadata_epoch(), 0.80);
+    let before = manager.blockreport_convergence_snapshot(now_ms, 60_000, 0.80);
     assert_eq!(before.active_workers, 1);
     assert_eq!(before.full_reported_workers, 0);
     assert!(!before.converged);
@@ -157,7 +157,7 @@ fn final_full_report_marks_active_worker_converged() {
         .receive_full_block_report(&group_name_value, worker_id, run_id, 1, 0, true, vec![report_block(0)])
         .unwrap();
 
-    let after = manager.blockreport_convergence_snapshot(now_ms, 60_000, manager.get_metadata_epoch(), 0.80);
+    let after = manager.blockreport_convergence_snapshot(now_ms, 60_000, 0.80);
     assert_eq!(after.active_workers, 1);
     assert_eq!(after.full_reported_workers, 1);
     assert!(after.converged);
@@ -856,7 +856,6 @@ fn worker_run_registration_replaces_restart_and_resets_run_state() {
             .unwrap()
             .as_millis() as u64,
         60_000,
-        manager.get_metadata_epoch(),
         0.80,
     );
     assert_eq!(after_restart_snapshot.active_workers, 0);
@@ -917,7 +916,6 @@ fn worker_run_registration_replaces_restart_and_resets_run_state() {
             .unwrap()
             .as_millis() as u64,
         60_000,
-        manager.get_metadata_epoch(),
         0.80,
     );
     assert_eq!(before_new_full_report.active_workers, 1);

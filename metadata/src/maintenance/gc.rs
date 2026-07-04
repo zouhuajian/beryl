@@ -281,12 +281,10 @@ impl GcService {
         }
 
         // Sweep pass: check block report convergence before destructive actions
-        let epoch = self.worker_manager.get_metadata_epoch();
         let active_ttl_ms = self.worker_manager.heartbeat_timeout_sec() * 1000;
         let snapshot = self.worker_manager.blockreport_convergence_snapshot(
             now_ms,
             active_ttl_ms,
-            epoch,
             BLOCKREPORT_CONVERGENCE_THRESHOLD,
         );
 
@@ -320,7 +318,6 @@ impl GcService {
                         full_reported_workers = snapshot.full_reported_workers,
                         ratio = snapshot.ratio,
                         threshold = BLOCKREPORT_CONVERGENCE_THRESHOLD,
-                        epoch = epoch,
                         "GC sweep blocked: block report not converged. Only scan/candidates allowed."
                     );
                     *last_log = now_ms;

@@ -117,16 +117,16 @@ mod tests {
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(
-                event = "metadata_epoch_initialized",
-                metadata_epoch = 7_u64,
-                "metadata epoch initialized"
+                event = "worker_soft_state_reset",
+                reset_reason = "startup",
+                "worker soft state reset"
             );
         });
 
         let line = String::from_utf8(output.lock().expect("test log output poisoned").clone()).unwrap();
         let json: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(json["event"], "metadata_epoch_initialized");
-        assert_eq!(json["metadata_epoch"], 7);
+        assert_eq!(json["event"], "worker_soft_state_reset");
+        assert_eq!(json["reset_reason"], "startup");
         assert!(json.get("fields").is_none(), "{line}");
         assert!(json.get("span").is_none(), "{line}");
         assert!(json.get("spans").is_none(), "{line}");

@@ -636,9 +636,9 @@ impl AppRaftStateMachine {
             )));
         }
 
-        // Get current mount version
-        let mount_version = self.storage.get_mount_version()?;
-        let new_version = mount_version + 1;
+        // Get current mount epoch
+        let mount_epoch = self.storage.get_mount_epoch()?;
+        let new_mount_epoch = mount_epoch + 1;
 
         // Validate root inode exists and is a directory.
         let mut root_inode_to_create = None;
@@ -680,7 +680,7 @@ impl AppRaftStateMachine {
             mount_kind,
             ufs_uri,
             data_io_policy,
-            mount_version: new_version,
+            mount_epoch: new_mount_epoch,
             namespace_owner_group_name,
             root_inode_id,
         };
@@ -691,7 +691,7 @@ impl AppRaftStateMachine {
         self.storage.create_mount_with_apply_result_atomic(
             &entry,
             root_inode_to_create.as_ref(),
-            new_version,
+            new_mount_epoch,
             new_route_epoch,
             dedup_key,
             applied_result,
@@ -722,13 +722,14 @@ impl AppRaftStateMachine {
             ));
         }
 
-        let mount_version = self.storage.get_mount_version()?;
+        let mount_epoch = self.storage.get_mount_epoch()?;
+        let new_mount_epoch = mount_epoch + 1;
         let new_route_epoch = self.next_authoritative_route_epoch()?;
         let result = MountCommandResult::Deleted;
         let applied_result = Self::make_applied_result(fingerprint, AppDataResponse::Mount(result.clone()));
         self.storage.delete_mount_with_apply_result_atomic(
             mount_id,
-            mount_version + 1,
+            new_mount_epoch,
             new_route_epoch,
             dedup_key,
             applied_result,
@@ -3069,7 +3070,7 @@ mod tests {
         let first = expect_mount_upserted(sm.apply(create_mount.clone()).unwrap());
         let second = expect_mount_upserted(sm.apply(create_mount).unwrap());
         assert_eq!(second.mount_id, first.mount_id);
-        assert_eq!(second.mount_version, first.mount_version);
+        assert_eq!(second.mount_epoch, first.mount_epoch);
         assert_eq!(
             mount_table.get_mount(mount_id).unwrap().unwrap().mount_prefix,
             first.mount_prefix

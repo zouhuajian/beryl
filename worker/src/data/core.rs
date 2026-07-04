@@ -214,7 +214,7 @@ pub struct SyncCommittedBlockRequest {
     pub group_name: GroupName,
     pub block_id: BlockId,
     pub worker_run_id: WorkerRunId,
-    /// Metadata-authoritative block stamp for the committed generation.
+    /// Metadata-authoritative block_stamp for the committed block version.
     pub block_stamp: u64,
     /// Complete committed block length expected by the metadata-visible prefix.
     pub expected_block_len: u64,

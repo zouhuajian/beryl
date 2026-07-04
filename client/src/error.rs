@@ -443,4 +443,87 @@ mod tests {
         assert!(displayed.contains("RouteEpochMismatch"));
         assert!(displayed.contains("route epoch is stale"));
     }
+
+    #[test]
+    fn client_action_roundtrip_preserves_machine_semantics_without_message_classification() {
+        let refresh_canonical = CanonicalError::need_refresh(
+            RpcErrorCode::NotLeader,
+            RefreshReason::NotLeader,
+            "fatal transport text",
+        );
+        let refresh = ClientError::from(ClientAction::Refresh {
+            reason: RefreshReason::NotLeader,
+            hint: Box::new(RefreshHint::default()),
+            canonical: Box::new(refresh_canonical),
+        });
+        match refresh {
+            ClientError::Action(action) => match action.as_ref() {
+                ClientAction::Refresh { reason, canonical, .. } => {
+                    assert_eq!(*reason, RefreshReason::NotLeader);
+                    assert_eq!(canonical.class, ErrorClass::NeedRefresh);
+                    assert_eq!(canonical.reason, Some(RefreshReason::NotLeader));
+                }
+                other => panic!("expected refresh action, got {other:?}"),
+            },
+            other => panic!("expected action error, got {other:?}"),
+        }
+
+        let retry_canonical = CanonicalError::retryable(RpcErrorCode::NodeUnavailable, Some(25), "please refresh");
+        let retry = ClientError::from(ClientAction::Retry {
+            after_ms: Some(25),
+            canonical: Box::new(retry_canonical),
+        });
+        match retry {
+            ClientError::Action(action) => match action.as_ref() {
+                ClientAction::Retry { after_ms, canonical } => {
+                    assert_eq!(*after_ms, Some(25));
+                    assert_eq!(canonical.class, ErrorClass::Retryable);
+                    assert_eq!(canonical.retry_after_ms, Some(25));
+                }
+                other => panic!("expected retry action, got {other:?}"),
+            },
+            other => panic!("expected action error, got {other:?}"),
+        }
+
+        let fail_canonical = CanonicalError {
+            class: ErrorClass::Fatal,
+            code: Some(common::error::canonical::ErrorCode::RpcCode(
+                RpcErrorCode::InvalidArgument,
+            )),
+            reason: None,
+            retry_after_ms: None,
+            message: "retry later".to_string(),
+            refresh_hint: None,
+        };
+        let fail = ClientError::from(ClientAction::Fail {
+            canonical: Box::new(fail_canonical),
+        });
+        match fail {
+            ClientError::Action(action) => match action.as_ref() {
+                ClientAction::Fail { canonical } => {
+                    assert_eq!(canonical.class, ErrorClass::Fatal);
+                    assert_eq!(
+                        canonical.code,
+                        Some(common::error::canonical::ErrorCode::RpcCode(
+                            RpcErrorCode::InvalidArgument
+                        ))
+                    );
+                }
+                other => panic!("expected fail action, got {other:?}"),
+            },
+            other => panic!("expected action error, got {other:?}"),
+        }
+
+        let transport = ClientError::from(tonic::Status::unavailable("not leader"));
+        match transport {
+            ClientError::Action(action) => match action.as_ref() {
+                ClientAction::TransportFail { status } => {
+                    assert_eq!(status.code(), tonic::Code::Unavailable);
+                    assert_eq!(status.message(), "not leader");
+                }
+                other => panic!("expected transport action, got {other:?}"),
+            },
+            other => panic!("expected action error, got {other:?}"),
+        }
+    }
 }

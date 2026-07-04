@@ -20,7 +20,7 @@ pub struct WorkerDescriptor {
     pub group_name: GroupName,
     pub worker_id: WorkerId,
     pub address: String,
-    /// Worker network protocol (0=unspecified/grpc, 1=grpc, 2=quic, 3=rdma).
+    /// Worker network protocol wire value. Current runtime accepts gRPC only.
     pub worker_net_protocol: i32,
     pub fault_domain: Option<String>,
 }
@@ -47,7 +47,7 @@ pub struct WorkerInfo {
     pub group_name: GroupName,
     pub worker_id: WorkerId,
     pub address: String,
-    /// Worker network protocol (0=unspecified/grpc, 1=grpc, 2=quic, 3=rdma).
+    /// Worker network protocol wire value. Current runtime accepts gRPC only.
     pub worker_net_protocol: i32,
     pub capacity_total: u64,
     pub capacity_used: u64,
@@ -276,20 +276,12 @@ pub struct WorkerManager {
     worker_blocks: Arc<RwLock<HashMap<WorkerRegistrationKey, Vec<BlockId>>>>,
     /// Full/delta block report runtime keyed by (group_name, worker_id).
     block_reports: Arc<RwLock<HashMap<WorkerRegistrationKey, WorkerBlockReportRuntime>>>,
-    /// Current metadata epoch (incremented on metadata restart).
-    metadata_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Heartbeat timeout in seconds.
     heartbeat_timeout_sec: u64,
 }
 
 impl WorkerManager {
     pub fn new(heartbeat_timeout_sec: u64) -> Self {
-        // Generate initial metadata epoch (based on current time in seconds)
-        let initial_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
         Self {
             descriptors: Arc::new(RwLock::new(HashMap::new())),
             registrations: Arc::new(RwLock::new(HashMap::new())),
@@ -298,14 +290,8 @@ impl WorkerManager {
             locations: Arc::new(RwLock::new(HashMap::new())),
             worker_blocks: Arc::new(RwLock::new(HashMap::new())),
             block_reports: Arc::new(RwLock::new(HashMap::new())),
-            metadata_epoch: Arc::new(std::sync::atomic::AtomicU64::new(initial_epoch)),
             heartbeat_timeout_sec,
         }
-    }
-
-    /// Get current metadata epoch (for detecting metadata restarts).
-    pub fn get_metadata_epoch(&self) -> u64 {
-        self.metadata_epoch.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get heartbeat timeout in seconds.
@@ -317,16 +303,8 @@ impl WorkerManager {
         Duration::from_secs(self.heartbeat_timeout_sec)
     }
 
-    /// Increment metadata epoch (call on metadata restart).
-    pub fn increment_metadata_epoch(&self) {
-        let new_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        self.metadata_epoch
-            .store(new_epoch, std::sync::atomic::Ordering::Relaxed);
-
-        // Metadata restart drops live registration and reconstructable report state.
+    /// Metadata restart drops live registration and reconstructable report state.
+    pub fn reset_worker_soft_state(&self) {
         self.registrations.write().clear();
         self.runtime.write().clear();
         self.heartbeat_rejections.write().clear();
@@ -1286,7 +1264,6 @@ impl WorkerManager {
         &self,
         now_ms: u64,
         active_ttl_ms: u64,
-        _required_epoch: u64,
         threshold: f64,
     ) -> BlockReportConvergenceSnapshot {
         let runtime = self.runtime.read();
@@ -1337,9 +1314,7 @@ impl WorkerManager {
         const DEFAULT_THRESHOLD: f64 = 0.80;
 
         let active_ttl_ms = self.heartbeat_timeout_sec * 1000;
-        let required_epoch = self.get_metadata_epoch();
-
-        self.blockreport_convergence_snapshot(now_ms, active_ttl_ms, required_epoch, DEFAULT_THRESHOLD)
+        self.blockreport_convergence_snapshot(now_ms, active_ttl_ms, DEFAULT_THRESHOLD)
     }
 }
 

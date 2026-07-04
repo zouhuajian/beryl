@@ -191,20 +191,6 @@ pub enum RpcStatus {
     Fatal,
 }
 
-/// Structured error details.
-#[derive(Clone, Debug)]
-pub struct RpcError {
-    /// Error code.
-    pub code: RpcErrorCode,
-    /// Short message (no stack traces).
-    pub message: String,
-    /// Optional error type/category.
-    pub error_type: Option<String>,
-    /// Optional retry hints.
-    pub retryable: bool,
-    pub retry_after_ms: Option<u64>,
-}
-
 /// Error code enumeration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RpcErrorCode {

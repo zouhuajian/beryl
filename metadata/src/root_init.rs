@@ -155,7 +155,7 @@ mod tests {
             mount_kind: MountKind::Internal,
             ufs_uri: None,
             data_io_policy: DataIoPolicy::Forbid,
-            mount_version: 1,
+            mount_epoch: 1,
             namespace_owner_group_name: GroupName::parse("root").unwrap(),
             root_inode_id: bad_root_inode,
         };

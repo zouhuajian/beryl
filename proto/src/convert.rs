@@ -380,8 +380,6 @@ impl From<WorkerNetProtocol> for proto_common::WorkerNetProtocolProto {
     fn from(protocol: WorkerNetProtocol) -> Self {
         match protocol {
             WorkerNetProtocol::Grpc => proto_common::WorkerNetProtocolProto::WorkerNetProtocolGrpc,
-            WorkerNetProtocol::Quic => proto_common::WorkerNetProtocolProto::WorkerNetProtocolQuic,
-            WorkerNetProtocol::Rdma => proto_common::WorkerNetProtocolProto::WorkerNetProtocolRdma,
         }
     }
 }
@@ -392,8 +390,12 @@ impl TryFrom<proto_common::WorkerNetProtocolProto> for WorkerNetProtocol {
     fn try_from(protocol: proto_common::WorkerNetProtocolProto) -> Result<Self, Self::Error> {
         match protocol {
             proto_common::WorkerNetProtocolProto::WorkerNetProtocolGrpc => Ok(Self::Grpc),
-            proto_common::WorkerNetProtocolProto::WorkerNetProtocolQuic => Ok(Self::Quic),
-            proto_common::WorkerNetProtocolProto::WorkerNetProtocolRdma => Ok(Self::Rdma),
+            proto_common::WorkerNetProtocolProto::WorkerNetProtocolQuic => {
+                Err("QUIC worker_net_protocol is not supported by the Rust runtime".to_string())
+            }
+            proto_common::WorkerNetProtocolProto::WorkerNetProtocolRdma => {
+                Err("RDMA worker_net_protocol is not supported by the Rust runtime".to_string())
+            }
             proto_common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified => {
                 Err("unspecified worker_net_protocol must not default to gRPC".to_string())
             }
@@ -1754,9 +1756,6 @@ mod tests {
                 ("uint64", "worker_id", 3),
                 ("string", "worker_run_id", 4),
                 ("common.EndpointProto", "advertised_endpoint", 5),
-                ("uint64", "capabilities", 6),
-                ("string", "version", 7),
-                ("map<string, string>", "labels", 8),
                 ("common.WorkerNetProtocolProto", "worker_net_protocol", 9),
                 ("string", "group_name", 10),
             ]
@@ -2203,6 +2202,21 @@ mod tests {
                 .expect("rdma must parse"),
             proto_common::WorkerNetProtocolProto::WorkerNetProtocolRdma
         );
+    }
+
+    #[test]
+    fn worker_net_protocol_domain_conversion_rejects_unsupported_wire_values() {
+        assert_eq!(
+            types::WorkerNetProtocol::try_from(proto_common::WorkerNetProtocolProto::WorkerNetProtocolGrpc)
+                .expect("grpc is supported"),
+            types::WorkerNetProtocol::Grpc
+        );
+        let quic = types::WorkerNetProtocol::try_from(proto_common::WorkerNetProtocolProto::WorkerNetProtocolQuic)
+            .expect_err("quic wire value is not a supported runtime protocol");
+        assert!(quic.contains("QUIC worker_net_protocol is not supported"));
+        let rdma = types::WorkerNetProtocol::try_from(proto_common::WorkerNetProtocolProto::WorkerNetProtocolRdma)
+            .expect_err("rdma wire value is not a supported runtime protocol");
+        assert!(rdma.contains("RDMA worker_net_protocol is not supported"));
     }
 
     #[test]
