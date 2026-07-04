@@ -16,6 +16,7 @@ use crate::service::extract_and_inject_context;
 use ::common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshReason};
 use ::common::header::{ResponseHeader, RpcErrorCode};
 use ::common::observe::propagation::{extract_trace_context, ExtractedContext};
+use proto::convert::require_worker_run_id;
 use proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProto;
 use proto::metadata::*;
 use std::net::IpAddr;
@@ -23,7 +24,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
-use types::{BlockId, GroupName, TierFree, WorkerId, WorkerRunId};
+use types::{BlockId, GroupName, TierFree, WorkerId};
 
 /// Worker service background task handles.
 pub struct WorkerBackgroundHandle {}
@@ -602,14 +603,10 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     "worker_id must be non-zero",
                 );
             }
-            let worker_run_id = match req.worker_run_id.parse::<WorkerRunId>() {
+            let worker_run_id = match require_worker_run_id(&req.worker_run_id, "RegisterWorkerRequest.worker_run_id") {
                 Ok(worker_run_id) => worker_run_id,
                 Err(error) => {
-                    return self.invalid_request_response(
-                        &req.header,
-                        register_worker_response_with_header,
-                        format!("worker_run_id must be a UUID: {error}"),
-                    )
+                    return self.invalid_request_response(&req.header, register_worker_response_with_header, error)
                 }
             };
             let worker_net_protocol = req.worker_net_protocol;
@@ -753,15 +750,9 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     "worker_id must be non-zero",
                 );
             }
-            let worker_run_id = match req.worker_run_id.parse::<WorkerRunId>() {
+            let worker_run_id = match require_worker_run_id(&req.worker_run_id, "HeartbeatRequest.worker_run_id") {
                 Ok(worker_run_id) => worker_run_id,
-                Err(error) => {
-                    return self.invalid_request_response(
-                        &req.header,
-                        heartbeat_response_with_header,
-                        format!("worker_run_id must be a UUID: {error}"),
-                    )
-                }
+                Err(error) => return self.invalid_request_response(&req.header, heartbeat_response_with_header, error),
             };
 
             let capacity = match req.capacity.as_ref() {
@@ -875,7 +866,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     );
                 }
             };
-            if registration.worker_run_id != worker_run_id {
+            if !registration.worker_run_id.matches(worker_run_id) {
                 if self
                     .worker_manager
                     .mark_heartbeat_run_mismatch_if_changed(&group_name, worker_id, worker_run_id)
@@ -1064,14 +1055,10 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     "worker_id must be non-zero",
                 );
             }
-            let worker_run_id = match req.worker_run_id.parse::<WorkerRunId>() {
+            let worker_run_id = match require_worker_run_id(&req.worker_run_id, "BlockReportRequest.worker_run_id") {
                 Ok(worker_run_id) => worker_run_id,
                 Err(error) => {
-                    return self.invalid_request_response(
-                        &req.header,
-                        block_report_response_with_header,
-                        format!("worker_run_id must be a UUID: {error}"),
-                    )
+                    return self.invalid_request_response(&req.header, block_report_response_with_header, error)
                 }
             };
             let report_seq = req.report_seq;
@@ -1363,6 +1350,7 @@ mod tests {
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::{fmt, layer::SubscriberExt, Registry};
     use types::ClientId;
+    use types::WorkerRunId;
 
     #[derive(Clone)]
     struct LogCaptureWriter {

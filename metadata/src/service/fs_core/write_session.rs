@@ -1330,7 +1330,7 @@ impl<'a> WriteSessionCoordinator<'a> {
                     let current_run_id = worker_manager
                         .get_registration(&worker_lookup_group_name, worker_id)
                         .map(|registration| registration.worker_run_id);
-                    if current_run_id != Some(endpoint.worker_run_id) {
+                    if !current_run_id.is_some_and(|run_id| run_id.matches(endpoint.worker_run_id)) {
                         let hint = worker_refresh_hint_from_session(&session, true);
                         return self.core.need_refresh_failure_with_hint(
                             &req.ctx,

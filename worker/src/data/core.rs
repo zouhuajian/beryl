@@ -991,7 +991,7 @@ fn validate_commit_request(state: &StreamState, req: &CommitWriteRequest) -> Wor
             ),
         });
     }
-    if req.worker_run_id != state.context.worker_run_id
+    if !req.worker_run_id.matches(state.context.worker_run_id)
         || req.block_format_id != state.context.block_format_id
         || req.block_size != state.context.block_size
         || req.chunk_size != state.context.chunk_size

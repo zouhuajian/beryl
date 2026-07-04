@@ -297,14 +297,7 @@ fn proto_to_required_fencing_token(
 }
 
 fn proto_to_worker_run_id(value: &str) -> WorkerCoreResult<WorkerRunId> {
-    if value.is_empty() {
-        return Err(WorkerError::InvalidArgument(
-            "worker_run_id must not be empty".to_string(),
-        ));
-    }
-    value
-        .parse::<WorkerRunId>()
-        .map_err(|err| WorkerError::InvalidArgument(format!("worker_run_id invalid: {err}")))
+    proto_convert::require_worker_run_id(value, "worker_run_id").map_err(WorkerError::InvalidArgument)
 }
 
 fn proto_to_group_name(value: &str, field_name: &str) -> WorkerCoreResult<GroupName> {

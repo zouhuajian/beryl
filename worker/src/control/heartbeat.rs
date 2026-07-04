@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use common::error::canonical::{CanonicalError, ErrorClass, RefreshReason};
 use common::header::RequestHeader;
 use proto::common::{EndpointProto, RequestHeaderProto};
-use proto::convert::error_detail_to_canonical;
+use proto::convert::{error_detail_to_canonical, require_worker_run_id};
 use proto::metadata::metadata_worker_service_proto_client::MetadataWorkerServiceProtoClient;
 use proto::metadata::{
     CapacityInfoProto, HealthStatusProto, HeartbeatRequestProto, HeartbeatResponseProto, LoadInfoProto,
@@ -342,7 +342,14 @@ fn classify_heartbeat_response(
             "metadata heartbeat response did not confirm worker_id".to_string(),
         ));
     }
-    if response.accepted_worker_run_id != request.worker_run_id {
+    let accepted_worker_run_id = require_worker_run_id(
+        &response.accepted_worker_run_id,
+        "HeartbeatResponse.accepted_worker_run_id",
+    )
+    .map_err(HeartbeatError::Fatal)?;
+    let expected_worker_run_id = require_worker_run_id(&request.worker_run_id, "HeartbeatRequest.worker_run_id")
+        .map_err(HeartbeatError::Fatal)?;
+    if !accepted_worker_run_id.matches(expected_worker_run_id) {
         return Err(HeartbeatError::Fatal(
             "metadata heartbeat response did not confirm worker_run_id".to_string(),
         ));

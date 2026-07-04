@@ -361,6 +361,14 @@ pub fn required_fencing_token(
     proto.ok_or_else(|| format!("missing {field_name}"))?.try_into()
 }
 
+/// Parse a required worker process-run identifier field without choosing caller error policy.
+pub fn require_worker_run_id(value: &str, field_name: &str) -> Result<WorkerRunId, String> {
+    if value.is_empty() {
+        return Err(format!("{field_name} must not be empty"));
+    }
+    WorkerRunId::parse(value).map_err(|err| format!("{field_name} invalid: {err}"))
+}
+
 /// Parse a known, explicitly specified worker network protocol value.
 ///
 /// Caller-owned policy still decides whether a known protocol is supported or
@@ -461,12 +469,7 @@ pub fn worker_endpoint_info_from_parts(
     if endpoint.is_empty() {
         return Err("WorkerEndpointInfoProto.endpoint must not be empty".to_string());
     }
-    if worker_run_id.is_empty() {
-        return Err("WorkerEndpointInfoProto.worker_run_id must not be empty".to_string());
-    }
-    let worker_run_id = worker_run_id
-        .parse::<WorkerRunId>()
-        .map_err(|err| format!("WorkerEndpointInfoProto.worker_run_id invalid: {err}"))?;
+    let worker_run_id = require_worker_run_id(&worker_run_id, "WorkerEndpointInfoProto.worker_run_id")?;
     let protocol = parse_known_worker_net_protocol(worker_net_protocol)?;
     Ok(WorkerEndpointInfo {
         worker_id,
@@ -2124,6 +2127,31 @@ mod tests {
                 .expect("rdma must parse"),
             proto_common::WorkerNetProtocolProto::WorkerNetProtocolRdma
         );
+    }
+
+    #[test]
+    fn require_worker_run_id_preserves_field_context() {
+        let parsed = require_worker_run_id(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "RegisterWorkerRequest.worker_run_id",
+        )
+        .expect("valid WorkerRunId");
+        assert_eq!(
+            parsed,
+            "550e8400-e29b-41d4-a716-446655440000"
+                .parse::<types::WorkerRunId>()
+                .expect("valid WorkerRunId")
+        );
+
+        let missing = require_worker_run_id("", "RegisterWorkerRequest.worker_run_id")
+            .expect_err("missing worker_run_id must fail");
+        assert!(missing.contains("RegisterWorkerRequest.worker_run_id"));
+        assert!(missing.contains("must not be empty"));
+
+        let invalid = require_worker_run_id("not-a-uuid", "HeartbeatRequest.worker_run_id")
+            .expect_err("invalid worker_run_id must fail");
+        assert!(invalid.contains("HeartbeatRequest.worker_run_id"));
+        assert!(invalid.contains("invalid"));
     }
 
     #[test]

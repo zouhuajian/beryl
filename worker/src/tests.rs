@@ -279,7 +279,7 @@ mod tests {
                 .pop_front()
                 .unwrap_or(MockHeartbeatReply::Ok {
                     worker_id: request.worker_id,
-                    worker_run_id: request.worker_run_id.parse().unwrap_or_else(|_| test_worker_run_id()),
+                    worker_run_id: WorkerRunId::parse(&request.worker_run_id).unwrap_or_else(|_| test_worker_run_id()),
                     server_role: MetadataServerRoleProto::MetadataServerRoleFollower,
                     commands: Vec::new(),
                 });

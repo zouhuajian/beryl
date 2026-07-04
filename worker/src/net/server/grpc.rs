@@ -12,6 +12,7 @@ use std::time::Instant;
 use anyhow::Context;
 use futures::{stream, Stream, StreamExt};
 use proto::common::{ClientInfoProto, ErrorDetailProto};
+use proto::convert::require_worker_run_id;
 use proto::worker::worker_data_service_server::{WorkerDataService, WorkerDataServiceServer};
 use proto::worker::{
     AbortWriteRequestProto, AbortWriteResponseProto, CommitWriteRequestProto, CommitWriteResponseProto,
@@ -34,7 +35,7 @@ use common::error::canonical::RefreshReason;
 use common::header::RpcErrorCode;
 use common::observe::propagation::{extract_trace_context, ExtractedContext};
 use tracing::Span;
-use types::{GroupName, WorkerRunId};
+use types::GroupName;
 
 /// Worker data service implementation.
 #[derive(Clone)]
@@ -93,14 +94,7 @@ impl WorkerDataServiceImpl {
 
     fn ensure_group_ready_for_run(&self, group_name: &str, worker_run_id: &str) -> Result<(), WorkerError> {
         let group_name = parse_group_name(group_name)?;
-        if worker_run_id.is_empty() {
-            return Err(WorkerError::InvalidArgument(
-                "worker_run_id must not be empty".to_string(),
-            ));
-        }
-        let requested = worker_run_id
-            .parse::<WorkerRunId>()
-            .map_err(|err| WorkerError::InvalidArgument(format!("worker_run_id invalid: {err}")))?;
+        let requested = require_worker_run_id(worker_run_id, "worker_run_id").map_err(WorkerError::InvalidArgument)?;
         let Some(registration) = self.registration_state.registration_for_group(&group_name) else {
             return Err(WorkerError::NeedRefresh {
                 code: RpcErrorCode::NodeUnavailable,
@@ -115,7 +109,7 @@ impl WorkerDataServiceImpl {
                 message: format!("worker is not ready for metadata group {}", group_name),
             });
         }
-        if requested != registration.worker_run_id {
+        if !requested.matches(registration.worker_run_id) {
             return Err(WorkerError::NeedRefresh {
                 code: RpcErrorCode::WorkerRunMismatch,
                 reason: RefreshReason::WorkerRunMismatch,

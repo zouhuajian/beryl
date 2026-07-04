@@ -10,7 +10,7 @@ use std::time::Duration;
 use common::error::canonical::{CanonicalError, ErrorClass};
 use common::header::RequestHeader;
 use proto::common::{EndpointProto, RequestHeaderProto, WorkerNetProtocolProto};
-use proto::convert::error_detail_to_canonical;
+use proto::convert::{error_detail_to_canonical, require_worker_run_id};
 use proto::metadata::metadata_worker_service_proto_client::MetadataWorkerServiceProtoClient;
 use proto::metadata::{RegisterWorkerRequestProto, RegisterWorkerResponseProto};
 use thiserror::Error;
@@ -212,12 +212,12 @@ impl MetadataRegistrar {
                 "metadata register response did not confirm worker_id".to_string(),
             ));
         }
-        let accepted_worker_run_id = response.accepted_worker_run_id.parse::<WorkerRunId>().map_err(|err| {
-            RegistrationError::Fatal(format!(
-                "metadata register response accepted_worker_run_id is malformed: {err}"
-            ))
-        })?;
-        if accepted_worker_run_id != self.descriptor.worker_run_id {
+        let accepted_worker_run_id = require_worker_run_id(
+            &response.accepted_worker_run_id,
+            "RegisterWorkerResponse.accepted_worker_run_id",
+        )
+        .map_err(RegistrationError::Fatal)?;
+        if !accepted_worker_run_id.matches(self.descriptor.worker_run_id) {
             return Err(RegistrationError::Fatal(
                 "metadata register response did not confirm worker_run_id".to_string(),
             ));

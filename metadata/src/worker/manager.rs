@@ -389,7 +389,7 @@ impl WorkerManager {
             registrations.get(&key).cloned()
         };
         if let Some(existing) = existing {
-            let same_run = existing.worker_run_id == worker_run_id;
+            let same_run = existing.worker_run_id.matches(worker_run_id);
             let endpoint_changed = existing.address != address || existing.worker_net_protocol != worker_net_protocol;
             if same_run {
                 validate_same_run_descriptor(group_name, worker_id, &existing, address, worker_net_protocol)?;
@@ -434,7 +434,7 @@ impl WorkerManager {
                     worker_id.as_raw()
                 )));
             }
-            if existing.worker_run_id == worker_run_id {
+            if existing.worker_run_id.matches(worker_run_id) {
                 validate_same_run_descriptor(group_name, worker_id, existing, address, worker_net_protocol)?;
                 return Ok(());
             }
@@ -483,7 +483,7 @@ impl WorkerManager {
             let registrations = self.registrations.read();
             registrations
                 .get(&key)
-                .map(|registration| registration.worker_run_id == worker_run_id)
+                .map(|registration| registration.worker_run_id.matches(worker_run_id))
                 .unwrap_or(false)
         };
         let descriptor_address = address.clone();
@@ -540,7 +540,11 @@ impl WorkerManager {
         let report = reports.entry(key.clone()).or_default();
         if batch_seq == 0 {
             let full_report_had_baseline = report.state == BlockReportState::Ready;
-            if report.worker_run_id == Some(worker_run_id) && report.report_seq > report_seq {
+            if report
+                .worker_run_id
+                .is_some_and(|report_worker_run_id| report_worker_run_id.matches(worker_run_id))
+                && report.report_seq > report_seq
+            {
                 return Err(MetadataError::FullReportRequired(format!(
                     "full report required: stale report_seq {} for group_name={}, worker_id={}, current {}",
                     report_seq,
@@ -558,7 +562,9 @@ impl WorkerManager {
         }
 
         if report.state != BlockReportState::Receiving
-            || report.worker_run_id != Some(worker_run_id)
+            || !report
+                .worker_run_id
+                .is_some_and(|report_worker_run_id| report_worker_run_id.matches(worker_run_id))
             || report.report_seq != report_seq
             || report.next_batch_seq != batch_seq
         {
@@ -634,7 +640,9 @@ impl WorkerManager {
             ))
         })?;
         if report.state != BlockReportState::Ready
-            || report.worker_run_id != Some(worker_run_id)
+            || !report
+                .worker_run_id
+                .is_some_and(|report_worker_run_id| report_worker_run_id.matches(worker_run_id))
             || report.report_seq != report_seq
         {
             return Err(MetadataError::FullReportRequired(format!(
@@ -715,7 +723,7 @@ impl WorkerManager {
                 worker_id.as_raw()
             ))
         })?;
-        if registration.worker_run_id != worker_run_id {
+        if !registration.worker_run_id.matches(worker_run_id) {
             return Err(MetadataError::StaleState(format!(
                 "worker_run_id mismatch for group_name={}, worker_id={}",
                 group_name,
@@ -910,7 +918,7 @@ impl WorkerManager {
             })?
         };
 
-        if registration.worker_run_id != worker_run_id {
+        if !registration.worker_run_id.matches(worker_run_id) {
             return Err(MetadataError::StaleState(format!(
                 "worker_run_id mismatch for group_name={}, worker_id={}",
                 group_name,
@@ -1286,7 +1294,9 @@ impl WorkerManager {
                     .get(key)
                     .map(|report| {
                         report.state == BlockReportState::Ready
-                            && report.worker_run_id == Some(runtime.get(key).expect("active runtime").worker_run_id)
+                            && report.worker_run_id.is_some_and(|report_worker_run_id| {
+                                report_worker_run_id.matches(runtime.get(key).expect("active runtime").worker_run_id)
+                            })
                     })
                     .unwrap_or(false)
             })

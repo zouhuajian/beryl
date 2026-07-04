@@ -114,7 +114,10 @@ impl FsCore {
                 .iter()
                 .find(|view| view.group_name == *worker_lookup_group_name && view.worker_id == location.worker_id)
             {
-                if view.worker_run_id.is_some() && view.worker_run_id != Some(location.worker_run_id) {
+                if view
+                    .worker_run_id
+                    .is_some_and(|worker_run_id| !worker_run_id.matches(location.worker_run_id))
+                {
                     return (
                         RpcErrorCode::WorkerRunMismatch,
                         RefreshReason::WorkerRunMismatch,
