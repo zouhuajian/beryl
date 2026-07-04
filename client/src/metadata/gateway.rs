@@ -4,7 +4,7 @@
 //! MetadataGateway trait and tonic implementation.
 
 use async_trait::async_trait;
-use common::header::ResponseHeader;
+use common::header::{HeaderIdentity, ResponseHeader};
 use proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -554,62 +554,39 @@ fn parse_metadata_response_header(
             "metadata OK response missing ResponseHeader",
         )));
     };
-    if header.group_name.is_empty() {
-        return Err(ClientError::from(invalid_header_action(
-            "metadata OK response invalid ResponseHeader: group_name missing",
-        )));
-    }
-    validate_metadata_response_identity(ctx, header)?;
     let header = ResponseHeader::try_from(header.clone()).map_err(|err| {
         ClientError::from(invalid_header_action(format!(
             "metadata OK response invalid ResponseHeader: {err}"
         )))
     })?;
-    validate_header_or_action(&header).map_err(ClientError::from)?;
-    header.group_name.ok_or_else(|| {
+    let identity = header.identity();
+    let group_name = identity.group_name.clone().ok_or_else(|| {
         ClientError::from(invalid_header_action(
             "metadata OK response invalid ResponseHeader: group_name missing",
         ))
-    })
+    })?;
+    validate_metadata_response_identity(ctx, &identity)?;
+    validate_header_or_action(&header).map_err(ClientError::from)?;
+    Ok(group_name)
 }
 
-fn validate_metadata_response_identity(
-    ctx: &AttemptContext,
-    header: &proto::common::ResponseHeaderProto,
-) -> ClientResult<()> {
-    if !header.group_name.is_empty() {
-        if let Some(request_group_name) = ctx.group_name() {
-            if header.group_name != request_group_name.as_str() {
-                return Err(ClientError::from(invalid_header_action(format!(
-                    "metadata OK response invalid ResponseHeader: group_name mismatch: expected {}, got {}",
-                    request_group_name, header.group_name
-                ))));
-            }
+fn validate_metadata_response_identity(ctx: &AttemptContext, identity: &HeaderIdentity) -> ClientResult<()> {
+    if let (Some(request_group_name), Some(response_group_name)) = (ctx.group_name(), identity.group_name.as_ref()) {
+        if response_group_name != request_group_name {
+            return Err(ClientError::from(invalid_header_action(format!(
+                "metadata OK response invalid ResponseHeader: group_name mismatch: expected {}, got {}",
+                request_group_name, response_group_name
+            ))));
         }
     }
-    let client = header.client.as_ref().ok_or_else(|| {
-        ClientError::from(invalid_header_action(
-            "metadata OK response invalid ResponseHeader: missing client identity",
-        ))
-    })?;
-    let client_id = proto::convert::required_client_id(client.client_id, "client_id").map_err(|err| {
-        ClientError::from(invalid_header_action(format!(
-            "metadata OK response invalid ResponseHeader: {err}"
-        )))
-    })?;
-    if client_id != ctx.client_id() {
+    if identity.client_id != ctx.client_id() {
         return Err(ClientError::from(invalid_header_action(format!(
             "metadata OK response invalid ResponseHeader: client_id mismatch: expected {}, got {}",
             ctx.client_id(),
-            client_id
+            identity.client_id
         ))));
     }
-    if client.call_id.is_empty() {
-        return Err(ClientError::from(invalid_header_action(
-            "metadata OK response invalid ResponseHeader: call_id must not be empty",
-        )));
-    }
-    if client.call_id != ctx.call_id() {
+    if identity.call_id.to_string() != ctx.call_id() {
         return Err(ClientError::from(invalid_header_action(
             "metadata OK response invalid ResponseHeader: call_id mismatch",
         )));

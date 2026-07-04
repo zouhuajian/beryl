@@ -283,31 +283,6 @@ impl OpendalUfs {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ufs_metrics_error_kind_uses_structured_error_variant() {
-        assert_eq!(
-            classify_ufs_error(&UfsError::NotFound("renamed".to_string())),
-            ErrorKind::NotFound
-        );
-        assert_eq!(
-            classify_ufs_error(&UfsError::PermissionDenied("renamed".to_string())),
-            ErrorKind::PermissionDenied
-        );
-        assert_eq!(
-            classify_ufs_error(&UfsError::InvalidPath("renamed".to_string())),
-            ErrorKind::InvalidArgument
-        );
-        assert_eq!(
-            classify_ufs_error(&UfsError::Overloaded("renamed".to_string())),
-            ErrorKind::Overloaded
-        );
-    }
-}
-
 #[async_trait]
 impl UfsMeta for OpendalUfs {
     async fn stat(&self, path: &str, ctx: &RequestHeader) -> Result<UfsFileStatus, UfsError> {
@@ -535,3 +510,28 @@ impl UfsData for OpendalUfs {
 }
 
 // OpendalUfs implements UfsAccess via blanket implementation in traits.rs
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ufs_metrics_error_kind_uses_structured_error_variant() {
+        assert_eq!(
+            classify_ufs_error(&UfsError::NotFound("renamed".to_string())),
+            ErrorKind::NotFound
+        );
+        assert_eq!(
+            classify_ufs_error(&UfsError::PermissionDenied("renamed".to_string())),
+            ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            classify_ufs_error(&UfsError::InvalidPath("renamed".to_string())),
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(
+            classify_ufs_error(&UfsError::Overloaded("renamed".to_string())),
+            ErrorKind::Overloaded
+        );
+    }
+}

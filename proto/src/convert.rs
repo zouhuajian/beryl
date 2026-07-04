@@ -876,11 +876,8 @@ impl TryFrom<proto_common::RequestHeaderProto> for RequestHeader {
         Ok(RequestHeader {
             client,
             trace_context,
-            group_name: if proto.group_name.is_empty() {
-                None
-            } else {
-                Some(GroupName::parse(&proto.group_name).map_err(|err| format!("invalid header group_name: {err}"))?)
-            },
+            group_name: GroupName::parse_optional(&proto.group_name)
+                .map_err(|err| format!("invalid header group_name: {err}"))?,
             mount_epoch: proto.mount_epoch,
             state,
             route_epoch: proto.route_epoch,
@@ -967,11 +964,8 @@ impl TryFrom<proto_common::ResponseHeaderProto> for ResponseHeader {
             state,
             mount_epoch: proto.mount_epoch,
             route_epoch: proto.route_epoch,
-            group_name: if proto.group_name.is_empty() {
-                None
-            } else {
-                Some(GroupName::parse(&proto.group_name).map_err(|err| format!("invalid header group_name: {err}"))?)
-            },
+            group_name: GroupName::parse_optional(&proto.group_name)
+                .map_err(|err| format!("invalid header group_name: {err}"))?,
         })
     }
 }

@@ -79,6 +79,23 @@ fn request_and_response_headers_use_group_state_vectors() {
 }
 
 #[test]
+fn request_and_response_headers_expose_basic_identity() {
+    let group_name = GroupName::parse("root").unwrap();
+    let request = RequestHeader::new(ClientId::new(11)).with_group_name(group_name.clone());
+    let response = ResponseHeader::ok(request.client.clone()).with_group_name(group_name.clone());
+
+    let request_identity = request.identity();
+    assert_eq!(request_identity.call_id, request.client.call_id);
+    assert_eq!(request_identity.client_id, request.client.client_id);
+    assert_eq!(request_identity.group_name.as_ref(), Some(&group_name));
+
+    let response_identity = response.identity();
+    assert_eq!(response_identity.call_id, request.client.call_id);
+    assert_eq!(response_identity.client_id, request.client.client_id);
+    assert_eq!(response_identity.group_name.as_ref(), Some(&group_name));
+}
+
+#[test]
 fn caller_context_fields_parse_locality_hints_and_ignore_invalid_entries() {
     let context = CallerContext {
         context: "ip=10.0.0.1,host=worker-a,az=az-a,rack=rack-1,region=us-west".to_string(),

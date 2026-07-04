@@ -137,8 +137,7 @@ impl MetadataWorkerServiceImpl {
     fn group_name_from_request_header(req_header: &Option<proto::common::RequestHeaderProto>) -> Option<GroupName> {
         req_header
             .as_ref()
-            .and_then(|header| (!header.group_name.is_empty()).then_some(header.group_name.as_str()))
-            .and_then(|group_name| GroupName::parse(group_name).ok())
+            .and_then(|header| GroupName::parse_optional(&header.group_name).ok().flatten())
     }
 
     fn error_response_header_from_request(
@@ -515,13 +514,22 @@ fn check_header_group_name(
     let Some(header) = req_header.as_ref() else {
         return Ok(());
     };
-    if header.group_name.is_empty() || header.group_name == body_group_name.as_str() {
+    let Some(header_group_name) =
+        GroupName::parse_optional(&header.group_name).map_err(|err| format!("header group_name is invalid: {err}"))?
+    else {
+        return Ok(());
+    };
+    if header_group_name == *body_group_name {
         return Ok(());
     }
     Err(format!(
         "header group_name {} does not match body group_name {}",
-        header.group_name, body_group_name
+        header_group_name, body_group_name
     ))
+}
+
+fn parse_worker_request_group_name(raw: &str) -> Result<GroupName, String> {
+    GroupName::parse(raw).map_err(|error| format!("group_name is invalid: {error}"))
 }
 
 fn parse_metadata_endpoint(address: &str) -> Option<proto::common::EndpointProto> {
@@ -567,14 +575,10 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 );
             }
 
-            let group_name = match GroupName::parse(&req.group_name) {
+            let group_name = match parse_worker_request_group_name(&req.group_name) {
                 Ok(group_name) => group_name,
                 Err(error) => {
-                    return self.invalid_request_response(
-                        &req.header,
-                        register_worker_response_with_header,
-                        format!("group_name is invalid: {error}"),
-                    )
+                    return self.invalid_request_response(&req.header, register_worker_response_with_header, error)
                 }
             };
             if let Err(message) = check_header_group_name(&req.header, &group_name) {
@@ -724,15 +728,9 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 Err(error) => return self.response_with_error(&req.header, error, heartbeat_response_with_header),
             };
 
-            let group_name = match GroupName::parse(&req.group_name) {
+            let group_name = match parse_worker_request_group_name(&req.group_name) {
                 Ok(group_name) => group_name,
-                Err(error) => {
-                    return self.invalid_request_response(
-                        &req.header,
-                        heartbeat_response_with_header,
-                        format!("group_name is invalid: {error}"),
-                    )
-                }
+                Err(error) => return self.invalid_request_response(&req.header, heartbeat_response_with_header, error),
             };
             if let Err(message) = check_header_group_name(&req.header, &group_name) {
                 return self.invalid_request_response(&req.header, heartbeat_response_with_header, message);
@@ -1039,14 +1037,10 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 Err(error) => return self.response_with_error(&req.header, error, block_report_response_with_header),
             };
 
-            let group_name = match GroupName::parse(&req.group_name) {
+            let group_name = match parse_worker_request_group_name(&req.group_name) {
                 Ok(group_name) => group_name,
                 Err(error) => {
-                    return self.invalid_request_response(
-                        &req.header,
-                        block_report_response_with_header,
-                        format!("group_name is invalid: {error}"),
-                    )
+                    return self.invalid_request_response(&req.header, block_report_response_with_header, error)
                 }
             };
             if let Err(message) = check_header_group_name(&req.header, &group_name) {

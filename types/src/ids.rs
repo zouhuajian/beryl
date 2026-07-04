@@ -413,6 +413,19 @@ impl GroupName {
         Ok(Self(value.to_string()))
     }
 
+    /// Parses an optional metadata group name from a wire/config field.
+    ///
+    /// An empty string is treated as absent. Non-empty values must satisfy the
+    /// same normalized `GroupName` contract as `parse`.
+    pub fn parse_optional(raw: impl AsRef<str>) -> Result<Option<Self>, GroupNameError> {
+        let value = raw.as_ref();
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            Self::parse(value).map(Some)
+        }
+    }
+
     /// Returns the validated group name.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -536,5 +549,16 @@ mod tests {
         ] {
             assert!(GroupName::parse(value).is_err(), "{value} must be invalid");
         }
+    }
+
+    #[test]
+    fn optional_group_name_parse_keeps_absent_distinct_from_invalid() {
+        assert_eq!(GroupName::parse_optional("").unwrap(), None);
+        assert_eq!(
+            GroupName::parse_optional("root").unwrap(),
+            Some(GroupName::parse("root").unwrap())
+        );
+        assert!(GroupName::parse_optional(" ").is_err());
+        assert!(GroupName::parse_optional("Root").is_err());
     }
 }

@@ -98,7 +98,8 @@ impl GuardChain {
         path: &str,
         resolved: &ResolvedPath,
     ) -> Result<(), GuardFailure> {
-        auth::check_perm(ctx, bits, path, resolved).map_err(GuardFailure::new)
+        auth::check_perm(ctx, bits, path, resolved);
+        Ok(())
     }
 
     pub async fn check_parent_perm(
@@ -108,11 +109,13 @@ impl GuardChain {
         path: &str,
         resolved: &ResolvedPath,
     ) -> Result<(), GuardFailure> {
-        auth::check_parent_perm(ctx, bits, path, resolved).map_err(GuardFailure::new)
+        auth::check_parent_perm(ctx, bits, path, resolved);
+        Ok(())
     }
 
     pub async fn check_super(&self, ctx: &RequestContext) -> Result<(), GuardFailure> {
-        auth::check_super(ctx).map_err(GuardFailure::new)
+        auth::check_super(ctx);
+        Ok(())
     }
 }
 

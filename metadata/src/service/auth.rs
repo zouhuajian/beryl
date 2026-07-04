@@ -12,7 +12,6 @@ use crate::metrics::AUTHZ_ALLOW_NONE_TOTAL;
 use crate::path_resolver::ResolvedPath;
 use crate::service::domain::RequestContext;
 use bitflags::bitflags;
-use common::error::canonical::CanonicalError;
 use common::error::{CommonError, CommonErrorCode};
 use std::sync::atomic::Ordering;
 
@@ -43,29 +42,16 @@ pub fn validate_filesystem_permission_mode(mode: FileSystemAuthzMode) -> Result<
     }
 }
 
-pub fn check_perm(
-    _ctx: &RequestContext,
-    _bits: PermissionBits,
-    _path: &str,
-    _resolved: &ResolvedPath,
-) -> Result<(), CanonicalError> {
+pub fn check_perm(_ctx: &RequestContext, _bits: PermissionBits, _path: &str, _resolved: &ResolvedPath) {
     record_none_allow();
-    Ok(())
 }
 
-pub fn check_parent_perm(
-    _ctx: &RequestContext,
-    _bits: PermissionBits,
-    _path: &str,
-    _resolved: &ResolvedPath,
-) -> Result<(), CanonicalError> {
+pub fn check_parent_perm(_ctx: &RequestContext, _bits: PermissionBits, _path: &str, _resolved: &ResolvedPath) {
     record_none_allow();
-    Ok(())
 }
 
-pub fn check_super(_ctx: &RequestContext) -> Result<(), CanonicalError> {
+pub fn check_super(_ctx: &RequestContext) {
     record_none_allow();
-    Ok(())
 }
 
 #[cfg(test)]
@@ -112,11 +98,9 @@ mod tests {
         let req_ctx = test_request_context();
         let resolved = resolved_parent(InodeId::new(3), vec![InodeId::new(1), InodeId::new(2)]);
 
-        check_perm(&req_ctx, PermissionBits::READ, "/mnt/target", &resolved)
-            .expect("NONE permission mode allows direct permission checks");
-        check_parent_perm(&req_ctx, PermissionBits::WRITE, "/mnt/parent/new-file", &resolved)
-            .expect("NONE permission mode allows parent permission checks");
-        check_super(&req_ctx).expect("NONE permission mode allows superuser checks");
+        check_perm(&req_ctx, PermissionBits::READ, "/mnt/target", &resolved);
+        check_parent_perm(&req_ctx, PermissionBits::WRITE, "/mnt/parent/new-file", &resolved);
+        check_super(&req_ctx);
     }
 
     #[test]

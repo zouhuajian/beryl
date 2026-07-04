@@ -20,6 +20,17 @@ pub struct ClientInfo {
     pub client_name: Option<String>,
 }
 
+/// Basic request/response identity parsed from a header.
+///
+/// This is only the client/call/group shape. Freshness and replay validation
+/// remain owned by route epoch, mount epoch, state watermark, and fingerprints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeaderIdentity {
+    pub call_id: CallId,
+    pub client_id: ClientId,
+    pub group_name: Option<GroupName>,
+}
+
 /// W3C trace propagation context.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TraceContext {
@@ -224,6 +235,14 @@ impl ClientInfo {
         }
     }
 
+    fn identity_with_group(&self, group_name: Option<GroupName>) -> HeaderIdentity {
+        HeaderIdentity {
+            call_id: self.call_id,
+            client_id: self.client_id,
+            group_name,
+        }
+    }
+
     /// Set the client name.
     pub fn with_client_name(mut self, client_name: String) -> Self {
         self.client_name = Some(client_name);
@@ -266,6 +285,11 @@ impl RequestHeader {
     pub fn with_group_name(mut self, group_name: GroupName) -> Self {
         self.group_name = Some(group_name);
         self
+    }
+
+    /// Return the basic parsed header identity.
+    pub fn identity(&self) -> HeaderIdentity {
+        self.client.identity_with_group(self.group_name.clone())
     }
 
     /// Set the traceparent.
@@ -457,5 +481,10 @@ impl ResponseHeader {
     pub fn with_group_name(mut self, group_name: GroupName) -> Self {
         self.group_name = Some(group_name);
         self
+    }
+
+    /// Return the basic parsed header identity.
+    pub fn identity(&self) -> HeaderIdentity {
+        self.client.identity_with_group(self.group_name.clone())
     }
 }

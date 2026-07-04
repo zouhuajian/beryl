@@ -82,8 +82,7 @@ impl MsyncHandler {
         let group_name = req
             .header
             .as_ref()
-            .and_then(|header| (!header.group_name.is_empty()).then_some(header.group_name.as_str()))
-            .and_then(|group_name| GroupName::parse(group_name).ok());
+            .and_then(|header| GroupName::parse_optional(&header.group_name).ok().flatten());
         Self::error_response(
             &req.header,
             group_name,
