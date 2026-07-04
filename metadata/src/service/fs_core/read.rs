@@ -4,13 +4,15 @@
 use super::{FsCore, StaleStateStatus};
 use crate::error::MetadataError;
 use crate::observe;
-use crate::placement::{PlacementOp, PlacementPlanner, PlacementRequest, WorkerPlacementView};
+use crate::placement::{
+    PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus, ReportedBlockLocation, WorkerPlacementView,
+};
 use crate::service::core_util::{need_refresh_core_failure, worker_endpoint_from_parts};
 use crate::service::domain::{
     CoreFailure, CoreResult, Freshness, GetAttrInput, GetAttrOutput, GetFileLayoutInput, GetFileLayoutOutput,
     InodeMountGuardInputs, ReadDirEntry, ReadDirInput, ReadDirOutput, RequestContext,
 };
-use common::error::canonical::RefreshReason;
+use common::error::canonical::{RefreshHint, RefreshReason};
 use common::header::CallerContextFields;
 use common::header::RpcErrorCode;
 use std::time::Instant;
@@ -78,6 +80,86 @@ impl FsCore {
             worker_run_id,
         )
         .is_ok()
+    }
+
+    pub(super) fn classify_unavailable_read_location(
+        req: &RequestContext,
+        worker_lookup_group_name: &GroupName,
+        extent: &Extent,
+        block_stamp: u64,
+        reported: &[ReportedBlockLocation],
+        views: &[WorkerPlacementView],
+    ) -> (RpcErrorCode, RefreshReason, String) {
+        let matching_stamp = reported
+            .iter()
+            .filter(|location| location.block_stamp == block_stamp)
+            .collect::<Vec<_>>();
+        if !reported.is_empty() && matching_stamp.is_empty() {
+            return (
+                RpcErrorCode::BlockStampMismatch,
+                RefreshReason::BlockStampMismatch,
+                format!(
+                    "block location unavailable: block stamp mismatch for group={} block={} file_offset={} expected_stamp={} reported_stamps={:?}",
+                    worker_lookup_group_name,
+                    extent.block_id,
+                    extent.file_offset,
+                    block_stamp,
+                    reported.iter().map(|location| location.block_stamp).collect::<Vec<_>>()
+                ),
+            );
+        }
+
+        for location in &matching_stamp {
+            if let Some(view) = views
+                .iter()
+                .find(|view| view.group_name == *worker_lookup_group_name && view.worker_id == location.worker_id)
+            {
+                if view.worker_run_id.is_some() && view.worker_run_id != Some(location.worker_run_id) {
+                    return (
+                        RpcErrorCode::WorkerRunMismatch,
+                        RefreshReason::WorkerRunMismatch,
+                        format!(
+                            "block location unavailable: stale worker run for group={} block={} file_offset={} worker={} reported_run={} current_run={:?}",
+                            worker_lookup_group_name,
+                            extent.block_id,
+                            extent.file_offset,
+                            location.worker_id,
+                            location.worker_run_id,
+                            view.worker_run_id
+                        ),
+                    );
+                }
+            }
+        }
+
+        let reason_detail = if reported.is_empty() {
+            "no ready block report"
+        } else if matching_stamp.is_empty() {
+            "no matching block stamp"
+        } else {
+            "no usable live replica"
+        };
+        let caller_context = req
+            .caller
+            .caller_context
+            .as_ref()
+            .map(|ctx| ctx.context.as_str())
+            .unwrap_or("-");
+        (
+            RpcErrorCode::BlockLocationUnavailable,
+            RefreshReason::BlockLocationUnavailable,
+            format!(
+                "block location unavailable: reason={} group={} block={} file_offset={} block_stamp={} caller_context={} reported_locations={} worker_views={}",
+                reason_detail,
+                worker_lookup_group_name,
+                extent.block_id,
+                extent.file_offset,
+                block_stamp,
+                caller_context,
+                reported.len(),
+                views.len()
+            ),
+        )
     }
 
     pub(crate) async fn plan_inode_mount(
@@ -479,12 +561,35 @@ impl FsCore {
                         block_stamp: Some(block_stamp),
                         layout,
                         caller: caller.clone(),
-                        existing: reported,
+                        existing: reported.clone(),
                         exclude_workers: Vec::new(),
                         target_replicas: layout.replication,
                     },
                     &usable_views,
                 );
+                if plan.status == PlacementStatus::NoLiveReplica {
+                    let (rpc_code, reason, message) = Self::classify_unavailable_read_location(
+                        &req.ctx,
+                        worker_lookup_group_name,
+                        extent,
+                        block_stamp,
+                        &reported,
+                        &usable_views,
+                    );
+                    return self.need_refresh_failure_with_hint(
+                        &req.ctx,
+                        rpc_code,
+                        reason,
+                        message,
+                        group_name,
+                        mount_epoch,
+                        route_epoch,
+                        Some(RefreshHint {
+                            worker_resolve_required: true,
+                            ..RefreshHint::default()
+                        }),
+                    );
+                }
                 workers.reserve(plan.workers.len());
                 for worker in plan.workers {
                     if let Ok(endpoint) = worker_endpoint_from_parts(

@@ -105,8 +105,8 @@ impl BlockManager {
             Ok(meta) => meta,
             Err(WorkerError::NotFound(message)) => {
                 return Err(Self::need_refresh(
-                    RpcErrorCode::ShardMoved,
-                    RefreshReason::Moved,
+                    RpcErrorCode::BlockLocationUnavailable,
+                    RefreshReason::BlockLocationUnavailable,
                     format!("local block is not available for read: {message}"),
                 ));
             }
@@ -115,8 +115,8 @@ impl BlockManager {
 
         if meta.visibility.block_state != BlockState::Ready {
             return Err(Self::need_refresh(
-                RpcErrorCode::ShardMoved,
-                RefreshReason::Moved,
+                RpcErrorCode::BlockLocationUnavailable,
+                RefreshReason::BlockLocationUnavailable,
                 format!(
                     "local block is not Ready: group_name={}, block_id={}, state={:?}",
                     req.group_name, req.block_id, meta.visibility.block_state

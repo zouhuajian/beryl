@@ -102,10 +102,7 @@ impl FileReader {
                                     metric_labels("Read", OperationKind::WorkerReadData)
                                         .with_refresh_reason(reason.label()),
                                 );
-                                return Err(ClientError::Worker(format!(
-                                    "read refresh budget exhausted for {}",
-                                    reason.label()
-                                )));
+                                return Err(err);
                             }
                             if retry_budget.saturating_sub(retry_used) == 0 {
                                 self.runtime.record_metric(

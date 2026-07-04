@@ -4,6 +4,7 @@
 use super::*;
 use crate::config::RaftConfig;
 use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
+use crate::placement::{ReportedBlockLocation, WorkerPlacementView};
 use crate::raft::{AppRaftNode, AppRaftStateMachine, Command, DedupKey, RocksDBStorage};
 use crate::service::domain::{
     AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CoreResult, CreateInput, Freshness,
@@ -17,6 +18,7 @@ use common::error::canonical::{ErrorCode as CanonicalErrorCode, RefreshReason};
 use common::header::{AuthnType, CallerContext, RequestHeader, RpcErrorCode};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tempfile::TempDir;
 use types::fs::{FileAttrs, Inode};
 use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, LeaseId, MountId, WorkerId};
@@ -320,6 +322,19 @@ fn fs_core_without_mount() -> FsCore {
     FsCore::new_default(Arc::new(MemoryStateStore::new()), Arc::new(MountTable::new()))
 }
 
+fn assert_block_location_unavailable(failure: &CoreFailure, block_id: BlockId) {
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::BlockLocationUnavailable))
+    );
+    assert_eq!(failure.error.reason, Some(RefreshReason::BlockLocationUnavailable));
+    assert!(
+        failure.error.message.contains(&block_id.to_string()),
+        "error should include block id context: {}",
+        failure.error.message
+    );
+}
+
 #[tokio::test]
 async fn get_file_layout_returns_reported_locations_using_read_placement() {
     let dir = TempDir::new().unwrap();
@@ -419,7 +434,7 @@ async fn get_file_layout_returns_reported_locations_using_read_placement() {
 }
 
 #[tokio::test]
-async fn get_file_layout_returns_empty_workers_when_report_is_missing() {
+async fn get_file_layout_rejects_visible_block_when_report_is_missing() {
     let dir = TempDir::new().unwrap();
     let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(53);
@@ -450,7 +465,7 @@ async fn get_file_layout_returns_empty_workers_when_report_is_missing() {
     storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
     storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
-    let success = fs_core
+    let failure = fs_core
         .execute_get_file_layout(GetFileLayoutInput {
             ctx: request_context(),
             inode_id,
@@ -459,11 +474,9 @@ async fn get_file_layout_returns_empty_workers_when_report_is_missing() {
             freshness: Freshness::default(),
         })
         .await
-        .expect("authoritative layout should be returned without reported locations");
+        .expect_err("visible block without reported location must fail precisely");
 
-    assert_eq!(success.payload.locations.len(), 1);
-    assert_eq!(success.payload.locations[0].block_id, block_id);
-    assert!(success.payload.locations[0].workers.is_empty());
+    assert_block_location_unavailable(&failure, block_id);
 }
 
 #[tokio::test]
@@ -521,7 +534,7 @@ async fn get_file_layout_filters_non_ready_reported_locations() {
     storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
     storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
-    let success = fs_core
+    let failure = fs_core
         .execute_get_file_layout(GetFileLayoutInput {
             ctx: request_context(),
             inode_id,
@@ -530,10 +543,9 @@ async fn get_file_layout_filters_non_ready_reported_locations() {
             freshness: Freshness::default(),
         })
         .await
-        .expect("layout read succeeds");
+        .expect_err("non-ready report must not produce an empty worker location");
 
-    assert_eq!(success.payload.locations.len(), 1);
-    assert!(success.payload.locations[0].workers.is_empty());
+    assert_block_location_unavailable(&failure, block_id);
 }
 
 #[tokio::test]
@@ -592,7 +604,7 @@ async fn get_file_layout_filters_reported_locations_with_mismatched_block_stamp(
     storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
     storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
-    let success = fs_core
+    let failure = fs_core
         .execute_get_file_layout(GetFileLayoutInput {
             ctx: request_context(),
             inode_id,
@@ -601,10 +613,148 @@ async fn get_file_layout_filters_reported_locations_with_mismatched_block_stamp(
             freshness: Freshness::default(),
         })
         .await
-        .expect("layout read succeeds");
+        .expect_err("mismatched reported block stamp must fail precisely");
 
-    assert_eq!(success.payload.locations.len(), 1);
-    assert!(success.payload.locations[0].workers.is_empty());
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::BlockStampMismatch))
+    );
+    assert_eq!(failure.error.reason, Some(RefreshReason::BlockStampMismatch));
+    assert!(failure.error.message.contains(&block_id.to_string()));
+}
+
+#[tokio::test]
+async fn get_file_layout_rejects_visible_block_when_reported_worker_is_not_live() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+    let mount_id = MountId::new(56);
+    let group_name_value = group_name("g8");
+    let inode_id = InodeId::new(560);
+    let data_handle_id = DataHandleId::new(9560);
+    let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+    let worker_id = WorkerId::new(1);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name_value);
+    let worker_manager = Arc::new(WorkerManager::new(1));
+    worker_manager
+        .register_worker(&group_name_value, worker_id, "127.0.0.1:9101".to_string(), 1, None)
+        .unwrap();
+    record_worker_heartbeat(
+        &worker_manager,
+        &group_name_value,
+        worker_id,
+        1024,
+        0,
+        1024,
+        0,
+        0,
+        HealthStatus::Healthy,
+    );
+    publish_report_locations_with_stamp(
+        &worker_manager,
+        &group_name_value,
+        worker_id,
+        1,
+        Some(41),
+        vec![block_id],
+    );
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(
+        worker_manager.expire_liveness(),
+        vec![(group_name_value.clone(), worker_id)]
+    );
+    fs_core.set_storage(Arc::clone(&storage));
+    fs_core.set_worker_manager(worker_manager);
+
+    let mut attrs = FileAttrs::new();
+    attrs.size = 512;
+    let mut inode = Inode::new_file(inode_id, attrs, mount_id, data_handle_id);
+    inode.data = types::fs::InodeData::File {
+        extents: vec![types::fs::Extent {
+            file_offset: 0,
+            block_id,
+            block_offset: 0,
+            len: 512,
+            file_version: Some(1),
+            block_stamp: Some(41),
+        }],
+        file_version: Some(1),
+        lease_epoch: None,
+    };
+    storage.put_inode(&inode).unwrap();
+    storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
+
+    let failure = fs_core
+        .execute_get_file_layout(GetFileLayoutInput {
+            ctx: request_context(),
+            inode_id,
+            range: None,
+            requested_data_handle_id: None,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect_err("reported block on an expired worker must fail precisely");
+
+    assert_block_location_unavailable(&failure, block_id);
+}
+
+#[test]
+fn unavailable_read_location_classifier_detects_stale_worker_run() {
+    let group_name_value = group_name("g8b");
+    let data_handle_id = DataHandleId::new(9561);
+    let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
+    let worker_id = WorkerId::new(1);
+    let reported_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440061".parse().unwrap();
+    let current_run_id: WorkerRunId = "550e8400-e29b-41d4-a716-446655440062".parse().unwrap();
+    let extent = types::fs::Extent {
+        file_offset: 0,
+        block_id,
+        block_offset: 0,
+        len: 512,
+        file_version: Some(1),
+        block_stamp: Some(41),
+    };
+    let reported = vec![ReportedBlockLocation {
+        group_name: group_name_value.clone(),
+        block_id,
+        block_stamp: 41,
+        worker_id,
+        worker_run_id: reported_run_id,
+    }];
+    let views = vec![WorkerPlacementView {
+        group_name: group_name_value.clone(),
+        worker_id,
+        worker_run_id: Some(current_run_id),
+        endpoint: "127.0.0.1:9101".to_string(),
+        worker_net_protocol: 1,
+        registered: true,
+        lease_valid: true,
+        ip: Some("127.0.0.1".to_string()),
+        host: Some("127.0.0.1".to_string()),
+        az: None,
+        rack: None,
+        region: None,
+        free_bytes: Some(1024),
+        tier_free: vec![TierFree {
+            tier: Tier::Hdd,
+            free_bytes: 1024,
+        }],
+        supported_block_formats: vec![types::BlockFormatId::CURRENT_FOR_NEW_FILE],
+    }];
+
+    let (rpc_code, reason, message) = FsCore::classify_unavailable_read_location(
+        &request_context(),
+        &group_name_value,
+        &extent,
+        41,
+        &reported,
+        &views,
+    );
+
+    assert_eq!(rpc_code, RpcErrorCode::WorkerRunMismatch);
+    assert_eq!(reason, RefreshReason::WorkerRunMismatch);
+    assert!(message.contains("stale worker run"));
+    assert!(message.contains(&block_id.to_string()));
 }
 
 #[tokio::test]
@@ -743,7 +893,7 @@ async fn get_file_layout_does_not_cross_read_worker_descriptor_from_other_group(
     storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
     storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
-    let success = fs_core
+    let failure = fs_core
         .execute_get_file_layout(GetFileLayoutInput {
             ctx: request_context(),
             inode_id,
@@ -752,13 +902,9 @@ async fn get_file_layout_does_not_cross_read_worker_descriptor_from_other_group(
             freshness: Freshness::default(),
         })
         .await
-        .expect("layout read succeeds");
+        .expect_err("served group must not return empty locations from another group");
 
-    assert_eq!(success.payload.locations.len(), 1);
-    assert!(
-        success.payload.locations[0].workers.is_empty(),
-        "served group must not reuse another group's worker descriptor"
-    );
+    assert_block_location_unavailable(&failure, block_id);
 }
 
 #[tokio::test]
@@ -1424,6 +1570,18 @@ fn seed_committed_file_version(env: &WriteFlowEnv, file_version: u64, lease_epoc
     }
     env.storage.put_inode(&inode).unwrap();
     env.storage.put_block_ref_count(block_id, 1).unwrap();
+}
+
+fn publish_env_block_location(env: &WriteFlowEnv, block_id: BlockId, block_stamp: u64, report_seq: u64) {
+    let worker_manager = env.fs_core.worker_manager.as_ref().expect("worker manager");
+    publish_report_locations_with_stamp(
+        worker_manager,
+        &env.group_name,
+        WorkerId::new(1),
+        report_seq,
+        Some(block_stamp),
+        vec![block_id],
+    );
 }
 
 fn stored_file_version(storage: &RocksDBStorage, inode_id: InodeId) -> Option<u64> {
@@ -2505,6 +2663,7 @@ async fn create_new_commit_returns_initial_file_version() {
 async fn open_returns_file_version() {
     let env = write_flow_env(64).await;
     seed_committed_file_version(&env, 41, 900);
+    publish_env_block_location(&env, BlockId::new(env.data_handle_id, BlockIndex::new(0)), 41, 1);
 
     let read = env
         .fs_core
@@ -2585,6 +2744,7 @@ async fn append_advances_file_version() {
 async fn locations_return_file_version() {
     let env = write_flow_env(64).await;
     seed_committed_file_version(&env, 41, 900);
+    publish_env_block_location(&env, BlockId::new(env.data_handle_id, BlockIndex::new(0)), 41, 1);
 
     let locations = env
         .fs_core
@@ -2948,6 +3108,7 @@ async fn sync_write_visibility_publishes_prefix_and_keeps_session_open() {
     assert_eq!(env.storage.get_inode(env.inode_id).unwrap().unwrap().attrs.size, 64);
     assert!(synced.payload.file_version.is_some());
     assert!(env.fs_core.write_session_for_handle(key.file_handle).is_some());
+    publish_env_block_location(&env, first.block_id, first.block_stamp, 1);
 
     let layout = env
         .fs_core

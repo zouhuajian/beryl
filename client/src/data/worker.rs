@@ -10,6 +10,8 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::stream;
 
+use common::error::canonical::RefreshReason as CanonicalRefreshReason;
+
 use super::channel_pool::GrpcWorkerChannelPool;
 use super::protocol::{
     build_abort_write_request, build_commit_write_request, build_open_read_stream_request,
@@ -27,7 +29,7 @@ use crate::cache::CacheInvalidationReason;
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
 use crate::metrics::{ClientMetrics, NoopClientMetrics};
-use crate::planner::PlannedBlockRead;
+use crate::planner::{block_location_unavailable_error, PlannedBlockRead};
 use crate::runtime::{AttemptContext, ErrorClass, ErrorClassifier};
 use types::{GroupName, WriteTarget};
 
@@ -88,6 +90,25 @@ impl GrpcWorkerDataClient {
     }
 }
 
+fn is_stale_read_location_error(err: &ClientError) -> bool {
+    match err {
+        ClientError::Action(action) => match action.as_ref() {
+            crate::canonical::ClientAction::Refresh { reason, .. } => matches!(
+                reason,
+                CanonicalRefreshReason::BlockLocationUnavailable
+                    | CanonicalRefreshReason::BlockStampMismatch
+                    | CanonicalRefreshReason::WorkerRunMismatch
+                    | CanonicalRefreshReason::StaleState
+                    | CanonicalRefreshReason::Moved
+                    | CanonicalRefreshReason::FullReportRequired
+                    | CanonicalRefreshReason::NeedRegister
+            ),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 #[async_trait]
 impl WorkerDataClient for GrpcWorkerDataClient {
     async fn read_block_range(
@@ -96,7 +117,14 @@ impl WorkerDataClient for GrpcWorkerDataClient {
         group_name: GroupName,
         block_read: &PlannedBlockRead,
     ) -> ClientResult<WorkerReadResult> {
+        if block_read.workers.is_empty() {
+            return Err(block_location_unavailable_error(format!(
+                "block location unavailable: no worker candidates for block {} file_offset={} len={} block_stamp={}",
+                block_read.block_id, block_read.file_offset, block_read.len, block_read.block_stamp
+            )));
+        }
         let mut last_transport_error = None;
+        let mut last_location_error = None;
         for worker in self.worker_candidates(&block_read.workers) {
             let mut client = self.channel_pool.worker_data_service_client(worker, "OpenReadStream")?;
             let request = build_open_read_stream_request(&attempt, &group_name, block_read, worker)?;
@@ -112,9 +140,19 @@ impl WorkerDataClient for GrpcWorkerDataClient {
             };
             if let Err(err) = parse_worker_control_header(&attempt, open_response.header.as_ref()) {
                 self.channel_pool.invalidate_on_worker_run_mismatch(worker, &err);
+                if is_stale_read_location_error(&err) {
+                    last_location_error = Some(err);
+                    continue;
+                }
                 return Err(err);
             }
-            validate_open_read_stream_response(block_read, &open_response)?;
+            if let Err(err) = validate_open_read_stream_response(block_read, &open_response) {
+                if is_stale_read_location_error(&err) {
+                    last_location_error = Some(err);
+                    continue;
+                }
+                return Err(err);
+            }
             let stream_id = open_response
                 .stream_id
                 .ok_or_else(|| invalid_worker_header("worker OK response missing stream_id"))?;
@@ -153,8 +191,15 @@ impl WorkerDataClient for GrpcWorkerDataClient {
                 committed_length: open_response.committed_length,
             });
         }
-        Err(last_transport_error
-            .unwrap_or_else(|| ClientError::Worker("worker read has no reachable worker candidates".to_string())))
+        if let Some(err) = last_transport_error {
+            return Err(err);
+        }
+        Err(last_location_error.unwrap_or_else(|| {
+            block_location_unavailable_error(format!(
+                "block location unavailable: no reachable worker candidates for block {} file_offset={} len={} block_stamp={}",
+                block_read.block_id, block_read.file_offset, block_read.len, block_read.block_stamp
+            ))
+        }))
     }
 
     async fn open_block_write(
@@ -411,7 +456,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
-    use common::error::canonical::CanonicalError;
+    use common::error::canonical::{
+        CanonicalError, ErrorCode as CanonicalErrorCode, RefreshReason as CanonicalRefreshReason,
+    };
     use common::header::RpcErrorCode;
     use proto::convert::canonical_to_error_detail;
     use proto::worker::worker_data_service_server::{WorkerDataService, WorkerDataServiceServer};
@@ -528,6 +575,140 @@ mod tests {
         assert_metric(&metrics.events(), ClientMetric::CachePreciseInvalidation);
         let _ = first_shutdown.send(());
         let _ = second_shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn stale_read_location_error_tries_next_worker() {
+        let first_state = Arc::new(MockWorkerDataState {
+            open_read_response: Mutex::new(Some(open_read_error(CanonicalError::need_refresh(
+                RpcErrorCode::BlockLocationUnavailable,
+                CanonicalRefreshReason::BlockLocationUnavailable,
+                "local block is not available for read",
+            )))),
+            ..MockWorkerDataState::default()
+        });
+        let second_state = Arc::new(MockWorkerDataState {
+            read_payload: Bytes::from_static(b"data"),
+            ..MockWorkerDataState::default()
+        });
+        let (first_worker, first_shutdown) = start_mock_worker(Arc::clone(&first_state), 1).await;
+        let (second_worker, second_shutdown) = start_mock_worker(Arc::clone(&second_state), 2).await;
+        let metrics = Arc::new(RecordingMetrics::default());
+        let client = grpc_client_with_metrics(metrics);
+        let block_read = planned_block_read(vec![first_worker, second_worker]);
+
+        let result = client
+            .read_block_range(data_attempt_context("OpenReadStream"), test_group_name(), &block_read)
+            .await
+            .expect("second worker should satisfy read after stale first candidate");
+
+        assert_eq!(result.bytes, Bytes::from_static(b"data"));
+        assert_eq!(first_state.open_read_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first_state.read_stream_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(second_state.open_read_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_state.read_stream_calls.load(Ordering::SeqCst), 1);
+        let _ = first_shutdown.send(());
+        let _ = second_shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn exhausted_missing_block_candidates_surface_block_location_unavailable() {
+        let first_state = Arc::new(MockWorkerDataState {
+            open_read_response: Mutex::new(Some(open_read_error(CanonicalError::need_refresh(
+                RpcErrorCode::BlockLocationUnavailable,
+                CanonicalRefreshReason::BlockLocationUnavailable,
+                "local block is not available for read: first",
+            )))),
+            ..MockWorkerDataState::default()
+        });
+        let second_state = Arc::new(MockWorkerDataState {
+            open_read_response: Mutex::new(Some(open_read_error(CanonicalError::need_refresh(
+                RpcErrorCode::BlockLocationUnavailable,
+                CanonicalRefreshReason::BlockLocationUnavailable,
+                "local block is not available for read: second",
+            )))),
+            ..MockWorkerDataState::default()
+        });
+        let (first_worker, first_shutdown) = start_mock_worker(Arc::clone(&first_state), 1).await;
+        let (second_worker, second_shutdown) = start_mock_worker(Arc::clone(&second_state), 2).await;
+        let metrics = Arc::new(RecordingMetrics::default());
+        let client = grpc_client_with_metrics(metrics);
+        let block_read = planned_block_read(vec![first_worker, second_worker]);
+
+        let err = client
+            .read_block_range(data_attempt_context("OpenReadStream"), test_group_name(), &block_read)
+            .await
+            .expect_err("exhausted stale candidates must surface typed location error");
+
+        assert_canonical_refresh(
+            &err,
+            RpcErrorCode::BlockLocationUnavailable,
+            CanonicalRefreshReason::BlockLocationUnavailable,
+        );
+        assert_eq!(first_state.open_read_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_state.open_read_calls.load(Ordering::SeqCst), 1);
+        let _ = first_shutdown.send(());
+        let _ = second_shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn exhausted_block_stamp_mismatch_candidates_surface_block_stamp_mismatch() {
+        let state = Arc::new(MockWorkerDataState {
+            open_read_response: Mutex::new(Some(open_read_error(CanonicalError::need_refresh(
+                RpcErrorCode::BlockStampMismatch,
+                CanonicalRefreshReason::BlockStampMismatch,
+                "block stamp mismatch",
+            )))),
+            ..MockWorkerDataState::default()
+        });
+        let (worker, shutdown) = start_mock_worker(Arc::clone(&state), 1).await;
+        let metrics = Arc::new(RecordingMetrics::default());
+        let client = grpc_client_with_metrics(metrics);
+        let block_read = planned_block_read(vec![worker]);
+
+        let err = client
+            .read_block_range(data_attempt_context("OpenReadStream"), test_group_name(), &block_read)
+            .await
+            .expect_err("stamp mismatch must surface typed refresh error");
+
+        assert_canonical_refresh(
+            &err,
+            RpcErrorCode::BlockStampMismatch,
+            CanonicalRefreshReason::BlockStampMismatch,
+        );
+        assert_eq!(state.open_read_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.read_stream_calls.load(Ordering::SeqCst), 0);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn exhausted_stale_worker_run_candidates_surface_worker_run_mismatch() {
+        let state = Arc::new(MockWorkerDataState {
+            open_read_response: Mutex::new(Some(open_read_error(CanonicalError::need_refresh(
+                RpcErrorCode::WorkerRunMismatch,
+                CanonicalRefreshReason::WorkerRunMismatch,
+                "worker run mismatch",
+            )))),
+            ..MockWorkerDataState::default()
+        });
+        let (worker, shutdown) = start_mock_worker(Arc::clone(&state), 1).await;
+        let metrics = Arc::new(RecordingMetrics::default());
+        let client = grpc_client_with_metrics(metrics);
+        let block_read = planned_block_read(vec![worker]);
+
+        let err = client
+            .read_block_range(data_attempt_context("OpenReadStream"), test_group_name(), &block_read)
+            .await
+            .expect_err("worker run mismatch must surface typed refresh error");
+
+        assert_canonical_refresh(
+            &err,
+            RpcErrorCode::WorkerRunMismatch,
+            CanonicalRefreshReason::WorkerRunMismatch,
+        );
+        assert_eq!(state.open_read_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.read_stream_calls.load(Ordering::SeqCst), 0);
+        let _ = shutdown.send(());
     }
 
     #[tokio::test]
@@ -774,6 +955,7 @@ mod tests {
         read_stream_status: Option<tonic::Code>,
         read_stream_frames: Mutex<Option<Vec<Result<ReadStreamResponseProto, Status>>>>,
         read_payload: Bytes,
+        open_read_response: Mutex<Option<OpenReadStreamResponseProto>>,
         commit_status: Mutex<Option<Status>>,
         abort_response: Mutex<Option<AbortWriteResponseProto>>,
     }
@@ -793,6 +975,12 @@ mod tests {
         ) -> Result<Response<OpenReadStreamResponseProto>, Status> {
             self.state.open_read_calls.fetch_add(1, Ordering::SeqCst);
             let request = request.into_inner();
+            if let Some(mut response) = self.state.open_read_response.lock().expect("open read response").take() {
+                if let Some(header) = response.header.as_mut() {
+                    header.client = request.header.as_ref().and_then(|header| header.client.clone());
+                }
+                return Ok(Response::new(response));
+            }
             Ok(Response::new(OpenReadStreamResponseProto {
                 header: Some(ok_data_header(request.header.as_ref())),
                 stream_id: Some(proto::common::StreamIdProto { high: 1, low: 1 }),
@@ -1019,6 +1207,34 @@ mod tests {
         DataResponseHeaderProto {
             client: Some(attempt.client_info()),
             error: Some(canonical_to_error_detail(&canonical)),
+        }
+    }
+
+    fn open_read_error(canonical: CanonicalError) -> OpenReadStreamResponseProto {
+        OpenReadStreamResponseProto {
+            header: Some(data_header_with_error(canonical)),
+            stream_id: None,
+            frame_size: 0,
+            window_bytes: 0,
+            block_stamp: 0,
+            committed_length: 0,
+        }
+    }
+
+    fn assert_canonical_refresh(
+        err: &ClientError,
+        expected_code: RpcErrorCode,
+        expected_reason: CanonicalRefreshReason,
+    ) {
+        match err {
+            ClientError::Action(action) => match action.as_ref() {
+                crate::canonical::ClientAction::Refresh { reason, canonical, .. } => {
+                    assert_eq!(*reason, expected_reason);
+                    assert_eq!(canonical.code, Some(CanonicalErrorCode::RpcCode(expected_code)));
+                }
+                other => panic!("expected refresh action, got {other:?}"),
+            },
+            other => panic!("expected action error, got {other:?}"),
         }
     }
 

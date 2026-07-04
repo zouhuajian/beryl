@@ -9,6 +9,8 @@
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use common::error::canonical::{CanonicalError, RefreshHint as CanonicalRefreshHint, RefreshReason};
+use common::header::RpcErrorCode;
 use types::chunk::ByteRange;
 use types::{GroupName, WorkerEndpointInfo, WriteTarget};
 
@@ -441,12 +443,10 @@ pub(super) fn validate_worker_read_result(
     result: &WorkerReadResult,
 ) -> ClientResult<()> {
     if result.block_stamp != block_read.block_stamp {
-        return Err(invalid_response(
+        return Err(block_stamp_mismatch_error(
+            block_read,
+            result.block_stamp,
             "OpenReadStream",
-            format!(
-                "block_stamp expected {}, got {}",
-                block_read.block_stamp, result.block_stamp
-            ),
         ));
     }
     let required_committed_length = block_read
@@ -463,6 +463,30 @@ pub(super) fn validate_worker_read_result(
         ));
     }
     Ok(())
+}
+
+fn block_stamp_mismatch_error(block_read: &PlannedBlockRead, actual: u64, operation: &'static str) -> ClientError {
+    let message = format!(
+        "block stamp mismatch from {operation}: block={} expected={}, got={}",
+        block_read.block_id, block_read.block_stamp, actual
+    );
+    let canonical = CanonicalError::need_refresh_with_hint(
+        RpcErrorCode::BlockStampMismatch,
+        RefreshReason::BlockStampMismatch,
+        CanonicalRefreshHint {
+            worker_resolve_required: true,
+            ..CanonicalRefreshHint::default()
+        },
+        message,
+    );
+    ClientError::from(crate::canonical::ClientAction::Refresh {
+        reason: RefreshReason::BlockStampMismatch,
+        hint: Box::new(crate::canonical::RefreshHint {
+            worker_resolve_required: true,
+            ..crate::canonical::RefreshHint::default()
+        }),
+        canonical: Box::new(canonical),
+    })
 }
 
 fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> {
@@ -637,6 +661,31 @@ mod tests {
                 assert!(hint.worker_resolve_required);
             }
             other => panic!("expected refresh action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worker_read_result_block_stamp_mismatch_is_typed_refresh_error() {
+        let block_read = planned_block_read(77);
+        let err = validate_worker_read_result(
+            &block_read,
+            &WorkerReadResult {
+                bytes: Bytes::new(),
+                block_stamp: 78,
+                committed_length: block_read.effective_len,
+            },
+        )
+        .expect_err("block stamp mismatch must be typed");
+
+        match action(&err) {
+            ClientAction::Refresh { reason, canonical, .. } => {
+                assert_eq!(*reason, CanonicalRefreshReason::BlockStampMismatch);
+                assert_eq!(
+                    canonical.code,
+                    Some(CanonicalErrorCode::RpcCode(RpcErrorCode::BlockStampMismatch))
+                );
+            }
+            other => panic!("expected block stamp refresh action, got {other:?}"),
         }
     }
 

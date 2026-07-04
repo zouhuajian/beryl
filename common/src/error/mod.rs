@@ -76,6 +76,8 @@ pub mod canonical {
         WorkerRunMismatch,
         /// Worker must send a new full block report before deltas continue.
         FullReportRequired,
+        /// Metadata or worker cannot provide a usable location for a visible block.
+        BlockLocationUnavailable,
         /// Block stamp mismatch (data-plane).
         BlockStampMismatch,
         /// Fencing / lease fenced.

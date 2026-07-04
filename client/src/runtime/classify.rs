@@ -165,7 +165,8 @@ fn refresh_reason_from_canonical(reason: CanonicalRefreshReason) -> RefreshReaso
         CanonicalRefreshReason::WorkerRunMismatch => RefreshReason::WorkerRunMismatch,
         CanonicalRefreshReason::GroupMismatch
         | CanonicalRefreshReason::NeedRegister
-        | CanonicalRefreshReason::FullReportRequired => RefreshReason::Unknown,
+        | CanonicalRefreshReason::FullReportRequired
+        | CanonicalRefreshReason::BlockLocationUnavailable => RefreshReason::Unknown,
         CanonicalRefreshReason::BlockStampMismatch => RefreshReason::BlockStampMismatch,
         CanonicalRefreshReason::Unknown => RefreshReason::Unknown,
         CanonicalRefreshReason::Fencing

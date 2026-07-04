@@ -19,7 +19,9 @@ use crate::runtime::{AttemptContext, ErrorClass, ErrorClassifier, MetadataTarget
 use crate::session::write_session::WriteSession;
 use async_trait::async_trait;
 use bytes::Bytes;
-use common::error::canonical::{CanonicalError, RefreshHint as CanonicalRefreshHint, RefreshReason};
+use common::error::canonical::{
+    CanonicalError, ErrorCode as CanonicalErrorCode, RefreshHint as CanonicalRefreshHint, RefreshReason,
+};
 use common::header::RpcErrorCode;
 use proto::common::{BlockIdProto, FencingTokenProto};
 use proto::metadata::{
@@ -415,8 +417,19 @@ async fn reader_rejects_worker_block_stamp_mismatch() {
         .await
         .expect_err("worker block_stamp mismatch must fail");
 
-    assert!(matches!(&err, ClientError::InvalidResponse { operation, reason }
-        if *operation == "OpenReadStream" && reason.contains("block_stamp")));
+    match &err {
+        ClientError::Action(action) => match action.as_ref() {
+            ClientAction::Refresh { reason, canonical, .. } => {
+                assert_eq!(*reason, RefreshReason::BlockStampMismatch);
+                assert_eq!(
+                    canonical.code,
+                    Some(CanonicalErrorCode::RpcCode(RpcErrorCode::BlockStampMismatch))
+                );
+            }
+            other => panic!("expected refresh action, got {other:?}"),
+        },
+        other => panic!("expected typed action error, got {other:?}"),
+    }
 }
 
 #[tokio::test]

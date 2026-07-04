@@ -213,6 +213,7 @@ pub(crate) fn worker_error_kind(error: &WorkerError) -> &'static str {
             common::error::canonical::RefreshReason::GroupMismatch => "group_mismatch",
             common::error::canonical::RefreshReason::StaleState => "stale_state",
             common::error::canonical::RefreshReason::FullReportRequired => "full_report_required",
+            common::error::canonical::RefreshReason::BlockLocationUnavailable => "block_location_unavailable",
             common::error::canonical::RefreshReason::BlockStampMismatch => "block_stamp_mismatch",
             common::error::canonical::RefreshReason::Fencing => "fencing",
             common::error::canonical::RefreshReason::EpochMismatch => "epoch_mismatch",

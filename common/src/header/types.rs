@@ -227,6 +227,7 @@ pub enum RpcErrorCode {
     WorkerRunMismatch,
     WorkerDescriptorMismatch,
     FullReportRequired,
+    BlockLocationUnavailable,
     BlockStampMismatch,
     EpochMismatch,
     Fencing,

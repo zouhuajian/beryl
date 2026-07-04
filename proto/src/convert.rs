@@ -1143,6 +1143,9 @@ fn rpc_code_proto_to_enum(code: i32) -> RpcErrorCode {
         x if x == proto_common::RpcErrorCodeProto::RpcErrCodeFullReportRequired as i32 => {
             RpcErrorCode::FullReportRequired
         }
+        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeBlockLocationUnavailable as i32 => {
+            RpcErrorCode::BlockLocationUnavailable
+        }
         x if x == proto_common::RpcErrorCodeProto::RpcErrCodeBlockStampMismatch as i32 => {
             RpcErrorCode::BlockStampMismatch
         }
@@ -1176,6 +1179,9 @@ fn rpc_code_enum_to_proto(code: RpcErrorCode) -> i32 {
             proto_common::RpcErrorCodeProto::RpcErrCodeWorkerDescriptorMismatch as i32
         }
         RpcErrorCode::FullReportRequired => proto_common::RpcErrorCodeProto::RpcErrCodeFullReportRequired as i32,
+        RpcErrorCode::BlockLocationUnavailable => {
+            proto_common::RpcErrorCodeProto::RpcErrCodeBlockLocationUnavailable as i32
+        }
         RpcErrorCode::BlockStampMismatch => proto_common::RpcErrorCodeProto::RpcErrCodeBlockStampMismatch as i32,
         RpcErrorCode::EpochMismatch => proto_common::RpcErrorCodeProto::RpcErrCodeEpochMismatch as i32,
         RpcErrorCode::Fencing => proto_common::RpcErrorCodeProto::RpcErrCodeFencing as i32,
@@ -1199,6 +1205,9 @@ fn refresh_reason_proto_to_enum(reason: proto_common::RefreshReasonProto) -> Ref
         proto_common::RefreshReasonProto::RefreshReasonNeedRegister => RefreshReason::NeedRegister,
         proto_common::RefreshReasonProto::RefreshReasonWorkerRunMismatch => RefreshReason::WorkerRunMismatch,
         proto_common::RefreshReasonProto::RefreshReasonFullReportRequired => RefreshReason::FullReportRequired,
+        proto_common::RefreshReasonProto::RefreshReasonBlockLocationUnavailable => {
+            RefreshReason::BlockLocationUnavailable
+        }
         proto_common::RefreshReasonProto::RefreshReasonBlockStampMismatch => RefreshReason::BlockStampMismatch,
         proto_common::RefreshReasonProto::RefreshReasonFencing => RefreshReason::Fencing,
         proto_common::RefreshReasonProto::RefreshReasonEpochMismatch => RefreshReason::EpochMismatch,
@@ -1220,6 +1229,9 @@ fn refresh_reason_to_proto(reason: &Option<RefreshReason>) -> i32 {
         RefreshReason::NeedRegister => proto_common::RefreshReasonProto::RefreshReasonNeedRegister as i32,
         RefreshReason::WorkerRunMismatch => proto_common::RefreshReasonProto::RefreshReasonWorkerRunMismatch as i32,
         RefreshReason::FullReportRequired => proto_common::RefreshReasonProto::RefreshReasonFullReportRequired as i32,
+        RefreshReason::BlockLocationUnavailable => {
+            proto_common::RefreshReasonProto::RefreshReasonBlockLocationUnavailable as i32
+        }
         RefreshReason::BlockStampMismatch => proto_common::RefreshReasonProto::RefreshReasonBlockStampMismatch as i32,
         RefreshReason::Fencing => proto_common::RefreshReasonProto::RefreshReasonFencing as i32,
         RefreshReason::EpochMismatch => proto_common::RefreshReasonProto::RefreshReasonEpochMismatch as i32,
@@ -1596,6 +1608,7 @@ mod tests {
                 ("REFRESH_REASON_NEED_REGISTER", 13),
                 ("REFRESH_REASON_WORKER_RUN_MISMATCH", 14),
                 ("REFRESH_REASON_FULL_REPORT_REQUIRED", 15),
+                ("REFRESH_REASON_BLOCK_LOCATION_UNAVAILABLE", 16),
             ]
         );
         assert_eq!(
@@ -1626,6 +1639,7 @@ mod tests {
                 ("RPC_ERR_CODE_FENCING", 42),
                 ("RPC_ERR_CODE_SHARD_MOVED", 43),
                 ("RPC_ERR_CODE_NODE_UNAVAILABLE", 44),
+                ("RPC_ERR_CODE_BLOCK_LOCATION_UNAVAILABLE", 45),
                 ("RPC_ERR_CODE_MOUNT_EPOCH_MISMATCH", 50),
                 ("RPC_ERR_CODE_ROUTE_EPOCH_MISMATCH", 51),
                 ("RPC_ERR_CODE_BLOCK_STAMP_MISMATCH", 52),

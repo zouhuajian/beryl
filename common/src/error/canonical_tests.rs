@@ -89,6 +89,7 @@ mod tests {
             RefreshReason::StaleState,
             RefreshReason::MountEpochMismatch,
             RefreshReason::RouteEpochMismatch,
+            RefreshReason::BlockLocationUnavailable,
             RefreshReason::BlockStampMismatch,
             RefreshReason::Fencing,
             RefreshReason::EpochMismatch,

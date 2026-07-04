@@ -2909,7 +2909,7 @@ mod tests {
         assert_not_found(store.read_at(&group_name(), block_id(), 0, 1));
         assert_need_refresh(
             core.open_read(read_open_request_for(0, 1, BLOCK_STAMP, 512)).await,
-            RefreshReason::Moved,
+            RefreshReason::BlockLocationUnavailable,
         );
         assert!(store.scan_group_blocks(&group_name()).expect("scan group").is_empty());
     }
@@ -3203,7 +3203,7 @@ mod tests {
 
         assert_need_refresh(
             core.open_read(read_open_request_for(0, 1024, BLOCK_STAMP, 512)).await,
-            common::error::canonical::RefreshReason::Moved,
+            common::error::canonical::RefreshReason::BlockLocationUnavailable,
         );
         assert_eq!(core.stream_manager().active_count().await, 0);
     }
@@ -3796,6 +3796,30 @@ mod tests {
         assert_eq!(
             error.refresh_reason,
             RefreshReasonProto::RefreshReasonBlockStampMismatch as i32
+        );
+        assert!(response.stream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn open_read_stream_returns_unavailable_location_on_missing_block() {
+        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let service = registered_data_service(Arc::new(core));
+
+        let response = service
+            .open_read_stream(tonic::Request::new(open_read_proto(0, 1024, BLOCK_STAMP, 512)))
+            .await
+            .expect("open read response")
+            .into_inner();
+        let error = response
+            .header
+            .expect("header")
+            .error
+            .expect("missing block should return structured error");
+
+        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+        assert_eq!(
+            error.refresh_reason,
+            RefreshReasonProto::RefreshReasonBlockLocationUnavailable as i32
         );
         assert!(response.stream_id.is_none());
     }

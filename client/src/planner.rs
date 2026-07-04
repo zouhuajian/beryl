@@ -3,6 +3,9 @@
 
 //! Read planning from metadata block locations to worker block reads.
 
+use common::error::canonical::{CanonicalError, RefreshHint, RefreshReason};
+use common::header::RpcErrorCode;
+
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::ReadLayout;
 use types::{BlockId, DataHandleId, FileBlockLocation, GroupName, WorkerEndpointInfo};
@@ -111,6 +114,12 @@ pub(crate) fn plan_block_reads(
                 block_id
             )));
         }
+        if location.workers.is_empty() {
+            return Err(block_location_unavailable_error(format!(
+                "block location unavailable: metadata returned no worker candidates for block {} file_offset={} len={} block_stamp={}",
+                block_id, location.file_offset, location.len, block_stamp
+            )));
+        }
         if end <= requested_range.file_offset || location.file_offset >= requested_range.end_file_offset() {
             continue;
         }
@@ -213,6 +222,26 @@ pub(crate) fn plan_block_reads_from_layout(
 
 fn file_version_from_response(value: Option<u64>, field: &str) -> ClientResult<u64> {
     value.ok_or_else(|| ClientError::InvalidLayout(format!("{field} missing")))
+}
+
+pub(crate) fn block_location_unavailable_error(message: impl Into<String>) -> ClientError {
+    let canonical = CanonicalError::need_refresh_with_hint(
+        RpcErrorCode::BlockLocationUnavailable,
+        RefreshReason::BlockLocationUnavailable,
+        RefreshHint {
+            worker_resolve_required: true,
+            ..RefreshHint::default()
+        },
+        message,
+    );
+    ClientError::from(crate::canonical::ClientAction::Refresh {
+        reason: RefreshReason::BlockLocationUnavailable,
+        hint: Box::new(crate::canonical::RefreshHint {
+            worker_resolve_required: true,
+            ..crate::canonical::RefreshHint::default()
+        }),
+        canonical: Box::new(canonical),
+    })
 }
 
 #[cfg(test)]
@@ -335,18 +364,17 @@ mod tests {
     }
 
     #[test]
-    fn planner_accepts_empty_worker_candidates_from_metadata() {
+    fn planner_rejects_empty_worker_candidates_from_metadata_as_block_location_unavailable() {
         let requested_range = requested_range(0, 4, 20)
             .expect("range planning succeeds")
             .expect("non-empty requested range");
         let mut location = location(10, 0, 0, 4, 101);
         location.workers.clear();
 
-        let block_reads =
-            plan_block_reads(DataHandleId::new(10), requested_range, &[location]).expect("location covers range");
+        let err = plan_block_reads(DataHandleId::new(10), requested_range, &[location])
+            .expect_err("empty worker candidate list must not produce a read plan");
 
-        assert_eq!(block_reads.len(), 1);
-        assert!(block_reads[0].workers.is_empty());
+        assert_block_location_unavailable(&err);
     }
 
     fn location(
@@ -371,6 +399,27 @@ mod tests {
             block_size: 4096,
             chunk_size: 1024,
             effective_len: len,
+        }
+    }
+
+    fn assert_block_location_unavailable(err: &ClientError) {
+        match err {
+            ClientError::Action(action) => match action.as_ref() {
+                crate::canonical::ClientAction::Refresh { reason, canonical, .. } => {
+                    assert_eq!(
+                        *reason,
+                        common::error::canonical::RefreshReason::BlockLocationUnavailable
+                    );
+                    assert_eq!(
+                        canonical.code,
+                        Some(common::error::canonical::ErrorCode::RpcCode(
+                            common::header::RpcErrorCode::BlockLocationUnavailable
+                        ))
+                    );
+                }
+                other => panic!("expected block-location refresh error, got {other:?}"),
+            },
+            other => panic!("expected action error, got {other:?}"),
         }
     }
 }

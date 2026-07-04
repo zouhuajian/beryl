@@ -416,6 +416,7 @@ fn metadata_worker_refresh_reason_kind(reason: RefreshReason) -> &'static str {
         RefreshReason::NeedRegister => "need_register",
         RefreshReason::WorkerRunMismatch => "worker_run_mismatch",
         RefreshReason::FullReportRequired => "full_report_required",
+        RefreshReason::BlockLocationUnavailable => "block_location_unavailable",
         RefreshReason::BlockStampMismatch => "block_stamp_mismatch",
         RefreshReason::Fencing => "fencing",
         RefreshReason::EpochMismatch => "epoch_mismatch",

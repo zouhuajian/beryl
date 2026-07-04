@@ -14,7 +14,7 @@ use metadata::service::{
     SharedWorkerCommitHook,
 };
 use metadata::state::MemoryStateStore;
-use metadata::worker::{HealthStatus, WorkerManager};
+use metadata::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerManager};
 use openraft::{LeaderId, LogId};
 use proto::common::{
     error_detail_proto::Code as ErrorCodeProto, DataHandleIdProto, ErrorClassProto, FsErrnoProto,
@@ -46,6 +46,7 @@ struct PathTestEnv {
     mount_table: Arc<MountTable>,
     service: MetadataFileSystemServiceImpl,
     write_session_manager: Arc<metadata::write_session::WriteSessionManager>,
+    worker_manager: Option<Arc<WorkerManager>>,
     mount_id: types::ids::MountId,
     root_inode_id: InodeId,
 }
@@ -319,6 +320,7 @@ fn build_env(
         mount_table,
         service,
         write_session_manager,
+        worker_manager: None,
         mount_id: mount_entry.mount_id,
         root_inode_id,
     }
@@ -407,7 +409,7 @@ async fn build_env_with_raft_and_workers(
             write_session_manager: Arc::clone(&write_session_manager),
             inode_lease_manager,
             worker_commit_hook,
-            worker_manager,
+            worker_manager: worker_manager.clone(),
             metrics: None,
             readiness_gate: None,
         },
@@ -423,6 +425,7 @@ async fn build_env_with_raft_and_workers(
         mount_table,
         service,
         write_session_manager,
+        worker_manager,
         mount_id: mount_entry.mount_id,
         root_inode_id,
     }
@@ -463,6 +466,34 @@ fn worker_manager_for_write_targets() -> Arc<WorkerManager> {
             .expect("record worker heartbeat");
     }
     manager
+}
+
+fn publish_reported_location(env: &PathTestEnv, block_id: BlockId, block_stamp: u64, effective_len: u64) {
+    let worker_manager = env.worker_manager.as_ref().expect("worker manager");
+    let worker_id = WorkerId::new(1);
+    let worker_run_id = worker_manager
+        .get_registration(&group_name("root"), worker_id)
+        .expect("worker registration")
+        .worker_run_id;
+    worker_manager
+        .receive_full_block_report(
+            &group_name("root"),
+            worker_id,
+            worker_run_id,
+            1,
+            0,
+            true,
+            vec![BlockReportBlock {
+                block_id,
+                data_handle_id: block_id.data_handle_id.as_raw(),
+                block_index: block_id.index.as_raw(),
+                block_stamp,
+                effective_len,
+                committed_length: effective_len,
+                block_state: BlockReportBlockState::Ready,
+            }],
+        )
+        .expect("full block report should publish location");
 }
 
 async fn open_write_session_with_committed_block(
@@ -1891,6 +1922,7 @@ async fn commit_file_public_replay_returns_persisted_result_and_rejects_fingerpr
         BlockIndex::new(block_id.block_index),
     );
     assert_eq!(env.storage.get_block_ref_count(typed_block_id).unwrap(), Some(1));
+    publish_reported_location(&env, typed_block_id, first_file_version, target.effective_len);
 
     let locations = FileSystemServiceProto::get_block_locations(
         &env.service,
