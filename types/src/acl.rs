@@ -17,8 +17,7 @@
 //!
 //! Notes:
 //! - POSIX ACL models subject-level `rwx` permissions (`User/Group/Other/Mask`).
-//! - Mapping from ACL `rwx` permissions to authz operation primitives (`READ/WRITE/EXECUTE/RENAME/DELETE/XATTR`)
-//!   is a provider/policy concern (future ACL provider), not part of this data model.
+//! - Mapping ACL `rwx` permissions to authz operation primitives is not active runtime behavior.
 //! - This module defines storage/domain representation only; it does not validate or deny runtime operations.
 
 use serde::{Deserialize, Serialize};

@@ -132,7 +132,7 @@ impl DedupKey {
         Self { client_id, call_id }
     }
 
-    pub fn from_header_identity(identity: &HeaderIdentity) -> Result<Self, String> {
+    pub(crate) fn from_header_identity(identity: &HeaderIdentity) -> Result<Self, String> {
         if identity.client_id.is_zero() {
             return Err("client_id must be non-zero for dedup".to_string());
         }

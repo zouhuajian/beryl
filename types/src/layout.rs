@@ -167,7 +167,7 @@ impl FileLayout {
     /// This is the unified conversion function that should be reused by all read/write paths.
     ///
     /// # Arguments
-    /// * `_block_id` - The block ID (for future use, e.g., validation)
+    /// * `_block_id` - The block ID, currently unused by chunk slicing.
     /// * `offset` - Offset within the block (0-based)
     /// * `len` - Length in bytes
     ///

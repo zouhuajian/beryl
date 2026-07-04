@@ -559,7 +559,11 @@ fn parse_metadata_response_header(
             "metadata OK response invalid ResponseHeader: {err}"
         )))
     })?;
-    let identity = header.identity();
+    let identity = HeaderIdentity {
+        call_id: header.client.call_id,
+        client_id: header.client.client_id,
+        group_name: header.group_name.clone(),
+    };
     let group_name = identity.group_name.clone().ok_or_else(|| {
         ClientError::from(invalid_header_action(
             "metadata OK response invalid ResponseHeader: group_name missing",

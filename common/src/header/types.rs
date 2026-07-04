@@ -32,17 +32,12 @@ pub struct HeaderIdentity {
 }
 
 impl HeaderIdentity {
-    /// Return true when two headers belong to the same client logical call.
-    pub fn same_client_call(&self, other: &Self) -> bool {
-        self.client_id == other.client_id && self.call_id == other.call_id
-    }
-
     /// Return true when a response identity matches the basic request identity.
     ///
     /// This intentionally excludes freshness, replay, and state-watermark
     /// checks; those remain owned by the caller's boundary logic.
     pub fn matches_request(&self, request: &Self) -> bool {
-        self.same_client_call(request) && self.group_name == request.group_name
+        self.client_id == request.client_id && self.call_id == request.call_id && self.group_name == request.group_name
     }
 }
 
@@ -77,13 +72,11 @@ pub struct RequestHeader {
     pub state: Vec<GroupStateWatermark>,
     /// Optional route epoch observed by client.
     pub route_epoch: Option<u64>,
-    /// Authenticated principal/user identity.
-    ///
-    /// Required when ACL authorization mode is enabled.
+    /// Authenticated principal/user identity for audit and diagnostics.
     pub principal: Option<String>,
-    /// Real user identity (proxy-user scenarios; reserved for future use).
+    /// Real user identity carried for proxy-user diagnostics.
     pub real_user: Option<String>,
-    /// Proxy/doAs target user (reserved for future use).
+    /// Proxy/doAs target user carried for diagnostics.
     pub doas: Option<String>,
     /// Authentication type marker for the request.
     pub authn_type: AuthnType,
@@ -496,10 +489,5 @@ impl ResponseHeader {
     pub fn with_group_name(mut self, group_name: GroupName) -> Self {
         self.group_name = Some(group_name);
         self
-    }
-
-    /// Return the basic parsed header identity.
-    pub fn identity(&self) -> HeaderIdentity {
-        self.client.identity_with_group(self.group_name.clone())
     }
 }

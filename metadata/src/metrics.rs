@@ -18,8 +18,7 @@ pub(crate) static DEDUP_EVICTED_TTL_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DEDUP_EVICTED_SIZE_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DEDUP_STORE_ENTRIES_GAUGE: AtomicU64 = AtomicU64::new(0);
 
-// Current authz implementation only supports NONE; future ACL/Ranger metrics
-// should be added with their implementation rather than exported as zeroes.
+// Current authz implementation only supports NONE.
 pub(crate) static AUTHZ_ALLOW_NONE_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Process-local metadata counters.

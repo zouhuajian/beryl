@@ -42,10 +42,10 @@ pub struct AuditRecord {
 pub struct AuditLogger {
     /// Sender for audit records.
     sender: mpsc::UnboundedSender<AuditRecord>,
-    /// Current log file path (stored for potential future use, e.g., querying current log file).
+    /// Current log file path retained with the logger state.
     #[allow(dead_code)]
     current_log_path: PathBuf,
-    /// Base directory for audit logs (stored for potential future use, e.g., querying base directory).
+    /// Base directory retained with the logger state.
     #[allow(dead_code)]
     base_dir: PathBuf,
 }
