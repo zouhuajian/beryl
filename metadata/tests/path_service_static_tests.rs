@@ -225,14 +225,13 @@ fn auth_permission_contract_lives_in_single_file_without_stale_public_surface() 
     }
 
     let auth_mod = std::fs::read_to_string(auth_file).expect("read auth.rs");
-    assert!(auth_mod.contains("pub struct NonePermissionChecker"));
-    assert!(auth_mod.contains("pub trait PermissionChecker"));
+    assert!(!auth_mod.contains("pub struct NonePermissionChecker"));
+    assert!(!auth_mod.contains("pub trait PermissionChecker"));
     assert!(
         auth_mod.contains("Current active behavior is the NONE")
-            && auth_mod.contains("Vecton currently supports only the NONE")
-            && auth_mod.contains("ACL and Ranger providers")
-            && auth_mod.contains("expected future implementations"),
-        "auth.rs must state that ACL/Ranger are future implementations, not active behavior"
+            && auth_mod.contains("supports only the NONE permission mode")
+            && auth_mod.contains("ACL and Ranger modes fail fast"),
+        "auth.rs must state that ACL/Ranger are not active behavior"
     );
     for forbidden in [
         "AuthzTarget",
@@ -249,10 +248,49 @@ fn auth_permission_contract_lives_in_single_file_without_stale_public_surface() 
         "InodePermReader",
         "StaticPermReader",
         "StaticGroupResolver",
+        "PermissionChecker",
+        "NonePermissionChecker",
     ] {
         assert!(
             !auth_mod.contains(forbidden),
             "auth.rs must not expose ACL/Ranger stale implementation detail `{forbidden}`"
         );
     }
+}
+
+#[test]
+fn guard_and_path_service_do_not_expose_leadership_trait_injection() {
+    let service_mod = include_str!("../src/service/mod.rs");
+    let guard = include_str!("../src/service/guard.rs");
+    let path_service = include_str!("../src/service/path_service.rs");
+
+    for (name, source) in [
+        ("service/mod.rs", service_mod),
+        ("guard.rs", guard),
+        ("path_service.rs", path_service),
+    ] {
+        assert!(
+            !source.contains("LeadershipChecker"),
+            "{name} must not expose production leadership trait injection"
+        );
+    }
+}
+
+#[test]
+fn memory_state_store_is_test_only_not_production_surface() {
+    let state_mod = include_str!("../src/state/mod.rs");
+    let metadata_lib = include_str!("../src/lib.rs");
+
+    assert!(
+        state_mod.contains("#[cfg(test)]\nmod memory;"),
+        "memory StateStore implementation must be compiled only for metadata unit tests"
+    );
+    assert!(
+        state_mod.contains("#[cfg(test)]\npub use memory::MemoryStateStore;"),
+        "MemoryStateStore export must be test-only"
+    );
+    assert!(
+        !metadata_lib.contains("MemoryStateStore"),
+        "metadata lib docs must not present MemoryStateStore as production-visible surface"
+    );
 }

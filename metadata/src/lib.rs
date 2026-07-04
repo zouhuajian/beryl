@@ -39,7 +39,7 @@
 //!   state.
 //! - **Raft** commits metadata mutations at authority boundaries.
 //! - **RaftStateStore** is the production route-epoch `StateStore`
-//!   implementation. `MemoryStateStore` is retained under `state` for tests.
+//!   implementation.
 //!
 //! ## Freshness and Current Limitations
 //!

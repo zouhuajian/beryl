@@ -1,25 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Permission checker contract and current allow-all implementation.
+//! Current filesystem permission policy.
 //!
-//! This module currently provides the permission-checking extension point and
-//! the default allow-all implementation. Current active behavior is the NONE
-//! allow-all mode. Vecton currently supports only the NONE permission mode in
-//! this metadata service. ACL and Ranger providers are
-//! expected future implementations: their config values fail fast until explicit
-//! `PermissionChecker` implementations and tests exist.
+//! Current active behavior is the NONE allow-all mode. Vecton currently
+//! supports only the NONE permission mode in this metadata service.
+//! ACL and Ranger modes fail fast; they are not active behavior.
 
 use crate::config::FileSystemAuthzMode;
 use crate::metrics::AUTHZ_ALLOW_NONE_TOTAL;
 use crate::path_resolver::ResolvedPath;
 use crate::service::domain::RequestContext;
-use async_trait::async_trait;
 use bitflags::bitflags;
 use common::error::canonical::CanonicalError;
 use common::error::{CommonError, CommonErrorCode};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,106 +25,13 @@ bitflags! {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SetAttrPerm {
-    pub super_required: bool,
-    pub owner_required: bool,
-    pub write_required: bool,
+fn record_none_allow() {
+    AUTHZ_ALLOW_NONE_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
-#[async_trait]
-pub trait PermissionChecker: Send + Sync {
-    async fn check_perm(
-        &self,
-        ctx: &RequestContext,
-        bits: PermissionBits,
-        path: &str,
-        resolved: &ResolvedPath,
-    ) -> Result<(), CanonicalError>;
-
-    async fn check_parent_perm(
-        &self,
-        ctx: &RequestContext,
-        bits: PermissionBits,
-        path: &str,
-        resolved: &ResolvedPath,
-    ) -> Result<(), CanonicalError>;
-
-    async fn check_super(&self, ctx: &RequestContext) -> Result<(), CanonicalError>;
-
-    async fn get_perm(
-        &self,
-        ctx: &RequestContext,
-        path: &str,
-        resolved: &ResolvedPath,
-    ) -> Result<PermissionBits, CanonicalError>;
-
-    async fn check_set_attr_perm(
-        &self,
-        ctx: &RequestContext,
-        path: &str,
-        resolved: &ResolvedPath,
-        req: SetAttrPerm,
-    ) -> Result<(), CanonicalError>;
-}
-
-#[derive(Clone, Debug)]
-pub struct NonePermissionChecker;
-
-#[async_trait]
-impl PermissionChecker for NonePermissionChecker {
-    async fn check_perm(
-        &self,
-        _ctx: &RequestContext,
-        _bits: PermissionBits,
-        _path: &str,
-        _resolved: &ResolvedPath,
-    ) -> Result<(), CanonicalError> {
-        AUTHZ_ALLOW_NONE_TOTAL.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
-    async fn check_parent_perm(
-        &self,
-        _ctx: &RequestContext,
-        _bits: PermissionBits,
-        _path: &str,
-        _resolved: &ResolvedPath,
-    ) -> Result<(), CanonicalError> {
-        AUTHZ_ALLOW_NONE_TOTAL.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
-    async fn check_super(&self, _ctx: &RequestContext) -> Result<(), CanonicalError> {
-        AUTHZ_ALLOW_NONE_TOTAL.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
-    async fn get_perm(
-        &self,
-        _ctx: &RequestContext,
-        _path: &str,
-        _resolved: &ResolvedPath,
-    ) -> Result<PermissionBits, CanonicalError> {
-        AUTHZ_ALLOW_NONE_TOTAL.fetch_add(1, Ordering::Relaxed);
-        Ok(PermissionBits::all())
-    }
-
-    async fn check_set_attr_perm(
-        &self,
-        _ctx: &RequestContext,
-        _path: &str,
-        _resolved: &ResolvedPath,
-        _req: SetAttrPerm,
-    ) -> Result<(), CanonicalError> {
-        AUTHZ_ALLOW_NONE_TOTAL.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-}
-
-pub fn filesystem_permission_checker(mode: FileSystemAuthzMode) -> Result<Arc<dyn PermissionChecker>, CommonError> {
+pub fn validate_filesystem_permission_mode(mode: FileSystemAuthzMode) -> Result<(), CommonError> {
     match mode {
-        FileSystemAuthzMode::None => Ok(Arc::new(NonePermissionChecker)),
+        FileSystemAuthzMode::None => Ok(()),
         FileSystemAuthzMode::Acl => Err(CommonError::new(
             CommonErrorCode::InvalidArgument,
             "ACL permission mode is not implemented yet",
@@ -139,6 +41,31 @@ pub fn filesystem_permission_checker(mode: FileSystemAuthzMode) -> Result<Arc<dy
             "Ranger permission mode is not implemented yet",
         )),
     }
+}
+
+pub fn check_perm(
+    _ctx: &RequestContext,
+    _bits: PermissionBits,
+    _path: &str,
+    _resolved: &ResolvedPath,
+) -> Result<(), CanonicalError> {
+    record_none_allow();
+    Ok(())
+}
+
+pub fn check_parent_perm(
+    _ctx: &RequestContext,
+    _bits: PermissionBits,
+    _path: &str,
+    _resolved: &ResolvedPath,
+) -> Result<(), CanonicalError> {
+    record_none_allow();
+    Ok(())
+}
+
+pub fn check_super(_ctx: &RequestContext) -> Result<(), CanonicalError> {
+    record_none_allow();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -180,48 +107,28 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn none_permission_checker_allows_all_operations() {
+    #[test]
+    fn none_permission_policy_allows_current_guard_operations() {
         let req_ctx = test_request_context();
-        let checker = NonePermissionChecker;
         let resolved = resolved_parent(InodeId::new(3), vec![InodeId::new(1), InodeId::new(2)]);
 
-        checker
-            .check_perm(&req_ctx, PermissionBits::READ, "/mnt/target", &resolved)
-            .await
+        check_perm(&req_ctx, PermissionBits::READ, "/mnt/target", &resolved)
             .expect("NONE permission mode allows direct permission checks");
-        checker
-            .check_parent_perm(&req_ctx, PermissionBits::WRITE, "/mnt/parent/new-file", &resolved)
-            .await
+        check_parent_perm(&req_ctx, PermissionBits::WRITE, "/mnt/parent/new-file", &resolved)
             .expect("NONE permission mode allows parent permission checks");
-        checker
-            .check_set_attr_perm(&req_ctx, "/mnt/target", &resolved, SetAttrPerm::default())
-            .await
-            .expect("NONE permission mode allows setattr permission checks");
-        checker
-            .check_super(&req_ctx)
-            .await
-            .expect("NONE permission mode allows superuser checks");
-
-        assert_eq!(
-            checker
-                .get_perm(&req_ctx, "/mnt/target", &resolved)
-                .await
-                .expect("NONE permission mode reports allow-all bits"),
-            PermissionBits::all()
-        );
+        check_super(&req_ctx).expect("NONE permission mode allows superuser checks");
     }
 
     #[test]
-    fn factory_constructs_none_and_rejects_future_modes() {
-        assert!(filesystem_permission_checker(FileSystemAuthzMode::None).is_ok());
+    fn permission_mode_validator_accepts_none_and_rejects_future_modes() {
+        assert!(validate_filesystem_permission_mode(FileSystemAuthzMode::None).is_ok());
 
-        match filesystem_permission_checker(FileSystemAuthzMode::Acl) {
+        match validate_filesystem_permission_mode(FileSystemAuthzMode::Acl) {
             Ok(_) => panic!("ACL mode must fail fast instead of mapping to NONE"),
             Err(err) => assert_eq!(err.message, "ACL permission mode is not implemented yet"),
         }
 
-        match filesystem_permission_checker(FileSystemAuthzMode::Ranger) {
+        match validate_filesystem_permission_mode(FileSystemAuthzMode::Ranger) {
             Ok(_) => panic!("Ranger mode must fail fast instead of mapping to NONE"),
             Err(err) => assert_eq!(err.message, "Ranger permission mode is not implemented yet"),
         }

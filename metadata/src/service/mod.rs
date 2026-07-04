@@ -4,8 +4,8 @@
 //! Metadata service implementation.
 //!
 //! Implements the FileSystemService adapter, guard chain, FsCore domain layer,
-//! msync handler, and permission-checking extension point used by the metadata
-//! runtime.
+//! msync handler, and current NONE filesystem permission policy used by the
+//! metadata runtime.
 
 pub mod auth;
 mod core_util;
@@ -15,9 +15,7 @@ mod guard;
 mod msync;
 mod path_service;
 
-pub use self::auth::{
-    filesystem_permission_checker, NonePermissionChecker, PermissionBits, PermissionChecker, SetAttrPerm,
-};
+pub use self::auth::{validate_filesystem_permission_mode, PermissionBits};
 pub use core_util::{
     extract_and_inject_context, fatal_fs_header, fencing_to_proto, file_attrs_from_proto, file_attrs_to_proto,
     file_layout_from_proto, header_from_canonical_error, header_from_core_failure, lease_id_from_proto,
@@ -27,9 +25,8 @@ pub use core_util::{
 };
 pub(crate) use fs_core::FsCore;
 pub use fs_core::SharedWorkerCommitHook;
-pub use guard::{GuardChain, GuardFailure, LeadershipChecker};
+pub use guard::{GuardChain, GuardFailure};
 pub use msync::MsyncHandler;
 pub use path_service::{
-    FileSystemAuthorityDeps, FileSystemPolicyDeps, FileSystemRuntimeDeps, MetadataFileSystemServiceDeps,
-    MetadataFileSystemServiceImpl,
+    FileSystemAuthorityDeps, FileSystemRuntimeDeps, MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl,
 };

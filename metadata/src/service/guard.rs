@@ -3,7 +3,7 @@
 
 //! Request guard pipeline for metadata services.
 
-use super::auth::{NonePermissionChecker, PermissionBits, PermissionChecker, SetAttrPerm};
+use super::auth::{self, PermissionBits};
 use super::domain::RequestContext;
 use crate::data_io::DataIoOp;
 use crate::error::{to_canonical_rpc, MetadataError};
@@ -17,26 +17,6 @@ use std::sync::Arc;
 use types::fs::FsErrorCode;
 use types::ids::MountId;
 use types::GroupName;
-
-pub trait LeadershipChecker: Send + Sync {
-    fn is_leader(&self) -> bool;
-    fn leader_endpoint(&self) -> Option<String> {
-        None
-    }
-}
-
-impl LeadershipChecker for AppRaftNode {
-    fn is_leader(&self) -> bool {
-        self.is_leader()
-    }
-
-    fn leader_endpoint(&self) -> Option<String> {
-        let leader_id = self.get_leader_id()?;
-        let membership = self.get_membership()?;
-        let leader_node = membership.nodes().find(|(node_id, _)| **node_id == leader_id)?.1;
-        Some(leader_node.address.clone())
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct GuardFailure {
@@ -70,16 +50,14 @@ pub struct GuardChain {
     readiness: ReadinessGuard,
     leadership: LeadershipGuard,
     data_io: DataIoPolicyGuard,
-    permission: Arc<dyn PermissionChecker>,
 }
 
 impl GuardChain {
     pub fn new(mount_table: Arc<MountTable>) -> Self {
         Self {
             readiness: ReadinessGuard { readiness_gate: None },
-            leadership: LeadershipGuard { checker: None },
+            leadership: LeadershipGuard { raft_node: None },
             data_io: DataIoPolicyGuard { mount_table },
-            permission: Arc::new(NonePermissionChecker),
         }
     }
 
@@ -88,13 +66,8 @@ impl GuardChain {
         self
     }
 
-    pub(crate) fn with_leadership_checker(mut self, checker: Option<Arc<dyn LeadershipChecker>>) -> Self {
-        self.leadership.checker = checker;
-        self
-    }
-
-    pub(crate) fn with_permission_checker(mut self, checker: Arc<dyn PermissionChecker>) -> Self {
-        self.permission = checker;
+    pub(crate) fn with_raft_node(mut self, raft_node: Option<Arc<AppRaftNode>>) -> Self {
+        self.leadership.raft_node = raft_node;
         self
     }
 
@@ -125,10 +98,7 @@ impl GuardChain {
         path: &str,
         resolved: &ResolvedPath,
     ) -> Result<(), GuardFailure> {
-        self.permission
-            .check_perm(ctx, bits, path, resolved)
-            .await
-            .map_err(GuardFailure::new)
+        auth::check_perm(ctx, bits, path, resolved).map_err(GuardFailure::new)
     }
 
     pub async fn check_parent_perm(
@@ -138,27 +108,11 @@ impl GuardChain {
         path: &str,
         resolved: &ResolvedPath,
     ) -> Result<(), GuardFailure> {
-        self.permission
-            .check_parent_perm(ctx, bits, path, resolved)
-            .await
-            .map_err(GuardFailure::new)
-    }
-
-    pub async fn check_set_attr_perm(
-        &self,
-        ctx: &RequestContext,
-        path: &str,
-        resolved: &ResolvedPath,
-        req: SetAttrPerm,
-    ) -> Result<(), GuardFailure> {
-        self.permission
-            .check_set_attr_perm(ctx, path, resolved, req)
-            .await
-            .map_err(GuardFailure::new)
+        auth::check_parent_perm(ctx, bits, path, resolved).map_err(GuardFailure::new)
     }
 
     pub async fn check_super(&self, ctx: &RequestContext) -> Result<(), GuardFailure> {
-        self.permission.check_super(ctx).await.map_err(GuardFailure::new)
+        auth::check_super(ctx).map_err(GuardFailure::new)
     }
 }
 
@@ -183,21 +137,21 @@ impl ReadinessGuard {
 
 #[derive(Clone)]
 struct LeadershipGuard {
-    checker: Option<Arc<dyn LeadershipChecker>>,
+    raft_node: Option<Arc<AppRaftNode>>,
 }
 
 impl LeadershipGuard {
     fn check(&self, ctx: &RequestContext) -> Result<(), GuardFailure> {
-        let Some(checker) = self.checker.as_ref() else {
+        let Some(raft_node) = self.raft_node.as_ref() else {
             return Err(GuardFailure::from_rpc_metadata_error(
                 MetadataError::ServiceUnavailable("raft node not available".to_string()),
             ));
         };
-        if checker.is_leader() {
+        if raft_node.is_leader() {
             Ok(())
         } else {
             let hint = RefreshHint {
-                leader_endpoint: checker.leader_endpoint(),
+                leader_endpoint: leader_endpoint(raft_node),
                 group_name: ctx.caller.group_name.as_ref().map(ToString::to_string),
                 ..Default::default()
             };
@@ -209,6 +163,13 @@ impl LeadershipGuard {
             )))
         }
     }
+}
+
+fn leader_endpoint(raft_node: &AppRaftNode) -> Option<String> {
+    let leader_id = raft_node.get_leader_id()?;
+    let membership = raft_node.get_membership()?;
+    let leader_node = membership.nodes().find(|(node_id, _)| **node_id == leader_id)?.1;
+    Some(leader_node.address.clone())
 }
 
 #[derive(Clone)]
@@ -252,77 +213,17 @@ impl DataIoPolicyGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RaftConfig;
     use crate::mount::{DataIoPolicy, MountKind, ROOT_INODE_ID};
+    use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
     use crate::readiness::RootReadinessGate;
-    use async_trait::async_trait;
     use common::error::canonical::{ErrorClass, ErrorCode};
     use common::header::{RequestHeader, RpcErrorCode};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::TempDir;
     use types::GroupName;
 
     fn group_name(raw: &str) -> GroupName {
         GroupName::parse(raw).unwrap()
-    }
-
-    struct StaticLeader(bool);
-
-    impl LeadershipChecker for StaticLeader {
-        fn is_leader(&self) -> bool {
-            self.0
-        }
-    }
-
-    struct CountingPermissionChecker {
-        perm_calls: Arc<AtomicUsize>,
-        parent_calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl PermissionChecker for CountingPermissionChecker {
-        async fn check_perm(
-            &self,
-            _ctx: &RequestContext,
-            _bits: PermissionBits,
-            _path: &str,
-            _resolved: &ResolvedPath,
-        ) -> Result<(), CanonicalError> {
-            self.perm_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-
-        async fn check_parent_perm(
-            &self,
-            _ctx: &RequestContext,
-            _bits: PermissionBits,
-            _path: &str,
-            _resolved: &ResolvedPath,
-        ) -> Result<(), CanonicalError> {
-            self.parent_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-
-        async fn check_super(&self, _ctx: &RequestContext) -> Result<(), CanonicalError> {
-            Ok(())
-        }
-
-        async fn get_perm(
-            &self,
-            _ctx: &RequestContext,
-            _path: &str,
-            _resolved: &ResolvedPath,
-        ) -> Result<PermissionBits, CanonicalError> {
-            Ok(PermissionBits::all())
-        }
-
-        async fn check_set_attr_perm(
-            &self,
-            _ctx: &RequestContext,
-            _path: &str,
-            _resolved: &ResolvedPath,
-            _req: SetAttrPerm,
-        ) -> Result<(), CanonicalError> {
-            Ok(())
-        }
     }
 
     fn request_context(client_id: u128) -> RequestContext {
@@ -368,9 +269,7 @@ mod tests {
     #[tokio::test]
     async fn check_meta_write_checks_readiness_then_leadership() {
         let gate = Arc::new(RootReadinessGate::new(None));
-        let chain = GuardChain::new(Arc::new(MountTable::new()))
-            .with_readiness_gate(Some(Arc::clone(&gate)))
-            .with_leadership_checker(Some(Arc::new(StaticLeader(false))));
+        let chain = GuardChain::new(Arc::new(MountTable::new())).with_readiness_gate(Some(Arc::clone(&gate)));
 
         let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
         assert_eq!(err.err.class, ErrorClass::Retryable);
@@ -378,13 +277,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leadership_guard_returns_not_leader() {
-        let chain =
-            GuardChain::new(Arc::new(MountTable::new())).with_leadership_checker(Some(Arc::new(StaticLeader(false))));
+    async fn leadership_guard_without_raft_node_returns_unavailable() {
+        let chain = GuardChain::new(Arc::new(MountTable::new()));
 
         let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
+        assert_eq!(err.err.class, ErrorClass::Retryable);
+        assert_eq!(err.err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NodeUnavailable)));
+    }
+
+    #[tokio::test]
+    async fn leadership_guard_returns_not_leader_for_nonleader_raft_node() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let mount_table = Arc::new(MountTable::new());
+        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
+        let raft_config = RaftConfig::default();
+        let raft_node = Arc::new(AppRaftNode::new(1, storage, state_machine, &raft_config).await.unwrap());
+        assert!(!raft_node.is_leader());
+        let chain = GuardChain::new(mount_table).with_raft_node(Some(raft_node));
+
+        let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
+
         assert_eq!(err.err.class, ErrorClass::NeedRefresh);
         assert_eq!(err.err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NotLeader)));
+        assert_eq!(err.err.reason, Some(RefreshReason::NotLeader));
     }
 
     #[tokio::test]
@@ -400,15 +316,14 @@ mod tests {
                 ROOT_INODE_ID,
             )
             .unwrap();
-        let chain =
-            GuardChain::new(Arc::clone(&mount_table)).with_leadership_checker(Some(Arc::new(StaticLeader(false))));
+        let chain = GuardChain::new(Arc::clone(&mount_table));
 
         let err = chain
             .check_data_write(&request_context(3), root_entry.mount_id)
             .await
             .unwrap_err();
-        assert_eq!(err.err.class, ErrorClass::NeedRefresh);
-        assert_eq!(err.err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NotLeader)));
+        assert_eq!(err.err.class, ErrorClass::Retryable);
+        assert_eq!(err.err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NodeUnavailable)));
     }
 
     #[tokio::test]
@@ -438,14 +353,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permission_methods_delegate_to_configured_checker() {
-        let perm_calls = Arc::new(AtomicUsize::new(0));
-        let parent_calls = Arc::new(AtomicUsize::new(0));
-        let chain =
-            GuardChain::new(Arc::new(MountTable::new())).with_permission_checker(Arc::new(CountingPermissionChecker {
-                perm_calls: Arc::clone(&perm_calls),
-                parent_calls: Arc::clone(&parent_calls),
-            }));
+    async fn permission_methods_use_current_none_policy() {
+        let chain = GuardChain::new(Arc::new(MountTable::new()));
         let ctx = request_context(5);
         let resolved = resolved_path();
 
@@ -458,12 +367,5 @@ mod tests {
             .await
             .unwrap();
         chain.check_super(&ctx).await.unwrap();
-        chain
-            .check_set_attr_perm(&ctx, "/file", &resolved, SetAttrPerm::default())
-            .await
-            .unwrap();
-
-        assert_eq!(perm_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(parent_calls.load(Ordering::Relaxed), 1);
     }
 }

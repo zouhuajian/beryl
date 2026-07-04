@@ -9,11 +9,10 @@ use metadata::mount::{DataIoPolicy, MountKind, MountTable, ROOT_INODE_ID};
 use metadata::raft::{AppMetadataRaftState, AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use metadata::readiness::RootReadinessGate;
 use metadata::service::{
-    FileSystemAuthorityDeps, FileSystemPolicyDeps, FileSystemRuntimeDeps, LeadershipChecker,
-    MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl, NonePermissionChecker, PermissionChecker,
+    FileSystemAuthorityDeps, FileSystemRuntimeDeps, MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl,
     SharedWorkerCommitHook,
 };
-use metadata::state::MemoryStateStore;
+use metadata::state::RouteEpoch;
 use metadata::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerManager};
 use openraft::{LeaderId, LogId};
 use proto::common::{
@@ -49,6 +48,25 @@ struct PathTestEnv {
     worker_manager: Option<Arc<WorkerManager>>,
     mount_id: types::ids::MountId,
     root_inode_id: InodeId,
+}
+
+struct TestStateStore {
+    route_epoch: RouteEpoch,
+}
+
+impl TestStateStore {
+    fn new() -> Self {
+        Self {
+            route_epoch: RouteEpoch::new(1),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl metadata::state::StateStore for TestStateStore {
+    async fn get_route_epoch(&self) -> metadata::MetadataResult<RouteEpoch> {
+        Ok(self.route_epoch)
+    }
 }
 
 #[derive(Clone)]
@@ -129,28 +147,6 @@ fn captured_text_subscriber(output: &Arc<Mutex<Vec<u8>>>) -> tracing::Dispatch {
 async fn run_with_log_dispatch<T>(dispatch: &tracing::Dispatch, future: impl Future<Output = T>) -> T {
     let _dispatch_guard = tracing::dispatcher::set_default(dispatch);
     future.await
-}
-
-#[derive(Clone)]
-struct AlwaysLeader;
-
-impl LeadershipChecker for AlwaysLeader {
-    fn is_leader(&self) -> bool {
-        true
-    }
-}
-
-#[derive(Clone)]
-struct NotLeader;
-
-impl LeadershipChecker for NotLeader {
-    fn is_leader(&self) -> bool {
-        false
-    }
-
-    fn leader_endpoint(&self) -> Option<String> {
-        Some("127.0.0.1:17000".to_string())
-    }
 }
 
 fn header(client_id: u128) -> Option<RequestHeaderProto> {
@@ -251,8 +247,6 @@ fn build_env(
     mount_prefix: &str,
     data_io_policy: DataIoPolicy,
     readiness_gate: Option<Arc<RootReadinessGate>>,
-    leadership_checker: Option<Arc<dyn LeadershipChecker>>,
-    permission_builder: impl FnOnce(&Arc<RocksDBStorage>) -> Arc<dyn PermissionChecker>,
 ) -> PathTestEnv {
     let temp_dir = TempDir::new().expect("create temp dir");
     let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).expect("open rocksdb"));
@@ -286,8 +280,7 @@ fn build_env(
         .put_inode(&Inode::new_dir(root_inode_id, root_attrs, mount_entry.mount_id))
         .expect("put root inode");
 
-    let permission_checker = permission_builder(&storage);
-    let state_store: Arc<dyn metadata::state::StateStore> = Arc::new(MemoryStateStore::new());
+    let state_store: Arc<dyn metadata::state::StateStore> = Arc::new(TestStateStore::new());
     let write_session_manager = Arc::new(metadata::write_session::WriteSessionManager::default());
     let inode_lease_manager = Arc::new(metadata::inode_lease::InodeLeaseManager::default());
     let worker_commit_hook: SharedWorkerCommitHook = Arc::new(Mutex::new(None));
@@ -308,10 +301,6 @@ fn build_env(
             metrics: None,
             readiness_gate,
         },
-        policy: FileSystemPolicyDeps {
-            leadership_checker,
-            permission_checker,
-        },
     });
 
     PathTestEnv {
@@ -326,19 +315,27 @@ fn build_env(
     }
 }
 
-async fn build_env_with_raft(
-    mount_prefix: &str,
-    data_io_policy: DataIoPolicy,
-    permission_builder: impl FnOnce(&Arc<RocksDBStorage>) -> Arc<dyn PermissionChecker>,
-) -> PathTestEnv {
-    build_env_with_raft_and_workers(mount_prefix, data_io_policy, None, permission_builder).await
+async fn build_env_with_raft(mount_prefix: &str, data_io_policy: DataIoPolicy) -> PathTestEnv {
+    build_env_with_raft_and_workers(mount_prefix, data_io_policy, None).await
 }
 
 async fn build_env_with_raft_and_workers(
     mount_prefix: &str,
     data_io_policy: DataIoPolicy,
     worker_manager: Option<Arc<WorkerManager>>,
-    permission_builder: impl FnOnce(&Arc<RocksDBStorage>) -> Arc<dyn PermissionChecker>,
+) -> PathTestEnv {
+    build_env_with_optional_raft(mount_prefix, data_io_policy, worker_manager, true).await
+}
+
+async fn build_env_with_nonleader_raft(mount_prefix: &str, data_io_policy: DataIoPolicy) -> PathTestEnv {
+    build_env_with_optional_raft(mount_prefix, data_io_policy, None, false).await
+}
+
+async fn build_env_with_optional_raft(
+    mount_prefix: &str,
+    data_io_policy: DataIoPolicy,
+    worker_manager: Option<Arc<WorkerManager>>,
+    initialize_single_node: bool,
 ) -> PathTestEnv {
     let temp_dir = TempDir::new().expect("create temp dir");
     let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).expect("open rocksdb"));
@@ -379,20 +376,23 @@ async fn build_env_with_raft_and_workers(
             .await
             .expect("create raft node"),
     );
-    raft_node
-        .initialize_single_node("127.0.0.1:0".to_string())
-        .await
-        .expect("initialize single-node raft");
-    for _ in 0..50 {
-        if raft_node.is_leader() {
-            break;
+    if initialize_single_node {
+        raft_node
+            .initialize_single_node("127.0.0.1:0".to_string())
+            .await
+            .expect("initialize single-node raft");
+        for _ in 0..50 {
+            if raft_node.is_leader() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(raft_node.is_leader(), "single-node raft must become leader");
+    } else {
+        assert!(!raft_node.is_leader(), "uninitialized raft node must not be leader");
     }
-    assert!(raft_node.is_leader(), "single-node raft must become leader");
 
-    let permission_checker = permission_builder(&storage);
-    let state_store: Arc<dyn metadata::state::StateStore> = Arc::new(MemoryStateStore::new());
+    let state_store: Arc<dyn metadata::state::StateStore> = Arc::new(TestStateStore::new());
     let write_session_manager = Arc::new(metadata::write_session::WriteSessionManager::default());
     let inode_lease_manager = Arc::new(metadata::inode_lease::InodeLeaseManager::default());
     let worker_commit_hook: SharedWorkerCommitHook = Arc::new(Mutex::new(None));
@@ -412,10 +412,6 @@ async fn build_env_with_raft_and_workers(
             worker_manager: worker_manager.clone(),
             metrics: None,
             readiness_gate: None,
-        },
-        policy: FileSystemPolicyDeps {
-            leadership_checker: None,
-            permission_checker,
         },
     });
 
@@ -559,7 +555,6 @@ async fn create_file_success_emits_metadata_state_log() {
         "/mnt/test",
         DataIoPolicy::Allow,
         Some(worker_manager_for_write_targets()),
-        |_| Arc::new(NonePermissionChecker),
     )
     .await;
     let output = Arc::new(Mutex::new(Vec::new()));
@@ -628,7 +623,7 @@ async fn create_file_success_emits_metadata_state_log() {
 #[tokio::test(flavor = "current_thread")]
 async fn create_directory_failure_emits_metadata_state_warn_log() {
     let _log_guard = log_test_mutex().lock().await;
-    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
     let first = FileSystemServiceProto::create_directory(
         &env.service,
         Request::new(CreateDirectoryRequestProto {
@@ -689,7 +684,7 @@ async fn create_directory_failure_emits_metadata_state_warn_log() {
 
 #[tokio::test]
 async fn recursive_create_directory_creates_missing_parent_directories() {
-    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
 
     let response = FileSystemServiceProto::create_directory(
         &env.service,
@@ -750,7 +745,7 @@ async fn recursive_create_directory_creates_missing_parent_directories() {
 
 #[tokio::test]
 async fn recursive_create_directory_fails_when_parent_component_is_file() {
-    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
     let file_inode_id = InodeId::new(5001);
     env.storage
         .put_inode(&Inode::new_file(
@@ -789,7 +784,7 @@ async fn recursive_create_directory_fails_when_parent_component_is_file() {
 
 #[tokio::test]
 async fn recursive_create_directory_succeeds_when_target_directory_exists() {
-    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
 
     let first = FileSystemServiceProto::create_directory(
         &env.service,
@@ -838,7 +833,6 @@ async fn create_file_early_create_failure_emits_metadata_state_warn_log() {
         "/mnt/test",
         DataIoPolicy::Allow,
         Some(worker_manager_for_write_targets()),
-        |_| Arc::new(NonePermissionChecker),
     )
     .await;
     let request = |client_id, path: &str| CreateFileRequestProto {
@@ -900,7 +894,6 @@ async fn add_block_success_emits_metadata_block_log_with_target_count() {
         "/mnt/test",
         DataIoPolicy::Allow,
         Some(worker_manager_for_write_targets()),
-        |_| Arc::new(NonePermissionChecker),
     )
     .await;
     let create = FileSystemServiceProto::create_file(
@@ -983,7 +976,6 @@ async fn add_block_text_log_does_not_dump_request_or_duplicate_client_call_ident
         "/mnt/test",
         DataIoPolicy::Allow,
         Some(worker_manager_for_write_targets()),
-        |_| Arc::new(NonePermissionChecker),
     )
     .await;
     let create = FileSystemServiceProto::create_file(
@@ -1045,7 +1037,6 @@ async fn add_block_failure_emits_metadata_block_warn_log_with_error_code() {
         "/mnt/test",
         DataIoPolicy::Allow,
         Some(worker_manager_for_write_targets()),
-        |_| Arc::new(NonePermissionChecker),
     )
     .await;
     let create = FileSystemServiceProto::create_file(
@@ -1199,13 +1190,7 @@ fn put_extent_file(
 
 #[tokio::test]
 async fn stale_mount_epoch_returns_need_refresh_header_with_consumable_mount_hint() {
-    let env = build_env(
-        "/mnt/test",
-        DataIoPolicy::Allow,
-        None,
-        Some(Arc::new(AlwaysLeader)),
-        |_| Arc::new(NonePermissionChecker),
-    );
+    let env = build_env("/mnt/test", DataIoPolicy::Allow, None);
 
     let response = FileSystemServiceProto::get_status(
         &env.service,
@@ -1235,13 +1220,7 @@ async fn stale_mount_epoch_returns_need_refresh_header_with_consumable_mount_hin
 
 #[tokio::test]
 async fn stale_route_epoch_returns_need_refresh_header_with_consumable_route_hint() {
-    let env = build_env(
-        "/mnt/test",
-        DataIoPolicy::Allow,
-        None,
-        Some(Arc::new(AlwaysLeader)),
-        |_| Arc::new(NonePermissionChecker),
-    );
+    let env = build_env("/mnt/test", DataIoPolicy::Allow, None);
 
     let response = FileSystemServiceProto::get_status(
         &env.service,
@@ -1272,7 +1251,7 @@ async fn stale_route_epoch_returns_need_refresh_header_with_consumable_route_hin
 
 #[tokio::test]
 async fn stale_state_id_returns_stale_state_without_epoch_domain_mixup() {
-    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
     let local_state_id = RaftLogId::new(1, 1, 10);
     let required_state_id = RaftLogId::new(1, 1, 12);
     persist_last_applied(&env, local_state_id);
@@ -1310,7 +1289,7 @@ async fn stale_state_id_returns_stale_state_without_epoch_domain_mixup() {
 
 #[tokio::test]
 async fn leader_success_header_includes_group_state_watermark_when_last_applied_is_known() {
-    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
     let last_applied = RaftLogId::new(2, 1, 20);
     persist_last_applied(&env, last_applied);
 
@@ -1338,13 +1317,7 @@ async fn leader_success_header_includes_group_state_watermark_when_last_applied_
 
 #[tokio::test]
 async fn non_leader_success_header_leaves_state_empty() {
-    let env = build_env(
-        "/mnt/test",
-        DataIoPolicy::Allow,
-        None,
-        Some(Arc::new(AlwaysLeader)),
-        |_| Arc::new(NonePermissionChecker),
-    );
+    let env = build_env("/mnt/test", DataIoPolicy::Allow, None);
 
     let response = FileSystemServiceProto::get_status(
         &env.service,
@@ -1368,9 +1341,7 @@ async fn non_leader_success_header_leaves_state_empty() {
 #[tokio::test]
 async fn readiness_precedence_blocks_before_path_resolution() {
     let readiness_gate = Arc::new(RootReadinessGate::new(None));
-    let env = build_env("/mnt/test", DataIoPolicy::Allow, Some(readiness_gate), None, |_| {
-        Arc::new(NonePermissionChecker)
-    });
+    let env = build_env("/mnt/test", DataIoPolicy::Allow, Some(readiness_gate));
 
     let response = FileSystemServiceProto::get_status(
         &env.service,
@@ -1393,13 +1364,7 @@ async fn readiness_precedence_blocks_before_path_resolution() {
 
 #[tokio::test]
 async fn leadership_precedence_write_returns_not_leader_before_not_found() {
-    let env = build_env(
-        "/mnt/test",
-        DataIoPolicy::Allow,
-        None,
-        Some(Arc::new(NotLeader)),
-        |_| Arc::new(NonePermissionChecker),
-    );
+    let env = build_env_with_nonleader_raft("/mnt/test", DataIoPolicy::Allow).await;
 
     let response = FileSystemServiceProto::create_directory(
         &env.service,
@@ -1420,9 +1385,7 @@ async fn leadership_precedence_write_returns_not_leader_before_not_found() {
 
 #[tokio::test]
 async fn leadership_precedence_data_io_returns_not_leader_before_root_policy_error() {
-    let env = build_env("/", DataIoPolicy::Forbid, None, Some(Arc::new(NotLeader)), |_| {
-        Arc::new(NonePermissionChecker)
-    });
+    let env = build_env_with_nonleader_raft("/", DataIoPolicy::Forbid).await;
     let file_inode_id = InodeId::new(2001);
     env.storage
         .put_inode(&Inode::new_file(
@@ -1454,9 +1417,7 @@ async fn leadership_precedence_data_io_returns_not_leader_before_root_policy_err
 
 #[tokio::test]
 async fn root_mount_data_io_gate_is_enforced() {
-    let env = build_env("/", DataIoPolicy::Forbid, None, Some(Arc::new(AlwaysLeader)), |_| {
-        Arc::new(NonePermissionChecker)
-    });
+    let env = build_env_with_raft("/", DataIoPolicy::Forbid).await;
     let file_inode_id = InodeId::new(3001);
     env.storage
         .put_inode(&Inode::new_file(
@@ -1497,7 +1458,6 @@ async fn sync_write_rejects_structural_validation_errors() {
         "/mnt/test",
         DataIoPolicy::Allow,
         Some(worker_manager_for_write_targets()),
-        |_| Arc::new(NonePermissionChecker),
     )
     .await;
     let (write_handle, data_handle_id, committed) =
@@ -1569,7 +1529,6 @@ async fn sync_write_valid_request_publishes_prefix_and_keeps_session_open() {
         "/mnt/test",
         DataIoPolicy::Allow,
         Some(worker_manager_for_write_targets()),
-        |_| Arc::new(NonePermissionChecker),
     )
     .await;
     let (write_handle, data_handle_id, committed) =
@@ -1606,9 +1565,7 @@ async fn sync_write_valid_request_publishes_prefix_and_keeps_session_open() {
 
 #[tokio::test]
 async fn get_locations_rejects_stale_handle() {
-    let env = build_env("/", DataIoPolicy::Allow, None, Some(Arc::new(AlwaysLeader)), |_| {
-        Arc::new(NonePermissionChecker)
-    });
+    let env = build_env("/", DataIoPolicy::Allow, None);
     let file_inode_id = InodeId::new(9101);
     let current_handle = DataHandleId::new(99101);
     let stale_handle = DataHandleId::new(99100);
@@ -1668,9 +1625,7 @@ async fn get_locations_rejects_stale_handle() {
 
 #[tokio::test]
 async fn get_locations_accepts_current_handle() {
-    let env = build_env("/", DataIoPolicy::Allow, None, Some(Arc::new(AlwaysLeader)), |_| {
-        Arc::new(NonePermissionChecker)
-    });
+    let env = build_env("/", DataIoPolicy::Allow, None);
     let file_inode_id = InodeId::new(9102);
     let current_handle = DataHandleId::new(99102);
     let mut attrs = FileAttrs::new();
@@ -1735,9 +1690,7 @@ async fn get_locations_accepts_current_handle() {
 
 #[tokio::test]
 async fn get_locations_by_path_uses_current_handle() {
-    let env = build_env("/", DataIoPolicy::Allow, None, Some(Arc::new(AlwaysLeader)), |_| {
-        Arc::new(NonePermissionChecker)
-    });
+    let env = build_env("/", DataIoPolicy::Allow, None);
     let file_inode_id = InodeId::new(9103);
     let current_handle = DataHandleId::new(99103);
     let stale_handle = DataHandleId::new(99104);
@@ -1800,7 +1753,7 @@ async fn get_locations_by_path_uses_current_handle() {
 
 #[tokio::test]
 async fn create_file_failure_leaves_no_inode() {
-    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
 
     let response = FileSystemServiceProto::create_file(
         &env.service,
@@ -1838,7 +1791,6 @@ async fn commit_file_public_replay_returns_persisted_result_and_rejects_fingerpr
         "/mnt/test",
         DataIoPolicy::Allow,
         Some(worker_manager_for_write_targets()),
-        |_| Arc::new(NonePermissionChecker),
     )
     .await;
 
@@ -2013,7 +1965,6 @@ async fn commit_file_success_log_includes_explicit_commit_summary() {
         "/mnt/test",
         DataIoPolicy::Allow,
         Some(worker_manager_for_write_targets()),
-        |_| Arc::new(NonePermissionChecker),
     )
     .await;
     let (write_handle, data_handle_id, committed) =
@@ -2055,13 +2006,7 @@ async fn commit_file_success_log_includes_explicit_commit_summary() {
 
 #[tokio::test]
 async fn delete_missing_path_returns_structured_header_error() {
-    let env = build_env(
-        "/mnt/test",
-        DataIoPolicy::Allow,
-        None,
-        Some(Arc::new(AlwaysLeader)),
-        |_| Arc::new(NonePermissionChecker),
-    );
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
 
     let response = FileSystemServiceProto::delete(
         &env.service,
@@ -2085,7 +2030,7 @@ async fn delete_missing_path_returns_structured_header_error() {
 
 #[tokio::test]
 async fn recursive_delete_nested_tree_success_removes_subtree_only() {
-    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
     let dir = InodeId::new(4101);
     let a = InodeId::new(4102);
     let b = InodeId::new(4103);
@@ -2127,7 +2072,7 @@ async fn recursive_delete_nested_tree_success_removes_subtree_only() {
 
 #[tokio::test]
 async fn recursive_delete_extent_file_cleans_layout_refcount_intent_and_replays_once() {
-    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
     let dir = InodeId::new(4201);
     let file = InodeId::new(4202);
     let data_handle_id = DataHandleId::new(4202);
@@ -2182,7 +2127,6 @@ async fn recursive_delete_rejects_active_write_session_without_half_delete() {
         "/mnt/test",
         DataIoPolicy::Allow,
         Some(worker_manager_for_write_targets()),
-        |_| Arc::new(NonePermissionChecker),
     )
     .await;
     let dir = InodeId::new(4301);
@@ -2255,7 +2199,7 @@ async fn recursive_delete_rejects_active_write_session_without_half_delete() {
 
 #[tokio::test]
 async fn recursive_delete_rejects_root_or_mount_root_without_mutation() {
-    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
 
     let mount_root_response = FileSystemServiceProto::delete(
         &env.service,
@@ -2273,7 +2217,7 @@ async fn recursive_delete_rejects_root_or_mount_root_without_mutation() {
     assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
     assert!(env.storage.get_inode(env.root_inode_id).unwrap().is_some());
 
-    let root_env = build_env_with_raft("/", DataIoPolicy::Forbid, |_| Arc::new(NonePermissionChecker)).await;
+    let root_env = build_env_with_raft("/", DataIoPolicy::Forbid).await;
     let root_response = FileSystemServiceProto::delete(
         &root_env.service,
         Request::new(DeleteRequestProto {
@@ -2293,7 +2237,7 @@ async fn recursive_delete_rejects_root_or_mount_root_without_mutation() {
 
 #[tokio::test]
 async fn recursive_delete_rejects_cross_mount_subtree_without_half_delete() {
-    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
     let dir = InodeId::new(4401);
     let child_mount_root = InodeId::new(4402);
     put_dir(&env, env.root_inode_id, "dir", dir);
@@ -2341,7 +2285,7 @@ async fn recursive_delete_rejects_cross_mount_subtree_without_half_delete() {
 
 #[tokio::test]
 async fn recursive_delete_fingerprint_mismatch_does_not_mutate_second_tree() {
-    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
     let dir1 = InodeId::new(4501);
     let dir2 = InodeId::new(4502);
     put_dir(&env, env.root_inode_id, "dir1", dir1);
@@ -2383,7 +2327,7 @@ async fn recursive_delete_fingerprint_mismatch_does_not_mutate_second_tree() {
 
 #[tokio::test]
 async fn delete_regular_empty_file_success_removes_namespace_layout_and_data_owner() {
-    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
     let file_inode_id = InodeId::new(5001);
     let data_handle_id = DataHandleId::new(5001);
     let parent = env
@@ -2418,7 +2362,7 @@ async fn delete_regular_empty_file_success_removes_namespace_layout_and_data_own
 
 #[tokio::test]
 async fn delete_empty_dir_success_removes_namespace_and_inode() {
-    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
     let dir_inode_id = InodeId::new(6001);
     env.storage
         .put_inode(&Inode::new_dir(dir_inode_id, FileAttrs::new(), env.mount_id))
@@ -2447,7 +2391,7 @@ async fn delete_empty_dir_success_removes_namespace_and_inode() {
 
 #[tokio::test]
 async fn delete_non_empty_dir_recursive_false_returns_structured_error_without_half_delete() {
-    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
     let dir_inode_id = InodeId::new(7001);
     let child_inode_id = InodeId::new(7002);
     env.storage
@@ -2496,7 +2440,7 @@ async fn delete_non_empty_dir_recursive_false_returns_structured_error_without_h
 
 #[tokio::test]
 async fn delete_symlink_success_preserves_data_handle_owner_zero_mapping() {
-    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow, |_| Arc::new(NonePermissionChecker)).await;
+    let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
     let symlink_inode_id = InodeId::new(8001);
     let sentinel_owner_inode_id = InodeId::new(8002);
     let symlink_inode = Inode::new_symlink(

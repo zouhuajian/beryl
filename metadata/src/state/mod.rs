@@ -3,12 +3,13 @@
 
 //! State storage abstraction for metadata service.
 //!
-//! The production runtime uses `RaftStateStore`. The in-memory implementation
-//! remains available only as route-epoch test support.
+//! The production runtime uses `RaftStateStore`.
 
+#[cfg(test)]
 mod memory;
 mod raft_store;
 
+#[cfg(test)]
 pub use memory::MemoryStateStore;
 pub use raft_store::RaftStateStore;
 

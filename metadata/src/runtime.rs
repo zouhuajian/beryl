@@ -11,8 +11,8 @@ use crate::metrics::MetadataMetrics;
 use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use crate::readiness::{wait_for_root_ready_with_inputs, RootReadinessGate, RootReadinessLogFields, RootReadyInputs};
 use crate::service::{
-    filesystem_permission_checker, FileSystemAuthorityDeps, FileSystemPolicyDeps, FileSystemRuntimeDeps,
-    MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl, SharedWorkerCommitHook,
+    validate_filesystem_permission_mode, FileSystemAuthorityDeps, FileSystemRuntimeDeps, MetadataFileSystemServiceDeps,
+    MetadataFileSystemServiceImpl, SharedWorkerCommitHook,
 };
 use crate::state::RaftStateStore;
 use crate::worker::{MetadataWorkerServiceImpl, WorkerBackgroundHandle, WorkerManager};
@@ -432,6 +432,7 @@ pub async fn build_filesystem_service(
     worker_manager: Arc<WorkerManager>,
     readiness: &Readiness,
 ) -> Result<MetadataFileSystemServiceImpl, DynError> {
+    validate_filesystem_permission_mode(config.authz.filesystem.mode)?;
     let write_session_manager = Arc::new(crate::write_session::WriteSessionManager::default());
     let inode_lease_manager = Arc::new(crate::inode_lease::InodeLeaseManager::default());
     let worker_commit_hook: SharedWorkerCommitHook = Arc::new(Mutex::new(None));
@@ -450,10 +451,6 @@ pub async fn build_filesystem_service(
             worker_manager: Some(worker_manager),
             metrics: Some(Arc::clone(&authority.metadata_metrics)),
             readiness_gate: Some(readiness.gate()),
-        },
-        policy: FileSystemPolicyDeps {
-            leadership_checker: None,
-            permission_checker: filesystem_permission_checker(config.authz.filesystem.mode)?,
         },
     });
 
@@ -609,10 +606,6 @@ mod tests {
                 worker_manager: None,
                 metrics: None,
                 readiness_gate: None,
-            },
-            policy: FileSystemPolicyDeps {
-                leadership_checker: None,
-                permission_checker: Arc::new(crate::service::NonePermissionChecker),
             },
         })
     }

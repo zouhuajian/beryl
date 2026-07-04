@@ -7,7 +7,7 @@
 //! request context extraction, guard checks, path resolution, permission
 //! checks, FsCore calls, and response/header construction.
 //!
-//! Provider-specific permission rules live behind GuardChain/PermissionChecker.
+//! Permission checks currently use the metadata NONE policy in GuardChain.
 //! Domain freshness, session, lease, and fencing semantics remain in FsCore.
 
 use super::domain::{
@@ -15,14 +15,14 @@ use super::domain::{
     DeleteTreeInput, FileRange, Freshness, GetAttrInput, GetFileLayoutInput, MkdirInput, OpenWriteInput, ReadDirInput,
     RenameInput, RenewLeaseInput, RequestContext, SyncWriteInput, SyncWriteMode, UnlinkInput,
 };
-use super::guard::{GuardChain, GuardFailure, LeadershipChecker};
+use super::guard::{GuardChain, GuardFailure};
 use super::MsyncHandler;
 use super::{
     fencing_to_proto, file_attrs_from_proto, file_attrs_to_proto, file_layout_from_proto, header_from_canonical_error,
     header_from_core_failure, lease_id_from_proto, lease_id_to_proto, location_to_proto, ok_header_from_core_success,
     presented_fencing_from_proto, request_context_from_proto, validate_active_write_layout, write_target_to_proto,
 };
-use super::{FsCore, PermissionBits, PermissionChecker, SharedWorkerCommitHook};
+use super::{FsCore, PermissionBits, SharedWorkerCommitHook};
 use crate::error::{to_canonical_fs, MetadataError};
 use crate::mount::MountTable;
 use crate::observe;
@@ -115,7 +115,6 @@ macro_rules! guard_or_error {
 pub struct MetadataFileSystemServiceDeps {
     pub authority: FileSystemAuthorityDeps,
     pub runtime: FileSystemRuntimeDeps,
-    pub policy: FileSystemPolicyDeps,
 }
 
 pub struct FileSystemAuthorityDeps {
@@ -135,18 +134,9 @@ pub struct FileSystemRuntimeDeps {
     pub readiness_gate: Option<Arc<crate::readiness::RootReadinessGate>>,
 }
 
-pub struct FileSystemPolicyDeps {
-    pub leadership_checker: Option<Arc<dyn LeadershipChecker>>,
-    pub permission_checker: Arc<dyn PermissionChecker>,
-}
-
 impl MetadataFileSystemServiceImpl {
     pub fn new(deps: MetadataFileSystemServiceDeps) -> Self {
-        let MetadataFileSystemServiceDeps {
-            authority,
-            runtime,
-            policy,
-        } = deps;
+        let MetadataFileSystemServiceDeps { authority, runtime } = deps;
         let FileSystemAuthorityDeps {
             state_store,
             mount_table,
@@ -162,11 +152,6 @@ impl MetadataFileSystemServiceImpl {
             metrics,
             readiness_gate,
         } = runtime;
-        let FileSystemPolicyDeps {
-            leadership_checker,
-            permission_checker,
-        } = policy;
-
         let path_resolver = PathResolver::new(Arc::clone(&mount_table), Arc::clone(&storage));
         let mut fs_core = FsCore::new(
             state_store,
@@ -187,15 +172,9 @@ impl MetadataFileSystemServiceImpl {
         }
         let fs_core = Arc::new(fs_core);
 
-        let leadership_checker = leadership_checker.or_else(|| {
-            raft_node
-                .as_ref()
-                .map(|raft_node| Arc::clone(raft_node) as Arc<dyn LeadershipChecker>)
-        });
         let guard_chain = GuardChain::new(mount_table)
             .with_readiness_gate(readiness_gate)
-            .with_leadership_checker(leadership_checker)
-            .with_permission_checker(permission_checker);
+            .with_raft_node(raft_node.clone());
         let msync = raft_node
             .as_ref()
             .map(|raft_node| MsyncHandler::new(Arc::clone(raft_node), group_name));
