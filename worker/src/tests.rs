@@ -142,7 +142,7 @@ mod tests {
     fn test_header() -> DataRequestHeaderProto {
         DataRequestHeaderProto {
             client: Some(ClientInfoProto {
-                call_id: "call-1".to_string(),
+                call_id: types::CallId::new().to_string(),
                 client_id: Some(ClientId::new(9).into()),
                 client_name: "worker-test".to_string(),
             }),

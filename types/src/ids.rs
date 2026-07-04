@@ -288,6 +288,17 @@ impl ClientId {
     pub const fn is_zero(self) -> bool {
         self.0 == 0
     }
+
+    /// Parse a non-zero client identity from its decimal wire/header value.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let raw = value
+            .parse::<u128>()
+            .map_err(|err| format!("invalid client_id: {err}"))?;
+        if raw == 0 {
+            return Err("client_id must be non-zero".to_string());
+        }
+        Ok(Self(raw))
+    }
 }
 
 impl fmt::Debug for ClientId {
@@ -343,6 +354,20 @@ impl CallId {
     pub fn as_uuid(&self) -> Uuid {
         self.0
     }
+
+    /// Returns true when the identity is the invalid nil UUID.
+    pub fn is_zero(&self) -> bool {
+        self.0.is_nil()
+    }
+
+    /// Parse a non-zero call identifier from its wire/header UUID value.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let uuid = Uuid::parse_str(value).map_err(|err| format!("invalid call_id: {err}"))?;
+        if uuid.is_nil() {
+            return Err("call_id must be non-zero".to_string());
+        }
+        Ok(Self(uuid))
+    }
 }
 
 impl Default for CallId {
@@ -364,10 +389,10 @@ impl fmt::Display for CallId {
 }
 
 impl FromStr for CallId {
-    type Err = uuid::Error;
+    type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(Uuid::parse_str(s)?))
+        Self::parse(s)
     }
 }
 
@@ -500,6 +525,23 @@ impl fmt::Display for MountId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_id_parse_requires_non_zero_decimal_value() {
+        assert_eq!(ClientId::parse("123").expect("valid ClientId"), ClientId::new(123));
+        assert!(ClientId::parse("0").is_err());
+        assert!(ClientId::parse("not-a-number").is_err());
+    }
+
+    #[test]
+    fn call_id_parse_matches_from_str_and_rejects_zero_uuid() {
+        let value = "550e8400-e29b-41d4-a716-446655440000";
+        let parsed = CallId::parse(value).expect("valid CallId");
+        assert_eq!(parsed, value.parse::<CallId>().expect("valid CallId"));
+
+        assert!(CallId::parse("").is_err());
+        assert!(CallId::parse("00000000-0000-0000-0000-000000000000").is_err());
+    }
 
     #[test]
     fn display_formats_are_stable() {

@@ -7,6 +7,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use common::header::HeaderIdentity;
 use proto::common::{ClientInfoProto, RequestHeaderProto};
 use proto::worker::DataRequestHeaderProto;
 use types::{CallId, ClientId, GroupName};
@@ -358,11 +359,13 @@ impl AttemptContext {
     }
 
     /// Return the stable logical call id.
+    #[cfg(test)]
     pub(crate) fn call_id(&self) -> &str {
         &self.call_id_text
     }
 
     /// Return the stable client identity for this attempt.
+    #[cfg(test)]
     pub(crate) fn client_id(&self) -> ClientId {
         self.operation.client_id
     }
@@ -370,6 +373,15 @@ impl AttemptContext {
     /// Return the metadata group name carried by this attempt, when present.
     pub(crate) fn group_name(&self) -> Option<&GroupName> {
         self.group_name.as_ref()
+    }
+
+    /// Return the basic client/call/group identity for response integrity checks.
+    pub(crate) fn header_identity(&self) -> HeaderIdentity {
+        HeaderIdentity {
+            call_id: self.operation.call_id,
+            client_id: self.operation.client_id,
+            group_name: self.group_name.clone(),
+        }
     }
 
     /// Return the absolute deadline in Unix epoch milliseconds, or zero when unset.

@@ -8,7 +8,6 @@
 
 use crate::header::{AuthnType, RequestHeader};
 use crate::time::Deadline;
-use std::str::FromStr;
 use types::{CallId, ClientId, GroupName, GroupStateWatermark, RaftLogId};
 
 /// Header keys for context propagation.
@@ -150,17 +149,11 @@ impl RequestHeaderCodec {
             match key.as_str() {
                 k if k.eq_ignore_ascii_case(HEADER_CALL_ID) => {
                     saw_call_id = true;
-                    call_id = Some(CallId::from_str(&value).map_err(|err| format!("invalid call_id: {err}"))?);
+                    call_id = Some(require_call_id(&value, "call_id")?);
                 }
                 k if k.eq_ignore_ascii_case(HEADER_CLIENT_ID) => {
                     saw_client_id = true;
-                    let raw = value
-                        .parse::<u128>()
-                        .map_err(|err| format!("invalid client_id: {err}"))?;
-                    if raw == 0 {
-                        return Err("client_id must be non-zero".to_string());
-                    }
-                    client_id = Some(ClientId::new(raw));
+                    client_id = Some(require_client_id(&value, "client_id")?);
                 }
                 k if k.eq_ignore_ascii_case(HEADER_STATE_ID) => {
                     state.extend(parse_state_header(&value)?);
@@ -265,6 +258,20 @@ impl RequestHeaderCodec {
             retry_count: 0,
         })
     }
+}
+
+fn require_client_id(value: &str, field_name: &str) -> Result<ClientId, String> {
+    if value.is_empty() {
+        return Err(format!("{field_name} must not be empty"));
+    }
+    ClientId::parse(value).map_err(|err| format!("{field_name} {err}"))
+}
+
+fn require_call_id(value: &str, field_name: &str) -> Result<CallId, String> {
+    if value.is_empty() {
+        return Err(format!("{field_name} must not be empty"));
+    }
+    CallId::parse(value).map_err(|err| format!("{field_name} {err}"))
 }
 
 fn parse_state_header(value: &str) -> Result<Vec<GroupStateWatermark>, String> {
@@ -482,6 +489,23 @@ mod tests {
             .into_iter(),
         )
         .expect_err("invalid call_id must fail");
+
+        assert!(error.contains("call_id"));
+    }
+
+    #[test]
+    fn test_decode_zero_call_id_rejects() {
+        let error = RequestHeaderCodec::decode_from_headers(
+            vec![
+                (
+                    HEADER_CALL_ID.to_string(),
+                    "00000000-0000-0000-0000-000000000000".to_string(),
+                ),
+                (HEADER_CLIENT_ID.to_string(), ClientId::new(99).as_raw().to_string()),
+            ]
+            .into_iter(),
+        )
+        .expect_err("zero call_id must fail");
 
         assert!(error.contains("call_id"));
     }

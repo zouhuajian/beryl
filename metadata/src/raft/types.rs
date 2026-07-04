@@ -5,6 +5,7 @@
 
 use crate::raft::snapshot::SnapshotFile;
 use crate::state::DeleteIntentStatus;
+use common::header::HeaderIdentity;
 use openraft::RaftTypeConfig;
 use serde::{Deserialize, Serialize};
 use types::fs::{FsErrorCode, InodeId};
@@ -131,6 +132,16 @@ impl DedupKey {
         Self { client_id, call_id }
     }
 
+    pub fn from_header_identity(identity: &HeaderIdentity) -> Result<Self, String> {
+        if identity.client_id.is_zero() {
+            return Err("client_id must be non-zero for dedup".to_string());
+        }
+        if identity.call_id.is_zero() {
+            return Err("call_id must be non-zero for dedup".to_string());
+        }
+        Ok(Self::new(identity.client_id, identity.call_id))
+    }
+
     /// Generate a dedup key for internal/system-triggered commands.
     /// Uses an explicit non-zero reserved identity for non-user initiated operations.
     /// System calls generate a fresh call_id per submitted logical op; retries must reuse it.
@@ -198,4 +209,36 @@ pub struct ShardGroupInfo {
     pub shard_ids: Vec<u64>,
     pub initial_members: Vec<u64>,
     pub version: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::header::HeaderIdentity;
+    use uuid::Uuid;
+
+    #[test]
+    fn dedup_key_from_header_identity_uses_checked_client_call_identity() {
+        let identity = HeaderIdentity {
+            client_id: ClientId::new(42),
+            call_id: CallId::new(),
+            group_name: Some(GroupName::parse("root").unwrap()),
+        };
+
+        let dedup = DedupKey::from_header_identity(&identity).expect("dedup key");
+        assert_eq!(dedup.client_id, identity.client_id);
+        assert_eq!(dedup.call_id, identity.call_id);
+
+        let zero_client = HeaderIdentity {
+            client_id: ClientId::new(0),
+            ..identity.clone()
+        };
+        assert!(DedupKey::from_header_identity(&zero_client).is_err());
+
+        let zero_call = HeaderIdentity {
+            call_id: CallId::from_uuid(Uuid::nil()),
+            ..identity
+        };
+        assert!(DedupKey::from_header_identity(&zero_call).is_err());
+    }
 }

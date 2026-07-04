@@ -3,10 +3,11 @@
 
 use crate::error::canonical::{CanonicalError, ErrorClass, ErrorCode, RefreshReason};
 use crate::header::ClientInfo;
+use crate::header::HeaderIdentity;
 use crate::time::Deadline;
 use crate::{CallerContext, CallerContextFields, RequestHeader, ResponseHeader, RpcErrorCode, RpcStatus};
 use std::time::Duration;
-use types::{ClientId, GroupName, GroupStateWatermark, RaftLogId};
+use types::{CallId, ClientId, GroupName, GroupStateWatermark, RaftLogId};
 
 #[test]
 fn test_client_info() {
@@ -93,6 +94,32 @@ fn request_and_response_headers_expose_basic_identity() {
     assert_eq!(response_identity.call_id, request.client.call_id);
     assert_eq!(response_identity.client_id, request.client.client_id);
     assert_eq!(response_identity.group_name.as_ref(), Some(&group_name));
+}
+
+#[test]
+fn header_identity_matches_client_call_and_optional_group() {
+    let group_name = GroupName::parse("root").unwrap();
+    let request = RequestHeader::new(ClientId::new(11)).with_group_name(group_name.clone());
+    let same = ResponseHeader::ok(request.client.clone())
+        .with_group_name(group_name.clone())
+        .identity();
+
+    assert!(same.same_client_call(&request.identity()));
+    assert!(same.matches_request(&request.identity()));
+
+    let wrong_call = HeaderIdentity {
+        call_id: CallId::new(),
+        ..same.clone()
+    };
+    assert!(!wrong_call.same_client_call(&request.identity()));
+    assert!(!wrong_call.matches_request(&request.identity()));
+
+    let wrong_group = HeaderIdentity {
+        group_name: Some(GroupName::parse("other").unwrap()),
+        ..same
+    };
+    assert!(wrong_group.same_client_call(&request.identity()));
+    assert!(!wrong_group.matches_request(&request.identity()));
 }
 
 #[test]

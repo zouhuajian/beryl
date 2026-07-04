@@ -31,6 +31,21 @@ pub struct HeaderIdentity {
     pub group_name: Option<GroupName>,
 }
 
+impl HeaderIdentity {
+    /// Return true when two headers belong to the same client logical call.
+    pub fn same_client_call(&self, other: &Self) -> bool {
+        self.client_id == other.client_id && self.call_id == other.call_id
+    }
+
+    /// Return true when a response identity matches the basic request identity.
+    ///
+    /// This intentionally excludes freshness, replay, and state-watermark
+    /// checks; those remain owned by the caller's boundary logic.
+    pub fn matches_request(&self, request: &Self) -> bool {
+        self.same_client_call(request) && self.group_name == request.group_name
+    }
+}
+
 /// W3C trace propagation context.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TraceContext {

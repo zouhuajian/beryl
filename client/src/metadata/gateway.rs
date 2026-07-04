@@ -571,7 +571,13 @@ fn parse_metadata_response_header(
 }
 
 fn validate_metadata_response_identity(ctx: &AttemptContext, identity: &HeaderIdentity) -> ClientResult<()> {
-    if let (Some(request_group_name), Some(response_group_name)) = (ctx.group_name(), identity.group_name.as_ref()) {
+    let request_identity = ctx.header_identity();
+    if identity.matches_request(&request_identity) {
+        return Ok(());
+    }
+    if let (Some(request_group_name), Some(response_group_name)) =
+        (request_identity.group_name.as_ref(), identity.group_name.as_ref())
+    {
         if response_group_name != request_group_name {
             return Err(ClientError::from(invalid_header_action(format!(
                 "metadata OK response invalid ResponseHeader: group_name mismatch: expected {}, got {}",
@@ -579,14 +585,13 @@ fn validate_metadata_response_identity(ctx: &AttemptContext, identity: &HeaderId
             ))));
         }
     }
-    if identity.client_id != ctx.client_id() {
+    if identity.client_id != request_identity.client_id {
         return Err(ClientError::from(invalid_header_action(format!(
             "metadata OK response invalid ResponseHeader: client_id mismatch: expected {}, got {}",
-            ctx.client_id(),
-            identity.client_id
+            request_identity.client_id, identity.client_id
         ))));
     }
-    if identity.call_id.to_string() != ctx.call_id() {
+    if identity.call_id != request_identity.call_id {
         return Err(ClientError::from(invalid_header_action(
             "metadata OK response invalid ResponseHeader: call_id mismatch",
         )));

@@ -17,7 +17,6 @@ use ::common::{
     },
     header::{AuthnType, CallerContext, ClientInfo, RequestHeader, ResponseHeader, RpcErrorCode, TraceContext},
 };
-use std::str::FromStr;
 use types::chunk::ByteRange;
 use types::ids::{
     BlockId, BlockIndex, ChunkId, ChunkIndex, DataHandleId, LeaseId, MountId, ShardId, StreamId, WorkerId,
@@ -209,6 +208,14 @@ pub fn required_client_id(proto: Option<proto_common::ClientIdProto>, field_name
         .ok_or_else(|| format!("missing {field_name}"))?
         .try_into()
         .map_err(|err| format!("invalid {field_name}: {err}"))
+}
+
+/// Parse a required call UUID field without choosing caller error policy.
+pub fn require_call_id(value: &str, field_name: &str) -> Result<CallId, String> {
+    if value.is_empty() {
+        return Err(format!("{field_name} must not be empty"));
+    }
+    CallId::parse(value).map_err(|err| format!("{field_name} {err}"))
 }
 
 impl From<ByteRange> for proto_common::ByteRangeProto {
@@ -758,7 +765,7 @@ impl TryFrom<proto_common::ClientInfoProto> for ClientInfo {
     type Error = String;
 
     fn try_from(proto: proto_common::ClientInfoProto) -> Result<Self, Self::Error> {
-        let call_id = CallId::from_str(&proto.call_id).map_err(|e| format!("Invalid call_id: {}", e))?;
+        let call_id = require_call_id(&proto.call_id, "call_id")?;
         let client_id = required_client_id(proto.client_id, "client_id")?;
         let client_name = if proto.client_name.is_empty() {
             None
@@ -1911,6 +1918,45 @@ mod tests {
             ClientId::try_from(proto_common::ClientIdProto { high: 0, low: 0 }).expect_err("zero client id must fail");
 
         assert!(err.contains("client_id"));
+    }
+
+    #[test]
+    fn required_client_and_call_identity_helpers_preserve_field_context() {
+        let client_id =
+            required_client_id(Some(ClientId::new(123).into()), "RequestHeader.client_id").expect("valid ClientId");
+        assert_eq!(client_id, ClientId::new(123));
+        assert!(
+            required_client_id(None, "RequestHeader.client_id")
+                .expect_err("missing client_id must fail")
+                .contains("RequestHeader.client_id")
+        );
+        assert!(
+            required_client_id(
+                Some(proto_common::ClientIdProto { high: 0, low: 0 }),
+                "RequestHeader.client_id"
+            )
+            .expect_err("zero client_id must fail")
+            .contains("non-zero")
+        );
+
+        let call_id =
+            require_call_id("550e8400-e29b-41d4-a716-446655440000", "RequestHeader.call_id").expect("valid CallId");
+        assert_eq!(
+            call_id,
+            "550e8400-e29b-41d4-a716-446655440000"
+                .parse::<types::CallId>()
+                .expect("valid CallId")
+        );
+        assert!(
+            require_call_id("", "RequestHeader.call_id")
+                .expect_err("missing call_id must fail")
+                .contains("RequestHeader.call_id")
+        );
+        assert!(
+            require_call_id("not-a-uuid", "ResponseHeader.call_id")
+                .expect_err("invalid call_id must fail")
+                .contains("ResponseHeader.call_id")
+        );
     }
 
     #[test]

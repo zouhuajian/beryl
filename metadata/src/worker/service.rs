@@ -643,8 +643,19 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 return self.metadata_error_response(&req.header, register_worker_response_with_header, error);
             }
 
+            let dedup = match crate::raft::DedupKey::from_header_identity(&_caller_ctx.identity()) {
+                Ok(dedup) => dedup,
+                Err(error) => {
+                    return self.metadata_error_response(
+                        &req.header,
+                        register_worker_response_with_header,
+                        MetadataError::InvalidArgument(error),
+                    )
+                }
+            };
+
             let command = Command::RegisterWorker {
-                dedup: crate::raft::DedupKey::new(_caller_ctx.client.client_id, _caller_ctx.client.call_id),
+                dedup,
                 group_name: group_name.clone(),
                 worker_id,
                 worker_run_id,

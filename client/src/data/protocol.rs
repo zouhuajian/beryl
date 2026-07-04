@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use common::error::canonical::{CanonicalError, RefreshHint as CanonicalRefreshHint, RefreshReason};
-use common::header::RpcErrorCode;
+use common::header::{HeaderIdentity, RpcErrorCode};
 use types::chunk::ByteRange;
 use types::{BlockShape, GroupName, WorkerEndpointInfo, WriteTarget};
 
@@ -395,17 +395,23 @@ pub(super) fn parse_worker_control_header(
     })?;
     let client_id = proto::convert::required_client_id(client.client_id, "client_id")
         .map_err(|err| invalid_worker_header(format!("worker OK response invalid DataResponseHeader: {err}")))?;
-    if client_id != attempt.client_id() {
+    let call_id = proto::convert::require_call_id(&client.call_id, "call_id")
+        .map_err(|err| invalid_worker_header(format!("worker OK response invalid DataResponseHeader: {err}")))?;
+    let response_identity = HeaderIdentity {
+        call_id,
+        client_id,
+        group_name: None,
+    };
+    let request_identity = attempt.header_identity();
+    if response_identity.matches_request(&request_identity) {
+        return validate_data_header_or_action(Some(header)).map_err(ClientError::from);
+    }
+    if response_identity.client_id != request_identity.client_id {
         return Err(invalid_worker_header(
             "worker OK response invalid DataResponseHeader: client_id mismatch",
         ));
     }
-    if client.call_id.is_empty() {
-        return Err(invalid_worker_header(
-            "worker OK response invalid DataResponseHeader: call_id must not be empty",
-        ));
-    }
-    if client.call_id != attempt.call_id() {
+    if response_identity.call_id != request_identity.call_id {
         return Err(invalid_worker_header(
             "worker OK response invalid DataResponseHeader: call_id mismatch",
         ));

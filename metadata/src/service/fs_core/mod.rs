@@ -114,13 +114,7 @@ impl FsCore {
     }
 
     fn dedup_key(&self, caller_ctx: &RequestHeader) -> MetadataResult<DedupKey> {
-        let client_id = caller_ctx.client.client_id;
-        if client_id.as_raw() == 0 {
-            return Err(MetadataError::InvalidArgument(
-                "client_id must be provided for dedup".to_string(),
-            ));
-        }
-        Ok(DedupKey::new(client_id, caller_ctx.client.call_id))
+        DedupKey::from_header_identity(&caller_ctx.identity()).map_err(MetadataError::InvalidArgument)
     }
 
     async fn authoritative_route_epoch(&self) -> Option<u64> {
