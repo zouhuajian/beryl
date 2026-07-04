@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use types::ids::BlockId;
-use types::layout::BlockFormatId;
+use types::layout::{BlockFormatId, BlockShape};
 use types::{GroupName, Tier};
 
 use super::meta_codec::{
@@ -268,7 +268,13 @@ impl FullBlockFileStore {
     /// Creates an unpublished staging block.
     /// This does not create final `.meta` and does not make the block readable.
     pub fn create_staging_block(&self, req: CreateStagingBlockRequest) -> StoreResult<BlockMetaPayload> {
-        validate_create_block_shape(req.block_format_id, req.block_size, req.chunk_size)?;
+        validate_store_block_shape(
+            req.block_format_id,
+            req.block_size,
+            req.chunk_size,
+            req.block_size,
+            invalid_argument,
+        )?;
 
         let paths = self.paths(&req.group_name, req.block_id);
         let parent = paths.parent_dir()?;
@@ -765,7 +771,8 @@ fn validate_final_meta_payload(meta: &BlockMetaPayload, group_name: &GroupName, 
         BlockState::Ready | BlockState::Corrupt => Ok(()),
         BlockState::Loading => Err(corrupt("loading block metadata is not valid final metadata")),
     }?;
-    validate_final_effective_len(meta.source.effective_len, meta.format.block_size, corrupt)?;
+    BlockShape::validate_effective_len(meta.format.block_size, meta.source.effective_len)
+        .map_err(|err| corrupt(err.to_string()))?;
     Ok(())
 }
 
@@ -801,7 +808,15 @@ fn validate_common_meta_shape(meta: &BlockMetaPayload, group_name: &GroupName, b
     if meta.format.checksum_kind != ChecksumKind::None {
         return Err(corrupt("unsupported checksum kind"));
     }
-    validate_common_block_shape(meta.format.block_size, meta.format.chunk_size, corrupt)?;
+    let chunk_size =
+        u32::try_from(meta.format.chunk_size).map_err(|_| corrupt("chunk_size does not fit block metadata format"))?;
+    validate_store_block_shape(
+        meta.format.format_id,
+        meta.format.block_size,
+        chunk_size,
+        meta.format.block_size,
+        corrupt,
+    )?;
     Ok(())
 }
 
@@ -834,46 +849,20 @@ pub fn validate_expected_block_shape(expected: &ExpectedBlockShape, actual: &Blo
     Ok(())
 }
 
-fn validate_create_block_shape(block_format_id: BlockFormatId, block_size: u64, chunk_size: u32) -> StoreResult<()> {
+fn validate_store_block_shape(
+    block_format_id: BlockFormatId,
+    block_size: u64,
+    chunk_size: u32,
+    effective_len: u64,
+    error: fn(String) -> WorkerError,
+) -> StoreResult<()> {
     if block_format_id != BlockFormatId::FULL_EFFECTIVE {
-        return Err(invalid_argument(format!(
+        return Err(error(format!(
             "unsupported block_format_id {}",
             block_format_id.as_raw()
         )));
     }
-    validate_common_block_shape(block_size, u64::from(chunk_size), invalid_argument)
-}
-
-fn validate_common_block_shape(block_size: u64, chunk_size: u64, error: fn(String) -> WorkerError) -> StoreResult<()> {
-    if block_size == 0 {
-        return Err(error("block size must be non-zero".to_string()));
-    }
-    if chunk_size == 0 {
-        return Err(error("chunk size must be non-zero".to_string()));
-    }
-    if chunk_size > u64::from(u32::MAX) {
-        return Err(error("chunk size does not fit block metadata format".to_string()));
-    }
-    if chunk_size > block_size {
-        return Err(error("chunk size must not exceed block size".to_string()));
-    }
-    if !block_size.is_multiple_of(chunk_size) {
-        return Err(error("block size must be a multiple of chunk size".to_string()));
-    }
-    Ok(())
-}
-
-fn validate_final_effective_len(
-    effective_len: u64,
-    block_size: u64,
-    error: fn(String) -> WorkerError,
-) -> StoreResult<()> {
-    if effective_len == 0 {
-        return Err(error("effective length must be non-zero".to_string()));
-    }
-    if effective_len > block_size {
-        return Err(error("effective length exceeds block size".to_string()));
-    }
+    BlockShape::new(block_format_id, block_size, chunk_size, effective_len).map_err(|err| error(err.to_string()))?;
     Ok(())
 }
 

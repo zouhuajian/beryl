@@ -21,7 +21,7 @@ use types::fs::{Extent, FsErrorCode};
 use types::ids::{BlockId, BlockIndex, DataHandleId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
-use types::{CommittedBlock, GroupName, Tier, WorkerEndpointInfo, WriteTarget};
+use types::{BlockShape, CommittedBlock, GroupName, Tier, WorkerEndpointInfo, WriteTarget};
 
 impl FsCore {
     pub(crate) fn write_session_for_handle(&self, file_handle: u64) -> Option<crate::write_session::WriteSession> {
@@ -880,21 +880,34 @@ impl<'a> WriteSessionCoordinator<'a> {
                 block_format_id: layout.block_format_id,
                 tier: planned.tier,
             };
-            if target.effective_len == 0 || target.effective_len > target.block_size {
-                return self.core.failure_from_error(
-                    &req.ctx,
-                    MetadataError::InvalidArgument(format!(
-                        "invalid write target length: effective_len={}, block_size={}",
-                        target.effective_len, target.block_size
-                    )),
-                    group_name,
-                    mount_epoch,
-                );
-            }
-            if target.block_size != block_size
-                || target.chunk_size != layout.chunk_size
-                || target.block_format_id != layout.block_format_id
-            {
+            let target_shape = match BlockShape::new(
+                target.block_format_id,
+                target.block_size,
+                target.chunk_size,
+                target.effective_len,
+            ) {
+                Ok(shape) => shape,
+                Err(err) => {
+                    return self.core.failure_from_error(
+                        &req.ctx,
+                        MetadataError::InvalidArgument(format!("invalid write target shape: {err}")),
+                        group_name,
+                        mount_epoch,
+                    );
+                }
+            };
+            let expected_shape = match BlockShape::for_effective_len(&layout, target.effective_len) {
+                Ok(shape) => shape,
+                Err(err) => {
+                    return self.core.failure_from_error(
+                        &req.ctx,
+                        MetadataError::InvalidArgument(format!("invalid write target shape: {err}")),
+                        group_name,
+                        mount_epoch,
+                    );
+                }
+            };
+            if target_shape != expected_shape {
                 return self.core.failure_from_error(
                     &req.ctx,
                     MetadataError::InvalidArgument(

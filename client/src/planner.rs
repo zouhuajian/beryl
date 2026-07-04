@@ -8,7 +8,7 @@ use common::header::RpcErrorCode;
 
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::ReadLayout;
-use types::{BlockId, DataHandleId, FileBlockLocation, GroupName, WorkerEndpointInfo};
+use types::{BlockId, BlockShape, DataHandleId, FileBlockLocation, GroupName, WorkerEndpointInfo};
 
 /// File byte range requested by a reader after EOF truncation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,30 +90,13 @@ pub(crate) fn plan_block_reads(
                 block_id
             )));
         }
-        if location.block_size == 0 {
-            return Err(ClientError::InvalidLayout(format!(
-                "block location {} has zero block_size",
-                block_id
-            )));
-        }
-        if location.chunk_size == 0 {
-            return Err(ClientError::InvalidLayout(format!(
-                "block location {} has zero chunk_size",
-                block_id
-            )));
-        }
-        if location.effective_len == 0 {
-            return Err(ClientError::InvalidLayout(format!(
-                "block location {} has zero effective_len",
-                block_id
-            )));
-        }
-        if location.effective_len > location.block_size {
-            return Err(ClientError::InvalidLayout(format!(
-                "block location {} effective_len exceeds block_size",
-                block_id
-            )));
-        }
+        BlockShape::new(
+            location.block_format_id,
+            location.block_size,
+            location.chunk_size,
+            location.effective_len,
+        )
+        .map_err(|err| ClientError::InvalidLayout(format!("block location {block_id} has invalid shape: {err}")))?;
         if location.workers.is_empty() {
             return Err(block_location_unavailable_error(format!(
                 "block location unavailable: metadata returned no worker candidates for block {} file_offset={} len={} block_stamp={}",

@@ -13,7 +13,7 @@ use common::error::canonical::RefreshReason;
 use common::header::RpcErrorCode;
 use types::chunk::ByteRange;
 use types::ids::{BlockId, ChunkIndex, StreamId};
-use types::layout::BlockFormatId;
+use types::layout::{BlockFormatId, BlockShape, BlockShapeError};
 use types::lease::FencingToken;
 use types::{GroupName, Tier, WorkerRunId};
 
@@ -848,52 +848,25 @@ fn validate_write_open_request(req: &WriteOpenRequest) -> WorkerCoreResult<()> {
             "block_stamp must be metadata-assigned and non-zero".to_string(),
         ));
     }
-    validate_block_format(req.block_format_id, req.block_size, req.chunk_size, req.checksum_kind)?;
-    if req.effective_len == 0 {
-        return Err(WorkerError::InvalidArgument(
-            "effective_len must be greater than zero".to_string(),
-        ));
-    }
-    if req.effective_len > req.block_size {
-        return Err(WorkerError::InvalidArgument(
-            "effective_len must not exceed block_size".to_string(),
-        ));
-    }
+    validate_block_shape(
+        req.block_format_id,
+        req.block_size,
+        req.chunk_size,
+        req.effective_len,
+        req.checksum_kind,
+    )?;
     Ok(())
 }
 
-fn validate_block_format(
+fn validate_block_shape(
     block_format_id: BlockFormatId,
     block_size: u64,
     chunk_size: u32,
+    effective_len: u64,
     checksum_kind: ChecksumKind,
 ) -> WorkerCoreResult<()> {
-    if block_format_id != BlockFormatId::FULL_EFFECTIVE {
-        return Err(WorkerError::InvalidArgument(format!(
-            "unsupported block_format_id {}",
-            block_format_id.as_raw()
-        )));
-    }
-    if block_size == 0 {
-        return Err(WorkerError::InvalidArgument(
-            "block_size must be greater than zero".to_string(),
-        ));
-    }
-    if chunk_size == 0 {
-        return Err(WorkerError::InvalidArgument(
-            "chunk_size must be greater than zero".to_string(),
-        ));
-    }
-    if u64::from(chunk_size) > block_size {
-        return Err(WorkerError::InvalidArgument(
-            "chunk_size must not exceed block_size".to_string(),
-        ));
-    }
-    if !block_size.is_multiple_of(u64::from(chunk_size)) {
-        return Err(WorkerError::InvalidArgument(
-            "block_size must be a multiple of chunk_size".to_string(),
-        ));
-    }
+    BlockShape::new(block_format_id, block_size, chunk_size, effective_len)
+        .map_err(|err| WorkerError::InvalidArgument(err.to_string()))?;
     if checksum_kind != ChecksumKind::None {
         return Err(WorkerError::InvalidArgument(
             "only checksum_kind None is supported".to_string(),
@@ -985,16 +958,17 @@ fn validate_commit_request(state: &StreamState, req: &CommitWriteRequest) -> Wor
             req.commit_seq, state.last_acked_seq
         )));
     }
-    if req.effective_len == 0 {
-        return Err(WorkerError::InvalidArgument(
-            "effective_len must be greater than zero".to_string(),
-        ));
-    }
-    if req.effective_len > state.context.end_offset {
-        return Err(WorkerError::InvalidArgument(format!(
-            "effective_len exceeds block_size: requested={}, block_size={}",
-            req.effective_len, state.context.end_offset
-        )));
+    if let Err(err) = BlockShape::validate_effective_len(state.context.end_offset, req.effective_len) {
+        return Err(match err {
+            BlockShapeError::ZeroEffectiveLen => {
+                WorkerError::InvalidArgument("effective_len must be greater than zero".to_string())
+            }
+            BlockShapeError::EffectiveLenExceedsBlock => WorkerError::InvalidArgument(format!(
+                "effective_len exceeds block_size: requested={}, block_size={}",
+                req.effective_len, state.context.end_offset
+            )),
+            other => WorkerError::InvalidArgument(other.to_string()),
+        });
     }
     if state.cursor != req.effective_len {
         return Err(WorkerError::InvalidArgument(format!(
@@ -1037,17 +1011,13 @@ fn validate_sync_committed_block_request(req: &SyncCommittedBlockRequest) -> Wor
             "sync committed block requires non-zero block_stamp".to_string(),
         ));
     }
-    if req.expected_block_len == 0 {
-        return Err(WorkerError::InvalidArgument(
-            "sync committed block requires non-zero expected_block_len".to_string(),
-        ));
-    }
-    validate_block_format(req.block_format_id, req.block_size, req.chunk_size, ChecksumKind::None)?;
-    if req.expected_block_len > req.block_size {
-        return Err(WorkerError::InvalidArgument(
-            "sync committed block expected_block_len must not exceed block_size".to_string(),
-        ));
-    }
+    validate_block_shape(
+        req.block_format_id,
+        req.block_size,
+        req.chunk_size,
+        req.expected_block_len,
+        ChecksumKind::None,
+    )?;
     Ok(())
 }
 

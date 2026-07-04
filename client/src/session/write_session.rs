@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
 use proto::metadata::WriteHandleProto;
-use types::{CallId, ClientId, CommittedBlock, DataHandleId, FileLayout, WriteTarget};
+use types::{BlockShape, CallId, ClientId, CommittedBlock, DataHandleId, FileLayout, WriteTarget};
 
 use crate::data::WorkerBlockWriteHandle;
 use crate::error::{ClientError, ClientResult};
@@ -165,16 +165,13 @@ impl WriteSession {
                 expected_len, target.effective_len
             )));
         }
-        if target.block_size == 0 {
-            return Err(ClientError::InvalidLayout(
-                "write target block_size must be non-zero".to_string(),
-            ));
-        }
-        if target.effective_len > target.block_size {
-            return Err(ClientError::InvalidLayout(
-                "write target effective_len must not exceed block_size".to_string(),
-            ));
-        }
+        BlockShape::new(
+            target.block_format_id,
+            target.block_size,
+            target.chunk_size,
+            target.effective_len,
+        )
+        .map_err(|err| ClientError::InvalidLayout(format!("write target has invalid shape: {err}")))?;
         let block = target.block_id;
         if block.data_handle_id != self.data_handle_id {
             return Err(ClientError::StaleHandle {
@@ -188,21 +185,6 @@ impl WriteSession {
         if target.block_stamp == 0 {
             return Err(ClientError::InvalidLayout(
                 "write target block_stamp must be non-zero".to_string(),
-            ));
-        }
-        if target.chunk_size == 0 {
-            return Err(ClientError::InvalidLayout(
-                "write target chunk_size must be non-zero".to_string(),
-            ));
-        }
-        if u64::from(target.chunk_size) > target.block_size {
-            return Err(ClientError::InvalidLayout(
-                "write target chunk_size must not exceed block_size".to_string(),
-            ));
-        }
-        if !target.block_size.is_multiple_of(u64::from(target.chunk_size)) {
-            return Err(ClientError::InvalidLayout(
-                "write target block_size must be a multiple of chunk_size".to_string(),
             ));
         }
         Ok(())

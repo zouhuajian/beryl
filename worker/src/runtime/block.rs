@@ -6,7 +6,7 @@
 use common::error::canonical::RefreshReason;
 use common::header::RpcErrorCode;
 use types::ids::BlockId;
-use types::layout::BlockFormatId;
+use types::layout::{BlockFormatId, BlockShape};
 use types::GroupName;
 
 use crate::data::core::{ReadOpenRequest, WorkerCoreResult};
@@ -75,31 +75,8 @@ impl BlockManager {
                 "block_stamp must be metadata-assigned and non-zero".to_string(),
             ));
         }
-        if req.block_size == 0 {
-            return Err(WorkerError::InvalidArgument(
-                "block_size must be greater than zero".to_string(),
-            ));
-        }
-        if req.chunk_size == 0 {
-            return Err(WorkerError::InvalidArgument(
-                "chunk_size must be greater than zero".to_string(),
-            ));
-        }
-        if !req.block_size.is_multiple_of(u64::from(req.chunk_size)) {
-            return Err(WorkerError::InvalidArgument(
-                "block_size must be a multiple of chunk_size".to_string(),
-            ));
-        }
-        if req.effective_len == 0 {
-            return Err(WorkerError::InvalidArgument(
-                "effective_len must be greater than zero".to_string(),
-            ));
-        }
-        if req.effective_len > req.block_size {
-            return Err(WorkerError::InvalidArgument(
-                "effective_len must not exceed block_size".to_string(),
-            ));
-        }
+        BlockShape::new(req.block_format_id, req.block_size, req.chunk_size, req.effective_len)
+            .map_err(|err| WorkerError::InvalidArgument(err.to_string()))?;
 
         let meta = match store.load_meta(&req.group_name, req.block_id) {
             Ok(meta) => meta,

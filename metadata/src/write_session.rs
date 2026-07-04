@@ -15,7 +15,7 @@ use types::fs::Extent;
 use types::fs::InodeId;
 use types::ids::{ClientId, DataHandleId, LeaseId, MountId};
 use types::lease::FencingToken;
-use types::WriteTarget;
+use types::{BlockShape, WriteTarget};
 
 /// Write session (runtime-only, not persisted to Raft).
 #[derive(Clone, Debug)]
@@ -141,7 +141,14 @@ impl WriteSessionManager {
         if let Some(len) = desired_len {
             target.effective_len = len.min(target.effective_len).max(1);
         }
-        if target.effective_len == 0 || target.effective_len > target.block_size {
+        if BlockShape::new(
+            target.block_format_id,
+            target.block_size,
+            target.chunk_size,
+            target.effective_len,
+        )
+        .is_err()
+        {
             return None;
         }
         session.next_target_index += 1;

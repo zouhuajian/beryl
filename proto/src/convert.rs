@@ -22,7 +22,7 @@ use types::chunk::ByteRange;
 use types::ids::{
     BlockId, BlockIndex, ChunkId, ChunkIndex, DataHandleId, LeaseId, MountId, ShardId, StreamId, WorkerId,
 };
-use types::layout::FileLayout;
+use types::layout::{BlockShape, FileLayout};
 use types::lease::FencingToken;
 use types::{
     CallId, ClientId, CommittedBlock, FileAttrs, FileBlockLocation, GroupName, GroupStateWatermark, InodeKind,
@@ -502,32 +502,21 @@ impl TryFrom<proto_metadata::WriteTargetProto> for WriteTarget {
     type Error = String;
 
     fn try_from(target: proto_metadata::WriteTargetProto) -> Result<Self, Self::Error> {
-        if target.block_size == 0 {
-            return Err("WriteTargetProto.block_size must be non-zero".to_string());
-        }
-        if target.effective_len == 0 {
-            return Err("WriteTargetProto.effective_len must be non-zero".to_string());
-        }
-        if target.effective_len > target.block_size {
-            return Err("WriteTargetProto.effective_len must not exceed block_size".to_string());
-        }
+        let block_format_id = types::layout::BlockFormatId::from_raw(target.block_format_id)
+            .map_err(|err| format!("WriteTargetProto.block_format_id invalid: {err}"))?;
+        BlockShape::new(
+            block_format_id,
+            target.block_size,
+            target.chunk_size,
+            target.effective_len,
+        )
+        .map_err(|err| format!("WriteTargetProto invalid block shape: {err}"))?;
         if target.worker_endpoints.is_empty() {
             return Err("WriteTargetProto.worker_endpoints must not be empty".to_string());
         }
         if target.block_stamp == 0 {
             return Err("WriteTargetProto.block_stamp must be non-zero".to_string());
         }
-        if target.chunk_size == 0 {
-            return Err("WriteTargetProto.chunk_size must be non-zero".to_string());
-        }
-        if u64::from(target.chunk_size) > target.block_size {
-            return Err("WriteTargetProto.chunk_size must not exceed block_size".to_string());
-        }
-        if !target.block_size.is_multiple_of(u64::from(target.chunk_size)) {
-            return Err("WriteTargetProto.block_size must be a multiple of chunk_size".to_string());
-        }
-        let block_format_id = types::layout::BlockFormatId::from_raw(target.block_format_id)
-            .map_err(|err| format!("WriteTargetProto.block_format_id invalid: {err}"))?;
         let tier = parse_known_tier(target.tier).map_err(|err| format!("WriteTargetProto.tier invalid: {err}"))?;
         let block_id = required_block_id(target.block_id, "WriteTargetProto.block_id")?;
         let fencing_token = required_fencing_token(target.fencing_token, "WriteTargetProto.fencing_token")?;
@@ -640,26 +629,15 @@ impl TryFrom<proto_metadata::FileBlockLocationProto> for FileBlockLocation {
         if block_stamp == 0 {
             return Err("FileBlockLocationProto.block_stamp must be non-zero".to_string());
         }
-        if location.block_size == 0 {
-            return Err("FileBlockLocationProto.block_size must be non-zero".to_string());
-        }
-        if location.effective_len == 0 {
-            return Err("FileBlockLocationProto.effective_len must be non-zero".to_string());
-        }
-        if location.effective_len > location.block_size {
-            return Err("FileBlockLocationProto.effective_len must not exceed block_size".to_string());
-        }
-        if location.chunk_size == 0 {
-            return Err("FileBlockLocationProto.chunk_size must be non-zero".to_string());
-        }
-        if u64::from(location.chunk_size) > location.block_size {
-            return Err("FileBlockLocationProto.chunk_size must not exceed block_size".to_string());
-        }
-        if !location.block_size.is_multiple_of(u64::from(location.chunk_size)) {
-            return Err("FileBlockLocationProto.block_size must be a multiple of chunk_size".to_string());
-        }
         let block_format_id = types::layout::BlockFormatId::from_raw(location.block_format_id)
             .map_err(|err| format!("FileBlockLocationProto.block_format_id invalid: {err}"))?;
+        BlockShape::new(
+            block_format_id,
+            location.block_size,
+            location.chunk_size,
+            location.effective_len,
+        )
+        .map_err(|err| format!("FileBlockLocationProto invalid block shape: {err}"))?;
         let block_id = required_block_id(location.block_id, "FileBlockLocationProto.block_id")?;
         let workers = location
             .workers

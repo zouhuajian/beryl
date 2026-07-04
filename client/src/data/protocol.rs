@@ -12,7 +12,7 @@ use bytes::{Bytes, BytesMut};
 use common::error::canonical::{CanonicalError, RefreshHint as CanonicalRefreshHint, RefreshReason};
 use common::header::RpcErrorCode;
 use types::chunk::ByteRange;
-use types::{GroupName, WorkerEndpointInfo, WriteTarget};
+use types::{BlockShape, GroupName, WorkerEndpointInfo, WriteTarget};
 
 use super::{WorkerBlockSyncResult, WorkerBlockWriteHandle, WorkerCommitResult, WorkerReadResult, WorkerWriteTarget};
 use crate::canonical::{invalid_header_action, validate_data_header_or_action};
@@ -31,15 +31,13 @@ pub(super) fn build_open_read_stream_request(
             "planned block read has zero block_stamp".to_string(),
         ));
     }
-    if block_read.block_size == 0
-        || block_read.chunk_size == 0
-        || block_read.effective_len == 0
-        || block_read.effective_len > block_read.block_size
-    {
-        return Err(ClientError::InvalidLayout(
-            "planned block read has invalid expected block shape".to_string(),
-        ));
-    }
+    BlockShape::new(
+        block_read.block_format_id,
+        block_read.block_size,
+        block_read.chunk_size,
+        block_read.effective_len,
+    )
+    .map_err(|err| ClientError::InvalidLayout(format!("planned block read has invalid expected block shape: {err}")))?;
     Ok(proto::worker::OpenReadStreamRequestProto {
         header: Some(attempt.data_header()),
         group_name: group_name.to_string(),
@@ -496,21 +494,13 @@ fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> 
             "write target block_id data_handle_id must be non-zero".to_string(),
         ));
     }
-    if target.target.block_size == 0 {
-        return Err(ClientError::InvalidLayout(
-            "write target block_size must be non-zero".to_string(),
-        ));
-    }
-    if target.target.effective_len == 0 {
-        return Err(ClientError::InvalidLayout(
-            "write target effective_len must be non-zero".to_string(),
-        ));
-    }
-    if target.target.effective_len > target.target.block_size {
-        return Err(ClientError::InvalidLayout(
-            "write target effective_len must not exceed block_size".to_string(),
-        ));
-    }
+    BlockShape::new(
+        target.target.block_format_id,
+        target.target.block_size,
+        target.target.chunk_size,
+        target.target.effective_len,
+    )
+    .map_err(|err| ClientError::InvalidLayout(format!("write target has invalid shape: {err}")))?;
     if target.target.worker_endpoints.is_empty() {
         return Err(ClientError::InvalidLayout(
             "write target has no worker endpoints".to_string(),
@@ -519,25 +509,6 @@ fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> 
     if target.target.block_stamp == 0 {
         return Err(ClientError::InvalidLayout(
             "write target block_stamp must be non-zero".to_string(),
-        ));
-    }
-    if target.target.chunk_size == 0 {
-        return Err(ClientError::InvalidLayout(
-            "write target chunk_size must be non-zero".to_string(),
-        ));
-    }
-    if u64::from(target.target.chunk_size) > target.target.block_size {
-        return Err(ClientError::InvalidLayout(
-            "write target chunk_size must not exceed block_size".to_string(),
-        ));
-    }
-    if !target
-        .target
-        .block_size
-        .is_multiple_of(u64::from(target.target.chunk_size))
-    {
-        return Err(ClientError::InvalidLayout(
-            "write target block_size must be a multiple of chunk_size".to_string(),
         ));
     }
     validate_fencing_token(&target.target)?;

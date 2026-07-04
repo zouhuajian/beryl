@@ -35,7 +35,7 @@ pub use ids::{
     BlockId, BlockIndex, CallId, ChunkId, ChunkIndex, ClientId, DataHandleId, GroupName, GroupNameError, LeaseId,
     MountId, ShardId, StreamId, WorkerId,
 };
-pub use layout::{BlockFormatId, BlockFormatIdError, FileLayout, FileLayoutError};
+pub use layout::{BlockFormatId, BlockFormatIdError, BlockShape, BlockShapeError, FileLayout, FileLayoutError};
 pub use location::{CommittedBlock, FileBlockLocation, WriteTarget};
 pub use raft_log_id::RaftLogId;
 pub use tier::{Tier, TierError, TierFree};
