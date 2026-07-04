@@ -80,10 +80,10 @@ pub enum ClientAction {
         /// Original canonical error.
         canonical: Box<CanonicalError>,
     },
-    /// Client may retry after delay.
+    /// Client may retry; server retry_after_ms is preserved as a hint.
     Retry {
-        /// Retry delay in milliseconds.
-        after_ms: Option<u64>,
+        /// Optional server retry delay hint in milliseconds.
+        retry_after_ms_hint: Option<u64>,
         /// Original canonical error.
         canonical: Box<CanonicalError>,
     },
@@ -104,9 +104,9 @@ pub enum ClientAction {
 /// This is the single entrypoint for header validation before response body use.
 pub fn validate_header_or_action(header: &ResponseHeader) -> Result<(), ClientAction> {
     debug_assert!(
-        (header.status == common::header::RpcStatus::Ok) == header.canonical_error.is_none(),
+        (header.status() == common::header::RpcStatus::Ok) == header.canonical_error.is_none(),
         "response header status/canonical mismatch: status={:?} canonical_present={}",
-        header.status,
+        header.status(),
         header.canonical_error.is_some()
     );
 
@@ -152,7 +152,7 @@ fn validate_canonical_with_hint(canonical: CanonicalError, hint: RefreshHint) ->
             })
         }
         ErrorClass::Retryable => Err(ClientAction::Retry {
-            after_ms: canonical.retry_after_ms,
+            retry_after_ms_hint: canonical.retry_after_ms,
             canonical: Box::new(canonical),
         }),
         ErrorClass::Fatal => Err(ClientAction::Fail {
@@ -370,10 +370,10 @@ mod tests {
         let result = validate_header_or_action(&header);
         match result {
             Err(ClientAction::Retry {
-                after_ms,
+                retry_after_ms_hint,
                 canonical: returned,
             }) => {
-                assert_eq!(after_ms, Some(1000));
+                assert_eq!(retry_after_ms_hint, Some(1000));
                 assert_eq!(returned.retry_after_ms, canonical.retry_after_ms);
                 assert_eq!(returned.code, canonical.code);
             }

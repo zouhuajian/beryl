@@ -15,9 +15,7 @@ use ::common::{
         CanonicalError, ErrorClass as CanonicalErrorClass, ErrorCode as CanonicalErrorCode,
         RefreshHint as CanonicalRefreshHint, RefreshReason, WorkerEndpointHint,
     },
-    header::{
-        AuthnType, CallerContext, ClientInfo, RequestHeader, ResponseHeader, RpcErrorCode, RpcStatus, TraceContext,
-    },
+    header::{AuthnType, CallerContext, ClientInfo, RequestHeader, ResponseHeader, RpcErrorCode, TraceContext},
 };
 use std::str::FromStr;
 use types::chunk::ByteRange;
@@ -950,18 +948,11 @@ impl TryFrom<proto_common::ResponseHeaderProto> for ResponseHeader {
             canonical_error = None;
         }
 
-        let status = match canonical_error
-            .as_ref()
-            .map(|err| err.class)
-            .unwrap_or(CanonicalErrorClass::Ok)
-        {
-            CanonicalErrorClass::Ok => RpcStatus::Ok,
-            CanonicalErrorClass::NeedRefresh | CanonicalErrorClass::Retryable => RpcStatus::Error,
-            CanonicalErrorClass::Fatal => RpcStatus::Fatal,
-        };
         debug_assert!(
-            (status == RpcStatus::Ok) == canonical_error.is_none(),
-            "status must align with canonical_error presence"
+            canonical_error
+                .as_ref()
+                .is_none_or(|err| !matches!(err.class, CanonicalErrorClass::Ok)),
+            "Ok canonical error detail must be normalized away"
         );
 
         let state = proto
@@ -972,7 +963,6 @@ impl TryFrom<proto_common::ResponseHeaderProto> for ResponseHeader {
 
         Ok(ResponseHeader {
             client,
-            status,
             canonical_error,
             state,
             mount_epoch: proto.mount_epoch,
@@ -988,29 +978,11 @@ impl TryFrom<proto_common::ResponseHeaderProto> for ResponseHeader {
 
 impl From<&ResponseHeader> for proto_common::ResponseHeaderProto {
     fn from(header: &ResponseHeader) -> Self {
-        let canonical_owned = match header.status {
-            RpcStatus::Ok => {
-                debug_assert!(
-                    header.canonical_error.is_none(),
-                    "status Ok must not carry canonical_error; dropping unexpected value"
-                );
-                None
-            }
-            RpcStatus::Error | RpcStatus::Fatal => header.canonical_error.clone().or_else(|| {
-                debug_assert!(
-                    false,
-                    "non-Ok response missing canonical_error; emitting fallback fatal canonical error"
-                );
-                Some(CanonicalError {
-                    class: CanonicalErrorClass::Fatal,
-                    code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                    reason: None,
-                    retry_after_ms: None,
-                    message: format!("missing canonical_error for status {:?}", header.status),
-                    refresh_hint: None,
-                })
-            }),
-        };
+        let canonical_owned = header
+            .canonical_error
+            .as_ref()
+            .filter(|err| !matches!(err.class, CanonicalErrorClass::Ok))
+            .cloned();
 
         let error_detail = canonical_owned.as_ref().map(canonical_to_error_detail);
 
@@ -1114,17 +1086,7 @@ fn fs_errno_enum_to_proto(code: &types::fs::FsErrorCode) -> proto_common::FsErrn
 fn rpc_code_proto_to_enum(code: i32) -> RpcErrorCode {
     match code {
         x if x == proto_common::RpcErrorCodeProto::RpcErrCodeUnspecified as i32 => RpcErrorCode::Unspecified,
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeNoSuchMethod as i32 => RpcErrorCode::NoSuchMethod,
         x if x == proto_common::RpcErrorCodeProto::RpcErrCodeInvalidHeader as i32 => RpcErrorCode::InvalidHeader,
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeVersionMismatch as i32 => RpcErrorCode::VersionMismatch,
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeDeserializeRequest as i32 => {
-            RpcErrorCode::DeserializeRequest
-        }
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeSerializeResponse as i32 => {
-            RpcErrorCode::SerializeResponse
-        }
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeUnauthenticated as i32 => RpcErrorCode::Unauthenticated,
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodePermissionDenied as i32 => RpcErrorCode::PermissionDenied,
         x if x == proto_common::RpcErrorCodeProto::RpcErrCodeNotLeader as i32 => RpcErrorCode::NotLeader,
         x if x == proto_common::RpcErrorCodeProto::RpcErrCodeStaleState as i32 => RpcErrorCode::StaleState,
         x if x == proto_common::RpcErrorCodeProto::RpcErrCodeMountEpochMismatch as i32 => {
@@ -1164,13 +1126,7 @@ fn rpc_code_proto_to_enum(code: i32) -> RpcErrorCode {
 fn rpc_code_enum_to_proto(code: RpcErrorCode) -> i32 {
     match code {
         RpcErrorCode::Unspecified => proto_common::RpcErrorCodeProto::RpcErrCodeUnspecified as i32,
-        RpcErrorCode::NoSuchMethod => proto_common::RpcErrorCodeProto::RpcErrCodeNoSuchMethod as i32,
         RpcErrorCode::InvalidHeader => proto_common::RpcErrorCodeProto::RpcErrCodeInvalidHeader as i32,
-        RpcErrorCode::VersionMismatch => proto_common::RpcErrorCodeProto::RpcErrCodeVersionMismatch as i32,
-        RpcErrorCode::DeserializeRequest => proto_common::RpcErrorCodeProto::RpcErrCodeDeserializeRequest as i32,
-        RpcErrorCode::SerializeResponse => proto_common::RpcErrorCodeProto::RpcErrCodeSerializeResponse as i32,
-        RpcErrorCode::Unauthenticated => proto_common::RpcErrorCodeProto::RpcErrCodeUnauthenticated as i32,
-        RpcErrorCode::PermissionDenied => proto_common::RpcErrorCodeProto::RpcErrCodePermissionDenied as i32,
         RpcErrorCode::NotLeader => proto_common::RpcErrorCodeProto::RpcErrCodeNotLeader as i32,
         RpcErrorCode::StaleState => proto_common::RpcErrorCodeProto::RpcErrCodeStaleState as i32,
         RpcErrorCode::MountEpochMismatch => proto_common::RpcErrorCodeProto::RpcErrCodeMountEpochMismatch as i32,
@@ -1629,13 +1585,7 @@ mod tests {
             proto_enum_values(errors_proto, "RpcErrorCodeProto"),
             vec![
                 ("RPC_ERR_CODE_UNSPECIFIED", 0),
-                ("RPC_ERR_CODE_NO_SUCH_METHOD", 1),
                 ("RPC_ERR_CODE_INVALID_HEADER", 2),
-                ("RPC_ERR_CODE_VERSION_MISMATCH", 3),
-                ("RPC_ERR_CODE_DESERIALIZE_REQUEST", 4),
-                ("RPC_ERR_CODE_SERIALIZE_RESPONSE", 5),
-                ("RPC_ERR_CODE_UNAUTHENTICATED", 20),
-                ("RPC_ERR_CODE_PERMISSION_DENIED", 21),
                 ("RPC_ERR_CODE_NOT_LEADER", 40),
                 ("RPC_ERR_CODE_STALE_STATE", 41),
                 ("RPC_ERR_CODE_FENCING", 42),
@@ -2016,7 +1966,7 @@ mod tests {
         };
 
         let header: ResponseHeader = proto_header.try_into().unwrap();
-        assert_eq!(header.status, RpcStatus::Error);
+        assert_eq!(header.status(), RpcStatus::Error);
         assert_eq!(header.mount_epoch, Some(7));
         assert_eq!(header.route_epoch, Some(9));
         let canonical = header

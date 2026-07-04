@@ -161,8 +161,6 @@ pub enum AuthnType {
 pub struct ResponseHeader {
     /// Client information (call_id, client_id, client_name).
     pub client: ClientInfo,
-    /// High-level status for the RPC outcome.
-    pub status: RpcStatus,
     /// Canonical error detail (single source of truth for error semantics).
     pub canonical_error: Option<CanonicalError>,
     /// Server-authorized client state cache updates.
@@ -196,14 +194,7 @@ pub enum RpcStatus {
 pub enum RpcErrorCode {
     Unspecified,
     // Framework / protocol
-    NoSuchMethod,
     InvalidHeader,
-    VersionMismatch,
-    DeserializeRequest,
-    SerializeResponse,
-    // Auth / permission
-    Unauthenticated,
-    PermissionDenied,
     // Routing / topology / raft
     NotLeader,
     StaleState,
@@ -418,7 +409,6 @@ impl ResponseHeader {
     pub fn ok(client: ClientInfo) -> Self {
         Self {
             client,
-            status: RpcStatus::Ok,
             canonical_error: None,
             state: Vec::new(),
             mount_epoch: None,
@@ -438,23 +428,22 @@ impl ResponseHeader {
             !matches!(canonical_error.class, CanonicalErrorClass::Ok),
             "ResponseHeader::from_canonical must not be called with Ok class; use ResponseHeader::ok instead"
         );
-        let status = match canonical_error.class {
-            CanonicalErrorClass::Ok => RpcStatus::Ok,
-            CanonicalErrorClass::NeedRefresh | CanonicalErrorClass::Retryable => RpcStatus::Error,
-            CanonicalErrorClass::Fatal => RpcStatus::Fatal,
-        };
-        debug_assert!(
-            status == RpcStatus::Ok || !matches!(canonical_error.class, CanonicalErrorClass::Ok),
-            "status and canonical_error.class must align: Ok => None, non-Ok => Some"
-        );
         Self {
             client,
-            status,
             canonical_error: Some(canonical_error),
             state: Vec::new(),
             mount_epoch: None,
             route_epoch: None,
             group_name: None,
+        }
+    }
+
+    /// Derive high-level RPC status from canonical error detail.
+    pub fn status(&self) -> RpcStatus {
+        match self.canonical_error.as_ref().map(|error| error.class) {
+            None | Some(CanonicalErrorClass::Ok) => RpcStatus::Ok,
+            Some(CanonicalErrorClass::NeedRefresh | CanonicalErrorClass::Retryable) => RpcStatus::Error,
+            Some(CanonicalErrorClass::Fatal) => RpcStatus::Fatal,
         }
     }
 

@@ -225,30 +225,6 @@ pub(crate) fn fatal_fs_core_failure(
     )
 }
 
-pub(crate) fn terminal_rpc_core_failure(
-    ctx: &RequestContext,
-    reason: RefreshReason,
-    rpc_code: RpcErrorCode,
-    message: impl Into<String>,
-    group_name: Option<GroupName>,
-    mount_epoch: Option<u64>,
-) -> CoreFailure {
-    core_failure_from_canonical_error(
-        ctx,
-        CanonicalError {
-            class: ErrorClass::Fatal,
-            code: Some(CanonicalErrorCode::RpcCode(rpc_code)),
-            reason: Some(reason),
-            retry_after_ms: None,
-            message: message.into(),
-            refresh_hint: None,
-        },
-        group_name,
-        mount_epoch,
-        None,
-    )
-}
-
 pub fn ok_header_from_request(
     req_header: &Option<proto::common::RequestHeaderProto>,
     group_name: Option<GroupName>,

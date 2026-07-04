@@ -8,9 +8,8 @@ use std::future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode, RefreshReason};
+use common::error::canonical::{CanonicalError, ErrorClass, RefreshReason};
 use common::header::RequestHeader;
-use common::header::RpcErrorCode;
 use proto::common::{EndpointProto, RequestHeaderProto};
 use proto::convert::error_detail_to_canonical;
 use proto::metadata::metadata_worker_service_proto_client::MetadataWorkerServiceProtoClient;
@@ -377,19 +376,6 @@ fn classify_canonical_error(error: CanonicalError) -> Result<HeartbeatPeerOutcom
         ErrorClass::Ok => Err(HeartbeatError::Fatal(
             "metadata heartbeat response contained malformed OK error detail".to_string(),
         )),
-        ErrorClass::NeedRefresh
-            if matches!(
-                error.code,
-                Some(ErrorCode::RpcCode(
-                    RpcErrorCode::WorkerNotRegistered | RpcErrorCode::WorkerDescriptorMismatch
-                ))
-            ) =>
-        {
-            Ok(HeartbeatPeerOutcome::NeedRegister)
-        }
-        ErrorClass::NeedRefresh if matches!(error.code, Some(ErrorCode::RpcCode(RpcErrorCode::WorkerRunMismatch))) => {
-            Ok(HeartbeatPeerOutcome::WorkerRunMismatch)
-        }
         ErrorClass::Retryable | ErrorClass::NeedRefresh => Err(HeartbeatError::Retryable(error.message)),
         ErrorClass::Fatal => Err(HeartbeatError::Fatal(format!(
             "fatal metadata heartbeat error: {}",

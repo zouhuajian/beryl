@@ -46,8 +46,8 @@ mod tests {
     use crate::config::{StoreDirConfig, WorkerConfig, WorkerRegistrationConfig};
     use crate::control::identity::resolve_worker_id;
     use crate::control::{
-        BlockReportOptions, HeartbeatSnapshot, MetadataBlockReportLoop, MetadataHeartbeatLoop, MetadataRegistrar,
-        Registration, RegistrationDescriptor, RegistrationSet,
+        BlockReportError, BlockReportOptions, HeartbeatError, HeartbeatSnapshot, MetadataBlockReportLoop,
+        MetadataHeartbeatLoop, MetadataRegistrar, Registration, RegistrationDescriptor, RegistrationSet,
     };
     use crate::data::convert::{
         proto_to_abort_write_request, proto_to_commit_write_request, proto_to_read_open_request,
@@ -1021,6 +1021,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_refresh_code_without_reason_does_not_clear_registration() {
+        let worker_run_id = test_worker_run_id();
+        let (endpoint, _mock, shutdown) =
+            start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::HeaderError(CanonicalError::need_refresh(
+                RpcErrorCode::WorkerNotRegistered,
+                RefreshReason::Unknown,
+                "legacy code-only refresh",
+            ))])
+            .await;
+        let state = Arc::new(RegistrationSet::new());
+        state.record_registered(Registration {
+            group_name: group_name(),
+            worker_id: WorkerId::new(42),
+            worker_run_id,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        });
+        state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
+        let heartbeat = MetadataHeartbeatLoop::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+        )
+        .expect("heartbeat loop");
+
+        let err = heartbeat
+            .send_once(HeartbeatSnapshot::default())
+            .await
+            .expect_err("unknown refresh reason must not become a hard control outcome");
+
+        assert!(matches!(err, HeartbeatError::Retryable(_)));
+        assert!(state.is_registered(&group_name()));
+        assert!(state.is_ready(&group_name()));
+        shutdown.send(()).ok();
+    }
+
+    #[tokio::test]
     async fn worker_run_mismatch_heartbeat_response_clears_registration_for_recovery() {
         let worker_run_id = test_worker_run_id();
         let (endpoint, mock, shutdown) = start_mock_metadata(vec![MockRegisterReply::Ok {
@@ -1412,6 +1448,45 @@ mod tests {
             );
             shutdown.send(()).ok();
         }
+    }
+
+    #[tokio::test]
+    async fn block_report_refresh_code_without_reason_does_not_set_control_outcome() {
+        let worker_run_id = test_worker_run_id();
+        let error = CanonicalError::need_refresh(
+            RpcErrorCode::FullReportRequired,
+            RefreshReason::Unknown,
+            "legacy code-only refresh",
+        );
+        let (endpoint, _mock, shutdown) =
+            start_mock_metadata_with_block_reports(vec![MockBlockReportReply::HeaderError(error)]).await;
+        let state = Arc::new(RegistrationSet::new());
+        state.record_registered(Registration {
+            group_name: group_name(),
+            worker_id: WorkerId::new(42),
+            worker_run_id,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        });
+        state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
+        let temp = TempDir::new().expect("tempdir");
+        let store = report_store(&temp);
+        publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
+        let reporter = MetadataBlockReportLoop::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+            Arc::clone(&store),
+        )
+        .expect("block reporter");
+
+        let err = reporter
+            .send_full_once()
+            .await
+            .expect_err("unknown refresh reason must not become a hard block-report outcome");
+
+        assert!(matches!(err, BlockReportError::Retryable(_)));
+        assert!(state.is_registered(&group_name()));
+        shutdown.send(()).ok();
     }
 
     #[tokio::test]

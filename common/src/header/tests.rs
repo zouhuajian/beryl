@@ -44,7 +44,7 @@ fn test_response_header_with_client_info() {
     let resp = ResponseHeader::ok(client.clone());
 
     assert_eq!(resp.client.client_id.as_raw(), 789);
-    assert_eq!(resp.status, RpcStatus::Ok);
+    assert_eq!(resp.status(), RpcStatus::Ok);
     assert!(resp.canonical_error.is_none());
 
     let canonical = CanonicalError {
@@ -56,7 +56,7 @@ fn test_response_header_with_client_info() {
         refresh_hint: None,
     };
     let resp_error = ResponseHeader::error(client, canonical);
-    assert_eq!(resp_error.status, RpcStatus::Error);
+    assert_eq!(resp_error.status(), RpcStatus::Error);
     assert_eq!(
         resp_error.canonical_error.as_ref().and_then(|c| c.retry_after_ms),
         Some(1000)

@@ -104,10 +104,13 @@ impl std::fmt::Display for ClientActionError {
                 "Client action error: class={:?}, code={:?}, reason={:?}, message={}",
                 canonical.class, canonical.code, reason, canonical.message
             ),
-            ClientAction::Retry { after_ms, canonical } => write!(
+            ClientAction::Retry {
+                retry_after_ms_hint,
+                canonical,
+            } => write!(
                 f,
-                "Client action error: class={:?}, code={:?}, retry_after_ms={:?}, message={}",
-                canonical.class, canonical.code, after_ms, canonical.message
+                "Client action error: class={:?}, code={:?}, retry_after_ms_hint={:?}, message={}",
+                canonical.class, canonical.code, retry_after_ms_hint, canonical.message
             ),
             ClientAction::Fail { canonical } => write!(
                 f,
@@ -470,13 +473,16 @@ mod tests {
 
         let retry_canonical = CanonicalError::retryable(RpcErrorCode::NodeUnavailable, Some(25), "please refresh");
         let retry = ClientError::from(ClientAction::Retry {
-            after_ms: Some(25),
+            retry_after_ms_hint: Some(25),
             canonical: Box::new(retry_canonical),
         });
         match retry {
             ClientError::Action(action) => match action.as_ref() {
-                ClientAction::Retry { after_ms, canonical } => {
-                    assert_eq!(*after_ms, Some(25));
+                ClientAction::Retry {
+                    retry_after_ms_hint,
+                    canonical,
+                } => {
+                    assert_eq!(*retry_after_ms_hint, Some(25));
                     assert_eq!(canonical.class, ErrorClass::Retryable);
                     assert_eq!(canonical.retry_after_ms, Some(25));
                 }

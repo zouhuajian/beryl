@@ -14,7 +14,7 @@ use crate::service::domain::{
 use crate::state::{MemoryStateStore, RouteEpoch};
 use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerInfo, WorkerManager};
 use async_trait::async_trait;
-use common::error::canonical::{ErrorCode as CanonicalErrorCode, RefreshReason};
+use common::error::canonical::{ErrorClass, ErrorCode as CanonicalErrorCode, RefreshReason};
 use common::header::{AuthnType, CallerContext, RequestHeader, RpcErrorCode};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -1790,7 +1790,14 @@ async fn abort_checks_handle() {
         failure.error.code,
         Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
     );
+    assert_eq!(failure.error.class, ErrorClass::NeedRefresh);
     assert_eq!(failure.error.reason, Some(RefreshReason::SessionInvalid));
+    let roundtrip = crate::service::core_util::header_from_core_failure(&request_context(), &failure);
+    let roundtrip_error = proto::convert::error_detail_to_canonical(
+        roundtrip.error.as_ref().expect("session failure must carry wire error"),
+    );
+    assert_eq!(roundtrip_error.class, ErrorClass::NeedRefresh);
+    assert_eq!(roundtrip_error.reason, Some(RefreshReason::SessionInvalid));
 
     let file_handle = install_write_session(&fs_core, inode_id, mount_id);
     let session = fs_core
@@ -1808,6 +1815,7 @@ async fn abort_checks_handle() {
         stale_failure.error.code,
         Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
     );
+    assert_eq!(stale_failure.error.class, ErrorClass::NeedRefresh);
     assert_eq!(stale_failure.error.reason, Some(RefreshReason::SessionInvalid));
     assert!(fs_core.write_session_for_handle(file_handle).is_some());
     assert!(fs_core

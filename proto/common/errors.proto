@@ -16,7 +16,7 @@ import "common/common.proto";
 //
 // Key principles:
 // - FS errno and RPC error codes are mutually exclusive (oneof)
-// - retry_after_ms has a single source of truth
+// - retry_after_ms is a server hint, not a strict client scheduling source
 // - ErrorClass and RefreshReason are enums (not strings)
 // - No duplicate fields or conflicting priorities
 
@@ -101,16 +101,13 @@ enum FsErrnoProto {
 enum RpcErrorCodeProto {
   RPC_ERR_CODE_UNSPECIFIED = 0;
 
-  // ---- Framework / protocol ----
-  RPC_ERR_CODE_NO_SUCH_METHOD = 1;
-  RPC_ERR_CODE_INVALID_HEADER = 2;
-  RPC_ERR_CODE_VERSION_MISMATCH = 3;
-  RPC_ERR_CODE_DESERIALIZE_REQUEST = 4;
-  RPC_ERR_CODE_SERIALIZE_RESPONSE = 5;
+  reserved 1, 3, 4, 5, 20, 21;
+  reserved "RPC_ERR_CODE_NO_SUCH_METHOD", "RPC_ERR_CODE_VERSION_MISMATCH",
+      "RPC_ERR_CODE_DESERIALIZE_REQUEST", "RPC_ERR_CODE_SERIALIZE_RESPONSE",
+      "RPC_ERR_CODE_UNAUTHENTICATED", "RPC_ERR_CODE_PERMISSION_DENIED";
 
-  // ---- Auth / permission ----
-  RPC_ERR_CODE_UNAUTHENTICATED = 20;
-  RPC_ERR_CODE_PERMISSION_DENIED = 21;
+  // ---- Framework / protocol ----
+  RPC_ERR_CODE_INVALID_HEADER = 2;
 
   // ---- Routing / topology / raft ----
   RPC_ERR_CODE_NOT_LEADER = 40;
@@ -150,8 +147,8 @@ message ErrorDetailProto {
   /// Refresh reason (required when error_class = NEED_REFRESH).
   RefreshReasonProto refresh_reason = 4;
 
-  /// Retry after delay in milliseconds (optional, only for RETRYABLE errors).
-  /// This is the SINGLE source of truth for retry timing.
+  /// Retry-after hint in milliseconds (optional, only for RETRYABLE errors).
+  /// Current client runtime records this hint but schedules retry sleep from its configured backoff.
   optional uint64 retry_after_ms = 5;
 
   /// Human-readable error message.

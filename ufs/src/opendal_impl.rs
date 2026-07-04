@@ -26,22 +26,22 @@ mod ufs_metrics {
     pub const BYTES_TOTAL: &str = "ufs_bytes_total";
 }
 
-fn classify_ufs_error_from_message(error_msg: &str) -> ErrorKind {
-    let msg_lower = error_msg.to_lowercase();
-    if msg_lower.contains("not found") {
-        ErrorKind::NotFound
-    } else if msg_lower.contains("permission denied") {
-        ErrorKind::PermissionDenied
-    } else if msg_lower.contains("unsupported") || msg_lower.contains("not supported") {
-        ErrorKind::Unsupported
-    } else if msg_lower.contains("not implemented") {
-        ErrorKind::NotImplemented
-    } else if msg_lower.contains("invalid") && (msg_lower.contains("path") || msg_lower.contains("range")) {
-        ErrorKind::InvalidArgument
-    } else if msg_lower.contains("backend error") {
-        ErrorKind::Io
-    } else {
-        ErrorKind::Unknown
+fn classify_ufs_error(error: &UfsError) -> ErrorKind {
+    match error {
+        UfsError::NotFound(_) => ErrorKind::NotFound,
+        UfsError::PermissionDenied(_) => ErrorKind::PermissionDenied,
+        UfsError::Unsupported(_) => ErrorKind::Unsupported,
+        UfsError::NotImplemented(_) => ErrorKind::NotImplemented,
+        UfsError::InvalidSpec(_) | UfsError::InvalidPath(_) => ErrorKind::InvalidArgument,
+        UfsError::UnexpectedEof { .. } => ErrorKind::Io,
+        UfsError::Internal(_) => ErrorKind::Internal,
+        UfsError::Overloaded(_) => ErrorKind::Overloaded,
+        UfsError::Backend(error) => match error.kind() {
+            opendal::ErrorKind::NotFound => ErrorKind::NotFound,
+            opendal::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
+            opendal::ErrorKind::Unsupported => ErrorKind::Unsupported,
+            _ => ErrorKind::Io,
+        },
     }
 }
 
@@ -263,7 +263,7 @@ impl OpendalUfs {
                 let (status, error_kind) = match &result {
                     Ok(_) => ("ok", ErrorKind::Ok),
                     Err(e) => {
-                        let kind = classify_ufs_error_from_message(&e.to_string());
+                        let kind = classify_ufs_error(e);
                         (kind.as_str(), kind)
                     }
                 };
@@ -280,6 +280,31 @@ impl OpendalUfs {
         }
         .instrument(span)
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ufs_metrics_error_kind_uses_structured_error_variant() {
+        assert_eq!(
+            classify_ufs_error(&UfsError::NotFound("renamed".to_string())),
+            ErrorKind::NotFound
+        );
+        assert_eq!(
+            classify_ufs_error(&UfsError::PermissionDenied("renamed".to_string())),
+            ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            classify_ufs_error(&UfsError::InvalidPath("renamed".to_string())),
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(
+            classify_ufs_error(&UfsError::Overloaded("renamed".to_string())),
+            ErrorKind::Overloaded
+        );
     }
 }
 

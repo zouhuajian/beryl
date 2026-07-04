@@ -20,7 +20,7 @@ pub mod canonical {
     //!     epoch/route mismatch, fencing, block stamp mismatch, etc.)
     //! - Provide a single place for:
     //!   - FS errno vs RPC error code (`ErrorCode`)
-    //!   - `retry_after_ms` source of truth
+    //!   - `retry_after_ms` server hint for retryable errors
     //! - Enforce invariants *in Rust* even before protobuf headers are fully
     //!   converged.
     //!
@@ -124,7 +124,7 @@ pub mod canonical {
     /// 1. `class == ErrorClass::Ok`  => `code/reason/retry_after_ms` must be `None`.
     /// 2. `class == ErrorClass::NeedRefresh` => `reason.is_some()`; `code`
     ///    SHOULD be `Some(ErrorCode::RpcCode(_))`.
-    /// 3. `class == ErrorClass::Retryable`   => `retry_after_ms` is optional;
+    /// 3. `class == ErrorClass::Retryable`   => `retry_after_ms` is an optional hint;
     ///    `code` SHOULD be `Some(ErrorCode::RpcCode(_))`.
     /// 4. FS errno errors default to `class == Fatal` unless explicitly marked retriable/refreshable.
     #[derive(Clone, Debug)]

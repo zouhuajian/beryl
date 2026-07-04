@@ -393,9 +393,7 @@ fn metadata_worker_error_detail_kind(error: &proto::common::ErrorDetailProto) ->
     }
     match canonical.code.as_ref() {
         Some(CanonicalErrorCode::RpcCode(RpcErrorCode::InvalidArgument)) => "invalid_argument",
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)) => {
-            metadata_worker_application_error_kind(&canonical.message)
-        }
+        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)) => "application",
         _ => observe::canonical_error_kind(&canonical),
     }
 }
@@ -419,29 +417,6 @@ fn metadata_worker_refresh_reason_kind(reason: RefreshReason) -> &'static str {
         RefreshReason::EpochMismatch => "epoch_mismatch",
         RefreshReason::SessionInvalid => "session_invalid",
         RefreshReason::SessionExpired => "session_expired",
-    }
-}
-
-fn metadata_worker_application_error_kind(message: &str) -> &'static str {
-    let message = message.to_ascii_lowercase();
-    if message.starts_with("invalid argument:") {
-        "invalid_argument"
-    } else if message.starts_with("not found:") {
-        "not_found"
-    } else if message.starts_with("already exists:") {
-        "already_exists"
-    } else if message.starts_with("permission denied:") {
-        "permission_denied"
-    } else if message.starts_with("operation not supported:") {
-        "not_supported"
-    } else if message.starts_with("resource busy:") {
-        "busy"
-    } else if message.starts_with("active worker conflict:") {
-        "active_worker_conflict"
-    } else if message.starts_with("internal error:") {
-        "internal"
-    } else {
-        "application"
     }
 }
 
@@ -2940,12 +2915,12 @@ mod tests {
                 ("service", "metadata_worker"),
                 ("method", "register_worker"),
                 ("status", "error"),
-                ("error_kind", "invalid_argument"),
+                ("error_kind", "application"),
             ],
         ));
         assert!(recorder.has_counter(
             observe::METADATA_WORKER_REGISTERED_TOTAL,
-            &[("status", "error"), ("error_kind", "invalid_argument")],
+            &[("status", "error"), ("error_kind", "application")],
         ));
         assert!(recorder.has_histogram(
             observe::METADATA_RPC_REQUEST_DURATION_SECONDS,
@@ -2953,13 +2928,34 @@ mod tests {
                 ("service", "metadata_worker"),
                 ("method", "register_worker"),
                 ("status", "error"),
-                ("error_kind", "invalid_argument"),
+                ("error_kind", "application"),
             ],
         ));
         assert!(recorder.has_histogram(
             observe::METADATA_WORKER_REGISTRATION_DURATION_SECONDS,
-            &[("status", "error"), ("error_kind", "invalid_argument")],
+            &[("status", "error"), ("error_kind", "application")],
         ));
+    }
+
+    #[test]
+    fn metadata_worker_application_error_label_ignores_message_text() {
+        for message in [
+            "not found: block",
+            "permission denied: worker",
+            "active worker conflict: run",
+            "arbitrary application failure",
+        ] {
+            let canonical = CanonicalError {
+                class: ErrorClass::Fatal,
+                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
+                reason: None,
+                retry_after_ms: None,
+                message: message.to_string(),
+                refresh_hint: None,
+            };
+            let detail = proto::convert::canonical_to_error_detail(&canonical);
+            assert_eq!(metadata_worker_error_detail_kind(&detail), "application");
+        }
     }
 
     #[tokio::test]

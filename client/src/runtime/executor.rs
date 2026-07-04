@@ -1458,6 +1458,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_retry_after_ms_is_hint_and_runtime_backoff_schedules_sleep() {
+        let gateway = Arc::new(ScriptedGateway::new(vec![
+            GatewayOutcome::Retryable {
+                retry_after_ms: Some(250),
+            },
+            GatewayOutcome::Ok,
+        ]));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let metrics_hook: Arc<dyn ClientMetrics> = metrics.clone();
+        let sleeper_hook: Arc<dyn BackoffSleeper> = sleeper.clone();
+        let executor = test_executor_with_hooks(
+            gateway.clone(),
+            retry_config(1),
+            RefreshConfig {
+                max_refresh_attempts: 1,
+            },
+            metrics_hook,
+            sleeper_hook,
+        );
+
+        executor
+            .get_status_request(
+                "/alpha",
+                GetStatusRequestProto {
+                    header: None,
+                    path: "/alpha".to_string(),
+                },
+            )
+            .await
+            .expect("retry succeeds");
+
+        assert_eq!(gateway.calls().len(), 2);
+        assert_eq!(
+            sleeper.delays.lock().expect("delays").as_slice(),
+            &[Duration::from_millis(100)]
+        );
+    }
+
+    #[tokio::test]
     async fn add_block_session_expired_is_not_replayed_as_refresh() {
         let gateway = Arc::new(ScriptedGateway::new(vec![refresh_outcome(
             RpcErrorCode::Application,
@@ -1616,6 +1656,9 @@ mod tests {
             reason: CanonicalRefreshReason,
             hint: CanonicalRefreshHint,
         },
+        Retryable {
+            retry_after_ms: Option<u64>,
+        },
         TransportUnavailable,
         MissingHeader,
         Pending,
@@ -1681,6 +1724,7 @@ mod tests {
             match outcome {
                 GatewayOutcome::Ok => Ok(()),
                 GatewayOutcome::Refresh { code, reason, hint } => Err(refresh_error(code, reason, hint)),
+                GatewayOutcome::Retryable { retry_after_ms } => Err(retryable_error(retry_after_ms)),
                 GatewayOutcome::TransportUnavailable => Err(ClientError::from(tonic::Status::unavailable(
                     "injected metadata transport failure",
                 ))),
@@ -1963,6 +2007,14 @@ mod tests {
         ClientError::from(ClientAction::Refresh {
             reason,
             hint: Box::new(client_hint_from_canonical(&hint)),
+            canonical: Box::new(canonical),
+        })
+    }
+
+    fn retryable_error(retry_after_ms: Option<u64>) -> ClientError {
+        let canonical = CanonicalError::retryable(RpcErrorCode::NodeUnavailable, retry_after_ms, "retry later");
+        ClientError::from(ClientAction::Retry {
+            retry_after_ms_hint: retry_after_ms,
             canonical: Box::new(canonical),
         })
     }

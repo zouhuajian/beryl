@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode, RefreshReason};
-use common::header::{RequestHeader, RpcErrorCode};
+use common::error::canonical::{CanonicalError, ErrorClass, RefreshReason};
+use common::header::RequestHeader;
 use proto::common::RequestHeaderProto;
 use proto::convert::error_detail_to_canonical;
 use proto::metadata::metadata_worker_service_proto_client::MetadataWorkerServiceProtoClient;
@@ -653,22 +653,6 @@ fn classify_canonical_error(error: CanonicalError) -> Result<BlockReportPeerOutc
         ErrorClass::Ok => Err(BlockReportError::Fatal(
             "metadata block report response contained malformed OK error detail".to_string(),
         )),
-        ErrorClass::NeedRefresh if matches!(error.code, Some(ErrorCode::RpcCode(RpcErrorCode::FullReportRequired))) => {
-            Ok(BlockReportPeerOutcome::FullReportRequired)
-        }
-        ErrorClass::NeedRefresh
-            if matches!(
-                error.code,
-                Some(ErrorCode::RpcCode(
-                    RpcErrorCode::WorkerNotRegistered | RpcErrorCode::WorkerDescriptorMismatch
-                ))
-            ) =>
-        {
-            Ok(BlockReportPeerOutcome::NeedRegister)
-        }
-        ErrorClass::NeedRefresh if matches!(error.code, Some(ErrorCode::RpcCode(RpcErrorCode::WorkerRunMismatch))) => {
-            Ok(BlockReportPeerOutcome::WorkerRunMismatch)
-        }
         ErrorClass::Retryable | ErrorClass::NeedRefresh => Err(BlockReportError::Retryable(error.message)),
         ErrorClass::Fatal => Err(BlockReportError::Fatal(format!(
             "fatal metadata block report error: {}",

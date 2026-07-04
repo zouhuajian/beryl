@@ -11,7 +11,6 @@ use common::header::RpcErrorCode;
 use thiserror::Error;
 use tonic::Status;
 use types::fs::FsErrorCode;
-use types::GroupName;
 
 /// Worker error types.
 #[derive(Error, Debug, Clone)]
@@ -84,18 +83,8 @@ pub enum WorkerError {
 /// Error metadata for retry and observability.
 #[derive(Clone, Debug)]
 pub struct ErrorMetadata {
-    /// Whether this error is retryable.
-    pub retryable: bool,
-    /// Suggested retry after duration (if retryable).
+    /// Suggested retry delay hint for retryable errors.
     pub retry_after_ms: Option<u64>,
-    /// Limit type (e.g., "rate_limit", "capacity_limit").
-    pub limit_type: Option<String>,
-    /// Leader hint (if leader changed).
-    pub leader_hint: Option<u64>,
-    /// Metadata group name (if applicable).
-    pub group_name: Option<GroupName>,
-    /// Additional context.
-    pub context: std::collections::HashMap<String, String>,
 }
 
 impl WorkerError {
@@ -112,67 +101,32 @@ impl WorkerError {
 
     /// Get error metadata.
     pub fn metadata(&self) -> ErrorMetadata {
-        let (retryable, retry_after_ms, limit_type, leader_hint) = match self {
-            WorkerError::LeaderChanged(_) => (true, Some(500), None, None),
-            WorkerError::Timeout(_) => (true, Some(100), None, None),
-            WorkerError::ResourceExhausted(msg) => {
-                let limit_type = if msg.contains("disk") || msg.contains("capacity") {
-                    Some("capacity_limit".to_string())
-                } else if msg.contains("rate") || msg.contains("quota") {
-                    Some("rate_limit".to_string())
-                } else {
-                    None
-                };
-                (true, Some(5000), limit_type, None)
-            }
-            WorkerError::Unavailable(_) => (true, Some(500), None, None),
-            WorkerError::ChunkConflict(_) => (false, None, None, None),
-            WorkerError::DiskError(_) => (false, None, None, None),
-            WorkerError::Cancelled(_) => (false, None, None, None),
-            WorkerError::InvalidArgument(_) => (false, None, None, None),
-            WorkerError::NotFound(_) => (false, None, None, None),
-            WorkerError::Corrupt(_) => (false, None, None, None),
-            WorkerError::NeedRefresh { .. } => (false, None, None, None),
-            WorkerError::Fencing(_) => (false, None, None, None),
-            WorkerError::PermissionDenied(_) => (false, None, None, None),
-            WorkerError::Unimplemented(_) => (false, None, None, None),
-            WorkerError::Internal(_) => (false, None, None, None),
+        let retry_after_ms = match self {
+            WorkerError::LeaderChanged(_) => Some(500),
+            WorkerError::Timeout(_) => Some(100),
+            WorkerError::ResourceExhausted(_) => Some(5000),
+            WorkerError::Unavailable(_) => Some(500),
+            WorkerError::ChunkConflict(_)
+            | WorkerError::DiskError(_)
+            | WorkerError::Cancelled(_)
+            | WorkerError::InvalidArgument(_)
+            | WorkerError::NotFound(_)
+            | WorkerError::Corrupt(_)
+            | WorkerError::NeedRefresh { .. }
+            | WorkerError::Fencing(_)
+            | WorkerError::PermissionDenied(_)
+            | WorkerError::Unimplemented(_)
+            | WorkerError::Internal(_) => None,
         };
 
-        ErrorMetadata {
-            retryable,
-            retry_after_ms,
-            limit_type,
-            leader_hint,
-            group_name: None,
-            context: std::collections::HashMap::new(),
-        }
+        ErrorMetadata { retry_after_ms }
     }
 
     /// Convert to gRPC Status (without modifying proto).
     pub fn to_status(&self) -> Status {
-        let metadata = self.metadata();
         let code = self.to_grpc_code();
         let message = self.to_string();
-        let message_clone = message.clone();
-
-        let mut status = Status::new(code, message);
-
-        // Add retry information to status details if possible
-        // Note: We can't modify proto, but we can encode retry hints in the message
-        // or use status details (if proto supports it via extensions)
-        if metadata.retryable {
-            let retry_hint = if let Some(retry_after_ms) = metadata.retry_after_ms {
-                format!("retry_after_ms: {}", retry_after_ms)
-            } else {
-                "retryable".to_string()
-            };
-            // For now, append to message (in production, use status details if available)
-            let enhanced_message = format!("{} [{}]", message_clone, retry_hint);
-            status = Status::new(code, enhanced_message);
-        }
-
-        status
+        Status::new(code, message)
     }
 
     /// Convert to gRPC status code.
@@ -205,18 +159,7 @@ impl From<WorkerError> for Status {
 
 impl From<anyhow::Error> for WorkerError {
     fn from(err: anyhow::Error) -> Self {
-        let msg = err.to_string();
-        if msg.contains("timeout") || msg.contains("deadline") {
-            WorkerError::Timeout(msg)
-        } else if msg.contains("not found") || msg.contains("NotFound") {
-            WorkerError::NotFound(msg)
-        } else if msg.contains("permission") || msg.contains("Permission") {
-            WorkerError::PermissionDenied(msg)
-        } else if msg.contains("disk") || msg.contains("I/O") || msg.contains("io") {
-            WorkerError::DiskError(msg)
-        } else {
-            WorkerError::Internal(msg)
-        }
+        WorkerError::Internal(err.to_string())
     }
 }
 
@@ -327,13 +270,12 @@ mod tests {
     fn test_error_metadata() {
         let err = WorkerError::LeaderChanged("leader moved".to_string());
         let metadata = err.metadata();
-        assert!(metadata.retryable);
         assert_eq!(metadata.retry_after_ms, Some(500));
 
-        let err = WorkerError::ResourceExhausted("disk full".to_string());
-        let metadata = err.metadata();
-        assert!(metadata.retryable);
-        assert_eq!(metadata.limit_type, Some("capacity_limit".to_string()));
+        let disk = WorkerError::ResourceExhausted("disk full".to_string()).metadata();
+        let quota = WorkerError::ResourceExhausted("quota exhausted".to_string()).metadata();
+        assert_eq!(disk.retry_after_ms, Some(5000));
+        assert_eq!(quota.retry_after_ms, Some(5000));
     }
 
     #[test]
@@ -345,6 +287,6 @@ mod tests {
         let err = WorkerError::LeaderChanged("not leader".to_string());
         let status = err.to_status();
         assert_eq!(status.code(), tonic::Code::Unavailable);
-        assert!(status.message().contains("retry_after_ms"));
+        assert!(!status.message().contains("retry_after_ms"));
     }
 }

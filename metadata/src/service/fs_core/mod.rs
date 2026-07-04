@@ -8,9 +8,7 @@ mod mutation;
 mod read;
 mod write_session;
 
-use super::core_util::{
-    core_failure_from_metadata_error, fatal_fs_core_failure, need_refresh_core_failure, terminal_rpc_core_failure,
-};
+use super::core_util::{core_failure_from_metadata_error, fatal_fs_core_failure, need_refresh_core_failure};
 use super::domain::{CoreFailure, CoreResult, CoreSuccess, Freshness, PresentedFencingToken, RequestContext};
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::MountTable;
@@ -272,14 +270,7 @@ impl FsCore {
         group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
     ) -> CoreResult<T> {
-        Err(terminal_rpc_core_failure(
-            ctx,
-            reason,
-            rpc_code,
-            message,
-            group_name,
-            mount_epoch,
-        ))
+        self.need_refresh_failure_with_hint(ctx, rpc_code, reason, message, group_name, mount_epoch, None, None)
     }
 
     fn replay_hint(intent: &str) -> String {

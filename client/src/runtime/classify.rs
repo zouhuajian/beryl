@@ -130,9 +130,6 @@ impl ErrorClassifier {
                 use common::error::canonical::ErrorCode;
                 use types::fs::FsErrorCode;
                 match canonical.code.as_ref() {
-                    Some(ErrorCode::RpcCode(common::header::RpcErrorCode::PermissionDenied)) => {
-                        ErrorClass::PermissionDenied
-                    }
                     Some(ErrorCode::RpcCode(common::header::RpcErrorCode::InvalidHeader)) => ErrorClass::InvalidHeader,
                     Some(ErrorCode::RpcCode(common::header::RpcErrorCode::Fencing)) => ErrorClass::Fencing,
                     Some(ErrorCode::FsErrno(FsErrorCode::EPerm | FsErrorCode::EAcces)) => ErrorClass::PermissionDenied,
@@ -409,5 +406,23 @@ mod tests {
         let classified = ErrorClassifier.classify_error(&err);
 
         assert_eq!(classified, ErrorClass::SessionExpired);
+    }
+
+    #[test]
+    fn fatal_session_reason_is_not_a_session_control_signal() {
+        let err = ClientError::from(ClientAction::Fail {
+            canonical: Box::new(CanonicalError {
+                class: common::error::canonical::ErrorClass::Fatal,
+                code: Some(common::error::canonical::ErrorCode::RpcCode(RpcErrorCode::Application)),
+                reason: Some(common::error::canonical::RefreshReason::SessionExpired),
+                retry_after_ms: None,
+                message: "legacy fatal session error".to_string(),
+                refresh_hint: None,
+            }),
+        });
+
+        let classified = ErrorClassifier.classify_error(&err);
+
+        assert_eq!(classified, ErrorClass::Fatal);
     }
 }

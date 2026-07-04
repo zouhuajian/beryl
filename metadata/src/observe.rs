@@ -327,13 +327,7 @@ fn refresh_reason_kind(reason: RefreshReason) -> &'static str {
 fn rpc_error_code_kind(code: common::header::RpcErrorCode) -> &'static str {
     match code {
         common::header::RpcErrorCode::Unspecified => "unspecified",
-        common::header::RpcErrorCode::NoSuchMethod => "no_such_method",
         common::header::RpcErrorCode::InvalidHeader => "invalid_header",
-        common::header::RpcErrorCode::VersionMismatch => "version_mismatch",
-        common::header::RpcErrorCode::DeserializeRequest => "deserialize_request",
-        common::header::RpcErrorCode::SerializeResponse => "serialize_response",
-        common::header::RpcErrorCode::Unauthenticated => "unauthenticated",
-        common::header::RpcErrorCode::PermissionDenied => "permission_denied",
         common::header::RpcErrorCode::NotLeader => "not_leader",
         common::header::RpcErrorCode::StaleState => "stale_state",
         common::header::RpcErrorCode::MountEpochMismatch => "mount_epoch_mismatch",

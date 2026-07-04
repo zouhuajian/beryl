@@ -6,7 +6,7 @@
 //! These tests verify the invariants of CanonicalError:
 //! - Ok must not carry error fields
 //! - NeedRefresh must have reason
-//! - Retryable's retry_after_ms has a single source
+//! - Retryable's retry_after_ms is carried as a server hint
 //! - Code oneof is mutually exclusive
 
 #[cfg(test)]
@@ -59,7 +59,7 @@ mod tests {
 
     #[test]
     fn test_invariant_retryable_retry_after_ms_source() {
-        // retry_after_ms should only come from CanonicalError.retry_after_ms
+        // retry_after_ms should only be carried as CanonicalError.retry_after_ms
         let err1 = CanonicalError::retryable(RpcErrorCode::NodeUnavailable, Some(2000), "unavailable");
         assert_eq!(err1.retry_after_ms, Some(2000));
 
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn test_invariant_retryable_optional_retry_after() {
-        // Retryable errors can have retry_after_ms or not
+        // Retryable errors can carry retry_after_ms as a hint or omit it
         let err_with = CanonicalError::retryable(RpcErrorCode::NodeUnavailable, Some(1000), "test");
         assert_eq!(err_with.retry_after_ms, Some(1000));
 
