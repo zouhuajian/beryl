@@ -45,8 +45,10 @@
 //!
 //! `GroupStateWatermark` carries state-machine applied `RaftLogId` freshness.
 //! `route_epoch` and `mount_epoch` remain separate metadata freshness domains.
-//! Current no-op, stale unsupported, and partially wired boundaries
-//! are tracked in `metadata/README_ZH.md`.
+//! These fields are active correctness checks for the current single-group
+//! runtime; they do not mean multi-group metadata is supported. Product
+//! boundaries are summarized in `docs/freshness-and-ownership.md` and the
+//! crate README.
 
 pub mod config;
 pub(crate) mod data_io;

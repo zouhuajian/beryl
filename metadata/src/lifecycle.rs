@@ -127,6 +127,8 @@ fn validate_format_config(config: &MetadataConfig) -> MetadataResult<()> {
         ));
     }
     if config.raft.mode == RaftMode::Cluster {
+        // Cluster mode is rejected until metadata peer RPC semantics,
+        // membership, and freshness fencing are implemented.
         return Err(MetadataError::InvalidArgument(
             "cluster Raft mode is not implemented yet".to_string(),
         ));

@@ -5,9 +5,11 @@ This crate owns full-system Vecton E2E tests for the current supported runtime p
 The tests start local metadata and worker services with temporary state, then use the public `FsClient` for user-visible operations. Run them directly with:
 
 ```bash
-cargo test -p vecton-e2e-tests
+cargo test -p e2e_tests
 ```
 
 `cargo test --workspace` includes this crate by default.
 
-The first test set does not cover active UFS read/write paths, QUIC/RDMA, replication, multi-group metadata, physical block free, or restart recovery.
+The current suite covers the supported Rust client -> metadata -> worker path, metadata restart fail-closed behavior for active writes, and worker restart/full-report convergence.
+
+It does not cover active UFS read/write paths, worker peer transfer, QUIC/RDMA, replication, multi-group metadata, metadata peer RPC, admin API, physical block free, or complete repair/rebalance product behavior.

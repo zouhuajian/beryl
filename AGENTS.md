@@ -9,6 +9,8 @@
 - The Rust native client is the supported client interface today.
 - Reads and writes currently go through metadata-authorized worker storage.
 - UFS is not used for current reads or writes.
+- Namespace delete is active; complete physical resident-block reclamation is not productized unless explicitly implemented and tested.
+- `route_epoch`, `mount_epoch`, and `GroupStateWatermark` are active correctness mechanisms, not future-only noise.
 - Multi-group metadata is future work.
 - `/local` is a current local development namespace, not the product identity.
 
@@ -43,12 +45,12 @@ Production dependency direction must stay clean:
 
 ## Current Priorities
 
-- Non-ignored metadata + worker + client E2E coverage.
-- Worker stream correctness.
-- Worker block publish/recovery hardening.
-- Metadata restart fail-closed behavior.
-- Worker restart full-report convergence.
-- Precise no-replica/block-location-unavailable behavior.
+- Keep non-ignored current-path E2E coverage green.
+- Preserve worker stream/session, Ready publish/recovery, restart/full-report convergence, and precise unavailable-block semantics.
+- Preserve metadata restart fail-closed behavior for active writes.
+- Keep freshness and owner-group routing fields intact unless replacement invariants are designed and tested.
+- Keep maintenance internals separate from productized repair/rebalance behavior.
+- Keep unsupported config and runtime surfaces fail-closed.
 
 ## Validation
 
@@ -56,6 +58,7 @@ Production dependency direction must stay clean:
 cargo fmt --all -- --check
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p e2e_tests
 cargo test --workspace
 ```
 
@@ -69,8 +72,13 @@ git diff --check
 
 - Alluxio full feature parity.
 - Production-ready multi-group metadata.
+- Multiple metadata leaders.
+- Metadata peer RPC.
+- Admin API.
 - POSIX compatibility.
 - FUSE.
 - UFS-backed read/write data path.
 - Replication, repair, or rebalancing as completed user-facing behavior.
 - Alternate transports such as QUIC or RDMA.
+- Worker peer transfer.
+- io_uring or SPDK worker runtime support.

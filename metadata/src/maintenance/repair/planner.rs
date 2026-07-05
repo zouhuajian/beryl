@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Repair planner: converts system state anomalies into repair actions.
+//! Repair planner internals for maintenance actions.
 //!
 //! RepairPlanner is a **pure planning layer**:
 //! - It does NOT execute repair tasks (execution happens via worker heartbeat pull)
@@ -12,14 +12,14 @@
 //! This separation allows:
 //! - Easy testing of planning logic (pure functions)
 //! - Flexible execution strategies (batch enqueue, rate limiting, etc.)
-//! - Clear extension points for new action types (e.g., EvictReplica for excess replicas)
+//! - Local testing of planning decisions without widening the product surface
 
 use super::actions::RepairAction;
 use super::orphan::OrphanQueue;
 use std::sync::Arc;
 use types::ids::{BlockId, WorkerId};
 
-/// Repair planner for converting system state anomalies into repair actions.
+/// Internal planner for converting maintenance observations into actions.
 ///
 /// # Responsibilities
 ///
@@ -32,7 +32,7 @@ use types::ids::{BlockId, WorkerId};
 /// # Inputs
 ///
 /// - Replication factor checks (current locations vs target)
-/// - Rebalance decisions (worker load analysis)
+/// - Rebalance decisions (currently emits no copy actions)
 /// - orphan_queue: suspected orphan blocks (signals, not actions)
 ///
 /// # Outputs

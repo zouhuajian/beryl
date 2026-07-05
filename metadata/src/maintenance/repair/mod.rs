@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Repair module: queue, planner, and orphan management for maintenance repair operations.
+//! Internal repair queue, planner, and orphan-signal primitives.
+//!
+//! These types are maintenance internals for safety and cleanup. They are not
+//! a complete productized repair or rebalance lifecycle.
 //!
 //! This module is organized as follows:
 //! - `types.rs`: Core types (RepairTaskId, RepairTask, RepairTaskState, etc.)

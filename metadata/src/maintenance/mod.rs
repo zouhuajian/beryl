@@ -3,9 +3,12 @@
 
 //! Maintenance subsystem entrypoint.
 //!
-//! The public surface is intentionally small. Repair, delete, GC, orphan,
-//! over-replica cleanup, lost-worker cleanup, and destructive gates are
-//! maintenance-owned implementation details wired by `MaintenanceService`.
+//! The public surface is intentionally small. Delete-intent execution, GC,
+//! orphan cleanup, lease cleanup, lost-worker cleanup, over-replica cleanup,
+//! repair queues, and destructive gates are maintenance-owned internals.
+//! They protect current metadata/worker consistency, but they do not make
+//! complete repair, rebalance, or replication lifecycle behavior a supported
+//! product surface.
 
 pub(crate) mod delete;
 mod gate;

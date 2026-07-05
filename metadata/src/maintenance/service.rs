@@ -414,7 +414,8 @@ impl MaintenanceService {
             }));
         }
 
-        // Start rebalance task
+        // Start internal rebalance scan. The current planner emits no movement
+        // actions, so this is not a supported rebalance product lifecycle.
         {
             let repair_planner: Arc<RepairPlanner> = Arc::clone(&self.repair_planner);
             let repair_queue: Arc<RepairQueue> = Arc::clone(&self.repair_queue);

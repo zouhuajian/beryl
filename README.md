@@ -16,8 +16,9 @@ Vecton is a Rust-based distributed storage/cache layer for big data and AI workl
 - Metadata is the authority for namespace, file layout, and data visibility.
 - Workers store and serve blocks authorized by metadata.
 - Data made visible by metadata is Vecton resident data.
-- Vecton should keep resident data durable until explicit delete/free or a documented recovery state.
-- External storage integration is future work unless it is wired into the current read/write path.
+- Namespace delete removes the metadata namespace entry and visible layout.
+- Physical resident-block reclamation is not a completed product lifecycle unless explicitly implemented and tested.
+- External storage integration is adapter-only today, not the active read/write path.
 
 ## Architecture
 
@@ -42,6 +43,9 @@ Vecton is a Rust-based distributed storage/cache layer for big data and AI workl
 - The current metadata runtime uses one leader.
 - The Rust native client is the client interface used today.
 - Reads and writes currently go through metadata-authorized worker storage.
+- Worker registration, heartbeat, and full block-report convergence are active runtime paths.
+- `route_epoch`, `mount_epoch`, and `GroupStateWatermark` are active freshness checks.
+- Unsupported legacy, admin, peer, and cluster-mode config keys are rejected rather than treated as compatibility aliases.
 - UFS is present as an adapter boundary, but current reads and writes do not use it.
 - Multi-group metadata is future work.
 - `/local` is the current local development namespace.
@@ -50,27 +54,32 @@ Vecton is a Rust-based distributed storage/cache layer for big data and AI workl
 
 - Metadata format/start lifecycle and gRPC filesystem service.
 - Worker registration, heartbeat, and block reports.
-- Rust client APIs for core file operations including status, list, mkdirs, delete, rename, open, create, append, read, write, sync, close, and abort.
+- Rust client APIs for core file operations including status, non-recursive list, mkdirs, namespace delete, rename, open, create, append, read, write, sync, close, and abort.
 - Metadata-authorized worker reads and writes.
+- Metadata restart fail-closed behavior for active writes.
+- Worker restart with full-report convergence for valid Ready blocks.
+- Precise unavailable-block and stale-location errors for visible blocks without usable live replicas.
 - Structured error and proto contracts for current metadata and worker paths.
 - Default and local development configuration.
 
-## Known Gaps
+## Current Boundaries and Gaps
 
-- Non-ignored metadata + worker + client E2E coverage.
-- Worker stream correctness hardening.
-- Worker block publish/recovery hardening.
-- Metadata restart behavior for in-flight writes.
-- Worker restart/full-report convergence.
-- Precise no-replica and block-location-unavailable behavior.
-- UFS integration for reads and writes.
+- Recursive listing is not supported; metadata rejects recursive list requests.
+- Namespace delete is active, but complete worker-side physical block free is not complete.
+- UFS remains an adapter boundary; active UFS read-through/write-through is future work.
+- Admin and metadata-peer schemas are not active runtime services.
+- Multi-group metadata, multiple metadata leaders, and metadata peer RPC are future work.
+- Worker peer transfer and alternate worker transports such as QUIC or RDMA are future work.
+- Maintenance internals exist for safety and cleanup, but complete replication, repair, or rebalancing is not productized behavior.
+- POSIX, FUSE, and Hadoop compatibility are not implemented.
 
 ## Roadmap
 
-- P0: stabilize the single-group core path.
-- P1: mount-level metadata sharding.
-- P2: UFS read-through/write-through integration.
-- P3: replication, repair, and ecosystem integration.
+- Keep the supported Rust client -> metadata -> worker path stable under default validation.
+- Finish resident-block reclamation and worker delete lifecycle only with explicit design and tests.
+- Design UFS read-through/write-through integration without changing metadata-owned visibility.
+- Design multi-group metadata, metadata peer RPC, admin APIs, and ecosystem compatibility as future product work.
+- Treat complete replication, repair, and rebalancing as future lifecycle features, separate from current maintenance internals.
 
 ## Crates
 
@@ -83,12 +92,15 @@ Vecton is a Rust-based distributed storage/cache layer for big data and AI workl
 - `proto`
   - Protobuf/gRPC contracts and generated Rust bindings.
   - Covers the current metadata filesystem, metadata-worker control, and worker data services.
+  - Admin and metadata-peer schemas are future/schema-only, not active runtime services.
 - `metadata`
   - Namespace, layout, visibility, lease, worker registry, block location, freshness, and Raft/RocksDB authority.
   - Multi-group metadata remains future work.
+  - Maintenance internals do not make repair/rebalance a completed product behavior.
 - `worker`
   - Local block storage and metadata-authorized data-plane execution.
   - Does not own namespace visibility or file layout decisions.
+  - Uses the current gRPC data service and worker-local filesystem storage path.
 - `client`
   - Rust native API and orchestration for metadata and worker RPCs.
   - Does not provide POSIX, FUSE, or Hadoop compatibility today.
@@ -131,11 +143,16 @@ The client reads `conf/client-site.yaml` or `conf/local/client-site.yaml` depend
 
 - Alluxio full feature parity.
 - Production-ready multi-group metadata.
+- Multiple metadata leaders.
+- Metadata peer RPC.
+- Admin API.
 - POSIX compatibility.
 - FUSE.
 - UFS-backed cache read/write path.
 - Replication, repair, or rebalancing as completed user-facing behavior.
 - Alternate transports such as QUIC or RDMA.
+- Worker peer transfer.
+- io_uring or SPDK worker runtime support.
 
 ## License
 

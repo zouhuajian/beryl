@@ -20,12 +20,15 @@
 
 The current runtime uses metadata filesystem RPCs for client-to-metadata operations, metadata-worker control RPCs for registration/heartbeat/block reports, and worker data RPCs for metadata-authorized reads and writes.
 
+Admin and metadata-peer proto packages are generated as crate-private future/schema-only surfaces. They are not registered or served by the current runtime. Worker maintenance command schemas do not make repair, rebalance, worker peer transfer, or physical block reclamation a completed product behavior.
+
 ## Not in Current Scope
 
 - Business policy or authority decisions.
 - Retry, replay, cache, endpoint-health, or route-refresh policy.
 - Worker storage/runtime behavior.
-- Admin, peer, or shard-style proto contracts as production-ready multi-group metadata unless they are wired into the current runtime.
+- Admin, peer, or shard-style proto contracts as production-ready multi-group metadata.
+- Alternate worker transports such as QUIC or RDMA unless a current handler uses them.
 
 ## Contributor Notes
 

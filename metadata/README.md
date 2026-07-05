@@ -19,12 +19,18 @@
 
 ## Current Active Use
 
-The current runtime uses one metadata group with one leader. The metadata service handles format/start lifecycle, filesystem RPCs, worker control RPCs, and Raft/RocksDB-backed state for the current worker-authorized read/write path.
+The current runtime uses one metadata group with one leader. The metadata service handles format/start lifecycle, filesystem RPCs, worker control RPCs, worker registration/heartbeat/full reports, freshness checks, and Raft/RocksDB-backed state for the current worker-authorized read/write path.
+
+Namespace delete is active. Recursive delete removes namespace/layout state and creates delete-intent state for resident blocks, but complete physical worker-side block reclamation is not a completed product lifecycle.
+
+Recursive listing is not supported. Metadata rejects recursive list requests with a structured unsupported error.
 
 ## Not in Current Scope
 
 - Production-ready multi-group metadata.
 - Multiple metadata leaders for different mount namespaces.
+- Metadata peer RPC.
+- Admin API.
 - UFS-backed read/write namespace.
 - POSIX, FUSE, or Hadoop compatibility.
 - Complete replication, repair, rebalancing, or autonomous lifecycle management.
@@ -34,3 +40,4 @@ The current runtime uses one metadata group with one leader. The metadata servic
 - Keep metadata as the source of truth for namespace, layout, and visibility.
 - Do not bypass Raft-backed mutation paths for authoritative state changes.
 - Surface consistency, storage, replay, and snapshot errors explicitly.
+- Treat maintenance internals as safety/cleanup mechanisms unless a complete lifecycle feature is designed and tested.

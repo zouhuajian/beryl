@@ -19,7 +19,7 @@
 
 ## Current Active Use
 
-The current runtime starts a gRPC worker data service, registers with metadata, sends heartbeats and block reports, stores blocks locally, and serves metadata-authorized read/write streams.
+The current runtime starts a gRPC worker data service, registers with metadata, sends heartbeats and block reports, stores Ready blocks locally through the filesystem I/O engine, and serves metadata-authorized read/write streams.
 
 ## Not in Current Scope
 
@@ -27,6 +27,7 @@ The current runtime starts a gRPC worker data service, registers with metadata, 
 - Metadata route ownership.
 - Client retry/cache policy.
 - UFS path derivation from data handles or block IDs.
+- Worker peer transfer.
 - Production QUIC/RDMA/io_uring/SPDK data paths.
 - Complete autonomous replication, repair, rebalancing, or partial-cache semantics.
 

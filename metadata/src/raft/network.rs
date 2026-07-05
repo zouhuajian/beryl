@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Raft network implementation.
+//! Raft network placeholder.
+//!
+//! This network is not part of the active runtime. Metadata lifecycle rejects
+//! cluster mode until metadata peer RPC semantics, membership, and freshness
+//! fencing are implemented.
 
 use crate::raft::types::{MetadataNode, MetadataRaftTypeConfig};
 use openraft::error::{RPCError, RaftError, Unreachable};
@@ -13,11 +17,11 @@ use openraft::raft::{
 use openraft::{RaftNetwork, RaftNetworkFactory};
 use std::fmt;
 
-/// Raft network implementation.
+/// Inactive Raft network adapter.
 pub struct Network {
     target: u64,
-    // TODO: Add actual network client (gRPC, HTTP, etc.)
-    // For now, this is a placeholder
+    // No network client is stored because cluster mode is rejected before this
+    // adapter can be part of the active runtime.
 }
 
 impl Network {
@@ -32,8 +36,8 @@ impl RaftNetwork<MetadataRaftTypeConfig> for Network {
         _rpc: AppendEntriesRequest<MetadataRaftTypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, MetadataNode, RaftError<u64>>> {
-        // TODO: Implement actual RPC call to target node
-        // For now, return an error indicating not implemented
+        // Keep the placeholder fail-closed if a test or exploratory path ever
+        // constructs it directly.
         #[derive(Debug)]
         struct NotImplementedError(u64);
         impl fmt::Display for NotImplementedError {
@@ -56,7 +60,8 @@ impl RaftNetwork<MetadataRaftTypeConfig> for Network {
         InstallSnapshotResponse<u64>,
         RPCError<u64, MetadataNode, RaftError<u64, openraft::error::InstallSnapshotError>>,
     > {
-        // TODO: Implement actual RPC call to target node
+        // Keep the placeholder fail-closed if a test or exploratory path ever
+        // constructs it directly.
         #[derive(Debug)]
         struct NotImplementedError(u64);
         impl fmt::Display for NotImplementedError {
@@ -76,7 +81,8 @@ impl RaftNetwork<MetadataRaftTypeConfig> for Network {
         _rpc: VoteRequest<u64>,
         _option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, MetadataNode, RaftError<u64>>> {
-        // TODO: Implement actual RPC call to target node
+        // Keep the placeholder fail-closed if a test or exploratory path ever
+        // constructs it directly.
         #[derive(Debug)]
         struct NotImplementedError(u64);
         impl fmt::Display for NotImplementedError {
@@ -92,9 +98,9 @@ impl RaftNetwork<MetadataRaftTypeConfig> for Network {
     }
 }
 
-/// Raft network factory.
+/// Inactive Raft network factory.
 pub struct NetworkFactory {
-    // TODO: Add network client pool or factory
+    // Cluster mode is rejected before this factory can select a real client.
 }
 
 impl NetworkFactory {
@@ -113,8 +119,7 @@ impl RaftNetworkFactory<MetadataRaftTypeConfig> for NetworkFactory {
     type Network = Network;
 
     async fn new_client(&mut self, target: u64, _node: &MetadataNode) -> Self::Network {
-        // Create a new network client for the target node
-        // Connection is established lazily when needed
+        // The returned adapter is intentionally unreachable in active runtime.
         Network::new(target)
     }
 }

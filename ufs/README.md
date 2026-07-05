@@ -19,7 +19,7 @@
 
 ## Current Active Use
 
-`ufs` provides adapter types and traits, but current Vecton file IO does not use it for reads or writes. Current file IO uses metadata-authorized worker storage.
+`ufs` provides adapter types and traits, but it is not the active user read/write path. Current Vecton file IO uses metadata-authorized worker-local storage.
 
 ## Not in Current Scope
 
@@ -28,6 +28,7 @@
 - Client retry/replay/cache behavior.
 - UFS-backed cache semantics.
 - Current read-through or write-through file IO.
+- Fallback reads or writes when resident worker data is unavailable.
 
 ## Contributor Notes
 

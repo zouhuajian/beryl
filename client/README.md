@@ -19,7 +19,9 @@
 
 ## Current Active Use
 
-The Rust native API is the client interface used today. It supports core operations such as status, list, mkdirs, delete, rename, open, create, append, read, write, sync, close, and abort.
+The Rust native API is the client interface used today. It supports core operations such as status, non-recursive list, mkdirs, namespace delete, rename, open, create, append, read, write, sync, close, and abort.
+
+`ListOptions::recursive` is part of the Rust API shape, but recursive listing is not supported by the current metadata service. Requests with that flag are rejected instead of silently falling back to non-recursive listing.
 
 ## Not in Current Scope
 
@@ -28,6 +30,7 @@ The Rust native API is the client interface used today. It supports core operati
 - Hadoop-compatible filesystem client.
 - Metadata-free direct worker reads or writes.
 - Separate UFS-backed cache semantics.
+- Recursive directory listing.
 
 ## Contributor Notes
 
