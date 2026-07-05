@@ -20,7 +20,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
-use types::fs::{FileAttrs, Inode};
+use types::fs::{FileAttrs, FsErrorCode, Inode};
 use types::ids::{BlockId, BlockIndex, ClientId, DataHandleId, LeaseId, MountId, WorkerId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
@@ -1074,6 +1074,132 @@ async fn list_status_rejects_stale_mount_epoch() {
     assert_eq!(failure.error.reason, Some(RefreshReason::MountEpochMismatch));
     assert_eq!(failure.group_name, Some(group_name("g18")));
     assert_eq!(failure.mount_epoch, Some(9));
+}
+
+#[tokio::test]
+async fn list_status_returns_complete_child_metadata() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+    let mount_id = MountId::new(711);
+    let parent_inode_id = InodeId::new(7110);
+    let child_inode_id = InodeId::new(7111);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name("g18"));
+    fs_core.set_storage(Arc::clone(&storage));
+
+    let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id);
+    let mut child_attrs = FileAttrs::new();
+    child_attrs.size = 128;
+    child_attrs.mode = 0o600;
+    let child = Inode::new_file(child_inode_id, child_attrs.clone(), mount_id, DataHandleId::new(7111));
+    storage.put_inode(&parent).unwrap();
+    storage.put_inode(&child).unwrap();
+    storage.put_dentry(parent_inode_id, "child", child_inode_id).unwrap();
+
+    let output = fs_core
+        .execute_read_dir(ReadDirInput {
+            ctx: request_context(),
+            parent_inode_id,
+            cursor_key: None,
+            max_entries: None,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect("list should succeed")
+        .payload;
+
+    assert_eq!(output.entries.len(), 1);
+    let entry = &output.entries[0];
+    assert_eq!(entry.name, "child");
+    assert_eq!(entry.inode_id, child_inode_id);
+    assert_eq!(entry.kind, Some(types::fs::InodeKind::File));
+    assert_eq!(entry.attrs, Some(child_attrs));
+    assert!(output.eof);
+    assert!(output.next_cursor_key.is_empty());
+}
+
+#[tokio::test]
+async fn list_status_propagates_child_inode_load_error() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+    let mount_id = MountId::new(712);
+    let parent_inode_id = InodeId::new(7120);
+    let child_inode_id = InodeId::new(7121);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name("g18"));
+    fs_core.set_storage(Arc::clone(&storage));
+
+    storage
+        .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
+        .unwrap();
+    storage
+        .put_dentry(parent_inode_id, "bad-child", child_inode_id)
+        .unwrap();
+    let inodes_cf = storage.db().cf_handle("inodes").expect("inodes column family");
+    let mut key = b"inode/".to_vec();
+    key.extend_from_slice(&child_inode_id.to_be_bytes());
+    storage
+        .db()
+        .put_cf(inodes_cf, key, b"not-json-inode")
+        .expect("write malformed child inode value");
+
+    let failure = fs_core
+        .execute_read_dir(ReadDirInput {
+            ctx: request_context(),
+            parent_inode_id,
+            cursor_key: None,
+            max_entries: None,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect_err("child inode storage failure must reject ListStatus");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
+    );
+    assert!(
+        failure.error.message.contains("Failed to deserialize Inode"),
+        "{}",
+        failure.error.message
+    );
+}
+
+#[tokio::test]
+async fn list_status_rejects_dangling_child_inode() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+    let mount_id = MountId::new(713);
+    let parent_inode_id = InodeId::new(7130);
+    let child_inode_id = InodeId::new(7131);
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name("g18"));
+    fs_core.set_storage(Arc::clone(&storage));
+
+    storage
+        .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
+        .unwrap();
+    storage
+        .put_dentry(parent_inode_id, "missing-child", child_inode_id)
+        .unwrap();
+
+    let failure = fs_core
+        .execute_read_dir(ReadDirInput {
+            ctx: request_context(),
+            parent_inode_id,
+            cursor_key: None,
+            max_entries: None,
+            freshness: Freshness::default(),
+        })
+        .await
+        .expect_err("dangling child inode must reject ListStatus");
+
+    assert_eq!(
+        failure.error.code,
+        Some(CanonicalErrorCode::FsErrno(FsErrorCode::ENoEnt))
+    );
+    assert!(
+        failure.error.message.contains("missing-child") && failure.error.message.contains(&child_inode_id.to_string()),
+        "{}",
+        failure.error.message
+    );
 }
 
 #[tokio::test]

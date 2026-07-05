@@ -24,7 +24,8 @@ use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::{
     get_block_locations_request_proto, AddBlockRequestProto, AppendFileRequestProto, CommitFileRequestProto,
     CommittedBlockProto, CreateDirectoryRequestProto, CreateFileRequestProto, CreateModeProto, DeleteRequestProto,
-    GetBlockLocationsRequestProto, GetStatusRequestProto, SyncWriteRequestProto, WriteHandleProto, WriteSyncModeProto,
+    GetBlockLocationsRequestProto, GetStatusRequestProto, ListStatusRequestProto, SyncWriteRequestProto,
+    WriteHandleProto, WriteSyncModeProto,
 };
 use std::future::Future;
 use std::io;
@@ -669,6 +670,30 @@ async fn create_directory_failure_emits_metadata_state_warn_log() {
         }),
         "{logs:?}"
     );
+}
+
+#[tokio::test]
+async fn list_status_recursive_request_returns_not_supported() {
+    let env = build_env("/mnt/test", DataIoPolicy::Allow, None);
+
+    let response = FileSystemServiceProto::list_status(
+        &env.service,
+        Request::new(ListStatusRequestProto {
+            header: header(708),
+            path: "/mnt/test".to_string(),
+            recursive: true,
+            cursor: Vec::new(),
+            limit: 0,
+        }),
+    )
+    .await
+    .expect("transport status must remain OK")
+    .into_inner();
+    let err = header_error(response.header);
+
+    assert_fs_errno(&err, FsErrnoProto::FsErrnoEnotsup);
+    assert!(err.message.contains("Recursive listing not yet implemented"));
+    assert!(response.entries.is_empty());
 }
 
 #[tokio::test]

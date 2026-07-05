@@ -323,12 +323,35 @@ impl FsCore {
 
             let mut dir_entries = Vec::with_capacity(entries.len());
             for (name, child_inode_id) in entries {
-                let child_inode = storage.get_inode(child_inode_id).ok().flatten();
+                let child_inode = match storage.get_inode(child_inode_id) {
+                    Ok(Some(child_inode)) => child_inode,
+                    Ok(None) => {
+                        return self.failure_from_error_with_route_epoch(
+                            &req.ctx,
+                            MetadataError::NotFound(format!(
+                                "Directory dentry '{}' under parent inode {} points to missing inode {}",
+                                name, req.parent_inode_id, child_inode_id
+                            )),
+                            group_name,
+                            mount_epoch,
+                            route_epoch,
+                        );
+                    }
+                    Err(err) => {
+                        return self.failure_from_error_with_route_epoch(
+                            &req.ctx,
+                            err,
+                            group_name,
+                            mount_epoch,
+                            route_epoch,
+                        );
+                    }
+                };
                 dir_entries.push(ReadDirEntry {
                     name,
                     inode_id: child_inode_id,
-                    kind: child_inode.as_ref().map(|i| i.kind),
-                    attrs: child_inode.as_ref().map(|i| i.attrs.clone()),
+                    kind: Some(child_inode.kind),
+                    attrs: Some(child_inode.attrs.clone()),
                 });
             }
 
