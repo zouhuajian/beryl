@@ -498,9 +498,10 @@ impl FullBlockFileStore {
                     let meta = read_meta_file(&path)?;
                     let block_id = meta.identity.block_id;
                     validate_final_meta_payload(&meta, group_name, block_id)?;
-                    if meta.visibility.block_state == BlockState::Ready {
-                        validate_ready_data_file(&self.paths(group_name, block_id), &meta)?;
+                    if meta.visibility.block_state != BlockState::Ready {
+                        continue;
                     }
+                    validate_ready_data_file(&self.paths(group_name, block_id), &meta)?;
                     blocks.push(meta);
                 }
             }
@@ -771,6 +772,9 @@ fn validate_final_meta_payload(meta: &BlockMetaPayload, group_name: &GroupName, 
         BlockState::Ready | BlockState::Corrupt => Ok(()),
         BlockState::Loading => Err(corrupt("loading block metadata is not valid final metadata")),
     }?;
+    if meta.visibility.block_stamp == 0 {
+        return Err(corrupt("final block metadata must carry a non-zero block stamp"));
+    }
     BlockShape::validate_effective_len(meta.format.block_size, meta.source.effective_len)
         .map_err(|err| corrupt(err.to_string()))?;
     Ok(())
@@ -1238,6 +1242,21 @@ mod tests {
             .expect("open data")
             .set_len(len)
             .expect("set data len");
+    }
+
+    fn write_final_data(store: &FullBlockFileStore, group_name: &GroupName, block_id: BlockId, data: &[u8]) {
+        let paths = store.paths(group_name, block_id);
+        fs::create_dir_all(paths.parent_dir().expect("parent dir")).expect("create block parent");
+        fs::write(&paths.data_path, data).expect("write final data");
+    }
+
+    fn assert_scan_corrupt(store: &FullBlockFileStore, group_name: &GroupName) {
+        assert_corrupt(store.scan_group_blocks(group_name));
+    }
+
+    fn assert_empty_ready_scan(store: &FullBlockFileStore, group_name: &GroupName) {
+        let scanned = store.scan_group_blocks(group_name).expect("scan group blocks");
+        assert!(scanned.is_empty(), "scan should not report Ready blocks: {scanned:?}");
     }
 
     fn ready_meta(group_name: &GroupName, block_id: BlockId) -> BlockMetaPayload {
@@ -2172,6 +2191,254 @@ mod tests {
         invalid.identity.block_id = BlockId::new(block_id.data_handle_id, BlockIndex::new(block_id.index.as_raw() + 1));
         persist_raw_meta_payload(&paths, &invalid);
         assert_corrupt(store.load_meta(group_name_value, block_id));
+    }
+
+    #[test]
+    fn ready_block_is_reported_after_store_reload() {
+        let (temp, store) = store();
+        let (group_name_value, block_id) = ids();
+        let data = Bytes::from((0..3072).map(|idx| (idx % 251) as u8).collect::<Vec<_>>());
+        create_default_block(&store, group_name_value, block_id);
+        store
+            .write_at(group_name_value, block_id, 0, data.clone())
+            .expect("write staging data");
+        store
+            .publish_ready(publish_request(group_name_value, block_id, data.len() as u64, 55))
+            .expect("publish ready block");
+
+        let reloaded = FullBlockFileStore::new(FullBlockFileStoreConfig::new(temp.path().to_path_buf()));
+        let scanned = reloaded.scan_group_blocks(group_name_value).expect("scan group blocks");
+
+        assert_eq!(scanned.len(), 1);
+        let meta = &scanned[0];
+        assert_eq!(meta.identity.group_name, *group_name_value);
+        assert_eq!(meta.identity.block_id, block_id);
+        assert_eq!(meta.visibility.block_state, BlockState::Ready);
+        assert_eq!(meta.visibility.block_stamp, 55);
+        assert_eq!(meta.format.format_id, BlockFormatId::FULL_EFFECTIVE);
+        assert_eq!(meta.format.block_size, 4096);
+        assert_eq!(meta.format.chunk_size, 1024);
+        assert_eq!(meta.format.checksum_kind, ChecksumKind::None);
+        assert_eq!(meta.source.effective_len, data.len() as u64);
+        assert_eq!(meta.tier, Tier::Hdd);
+        assert_eq!(
+            reloaded
+                .read_at(group_name_value, block_id, 0, data.len() as u64)
+                .expect("read ready data"),
+            data
+        );
+        assert_eq!(
+            reloaded
+                .read_at(group_name_value, block_id, data.len() as u64, 0)
+                .expect("read eof"),
+            Bytes::new()
+        );
+        assert_invalid_argument(reloaded.read_at(group_name_value, block_id, data.len() as u64, 1));
+    }
+
+    #[test]
+    fn staging_only_block_is_not_reported_ready() {
+        let (_temp, store) = store();
+        let (group_name_value, block_id) = ids();
+        create_default_block(&store, group_name_value, block_id);
+        store
+            .write_at(group_name_value, block_id, 0, Bytes::from_static(b"staging"))
+            .expect("write staging data");
+
+        assert_empty_ready_scan(&store, group_name_value);
+        assert_not_found(store.read_at(group_name_value, block_id, 0, 1));
+    }
+
+    #[test]
+    fn renamed_data_without_final_meta_is_not_reported_ready() {
+        let (_temp, store) = store();
+        let (group_name_value, block_id) = ids();
+        create_default_block(&store, group_name_value, block_id);
+        store
+            .write_at(group_name_value, block_id, 0, Bytes::from(vec![3; 4096]))
+            .expect("write staging data");
+        let paths = store.paths(group_name_value, block_id);
+        fs::create_dir_all(paths.parent_dir().expect("parent dir")).expect("create block parent");
+        fs::rename(&paths.staging_data_path, &paths.data_path).expect("rename data without meta");
+
+        assert_empty_ready_scan(&store, group_name_value);
+        assert_not_found(store.read_at(group_name_value, block_id, 0, 1));
+    }
+
+    #[test]
+    fn final_meta_without_data_is_rejected() {
+        let (_temp, store) = store();
+        let (group_name_value, block_id) = ids();
+        let mut meta = ready_meta(group_name_value, block_id);
+        meta.source.effective_len = 4096;
+        meta.visibility.block_stamp = 55;
+        persist_meta(&store, group_name_value, block_id, &meta);
+
+        assert_scan_corrupt(&store, group_name_value);
+        assert_corrupt(store.read_at(group_name_value, block_id, 0, 1));
+    }
+
+    #[test]
+    fn short_data_for_effective_len_is_rejected() {
+        let (_temp, store) = store();
+        let (group_name_value, block_id) = ids();
+        let mut meta = ready_meta(group_name_value, block_id);
+        meta.source.effective_len = 3072;
+        meta.visibility.block_stamp = 55;
+        write_final_data(&store, group_name_value, block_id, &[7; 2048]);
+        persist_meta(&store, group_name_value, block_id, &meta);
+
+        assert_scan_corrupt(&store, group_name_value);
+        assert_corrupt(store.read_at(group_name_value, block_id, 0, 1));
+    }
+
+    #[test]
+    fn long_data_for_effective_len_is_rejected() {
+        let (_temp, store) = store();
+        let (group_name_value, block_id) = ids();
+        let mut meta = ready_meta(group_name_value, block_id);
+        meta.source.effective_len = 3072;
+        meta.visibility.block_stamp = 55;
+        write_final_data(&store, group_name_value, block_id, &[7; 4096]);
+        persist_meta(&store, group_name_value, block_id, &meta);
+
+        assert_scan_corrupt(&store, group_name_value);
+        assert_corrupt(store.read_at(group_name_value, block_id, 0, 1));
+    }
+
+    #[test]
+    fn corrupt_final_meta_is_not_reported_ready() {
+        for corrupt_meta in [
+            |paths: &BlockPaths| {
+                let mut encoded = fs::read(&paths.meta_path).expect("read meta");
+                encoded[0] ^= 0xff;
+                fs::write(&paths.meta_path, encoded).expect("write bad magic");
+            },
+            |paths: &BlockPaths| overwrite_header_u32(paths, 8, BLOCK_META_VERSION + 1),
+            |paths: &BlockPaths| {
+                let actual_len = fs::metadata(&paths.meta_path).expect("meta metadata").len();
+                overwrite_header_u64(paths, 16, actual_len - BlockMetaHeader::encoded_len() as u64 + 1);
+            },
+        ] {
+            let (_temp, store) = store();
+            let (group_name_value, block_id) = ids();
+            publish_default_block(&store, group_name_value, block_id);
+            let paths = store.paths(group_name_value, block_id);
+
+            corrupt_meta(&paths);
+
+            assert_scan_corrupt(&store, group_name_value);
+            assert_corrupt(store.read_at(group_name_value, block_id, 0, 1));
+        }
+    }
+
+    #[test]
+    fn metadata_identity_mismatch_is_not_reported_ready() {
+        for make_invalid in [
+            |valid: &BlockMetaPayload| {
+                let mut invalid = valid.clone();
+                invalid.identity.group_name = GroupName::parse("analytics").unwrap();
+                encode_meta_payload(&invalid).expect("encode group mismatch")
+            },
+            |valid: &BlockMetaPayload| {
+                let mut invalid = valid.clone();
+                invalid.identity.block_id = BlockId::new(
+                    invalid.identity.block_id.data_handle_id,
+                    BlockIndex::new(invalid.identity.block_id.index.as_raw() + 1),
+                );
+                encode_meta_payload(&invalid).expect("encode block id mismatch")
+            },
+            |valid: &BlockMetaPayload| {
+                protobuf_payload_with_format_id(valid, BlockFormatId::FULL_EFFECTIVE.as_raw() + 1)
+            },
+            |valid: &BlockMetaPayload| {
+                let mut invalid = valid.clone();
+                invalid.format.block_size = 4097;
+                encode_meta_payload(&invalid).expect("encode block size mismatch")
+            },
+            |valid: &BlockMetaPayload| {
+                let mut invalid = valid.clone();
+                invalid.format.chunk_size = 3072;
+                encode_meta_payload(&invalid).expect("encode chunk size mismatch")
+            },
+            |valid: &BlockMetaPayload| protobuf_payload_with_checksum_kind(valid, 99),
+        ] {
+            let (_temp, store) = store();
+            let (group_name_value, block_id) = ids();
+            publish_default_block(&store, group_name_value, block_id);
+            let paths = store.paths(group_name_value, block_id);
+            let valid = store.load_meta(group_name_value, block_id).expect("load meta");
+            let payload = make_invalid(&valid);
+
+            persist_raw_payload(&paths, &payload);
+
+            assert_scan_corrupt(&store, group_name_value);
+            assert_corrupt(store.read_at(group_name_value, block_id, 0, 1));
+        }
+    }
+
+    #[test]
+    fn final_meta_with_zero_block_stamp_is_rejected() {
+        let (_temp, store) = store();
+        let (group_name_value, block_id) = ids();
+        let mut meta = ready_meta(group_name_value, block_id);
+        meta.source.effective_len = 4096;
+        meta.visibility.block_stamp = 0;
+        write_final_data(&store, group_name_value, block_id, &[7; 4096]);
+        persist_raw_meta_payload(&store.paths(group_name_value, block_id), &meta);
+
+        assert_scan_corrupt(&store, group_name_value);
+        assert_corrupt(store.read_at(group_name_value, block_id, 0, 1));
+    }
+
+    #[test]
+    fn corrupt_state_final_meta_is_not_reported_ready() {
+        let (_temp, store) = store();
+        let (group_name_value, block_id) = ids();
+        let mut meta = ready_meta(group_name_value, block_id);
+        meta.visibility.block_state = BlockState::Corrupt;
+        persist_meta(&store, group_name_value, block_id, &meta);
+
+        assert_empty_ready_scan(&store, group_name_value);
+        assert_corrupt(store.read_at(group_name_value, block_id, 0, 1));
+    }
+
+    #[test]
+    fn leftover_staging_files_do_not_duplicate_ready_report() {
+        let (_temp, store) = store();
+        let (group_name_value, block_id) = ids();
+        let data = Bytes::from(vec![9; 4096]);
+        create_default_block(&store, group_name_value, block_id);
+        store
+            .write_at(group_name_value, block_id, 0, data.clone())
+            .expect("write staging data");
+        let meta = store
+            .publish_ready(publish_request(group_name_value, block_id, 4096, 55))
+            .expect("publish ready block");
+        let paths = store.paths(group_name_value, block_id);
+        fs::write(&paths.temp_meta_path, encode_meta(&meta).expect("encode temp meta")).expect("write temp meta");
+        fs::write(&paths.staging_data_path, b"leftover staging").expect("write staging data");
+        fs::write(
+            &paths.staging_meta_path,
+            encode_staging_meta(&BlockMetaPayload {
+                visibility: BlockVisibility {
+                    block_state: BlockState::Loading,
+                    block_stamp: 0,
+                },
+                source: BlockSource {
+                    effective_len: meta.format.block_size,
+                },
+                ..meta.clone()
+            })
+            .expect("encode staging meta"),
+        )
+        .expect("write staging meta");
+
+        let scanned = store.scan_group_blocks(group_name_value).expect("scan group blocks");
+
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].identity.block_id, block_id);
+        assert_eq!(store.read_at(group_name_value, block_id, 0, 4096).unwrap(), data);
     }
 
     #[test]

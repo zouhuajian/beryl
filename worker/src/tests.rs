@@ -1266,6 +1266,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_local_ready_state_is_not_submitted_in_full_block_report() {
+        let worker_run_id = test_worker_run_id();
+        let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(Vec::new()).await;
+        let state = Arc::new(RegistrationSet::new());
+        state.record_registered(Registration {
+            group_name: group_name(),
+            worker_id: WorkerId::new(42),
+            worker_run_id,
+            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
+        });
+        state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
+        let temp = TempDir::new().expect("tempdir");
+        let store = report_store(&temp);
+        publish_ready_block_for(store.as_ref(), group_name(), block_id(), payload(), 101);
+        let raw_store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(temp.path().join("hdd0")));
+        let paths = raw_store.paths(&group_name(), block_id());
+        std::fs::remove_file(paths.data_path).expect("remove ready data file");
+        let reporter = MetadataBlockReportLoop::new(
+            test_registration_config(endpoint),
+            test_registration_descriptor(worker_run_id),
+            Arc::clone(&state),
+            Arc::clone(&store),
+        )
+        .expect("block reporter");
+
+        let error = reporter
+            .send_full_once()
+            .await
+            .expect_err("invalid local Ready state must stop report construction");
+
+        assert!(matches!(error, BlockReportError::Retryable(_)));
+        assert!(mock.block_report_requests.lock().unwrap().is_empty());
+        shutdown.send(()).ok();
+    }
+
+    #[tokio::test]
     async fn block_report_waits_for_registration_and_heartbeat_readiness() {
         let worker_run_id = test_worker_run_id();
         let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(Vec::new()).await;
