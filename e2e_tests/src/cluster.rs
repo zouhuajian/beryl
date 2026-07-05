@@ -17,7 +17,7 @@ use metadata::lifecycle::format_metadata_storage;
 use metadata::runtime::{build_authority, build_filesystem_service, build_readiness};
 use metadata::worker::{MetadataWorkerServiceImpl, WorkerManager};
 use tokio::net::TcpListener;
-use types::{GroupName, Tier, WorkerId};
+use types::{GroupName, Tier, WorkerId, WorkerRunId};
 use worker::config::{
     StoreDirConfig, WorkerConfig as WorkerServiceConfig, WorkerRegistrationConfig, WorkerStoreConfig,
 };
@@ -40,8 +40,10 @@ pub struct TestCluster {
     client: FsClient,
     group_name: GroupName,
     worker_id: WorkerId,
+    worker_addr: SocketAddr,
     metadata_addr: SocketAddr,
     metadata_config: MetadataConfig,
+    worker_config: WorkerServiceConfig,
     worker_manager: Arc<WorkerManager>,
     registrar: MetadataRegistrar,
     registration_state: Arc<worker::control::RegistrationSet>,
@@ -70,65 +72,43 @@ impl TestCluster {
         readiness::wait_for_metadata_filesystem(&client).await?;
 
         let worker_config = worker_config(temp_state.worker_root(), worker_addr, metadata_addr, group_name.clone())?;
-        std::fs::create_dir_all(worker_config.identity_path.parent().expect("identity path has parent"))?;
-        let worker_id = prepare_worker_start(&worker_config)?;
-        let registration_state = readiness::shared_registration_state();
-        let descriptor = MetadataRegistrar::descriptor_from_config(&worker_config, worker_id)?;
-        let registrar = MetadataRegistrar::new(
-            worker_config.metadata.clone(),
-            descriptor.clone(),
-            Arc::clone(&registration_state),
-        )?;
-        let heartbeat = MetadataHeartbeatLoop::new(
-            worker_config.metadata.clone(),
-            descriptor.clone(),
-            Arc::clone(&registration_state),
-        )?;
-        let block_store = Arc::new(StoreDirs::open(
-            worker_config.store.dirs.clone(),
-            worker_config.store.reserve_space_bytes,
-            worker_config.store.check_interval_ms,
-        )?);
-        let block_report = MetadataBlockReportLoop::new(
-            worker_config.metadata.clone(),
-            descriptor,
-            Arc::clone(&registration_state),
-            Arc::clone(&block_store),
-        )?;
-        let worker_core = Arc::new(WorkerCore::with_local_store(
-            worker_config.default_frame_size,
-            worker_config.max_frame_size,
-            worker_config.window_bytes,
-            Duration::from_millis(worker_config.stream_idle_timeout_ms),
-            Arc::clone(&block_store) as Arc<dyn worker::store::block::LocalBlockStore + Send + Sync>,
-        ));
-        let worker_server = WorkerServiceInstance::start(
-            worker_port.into_listener(),
-            worker_core,
-            Arc::clone(&registration_state),
-        );
+        let worker = start_worker_instance(&worker_config, worker_port.into_listener())?;
 
-        registrar.register_once().await?;
-        readiness::wait_for_worker_registration(&registration_state, &worker_manager, &group_name, worker_id).await?;
+        worker.registrar.register_once().await?;
+        readiness::wait_for_worker_registration(
+            &worker.registration_state,
+            &worker_manager,
+            &group_name,
+            worker.worker_id,
+        )
+        .await?;
 
-        readiness::send_heartbeat(&heartbeat, &block_store).await?;
-        readiness::wait_for_worker_heartbeat(&registration_state, &worker_manager, &group_name, worker_id).await?;
+        readiness::send_heartbeat(&worker.heartbeat, &worker.block_store).await?;
+        readiness::wait_for_worker_heartbeat(
+            &worker.registration_state,
+            &worker_manager,
+            &group_name,
+            worker.worker_id,
+        )
+        .await?;
 
         let cluster = Self {
             _temp_state: temp_state,
             client,
             group_name,
-            worker_id,
+            worker_id: worker.worker_id,
+            worker_addr,
             metadata_addr,
             metadata_config,
+            worker_config,
             worker_manager,
-            registrar,
-            registration_state,
-            block_report,
-            heartbeat,
-            block_store,
+            registrar: worker.registrar,
+            registration_state: worker.registration_state,
+            block_report: worker.block_report,
+            heartbeat: worker.heartbeat,
+            block_store: worker.block_store,
             metadata_server,
-            worker_server,
+            worker_server: worker.worker_server,
         };
         cluster.converge_block_reports().await?;
         Ok(cluster)
@@ -144,6 +124,49 @@ impl TestCluster {
 
     pub fn ready_block_count(&self) -> TestResult<usize> {
         Ok(self.block_store.scan_group_blocks(&self.group_name)?.len())
+    }
+
+    pub fn current_worker_run_id(&self) -> Option<WorkerRunId> {
+        self.registration_state
+            .registration_for_group(&self.group_name)
+            .map(|registration| registration.worker_run_id)
+    }
+
+    pub async fn restart_worker(&mut self) -> TestResult<()> {
+        self.restart_worker_until_heartbeat().await?;
+        self.converge_block_reports().await
+    }
+
+    pub async fn restart_worker_until_heartbeat(&mut self) -> TestResult<()> {
+        self.worker_server.shutdown().await?;
+        let listener = TcpListener::bind(self.worker_addr).await?;
+        let worker = start_worker_instance(&self.worker_config, listener)?;
+        let worker_id = worker.worker_id;
+
+        self.worker_id = worker_id;
+        self.registrar = worker.registrar;
+        self.registration_state = worker.registration_state;
+        self.block_report = worker.block_report;
+        self.heartbeat = worker.heartbeat;
+        self.block_store = worker.block_store;
+        self.worker_server = worker.worker_server;
+
+        self.registrar.register_once().await?;
+        readiness::wait_for_worker_registration(
+            &self.registration_state,
+            &self.worker_manager,
+            &self.group_name,
+            worker_id,
+        )
+        .await?;
+        readiness::send_heartbeat(&self.heartbeat, &self.block_store).await?;
+        readiness::wait_for_worker_heartbeat(
+            &self.registration_state,
+            &self.worker_manager,
+            &self.group_name,
+            worker_id,
+        )
+        .await
     }
 
     pub async fn restart_metadata(&mut self) -> TestResult<()> {
@@ -231,6 +254,64 @@ async fn start_metadata_instance(
     let metadata_server =
         MetadataServiceInstance::start(listener, filesystem, worker_control, Arc::clone(&authority.raft_node));
     Ok((metadata_server, worker_manager))
+}
+
+struct StartedWorkerService {
+    worker_id: WorkerId,
+    registrar: MetadataRegistrar,
+    registration_state: Arc<worker::control::RegistrationSet>,
+    block_report: MetadataBlockReportLoop,
+    heartbeat: MetadataHeartbeatLoop,
+    block_store: Arc<StoreDirs>,
+    worker_server: WorkerServiceInstance,
+}
+
+fn start_worker_instance(
+    worker_config: &WorkerServiceConfig,
+    listener: TcpListener,
+) -> TestResult<StartedWorkerService> {
+    std::fs::create_dir_all(worker_config.identity_path.parent().expect("identity path has parent"))?;
+    let worker_id = prepare_worker_start(worker_config)?;
+    let registration_state = readiness::shared_registration_state();
+    let descriptor = MetadataRegistrar::descriptor_from_config(worker_config, worker_id)?;
+    let registrar = MetadataRegistrar::new(
+        worker_config.metadata.clone(),
+        descriptor.clone(),
+        Arc::clone(&registration_state),
+    )?;
+    let heartbeat = MetadataHeartbeatLoop::new(
+        worker_config.metadata.clone(),
+        descriptor.clone(),
+        Arc::clone(&registration_state),
+    )?;
+    let block_store = Arc::new(StoreDirs::open(
+        worker_config.store.dirs.clone(),
+        worker_config.store.reserve_space_bytes,
+        worker_config.store.check_interval_ms,
+    )?);
+    let block_report = MetadataBlockReportLoop::new(
+        worker_config.metadata.clone(),
+        descriptor,
+        Arc::clone(&registration_state),
+        Arc::clone(&block_store),
+    )?;
+    let worker_core = Arc::new(WorkerCore::with_local_store(
+        worker_config.default_frame_size,
+        worker_config.max_frame_size,
+        worker_config.window_bytes,
+        Duration::from_millis(worker_config.stream_idle_timeout_ms),
+        Arc::clone(&block_store) as Arc<dyn worker::store::block::LocalBlockStore + Send + Sync>,
+    ));
+    let worker_server = WorkerServiceInstance::start(listener, worker_core, Arc::clone(&registration_state));
+    Ok(StartedWorkerService {
+        worker_id,
+        registrar,
+        registration_state,
+        block_report,
+        heartbeat,
+        block_store,
+        worker_server,
+    })
 }
 
 fn metadata_config(
