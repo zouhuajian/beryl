@@ -21,6 +21,8 @@
 
 The current runtime starts a gRPC worker data service, registers with metadata, sends heartbeats and block reports, stores Ready blocks locally through the filesystem I/O engine, and serves metadata-authorized read/write streams.
 
+Worker-local block deletion exists as a store operation, but physical resident-block reclamation is future/partial. The current worker gRPC data service does not expose an active metadata-driven delete RPC path.
+
 ## Not in Current Scope
 
 - Namespace visibility or file layout authority.

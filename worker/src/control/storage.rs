@@ -6,6 +6,9 @@
 use crate::config::WorkerConfig;
 use crate::WorkerError;
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use types::ids::WorkerId;
@@ -14,6 +17,7 @@ use uuid::Uuid;
 use super::identity::{resolve_existing_worker_id, resolve_worker_id};
 
 const WORKER_STORAGE_INFO_FILE: &str = "worker.storage.json";
+const WORKER_STORAGE_INFO_TEMP_SUFFIX: &str = ".tmp";
 const FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -44,6 +48,7 @@ pub fn prepare_worker_start(config: &WorkerConfig) -> Result<WorkerId, WorkerErr
         let worker_id = validate_info(config, &info)?;
         return Ok(worker_id);
     }
+    reject_partial_info_marker(&info_path)?;
 
     if store_dirs_have_entries(config)? {
         return Err(info_missing_error(config));
@@ -111,7 +116,7 @@ fn storage_dir_has_entries(path: &Path) -> Result<bool, WorkerError> {
             path.display()
         )));
     }
-    let mut entries = std::fs::read_dir(path).map_err(|err| {
+    let mut entries = fs::read_dir(path).map_err(|err| {
         WorkerError::Internal(format!(
             "failed to read worker.store.dirs path {}: {err}",
             path.display()
@@ -143,7 +148,7 @@ fn info_mismatch(field: &str, actual: &str, expected: &str) -> WorkerError {
 }
 
 fn read_info(path: &Path) -> Result<WorkerStorageInfo, WorkerError> {
-    let raw = std::fs::read_to_string(path).map_err(|err| {
+    let raw = fs::read_to_string(path).map_err(|err| {
         WorkerError::Internal(format!("failed to read worker storage info {}: {err}", path.display()))
     })?;
     serde_json::from_str(&raw).map_err(|err| {
@@ -157,8 +162,87 @@ fn read_info(path: &Path) -> Result<WorkerStorageInfo, WorkerError> {
 fn write_info(path: &Path, info: &WorkerStorageInfo) -> Result<(), WorkerError> {
     let payload = serde_json::to_vec_pretty(info)
         .map_err(|err| WorkerError::Internal(format!("failed to encode worker storage info: {err}")))?;
-    std::fs::write(path, payload)
-        .map_err(|err| WorkerError::Internal(format!("failed to write worker storage info {}: {err}", path.display())))
+    let parent = info_parent_dir(path);
+    fs::create_dir_all(parent).map_err(|err| {
+        WorkerError::Internal(format!(
+            "failed to create worker storage info parent {}: {err}",
+            parent.display()
+        ))
+    })?;
+    let temp_path = worker_storage_info_temp_path(path)?;
+    {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .map_err(|err| {
+                WorkerError::Internal(format!(
+                    "failed to create worker storage info temp marker {}: {err}",
+                    temp_path.display()
+                ))
+            })?;
+        file.write_all(&payload).map_err(|err| {
+            WorkerError::Internal(format!(
+                "failed to write worker storage info temp marker {}: {err}",
+                temp_path.display()
+            ))
+        })?;
+        file.sync_all().map_err(|err| {
+            WorkerError::Internal(format!(
+                "failed to fsync worker storage info temp marker {}: {err}",
+                temp_path.display()
+            ))
+        })?;
+    }
+    fs::rename(&temp_path, path).map_err(|err| {
+        WorkerError::Internal(format!(
+            "failed to rename worker storage info temp marker {} to {}: {err}",
+            temp_path.display(),
+            path.display()
+        ))
+    })?;
+    sync_info_parent_dir(parent)
+}
+
+fn reject_partial_info_marker(path: &Path) -> Result<(), WorkerError> {
+    let temp_path = worker_storage_info_temp_path(path)?;
+    if temp_path.try_exists().map_err(|err| {
+        WorkerError::Internal(format!(
+            "failed to inspect worker storage info temp marker {}: {err}",
+            temp_path.display()
+        ))
+    })? {
+        return Err(WorkerError::InvalidArgument(format!(
+            "partial worker storage info temp marker {} exists without final marker {}; refusing to start",
+            temp_path.display(),
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn worker_storage_info_temp_path(path: &Path) -> Result<PathBuf, WorkerError> {
+    let file_name = path.file_name().ok_or_else(|| {
+        WorkerError::InvalidArgument(format!("worker storage info path {} has no file name", path.display()))
+    })?;
+    let mut temp_name = OsString::from(file_name);
+    temp_name.push(WORKER_STORAGE_INFO_TEMP_SUFFIX);
+    Ok(path.with_file_name(temp_name))
+}
+
+fn info_parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn sync_info_parent_dir(parent: &Path) -> Result<(), WorkerError> {
+    File::open(parent).and_then(|file| file.sync_all()).map_err(|err| {
+        WorkerError::Internal(format!(
+            "failed to fsync worker storage info parent {}: {err}",
+            parent.display()
+        ))
+    })
 }
 
 fn now_ms() -> u64 {

@@ -5,6 +5,12 @@ use tempfile::TempDir;
 use worker::config::WorkerConfig;
 use worker::control::{prepare_worker_start, worker_storage_info_path, MetadataRegistrar};
 
+fn worker_storage_info_temp_path_for_test(config: &WorkerConfig) -> std::path::PathBuf {
+    let info_path = worker_storage_info_path(config);
+    let file_name = info_path.file_name().unwrap().to_string_lossy();
+    info_path.with_file_name(format!("{file_name}.tmp"))
+}
+
 fn prepare_start_descriptor(config: &WorkerConfig) -> Result<(), String> {
     let worker_id = prepare_worker_start(config).map_err(|err| err.to_string())?;
     MetadataRegistrar::descriptor_from_config(config, worker_id)
@@ -58,6 +64,7 @@ fn worker_start_on_missing_store_dirs_creates_identity_info() {
     assert!(worker_id.as_raw() > 0);
     assert!(config.identity_path.exists());
     assert!(worker_storage_info_path(&config).exists());
+    assert!(!worker_storage_info_temp_path_for_test(&config).exists());
 
     let info_json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(worker_storage_info_path(&config)).unwrap()).unwrap();
@@ -149,6 +156,59 @@ fn worker_start_refuses_worker_id_mismatch_without_rewriting_storage() {
     assert!(err.contains("worker_id"));
     assert_eq!(std::fs::read(worker_storage_info_path(&config)).unwrap(), info_payload);
     assert_eq!(std::fs::read(&config.identity_path).unwrap(), identity_before);
+}
+
+#[test]
+fn worker_start_refuses_partial_storage_info_temp_without_final_marker() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "cluster-a", "root");
+    let config = WorkerConfig::load(&config_path).unwrap();
+    let info_path = worker_storage_info_path(&config);
+    let temp_path = worker_storage_info_temp_path_for_test(&config);
+    std::fs::create_dir_all(temp_path.parent().unwrap()).unwrap();
+    std::fs::write(&temp_path, br#"{"cluster_id":"cluster-a""#).unwrap();
+
+    let err = prepare_worker_start(&config).unwrap_err();
+    let message = err.to_string();
+
+    assert!(message.contains("partial worker storage info"));
+    assert!(message.contains(&temp_path.display().to_string()));
+    assert!(temp_path.exists());
+    assert!(!info_path.exists());
+    assert!(!config.identity_path.exists());
+}
+
+#[test]
+fn worker_start_ignores_temp_storage_info_when_valid_final_marker_exists() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "cluster-a", "root");
+    let config = WorkerConfig::load(&config_path).unwrap();
+    let worker_id = prepare_worker_start(&config).unwrap();
+    let info_before = std::fs::read(worker_storage_info_path(&config)).unwrap();
+    let temp_path = worker_storage_info_temp_path_for_test(&config);
+    std::fs::write(&temp_path, br#"{"cluster_id":"partial"}"#).unwrap();
+
+    let second_worker_id = prepare_worker_start(&config).unwrap();
+
+    assert_eq!(second_worker_id, worker_id);
+    assert_eq!(std::fs::read(worker_storage_info_path(&config)).unwrap(), info_before);
+    assert!(temp_path.exists());
+}
+
+#[test]
+fn worker_start_refuses_invalid_final_storage_info() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "cluster-a", "root");
+    let config = WorkerConfig::load(&config_path).unwrap();
+    prepare_worker_start(&config).unwrap();
+    std::fs::write(worker_storage_info_path(&config), b"not-json").unwrap();
+
+    let err = prepare_worker_start(&config).unwrap_err();
+    let message = err.to_string();
+
+    assert!(message.contains("worker storage info"));
+    assert!(message.contains("malformed"));
+    assert!(message.contains("clean storage"));
 }
 
 #[test]
