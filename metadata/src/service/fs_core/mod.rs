@@ -264,6 +264,7 @@ impl FsCore {
         group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
     ) -> CoreResult<T> {
+        let group_name = group_name.or_else(|| ctx.caller.group_name.clone());
         self.need_refresh_failure_with_hint(ctx, rpc_code, reason, message, group_name, mount_epoch, None, None)
     }
 

@@ -3688,11 +3688,14 @@ async fn rename_rejects_cross_mount() {
 
 #[tokio::test]
 async fn close_write_session_missing_without_applied_result_stays_session_invalid() {
-    let fs_core = fs_core_with_mount(MountId::new(55), 9, &group_name("g13"));
+    let group_name_value = group_name("g13");
+    let fs_core = fs_core_with_mount(MountId::new(55), 9, &group_name_value);
+    let mut ctx = request_context();
+    ctx.caller = ctx.caller.with_group_name(group_name_value.clone());
 
     let failure = fs_core
         .execute_close_write(CloseWriteInput {
-            ctx: request_context(),
+            ctx,
             file_handle: 999_999,
             lease_id: Some(types::ids::LeaseId::new(1)),
             lease_epoch: 1,
@@ -3716,6 +3719,7 @@ async fn close_write_session_missing_without_applied_result_stays_session_invali
         Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
     );
     assert_eq!(failure.error.reason, Some(RefreshReason::SessionInvalid));
+    assert_eq!(failure.group_name, Some(group_name_value));
 }
 
 #[tokio::test]

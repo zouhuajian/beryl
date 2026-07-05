@@ -1355,11 +1355,12 @@ mod tests {
         Counter, CounterFn, Gauge, Histogram, HistogramFn, Key, KeyName, Metadata, Recorder, SharedString, Unit,
     };
     use proto::common::{error_detail_proto, ErrorClassProto, RefreshReasonProto, RpcErrorCodeProto};
+    use std::future::Future;
     use std::io;
     use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
     use tracing::instrument::WithSubscriber;
-    use tracing_subscriber::{fmt, layer::SubscriberExt, Registry};
+    use tracing_subscriber::{filter::LevelFilter, fmt, layer::SubscriberExt, Layer, Registry};
     use types::ClientId;
     use types::WorkerRunId;
 
@@ -1419,7 +1420,8 @@ mod tests {
                 .with_target(true)
                 .with_file(false)
                 .with_line_number(false)
-                .with_writer(move || writer.clone()),
+                .with_writer(move || writer.clone())
+                .with_filter(LevelFilter::INFO),
         );
         tracing::Dispatch::new(subscriber)
     }
@@ -1433,9 +1435,15 @@ mod tests {
                 .with_target(true)
                 .with_file(false)
                 .with_line_number(false)
-                .with_writer(move || writer.clone()),
+                .with_writer(move || writer.clone())
+                .with_filter(LevelFilter::INFO),
         );
         tracing::Dispatch::new(subscriber)
+    }
+
+    async fn run_with_log_dispatch<T>(dispatch: &tracing::Dispatch, future: impl Future<Output = T>) -> T {
+        let _dispatch_guard = tracing::dispatcher::set_default(dispatch);
+        future.with_subscriber(dispatch.clone()).await
     }
 
     fn header_client_identity(header: &proto::common::RequestHeaderProto) -> (String, String) {
@@ -1751,7 +1759,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn register_worker_accepted_emits_metadata_worker_log() {
         let _log_guard = log_test_mutex().lock().await;
         let dir = TempDir::new().unwrap();
@@ -1767,7 +1775,7 @@ mod tests {
         let output = Arc::new(Mutex::new(Vec::new()));
         let dispatch = captured_json_subscriber(&output);
 
-        async {
+        run_with_log_dispatch(&dispatch, async {
             let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
                 &service,
                 Request::new(register_request_with_header(
@@ -1779,8 +1787,7 @@ mod tests {
             .expect("register worker response")
             .into_inner();
             assert!(response.header.expect("header").error.is_none());
-        }
-        .with_subscriber(dispatch)
+        })
         .await;
 
         let logs = captured_logs(&output);

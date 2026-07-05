@@ -31,7 +31,8 @@ use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 use tempfile::TempDir;
 use tonic::Request;
-use tracing_subscriber::{fmt, layer::SubscriberExt, Registry};
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::{filter::LevelFilter, fmt, layer::SubscriberExt, Layer, Registry};
 use types::fs::{Extent, FileAttrs, Inode, InodeId};
 use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
 use types::layout::FileLayout;
@@ -125,7 +126,8 @@ fn captured_json_subscriber(output: &Arc<Mutex<Vec<u8>>>) -> tracing::Dispatch {
             .with_target(true)
             .with_file(false)
             .with_line_number(false)
-            .with_writer(move || writer.clone()),
+            .with_writer(move || writer.clone())
+            .with_filter(LevelFilter::INFO),
     );
     tracing::Dispatch::new(subscriber)
 }
@@ -139,14 +141,15 @@ fn captured_text_subscriber(output: &Arc<Mutex<Vec<u8>>>) -> tracing::Dispatch {
             .with_target(true)
             .with_file(false)
             .with_line_number(false)
-            .with_writer(move || writer.clone()),
+            .with_writer(move || writer.clone())
+            .with_filter(LevelFilter::INFO),
     );
     tracing::Dispatch::new(subscriber)
 }
 
 async fn run_with_log_dispatch<T>(dispatch: &tracing::Dispatch, future: impl Future<Output = T>) -> T {
     let _dispatch_guard = tracing::dispatcher::set_default(dispatch);
-    future.await
+    future.with_subscriber(dispatch.clone()).await
 }
 
 fn header(client_id: u128) -> Option<RequestHeaderProto> {
@@ -558,21 +561,7 @@ async fn create_file_success_emits_metadata_state_log() {
     )
     .await;
     let output = Arc::new(Mutex::new(Vec::new()));
-    let writer = LogCaptureWriter::new(Arc::clone(&output));
-    let subscriber = Registry::default().with(
-        fmt::layer()
-            .json()
-            .flatten_event(true)
-            .with_current_span(false)
-            .with_span_list(false)
-            .with_ansi(false)
-            .with_target(true)
-            .with_file(false)
-            .with_line_number(false)
-            .with_writer(move || writer.clone()),
-    );
-
-    let dispatch = tracing::Dispatch::new(subscriber);
+    let dispatch = captured_json_subscriber(&output);
     run_with_log_dispatch(&dispatch, async {
         let response = FileSystemServiceProto::create_file(
             &env.service,
@@ -924,21 +913,7 @@ async fn add_block_success_emits_metadata_block_log_with_target_count() {
     let write_handle = create.write_handle.expect("write handle");
 
     let output = Arc::new(Mutex::new(Vec::new()));
-    let writer = LogCaptureWriter::new(Arc::clone(&output));
-    let subscriber = Registry::default().with(
-        fmt::layer()
-            .json()
-            .flatten_event(true)
-            .with_current_span(false)
-            .with_span_list(false)
-            .with_ansi(false)
-            .with_target(true)
-            .with_file(false)
-            .with_line_number(false)
-            .with_writer(move || writer.clone()),
-    );
-
-    let dispatch = tracing::Dispatch::new(subscriber);
+    let dispatch = captured_json_subscriber(&output);
     run_with_log_dispatch(&dispatch, async {
         let response = FileSystemServiceProto::add_block(
             &env.service,
@@ -1068,21 +1043,7 @@ async fn add_block_failure_emits_metadata_block_warn_log_with_error_code() {
     write_handle.lease_epoch += 1;
 
     let output = Arc::new(Mutex::new(Vec::new()));
-    let writer = LogCaptureWriter::new(Arc::clone(&output));
-    let subscriber = Registry::default().with(
-        fmt::layer()
-            .json()
-            .flatten_event(true)
-            .with_current_span(false)
-            .with_span_list(false)
-            .with_ansi(false)
-            .with_target(true)
-            .with_file(false)
-            .with_line_number(false)
-            .with_writer(move || writer.clone()),
-    );
-
-    let dispatch = tracing::Dispatch::new(subscriber);
+    let dispatch = captured_json_subscriber(&output);
     run_with_log_dispatch(&dispatch, async {
         let response = FileSystemServiceProto::add_block(
             &env.service,
