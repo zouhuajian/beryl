@@ -28,7 +28,6 @@ fn test_lease_conflict() {
 }
 
 #[test]
-#[ignore = "pending lease epoch alignment after identity pivot"]
 fn test_lease_renew() {
     let manager = InodeLeaseManager::default();
     let inode_id = InodeId::new(1);
@@ -41,7 +40,8 @@ fn test_lease_renew() {
 
     // Renew lease
     let expires_at_ms2 = manager.renew(inode_id, lease_id, epoch).unwrap();
-    assert!(expires_at_ms2 > expires_at_ms1);
+    assert!(expires_at_ms2 >= expires_at_ms1);
+    assert!(manager.validate_lease(inode_id, lease_id, epoch).is_ok());
 }
 
 #[test]

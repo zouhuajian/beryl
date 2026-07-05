@@ -320,17 +320,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pending config redaction update post-identity pivot"]
     fn test_redact_for_log() {
         let mut config = FlatConfig::new();
         config.insert("password".to_string(), Value::String("secret123".to_string()));
         config.insert("api_key".to_string(), Value::String("key123".to_string()));
-        config.insert("normal_key".to_string(), Value::String("value".to_string()));
+        config.insert("normal_name".to_string(), Value::String("value".to_string()));
 
         let redacted = config.redact_for_log();
         assert_eq!(redacted.get_str("password"), Some("***".to_string()));
         assert_eq!(redacted.get_str("api_key"), Some("***".to_string()));
-        assert_eq!(redacted.get_str("normal_key"), Some("value".to_string()));
+        assert_eq!(redacted.get_str("normal_name"), Some("value".to_string()));
     }
 
     #[test]

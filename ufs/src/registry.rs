@@ -187,6 +187,7 @@ impl Default for UfsRegistry {
 mod tests {
     use super::*;
     use crate::spec::{BackendConfig, BackendKind, FsConfig};
+    use tempfile::TempDir;
 
     #[test]
     fn test_registry_upsert_and_get() {
@@ -223,22 +224,23 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires filesystem permissions not available in default test env"]
     fn test_registry_apply() {
         let registry = UfsRegistry::new();
+        let temp_dir1 = TempDir::new().unwrap();
+        let temp_dir2 = TempDir::new().unwrap();
 
         let spec1 = UfsSpec::new(
             "fs1",
             BackendKind::Fs,
             BackendConfig::Fs(FsConfig {
-                root: "/tmp1".to_string(),
+                root: temp_dir1.path().to_string_lossy().to_string(),
             }),
         );
         let spec2 = UfsSpec::new(
             "fs2",
             BackendKind::Fs,
             BackendConfig::Fs(FsConfig {
-                root: "/tmp2".to_string(),
+                root: temp_dir2.path().to_string_lossy().to_string(),
             }),
         );
 

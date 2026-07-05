@@ -10,7 +10,6 @@ use tempfile::TempDir;
 use types::ClientId;
 
 #[tokio::test]
-#[ignore = "requires filesystem permissions not available in default test env"]
 async fn test_fs_backend_basic_ops() {
     let temp_dir = TempDir::new().unwrap();
     let root = temp_dir.path().to_string_lossy().to_string();

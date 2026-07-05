@@ -5485,7 +5485,6 @@ mod tests {
         assert_eq!(storage.get_block_ref_count(second_block_id).unwrap(), None);
     }
     #[test]
-    #[ignore = "pending identity-pivot follow-ups"]
     fn allocate_block_validates_handle_owner() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
@@ -5512,15 +5511,17 @@ mod tests {
         .unwrap();
 
         // Mismatch should fail
+        let mismatch_block_id = BlockId::new(data_handle, BlockIndex::new(1));
         let err = sm
             .apply(Command::AllocateBlock {
                 dedup: crate::raft::types::DedupKey::new(ClientId::new(12), CallId::new()),
                 inode_id: InodeId::new(999),
-                block_id,
+                block_id: mismatch_block_id,
                 placement,
             })
             .unwrap_err();
         assert!(matches!(err, MetadataError::InvalidArgument(_)));
+        assert!(storage.get_block(mismatch_block_id).unwrap().is_none());
     }
 
     #[test]

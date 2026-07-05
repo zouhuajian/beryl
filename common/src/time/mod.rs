@@ -6,7 +6,7 @@
 use crate::error::{CommonError, CommonErrorCode};
 use std::future::Future;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::time::{Duration as TokioDuration, timeout as tokio_timeout};
+use tokio::time::timeout as tokio_timeout;
 
 /// Deadline represents an absolute time point for request expiration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -77,7 +77,7 @@ where
         ));
     }
 
-    match tokio_timeout(TokioDuration::from_secs(remaining.as_secs() + 1), future).await {
+    match tokio_timeout(remaining, future).await {
         Ok(result) => Ok(result),
         Err(_) => Err(CommonError::new(
             CommonErrorCode::Timeout,
@@ -114,7 +114,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "pending timeout behavior review after identity pivot"]
     async fn test_timeout_at_timeout() {
         let deadline = Deadline::from_now(Duration::from_millis(10));
         let result = timeout_at(deadline, async {

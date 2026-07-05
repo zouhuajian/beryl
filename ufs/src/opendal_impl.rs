@@ -419,7 +419,14 @@ impl UfsMeta for OpendalUfs {
                 return Ok(());
             }
 
-            self.op.create_dir(path).await?;
+            let path_for_create;
+            let create_path = if path.is_empty() || path.ends_with('/') {
+                path
+            } else {
+                path_for_create = format!("{}/", path);
+                path_for_create.as_str()
+            };
+            self.op.create_dir(create_path).await?;
             Ok(())
         })
         .await

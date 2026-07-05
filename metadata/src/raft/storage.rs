@@ -3145,7 +3145,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pagination semantics under identity pivot pending"]
     fn test_list_dentries_with_cursor_pagination() {
         let entries = [("a", InodeId::new(2)), ("b", InodeId::new(3)), ("c", InodeId::new(4))];
         let (_tmp_dir, storage) = setup_dir_with_entries(InodeId::new(1), &entries);
@@ -3167,7 +3166,7 @@ mod tests {
             .unwrap();
         assert_eq!(page2, vec![("c".to_string(), InodeId::new(4))]);
         assert!(eof2);
-        assert!(cursor2.is_some()); // The current implementation returns the last key at EOF.
+        assert!(cursor2.is_none());
     }
 
     #[test]

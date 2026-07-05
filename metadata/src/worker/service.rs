@@ -1443,7 +1443,7 @@ mod tests {
 
     async fn run_with_log_dispatch<T>(dispatch: &tracing::Dispatch, future: impl Future<Output = T>) -> T {
         let _dispatch_guard = tracing::dispatcher::set_default(dispatch);
-        future.with_subscriber(dispatch.clone()).await
+        future.await
     }
 
     fn header_client_identity(header: &proto::common::RequestHeaderProto) -> (String, String) {
