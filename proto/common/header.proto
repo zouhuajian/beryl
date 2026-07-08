@@ -48,7 +48,7 @@ message ClientInfoProto {
 
 /// Request header carried with every RPC request (metadata-plane and optionally data-plane).
 ///
-/// Canonical cross-transport propagation:
+/// RPC error cross-transport propagation:
 /// - gRPC: embedded in request messages AND (optionally) mirrored into gRPC metadata for early reject.
 /// - QUIC/RDMA/CUSTOM: serialized as the first frame/message before the request body.
 ///
@@ -95,7 +95,7 @@ message RequestHeaderProto {
   AuthnTypeProto authn_type = 10;
 
   /// Absolute deadline (Unix epoch milliseconds).
-  /// For gRPC, grpc-timeout should be authoritative; this is the cross-transport canonical form.
+  /// For gRPC, grpc-timeout should be authoritative; this is the cross-transport shared wire form.
   int64 deadline_ms = 11;
 
   /// Optional caller context for auditing/diagnostics.
@@ -161,23 +161,23 @@ message GroupStateWatermarkProto {
 /// If gRPC returns a non-OK status, many clients will not receive the response message body.
 /// Therefore, for recoverable business/protocol errors, prefer:
 /// - gRPC status = OK
-/// - ResponseHeaderProto.error (ErrorDetailProto) with appropriate error_class
+/// - ResponseHeaderProto.error (ErrorDetailProto) with RPC kind and recovery action
 /// Use non-OK gRPC status only for unrecoverable transport/auth/framework errors, and include
 /// minimal correlation info (e.g., x-call-id, x-error-code) in trailers metadata.
 message ResponseHeaderProto {
   /// Client information (call_id, client_id, client_name).
   ClientInfoProto client = 1;
 
-  /// Canonical error detail (single source of truth for all error semantics).
-  /// If error_class = ERROR_CLASS_OK, this field should be unset or have error_class = OK.
-  /// For errors, this field contains all error information (class, code, reason, retry_after_ms).
+  /// RPC error detail (single source of truth for all error semantics).
+  /// Unset means success. When set, this field contains the RPC failure
+  /// fact, recovery action, message, and diagnostic detail.
   optional ErrorDetailProto error = 2;
 
   /// Server-authorized client state cache update.
   /// Leaders and msync may return one or more applied watermarks. Follower
   /// successful responses must return this field empty. Empty means "do not
   /// update client state cache"; stale-state is expressed only through the
-  /// canonical stale-state error.
+  /// RPC stale-state error.
   repeated GroupStateWatermarkProto state = 3;
 
   /// Mount epoch returned by server (for FS operations).

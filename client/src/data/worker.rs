@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::stream;
 
-use common::error::canonical::RefreshReason as CanonicalRefreshReason;
+use common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
 
 use super::channel_pool::GrpcWorkerChannelPool;
 use super::protocol::{
@@ -92,16 +92,16 @@ impl GrpcWorkerDataClient {
 
 fn is_stale_read_location_error(err: &ClientError) -> bool {
     match err {
-        ClientError::Action(action) => match action.as_ref() {
-            crate::canonical::ClientAction::Refresh { reason, .. } => matches!(
-                reason,
-                CanonicalRefreshReason::BlockLocationUnavailable
-                    | CanonicalRefreshReason::BlockStampMismatch
-                    | CanonicalRefreshReason::WorkerRunMismatch
-                    | CanonicalRefreshReason::StaleState
-                    | CanonicalRefreshReason::Moved
-                    | CanonicalRefreshReason::FullReportRequired
-                    | CanonicalRefreshReason::NeedRegister
+        ClientError::Action(action) => match action.action() {
+            crate::rpc_error::ClientAction::Refresh { rpc_error, .. } => matches!(
+                rpc_error.kind,
+                ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable)
+                    | ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch)
+                    | ErrorKind::Worker(WorkerErrorKind::RunMismatch)
+                    | ErrorKind::Metadata(MetadataErrorKind::StaleState)
+                    | ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch)
+                    | ErrorKind::Worker(WorkerErrorKind::FullReportRequired)
+                    | ErrorKind::Worker(WorkerErrorKind::NotRegistered)
             ),
             _ => false,
         },
@@ -456,11 +456,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
-    use common::error::canonical::{
-        CanonicalError, ErrorCode as CanonicalErrorCode, RefreshReason as CanonicalRefreshReason,
-    };
-    use common::header::RpcErrorCode;
-    use proto::convert::canonical_to_error_detail;
+    use common::error::rpc::{ErrorKind, RefreshHint as RpcRefreshHint, RpcErrorDetail};
+    use proto::convert::rpc_error_to_proto;
     use proto::worker::worker_data_service_server::{WorkerDataService, WorkerDataServiceServer};
     use proto::worker::{
         AbortWriteRequestProto, AbortWriteResponseProto, CommitWriteRequestProto, CommitWriteResponseProto,
@@ -475,7 +472,9 @@ mod tests {
     use types::{BlockId, BlockIndex, ClientId, DataHandleId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
 
     use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetrics};
-    use crate::runtime::{ErrorClass, ErrorClassifier, OperationContext, OperationIdentity, OperationKind};
+    use crate::runtime::{
+        ErrorClass, ErrorClassifier, MetadataRefreshCause, OperationContext, OperationIdentity, OperationKind,
+    };
 
     #[derive(Debug, Default)]
     struct RecordingMetrics {
@@ -580,9 +579,9 @@ mod tests {
     #[tokio::test]
     async fn stale_read_location_error_tries_next_worker() {
         let first_state = Arc::new(MockWorkerDataState {
-            open_read_response: Mutex::new(Some(open_read_error(CanonicalError::need_refresh(
-                RpcErrorCode::BlockLocationUnavailable,
-                CanonicalRefreshReason::BlockLocationUnavailable,
+            open_read_response: Mutex::new(Some(open_read_error(RpcErrorDetail::refresh_metadata(
+                ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
+                RpcRefreshHint::default(),
                 "local block is not available for read",
             )))),
             ..MockWorkerDataState::default()
@@ -614,17 +613,17 @@ mod tests {
     #[tokio::test]
     async fn exhausted_missing_block_candidates_surface_block_location_unavailable() {
         let first_state = Arc::new(MockWorkerDataState {
-            open_read_response: Mutex::new(Some(open_read_error(CanonicalError::need_refresh(
-                RpcErrorCode::BlockLocationUnavailable,
-                CanonicalRefreshReason::BlockLocationUnavailable,
+            open_read_response: Mutex::new(Some(open_read_error(RpcErrorDetail::refresh_metadata(
+                ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
+                RpcRefreshHint::default(),
                 "local block is not available for read: first",
             )))),
             ..MockWorkerDataState::default()
         });
         let second_state = Arc::new(MockWorkerDataState {
-            open_read_response: Mutex::new(Some(open_read_error(CanonicalError::need_refresh(
-                RpcErrorCode::BlockLocationUnavailable,
-                CanonicalRefreshReason::BlockLocationUnavailable,
+            open_read_response: Mutex::new(Some(open_read_error(RpcErrorDetail::refresh_metadata(
+                ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
+                RpcRefreshHint::default(),
                 "local block is not available for read: second",
             )))),
             ..MockWorkerDataState::default()
@@ -640,10 +639,10 @@ mod tests {
             .await
             .expect_err("exhausted stale candidates must surface typed location error");
 
-        assert_canonical_refresh(
+        assert_rpc_refresh(
             &err,
-            RpcErrorCode::BlockLocationUnavailable,
-            CanonicalRefreshReason::BlockLocationUnavailable,
+            ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
+            MetadataRefreshCause::Unknown,
         );
         assert_eq!(first_state.open_read_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second_state.open_read_calls.load(Ordering::SeqCst), 1);
@@ -654,9 +653,9 @@ mod tests {
     #[tokio::test]
     async fn exhausted_block_stamp_mismatch_candidates_surface_block_stamp_mismatch() {
         let state = Arc::new(MockWorkerDataState {
-            open_read_response: Mutex::new(Some(open_read_error(CanonicalError::need_refresh(
-                RpcErrorCode::BlockStampMismatch,
-                CanonicalRefreshReason::BlockStampMismatch,
+            open_read_response: Mutex::new(Some(open_read_error(RpcErrorDetail::refresh_metadata(
+                ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
+                RpcRefreshHint::default(),
                 "block stamp mismatch",
             )))),
             ..MockWorkerDataState::default()
@@ -671,10 +670,10 @@ mod tests {
             .await
             .expect_err("stamp mismatch must surface typed refresh error");
 
-        assert_canonical_refresh(
+        assert_rpc_refresh(
             &err,
-            RpcErrorCode::BlockStampMismatch,
-            CanonicalRefreshReason::BlockStampMismatch,
+            ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
+            MetadataRefreshCause::BlockStampMismatch,
         );
         assert_eq!(state.open_read_calls.load(Ordering::SeqCst), 1);
         assert_eq!(state.read_stream_calls.load(Ordering::SeqCst), 0);
@@ -684,9 +683,9 @@ mod tests {
     #[tokio::test]
     async fn exhausted_stale_worker_run_candidates_surface_worker_run_mismatch() {
         let state = Arc::new(MockWorkerDataState {
-            open_read_response: Mutex::new(Some(open_read_error(CanonicalError::need_refresh(
-                RpcErrorCode::WorkerRunMismatch,
-                CanonicalRefreshReason::WorkerRunMismatch,
+            open_read_response: Mutex::new(Some(open_read_error(RpcErrorDetail::refresh_metadata(
+                ErrorKind::Worker(WorkerErrorKind::RunMismatch),
+                RpcRefreshHint::default(),
                 "worker run mismatch",
             )))),
             ..MockWorkerDataState::default()
@@ -701,10 +700,10 @@ mod tests {
             .await
             .expect_err("worker run mismatch must surface typed refresh error");
 
-        assert_canonical_refresh(
+        assert_rpc_refresh(
             &err,
-            RpcErrorCode::WorkerRunMismatch,
-            CanonicalRefreshReason::WorkerRunMismatch,
+            ErrorKind::Worker(WorkerErrorKind::RunMismatch),
+            MetadataRefreshCause::WorkerRunMismatch,
         );
         assert_eq!(state.open_read_calls.load(Ordering::SeqCst), 1);
         assert_eq!(state.read_stream_calls.load(Ordering::SeqCst), 0);
@@ -918,9 +917,9 @@ mod tests {
     async fn abort_write_worker_run_mismatch_invalidates_channel() {
         let abort_state = Arc::new(MockWorkerDataState {
             abort_response: Mutex::new(Some(AbortWriteResponseProto {
-                header: Some(data_header_with_error(CanonicalError::need_refresh(
-                    RpcErrorCode::WorkerRunMismatch,
-                    common::error::canonical::RefreshReason::WorkerRunMismatch,
+                header: Some(data_header_with_error(RpcErrorDetail::refresh_metadata(
+                    ErrorKind::Worker(WorkerErrorKind::RunMismatch),
+                    RpcRefreshHint::default(),
                     "worker run mismatch",
                 ))),
                 aborted: false,
@@ -939,7 +938,7 @@ mod tests {
 
         assert_eq!(
             ErrorClassifier.classify_error(&err),
-            ErrorClass::NeedRefresh(crate::runtime::RefreshReason::WorkerRunMismatch)
+            ErrorClass::RefreshMetadata(crate::runtime::MetadataRefreshCause::WorkerRunMismatch)
         );
         assert_metric(&metrics.events(), ClientMetric::CachePreciseInvalidation);
         let _ = shutdown.send(());
@@ -1202,17 +1201,17 @@ mod tests {
         }
     }
 
-    fn data_header_with_error(canonical: CanonicalError) -> DataResponseHeaderProto {
+    fn data_header_with_error(rpc_error: RpcErrorDetail) -> DataResponseHeaderProto {
         let attempt = data_attempt_context("AbortWrite");
         DataResponseHeaderProto {
             client: Some(attempt.client_info()),
-            error: Some(canonical_to_error_detail(&canonical)),
+            error: Some(rpc_error_to_proto(&rpc_error)),
         }
     }
 
-    fn open_read_error(canonical: CanonicalError) -> OpenReadStreamResponseProto {
+    fn open_read_error(rpc_error: RpcErrorDetail) -> OpenReadStreamResponseProto {
         OpenReadStreamResponseProto {
-            header: Some(data_header_with_error(canonical)),
+            header: Some(data_header_with_error(rpc_error)),
             stream_id: None,
             frame_size: 0,
             window_bytes: 0,
@@ -1221,16 +1220,12 @@ mod tests {
         }
     }
 
-    fn assert_canonical_refresh(
-        err: &ClientError,
-        expected_code: RpcErrorCode,
-        expected_reason: CanonicalRefreshReason,
-    ) {
+    fn assert_rpc_refresh(err: &ClientError, expected_kind: ErrorKind, expected_reason: MetadataRefreshCause) {
         match err {
-            ClientError::Action(action) => match action.as_ref() {
-                crate::canonical::ClientAction::Refresh { reason, canonical, .. } => {
+            ClientError::Action(action) => match action.action() {
+                crate::rpc_error::ClientAction::Refresh { reason, rpc_error, .. } => {
                     assert_eq!(*reason, expected_reason);
-                    assert_eq!(canonical.code, Some(CanonicalErrorCode::RpcCode(expected_code)));
+                    assert_eq!(rpc_error.kind, expected_kind);
                 }
                 other => panic!("expected refresh action, got {other:?}"),
             },

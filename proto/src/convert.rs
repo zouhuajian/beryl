@@ -11,11 +11,13 @@ use crate::fs as proto_fs;
 use crate::metadata as proto_metadata;
 use ::common::{
     Deadline,
-    error::canonical::{
-        CanonicalError, ErrorClass as CanonicalErrorClass, ErrorCode as CanonicalErrorCode,
-        RefreshHint as CanonicalRefreshHint, RefreshReason, WorkerEndpointHint,
+    error::rpc::{
+        ErrorDetail, ErrorDetailField, ErrorKind as RpcErrorKind, InternalErrorKind as RpcInternalErrorKind,
+        MetadataErrorKind as RpcMetadataErrorKind, ProtocolErrorKind as RpcProtocolErrorKind,
+        RecoveryAction as RpcRecoveryAction, RefreshHint as RpcRefreshHint, RpcErrorDetail,
+        UfsErrorKind as RpcUfsErrorKind, WorkerEndpointHint, WorkerErrorKind as RpcWorkerErrorKind,
     },
-    header::{AuthnType, CallerContext, ClientInfo, RequestHeader, ResponseHeader, RpcErrorCode, TraceContext},
+    header::{AuthnType, CallerContext, ClientInfo, RequestHeader, ResponseHeader, TraceContext},
 };
 use types::chunk::ByteRange;
 use types::ids::{
@@ -925,20 +927,7 @@ impl TryFrom<proto_common::ResponseHeaderProto> for ResponseHeader {
             .ok_or_else(|| "missing client".to_string())?
             .try_into()?;
 
-        let mut canonical_error = proto.error.as_ref().map(error_detail_to_canonical);
-        if matches!(
-            canonical_error.as_ref().map(|err| err.class),
-            Some(CanonicalErrorClass::Ok)
-        ) {
-            canonical_error = None;
-        }
-
-        debug_assert!(
-            canonical_error
-                .as_ref()
-                .is_none_or(|err| !matches!(err.class, CanonicalErrorClass::Ok)),
-            "Ok canonical error detail must be normalized away"
-        );
+        let rpc_error = proto.error.as_ref().map(rpc_error_from_proto);
 
         let state = proto
             .state
@@ -948,7 +937,7 @@ impl TryFrom<proto_common::ResponseHeaderProto> for ResponseHeader {
 
         Ok(ResponseHeader {
             client,
-            canonical_error,
+            rpc_error,
             state,
             mount_epoch: proto.mount_epoch,
             route_epoch: proto.route_epoch,
@@ -960,13 +949,7 @@ impl TryFrom<proto_common::ResponseHeaderProto> for ResponseHeader {
 
 impl From<&ResponseHeader> for proto_common::ResponseHeaderProto {
     fn from(header: &ResponseHeader) -> Self {
-        let canonical_owned = header
-            .canonical_error
-            .as_ref()
-            .filter(|err| !matches!(err.class, CanonicalErrorClass::Ok))
-            .cloned();
-
-        let error_detail = canonical_owned.as_ref().map(canonical_to_error_detail);
+        let error_detail = header.rpc_error.as_ref().map(rpc_error_to_proto);
 
         proto_common::ResponseHeaderProto {
             client: Some((&header.client).into()),
@@ -1023,7 +1006,7 @@ impl From<&RequestHeader> for crate::worker::DataRequestHeaderProto {
 }
 
 // ============================================================================
-// Canonical error helpers (shared between control/data-plane conversions)
+// RPC error helpers (shared between control/data-plane conversions)
 // ============================================================================
 
 fn fs_errno_proto_to_enum(code: i32) -> types::fs::FsErrorCode {
@@ -1065,123 +1048,259 @@ fn fs_errno_enum_to_proto(code: &types::fs::FsErrorCode) -> proto_common::FsErrn
     }
 }
 
-fn rpc_code_proto_to_enum(code: i32) -> RpcErrorCode {
-    match code {
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeUnspecified as i32 => RpcErrorCode::Unspecified,
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeInvalidHeader as i32 => RpcErrorCode::InvalidHeader,
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeNotLeader as i32 => RpcErrorCode::NotLeader,
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeStaleState as i32 => RpcErrorCode::StaleState,
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeMountEpochMismatch as i32 => {
-            RpcErrorCode::MountEpochMismatch
+fn metadata_kind_proto_to_kind(kind: proto_common::MetadataErrorKindProto) -> RpcMetadataErrorKind {
+    match kind {
+        proto_common::MetadataErrorKindProto::MetadataErrorKindUnspecified => RpcMetadataErrorKind::StaleState,
+        proto_common::MetadataErrorKindProto::MetadataErrorKindNotFound => RpcMetadataErrorKind::NotFound,
+        proto_common::MetadataErrorKindProto::MetadataErrorKindAlreadyExists => RpcMetadataErrorKind::AlreadyExists,
+        proto_common::MetadataErrorKindProto::MetadataErrorKindNotDirectory => RpcMetadataErrorKind::NotDirectory,
+        proto_common::MetadataErrorKindProto::MetadataErrorKindIsDirectory => RpcMetadataErrorKind::IsDirectory,
+        proto_common::MetadataErrorKindProto::MetadataErrorKindDirectoryNotEmpty => {
+            RpcMetadataErrorKind::DirectoryNotEmpty
         }
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeRouteEpochMismatch as i32 => {
-            RpcErrorCode::RouteEpochMismatch
+        proto_common::MetadataErrorKindProto::MetadataErrorKindCrossMountRename => {
+            RpcMetadataErrorKind::CrossMountRename
         }
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeWorkerNotRegistered as i32 => {
-            RpcErrorCode::WorkerNotRegistered
+        proto_common::MetadataErrorKindProto::MetadataErrorKindBusy => RpcMetadataErrorKind::Busy,
+        proto_common::MetadataErrorKindProto::MetadataErrorKindConflict => RpcMetadataErrorKind::Conflict,
+        proto_common::MetadataErrorKindProto::MetadataErrorKindNotLeader => RpcMetadataErrorKind::NotLeader,
+        proto_common::MetadataErrorKindProto::MetadataErrorKindStaleState => RpcMetadataErrorKind::StaleState,
+        proto_common::MetadataErrorKindProto::MetadataErrorKindMountEpochMismatch => {
+            RpcMetadataErrorKind::MountEpochMismatch
         }
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeWorkerRunMismatch as i32 => {
-            RpcErrorCode::WorkerRunMismatch
+        proto_common::MetadataErrorKindProto::MetadataErrorKindRouteEpochMismatch => {
+            RpcMetadataErrorKind::RouteEpochMismatch
         }
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeWorkerDescriptorMismatch as i32 => {
-            RpcErrorCode::WorkerDescriptorMismatch
+        proto_common::MetadataErrorKindProto::MetadataErrorKindOwnerGroupMismatch => {
+            RpcMetadataErrorKind::OwnerGroupMismatch
         }
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeFullReportRequired as i32 => {
-            RpcErrorCode::FullReportRequired
+        proto_common::MetadataErrorKindProto::MetadataErrorKindGroupMismatch => RpcMetadataErrorKind::GroupMismatch,
+        proto_common::MetadataErrorKindProto::MetadataErrorKindFencing => RpcMetadataErrorKind::Fencing,
+        proto_common::MetadataErrorKindProto::MetadataErrorKindSessionInvalid => RpcMetadataErrorKind::SessionInvalid,
+        proto_common::MetadataErrorKindProto::MetadataErrorKindSessionExpired => RpcMetadataErrorKind::SessionExpired,
+        proto_common::MetadataErrorKindProto::MetadataErrorKindEpochMismatch => RpcMetadataErrorKind::EpochMismatch,
+        proto_common::MetadataErrorKindProto::MetadataErrorKindResourceExhausted => {
+            RpcMetadataErrorKind::ResourceExhausted
         }
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeBlockLocationUnavailable as i32 => {
-            RpcErrorCode::BlockLocationUnavailable
-        }
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeBlockStampMismatch as i32 => {
-            RpcErrorCode::BlockStampMismatch
-        }
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeEpochMismatch as i32 => RpcErrorCode::EpochMismatch,
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeFencing as i32 => RpcErrorCode::Fencing,
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeShardMoved as i32 => RpcErrorCode::ShardMoved,
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeNodeUnavailable as i32 => RpcErrorCode::NodeUnavailable,
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeInvalidArgument as i32 => RpcErrorCode::InvalidArgument,
-        x if x == proto_common::RpcErrorCodeProto::RpcErrCodeInternal as i32 => RpcErrorCode::Application,
-        _ => RpcErrorCode::Application,
     }
 }
 
-fn rpc_code_enum_to_proto(code: RpcErrorCode) -> i32 {
-    match code {
-        RpcErrorCode::Unspecified => proto_common::RpcErrorCodeProto::RpcErrCodeUnspecified as i32,
-        RpcErrorCode::InvalidHeader => proto_common::RpcErrorCodeProto::RpcErrCodeInvalidHeader as i32,
-        RpcErrorCode::NotLeader => proto_common::RpcErrorCodeProto::RpcErrCodeNotLeader as i32,
-        RpcErrorCode::StaleState => proto_common::RpcErrorCodeProto::RpcErrCodeStaleState as i32,
-        RpcErrorCode::MountEpochMismatch => proto_common::RpcErrorCodeProto::RpcErrCodeMountEpochMismatch as i32,
-        RpcErrorCode::RouteEpochMismatch => proto_common::RpcErrorCodeProto::RpcErrCodeRouteEpochMismatch as i32,
-        RpcErrorCode::WorkerNotRegistered => proto_common::RpcErrorCodeProto::RpcErrCodeWorkerNotRegistered as i32,
-        RpcErrorCode::WorkerRunMismatch => proto_common::RpcErrorCodeProto::RpcErrCodeWorkerRunMismatch as i32,
-        RpcErrorCode::WorkerDescriptorMismatch => {
-            proto_common::RpcErrorCodeProto::RpcErrCodeWorkerDescriptorMismatch as i32
+fn metadata_kind_to_proto(kind: RpcMetadataErrorKind) -> proto_common::MetadataErrorKindProto {
+    match kind {
+        RpcMetadataErrorKind::NotFound => proto_common::MetadataErrorKindProto::MetadataErrorKindNotFound,
+        RpcMetadataErrorKind::AlreadyExists => proto_common::MetadataErrorKindProto::MetadataErrorKindAlreadyExists,
+        RpcMetadataErrorKind::NotDirectory => proto_common::MetadataErrorKindProto::MetadataErrorKindNotDirectory,
+        RpcMetadataErrorKind::IsDirectory => proto_common::MetadataErrorKindProto::MetadataErrorKindIsDirectory,
+        RpcMetadataErrorKind::DirectoryNotEmpty => {
+            proto_common::MetadataErrorKindProto::MetadataErrorKindDirectoryNotEmpty
         }
-        RpcErrorCode::FullReportRequired => proto_common::RpcErrorCodeProto::RpcErrCodeFullReportRequired as i32,
-        RpcErrorCode::BlockLocationUnavailable => {
-            proto_common::RpcErrorCodeProto::RpcErrCodeBlockLocationUnavailable as i32
+        RpcMetadataErrorKind::CrossMountRename => {
+            proto_common::MetadataErrorKindProto::MetadataErrorKindCrossMountRename
         }
-        RpcErrorCode::BlockStampMismatch => proto_common::RpcErrorCodeProto::RpcErrCodeBlockStampMismatch as i32,
-        RpcErrorCode::EpochMismatch => proto_common::RpcErrorCodeProto::RpcErrCodeEpochMismatch as i32,
-        RpcErrorCode::Fencing => proto_common::RpcErrorCodeProto::RpcErrCodeFencing as i32,
-        RpcErrorCode::ShardMoved => proto_common::RpcErrorCodeProto::RpcErrCodeShardMoved as i32,
-        RpcErrorCode::NodeUnavailable => proto_common::RpcErrorCodeProto::RpcErrCodeNodeUnavailable as i32,
-        RpcErrorCode::InvalidArgument => proto_common::RpcErrorCodeProto::RpcErrCodeInvalidArgument as i32,
-        RpcErrorCode::Application => proto_common::RpcErrorCodeProto::RpcErrCodeApplication as i32,
+        RpcMetadataErrorKind::Busy => proto_common::MetadataErrorKindProto::MetadataErrorKindBusy,
+        RpcMetadataErrorKind::Conflict => proto_common::MetadataErrorKindProto::MetadataErrorKindConflict,
+        RpcMetadataErrorKind::NotLeader => proto_common::MetadataErrorKindProto::MetadataErrorKindNotLeader,
+        RpcMetadataErrorKind::StaleState => proto_common::MetadataErrorKindProto::MetadataErrorKindStaleState,
+        RpcMetadataErrorKind::MountEpochMismatch => {
+            proto_common::MetadataErrorKindProto::MetadataErrorKindMountEpochMismatch
+        }
+        RpcMetadataErrorKind::RouteEpochMismatch => {
+            proto_common::MetadataErrorKindProto::MetadataErrorKindRouteEpochMismatch
+        }
+        RpcMetadataErrorKind::OwnerGroupMismatch => {
+            proto_common::MetadataErrorKindProto::MetadataErrorKindOwnerGroupMismatch
+        }
+        RpcMetadataErrorKind::GroupMismatch => proto_common::MetadataErrorKindProto::MetadataErrorKindGroupMismatch,
+        RpcMetadataErrorKind::Fencing => proto_common::MetadataErrorKindProto::MetadataErrorKindFencing,
+        RpcMetadataErrorKind::SessionInvalid => proto_common::MetadataErrorKindProto::MetadataErrorKindSessionInvalid,
+        RpcMetadataErrorKind::SessionExpired => proto_common::MetadataErrorKindProto::MetadataErrorKindSessionExpired,
+        RpcMetadataErrorKind::EpochMismatch => proto_common::MetadataErrorKindProto::MetadataErrorKindEpochMismatch,
+        RpcMetadataErrorKind::ResourceExhausted => {
+            proto_common::MetadataErrorKindProto::MetadataErrorKindResourceExhausted
+        }
     }
 }
 
-fn refresh_reason_proto_to_enum(reason: proto_common::RefreshReasonProto) -> RefreshReason {
-    match reason {
-        proto_common::RefreshReasonProto::RefreshReasonUnknown => RefreshReason::Unknown,
-        proto_common::RefreshReasonProto::RefreshReasonNotLeader => RefreshReason::NotLeader,
-        proto_common::RefreshReasonProto::RefreshReasonOwnerGroupMismatch => RefreshReason::OwnerGroupMismatch,
-        proto_common::RefreshReasonProto::RefreshReasonMoved => RefreshReason::Moved,
-        proto_common::RefreshReasonProto::RefreshReasonStaleState => RefreshReason::StaleState,
-        proto_common::RefreshReasonProto::RefreshReasonMountEpochMismatch => RefreshReason::MountEpochMismatch,
-        proto_common::RefreshReasonProto::RefreshReasonRouteEpochMismatch => RefreshReason::RouteEpochMismatch,
-        proto_common::RefreshReasonProto::RefreshReasonGroupMismatch => RefreshReason::GroupMismatch,
-        proto_common::RefreshReasonProto::RefreshReasonNeedRegister => RefreshReason::NeedRegister,
-        proto_common::RefreshReasonProto::RefreshReasonWorkerRunMismatch => RefreshReason::WorkerRunMismatch,
-        proto_common::RefreshReasonProto::RefreshReasonFullReportRequired => RefreshReason::FullReportRequired,
-        proto_common::RefreshReasonProto::RefreshReasonBlockLocationUnavailable => {
-            RefreshReason::BlockLocationUnavailable
+fn worker_kind_proto_to_kind(kind: proto_common::WorkerErrorKindProto) -> RpcWorkerErrorKind {
+    match kind {
+        proto_common::WorkerErrorKindProto::WorkerErrorKindUnspecified => RpcWorkerErrorKind::Io,
+        proto_common::WorkerErrorKindProto::WorkerErrorKindNotRegistered => RpcWorkerErrorKind::NotRegistered,
+        proto_common::WorkerErrorKindProto::WorkerErrorKindRunMismatch => RpcWorkerErrorKind::RunMismatch,
+        proto_common::WorkerErrorKindProto::WorkerErrorKindDescriptorMismatch => RpcWorkerErrorKind::DescriptorMismatch,
+        proto_common::WorkerErrorKindProto::WorkerErrorKindFullReportRequired => RpcWorkerErrorKind::FullReportRequired,
+        proto_common::WorkerErrorKindProto::WorkerErrorKindBlockLocationUnavailable => {
+            RpcWorkerErrorKind::BlockLocationUnavailable
         }
-        proto_common::RefreshReasonProto::RefreshReasonBlockStampMismatch => RefreshReason::BlockStampMismatch,
-        proto_common::RefreshReasonProto::RefreshReasonFencing => RefreshReason::Fencing,
-        proto_common::RefreshReasonProto::RefreshReasonEpochMismatch => RefreshReason::EpochMismatch,
-        proto_common::RefreshReasonProto::RefreshReasonSessionInvalid => RefreshReason::SessionInvalid,
-        proto_common::RefreshReasonProto::RefreshReasonSessionExpired => RefreshReason::SessionExpired,
+        proto_common::WorkerErrorKindProto::WorkerErrorKindBlockStampMismatch => RpcWorkerErrorKind::BlockStampMismatch,
+        proto_common::WorkerErrorKindProto::WorkerErrorKindNodeUnavailable => RpcWorkerErrorKind::NodeUnavailable,
+        proto_common::WorkerErrorKindProto::WorkerErrorKindTimeout => RpcWorkerErrorKind::Timeout,
+        proto_common::WorkerErrorKindProto::WorkerErrorKindResourceExhausted => RpcWorkerErrorKind::ResourceExhausted,
+        proto_common::WorkerErrorKindProto::WorkerErrorKindConflict => RpcWorkerErrorKind::Conflict,
+        proto_common::WorkerErrorKindProto::WorkerErrorKindCorrupt => RpcWorkerErrorKind::Corrupt,
+        proto_common::WorkerErrorKindProto::WorkerErrorKindFencing => RpcWorkerErrorKind::Fencing,
+        proto_common::WorkerErrorKindProto::WorkerErrorKindCancelled => RpcWorkerErrorKind::Cancelled,
+        proto_common::WorkerErrorKindProto::WorkerErrorKindIo => RpcWorkerErrorKind::Io,
     }
 }
 
-fn refresh_reason_to_proto(reason: &Option<RefreshReason>) -> i32 {
-    match reason.unwrap_or(RefreshReason::Unknown) {
-        RefreshReason::Unknown => proto_common::RefreshReasonProto::RefreshReasonUnknown as i32,
-        RefreshReason::NotLeader => proto_common::RefreshReasonProto::RefreshReasonNotLeader as i32,
-        RefreshReason::OwnerGroupMismatch => proto_common::RefreshReasonProto::RefreshReasonOwnerGroupMismatch as i32,
-        RefreshReason::Moved => proto_common::RefreshReasonProto::RefreshReasonMoved as i32,
-        RefreshReason::StaleState => proto_common::RefreshReasonProto::RefreshReasonStaleState as i32,
-        RefreshReason::MountEpochMismatch => proto_common::RefreshReasonProto::RefreshReasonMountEpochMismatch as i32,
-        RefreshReason::RouteEpochMismatch => proto_common::RefreshReasonProto::RefreshReasonRouteEpochMismatch as i32,
-        RefreshReason::GroupMismatch => proto_common::RefreshReasonProto::RefreshReasonGroupMismatch as i32,
-        RefreshReason::NeedRegister => proto_common::RefreshReasonProto::RefreshReasonNeedRegister as i32,
-        RefreshReason::WorkerRunMismatch => proto_common::RefreshReasonProto::RefreshReasonWorkerRunMismatch as i32,
-        RefreshReason::FullReportRequired => proto_common::RefreshReasonProto::RefreshReasonFullReportRequired as i32,
-        RefreshReason::BlockLocationUnavailable => {
-            proto_common::RefreshReasonProto::RefreshReasonBlockLocationUnavailable as i32
+fn worker_kind_to_proto(kind: RpcWorkerErrorKind) -> proto_common::WorkerErrorKindProto {
+    match kind {
+        RpcWorkerErrorKind::NotRegistered => proto_common::WorkerErrorKindProto::WorkerErrorKindNotRegistered,
+        RpcWorkerErrorKind::RunMismatch => proto_common::WorkerErrorKindProto::WorkerErrorKindRunMismatch,
+        RpcWorkerErrorKind::DescriptorMismatch => proto_common::WorkerErrorKindProto::WorkerErrorKindDescriptorMismatch,
+        RpcWorkerErrorKind::FullReportRequired => proto_common::WorkerErrorKindProto::WorkerErrorKindFullReportRequired,
+        RpcWorkerErrorKind::BlockLocationUnavailable => {
+            proto_common::WorkerErrorKindProto::WorkerErrorKindBlockLocationUnavailable
         }
-        RefreshReason::BlockStampMismatch => proto_common::RefreshReasonProto::RefreshReasonBlockStampMismatch as i32,
-        RefreshReason::Fencing => proto_common::RefreshReasonProto::RefreshReasonFencing as i32,
-        RefreshReason::EpochMismatch => proto_common::RefreshReasonProto::RefreshReasonEpochMismatch as i32,
-        RefreshReason::SessionInvalid => proto_common::RefreshReasonProto::RefreshReasonSessionInvalid as i32,
-        RefreshReason::SessionExpired => proto_common::RefreshReasonProto::RefreshReasonSessionExpired as i32,
+        RpcWorkerErrorKind::BlockStampMismatch => proto_common::WorkerErrorKindProto::WorkerErrorKindBlockStampMismatch,
+        RpcWorkerErrorKind::NodeUnavailable => proto_common::WorkerErrorKindProto::WorkerErrorKindNodeUnavailable,
+        RpcWorkerErrorKind::Timeout => proto_common::WorkerErrorKindProto::WorkerErrorKindTimeout,
+        RpcWorkerErrorKind::ResourceExhausted => proto_common::WorkerErrorKindProto::WorkerErrorKindResourceExhausted,
+        RpcWorkerErrorKind::Conflict => proto_common::WorkerErrorKindProto::WorkerErrorKindConflict,
+        RpcWorkerErrorKind::Corrupt => proto_common::WorkerErrorKindProto::WorkerErrorKindCorrupt,
+        RpcWorkerErrorKind::Fencing => proto_common::WorkerErrorKindProto::WorkerErrorKindFencing,
+        RpcWorkerErrorKind::Cancelled => proto_common::WorkerErrorKindProto::WorkerErrorKindCancelled,
+        RpcWorkerErrorKind::Io => proto_common::WorkerErrorKindProto::WorkerErrorKindIo,
     }
 }
 
-fn refresh_hint_proto_to_hint(hint: Option<&proto_common::RefreshHintProto>) -> Option<CanonicalRefreshHint> {
-    hint.map(|hint| CanonicalRefreshHint {
+fn ufs_kind_proto_to_kind(kind: proto_common::UfsErrorKindProto) -> RpcUfsErrorKind {
+    match kind {
+        proto_common::UfsErrorKindProto::UfsErrorKindUnspecified => RpcUfsErrorKind::Backend,
+        proto_common::UfsErrorKindProto::UfsErrorKindNotFound => RpcUfsErrorKind::NotFound,
+        proto_common::UfsErrorKindProto::UfsErrorKindPermissionDenied => RpcUfsErrorKind::PermissionDenied,
+        proto_common::UfsErrorKindProto::UfsErrorKindUnsupported => RpcUfsErrorKind::Unsupported,
+        proto_common::UfsErrorKindProto::UfsErrorKindNotImplemented => RpcUfsErrorKind::NotImplemented,
+        proto_common::UfsErrorKindProto::UfsErrorKindInvalidSpec => RpcUfsErrorKind::InvalidSpec,
+        proto_common::UfsErrorKindProto::UfsErrorKindInvalidPath => RpcUfsErrorKind::InvalidPath,
+        proto_common::UfsErrorKindProto::UfsErrorKindUnexpectedEof => RpcUfsErrorKind::UnexpectedEof,
+        proto_common::UfsErrorKindProto::UfsErrorKindBackend => RpcUfsErrorKind::Backend,
+        proto_common::UfsErrorKindProto::UfsErrorKindOverloaded => RpcUfsErrorKind::Overloaded,
+        proto_common::UfsErrorKindProto::UfsErrorKindTimeout => RpcUfsErrorKind::Timeout,
+    }
+}
+
+fn ufs_kind_to_proto(kind: RpcUfsErrorKind) -> proto_common::UfsErrorKindProto {
+    match kind {
+        RpcUfsErrorKind::NotFound => proto_common::UfsErrorKindProto::UfsErrorKindNotFound,
+        RpcUfsErrorKind::PermissionDenied => proto_common::UfsErrorKindProto::UfsErrorKindPermissionDenied,
+        RpcUfsErrorKind::Unsupported => proto_common::UfsErrorKindProto::UfsErrorKindUnsupported,
+        RpcUfsErrorKind::NotImplemented => proto_common::UfsErrorKindProto::UfsErrorKindNotImplemented,
+        RpcUfsErrorKind::InvalidSpec => proto_common::UfsErrorKindProto::UfsErrorKindInvalidSpec,
+        RpcUfsErrorKind::InvalidPath => proto_common::UfsErrorKindProto::UfsErrorKindInvalidPath,
+        RpcUfsErrorKind::UnexpectedEof => proto_common::UfsErrorKindProto::UfsErrorKindUnexpectedEof,
+        RpcUfsErrorKind::Backend => proto_common::UfsErrorKindProto::UfsErrorKindBackend,
+        RpcUfsErrorKind::Overloaded => proto_common::UfsErrorKindProto::UfsErrorKindOverloaded,
+        RpcUfsErrorKind::Timeout => proto_common::UfsErrorKindProto::UfsErrorKindTimeout,
+    }
+}
+
+fn protocol_kind_proto_to_kind(kind: proto_common::ProtocolErrorKindProto) -> RpcProtocolErrorKind {
+    match kind {
+        proto_common::ProtocolErrorKindProto::ProtocolErrorKindUnspecified => RpcProtocolErrorKind::InvalidHeader,
+        proto_common::ProtocolErrorKindProto::ProtocolErrorKindInvalidHeader => RpcProtocolErrorKind::InvalidHeader,
+        proto_common::ProtocolErrorKindProto::ProtocolErrorKindInvalidArgument => RpcProtocolErrorKind::InvalidArgument,
+        proto_common::ProtocolErrorKindProto::ProtocolErrorKindPermissionDenied => {
+            RpcProtocolErrorKind::PermissionDenied
+        }
+        proto_common::ProtocolErrorKindProto::ProtocolErrorKindUnsupported => RpcProtocolErrorKind::Unsupported,
+        proto_common::ProtocolErrorKindProto::ProtocolErrorKindCancelled => RpcProtocolErrorKind::Cancelled,
+        proto_common::ProtocolErrorKindProto::ProtocolErrorKindCorrupt => RpcProtocolErrorKind::Corrupt,
+    }
+}
+
+fn protocol_kind_to_proto(kind: RpcProtocolErrorKind) -> proto_common::ProtocolErrorKindProto {
+    match kind {
+        RpcProtocolErrorKind::InvalidHeader => proto_common::ProtocolErrorKindProto::ProtocolErrorKindInvalidHeader,
+        RpcProtocolErrorKind::InvalidArgument => proto_common::ProtocolErrorKindProto::ProtocolErrorKindInvalidArgument,
+        RpcProtocolErrorKind::PermissionDenied => {
+            proto_common::ProtocolErrorKindProto::ProtocolErrorKindPermissionDenied
+        }
+        RpcProtocolErrorKind::Unsupported => proto_common::ProtocolErrorKindProto::ProtocolErrorKindUnsupported,
+        RpcProtocolErrorKind::Cancelled => proto_common::ProtocolErrorKindProto::ProtocolErrorKindCancelled,
+        RpcProtocolErrorKind::Corrupt => proto_common::ProtocolErrorKindProto::ProtocolErrorKindCorrupt,
+    }
+}
+
+fn internal_kind_proto_to_kind(kind: proto_common::InternalErrorKindProto) -> RpcInternalErrorKind {
+    match kind {
+        proto_common::InternalErrorKindProto::InternalErrorKindUnspecified => RpcInternalErrorKind::Internal,
+        proto_common::InternalErrorKindProto::InternalErrorKindNodeUnavailable => RpcInternalErrorKind::NodeUnavailable,
+        proto_common::InternalErrorKindProto::InternalErrorKindTimeout => RpcInternalErrorKind::Timeout,
+        proto_common::InternalErrorKindProto::InternalErrorKindResourceExhausted => {
+            RpcInternalErrorKind::ResourceExhausted
+        }
+        proto_common::InternalErrorKindProto::InternalErrorKindCancelled => RpcInternalErrorKind::Cancelled,
+        proto_common::InternalErrorKindProto::InternalErrorKindCorrupt => RpcInternalErrorKind::Corrupt,
+        proto_common::InternalErrorKindProto::InternalErrorKindInternal => RpcInternalErrorKind::Internal,
+    }
+}
+
+fn internal_kind_to_proto(kind: RpcInternalErrorKind) -> proto_common::InternalErrorKindProto {
+    match kind {
+        RpcInternalErrorKind::NodeUnavailable => proto_common::InternalErrorKindProto::InternalErrorKindNodeUnavailable,
+        RpcInternalErrorKind::Timeout => proto_common::InternalErrorKindProto::InternalErrorKindTimeout,
+        RpcInternalErrorKind::ResourceExhausted => {
+            proto_common::InternalErrorKindProto::InternalErrorKindResourceExhausted
+        }
+        RpcInternalErrorKind::Cancelled => proto_common::InternalErrorKindProto::InternalErrorKindCancelled,
+        RpcInternalErrorKind::Corrupt => proto_common::InternalErrorKindProto::InternalErrorKindCorrupt,
+        RpcInternalErrorKind::Internal => proto_common::InternalErrorKindProto::InternalErrorKindInternal,
+    }
+}
+
+fn error_kind_proto_to_kind(kind: Option<&proto_common::ErrorKindProto>) -> RpcErrorKind {
+    match kind.and_then(|kind| kind.kind.as_ref()) {
+        Some(proto_common::error_kind_proto::Kind::Fs(errno)) => RpcErrorKind::Fs(fs_errno_proto_to_enum(*errno)),
+        Some(proto_common::error_kind_proto::Kind::Metadata(kind)) => {
+            let kind = proto_common::MetadataErrorKindProto::try_from(*kind)
+                .unwrap_or(proto_common::MetadataErrorKindProto::MetadataErrorKindUnspecified);
+            RpcErrorKind::Metadata(metadata_kind_proto_to_kind(kind))
+        }
+        Some(proto_common::error_kind_proto::Kind::Worker(kind)) => {
+            let kind = proto_common::WorkerErrorKindProto::try_from(*kind)
+                .unwrap_or(proto_common::WorkerErrorKindProto::WorkerErrorKindUnspecified);
+            RpcErrorKind::Worker(worker_kind_proto_to_kind(kind))
+        }
+        Some(proto_common::error_kind_proto::Kind::Ufs(kind)) => {
+            let kind = proto_common::UfsErrorKindProto::try_from(*kind)
+                .unwrap_or(proto_common::UfsErrorKindProto::UfsErrorKindUnspecified);
+            RpcErrorKind::Ufs(ufs_kind_proto_to_kind(kind))
+        }
+        Some(proto_common::error_kind_proto::Kind::Protocol(kind)) => {
+            let kind = proto_common::ProtocolErrorKindProto::try_from(*kind)
+                .unwrap_or(proto_common::ProtocolErrorKindProto::ProtocolErrorKindUnspecified);
+            RpcErrorKind::Protocol(protocol_kind_proto_to_kind(kind))
+        }
+        Some(proto_common::error_kind_proto::Kind::Internal(kind)) => {
+            let kind = proto_common::InternalErrorKindProto::try_from(*kind)
+                .unwrap_or(proto_common::InternalErrorKindProto::InternalErrorKindUnspecified);
+            RpcErrorKind::Internal(internal_kind_proto_to_kind(kind))
+        }
+        None => RpcErrorKind::Internal(RpcInternalErrorKind::Internal),
+    }
+}
+
+fn error_kind_to_proto(kind: RpcErrorKind) -> proto_common::ErrorKindProto {
+    let kind = match kind {
+        RpcErrorKind::Fs(errno) => proto_common::error_kind_proto::Kind::Fs(fs_errno_enum_to_proto(&errno) as i32),
+        RpcErrorKind::Metadata(kind) => {
+            proto_common::error_kind_proto::Kind::Metadata(metadata_kind_to_proto(kind) as i32)
+        }
+        RpcErrorKind::Worker(kind) => proto_common::error_kind_proto::Kind::Worker(worker_kind_to_proto(kind) as i32),
+        RpcErrorKind::Ufs(kind) => proto_common::error_kind_proto::Kind::Ufs(ufs_kind_to_proto(kind) as i32),
+        RpcErrorKind::Protocol(kind) => {
+            proto_common::error_kind_proto::Kind::Protocol(protocol_kind_to_proto(kind) as i32)
+        }
+        RpcErrorKind::Internal(kind) => {
+            proto_common::error_kind_proto::Kind::Internal(internal_kind_to_proto(kind) as i32)
+        }
+    };
+    proto_common::ErrorKindProto { kind: Some(kind) }
+}
+
+fn refresh_hint_proto_to_hint(hint: Option<&proto_common::RefreshHintProto>) -> RpcRefreshHint {
+    hint.map_or_else(RpcRefreshHint::default, |hint| RpcRefreshHint {
         leader_endpoint: hint.leader_endpoint.clone(),
         group_name: hint.group_name.clone(),
         mount_epoch: hint.mount_epoch,
@@ -1200,8 +1319,8 @@ fn refresh_hint_proto_to_hint(hint: Option<&proto_common::RefreshHintProto>) -> 
     })
 }
 
-fn refresh_hint_to_proto(hint: Option<&CanonicalRefreshHint>) -> Option<proto_common::RefreshHintProto> {
-    hint.map(|hint| proto_common::RefreshHintProto {
+fn refresh_hint_to_proto(hint: &RpcRefreshHint) -> proto_common::RefreshHintProto {
+    proto_common::RefreshHintProto {
         leader_endpoint: hint.leader_endpoint.clone(),
         group_name: hint.group_name.clone(),
         mount_epoch: hint.mount_epoch,
@@ -1218,69 +1337,106 @@ fn refresh_hint_to_proto(hint: Option<&CanonicalRefreshHint>) -> Option<proto_co
             })
             .collect(),
         worker_resolve_required: hint.worker_resolve_required,
-    })
-}
-
-/// Convert proto ErrorDetailProto into canonical error.
-pub fn error_detail_to_canonical(err_detail: &proto_common::ErrorDetailProto) -> CanonicalError {
-    let class = match err_detail.error_class() {
-        proto_common::ErrorClassProto::ErrorClassOk => CanonicalErrorClass::Ok,
-        proto_common::ErrorClassProto::ErrorClassNeedRefresh => CanonicalErrorClass::NeedRefresh,
-        proto_common::ErrorClassProto::ErrorClassRetryable => CanonicalErrorClass::Retryable,
-        proto_common::ErrorClassProto::ErrorClassFatal => CanonicalErrorClass::Fatal,
-    };
-
-    let code = match &err_detail.code {
-        Some(proto_common::error_detail_proto::Code::FsErrno(errno)) => {
-            Some(CanonicalErrorCode::FsErrno(fs_errno_proto_to_enum(*errno)))
-        }
-        Some(proto_common::error_detail_proto::Code::RpcCode(code)) => {
-            Some(CanonicalErrorCode::RpcCode(rpc_code_proto_to_enum(*code)))
-        }
-        None => None,
-    };
-
-    let refresh_proto = proto_common::RefreshReasonProto::try_from(err_detail.refresh_reason)
-        .unwrap_or(proto_common::RefreshReasonProto::RefreshReasonUnknown);
-    let reason =
-        Some(refresh_reason_proto_to_enum(refresh_proto)).filter(|_| !matches!(class, CanonicalErrorClass::Ok));
-
-    CanonicalError {
-        class,
-        code,
-        reason,
-        retry_after_ms: err_detail.retry_after_ms,
-        message: err_detail.message.clone(),
-        refresh_hint: refresh_hint_proto_to_hint(err_detail.refresh_hint.as_ref()),
     }
 }
 
-/// Convert canonical error into proto ErrorDetailProto.
-pub fn canonical_to_error_detail(err: &CanonicalError) -> proto_common::ErrorDetailProto {
-    let error_class = match err.class {
-        CanonicalErrorClass::Ok => proto_common::ErrorClassProto::ErrorClassOk,
-        CanonicalErrorClass::NeedRefresh => proto_common::ErrorClassProto::ErrorClassNeedRefresh,
-        CanonicalErrorClass::Retryable => proto_common::ErrorClassProto::ErrorClassRetryable,
-        CanonicalErrorClass::Fatal => proto_common::ErrorClassProto::ErrorClassFatal,
-    };
+fn recovery_proto_to_action(recovery: Option<&proto_common::RecoveryActionProto>) -> RpcRecoveryAction {
+    match recovery.and_then(|recovery| recovery.action.as_ref()) {
+        Some(proto_common::recovery_action_proto::Action::Fail(_)) => RpcRecoveryAction::Fail,
+        Some(proto_common::recovery_action_proto::Action::Retry(retry)) => RpcRecoveryAction::Retry {
+            after_ms: retry.after_ms,
+        },
+        Some(proto_common::recovery_action_proto::Action::RefreshMetadata(refresh)) => {
+            RpcRecoveryAction::RefreshMetadata {
+                hint: refresh_hint_proto_to_hint(refresh.hint.as_ref()),
+            }
+        }
+        Some(proto_common::recovery_action_proto::Action::ReopenWriteSession(reopen)) => {
+            RpcRecoveryAction::ReopenWriteSession {
+                hint: refresh_hint_proto_to_hint(reopen.hint.as_ref()),
+            }
+        }
+        Some(proto_common::recovery_action_proto::Action::RegisterWorker(_)) => RpcRecoveryAction::RegisterWorker,
+        Some(proto_common::recovery_action_proto::Action::SendFullBlockReport(_)) => {
+            RpcRecoveryAction::SendFullBlockReport
+        }
+        None => RpcRecoveryAction::Fail,
+    }
+}
 
-    let code = match &err.code {
-        Some(CanonicalErrorCode::FsErrno(errno)) => Some(proto_common::error_detail_proto::Code::FsErrno(
-            fs_errno_enum_to_proto(errno) as i32,
-        )),
-        Some(CanonicalErrorCode::RpcCode(code)) => Some(proto_common::error_detail_proto::Code::RpcCode(
-            rpc_code_enum_to_proto(*code),
-        )),
-        None => None,
+fn recovery_action_to_proto(action: &RpcRecoveryAction) -> proto_common::RecoveryActionProto {
+    let action = match action {
+        RpcRecoveryAction::Fail => {
+            proto_common::recovery_action_proto::Action::Fail(proto_common::FailRecoveryProto {})
+        }
+        RpcRecoveryAction::Retry { after_ms } => {
+            proto_common::recovery_action_proto::Action::Retry(proto_common::RetryRecoveryProto { after_ms: *after_ms })
+        }
+        RpcRecoveryAction::RefreshMetadata { hint } => {
+            proto_common::recovery_action_proto::Action::RefreshMetadata(proto_common::RefreshMetadataRecoveryProto {
+                hint: Some(refresh_hint_to_proto(hint)),
+            })
+        }
+        RpcRecoveryAction::ReopenWriteSession { hint } => {
+            proto_common::recovery_action_proto::Action::ReopenWriteSession(
+                proto_common::ReopenWriteSessionRecoveryProto {
+                    hint: Some(refresh_hint_to_proto(hint)),
+                },
+            )
+        }
+        RpcRecoveryAction::RegisterWorker => {
+            proto_common::recovery_action_proto::Action::RegisterWorker(proto_common::RegisterWorkerRecoveryProto {})
+        }
+        RpcRecoveryAction::SendFullBlockReport => proto_common::recovery_action_proto::Action::SendFullBlockReport(
+            proto_common::SendFullBlockReportRecoveryProto {},
+        ),
     };
+    proto_common::RecoveryActionProto { action: Some(action) }
+}
 
+fn error_context_proto_to_detail(detail: Option<&proto_common::ErrorContextProto>) -> ErrorDetail {
+    ErrorDetail {
+        fields: detail
+            .into_iter()
+            .flat_map(|detail| detail.fields.iter())
+            .map(|field| ErrorDetailField {
+                key: field.key.clone(),
+                value: field.value.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn error_detail_to_context(detail: &ErrorDetail) -> Option<proto_common::ErrorContextProto> {
+    (!detail.fields.is_empty()).then(|| proto_common::ErrorContextProto {
+        fields: detail
+            .fields
+            .iter()
+            .map(|field| proto_common::ErrorContextFieldProto {
+                key: field.key.clone(),
+                value: field.value.clone(),
+            })
+            .collect(),
+    })
+}
+
+/// Convert proto ErrorDetailProto into RPC error.
+pub fn rpc_error_from_proto(err_detail: &proto_common::ErrorDetailProto) -> RpcErrorDetail {
+    RpcErrorDetail {
+        kind: error_kind_proto_to_kind(err_detail.kind.as_ref()),
+        recovery: recovery_proto_to_action(err_detail.recovery.as_ref()),
+        message: err_detail.message.clone(),
+        detail: error_context_proto_to_detail(err_detail.detail.as_ref()),
+    }
+}
+
+/// Convert RPC error into proto ErrorDetailProto.
+pub fn rpc_error_to_proto(err: &RpcErrorDetail) -> proto_common::ErrorDetailProto {
     proto_common::ErrorDetailProto {
-        error_class: error_class as i32,
-        code,
-        refresh_reason: refresh_reason_to_proto(&err.reason),
-        retry_after_ms: err.retry_after_ms,
+        kind: Some(error_kind_to_proto(err.kind)),
+        recovery: Some(recovery_action_to_proto(&err.recovery)),
         message: err.message.clone(),
-        refresh_hint: refresh_hint_to_proto(err.refresh_hint.as_ref()),
+        detail: error_detail_to_context(&err.detail),
     }
 }
 
@@ -1530,61 +1686,64 @@ mod tests {
 
         let errors_proto = include_str!("../common/errors.proto");
         assert_eq!(
-            proto_enum_values(errors_proto, "RefreshReasonProto"),
+            proto_message_fields(errors_proto, "ErrorDetailProto"),
             vec![
-                ("REFRESH_REASON_UNKNOWN", 0),
-                ("REFRESH_REASON_NOT_LEADER", 1),
-                ("REFRESH_REASON_MOVED", 2),
-                ("REFRESH_REASON_STALE_STATE", 3),
-                ("REFRESH_REASON_MOUNT_EPOCH_MISMATCH", 4),
-                ("REFRESH_REASON_ROUTE_EPOCH_MISMATCH", 5),
-                ("REFRESH_REASON_BLOCK_STAMP_MISMATCH", 6),
-                ("REFRESH_REASON_FENCING", 7),
-                ("REFRESH_REASON_EPOCH_MISMATCH", 8),
-                ("REFRESH_REASON_SESSION_INVALID", 9),
-                ("REFRESH_REASON_SESSION_EXPIRED", 10),
-                ("REFRESH_REASON_OWNER_GROUP_MISMATCH", 11),
-                ("REFRESH_REASON_GROUP_MISMATCH", 12),
-                ("REFRESH_REASON_NEED_REGISTER", 13),
-                ("REFRESH_REASON_WORKER_RUN_MISMATCH", 14),
-                ("REFRESH_REASON_FULL_REPORT_REQUIRED", 15),
-                ("REFRESH_REASON_BLOCK_LOCATION_UNAVAILABLE", 16),
+                ("ErrorKindProto", "kind", 1),
+                ("RecoveryActionProto", "recovery", 2),
+                ("string", "message", 3),
+                ("ErrorContextProto", "detail", 4),
+            ]
+        );
+        let error_detail = proto_message_body(errors_proto, "ErrorDetailProto");
+        assert!(!error_detail.contains("error_class"));
+        assert!(!error_detail.contains("refresh_reason"));
+        assert!(!error_detail.contains("retry_after_ms"));
+        assert_eq!(
+            proto_message_fields(errors_proto, "ErrorKindProto"),
+            vec![
+                ("FsErrnoProto", "fs", 1),
+                ("MetadataErrorKindProto", "metadata", 2),
+                ("WorkerErrorKindProto", "worker", 3),
+                ("UfsErrorKindProto", "ufs", 4),
+                ("ProtocolErrorKindProto", "protocol", 5),
+                ("InternalErrorKindProto", "internal", 6),
             ]
         );
         assert_eq!(
             proto_message_fields(errors_proto, "RefreshHintProto"),
             vec![
                 ("string", "leader_endpoint", 1),
+                ("string", "group_name", 2),
                 ("uint64", "mount_epoch", 3),
                 ("string", "mount_prefix", 4),
                 ("uint64", "route_epoch", 5),
                 ("WorkerEndpointInfoProto", "worker_endpoints", 6),
                 ("bool", "worker_resolve_required", 7),
-                ("string", "group_name", 8),
             ]
         );
         assert_eq!(
-            proto_enum_values(errors_proto, "RpcErrorCodeProto"),
+            proto_enum_values(errors_proto, "MetadataErrorKindProto"),
             vec![
-                ("RPC_ERR_CODE_UNSPECIFIED", 0),
-                ("RPC_ERR_CODE_INVALID_HEADER", 2),
-                ("RPC_ERR_CODE_NOT_LEADER", 40),
-                ("RPC_ERR_CODE_STALE_STATE", 41),
-                ("RPC_ERR_CODE_FENCING", 42),
-                ("RPC_ERR_CODE_SHARD_MOVED", 43),
-                ("RPC_ERR_CODE_NODE_UNAVAILABLE", 44),
-                ("RPC_ERR_CODE_BLOCK_LOCATION_UNAVAILABLE", 45),
-                ("RPC_ERR_CODE_MOUNT_EPOCH_MISMATCH", 50),
-                ("RPC_ERR_CODE_ROUTE_EPOCH_MISMATCH", 51),
-                ("RPC_ERR_CODE_BLOCK_STAMP_MISMATCH", 52),
-                ("RPC_ERR_CODE_EPOCH_MISMATCH", 53),
-                ("RPC_ERR_CODE_WORKER_NOT_REGISTERED", 54),
-                ("RPC_ERR_CODE_WORKER_RUN_MISMATCH", 55),
-                ("RPC_ERR_CODE_WORKER_DESCRIPTOR_MISMATCH", 56),
-                ("RPC_ERR_CODE_FULL_REPORT_REQUIRED", 57),
-                ("RPC_ERR_CODE_INVALID_ARGUMENT", 100),
-                ("RPC_ERR_CODE_INTERNAL", 101),
-                ("RPC_ERR_CODE_APPLICATION", 102),
+                ("METADATA_ERROR_KIND_UNSPECIFIED", 0),
+                ("METADATA_ERROR_KIND_NOT_FOUND", 1),
+                ("METADATA_ERROR_KIND_ALREADY_EXISTS", 2),
+                ("METADATA_ERROR_KIND_NOT_DIRECTORY", 3),
+                ("METADATA_ERROR_KIND_IS_DIRECTORY", 4),
+                ("METADATA_ERROR_KIND_DIRECTORY_NOT_EMPTY", 5),
+                ("METADATA_ERROR_KIND_CROSS_MOUNT_RENAME", 6),
+                ("METADATA_ERROR_KIND_BUSY", 7),
+                ("METADATA_ERROR_KIND_CONFLICT", 8),
+                ("METADATA_ERROR_KIND_NOT_LEADER", 9),
+                ("METADATA_ERROR_KIND_STALE_STATE", 10),
+                ("METADATA_ERROR_KIND_MOUNT_EPOCH_MISMATCH", 11),
+                ("METADATA_ERROR_KIND_ROUTE_EPOCH_MISMATCH", 12),
+                ("METADATA_ERROR_KIND_OWNER_GROUP_MISMATCH", 13),
+                ("METADATA_ERROR_KIND_GROUP_MISMATCH", 14),
+                ("METADATA_ERROR_KIND_FENCING", 15),
+                ("METADATA_ERROR_KIND_SESSION_INVALID", 16),
+                ("METADATA_ERROR_KIND_SESSION_EXPIRED", 17),
+                ("METADATA_ERROR_KIND_EPOCH_MISMATCH", 18),
+                ("METADATA_ERROR_KIND_RESOURCE_EXHAUSTED", 19),
             ]
         );
 
@@ -1960,10 +2119,7 @@ mod tests {
     }
 
     #[test]
-    fn test_response_header_proto_to_canonical_need_refresh() {
-        use common::error::canonical::ErrorCode as CanonicalErrorCode;
-        use common::header::RpcStatus;
-
+    fn test_response_header_proto_to_rpc_refresh_metadata() {
         let proto_header = proto_common::ResponseHeaderProto {
             client: Some(proto_common::ClientInfoProto {
                 call_id: types::CallId::new().to_string(),
@@ -1971,14 +2127,28 @@ mod tests {
                 client_name: String::new(),
             }),
             error: Some(proto_common::ErrorDetailProto {
-                error_class: proto_common::ErrorClassProto::ErrorClassNeedRefresh as i32,
-                code: Some(proto_common::error_detail_proto::Code::RpcCode(
-                    proto_common::RpcErrorCodeProto::RpcErrCodeRouteEpochMismatch as i32,
-                )),
-                refresh_reason: proto_common::RefreshReasonProto::RefreshReasonRouteEpochMismatch as i32,
-                retry_after_ms: None,
+                kind: Some(proto_common::ErrorKindProto {
+                    kind: Some(proto_common::error_kind_proto::Kind::Metadata(
+                        proto_common::MetadataErrorKindProto::MetadataErrorKindRouteEpochMismatch as i32,
+                    )),
+                }),
+                recovery: Some(proto_common::RecoveryActionProto {
+                    action: Some(proto_common::recovery_action_proto::Action::RefreshMetadata(
+                        proto_common::RefreshMetadataRecoveryProto {
+                            hint: Some(proto_common::RefreshHintProto {
+                                leader_endpoint: None,
+                                group_name: None,
+                                mount_epoch: None,
+                                mount_prefix: None,
+                                route_epoch: Some(9),
+                                worker_endpoints: Vec::new(),
+                                worker_resolve_required: false,
+                            }),
+                        },
+                    )),
+                }),
                 message: "route epoch mismatch".to_string(),
-                refresh_hint: None,
+                detail: None,
             }),
             state: Vec::new(),
             group_name: "root".to_string(),
@@ -1987,49 +2157,53 @@ mod tests {
         };
 
         let header: ResponseHeader = proto_header.try_into().unwrap();
-        assert_eq!(header.status(), RpcStatus::Error);
         assert_eq!(header.mount_epoch, Some(7));
         assert_eq!(header.route_epoch, Some(9));
-        let canonical = header
-            .canonical_error
+        let rpc_error = header
+            .rpc_error
             .as_ref()
-            .expect("canonical_error must be present for non-OK status");
+            .expect("rpc_error must be present for non-OK status");
         assert_eq!(
-            canonical.code,
-            Some(CanonicalErrorCode::RpcCode(RpcErrorCode::RouteEpochMismatch))
+            rpc_error.kind,
+            RpcErrorKind::Metadata(RpcMetadataErrorKind::RouteEpochMismatch)
         );
         assert_eq!(
-            canonical.reason,
-            Some(common::error::canonical::RefreshReason::RouteEpochMismatch)
+            rpc_error.recovery,
+            RpcRecoveryAction::RefreshMetadata {
+                hint: RpcRefreshHint {
+                    route_epoch: Some(9),
+                    ..RpcRefreshHint::default()
+                }
+            }
         );
     }
 
     #[test]
-    fn test_response_header_roundtrip_need_refresh() {
-        let canonical = CanonicalError::need_refresh(
-            RpcErrorCode::RouteEpochMismatch,
-            RefreshReason::RouteEpochMismatch,
+    fn test_response_header_roundtrip_refresh_metadata() {
+        let hint = RpcRefreshHint {
+            route_epoch: Some(11),
+            ..RpcRefreshHint::default()
+        };
+        let rpc_error = RpcErrorDetail::refresh_metadata(
+            RpcErrorKind::Metadata(RpcMetadataErrorKind::RouteEpochMismatch),
+            hint.clone(),
             "route epoch mismatch",
         );
-        let header = ResponseHeader::error(ClientInfo::new(ClientId::new(1)), canonical.clone());
+        let header = ResponseHeader::error(ClientInfo::new(ClientId::new(1)), rpc_error.clone());
 
         let proto: proto_common::ResponseHeaderProto = (&header).into();
         let decoded: ResponseHeader = proto.clone().try_into().expect("decode response header");
         let reencoded: proto_common::ResponseHeaderProto = (&decoded).into();
 
-        let decoded_canonical = decoded
-            .canonical_error
+        let decoded_rpc_error = decoded
+            .rpc_error
             .as_ref()
-            .expect("canonical_error should persist across roundtrip");
-        assert_eq!(decoded_canonical.class, CanonicalErrorClass::NeedRefresh);
+            .expect("rpc_error should persist across roundtrip");
         assert_eq!(
-            decoded_canonical.code,
-            Some(CanonicalErrorCode::RpcCode(RpcErrorCode::RouteEpochMismatch))
+            decoded_rpc_error.kind,
+            RpcErrorKind::Metadata(RpcMetadataErrorKind::RouteEpochMismatch)
         );
-        assert_eq!(
-            decoded_canonical.reason,
-            Some(common::error::canonical::RefreshReason::RouteEpochMismatch)
-        );
+        assert_eq!(decoded_rpc_error.recovery, RpcRecoveryAction::RefreshMetadata { hint });
 
         assert_eq!(proto.error, reencoded.error, "wire form must roundtrip");
     }

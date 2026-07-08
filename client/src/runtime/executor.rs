@@ -12,12 +12,12 @@ use crate::api::handle::{ReadHandle, WriteHandle};
 use crate::api::options::{DEFAULT_BLOCK_SIZE, DEFAULT_REPLICATION, MAX_PREALLOCATED_WRITE_BLOCKS};
 use crate::api::path::NamespacePathBuf;
 use crate::api::{CreateMode, CreateOptions, DirectoryEntry, DirectoryListing, FileStatus, ListOptions};
-use crate::canonical::ClientAction;
 use crate::config::{ClientConfig, RefreshConfig, RetryConfig};
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::{AddBlockResult, MetadataGateway, ReadLayout};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
-use crate::runtime::classify::{ErrorClass, ErrorClassifier, RefreshReason};
+use crate::rpc_error::ClientAction;
+use crate::runtime::classify::{ErrorClass, ErrorClassifier, MetadataRefreshCause};
 pub(crate) use crate::runtime::context::{AttemptContext, OperationContext, OperationIdentity};
 use crate::runtime::policy::{OperationKind, ReplayPolicyTable};
 use crate::runtime::refresh::MetadataTargets;
@@ -242,8 +242,8 @@ impl OperationExecutor {
     pub(crate) fn record_data_refresh(
         &self,
         operation: &OperationContext,
-        reason: RefreshReason,
-        hint: &crate::canonical::RefreshHint,
+        reason: MetadataRefreshCause,
+        hint: &crate::rpc_error::RefreshHint,
     ) -> ClientResult<()> {
         self.metadata_targets.record_refresh(operation, reason, hint)
     }
@@ -645,8 +645,8 @@ impl OperationExecutor {
                                 )),
                             });
                         }
-                        ErrorClass::NeedRefresh(RefreshReason::Unknown) => return Err(err),
-                        ErrorClass::NeedRefresh(reason) => {
+                        ErrorClass::RefreshMetadata(MetadataRefreshCause::Unknown) => return Err(err),
+                        ErrorClass::RefreshMetadata(reason) => {
                             if refresh_budget.saturating_sub(refresh_used) == 0 {
                                 self.record_exhausted_if_needed(
                                     &operation,
@@ -681,15 +681,15 @@ impl OperationExecutor {
                                 ClientMetric::RefreshDecision,
                                 operation_labels(&operation)
                                     .with_error_class(class.label())
-                                    .with_refresh_reason(reason.label())
+                                    .with_metadata_refresh_cause(reason.label())
                                     .with_outcome("refresh"),
                             );
                             self.record_metric(
-                                ClientMetric::RefreshReason,
-                                operation_labels(&operation).with_refresh_reason(reason.label()),
+                                ClientMetric::MetadataRefreshCause,
+                                operation_labels(&operation).with_metadata_refresh_cause(reason.label()),
                             );
                             self.metadata_targets.record_refresh(&operation, reason, &hint)?;
-                            if reason == RefreshReason::StaleState {
+                            if reason == MetadataRefreshCause::StaleState {
                                 self.refresh_state(&operation, target_group.clone(), attempt.saturating_add(1))
                                     .await?;
                             }
@@ -815,12 +815,14 @@ impl OperationExecutor {
                 ClientMetric::RetryExhausted,
                 operation_labels(operation).with_error_class(class.label()),
             ),
-            ErrorClass::NeedRefresh(reason) if *reason != RefreshReason::Unknown && refresh_remaining == 0 => {
+            ErrorClass::RefreshMetadata(reason)
+                if *reason != MetadataRefreshCause::Unknown && refresh_remaining == 0 =>
+            {
                 self.record_metric(
                     ClientMetric::RefreshExhausted,
                     operation_labels(operation)
                         .with_error_class(class.label())
-                        .with_refresh_reason(reason.label()),
+                        .with_metadata_refresh_cause(reason.label()),
                 );
             }
             _ => {}
@@ -972,13 +974,13 @@ fn operation_labels(operation: &OperationContext) -> ClientMetricLabels {
     )
 }
 
-fn refresh_hint_from_error(err: &ClientError) -> crate::canonical::RefreshHint {
+fn refresh_hint_from_error(err: &ClientError) -> crate::rpc_error::RefreshHint {
     match err {
-        ClientError::Action(action) => match action.as_ref() {
+        ClientError::Action(action) => match action.action() {
             ClientAction::Refresh { hint, .. } => hint.as_ref().clone(),
-            _ => crate::canonical::RefreshHint::default(),
+            _ => crate::rpc_error::RefreshHint::default(),
         },
-        _ => crate::canonical::RefreshHint::default(),
+        _ => crate::rpc_error::RefreshHint::default(),
     }
 }
 
@@ -989,11 +991,10 @@ mod tests {
     use crate::runtime::policy::OperationKind;
     use crate::runtime::refresh::MetadataGroupTargets;
     use async_trait::async_trait;
-    use common::error::canonical::{
-        CanonicalError, ErrorClass as CanonicalErrorClass, ErrorCode as CanonicalErrorCode,
-        RefreshHint as CanonicalRefreshHint, RefreshReason as CanonicalRefreshReason,
+    use common::error::rpc::{
+        ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction,
+        RefreshHint as RpcRefreshHint, RpcErrorDetail,
     };
-    use common::header::RpcErrorCode;
     use proto::common::{GroupStateWatermarkProto, RaftLogIdProto};
     use proto::metadata::{
         AbortFileWriteResponseProto, AppendFileResponseProto, CommitFileResponseProto, CreateFileResponseProto,
@@ -1042,12 +1043,12 @@ mod tests {
     async fn not_leader_refresh_replays_metadata_read_on_cached_leader_endpoint() {
         let gateway = Arc::new(ScriptedGateway::new(vec![
             refresh_outcome(
-                RpcErrorCode::NotLeader,
-                CanonicalRefreshReason::NotLeader,
-                CanonicalRefreshHint {
+                ErrorKind::Metadata(MetadataErrorKind::NotLeader),
+                MetadataRefreshCause::NotLeader,
+                RpcRefreshHint {
                     group_name: Some("root".to_string()),
                     leader_endpoint: Some("http://127.0.0.1:18081".to_string()),
-                    ..CanonicalRefreshHint::default()
+                    ..RpcRefreshHint::default()
                 },
             ),
             GatewayOutcome::Ok,
@@ -1076,12 +1077,12 @@ mod tests {
     async fn owner_group_mismatch_with_leader_hint_replays_same_call_id_on_refreshed_endpoint() {
         let gateway = Arc::new(ScriptedGateway::new(vec![
             refresh_outcome(
-                RpcErrorCode::ShardMoved,
-                CanonicalRefreshReason::OwnerGroupMismatch,
-                CanonicalRefreshHint {
+                ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch),
+                MetadataRefreshCause::OwnerGroupMismatch,
+                RpcRefreshHint {
                     group_name: Some("analytics".to_string()),
                     leader_endpoint: Some("http://127.0.0.1:18082".to_string()),
-                    ..CanonicalRefreshHint::default()
+                    ..RpcRefreshHint::default()
                 },
             ),
             GatewayOutcome::Ok,
@@ -1111,11 +1112,11 @@ mod tests {
     async fn metadata_mutation_owner_redirect_replays_same_call_id() {
         let gateway = Arc::new(ScriptedGateway::new(vec![
             refresh_outcome(
-                RpcErrorCode::ShardMoved,
-                CanonicalRefreshReason::OwnerGroupMismatch,
-                CanonicalRefreshHint {
+                ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch),
+                MetadataRefreshCause::OwnerGroupMismatch,
+                RpcRefreshHint {
                     group_name: Some("analytics".to_string()),
-                    ..CanonicalRefreshHint::default()
+                    ..RpcRefreshHint::default()
                 },
             ),
             GatewayOutcome::Ok,
@@ -1147,11 +1148,11 @@ mod tests {
         let gateway = Arc::new(
             ScriptedGateway::new(vec![
                 refresh_outcome(
-                    RpcErrorCode::StaleState,
-                    CanonicalRefreshReason::StaleState,
-                    CanonicalRefreshHint {
+                    ErrorKind::Metadata(MetadataErrorKind::StaleState),
+                    MetadataRefreshCause::StaleState,
+                    RpcRefreshHint {
                         group_name: Some("root".to_string()),
-                        ..CanonicalRefreshHint::default()
+                        ..RpcRefreshHint::default()
                     },
                 ),
                 GatewayOutcome::Ok,
@@ -1185,11 +1186,11 @@ mod tests {
     async fn mount_epoch_mismatch_replays_with_refreshed_mount_epoch_header() {
         let gateway = Arc::new(ScriptedGateway::new(vec![
             refresh_outcome(
-                RpcErrorCode::MountEpochMismatch,
-                CanonicalRefreshReason::MountEpochMismatch,
-                CanonicalRefreshHint {
+                ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
+                MetadataRefreshCause::MountEpochMismatch,
+                RpcRefreshHint {
                     mount_epoch: Some(42),
-                    ..CanonicalRefreshHint::default()
+                    ..RpcRefreshHint::default()
                 },
             ),
             GatewayOutcome::Ok,
@@ -1218,11 +1219,11 @@ mod tests {
     async fn route_epoch_mismatch_replays_with_refreshed_route_epoch_header() {
         let gateway = Arc::new(ScriptedGateway::new(vec![
             refresh_outcome(
-                RpcErrorCode::RouteEpochMismatch,
-                CanonicalRefreshReason::RouteEpochMismatch,
-                CanonicalRefreshHint {
+                ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
+                MetadataRefreshCause::RouteEpochMismatch,
+                RpcRefreshHint {
                     route_epoch: Some(24),
-                    ..CanonicalRefreshHint::default()
+                    ..RpcRefreshHint::default()
                 },
             ),
             GatewayOutcome::Ok,
@@ -1251,9 +1252,9 @@ mod tests {
     async fn refresh_without_epoch_hint_does_not_inject_fake_default_epoch() {
         let gateway = Arc::new(ScriptedGateway::new(vec![
             refresh_outcome(
-                RpcErrorCode::MountEpochMismatch,
-                CanonicalRefreshReason::MountEpochMismatch,
-                CanonicalRefreshHint::default(),
+                ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
+                MetadataRefreshCause::MountEpochMismatch,
+                RpcRefreshHint::default(),
             ),
             GatewayOutcome::Ok,
         ]));
@@ -1277,11 +1278,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_barrier_need_refresh_honors_retry_budget_before_replay_gate() {
+    async fn session_barrier_refresh_metadata_honors_retry_budget_before_replay_gate() {
         let gateway = Arc::new(ScriptedGateway::new(vec![refresh_outcome(
-            RpcErrorCode::StaleState,
-            CanonicalRefreshReason::StaleState,
-            CanonicalRefreshHint::default(),
+            ErrorKind::Metadata(MetadataErrorKind::StaleState),
+            MetadataRefreshCause::StaleState,
+            RpcRefreshHint::default(),
         )]));
         let metrics = Arc::new(RecordingMetrics::default());
         let executor = test_executor_with_budgets(gateway.clone(), 1, 1, Arc::clone(&metrics));
@@ -1307,7 +1308,7 @@ mod tests {
 
         assert_eq!(
             ErrorClassifier.classify_error(&err),
-            ErrorClass::NeedRefresh(RefreshReason::StaleState)
+            ErrorClass::RefreshMetadata(MetadataRefreshCause::StaleState)
         );
         assert_eq!(gateway.calls().len(), 1);
         assert!(metrics
@@ -1388,12 +1389,12 @@ mod tests {
     #[tokio::test]
     async fn metadata_refresh_zero_budget_is_honored_and_observed() {
         let gateway = Arc::new(ScriptedGateway::new(vec![refresh_outcome(
-            RpcErrorCode::NotLeader,
-            CanonicalRefreshReason::NotLeader,
-            CanonicalRefreshHint {
+            ErrorKind::Metadata(MetadataErrorKind::NotLeader),
+            MetadataRefreshCause::NotLeader,
+            RpcRefreshHint {
                 group_name: Some("root".to_string()),
                 leader_endpoint: Some("http://127.0.0.1:18081".to_string()),
-                ..CanonicalRefreshHint::default()
+                ..RpcRefreshHint::default()
             },
         )]));
         let metrics = Arc::new(RecordingMetrics::default());
@@ -1500,9 +1501,9 @@ mod tests {
     #[tokio::test]
     async fn add_block_session_expired_is_not_replayed_as_refresh() {
         let gateway = Arc::new(ScriptedGateway::new(vec![refresh_outcome(
-            RpcErrorCode::Application,
-            CanonicalRefreshReason::SessionExpired,
-            CanonicalRefreshHint::default(),
+            ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
+            MetadataRefreshCause::Unknown,
+            RpcRefreshHint::default(),
         )]));
         let executor = test_executor(gateway.clone());
 
@@ -1523,9 +1524,9 @@ mod tests {
     #[tokio::test]
     async fn commit_file_fencing_is_not_replayed_as_refresh() {
         let gateway = Arc::new(ScriptedGateway::new(vec![refresh_outcome(
-            RpcErrorCode::Fencing,
-            CanonicalRefreshReason::Fencing,
-            CanonicalRefreshHint::default(),
+            ErrorKind::Metadata(MetadataErrorKind::Fencing),
+            MetadataRefreshCause::Unknown,
+            RpcRefreshHint::default(),
         )]));
         let executor = test_executor(gateway.clone());
         let operation = OperationContext::new(
@@ -1553,11 +1554,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_refresh_reason_is_not_blindly_replayed() {
+    async fn unknown_metadata_refresh_cause_is_not_blindly_replayed() {
         let gateway = Arc::new(ScriptedGateway::new(vec![refresh_outcome(
-            RpcErrorCode::Application,
-            CanonicalRefreshReason::Unknown,
-            CanonicalRefreshHint::default(),
+            ErrorKind::Internal(InternalErrorKind::Internal),
+            MetadataRefreshCause::Unknown,
+            RpcRefreshHint::default(),
         )]));
         let executor = test_executor(gateway.clone());
 
@@ -1570,11 +1571,11 @@ mod tests {
                 },
             )
             .await
-            .expect_err("unknown refresh reason must fail without replay");
+            .expect_err("unknown metadata refresh cause must fail without replay");
 
         assert_eq!(
             ErrorClassifier.classify_error(&err),
-            ErrorClass::NeedRefresh(RefreshReason::Unknown)
+            ErrorClass::RefreshMetadata(MetadataRefreshCause::Unknown)
         );
         assert_eq!(gateway.calls().len(), 1);
     }
@@ -1652,9 +1653,9 @@ mod tests {
     enum GatewayOutcome {
         Ok,
         Refresh {
-            code: RpcErrorCode,
-            reason: CanonicalRefreshReason,
-            hint: CanonicalRefreshHint,
+            kind: ErrorKind,
+            reason: MetadataRefreshCause,
+            hint: RpcRefreshHint,
         },
         Retryable {
             retry_after_ms: Option<u64>,
@@ -1723,7 +1724,7 @@ mod tests {
             };
             match outcome {
                 GatewayOutcome::Ok => Ok(()),
-                GatewayOutcome::Refresh { code, reason, hint } => Err(refresh_error(code, reason, hint)),
+                GatewayOutcome::Refresh { kind, reason, hint } => Err(refresh_error(kind, reason, hint)),
                 GatewayOutcome::Retryable { retry_after_ms } => Err(retryable_error(retry_after_ms)),
                 GatewayOutcome::TransportUnavailable => Err(ClientError::from(tonic::Status::unavailable(
                     "injected metadata transport failure",
@@ -1994,39 +1995,47 @@ mod tests {
         );
     }
 
-    fn refresh_outcome(
-        code: RpcErrorCode,
-        reason: CanonicalRefreshReason,
-        hint: CanonicalRefreshHint,
-    ) -> GatewayOutcome {
-        GatewayOutcome::Refresh { code, reason, hint }
+    fn refresh_outcome(kind: ErrorKind, reason: MetadataRefreshCause, hint: RpcRefreshHint) -> GatewayOutcome {
+        GatewayOutcome::Refresh { kind, reason, hint }
     }
 
-    fn refresh_error(code: RpcErrorCode, reason: CanonicalRefreshReason, hint: CanonicalRefreshHint) -> ClientError {
-        let canonical = CanonicalError::need_refresh_with_hint(code, reason, hint.clone(), "needs refresh");
+    fn refresh_error(kind: ErrorKind, reason: MetadataRefreshCause, hint: RpcRefreshHint) -> ClientError {
+        let rpc_error = match kind {
+            ErrorKind::Metadata(MetadataErrorKind::SessionExpired)
+            | ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)
+            | ErrorKind::Metadata(MetadataErrorKind::Fencing)
+            | ErrorKind::Metadata(MetadataErrorKind::EpochMismatch) => {
+                RpcErrorDetail::reopen_write_session(kind, hint.clone(), "needs refresh")
+            }
+            _ => RpcErrorDetail::refresh_metadata(kind, hint.clone(), "needs refresh"),
+        };
         ClientError::from(ClientAction::Refresh {
             reason,
-            hint: Box::new(client_hint_from_canonical(&hint)),
-            canonical: Box::new(canonical),
+            hint: Box::new(client_hint_from_rpc_error(&hint)),
+            rpc_error: Box::new(rpc_error),
         })
     }
 
     fn retryable_error(retry_after_ms: Option<u64>) -> ClientError {
-        let canonical = CanonicalError::retryable(RpcErrorCode::NodeUnavailable, retry_after_ms, "retry later");
+        let rpc_error = RpcErrorDetail::retry(
+            ErrorKind::Internal(InternalErrorKind::NodeUnavailable),
+            retry_after_ms,
+            "retry later",
+        );
         ClientError::from(ClientAction::Retry {
             retry_after_ms_hint: retry_after_ms,
-            canonical: Box::new(canonical),
+            rpc_error: Box::new(rpc_error),
         })
     }
 
-    fn client_hint_from_canonical(hint: &CanonicalRefreshHint) -> crate::canonical::RefreshHint {
+    fn client_hint_from_rpc_error(hint: &RpcRefreshHint) -> crate::rpc_error::RefreshHint {
         let worker_endpoints = hint
             .worker_endpoints
             .iter()
             .cloned()
-            .map(crate::canonical::EndpointHint::from)
+            .map(crate::rpc_error::EndpointHint::from)
             .collect::<Vec<_>>();
-        crate::canonical::RefreshHint {
+        crate::rpc_error::RefreshHint {
             leader_endpoint: hint.leader_endpoint.clone(),
             group_name: hint.group_name.as_deref().and_then(|name| GroupName::parse(name).ok()),
             route_epoch: hint.route_epoch,
@@ -2040,14 +2049,10 @@ mod tests {
 
     fn invalid_header_error(message: impl Into<String>) -> ClientError {
         ClientError::from(ClientAction::Fail {
-            canonical: Box::new(CanonicalError {
-                class: CanonicalErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::InvalidHeader)),
-                reason: None,
-                retry_after_ms: None,
-                message: message.into(),
-                refresh_hint: None,
-            }),
+            rpc_error: Box::new(RpcErrorDetail::fail(
+                ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader),
+                message,
+            )),
         })
     }
 
@@ -2058,12 +2063,9 @@ mod tests {
             "invalid OK response headers must not enter transport retry handling"
         );
         match action(err) {
-            ClientAction::Fail { canonical } => {
-                assert_eq!(canonical.class, CanonicalErrorClass::Fatal);
-                assert!(matches!(
-                    canonical.code,
-                    Some(CanonicalErrorCode::RpcCode(RpcErrorCode::InvalidHeader))
-                ));
+            ClientAction::Fail { rpc_error } => {
+                assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
+                assert_eq!(rpc_error.recovery, RecoveryAction::Fail);
             }
             other => panic!("expected fatal invalid header action, got {other:?}"),
         }
@@ -2071,7 +2073,7 @@ mod tests {
 
     fn action(err: &ClientError) -> &ClientAction {
         match err {
-            ClientError::Action(action) => action.as_ref(),
+            ClientError::Action(action) => action.action(),
             other => panic!("expected action error, got {other:?}"),
         }
     }

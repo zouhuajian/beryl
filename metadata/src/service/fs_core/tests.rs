@@ -14,8 +14,8 @@ use crate::service::domain::{
 use crate::state::{MemoryStateStore, RouteEpoch};
 use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerInfo, WorkerManager};
 use async_trait::async_trait;
-use common::error::canonical::{ErrorClass, ErrorCode as CanonicalErrorCode, RefreshReason};
-use common::header::{AuthnType, CallerContext, RequestHeader, RpcErrorCode};
+use common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail, WorkerErrorKind};
+use common::header::{AuthnType, CallerContext, RequestHeader};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -323,16 +323,37 @@ fn fs_core_without_mount() -> FsCore {
 }
 
 fn assert_block_location_unavailable(failure: &CoreFailure, block_id: BlockId) {
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::BlockLocationUnavailable))
+    assert_refresh_metadata(
+        &failure.error,
+        ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
     );
-    assert_eq!(failure.error.reason, Some(RefreshReason::BlockLocationUnavailable));
     assert!(
         failure.error.message.contains(&block_id.to_string()),
         "error should include block id context: {}",
         failure.error.message
     );
+}
+
+fn assert_fail(error: &RpcErrorDetail, kind: ErrorKind) {
+    assert_eq!(error.kind, kind);
+    assert_eq!(error.recovery, RecoveryAction::Fail);
+}
+
+fn assert_refresh_metadata(error: &RpcErrorDetail, kind: ErrorKind) {
+    assert_eq!(error.kind, kind);
+    assert!(matches!(error.recovery, RecoveryAction::RefreshMetadata { .. }));
+}
+
+fn assert_reopen_write_session(error: &RpcErrorDetail, kind: ErrorKind) {
+    assert_eq!(error.kind, kind);
+    assert!(matches!(error.recovery, RecoveryAction::ReopenWriteSession { .. }));
+}
+
+fn refresh_hint(error: &RpcErrorDetail) -> &RefreshHint {
+    match &error.recovery {
+        RecoveryAction::RefreshMetadata { hint } | RecoveryAction::ReopenWriteSession { hint } => hint,
+        other => panic!("expected refresh-like recovery, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -615,11 +636,7 @@ async fn get_file_layout_filters_reported_locations_with_mismatched_block_stamp(
         .await
         .expect_err("mismatched reported block stamp must fail precisely");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::BlockStampMismatch))
-    );
-    assert_eq!(failure.error.reason, Some(RefreshReason::BlockStampMismatch));
+    assert_refresh_metadata(&failure.error, ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch));
     assert!(failure.error.message.contains(&block_id.to_string()));
 }
 
@@ -742,7 +759,7 @@ fn unavailable_read_location_classifier_detects_stale_worker_run() {
         supported_block_formats: vec![types::BlockFormatId::CURRENT_FOR_NEW_FILE],
     }];
 
-    let (rpc_code, reason, message) = FsCore::classify_unavailable_read_location(
+    let (kind, message) = FsCore::classify_unavailable_read_location(
         &request_context(),
         &group_name_value,
         &extent,
@@ -751,8 +768,7 @@ fn unavailable_read_location_classifier_detects_stale_worker_run() {
         &views,
     );
 
-    assert_eq!(rpc_code, RpcErrorCode::WorkerRunMismatch);
-    assert_eq!(reason, RefreshReason::WorkerRunMismatch);
+    assert_eq!(kind, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
     assert!(message.contains("stale worker run"));
     assert!(message.contains(&block_id.to_string()));
 }
@@ -948,10 +964,7 @@ async fn get_file_layout_rejects_returned_extent_without_block_stamp() {
         .await
         .expect_err("missing block_stamp must reject returned layout");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
-    );
+    assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
     assert!(failure.error.message.contains("block_stamp"));
 }
 
@@ -996,10 +1009,7 @@ async fn get_file_layout_rejects_returned_extent_with_zero_block_stamp() {
         .await
         .expect_err("zero block_stamp must reject returned layout");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
-    );
+    assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
     assert!(failure.error.message.contains("zero block_stamp"));
 }
 
@@ -1032,11 +1042,10 @@ async fn get_status_rejects_stale_mount_epoch() {
         .await
         .expect_err("stale mount_epoch must reject GetStatus");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::MountEpochMismatch))
+    assert_refresh_metadata(
+        &failure.error,
+        ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
     );
-    assert_eq!(failure.error.reason, Some(RefreshReason::MountEpochMismatch));
     assert_eq!(failure.group_name, Some(group_name("g17")));
     assert_eq!(failure.mount_epoch, Some(9));
 }
@@ -1067,11 +1076,10 @@ async fn list_status_rejects_stale_mount_epoch() {
         .await
         .expect_err("stale mount_epoch must reject ListStatus");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::MountEpochMismatch))
+    assert_refresh_metadata(
+        &failure.error,
+        ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
     );
-    assert_eq!(failure.error.reason, Some(RefreshReason::MountEpochMismatch));
     assert_eq!(failure.group_name, Some(group_name("g18")));
     assert_eq!(failure.mount_epoch, Some(9));
 }
@@ -1152,10 +1160,7 @@ async fn list_status_propagates_child_inode_load_error() {
         .await
         .expect_err("child inode storage failure must reject ListStatus");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
-    );
+    assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
     assert!(
         failure.error.message.contains("Failed to deserialize Inode"),
         "{}",
@@ -1191,10 +1196,7 @@ async fn list_status_rejects_dangling_child_inode() {
         .await
         .expect_err("dangling child inode must reject ListStatus");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::FsErrno(FsErrorCode::ENoEnt))
-    );
+    assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::ENoEnt));
     assert!(
         failure.error.message.contains("missing-child") && failure.error.message.contains(&child_inode_id.to_string()),
         "{}",
@@ -1231,11 +1233,10 @@ async fn open_file_rejects_stale_route_epoch() {
         .await
         .expect_err("stale route_epoch must reject OpenFile");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::RouteEpochMismatch))
+    assert_refresh_metadata(
+        &failure.error,
+        ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
     );
-    assert_eq!(failure.error.reason, Some(RefreshReason::RouteEpochMismatch));
     assert_eq!(failure.route_epoch, Some(1));
 }
 
@@ -1268,11 +1269,10 @@ async fn get_locations_rejects_stale_route_epoch() {
         .await
         .expect_err("stale route_epoch must reject GetBlockLocations");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::RouteEpochMismatch))
+    assert_refresh_metadata(
+        &failure.error,
+        ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
     );
-    assert_eq!(failure.error.reason, Some(RefreshReason::RouteEpochMismatch));
     assert_eq!(failure.route_epoch, Some(1));
 }
 
@@ -1336,10 +1336,7 @@ async fn get_locations_rejects_range_overflow() {
         .await
         .expect_err("overflowing range must be rejected");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
-    );
+    assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
     assert!(failure.error.message.contains("range end overflows"));
 }
 
@@ -1767,16 +1764,15 @@ fn freshness_validator_rejects_routed_write_mount_epoch_with_replay_hint() {
         )
         .unwrap_err();
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::MountEpochMismatch))
+    assert_refresh_metadata(
+        &failure.error,
+        ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
     );
-    assert_eq!(failure.error.reason, Some(RefreshReason::MountEpochMismatch));
     assert_eq!(
         failure.error.message,
         "mount_epoch mismatch: client=4, server=9; refresh metadata and reopen write handle, then replay request"
     );
-    let hint = failure.error.refresh_hint.expect("refresh hint");
+    let hint = refresh_hint(&failure.error);
     assert_eq!(hint.group_name, Some(group_name_value.to_string()));
     assert_eq!(hint.mount_epoch, Some(9));
     assert_eq!(failure.group_name, Some(group_name_value.clone()));
@@ -1809,16 +1805,15 @@ fn routed_write_mount_epoch_mismatch_preserves_metrics_and_wire_shape() {
         )
         .unwrap_err();
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::MountEpochMismatch))
+    assert_refresh_metadata(
+        &failure.error,
+        ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
     );
-    assert_eq!(failure.error.reason, Some(RefreshReason::MountEpochMismatch));
     assert_eq!(
         failure.error.message,
         "mount_epoch mismatch: client=4, server=9; refresh metadata and reopen write handle, then replay request"
     );
-    let hint = failure.error.refresh_hint.expect("refresh hint");
+    let hint = refresh_hint(&failure.error);
     assert_eq!(hint.group_name, Some("g5".to_string()));
     assert_eq!(hint.mount_epoch, Some(9));
     assert_eq!(failure.group_name, Some(group_name("g5")));
@@ -1845,11 +1840,7 @@ fn freshness_validator_rejects_stale_state_watermark() {
         )
         .unwrap_err();
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::StaleState))
-    );
-    assert_eq!(failure.error.reason, Some(RefreshReason::StaleState));
+    assert_refresh_metadata(&failure.error, ErrorKind::Metadata(MetadataErrorKind::StaleState));
     assert_eq!(
         failure.error.message,
         "Stale state: last_applied=RaftLogId { term: 1, leader_node_id: 7, index: 10 } < required=RaftLogId { term: 1, leader_node_id: 7, index: 12 }"
@@ -1912,18 +1903,11 @@ async fn abort_checks_handle() {
         .await
         .expect_err("missing write handle must be rejected");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
-    );
-    assert_eq!(failure.error.class, ErrorClass::NeedRefresh);
-    assert_eq!(failure.error.reason, Some(RefreshReason::SessionInvalid));
+    assert_reopen_write_session(&failure.error, ErrorKind::Metadata(MetadataErrorKind::SessionInvalid));
     let roundtrip = crate::service::core_util::header_from_core_failure(&request_context(), &failure);
-    let roundtrip_error = proto::convert::error_detail_to_canonical(
-        roundtrip.error.as_ref().expect("session failure must carry wire error"),
-    );
-    assert_eq!(roundtrip_error.class, ErrorClass::NeedRefresh);
-    assert_eq!(roundtrip_error.reason, Some(RefreshReason::SessionInvalid));
+    let roundtrip_error =
+        proto::convert::rpc_error_from_proto(roundtrip.error.as_ref().expect("session failure must carry wire error"));
+    assert_reopen_write_session(&roundtrip_error, ErrorKind::Metadata(MetadataErrorKind::SessionInvalid));
 
     let file_handle = install_write_session(&fs_core, inode_id, mount_id);
     let session = fs_core
@@ -1937,12 +1921,10 @@ async fn abort_checks_handle() {
         .await
         .expect_err("stale abort handle must be rejected");
 
-    assert_eq!(
-        stale_failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
+    assert_reopen_write_session(
+        &stale_failure.error,
+        ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
     );
-    assert_eq!(stale_failure.error.class, ErrorClass::NeedRefresh);
-    assert_eq!(stale_failure.error.reason, Some(RefreshReason::SessionInvalid));
     assert!(fs_core.write_session_for_handle(file_handle).is_some());
     assert!(fs_core
         .inode_lease_manager_for_test()
@@ -1972,11 +1954,7 @@ async fn renew_lease_checks_open_epoch() {
         .await
         .expect_err("open_epoch mismatch must be rejected");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::EpochMismatch))
-    );
-    assert_eq!(failure.error.reason, Some(RefreshReason::SessionInvalid));
+    assert_reopen_write_session(&failure.error, ErrorKind::Metadata(MetadataErrorKind::SessionInvalid));
 }
 
 #[tokio::test]
@@ -2000,11 +1978,7 @@ async fn renew_lease_checks_fencing() {
         .await
         .expect_err("fencing token mismatch must be rejected");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
-    );
-    assert_eq!(failure.error.reason, Some(RefreshReason::SessionInvalid));
+    assert_reopen_write_session(&failure.error, ErrorKind::Metadata(MetadataErrorKind::SessionInvalid));
 
     let mut missing_fencing = renew_input_for_session(&session, file_handle, request_context());
     missing_fencing.fencing_token = None;
@@ -2013,11 +1987,7 @@ async fn renew_lease_checks_fencing() {
         .await
         .expect_err("missing fencing token must be rejected");
 
-    assert_eq!(
-        missing.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
-    );
-    assert_eq!(missing.error.reason, Some(RefreshReason::SessionInvalid));
+    assert_reopen_write_session(&missing.error, ErrorKind::Metadata(MetadataErrorKind::SessionInvalid));
 }
 
 #[tokio::test]
@@ -2037,11 +2007,7 @@ async fn renew_lease_rejects_lease_epoch_mismatch() {
         .await
         .expect_err("lease_epoch mismatch must be rejected");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
-    );
-    assert_eq!(failure.error.reason, Some(RefreshReason::SessionInvalid));
+    assert_reopen_write_session(&failure.error, ErrorKind::Metadata(MetadataErrorKind::SessionInvalid));
 }
 
 #[tokio::test]
@@ -2065,11 +2031,7 @@ async fn renew_lease_rejects_missing_or_stale_handle() {
         .await
         .expect_err("missing write handle must be rejected");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
-    );
-    assert_eq!(failure.error.reason, Some(RefreshReason::SessionInvalid));
+    assert_reopen_write_session(&failure.error, ErrorKind::Metadata(MetadataErrorKind::SessionInvalid));
 }
 
 #[tokio::test]
@@ -2682,11 +2644,7 @@ async fn commit_worker_run_check_uses_session_group() {
     .await
     .expect_err("commit must not validate worker_run_id against another group's registration");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::WorkerRunMismatch))
-    );
-    assert_eq!(failure.error.reason, Some(RefreshReason::WorkerRunMismatch));
+    assert_refresh_metadata(&failure.error, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
     assert!(failure.error.message.contains("worker_run_id mismatch"));
 }
 
@@ -2752,11 +2710,7 @@ async fn commit_worker_run_check_rejects_stale_live_registration() {
     .await
     .expect_err("commit must reject stale worker process-run identity");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::WorkerRunMismatch))
-    );
-    assert_eq!(failure.error.reason, Some(RefreshReason::WorkerRunMismatch));
+    assert_refresh_metadata(&failure.error, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
     assert!(failure.error.message.contains("worker_run_id mismatch"));
 }
 
@@ -3018,11 +2972,7 @@ async fn get_locations_rejects_stale_state_watermark() {
         .await
         .expect_err("read should reject state watermark beyond local applied state");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::StaleState))
-    );
-    assert_eq!(failure.error.reason, Some(RefreshReason::StaleState));
+    assert_refresh_metadata(&failure.error, ErrorKind::Metadata(MetadataErrorKind::StaleState));
 }
 
 #[tokio::test]
@@ -3057,11 +3007,10 @@ async fn close_write_invalid_lease_or_fencing_does_not_clear_runtime_session() {
         .await
         .unwrap_err();
 
-    assert_eq!(
-        wrong_lease.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
+    assert_reopen_write_session(
+        &wrong_lease.error,
+        ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
     );
-    assert_eq!(wrong_lease.error.reason, Some(RefreshReason::SessionInvalid));
     assert!(fs_core.write_session_for_handle(file_handle).is_some());
     assert!(fs_core
         .inode_lease_manager_for_test()
@@ -3089,11 +3038,10 @@ async fn close_write_invalid_lease_or_fencing_does_not_clear_runtime_session() {
         .await
         .unwrap_err();
 
-    assert_eq!(
-        wrong_fencing.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
+    assert_reopen_write_session(
+        &wrong_fencing.error,
+        ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
     );
-    assert_eq!(wrong_fencing.error.reason, Some(RefreshReason::SessionInvalid));
     assert!(fs_core.write_session_for_handle(file_handle).is_some());
     assert!(fs_core
         .inode_lease_manager_for_test()
@@ -3145,10 +3093,7 @@ async fn commit_rejects_unissued_block() {
         .await
         .expect_err("unissued block must be rejected");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
-    );
+    assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
     assert!(fs_core.write_session_for_handle(file_handle).is_some());
 }
 
@@ -3174,10 +3119,7 @@ async fn commit_rejects_duplicate_block() {
         .await
         .expect_err("duplicate committed block must be rejected");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
-    );
+    assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
     assert!(env.fs_core.write_session_for_handle(key.file_handle).is_some());
 }
 
@@ -3203,10 +3145,7 @@ async fn commit_rejects_offset_mismatch() {
         .await
         .expect_err("offset mismatch must be rejected");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
-    );
+    assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
     assert!(env.fs_core.write_session_for_handle(key.file_handle).is_some());
 }
 
@@ -3341,10 +3280,7 @@ async fn sync_write_rejects_target_beyond_committed_block_coverage() {
     .await
     .expect_err("target beyond committed coverage must be rejected");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
-    );
+    assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
     assert!(env.fs_core.write_session_for_handle(key.file_handle).is_some());
     assert_eq!(env.storage.get_inode(env.inode_id).unwrap().unwrap().attrs.size, 0);
 }
@@ -3407,10 +3343,7 @@ async fn append_uses_base_size() {
         .await
         .expect_err("append commit must start at base_size");
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
-    );
+    assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EInval));
     assert!(env.fs_core.write_session_for_handle(key.file_handle).is_some());
 }
 
@@ -3494,10 +3427,7 @@ async fn replay_keeps_file_version() {
         .execute_close_write(mismatch)
         .await
         .expect_err("same call_id with different close payload should fail");
-    assert_eq!(
-        mismatch_failure.error.code,
-        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EInval))
-    );
+    assert_fail(&mismatch_failure.error, ErrorKind::Fs(FsErrorCode::EInval));
     assert!(fs_core.write_session_for_handle(file_handle).is_none());
     assert_eq!(storage.get_inode(inode_id).unwrap().unwrap(), inode_after_first);
     assert_eq!(
@@ -3596,10 +3526,7 @@ async fn delete_file_with_active_write_session_returns_busy_without_namespace_mu
         .await
         .unwrap_err();
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EBusy))
-    );
+    assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EBusy));
     assert!(fs_core.write_session_for_handle(file_handle).is_some());
     assert_eq!(storage.get_dentry(parent_inode_id, "busy").unwrap(), Some(inode_id));
     assert!(storage.get_inode(inode_id).unwrap().is_some());
@@ -3666,10 +3593,7 @@ async fn rename_rejects_active_write_target() {
         .await
         .unwrap_err();
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EBusy))
-    );
+    assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EBusy));
     assert!(fs_core.write_session_for_handle(file_handle).is_some());
     assert_eq!(
         storage.get_dentry(parent_inode_id, "source").unwrap(),
@@ -3801,10 +3725,7 @@ async fn rename_rejects_cross_mount() {
         .await
         .unwrap_err();
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::FsErrno(FsErrorCode::EXDev))
-    );
+    assert_fail(&failure.error, ErrorKind::Fs(FsErrorCode::EXDev));
     assert_eq!(
         storage.get_dentry(src_parent_inode_id, "source").unwrap(),
         Some(source_inode_id)
@@ -3840,11 +3761,7 @@ async fn close_write_session_missing_without_applied_result_stays_session_invali
         .await
         .unwrap_err();
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing))
-    );
-    assert_eq!(failure.error.reason, Some(RefreshReason::SessionInvalid));
+    assert_reopen_write_session(&failure.error, ErrorKind::Metadata(MetadataErrorKind::SessionInvalid));
     assert_eq!(failure.group_name, Some(group_name_value));
 }
 
@@ -3898,12 +3815,11 @@ async fn create_mount_route_epoch_progression_rejects_stale_client_route_epoch()
         .await
         .unwrap_err();
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::RouteEpochMismatch))
+    assert_refresh_metadata(
+        &failure.error,
+        ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
     );
-    assert_eq!(failure.error.reason, Some(RefreshReason::RouteEpochMismatch));
-    let hint = failure.error.refresh_hint.expect("refresh hint");
+    let hint = refresh_hint(&failure.error);
     assert_eq!(hint.route_epoch, Some(advanced_route_epoch));
     assert_eq!(hint.mount_epoch, Some(1));
     assert_eq!(failure.route_epoch, Some(advanced_route_epoch));
@@ -3966,12 +3882,11 @@ async fn delete_mount_route_epoch_progression_rejects_stale_client_route_epoch()
         .await
         .unwrap_err();
 
-    assert_eq!(
-        failure.error.code,
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::RouteEpochMismatch))
+    assert_refresh_metadata(
+        &failure.error,
+        ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
     );
-    assert_eq!(failure.error.reason, Some(RefreshReason::RouteEpochMismatch));
-    let hint = failure.error.refresh_hint.expect("refresh hint");
+    let hint = refresh_hint(&failure.error);
     assert_eq!(hint.route_epoch, Some(advanced_route_epoch));
     assert_eq!(failure.route_epoch, Some(advanced_route_epoch));
 }

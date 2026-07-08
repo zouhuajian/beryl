@@ -7,90 +7,129 @@ use crate::header::RequestHeader;
 use std::error::Error as StdError;
 use std::fmt;
 
-pub mod canonical {
-    //! Canonical, protocol-independent error model for vecton.
+pub mod rpc {
+    //! RPC header error model for Vecton.
     //!
-    //! This sits *above* module-local error types (MetadataError, WorkerError,
-    //! ClientError, FsErrorCode, RpcErrorCode) and *below* the
-    //! concrete protobuf headers. The goal is:
+    //! The model has two independent axes:
+    //! - `ErrorKind`: the fact that failed.
+    //! - `RecoveryAction`: what a caller should do next.
     //!
-    //! - Provide a single semantic classification:
-    //!   - `ErrorClass`: `Ok` / `NeedRefresh` / `Retryable` / `Fatal`
-    //!   - `RefreshReason`: fine‑grained refresh reasons (leader change,
-    //!     epoch/route mismatch, fencing, block stamp mismatch, etc.)
-    //! - Provide a single place for:
-    //!   - FS errno vs RPC error code (`ErrorCode`)
-    //!   - `retry_after_ms` server hint for retryable errors
-    //! - Enforce invariants *in Rust* even before protobuf headers are fully
-    //!   converged.
-    //!
-    //! NOTE:
-    //! - This module MUST NOT depend on generated protobuf types.
-    //! - All conversions between module errors and `CanonicalError` should live
-    //!   in the respective owner crates (metadata/worker/client).
+    //! Human-readable `message` and structured `detail` are diagnostic only.
+    //! Machine control flow must branch on `kind` and `recovery`.
 
-    use crate::header::RpcErrorCode;
     use serde::{Deserialize, Serialize};
     use types::fs::FsErrorCode;
 
-    /// Coarse-grained error class used for client behaviour.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    /// Stable, machine-readable failure fact.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
     #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-    pub enum ErrorClass {
-        /// No error.
-        Ok,
-        /// Client must refresh routing / mount / state before retrying.
-        NeedRefresh,
-        /// Temporary failure, can retry (possibly with backoff).
-        Retryable,
-        /// Unrecoverable from client perspective.
-        Fatal,
+    pub enum ErrorKind {
+        Fs(FsErrorCode),
+        Metadata(MetadataErrorKind),
+        Worker(WorkerErrorKind),
+        Ufs(UfsErrorKind),
+        Protocol(ProtocolErrorKind),
+        Internal(InternalErrorKind),
     }
 
-    /// Reason for `ErrorClass::NeedRefresh` (or closely related routing/state
-    /// issues). This enum intentionally mirrors – but does not *depend on* –
-    /// current RpcErrorCode / data-plane enums so that we can evolve proto
-    /// independently.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    /// Metadata-domain failure fact.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
     #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-    pub enum RefreshReason {
-        /// Unknown or unclassified refresh hint.
-        Unknown,
-        /// Not leader for the requested group.
+    pub enum MetadataErrorKind {
+        NotFound,
+        AlreadyExists,
+        NotDirectory,
+        IsDirectory,
+        DirectoryNotEmpty,
+        CrossMountRename,
+        Busy,
+        Conflict,
         NotLeader,
-        /// Path or mount owner group mismatch.
-        OwnerGroupMismatch,
-        /// Resource relocated, but the producer cannot classify the refresh more specifically.
-        Moved,
-        /// Follower state is behind requested state watermark.
         StaleState,
-        /// Mount epoch mismatch (client vs server).
         MountEpochMismatch,
-        /// Route epoch mismatch.
         RouteEpochMismatch,
-        /// Request targeted a metadata group this server does not serve.
+        OwnerGroupMismatch,
         GroupMismatch,
-        /// Worker must run startup registration for the target group.
-        NeedRegister,
-        /// Worker process-run identity no longer matches metadata live state.
-        WorkerRunMismatch,
-        /// Worker must send a new full block report before deltas continue.
-        FullReportRequired,
-        /// Metadata or worker cannot provide a usable location for a visible block.
-        BlockLocationUnavailable,
-        /// Block stamp mismatch (data-plane).
-        BlockStampMismatch,
-        /// Fencing / lease fenced.
         Fencing,
-        /// Generic epoch mismatch not further classified.
-        EpochMismatch,
-        /// Write session is invalid and must be reopened.
         SessionInvalid,
-        /// Write session lease/session has expired and must be reopened.
         SessionExpired,
+        EpochMismatch,
+        ResourceExhausted,
     }
 
-    /// Worker endpoint hint used in canonical refresh hints.
+    /// Worker-domain failure fact.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+    pub enum WorkerErrorKind {
+        NotRegistered,
+        RunMismatch,
+        DescriptorMismatch,
+        FullReportRequired,
+        BlockLocationUnavailable,
+        BlockStampMismatch,
+        NodeUnavailable,
+        Timeout,
+        ResourceExhausted,
+        Conflict,
+        Corrupt,
+        Fencing,
+        Cancelled,
+        Io,
+    }
+
+    /// UFS-domain failure fact.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+    pub enum UfsErrorKind {
+        NotFound,
+        PermissionDenied,
+        Unsupported,
+        NotImplemented,
+        InvalidSpec,
+        InvalidPath,
+        UnexpectedEof,
+        Backend,
+        Overloaded,
+        Timeout,
+    }
+
+    /// Protocol and request-shape failure fact.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+    pub enum ProtocolErrorKind {
+        InvalidHeader,
+        InvalidArgument,
+        PermissionDenied,
+        Unsupported,
+        Cancelled,
+        Corrupt,
+    }
+
+    /// Internal or infrastructure failure fact.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+    pub enum InternalErrorKind {
+        NodeUnavailable,
+        Timeout,
+        ResourceExhausted,
+        Cancelled,
+        Corrupt,
+        Internal,
+    }
+
+    /// Caller recovery strategy. This is deliberately smaller than `ErrorKind`.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+    pub enum RecoveryAction {
+        Fail,
+        Retry { after_ms: Option<u64> },
+        RefreshMetadata { hint: RefreshHint },
+        ReopenWriteSession { hint: RefreshHint },
+        RegisterWorker,
+        SendFullBlockReport,
+    }
+
+    /// Worker endpoint hint used in RPC refresh hints.
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct WorkerEndpointHint {
         pub worker_id: u64,
@@ -98,7 +137,7 @@ pub mod canonical {
         pub worker_net_protocol: i32,
     }
 
-    /// Structured refresh hints attached to canonical errors.
+    /// Structured refresh hints attached to RPC errors.
     #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct RefreshHint {
         pub leader_endpoint: Option<String>,
@@ -110,139 +149,72 @@ pub mod canonical {
         pub worker_resolve_required: bool,
     }
 
-    /// Error code namespace – either a filesystem errno or an RPC‑level code.
+    /// Diagnostic structured data. This must not drive control flow.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ErrorDetail {
+        pub fields: Vec<ErrorDetailField>,
+    }
+
+    /// One diagnostic field in `ErrorDetail`.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ErrorDetailField {
+        pub key: String,
+        pub value: String,
+    }
+
+    /// RPC error model for Vecton.
     #[derive(Clone, Debug, PartialEq, Eq)]
-    pub enum ErrorCode {
-        FsErrno(FsErrorCode),
-        RpcCode(RpcErrorCode),
-    }
-
-    /// Canonical error model for vecton.
-    ///
-    /// Invariants (enforced via `debug_assert!` and constructor helpers):
-    ///
-    /// 1. `class == ErrorClass::Ok`  => `code/reason/retry_after_ms` must be `None`.
-    /// 2. `class == ErrorClass::NeedRefresh` => `reason.is_some()`; `code`
-    ///    SHOULD be `Some(ErrorCode::RpcCode(_))`.
-    /// 3. `class == ErrorClass::Retryable`   => `retry_after_ms` is an optional hint;
-    ///    `code` SHOULD be `Some(ErrorCode::RpcCode(_))`.
-    /// 4. FS errno errors default to `class == Fatal` unless explicitly marked retriable/refreshable.
-    #[derive(Clone, Debug)]
-    pub struct CanonicalError {
-        pub class: ErrorClass,
-        pub code: Option<ErrorCode>,
-        pub reason: Option<RefreshReason>,
-        pub retry_after_ms: Option<u64>,
+    pub struct RpcErrorDetail {
+        pub kind: ErrorKind,
+        pub recovery: RecoveryAction,
         pub message: String,
-        pub refresh_hint: Option<RefreshHint>,
+        pub detail: ErrorDetail,
     }
 
-    impl CanonicalError {
-        /// Construct an `Ok` error (mainly for completeness / tests).
-        pub fn ok(message: impl Into<String>) -> Self {
-            let err = Self {
-                class: ErrorClass::Ok,
-                code: None,
-                reason: None,
-                retry_after_ms: None,
+    impl RpcErrorDetail {
+        pub fn new(kind: ErrorKind, recovery: RecoveryAction, message: impl Into<String>) -> Self {
+            Self {
+                kind,
+                recovery,
                 message: message.into(),
-                refresh_hint: None,
-            };
-            err.debug_validate();
-            err
-        }
-
-        /// Construct a fatal FS errno error.
-        pub fn fatal_fs(errno: FsErrorCode, message: impl Into<String>) -> Self {
-            let err = Self {
-                class: ErrorClass::Fatal,
-                code: Some(ErrorCode::FsErrno(errno)),
-                reason: None,
-                retry_after_ms: None,
-                message: message.into(),
-                refresh_hint: None,
-            };
-            err.debug_validate();
-            err
-        }
-
-        /// Construct a NEED_REFRESH error from an RPC code + refresh reason.
-        pub fn need_refresh(code: RpcErrorCode, reason: RefreshReason, message: impl Into<String>) -> Self {
-            let err = Self {
-                class: ErrorClass::NeedRefresh,
-                code: Some(ErrorCode::RpcCode(code)),
-                reason: Some(reason),
-                retry_after_ms: None,
-                message: message.into(),
-                refresh_hint: None,
-            };
-            err.debug_validate();
-            err
-        }
-
-        /// Construct a NEED_REFRESH error from an RPC code + refresh reason + structured hint.
-        pub fn need_refresh_with_hint(
-            code: RpcErrorCode,
-            reason: RefreshReason,
-            hint: RefreshHint,
-            message: impl Into<String>,
-        ) -> Self {
-            let err = Self {
-                class: ErrorClass::NeedRefresh,
-                code: Some(ErrorCode::RpcCode(code)),
-                reason: Some(reason),
-                retry_after_ms: None,
-                message: message.into(),
-                refresh_hint: Some(hint),
-            };
-            err.debug_validate();
-            err
-        }
-
-        /// Construct a RETRYABLE error from an RPC code and optional backoff.
-        pub fn retryable(code: RpcErrorCode, retry_after_ms: Option<u64>, message: impl Into<String>) -> Self {
-            let err = Self {
-                class: ErrorClass::Retryable,
-                code: Some(ErrorCode::RpcCode(code)),
-                reason: None,
-                retry_after_ms,
-                message: message.into(),
-                refresh_hint: None,
-            };
-            err.debug_validate();
-            err
-        }
-
-        /// Attach structured refresh hint to an existing canonical error.
-        pub fn with_refresh_hint(mut self, hint: RefreshHint) -> Self {
-            self.refresh_hint = Some(hint);
-            self
-        }
-
-        /// Best-effort invariant checks; only compiled in debug/profile builds.
-        fn debug_validate(&self) {
-            match self.class {
-                ErrorClass::Ok => {
-                    debug_assert!(
-                        self.code.is_none() && self.reason.is_none() && self.retry_after_ms.is_none(),
-                        "CanonicalError invariant violated: Ok must not carry code/reason/retry_after_ms: {:?}",
-                        self
-                    );
-                }
-                ErrorClass::NeedRefresh => {
-                    debug_assert!(
-                        self.reason.is_some(),
-                        "CanonicalError invariant violated: NeedRefresh must have reason: {:?}",
-                        self
-                    );
-                }
-                ErrorClass::Retryable => {
-                    // No strict invariant beyond class at the moment.
-                }
-                ErrorClass::Fatal => {
-                    // Fs errno defaults to Fatal by convention; no strict rule.
-                }
+                detail: ErrorDetail::default(),
             }
+        }
+
+        pub fn fs(errno: FsErrorCode, message: impl Into<String>) -> Self {
+            Self::new(ErrorKind::Fs(errno), RecoveryAction::Fail, message)
+        }
+
+        pub fn fail(kind: ErrorKind, message: impl Into<String>) -> Self {
+            Self::new(kind, RecoveryAction::Fail, message)
+        }
+
+        pub fn retry(kind: ErrorKind, after_ms: Option<u64>, message: impl Into<String>) -> Self {
+            Self::new(kind, RecoveryAction::Retry { after_ms }, message)
+        }
+
+        pub fn refresh_metadata(kind: ErrorKind, hint: RefreshHint, message: impl Into<String>) -> Self {
+            Self::new(kind, RecoveryAction::RefreshMetadata { hint }, message)
+        }
+
+        pub fn reopen_write_session(kind: ErrorKind, hint: RefreshHint, message: impl Into<String>) -> Self {
+            Self::new(kind, RecoveryAction::ReopenWriteSession { hint }, message)
+        }
+
+        pub fn register_worker(kind: ErrorKind, message: impl Into<String>) -> Self {
+            Self::new(kind, RecoveryAction::RegisterWorker, message)
+        }
+
+        pub fn send_full_block_report(kind: ErrorKind, message: impl Into<String>) -> Self {
+            Self::new(kind, RecoveryAction::SendFullBlockReport, message)
+        }
+
+        pub fn with_detail_field(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+            self.detail.fields.push(ErrorDetailField {
+                key: key.into(),
+                value: value.into(),
+            });
+            self
         }
     }
 }
@@ -439,41 +411,43 @@ impl From<CommonErrorCode> for CommonError {
 }
 
 #[cfg(test)]
-#[path = "canonical_tests.rs"]
-mod canonical_tests;
+#[path = "rpc_tests.rs"]
+mod rpc_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::canonical::{CanonicalError, ErrorClass, ErrorCode as CanonicalCode, RefreshReason};
+    use super::rpc::{ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail};
     use types::fs::FsErrorCode;
 
     #[test]
-    fn canonical_ok_invariant() {
-        let err = CanonicalError::ok("ok");
-        assert_eq!(err.class, ErrorClass::Ok);
-        assert!(err.code.is_none());
-        assert!(err.reason.is_none());
-        assert!(err.retry_after_ms.is_none());
+    fn rpc_fs_error_fails() {
+        let err = RpcErrorDetail::fs(FsErrorCode::ENoEnt, "no such file");
+        assert_eq!(err.kind, ErrorKind::Fs(FsErrorCode::ENoEnt));
+        assert_eq!(err.recovery, RecoveryAction::Fail);
     }
 
     #[test]
-    fn canonical_need_refresh_has_reason() {
-        let err = CanonicalError::need_refresh(
-            crate::header::RpcErrorCode::NotLeader,
-            RefreshReason::NotLeader,
+    fn rpc_refresh_carries_hint() {
+        let hint = RefreshHint {
+            group_name: Some("root".to_string()),
+            ..RefreshHint::default()
+        };
+        let err = RpcErrorDetail::refresh_metadata(
+            ErrorKind::Metadata(MetadataErrorKind::NotLeader),
+            hint,
             "leader changed",
         );
-        assert_eq!(err.class, ErrorClass::NeedRefresh);
-        assert!(err.reason.is_some());
+        assert_eq!(err.kind, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
+        assert!(matches!(err.recovery, RecoveryAction::RefreshMetadata { .. }));
     }
 
     #[test]
-    fn canonical_fatal_fs_sets_errno() {
-        let err = CanonicalError::fatal_fs(FsErrorCode::ENoEnt, "no such file");
-        assert_eq!(err.class, ErrorClass::Fatal);
-        match err.code.unwrap() {
-            CanonicalCode::FsErrno(code) => assert_eq!(code, FsErrorCode::ENoEnt),
-            _ => panic!("expected FsErrno"),
-        }
+    fn rpc_retry_keeps_backoff_in_recovery() {
+        let err = RpcErrorDetail::retry(
+            ErrorKind::Internal(InternalErrorKind::NodeUnavailable),
+            Some(1000),
+            "unavailable",
+        );
+        assert_eq!(err.recovery, RecoveryAction::Retry { after_ms: Some(1000) });
     }
 }

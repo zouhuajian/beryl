@@ -11,15 +11,16 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
-    use common::error::canonical::{CanonicalError, RefreshReason};
-    use common::header::RpcErrorCode;
+    use common::error::rpc::{
+        ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail, WorkerErrorKind,
+    };
     use futures::StreamExt;
     use metrics::{Counter, Gauge, GaugeFn, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
     use proto::common::{
-        BlockIdProto, ByteRangeProto, ClientInfoProto, EndpointProto, ErrorClassProto, FencingTokenProto,
-        RefreshReasonProto, ResponseHeaderProto, StreamIdProto,
+        BlockIdProto, ByteRangeProto, ClientInfoProto, EndpointProto, FencingTokenProto, ResponseHeaderProto,
+        StreamIdProto,
     };
-    use proto::convert::canonical_to_error_detail;
+    use proto::convert::rpc_error_to_proto;
     use proto::metadata::metadata_worker_service_proto_server::{
         MetadataWorkerServiceProto, MetadataWorkerServiceProtoServer,
     };
@@ -150,15 +151,31 @@ mod tests {
         }
     }
 
-    fn assert_need_refresh<T: std::fmt::Debug>(
-        result: WorkerCoreResult<T>,
-        expected_reason: common::error::canonical::RefreshReason,
-    ) {
+    fn assert_refresh_metadata<T: std::fmt::Debug>(result: WorkerCoreResult<T>, expected_kind: ErrorKind) {
         let error = result.expect_err("operation should need refresh");
         match error {
-            WorkerError::NeedRefresh { reason, .. } => assert_eq!(reason, expected_reason),
-            other => panic!("expected NeedRefresh, got {other:?}"),
+            WorkerError::RefreshMetadata { kind, .. } => assert_eq!(kind, expected_kind),
+            other => panic!("expected RefreshMetadata, got {other:?}"),
         }
+    }
+
+    fn assert_header_recovery(error: &proto::common::ErrorDetailProto, expected_kind: ErrorKind) -> RpcErrorDetail {
+        let rpc_error = proto::convert::rpc_error_from_proto(error);
+        assert_eq!(rpc_error.kind, expected_kind, "{rpc_error:?}");
+        rpc_error
+    }
+
+    fn assert_header_refresh_metadata(error: &proto::common::ErrorDetailProto, expected_kind: ErrorKind) {
+        let rpc_error = assert_header_recovery(error, expected_kind);
+        assert!(
+            matches!(rpc_error.recovery, RecoveryAction::RefreshMetadata { .. }),
+            "{rpc_error:?}"
+        );
+    }
+
+    fn assert_header_fail(error: &proto::common::ErrorDetailProto, expected_kind: ErrorKind) {
+        let rpc_error = assert_header_recovery(error, expected_kind);
+        assert!(matches!(rpc_error.recovery, RecoveryAction::Fail), "{rpc_error:?}");
     }
 
     fn assert_invalid_argument<T: std::fmt::Debug>(result: WorkerCoreResult<T>) {
@@ -178,8 +195,8 @@ mod tests {
     #[derive(Clone)]
     enum MockRegisterReply {
         Ok { worker_id: u64, worker_run_id: WorkerRunId },
-        MalformedOkHeader { worker_id: u64, worker_run_id: WorkerRunId },
-        HeaderError(CanonicalError),
+        HeaderErrorWithAcceptedBody { worker_id: u64, worker_run_id: WorkerRunId },
+        HeaderError(RpcErrorDetail),
         Status(Status),
     }
 
@@ -191,14 +208,14 @@ mod tests {
             server_role: MetadataServerRoleProto,
             commands: Vec<WorkerCommandProto>,
         },
-        HeaderError(CanonicalError),
+        HeaderError(RpcErrorDetail),
         Status(Status),
     }
 
     #[derive(Clone)]
     enum MockBlockReportReply {
         Ok,
-        HeaderError(CanonicalError),
+        HeaderError(RpcErrorDetail),
         Status(Status),
     }
 
@@ -243,13 +260,16 @@ mod tests {
                     worker_id,
                     accepted_worker_run_id: worker_run_id.to_string(),
                 })),
-                MockRegisterReply::MalformedOkHeader {
+                MockRegisterReply::HeaderErrorWithAcceptedBody {
                     worker_id,
                     worker_run_id,
                 } => Ok(Response::new(RegisterWorkerResponseProto {
                     header: Some(response_header_from_request(
                         &request,
-                        Some(CanonicalError::ok("malformed ok")),
+                        Some(RpcErrorDetail::fail(
+                            ErrorKind::Internal(InternalErrorKind::Internal),
+                            "malformed success header",
+                        )),
                     )),
                     group_name: request.group_name.clone(),
                     worker_id,
@@ -343,11 +363,11 @@ mod tests {
 
     fn response_header_from_request(
         request: &RegisterWorkerRequestProto,
-        error: Option<CanonicalError>,
+        error: Option<RpcErrorDetail>,
     ) -> ResponseHeaderProto {
         ResponseHeaderProto {
             client: request.header.as_ref().and_then(|header| header.client.clone()),
-            error: error.as_ref().map(canonical_to_error_detail),
+            error: error.as_ref().map(rpc_error_to_proto),
             state: Vec::new(),
             group_name: request
                 .header
@@ -361,11 +381,11 @@ mod tests {
 
     fn response_header_from_heartbeat_request(
         request: &HeartbeatRequestProto,
-        error: Option<CanonicalError>,
+        error: Option<RpcErrorDetail>,
     ) -> ResponseHeaderProto {
         ResponseHeaderProto {
             client: request.header.as_ref().and_then(|header| header.client.clone()),
-            error: error.as_ref().map(canonical_to_error_detail),
+            error: error.as_ref().map(rpc_error_to_proto),
             state: Vec::new(),
             group_name: request
                 .header
@@ -379,11 +399,11 @@ mod tests {
 
     fn response_header_from_block_report_request(
         request: &BlockReportRequestProto,
-        error: Option<CanonicalError>,
+        error: Option<RpcErrorDetail>,
     ) -> ResponseHeaderProto {
         ResponseHeaderProto {
             client: request.header.as_ref().and_then(|header| header.client.clone()),
-            error: error.as_ref().map(canonical_to_error_detail),
+            error: error.as_ref().map(rpc_error_to_proto),
             state: Vec::new(),
             group_name: request
                 .header
@@ -568,9 +588,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registrar_rejects_malformed_ok_header_error_and_does_not_set_ready() {
+    async fn registrar_rejects_header_error_with_accepted_body_and_does_not_set_ready() {
         let worker_run_id = test_worker_run_id();
-        let (endpoint, mock, shutdown) = start_mock_metadata(vec![MockRegisterReply::MalformedOkHeader {
+        let (endpoint, mock, shutdown) = start_mock_metadata(vec![MockRegisterReply::HeaderErrorWithAcceptedBody {
             worker_id: 44,
             worker_run_id,
         }])
@@ -586,9 +606,9 @@ mod tests {
         let error = registrar
             .register_once()
             .await
-            .expect_err("malformed OK header error must fail registration");
+            .expect_err("header error with accepted body must fail registration");
 
-        assert!(error.to_string().contains("malformed"));
+        assert!(error.to_string().contains("malformed success header"));
         assert!(!state.is_registered(&group_name()));
         assert!(!state.is_ready(&group_name()));
         assert_eq!(mock.requests.lock().unwrap().len(), 1);
@@ -637,8 +657,8 @@ mod tests {
 
     #[tokio::test]
     async fn retryable_register_failure_is_retried() {
-        let retryable = CanonicalError::retryable(
-            RpcErrorCode::NodeUnavailable,
+        let retryable = RpcErrorDetail::retry(
+            ErrorKind::Internal(InternalErrorKind::NodeUnavailable),
             Some(1),
             "metadata temporarily unavailable",
         );
@@ -723,7 +743,7 @@ mod tests {
 
     #[tokio::test]
     async fn fatal_register_failure_stops_startup() {
-        let fatal = CanonicalError::fatal_fs(FsErrorCode::EInval, "bad worker descriptor");
+        let fatal = RpcErrorDetail::fs(FsErrorCode::EInval, "bad worker descriptor");
         let (endpoint, mock, shutdown) = start_mock_metadata(vec![MockRegisterReply::HeaderError(fatal)]).await;
         let state = Arc::new(RegistrationSet::new());
         let registrar = MetadataRegistrar::new(
@@ -984,14 +1004,17 @@ mod tests {
 
     #[tokio::test]
     async fn need_register_heartbeat_responses_clear_registration() {
-        for (code, message) in [
-            (RpcErrorCode::WorkerNotRegistered, "register first"),
-            (RpcErrorCode::WorkerDescriptorMismatch, "descriptor changed"),
+        for (kind, message) in [
+            (ErrorKind::Worker(WorkerErrorKind::NotRegistered), "register first"),
+            (
+                ErrorKind::Worker(WorkerErrorKind::DescriptorMismatch),
+                "descriptor changed",
+            ),
         ] {
             let worker_run_id = test_worker_run_id();
             let (endpoint, _mock, shutdown) =
                 start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::HeaderError(
-                    CanonicalError::need_refresh(code, RefreshReason::NeedRegister, message),
+                    RpcErrorDetail::register_worker(kind, message),
                 )])
                 .await;
             let state = Arc::new(RegistrationSet::new());
@@ -1010,26 +1033,27 @@ mod tests {
 
             let round = heartbeat.send_once(HeartbeatSnapshot::default()).await.unwrap();
 
-            assert!(round.needs_register, "{code:?} should request registration");
+            assert!(round.needs_register, "{kind:?} should request registration");
             assert!(
                 !state.is_registered(&group_name()),
-                "{code:?} should clear registration"
+                "{kind:?} should clear registration"
             );
-            assert!(!state.is_ready(&group_name()), "{code:?} should clear readiness");
+            assert!(!state.is_ready(&group_name()), "{kind:?} should clear readiness");
             shutdown.send(()).ok();
         }
     }
 
     #[tokio::test]
-    async fn heartbeat_refresh_code_without_reason_does_not_clear_registration() {
+    async fn heartbeat_refresh_metadata_recovery_does_not_clear_registration() {
         let worker_run_id = test_worker_run_id();
-        let (endpoint, _mock, shutdown) =
-            start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::HeaderError(CanonicalError::need_refresh(
-                RpcErrorCode::WorkerNotRegistered,
-                RefreshReason::Unknown,
-                "legacy code-only refresh",
-            ))])
-            .await;
+        let (endpoint, _mock, shutdown) = start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::HeaderError(
+            RpcErrorDetail::refresh_metadata(
+                ErrorKind::Worker(WorkerErrorKind::NotRegistered),
+                RefreshHint::default(),
+                "metadata refresh only",
+            ),
+        )])
+        .await;
         let state = Arc::new(RegistrationSet::new());
         state.record_registered(Registration {
             group_name: group_name(),
@@ -1048,7 +1072,7 @@ mod tests {
         let err = heartbeat
             .send_once(HeartbeatSnapshot::default())
             .await
-            .expect_err("unknown refresh reason must not become a hard control outcome");
+            .expect_err("refresh metadata recovery must not become a hard control outcome");
 
         assert!(matches!(err, HeartbeatError::Retryable(_)));
         assert!(state.is_registered(&group_name()));
@@ -1064,12 +1088,9 @@ mod tests {
             worker_run_id,
         }])
         .await;
-        *mock.heartbeat_replies.lock().unwrap() =
-            VecDeque::from(vec![MockHeartbeatReply::HeaderError(CanonicalError::need_refresh(
-                RpcErrorCode::WorkerRunMismatch,
-                common::error::canonical::RefreshReason::WorkerRunMismatch,
-                "stale worker run",
-            ))]);
+        *mock.heartbeat_replies.lock().unwrap() = VecDeque::from(vec![MockHeartbeatReply::HeaderError(
+            RpcErrorDetail::register_worker(ErrorKind::Worker(WorkerErrorKind::RunMismatch), "stale worker run"),
+        )]);
         let state = Arc::new(RegistrationSet::new());
         state.record_registered(Registration {
             group_name: group_name(),
@@ -1156,12 +1177,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_ok_heartbeat_header_is_rejected() {
+    async fn heartbeat_header_error_is_rejected() {
         let worker_run_id = test_worker_run_id();
-        let (endpoint, _mock, shutdown) = start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::HeaderError(
-            CanonicalError::ok("malformed ok"),
-        )])
-        .await;
+        let (endpoint, _mock, shutdown) =
+            start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::HeaderError(RpcErrorDetail::fail(
+                ErrorKind::Internal(InternalErrorKind::Internal),
+                "malformed success header",
+            ))])
+            .await;
         let state = Arc::new(RegistrationSet::new());
         state.record_registered(Registration {
             group_name: group_name(),
@@ -1179,9 +1202,9 @@ mod tests {
         let error = heartbeat
             .send_once(HeartbeatSnapshot::default())
             .await
-            .expect_err("malformed OK header must fail heartbeat");
+            .expect_err("header error must fail heartbeat");
 
-        assert!(error.to_string().contains("malformed OK"));
+        assert!(error.to_string().contains("malformed success header"));
         shutdown.send(()).ok();
     }
 
@@ -1412,25 +1435,24 @@ mod tests {
 
     #[tokio::test]
     async fn full_block_report_stops_peer_batches_after_hard_report_errors() {
-        for (code, reason, message) in [
+        for (error, expected_outcome) in [
             (
-                RpcErrorCode::FullReportRequired,
-                RefreshReason::FullReportRequired,
-                "send full report",
+                RpcErrorDetail::send_full_block_report(
+                    ErrorKind::Worker(WorkerErrorKind::FullReportRequired),
+                    "send full report",
+                ),
+                "full_report_required",
             ),
             (
-                RpcErrorCode::WorkerNotRegistered,
-                RefreshReason::NeedRegister,
-                "register first",
+                RpcErrorDetail::register_worker(ErrorKind::Worker(WorkerErrorKind::NotRegistered), "register first"),
+                "needs_register",
             ),
             (
-                RpcErrorCode::WorkerRunMismatch,
-                RefreshReason::WorkerRunMismatch,
-                "worker run mismatch",
+                RpcErrorDetail::register_worker(ErrorKind::Worker(WorkerErrorKind::RunMismatch), "worker run mismatch"),
+                "worker_run_mismatch",
             ),
         ] {
             let worker_run_id = test_worker_run_id();
-            let error = CanonicalError::need_refresh(code, reason, message);
             let (endpoint, mock, shutdown) =
                 start_mock_metadata_with_block_reports(vec![MockBlockReportReply::HeaderError(error)]).await;
             let state = Arc::new(RegistrationSet::new());
@@ -1471,28 +1493,28 @@ mod tests {
 
             let round = reporter.send_full_once().await.expect("full report round");
 
-            match reason {
-                RefreshReason::FullReportRequired => assert!(round.full_report_required),
-                RefreshReason::NeedRegister => assert!(round.needs_register),
-                RefreshReason::WorkerRunMismatch => assert!(round.worker_run_mismatch),
-                other => panic!("unexpected hard report reason: {other:?}"),
+            match expected_outcome {
+                "full_report_required" => assert!(round.full_report_required),
+                "needs_register" => assert!(round.needs_register),
+                "worker_run_mismatch" => assert!(round.worker_run_mismatch),
+                other => panic!("unexpected hard report outcome: {other}"),
             }
             assert_eq!(
                 mock.block_report_requests.lock().unwrap().len(),
                 1,
-                "{code:?} should stop later full-report batches for the same peer"
+                "{expected_outcome} should stop later full-report batches for the same peer"
             );
             shutdown.send(()).ok();
         }
     }
 
     #[tokio::test]
-    async fn block_report_refresh_code_without_reason_does_not_set_control_outcome() {
+    async fn block_report_refresh_metadata_recovery_does_not_set_control_outcome() {
         let worker_run_id = test_worker_run_id();
-        let error = CanonicalError::need_refresh(
-            RpcErrorCode::FullReportRequired,
-            RefreshReason::Unknown,
-            "legacy code-only refresh",
+        let error = RpcErrorDetail::refresh_metadata(
+            ErrorKind::Worker(WorkerErrorKind::FullReportRequired),
+            RefreshHint::default(),
+            "metadata refresh only",
         );
         let (endpoint, _mock, shutdown) =
             start_mock_metadata_with_block_reports(vec![MockBlockReportReply::HeaderError(error)]).await;
@@ -1518,7 +1540,7 @@ mod tests {
         let err = reporter
             .send_full_once()
             .await
-            .expect_err("unknown refresh reason must not become a hard block-report outcome");
+            .expect_err("refresh metadata recovery must not become a hard block-report outcome");
 
         assert!(matches!(err, BlockReportError::Retryable(_)));
         assert!(state.is_registered(&group_name()));
@@ -1528,9 +1550,8 @@ mod tests {
     #[tokio::test]
     async fn full_report_required_from_one_peer_does_not_stop_other_peers() {
         let worker_run_id = test_worker_run_id();
-        let full_required = CanonicalError::need_refresh(
-            RpcErrorCode::FullReportRequired,
-            RefreshReason::FullReportRequired,
+        let full_required = RpcErrorDetail::send_full_block_report(
+            ErrorKind::Worker(WorkerErrorKind::FullReportRequired),
             "send full report",
         );
         let (first_endpoint, first_mock, first_shutdown) =
@@ -1587,11 +1608,8 @@ mod tests {
     #[tokio::test]
     async fn block_report_worker_run_mismatch_clears_registration() {
         let worker_run_id = test_worker_run_id();
-        let mismatch = CanonicalError::need_refresh(
-            RpcErrorCode::WorkerRunMismatch,
-            RefreshReason::WorkerRunMismatch,
-            "worker run mismatch",
-        );
+        let mismatch =
+            RpcErrorDetail::register_worker(ErrorKind::Worker(WorkerErrorKind::RunMismatch), "worker run mismatch");
         let (endpoint, mock, shutdown) =
             start_mock_metadata_with_block_reports(vec![MockBlockReportReply::HeaderError(mismatch)]).await;
         let state = Arc::new(RegistrationSet::new());
@@ -1666,9 +1684,8 @@ mod tests {
     #[tokio::test]
     async fn delta_report_starts_after_full_and_full_required_resets_baseline() {
         let worker_run_id = test_worker_run_id();
-        let full_required = CanonicalError::need_refresh(
-            RpcErrorCode::FullReportRequired,
-            RefreshReason::FullReportRequired,
+        let full_required = RpcErrorDetail::send_full_block_report(
+            ErrorKind::Worker(WorkerErrorKind::FullReportRequired),
             "send full report",
         );
         let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(vec![
@@ -2359,9 +2376,9 @@ mod tests {
         let (_temp, store, core) = core_with_store(512, 2048, 4096);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
 
-        assert_need_refresh(
+        assert_refresh_metadata(
             core.open_write(write_open_request()).await,
-            common::error::canonical::RefreshReason::Moved,
+            ErrorKind::Metadata(MetadataErrorKind::StaleState),
         );
         assert_eq!(core.stream_manager().active_count().await, 0);
     }
@@ -2373,9 +2390,9 @@ mod tests {
         let mut req = write_open_request();
         req.block_size = BLOCK_SIZE * 2;
 
-        assert_need_refresh(
+        assert_refresh_metadata(
             core.open_write(req).await,
-            common::error::canonical::RefreshReason::StaleState,
+            ErrorKind::Metadata(MetadataErrorKind::StaleState),
         );
         assert_eq!(core.stream_manager().active_count().await, 0);
     }
@@ -2385,9 +2402,9 @@ mod tests {
         let (_temp, store, core) = core_with_store(512, 2048, 4096);
         publish_ready_block(&store, payload(), BLOCK_STAMP + 1);
 
-        assert_need_refresh(
+        assert_refresh_metadata(
             core.open_write(write_open_request()).await,
-            common::error::canonical::RefreshReason::BlockStampMismatch,
+            ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
         );
         assert_eq!(core.stream_manager().active_count().await, 0);
     }
@@ -2684,7 +2701,7 @@ mod tests {
         .await
         .expect("write frame");
 
-        assert_need_refresh(
+        assert_refresh_metadata(
             core.commit_write(CommitWriteRequest {
                 stream_id: open.stream_id,
                 commit_seq: 1,
@@ -2693,7 +2710,7 @@ mod tests {
                 ..commit_write_request()
             })
             .await,
-            common::error::canonical::RefreshReason::StaleState,
+            ErrorKind::Metadata(MetadataErrorKind::StaleState),
         );
     }
 
@@ -2866,10 +2883,10 @@ mod tests {
     #[tokio::test]
     async fn sync_committed_block_rejects_missing_wrong_generation_and_uncommitted_block() {
         let (_temp, _store, core) = core_with_store(512, 2048, 4096);
-        assert_need_refresh(
+        assert_refresh_metadata(
             core.sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE))
                 .await,
-            common::error::canonical::RefreshReason::Moved,
+            ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
         );
 
         let open = core.open_write(write_open_request()).await.expect("open write");
@@ -2882,10 +2899,10 @@ mod tests {
         })
         .await
         .expect("write frame");
-        assert_need_refresh(
+        assert_refresh_metadata(
             core.sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE))
                 .await,
-            common::error::canonical::RefreshReason::Moved,
+            ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
         );
 
         core.commit_write(CommitWriteRequest {
@@ -2896,15 +2913,15 @@ mod tests {
         })
         .await
         .expect("commit write");
-        assert_need_refresh(
+        assert_refresh_metadata(
             core.sync_committed_block(sync_committed_block_request(BLOCK_STAMP + 1, BLOCK_SIZE))
                 .await,
-            common::error::canonical::RefreshReason::BlockStampMismatch,
+            ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
         );
-        assert_need_refresh(
+        assert_refresh_metadata(
             core.sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE - 1))
                 .await,
-            common::error::canonical::RefreshReason::StaleState,
+            ErrorKind::Metadata(MetadataErrorKind::StaleState),
         );
     }
 
@@ -2915,16 +2932,16 @@ mod tests {
 
         let mut block_size_mismatch = sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE);
         block_size_mismatch.block_size = BLOCK_SIZE * 2;
-        assert_need_refresh(
+        assert_refresh_metadata(
             core.sync_committed_block(block_size_mismatch).await,
-            common::error::canonical::RefreshReason::StaleState,
+            ErrorKind::Metadata(MetadataErrorKind::StaleState),
         );
 
         let mut chunk_size_mismatch = sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE);
         chunk_size_mismatch.chunk_size = CHUNK_SIZE * 2;
-        assert_need_refresh(
+        assert_refresh_metadata(
             core.sync_committed_block(chunk_size_mismatch).await,
-            common::error::canonical::RefreshReason::StaleState,
+            ErrorKind::Metadata(MetadataErrorKind::StaleState),
         );
     }
 
@@ -3014,9 +3031,9 @@ mod tests {
         assert!(core.stream_manager().get(open.stream_id).await.is_none());
         assert!(!store.paths(&group_name(), block_id()).meta_path.exists());
         assert_not_found(store.read_at(&group_name(), block_id(), 0, 1));
-        assert_need_refresh(
+        assert_refresh_metadata(
             core.open_read(read_open_request_for(0, 1, BLOCK_STAMP, 512)).await,
-            RefreshReason::BlockLocationUnavailable,
+            ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
         );
         assert!(store.scan_group_blocks(&group_name()).expect("scan group").is_empty());
     }
@@ -3266,10 +3283,10 @@ mod tests {
         let (_temp, store, core) = core_with_store(512, 2048, 4096);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
 
-        assert_need_refresh(
+        assert_refresh_metadata(
             core.open_read(read_open_request_for(0, 1024, BLOCK_STAMP + 1, 512))
                 .await,
-            common::error::canonical::RefreshReason::BlockStampMismatch,
+            ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
         );
         assert_eq!(core.stream_manager().active_count().await, 0);
     }
@@ -3281,16 +3298,16 @@ mod tests {
 
         let mut block_size_mismatch = read_open_request_for(0, 1024, BLOCK_STAMP, 512);
         block_size_mismatch.block_size = BLOCK_SIZE * 2;
-        assert_need_refresh(
+        assert_refresh_metadata(
             core.open_read(block_size_mismatch).await,
-            common::error::canonical::RefreshReason::StaleState,
+            ErrorKind::Metadata(MetadataErrorKind::StaleState),
         );
 
         let mut chunk_size_mismatch = read_open_request_for(0, 1024, BLOCK_STAMP, 512);
         chunk_size_mismatch.chunk_size = CHUNK_SIZE * 2;
-        assert_need_refresh(
+        assert_refresh_metadata(
             core.open_read(chunk_size_mismatch).await,
-            common::error::canonical::RefreshReason::StaleState,
+            ErrorKind::Metadata(MetadataErrorKind::StaleState),
         );
         assert_eq!(core.stream_manager().active_count().await, 0);
     }
@@ -3308,9 +3325,9 @@ mod tests {
     async fn open_read_rejects_missing_block() {
         let (_temp, _store, core) = core_with_store(512, 2048, 4096);
 
-        assert_need_refresh(
+        assert_refresh_metadata(
             core.open_read(read_open_request_for(0, 1024, BLOCK_STAMP, 512)).await,
-            common::error::canonical::RefreshReason::BlockLocationUnavailable,
+            ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
         );
         assert_eq!(core.stream_manager().active_count().await, 0);
     }
@@ -3530,7 +3547,7 @@ mod tests {
             .into_inner();
         let error = response.header.expect("header").error.expect("header error");
 
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
+        assert_header_refresh_metadata(&error, ErrorKind::Metadata(MetadataErrorKind::StaleState));
         assert!(error.message.contains("not registered"));
         assert!(response.stream_id.is_none());
     }
@@ -3567,11 +3584,7 @@ mod tests {
             .into_inner();
         let error = response.header.expect("header").error.expect("header error");
 
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-        assert_eq!(
-            error.refresh_reason,
-            RefreshReasonProto::RefreshReasonWorkerRunMismatch as i32
-        );
+        assert_header_refresh_metadata(&error, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
         assert!(response.stream_id.is_none());
     }
 
@@ -3883,7 +3896,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_read_stream_returns_need_refresh_on_stale_stamp() {
+    async fn open_read_stream_returns_refresh_metadata_on_stale_stamp() {
         let (_temp, store, core) = core_with_store(512, 2048, 4096);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
         let service = registered_data_service(Arc::new(core));
@@ -3899,11 +3912,7 @@ mod tests {
             .error
             .expect("stale stamp should return structured error");
 
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-        assert_eq!(
-            error.refresh_reason,
-            RefreshReasonProto::RefreshReasonBlockStampMismatch as i32
-        );
+        assert_header_refresh_metadata(&error, ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch));
         assert!(response.stream_id.is_none());
     }
 
@@ -3923,11 +3932,7 @@ mod tests {
             .error
             .expect("missing block should return structured error");
 
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-        assert_eq!(
-            error.refresh_reason,
-            RefreshReasonProto::RefreshReasonBlockLocationUnavailable as i32
-        );
+        assert_header_refresh_metadata(&error, ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable));
         assert!(response.stream_id.is_none());
     }
 
@@ -3948,7 +3953,7 @@ mod tests {
             .error
             .expect("zero stamp should return structured error");
 
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
+        assert_header_fail(&error, ErrorKind::Fs(FsErrorCode::EInval));
         assert!(error.message.contains("block_stamp"));
         assert!(response.stream_id.is_none());
     }

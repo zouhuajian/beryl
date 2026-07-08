@@ -16,7 +16,7 @@ use crate::cache::CacheInvalidationReason;
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
-use crate::runtime::{ErrorClass, ErrorClassifier, RefreshReason};
+use crate::runtime::{ErrorClass, ErrorClassifier, MetadataRefreshCause};
 
 const WORKER_ENDPOINT_COOLDOWN_CACHE_LIMIT: usize = 1_024;
 
@@ -260,7 +260,9 @@ fn evict_worker_cooldown_if_needed(cooldowns: &mut HashMap<WorkerChannelKey, Ins
 
 fn worker_run_mismatch_invalidation_reason(err: &ClientError) -> Option<CacheInvalidationReason> {
     match ErrorClassifier.classify_error(err) {
-        ErrorClass::NeedRefresh(RefreshReason::WorkerRunMismatch) => Some(CacheInvalidationReason::WorkerRun),
+        ErrorClass::RefreshMetadata(MetadataRefreshCause::WorkerRunMismatch) => {
+            Some(CacheInvalidationReason::WorkerRun)
+        }
         _ => None,
     }
 }
@@ -269,9 +271,8 @@ fn worker_run_mismatch_invalidation_reason(err: &ClientError) -> Option<CacheInv
 mod tests {
     use super::*;
 
-    use common::error::canonical::CanonicalError;
-    use common::header::RpcErrorCode;
-    use proto::convert::canonical_to_error_detail;
+    use common::error::rpc::{ErrorKind, RefreshHint as RpcRefreshHint, RpcErrorDetail, WorkerErrorKind};
+    use proto::convert::rpc_error_to_proto;
     use std::sync::Mutex;
     use types::{ClientId, WorkerEndpointInfo, WorkerId};
 
@@ -376,9 +377,9 @@ mod tests {
             &attempt,
             Some(&data_header_with_error(
                 &attempt,
-                CanonicalError::need_refresh(
-                    RpcErrorCode::WorkerRunMismatch,
-                    common::error::canonical::RefreshReason::WorkerRunMismatch,
+                RpcErrorDetail::refresh_metadata(
+                    ErrorKind::Worker(WorkerErrorKind::RunMismatch),
+                    RpcRefreshHint::default(),
                     "worker run mismatch",
                 ),
             )),
@@ -501,11 +502,11 @@ mod tests {
 
     fn data_header_with_error(
         attempt: &AttemptContext,
-        canonical: CanonicalError,
+        rpc_error: RpcErrorDetail,
     ) -> proto::worker::DataResponseHeaderProto {
         proto::worker::DataResponseHeaderProto {
             client: Some(attempt.client_info()),
-            error: Some(canonical_to_error_detail(&canonical)),
+            error: Some(rpc_error_to_proto(&rpc_error)),
         }
     }
 
@@ -551,7 +552,7 @@ mod tests {
             labels.operation_kind,
             labels.operation_name.as_deref(),
             labels.error_class,
-            labels.refresh_reason,
+            labels.metadata_refresh_cause,
             labels.target_plane,
             labels.cache,
             labels.reason,

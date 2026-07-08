@@ -7,10 +7,10 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::error::canonical::{CanonicalError, ErrorClass};
+use common::error::rpc::{RecoveryAction, RpcErrorDetail};
 use common::header::RequestHeader;
 use proto::common::{EndpointProto, RequestHeaderProto, WorkerNetProtocolProto};
-use proto::convert::{error_detail_to_canonical, require_worker_run_id};
+use proto::convert::{require_worker_run_id, rpc_error_from_proto};
 use proto::metadata::metadata_worker_service_proto_client::MetadataWorkerServiceProtoClient;
 use proto::metadata::{RegisterWorkerRequestProto, RegisterWorkerResponseProto};
 use thiserror::Error;
@@ -252,19 +252,17 @@ fn classify_header(header: Option<proto::common::ResponseHeaderProto>) -> Result
     let Some(error) = header.error.as_ref() else {
         return Ok(());
     };
-    classify_canonical_error(error_detail_to_canonical(error))
+    classify_rpc_error(rpc_error_from_proto(error))
 }
 
-fn classify_canonical_error(error: CanonicalError) -> Result<(), RegistrationError> {
-    match error.class {
-        ErrorClass::Ok => Err(RegistrationError::Fatal(
-            "metadata register response contained malformed OK error detail".to_string(),
-        )),
-        ErrorClass::Retryable | ErrorClass::NeedRefresh => Err(RegistrationError::Retryable(error.message)),
-        ErrorClass::Fatal => Err(RegistrationError::Fatal(format!(
-            "fatal metadata registration error: {}",
-            error.message
-        ))),
+fn classify_rpc_error(error: RpcErrorDetail) -> Result<(), RegistrationError> {
+    match error.recovery {
+        RecoveryAction::Retry { .. } | RecoveryAction::RefreshMetadata { .. } | RecoveryAction::RegisterWorker => {
+            Err(RegistrationError::Retryable(error.message))
+        }
+        RecoveryAction::Fail | RecoveryAction::ReopenWriteSession { .. } | RecoveryAction::SendFullBlockReport => Err(
+            RegistrationError::Fatal(format!("fatal metadata registration error: {}", error.message)),
+        ),
     }
 }
 

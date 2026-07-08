@@ -6,7 +6,6 @@
 use super::handle::{ReadHandle, WriteHandle};
 use super::options::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_REPLICATION};
 use super::*;
-use crate::canonical::{ClientAction, RefreshHint};
 use crate::config::{ClientConfig, MetadataGroupConfig};
 use crate::data::{
     WorkerBlockSyncResult, WorkerBlockWriteHandle, WorkerCommitResult, WorkerDataClient, WorkerDataPlane,
@@ -15,14 +14,14 @@ use crate::data::{
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::{AddBlockResult, MetadataGateway, ReadLayout};
 use crate::planner::PlannedBlockRead;
-use crate::runtime::{AttemptContext, ErrorClass, ErrorClassifier, MetadataTargets};
+use crate::rpc_error::{ClientAction, RefreshHint};
+use crate::runtime::{AttemptContext, ErrorClass, ErrorClassifier, MetadataRefreshCause, MetadataTargets};
 use crate::session::write_session::WriteSession;
 use async_trait::async_trait;
 use bytes::Bytes;
-use common::error::canonical::{
-    CanonicalError, ErrorCode as CanonicalErrorCode, RefreshHint as CanonicalRefreshHint, RefreshReason,
+use common::error::rpc::{
+    ErrorKind, MetadataErrorKind, RefreshHint as RpcRefreshHint, RpcErrorDetail, WorkerErrorKind,
 };
-use common::header::RpcErrorCode;
 use proto::common::{BlockIdProto, FencingTokenProto};
 use proto::metadata::{
     AbortFileWriteResponseProto, AppendFileResponseProto, CommitFileResponseProto, CreateDirectoryResponseProto,
@@ -418,13 +417,10 @@ async fn reader_rejects_worker_block_stamp_mismatch() {
         .expect_err("worker block_stamp mismatch must fail");
 
     match &err {
-        ClientError::Action(action) => match action.as_ref() {
-            ClientAction::Refresh { reason, canonical, .. } => {
-                assert_eq!(*reason, RefreshReason::BlockStampMismatch);
-                assert_eq!(
-                    canonical.code,
-                    Some(CanonicalErrorCode::RpcCode(RpcErrorCode::BlockStampMismatch))
-                );
+        ClientError::Action(action) => match action.action() {
+            ClientAction::Refresh { reason, rpc_error, .. } => {
+                assert_eq!(*reason, MetadataRefreshCause::BlockStampMismatch);
+                assert_eq!(rpc_error.kind, ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch));
             }
             other => panic!("expected refresh action, got {other:?}"),
         },
@@ -486,7 +482,7 @@ async fn reader_replans_after_worker_refresh() {
     )));
     let worker = Arc::new(MockDataClient::with_refresh_once(
         b"abcdefghijklmnop",
-        RefreshReason::WorkerRunMismatch,
+        MetadataRefreshCause::WorkerRunMismatch,
     ));
     let client = fs_client_with_data_plane(test_config("root"), gateway.clone(), data_plane(worker)).expect("client");
     let reader = read_reader(&client, 16);
@@ -1643,7 +1639,7 @@ impl MetadataGateway for MockGateway {
                 expires_at_ms: u64::MAX / 2,
                 ..RenewLeaseResponseProto::default()
             }),
-            RenewOutcome::SessionExpired => Err(session_error(RefreshReason::SessionExpired)),
+            RenewOutcome::SessionExpired => Err(session_error(ErrorKind::Metadata(MetadataErrorKind::SessionExpired))),
             RenewOutcome::ZeroExpiry => Ok(RenewLeaseResponseProto {
                 expires_at_ms: 0,
                 ..RenewLeaseResponseProto::default()
@@ -1701,7 +1697,7 @@ enum WorkerWriteOutcome {
 #[derive(Debug)]
 struct MockDataClient {
     file: Bytes,
-    refresh_once: Mutex<Option<RefreshReason>>,
+    refresh_once: Mutex<Option<MetadataRefreshCause>>,
     calls: Mutex<usize>,
     written: Mutex<Vec<u8>>,
     written_lens: Mutex<Vec<u64>>,
@@ -1743,7 +1739,7 @@ impl MockDataClient {
         }
     }
 
-    fn with_refresh_once(file: &'static [u8], reason: RefreshReason) -> Self {
+    fn with_refresh_once(file: &'static [u8], reason: MetadataRefreshCause) -> Self {
         Self {
             refresh_once: Mutex::new(Some(reason)),
             ..Self::from_file(file)
@@ -2062,17 +2058,16 @@ fn location(data_handle_id: u64, block_index: u32, file_offset: u64, len: u64) -
     }
 }
 
-fn refresh_action_error(reason: RefreshReason) -> ClientError {
-    let code = match reason {
-        RefreshReason::WorkerRunMismatch => RpcErrorCode::WorkerRunMismatch,
-        other => panic!("unsupported test refresh reason {other:?}"),
+fn refresh_action_error(reason: MetadataRefreshCause) -> ClientError {
+    let kind = match reason {
+        MetadataRefreshCause::WorkerRunMismatch => ErrorKind::Worker(WorkerErrorKind::RunMismatch),
+        other => panic!("unsupported test metadata refresh cause {other:?}"),
     };
-    let canonical = CanonicalError::need_refresh_with_hint(
-        code,
-        reason,
-        CanonicalRefreshHint {
+    let rpc_error = RpcErrorDetail::refresh_metadata(
+        kind,
+        RpcRefreshHint {
             worker_resolve_required: true,
-            ..CanonicalRefreshHint::default()
+            ..RpcRefreshHint::default()
         },
         "worker requested refresh",
     );
@@ -2082,15 +2077,15 @@ fn refresh_action_error(reason: RefreshReason) -> ClientError {
             worker_resolve_required: true,
             ..RefreshHint::default()
         }),
-        canonical: Box::new(canonical),
+        rpc_error: Box::new(rpc_error),
     })
 }
 
-fn session_error(reason: RefreshReason) -> ClientError {
-    let canonical = CanonicalError::need_refresh(RpcErrorCode::Application, reason, "write session expired");
+fn session_error(kind: ErrorKind) -> ClientError {
+    let rpc_error = RpcErrorDetail::reopen_write_session(kind, RpcRefreshHint::default(), "write session expired");
     ClientError::from(ClientAction::Refresh {
-        reason,
+        reason: MetadataRefreshCause::Unknown,
         hint: Box::default(),
-        canonical: Box::new(canonical),
+        rpc_error: Box::new(rpc_error),
     })
 }

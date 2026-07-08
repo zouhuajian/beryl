@@ -4,11 +4,9 @@
 //! Core wire/context utilities shared by service adapters and FsCore.
 
 use super::domain::{CoreFailure, CoreSuccess, PresentedFencingToken, RequestContext};
-use crate::error::{to_canonical_fs, MetadataError};
-use common::error::canonical::{
-    CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshHint, RefreshReason,
-};
-use common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
+use crate::error::{to_fs_error_detail, MetadataError};
+use common::error::rpc::{ErrorKind, ProtocolErrorKind, RefreshHint, RpcErrorDetail};
+use common::header::{RequestHeader, ResponseHeader};
 use tracing::Span;
 use types::fs::FsErrorCode;
 use types::ids::{BlockId, LeaseId, WorkerId};
@@ -19,12 +17,12 @@ use types::{FileBlockLocation, GroupName, GroupStateWatermark, WorkerEndpointInf
 #[allow(clippy::result_large_err)]
 pub fn request_context_from_proto(
     req_header: &Option<proto::common::RequestHeaderProto>,
-) -> Result<RequestContext, CanonicalError> {
+) -> Result<RequestContext, RpcErrorDetail> {
     let proto_header = req_header
         .clone()
-        .ok_or_else(|| invalid_header_canonical_error("external request requires RequestHeader"))?;
+        .ok_or_else(|| invalid_header_rpc_error("external request requires RequestHeader"))?;
     let caller = RequestHeader::try_from(proto_header)
-        .map_err(|err| invalid_header_canonical_error(format!("invalid RequestHeader: {err}")))?;
+        .map_err(|err| invalid_header_rpc_error(format!("invalid RequestHeader: {err}")))?;
 
     Span::current().record("call_id", caller.client.call_id.to_string());
     Span::current().record("client_id", caller.client.client_id.to_string());
@@ -55,41 +53,16 @@ pub fn request_context_from_proto(
 #[allow(clippy::result_large_err)]
 pub fn extract_and_inject_context(
     req_header: &Option<proto::common::RequestHeaderProto>,
-) -> Result<RequestHeader, CanonicalError> {
+) -> Result<RequestHeader, RpcErrorDetail> {
     request_context_from_proto(req_header).map(|ctx| ctx.caller)
 }
 
-pub fn invalid_header_canonical_error(message: impl Into<String>) -> CanonicalError {
-    CanonicalError {
-        class: ErrorClass::Fatal,
-        code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::InvalidHeader)),
-        reason: None,
-        retry_after_ms: None,
-        message: message.into(),
-        refresh_hint: None,
-    }
+pub fn invalid_header_rpc_error(message: impl Into<String>) -> RpcErrorDetail {
+    RpcErrorDetail::fail(ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader), message)
 }
 
-fn error_detail_from_canonical(err: &CanonicalError) -> Option<proto::common::ErrorDetailProto> {
-    debug_assert!(
-        err.class != ErrorClass::Ok || (err.code.is_none() && err.reason.is_none() && err.retry_after_ms.is_none()),
-        "CanonicalError invariant violated: Ok must not carry code/reason/retry_after_ms"
-    );
-    debug_assert!(
-        err.class != ErrorClass::NeedRefresh || err.reason.is_some(),
-        "CanonicalError invariant violated: NeedRefresh must have reason"
-    );
-    if err.class == ErrorClass::Ok {
-        return None;
-    }
-
-    let mut wire_error = err.clone();
-    // FileSystemService deliberately does not expose generic Moved; structural
-    // encoding stays in proto::convert after this service-local policy choice.
-    if wire_error.reason == Some(RefreshReason::Moved) {
-        wire_error.reason = Some(RefreshReason::Unknown);
-    }
-    Some(proto::convert::canonical_to_error_detail(&wire_error))
+fn error_detail_from_rpc_error(err: &RpcErrorDetail) -> Option<proto::common::ErrorDetailProto> {
+    Some(proto::convert::rpc_error_to_proto(err))
 }
 
 fn build_base_response_header(
@@ -133,16 +106,16 @@ pub fn ok_header_from_context(
     build_base_response_header(ctx, group_name, mount_epoch, route_epoch, state)
 }
 
-pub fn header_from_canonical_error_with_context(
+pub fn header_from_rpc_error_with_context(
     ctx: &RequestContext,
     group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
     route_epoch: Option<u64>,
     state: Vec<GroupStateWatermark>,
-    err: &CanonicalError,
+    err: &RpcErrorDetail,
 ) -> proto::common::ResponseHeaderProto {
     let mut header = build_base_response_header(ctx, group_name, mount_epoch, route_epoch, state);
-    header.error = error_detail_from_canonical(err);
+    header.error = error_detail_from_rpc_error(err);
     header
 }
 
@@ -160,7 +133,7 @@ pub fn ok_header_from_core_success<T>(
 }
 
 pub fn header_from_core_failure(ctx: &RequestContext, failure: &CoreFailure) -> proto::common::ResponseHeaderProto {
-    header_from_canonical_error_with_context(
+    header_from_rpc_error_with_context(
         ctx,
         failure.group_name.clone(),
         failure.mount_epoch,
@@ -177,12 +150,12 @@ pub(crate) fn core_failure_from_metadata_error(
     mount_epoch: Option<u64>,
     route_epoch: Option<u64>,
 ) -> CoreFailure {
-    core_failure_from_canonical_error(ctx, to_canonical_fs(err), group_name, mount_epoch, route_epoch)
+    core_failure_from_rpc_error(ctx, to_fs_error_detail(err), group_name, mount_epoch, route_epoch)
 }
 
-fn core_failure_from_canonical_error(
+fn core_failure_from_rpc_error(
     _ctx: &RequestContext,
-    err: CanonicalError,
+    err: RpcErrorDetail,
     group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
     route_epoch: Option<u64>,
@@ -190,23 +163,19 @@ fn core_failure_from_canonical_error(
     CoreFailure::new(err, group_name, mount_epoch, route_epoch, Vec::new())
 }
 
-// Refresh failures must keep caller and server hint fields explicit.
+// Refresh-metadata failures must keep caller and server hint fields explicit.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn need_refresh_core_failure(
+pub(crate) fn refresh_metadata_core_failure(
     ctx: &RequestContext,
-    rpc_code: RpcErrorCode,
-    reason: RefreshReason,
+    kind: ErrorKind,
     message: impl Into<String>,
     group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
     route_epoch: Option<u64>,
     hint: Option<RefreshHint>,
 ) -> CoreFailure {
-    let err = match hint {
-        Some(hint) => CanonicalError::need_refresh_with_hint(rpc_code, reason, hint, message),
-        None => CanonicalError::need_refresh(rpc_code, reason, message),
-    };
-    core_failure_from_canonical_error(ctx, err, group_name, mount_epoch, route_epoch)
+    let err = RpcErrorDetail::refresh_metadata(kind, hint.unwrap_or_default(), message);
+    core_failure_from_rpc_error(ctx, err, group_name, mount_epoch, route_epoch)
 }
 
 pub(crate) fn fatal_fs_core_failure(
@@ -216,13 +185,7 @@ pub(crate) fn fatal_fs_core_failure(
     group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
 ) -> CoreFailure {
-    core_failure_from_canonical_error(
-        ctx,
-        CanonicalError::fatal_fs(errno, message),
-        group_name,
-        mount_epoch,
-        None,
-    )
+    core_failure_from_rpc_error(ctx, RpcErrorDetail::fs(errno, message), group_name, mount_epoch, None)
 }
 
 pub fn ok_header_from_request(
@@ -246,15 +209,15 @@ pub fn ok_header_from_request(
     header
 }
 
-pub fn header_from_canonical_error(
+pub fn header_from_rpc_error(
     req_header: &Option<proto::common::RequestHeaderProto>,
     group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
-    err: &CanonicalError,
+    err: &RpcErrorDetail,
 ) -> proto::common::ResponseHeaderProto {
     let mut header: proto::common::ResponseHeaderProto = client_from_request_header(req_header)
         .map(|client| {
-            let mut header = ResponseHeader::from_canonical(client, err.clone());
+            let mut header = ResponseHeader::from_rpc_error(client, err.clone());
             if let Some(group_name) = group_name.clone() {
                 header = header.with_group_name(group_name);
             }
@@ -265,7 +228,7 @@ pub fn header_from_canonical_error(
         header.group_name = group_name.to_string();
     }
     header.mount_epoch = mount_epoch;
-    header.error = error_detail_from_canonical(err);
+    header.error = error_detail_from_rpc_error(err);
     header
 }
 
@@ -320,14 +283,13 @@ pub fn fatal_fs_header(
     group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
 ) -> proto::common::ResponseHeaderProto {
-    let err = CanonicalError::fatal_fs(errno, message);
-    header_from_canonical_error(req_header, group_name, mount_epoch, &err)
+    let err = RpcErrorDetail::fs(errno, message);
+    header_from_rpc_error(req_header, group_name, mount_epoch, &err)
 }
 
-pub fn need_refresh_header(
+pub fn refresh_metadata_header(
     req_header: &Option<proto::common::RequestHeaderProto>,
-    rpc_code: RpcErrorCode,
-    reason: common::error::canonical::RefreshReason,
+    kind: ErrorKind,
     message: impl Into<String>,
     group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
@@ -337,30 +299,30 @@ pub fn need_refresh_header(
         mount_epoch,
         ..Default::default()
     };
-    let err = CanonicalError::need_refresh_with_hint(rpc_code, reason, hint, message);
-    header_from_canonical_error(req_header, group_name, mount_epoch, &err)
+    let err = RpcErrorDetail::refresh_metadata(kind, hint, message);
+    header_from_rpc_error(req_header, group_name, mount_epoch, &err)
 }
 
 pub fn retryable_header(
     req_header: &Option<proto::common::RequestHeaderProto>,
-    rpc_code: RpcErrorCode,
+    kind: ErrorKind,
     retry_after_ms: Option<u64>,
     message: impl Into<String>,
     group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
 ) -> proto::common::ResponseHeaderProto {
-    let err = CanonicalError::retryable(rpc_code, retry_after_ms, message);
-    header_from_canonical_error(req_header, group_name, mount_epoch, &err)
+    let err = RpcErrorDetail::retry(kind, retry_after_ms, message);
+    header_from_rpc_error(req_header, group_name, mount_epoch, &err)
 }
 
-pub fn permission_denied_canonical_error(op: Option<&str>, detail: Option<&str>) -> CanonicalError {
+pub fn permission_denied_rpc_error(op: Option<&str>, detail: Option<&str>) -> RpcErrorDetail {
     let message = match (op, detail) {
         (Some(op), Some(detail)) => format!("permission denied: op={} target={}", op, detail),
         (Some(op), None) => format!("permission denied: op={}", op),
         (None, Some(detail)) => format!("permission denied: target={}", detail),
         (None, None) => "permission denied".to_string(),
     };
-    CanonicalError::fatal_fs(FsErrorCode::EAcces, message)
+    RpcErrorDetail::fs(FsErrorCode::EAcces, message)
 }
 
 pub fn lease_id_from_proto(lease_id: Option<proto::common::LeaseIdProto>) -> Option<LeaseId> {
@@ -408,17 +370,13 @@ pub fn location_to_proto(location: &FileBlockLocation) -> proto::metadata::FileB
 
 #[cfg(test)]
 mod tests {
-    use super::{header_from_canonical_error, request_context_from_proto};
-    use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshReason};
-    use common::header::{RequestHeader, RpcErrorCode};
-    use types::{ClientId, GroupName};
+    use super::request_context_from_proto;
+    use common::error::rpc::{ErrorKind, ProtocolErrorKind, RecoveryAction, RpcErrorDetail};
+    use types::ClientId;
 
-    fn assert_invalid_header_error(error: &CanonicalError, expected_message: &str) {
-        assert_eq!(error.class, ErrorClass::Fatal);
-        assert_eq!(
-            error.code,
-            Some(CanonicalErrorCode::RpcCode(RpcErrorCode::InvalidHeader))
-        );
+    fn assert_invalid_header_error(error: &RpcErrorDetail, expected_message: &str) {
+        assert_eq!(error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
+        assert_eq!(error.recovery, RecoveryAction::Fail);
         assert!(
             error.message.contains(expected_message),
             "message {:?} did not contain {:?}",
@@ -434,29 +392,6 @@ mod tests {
             client,
             ..Default::default()
         })
-    }
-
-    #[test]
-    fn filesystem_header_builder_does_not_emit_moved_reason() {
-        let req_header: proto::common::RequestHeaderProto = (&RequestHeader::new(ClientId::new(1))).into();
-        let req_header = Some(req_header);
-        let canonical = CanonicalError::need_refresh(
-            RpcErrorCode::ShardMoved,
-            RefreshReason::Moved,
-            "moved should be de-scoped",
-        );
-
-        let header = header_from_canonical_error(
-            &req_header,
-            Some(GroupName::parse("root").unwrap()),
-            Some(7),
-            &canonical,
-        );
-        let error = header.error.expect("expected canonical error header");
-        assert_eq!(
-            error.refresh_reason,
-            proto::common::RefreshReasonProto::RefreshReasonUnknown as i32
-        );
     }
 
     #[test]

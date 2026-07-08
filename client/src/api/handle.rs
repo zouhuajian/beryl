@@ -17,7 +17,8 @@ use crate::metrics::ClientMetric;
 use crate::planner;
 use crate::runtime::{
     is_unknown_session_barrier_outcome, mark_session_after_metadata_error, metric_labels, refresh_hint_from_error,
-    ClientRuntime, ErrorClass, ErrorClassifier, OperationContext, OperationIdentity, OperationKind, RefreshReason,
+    ClientRuntime, ErrorClass, ErrorClassifier, MetadataRefreshCause, OperationContext, OperationIdentity,
+    OperationKind,
 };
 use crate::session::write_session::{WorkerCommitLevel, WriteSession};
 
@@ -94,13 +95,13 @@ impl FileReader {
                     self.runtime
                         .record_error_metric("Read", OperationKind::WorkerReadData, &class);
                     match class.clone() {
-                        ErrorClass::NeedRefresh(RefreshReason::Unknown) => return Err(err),
-                        ErrorClass::NeedRefresh(reason) if should_replan_after_worker_error(&err) => {
+                        ErrorClass::RefreshMetadata(MetadataRefreshCause::Unknown) => return Err(err),
+                        ErrorClass::RefreshMetadata(reason) if should_replan_after_worker_error(&err) => {
                             if refresh_budget.saturating_sub(refresh_used) == 0 {
                                 self.runtime.record_metric(
                                     ClientMetric::RefreshExhausted,
                                     metric_labels("Read", OperationKind::WorkerReadData)
-                                        .with_refresh_reason(reason.label()),
+                                        .with_metadata_refresh_cause(reason.label()),
                                 );
                                 return Err(err);
                             }
@@ -127,7 +128,7 @@ impl FileReader {
                             refresh_used += 1;
                             attempt = attempt.saturating_add(1);
                         }
-                        ErrorClass::NeedRefresh(_) => return Err(err),
+                        ErrorClass::RefreshMetadata(_) => return Err(err),
                         ErrorClass::RetryableTransport => {
                             if retry_budget.saturating_sub(retry_used) == 0 {
                                 self.runtime.record_metric(
@@ -211,8 +212,10 @@ impl fmt::Debug for FileReader {
 fn should_replan_after_worker_error(err: &ClientError) -> bool {
     matches!(
         ErrorClassifier.classify_error(err),
-        ErrorClass::NeedRefresh(
-            RefreshReason::RouteEpochMismatch | RefreshReason::WorkerRunMismatch | RefreshReason::BlockStampMismatch
+        ErrorClass::RefreshMetadata(
+            MetadataRefreshCause::RouteEpochMismatch
+                | MetadataRefreshCause::WorkerRunMismatch
+                | MetadataRefreshCause::BlockStampMismatch
         )
     )
 }

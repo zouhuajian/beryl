@@ -7,16 +7,16 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::canonical::{ClientAction, RefreshHint};
 use crate::config::ClientConfig;
 use crate::data::{WorkerBlockSyncResult, WorkerCommitResult, WorkerDataPlane};
 use crate::error::side_effect_response_body_mismatch;
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::MetadataGateway;
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
+use crate::rpc_error::{ClientAction, RefreshHint};
 use crate::runtime::{
-    AttemptContext, BackoffPolicy, BackoffSleeper, ClientIdentity, ErrorClass, ErrorClassifier, MetadataTargets,
-    OperationContext, OperationExecutor, OperationIdentity, OperationKind, RefreshReason,
+    AttemptContext, BackoffPolicy, BackoffSleeper, ClientIdentity, ErrorClass, ErrorClassifier, MetadataRefreshCause,
+    MetadataTargets, OperationContext, OperationExecutor, OperationIdentity, OperationKind,
 };
 use crate::session::write_session::{PendingBlock, WorkerCommitLevel, WriteSession};
 use bytes::Bytes;
@@ -332,19 +332,19 @@ impl ClientRuntime {
         self.sleeper.sleep(self.backoff.delay_for_retry(retry_index)).await;
     }
 
-    /// Records refresh decision and refresh reason metrics with a shared label shape.
+    /// Records refresh decision and metadata refresh cause metrics with a shared label shape.
     pub(crate) fn record_refresh_metric(
         &self,
         operation: &'static str,
         kind: OperationKind,
-        reason: RefreshReason,
+        reason: MetadataRefreshCause,
         outcome: &'static str,
     ) {
         let labels = metric_labels(operation, kind)
-            .with_refresh_reason(reason.label())
+            .with_metadata_refresh_cause(reason.label())
             .with_outcome(outcome);
         self.record_metric(ClientMetric::RefreshDecision, labels.clone());
-        self.record_metric(ClientMetric::RefreshReason, labels);
+        self.record_metric(ClientMetric::MetadataRefreshCause, labels);
     }
 
     /// Records error-class metrics for client-recognized protocol and session failures.
@@ -398,7 +398,7 @@ pub(crate) fn metric_labels(operation: &'static str, kind: OperationKind) -> Cli
 /// Extracts a structured refresh hint from action errors when one is available.
 pub(crate) fn refresh_hint_from_error(err: &ClientError) -> RefreshHint {
     match err {
-        ClientError::Action(action) => match action.as_ref() {
+        ClientError::Action(action) => match action.action() {
             ClientAction::Refresh { hint, .. } => hint.as_ref().clone(),
             _ => RefreshHint::default(),
         },
@@ -416,7 +416,9 @@ pub(crate) fn is_unknown_session_barrier_outcome(err: &ClientError) -> bool {
 pub(crate) fn mark_session_after_metadata_error(session: &mut WriteSession, err: &ClientError) {
     match ErrorClassifier.classify_error(err) {
         ErrorClass::SessionExpired => session.mark_session_expired(),
-        ErrorClass::Fencing | ErrorClass::SessionInvalid | ErrorClass::NeedRefresh(_) => session.mark_session_invalid(),
+        ErrorClass::Fencing | ErrorClass::SessionInvalid | ErrorClass::RefreshMetadata(_) => {
+            session.mark_session_invalid()
+        }
         _ => {}
     }
 }
@@ -539,15 +541,15 @@ fn is_session_or_fencing_error(err: &ClientError) -> bool {
     )
 }
 
-/// Returns true when a write-path refresh reason invalidates the current session.
+/// Returns true when a write-path metadata refresh cause invalidates the current session.
 fn is_write_refresh_error(err: &ClientError) -> bool {
     matches!(
         ErrorClassifier.classify_error(err),
-        ErrorClass::NeedRefresh(
-            RefreshReason::RouteEpochMismatch
-                | RefreshReason::WorkerRunMismatch
-                | RefreshReason::BlockStampMismatch
-                | RefreshReason::Unknown
+        ErrorClass::RefreshMetadata(
+            MetadataRefreshCause::RouteEpochMismatch
+                | MetadataRefreshCause::WorkerRunMismatch
+                | MetadataRefreshCause::BlockStampMismatch
+                | MetadataRefreshCause::Unknown
         )
     )
 }

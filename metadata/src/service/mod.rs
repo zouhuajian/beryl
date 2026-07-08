@@ -18,9 +18,9 @@ mod path_service;
 pub use self::auth::{validate_filesystem_permission_mode, PermissionBits};
 pub use core_util::{
     extract_and_inject_context, fatal_fs_header, fencing_to_proto, file_attrs_from_proto, file_attrs_to_proto,
-    file_layout_from_proto, header_from_canonical_error, header_from_core_failure, lease_id_from_proto,
-    lease_id_to_proto, location_to_proto, need_refresh_header, ok_header_from_core_success, ok_header_from_request,
-    permission_denied_canonical_error, presented_fencing_from_proto, request_context_from_proto, retryable_header,
+    file_layout_from_proto, header_from_core_failure, header_from_rpc_error, lease_id_from_proto, lease_id_to_proto,
+    location_to_proto, ok_header_from_core_success, ok_header_from_request, permission_denied_rpc_error,
+    presented_fencing_from_proto, refresh_metadata_header, request_context_from_proto, retryable_header,
     validate_active_write_layout, worker_endpoint_from_parts, write_target_to_proto,
 };
 pub(crate) use fs_core::FsCore;

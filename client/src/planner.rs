@@ -3,8 +3,7 @@
 
 //! Read planning from metadata block locations to worker block reads.
 
-use common::error::canonical::{CanonicalError, RefreshHint, RefreshReason};
-use common::header::RpcErrorCode;
+use common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind};
 
 use crate::error::{ClientError, ClientResult};
 use crate::metadata::ReadLayout;
@@ -208,22 +207,21 @@ fn file_version_from_response(value: Option<u64>, field: &str) -> ClientResult<u
 }
 
 pub(crate) fn block_location_unavailable_error(message: impl Into<String>) -> ClientError {
-    let canonical = CanonicalError::need_refresh_with_hint(
-        RpcErrorCode::BlockLocationUnavailable,
-        RefreshReason::BlockLocationUnavailable,
+    let rpc_error = RpcErrorDetail::refresh_metadata(
+        ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
         RefreshHint {
             worker_resolve_required: true,
             ..RefreshHint::default()
         },
         message,
     );
-    ClientError::from(crate::canonical::ClientAction::Refresh {
-        reason: RefreshReason::BlockLocationUnavailable,
-        hint: Box::new(crate::canonical::RefreshHint {
+    ClientError::from(crate::rpc_error::ClientAction::Refresh {
+        reason: crate::runtime::MetadataRefreshCause::Unknown,
+        hint: Box::new(crate::rpc_error::RefreshHint {
             worker_resolve_required: true,
-            ..crate::canonical::RefreshHint::default()
+            ..crate::rpc_error::RefreshHint::default()
         }),
-        canonical: Box::new(canonical),
+        rpc_error: Box::new(rpc_error),
     })
 }
 
@@ -387,18 +385,18 @@ mod tests {
 
     fn assert_block_location_unavailable(err: &ClientError) {
         match err {
-            ClientError::Action(action) => match action.as_ref() {
-                crate::canonical::ClientAction::Refresh { reason, canonical, .. } => {
+            ClientError::Action(action) => match action.action() {
+                crate::rpc_error::ClientAction::Refresh {
+                    reason,
+                    rpc_error,
+                    hint,
+                } => {
+                    assert_eq!(*reason, crate::runtime::MetadataRefreshCause::Unknown);
                     assert_eq!(
-                        *reason,
-                        common::error::canonical::RefreshReason::BlockLocationUnavailable
+                        rpc_error.kind,
+                        common::error::rpc::ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable)
                     );
-                    assert_eq!(
-                        canonical.code,
-                        Some(common::error::canonical::ErrorCode::RpcCode(
-                            common::header::RpcErrorCode::BlockLocationUnavailable
-                        ))
-                    );
+                    assert!(hint.worker_resolve_required);
                 }
                 other => panic!("expected block-location refresh error, got {other:?}"),
             },

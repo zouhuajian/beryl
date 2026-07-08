@@ -16,7 +16,7 @@ pub(crate) mod policy;
 pub(crate) mod refresh;
 
 pub(crate) use backoff::{BackoffPolicy, BackoffSleeper, TokioBackoffSleeper};
-pub(crate) use classify::{ErrorClass, ErrorClassifier, RefreshReason};
+pub(crate) use classify::{ErrorClass, ErrorClassifier, MetadataRefreshCause};
 pub(crate) use client_runtime::{
     is_unknown_session_barrier_outcome, mark_session_after_metadata_error, metric_labels, refresh_hint_from_error,
     ClientRuntime,

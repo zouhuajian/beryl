@@ -3,11 +3,13 @@
 
 //! Client error types and error code mapping.
 
-use crate::canonical::ClientAction;
-use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshReason};
-use common::header::RpcErrorCode;
-use common::CommonError;
+use crate::rpc_error::ClientAction;
+use common::error::rpc::{
+    ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail,
+};
+use common::{CommonError, CommonErrorCode};
 use thiserror::Error;
+use types::fs::FsErrorCode;
 
 /// Opaque structured action error derived from RPC header validation.
 #[derive(Clone)]
@@ -26,67 +28,61 @@ impl ClientActionError {
         *self.action
     }
 
-    /// Return the canonical error carried by this action, when one exists.
-    pub fn canonical(&self) -> Option<&CanonicalError> {
-        self.action.canonical()
+    pub(crate) fn action(&self) -> &ClientAction {
+        self.action.as_ref()
     }
 
-    /// Return the canonical error class, when this action carries a canonical error.
-    pub fn class(&self) -> Option<ErrorClass> {
-        self.canonical().map(|canonical| canonical.class)
+    /// Return the RPC error carried by this action, when one exists.
+    pub fn rpc_error(&self) -> Option<&RpcErrorDetail> {
+        self.action.rpc_error()
     }
 
-    /// Return the canonical error code, when this action carries one.
-    pub fn code(&self) -> Option<&CanonicalErrorCode> {
-        self.canonical().and_then(|canonical| canonical.code.as_ref())
+    /// Return the RPC error kind, when this action carries a RPC error.
+    pub fn kind(&self) -> Option<ErrorKind> {
+        self.rpc_error().map(|rpc_error| rpc_error.kind)
     }
 
-    /// Return the canonical refresh reason, when this action carries one.
-    pub fn reason(&self) -> Option<RefreshReason> {
-        self.canonical().and_then(|canonical| canonical.reason)
+    /// Return the rpc_error recovery action, when this action carries a RPC error.
+    pub fn recovery(&self) -> Option<&RecoveryAction> {
+        self.rpc_error().map(|rpc_error| &rpc_error.recovery)
     }
 
-    /// Return the canonical error message, when this action carries one.
+    /// Return the RPC error message, when this action carries one.
     pub fn message(&self) -> Option<&str> {
-        self.canonical().map(|canonical| canonical.message.as_str())
+        self.rpc_error().map(|rpc_error| rpc_error.message.as_str())
     }
 
     /// Return the retry-after delay in milliseconds, when this action carries one.
     pub fn retry_after_ms(&self) -> Option<u64> {
-        self.canonical().and_then(|canonical| canonical.retry_after_ms)
+        self.rpc_error().and_then(|rpc_error| match rpc_error.recovery {
+            RecoveryAction::Retry { after_ms } => after_ms,
+            _ => None,
+        })
     }
 
     /// Return whether the action is retryable under client retry policy.
     pub fn is_retryable(&self) -> bool {
         match self.action.as_ref() {
-            ClientAction::Refresh {
-                reason:
-                    RefreshReason::Fencing
-                    | RefreshReason::EpochMismatch
-                    | RefreshReason::SessionInvalid
-                    | RefreshReason::SessionExpired,
-                ..
-            } => false,
-            ClientAction::Retry { .. } | ClientAction::Refresh { .. } => true,
+            ClientAction::Refresh { rpc_error, .. } => matches!(
+                rpc_error.recovery,
+                RecoveryAction::RefreshMetadata { .. }
+                    | RecoveryAction::RegisterWorker
+                    | RecoveryAction::SendFullBlockReport
+            ),
+            ClientAction::Retry { .. } => true,
             ClientAction::TransportFail { status } => {
                 matches!(
                     status.code(),
                     tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::ResourceExhausted
                 )
             }
-            ClientAction::Fail { .. } | ClientAction::Ok => false,
+            ClientAction::Fail { .. } => false,
         }
     }
 
     /// Return whether the action requires refreshing client metadata state.
     pub fn is_refresh_required(&self) -> bool {
         matches!(self.action.as_ref(), ClientAction::Refresh { .. })
-    }
-}
-
-impl AsRef<ClientAction> for ClientActionError {
-    fn as_ref(&self) -> &ClientAction {
-        self.action.as_ref()
     }
 }
 
@@ -99,23 +95,23 @@ impl std::fmt::Debug for ClientActionError {
 impl std::fmt::Display for ClientActionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.action.as_ref() {
-            ClientAction::Refresh { reason, canonical, .. } => write!(
+            ClientAction::Refresh { reason, rpc_error, .. } => write!(
                 f,
-                "Client action error: class={:?}, code={:?}, reason={:?}, message={}",
-                canonical.class, canonical.code, reason, canonical.message
+                "Client action error: kind={:?}, recovery={:?}, reason={:?}, message={}",
+                rpc_error.kind, rpc_error.recovery, reason, rpc_error.message
             ),
             ClientAction::Retry {
                 retry_after_ms_hint,
-                canonical,
+                rpc_error,
             } => write!(
                 f,
-                "Client action error: class={:?}, code={:?}, retry_after_ms_hint={:?}, message={}",
-                canonical.class, canonical.code, retry_after_ms_hint, canonical.message
+                "Client action error: kind={:?}, recovery={:?}, retry_after_ms_hint={:?}, message={}",
+                rpc_error.kind, rpc_error.recovery, retry_after_ms_hint, rpc_error.message
             ),
-            ClientAction::Fail { canonical } => write!(
+            ClientAction::Fail { rpc_error } => write!(
                 f,
-                "Client action error: class={:?}, code={:?}, reason={:?}, message={}",
-                canonical.class, canonical.code, canonical.reason, canonical.message
+                "Client action error: kind={:?}, recovery={:?}, message={}",
+                rpc_error.kind, rpc_error.recovery, rpc_error.message
             ),
             ClientAction::TransportFail { status } => write!(
                 f,
@@ -123,7 +119,6 @@ impl std::fmt::Display for ClientActionError {
                 status.code(),
                 status.message()
             ),
-            ClientAction::Ok => f.write_str("Client action error: ok action"),
         }
     }
 }
@@ -225,7 +220,7 @@ pub enum ClientError {
     #[error("Not supported: {0}")]
     NotSupported(String),
 
-    /// Structured action error derived from canonical/header validation.
+    /// Structured action error derived from rpc header validation.
     #[error("{0}")]
     Action(ClientActionError),
 }
@@ -256,23 +251,21 @@ impl ClientError {
             ClientError::NotLeader(_) => true,
             ClientError::RouteEpochMismatch { .. } => true,
             ClientError::StaleMeta(_) => true,
-            ClientError::Action(action) => match action.as_ref() {
-                ClientAction::Refresh {
-                    reason:
-                        common::error::canonical::RefreshReason::Fencing
-                        | common::error::canonical::RefreshReason::EpochMismatch
-                        | common::error::canonical::RefreshReason::SessionInvalid
-                        | common::error::canonical::RefreshReason::SessionExpired,
-                    ..
-                } => false,
-                ClientAction::Retry { .. } | ClientAction::Refresh { .. } => true,
+            ClientError::Action(action) => match action.action() {
+                ClientAction::Refresh { rpc_error, .. } => matches!(
+                    rpc_error.recovery,
+                    RecoveryAction::RefreshMetadata { .. }
+                        | RecoveryAction::RegisterWorker
+                        | RecoveryAction::SendFullBlockReport
+                ),
+                ClientAction::Retry { .. } => true,
                 ClientAction::TransportFail { status } => {
                     matches!(
                         status.code(),
                         tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::ResourceExhausted
                     )
                 }
-                ClientAction::Fail { .. } | ClientAction::Ok => false,
+                ClientAction::Fail { .. } => false,
             },
             ClientError::VersionMismatch { .. } => false, // Cache invalidation, not retry
             ClientError::Cache(_) => false,
@@ -298,7 +291,7 @@ impl ClientError {
                 | ClientError::Moved(_)
         ) || matches!(
             self,
-            ClientError::Action(action) if matches!(action.as_ref(), ClientAction::Refresh { .. })
+            ClientError::Action(action) if matches!(action.action(), ClientAction::Refresh { .. })
         )
     }
 
@@ -320,95 +313,95 @@ impl From<tonic::Status> for ClientError {
     }
 }
 
-impl From<ClientError> for CanonicalError {
+impl From<ClientError> for RpcErrorDetail {
     fn from(err: ClientError) -> Self {
         match err {
             ClientError::NotLeader(leader_id) => {
                 let msg = format!("not leader: {:?}", leader_id);
-                CanonicalError::need_refresh(RpcErrorCode::NotLeader, RefreshReason::NotLeader, msg)
+                RpcErrorDetail::refresh_metadata(
+                    ErrorKind::Metadata(MetadataErrorKind::NotLeader),
+                    RefreshHint::default(),
+                    msg,
+                )
             }
-            ClientError::RouteEpochMismatch { expected, actual } => CanonicalError::need_refresh(
-                RpcErrorCode::ShardMoved,
-                RefreshReason::RouteEpochMismatch,
+            ClientError::RouteEpochMismatch { expected, actual } => RpcErrorDetail::refresh_metadata(
+                ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
+                RefreshHint::default(),
                 format!("route epoch mismatch: expected {}, got {}", expected, actual),
             ),
-            ClientError::StaleMeta(msg) => {
-                CanonicalError::need_refresh(RpcErrorCode::StaleState, RefreshReason::StaleState, msg)
-            }
-            ClientError::Moved(msg) => {
-                CanonicalError::need_refresh(RpcErrorCode::ShardMoved, RefreshReason::Moved, msg)
-            }
-            ClientError::VersionMismatch { expected, actual } => CanonicalError {
-                class: ErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                reason: None,
-                retry_after_ms: None,
-                message: format!("version mismatch: expected {}, got {}", expected, actual),
-                refresh_hint: None,
-            },
+            ClientError::StaleMeta(msg) => RpcErrorDetail::refresh_metadata(
+                ErrorKind::Metadata(MetadataErrorKind::StaleState),
+                RefreshHint::default(),
+                msg,
+            ),
+            ClientError::Moved(msg) => RpcErrorDetail::refresh_metadata(
+                ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
+                RefreshHint::default(),
+                msg,
+            ),
+            ClientError::VersionMismatch { expected, actual } => RpcErrorDetail::fail(
+                ErrorKind::Metadata(MetadataErrorKind::StaleState),
+                format!("version mismatch: expected {}, got {}", expected, actual),
+            ),
             ClientError::Action(action) => match action.into_action() {
-                ClientAction::Ok => CanonicalError::ok("ok"),
-                ClientAction::Refresh { canonical, .. }
-                | ClientAction::Retry { canonical, .. }
-                | ClientAction::Fail { canonical } => *canonical,
-                ClientAction::TransportFail { status } => CanonicalError {
-                    class: ErrorClass::Fatal,
-                    code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                    reason: None,
-                    retry_after_ms: None,
-                    message: format!("transport status {:?}: {}", status.code(), status.message()),
-                    refresh_hint: None,
-                },
+                ClientAction::Refresh { rpc_error, .. }
+                | ClientAction::Retry { rpc_error, .. }
+                | ClientAction::Fail { rpc_error } => *rpc_error,
+                ClientAction::TransportFail { status } => RpcErrorDetail::fail(
+                    ErrorKind::Internal(InternalErrorKind::NodeUnavailable),
+                    format!("transport status {:?}: {}", status.code(), status.message()),
+                ),
             },
-            ClientError::Common(common_err) => {
-                let is_retryable = common_err.is_retryable();
-                CanonicalError {
-                    class: if is_retryable {
-                        ErrorClass::Retryable
-                    } else {
-                        ErrorClass::Fatal
-                    },
-                    code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                    reason: None,
-                    retry_after_ms: if is_retryable { Some(1000) } else { None },
-                    message: common_err.to_string(),
-                    refresh_hint: None,
-                }
-            }
+            ClientError::Common(common_err) => rpc_error_from_common_error(common_err),
             ClientError::Metadata(msg) | ClientError::Worker(msg) | ClientError::Routing(msg) => {
-                CanonicalError::retryable(RpcErrorCode::Application, Some(1000), msg)
+                RpcErrorDetail::retry(ErrorKind::Internal(InternalErrorKind::NodeUnavailable), Some(1000), msg)
             }
-            ClientError::Cache(msg)
-            | ClientError::Config(msg)
-            | ClientError::InvalidArgument(msg)
-            | ClientError::InvalidLayout(msg)
-            | ClientError::UnknownOutcome(msg)
-            | ClientError::Unimplemented(msg)
-            | ClientError::Unsupported(msg)
-            | ClientError::NotSupported(msg) => CanonicalError {
-                class: ErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                reason: None,
-                retry_after_ms: None,
-                message: msg,
-                refresh_hint: None,
-            },
-            ClientError::InvalidResponse { operation, reason } => CanonicalError {
-                class: ErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                reason: None,
-                retry_after_ms: None,
-                message: format!("invalid response from {operation}: {reason}"),
-                refresh_hint: None,
-            },
-            ClientError::StaleHandle { reason } => CanonicalError {
-                class: ErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                reason: None,
-                retry_after_ms: None,
-                message: reason,
-                refresh_hint: None,
-            },
+            ClientError::InvalidArgument(msg) | ClientError::InvalidLayout(msg) => {
+                RpcErrorDetail::fail(ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument), msg)
+            }
+            ClientError::Unimplemented(msg) | ClientError::Unsupported(msg) | ClientError::NotSupported(msg) => {
+                RpcErrorDetail::fail(ErrorKind::Protocol(ProtocolErrorKind::Unsupported), msg)
+            }
+            ClientError::Cache(msg) | ClientError::Config(msg) | ClientError::UnknownOutcome(msg) => {
+                RpcErrorDetail::fail(ErrorKind::Internal(InternalErrorKind::Internal), msg)
+            }
+            ClientError::InvalidResponse { operation, reason } => RpcErrorDetail::fail(
+                ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader),
+                format!("invalid response from {operation}: {reason}"),
+            ),
+            ClientError::StaleHandle { reason } => {
+                RpcErrorDetail::fail(ErrorKind::Metadata(MetadataErrorKind::StaleState), reason)
+            }
+        }
+    }
+}
+
+fn rpc_error_from_common_error(err: CommonError) -> RpcErrorDetail {
+    match err.code {
+        CommonErrorCode::Timeout => RpcErrorDetail::retry(
+            ErrorKind::Internal(InternalErrorKind::Timeout),
+            Some(1000),
+            err.to_string(),
+        ),
+        CommonErrorCode::Unavailable => RpcErrorDetail::retry(
+            ErrorKind::Internal(InternalErrorKind::NodeUnavailable),
+            Some(1000),
+            err.to_string(),
+        ),
+        CommonErrorCode::Throttled | CommonErrorCode::Overloaded => RpcErrorDetail::retry(
+            ErrorKind::Internal(InternalErrorKind::ResourceExhausted),
+            Some(1000),
+            err.to_string(),
+        ),
+        CommonErrorCode::NotFound => {
+            RpcErrorDetail::fail(ErrorKind::Metadata(MetadataErrorKind::NotFound), err.to_string())
+        }
+        CommonErrorCode::PermissionDenied => RpcErrorDetail::fs(FsErrorCode::EAcces, err.to_string()),
+        CommonErrorCode::InvalidArgument => {
+            RpcErrorDetail::fail(ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument), err.to_string())
+        }
+        CommonErrorCode::Io | CommonErrorCode::Internal => {
+            RpcErrorDetail::fail(ErrorKind::Internal(InternalErrorKind::Internal), err.to_string())
         }
     }
 }
@@ -416,104 +409,98 @@ impl From<ClientError> for CanonicalError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::{ClientAction, RefreshHint};
+    use crate::rpc_error::{ClientAction, RefreshHint};
+    use crate::runtime::MetadataRefreshCause;
+    use common::error::rpc::RefreshHint as RpcRefreshHint;
 
     #[test]
-    fn action_error_exposes_canonical_diagnostics() {
-        let canonical = CanonicalError::need_refresh(
-            RpcErrorCode::ShardMoved,
-            RefreshReason::RouteEpochMismatch,
+    fn action_error_exposes_rpc_diagnostics() {
+        let rpc_error = RpcErrorDetail::refresh_metadata(
+            ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
+            RpcRefreshHint::default(),
             "route epoch is stale",
         );
         let err = ClientActionError::new(ClientAction::Refresh {
-            reason: RefreshReason::RouteEpochMismatch,
+            reason: MetadataRefreshCause::RouteEpochMismatch,
             hint: Box::new(RefreshHint::default()),
-            canonical: Box::new(canonical.clone()),
+            rpc_error: Box::new(rpc_error.clone()),
         });
 
-        assert_eq!(err.canonical().unwrap().message, canonical.message);
-        assert_eq!(err.class(), Some(ErrorClass::NeedRefresh));
-        assert_eq!(err.code(), canonical.code.as_ref());
-        assert_eq!(err.reason(), Some(RefreshReason::RouteEpochMismatch));
+        assert_eq!(err.rpc_error().unwrap().message, rpc_error.message);
+        assert_eq!(
+            err.kind(),
+            Some(ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch))
+        );
+        assert_eq!(err.recovery(), Some(&rpc_error.recovery));
         assert_eq!(err.message(), Some("route epoch is stale"));
         assert_eq!(err.retry_after_ms(), None);
         assert!(err.is_retryable());
         assert!(err.is_refresh_required());
 
         let displayed = ClientError::Action(err).to_string();
-        assert!(displayed.contains("NeedRefresh"));
-        assert!(displayed.contains("ShardMoved"));
+        assert!(displayed.contains("RefreshMetadata"));
         assert!(displayed.contains("RouteEpochMismatch"));
         assert!(displayed.contains("route epoch is stale"));
     }
 
     #[test]
     fn client_action_roundtrip_preserves_machine_semantics_without_message_classification() {
-        let refresh_canonical = CanonicalError::need_refresh(
-            RpcErrorCode::NotLeader,
-            RefreshReason::NotLeader,
+        let refresh_rpc_error = RpcErrorDetail::refresh_metadata(
+            ErrorKind::Metadata(MetadataErrorKind::NotLeader),
+            RpcRefreshHint::default(),
             "fatal transport text",
         );
         let refresh = ClientError::from(ClientAction::Refresh {
-            reason: RefreshReason::NotLeader,
+            reason: MetadataRefreshCause::NotLeader,
             hint: Box::new(RefreshHint::default()),
-            canonical: Box::new(refresh_canonical),
+            rpc_error: Box::new(refresh_rpc_error),
         });
         match refresh {
-            ClientError::Action(action) => match action.as_ref() {
-                ClientAction::Refresh { reason, canonical, .. } => {
-                    assert_eq!(*reason, RefreshReason::NotLeader);
-                    assert_eq!(canonical.class, ErrorClass::NeedRefresh);
-                    assert_eq!(canonical.reason, Some(RefreshReason::NotLeader));
+            ClientError::Action(action) => match action.action() {
+                ClientAction::Refresh { reason, rpc_error, .. } => {
+                    assert_eq!(*reason, MetadataRefreshCause::NotLeader);
+                    assert_eq!(rpc_error.kind, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
+                    assert!(matches!(rpc_error.recovery, RecoveryAction::RefreshMetadata { .. }));
                 }
                 other => panic!("expected refresh action, got {other:?}"),
             },
             other => panic!("expected action error, got {other:?}"),
         }
 
-        let retry_canonical = CanonicalError::retryable(RpcErrorCode::NodeUnavailable, Some(25), "please refresh");
+        let retry_rpc_error = RpcErrorDetail::retry(
+            ErrorKind::Internal(InternalErrorKind::NodeUnavailable),
+            Some(25),
+            "please refresh",
+        );
         let retry = ClientError::from(ClientAction::Retry {
             retry_after_ms_hint: Some(25),
-            canonical: Box::new(retry_canonical),
+            rpc_error: Box::new(retry_rpc_error),
         });
         match retry {
-            ClientError::Action(action) => match action.as_ref() {
+            ClientError::Action(action) => match action.action() {
                 ClientAction::Retry {
                     retry_after_ms_hint,
-                    canonical,
+                    rpc_error,
                 } => {
                     assert_eq!(*retry_after_ms_hint, Some(25));
-                    assert_eq!(canonical.class, ErrorClass::Retryable);
-                    assert_eq!(canonical.retry_after_ms, Some(25));
+                    assert_eq!(rpc_error.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
+                    assert_eq!(rpc_error.recovery, RecoveryAction::Retry { after_ms: Some(25) });
                 }
                 other => panic!("expected retry action, got {other:?}"),
             },
             other => panic!("expected action error, got {other:?}"),
         }
 
-        let fail_canonical = CanonicalError {
-            class: ErrorClass::Fatal,
-            code: Some(common::error::canonical::ErrorCode::RpcCode(
-                RpcErrorCode::InvalidArgument,
-            )),
-            reason: None,
-            retry_after_ms: None,
-            message: "retry later".to_string(),
-            refresh_hint: None,
-        };
+        let fail_rpc_error =
+            RpcErrorDetail::fail(ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument), "retry later");
         let fail = ClientError::from(ClientAction::Fail {
-            canonical: Box::new(fail_canonical),
+            rpc_error: Box::new(fail_rpc_error),
         });
         match fail {
-            ClientError::Action(action) => match action.as_ref() {
-                ClientAction::Fail { canonical } => {
-                    assert_eq!(canonical.class, ErrorClass::Fatal);
-                    assert_eq!(
-                        canonical.code,
-                        Some(common::error::canonical::ErrorCode::RpcCode(
-                            RpcErrorCode::InvalidArgument
-                        ))
-                    );
+            ClientError::Action(action) => match action.action() {
+                ClientAction::Fail { rpc_error } => {
+                    assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
+                    assert_eq!(rpc_error.recovery, RecoveryAction::Fail);
                 }
                 other => panic!("expected fail action, got {other:?}"),
             },
@@ -522,7 +509,7 @@ mod tests {
 
         let transport = ClientError::from(tonic::Status::unavailable("not leader"));
         match transport {
-            ClientError::Action(action) => match action.as_ref() {
+            ClientError::Action(action) => match action.action() {
                 ClientAction::TransportFail { status } => {
                     assert_eq!(status.code(), tonic::Code::Unavailable);
                     assert_eq!(status.message(), "not leader");

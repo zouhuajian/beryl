@@ -8,15 +8,15 @@ mod mutation;
 mod read;
 mod write_session;
 
-use super::core_util::{core_failure_from_metadata_error, fatal_fs_core_failure, need_refresh_core_failure};
+use super::core_util::{core_failure_from_metadata_error, fatal_fs_core_failure, refresh_metadata_core_failure};
 use super::domain::{CoreFailure, CoreResult, CoreSuccess, Freshness, PresentedFencingToken, RequestContext};
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::MountTable;
 use crate::observe;
 use crate::raft::{AppDataResponse, AppRaftNode, Command, DedupKey, FsCommandResult, RocksDBStorage};
 use crate::state::StateStore;
-use common::error::canonical::{RefreshHint, RefreshReason};
-use common::header::{RequestHeader, RpcErrorCode};
+use common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail};
+use common::header::RequestHeader;
 use proto::worker::CommitWriteRequestProto;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -211,11 +211,10 @@ impl FsCore {
 
     // Refresh failures must keep caller and server hint fields explicit.
     #[allow(clippy::too_many_arguments)]
-    fn need_refresh_failure_with_hint<T>(
+    fn refresh_metadata_failure_with_hint<T>(
         &self,
         ctx: &RequestContext,
-        rpc_code: RpcErrorCode,
-        reason: RefreshReason,
+        kind: ErrorKind,
         message: impl Into<String>,
         group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
@@ -232,10 +231,9 @@ impl FsCore {
             hint.get_or_insert_with(RefreshHint::default).route_epoch = Some(route_epoch_value);
         }
 
-        Err(need_refresh_core_failure(
+        Err(refresh_metadata_core_failure(
             ctx,
-            rpc_code,
-            reason,
+            kind,
             message,
             group_name.clone(),
             mount_epoch,
@@ -258,14 +256,19 @@ impl FsCore {
     fn session_terminal_failure<T>(
         &self,
         ctx: &RequestContext,
-        reason: RefreshReason,
-        rpc_code: RpcErrorCode,
+        kind: ErrorKind,
         message: impl Into<String>,
         group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
     ) -> CoreResult<T> {
         let group_name = group_name.or_else(|| ctx.caller.group_name.clone());
-        self.need_refresh_failure_with_hint(ctx, rpc_code, reason, message, group_name, mount_epoch, None, None)
+        Err(CoreFailure::new(
+            RpcErrorDetail::reopen_write_session(kind, RefreshHint::default(), message),
+            group_name,
+            mount_epoch,
+            None,
+            Vec::new(),
+        ))
     }
 
     fn replay_hint(intent: &str) -> String {

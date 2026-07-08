@@ -3,10 +3,9 @@
 
 //! Service-layer error contract guardrails.
 
-use common::error::canonical::{CanonicalError, RefreshReason};
-use common::header::RpcErrorCode;
-use metadata::service::header_from_canonical_error;
-use proto::common::{ErrorClassProto, RefreshReasonProto};
+use common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail};
+use metadata::service::header_from_rpc_error;
+use proto::convert::rpc_error_from_proto;
 use std::fs;
 use std::path::{Path, PathBuf};
 use types::GroupName;
@@ -24,9 +23,6 @@ const SERVER_IMPL_MARKERS: &[&str] = &[
     "impl WorkerDataService for",
 ];
 const FORBIDDEN_PATTERNS: &[&str] = &["Status::from_error", "return Err(Status", "Err(Status"];
-const FS_HANDLER_FILES: &[&str] = &["src/service/path_service.rs"];
-const FS_RPC_APPLICATION_ALLOWLIST: &[&str] = &[];
-const FORBIDDEN_FS_APPLICATION_PATTERN: &str = "RpcErrorCode::Application";
 
 fn collect_rs_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("failed to read {}: {}", dir.display(), e)) {
@@ -91,26 +87,6 @@ fn coverage_report(scanned_files: &[PathBuf]) -> String {
     )
 }
 
-fn fs_handler_application_report(findings: &[String]) -> String {
-    let allowlist = FS_RPC_APPLICATION_ALLOWLIST
-        .iter()
-        .map(|p| format!("  - {}", p))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let files = FS_HANDLER_FILES
-        .iter()
-        .map(|p| format!("  - {}", p))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "fs_handler_files:\n{}\napplication_allowlist ({}):\n{}\nfindings:\n{}",
-        files,
-        FS_RPC_APPLICATION_ALLOWLIST.len(),
-        allowlist,
-        findings.join("\n")
-    )
-}
-
 #[test]
 fn test_server_grpc_impl_scan_coverage() {
     let scanned_files = grpc_server_impl_files();
@@ -167,70 +143,34 @@ fn test_server_grpc_impls_have_no_status_business_error_shortcuts() {
     );
 }
 
-#[test]
-fn test_fs_handlers_do_not_emit_rpc_application() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut findings = Vec::new();
-
-    for rel in FS_HANDLER_FILES {
-        if FS_RPC_APPLICATION_ALLOWLIST.contains(rel) {
-            continue;
-        }
-        let path = manifest_dir.join(rel);
-        let content = fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
-        for (line_no, line) in content.lines().enumerate() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("//") {
-                continue;
-            }
-            if line.contains(FORBIDDEN_FS_APPLICATION_PATTERN) {
-                findings.push(format!(
-                    "{}:{} => {}",
-                    rel,
-                    line_no + 1,
-                    FORBIDDEN_FS_APPLICATION_PATTERN
-                ));
-            }
-        }
-    }
-
-    assert!(
-        findings.is_empty(),
-        "filesystem handlers must not emit RpcCode::Application; use errno mapping via to_canonical_fs()\n{}",
-        fs_handler_application_report(&findings)
-    );
-}
-
-mod canonical_header_invariant_tests {
+mod rpc_header_invariant_tests {
     use super::*;
 
     #[test]
-    fn ok_header_has_no_error() {
-        let ok = CanonicalError::ok("success");
-        let header = header_from_canonical_error(&None, Some(GroupName::parse("root").unwrap()), Some(7), &ok);
-
-        assert!(header.error.is_none(), "Ok must not carry header.error");
-    }
-
-    #[test]
-    fn need_refresh_header_must_include_specific_refresh_reason() {
-        let err = CanonicalError::need_refresh(
-            RpcErrorCode::MountEpochMismatch,
-            RefreshReason::MountEpochMismatch,
+    fn refresh_metadata_header_carries_kind_recovery_and_hint() {
+        let err = RpcErrorDetail::refresh_metadata(
+            ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
+            RefreshHint {
+                group_name: Some("root".to_string()),
+                mount_epoch: Some(7),
+                ..Default::default()
+            },
             "mount epoch mismatch",
         );
-        let header = header_from_canonical_error(&None, Some(GroupName::parse("root").unwrap()), Some(7), &err);
-        let detail = header.error.expect("NeedRefresh must carry header.error");
+        let header = header_from_rpc_error(&None, Some(GroupName::parse("root").unwrap()), Some(7), &err);
+        let detail = header.error.expect("refresh failure must carry header.error");
+        let rpc_error = rpc_error_from_proto(&detail);
 
-        assert_eq!(detail.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
         assert_eq!(
-            detail.refresh_reason,
-            RefreshReasonProto::RefreshReasonMountEpochMismatch as i32
+            rpc_error.kind,
+            ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch)
         );
-        assert_ne!(
-            detail.refresh_reason,
-            RefreshReasonProto::RefreshReasonUnknown as i32,
-            "NeedRefresh must include a specific refresh reason"
-        );
+        match rpc_error.recovery {
+            RecoveryAction::RefreshMetadata { hint } => {
+                assert_eq!(hint.group_name.as_deref(), Some("root"));
+                assert_eq!(hint.mount_epoch, Some(7));
+            }
+            other => panic!("expected RefreshMetadata recovery, got {other:?}"),
+        }
     }
 }

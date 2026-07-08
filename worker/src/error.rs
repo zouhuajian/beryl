@@ -6,8 +6,9 @@
 //! This module provides unified error handling for the worker, mapping internal errors
 //! to gRPC Status codes with retry information and details.
 
-use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshReason};
-use common::header::RpcErrorCode;
+use common::error::rpc::{
+    ErrorKind, InternalErrorKind, MetadataErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind,
+};
 use thiserror::Error;
 use tonic::Status;
 use types::fs::FsErrorCode;
@@ -56,12 +57,8 @@ pub enum WorkerError {
     Corrupt(String),
 
     /// Caller must refresh routing or block placement/state before retrying.
-    #[error("Need refresh ({reason:?}): {message}")]
-    NeedRefresh {
-        code: RpcErrorCode,
-        reason: RefreshReason,
-        message: String,
-    },
+    #[error("Refresh metadata ({kind:?}): {message}")]
+    RefreshMetadata { kind: ErrorKind, message: String },
 
     /// Fencing token is missing, malformed, or does not match the active writer.
     #[error("Fencing: {0}")]
@@ -112,7 +109,7 @@ impl WorkerError {
             | WorkerError::InvalidArgument(_)
             | WorkerError::NotFound(_)
             | WorkerError::Corrupt(_)
-            | WorkerError::NeedRefresh { .. }
+            | WorkerError::RefreshMetadata { .. }
             | WorkerError::Fencing(_)
             | WorkerError::PermissionDenied(_)
             | WorkerError::Unimplemented(_)
@@ -142,7 +139,7 @@ impl WorkerError {
             WorkerError::InvalidArgument(_) => tonic::Code::InvalidArgument,
             WorkerError::NotFound(_) => tonic::Code::NotFound,
             WorkerError::Corrupt(_) => tonic::Code::DataLoss,
-            WorkerError::NeedRefresh { .. } => tonic::Code::FailedPrecondition,
+            WorkerError::RefreshMetadata { .. } => tonic::Code::FailedPrecondition,
             WorkerError::Fencing(_) => tonic::Code::FailedPrecondition,
             WorkerError::PermissionDenied(_) => tonic::Code::PermissionDenied,
             WorkerError::Unimplemented(_) => tonic::Code::Unimplemented,
@@ -174,81 +171,65 @@ impl From<std::io::Error> for WorkerError {
     }
 }
 
-impl From<WorkerError> for CanonicalError {
+impl From<WorkerError> for RpcErrorDetail {
     fn from(err: WorkerError) -> Self {
         let metadata = err.metadata();
         match err {
-            WorkerError::LeaderChanged(msg) => {
-                CanonicalError::need_refresh(RpcErrorCode::NotLeader, RefreshReason::NotLeader, msg)
-            }
-            WorkerError::Timeout(msg) => {
-                CanonicalError::retryable(RpcErrorCode::Application, metadata.retry_after_ms, msg)
-            }
-            WorkerError::ResourceExhausted(msg) => {
-                CanonicalError::retryable(RpcErrorCode::Application, metadata.retry_after_ms, msg)
-            }
-            WorkerError::Unavailable(msg) => {
-                CanonicalError::retryable(RpcErrorCode::NodeUnavailable, metadata.retry_after_ms, msg)
-            }
-            WorkerError::ChunkConflict(msg) => CanonicalError {
-                class: ErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                reason: None,
-                retry_after_ms: None,
-                message: format!("chunk conflict: {}", msg),
-                refresh_hint: None,
-            },
-            WorkerError::DiskError(msg) => CanonicalError {
-                class: ErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                reason: None,
-                retry_after_ms: None,
-                message: format!("disk I/O error: {}", msg),
-                refresh_hint: None,
-            },
-            WorkerError::Cancelled(msg) => CanonicalError {
-                class: ErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                reason: None,
-                retry_after_ms: None,
-                message: format!("operation cancelled: {}", msg),
-                refresh_hint: None,
-            },
+            WorkerError::LeaderChanged(msg) => RpcErrorDetail::refresh_metadata(
+                ErrorKind::Metadata(MetadataErrorKind::NotLeader),
+                RefreshHint::default(),
+                msg,
+            ),
+            WorkerError::Timeout(msg) => RpcErrorDetail::retry(
+                ErrorKind::Worker(WorkerErrorKind::Timeout),
+                metadata.retry_after_ms,
+                msg,
+            ),
+            WorkerError::ResourceExhausted(msg) => RpcErrorDetail::retry(
+                ErrorKind::Worker(WorkerErrorKind::ResourceExhausted),
+                metadata.retry_after_ms,
+                msg,
+            ),
+            WorkerError::Unavailable(msg) => RpcErrorDetail::retry(
+                ErrorKind::Worker(WorkerErrorKind::NodeUnavailable),
+                metadata.retry_after_ms,
+                msg,
+            ),
+            WorkerError::ChunkConflict(msg) => RpcErrorDetail::fail(
+                ErrorKind::Worker(WorkerErrorKind::Conflict),
+                format!("chunk conflict: {}", msg),
+            ),
+            WorkerError::DiskError(msg) => RpcErrorDetail::fail(
+                ErrorKind::Worker(WorkerErrorKind::Io),
+                format!("disk I/O error: {}", msg),
+            ),
+            WorkerError::Cancelled(msg) => RpcErrorDetail::fail(
+                ErrorKind::Worker(WorkerErrorKind::Cancelled),
+                format!("operation cancelled: {}", msg),
+            ),
             WorkerError::InvalidArgument(msg) => {
-                CanonicalError::fatal_fs(FsErrorCode::EInval, format!("invalid argument: {}", msg))
+                RpcErrorDetail::fs(FsErrorCode::EInval, format!("invalid argument: {}", msg))
             }
-            WorkerError::NotFound(msg) => CanonicalError::fatal_fs(FsErrorCode::ENoEnt, format!("not found: {}", msg)),
-            WorkerError::Corrupt(msg) => CanonicalError {
-                class: ErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                reason: None,
-                retry_after_ms: None,
-                message: format!("corrupt: {}", msg),
-                refresh_hint: None,
-            },
-            WorkerError::NeedRefresh { code, reason, message } => CanonicalError::need_refresh(code, reason, message),
-            WorkerError::Fencing(msg) => CanonicalError {
-                class: ErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing)),
-                reason: None,
-                retry_after_ms: None,
-                message: format!("fencing: {}", msg),
-                refresh_hint: None,
-            },
+            WorkerError::NotFound(msg) => RpcErrorDetail::fs(FsErrorCode::ENoEnt, format!("not found: {}", msg)),
+            WorkerError::Corrupt(msg) => {
+                RpcErrorDetail::fail(ErrorKind::Worker(WorkerErrorKind::Corrupt), format!("corrupt: {}", msg))
+            }
+            WorkerError::RefreshMetadata { kind, message } => {
+                RpcErrorDetail::refresh_metadata(kind, RefreshHint::default(), message)
+            }
+            WorkerError::Fencing(msg) => {
+                RpcErrorDetail::fail(ErrorKind::Worker(WorkerErrorKind::Fencing), format!("fencing: {}", msg))
+            }
             WorkerError::PermissionDenied(msg) => {
-                CanonicalError::fatal_fs(FsErrorCode::EAcces, format!("permission denied: {}", msg))
+                RpcErrorDetail::fs(FsErrorCode::EAcces, format!("permission denied: {}", msg))
             }
             WorkerError::Unimplemented(msg) => {
-                CanonicalError::fatal_fs(FsErrorCode::ENotImpl, format!("unimplemented: {}", msg))
+                RpcErrorDetail::fs(FsErrorCode::ENotImpl, format!("unimplemented: {}", msg))
             }
-            WorkerError::Internal(msg) => CanonicalError {
-                class: ErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                reason: None,
-                retry_after_ms: None,
-                message: format!("internal error: {}", msg),
-                refresh_hint: None,
-            },
+            WorkerError::Internal(msg) => RpcErrorDetail::fail(
+                ErrorKind::Internal(InternalErrorKind::Internal),
+                format!("internal error: {}", msg),
+            ),
         }
     }
 }

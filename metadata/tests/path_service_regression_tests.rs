@@ -3,6 +3,9 @@
 
 //! Behavioral regression tests for path service guard/authz/error contracts.
 
+use common::error::rpc::{
+    ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail,
+};
 use common::header::RequestHeader;
 use metadata::config::RaftConfig;
 use metadata::mount::{DataIoPolicy, MountKind, MountTable, ROOT_INODE_ID};
@@ -16,9 +19,7 @@ use metadata::state::RouteEpoch;
 use metadata::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerManager};
 use openraft::{LeaderId, LogId};
 use proto::common::{
-    error_detail_proto::Code as ErrorCodeProto, DataHandleIdProto, ErrorClassProto, FsErrnoProto,
-    GroupStateWatermarkProto, RaftLogIdProto, RefreshReasonProto, RequestHeaderProto, ResponseHeaderProto,
-    RpcErrorCodeProto,
+    DataHandleIdProto, FsErrnoProto, GroupStateWatermarkProto, RaftLogIdProto, RequestHeaderProto, ResponseHeaderProto,
 };
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::{
@@ -34,7 +35,7 @@ use tempfile::TempDir;
 use tonic::Request;
 use tracing::instrument::WithSubscriber;
 use tracing_subscriber::{filter::LevelFilter, fmt, layer::SubscriberExt, Layer, Registry};
-use types::fs::{Extent, FileAttrs, Inode, InodeId};
+use types::fs::{Extent, FileAttrs, FsErrorCode, Inode, InodeId};
 use types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
 use types::layout::FileLayout;
 use types::{ClientId, GroupName, RaftLogId, WorkerRunId};
@@ -218,33 +219,78 @@ fn assert_state_id(actual: &RaftLogIdProto, expected: RaftLogId) {
     assert_eq!(actual.index, expected.index);
 }
 
+fn rpc_error(err: &proto::common::ErrorDetailProto) -> RpcErrorDetail {
+    proto::convert::rpc_error_from_proto(err)
+}
+
+fn fs_errno_to_error_kind(errno: FsErrnoProto) -> ErrorKind {
+    let errno = match errno {
+        FsErrnoProto::FsErrnoEnoent => FsErrorCode::ENoEnt,
+        FsErrnoProto::FsErrnoEexist => FsErrorCode::EExist,
+        FsErrnoProto::FsErrnoEnotempty => FsErrorCode::ENotEmpty,
+        FsErrnoProto::FsErrnoEnotdir => FsErrorCode::ENotDir,
+        FsErrnoProto::FsErrnoEisdir => FsErrorCode::EIsDir,
+        FsErrnoProto::FsErrnoExdev => FsErrorCode::EXDev,
+        FsErrnoProto::FsErrnoEperm => FsErrorCode::EPerm,
+        FsErrnoProto::FsErrnoEacces => FsErrorCode::EAcces,
+        FsErrnoProto::FsErrnoEinval => FsErrorCode::EInval,
+        FsErrnoProto::FsErrnoEnotsup => FsErrorCode::ENotsup,
+        FsErrnoProto::FsErrnoEnotimpl => FsErrorCode::ENotImpl,
+        FsErrnoProto::FsErrnoEagain => FsErrorCode::EAgain,
+        FsErrnoProto::FsErrnoEbusy => FsErrorCode::EBusy,
+        FsErrnoProto::FsErrnoOk => FsErrorCode::Ok,
+    };
+    ErrorKind::Fs(errno)
+}
+
+fn assert_fail_kind(err: &proto::common::ErrorDetailProto, expected: ErrorKind) -> RpcErrorDetail {
+    let rpc_error = rpc_error(err);
+    assert_eq!(rpc_error.kind, expected, "{rpc_error:?}");
+    assert!(matches!(rpc_error.recovery, RecoveryAction::Fail), "{rpc_error:?}");
+    rpc_error
+}
+
 fn assert_fs_errno(err: &proto::common::ErrorDetailProto, expected: FsErrnoProto) {
-    assert_eq!(err.error_class, ErrorClassProto::ErrorClassFatal as i32);
-    match err.code {
-        Some(ErrorCodeProto::FsErrno(errno)) if errno == expected as i32 => {}
-        other => panic!("expected {:?} fs errno, got {:?}", expected, other),
-    }
+    assert_fail_kind(err, fs_errno_to_error_kind(expected));
 }
 
 fn assert_not_leader(err: &proto::common::ErrorDetailProto) {
-    assert_eq!(err.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-    match err.code {
-        Some(ErrorCodeProto::RpcCode(code)) if code == RpcErrorCodeProto::RpcErrCodeNotLeader as i32 => {}
-        other => panic!("expected NotLeader rpc code, got {:?}", other),
-    }
+    assert_refresh_metadata(err, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
 }
 
-fn assert_need_refresh_rpc(
-    err: &proto::common::ErrorDetailProto,
-    expected_code: RpcErrorCodeProto,
-    expected_reason: RefreshReasonProto,
-) {
-    assert_eq!(err.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-    match err.code {
-        Some(ErrorCodeProto::RpcCode(code)) if code == expected_code as i32 => {}
-        other => panic!("expected {:?} rpc code, got {:?}", expected_code, other),
+fn assert_refresh_metadata(err: &proto::common::ErrorDetailProto, expected: ErrorKind) -> RpcErrorDetail {
+    let rpc_error = rpc_error(err);
+    assert_eq!(rpc_error.kind, expected, "{rpc_error:?}");
+    assert!(
+        matches!(rpc_error.recovery, RecoveryAction::RefreshMetadata { .. }),
+        "{rpc_error:?}"
+    );
+    rpc_error
+}
+
+fn assert_retry(err: &proto::common::ErrorDetailProto, expected: ErrorKind) {
+    let rpc_error = rpc_error(err);
+    assert_eq!(rpc_error.kind, expected, "{rpc_error:?}");
+    assert!(
+        matches!(rpc_error.recovery, RecoveryAction::Retry { .. }),
+        "{rpc_error:?}"
+    );
+}
+
+fn assert_reopen_write_session(err: &proto::common::ErrorDetailProto, expected: ErrorKind) {
+    let rpc_error = rpc_error(err);
+    assert_eq!(rpc_error.kind, expected, "{rpc_error:?}");
+    assert!(
+        matches!(rpc_error.recovery, RecoveryAction::ReopenWriteSession { .. }),
+        "{rpc_error:?}"
+    );
+}
+
+fn refresh_hint(rpc_error: &RpcErrorDetail) -> &RefreshHint {
+    match &rpc_error.recovery {
+        RecoveryAction::RefreshMetadata { hint } | RecoveryAction::ReopenWriteSession { hint } => hint,
+        other => panic!("expected refresh-like recovery, got {other:?}"),
     }
-    assert_eq!(err.refresh_reason, expected_reason as i32);
 }
 
 fn build_env(
@@ -1082,7 +1128,7 @@ async fn add_block_failure_emits_metadata_block_warn_log_with_error_code() {
         .expect("transport status must remain OK")
         .into_inner();
         let err = header_error(response.header);
-        assert_ne!(err.error_class, ErrorClassProto::ErrorClassOk as i32);
+        assert_reopen_write_session(&err, ErrorKind::Metadata(MetadataErrorKind::SessionInvalid));
     })
     .await;
 
@@ -1175,7 +1221,7 @@ fn put_extent_file(
 }
 
 #[tokio::test]
-async fn stale_mount_epoch_returns_need_refresh_header_with_consumable_mount_hint() {
+async fn stale_mount_epoch_returns_refresh_metadata_header_with_consumable_mount_hint() {
     let env = build_env("/mnt/test", DataIoPolicy::Allow, None);
 
     let response = FileSystemServiceProto::get_status(
@@ -1191,21 +1237,17 @@ async fn stale_mount_epoch_returns_need_refresh_header_with_consumable_mount_hin
 
     let response_header = response.header.expect("response header must exist");
     let err = response_header.error.expect("header.error must exist");
-    assert_need_refresh_rpc(
-        &err,
-        RpcErrorCodeProto::RpcErrCodeMountEpochMismatch,
-        RefreshReasonProto::RefreshReasonMountEpochMismatch,
-    );
+    let rpc_error = assert_refresh_metadata(&err, ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch));
     assert_eq!(response_header.group_name, TEST_GROUP_NAME);
     assert_eq!(response_header.mount_epoch, Some(1));
-    let hint = err.refresh_hint.expect("refresh hint");
-    assert_eq!(hint.group_name, Some(TEST_GROUP_NAME.to_string()));
+    let hint = refresh_hint(&rpc_error);
+    assert_eq!(hint.group_name.as_deref(), Some(TEST_GROUP_NAME));
     assert_eq!(hint.mount_epoch, Some(1));
     assert_eq!(hint.route_epoch, None);
 }
 
 #[tokio::test]
-async fn stale_route_epoch_returns_need_refresh_header_with_consumable_route_hint() {
+async fn stale_route_epoch_returns_refresh_metadata_header_with_consumable_route_hint() {
     let env = build_env("/mnt/test", DataIoPolicy::Allow, None);
 
     let response = FileSystemServiceProto::get_status(
@@ -1221,16 +1263,12 @@ async fn stale_route_epoch_returns_need_refresh_header_with_consumable_route_hin
 
     let response_header = response.header.expect("response header must exist");
     let err = response_header.error.expect("header.error must exist");
-    assert_need_refresh_rpc(
-        &err,
-        RpcErrorCodeProto::RpcErrCodeRouteEpochMismatch,
-        RefreshReasonProto::RefreshReasonRouteEpochMismatch,
-    );
+    let rpc_error = assert_refresh_metadata(&err, ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch));
     assert_eq!(response_header.group_name, TEST_GROUP_NAME);
     assert_eq!(response_header.mount_epoch, Some(1));
     assert_eq!(response_header.route_epoch, Some(1));
-    let hint = err.refresh_hint.expect("refresh hint");
-    assert_eq!(hint.group_name, Some(TEST_GROUP_NAME.to_string()));
+    let hint = refresh_hint(&rpc_error);
+    assert_eq!(hint.group_name.as_deref(), Some(TEST_GROUP_NAME));
     assert_eq!(hint.mount_epoch, Some(1));
     assert_eq!(hint.route_epoch, Some(1));
 }
@@ -1260,17 +1298,13 @@ async fn stale_state_id_returns_stale_state_without_epoch_domain_mixup() {
 
     let response_header = response.header.expect("response header must exist");
     let err = response_header.error.expect("header.error must exist");
-    assert_need_refresh_rpc(
-        &err,
-        RpcErrorCodeProto::RpcErrCodeStaleState,
-        RefreshReasonProto::RefreshReasonStaleState,
-    );
+    let rpc_error = assert_refresh_metadata(&err, ErrorKind::Metadata(MetadataErrorKind::StaleState));
     assert_eq!(response_header.group_name, TEST_GROUP_NAME);
     assert_eq!(response_header.mount_epoch, Some(1));
     assert_ne!(response_header.mount_epoch, Some(required_state_id.index));
     assert_ne!(response_header.route_epoch, Some(required_state_id.index));
     assert!(response_header.state.is_empty());
-    assert!(err.refresh_hint.is_none());
+    assert_eq!(refresh_hint(&rpc_error), &RefreshHint::default());
 }
 
 #[tokio::test]
@@ -1341,11 +1375,7 @@ async fn readiness_precedence_blocks_before_path_resolution() {
     .into_inner();
 
     let err = header_error(response.header);
-    assert_eq!(err.error_class, ErrorClassProto::ErrorClassRetryable as i32);
-    match err.code {
-        Some(ErrorCodeProto::RpcCode(code)) if code == RpcErrorCodeProto::RpcErrCodeNodeUnavailable as i32 => {}
-        other => panic!("expected NodeUnavailable rpc code, got {:?}", other),
-    }
+    assert_retry(&err, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
 }
 
 #[tokio::test]
@@ -1430,11 +1460,7 @@ async fn root_mount_data_io_gate_is_enforced() {
     .into_inner();
     let err = header_error(response.header);
 
-    assert_eq!(err.error_class, ErrorClassProto::ErrorClassFatal as i32);
-    match err.code {
-        Some(ErrorCodeProto::FsErrno(errno)) if errno == proto::common::FsErrnoProto::FsErrnoEnotsup as i32 => {}
-        other => panic!("expected ENOTSUP fs errno, got {:?}", other),
-    }
+    assert_fs_errno(&err, FsErrnoProto::FsErrnoEnotsup);
     assert!(err.message.contains("RootDataIoForbidden"));
 }
 
@@ -1601,11 +1627,7 @@ async fn get_locations_rejects_stale_handle() {
     .into_inner();
 
     let err = header_error(response.header);
-    assert_need_refresh_rpc(
-        &err,
-        RpcErrorCodeProto::RpcErrCodeStaleState,
-        RefreshReasonProto::RefreshReasonStaleState,
-    );
+    assert_refresh_metadata(&err, ErrorKind::Metadata(MetadataErrorKind::StaleState));
     assert!(err.message.contains("not current data_handle_id"));
 }
 
@@ -1767,7 +1789,7 @@ async fn create_file_failure_leaves_no_inode() {
     .into_inner();
 
     let err = header_error(response.header);
-    assert_eq!(err.error_class, ErrorClassProto::ErrorClassRetryable as i32);
+    assert_retry(&err, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
     assert_eq!(env.storage.get_dentry(env.root_inode_id, "new-file").unwrap(), None);
 }
 
@@ -2007,11 +2029,7 @@ async fn delete_missing_path_returns_structured_header_error() {
     .into_inner();
 
     let err = header_error(response.header);
-    assert_eq!(err.error_class, ErrorClassProto::ErrorClassFatal as i32);
-    match err.code {
-        Some(ErrorCodeProto::FsErrno(errno)) if errno == proto::common::FsErrnoProto::FsErrnoEnoent as i32 => {}
-        other => panic!("expected ENOENT fs errno, got {:?}", other),
-    }
+    assert_fs_errno(&err, FsErrnoProto::FsErrnoEnoent);
 }
 
 #[tokio::test]

@@ -6,13 +6,12 @@
 use super::auth::{self, PermissionBits};
 use super::domain::RequestContext;
 use crate::data_io::DataIoOp;
-use crate::error::{to_canonical_rpc, MetadataError};
+use crate::error::{to_rpc_error, MetadataError};
 use crate::mount::{DataIoPolicy, MountTable, ROOT_MOUNT_PREFIX};
 use crate::path_resolver::ResolvedPath;
 use crate::raft::AppRaftNode;
 use crate::readiness::RootReadinessGate;
-use common::error::canonical::{CanonicalError, RefreshHint, RefreshReason};
-use common::header::RpcErrorCode;
+use common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint, RpcErrorDetail};
 use std::sync::Arc;
 use types::fs::FsErrorCode;
 use types::ids::MountId;
@@ -20,13 +19,13 @@ use types::GroupName;
 
 #[derive(Clone, Debug)]
 pub struct GuardFailure {
-    pub err: Box<CanonicalError>,
+    pub err: Box<RpcErrorDetail>,
     pub group_name: Option<GroupName>,
     pub mount_epoch: Option<u64>,
 }
 
 impl GuardFailure {
-    fn new(err: CanonicalError) -> Self {
+    fn new(err: RpcErrorDetail) -> Self {
         Self {
             err: Box::new(err),
             group_name: None,
@@ -35,7 +34,7 @@ impl GuardFailure {
     }
 
     fn from_rpc_metadata_error(err: MetadataError) -> Self {
-        Self::new(to_canonical_rpc(err))
+        Self::new(to_rpc_error(err))
     }
 
     fn with_mount(mut self, group_name: Option<GroupName>, mount_epoch: Option<u64>) -> Self {
@@ -158,9 +157,8 @@ impl LeadershipGuard {
                 group_name: ctx.caller.group_name.as_ref().map(ToString::to_string),
                 ..Default::default()
             };
-            Err(GuardFailure::new(CanonicalError::need_refresh_with_hint(
-                RpcErrorCode::NotLeader,
-                RefreshReason::NotLeader,
+            Err(GuardFailure::new(RpcErrorDetail::refresh_metadata(
+                ErrorKind::Metadata(MetadataErrorKind::NotLeader),
                 hint,
                 "not leader",
             )))
@@ -202,7 +200,7 @@ impl DataIoPolicyGuard {
         } else {
             "MountHasNoUfs"
         };
-        let err = CanonicalError::fatal_fs(
+        let err = RpcErrorDetail::fs(
             FsErrorCode::ENotsup,
             format!("{reason}: op={} mount_prefix={}", op.as_str(), mount_entry.mount_prefix),
         );
@@ -220,8 +218,9 @@ mod tests {
     use crate::mount::{DataIoPolicy, MountKind, ROOT_INODE_ID};
     use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
     use crate::readiness::RootReadinessGate;
-    use common::error::canonical::{ErrorClass, ErrorCode};
-    use common::header::{RequestHeader, RpcErrorCode};
+    use common::error::rpc::InternalErrorKind;
+    use common::error::rpc::{ErrorKind, RecoveryAction};
+    use common::header::RequestHeader;
     use tempfile::TempDir;
     use types::GroupName;
 
@@ -264,8 +263,8 @@ mod tests {
         let chain = GuardChain::new(mount_table).with_readiness_gate(Some(Arc::clone(&gate)));
 
         let err = chain.check_meta_read(&request_context(1)).await.unwrap_err();
-        assert_eq!(err.err.class, ErrorClass::Retryable);
-        assert_eq!(err.err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NodeUnavailable)));
+        assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
+        assert_eq!(err.err.recovery, RecoveryAction::Retry { after_ms: Some(1000) });
         assert!(!gate.is_ready());
     }
 
@@ -275,8 +274,8 @@ mod tests {
         let chain = GuardChain::new(Arc::new(MountTable::new())).with_readiness_gate(Some(Arc::clone(&gate)));
 
         let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
-        assert_eq!(err.err.class, ErrorClass::Retryable);
-        assert_eq!(err.err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NodeUnavailable)));
+        assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
+        assert_eq!(err.err.recovery, RecoveryAction::Retry { after_ms: Some(1000) });
     }
 
     #[tokio::test]
@@ -284,8 +283,8 @@ mod tests {
         let chain = GuardChain::new(Arc::new(MountTable::new()));
 
         let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
-        assert_eq!(err.err.class, ErrorClass::Retryable);
-        assert_eq!(err.err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NodeUnavailable)));
+        assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
+        assert_eq!(err.err.recovery, RecoveryAction::Retry { after_ms: Some(1000) });
     }
 
     #[tokio::test]
@@ -301,9 +300,8 @@ mod tests {
 
         let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
 
-        assert_eq!(err.err.class, ErrorClass::NeedRefresh);
-        assert_eq!(err.err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NotLeader)));
-        assert_eq!(err.err.reason, Some(RefreshReason::NotLeader));
+        assert_eq!(err.err.kind, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
+        assert!(matches!(err.err.recovery, RecoveryAction::RefreshMetadata { .. }));
     }
 
     #[tokio::test]
@@ -325,8 +323,8 @@ mod tests {
             .check_data_write(&request_context(3), root_entry.mount_id)
             .await
             .unwrap_err();
-        assert_eq!(err.err.class, ErrorClass::Retryable);
-        assert_eq!(err.err.code, Some(ErrorCode::RpcCode(RpcErrorCode::NodeUnavailable)));
+        assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
+        assert_eq!(err.err.recovery, RecoveryAction::Retry { after_ms: Some(1000) });
     }
 
     #[tokio::test]
@@ -348,8 +346,8 @@ mod tests {
             .check_data_read(&request_context(3), root_entry.mount_id)
             .await
             .unwrap_err();
-        assert_eq!(err.err.class, ErrorClass::Fatal);
-        assert_eq!(err.err.code, Some(ErrorCode::FsErrno(FsErrorCode::ENotsup)));
+        assert_eq!(err.err.kind, ErrorKind::Fs(FsErrorCode::ENotsup));
+        assert_eq!(err.err.recovery, RecoveryAction::Fail);
         assert!(err.err.message.contains("RootDataIoForbidden"));
         assert_eq!(err.group_name, Some(root_entry.namespace_owner_group_name.clone()));
         assert_eq!(err.mount_epoch, Some(root_entry.mount_epoch));

@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::error::canonical::{CanonicalError, ErrorClass, RefreshReason};
+use common::error::rpc::{ErrorKind, RecoveryAction, RpcErrorDetail, WorkerErrorKind};
 use common::header::RequestHeader;
 use proto::common::RequestHeaderProto;
-use proto::convert::error_detail_to_canonical;
+use proto::convert::rpc_error_from_proto;
 use proto::metadata::metadata_worker_service_proto_client::MetadataWorkerServiceProtoClient;
 use proto::metadata::{
     block_report_request_proto, BlockReportBlockProto, BlockReportBlockStateProto, BlockReportDeltaOpProto,
@@ -638,23 +638,20 @@ fn classify_header(
     let Some(error) = header.error.as_ref() else {
         return Ok(None);
     };
-    classify_canonical_error(error_detail_to_canonical(error)).map(Some)
+    classify_rpc_error(rpc_error_from_proto(error)).map(Some)
 }
 
-fn classify_canonical_error(error: CanonicalError) -> Result<BlockReportPeerOutcome, BlockReportError> {
-    match error.reason {
-        Some(RefreshReason::FullReportRequired) => return Ok(BlockReportPeerOutcome::FullReportRequired),
-        Some(RefreshReason::NeedRegister) => return Ok(BlockReportPeerOutcome::NeedRegister),
-        Some(RefreshReason::WorkerRunMismatch) => return Ok(BlockReportPeerOutcome::WorkerRunMismatch),
-        _ => {}
-    }
-
-    match error.class {
-        ErrorClass::Ok => Err(BlockReportError::Fatal(
-            "metadata block report response contained malformed OK error detail".to_string(),
-        )),
-        ErrorClass::Retryable | ErrorClass::NeedRefresh => Err(BlockReportError::Retryable(error.message)),
-        ErrorClass::Fatal => Err(BlockReportError::Fatal(format!(
+fn classify_rpc_error(error: RpcErrorDetail) -> Result<BlockReportPeerOutcome, BlockReportError> {
+    match error.recovery {
+        RecoveryAction::SendFullBlockReport => Ok(BlockReportPeerOutcome::FullReportRequired),
+        RecoveryAction::RegisterWorker if error.kind == ErrorKind::Worker(WorkerErrorKind::RunMismatch) => {
+            Ok(BlockReportPeerOutcome::WorkerRunMismatch)
+        }
+        RecoveryAction::RegisterWorker => Ok(BlockReportPeerOutcome::NeedRegister),
+        RecoveryAction::Retry { .. } | RecoveryAction::RefreshMetadata { .. } => {
+            Err(BlockReportError::Retryable(error.message))
+        }
+        RecoveryAction::Fail | RecoveryAction::ReopenWriteSession { .. } => Err(BlockReportError::Fatal(format!(
             "fatal metadata block report error: {}",
             error.message
         ))),

@@ -11,10 +11,10 @@ use parking_lot::RwLock;
 use types::{GroupName, GroupStateWatermark};
 
 use crate::cache::StateIdCache;
-use crate::canonical::RefreshHint;
 use crate::config::ClientConfig;
 use crate::error::{ClientError, ClientResult};
-use crate::runtime::classify::RefreshReason;
+use crate::rpc_error::RefreshHint;
+use crate::runtime::classify::MetadataRefreshCause;
 use crate::runtime::context::{AttemptContext, OperationContext};
 
 const METADATA_TARGET_CACHE_LIMIT: usize = 300;
@@ -195,17 +195,17 @@ impl MetadataTargets {
     pub(crate) fn record_refresh(
         &self,
         operation: &OperationContext,
-        reason: RefreshReason,
+        reason: MetadataRefreshCause,
         hint: &RefreshHint,
     ) -> ClientResult<()> {
         let mut state = self.state.write();
         match reason {
-            RefreshReason::NotLeader => {
+            MetadataRefreshCause::NotLeader => {
                 if let (Some(group_name), Some(endpoint)) = (hint.group_name.as_ref(), hint.leader_endpoint.as_ref()) {
                     state.leader_cache.insert(group_name.clone(), endpoint.clone());
                 }
             }
-            RefreshReason::OwnerGroupMismatch => {
+            MetadataRefreshCause::OwnerGroupMismatch => {
                 let Some(group_name) = hint.group_name.as_ref() else {
                     return Err(ClientError::Metadata(
                         "owner group mismatch refresh missing group_name hint".to_string(),
@@ -218,7 +218,7 @@ impl MetadataTargets {
                     state.leader_cache.insert(group_name.clone(), endpoint.clone());
                 }
             }
-            RefreshReason::MountEpochMismatch => {
+            MetadataRefreshCause::MountEpochMismatch => {
                 if let Some(mount_epoch) = hint.mount_epoch {
                     state.record_mount_epoch_hint(
                         operation.original_target_path(),
@@ -227,7 +227,7 @@ impl MetadataTargets {
                     );
                 }
             }
-            RefreshReason::RouteEpochMismatch => {
+            MetadataRefreshCause::RouteEpochMismatch => {
                 if let Some(route_epoch) = hint.route_epoch {
                     state.record_route_epoch_hint(
                         operation.original_target_path(),
@@ -236,10 +236,10 @@ impl MetadataTargets {
                     );
                 }
             }
-            RefreshReason::StaleState
-            | RefreshReason::WorkerRunMismatch
-            | RefreshReason::BlockStampMismatch
-            | RefreshReason::Unknown => {}
+            MetadataRefreshCause::StaleState
+            | MetadataRefreshCause::WorkerRunMismatch
+            | MetadataRefreshCause::BlockStampMismatch
+            | MetadataRefreshCause::Unknown => {}
         }
         Ok(())
     }
@@ -350,8 +350,8 @@ impl Default for MetadataTargets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::RefreshHint;
-    use crate::runtime::classify::RefreshReason;
+    use crate::rpc_error::RefreshHint;
+    use crate::runtime::classify::MetadataRefreshCause;
     use crate::runtime::policy::OperationKind;
     use crate::runtime::{OperationContext, OperationIdentity};
     use proto::common::{GroupStateWatermarkProto, RaftLogIdProto};
@@ -394,7 +394,7 @@ mod tests {
         manager
             .record_refresh(
                 &op,
-                RefreshReason::OwnerGroupMismatch,
+                MetadataRefreshCause::OwnerGroupMismatch,
                 &RefreshHint {
                     group_name: Some(group_name("analytics")),
                     ..RefreshHint::default()
@@ -416,7 +416,7 @@ mod tests {
         manager
             .record_refresh(
                 &op,
-                RefreshReason::OwnerGroupMismatch,
+                MetadataRefreshCause::OwnerGroupMismatch,
                 &RefreshHint {
                     group_name: Some(group_name("analytics")),
                     leader_endpoint: Some("http://127.0.0.1:18082".to_string()),
@@ -445,7 +445,7 @@ mod tests {
         manager
             .record_refresh(
                 &op,
-                RefreshReason::NotLeader,
+                MetadataRefreshCause::NotLeader,
                 &RefreshHint {
                     group_name: Some(group_name("root")),
                     leader_endpoint: Some("http://127.0.0.1:18081".to_string()),
@@ -488,7 +488,7 @@ mod tests {
         targets
             .record_refresh(
                 &op,
-                RefreshReason::NotLeader,
+                MetadataRefreshCause::NotLeader,
                 &RefreshHint {
                     group_name: Some(group_name("root")),
                     leader_endpoint: Some("leader".to_string()),
@@ -511,7 +511,7 @@ mod tests {
         manager
             .record_refresh(
                 &op,
-                RefreshReason::MountEpochMismatch,
+                MetadataRefreshCause::MountEpochMismatch,
                 &RefreshHint {
                     mount_epoch: Some(31),
                     mount_prefix: Some("/alpha".to_string()),
@@ -534,7 +534,7 @@ mod tests {
         manager
             .record_refresh(
                 &op,
-                RefreshReason::RouteEpochMismatch,
+                MetadataRefreshCause::RouteEpochMismatch,
                 &RefreshHint {
                     route_epoch: Some(23),
                     mount_prefix: Some("/alpha".to_string()),
@@ -564,7 +564,7 @@ mod tests {
             manager
                 .record_refresh(
                     &operation,
-                    RefreshReason::OwnerGroupMismatch,
+                    MetadataRefreshCause::OwnerGroupMismatch,
                     &RefreshHint {
                         group_name: Some(group_name("analytics")),
                         ..RefreshHint::default()
@@ -574,7 +574,7 @@ mod tests {
             manager
                 .record_refresh(
                     &operation,
-                    RefreshReason::MountEpochMismatch,
+                    MetadataRefreshCause::MountEpochMismatch,
                     &RefreshHint {
                         mount_epoch: Some(index as u64),
                         mount_prefix: Some(format!("/tenant/{index}")),
@@ -585,7 +585,7 @@ mod tests {
             manager
                 .record_refresh(
                     &operation,
-                    RefreshReason::RouteEpochMismatch,
+                    MetadataRefreshCause::RouteEpochMismatch,
                     &RefreshHint {
                         route_epoch: Some(index as u64),
                         mount_prefix: Some(format!("/tenant/{index}")),

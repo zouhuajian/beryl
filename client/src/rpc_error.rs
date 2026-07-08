@@ -2,16 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Canonical error handling for client operations.
+//! RPC error handling for client operations.
 //!
 //! This module provides a unified entry point for client error decision-making,
 //! converting response headers to a structured `ClientAction` that preserves
-//! canonical error details and refresh hints.
+//! RPC error details and refresh hints.
 
 use crate::error::ClientError;
-use common::error::canonical::{CanonicalError, ErrorClass, RefreshReason};
-use common::header::{ResponseHeader, RpcErrorCode};
-use proto::convert::error_detail_to_canonical;
+use crate::runtime::MetadataRefreshCause;
+use common::error::rpc::{
+    ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RpcErrorDetail, WorkerErrorKind,
+};
+use common::header::ResponseHeader;
+use proto::convert::rpc_error_from_proto;
 use types::GroupName;
 
 /// Endpoint hint preserved on refresh actions.
@@ -35,8 +38,8 @@ impl From<proto::common::WorkerEndpointInfoProto> for EndpointHint {
     }
 }
 
-impl From<common::error::canonical::WorkerEndpointHint> for EndpointHint {
-    fn from(value: common::error::canonical::WorkerEndpointHint) -> Self {
+impl From<common::error::rpc::WorkerEndpointHint> for EndpointHint {
+    fn from(value: common::error::rpc::WorkerEndpointHint) -> Self {
         Self {
             worker_id: value.worker_id,
             endpoint: value.endpoint,
@@ -48,7 +51,7 @@ impl From<common::error::canonical::WorkerEndpointHint> for EndpointHint {
 /// Structured refresh hints preserved from response headers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RefreshHint {
-    /// Metadata leader endpoint from canonical refresh hint.
+    /// Metadata leader endpoint from RPC refresh hint.
     pub leader_endpoint: Option<String>,
     /// Stable metadata group name hint from metadata header.
     pub group_name: Option<GroupName>,
@@ -60,37 +63,35 @@ pub struct RefreshHint {
     pub mount_epoch: Option<u64>,
     /// Primary endpoint hint for callers that expect a single target.
     pub endpoint_hint: Option<EndpointHint>,
-    /// All worker endpoint hints from the canonical refresh hint.
+    /// All worker endpoint hints from the RPC refresh hint.
     pub worker_endpoints: Vec<EndpointHint>,
     /// Whether the server requires worker placement re-resolution.
     pub worker_resolve_required: bool,
 }
 
-/// Client action determined from canonical/header validation.
+/// Client action determined from rpc header validation.
 #[derive(Clone, Debug)]
-pub enum ClientAction {
-    /// Header is valid and body is safe to consume.
-    Ok,
+pub(crate) enum ClientAction {
     /// Client must refresh state before retrying.
     Refresh {
-        /// Refresh reason from canonical error.
-        reason: RefreshReason,
+        /// Local runtime refresh strategy label.
+        reason: MetadataRefreshCause,
         /// Structured refresh hints from response header.
         hint: Box<RefreshHint>,
-        /// Original canonical error.
-        canonical: Box<CanonicalError>,
+        /// Original RPC error.
+        rpc_error: Box<RpcErrorDetail>,
     },
     /// Client may retry; server retry_after_ms is preserved as a hint.
     Retry {
         /// Optional server retry delay hint in milliseconds.
         retry_after_ms_hint: Option<u64>,
-        /// Original canonical error.
-        canonical: Box<CanonicalError>,
+        /// Original RPC error.
+        rpc_error: Box<RpcErrorDetail>,
     },
     /// Unrecoverable business failure.
     Fail {
-        /// Original canonical error.
-        canonical: Box<CanonicalError>,
+        /// Original RPC error.
+        rpc_error: Box<RpcErrorDetail>,
     },
     /// gRPC transport/auth/framework failure (non-OK status).
     TransportFail {
@@ -102,24 +103,17 @@ pub enum ClientAction {
 /// Validate metadata response header and return structured action on error.
 ///
 /// This is the single entrypoint for header validation before response body use.
-pub fn validate_header_or_action(header: &ResponseHeader) -> Result<(), ClientAction> {
-    debug_assert!(
-        (header.status() == common::header::RpcStatus::Ok) == header.canonical_error.is_none(),
-        "response header status/canonical mismatch: status={:?} canonical_present={}",
-        header.status(),
-        header.canonical_error.is_some()
-    );
-
-    let Some(canonical) = header.canonical_error.clone() else {
+pub(crate) fn validate_header_or_action(header: &ResponseHeader) -> Result<(), ClientAction> {
+    let Some(rpc_error) = header.rpc_error.clone() else {
         return Ok(());
     };
 
-    let hint = refresh_hint_from_canonical_and_header(canonical.refresh_hint.as_ref(), header);
-    validate_canonical_with_hint(canonical, hint)
+    let hint = refresh_hint_from_rpc_error_and_header(recovery_hint(&rpc_error.recovery), header);
+    validate_rpc_error_with_hint(rpc_error, hint)
 }
 
 /// Validate worker data-plane header and return structured action on error.
-pub fn validate_data_header_or_action(
+pub(crate) fn validate_data_header_or_action(
     header: Option<&proto::worker::DataResponseHeaderProto>,
 ) -> Result<(), ClientAction> {
     let Some(header) = header else {
@@ -130,100 +124,114 @@ pub fn validate_data_header_or_action(
         return Ok(());
     };
 
-    let canonical = error_detail_to_canonical(err_detail);
-    let hint = refresh_hint_from_canonical(canonical.refresh_hint.as_ref());
+    let rpc_error = rpc_error_from_proto(err_detail);
+    let hint = refresh_hint_from_rpc_error(recovery_hint(&rpc_error.recovery));
 
-    validate_canonical_with_hint(canonical, hint)
+    validate_rpc_error_with_hint(rpc_error, hint)
 }
 
-fn validate_canonical_with_hint(canonical: CanonicalError, hint: RefreshHint) -> Result<(), ClientAction> {
-    match canonical.class {
-        ErrorClass::Ok => Ok(()),
-        ErrorClass::NeedRefresh => {
-            let reason = canonical.reason.unwrap_or(RefreshReason::Unknown);
-            debug_assert!(
-                reason != RefreshReason::Unknown,
-                "NeedRefresh canonical error should include a specific refresh reason"
-            );
-            Err(ClientAction::Refresh {
-                reason,
-                hint: Box::new(hint),
-                canonical: Box::new(canonical),
-            })
-        }
-        ErrorClass::Retryable => Err(ClientAction::Retry {
-            retry_after_ms_hint: canonical.retry_after_ms,
-            canonical: Box::new(canonical),
+fn validate_rpc_error_with_hint(rpc_error: RpcErrorDetail, hint: RefreshHint) -> Result<(), ClientAction> {
+    match &rpc_error.recovery {
+        RecoveryAction::RefreshMetadata { .. } => Err(ClientAction::Refresh {
+            reason: metadata_refresh_cause_from_kind(rpc_error.kind),
+            hint: Box::new(hint),
+            rpc_error: Box::new(rpc_error),
         }),
-        ErrorClass::Fatal => Err(ClientAction::Fail {
-            canonical: Box::new(canonical),
+        RecoveryAction::ReopenWriteSession { .. } => Err(ClientAction::Refresh {
+            reason: MetadataRefreshCause::Unknown,
+            hint: Box::new(hint),
+            rpc_error: Box::new(rpc_error),
         }),
+        RecoveryAction::Retry { after_ms } => Err(ClientAction::Retry {
+            retry_after_ms_hint: *after_ms,
+            rpc_error: Box::new(rpc_error),
+        }),
+        RecoveryAction::RegisterWorker | RecoveryAction::SendFullBlockReport => Err(ClientAction::Refresh {
+            reason: MetadataRefreshCause::Unknown,
+            hint: Box::new(hint),
+            rpc_error: Box::new(rpc_error),
+        }),
+        RecoveryAction::Fail => Err(ClientAction::Fail {
+            rpc_error: Box::new(rpc_error),
+        }),
+    }
+}
+
+fn metadata_refresh_cause_from_kind(kind: ErrorKind) -> MetadataRefreshCause {
+    match kind {
+        ErrorKind::Metadata(MetadataErrorKind::NotLeader) => MetadataRefreshCause::NotLeader,
+        ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch)
+        | ErrorKind::Metadata(MetadataErrorKind::GroupMismatch) => MetadataRefreshCause::OwnerGroupMismatch,
+        ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch) => MetadataRefreshCause::MountEpochMismatch,
+        ErrorKind::Metadata(MetadataErrorKind::StaleState) => MetadataRefreshCause::StaleState,
+        ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch) => MetadataRefreshCause::RouteEpochMismatch,
+        ErrorKind::Worker(WorkerErrorKind::RunMismatch) => MetadataRefreshCause::WorkerRunMismatch,
+        ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch) => MetadataRefreshCause::BlockStampMismatch,
+        _ => MetadataRefreshCause::Unknown,
+    }
+}
+
+fn recovery_hint(recovery: &RecoveryAction) -> Option<&common::error::rpc::RefreshHint> {
+    match recovery {
+        RecoveryAction::RefreshMetadata { hint } | RecoveryAction::ReopenWriteSession { hint } => Some(hint),
+        _ => None,
     }
 }
 
 pub(crate) fn invalid_header_action(message: impl Into<String>) -> ClientAction {
     ClientAction::Fail {
-        canonical: Box::new(invalid_header_canonical(message)),
+        rpc_error: Box::new(invalid_header_rpc_error(message)),
     }
 }
 
-fn invalid_header_canonical(message: impl Into<String>) -> CanonicalError {
-    CanonicalError {
-        class: ErrorClass::Fatal,
-        code: Some(common::error::canonical::ErrorCode::RpcCode(
-            RpcErrorCode::InvalidHeader,
-        )),
-        reason: None,
-        retry_after_ms: None,
-        message: message.into(),
-        refresh_hint: None,
-    }
+fn invalid_header_rpc_error(message: impl Into<String>) -> RpcErrorDetail {
+    RpcErrorDetail::fail(ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader), message)
 }
 
-fn refresh_hint_from_canonical_and_header(
-    canonical_hint: Option<&common::error::canonical::RefreshHint>,
+fn refresh_hint_from_rpc_error_and_header(
+    rpc_hint: Option<&common::error::rpc::RefreshHint>,
     header: &ResponseHeader,
 ) -> RefreshHint {
-    let mut hint = refresh_hint_from_canonical(canonical_hint);
+    let mut hint = refresh_hint_from_rpc_error(rpc_hint);
     hint.group_name = hint.group_name.or_else(|| header.group_name.clone());
     hint.route_epoch = hint.route_epoch.or(header.route_epoch);
     hint.mount_epoch = hint.mount_epoch.or(header.mount_epoch);
     hint
 }
 
-fn refresh_hint_from_canonical(canonical_hint: Option<&common::error::canonical::RefreshHint>) -> RefreshHint {
-    let Some(canonical_hint) = canonical_hint else {
+fn refresh_hint_from_rpc_error(rpc_hint: Option<&common::error::rpc::RefreshHint>) -> RefreshHint {
+    let Some(rpc_hint) = rpc_hint else {
         return RefreshHint::default();
     };
-    let worker_endpoints = canonical_hint
+    let worker_endpoints = rpc_hint
         .worker_endpoints
         .iter()
         .cloned()
         .map(EndpointHint::from)
         .collect::<Vec<_>>();
     RefreshHint {
-        leader_endpoint: canonical_hint.leader_endpoint.clone(),
-        group_name: canonical_hint
+        leader_endpoint: rpc_hint.leader_endpoint.clone(),
+        group_name: rpc_hint
             .group_name
             .as_deref()
             .and_then(|group_name| GroupName::parse(group_name).ok()),
-        mount_prefix: canonical_hint.mount_prefix.clone(),
-        route_epoch: canonical_hint.route_epoch,
-        mount_epoch: canonical_hint.mount_epoch,
+        mount_prefix: rpc_hint.mount_prefix.clone(),
+        route_epoch: rpc_hint.route_epoch,
+        mount_epoch: rpc_hint.mount_epoch,
         endpoint_hint: worker_endpoints.first().cloned(),
         worker_endpoints,
-        worker_resolve_required: canonical_hint.worker_resolve_required,
+        worker_resolve_required: rpc_hint.worker_resolve_required,
     }
 }
 
 impl ClientAction {
-    /// Return canonical error if this action carries one.
-    pub fn canonical(&self) -> Option<&CanonicalError> {
+    /// Return RPC error if this action carries one.
+    pub fn rpc_error(&self) -> Option<&RpcErrorDetail> {
         match self {
-            ClientAction::Refresh { canonical, .. }
-            | ClientAction::Retry { canonical, .. }
-            | ClientAction::Fail { canonical } => Some(canonical.as_ref()),
-            ClientAction::Ok | ClientAction::TransportFail { .. } => None,
+            ClientAction::Refresh { rpc_error, .. }
+            | ClientAction::Retry { rpc_error, .. }
+            | ClientAction::Fail { rpc_error } => Some(rpc_error.as_ref()),
+            ClientAction::TransportFail { .. } => None,
         }
     }
 }
@@ -237,18 +245,17 @@ impl From<ClientAction> for ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::error::canonical::{
-        ErrorCode as CanonicalErrorCode, RefreshHint as CanonicalRefreshHint, WorkerEndpointHint,
-    };
-    use common::header::RpcErrorCode;
+    use common::error::rpc::InternalErrorKind;
+    use common::error::rpc::{RefreshHint as RpcRefreshHint, WorkerEndpointHint};
     use common::header::{ClientInfo, ResponseHeader};
-    use proto::convert::canonical_to_error_detail;
+    use proto::convert::rpc_error_to_proto;
+    use types::fs::FsErrorCode;
 
     #[derive(Clone, Debug)]
     enum RpcEnvelope {
         Ok,
         TransportStatus(tonic::Status),
-        CanonicalError(CanonicalError),
+        RpcErrorDetail(RpcErrorDetail),
     }
 
     fn parse_rpc_envelope(
@@ -259,25 +266,24 @@ mod tests {
             Err(status) => RpcEnvelope::TransportStatus(status),
             Ok(()) => {
                 let Some(header) = response_header else {
-                    return RpcEnvelope::CanonicalError(invalid_header_canonical("missing response header"));
+                    return RpcEnvelope::RpcErrorDetail(invalid_header_rpc_error("missing response header"));
                 };
                 if header.group_name.is_empty() {
-                    return RpcEnvelope::CanonicalError(invalid_header_canonical(
+                    return RpcEnvelope::RpcErrorDetail(invalid_header_rpc_error(
                         "invalid response header: group_name missing",
                     ));
                 }
                 let header = match ResponseHeader::try_from(header.clone()) {
                     Ok(header) => header,
                     Err(err) => {
-                        return RpcEnvelope::CanonicalError(invalid_header_canonical(format!(
+                        return RpcEnvelope::RpcErrorDetail(invalid_header_rpc_error(format!(
                             "invalid response header: {err}"
                         )));
                     }
                 };
-                match header.canonical_error {
+                match header.rpc_error {
                     None => RpcEnvelope::Ok,
-                    Some(canonical) if matches!(canonical.class, ErrorClass::Ok) => RpcEnvelope::Ok,
-                    Some(canonical) => RpcEnvelope::CanonicalError(canonical),
+                    Some(rpc_error) => RpcEnvelope::RpcErrorDetail(rpc_error),
                 }
             }
         }
@@ -290,9 +296,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_need_refresh_preserves_reason_and_hint() {
-        let canonical = CanonicalError::need_refresh(RpcErrorCode::NotLeader, RefreshReason::NotLeader, "not leader");
-        let mut header = ResponseHeader::error(ClientInfo::new(types::ClientId::new(1)), canonical.clone());
+    fn validate_refresh_metadata_preserves_cause_and_hint() {
+        let rpc_error = RpcErrorDetail::refresh_metadata(
+            ErrorKind::Metadata(MetadataErrorKind::NotLeader),
+            RpcRefreshHint::default(),
+            "not leader",
+        );
+        let mut header = ResponseHeader::error(ClientInfo::new(types::ClientId::new(1)), rpc_error.clone());
         header.group_name = Some(GroupName::parse("root").unwrap());
         header.mount_epoch = Some(12);
 
@@ -301,24 +311,23 @@ mod tests {
             Err(ClientAction::Refresh {
                 reason,
                 hint,
-                canonical: returned,
+                rpc_error: returned,
             }) => {
-                assert_eq!(reason, RefreshReason::NotLeader);
+                assert_eq!(reason, MetadataRefreshCause::NotLeader);
                 assert_eq!(hint.group_name, Some(GroupName::parse("root").unwrap()));
                 assert_eq!(hint.mount_epoch, Some(12));
-                assert_eq!(returned.reason, canonical.reason);
-                assert_eq!(returned.code, canonical.code);
+                assert_eq!(returned.kind, rpc_error.kind);
+                assert_eq!(returned.recovery, rpc_error.recovery);
             }
             _ => panic!("expected Refresh action"),
         }
     }
 
     #[test]
-    fn validate_need_refresh_preserves_full_refresh_hint_fields() {
-        let canonical = CanonicalError::need_refresh_with_hint(
-            RpcErrorCode::ShardMoved,
-            RefreshReason::OwnerGroupMismatch,
-            CanonicalRefreshHint {
+    fn validate_refresh_metadata_preserves_full_hint_fields() {
+        let rpc_error = RpcErrorDetail::refresh_metadata(
+            ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch),
+            RpcRefreshHint {
                 leader_endpoint: Some("http://127.0.0.1:18081".to_string()),
                 group_name: Some("analytics".to_string()),
                 mount_epoch: Some(31),
@@ -340,7 +349,7 @@ mod tests {
             },
             "route moved",
         );
-        let mut header = ResponseHeader::error(ClientInfo::new(types::ClientId::new(1)), canonical);
+        let mut header = ResponseHeader::error(ClientInfo::new(types::ClientId::new(1)), rpc_error);
         header.group_name = Some(GroupName::parse("root").unwrap());
         header.mount_epoch = Some(111);
         header.route_epoch = Some(222);
@@ -365,17 +374,21 @@ mod tests {
 
     #[test]
     fn validate_retryable_preserves_retry_after() {
-        let canonical = CanonicalError::retryable(RpcErrorCode::NodeUnavailable, Some(1000), "unavailable");
-        let header = ResponseHeader::error(ClientInfo::new(types::ClientId::new(1)), canonical.clone());
+        let rpc_error = RpcErrorDetail::retry(
+            ErrorKind::Internal(InternalErrorKind::NodeUnavailable),
+            Some(1000),
+            "unavailable",
+        );
+        let header = ResponseHeader::error(ClientInfo::new(types::ClientId::new(1)), rpc_error.clone());
         let result = validate_header_or_action(&header);
         match result {
             Err(ClientAction::Retry {
                 retry_after_ms_hint,
-                canonical: returned,
+                rpc_error: returned,
             }) => {
                 assert_eq!(retry_after_ms_hint, Some(1000));
-                assert_eq!(returned.retry_after_ms, canonical.retry_after_ms);
-                assert_eq!(returned.code, canonical.code);
+                assert_eq!(returned.kind, rpc_error.kind);
+                assert_eq!(returned.recovery, rpc_error.recovery);
             }
             _ => panic!("expected Retry action"),
         }
@@ -383,20 +396,13 @@ mod tests {
 
     #[test]
     fn validate_fatal_returns_fail() {
-        let canonical = CanonicalError {
-            class: ErrorClass::Fatal,
-            code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-            reason: None,
-            retry_after_ms: None,
-            message: "fatal error".to_string(),
-            refresh_hint: None,
-        };
-        let header = ResponseHeader::error(ClientInfo::new(types::ClientId::new(1)), canonical.clone());
+        let rpc_error = RpcErrorDetail::fail(ErrorKind::Internal(InternalErrorKind::Internal), "fatal error");
+        let header = ResponseHeader::error(ClientInfo::new(types::ClientId::new(1)), rpc_error.clone());
         let result = validate_header_or_action(&header);
         match result {
-            Err(ClientAction::Fail { canonical: returned }) => {
-                assert_eq!(returned.class, ErrorClass::Fatal);
-                assert_eq!(returned.code, canonical.code);
+            Err(ClientAction::Fail { rpc_error: returned }) => {
+                assert_eq!(returned.kind, ErrorKind::Internal(InternalErrorKind::Internal));
+                assert_eq!(returned.recovery, RecoveryAction::Fail);
             }
             _ => panic!("expected Fail action"),
         }
@@ -411,62 +417,60 @@ mod tests {
     }
 
     #[test]
-    fn parse_rpc_envelope_reports_canonical_error() {
-        let canonical = CanonicalError::need_refresh(RpcErrorCode::NotLeader, RefreshReason::NotLeader, "not leader");
+    fn parse_rpc_envelope_reports_rpc_error() {
+        let rpc_error = RpcErrorDetail::refresh_metadata(
+            ErrorKind::Metadata(MetadataErrorKind::NotLeader),
+            RpcRefreshHint::default(),
+            "not leader",
+        );
         let header = proto::common::ResponseHeaderProto {
             client: Some(proto::common::ClientInfoProto {
                 call_id: types::CallId::new().to_string(),
                 client_id: Some(types::ClientId::new(7).into()),
                 client_name: "test".to_string(),
             }),
-            error: Some(canonical_to_error_detail(&canonical)),
+            error: Some(rpc_error_to_proto(&rpc_error)),
             state: Vec::new(),
             group_name: "root".to_string(),
             mount_epoch: None,
             route_epoch: None,
         };
         match parse_rpc_envelope(Ok(()), Some(&header)) {
-            RpcEnvelope::CanonicalError(err) => {
-                assert_eq!(err.class, ErrorClass::NeedRefresh);
-                assert_eq!(err.reason, Some(RefreshReason::NotLeader));
+            RpcEnvelope::RpcErrorDetail(err) => {
+                assert_eq!(err.kind, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
+                assert!(matches!(err.recovery, RecoveryAction::RefreshMetadata { .. }));
             }
-            _ => panic!("expected canonical envelope"),
+            _ => panic!("expected rpc error envelope"),
         }
     }
 
     #[test]
-    fn parse_rpc_envelope_missing_header_is_fatal_canonical() {
+    fn parse_rpc_envelope_missing_header_is_fatal_rpc_error() {
         match parse_rpc_envelope(Ok(()), None) {
-            RpcEnvelope::CanonicalError(err) => {
-                assert_eq!(err.class, ErrorClass::Fatal);
-                assert!(matches!(
-                    err.code,
-                    Some(CanonicalErrorCode::RpcCode(RpcErrorCode::InvalidHeader))
-                ));
+            RpcEnvelope::RpcErrorDetail(err) => {
+                assert_eq!(err.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
+                assert_eq!(err.recovery, RecoveryAction::Fail);
             }
-            _ => panic!("expected fatal canonical envelope"),
+            _ => panic!("expected fatal rpc error envelope"),
         }
     }
 
     #[test]
-    fn parse_rpc_envelope_malformed_ok_header_is_fatal_canonical() {
+    fn parse_rpc_envelope_malformed_ok_header_is_fatal_rpc_error() {
         let malformed = proto::common::ResponseHeaderProto::default();
 
         match parse_rpc_envelope(Ok(()), Some(&malformed)) {
-            RpcEnvelope::CanonicalError(err) => {
-                assert_eq!(err.class, ErrorClass::Fatal);
-                assert!(matches!(
-                    err.code,
-                    Some(CanonicalErrorCode::RpcCode(RpcErrorCode::InvalidHeader))
-                ));
+            RpcEnvelope::RpcErrorDetail(err) => {
+                assert_eq!(err.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
+                assert_eq!(err.recovery, RecoveryAction::Fail);
                 assert!(err.message.contains("invalid response header"));
             }
-            _ => panic!("expected fatal canonical envelope"),
+            _ => panic!("expected fatal rpc error envelope"),
         }
     }
 
     #[test]
-    fn parse_rpc_envelope_missing_group_name_ok_header_is_fatal_canonical() {
+    fn parse_rpc_envelope_missing_group_name_ok_header_is_fatal_rpc_error() {
         let header = proto::common::ResponseHeaderProto {
             client: Some(proto::common::ClientInfoProto {
                 call_id: types::CallId::new().to_string(),
@@ -481,15 +485,28 @@ mod tests {
         };
 
         match parse_rpc_envelope(Ok(()), Some(&header)) {
-            RpcEnvelope::CanonicalError(err) => {
-                assert_eq!(err.class, ErrorClass::Fatal);
-                assert!(matches!(
-                    err.code,
-                    Some(CanonicalErrorCode::RpcCode(RpcErrorCode::InvalidHeader))
-                ));
+            RpcEnvelope::RpcErrorDetail(err) => {
+                assert_eq!(err.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
+                assert_eq!(err.recovery, RecoveryAction::Fail);
                 assert!(err.message.contains("group_name"));
             }
-            _ => panic!("expected fatal canonical envelope"),
+            _ => panic!("expected fatal rpc error envelope"),
+        }
+    }
+
+    #[test]
+    fn validate_fs_error_fails_without_refresh() {
+        let rpc_error = RpcErrorDetail::fs(FsErrorCode::EPerm, "denied");
+        let header = ResponseHeader::error(ClientInfo::new(types::ClientId::new(1)), rpc_error);
+
+        let result = validate_header_or_action(&header);
+
+        match result {
+            Err(ClientAction::Fail { rpc_error }) => {
+                assert_eq!(rpc_error.kind, ErrorKind::Fs(FsErrorCode::EPerm));
+                assert_eq!(rpc_error.recovery, RecoveryAction::Fail);
+            }
+            _ => panic!("expected Fail action"),
         }
     }
 }

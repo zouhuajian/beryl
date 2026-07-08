@@ -13,8 +13,8 @@ use crate::service::domain::{
     SessionKey, SyncWriteInput, SyncWriteMode, SyncWriteOutput,
 };
 use crate::service::{validate_active_write_layout, worker_endpoint_from_parts};
-use common::error::canonical::{RefreshHint, RefreshReason};
-use common::header::{CallerContextFields, RpcErrorCode};
+use common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint, WorkerErrorKind};
+use common::header::CallerContextFields;
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use types::fs::{Extent, FsErrorCode};
@@ -113,8 +113,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             None => {
                 return self.core.session_terminal_failure(
                     &req.ctx,
-                    RefreshReason::SessionInvalid,
-                    RpcErrorCode::Fencing,
+                    ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                     format!(
                         "write handle not found for handle={}; AbortFileWrite cannot be replayed automatically",
                         file_handle,
@@ -162,8 +161,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         if lease_id != session.lease_id || req.lease_epoch != session.lease_epoch {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::SessionInvalid,
-                RpcErrorCode::Fencing,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                 format!(
                     "lease/write handle mismatch for handle={}; AbortFileWrite cannot be replayed automatically",
                     file_handle
@@ -175,8 +173,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         if req.open_epoch != session.open_epoch {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::SessionInvalid,
-                RpcErrorCode::EpochMismatch,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                 format!(
                     "open_epoch mismatch: expected {}, got {}; AbortFileWrite cannot be replayed automatically",
                     session.open_epoch, req.open_epoch
@@ -190,8 +187,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             None => {
                 return self.core.session_terminal_failure(
                     &req.ctx,
-                    RefreshReason::SessionInvalid,
-                    RpcErrorCode::Fencing,
+                    ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                     format!(
                         "missing fencing_token for handle={}; AbortFileWrite cannot be replayed automatically",
                         file_handle
@@ -204,8 +200,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         if !FsCore::fencing_token_matches_session(&session, token) {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::SessionInvalid,
-                RpcErrorCode::Fencing,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                 format!(
                     "fencing_token mismatch for handle={}; AbortFileWrite cannot be replayed automatically",
                     file_handle
@@ -222,8 +217,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::SessionExpired,
-                RpcErrorCode::Fencing,
+                ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
                 format!(
                     "lease validation rejected for handle={}; write lease expired and AbortFileWrite cannot be replayed automatically",
                     file_handle,
@@ -250,8 +244,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             None => {
                 return self.core.session_terminal_failure(
                     &req.ctx,
-                    RefreshReason::SessionInvalid,
-                    RpcErrorCode::Fencing,
+                    ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                     format!(
                         "write handle not found for handle={}; RenewLease cannot be replayed automatically",
                         file_handle,
@@ -286,8 +279,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         if lease_id_typed != session.lease_id || req.lease_epoch != session.lease_epoch {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::SessionInvalid,
-                RpcErrorCode::Fencing,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                 format!(
                     "lease/write handle mismatch: expected lease_id={:?} lease_epoch={}, got lease_id={:?} lease_epoch={}; RenewLease cannot be replayed automatically",
                     session.lease_id,
@@ -303,8 +295,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         if req.open_epoch != session.open_epoch {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::SessionInvalid,
-                RpcErrorCode::EpochMismatch,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                 format!(
                     "open_epoch mismatch: expected {}, got {}; RenewLease cannot be replayed automatically",
                     session.open_epoch, req.open_epoch,
@@ -319,8 +310,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             None => {
                 return self.core.session_terminal_failure(
                     &req.ctx,
-                    RefreshReason::SessionInvalid,
-                    RpcErrorCode::Fencing,
+                    ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                     format!(
                         "missing fencing_token for handle={}; RenewLease cannot be replayed automatically",
                         file_handle,
@@ -333,8 +323,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         if !FsCore::fencing_token_matches_session(&session, req_token) {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::SessionInvalid,
-                RpcErrorCode::Fencing,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                 format!(
                     "fencing_token mismatch for handle={}; RenewLease cannot be replayed automatically",
                     file_handle,
@@ -353,8 +342,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             Err(_) => {
                 return self.core.session_terminal_failure(
                     &req.ctx,
-                    RefreshReason::SessionExpired,
-                    RpcErrorCode::Fencing,
+                    ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
                     format!(
                         "lease renewal rejected for handle={}; write lease expired and RenewLease cannot be replayed automatically",
                         file_handle,
@@ -383,8 +371,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             None => {
                 return self.core.session_terminal_failure(
                     &req.ctx,
-                    RefreshReason::SessionInvalid,
-                    RpcErrorCode::Fencing,
+                    ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                     format!(
                         "write handle not found for handle={}; SyncWrite cannot be replayed automatically",
                         file_handle,
@@ -455,8 +442,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         if lease_id_typed != session.lease_id || req.lease_epoch != session.lease_epoch {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::SessionInvalid,
-                RpcErrorCode::Fencing,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                 format!(
                     "lease/write handle mismatch: expected lease_id={:?} lease_epoch={}, got lease_id={:?} lease_epoch={}; SyncWrite cannot be replayed automatically",
                     session.lease_id,
@@ -471,8 +457,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         if req.open_epoch != session.open_epoch {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::SessionInvalid,
-                RpcErrorCode::EpochMismatch,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                 format!(
                     "open_epoch mismatch: expected {}, got {}; SyncWrite cannot be replayed automatically",
                     session.open_epoch, req.open_epoch,
@@ -486,8 +471,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             None => {
                 return self.core.session_terminal_failure(
                     &req.ctx,
-                    RefreshReason::SessionInvalid,
-                    RpcErrorCode::Fencing,
+                    ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                     format!(
                         "missing fencing_token for handle={}; SyncWrite cannot be replayed automatically",
                         file_handle,
@@ -500,8 +484,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         if !FsCore::fencing_token_matches_session(&session, req_token) {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::SessionInvalid,
-                RpcErrorCode::Fencing,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                 format!(
                     "fencing_token mismatch for handle={}; SyncWrite cannot be replayed automatically",
                     file_handle,
@@ -518,8 +501,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::SessionExpired,
-                RpcErrorCode::Fencing,
+                ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
                 format!(
                     "lease validation rejected for handle={}; SyncWrite cannot be replayed automatically",
                     file_handle,
@@ -975,8 +957,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             None => {
                 return self.core.session_terminal_failure(
                     &req.ctx,
-                    RefreshReason::SessionInvalid,
-                    RpcErrorCode::Fencing,
+                    ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                     format!(
                         "write handle not found for handle={}; reopen before AddBlock",
                         file_handle
@@ -1018,8 +999,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         if lease_id != session.lease_id || req.lease_epoch != session.lease_epoch {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::SessionInvalid,
-                RpcErrorCode::Fencing,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                 format!("lease mismatch for handle={}; reopen before AddBlock", file_handle),
                 group_name,
                 mount_epoch,
@@ -1028,8 +1008,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         if req.open_epoch != session.open_epoch {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::EpochMismatch,
-                RpcErrorCode::EpochMismatch,
+                ErrorKind::Metadata(MetadataErrorKind::EpochMismatch),
                 format!(
                     "open_epoch mismatch: expected {}, got {}; reopen before AddBlock",
                     session.open_epoch, req.open_epoch
@@ -1043,8 +1022,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             None => {
                 return self.core.session_terminal_failure(
                     &req.ctx,
-                    RefreshReason::SessionInvalid,
-                    RpcErrorCode::Fencing,
+                    ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                     format!(
                         "missing fencing_token for handle={}; reopen before AddBlock",
                         file_handle
@@ -1057,8 +1035,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         if !FsCore::fencing_token_matches_session(&session, token) {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::SessionInvalid,
-                RpcErrorCode::Fencing,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                 format!(
                     "fencing_token mismatch for handle={}; reopen before AddBlock",
                     file_handle
@@ -1075,8 +1052,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::SessionExpired,
-                RpcErrorCode::Fencing,
+                ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
                 format!(
                     "lease validation rejected for handle={}; reopen before AddBlock",
                     file_handle
@@ -1286,8 +1262,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             None => {
                 return self.core.session_terminal_failure(
                     &req.ctx,
-                    RefreshReason::SessionInvalid,
-                    RpcErrorCode::Fencing,
+                    ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                     format!(
                         "write handle not found for handle={}; CommitFile cannot be replayed automatically",
                         file_handle,
@@ -1332,10 +1307,9 @@ impl<'a> WriteSessionCoordinator<'a> {
                         .map(|registration| registration.worker_run_id);
                     if !current_run_id.is_some_and(|run_id| run_id.matches(endpoint.worker_run_id)) {
                         let hint = worker_refresh_hint_from_session(&session, true);
-                        return self.core.need_refresh_failure_with_hint(
+                        return self.core.refresh_metadata_failure_with_hint(
                             &req.ctx,
-                            RpcErrorCode::WorkerRunMismatch,
-                            RefreshReason::WorkerRunMismatch,
+                            ErrorKind::Worker(WorkerErrorKind::RunMismatch),
                             format!(
                                 "worker_run_id mismatch for worker_id={}: client/session={}, server={:?}; {}",
                                 endpoint.worker_id,
@@ -1369,8 +1343,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         if lease_id_typed != session.lease_id || request_lease_epoch != session.lease_epoch {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::SessionInvalid,
-                RpcErrorCode::Fencing,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                 format!(
                     "lease/write handle mismatch: expected lease_id={:?} lease_epoch={}, got lease_id={:?} lease_epoch={}; CommitFile cannot be replayed automatically",
                     session.lease_id,
@@ -1388,8 +1361,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             None => {
                 return self.core.session_terminal_failure(
                     &req.ctx,
-                    RefreshReason::SessionInvalid,
-                    RpcErrorCode::Fencing,
+                    ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                     format!(
                         "missing fencing_token for handle={}; CommitFile cannot be replayed automatically",
                         file_handle,
@@ -1402,8 +1374,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         if !FsCore::fencing_token_matches_session(&session, req_token) {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::SessionInvalid,
-                RpcErrorCode::Fencing,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                 format!(
                     "fencing_token mismatch for handle={}; CommitFile cannot be replayed automatically",
                     file_handle,
@@ -1416,8 +1387,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         if req.open_epoch != session.open_epoch {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::SessionInvalid,
-                RpcErrorCode::EpochMismatch,
+                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
                 format!(
                     "open_epoch mismatch: expected {}, got {}; CommitFile cannot be replayed automatically",
                     session.open_epoch, req.open_epoch,
@@ -1435,8 +1405,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         {
             return self.core.session_terminal_failure(
                 &req.ctx,
-                RefreshReason::SessionExpired,
-                RpcErrorCode::Fencing,
+                ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
                 format!(
                     "lease validation rejected for handle={}; write lease expired and CommitFile cannot be replayed automatically",
                     file_handle,

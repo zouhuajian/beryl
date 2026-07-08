@@ -9,15 +9,15 @@
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use common::error::canonical::{CanonicalError, RefreshHint as CanonicalRefreshHint, RefreshReason};
-use common::header::{HeaderIdentity, RpcErrorCode};
+use common::error::rpc::{ErrorKind, RefreshHint as RpcRefreshHint, RpcErrorDetail, WorkerErrorKind};
+use common::header::HeaderIdentity;
 use types::chunk::ByteRange;
 use types::{BlockShape, GroupName, WorkerEndpointInfo, WriteTarget};
 
 use super::{WorkerBlockSyncResult, WorkerBlockWriteHandle, WorkerCommitResult, WorkerReadResult, WorkerWriteTarget};
-use crate::canonical::{invalid_header_action, validate_data_header_or_action};
 use crate::error::{invalid_response, side_effect_response_body_mismatch, ClientError, ClientResult};
 use crate::planner::PlannedBlockRead;
+use crate::rpc_error::{invalid_header_action, validate_data_header_or_action};
 use crate::runtime::AttemptContext;
 
 pub(super) fn build_open_read_stream_request(
@@ -474,22 +474,21 @@ fn block_stamp_mismatch_error(block_read: &PlannedBlockRead, actual: u64, operat
         "block stamp mismatch from {operation}: block={} expected={}, got={}",
         block_read.block_id, block_read.block_stamp, actual
     );
-    let canonical = CanonicalError::need_refresh_with_hint(
-        RpcErrorCode::BlockStampMismatch,
-        RefreshReason::BlockStampMismatch,
-        CanonicalRefreshHint {
+    let rpc_error = RpcErrorDetail::refresh_metadata(
+        ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
+        RpcRefreshHint {
             worker_resolve_required: true,
-            ..CanonicalRefreshHint::default()
+            ..RpcRefreshHint::default()
         },
         message,
     );
-    ClientError::from(crate::canonical::ClientAction::Refresh {
-        reason: RefreshReason::BlockStampMismatch,
-        hint: Box::new(crate::canonical::RefreshHint {
+    ClientError::from(crate::rpc_error::ClientAction::Refresh {
+        reason: crate::runtime::MetadataRefreshCause::BlockStampMismatch,
+        hint: Box::new(crate::rpc_error::RefreshHint {
             worker_resolve_required: true,
-            ..crate::canonical::RefreshHint::default()
+            ..crate::rpc_error::RefreshHint::default()
         }),
-        canonical: Box::new(canonical),
+        rpc_error: Box::new(rpc_error),
     })
 }
 
@@ -558,18 +557,17 @@ fn validate_handle_for_worker_sync(handle: &WorkerBlockWriteHandle) -> ClientRes
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::error::rpc::{MetadataErrorKind, ProtocolErrorKind};
 
-    use common::error::canonical::{
-        CanonicalError, ErrorClass as CanonicalErrorClass, ErrorCode as CanonicalErrorCode,
-        RefreshHint as CanonicalRefreshHint, RefreshReason as CanonicalRefreshReason,
-    };
-    use common::header::RpcErrorCode;
-    use proto::convert::canonical_to_error_detail;
+    use common::error::rpc::{ErrorKind, RefreshHint as RpcRefreshHint, RpcErrorDetail};
+    use proto::convert::rpc_error_to_proto;
     use types::lease::FencingToken;
     use types::{BlockId, BlockIndex, ClientId, DataHandleId, WorkerEndpointInfo, WorkerId, WorkerNetProtocol};
 
-    use crate::canonical::ClientAction;
-    use crate::runtime::{ErrorClass, ErrorClassifier, OperationContext, OperationIdentity, OperationKind};
+    use crate::rpc_error::ClientAction;
+    use crate::runtime::{
+        ErrorClass, ErrorClassifier, MetadataRefreshCause, OperationContext, OperationIdentity, OperationKind,
+    };
 
     #[test]
     fn missing_worker_control_header_is_invalid_header_action() {
@@ -578,14 +576,10 @@ mod tests {
 
         assert_ne!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
         match action(&err) {
-            ClientAction::Fail { canonical } => {
-                assert!(matches!(
-                    canonical.code,
-                    Some(common::error::canonical::ErrorCode::RpcCode(
-                        RpcErrorCode::InvalidHeader
-                    ))
-                ));
-                assert!(canonical.message.contains("missing DataResponseHeader"));
+            ClientAction::Fail { rpc_error } => {
+                assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
+                assert_eq!(rpc_error.recovery, common::error::rpc::RecoveryAction::Fail);
+                assert!(rpc_error.message.contains("missing DataResponseHeader"));
             }
             other => panic!("expected invalid header failure, got {other:?}"),
         }
@@ -600,41 +594,36 @@ mod tests {
 
         assert_ne!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
         match action(&err) {
-            ClientAction::Fail { canonical } => {
-                assert!(matches!(
-                    canonical.code,
-                    Some(common::error::canonical::ErrorCode::RpcCode(
-                        RpcErrorCode::InvalidHeader
-                    ))
-                ));
-                assert!(canonical.message.contains("invalid DataResponseHeader"));
+            ClientAction::Fail { rpc_error } => {
+                assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
+                assert_eq!(rpc_error.recovery, common::error::rpc::RecoveryAction::Fail);
+                assert!(rpc_error.message.contains("invalid DataResponseHeader"));
             }
             other => panic!("expected invalid header failure, got {other:?}"),
         }
     }
 
     #[test]
-    fn worker_control_header_preserves_refresh_reason() {
+    fn worker_control_header_preserves_metadata_refresh_cause() {
         let attempt = data_attempt_context();
-        let canonical = CanonicalError::need_refresh_with_hint(
-            RpcErrorCode::BlockStampMismatch,
-            CanonicalRefreshReason::BlockStampMismatch,
-            CanonicalRefreshHint {
+        let rpc_error = RpcErrorDetail::refresh_metadata(
+            ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
+            RpcRefreshHint {
                 worker_resolve_required: true,
-                ..CanonicalRefreshHint::default()
+                ..RpcRefreshHint::default()
             },
             "worker requires refreshed location",
         );
         let header = proto::worker::DataResponseHeaderProto {
             client: Some(attempt.client_info()),
-            error: Some(canonical_to_error_detail(&canonical)),
+            error: Some(rpc_error_to_proto(&rpc_error)),
         };
 
         let err = parse_worker_control_header(&attempt, Some(&header)).expect_err("refresh error must surface");
 
         match action(&err) {
             ClientAction::Refresh { reason, hint, .. } => {
-                assert_eq!(*reason, CanonicalRefreshReason::BlockStampMismatch);
+                assert_eq!(*reason, MetadataRefreshCause::BlockStampMismatch);
                 assert!(hint.worker_resolve_required);
             }
             other => panic!("expected refresh action, got {other:?}"),
@@ -655,12 +644,9 @@ mod tests {
         .expect_err("block stamp mismatch must be typed");
 
         match action(&err) {
-            ClientAction::Refresh { reason, canonical, .. } => {
-                assert_eq!(*reason, CanonicalRefreshReason::BlockStampMismatch);
-                assert_eq!(
-                    canonical.code,
-                    Some(CanonicalErrorCode::RpcCode(RpcErrorCode::BlockStampMismatch))
-                );
+            ClientAction::Refresh { reason, rpc_error, .. } => {
+                assert_eq!(*reason, MetadataRefreshCause::BlockStampMismatch);
+                assert_eq!(rpc_error.kind, ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch));
             }
             other => panic!("expected block stamp refresh action, got {other:?}"),
         }
@@ -677,7 +663,7 @@ mod tests {
 
         assert_invalid_worker_header(&err);
         match action(&err) {
-            ClientAction::Fail { canonical } => assert!(canonical.message.contains("client_id")),
+            ClientAction::Fail { rpc_error } => assert!(rpc_error.message.contains("client_id")),
             other => panic!("expected invalid header failure, got {other:?}"),
         }
     }
@@ -692,7 +678,7 @@ mod tests {
 
         assert_invalid_worker_header(&err);
         match action(&err) {
-            ClientAction::Fail { canonical } => assert!(canonical.message.contains("call_id")),
+            ClientAction::Fail { rpc_error } => assert!(rpc_error.message.contains("call_id")),
             other => panic!("expected invalid header failure, got {other:?}"),
         }
     }
@@ -883,14 +869,7 @@ mod tests {
             &attempt,
             Some(&data_header_with_error(
                 &attempt,
-                CanonicalError {
-                    class: CanonicalErrorClass::Fatal,
-                    code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Fencing)),
-                    reason: None,
-                    retry_after_ms: None,
-                    message: "fencing mismatch".to_string(),
-                    refresh_hint: None,
-                },
+                RpcErrorDetail::fail(ErrorKind::Metadata(MetadataErrorKind::Fencing), "fencing mismatch"),
             )),
         )
         .expect_err("fatal fencing mismatch must fail");
@@ -906,9 +885,9 @@ mod tests {
             &attempt,
             Some(&data_header_with_error(
                 &attempt,
-                CanonicalError::need_refresh(
-                    RpcErrorCode::WorkerRunMismatch,
-                    CanonicalRefreshReason::WorkerRunMismatch,
+                RpcErrorDetail::refresh_metadata(
+                    ErrorKind::Worker(WorkerErrorKind::RunMismatch),
+                    RpcRefreshHint::default(),
                     "worker run mismatch",
                 ),
             )),
@@ -917,7 +896,7 @@ mod tests {
 
         assert_eq!(
             ErrorClassifier.classify_error(&err),
-            ErrorClass::NeedRefresh(crate::runtime::RefreshReason::WorkerRunMismatch)
+            ErrorClass::RefreshMetadata(crate::runtime::MetadataRefreshCause::WorkerRunMismatch)
         );
     }
 
@@ -1108,11 +1087,11 @@ mod tests {
 
     fn data_header_with_error(
         attempt: &AttemptContext,
-        canonical: CanonicalError,
+        rpc_error: RpcErrorDetail,
     ) -> proto::worker::DataResponseHeaderProto {
         proto::worker::DataResponseHeaderProto {
             client: Some(attempt.client_info()),
-            error: Some(canonical_to_error_detail(&canonical)),
+            error: Some(rpc_error_to_proto(&rpc_error)),
         }
     }
 
@@ -1136,13 +1115,9 @@ mod tests {
     fn assert_invalid_worker_header(err: &ClientError) {
         assert_ne!(ErrorClassifier.classify_error(err), ErrorClass::RetryableTransport);
         match action(err) {
-            ClientAction::Fail { canonical } => {
-                assert!(matches!(
-                    canonical.code,
-                    Some(common::error::canonical::ErrorCode::RpcCode(
-                        RpcErrorCode::InvalidHeader
-                    ))
-                ));
+            ClientAction::Fail { rpc_error } => {
+                assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
+                assert_eq!(rpc_error.recovery, common::error::rpc::RecoveryAction::Fail);
             }
             other => panic!("expected invalid header failure, got {other:?}"),
         }
@@ -1150,7 +1125,7 @@ mod tests {
 
     fn action(err: &ClientError) -> &ClientAction {
         match err {
-            ClientError::Action(action) => action.as_ref(),
+            ClientError::Action(action) => action.action(),
             other => panic!("expected action error, got {other:?}"),
         }
     }

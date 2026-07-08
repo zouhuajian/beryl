@@ -3,13 +3,14 @@
 
 //! Error classifier entry point.
 
-use crate::canonical::ClientAction;
 use crate::error::ClientError;
-use common::error::canonical::RefreshReason as CanonicalRefreshReason;
+use crate::rpc_error::ClientAction;
+use common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RpcErrorDetail};
+use types::fs::FsErrorCode;
 
-/// Refresh reason used by the runtime executor.
+/// Metadata refresh cause used by the runtime executor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RefreshReason {
+pub(crate) enum MetadataRefreshCause {
     /// Metadata leader changed or the target is not leader.
     NotLeader,
     /// Path or mount owner group changed.
@@ -28,7 +29,7 @@ pub(crate) enum RefreshReason {
     Unknown,
 }
 
-impl RefreshReason {
+impl MetadataRefreshCause {
     /// Low-cardinality label for metrics.
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -52,7 +53,7 @@ pub(crate) enum ErrorClass {
     /// Retryable transport/framework failure.
     RetryableTransport,
     /// Structured refresh is needed before replay.
-    NeedRefresh(RefreshReason),
+    RefreshMetadata(MetadataRefreshCause),
     /// Local or server-side invalid argument.
     InvalidArgument,
     /// Malformed successful RPC header.
@@ -77,7 +78,7 @@ impl ErrorClass {
         match self {
             Self::Fatal => "fatal",
             Self::RetryableTransport => "retryable_transport",
-            Self::NeedRefresh(_) => "need_refresh",
+            Self::RefreshMetadata(_) => "refresh_metadata",
             Self::InvalidArgument => "invalid_argument",
             Self::InvalidHeader => "invalid_header",
             Self::UnknownOutcome => "unknown_outcome",
@@ -90,7 +91,7 @@ impl ErrorClass {
     }
 }
 
-/// Classifies transport, metadata canonical, and worker canonical errors.
+/// Classifies transport, metadata rpc_error, and worker RPC errors.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ErrorClassifier;
 
@@ -103,14 +104,16 @@ impl ErrorClassifier {
             ClientError::Unsupported(_) | ClientError::NotSupported(_) | ClientError::Unimplemented(_) => {
                 ErrorClass::Unsupported
             }
-            ClientError::Action(action) => self.classify_action(action.as_ref()),
+            ClientError::Action(action) => self.classify_action(action.action()),
             ClientError::Common(common) if common.is_retryable() => ErrorClass::RetryableTransport,
             ClientError::UnknownOutcome(_) => ErrorClass::UnknownOutcome,
             ClientError::Metadata(_) | ClientError::Worker(_) | ClientError::Routing(_) => ErrorClass::Fatal,
-            ClientError::NotLeader(_) => ErrorClass::NeedRefresh(RefreshReason::NotLeader),
-            ClientError::RouteEpochMismatch { .. } => ErrorClass::NeedRefresh(RefreshReason::RouteEpochMismatch),
-            ClientError::StaleMeta(_) => ErrorClass::NeedRefresh(RefreshReason::StaleState),
-            ClientError::Moved(_) => ErrorClass::NeedRefresh(RefreshReason::Unknown),
+            ClientError::NotLeader(_) => ErrorClass::RefreshMetadata(MetadataRefreshCause::NotLeader),
+            ClientError::RouteEpochMismatch { .. } => {
+                ErrorClass::RefreshMetadata(MetadataRefreshCause::RouteEpochMismatch)
+            }
+            ClientError::StaleMeta(_) => ErrorClass::RefreshMetadata(MetadataRefreshCause::StaleState),
+            ClientError::Moved(_) => ErrorClass::RefreshMetadata(MetadataRefreshCause::Unknown),
             ClientError::Common(_)
             | ClientError::Cache(_)
             | ClientError::Config(_)
@@ -121,55 +124,49 @@ impl ErrorClassifier {
 
     fn classify_action(&self, action: &ClientAction) -> ErrorClass {
         match action {
-            ClientAction::Ok => ErrorClass::Fatal,
             ClientAction::TransportFail { status } if is_retryable_transport(status) => ErrorClass::RetryableTransport,
             ClientAction::TransportFail { .. } => ErrorClass::Fatal,
             ClientAction::Retry { .. } => ErrorClass::RetryableTransport,
-            ClientAction::Refresh { reason, hint, .. } => classify_refresh_reason(*reason, hint.group_name.as_ref()),
-            ClientAction::Fail { canonical } => {
-                use common::error::canonical::ErrorCode;
-                use types::fs::FsErrorCode;
-                match canonical.code.as_ref() {
-                    Some(ErrorCode::RpcCode(common::header::RpcErrorCode::InvalidHeader)) => ErrorClass::InvalidHeader,
-                    Some(ErrorCode::RpcCode(common::header::RpcErrorCode::Fencing)) => ErrorClass::Fencing,
-                    Some(ErrorCode::FsErrno(FsErrorCode::EPerm | FsErrorCode::EAcces)) => ErrorClass::PermissionDenied,
-                    Some(ErrorCode::FsErrno(FsErrorCode::EInval)) => ErrorClass::InvalidArgument,
-                    Some(ErrorCode::FsErrno(FsErrorCode::ENotsup | FsErrorCode::ENotImpl)) => ErrorClass::Unsupported,
-                    _ => ErrorClass::Fatal,
-                }
-            }
+            ClientAction::Refresh { reason, rpc_error, .. } => classify_refresh_action(*reason, rpc_error),
+            ClientAction::Fail { rpc_error } => classify_fail_action(rpc_error),
         }
     }
 }
 
-fn classify_refresh_reason(reason: CanonicalRefreshReason, _group_hint: Option<&types::GroupName>) -> ErrorClass {
-    match reason {
-        CanonicalRefreshReason::Fencing | CanonicalRefreshReason::EpochMismatch => ErrorClass::Fencing,
-        CanonicalRefreshReason::SessionInvalid => ErrorClass::SessionInvalid,
-        CanonicalRefreshReason::SessionExpired => ErrorClass::SessionExpired,
-        other => ErrorClass::NeedRefresh(refresh_reason_from_canonical(other)),
+fn classify_refresh_action(reason: MetadataRefreshCause, rpc_error: &RpcErrorDetail) -> ErrorClass {
+    match (&rpc_error.recovery, rpc_error.kind) {
+        (RecoveryAction::ReopenWriteSession { .. }, ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)) => {
+            ErrorClass::SessionInvalid
+        }
+        (RecoveryAction::ReopenWriteSession { .. }, ErrorKind::Metadata(MetadataErrorKind::SessionExpired)) => {
+            ErrorClass::SessionExpired
+        }
+        (
+            RecoveryAction::ReopenWriteSession { .. },
+            ErrorKind::Metadata(MetadataErrorKind::Fencing) | ErrorKind::Metadata(MetadataErrorKind::EpochMismatch),
+        ) => ErrorClass::Fencing,
+        (
+            _,
+            ErrorKind::Metadata(MetadataErrorKind::Fencing) | ErrorKind::Metadata(MetadataErrorKind::EpochMismatch),
+        ) => ErrorClass::Fencing,
+        _ => ErrorClass::RefreshMetadata(reason),
     }
 }
 
-fn refresh_reason_from_canonical(reason: CanonicalRefreshReason) -> RefreshReason {
-    match reason {
-        CanonicalRefreshReason::NotLeader => RefreshReason::NotLeader,
-        CanonicalRefreshReason::OwnerGroupMismatch => RefreshReason::OwnerGroupMismatch,
-        CanonicalRefreshReason::Moved => RefreshReason::Unknown,
-        CanonicalRefreshReason::StaleState => RefreshReason::StaleState,
-        CanonicalRefreshReason::MountEpochMismatch => RefreshReason::MountEpochMismatch,
-        CanonicalRefreshReason::RouteEpochMismatch => RefreshReason::RouteEpochMismatch,
-        CanonicalRefreshReason::WorkerRunMismatch => RefreshReason::WorkerRunMismatch,
-        CanonicalRefreshReason::GroupMismatch
-        | CanonicalRefreshReason::NeedRegister
-        | CanonicalRefreshReason::FullReportRequired
-        | CanonicalRefreshReason::BlockLocationUnavailable => RefreshReason::Unknown,
-        CanonicalRefreshReason::BlockStampMismatch => RefreshReason::BlockStampMismatch,
-        CanonicalRefreshReason::Unknown => RefreshReason::Unknown,
-        CanonicalRefreshReason::Fencing
-        | CanonicalRefreshReason::EpochMismatch
-        | CanonicalRefreshReason::SessionInvalid
-        | CanonicalRefreshReason::SessionExpired => RefreshReason::Unknown,
+fn classify_fail_action(rpc_error: &RpcErrorDetail) -> ErrorClass {
+    match rpc_error.kind {
+        ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader) => ErrorClass::InvalidHeader,
+        ErrorKind::Metadata(MetadataErrorKind::Fencing) | ErrorKind::Metadata(MetadataErrorKind::EpochMismatch) => {
+            ErrorClass::Fencing
+        }
+        ErrorKind::Protocol(ProtocolErrorKind::PermissionDenied)
+        | ErrorKind::Fs(FsErrorCode::EPerm | FsErrorCode::EAcces) => ErrorClass::PermissionDenied,
+        ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument) | ErrorKind::Fs(FsErrorCode::EInval) => {
+            ErrorClass::InvalidArgument
+        }
+        ErrorKind::Protocol(ProtocolErrorKind::Unsupported)
+        | ErrorKind::Fs(FsErrorCode::ENotsup | FsErrorCode::ENotImpl) => ErrorClass::Unsupported,
+        _ => ErrorClass::Fatal,
     }
 }
 
@@ -183,114 +180,27 @@ fn is_retryable_transport(status: &tonic::Status) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::{ClientAction, RefreshHint};
     use crate::error::ClientError;
-    use common::error::canonical::{CanonicalError, RefreshHint as CanonicalRefreshHint};
-    use common::header::RpcErrorCode;
-    use types::GroupName;
+    use crate::rpc_error::ClientAction;
+    use common::error::rpc::{ErrorKind, RecoveryAction, RefreshHint as RpcRefreshHint, RpcErrorDetail};
 
     #[test]
-    fn owner_group_mismatch_reason_classifies_as_owner_group_mismatch() {
-        let canonical = CanonicalError::need_refresh_with_hint(
-            RpcErrorCode::ShardMoved,
-            common::error::canonical::RefreshReason::OwnerGroupMismatch,
-            CanonicalRefreshHint {
-                group_name: Some("analytics".to_string()),
-                ..CanonicalRefreshHint::default()
-            },
+    fn refresh_action_uses_runtime_reason_for_refresh_class() {
+        let rpc_error = RpcErrorDetail::refresh_metadata(
+            ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch),
+            RpcRefreshHint::default(),
             "owner moved",
         );
         let err = ClientError::from(ClientAction::Refresh {
-            reason: common::error::canonical::RefreshReason::OwnerGroupMismatch,
-            hint: Box::new(RefreshHint {
-                group_name: Some(GroupName::parse("analytics").unwrap()),
-                ..RefreshHint::default()
-            }),
-            canonical: Box::new(canonical),
-        });
-
-        let classified = ErrorClassifier.classify_error(&err);
-
-        assert_eq!(classified, ErrorClass::NeedRefresh(RefreshReason::OwnerGroupMismatch));
-    }
-
-    #[test]
-    fn generic_moved_no_longer_infers_owner_group_from_hint() {
-        let canonical = CanonicalError::need_refresh_with_hint(
-            RpcErrorCode::ShardMoved,
-            common::error::canonical::RefreshReason::Moved,
-            CanonicalRefreshHint {
-                group_name: Some("analytics".to_string()),
-                ..CanonicalRefreshHint::default()
-            },
-            "resource moved",
-        );
-        let err = ClientError::from(ClientAction::Refresh {
-            reason: common::error::canonical::RefreshReason::Moved,
-            hint: Box::new(RefreshHint {
-                group_name: Some(GroupName::parse("analytics").unwrap()),
-                ..RefreshHint::default()
-            }),
-            canonical: Box::new(canonical),
-        });
-
-        let classified = ErrorClassifier.classify_error(&err);
-
-        assert_eq!(classified, ErrorClass::NeedRefresh(RefreshReason::Unknown));
-    }
-
-    #[test]
-    fn need_refresh_without_structured_reason_is_conservative() {
-        let canonical = CanonicalError::need_refresh(
-            RpcErrorCode::Application,
-            common::error::canonical::RefreshReason::Unknown,
-            "unknown refresh",
-        );
-        let err = ClientError::from(ClientAction::Refresh {
-            reason: common::error::canonical::RefreshReason::Unknown,
+            reason: MetadataRefreshCause::OwnerGroupMismatch,
             hint: Box::default(),
-            canonical: Box::new(canonical),
+            rpc_error: Box::new(rpc_error),
         });
 
-        let classified = ErrorClassifier.classify_error(&err);
-
-        assert_eq!(classified, ErrorClass::NeedRefresh(RefreshReason::Unknown));
-    }
-
-    #[test]
-    fn block_stamp_mismatch_classifies_as_typed_refresh_reason() {
-        let canonical = CanonicalError::need_refresh(
-            RpcErrorCode::BlockStampMismatch,
-            common::error::canonical::RefreshReason::BlockStampMismatch,
-            "block stamp mismatch",
+        assert_eq!(
+            ErrorClassifier.classify_error(&err),
+            ErrorClass::RefreshMetadata(MetadataRefreshCause::OwnerGroupMismatch)
         );
-        let err = ClientError::from(ClientAction::Refresh {
-            reason: common::error::canonical::RefreshReason::BlockStampMismatch,
-            hint: Box::default(),
-            canonical: Box::new(canonical),
-        });
-
-        let classified = ErrorClassifier.classify_error(&err);
-
-        assert_eq!(classified, ErrorClass::NeedRefresh(RefreshReason::BlockStampMismatch));
-    }
-
-    #[test]
-    fn worker_run_mismatch_classifies_as_typed_refresh_reason() {
-        let canonical = CanonicalError::need_refresh(
-            RpcErrorCode::WorkerRunMismatch,
-            common::error::canonical::RefreshReason::WorkerRunMismatch,
-            "worker run mismatch",
-        );
-        let err = ClientError::from(ClientAction::Refresh {
-            reason: common::error::canonical::RefreshReason::WorkerRunMismatch,
-            hint: Box::default(),
-            canonical: Box::new(canonical),
-        });
-
-        let classified = ErrorClassifier.classify_error(&err);
-
-        assert_eq!(classified, ErrorClass::NeedRefresh(RefreshReason::WorkerRunMismatch));
     }
 
     #[test]
@@ -315,34 +225,28 @@ mod tests {
     }
 
     #[test]
-    fn fencing_refresh_is_typed_and_not_transport_retryable() {
-        let canonical = CanonicalError::need_refresh(
-            RpcErrorCode::Fencing,
-            common::error::canonical::RefreshReason::Fencing,
-            "fencing mismatch",
+    fn reopen_session_action_classifies_session_expired() {
+        let rpc_error = RpcErrorDetail::reopen_write_session(
+            ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
+            RpcRefreshHint::default(),
+            "expired",
         );
         let err = ClientError::from(ClientAction::Refresh {
-            reason: common::error::canonical::RefreshReason::Fencing,
+            reason: MetadataRefreshCause::Unknown,
             hint: Box::default(),
-            canonical: Box::new(canonical),
+            rpc_error: Box::new(rpc_error),
         });
 
-        let classified = ErrorClassifier.classify_error(&err);
-
-        assert_eq!(classified, ErrorClass::Fencing);
+        assert_eq!(ErrorClassifier.classify_error(&err), ErrorClass::SessionExpired);
     }
 
     #[test]
-    fn fatal_fencing_rpc_code_is_typed_and_not_transport_retryable() {
+    fn fatal_fencing_kind_is_typed_and_not_transport_retryable() {
         let err = ClientError::from(ClientAction::Fail {
-            canonical: Box::new(CanonicalError {
-                class: common::error::canonical::ErrorClass::Fatal,
-                code: Some(common::error::canonical::ErrorCode::RpcCode(RpcErrorCode::Fencing)),
-                reason: None,
-                retry_after_ms: None,
-                message: "fencing mismatch".to_string(),
-                refresh_hint: None,
-            }),
+            rpc_error: Box::new(RpcErrorDetail::fail(
+                ErrorKind::Metadata(MetadataErrorKind::Fencing),
+                "fencing mismatch",
+            )),
         });
 
         let classified = ErrorClassifier.classify_error(&err);
@@ -352,18 +256,12 @@ mod tests {
     }
 
     #[test]
-    fn invalid_header_rpc_code_is_typed_and_not_transport_retryable() {
+    fn invalid_header_kind_is_typed_and_not_transport_retryable() {
         let err = ClientError::from(ClientAction::Fail {
-            canonical: Box::new(CanonicalError {
-                class: common::error::canonical::ErrorClass::Fatal,
-                code: Some(common::error::canonical::ErrorCode::RpcCode(
-                    RpcErrorCode::InvalidHeader,
-                )),
-                reason: None,
-                retry_after_ms: None,
-                message: "malformed OK response".to_string(),
-                refresh_hint: None,
-            }),
+            rpc_error: Box::new(RpcErrorDetail::fail(
+                ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader),
+                "malformed OK response",
+            )),
         });
 
         let classified = ErrorClassifier.classify_error(&err);
@@ -373,56 +271,15 @@ mod tests {
     }
 
     #[test]
-    fn session_invalid_refresh_is_typed_and_not_transport_retryable() {
-        let canonical = CanonicalError::need_refresh(
-            RpcErrorCode::Application,
-            common::error::canonical::RefreshReason::SessionInvalid,
-            "session invalid",
-        );
-        let err = ClientError::from(ClientAction::Refresh {
-            reason: common::error::canonical::RefreshReason::SessionInvalid,
-            hint: Box::default(),
-            canonical: Box::new(canonical),
-        });
-
-        let classified = ErrorClassifier.classify_error(&err);
-
-        assert_eq!(classified, ErrorClass::SessionInvalid);
-    }
-
-    #[test]
-    fn session_expired_refresh_is_typed_and_not_transport_retryable() {
-        let canonical = CanonicalError::need_refresh(
-            RpcErrorCode::Application,
-            common::error::canonical::RefreshReason::SessionExpired,
-            "session expired",
-        );
-        let err = ClientError::from(ClientAction::Refresh {
-            reason: common::error::canonical::RefreshReason::SessionExpired,
-            hint: Box::default(),
-            canonical: Box::new(canonical),
-        });
-
-        let classified = ErrorClassifier.classify_error(&err);
-
-        assert_eq!(classified, ErrorClass::SessionExpired);
-    }
-
-    #[test]
-    fn fatal_session_reason_is_not_a_session_control_signal() {
+    fn fail_session_kind_is_not_a_session_control_signal() {
         let err = ClientError::from(ClientAction::Fail {
-            canonical: Box::new(CanonicalError {
-                class: common::error::canonical::ErrorClass::Fatal,
-                code: Some(common::error::canonical::ErrorCode::RpcCode(RpcErrorCode::Application)),
-                reason: Some(common::error::canonical::RefreshReason::SessionExpired),
-                retry_after_ms: None,
-                message: "legacy fatal session error".to_string(),
-                refresh_hint: None,
-            }),
+            rpc_error: Box::new(RpcErrorDetail::new(
+                ErrorKind::Metadata(MetadataErrorKind::SessionExpired),
+                RecoveryAction::Fail,
+                "fatal session-shaped error",
+            )),
         });
 
-        let classified = ErrorClassifier.classify_error(&err);
-
-        assert_eq!(classified, ErrorClass::Fatal);
+        assert_eq!(ErrorClassifier.classify_error(&err), ErrorClass::Fatal);
     }
 }

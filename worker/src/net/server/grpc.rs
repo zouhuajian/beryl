@@ -31,8 +31,7 @@ use crate::data::convert::{
 use crate::data::core::{StreamMode, WorkerCore};
 use crate::error::WorkerError;
 use crate::observe;
-use common::error::canonical::RefreshReason;
-use common::header::RpcErrorCode;
+use common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
 use common::observe::propagation::{extract_trace_context, ExtractedContext};
 use tracing::Span;
 use types::GroupName;
@@ -75,8 +74,8 @@ impl WorkerDataServiceImpl {
     }
 
     fn error_detail(error: &WorkerError) -> ErrorDetailProto {
-        let canonical: common::error::canonical::CanonicalError = error.clone().into();
-        proto::convert::canonical_to_error_detail(&canonical)
+        let rpc_error: common::error::rpc::RpcErrorDetail = error.clone().into();
+        proto::convert::rpc_error_to_proto(&rpc_error)
     }
 
     fn ensure_group_ready(&self, group_name: &str) -> Result<(), WorkerError> {
@@ -85,9 +84,8 @@ impl WorkerDataServiceImpl {
             return Ok(());
         }
 
-        Err(WorkerError::NeedRefresh {
-            code: RpcErrorCode::NodeUnavailable,
-            reason: RefreshReason::StaleState,
+        Err(WorkerError::RefreshMetadata {
+            kind: ErrorKind::Metadata(MetadataErrorKind::StaleState),
             message: format!("worker is not registered for metadata group {}", group_name),
         })
     }
@@ -96,23 +94,20 @@ impl WorkerDataServiceImpl {
         let group_name = parse_group_name(group_name)?;
         let requested = require_worker_run_id(worker_run_id, "worker_run_id").map_err(WorkerError::InvalidArgument)?;
         let Some(registration) = self.registration_state.registration_for_group(&group_name) else {
-            return Err(WorkerError::NeedRefresh {
-                code: RpcErrorCode::NodeUnavailable,
-                reason: RefreshReason::StaleState,
+            return Err(WorkerError::RefreshMetadata {
+                kind: ErrorKind::Metadata(MetadataErrorKind::StaleState),
                 message: format!("worker is not registered for metadata group {}", group_name),
             });
         };
         if !self.registration_state.is_ready(&group_name) {
-            return Err(WorkerError::NeedRefresh {
-                code: RpcErrorCode::NodeUnavailable,
-                reason: RefreshReason::StaleState,
+            return Err(WorkerError::RefreshMetadata {
+                kind: ErrorKind::Metadata(MetadataErrorKind::StaleState),
                 message: format!("worker is not ready for metadata group {}", group_name),
             });
         }
         if !requested.matches(registration.worker_run_id) {
-            return Err(WorkerError::NeedRefresh {
-                code: RpcErrorCode::WorkerRunMismatch,
-                reason: RefreshReason::WorkerRunMismatch,
+            return Err(WorkerError::RefreshMetadata {
+                kind: ErrorKind::Worker(WorkerErrorKind::RunMismatch),
                 message: format!(
                     "worker_run_id mismatch: requested={}, current={}",
                     requested, registration.worker_run_id
@@ -127,9 +122,8 @@ impl WorkerDataServiceImpl {
             return Ok(());
         }
 
-        Err(WorkerError::NeedRefresh {
-            code: RpcErrorCode::NodeUnavailable,
-            reason: RefreshReason::StaleState,
+        Err(WorkerError::RefreshMetadata {
+            kind: ErrorKind::Metadata(MetadataErrorKind::StaleState),
             message: "worker is not registered with any metadata group".to_string(),
         })
     }
@@ -654,7 +648,7 @@ fn record_transport_context(context: &ExtractedContext) {
 
 fn response_status_error_kind(header: Option<&DataResponseHeaderProto>) -> (&'static str, &'static str) {
     match header.and_then(|header| header.error.as_ref()) {
-        Some(_) => ("error", "canonical_error"),
+        Some(_) => ("error", "rpc_error"),
         None => ("ok", "none"),
     }
 }

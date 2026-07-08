@@ -3,7 +3,7 @@
 
 //! Domain types for FsCore APIs.
 
-use common::error::canonical::CanonicalError;
+use common::error::rpc::RpcErrorDetail;
 use common::header::{AuthnType, RequestHeader};
 use types::fs::{Extent, FileAttrs, InodeId, InodeKind};
 use types::ids::{BlockId, DataHandleId, LeaseId, MountId};
@@ -67,7 +67,7 @@ pub struct CoreSuccess<T> {
 
 #[derive(Clone, Debug)]
 pub struct CoreFailure {
-    pub error: Box<CanonicalError>,
+    pub error: Box<RpcErrorDetail>,
     pub group_name: Option<GroupName>,
     pub mount_epoch: Option<u64>,
     pub route_epoch: Option<u64>,
@@ -76,7 +76,7 @@ pub struct CoreFailure {
 
 impl CoreFailure {
     pub fn new(
-        error: CanonicalError,
+        error: RpcErrorDetail,
         group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
         route_epoch: Option<u64>,

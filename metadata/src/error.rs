@@ -6,8 +6,9 @@
 //! This module defines unified error types for the metadata service,
 //! with proper mapping to proto status codes and retry semantics.
 
-use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshReason};
-use common::header::RpcErrorCode;
+use common::error::rpc::{
+    ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RefreshHint, RpcErrorDetail, WorkerErrorKind,
+};
 use thiserror::Error;
 use types::fs::FsErrorCode;
 use types::ids::MountId;
@@ -104,92 +105,73 @@ pub enum MetadataError {
     ServiceUnavailable(String),
 }
 
-impl MetadataError {
-    /// Check if this error is retryable.
-    pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::LeaderChanged(_)
-                | Self::EpochMismatch { .. }
-                | Self::MountEpochMismatch { .. }
-                | Self::RoutingStale(_)
-                | Self::StaleState(_)
-                | Self::FullReportRequired(_)
-        )
-    }
-}
-
-/// Authoritative metadata -> canonical mapping for non-filesystem handlers.
-///
-/// This keeps the existing RPC-style `Application` fallback semantics while
-/// making the authoritative RPC mapper explicit at production call sites.
-pub fn to_canonical_rpc(err: MetadataError) -> CanonicalError {
-    match map_shared_canonical(err) {
-        Ok(canonical) => canonical,
-        Err(err) => map_rpc_application_canonical(err),
+/// Authoritative metadata -> rpc_error mapping for non-filesystem handlers.
+pub fn to_rpc_error(err: MetadataError) -> RpcErrorDetail {
+    match map_shared_rpc_error(err) {
+        Ok(rpc_error) => rpc_error,
+        Err(err) => map_rpc_application_error(err),
     }
 }
 
 /// Result type for metadata operations.
 pub type MetadataResult<T> = Result<T, MetadataError>;
 
-/// Authoritative FS canonicalization entrypoint.
+/// Authoritative FS error mapping entrypoint.
 ///
 /// This is the single place that maps `MetadataError` into FS errno-backed
-/// canonical errors for filesystem-facing handlers.
-pub fn to_canonical_fs(err: MetadataError) -> CanonicalError {
-    match map_shared_canonical(err) {
-        Ok(canonical) => canonical,
-        Err(err) => map_fs_fatal_canonical(err),
+/// RPC errors for filesystem-facing handlers.
+pub fn to_fs_error_detail(err: MetadataError) -> RpcErrorDetail {
+    match map_shared_rpc_error(err) {
+        Ok(rpc_error) => rpc_error,
+        Err(err) => map_fs_fatal_rpc_error(err),
     }
 }
 
-fn map_shared_canonical(err: MetadataError) -> Result<CanonicalError, MetadataError> {
+fn map_shared_rpc_error(err: MetadataError) -> Result<RpcErrorDetail, MetadataError> {
     match err {
-        MetadataError::LeaderChanged(msg) => Ok(CanonicalError::need_refresh(
-            RpcErrorCode::NotLeader,
-            RefreshReason::NotLeader,
+        MetadataError::LeaderChanged(msg) => Ok(RpcErrorDetail::refresh_metadata(
+            ErrorKind::Metadata(MetadataErrorKind::NotLeader),
+            RefreshHint::default(),
             msg,
         )),
-        MetadataError::EpochMismatch { expected, got } => Ok(CanonicalError::need_refresh(
-            RpcErrorCode::EpochMismatch,
-            RefreshReason::EpochMismatch,
+        MetadataError::EpochMismatch { expected, got } => Ok(RpcErrorDetail::reopen_write_session(
+            ErrorKind::Metadata(MetadataErrorKind::EpochMismatch),
+            RefreshHint::default(),
             format!("epoch mismatch: expected {}, got {}", expected, got),
         )),
         MetadataError::MountEpochMismatch {
             expected,
             got,
             mount_id,
-        } => Ok(CanonicalError::need_refresh(
-            RpcErrorCode::MountEpochMismatch,
-            RefreshReason::MountEpochMismatch,
+        } => Ok(RpcErrorDetail::refresh_metadata(
+            ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
+            RefreshHint::default(),
             format!(
                 "mount epoch mismatch: expected {}, got {} (mount_id={:?})",
                 expected, got, mount_id
             ),
         )),
-        MetadataError::RoutingStale(msg) => Ok(CanonicalError::need_refresh(
-            RpcErrorCode::ShardMoved,
-            RefreshReason::RouteEpochMismatch,
+        MetadataError::RoutingStale(msg) => Ok(RpcErrorDetail::refresh_metadata(
+            ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
+            RefreshHint::default(),
             msg,
         )),
-        MetadataError::StaleState(msg) => Ok(CanonicalError::need_refresh(
-            RpcErrorCode::StaleState,
-            RefreshReason::StaleState,
+        MetadataError::StaleState(msg) => Ok(RpcErrorDetail::refresh_metadata(
+            ErrorKind::Metadata(MetadataErrorKind::StaleState),
+            RefreshHint::default(),
             msg,
         )),
-        MetadataError::FullReportRequired(msg) => Ok(CanonicalError::need_refresh(
-            RpcErrorCode::FullReportRequired,
-            RefreshReason::FullReportRequired,
+        MetadataError::FullReportRequired(msg) => Ok(RpcErrorDetail::send_full_block_report(
+            ErrorKind::Worker(WorkerErrorKind::FullReportRequired),
             msg,
         )),
-        MetadataError::LeaseFenced { expected, got } => Ok(CanonicalError::need_refresh(
-            RpcErrorCode::Fencing,
-            RefreshReason::Fencing,
+        MetadataError::LeaseFenced { expected, got } => Ok(RpcErrorDetail::reopen_write_session(
+            ErrorKind::Metadata(MetadataErrorKind::Fencing),
+            RefreshHint::default(),
             format!("lease fenced: expected >= {}, got {}", expected, got),
         )),
-        MetadataError::ServiceUnavailable(msg) => Ok(CanonicalError::retryable(
-            RpcErrorCode::NodeUnavailable,
+        MetadataError::ServiceUnavailable(msg) => Ok(RpcErrorDetail::retry(
+            ErrorKind::Internal(InternalErrorKind::NodeUnavailable),
             Some(1000),
             format!("service unavailable: {}", msg),
         )),
@@ -197,21 +179,61 @@ fn map_shared_canonical(err: MetadataError) -> Result<CanonicalError, MetadataEr
     }
 }
 
-fn map_rpc_application_canonical(err: MetadataError) -> CanonicalError {
+fn map_rpc_application_error(err: MetadataError) -> RpcErrorDetail {
     match err {
-        MetadataError::NotFound(msg) => application_canonical("not found", msg),
-        MetadataError::AlreadyExists(msg) => application_canonical("already exists", msg),
-        MetadataError::InvalidArgument(msg) => application_canonical("invalid argument", msg),
-        MetadataError::NotDir(msg) => application_canonical("not a directory", msg),
-        MetadataError::IsDir(msg) => application_canonical("is a directory", msg),
-        MetadataError::DirectoryNotEmpty(msg) => application_canonical("directory not empty", msg),
-        MetadataError::CrossMountRename(msg) => application_canonical("cross-mount rename not allowed", msg),
-        MetadataError::PermissionDenied(msg) => application_canonical("permission denied", msg),
-        MetadataError::NotSupported(msg) => application_canonical("operation not supported", msg),
-        MetadataError::Busy(msg) => application_canonical("resource busy", msg),
-        MetadataError::ActiveWorkerConflict(msg) => application_canonical("active worker conflict", msg),
-        MetadataError::Again(msg) => application_canonical("resource temporarily unavailable", msg),
-        MetadataError::Internal(msg) => application_canonical("internal error", msg),
+        MetadataError::NotFound(msg) => RpcErrorDetail::fail(
+            ErrorKind::Metadata(MetadataErrorKind::NotFound),
+            format!("not found: {}", msg),
+        ),
+        MetadataError::AlreadyExists(msg) => RpcErrorDetail::fail(
+            ErrorKind::Metadata(MetadataErrorKind::AlreadyExists),
+            format!("already exists: {}", msg),
+        ),
+        MetadataError::InvalidArgument(msg) => RpcErrorDetail::fail(
+            ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument),
+            format!("invalid argument: {}", msg),
+        ),
+        MetadataError::NotDir(msg) => RpcErrorDetail::fail(
+            ErrorKind::Metadata(MetadataErrorKind::NotDirectory),
+            format!("not a directory: {}", msg),
+        ),
+        MetadataError::IsDir(msg) => RpcErrorDetail::fail(
+            ErrorKind::Metadata(MetadataErrorKind::IsDirectory),
+            format!("is a directory: {}", msg),
+        ),
+        MetadataError::DirectoryNotEmpty(msg) => RpcErrorDetail::fail(
+            ErrorKind::Metadata(MetadataErrorKind::DirectoryNotEmpty),
+            format!("directory not empty: {}", msg),
+        ),
+        MetadataError::CrossMountRename(msg) => RpcErrorDetail::fail(
+            ErrorKind::Metadata(MetadataErrorKind::CrossMountRename),
+            format!("cross-mount rename not allowed: {}", msg),
+        ),
+        MetadataError::PermissionDenied(msg) => RpcErrorDetail::fail(
+            ErrorKind::Protocol(ProtocolErrorKind::PermissionDenied),
+            format!("permission denied: {}", msg),
+        ),
+        MetadataError::NotSupported(msg) => RpcErrorDetail::fail(
+            ErrorKind::Protocol(ProtocolErrorKind::Unsupported),
+            format!("operation not supported: {}", msg),
+        ),
+        MetadataError::Busy(msg) => RpcErrorDetail::fail(
+            ErrorKind::Metadata(MetadataErrorKind::Busy),
+            format!("resource busy: {}", msg),
+        ),
+        MetadataError::ActiveWorkerConflict(msg) => RpcErrorDetail::fail(
+            ErrorKind::Metadata(MetadataErrorKind::Conflict),
+            format!("active worker conflict: {}", msg),
+        ),
+        MetadataError::Again(msg) => RpcErrorDetail::retry(
+            ErrorKind::Internal(InternalErrorKind::ResourceExhausted),
+            None,
+            format!("resource temporarily unavailable: {}", msg),
+        ),
+        MetadataError::Internal(msg) => RpcErrorDetail::fail(
+            ErrorKind::Internal(InternalErrorKind::Internal),
+            format!("internal error: {}", msg),
+        ),
         MetadataError::LeaderChanged(_)
         | MetadataError::EpochMismatch { .. }
         | MetadataError::MountEpochMismatch { .. }
@@ -223,21 +245,21 @@ fn map_rpc_application_canonical(err: MetadataError) -> CanonicalError {
     }
 }
 
-fn map_fs_fatal_canonical(err: MetadataError) -> CanonicalError {
+fn map_fs_fatal_rpc_error(err: MetadataError) -> RpcErrorDetail {
     match err {
-        MetadataError::NotFound(msg) => CanonicalError::fatal_fs(FsErrorCode::ENoEnt, msg),
-        MetadataError::AlreadyExists(msg) => CanonicalError::fatal_fs(FsErrorCode::EExist, msg),
-        MetadataError::InvalidArgument(msg) => CanonicalError::fatal_fs(FsErrorCode::EInval, msg),
-        MetadataError::NotDir(msg) => CanonicalError::fatal_fs(FsErrorCode::ENotDir, msg),
-        MetadataError::IsDir(msg) => CanonicalError::fatal_fs(FsErrorCode::EIsDir, msg),
-        MetadataError::DirectoryNotEmpty(msg) => CanonicalError::fatal_fs(FsErrorCode::ENotEmpty, msg),
-        MetadataError::CrossMountRename(msg) => CanonicalError::fatal_fs(FsErrorCode::EXDev, msg),
-        MetadataError::PermissionDenied(msg) => CanonicalError::fatal_fs(FsErrorCode::EAcces, msg),
-        MetadataError::NotSupported(msg) => CanonicalError::fatal_fs(FsErrorCode::ENotsup, msg),
-        MetadataError::Busy(msg) => CanonicalError::fatal_fs(FsErrorCode::EBusy, msg),
-        MetadataError::ActiveWorkerConflict(msg) => CanonicalError::fatal_fs(FsErrorCode::EBusy, msg),
-        MetadataError::Again(msg) => CanonicalError::fatal_fs(FsErrorCode::EAgain, msg),
-        MetadataError::Internal(msg) => CanonicalError::fatal_fs(FsErrorCode::EInval, msg),
+        MetadataError::NotFound(msg) => RpcErrorDetail::fs(FsErrorCode::ENoEnt, msg),
+        MetadataError::AlreadyExists(msg) => RpcErrorDetail::fs(FsErrorCode::EExist, msg),
+        MetadataError::InvalidArgument(msg) => RpcErrorDetail::fs(FsErrorCode::EInval, msg),
+        MetadataError::NotDir(msg) => RpcErrorDetail::fs(FsErrorCode::ENotDir, msg),
+        MetadataError::IsDir(msg) => RpcErrorDetail::fs(FsErrorCode::EIsDir, msg),
+        MetadataError::DirectoryNotEmpty(msg) => RpcErrorDetail::fs(FsErrorCode::ENotEmpty, msg),
+        MetadataError::CrossMountRename(msg) => RpcErrorDetail::fs(FsErrorCode::EXDev, msg),
+        MetadataError::PermissionDenied(msg) => RpcErrorDetail::fs(FsErrorCode::EAcces, msg),
+        MetadataError::NotSupported(msg) => RpcErrorDetail::fs(FsErrorCode::ENotsup, msg),
+        MetadataError::Busy(msg) => RpcErrorDetail::fs(FsErrorCode::EBusy, msg),
+        MetadataError::ActiveWorkerConflict(msg) => RpcErrorDetail::fs(FsErrorCode::EBusy, msg),
+        MetadataError::Again(msg) => RpcErrorDetail::fs(FsErrorCode::EAgain, msg),
+        MetadataError::Internal(msg) => RpcErrorDetail::fs(FsErrorCode::EInval, msg),
         MetadataError::LeaderChanged(_)
         | MetadataError::EpochMismatch { .. }
         | MetadataError::MountEpochMismatch { .. }
@@ -246,43 +268,17 @@ fn map_fs_fatal_canonical(err: MetadataError) -> CanonicalError {
         | MetadataError::FullReportRequired(_)
         | MetadataError::LeaseFenced { .. }
         | MetadataError::ServiceUnavailable(_) => unreachable!("shared metadata errors must be mapped earlier"),
-    }
-}
-
-fn application_canonical(prefix: &str, message: String) -> CanonicalError {
-    CanonicalError {
-        class: ErrorClass::Fatal,
-        code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-        reason: None,
-        retry_after_ms: None,
-        message: format!("{}: {}", prefix, message),
-        refresh_hint: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::error::canonical::ErrorCode as CanonicalCode;
+    use common::error::rpc::RecoveryAction;
     use types::fs::FsErrorCode;
 
     #[test]
-    fn test_error_retryable() {
-        assert!(MetadataError::LeaderChanged("test".to_string()).is_retryable());
-        assert!(MetadataError::EpochMismatch { expected: 1, got: 0 }.is_retryable());
-        assert!(MetadataError::MountEpochMismatch {
-            expected: 2,
-            got: 1,
-            mount_id: None
-        }
-        .is_retryable());
-        assert!(MetadataError::RoutingStale("test".to_string()).is_retryable());
-        assert!(!MetadataError::NotFound("test".to_string()).is_retryable());
-        assert!(!MetadataError::LeaseFenced { expected: 1, got: 0 }.is_retryable());
-    }
-
-    #[test]
-    fn test_to_canonical_fs_errno_coverage() {
+    fn test_to_fs_error_detail_errno_coverage() {
         let cases = vec![
             (MetadataError::NotFound("x".to_string()), FsErrorCode::ENoEnt),
             (MetadataError::AlreadyExists("x".to_string()), FsErrorCode::EExist),
@@ -302,68 +298,86 @@ mod tests {
         ];
 
         for (input, expected_errno) in cases {
-            let canonical = to_canonical_fs(input);
-            assert_eq!(canonical.class, ErrorClass::Fatal);
-            assert!(matches!(
-                canonical.code,
-                Some(CanonicalCode::FsErrno(errno)) if errno == expected_errno
-            ));
+            let rpc_error = to_fs_error_detail(input);
+            assert_eq!(rpc_error.kind, ErrorKind::Fs(expected_errno));
+            assert_eq!(rpc_error.recovery, RecoveryAction::Fail);
         }
     }
 
     #[test]
-    fn test_to_canonical_rpc_application_code_coverage() {
+    fn test_to_rpc_error_kind_coverage() {
         let cases = vec![
-            (MetadataError::NotFound("x".to_string()), "not found: x".to_string()),
+            (
+                MetadataError::NotFound("x".to_string()),
+                ErrorKind::Metadata(MetadataErrorKind::NotFound),
+                "not found: x".to_string(),
+            ),
             (
                 MetadataError::AlreadyExists("x".to_string()),
+                ErrorKind::Metadata(MetadataErrorKind::AlreadyExists),
                 "already exists: x".to_string(),
             ),
             (
                 MetadataError::InvalidArgument("x".to_string()),
+                ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument),
                 "invalid argument: x".to_string(),
             ),
-            (MetadataError::NotDir("x".to_string()), "not a directory: x".to_string()),
-            (MetadataError::IsDir("x".to_string()), "is a directory: x".to_string()),
+            (
+                MetadataError::NotDir("x".to_string()),
+                ErrorKind::Metadata(MetadataErrorKind::NotDirectory),
+                "not a directory: x".to_string(),
+            ),
+            (
+                MetadataError::IsDir("x".to_string()),
+                ErrorKind::Metadata(MetadataErrorKind::IsDirectory),
+                "is a directory: x".to_string(),
+            ),
             (
                 MetadataError::DirectoryNotEmpty("x".to_string()),
+                ErrorKind::Metadata(MetadataErrorKind::DirectoryNotEmpty),
                 "directory not empty: x".to_string(),
             ),
             (
                 MetadataError::CrossMountRename("x".to_string()),
+                ErrorKind::Metadata(MetadataErrorKind::CrossMountRename),
                 "cross-mount rename not allowed: x".to_string(),
             ),
             (
                 MetadataError::PermissionDenied("x".to_string()),
+                ErrorKind::Protocol(ProtocolErrorKind::PermissionDenied),
                 "permission denied: x".to_string(),
             ),
             (
                 MetadataError::NotSupported("x".to_string()),
+                ErrorKind::Protocol(ProtocolErrorKind::Unsupported),
                 "operation not supported: x".to_string(),
             ),
-            (MetadataError::Busy("x".to_string()), "resource busy: x".to_string()),
+            (
+                MetadataError::Busy("x".to_string()),
+                ErrorKind::Metadata(MetadataErrorKind::Busy),
+                "resource busy: x".to_string(),
+            ),
             (
                 MetadataError::ActiveWorkerConflict("x".to_string()),
+                ErrorKind::Metadata(MetadataErrorKind::Conflict),
                 "active worker conflict: x".to_string(),
             ),
             (
                 MetadataError::Again("x".to_string()),
+                ErrorKind::Internal(InternalErrorKind::ResourceExhausted),
                 "resource temporarily unavailable: x".to_string(),
             ),
             (
                 MetadataError::Internal("x".to_string()),
+                ErrorKind::Internal(InternalErrorKind::Internal),
                 "internal error: x".to_string(),
             ),
         ];
 
-        for (input, expected_message) in cases {
-            let canonical = to_canonical_rpc(input);
-            assert_eq!(canonical.class, ErrorClass::Fatal);
-            assert!(matches!(
-                canonical.code,
-                Some(CanonicalCode::RpcCode(RpcErrorCode::Application))
-            ));
-            assert_eq!(canonical.message, expected_message);
+        for (input, expected_kind, expected_message) in cases {
+            let rpc_error = to_rpc_error(input);
+            assert_eq!(rpc_error.kind, expected_kind);
+            assert_eq!(rpc_error.message, expected_message);
         }
     }
 
@@ -384,12 +398,10 @@ mod tests {
         ];
 
         for input in cases {
-            let rpc = to_canonical_rpc(input.clone());
-            let fs = to_canonical_fs(input);
-            assert_eq!(rpc.class, fs.class);
-            assert_eq!(rpc.code, fs.code);
-            assert_eq!(rpc.reason, fs.reason);
-            assert_eq!(rpc.retry_after_ms, fs.retry_after_ms);
+            let rpc = to_rpc_error(input.clone());
+            let fs = to_fs_error_detail(input);
+            assert_eq!(rpc.kind, fs.kind);
+            assert_eq!(rpc.recovery, fs.recovery);
             assert_eq!(rpc.message, fs.message);
         }
     }

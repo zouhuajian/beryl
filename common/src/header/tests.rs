@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-use crate::error::canonical::{CanonicalError, ErrorClass, ErrorCode, RefreshReason};
+use crate::error::rpc::{ErrorKind, InternalErrorKind, RecoveryAction, RpcErrorDetail};
 use crate::header::ClientInfo;
 use crate::time::Deadline;
-use crate::{CallerContext, CallerContextFields, RequestHeader, ResponseHeader, RpcErrorCode, RpcStatus};
+use crate::{CallerContext, CallerContextFields, RequestHeader, ResponseHeader};
 use std::time::Duration;
 use types::{CallId, ClientId, GroupName, GroupStateWatermark, RaftLogId};
 
@@ -44,27 +44,18 @@ fn test_response_header_with_client_info() {
     let resp = ResponseHeader::ok(client.clone());
 
     assert_eq!(resp.client.client_id.as_raw(), 789);
-    assert_eq!(resp.status(), RpcStatus::Ok);
-    assert!(resp.canonical_error.is_none());
+    assert!(resp.rpc_error.is_none());
 
-    let canonical = CanonicalError {
-        class: ErrorClass::Retryable,
-        code: Some(ErrorCode::RpcCode(RpcErrorCode::NodeUnavailable)),
-        reason: None,
-        retry_after_ms: Some(1000),
-        message: "Test error".to_string(),
-        refresh_hint: None,
-    };
-    let resp_error = ResponseHeader::error(client, canonical);
-    assert_eq!(resp_error.status(), RpcStatus::Error);
-    assert_eq!(
-        resp_error.canonical_error.as_ref().and_then(|c| c.retry_after_ms),
-        Some(1000)
+    let rpc_error = RpcErrorDetail::retry(
+        ErrorKind::Internal(InternalErrorKind::NodeUnavailable),
+        Some(1000),
+        "Test error",
     );
-    assert!(matches!(
-        resp_error.canonical_error.as_ref().and_then(|c| c.reason),
-        None | Some(RefreshReason::Unknown)
-    ));
+    let resp_error = ResponseHeader::error(client, rpc_error);
+    assert_eq!(
+        resp_error.rpc_error.as_ref().map(|c| &c.recovery),
+        Some(&RecoveryAction::Retry { after_ms: Some(1000) })
+    );
 }
 
 #[test]

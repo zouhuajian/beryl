@@ -14,8 +14,8 @@ pub enum ClientMetric {
     RetryExhausted,
     /// Refresh decision selected for a classified error.
     RefreshDecision,
-    /// Refresh reason observed.
-    RefreshReason,
+    /// Metadata refresh cause observed.
+    MetadataRefreshCause,
     /// Refresh budget exhausted.
     RefreshExhausted,
     /// Unknown outcome observed.
@@ -79,8 +79,8 @@ pub struct ClientMetricLabels {
     pub(crate) operation_name: Option<String>,
     /// Classified error class.
     pub(crate) error_class: Option<&'static str>,
-    /// Refresh reason.
-    pub(crate) refresh_reason: Option<&'static str>,
+    /// Metadata refresh cause.
+    pub(crate) metadata_refresh_cause: Option<&'static str>,
     /// Target plane.
     pub(crate) target_plane: Option<&'static str>,
     /// Cache or pool name.
@@ -107,9 +107,9 @@ impl ClientMetricLabels {
         self.error_class
     }
 
-    /// Return the refresh reason label.
-    pub fn refresh_reason(&self) -> Option<&'static str> {
-        self.refresh_reason
+    /// Return the metadata refresh cause label.
+    pub fn metadata_refresh_cause(&self) -> Option<&'static str> {
+        self.metadata_refresh_cause
     }
 
     /// Return the target plane label.
@@ -151,9 +151,9 @@ impl ClientMetricLabels {
         self
     }
 
-    /// Attach refresh reason label.
-    pub(crate) fn with_refresh_reason(mut self, refresh_reason: &'static str) -> Self {
-        self.refresh_reason = Some(refresh_reason);
+    /// Attach metadata refresh cause label.
+    pub(crate) fn with_metadata_refresh_cause(mut self, metadata_refresh_cause: &'static str) -> Self {
+        self.metadata_refresh_cause = Some(metadata_refresh_cause);
         self
     }
 
@@ -187,7 +187,7 @@ impl ClientMetricLabels {
             self.operation_name.as_deref(),
             self.operation_kind,
             self.error_class,
-            self.refresh_reason,
+            self.metadata_refresh_cause,
             self.target_plane,
             self.cache,
             self.reason,

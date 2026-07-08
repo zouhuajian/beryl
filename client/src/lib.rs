@@ -21,11 +21,11 @@
 
 mod api;
 mod cache;
-mod canonical;
 mod config;
 mod error;
 mod metrics;
 mod planner;
+mod rpc_error;
 mod runtime;
 mod session;
 

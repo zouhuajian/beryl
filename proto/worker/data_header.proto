@@ -35,8 +35,6 @@ message DataResponseHeaderProto {
   /// Client information (call_id, client_id, client_name).
   common.ClientInfoProto client = 1;
 
-  /// Canonical error detail (single source of truth for all error semantics).
-  /// If error_class = ERROR_CLASS_OK, this field should be unset or have error_class = OK.
-  /// For errors, this field contains all error information (class, code, reason, retry_after_ms).
+  /// RPC error detail. Unset means success.
   optional common.ErrorDetailProto error = 2;
 }

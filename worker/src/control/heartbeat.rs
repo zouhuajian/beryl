@@ -8,10 +8,10 @@ use std::future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::error::canonical::{CanonicalError, ErrorClass, RefreshReason};
+use common::error::rpc::{ErrorKind, RecoveryAction, RpcErrorDetail, WorkerErrorKind};
 use common::header::RequestHeader;
 use proto::common::{EndpointProto, RequestHeaderProto};
-use proto::convert::{error_detail_to_canonical, require_worker_run_id};
+use proto::convert::{require_worker_run_id, rpc_error_from_proto};
 use proto::metadata::metadata_worker_service_proto_client::MetadataWorkerServiceProtoClient;
 use proto::metadata::{
     CapacityInfoProto, HealthStatusProto, HeartbeatRequestProto, HeartbeatResponseProto, LoadInfoProto,
@@ -369,22 +369,19 @@ fn classify_header(
     let Some(error) = header.error.as_ref() else {
         return Ok(None);
     };
-    classify_canonical_error(error_detail_to_canonical(error)).map(Some)
+    classify_rpc_error(rpc_error_from_proto(error)).map(Some)
 }
 
-fn classify_canonical_error(error: CanonicalError) -> Result<HeartbeatPeerOutcome, HeartbeatError> {
-    match error.reason {
-        Some(RefreshReason::NeedRegister) => return Ok(HeartbeatPeerOutcome::NeedRegister),
-        Some(RefreshReason::WorkerRunMismatch) => return Ok(HeartbeatPeerOutcome::WorkerRunMismatch),
-        _ => {}
-    }
-
-    match error.class {
-        ErrorClass::Ok => Err(HeartbeatError::Fatal(
-            "metadata heartbeat response contained malformed OK error detail".to_string(),
-        )),
-        ErrorClass::Retryable | ErrorClass::NeedRefresh => Err(HeartbeatError::Retryable(error.message)),
-        ErrorClass::Fatal => Err(HeartbeatError::Fatal(format!(
+fn classify_rpc_error(error: RpcErrorDetail) -> Result<HeartbeatPeerOutcome, HeartbeatError> {
+    match error.recovery {
+        RecoveryAction::RegisterWorker if error.kind == ErrorKind::Worker(WorkerErrorKind::RunMismatch) => {
+            Ok(HeartbeatPeerOutcome::WorkerRunMismatch)
+        }
+        RecoveryAction::RegisterWorker => Ok(HeartbeatPeerOutcome::NeedRegister),
+        RecoveryAction::Retry { .. } | RecoveryAction::RefreshMetadata { .. } | RecoveryAction::SendFullBlockReport => {
+            Err(HeartbeatError::Retryable(error.message))
+        }
+        RecoveryAction::Fail | RecoveryAction::ReopenWriteSession { .. } => Err(HeartbeatError::Fatal(format!(
             "fatal metadata heartbeat error: {}",
             error.message
         ))),

@@ -12,11 +12,11 @@ use std::time::Duration;
 use tonic::transport as tonic_net;
 use types::GroupName;
 
-use crate::canonical::{invalid_header_action, validate_header_or_action};
 use crate::config::ClientConfig;
 use crate::error::{side_effect_response_body_mismatch, ClientError, ClientResult};
 use crate::metadata::model::{AddBlockResult, ReadLayout};
 use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, ClientMetrics};
+use crate::rpc_error::{invalid_header_action, validate_header_or_action};
 use crate::runtime::AttemptContext;
 
 /// Client-owned metadata control-plane adapter.
@@ -628,12 +628,14 @@ fn tonic_request<T>(ctx: &AttemptContext, message: T) -> tonic::Request<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::ClientAction;
-    use crate::runtime::{ErrorClass, ErrorClassifier, OperationContext, OperationIdentity, OperationKind};
-    use common::error::canonical::{CanonicalError, RefreshHint as CanonicalRefreshHint, RefreshReason};
-    use common::header::RpcErrorCode as HeaderRpcErrorCode;
-    use common::header::RpcErrorCode;
-    use proto::convert::canonical_to_error_detail;
+    use crate::rpc_error::ClientAction;
+    use crate::runtime::{
+        ErrorClass, ErrorClassifier, MetadataRefreshCause, OperationContext, OperationIdentity, OperationKind,
+    };
+    use common::error::rpc::{
+        ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RefreshHint as RpcRefreshHint, RpcErrorDetail,
+    };
+    use proto::convert::rpc_error_to_proto;
     use std::sync::Mutex;
     use types::ClientId;
 
@@ -736,25 +738,24 @@ mod tests {
     }
 
     #[test]
-    fn metadata_response_header_preserves_need_refresh_hints() {
+    fn metadata_response_header_preserves_refresh_metadata_hints() {
         let ctx = metadata_attempt("analytics", None);
-        let canonical = CanonicalError::need_refresh_with_hint(
-            RpcErrorCode::ShardMoved,
-            RefreshReason::RouteEpochMismatch,
-            CanonicalRefreshHint {
+        let rpc_error = RpcErrorDetail::refresh_metadata(
+            ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
+            RpcRefreshHint {
                 leader_endpoint: Some("http://127.0.0.1:18081".to_string()),
                 group_name: Some("analytics".to_string()),
                 route_epoch: Some(23),
                 mount_epoch: Some(31),
                 mount_prefix: Some("/mnt".to_string()),
                 worker_resolve_required: true,
-                ..CanonicalRefreshHint::default()
+                ..RpcRefreshHint::default()
             },
             "route moved",
         );
         let header = proto::common::ResponseHeaderProto {
             client: Some(ctx.client_info()),
-            error: Some(canonical_to_error_detail(&canonical)),
+            error: Some(rpc_error_to_proto(&rpc_error)),
             state: Vec::new(),
             group_name: "analytics".to_string(),
             mount_epoch: Some(31),
@@ -764,7 +765,7 @@ mod tests {
         let err = parse_metadata_response_header(&ctx, Some(&header)).expect_err("need refresh must be surfaced");
         match action(&err) {
             ClientAction::Refresh { reason, hint, .. } => {
-                assert_eq!(*reason, RefreshReason::RouteEpochMismatch);
+                assert_eq!(*reason, MetadataRefreshCause::RouteEpochMismatch);
                 assert_eq!(hint.leader_endpoint.as_deref(), Some("http://127.0.0.1:18081"));
                 assert_eq!(hint.group_name, Some(GroupName::parse("analytics").unwrap()));
                 assert_eq!(hint.route_epoch, Some(23));
@@ -783,15 +784,10 @@ mod tests {
 
         assert_ne!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
         match action(&err) {
-            ClientAction::Fail { canonical } => {
-                assert_eq!(canonical.class, common::error::canonical::ErrorClass::Fatal);
-                assert!(matches!(
-                    canonical.code,
-                    Some(common::error::canonical::ErrorCode::RpcCode(
-                        HeaderRpcErrorCode::InvalidHeader
-                    ))
-                ));
-                assert!(canonical.message.contains("missing ResponseHeader"));
+            ClientAction::Fail { rpc_error } => {
+                assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
+                assert_eq!(rpc_error.recovery, RecoveryAction::Fail);
+                assert!(rpc_error.message.contains("missing ResponseHeader"));
             }
             other => panic!("expected invalid header Fail action, got {other:?}"),
         }
@@ -807,15 +803,10 @@ mod tests {
 
         assert_ne!(ErrorClassifier.classify_error(&err), ErrorClass::RetryableTransport);
         match action(&err) {
-            ClientAction::Fail { canonical } => {
-                assert_eq!(canonical.class, common::error::canonical::ErrorClass::Fatal);
-                assert!(matches!(
-                    canonical.code,
-                    Some(common::error::canonical::ErrorCode::RpcCode(
-                        HeaderRpcErrorCode::InvalidHeader
-                    ))
-                ));
-                assert!(canonical.message.contains("invalid ResponseHeader"));
+            ClientAction::Fail { rpc_error } => {
+                assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
+                assert_eq!(rpc_error.recovery, RecoveryAction::Fail);
+                assert!(rpc_error.message.contains("invalid ResponseHeader"));
             }
             other => panic!("expected invalid header Fail action, got {other:?}"),
         }
@@ -856,7 +847,7 @@ mod tests {
 
     fn action(err: &ClientError) -> &ClientAction {
         match err {
-            ClientError::Action(action) => action.as_ref(),
+            ClientError::Action(action) => action.action(),
             other => panic!("expected action error, got {other:?}"),
         }
     }
@@ -864,17 +855,13 @@ mod tests {
     fn assert_invalid_metadata_header(err: &ClientError, message_fragment: &str) {
         assert_eq!(ErrorClassifier.classify_error(err), ErrorClass::InvalidHeader);
         match action(err) {
-            ClientAction::Fail { canonical } => {
-                assert!(matches!(
-                    canonical.code,
-                    Some(common::error::canonical::ErrorCode::RpcCode(
-                        HeaderRpcErrorCode::InvalidHeader
-                    ))
-                ));
+            ClientAction::Fail { rpc_error } => {
+                assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
+                assert_eq!(rpc_error.recovery, RecoveryAction::Fail);
                 assert!(
-                    canonical.message.contains(message_fragment),
+                    rpc_error.message.contains(message_fragment),
                     "expected {message_fragment:?} in {:?}",
-                    canonical.message
+                    rpc_error.message
                 );
             }
             other => panic!("expected invalid header Fail action, got {other:?}"),
@@ -916,7 +903,7 @@ mod tests {
             labels.operation_kind,
             labels.operation_name.as_deref(),
             labels.error_class,
-            labels.refresh_reason,
+            labels.metadata_refresh_cause,
             labels.target_plane,
             labels.cache,
             labels.reason,

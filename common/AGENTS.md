@@ -2,11 +2,11 @@
 
 ## Crate Boundary
 
-`common` owns shared infrastructure: canonical errors, headers, config mechanics, retry/time helpers, observability utilities, and small crate-independent helpers.
+`common` owns shared infrastructure: RPC error details, headers, config mechanics, retry/time helpers, observability utilities, and small crate-independent helpers.
 
 ## Allowed Changes
 
-- Improve canonical error and header structures without losing machine-readable detail.
+- Improve RPC error detail and header structures without losing machine-readable detail.
 - Add config, retry, time, or observability helpers that are genuinely crate-independent.
 - Tighten validation mechanics that do not choose service policy.
 - Keep operational failures explicit and structured.
@@ -16,7 +16,7 @@
 - Do not put service-specific metadata, worker, client, or UFS behavior here.
 - Do not hide operational failures behind generic string-only errors.
 - Do not move product config semantics into common config mechanics.
-- Do not create a second error vocabulary that competes with canonical errors.
+- Do not create a second error vocabulary that competes with RPC error details.
 - Do not use `common` as a dumping ground for unrelated helpers.
 
 ## Cross-Crate Rules

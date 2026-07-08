@@ -3,10 +3,12 @@
 
 //! FileSystemService Msync handler.
 
-use super::core_util::{header_from_canonical_error, ok_header_from_request};
+use super::core_util::{header_from_rpc_error, ok_header_from_request};
 use crate::raft::AppRaftNode;
-use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode, RefreshReason};
-use common::header::{RequestHeader, RpcErrorCode};
+use common::error::rpc::{
+    ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RefreshHint, RpcErrorDetail,
+};
+use common::header::RequestHeader;
 use proto::metadata::{MsyncRequestProto, MsyncResponseProto};
 use std::sync::Arc;
 use types::{GroupName, GroupStateWatermark};
@@ -28,8 +30,8 @@ impl MsyncHandler {
         let req_header = req.header;
         let header = match Self::parse_header(req_header.clone()) {
             Ok(header) => header,
-            Err(canonical) => {
-                return Self::error_response(&req_header, None, canonical);
+            Err(rpc_error) => {
+                return Self::error_response(&req_header, None, rpc_error);
             }
         };
 
@@ -41,33 +43,33 @@ impl MsyncHandler {
             );
         };
         if header_group_name != self.group_name {
-            let canonical = CanonicalError::need_refresh(
-                RpcErrorCode::ShardMoved,
-                RefreshReason::OwnerGroupMismatch,
+            let rpc_error = RpcErrorDetail::refresh_metadata(
+                ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch),
+                RefreshHint::default(),
                 format!(
                     "requested group {} is not served by this metadata runtime",
                     header_group_name
                 ),
             );
-            return Self::error_response(&req_header, Some(header_group_name), canonical);
+            return Self::error_response(&req_header, Some(header_group_name), rpc_error);
         }
 
         if !self.raft_node.is_leader() {
-            let canonical = CanonicalError::need_refresh(
-                RpcErrorCode::NotLeader,
-                RefreshReason::NotLeader,
+            let rpc_error = RpcErrorDetail::refresh_metadata(
+                ErrorKind::Metadata(MetadataErrorKind::NotLeader),
+                RefreshHint::default(),
                 "msync requires leader",
             );
-            return Self::error_response(&req_header, Some(header_group_name), canonical);
+            return Self::error_response(&req_header, Some(header_group_name), rpc_error);
         }
 
         let Some(last_applied) = self.raft_node.get_last_applied_state_id() else {
-            let canonical = CanonicalError::retryable(
-                RpcErrorCode::NodeUnavailable,
+            let rpc_error = RpcErrorDetail::retry(
+                ErrorKind::Internal(InternalErrorKind::NodeUnavailable),
                 Some(10),
                 "last_applied_log_id is not available for msync",
             );
-            return Self::error_response(&req_header, Some(header_group_name), canonical);
+            return Self::error_response(&req_header, Some(header_group_name), rpc_error);
         };
 
         let authoritative = GroupStateWatermark::new(self.group_name.clone(), last_applied);
@@ -86,8 +88,8 @@ impl MsyncHandler {
         Self::error_response(
             &req.header,
             group_name,
-            CanonicalError::retryable(
-                RpcErrorCode::NodeUnavailable,
+            RpcErrorDetail::retry(
+                ErrorKind::Internal(InternalErrorKind::NodeUnavailable),
                 Some(10),
                 "msync raft node is not configured",
             ),
@@ -95,7 +97,7 @@ impl MsyncHandler {
     }
 
     #[allow(clippy::result_large_err)]
-    fn parse_header(proto: Option<proto::common::RequestHeaderProto>) -> Result<RequestHeader, CanonicalError> {
+    fn parse_header(proto: Option<proto::common::RequestHeaderProto>) -> Result<RequestHeader, RpcErrorDetail> {
         let Some(proto) = proto else {
             return Err(Self::fatal_invalid_header("MsyncRequestProto requires RequestHeader"));
         };
@@ -106,22 +108,15 @@ impl MsyncHandler {
     fn error_response(
         req_header: &Option<proto::common::RequestHeaderProto>,
         group_name: Option<GroupName>,
-        canonical: CanonicalError,
+        rpc_error: RpcErrorDetail,
     ) -> MsyncResponseProto {
         MsyncResponseProto {
-            header: Some(header_from_canonical_error(req_header, group_name, None, &canonical)),
+            header: Some(header_from_rpc_error(req_header, group_name, None, &rpc_error)),
             state: None,
         }
     }
 
-    fn fatal_invalid_header(message: impl Into<String>) -> CanonicalError {
-        CanonicalError {
-            class: ErrorClass::Fatal,
-            code: Some(ErrorCode::RpcCode(RpcErrorCode::InvalidHeader)),
-            reason: None,
-            retry_after_ms: None,
-            message: message.into(),
-            refresh_hint: None,
-        }
+    fn fatal_invalid_header(message: impl Into<String>) -> RpcErrorDetail {
+        RpcErrorDetail::fail(ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader), message)
     }
 }

@@ -4,7 +4,9 @@
 //! Metadata-owned metrics emitted through the shared recorder.
 
 use crate::error::MetadataError;
-use common::error::canonical::{CanonicalError, ErrorClass, ErrorCode, RefreshReason};
+use common::error::rpc::{
+    ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RpcErrorDetail, UfsErrorKind, WorkerErrorKind,
+};
 use types::fs::FsErrorCode;
 
 pub(crate) const METADATA_UP: &str = "metadata_up";
@@ -265,22 +267,8 @@ pub(crate) fn metadata_error_kind(error: &MetadataError) -> &'static str {
     }
 }
 
-pub(crate) fn canonical_error_kind(error: &CanonicalError) -> &'static str {
-    if let Some(reason) = error.reason {
-        return refresh_reason_kind(reason);
-    }
-    if let Some(code) = error.code.as_ref() {
-        return match code {
-            ErrorCode::FsErrno(errno) => fs_errno_kind(*errno),
-            ErrorCode::RpcCode(code) => rpc_error_code_kind(*code),
-        };
-    }
-    match error.class {
-        ErrorClass::Ok => "none",
-        ErrorClass::NeedRefresh => "need_refresh",
-        ErrorClass::Retryable => "retryable",
-        ErrorClass::Fatal => "fatal",
-    }
+pub(crate) fn rpc_error_kind(error: &RpcErrorDetail) -> &'static str {
+    error_kind_label(error.kind)
 }
 
 pub(crate) fn fs_errno_kind(errno: FsErrorCode) -> &'static str {
@@ -302,48 +290,92 @@ pub(crate) fn fs_errno_kind(errno: FsErrorCode) -> &'static str {
     }
 }
 
-fn refresh_reason_kind(reason: RefreshReason) -> &'static str {
-    match reason {
-        RefreshReason::Unknown => "unknown_refresh",
-        RefreshReason::NotLeader => "not_leader",
-        RefreshReason::OwnerGroupMismatch => "owner_group_mismatch",
-        RefreshReason::Moved => "moved",
-        RefreshReason::StaleState => "stale_state",
-        RefreshReason::MountEpochMismatch => "mount_epoch_mismatch",
-        RefreshReason::RouteEpochMismatch => "route_epoch_mismatch",
-        RefreshReason::GroupMismatch => "group_mismatch",
-        RefreshReason::NeedRegister => "need_register",
-        RefreshReason::WorkerRunMismatch => "worker_run_mismatch",
-        RefreshReason::FullReportRequired => "full_report_required",
-        RefreshReason::BlockLocationUnavailable => "block_location_unavailable",
-        RefreshReason::BlockStampMismatch => "block_stamp_mismatch",
-        RefreshReason::Fencing => "fencing",
-        RefreshReason::EpochMismatch => "epoch_mismatch",
-        RefreshReason::SessionInvalid => "session_invalid",
-        RefreshReason::SessionExpired => "session_expired",
+fn error_kind_label(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::Fs(errno) => fs_errno_kind(errno),
+        ErrorKind::Ufs(kind) => ufs_error_kind(kind),
+        ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader) => "invalid_header",
+        ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument) => "invalid_argument",
+        ErrorKind::Protocol(ProtocolErrorKind::PermissionDenied) => "permission_denied",
+        ErrorKind::Protocol(ProtocolErrorKind::Unsupported) => "unsupported",
+        ErrorKind::Metadata(MetadataErrorKind::NotFound) => "not_found",
+        ErrorKind::Metadata(MetadataErrorKind::AlreadyExists) => "already_exists",
+        ErrorKind::Metadata(MetadataErrorKind::NotDirectory) => "not_directory",
+        ErrorKind::Metadata(MetadataErrorKind::IsDirectory) => "is_directory",
+        ErrorKind::Metadata(MetadataErrorKind::DirectoryNotEmpty) => "directory_not_empty",
+        ErrorKind::Metadata(MetadataErrorKind::CrossMountRename) => "cross_mount_rename",
+        ErrorKind::Metadata(MetadataErrorKind::Busy) => "busy",
+        ErrorKind::Metadata(MetadataErrorKind::Conflict) => "conflict",
+        ErrorKind::Metadata(MetadataErrorKind::NotLeader) => "not_leader",
+        ErrorKind::Metadata(MetadataErrorKind::StaleState) => "stale_state",
+        ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch) => "mount_epoch_mismatch",
+        ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch) => "route_epoch_mismatch",
+        ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch) => "owner_group_mismatch",
+        ErrorKind::Metadata(MetadataErrorKind::GroupMismatch) => "group_mismatch",
+        ErrorKind::Worker(WorkerErrorKind::NotRegistered) => "worker_not_registered",
+        ErrorKind::Worker(WorkerErrorKind::RunMismatch) => "worker_run_mismatch",
+        ErrorKind::Worker(WorkerErrorKind::DescriptorMismatch) => "worker_descriptor_mismatch",
+        ErrorKind::Worker(WorkerErrorKind::FullReportRequired) => "full_report_required",
+        ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable) => "block_location_unavailable",
+        ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch) => "block_stamp_mismatch",
+        ErrorKind::Metadata(MetadataErrorKind::Fencing) => "fencing",
+        ErrorKind::Metadata(MetadataErrorKind::SessionInvalid) => "session_invalid",
+        ErrorKind::Metadata(MetadataErrorKind::SessionExpired) => "session_expired",
+        ErrorKind::Metadata(MetadataErrorKind::EpochMismatch) => "epoch_mismatch",
+        ErrorKind::Internal(InternalErrorKind::NodeUnavailable) => "node_unavailable",
+        ErrorKind::Internal(InternalErrorKind::Timeout) => "timeout",
+        ErrorKind::Internal(InternalErrorKind::ResourceExhausted) => "resource_exhausted",
+        ErrorKind::Internal(InternalErrorKind::Cancelled) => "cancelled",
+        ErrorKind::Internal(InternalErrorKind::Corrupt) => "corrupt",
+        ErrorKind::Metadata(MetadataErrorKind::ResourceExhausted) => "resource_exhausted",
+        ErrorKind::Worker(kind) => worker_error_kind(kind),
+        ErrorKind::Protocol(kind) => protocol_error_kind(kind),
+        ErrorKind::Internal(_) => "internal",
     }
 }
 
-fn rpc_error_code_kind(code: common::header::RpcErrorCode) -> &'static str {
-    match code {
-        common::header::RpcErrorCode::Unspecified => "unspecified",
-        common::header::RpcErrorCode::InvalidHeader => "invalid_header",
-        common::header::RpcErrorCode::NotLeader => "not_leader",
-        common::header::RpcErrorCode::StaleState => "stale_state",
-        common::header::RpcErrorCode::MountEpochMismatch => "mount_epoch_mismatch",
-        common::header::RpcErrorCode::RouteEpochMismatch => "route_epoch_mismatch",
-        common::header::RpcErrorCode::WorkerNotRegistered => "worker_not_registered",
-        common::header::RpcErrorCode::WorkerRunMismatch => "worker_run_mismatch",
-        common::header::RpcErrorCode::WorkerDescriptorMismatch => "worker_descriptor_mismatch",
-        common::header::RpcErrorCode::FullReportRequired => "full_report_required",
-        common::header::RpcErrorCode::BlockLocationUnavailable => "block_location_unavailable",
-        common::header::RpcErrorCode::BlockStampMismatch => "block_stamp_mismatch",
-        common::header::RpcErrorCode::EpochMismatch => "epoch_mismatch",
-        common::header::RpcErrorCode::Fencing => "fencing",
-        common::header::RpcErrorCode::ShardMoved => "shard_moved",
-        common::header::RpcErrorCode::NodeUnavailable => "node_unavailable",
-        common::header::RpcErrorCode::InvalidArgument => "invalid_argument",
-        common::header::RpcErrorCode::Application => "application",
+fn worker_error_kind(kind: WorkerErrorKind) -> &'static str {
+    match kind {
+        WorkerErrorKind::NotRegistered => "worker_not_registered",
+        WorkerErrorKind::RunMismatch => "worker_run_mismatch",
+        WorkerErrorKind::DescriptorMismatch => "worker_descriptor_mismatch",
+        WorkerErrorKind::FullReportRequired => "full_report_required",
+        WorkerErrorKind::BlockLocationUnavailable => "block_location_unavailable",
+        WorkerErrorKind::BlockStampMismatch => "block_stamp_mismatch",
+        WorkerErrorKind::NodeUnavailable => "worker_node_unavailable",
+        WorkerErrorKind::Timeout => "worker_timeout",
+        WorkerErrorKind::ResourceExhausted => "worker_resource_exhausted",
+        WorkerErrorKind::Conflict => "worker_conflict",
+        WorkerErrorKind::Corrupt => "worker_corrupt",
+        WorkerErrorKind::Fencing => "worker_fencing",
+        WorkerErrorKind::Cancelled => "worker_cancelled",
+        WorkerErrorKind::Io => "worker_io",
+    }
+}
+
+fn protocol_error_kind(kind: ProtocolErrorKind) -> &'static str {
+    match kind {
+        ProtocolErrorKind::InvalidHeader => "invalid_header",
+        ProtocolErrorKind::InvalidArgument => "invalid_argument",
+        ProtocolErrorKind::PermissionDenied => "permission_denied",
+        ProtocolErrorKind::Unsupported => "unsupported",
+        ProtocolErrorKind::Cancelled => "cancelled",
+        ProtocolErrorKind::Corrupt => "corrupt",
+    }
+}
+
+fn ufs_error_kind(kind: UfsErrorKind) -> &'static str {
+    match kind {
+        UfsErrorKind::NotFound => "ufs_not_found",
+        UfsErrorKind::PermissionDenied => "ufs_permission_denied",
+        UfsErrorKind::Unsupported => "ufs_unsupported",
+        UfsErrorKind::NotImplemented => "ufs_not_implemented",
+        UfsErrorKind::InvalidSpec => "ufs_invalid_spec",
+        UfsErrorKind::InvalidPath => "ufs_invalid_path",
+        UfsErrorKind::UnexpectedEof => "ufs_unexpected_eof",
+        UfsErrorKind::Backend => "ufs_backend",
+        UfsErrorKind::Overloaded => "ufs_overloaded",
+        UfsErrorKind::Timeout => "ufs_timeout",
     }
 }
 

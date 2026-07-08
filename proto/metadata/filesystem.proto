@@ -17,7 +17,7 @@ import "fs/types.proto";
 //
 // Error contract:
 // - Recoverable business, protocol, and consistency failures return gRPC OK.
-// - ResponseHeaderProto.error carries the canonical error envelope.
+// - ResponseHeaderProto.error carries the RPC error envelope.
 // - Non-OK gRPC status is reserved for transport, auth, and framework failures.
 //
 // Authority contract:

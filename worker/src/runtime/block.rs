@@ -3,8 +3,7 @@
 
 //! Block runtime metadata and validation boundary.
 
-use common::error::canonical::RefreshReason;
-use common::header::RpcErrorCode;
+use common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
 use types::ids::BlockId;
 use types::layout::{BlockFormatId, BlockShape};
 use types::GroupName;
@@ -81,9 +80,8 @@ impl BlockManager {
         let meta = match store.load_meta(&req.group_name, req.block_id) {
             Ok(meta) => meta,
             Err(WorkerError::NotFound(message)) => {
-                return Err(Self::need_refresh(
-                    RpcErrorCode::BlockLocationUnavailable,
-                    RefreshReason::BlockLocationUnavailable,
+                return Err(Self::refresh_metadata(
+                    ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
                     format!("local block is not available for read: {message}"),
                 ));
             }
@@ -91,9 +89,8 @@ impl BlockManager {
         };
 
         if meta.visibility.block_state != BlockState::Ready {
-            return Err(Self::need_refresh(
-                RpcErrorCode::BlockLocationUnavailable,
-                RefreshReason::BlockLocationUnavailable,
+            return Err(Self::refresh_metadata(
+                ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
                 format!(
                     "local block is not Ready: group_name={}, block_id={}, state={:?}",
                     req.group_name, req.block_id, meta.visibility.block_state
@@ -101,9 +98,8 @@ impl BlockManager {
             ));
         }
         if req.block_stamp != meta.visibility.block_stamp {
-            return Err(Self::need_refresh(
-                RpcErrorCode::BlockStampMismatch,
-                RefreshReason::BlockStampMismatch,
+            return Err(Self::refresh_metadata(
+                ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
                 format!(
                     "block stamp mismatch: group_name={}, block_id={}, requested={}, local={}",
                     req.group_name, req.block_id, req.block_stamp, meta.visibility.block_stamp
@@ -115,9 +111,8 @@ impl BlockManager {
             || u64::from(req.chunk_size) != meta.format.chunk_size
             || req.effective_len != meta.source.effective_len
         {
-            return Err(Self::need_refresh(
-                RpcErrorCode::StaleState,
-                RefreshReason::StaleState,
+            return Err(Self::refresh_metadata(
+                ErrorKind::Metadata(MetadataErrorKind::StaleState),
                 format!(
                     "block layout mismatch: group_name={}, block_id={}, requested_format={}, local_format={}, requested_block_size={}, local_block_size={}, requested_chunk_size={}, local_chunk_size={}, requested_effective_len={}, local_effective_len={}",
                     req.group_name,
@@ -158,8 +153,8 @@ impl BlockManager {
         })
     }
 
-    fn need_refresh(code: RpcErrorCode, reason: RefreshReason, message: String) -> WorkerError {
-        WorkerError::NeedRefresh { code, reason, message }
+    fn refresh_metadata(kind: ErrorKind, message: String) -> WorkerError {
+        WorkerError::RefreshMetadata { kind, message }
     }
 }
 

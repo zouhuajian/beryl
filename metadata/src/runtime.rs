@@ -527,8 +527,8 @@ mod tests {
     use super::*;
     use crate::config::{BootstrapConfig, MetadataAuthorityConfig, MetadataAuthzConfig, RaftConfig, WorkerConfig};
     use crate::ensure_root_mount_for_format;
-    use common::error::canonical::{ErrorClass, ErrorCode, RefreshReason};
-    use common::header::{RequestHeader, ResponseHeader, RpcErrorCode};
+    use common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction};
+    use common::header::{RequestHeader, ResponseHeader};
     use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
     use proto::metadata::{MsyncRequestProto, MsyncResponseProto};
     use tempfile::TempDir;
@@ -725,7 +725,7 @@ mod tests {
         let header = parse_msync_header(&response);
 
         assert_eq!(header.group_name, Some(group_name.clone()));
-        assert!(header.canonical_error.is_none());
+        assert!(header.rpc_error.is_none());
         assert!(header.state.is_empty());
         assert_eq!(
             response.state,
@@ -755,7 +755,7 @@ mod tests {
         let response = call_msync(&service, header).await;
         let response_header = parse_msync_header(&response);
 
-        assert!(response_header.canonical_error.is_none());
+        assert!(response_header.rpc_error.is_none());
         assert_eq!(
             response.state,
             Some((&GroupStateWatermark::new(group_name, expected_state_id)).into())
@@ -777,12 +777,12 @@ mod tests {
 
         let response = call_msync(&service, RequestHeader::new(ClientId::new(7))).await;
         let header = parse_msync_header(&response);
-        let canonical = header.canonical_error.expect("missing header group error");
+        let rpc_error = header.rpc_error.expect("missing header group error");
 
         assert!(header.state.is_empty());
         assert!(response.state.is_none());
-        assert_eq!(canonical.class, ErrorClass::Fatal);
-        assert_eq!(canonical.code, Some(ErrorCode::RpcCode(RpcErrorCode::InvalidHeader)));
+        assert_eq!(rpc_error.kind, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
+        assert_eq!(rpc_error.recovery, RecoveryAction::Fail);
     }
 
     #[tokio::test]
@@ -805,17 +805,19 @@ mod tests {
         )
         .await;
         let header = parse_msync_header(&response);
-        let canonical = header.canonical_error.expect("non-local group error");
+        let rpc_error = header.rpc_error.expect("non-local group error");
 
         assert!(header.state.is_empty());
         assert!(response.state.is_none());
-        assert_eq!(canonical.class, ErrorClass::NeedRefresh);
-        assert_eq!(canonical.code, Some(ErrorCode::RpcCode(RpcErrorCode::ShardMoved)));
-        assert_eq!(canonical.reason, Some(RefreshReason::OwnerGroupMismatch));
+        assert_eq!(
+            rpc_error.kind,
+            ErrorKind::Metadata(MetadataErrorKind::OwnerGroupMismatch)
+        );
+        assert!(matches!(rpc_error.recovery, RecoveryAction::RefreshMetadata { .. }));
     }
 
     #[tokio::test]
-    async fn msync_nonleader_returns_need_refresh_not_leader() {
+    async fn msync_nonleader_returns_refresh_metadata_not_leader() {
         let dir = TempDir::new().unwrap();
         let service = nonleader_filesystem_service(&dir).await;
 
@@ -825,13 +827,12 @@ mod tests {
         )
         .await;
         let header = parse_msync_header(&response);
-        let canonical = header.canonical_error.expect("not-leader error");
+        let rpc_error = header.rpc_error.expect("not-leader error");
 
         assert!(header.state.is_empty());
         assert!(response.state.is_none());
-        assert_eq!(canonical.class, ErrorClass::NeedRefresh);
-        assert_eq!(canonical.code, Some(ErrorCode::RpcCode(RpcErrorCode::NotLeader)));
-        assert_eq!(canonical.reason, Some(RefreshReason::NotLeader));
+        assert_eq!(rpc_error.kind, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
+        assert!(matches!(rpc_error.recovery, RecoveryAction::RefreshMetadata { .. }));
     }
 
     #[tokio::test]

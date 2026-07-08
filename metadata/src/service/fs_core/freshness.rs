@@ -2,11 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
 use crate::mount::MountTable;
-use crate::service::core_util::{core_failure_from_metadata_error, need_refresh_core_failure};
+use crate::service::core_util::{core_failure_from_metadata_error, refresh_metadata_core_failure};
 use crate::service::domain::{CoreFailure, Freshness, RequestContext};
 use crate::state::StateStore;
-use common::error::canonical::{RefreshHint, RefreshReason};
-use common::header::RpcErrorCode;
+use common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint};
 use std::sync::Arc;
 use types::ids::MountId;
 use types::{GroupName, RaftLogId};
@@ -87,10 +86,9 @@ impl FreshnessValidator {
                         client_mount_epoch, server_mount_epoch
                     ),
                 };
-                return Err(need_refresh_core_failure(
+                return Err(refresh_metadata_core_failure(
                     ctx,
-                    RpcErrorCode::MountEpochMismatch,
-                    RefreshReason::MountEpochMismatch,
+                    ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
                     message,
                     group_name.clone(),
                     Some(server_mount_epoch),
@@ -131,10 +129,9 @@ impl FreshnessValidator {
 
         if let Some(client_route_epoch) = client_route_epoch {
             if client_route_epoch != server_route_epoch {
-                return Err(need_refresh_core_failure(
+                return Err(refresh_metadata_core_failure(
                     ctx,
-                    RpcErrorCode::RouteEpochMismatch,
-                    RefreshReason::RouteEpochMismatch,
+                    ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
                     format!(
                         "route_epoch mismatch: client={}, server={}; refresh route and replay {}",
                         client_route_epoch, server_route_epoch, intent
@@ -178,10 +175,9 @@ impl FreshnessValidator {
             return Ok(StaleStateStatus::UnknownLastApplied);
         };
         if !last_applied.has_reached(&required_state_id) {
-            return Err(need_refresh_core_failure(
+            return Err(refresh_metadata_core_failure(
                 ctx,
-                RpcErrorCode::StaleState,
-                RefreshReason::StaleState,
+                ErrorKind::Metadata(MetadataErrorKind::StaleState),
                 format!(
                     "Stale state: last_applied={:?} < required={:?}",
                     last_applied, required_state_id

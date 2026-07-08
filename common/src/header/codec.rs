@@ -318,33 +318,6 @@ fn parse_grpc_timeout_ms(value: &str) -> Result<u64, String> {
     Err(format!("invalid grpc-timeout: {value}"))
 }
 
-/// Helper functions for writing error information to gRPC trailers.
-///
-/// For unrecoverable errors (UNAUTHENTICATED, PERMISSION_DENIED, INTERNAL, etc.),
-/// the server should return a non-OK gRPC status and include minimal correlation
-/// information in trailers metadata for debugging and correlation.
-pub mod grpc_trailers {
-    use super::super::types::RpcErrorCode;
-
-    /// Write minimal error information to gRPC trailers.
-    ///
-    /// This function creates trailer entries for:
-    /// - x-call-id: Call ID for correlation
-    /// - x-error-code: Error code as string
-    ///
-    /// Returns a vector of (key, value) pairs suitable for use with tonic::Response.
-    #[allow(dead_code)] // May be used in future error handling
-    pub fn write_error_trailers(
-        client_info: &crate::header::ClientInfo,
-        error_code: &RpcErrorCode,
-    ) -> Vec<(String, String)> {
-        vec![
-            ("x-call-id".to_string(), client_info.call_id.to_string()),
-            ("x-error-code".to_string(), format!("{:?}", error_code)),
-        ]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

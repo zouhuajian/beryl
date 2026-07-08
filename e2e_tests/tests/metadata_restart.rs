@@ -3,10 +3,11 @@
 
 use bytes::Bytes;
 use client::{ClientError, CreateOptions, FileStatus};
-use common::error::canonical::{ErrorClass, ErrorCode, RefreshReason};
+use common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction};
 use common::header::RequestHeader;
 use e2e_tests::{data::deterministic_bytes, TestCluster, TestResult};
 use proto::common::{ByteRangeProto, FileLayoutProto, RequestHeaderProto, ResponseHeaderProto};
+use proto::convert::rpc_error_from_proto;
 use proto::fs::FileAttrsProto;
 use proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
 use proto::metadata::get_block_locations_request_proto;
@@ -265,10 +266,9 @@ async fn assert_stale_commit_file(cluster: &TestCluster, active: RawWorkerCommit
         .expect("commit response header")
         .error
         .expect("stale commit error");
-    assert_eq!(
-        err.refresh_reason,
-        proto::common::RefreshReasonProto::RefreshReasonSessionInvalid as i32
-    );
+    let rpc_error = rpc_error_from_proto(&err);
+    assert_eq!(rpc_error.kind, ErrorKind::Metadata(MetadataErrorKind::SessionInvalid));
+    assert!(matches!(rpc_error.recovery, RecoveryAction::ReopenWriteSession { .. }));
     Ok(())
 }
 
@@ -394,10 +394,18 @@ fn assert_worker_ok(header: Option<DataResponseHeaderProto>) {
 fn assert_stale_writer_error(err: &ClientError) {
     match err {
         ClientError::Action(action) => {
-            assert_eq!(action.class(), Some(ErrorClass::NeedRefresh));
             assert!(matches!(
-                action.reason(),
-                Some(RefreshReason::SessionInvalid | RefreshReason::SessionExpired | RefreshReason::Fencing)
+                action.kind(),
+                Some(
+                    ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)
+                        | ErrorKind::Metadata(MetadataErrorKind::SessionExpired)
+                        | ErrorKind::Metadata(MetadataErrorKind::Fencing)
+                        | ErrorKind::Metadata(MetadataErrorKind::EpochMismatch)
+                )
+            ));
+            assert!(matches!(
+                action.recovery(),
+                Some(RecoveryAction::ReopenWriteSession { .. })
             ));
         }
         ClientError::StaleHandle { reason } => {
@@ -412,7 +420,10 @@ fn assert_stale_writer_error(err: &ClientError) {
 
 fn assert_not_found(err: &ClientError) {
     if let ClientError::Action(action) = err {
-        if matches!(action.code(), Some(ErrorCode::FsErrno(FsErrorCode::ENoEnt))) {
+        if matches!(
+            action.kind(),
+            Some(ErrorKind::Fs(FsErrorCode::ENoEnt) | ErrorKind::Metadata(MetadataErrorKind::NotFound))
+        ) {
             return;
         }
     }

@@ -7,153 +7,165 @@ package common;
 
 import "common/common.proto";
 
-// ============================================================================
-// Canonical Error Model (Single Source of Truth)
-// ============================================================================
+// RPC error model.
 //
-// This file defines the unified error model for the storage system.
-// All error semantics should be expressed through these types.
-//
-// Key principles:
-// - FS errno and RPC error codes are mutually exclusive (oneof)
-// - retry_after_ms is a server hint, not a strict client scheduling source
-// - ErrorClass and RefreshReason are enums (not strings)
-// - No duplicate fields or conflicting priorities
+// ErrorKindProto records the failure fact. RecoveryActionProto records the
+// caller action. ErrorContextProto is diagnostic only.
 
-/// Coarse-grained error class for client behavior.
-enum ErrorClassProto {
-  ERROR_CLASS_OK = 0;
-  ERROR_CLASS_NEED_REFRESH = 1;  // Client must refresh routing/mount/state
-  ERROR_CLASS_RETRYABLE = 2;     // Temporary failure, can retry
-  ERROR_CLASS_FATAL = 3;         // Unrecoverable error
+message ErrorDetailProto {
+  ErrorKindProto kind = 1;
+  RecoveryActionProto recovery = 2;
+  string message = 3;
+  ErrorContextProto detail = 4;
 }
 
-/// Structured reason for refresh and session lifecycle handling.
-enum RefreshReasonProto {
-  REFRESH_REASON_UNKNOWN = 0;
-  REFRESH_REASON_NOT_LEADER = 1;
-  // Generic relocation when no more specific refresh reason applies.
-  REFRESH_REASON_MOVED = 2;
-  REFRESH_REASON_STALE_STATE = 3;
-  REFRESH_REASON_MOUNT_EPOCH_MISMATCH = 4;
-  REFRESH_REASON_ROUTE_EPOCH_MISMATCH = 5;
-  REFRESH_REASON_BLOCK_STAMP_MISMATCH = 6;
-  REFRESH_REASON_FENCING = 7;
-  REFRESH_REASON_EPOCH_MISMATCH = 8;
-  REFRESH_REASON_SESSION_INVALID = 9;
-  REFRESH_REASON_SESSION_EXPIRED = 10;
-  REFRESH_REASON_OWNER_GROUP_MISMATCH = 11;
-  REFRESH_REASON_GROUP_MISMATCH = 12;
-  REFRESH_REASON_NEED_REGISTER = 13;
-  REFRESH_REASON_WORKER_RUN_MISMATCH = 14;
-  REFRESH_REASON_FULL_REPORT_REQUIRED = 15;
-  REFRESH_REASON_BLOCK_LOCATION_UNAVAILABLE = 16;
+message ErrorKindProto {
+  oneof kind {
+    FsErrnoProto fs = 1;
+    MetadataErrorKindProto metadata = 2;
+    WorkerErrorKindProto worker = 3;
+    UfsErrorKindProto ufs = 4;
+    ProtocolErrorKindProto protocol = 5;
+    InternalErrorKindProto internal = 6;
+  }
 }
 
-/// Structured hints for NEED_REFRESH handling.
+enum MetadataErrorKindProto {
+  METADATA_ERROR_KIND_UNSPECIFIED = 0;
+  METADATA_ERROR_KIND_NOT_FOUND = 1;
+  METADATA_ERROR_KIND_ALREADY_EXISTS = 2;
+  METADATA_ERROR_KIND_NOT_DIRECTORY = 3;
+  METADATA_ERROR_KIND_IS_DIRECTORY = 4;
+  METADATA_ERROR_KIND_DIRECTORY_NOT_EMPTY = 5;
+  METADATA_ERROR_KIND_CROSS_MOUNT_RENAME = 6;
+  METADATA_ERROR_KIND_BUSY = 7;
+  METADATA_ERROR_KIND_CONFLICT = 8;
+  METADATA_ERROR_KIND_NOT_LEADER = 9;
+  METADATA_ERROR_KIND_STALE_STATE = 10;
+  METADATA_ERROR_KIND_MOUNT_EPOCH_MISMATCH = 11;
+  METADATA_ERROR_KIND_ROUTE_EPOCH_MISMATCH = 12;
+  METADATA_ERROR_KIND_OWNER_GROUP_MISMATCH = 13;
+  METADATA_ERROR_KIND_GROUP_MISMATCH = 14;
+  METADATA_ERROR_KIND_FENCING = 15;
+  METADATA_ERROR_KIND_SESSION_INVALID = 16;
+  METADATA_ERROR_KIND_SESSION_EXPIRED = 17;
+  METADATA_ERROR_KIND_EPOCH_MISMATCH = 18;
+  METADATA_ERROR_KIND_RESOURCE_EXHAUSTED = 19;
+}
+
+enum WorkerErrorKindProto {
+  WORKER_ERROR_KIND_UNSPECIFIED = 0;
+  WORKER_ERROR_KIND_NOT_REGISTERED = 1;
+  WORKER_ERROR_KIND_RUN_MISMATCH = 2;
+  WORKER_ERROR_KIND_DESCRIPTOR_MISMATCH = 3;
+  WORKER_ERROR_KIND_FULL_REPORT_REQUIRED = 4;
+  WORKER_ERROR_KIND_BLOCK_LOCATION_UNAVAILABLE = 5;
+  WORKER_ERROR_KIND_BLOCK_STAMP_MISMATCH = 6;
+  WORKER_ERROR_KIND_NODE_UNAVAILABLE = 7;
+  WORKER_ERROR_KIND_TIMEOUT = 8;
+  WORKER_ERROR_KIND_RESOURCE_EXHAUSTED = 9;
+  WORKER_ERROR_KIND_CONFLICT = 10;
+  WORKER_ERROR_KIND_CORRUPT = 11;
+  WORKER_ERROR_KIND_FENCING = 12;
+  WORKER_ERROR_KIND_CANCELLED = 13;
+  WORKER_ERROR_KIND_IO = 14;
+}
+
+enum UfsErrorKindProto {
+  UFS_ERROR_KIND_UNSPECIFIED = 0;
+  UFS_ERROR_KIND_NOT_FOUND = 1;
+  UFS_ERROR_KIND_PERMISSION_DENIED = 2;
+  UFS_ERROR_KIND_UNSUPPORTED = 3;
+  UFS_ERROR_KIND_NOT_IMPLEMENTED = 4;
+  UFS_ERROR_KIND_INVALID_SPEC = 5;
+  UFS_ERROR_KIND_INVALID_PATH = 6;
+  UFS_ERROR_KIND_UNEXPECTED_EOF = 7;
+  UFS_ERROR_KIND_BACKEND = 8;
+  UFS_ERROR_KIND_OVERLOADED = 9;
+  UFS_ERROR_KIND_TIMEOUT = 10;
+}
+
+enum ProtocolErrorKindProto {
+  PROTOCOL_ERROR_KIND_UNSPECIFIED = 0;
+  PROTOCOL_ERROR_KIND_INVALID_HEADER = 1;
+  PROTOCOL_ERROR_KIND_INVALID_ARGUMENT = 2;
+  PROTOCOL_ERROR_KIND_PERMISSION_DENIED = 3;
+  PROTOCOL_ERROR_KIND_UNSUPPORTED = 4;
+  PROTOCOL_ERROR_KIND_CANCELLED = 5;
+  PROTOCOL_ERROR_KIND_CORRUPT = 6;
+}
+
+enum InternalErrorKindProto {
+  INTERNAL_ERROR_KIND_UNSPECIFIED = 0;
+  INTERNAL_ERROR_KIND_NODE_UNAVAILABLE = 1;
+  INTERNAL_ERROR_KIND_TIMEOUT = 2;
+  INTERNAL_ERROR_KIND_RESOURCE_EXHAUSTED = 3;
+  INTERNAL_ERROR_KIND_CANCELLED = 4;
+  INTERNAL_ERROR_KIND_CORRUPT = 5;
+  INTERNAL_ERROR_KIND_INTERNAL = 6;
+}
+
+message RecoveryActionProto {
+  oneof action {
+    FailRecoveryProto fail = 1;
+    RetryRecoveryProto retry = 2;
+    RefreshMetadataRecoveryProto refresh_metadata = 3;
+    ReopenWriteSessionRecoveryProto reopen_write_session = 4;
+    RegisterWorkerRecoveryProto register_worker = 5;
+    SendFullBlockReportRecoveryProto send_full_block_report = 6;
+  }
+}
+
+message FailRecoveryProto {}
+
+message RetryRecoveryProto {
+  optional uint64 after_ms = 1;
+}
+
+message RefreshMetadataRecoveryProto {
+  RefreshHintProto hint = 1;
+}
+
+message ReopenWriteSessionRecoveryProto {
+  RefreshHintProto hint = 1;
+}
+
+message RegisterWorkerRecoveryProto {}
+
+message SendFullBlockReportRecoveryProto {}
+
+message ErrorContextProto {
+  repeated ErrorContextFieldProto fields = 1;
+}
+
+message ErrorContextFieldProto {
+  string key = 1;
+  string value = 2;
+}
+
 message RefreshHintProto {
-  reserved 2;
-  reserved "group_id";
-
-  /// Metadata leader endpoint (`host:port` or URL).
   optional string leader_endpoint = 1;
-
-  /// Authoritative mount epoch for the target mount.
+  optional string group_name = 2;
   optional uint64 mount_epoch = 3;
-
-  /// Optional mount prefix associated with mount_epoch.
   optional string mount_prefix = 4;
-
-  /// Authoritative route/layout epoch.
   optional uint64 route_epoch = 5;
-
-  /// Worker endpoint hints when route/placement is already known.
   repeated WorkerEndpointInfoProto worker_endpoints = 6;
-
-  /// Server requests client to re-resolve worker placement.
   bool worker_resolve_required = 7;
-
-  /// Stable metadata group name associated with the refresh.
-  optional string group_name = 8;
 }
 
-/// Filesystem error codes (POSIX errno).
-/// These are used for FS operation errors and are mutually exclusive with RpcErrorCodeProto.
 enum FsErrnoProto {
   FS_ERRNO_OK = 0;
-  FS_ERRNO_ENOENT = 2;      // No such file or directory
-  FS_ERRNO_EEXIST = 17;     // File exists
-  FS_ERRNO_ENOTEMPTY = 39;   // Directory not empty
-  FS_ERRNO_ENOTDIR = 20;     // Not a directory
-  FS_ERRNO_EISDIR = 21;      // Is a directory
-  FS_ERRNO_EXDEV = 18;       // Cross-device link (rename across mounts)
-  FS_ERRNO_EPERM = 1;        // Permission denied
-  FS_ERRNO_EACCES = 13;      // Permission denied (access)
-  FS_ERRNO_EINVAL = 22;      // Invalid argument
-  FS_ERRNO_ENOTSUP = 45;     // Operation not supported
-  FS_ERRNO_ENOTIMPL = 38;    // Not implemented
-  FS_ERRNO_EAGAIN = 11;      // Resource temporarily unavailable (e.g., lease conflict)
-  FS_ERRNO_EBUSY = 16;       // Device or resource busy (e.g., file locked by another writer)
-}
-
-/// RPC-level error codes (framework/routing/consistency).
-/// These are used for RPC/protocol errors and are mutually exclusive with FsErrnoProto.
-enum RpcErrorCodeProto {
-  RPC_ERR_CODE_UNSPECIFIED = 0;
-
-  reserved 1, 3, 4, 5, 20, 21;
-  reserved "RPC_ERR_CODE_NO_SUCH_METHOD", "RPC_ERR_CODE_VERSION_MISMATCH",
-      "RPC_ERR_CODE_DESERIALIZE_REQUEST", "RPC_ERR_CODE_SERIALIZE_RESPONSE",
-      "RPC_ERR_CODE_UNAUTHENTICATED", "RPC_ERR_CODE_PERMISSION_DENIED";
-
-  // ---- Framework / protocol ----
-  RPC_ERR_CODE_INVALID_HEADER = 2;
-
-  // ---- Routing / topology / raft ----
-  RPC_ERR_CODE_NOT_LEADER = 40;
-  RPC_ERR_CODE_STALE_STATE = 41;      // follower last_applied < requested state_id
-  RPC_ERR_CODE_FENCING = 42;
-  RPC_ERR_CODE_SHARD_MOVED = 43;
-  RPC_ERR_CODE_NODE_UNAVAILABLE = 44;
-  RPC_ERR_CODE_BLOCK_LOCATION_UNAVAILABLE = 45;
-
-  // ---- Epoch mismatches (for refresh reasons) ----
-  RPC_ERR_CODE_MOUNT_EPOCH_MISMATCH = 50;
-  RPC_ERR_CODE_ROUTE_EPOCH_MISMATCH = 51;
-  RPC_ERR_CODE_BLOCK_STAMP_MISMATCH = 52;
-  RPC_ERR_CODE_EPOCH_MISMATCH = 53;
-  RPC_ERR_CODE_WORKER_NOT_REGISTERED = 54;
-  RPC_ERR_CODE_WORKER_RUN_MISMATCH = 55;
-  RPC_ERR_CODE_WORKER_DESCRIPTOR_MISMATCH = 56;
-  RPC_ERR_CODE_FULL_REPORT_REQUIRED = 57;
-
-  // ---- Application ----
-  RPC_ERR_CODE_INVALID_ARGUMENT = 100;
-  RPC_ERR_CODE_INTERNAL = 101;
-  RPC_ERR_CODE_APPLICATION = 102;
-}
-
-/// Canonical error detail (single source of truth for all error semantics).
-message ErrorDetailProto {
-  /// Error class (required).
-  ErrorClassProto error_class = 1;
-
-  /// Error code: either FS errno or RPC code (mutually exclusive via oneof).
-  oneof code {
-    FsErrnoProto fs_errno = 2;
-    RpcErrorCodeProto rpc_code = 3;
-  }
-
-  /// Refresh reason (required when error_class = NEED_REFRESH).
-  RefreshReasonProto refresh_reason = 4;
-
-  /// Retry-after hint in milliseconds (optional, only for RETRYABLE errors).
-  /// Current client runtime records this hint but schedules retry sleep from its configured backoff.
-  optional uint64 retry_after_ms = 5;
-
-  /// Human-readable error message.
-  string message = 6;
-
-  /// Structured refresh hints for deterministic client refresh+replay.
-  optional RefreshHintProto refresh_hint = 7;
+  FS_ERRNO_ENOENT = 1;
+  FS_ERRNO_EEXIST = 2;
+  FS_ERRNO_ENOTEMPTY = 3;
+  FS_ERRNO_ENOTDIR = 4;
+  FS_ERRNO_EISDIR = 5;
+  FS_ERRNO_EXDEV = 6;
+  FS_ERRNO_EPERM = 7;
+  FS_ERRNO_EACCES = 8;
+  FS_ERRNO_EINVAL = 9;
+  FS_ERRNO_ENOTSUP = 10;
+  FS_ERRNO_ENOTIMPL = 11;
+  FS_ERRNO_EAGAIN = 12;
+  FS_ERRNO_EBUSY = 13;
 }

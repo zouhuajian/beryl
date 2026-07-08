@@ -18,12 +18,12 @@ use super::domain::{
 use super::guard::{GuardChain, GuardFailure};
 use super::MsyncHandler;
 use super::{
-    fencing_to_proto, file_attrs_from_proto, file_attrs_to_proto, file_layout_from_proto, header_from_canonical_error,
-    header_from_core_failure, lease_id_from_proto, lease_id_to_proto, location_to_proto, ok_header_from_core_success,
+    fencing_to_proto, file_attrs_from_proto, file_attrs_to_proto, file_layout_from_proto, header_from_core_failure,
+    header_from_rpc_error, lease_id_from_proto, lease_id_to_proto, location_to_proto, ok_header_from_core_success,
     presented_fencing_from_proto, request_context_from_proto, validate_active_write_layout, write_target_to_proto,
 };
 use super::{FsCore, PermissionBits, SharedWorkerCommitHook};
-use crate::error::{to_canonical_fs, MetadataError};
+use crate::error::{to_fs_error_detail, MetadataError};
 use crate::mount::MountTable;
 use crate::observe;
 use crate::path_resolver::{MountContext, PathResolver, ResolvedPath};
@@ -97,7 +97,7 @@ macro_rules! request_context_or_error {
         match request_context_from_proto(&$req.header) {
             Ok(ctx) => ctx,
             Err(err) => {
-                return error_response!($resp_ty, header_from_canonical_error(&$req.header, None, None, &err));
+                return error_response!($resp_ty, header_from_rpc_error(&$req.header, None, None, &err));
             }
         }
     }};
@@ -198,8 +198,8 @@ impl MetadataFileSystemServiceImpl {
             .map(|ctx| (Some(ctx.owner_group_name.clone()), Some(ctx.mount_epoch)))
             .unwrap_or((None, None));
 
-        let canonical = to_canonical_fs(err);
-        header_from_canonical_error(req_header, group_name, mount_epoch, &canonical)
+        let rpc_error = to_fs_error_detail(err);
+        header_from_rpc_error(req_header, group_name, mount_epoch, &rpc_error)
     }
 
     fn header_from_resolution_error(
@@ -221,7 +221,7 @@ impl MetadataFileSystemServiceImpl {
         req_header: &Option<proto::common::RequestHeaderProto>,
         failure: GuardFailure,
     ) -> proto::common::ResponseHeaderProto {
-        header_from_canonical_error(req_header, failure.group_name, failure.mount_epoch, &failure.err)
+        header_from_rpc_error(req_header, failure.group_name, failure.mount_epoch, &failure.err)
     }
 
     fn freshness_from_header(header: &Option<proto::common::RequestHeaderProto>) -> Freshness {
@@ -246,11 +246,11 @@ impl MetadataFileSystemServiceImpl {
         handle: Option<WriteHandleProto>,
     ) -> Result<WriteHandleProto, Box<proto::common::ResponseHeaderProto>> {
         handle.ok_or_else(|| {
-            Box::new(header_from_canonical_error(
+            Box::new(header_from_rpc_error(
                 header,
                 None,
                 None,
-                &to_canonical_fs(MetadataError::InvalidArgument("missing write_handle".to_string())),
+                &to_fs_error_detail(MetadataError::InvalidArgument("missing write_handle".to_string())),
             ))
         })
     }
@@ -378,7 +378,7 @@ impl MetadataFileSystemServiceImpl {
                                 target: "metadata.state",
                                 op = "CreateDirectory",
                                 result = "rejected",
-                                error_code = observe::canonical_error_kind(&failure.error),
+                                error_code = observe::rpc_error_kind(&failure.error),
                                 client_id = %req_ctx.caller.client.client_id,
                                 call_id = %req_ctx.caller.client.call_id,
                                 path = %req.path,
@@ -611,7 +611,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     target: "metadata.state",
                     op = "CreateDirectory",
                     result = "rejected",
-                    error_code = observe::canonical_error_kind(&failure.error),
+                    error_code = observe::rpc_error_kind(&failure.error),
                     client_id = %req_ctx.caller.client.client_id,
                     call_id = %req_ctx.caller.client.call_id,
                     path = %req.path,
@@ -755,7 +755,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     target: "metadata.state",
                     op = "Delete",
                     result = "rejected",
-                    error_code = observe::canonical_error_kind(&failure.error),
+                    error_code = observe::rpc_error_kind(&failure.error),
                     client_id = %req_ctx.caller.client.client_id,
                     call_id = %req_ctx.caller.client.call_id,
                     path = %req.path,
@@ -874,7 +874,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     target: "metadata.state",
                     op = "Rename",
                     result = "rejected",
-                    error_code = observe::canonical_error_kind(&failure.error),
+                    error_code = observe::rpc_error_kind(&failure.error),
                     client_id = %req_ctx.caller.client.client_id,
                     call_id = %req_ctx.caller.client.call_id,
                     src = %req.src_path,
@@ -1348,7 +1348,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                             target: "metadata.state",
                             op = "CreateFile",
                             result = "rejected",
-                            error_code = observe::canonical_error_kind(&failure.error),
+                            error_code = observe::rpc_error_kind(&failure.error),
                             client_id = %req_ctx.caller.client.client_id,
                             call_id = %req_ctx.caller.client.call_id,
                             path = %req.path,
@@ -1387,7 +1387,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                                 target: "metadata.state",
                                 op = "CreateFile",
                                 result = "rejected",
-                                error_code = observe::canonical_error_kind(&failure.error),
+                                error_code = observe::rpc_error_kind(&failure.error),
                                 client_id = %req_ctx.caller.client.client_id,
                                 call_id = %req_ctx.caller.client.call_id,
                                 path = %req.path,
@@ -1472,7 +1472,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     target: "metadata.state",
                     op = "CreateFile",
                     result = "rejected",
-                    error_code = observe::canonical_error_kind(&failure.error),
+                    error_code = observe::rpc_error_kind(&failure.error),
                     client_id = %req_ctx.caller.client.client_id,
                     call_id = %req_ctx.caller.client.call_id,
                     path = %req.path,
@@ -1511,7 +1511,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         target: "metadata.state",
                         op = "CreateFile",
                         result = "rejected",
-                        error_code = observe::canonical_error_kind(&failure.error),
+                        error_code = observe::rpc_error_kind(&failure.error),
                         client_id = %req_ctx.caller.client.client_id,
                         call_id = %req_ctx.caller.client.call_id,
                         path = %req.path,
@@ -1576,7 +1576,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     target: "metadata.state",
                     op = "CreateFile",
                     result = "rejected",
-                    error_code = observe::canonical_error_kind(&failure.error),
+                    error_code = observe::rpc_error_kind(&failure.error),
                     client_id = %req_ctx.caller.client.client_id,
                     call_id = %req_ctx.caller.client.call_id,
                     path = %req.path,
@@ -1681,7 +1681,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     target: "metadata.state",
                     op = "AppendFile",
                     result = "rejected",
-                    error_code = observe::canonical_error_kind(&failure.error),
+                    error_code = observe::rpc_error_kind(&failure.error),
                     client_id = %req_ctx.caller.client.client_id,
                     call_id = %req_ctx.caller.client.call_id,
                     path = %req.path,
@@ -1767,7 +1767,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     target: "metadata.block",
                     op = "AddBlock",
                     result = "rejected",
-                    error_code = observe::canonical_error_kind(&failure.error),
+                    error_code = observe::rpc_error_kind(&failure.error),
                     client_id = %req_ctx.caller.client.client_id,
                     call_id = %req_ctx.caller.client.call_id,
                     desired_len = req.desired_len,
@@ -1901,7 +1901,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     target: "metadata.state",
                     op = "CommitFile",
                     result = "rejected",
-                    error_code = observe::canonical_error_kind(&failure.error),
+                    error_code = observe::rpc_error_kind(&failure.error),
                     client_id = %req_ctx.caller.client.client_id,
                     call_id = %req_ctx.caller.client.call_id,
                     data_handle_id,
@@ -1986,7 +1986,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     target: "metadata.state",
                     op = "AbortFileWrite",
                     result = "rejected",
-                    error_code = observe::canonical_error_kind(&failure.error),
+                    error_code = observe::rpc_error_kind(&failure.error),
                     client_id = %req_ctx.caller.client.client_id,
                     call_id = %req_ctx.caller.client.call_id,
                     file_handle = handle.handle_id,
@@ -2073,7 +2073,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     target: "metadata.state",
                     op = "RenewLease",
                     result = "rejected",
-                    error_code = observe::canonical_error_kind(&failure.error),
+                    error_code = observe::rpc_error_kind(&failure.error),
                     client_id = %req_ctx.caller.client.client_id,
                     call_id = %req_ctx.caller.client.call_id,
                     file_handle = handle.handle_id,

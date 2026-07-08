@@ -12,7 +12,7 @@
 
 ## Main Responsibilities
 
-- Canonical errors and request/response headers.
+- RPC errors and request/response headers.
 - Config loading, flattening, environment-key mapping, and validation mechanics.
 - Retry/time helpers, observability setup, and small module-independent utilities.
 
@@ -30,6 +30,6 @@ The current runtime uses `common` for config mechanics, structured error/header 
 
 ## Contributor Notes
 
-- Keep errors canonical, structured, and machine-usable.
+- Keep errors structured, structured, and machine-usable.
 - Keep service-specific behavior in the owning crate.
 - Do not hide operational failures behind generic string-only errors.

@@ -3,12 +3,11 @@
 
 use bytes::Bytes;
 use client::CreateOptions;
+use common::error::rpc::{ErrorKind, RecoveryAction, WorkerErrorKind};
 use common::header::RequestHeader;
 use e2e_tests::{data::deterministic_bytes, TestCluster, TestResult};
-use proto::common::{
-    error_detail_proto::Code as ErrorCodeProto, ByteRangeProto, ErrorClassProto, RefreshReasonProto,
-    RequestHeaderProto, RpcErrorCodeProto,
-};
+use proto::common::{ByteRangeProto, ErrorDetailProto, RequestHeaderProto};
+use proto::convert::rpc_error_from_proto;
 use proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
 use proto::metadata::get_block_locations_request_proto;
 use proto::metadata::{FileBlockLocationProto, GetBlockLocationsRequestProto};
@@ -199,17 +198,7 @@ async fn assert_block_location_unavailable(cluster: &TestCluster, path: &str, le
         .expect("metadata response header")
         .error
         .expect("pre-convergence metadata error");
-    assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-    assert_eq!(
-        error.code,
-        Some(ErrorCodeProto::RpcCode(
-            RpcErrorCodeProto::RpcErrCodeBlockLocationUnavailable as i32
-        ))
-    );
-    assert_eq!(
-        error.refresh_reason,
-        RefreshReasonProto::RefreshReasonBlockLocationUnavailable as i32
-    );
+    assert_refresh_metadata(&error, ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable));
     assert!(response.locations.is_empty());
     Ok(())
 }
@@ -249,19 +238,15 @@ async fn assert_stale_worker_run_rejected(
         .expect("worker response header")
         .error
         .expect("stale worker run error");
-    assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-    assert_eq!(
-        error.code,
-        Some(ErrorCodeProto::RpcCode(
-            RpcErrorCodeProto::RpcErrCodeWorkerRunMismatch as i32
-        ))
-    );
-    assert_eq!(
-        error.refresh_reason,
-        RefreshReasonProto::RefreshReasonWorkerRunMismatch as i32
-    );
+    assert_refresh_metadata(&error, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
     assert!(response.stream_id.is_none());
     Ok(())
+}
+
+fn assert_refresh_metadata(error: &ErrorDetailProto, expected_kind: ErrorKind) {
+    let rpc_error = rpc_error_from_proto(error);
+    assert_eq!(rpc_error.kind, expected_kind);
+    assert!(matches!(rpc_error.recovery, RecoveryAction::RefreshMetadata { .. }));
 }
 
 fn single_location_run_id(locations: &[FileBlockLocationProto]) -> WorkerRunId {

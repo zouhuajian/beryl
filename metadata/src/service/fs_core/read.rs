@@ -7,14 +7,13 @@ use crate::observe;
 use crate::placement::{
     PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus, ReportedBlockLocation, WorkerPlacementView,
 };
-use crate::service::core_util::{need_refresh_core_failure, worker_endpoint_from_parts};
+use crate::service::core_util::{refresh_metadata_core_failure, worker_endpoint_from_parts};
 use crate::service::domain::{
     CoreFailure, CoreResult, Freshness, GetAttrInput, GetAttrOutput, GetFileLayoutInput, GetFileLayoutOutput,
     InodeMountGuardInputs, ReadDirEntry, ReadDirInput, ReadDirOutput, RequestContext,
 };
-use common::error::canonical::{RefreshHint, RefreshReason};
+use common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint, WorkerErrorKind};
 use common::header::CallerContextFields;
-use common::header::RpcErrorCode;
 use std::time::Instant;
 use types::fs::{Extent, InodeId};
 use types::ids::DataHandleId;
@@ -41,10 +40,9 @@ impl FsCore {
             mount_epoch,
         )? {
             StaleStateStatus::Ready => Ok((group_name, mount_epoch, route_epoch)),
-            StaleStateStatus::UnknownLastApplied => Err(need_refresh_core_failure(
+            StaleStateStatus::UnknownLastApplied => Err(refresh_metadata_core_failure(
                 req_ctx,
-                RpcErrorCode::StaleState,
-                RefreshReason::StaleState,
+                ErrorKind::Metadata(MetadataErrorKind::StaleState),
                 "local applied state is unavailable for read freshness validation",
                 group_name,
                 mount_epoch,
@@ -89,15 +87,14 @@ impl FsCore {
         block_stamp: u64,
         reported: &[ReportedBlockLocation],
         views: &[WorkerPlacementView],
-    ) -> (RpcErrorCode, RefreshReason, String) {
+    ) -> (ErrorKind, String) {
         let matching_stamp = reported
             .iter()
             .filter(|location| location.block_stamp == block_stamp)
             .collect::<Vec<_>>();
         if !reported.is_empty() && matching_stamp.is_empty() {
             return (
-                RpcErrorCode::BlockStampMismatch,
-                RefreshReason::BlockStampMismatch,
+                ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
                 format!(
                     "block location unavailable: block stamp mismatch for group={} block={} file_offset={} expected_stamp={} reported_stamps={:?}",
                     worker_lookup_group_name,
@@ -119,8 +116,7 @@ impl FsCore {
                     .is_some_and(|worker_run_id| !worker_run_id.matches(location.worker_run_id))
                 {
                     return (
-                        RpcErrorCode::WorkerRunMismatch,
-                        RefreshReason::WorkerRunMismatch,
+                        ErrorKind::Worker(WorkerErrorKind::RunMismatch),
                         format!(
                             "block location unavailable: stale worker run for group={} block={} file_offset={} worker={} reported_run={} current_run={:?}",
                             worker_lookup_group_name,
@@ -149,8 +145,7 @@ impl FsCore {
             .map(|ctx| ctx.context.as_str())
             .unwrap_or("-");
         (
-            RpcErrorCode::BlockLocationUnavailable,
-            RefreshReason::BlockLocationUnavailable,
+            ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
             format!(
                 "block location unavailable: reason={} group={} block={} file_offset={} block_stamp={} caller_context={} reported_locations={} worker_views={}",
                 reason_detail,
@@ -594,7 +589,7 @@ impl FsCore {
                     &usable_views,
                 );
                 if plan.status == PlacementStatus::NoLiveReplica {
-                    let (rpc_code, reason, message) = Self::classify_unavailable_read_location(
+                    let (kind, message) = Self::classify_unavailable_read_location(
                         &req.ctx,
                         worker_lookup_group_name,
                         extent,
@@ -602,10 +597,9 @@ impl FsCore {
                         &reported,
                         &usable_views,
                     );
-                    return self.need_refresh_failure_with_hint(
+                    return self.refresh_metadata_failure_with_hint(
                         &req.ctx,
-                        rpc_code,
-                        reason,
+                        kind,
                         message,
                         group_name,
                         mount_epoch,
@@ -666,7 +660,7 @@ fn record_fs_read_result<T>(operation: &str, started: Instant, result: &CoreResu
         Err(failure) => observe::record_fs_op(
             operation,
             "error",
-            observe::canonical_error_kind(&failure.error),
+            observe::rpc_error_kind(&failure.error),
             started.elapsed().as_secs_f64(),
         ),
     }

@@ -5,7 +5,7 @@
 //!
 //! Applies commands to the state machine and maintains consistency.
 
-use crate::error::{to_canonical_fs, MetadataError, MetadataResult};
+use crate::error::{to_fs_error_detail, MetadataError, MetadataResult};
 use crate::mount::MountTable;
 use crate::raft::command::{Command, FileCommitMode};
 use crate::raft::storage::{
@@ -30,8 +30,8 @@ use types::lease::{FencingToken, Lease};
 use types::GroupName;
 
 fn meta_err_to_fs_errno(err: &MetadataError) -> Option<FsErrorCode> {
-    match to_canonical_fs(err.clone()).code {
-        Some(common::error::canonical::ErrorCode::FsErrno(errno)) => Some(errno),
+    match to_fs_error_detail(err.clone()).kind {
+        common::error::rpc::ErrorKind::Fs(errno) => Some(errno),
         _ => None,
     }
 }

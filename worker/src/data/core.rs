@@ -9,8 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use common::error::canonical::RefreshReason;
-use common::header::RpcErrorCode;
+use common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
 use types::chunk::ByteRange;
 use types::ids::{BlockId, ChunkIndex, StreamId};
 use types::layout::{BlockFormatId, BlockShape, BlockShapeError};
@@ -611,9 +610,8 @@ impl WorkerCore {
         let meta = match self.block_store.load_meta(&req.group_name, req.block_id) {
             Ok(meta) => meta,
             Err(WorkerError::NotFound(message)) => {
-                return Err(WorkerError::NeedRefresh {
-                    code: RpcErrorCode::ShardMoved,
-                    reason: RefreshReason::Moved,
+                return Err(WorkerError::RefreshMetadata {
+                    kind: ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
                     message: format!("local block is not available for durable sync: {message}"),
                 });
             }
@@ -899,9 +897,8 @@ fn reject_existing_final_block(
         Ok(meta) => {
             validate_existing_block_shape(req, &meta)?;
             match meta.visibility.block_state {
-                BlockState::Ready | BlockState::Corrupt => Err(WorkerError::NeedRefresh {
-                    code: RpcErrorCode::ShardMoved,
-                    reason: RefreshReason::Moved,
+                BlockState::Ready | BlockState::Corrupt => Err(WorkerError::RefreshMetadata {
+                    kind: ErrorKind::Metadata(MetadataErrorKind::StaleState),
                     message: format!(
                         "local block already has final metadata: group_name={}, block_id={}, state={:?}",
                         req.group_name, req.block_id, meta.visibility.block_state
@@ -922,9 +919,8 @@ fn validate_existing_block_shape(
     meta: &crate::store::block::BlockMetaPayload,
 ) -> WorkerCoreResult<()> {
     if meta.visibility.block_stamp != req.block_stamp {
-        return Err(WorkerError::NeedRefresh {
-            code: RpcErrorCode::BlockStampMismatch,
-            reason: RefreshReason::BlockStampMismatch,
+        return Err(WorkerError::RefreshMetadata {
+            kind: ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
             message: format!(
                 "block stamp mismatch: group_name={}, block_id={}, requested={}, local={}",
                 req.group_name, req.block_id, req.block_stamp, meta.visibility.block_stamp
@@ -937,9 +933,8 @@ fn validate_existing_block_shape(
         || meta.source.effective_len != req.effective_len
         || meta.tier != req.tier
     {
-        return Err(WorkerError::NeedRefresh {
-            code: RpcErrorCode::StaleState,
-            reason: RefreshReason::StaleState,
+        return Err(WorkerError::RefreshMetadata {
+            kind: ErrorKind::Metadata(MetadataErrorKind::StaleState),
             message: format!(
                 "block layout mismatch: group_name={}, block_id={}",
                 req.group_name, req.block_id
@@ -982,9 +977,8 @@ fn validate_commit_request(state: &StreamState, req: &CommitWriteRequest) -> Wor
         ));
     }
     if req.block_stamp != state.context.block_stamp {
-        return Err(WorkerError::NeedRefresh {
-            code: RpcErrorCode::BlockStampMismatch,
-            reason: RefreshReason::BlockStampMismatch,
+        return Err(WorkerError::RefreshMetadata {
+            kind: ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
             message: format!(
                 "block_stamp mismatch between open and commit: open={}, commit={}",
                 state.context.block_stamp, req.block_stamp
@@ -996,9 +990,8 @@ fn validate_commit_request(state: &StreamState, req: &CommitWriteRequest) -> Wor
         || req.block_size != state.context.block_size
         || req.chunk_size != state.context.chunk_size
     {
-        return Err(WorkerError::NeedRefresh {
-            code: RpcErrorCode::StaleState,
-            reason: RefreshReason::StaleState,
+        return Err(WorkerError::RefreshMetadata {
+            kind: ErrorKind::Metadata(MetadataErrorKind::StaleState),
             message: "commit block expectation does not match open write context".to_string(),
         });
     }
@@ -1026,9 +1019,8 @@ fn validate_sync_committed_block_meta(
     meta: &crate::store::block::BlockMetaPayload,
 ) -> WorkerCoreResult<()> {
     if meta.visibility.block_state != BlockState::Ready {
-        return Err(WorkerError::NeedRefresh {
-            code: RpcErrorCode::ShardMoved,
-            reason: RefreshReason::Moved,
+        return Err(WorkerError::RefreshMetadata {
+            kind: ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
             message: format!(
                 "local block is not Ready for durable sync: group_name={}, block_id={}, state={:?}",
                 req.group_name, req.block_id, meta.visibility.block_state
@@ -1036,9 +1028,8 @@ fn validate_sync_committed_block_meta(
         });
     }
     if meta.visibility.block_stamp != req.block_stamp {
-        return Err(WorkerError::NeedRefresh {
-            code: RpcErrorCode::BlockStampMismatch,
-            reason: RefreshReason::BlockStampMismatch,
+        return Err(WorkerError::RefreshMetadata {
+            kind: ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
             message: format!(
                 "block stamp mismatch during durable sync: group_name={}, block_id={}, requested={}, local={}",
                 req.group_name, req.block_id, req.block_stamp, meta.visibility.block_stamp
@@ -1046,9 +1037,8 @@ fn validate_sync_committed_block_meta(
         });
     }
     if meta.source.effective_len != req.expected_block_len {
-        return Err(WorkerError::NeedRefresh {
-            code: RpcErrorCode::StaleState,
-            reason: RefreshReason::StaleState,
+        return Err(WorkerError::RefreshMetadata {
+            kind: ErrorKind::Metadata(MetadataErrorKind::StaleState),
             message: format!(
                 "effective block length mismatch during durable sync: group_name={}, block_id={}, expected={}, local={}",
                 req.group_name, req.block_id, req.expected_block_len, meta.source.effective_len
@@ -1059,9 +1049,8 @@ fn validate_sync_committed_block_meta(
         || req.block_size != meta.format.block_size
         || u64::from(req.chunk_size) != meta.format.chunk_size
     {
-        return Err(WorkerError::NeedRefresh {
-            code: RpcErrorCode::StaleState,
-            reason: RefreshReason::StaleState,
+        return Err(WorkerError::RefreshMetadata {
+            kind: ErrorKind::Metadata(MetadataErrorKind::StaleState),
             message: format!(
                 "block layout mismatch during durable sync: group_name={}, block_id={}",
                 req.group_name, req.block_id

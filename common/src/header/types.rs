@@ -3,10 +3,7 @@
 
 //! Header type definitions.
 
-use crate::{
-    error::canonical::{CanonicalError, ErrorClass as CanonicalErrorClass},
-    time::Deadline,
-};
+use crate::{error::rpc::RpcErrorDetail, time::Deadline};
 use types::{CallId, ClientId, GroupName, GroupStateWatermark};
 
 /// Client information for correlation and routing.
@@ -180,8 +177,8 @@ pub enum AuthnType {
 pub struct ResponseHeader {
     /// Client information (call_id, client_id, client_name).
     pub client: ClientInfo,
-    /// Canonical error detail (single source of truth for error semantics).
-    pub canonical_error: Option<CanonicalError>,
+    /// RPC error detail (single source of truth for error semantics).
+    pub rpc_error: Option<RpcErrorDetail>,
     /// Server-authorized client state cache updates.
     ///
     /// Leaders and msync may return non-empty state. Follower successful
@@ -194,43 +191,6 @@ pub struct ResponseHeader {
     pub route_epoch: Option<u64>,
     /// Metadata group name that this response applies to.
     pub group_name: Option<GroupName>,
-}
-
-/// High-level status for the RPC outcome.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RpcStatus {
-    /// RPC succeeded.
-    Ok,
-    /// RPC failed with a recoverable error (business/protocol error).
-    /// Client should check ResponseHeader.canonical_error for details.
-    Error,
-    /// RPC failed with a fatal error (unrecoverable).
-    Fatal,
-}
-
-/// Error code enumeration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RpcErrorCode {
-    Unspecified,
-    // Framework / protocol
-    InvalidHeader,
-    // Routing / topology / raft
-    NotLeader,
-    StaleState,
-    MountEpochMismatch,
-    RouteEpochMismatch,
-    WorkerNotRegistered,
-    WorkerRunMismatch,
-    WorkerDescriptorMismatch,
-    FullReportRequired,
-    BlockLocationUnavailable,
-    BlockStampMismatch,
-    EpochMismatch,
-    Fencing,
-    ShardMoved,
-    NodeUnavailable,
-    InvalidArgument,
-    Application,
 }
 
 impl ClientInfo {
@@ -441,7 +401,7 @@ impl ResponseHeader {
     pub fn ok(client: ClientInfo) -> Self {
         Self {
             client,
-            canonical_error: None,
+            rpc_error: None,
             state: Vec::new(),
             mount_epoch: None,
             route_epoch: None,
@@ -449,33 +409,20 @@ impl ResponseHeader {
         }
     }
 
-    /// Create an error response header from canonical error.
-    pub fn error(client: ClientInfo, canonical_error: CanonicalError) -> Self {
-        Self::from_canonical(client, canonical_error)
+    /// Create an error response header from RPC error.
+    pub fn error(client: ClientInfo, rpc_error: RpcErrorDetail) -> Self {
+        Self::from_rpc_error(client, rpc_error)
     }
 
-    /// Create an error response header from canonical error.
-    pub fn from_canonical(client: ClientInfo, canonical_error: CanonicalError) -> Self {
-        debug_assert!(
-            !matches!(canonical_error.class, CanonicalErrorClass::Ok),
-            "ResponseHeader::from_canonical must not be called with Ok class; use ResponseHeader::ok instead"
-        );
+    /// Create an error response header from RPC error.
+    pub fn from_rpc_error(client: ClientInfo, rpc_error: RpcErrorDetail) -> Self {
         Self {
             client,
-            canonical_error: Some(canonical_error),
+            rpc_error: Some(rpc_error),
             state: Vec::new(),
             mount_epoch: None,
             route_epoch: None,
             group_name: None,
-        }
-    }
-
-    /// Derive high-level RPC status from canonical error detail.
-    pub fn status(&self) -> RpcStatus {
-        match self.canonical_error.as_ref().map(|error| error.class) {
-            None | Some(CanonicalErrorClass::Ok) => RpcStatus::Ok,
-            Some(CanonicalErrorClass::NeedRefresh | CanonicalErrorClass::Retryable) => RpcStatus::Error,
-            Some(CanonicalErrorClass::Fatal) => RpcStatus::Fatal,
         }
     }
 

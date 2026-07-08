@@ -8,13 +8,13 @@ use super::manager::{
     WorkerManager,
 };
 use super::metrics::WorkerMetrics;
-use crate::error::{to_canonical_rpc, MetadataError, MetadataResult};
+use crate::error::{to_rpc_error, MetadataError, MetadataResult};
 use crate::observe;
 use crate::raft::Command;
 use crate::raft::{AppDataResponse, AppRaftNode, WorkerCommandResult};
 use crate::service::extract_and_inject_context;
-use ::common::error::canonical::{CanonicalError, ErrorClass, ErrorCode as CanonicalErrorCode, RefreshReason};
-use ::common::header::{ResponseHeader, RpcErrorCode};
+use ::common::error::rpc::{ErrorKind, MetadataErrorKind, RpcErrorDetail, WorkerErrorKind};
+use ::common::header::ResponseHeader;
 use ::common::observe::propagation::{extract_trace_context, ExtractedContext};
 use proto::convert::require_worker_run_id;
 use proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProto;
@@ -144,22 +144,18 @@ impl MetadataWorkerServiceImpl {
     fn error_response_header_from_request(
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
-        error: CanonicalError,
+        error: RpcErrorDetail,
     ) -> proto::common::ResponseHeaderProto {
-        debug_assert!(
-            error.class != ErrorClass::Ok,
-            "metadata worker error response must carry a non-OK canonical error"
-        );
         let mut header = self
             .create_response_header_from_request(req_header, Self::group_name_from_request_header(req_header).as_ref());
-        header.error = Some(proto::convert::canonical_to_error_detail(&error));
+        header.error = Some(proto::convert::rpc_error_to_proto(&error));
         header
     }
 
     fn response_with_error<T>(
         &self,
         req_header: &Option<proto::common::RequestHeaderProto>,
-        error: CanonicalError,
+        error: RpcErrorDetail,
         make_response: fn(proto::common::ResponseHeaderProto) -> T,
     ) -> Result<Response<T>, Status> {
         Ok(Response::new(make_response(
@@ -175,7 +171,7 @@ impl MetadataWorkerServiceImpl {
     ) -> Result<Response<T>, Status> {
         self.response_with_error(
             req_header,
-            to_canonical_rpc(MetadataError::InvalidArgument(message.into())),
+            to_rpc_error(MetadataError::InvalidArgument(message.into())),
             make_response,
         )
     }
@@ -186,7 +182,7 @@ impl MetadataWorkerServiceImpl {
         make_response: fn(proto::common::ResponseHeaderProto) -> T,
         error: MetadataError,
     ) -> Result<Response<T>, Status> {
-        self.response_with_error(req_header, to_canonical_rpc(error), make_response)
+        self.response_with_error(req_header, to_rpc_error(error), make_response)
     }
 
     fn group_mismatch_response<T>(
@@ -197,14 +193,7 @@ impl MetadataWorkerServiceImpl {
     ) -> Result<Response<T>, Status> {
         self.response_with_error(
             req_header,
-            CanonicalError {
-                class: ErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::InvalidArgument)),
-                reason: Some(RefreshReason::GroupMismatch),
-                retry_after_ms: None,
-                message: message.into(),
-                refresh_hint: None,
-            },
+            RpcErrorDetail::fail(ErrorKind::Metadata(MetadataErrorKind::GroupMismatch), message),
             make_response,
         )
     }
@@ -217,7 +206,7 @@ impl MetadataWorkerServiceImpl {
     ) -> Result<Response<T>, Status> {
         self.response_with_error(
             req_header,
-            CanonicalError::need_refresh(RpcErrorCode::WorkerNotRegistered, RefreshReason::NeedRegister, message),
+            RpcErrorDetail::register_worker(ErrorKind::Worker(WorkerErrorKind::NotRegistered), message),
             make_response,
         )
     }
@@ -230,11 +219,7 @@ impl MetadataWorkerServiceImpl {
     ) -> Result<Response<T>, Status> {
         self.response_with_error(
             req_header,
-            CanonicalError::need_refresh(
-                RpcErrorCode::WorkerRunMismatch,
-                RefreshReason::WorkerRunMismatch,
-                message,
-            ),
+            RpcErrorDetail::register_worker(ErrorKind::Worker(WorkerErrorKind::RunMismatch), message),
             make_response,
         )
     }
@@ -247,11 +232,7 @@ impl MetadataWorkerServiceImpl {
     ) -> Result<Response<T>, Status> {
         self.response_with_error(
             req_header,
-            CanonicalError::need_refresh(
-                RpcErrorCode::WorkerDescriptorMismatch,
-                RefreshReason::NeedRegister,
-                message,
-            ),
+            RpcErrorDetail::register_worker(ErrorKind::Worker(WorkerErrorKind::DescriptorMismatch), message),
             make_response,
         )
     }
@@ -296,11 +277,7 @@ impl MetadataWorkerServiceImpl {
     ) -> Result<Response<T>, Status> {
         self.response_with_error(
             req_header,
-            CanonicalError::need_refresh(
-                RpcErrorCode::FullReportRequired,
-                RefreshReason::FullReportRequired,
-                message,
-            ),
+            RpcErrorDetail::send_full_block_report(ErrorKind::Worker(WorkerErrorKind::FullReportRequired), message),
             make_response,
         )
     }
@@ -387,37 +364,8 @@ fn metadata_worker_outcome_labels<T>(
 }
 
 fn metadata_worker_error_detail_kind(error: &proto::common::ErrorDetailProto) -> &'static str {
-    let canonical = proto::convert::error_detail_to_canonical(error);
-    if let Some(reason) = canonical.reason.filter(|reason| *reason != RefreshReason::Unknown) {
-        return metadata_worker_refresh_reason_kind(reason);
-    }
-    match canonical.code.as_ref() {
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::InvalidArgument)) => "invalid_argument",
-        Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)) => "application",
-        _ => observe::canonical_error_kind(&canonical),
-    }
-}
-
-fn metadata_worker_refresh_reason_kind(reason: RefreshReason) -> &'static str {
-    match reason {
-        RefreshReason::Unknown => "unknown_refresh",
-        RefreshReason::NotLeader => "not_leader",
-        RefreshReason::OwnerGroupMismatch => "owner_group_mismatch",
-        RefreshReason::Moved => "moved",
-        RefreshReason::StaleState => "stale_state",
-        RefreshReason::MountEpochMismatch => "mount_epoch_mismatch",
-        RefreshReason::RouteEpochMismatch => "route_epoch_mismatch",
-        RefreshReason::GroupMismatch => "group_mismatch",
-        RefreshReason::NeedRegister => "need_register",
-        RefreshReason::WorkerRunMismatch => "worker_run_mismatch",
-        RefreshReason::FullReportRequired => "full_report_required",
-        RefreshReason::BlockLocationUnavailable => "block_location_unavailable",
-        RefreshReason::BlockStampMismatch => "block_stamp_mismatch",
-        RefreshReason::Fencing => "fencing",
-        RefreshReason::EpochMismatch => "epoch_mismatch",
-        RefreshReason::SessionInvalid => "session_invalid",
-        RefreshReason::SessionExpired => "session_expired",
-    }
+    let rpc_error = proto::convert::rpc_error_from_proto(error);
+    observe::rpc_error_kind(&rpc_error)
 }
 
 fn tonic_status_error_kind(status: &Status) -> &'static str {
@@ -1351,10 +1299,11 @@ mod tests {
     use crate::raft::{AppRaftStateMachine, RocksDBStorage};
     use crate::worker::HealthStatus;
     use crate::MountTable;
+    use ::common::error::rpc::{InternalErrorKind, ProtocolErrorKind, RecoveryAction};
     use metrics::{
         Counter, CounterFn, Gauge, Histogram, HistogramFn, Key, KeyName, Metadata, Recorder, SharedString, Unit,
     };
-    use proto::common::{error_detail_proto, ErrorClassProto, RefreshReasonProto, RpcErrorCodeProto};
+    use proto::convert::rpc_error_from_proto;
     use std::future::Future;
     use std::io;
     use std::sync::{Mutex, OnceLock};
@@ -1444,6 +1393,42 @@ mod tests {
     async fn run_with_log_dispatch<T>(dispatch: &tracing::Dispatch, future: impl Future<Output = T>) -> T {
         let _dispatch_guard = tracing::dispatcher::set_default(dispatch);
         future.await
+    }
+
+    fn assert_error_kind(error: &proto::common::ErrorDetailProto, expected_kind: ErrorKind) -> RpcErrorDetail {
+        let rpc_error = rpc_error_from_proto(error);
+        assert_eq!(rpc_error.kind, expected_kind, "{rpc_error:?}");
+        rpc_error
+    }
+
+    fn assert_error_fail(error: &proto::common::ErrorDetailProto, expected_kind: ErrorKind) -> RpcErrorDetail {
+        let rpc_error = assert_error_kind(error, expected_kind);
+        assert!(matches!(rpc_error.recovery, RecoveryAction::Fail), "{rpc_error:?}");
+        rpc_error
+    }
+
+    fn assert_error_refresh_metadata(
+        error: &proto::common::ErrorDetailProto,
+        expected_kind: ErrorKind,
+    ) -> RpcErrorDetail {
+        let rpc_error = assert_error_kind(error, expected_kind);
+        assert!(
+            matches!(rpc_error.recovery, RecoveryAction::RefreshMetadata { .. }),
+            "{rpc_error:?}"
+        );
+        rpc_error
+    }
+
+    fn assert_error_register_worker(
+        error: &proto::common::ErrorDetailProto,
+        expected_kind: ErrorKind,
+    ) -> RpcErrorDetail {
+        let rpc_error = assert_error_kind(error, expected_kind);
+        assert!(
+            matches!(rpc_error.recovery, RecoveryAction::RegisterWorker),
+            "{rpc_error:?}"
+        );
+        rpc_error
     }
 
     fn header_client_identity(header: &proto::common::RequestHeaderProto) -> (String, String) {
@@ -1745,12 +1730,7 @@ mod tests {
     }
 
     fn assert_invalid_header(error: &proto::common::ErrorDetailProto, expected_message: &str) {
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
-        assert!(matches!(
-            error.code,
-            Some(error_detail_proto::Code::RpcCode(code))
-                if code == RpcErrorCodeProto::RpcErrCodeInvalidHeader as i32
-        ));
+        let error = assert_error_fail(error, ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader));
         assert!(
             error.message.contains(expected_message),
             "message {:?} did not contain {:?}",
@@ -1839,16 +1819,7 @@ mod tests {
                 .expect("heartbeat business error uses gRPC OK")
                 .into_inner();
                 let error = response.header.expect("header").error.expect("header error");
-                assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-                assert!(matches!(
-                    error.code,
-                    Some(error_detail_proto::Code::RpcCode(code))
-                        if code == RpcErrorCodeProto::RpcErrCodeWorkerNotRegistered as i32
-                ));
-                assert_eq!(
-                    error.refresh_reason,
-                    RefreshReasonProto::RefreshReasonNeedRegister as i32
-                );
+                assert_error_register_worker(&error, ErrorKind::Worker(WorkerErrorKind::NotRegistered));
             }
         }
         .with_subscriber(dispatch)
@@ -1900,16 +1871,7 @@ mod tests {
                 .expect("heartbeat business error uses gRPC OK")
                 .into_inner();
                 let error = response.header.expect("header").error.expect("header error");
-                assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-                assert!(matches!(
-                    error.code,
-                    Some(error_detail_proto::Code::RpcCode(code))
-                        if code == RpcErrorCodeProto::RpcErrCodeWorkerNotRegistered as i32
-                ));
-                assert_eq!(
-                    error.refresh_reason,
-                    RefreshReasonProto::RefreshReasonNeedRegister as i32
-                );
+                assert_error_register_worker(&error, ErrorKind::Worker(WorkerErrorKind::NotRegistered));
             }
         }
         .with_subscriber(dispatch)
@@ -1955,10 +1917,7 @@ mod tests {
             .expect("need-register heartbeat returns gRPC OK")
             .into_inner();
             let need_register_error = need_register.header.expect("header").error.expect("header error");
-            assert_eq!(
-                need_register_error.refresh_reason,
-                RefreshReasonProto::RefreshReasonNeedRegister as i32
-            );
+            assert_error_register_worker(&need_register_error, ErrorKind::Worker(WorkerErrorKind::NotRegistered));
 
             worker_manager
                 .register_worker_run(
@@ -1979,10 +1938,7 @@ mod tests {
             .expect("run-mismatch heartbeat returns gRPC OK")
             .into_inner();
             let run_mismatch_error = run_mismatch.header.expect("header").error.expect("header error");
-            assert_eq!(
-                run_mismatch_error.refresh_reason,
-                RefreshReasonProto::RefreshReasonWorkerRunMismatch as i32
-            );
+            assert_error_register_worker(&run_mismatch_error, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
         }
         .with_subscriber(dispatch)
         .await;
@@ -2039,16 +1995,7 @@ mod tests {
                 .expect("heartbeat business error uses gRPC OK")
                 .into_inner();
                 let error = response.header.expect("header").error.expect("header error");
-                assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-                assert!(matches!(
-                    error.code,
-                    Some(error_detail_proto::Code::RpcCode(code))
-                        if code == RpcErrorCodeProto::RpcErrCodeWorkerRunMismatch as i32
-                ));
-                assert_eq!(
-                    error.refresh_reason,
-                    RefreshReasonProto::RefreshReasonWorkerRunMismatch as i32
-                );
+                assert_error_register_worker(&error, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
             }
         }
         .with_subscriber(dispatch)
@@ -2637,16 +2584,7 @@ mod tests {
             .expect("rejected block report response")
             .into_inner();
             let error = response.header.expect("header").error.expect("header error");
-            assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-            assert!(matches!(
-                error.code,
-                Some(error_detail_proto::Code::RpcCode(code))
-                    if code == RpcErrorCodeProto::RpcErrCodeWorkerNotRegistered as i32
-            ));
-            assert_eq!(
-                error.refresh_reason,
-                RefreshReasonProto::RefreshReasonNeedRegister as i32
-            );
+            assert_error_register_worker(&error, ErrorKind::Worker(WorkerErrorKind::NotRegistered));
         }
         .with_subscriber(dispatch)
         .await;
@@ -2871,7 +2809,7 @@ mod tests {
         .into_inner();
 
         let error = response.header.expect("header").error.expect("header error");
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
+        let error = assert_error_fail(&error, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(error.message.contains("Missing advertised_endpoint"));
     }
 
@@ -2915,12 +2853,12 @@ mod tests {
                 ("service", "metadata_worker"),
                 ("method", "register_worker"),
                 ("status", "error"),
-                ("error_kind", "application"),
+                ("error_kind", "invalid_argument"),
             ],
         ));
         assert!(recorder.has_counter(
             observe::METADATA_WORKER_REGISTERED_TOTAL,
-            &[("status", "error"), ("error_kind", "application")],
+            &[("status", "error"), ("error_kind", "invalid_argument")],
         ));
         assert!(recorder.has_histogram(
             observe::METADATA_RPC_REQUEST_DURATION_SECONDS,
@@ -2928,33 +2866,26 @@ mod tests {
                 ("service", "metadata_worker"),
                 ("method", "register_worker"),
                 ("status", "error"),
-                ("error_kind", "application"),
+                ("error_kind", "invalid_argument"),
             ],
         ));
         assert!(recorder.has_histogram(
             observe::METADATA_WORKER_REGISTRATION_DURATION_SECONDS,
-            &[("status", "error"), ("error_kind", "application")],
+            &[("status", "error"), ("error_kind", "invalid_argument")],
         ));
     }
 
     #[test]
-    fn metadata_worker_application_error_label_ignores_message_text() {
+    fn metadata_worker_error_label_uses_kind_not_message_text() {
         for message in [
             "not found: block",
             "permission denied: worker",
             "active worker conflict: run",
             "arbitrary application failure",
         ] {
-            let canonical = CanonicalError {
-                class: ErrorClass::Fatal,
-                code: Some(CanonicalErrorCode::RpcCode(RpcErrorCode::Application)),
-                reason: None,
-                retry_after_ms: None,
-                message: message.to_string(),
-                refresh_hint: None,
-            };
-            let detail = proto::convert::canonical_to_error_detail(&canonical);
-            assert_eq!(metadata_worker_error_detail_kind(&detail), "application");
+            let rpc_error = RpcErrorDetail::fail(ErrorKind::Internal(InternalErrorKind::Internal), message);
+            let detail = proto::convert::rpc_error_to_proto(&rpc_error);
+            assert_eq!(metadata_worker_error_detail_kind(&detail), "internal");
         }
     }
 
@@ -3069,12 +3000,12 @@ mod tests {
                 ("service", "metadata_worker"),
                 ("method", "heartbeat"),
                 ("status", "error"),
-                ("error_kind", "need_register"),
+                ("error_kind", "worker_not_registered"),
             ],
         ));
         assert!(recorder.has_counter(
             observe::METADATA_WORKER_HEARTBEAT_TOTAL,
-            &[("status", "error"), ("error_kind", "need_register")],
+            &[("status", "error"), ("error_kind", "worker_not_registered")],
         ));
         assert!(recorder.has_histogram(
             observe::METADATA_RPC_REQUEST_DURATION_SECONDS,
@@ -3082,12 +3013,12 @@ mod tests {
                 ("service", "metadata_worker"),
                 ("method", "heartbeat"),
                 ("status", "error"),
-                ("error_kind", "need_register"),
+                ("error_kind", "worker_not_registered"),
             ],
         ));
         assert!(recorder.has_histogram(
             observe::METADATA_WORKER_HEARTBEAT_DURATION_SECONDS,
-            &[("status", "error"), ("error_kind", "need_register")],
+            &[("status", "error"), ("error_kind", "worker_not_registered")],
         ));
     }
 
@@ -3220,12 +3151,16 @@ mod tests {
                 ("service", "metadata_worker"),
                 ("method", "block_report"),
                 ("status", "error"),
-                ("error_kind", "need_register"),
+                ("error_kind", "worker_not_registered"),
             ],
         ));
         assert!(recorder.has_counter(
             observe::METADATA_WORKER_BLOCK_REPORT_TOTAL,
-            &[("kind", "full"), ("status", "error"), ("error_kind", "need_register")],
+            &[
+                ("kind", "full"),
+                ("status", "error"),
+                ("error_kind", "worker_not_registered")
+            ],
         ));
         assert!(!recorder.has_counter(
             observe::METADATA_WORKER_BLOCK_REPORT_BLOCKS_TOTAL,
@@ -3237,12 +3172,16 @@ mod tests {
                 ("service", "metadata_worker"),
                 ("method", "block_report"),
                 ("status", "error"),
-                ("error_kind", "need_register"),
+                ("error_kind", "worker_not_registered"),
             ],
         ));
         assert!(recorder.has_histogram(
             observe::METADATA_WORKER_BLOCK_REPORT_DURATION_SECONDS,
-            &[("kind", "full"), ("status", "error"), ("error_kind", "need_register")],
+            &[
+                ("kind", "full"),
+                ("status", "error"),
+                ("error_kind", "worker_not_registered")
+            ],
         ));
     }
 
@@ -3278,7 +3217,7 @@ mod tests {
         .into_inner();
 
         let error = register_response.header.expect("header").error.expect("header error");
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
+        let error = assert_error_fail(&error, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(error.message.contains("header group_name"));
         assert!(worker_manager
             .get_descriptor(&group_name("root"), WorkerId::new(9))
@@ -3293,7 +3232,7 @@ mod tests {
                 .into_inner();
 
         let error = heartbeat_response.header.expect("header").error.expect("header error");
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
+        let error = assert_error_fail(&error, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(error.message.contains("header group_name"));
 
         let block_id = BlockId::from_u64_u32(1000, 0);
@@ -3320,7 +3259,7 @@ mod tests {
             .expect("header")
             .error
             .expect("header error");
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
+        let error = assert_error_fail(&error, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(error.message.contains("header group_name"));
         assert!(worker_manager
             .get_block_locations(&group_name("root"), block_id)
@@ -3359,8 +3298,7 @@ mod tests {
         .into_inner();
 
         let error = response.header.expect("header").error.expect("header error");
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-        assert_eq!(error.refresh_reason, RefreshReasonProto::RefreshReasonNotLeader as i32);
+        assert_error_refresh_metadata(&error, ErrorKind::Metadata(MetadataErrorKind::NotLeader));
     }
 
     #[tokio::test]
@@ -3533,16 +3471,7 @@ mod tests {
         .expect("old heartbeat returns header error")
         .into_inner();
         let old_error = old_heartbeat.header.expect("header").error.expect("header error");
-        assert_eq!(old_error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-        assert!(matches!(
-            old_error.code,
-            Some(error_detail_proto::Code::RpcCode(code))
-                if code == RpcErrorCodeProto::RpcErrCodeWorkerRunMismatch as i32
-        ));
-        assert_eq!(
-            old_error.refresh_reason,
-            RefreshReasonProto::RefreshReasonWorkerRunMismatch as i32
-        );
+        assert_error_register_worker(&old_error, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
 
         let new_heartbeat = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::heartbeat(
             &service,
@@ -3632,7 +3561,7 @@ mod tests {
         .expect("active conflict returns header error")
         .into_inner();
         let error = conflict.header.expect("header").error.expect("header error");
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
+        let error = assert_error_fail(&error, ErrorKind::Metadata(MetadataErrorKind::Conflict));
         assert!(error.message.contains("active worker conflict"));
         assert_eq!(
             worker_manager
@@ -3717,7 +3646,7 @@ mod tests {
         .expect("same-run descriptor mismatch returns header error")
         .into_inner();
         let error = mismatch.header.expect("header").error.expect("header error");
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
+        let error = assert_error_fail(&error, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(error.message.contains("worker descriptor mismatch"));
         assert_eq!(
             worker_manager
@@ -3769,7 +3698,7 @@ mod tests {
         .into_inner();
 
         let error = response.header.expect("header").error.expect("header error");
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
+        let error = assert_error_fail(&error, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(error.message.contains("served metadata group"));
         assert!(worker_manager
             .get_descriptor(&group_name("g2"), WorkerId::new(123))
@@ -3803,16 +3732,7 @@ mod tests {
         .into_inner();
 
         let error = response.header.expect("header").error.expect("header error");
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-        assert!(matches!(
-            error.code,
-            Some(error_detail_proto::Code::RpcCode(code))
-                if code == RpcErrorCodeProto::RpcErrCodeWorkerNotRegistered as i32
-        ));
-        assert_eq!(
-            error.refresh_reason,
-            RefreshReasonProto::RefreshReasonNeedRegister as i32
-        );
+        assert_error_register_worker(&error, ErrorKind::Worker(WorkerErrorKind::NotRegistered));
     }
 
     #[tokio::test]
@@ -3846,16 +3766,7 @@ mod tests {
         .into_inner();
 
         let error = response.header.expect("header").error.expect("header error");
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-        assert!(matches!(
-            error.code,
-            Some(error_detail_proto::Code::RpcCode(code))
-                if code == RpcErrorCodeProto::RpcErrCodeWorkerNotRegistered as i32
-        ));
-        assert_eq!(
-            error.refresh_reason,
-            RefreshReasonProto::RefreshReasonNeedRegister as i32
-        );
+        assert_error_register_worker(&error, ErrorKind::Worker(WorkerErrorKind::NotRegistered));
         assert!(response.commands.is_empty());
     }
 
@@ -3897,16 +3808,7 @@ mod tests {
         .into_inner();
 
         let error = response.header.expect("header").error.expect("header error");
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-        assert!(matches!(
-            error.code,
-            Some(error_detail_proto::Code::RpcCode(code))
-                if code == RpcErrorCodeProto::RpcErrCodeWorkerRunMismatch as i32
-        ));
-        assert_eq!(
-            error.refresh_reason,
-            RefreshReasonProto::RefreshReasonWorkerRunMismatch as i32
-        );
+        assert_error_register_worker(&error, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
     }
 
     #[tokio::test]
@@ -3964,16 +3866,7 @@ mod tests {
         .into_inner();
 
         let error = response.header.expect("header").error.expect("header error");
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-        assert!(matches!(
-            error.code,
-            Some(error_detail_proto::Code::RpcCode(code))
-                if code == RpcErrorCodeProto::RpcErrCodeWorkerRunMismatch as i32
-        ));
-        assert_eq!(
-            error.refresh_reason,
-            RefreshReasonProto::RefreshReasonWorkerRunMismatch as i32
-        );
+        assert_error_register_worker(&error, ErrorKind::Worker(WorkerErrorKind::RunMismatch));
     }
 
     #[tokio::test]
@@ -4096,16 +3989,7 @@ mod tests {
                 .into_inner();
 
         let error = response.header.expect("header").error.expect("header error");
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
-        assert!(matches!(
-            error.code,
-            Some(error_detail_proto::Code::RpcCode(code))
-                if code == RpcErrorCodeProto::RpcErrCodeInvalidArgument as i32
-        ));
-        assert_eq!(
-            error.refresh_reason,
-            RefreshReasonProto::RefreshReasonGroupMismatch as i32
-        );
+        assert_error_fail(&error, ErrorKind::Metadata(MetadataErrorKind::GroupMismatch));
         assert!(response.commands.is_empty());
     }
 
@@ -4147,16 +4031,7 @@ mod tests {
         .into_inner();
 
         let error = response.header.expect("header").error.expect("header error");
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassNeedRefresh as i32);
-        assert!(matches!(
-            error.code,
-            Some(error_detail_proto::Code::RpcCode(code))
-                if code == RpcErrorCodeProto::RpcErrCodeWorkerDescriptorMismatch as i32
-        ));
-        assert_eq!(
-            error.refresh_reason,
-            RefreshReasonProto::RefreshReasonNeedRegister as i32
-        );
+        let error = assert_error_register_worker(&error, ErrorKind::Worker(WorkerErrorKind::DescriptorMismatch));
         assert!(error.message.contains("registration"));
     }
 
@@ -4212,7 +4087,7 @@ mod tests {
         .into_inner();
 
         let error = response.header.expect("header").error.expect("header error");
-        assert_eq!(error.error_class, ErrorClassProto::ErrorClassFatal as i32);
+        let error = assert_error_fail(&error, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
         assert!(error.message.contains("missing block"));
     }
 
