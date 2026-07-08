@@ -7,7 +7,7 @@
 
 use crate::readiness::RootReadinessConfig;
 use common::config::ServerConfig;
-use common::error::{CommonError, CommonErrorCode};
+use common::error::{CommonError, CommonErrorKind};
 use common::observe::ObservabilityConfig;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -223,7 +223,7 @@ impl MetadataConfig {
         let filesystem_mode_raw = get_str_or(flat, METADATA_AUTHZ_FILESYSTEM_MODE, "NONE")?;
         let filesystem_mode = FileSystemAuthzMode::parse(&filesystem_mode_raw).ok_or_else(|| {
             CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!(
                     "Invalid metadata.authz.filesystem.mode={}, expected one of NONE|RANGER|ACL",
                     filesystem_mode_raw
@@ -297,7 +297,7 @@ fn reject_removed_keys(flat: &common::config::FlatConfig) -> Result<(), CommonEr
 }
 
 fn parse_group_name(key: &'static str, raw: String) -> Result<GroupName, CommonError> {
-    GroupName::parse(raw).map_err(|err| CommonError::new(CommonErrorCode::InvalidArgument, format!("{key} {err}")))
+    GroupName::parse(raw).map_err(|err| CommonError::new(CommonErrorKind::InvalidArgument, format!("{key} {err}")))
 }
 
 fn get_i64_if_present(flat: &common::config::FlatConfig, key: &'static str) -> Result<Option<i64>, CommonError> {
@@ -316,14 +316,14 @@ fn rpc_addr_from_config(flat: &common::config::FlatConfig) -> Result<SocketAddr,
         port @ 1..=65535 => port as u16,
         port => {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!("{METADATA_RPC_PORT} must be in range 1-65535, got {port}"),
             ));
         }
     };
     format!("{}:{}", addr, port).parse().map_err(|e| {
         CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             format!("Invalid metadata.rpc.addr/port: {}", e),
         )
     })
@@ -412,7 +412,7 @@ fn get_positive_u32_or(flat: &common::config::FlatConfig, key: &'static str, def
 }
 
 fn invalid_config(key: &'static str, detail: &'static str) -> CommonError {
-    CommonError::new(CommonErrorCode::InvalidArgument, format!("{key} {detail}"))
+    CommonError::new(CommonErrorKind::InvalidArgument, format!("{key} {detail}"))
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@
 
 //! Flat configuration with dotted-key support.
 
-use crate::error::{CommonError, CommonErrorCode};
+use crate::error::{CommonError, CommonErrorKind};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -54,7 +54,7 @@ impl FlatConfig {
     pub fn get_required_str(&self, key: &str) -> Result<String, CommonError> {
         self.get_str(key).ok_or_else(|| {
             CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!("missing required config key: {}", key),
             )
         })
@@ -73,7 +73,7 @@ impl FlatConfig {
     pub fn get_required_i64(&self, key: &str) -> Result<i64, CommonError> {
         self.get_i64(key).ok_or_else(|| {
             CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!("missing or invalid config key: {} (expected i64)", key),
             )
         })
@@ -89,7 +89,7 @@ impl FlatConfig {
     pub fn get_required_usize(&self, key: &str) -> Result<usize, CommonError> {
         self.get_usize(key).ok_or_else(|| {
             CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!("missing or invalid config key: {} (expected usize)", key),
             )
         })
@@ -117,7 +117,7 @@ impl FlatConfig {
     pub fn get_required_duration_ms(&self, key: &str) -> Result<Duration, CommonError> {
         self.get_duration_ms(key).ok_or_else(|| {
             CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!("missing or invalid config key: {} (expected duration_ms)", key),
             )
         })

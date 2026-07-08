@@ -3,7 +3,7 @@
 
 //! Concurrency limiter for backpressure control.
 
-use crate::error::{CommonError, CommonErrorCode};
+use crate::error::{CommonError, CommonErrorKind};
 use crate::header::RequestHeader;
 use crate::time::timeout_at;
 use std::sync::Arc;
@@ -53,7 +53,7 @@ impl ConcurrencyLimiter {
 
         if remaining.is_zero() {
             return Err(CommonError::new(
-                CommonErrorCode::Timeout,
+                CommonErrorKind::Timeout,
                 "deadline has passed, cannot acquire permit",
             ));
         }
@@ -75,13 +75,13 @@ impl ConcurrencyLimiter {
             }
             Ok(Err(_)) => {
                 warn!("semaphore closed");
-                Err(CommonError::new(CommonErrorCode::Internal, "semaphore closed"))
+                Err(CommonError::new(CommonErrorKind::Internal, "semaphore closed"))
             }
             Err(_) => {
                 let wait_ms = start.elapsed().as_millis();
                 warn!(wait_ms, "timeout waiting for permit");
                 Err(CommonError::new(
-                    CommonErrorCode::Timeout,
+                    CommonErrorKind::Timeout,
                     format!("timeout waiting for permit after {}ms", wait_ms),
                 ))
             }
@@ -102,7 +102,7 @@ impl ConcurrencyLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::CommonErrorCode;
+    use crate::error::CommonErrorKind;
     use crate::header::RequestHeader;
     use crate::time::Deadline;
     use std::sync::Arc;
@@ -137,7 +137,7 @@ mod tests {
 
         let result = limiter.acquire(&ctx2).await;
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, CommonErrorCode::Timeout);
+        assert_eq!(result.unwrap_err().kind, CommonErrorKind::Timeout);
     }
 
     #[tokio::test]

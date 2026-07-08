@@ -7,7 +7,7 @@
 
 use crate::config::flat::FlatConfig;
 use crate::config::keys::observe_metrics;
-use crate::error::{CommonError, CommonErrorCode};
+use crate::error::{CommonError, CommonErrorKind};
 
 /// Validate shared core-site configuration primitives.
 pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
@@ -17,7 +17,7 @@ pub fn validate_core(config: &FlatConfig) -> Result<(), CommonError> {
         && !(1..=65535).contains(&port)
     {
         return Err(CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             format!(
                 "{} port must be in range 1-65535, got {}",
                 observe_metrics::PROMETHEUS_BIND,

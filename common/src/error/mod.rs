@@ -3,7 +3,6 @@
 
 //! Common error types and utilities.
 
-use crate::header::RequestHeader;
 use std::error::Error as StdError;
 use std::fmt;
 
@@ -219,15 +218,11 @@ pub mod rpc {
     }
 }
 
-/// Error codes for common error classification.
+/// Error kinds for common utility-layer failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum CommonErrorCode {
+pub enum CommonErrorKind {
     /// Operation timed out.
     Timeout,
-    /// Service is unavailable.
-    Unavailable,
-    /// Request was throttled/rate-limited.
-    Throttled,
     /// Service is overloaded (too many concurrent requests).
     Overloaded,
     /// Resource not found.
@@ -242,171 +237,62 @@ pub enum CommonErrorCode {
     Internal,
 }
 
-impl CommonErrorCode {
-    /// Check if this error code is retryable.
+impl CommonErrorKind {
+    /// Check if this error kind is retryable.
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            CommonErrorCode::Timeout
-                | CommonErrorCode::Unavailable
-                | CommonErrorCode::Throttled
-                | CommonErrorCode::Overloaded
-        )
+        matches!(self, CommonErrorKind::Timeout | CommonErrorKind::Overloaded)
     }
 }
 
-impl fmt::Display for CommonErrorCode {
+impl fmt::Display for CommonErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CommonErrorCode::Timeout => write!(f, "Timeout"),
-            CommonErrorCode::Unavailable => write!(f, "Unavailable"),
-            CommonErrorCode::Throttled => write!(f, "Throttled"),
-            CommonErrorCode::Overloaded => write!(f, "Overloaded"),
-            CommonErrorCode::NotFound => write!(f, "NotFound"),
-            CommonErrorCode::PermissionDenied => write!(f, "PermissionDenied"),
-            CommonErrorCode::InvalidArgument => write!(f, "InvalidArgument"),
-            CommonErrorCode::Io => write!(f, "Io"),
-            CommonErrorCode::Internal => write!(f, "Internal"),
+            CommonErrorKind::Timeout => write!(f, "Timeout"),
+            CommonErrorKind::Overloaded => write!(f, "Overloaded"),
+            CommonErrorKind::NotFound => write!(f, "NotFound"),
+            CommonErrorKind::PermissionDenied => write!(f, "PermissionDenied"),
+            CommonErrorKind::InvalidArgument => write!(f, "InvalidArgument"),
+            CommonErrorKind::Io => write!(f, "Io"),
+            CommonErrorKind::Internal => write!(f, "Internal"),
         }
     }
-}
-
-/// Metadata attached to errors for debugging and observability.
-#[derive(Clone, Debug, Default)]
-pub struct ErrorMeta {
-    /// Call ID associated with this error.
-    pub call_id: Option<types::CallId>,
-    /// Operation name (e.g., "ufs.read", "worker.rpc").
-    pub op: Option<String>,
-    /// Peer endpoint or identifier.
-    pub peer: Option<String>,
-    /// Whether this error is retryable.
-    pub retryable: bool,
 }
 
 /// Common error type used across all modules.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CommonError {
-    /// Error code.
-    pub code: CommonErrorCode,
+    /// Error kind.
+    pub kind: CommonErrorKind,
     /// Human-readable error message.
     pub message: String,
-    /// Source error (if any).
-    pub source: Option<Box<dyn StdError + Send + Sync>>,
-    /// Error metadata.
-    pub meta: ErrorMeta,
-}
-
-impl Clone for CommonError {
-    fn clone(&self) -> Self {
-        Self {
-            code: self.code,
-            message: self.message.clone(),
-            // We can't clone the source error, so just create a simple error with the message
-            source: None,
-            meta: self.meta.clone(),
-        }
-    }
 }
 
 impl CommonError {
     /// Create a new CommonError.
-    pub fn new(code: CommonErrorCode, message: impl Into<String>) -> Self {
+    pub fn new(kind: CommonErrorKind, message: impl Into<String>) -> Self {
         Self {
-            code,
+            kind,
             message: message.into(),
-            source: None,
-            meta: ErrorMeta {
-                retryable: code.is_retryable(),
-                ..Default::default()
-            },
         }
-    }
-
-    /// Set the source error.
-    pub fn with_source(mut self, source: Box<dyn StdError + Send + Sync>) -> Self {
-        self.source = Some(source);
-        self
-    }
-
-    /// Set error metadata from RequestHeader.
-    pub fn with_ctx(mut self, ctx: &RequestHeader) -> Self {
-        self.meta.call_id = Some(ctx.client.call_id);
-        self
-    }
-
-    /// Set the operation name.
-    pub fn with_op(mut self, op: impl Into<String>) -> Self {
-        self.meta.op = Some(op.into());
-        self
-    }
-
-    /// Set the peer identifier.
-    pub fn with_peer(mut self, peer: impl Into<String>) -> Self {
-        self.meta.peer = Some(peer.into());
-        self
     }
 
     /// Check if this error is retryable.
     pub fn is_retryable(&self) -> bool {
-        self.meta.retryable
+        self.kind.is_retryable()
     }
 }
 
 impl fmt::Display for CommonError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}] {}", self.code, self.message)?;
-        if let Some(ref op) = self.meta.op {
-            write!(f, " (op: {})", op)?;
-        }
-        if let Some(ref peer) = self.meta.peer {
-            write!(f, " (peer: {})", peer)?;
-        }
-        if let Some(ref call_id) = self.meta.call_id {
-            write!(f, " (call_id: {})", call_id)?;
-        }
-        Ok(())
+        write!(f, "[{}] {}", self.kind, self.message)
     }
 }
 
-impl StdError for CommonError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        self.source.as_ref().map(|e| e.as_ref() as _)
-    }
-}
+impl StdError for CommonError {}
 
-/// Extension trait for Result to add context.
-pub trait ResultExt<T> {
-    /// Add RequestHeader to the error.
-    fn with_ctx(self, ctx: &RequestHeader) -> Result<T, CommonError>;
-
-    /// Add operation name to the error.
-    fn with_op(self, op: &str) -> Result<T, CommonError>;
-
-    /// Add peer identifier to the error.
-    fn with_peer(self, peer: &str) -> Result<T, CommonError>;
-}
-
-impl<T, E> ResultExt<T> for Result<T, E>
-where
-    E: Into<CommonError>,
-{
-    fn with_ctx(self, ctx: &RequestHeader) -> Result<T, CommonError> {
-        self.map_err(|e| e.into().with_ctx(ctx))
-    }
-
-    fn with_op(self, op: &str) -> Result<T, CommonError> {
-        self.map_err(|e| e.into().with_op(op))
-    }
-
-    fn with_peer(self, peer: &str) -> Result<T, CommonError> {
-        self.map_err(|e| e.into().with_peer(peer))
-    }
-}
-
-impl From<CommonErrorCode> for CommonError {
-    fn from(code: CommonErrorCode) -> Self {
-        CommonError::new(code, code.to_string())
+impl From<CommonErrorKind> for CommonError {
+    fn from(kind: CommonErrorKind) -> Self {
+        CommonError::new(kind, kind.to_string())
     }
 }
 
@@ -417,7 +303,17 @@ mod rpc_tests;
 #[cfg(test)]
 mod tests {
     use super::rpc::{ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail};
+    use super::{CommonError, CommonErrorKind};
     use types::fs::FsErrorCode;
+
+    #[test]
+    fn common_error_retryability_is_derived_from_kind() {
+        let timeout = CommonError::new(CommonErrorKind::Timeout, "deadline exceeded");
+        let invalid = CommonError::new(CommonErrorKind::InvalidArgument, "bad config");
+
+        assert!(timeout.is_retryable());
+        assert!(!invalid.is_retryable());
+    }
 
     #[test]
     fn rpc_fs_error_fails() {

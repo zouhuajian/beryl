@@ -3,7 +3,7 @@
 
 //! Retry policy and async retry utilities.
 
-use crate::error::{CommonError, CommonErrorCode};
+use crate::error::{CommonError, CommonErrorKind};
 use crate::header::RequestHeader;
 use std::future::Future;
 use std::time::Duration;
@@ -109,7 +109,7 @@ where
         let remaining = ctx.deadline.remaining();
         if remaining.is_zero() {
             let err = last_error
-                .unwrap_or_else(|| CommonError::new(CommonErrorCode::Timeout, "deadline exceeded before retry"));
+                .unwrap_or_else(|| CommonError::new(CommonErrorKind::Timeout, "deadline exceeded before retry"));
             warn!(
                 attempt,
                 elapsed_ms = start.elapsed().as_millis(),
@@ -123,7 +123,7 @@ where
             && start.elapsed() > max_elapsed
         {
             let err =
-                last_error.unwrap_or_else(|| CommonError::new(CommonErrorCode::Timeout, "max elapsed time exceeded"));
+                last_error.unwrap_or_else(|| CommonError::new(CommonErrorKind::Timeout, "max elapsed time exceeded"));
             warn!(
                 attempt,
                 elapsed_ms = start.elapsed().as_millis(),
@@ -151,7 +151,7 @@ where
                 if !(policy.retry_on)(&e) {
                     debug!(
                         attempt,
-                        error_code = ?e.code,
+                        error_kind = ?e.kind,
                         "error is not retryable, stopping"
                     );
                     return Err(e);
@@ -163,7 +163,7 @@ where
                         attempt,
                         max_retries = policy.max_retries,
                         elapsed_ms = start.elapsed().as_millis(),
-                        error_code = ?e.code,
+                        error_kind = ?e.kind,
                         "max retries exceeded"
                     );
                     return Err(e);
@@ -181,7 +181,7 @@ where
                 debug!(
                     attempt,
                     backoff_ms = effective_backoff.as_millis(),
-                    error_code = ?e.code,
+                    error_kind = ?e.kind,
                     "retrying after backoff"
                 );
 
@@ -207,7 +207,7 @@ impl Default for RetryPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::CommonErrorCode;
+    use crate::error::CommonErrorKind;
     use crate::header::RequestHeader;
     use crate::time::Deadline;
     use tokio::time::sleep;
@@ -244,7 +244,7 @@ mod tests {
             attempts += 1;
             async move {
                 if attempts < 3 {
-                    Err(CommonError::new(CommonErrorCode::Unavailable, "temporary error"))
+                    Err(CommonError::new(CommonErrorKind::Overloaded, "temporary error"))
                 } else {
                     Ok::<i32, CommonError>(42)
                 }
@@ -265,7 +265,7 @@ mod tests {
         let mut attempts = 0;
         let result: Result<i32, CommonError> = retry_async(&policy, &ctx, "test", || {
             attempts += 1;
-            async move { Err(CommonError::new(CommonErrorCode::InvalidArgument, "not retryable")) }
+            async move { Err(CommonError::new(CommonErrorKind::InvalidArgument, "not retryable")) }
         })
         .await;
 
@@ -288,7 +288,7 @@ mod tests {
             attempts += 1;
             async move {
                 sleep(Duration::from_millis(20)).await;
-                Err(CommonError::new(CommonErrorCode::Unavailable, "temporary error"))
+                Err(CommonError::new(CommonErrorKind::Overloaded, "temporary error"))
             }
         })
         .await;
@@ -306,7 +306,7 @@ mod tests {
         let mut attempts = 0;
         let result: Result<i32, CommonError> = retry_async(&policy, &ctx, "test", || {
             attempts += 1;
-            async move { Err(CommonError::new(CommonErrorCode::Unavailable, "error")) }
+            async move { Err(CommonError::new(CommonErrorKind::Overloaded, "error")) }
         })
         .await;
 

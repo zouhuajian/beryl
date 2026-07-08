@@ -7,7 +7,7 @@ use crate::config::{
     FlatConfig,
     keys::{observe_log, observe_metrics},
 };
-use crate::error::{CommonError, CommonErrorCode};
+use crate::error::{CommonError, CommonErrorKind};
 use serde::{Deserialize, Serialize};
 
 /// Observability configuration loaded from flat `observe.*` file keys.
@@ -129,7 +129,7 @@ fn validate_log_config(config: &LogConfig) -> Result<(), CommonError> {
 fn validate_metrics_config(config: &MetricsConfig) -> Result<(), CommonError> {
     config.prometheus.bind.parse::<std::net::SocketAddr>().map_err(|err| {
         CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             format!("Invalid {}: {err}", observe_metrics::PROMETHEUS_BIND),
         )
     })?;
@@ -140,7 +140,7 @@ fn validate_metrics_config(config: &MetricsConfig) -> Result<(), CommonError> {
 }
 
 fn invalid_config(key: &'static str, detail: impl Into<String>) -> CommonError {
-    CommonError::new(CommonErrorCode::InvalidArgument, format!("{key} {}", detail.into()))
+    CommonError::new(CommonErrorKind::InvalidArgument, format!("{key} {}", detail.into()))
 }
 
 #[cfg(test)]

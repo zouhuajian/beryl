@@ -7,7 +7,7 @@ use crate::rpc_error::ClientAction;
 use common::error::rpc::{
     ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail,
 };
-use common::{CommonError, CommonErrorCode};
+use common::{CommonError, CommonErrorKind};
 use thiserror::Error;
 use types::fs::FsErrorCode;
 
@@ -377,30 +377,25 @@ impl From<ClientError> for RpcErrorDetail {
 }
 
 fn rpc_error_from_common_error(err: CommonError) -> RpcErrorDetail {
-    match err.code {
-        CommonErrorCode::Timeout => RpcErrorDetail::retry(
+    match err.kind {
+        CommonErrorKind::Timeout => RpcErrorDetail::retry(
             ErrorKind::Internal(InternalErrorKind::Timeout),
             Some(1000),
             err.to_string(),
         ),
-        CommonErrorCode::Unavailable => RpcErrorDetail::retry(
-            ErrorKind::Internal(InternalErrorKind::NodeUnavailable),
-            Some(1000),
-            err.to_string(),
-        ),
-        CommonErrorCode::Throttled | CommonErrorCode::Overloaded => RpcErrorDetail::retry(
+        CommonErrorKind::Overloaded => RpcErrorDetail::retry(
             ErrorKind::Internal(InternalErrorKind::ResourceExhausted),
             Some(1000),
             err.to_string(),
         ),
-        CommonErrorCode::NotFound => {
+        CommonErrorKind::NotFound => {
             RpcErrorDetail::fail(ErrorKind::Metadata(MetadataErrorKind::NotFound), err.to_string())
         }
-        CommonErrorCode::PermissionDenied => RpcErrorDetail::fs(FsErrorCode::EAcces, err.to_string()),
-        CommonErrorCode::InvalidArgument => {
+        CommonErrorKind::PermissionDenied => RpcErrorDetail::fs(FsErrorCode::EAcces, err.to_string()),
+        CommonErrorKind::InvalidArgument => {
             RpcErrorDetail::fail(ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument), err.to_string())
         }
-        CommonErrorCode::Io | CommonErrorCode::Internal => {
+        CommonErrorKind::Io | CommonErrorKind::Internal => {
             RpcErrorDetail::fail(ErrorKind::Internal(InternalErrorKind::Internal), err.to_string())
         }
     }

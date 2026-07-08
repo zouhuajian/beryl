@@ -3,7 +3,7 @@
 
 //! Deadline and timeout utilities.
 
-use crate::error::{CommonError, CommonErrorCode};
+use crate::error::{CommonError, CommonErrorKind};
 use std::future::Future;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::timeout as tokio_timeout;
@@ -72,7 +72,7 @@ where
     let remaining = deadline.remaining();
     if remaining.is_zero() {
         return Err(CommonError::new(
-            CommonErrorCode::Timeout,
+            CommonErrorKind::Timeout,
             "deadline has already passed",
         ));
     }
@@ -80,7 +80,7 @@ where
     match tokio_timeout(remaining, future).await {
         Ok(result) => Ok(result),
         Err(_) => Err(CommonError::new(
-            CommonErrorCode::Timeout,
+            CommonErrorKind::Timeout,
             format!("operation timed out after {}ms", remaining.as_millis()),
         )),
     }
@@ -124,7 +124,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, CommonErrorCode::Timeout);
+        assert_eq!(err.kind, CommonErrorKind::Timeout);
     }
 
     #[tokio::test]
@@ -134,7 +134,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, CommonErrorCode::Timeout);
+        assert_eq!(err.kind, CommonErrorKind::Timeout);
     }
 
     #[test]

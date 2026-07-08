@@ -8,7 +8,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use common::config::ServerConfig;
-use common::error::{CommonError, CommonErrorCode};
+use common::error::{CommonError, CommonErrorKind};
 use common::observe::ObservabilityConfig;
 use tonic::transport::Endpoint;
 use tracing::info;
@@ -249,21 +249,21 @@ impl WorkerConfig {
     pub fn validate(&self) -> Result<(), CommonError> {
         if self.cluster_id.trim().is_empty() {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 "vecton.cluster.id must not be empty",
             ));
         }
 
         if self.identity_path.as_os_str().is_empty() {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 "worker.identity.path must not be empty",
             ));
         }
 
         if self.rpc_bind.parse::<std::net::SocketAddr>().is_err() {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!("invalid worker.rpc.bind address: {}", self.rpc_bind),
             ));
         }
@@ -272,28 +272,28 @@ impl WorkerConfig {
 
         if self.rpc_max_inflight == 0 {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 "worker.rpc.max_inflight must be greater than zero",
             ));
         }
 
         if self.default_frame_size == 0 {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 "worker.default_frame_size must be greater than zero",
             ));
         }
 
         if self.max_frame_size == 0 {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 "worker.max_frame_size must be greater than zero",
             ));
         }
 
         if self.default_frame_size > self.max_frame_size {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!(
                     "worker.default_frame_size ({}) must be <= worker.max_frame_size ({})",
                     self.default_frame_size, self.max_frame_size
@@ -303,14 +303,14 @@ impl WorkerConfig {
 
         if self.window_bytes == 0 {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 "worker.window_bytes must be greater than zero",
             ));
         }
 
         if self.stream_idle_timeout_ms == 0 {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 "worker.stream.idle_timeout_ms must be greater than zero",
             ));
         }
@@ -321,7 +321,7 @@ impl WorkerConfig {
 
         if self.net.listeners.is_empty() {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 "worker.net.listeners must not be empty",
             ));
         }
@@ -329,19 +329,19 @@ impl WorkerConfig {
         for listener in &self.net.listeners {
             if listener.protocol == WorkerNetProtocol::Grpc && listener.bind.parse::<std::net::SocketAddr>().is_err() {
                 return Err(CommonError::new(
-                    CommonErrorCode::InvalidArgument,
+                    CommonErrorKind::InvalidArgument,
                     format!("invalid worker gRPC listener bind address: {}", listener.bind),
                 ));
             }
             if listener.max_inflight == 0 {
                 return Err(CommonError::new(
-                    CommonErrorCode::InvalidArgument,
+                    CommonErrorKind::InvalidArgument,
                     "worker.net.listeners.max_inflight must be greater than zero",
                 ));
             }
             if listener.max_frame_size == 0 {
                 return Err(CommonError::new(
-                    CommonErrorCode::InvalidArgument,
+                    CommonErrorKind::InvalidArgument,
                     "worker.net.listeners.max_frame_size must be greater than zero",
                 ));
             }
@@ -418,7 +418,7 @@ impl WorkerConfig {
         match flat.get_bytes(key) {
             Some(value) => u32::try_from(value).map_err(|_| {
                 CommonError::new(
-                    CommonErrorCode::InvalidArgument,
+                    CommonErrorKind::InvalidArgument,
                     format!("{field_name} exceeds u32 byte size"),
                 )
             }),
@@ -444,13 +444,13 @@ impl WorkerConfig {
 fn reject_removed_keys(flat: &common::config::FlatConfig) -> Result<(), CommonError> {
     if let Some(key) = flat.keys_with_prefix("storage").into_iter().next() {
         return Err(CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             format!("worker.{key} is unsupported: use worker.store.*"),
         ));
     }
     if let Some(key) = flat.keys_with_prefix("transport").into_iter().next() {
         return Err(CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             format!("worker.{key} is unsupported: use worker.default_frame_size and worker.max_frame_size"),
         ));
     }
@@ -504,7 +504,7 @@ fn reject_removed_keys(flat: &common::config::FlatConfig) -> Result<(), CommonEr
     ] {
         if flat.contains_key(key) {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!("{full_key} is unsupported: {detail}"),
             ));
         }
@@ -556,25 +556,25 @@ fn parse_store_dirs(flat: &common::config::FlatConfig) -> Result<BTreeMap<String
     for key in keys {
         let rest = key.strip_prefix("store.dirs.").ok_or_else(|| {
             CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!("worker.{key} must use worker.store.dirs.<dir_id>.<field>"),
             )
         })?;
         let (id, field) = rest.split_once('.').ok_or_else(|| {
             CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!("worker.{key} must use worker.store.dirs.<dir_id>.<field>"),
             )
         })?;
         if id.is_empty() || id.trim() != id {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!("worker.{key} has an invalid store dir id"),
             ));
         }
         if field.contains('.') {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!("worker.{key} has an unsupported nested store dir field"),
             ));
         }
@@ -582,19 +582,19 @@ fn parse_store_dirs(flat: &common::config::FlatConfig) -> Result<BTreeMap<String
             "path" | "tier" | "capacity" => {}
             "id" => {
                 return Err(CommonError::new(
-                    CommonErrorCode::InvalidArgument,
+                    CommonErrorKind::InvalidArgument,
                     format!("worker.{key} is unsupported; dir id must come from the key segment"),
                 ));
             }
             "cap" => {
                 return Err(CommonError::new(
-                    CommonErrorCode::InvalidArgument,
+                    CommonErrorKind::InvalidArgument,
                     format!("worker.{key} is unsupported; use worker.store.dirs.{id}.capacity"),
                 ));
             }
             _ => {
                 return Err(CommonError::new(
-                    CommonErrorCode::InvalidArgument,
+                    CommonErrorKind::InvalidArgument,
                     format!("worker.{key} is unsupported"),
                 ));
             }
@@ -615,14 +615,14 @@ fn parse_store_dirs(flat: &common::config::FlatConfig) -> Result<BTreeMap<String
         let tier_raw = required_store_str(flat, &tier_key, format!("worker.{tier_key}"))?;
         let tier = Tier::parse(&tier_raw).map_err(|err| {
             CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!("worker.store.dirs.{id}.tier {err}"),
             )
         })?;
         let capacity_bytes = required_store_bytes(flat, &capacity_key, format!("worker.{capacity_key}"))?;
         if capacity_bytes == 0 {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!("worker.store.dirs.{id}.capacity must be greater than zero"),
             ));
         }
@@ -645,13 +645,13 @@ fn required_store_str(
 ) -> Result<String, CommonError> {
     let value = flat.get_str(field).ok_or_else(|| {
         CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             format!("{display_key} must be present"),
         )
     })?;
     if value.trim().is_empty() {
         return Err(CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             format!("{display_key} must not be empty"),
         ));
     }
@@ -665,13 +665,13 @@ fn required_store_bytes(
 ) -> Result<u64, CommonError> {
     let value = flat.get_bytes(field).ok_or_else(|| {
         CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             format!("{display_key} must be a byte size"),
         )
     })?;
     u64::try_from(value).map_err(|_| {
         CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             format!("{display_key} exceeds u64 byte size"),
         )
     })
@@ -691,26 +691,26 @@ fn validate_store_config(config: &WorkerConfig) -> Result<(), CommonError> {
         }
         if dir.path.as_os_str().is_empty() {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!("worker.store.dirs.{id}.path must not be empty"),
             ));
         }
         if !paths.insert(dir.path.clone()) {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!("worker.store.dirs duplicate path: {}", dir.path.display()),
             ));
         }
         if dir.capacity_bytes == 0 {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!("worker.store.dirs.{id}.capacity must be greater than zero"),
             ));
         }
     }
     if config.store.selection_policy != "round_robin" {
         return Err(CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             "worker.store.selection_policy must be round_robin; balanced is TODO(store)".to_string(),
         ));
     }
@@ -728,7 +728,7 @@ impl WorkerRegistrationConfig {
     pub fn validate(&self) -> Result<(), CommonError> {
         if self.endpoints.is_empty() {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 "worker.metadata.endpoints must not be empty",
             ));
         }
@@ -736,19 +736,19 @@ impl WorkerRegistrationConfig {
         for endpoint in &self.endpoints {
             if endpoint.is_empty() {
                 return Err(CommonError::new(
-                    CommonErrorCode::InvalidArgument,
+                    CommonErrorKind::InvalidArgument,
                     "worker.metadata.endpoints entries must not be empty",
                 ));
             }
             if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
                 return Err(CommonError::new(
-                    CommonErrorCode::InvalidArgument,
+                    CommonErrorKind::InvalidArgument,
                     "worker.metadata.endpoints entries must include http:// or https:// scheme",
                 ));
             }
             Endpoint::from_shared(endpoint.clone()).map_err(|err| {
                 CommonError::new(
-                    CommonErrorCode::InvalidArgument,
+                    CommonErrorKind::InvalidArgument,
                     format!("worker.metadata.endpoints entry must be a valid tonic endpoint URI: {err}"),
                 )
             })?;
@@ -756,28 +756,28 @@ impl WorkerRegistrationConfig {
 
         if self.register_timeout_ms == 0 {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 "worker.metadata.register_timeout_ms must be greater than zero",
             ));
         }
 
         if self.register_retry_initial_backoff_ms == 0 {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 "worker.metadata.register_retry_initial_backoff_ms must be greater than zero",
             ));
         }
 
         if self.register_retry_max_backoff_ms == 0 {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 "worker.metadata.register_retry_max_backoff_ms must be greater than zero",
             ));
         }
 
         if self.register_retry_max_backoff_ms < self.register_retry_initial_backoff_ms {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!(
                     "worker.metadata.register_retry_max_backoff_ms ({}) must be >= worker.metadata.register_retry_initial_backoff_ms ({})",
                     self.register_retry_max_backoff_ms, self.register_retry_initial_backoff_ms
@@ -790,11 +790,11 @@ impl WorkerRegistrationConfig {
 }
 
 fn invalid_config(key: &'static str, detail: &'static str) -> CommonError {
-    CommonError::new(CommonErrorCode::InvalidArgument, format!("{key} {detail}"))
+    CommonError::new(CommonErrorKind::InvalidArgument, format!("{key} {detail}"))
 }
 
 fn parse_group_name(key: &'static str, raw: String) -> Result<GroupName, CommonError> {
-    GroupName::parse(raw).map_err(|err| CommonError::new(CommonErrorCode::InvalidArgument, format!("{key} {err}")))
+    GroupName::parse(raw).map_err(|err| CommonError::new(CommonErrorKind::InvalidArgument, format!("{key} {err}")))
 }
 
 fn metadata_endpoints(
@@ -829,28 +829,28 @@ fn parse_csv_endpoints(value: String) -> Result<Vec<String>, CommonError> {
 fn parse_advertised_endpoint(value: &str) -> Result<(String, u32), CommonError> {
     if value.is_empty() {
         return Err(CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             "worker.rpc.advertised_endpoint must not be empty",
         ));
     }
 
     if !(value.starts_with("http://") || value.starts_with("https://")) {
         return Err(CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             "worker.rpc.advertised_endpoint must include http:// or https:// scheme",
         ));
     }
 
     let endpoint = Endpoint::from_shared(value.to_string()).map_err(|err| {
         CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             format!("worker.rpc.advertised_endpoint must be a valid tonic endpoint URI: {err}"),
         )
     })?;
     let uri = endpoint.uri();
     let raw_host = uri.host().ok_or_else(|| {
         CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             "worker.rpc.advertised_endpoint must include a host",
         )
     })?;
@@ -860,19 +860,19 @@ fn parse_advertised_endpoint(value: &str) -> Result<(String, u32), CommonError> 
         .unwrap_or(raw_host);
     if host.is_empty() {
         return Err(CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             "worker.rpc.advertised_endpoint host must not be empty",
         ));
     }
     if host.parse::<IpAddr>().is_ok_and(|ip| ip.is_unspecified()) {
         return Err(CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             "worker.rpc.advertised_endpoint must not use a wildcard host",
         ));
     }
     let port = uri.port_u16().ok_or_else(|| {
         CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             "worker.rpc.advertised_endpoint must include a port",
         )
     })?;

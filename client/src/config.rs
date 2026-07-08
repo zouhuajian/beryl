@@ -260,7 +260,7 @@ fn channel_pool_config_from_flat(flat: &FlatConfig) -> Result<ChannelPoolConfig,
 fn parse_metadata_groups(flat: &FlatConfig) -> Result<Vec<MetadataGroupConfig>, CommonError> {
     if flat.contains_key("client.metadata.group_ids") {
         return Err(CommonError::new(
-            common::CommonErrorCode::InvalidArgument,
+            common::CommonErrorKind::InvalidArgument,
             "client.metadata.group_ids is unsupported; use client.metadata.group.names",
         ));
     }
@@ -268,7 +268,7 @@ fn parse_metadata_groups(flat: &FlatConfig) -> Result<Vec<MetadataGroupConfig>, 
     let removed_endpoint_key = ["client.metadata", "endpoints"].join(".");
     if flat.contains_key(&removed_endpoint_key) {
         return Err(CommonError::new(
-            common::CommonErrorCode::InvalidArgument,
+            common::CommonErrorKind::InvalidArgument,
             format!("{removed_endpoint_key} is unsupported; use client.metadata.group.<group>.endpoints"),
         ));
     }
@@ -282,13 +282,13 @@ fn parse_metadata_groups(flat: &FlatConfig) -> Result<Vec<MetadataGroupConfig>, 
             .collect::<Result<Vec<_>, _>>()
             .map_err(|err| {
                 CommonError::new(
-                    common::CommonErrorCode::InvalidArgument,
+                    common::CommonErrorKind::InvalidArgument,
                     format!("invalid client.metadata.group.names: {err}"),
                 )
             })?;
         if groups.is_empty() {
             return Err(CommonError::new(
-                common::CommonErrorCode::InvalidArgument,
+                common::CommonErrorKind::InvalidArgument,
                 "client.metadata.group.names must contain at least one group name",
             ));
         }
@@ -312,7 +312,7 @@ fn parse_metadata_groups(flat: &FlatConfig) -> Result<Vec<MetadataGroupConfig>, 
                         .collect::<Vec<_>>();
                     if endpoints.is_empty() {
                         return Err(CommonError::new(
-                            common::CommonErrorCode::InvalidArgument,
+                            common::CommonErrorKind::InvalidArgument,
                             format!("{key} must be configured and non-empty"),
                         ));
                     }
@@ -323,7 +323,7 @@ fn parse_metadata_groups(flat: &FlatConfig) -> Result<Vec<MetadataGroupConfig>, 
                 }
                 None => {
                     return Err(CommonError::new(
-                        common::CommonErrorCode::InvalidArgument,
+                        common::CommonErrorKind::InvalidArgument,
                         format!("{key} must be configured and non-empty"),
                     ));
                 }
@@ -449,7 +449,7 @@ fn get_f64_or(flat: &FlatConfig, key: &'static str, default: f64) -> Result<f64,
 
 fn invalid_config(key: &'static str, detail: impl Into<String>) -> CommonError {
     CommonError::new(
-        common::CommonErrorCode::InvalidArgument,
+        common::CommonErrorKind::InvalidArgument,
         format!("{key} {}", detail.into()),
     )
 }

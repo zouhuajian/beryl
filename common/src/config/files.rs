@@ -4,7 +4,7 @@
 //! Configuration file loading.
 
 use crate::config::flat::FlatConfig;
-use crate::error::{CommonError, CommonErrorCode};
+use crate::error::{CommonError, CommonErrorKind};
 use serde_yaml::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -18,14 +18,14 @@ pub fn load_from_yaml_file<P: AsRef<Path>>(path: P) -> Result<FlatConfig, Common
 
     let content = fs::read_to_string(path).map_err(|e| {
         CommonError::new(
-            CommonErrorCode::Io,
+            CommonErrorKind::Io,
             format!("failed to read config file {}: {}", path.display(), e),
         )
     })?;
 
     let value: Value = serde_yaml::from_str(&content).map_err(|e| {
         CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             format!("failed to parse YAML file {}: {}", path.display(), e),
         )
     })?;
@@ -40,7 +40,7 @@ fn flat_mapping(value: Value) -> Result<BTreeMap<String, Value>, CommonError> {
 
     let Value::Mapping(map) = value else {
         return Err(CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             "config file must be a YAML mapping with flat keys",
         ));
     };
@@ -54,7 +54,7 @@ fn flat_mapping(value: Value) -> Result<BTreeMap<String, Value>, CommonError> {
 
         if matches!(val, Value::Mapping(_)) {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!(
                     "nested YAML config is not supported; use flat keys such as observe.log.format instead of {key_str}"
                 ),
@@ -65,7 +65,7 @@ fn flat_mapping(value: Value) -> Result<BTreeMap<String, Value>, CommonError> {
             && entries.iter().any(|entry| matches!(entry, Value::Mapping(_)))
         {
             return Err(CommonError::new(
-                CommonErrorCode::InvalidArgument,
+                CommonErrorKind::InvalidArgument,
                 format!(
                     "nested YAML config is not supported; use flat keys such as observe.log.format instead of {key_str}"
                 ),

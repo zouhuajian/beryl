@@ -12,7 +12,7 @@ use crate::metrics::AUTHZ_ALLOW_NONE_TOTAL;
 use crate::path_resolver::ResolvedPath;
 use crate::service::domain::RequestContext;
 use bitflags::bitflags;
-use common::error::{CommonError, CommonErrorCode};
+use common::error::{CommonError, CommonErrorKind};
 use std::sync::atomic::Ordering;
 
 bitflags! {
@@ -32,11 +32,11 @@ pub fn validate_filesystem_permission_mode(mode: FileSystemAuthzMode) -> Result<
     match mode {
         FileSystemAuthzMode::None => Ok(()),
         FileSystemAuthzMode::Acl => Err(CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             "ACL permission mode is not implemented yet",
         )),
         FileSystemAuthzMode::Ranger => Err(CommonError::new(
-            CommonErrorCode::InvalidArgument,
+            CommonErrorKind::InvalidArgument,
             "Ranger permission mode is not implemented yet",
         )),
     }
