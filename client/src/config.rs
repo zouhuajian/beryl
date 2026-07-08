@@ -258,21 +258,6 @@ fn channel_pool_config_from_flat(flat: &FlatConfig) -> Result<ChannelPoolConfig,
 }
 
 fn parse_metadata_groups(flat: &FlatConfig) -> Result<Vec<MetadataGroupConfig>, CommonError> {
-    if flat.contains_key("client.metadata.group_ids") {
-        return Err(CommonError::new(
-            common::CommonErrorKind::InvalidArgument,
-            "client.metadata.group_ids is unsupported; use client.metadata.group.names",
-        ));
-    }
-
-    let removed_endpoint_key = ["client.metadata", "endpoints"].join(".");
-    if flat.contains_key(&removed_endpoint_key) {
-        return Err(CommonError::new(
-            common::CommonErrorKind::InvalidArgument,
-            format!("{removed_endpoint_key} is unsupported; use client.metadata.group.<group>.endpoints"),
-        ));
-    }
-
     let group_names = if let Some(groups_str) = flat.get_str("client.metadata.group.names") {
         let groups = groups_str
             .split(',')
@@ -486,14 +471,6 @@ mod tests {
             config.channel_pool.worker_endpoint_cooldown_ms,
             DEFAULT_WORKER_ENDPOINT_COOLDOWN_MS
         );
-    }
-
-    #[test]
-    fn removed_numeric_metadata_group_config_is_rejected() {
-        let mut flat = FlatConfig::new();
-        flat.set("client.metadata.group_ids", "-1");
-        let err = ClientConfig::from_flat(flat).expect_err("numeric metadata group config must fail");
-        assert!(err.to_string().contains("client.metadata.group_ids"));
     }
 
     #[test]

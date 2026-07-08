@@ -17,7 +17,7 @@ use ::common::{
         RecoveryAction as RpcRecoveryAction, RefreshHint as RpcRefreshHint, RpcErrorDetail,
         UfsErrorKind as RpcUfsErrorKind, WorkerEndpointHint, WorkerErrorKind as RpcWorkerErrorKind,
     },
-    header::{AuthnType, CallerContext, ClientInfo, RequestHeader, ResponseHeader, TraceContext},
+    header::{CallerContext, ClientInfo, RequestHeader, ResponseHeader, TraceContext},
 };
 use types::chunk::ByteRange;
 use types::ids::{
@@ -845,24 +845,6 @@ impl TryFrom<proto_common::RequestHeaderProto> for RequestHeader {
             .into_iter()
             .map(GroupStateWatermark::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        let principal = if proto.principal.is_empty() {
-            None
-        } else {
-            Some(proto.principal)
-        };
-        let real_user = if proto.real_user.is_empty() {
-            None
-        } else {
-            Some(proto.real_user)
-        };
-        let doas = if proto.doas.is_empty() { None } else { Some(proto.doas) };
-        let authn_type = match proto_common::AuthnTypeProto::try_from(proto.authn_type) {
-            Ok(proto_common::AuthnTypeProto::Simple) => AuthnType::Simple,
-            Ok(proto_common::AuthnTypeProto::Kerberos) => AuthnType::Kerberos,
-            Ok(proto_common::AuthnTypeProto::Token) => AuthnType::Token,
-            _ => AuthnType::Unspecified,
-        };
-
         Ok(RequestHeader {
             client,
             trace_context,
@@ -871,10 +853,6 @@ impl TryFrom<proto_common::RequestHeaderProto> for RequestHeader {
             mount_epoch: proto.mount_epoch,
             state,
             route_epoch: proto.route_epoch,
-            principal,
-            real_user,
-            doas,
-            authn_type,
             deadline,
             caller_context,
             retry_count: proto.retry_count,
@@ -895,15 +873,6 @@ impl From<&RequestHeader> for proto_common::RequestHeaderProto {
                 .map(proto_common::GroupStateWatermarkProto::from)
                 .collect(),
             route_epoch: header.route_epoch,
-            principal: header.principal.clone().unwrap_or_default(),
-            real_user: header.real_user.clone().unwrap_or_default(),
-            doas: header.doas.clone().unwrap_or_default(),
-            authn_type: match header.authn_type {
-                AuthnType::Unspecified => proto_common::AuthnTypeProto::Unspecified as i32,
-                AuthnType::Simple => proto_common::AuthnTypeProto::Simple as i32,
-                AuthnType::Kerberos => proto_common::AuthnTypeProto::Kerberos as i32,
-                AuthnType::Token => proto_common::AuthnTypeProto::Token as i32,
-            },
             deadline_ms: header.deadline.as_unix_ms(),
             caller_context: header
                 .caller_context
@@ -1601,13 +1570,9 @@ mod tests {
                 ("uint64", "mount_epoch", 4),
                 ("GroupStateWatermarkProto", "state", 5),
                 ("uint64", "route_epoch", 6),
-                ("string", "principal", 7),
-                ("string", "real_user", 8),
-                ("string", "doas", 9),
-                ("AuthnTypeProto", "authn_type", 10),
-                ("int64", "deadline_ms", 11),
-                ("CallerContextProto", "caller_context", 12),
-                ("int32", "retry_count", 13),
+                ("int64", "deadline_ms", 7),
+                ("CallerContextProto", "caller_context", 8),
+                ("int32", "retry_count", 9),
             ]
         );
         assert_eq!(

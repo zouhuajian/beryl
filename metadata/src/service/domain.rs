@@ -4,7 +4,7 @@
 //! Domain types for FsCore APIs.
 
 use common::error::rpc::RpcErrorDetail;
-use common::header::{AuthnType, RequestHeader};
+use common::header::RequestHeader;
 use types::fs::{Extent, FileAttrs, InodeId, InodeKind};
 use types::ids::{BlockId, DataHandleId, LeaseId, MountId};
 use types::layout::FileLayout;
@@ -16,10 +16,6 @@ pub struct RequestContext {
     pub caller: RequestHeader,
     pub traceparent: Option<String>,
     pub route_epoch: Option<u64>,
-    pub principal: Option<String>,
-    pub real_user: Option<String>,
-    pub doas: Option<String>,
-    pub authn_type: AuthnType,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

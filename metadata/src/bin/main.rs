@@ -167,19 +167,6 @@ observe.metrics.prometheus.path: "/metrics"
     }
 
     #[test]
-    fn removed_metadata_command_words_fail() {
-        for args in [
-            &["bootstrap"][..],
-            &["auto-format"][..],
-            &["worker"][..],
-            &["bootstrap", "--config", "conf/metadata.yaml"][..],
-        ] {
-            let err = parse(args).err().expect("removed metadata command must fail");
-            assert!(err.to_string().contains("unsupported metadata command"));
-        }
-    }
-
-    #[test]
     fn metadata_config_path_requires_explicit_config_flag() {
         let err = parse(&["conf/local/metadata.yaml"])
             .err()

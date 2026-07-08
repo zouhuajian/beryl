@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Behavioral regression tests for path service guard/authz/error contracts.
+//! Behavioral regression tests for path service guard/error contracts.
 
 use common::error::rpc::{
     ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail,

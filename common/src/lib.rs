@@ -13,7 +13,7 @@ pub mod time;
 pub use audit::{AuditLogger, AuditRecord};
 pub use config::{ClientConfig, FlatConfig, ServerConfig, load_client_site, load_server_config};
 pub use error::{CommonError, CommonErrorKind};
-pub use header::{AuthnType, CallerContext, CallerContextFields, RequestHeader, RequestHeaderCodec, ResponseHeader};
+pub use header::{CallerContext, CallerContextFields, RequestHeader, RequestHeaderCodec, ResponseHeader};
 pub use limit::{ConcurrencyLimiter, Permit};
 pub use retry::{RetryPolicy, retry_async};
 pub use time::{Deadline, timeout, timeout_at};

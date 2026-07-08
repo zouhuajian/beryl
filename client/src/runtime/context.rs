@@ -442,10 +442,6 @@ impl AttemptContext {
             state: self.state.clone(),
             retry_count: self.attempt_number as i32,
             route_epoch: self.route_epoch,
-            principal: String::new(),
-            real_user: String::new(),
-            doas: String::new(),
-            authn_type: 0,
         })
     }
 

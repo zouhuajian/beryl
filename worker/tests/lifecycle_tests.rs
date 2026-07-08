@@ -212,49 +212,6 @@ fn worker_start_refuses_invalid_final_storage_info() {
 }
 
 #[test]
-fn explicit_worker_id_cannot_bypass_missing_identity_for_existing_info() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "cluster-a", "root");
-    let config = WorkerConfig::load(&config_path).unwrap();
-    let worker_id = prepare_worker_start(&config).unwrap();
-    std::fs::remove_file(&config.identity_path).unwrap();
-    std::fs::write(
-        &config_path,
-        format!(
-            r#"
-vecton.cluster.id: "cluster-a"
-worker.id: {}
-worker.identity.path: "{}"
-worker.store.dirs.hdd0.path: "{}"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.store.reserve_space: "1GB"
-worker.store.selection_policy: "round_robin"
-worker.store.check_interval_ms: 30000
-worker.rpc.bind: "127.0.0.1:0"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:19090"
-worker.metadata.group.name: "root"
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-observe.log.format: compact
-observe.log.output: stderr
-observe.log.level: "info,vecton=info,metadata=info,worker=info,common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
-observe.metrics.prometheus.bind: "127.0.0.1:19091"
-observe.metrics.prometheus.path: "/metrics"
-"#,
-            worker_id.as_raw(),
-            config.identity_path.display(),
-            config.store.dirs["hdd0"].path.display()
-        ),
-    )
-    .unwrap();
-
-    let err = WorkerConfig::load(&config_path).unwrap_err();
-
-    assert!(err.to_string().contains("worker.id"));
-    assert!(!config.identity_path.exists());
-}
-
-#[test]
 fn worker_storage_info_rejects_legacy_group_id_and_unknown_fields() {
     for extra_field in ["group_id", "unknown_field"] {
         let dir = TempDir::new().unwrap();

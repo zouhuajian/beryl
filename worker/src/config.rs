@@ -136,7 +136,6 @@ impl WorkerConfig {
         let metadata_defaults = WorkerRegistrationConfig::default();
 
         let cluster_id = Self::root_str_or(flat, "vecton.cluster.id", &default_cluster_id)?;
-        reject_removed_keys(&worker_sub)?;
         let identity_path = Self::path_or(&worker_sub, "identity.path", default_identity_path)?;
         let rpc_bind = Self::str_or(&worker_sub, "rpc.bind", &default_rpc_bind, "worker.rpc.bind")?;
         let observability = ObservabilityConfig::from_flat(flat)?;
@@ -441,77 +440,6 @@ impl WorkerConfig {
     }
 }
 
-fn reject_removed_keys(flat: &common::config::FlatConfig) -> Result<(), CommonError> {
-    if let Some(key) = flat.keys_with_prefix("storage").into_iter().next() {
-        return Err(CommonError::new(
-            CommonErrorKind::InvalidArgument,
-            format!("worker.{key} is unsupported: use worker.store.*"),
-        ));
-    }
-    if let Some(key) = flat.keys_with_prefix("transport").into_iter().next() {
-        return Err(CommonError::new(
-            CommonErrorKind::InvalidArgument,
-            format!("worker.{key} is unsupported: use worker.default_frame_size and worker.max_frame_size"),
-        ));
-    }
-    for (key, full_key, detail) in [
-        (
-            "http.bind",
-            "worker.http.bind",
-            "worker.http.bind is unsupported; use observe.metrics.prometheus.bind for metrics",
-        ),
-        (
-            "id",
-            "worker.id",
-            "worker.id is unsupported; worker identity must come from worker.identity.path",
-        ),
-        (
-            "metadata.group_id",
-            "worker.metadata.group_id",
-            "worker.metadata.group_id is unsupported; use worker.metadata.group.name",
-        ),
-        (
-            "metadata.group.id",
-            "worker.metadata.group.id",
-            "worker.metadata.group.id is unsupported; use worker.metadata.group.name",
-        ),
-        (
-            "metadata.endpoint",
-            "worker.metadata.endpoint",
-            "worker.metadata.endpoint is unsupported; use worker.metadata.endpoints",
-        ),
-        (
-            "store.reserve",
-            "worker.store.reserve",
-            "worker.store.reserve is unsupported; use worker.store.reserve_space",
-        ),
-        (
-            "store.pick",
-            "worker.store.pick",
-            "worker.store.pick is unsupported; use worker.store.selection_policy",
-        ),
-        (
-            "store.check_ms",
-            "worker.store.check_ms",
-            "worker.store.check_ms is unsupported; use worker.store.check_interval_ms",
-        ),
-        (
-            "bootstrap.auto_format",
-            "worker.bootstrap.auto_format",
-            "worker.bootstrap.auto_format is unsupported",
-        ),
-        ("auto_format", "worker.auto_format", "worker.auto_format is unsupported"),
-    ] {
-        if flat.contains_key(key) {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!("{full_key} is unsupported: {detail}"),
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn parse_store_config(
     flat: &common::config::FlatConfig,
     defaults: &WorkerStoreConfig,
@@ -584,12 +512,6 @@ fn parse_store_dirs(flat: &common::config::FlatConfig) -> Result<BTreeMap<String
                 return Err(CommonError::new(
                     CommonErrorKind::InvalidArgument,
                     format!("worker.{key} is unsupported; dir id must come from the key segment"),
-                ));
-            }
-            "cap" => {
-                return Err(CommonError::new(
-                    CommonErrorKind::InvalidArgument,
-                    format!("worker.{key} is unsupported; use worker.store.dirs.{id}.capacity"),
                 ));
             }
             _ => {
@@ -1024,32 +946,6 @@ worker.metadata.endpoints: "http://127.0.0.1:18080"
     }
 
     #[test]
-    fn worker_http_bind_is_rejected_without_disabling_metrics_config() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
-                r#"
-worker.http.bind: "127.0.0.1:19091"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.store.dirs.hdd0.path: "/tmp/vecton-worker/hdd0"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-"#,
-            ),
-        )
-        .unwrap();
-
-        let err = WorkerConfig::load(&config_path)
-            .expect_err("worker.http.bind must not imply an active worker HTTP/admin service");
-
-        assert!(err.message.contains("worker.http.bind"));
-        assert!(err.message.contains("unsupported"));
-    }
-
-    #[test]
     fn loads_current_worker_knobs() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("worker.yaml");
@@ -1152,61 +1048,6 @@ worker.metadata.endpoints: "http://127.0.0.1:18080"
     }
 
     #[test]
-    fn removed_worker_identity_and_group_keys_are_rejected() {
-        for removed_key in [
-            "worker.id: 91",
-            "worker.metadata.group_id: 7\nworker.metadata.endpoints: \"http://127.0.0.1:18080\"",
-            "worker.metadata.group.id: 7\nworker.metadata.endpoints: \"http://127.0.0.1:18080\"",
-            "worker.bootstrap.auto_format: true\nworker.metadata.endpoints: \"http://127.0.0.1:18080\"",
-            "worker.auto_format: true\nworker.metadata.endpoints: \"http://127.0.0.1:18080\"",
-        ] {
-            let temp_dir = TempDir::new().unwrap();
-            let config_path = temp_dir.path().join("worker.yaml");
-            fs::write(
-                &config_path,
-                format!(
-                    r#"
-{removed_key}
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-"#
-                ),
-            )
-            .unwrap();
-
-            let err = WorkerConfig::load(&config_path).expect_err("removed worker key must fail");
-
-            assert!(err.message.contains("unsupported"));
-        }
-    }
-
-    #[test]
-    fn rejects_unsupported_worker_transport_frame_size_keys() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
-                r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.store.dirs.hdd0.path: "/tmp/vecton-worker/hdd0"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.transport.default_frame_size: 8388608
-worker.transport.max_frame_size: 16777216
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-"#,
-            ),
-        )
-        .unwrap();
-
-        let err = WorkerConfig::load(&config_path)
-            .expect_err("worker.transport.* must not imply alternate transport support");
-
-        assert!(err.message.contains("worker.transport."));
-        assert!(err.message.contains("unsupported"));
-    }
-
-    #[test]
     fn rejects_empty_worker_net_listeners() {
         let mut config = test_worker_config();
         config.net.listeners.clear();
@@ -1263,29 +1104,6 @@ worker.metadata.endpoints: "http://127.0.0.1:18080"
     }
 
     #[test]
-    fn worker_storage_root_is_rejected() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(
-            &config_path,
-            r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.storage.root: "/data/old"
-worker.store.dirs.hdd0.path: "/tmp/vecton-worker/hdd0"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-"#,
-        )
-        .unwrap();
-
-        let err = WorkerConfig::load(&config_path).expect_err("old storage root must fail");
-
-        assert!(err.message.contains("worker.storage.root"));
-        assert!(err.message.contains("unsupported"));
-    }
-
-    #[test]
     fn rejects_missing_or_empty_store_dirs() {
         for store_config in ["", "worker.store.dirs: []\n"] {
             let temp_dir = TempDir::new().unwrap();
@@ -1305,31 +1123,6 @@ worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
 
             assert!(err.message.contains("worker.store.dirs"), "{}", err.message);
         }
-    }
-
-    #[test]
-    fn rejects_old_list_based_store_dirs() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
-                r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.store.dirs:
-  - id: "hdd0"
-    path: "/tmp/a"
-    tier: "HDD"
-    cap: "10GB"
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-"#,
-            ),
-        )
-        .unwrap();
-
-        let err = WorkerConfig::load(&config_path).expect_err("old list-based store dirs must fail");
-
-        assert!(err.message.contains("worker.store.dirs"), "{}", err.message);
     }
 
     #[test]
@@ -1360,13 +1153,6 @@ worker.store.dirs.hdd0.path: "/tmp/a"
 worker.store.dirs.hdd0.tier: "HDD"
 worker.store.dirs.hdd0.capacity: "10GB""#,
                 "id",
-            ),
-            (
-                "old cap field",
-                r#"worker.store.dirs.hdd0.path: "/tmp/a"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.cap: "10GB""#,
-                "cap",
             ),
             (
                 "zero capacity",
@@ -1492,37 +1278,6 @@ worker.metadata.endpoints: "http://127.0.0.1:18080"
     }
 
     #[test]
-    fn rejects_removed_store_keys() {
-        for (store_tail, expected) in [
-            ("worker.store.reserve: \"1GB\"", "worker.store.reserve"),
-            ("worker.store.pick: \"round_robin\"", "worker.store.pick"),
-            ("worker.store.check_ms: 30000", "worker.store.check_ms"),
-        ] {
-            let temp_dir = TempDir::new().unwrap();
-            let config_path = temp_dir.path().join("worker.yaml");
-            fs::write(
-                &config_path,
-                format!(
-                    r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.store.dirs.hdd0.path: "/tmp/a"
-worker.store.dirs.hdd0.tier: "HDD"
-worker.store.dirs.hdd0.capacity: "10GB"
-{store_tail}
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-"#
-                ),
-            )
-            .unwrap();
-
-            let err = WorkerConfig::load(&config_path).unwrap_err();
-
-            assert!(err.message.contains(expected), "{}", err.message);
-            assert!(err.message.contains("unsupported"), "{}", err.message);
-        }
-    }
-
-    #[test]
     fn uses_default_worker_metadata_endpoints_when_absent() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("worker.yaml");
@@ -1546,27 +1301,6 @@ worker.store.dirs.hdd0.capacity: "10GB"
     }
 
     #[test]
-    fn worker_metadata_endpoint_key_is_rejected() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("worker.yaml");
-        fs::write(
-            &config_path,
-            with_test_observe_yaml(
-                r#"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.metadata.endpoint: "http://127.0.0.1:19080"
-"#,
-            ),
-        )
-        .unwrap();
-
-        let err = WorkerConfig::load(&config_path).unwrap_err();
-
-        assert!(err.message.contains("worker.metadata.endpoint"));
-        assert!(err.message.contains("unsupported"));
-    }
-
-    #[test]
     fn rejects_empty_worker_metadata_endpoints() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("worker.yaml");
@@ -1587,29 +1321,6 @@ worker.metadata.endpoints: " , "
         let error = WorkerConfig::load(&config_path).unwrap_err();
 
         assert!(error.message.contains("worker.metadata.endpoints"));
-    }
-
-    #[test]
-    fn rejects_invalid_explicit_worker_id() {
-        for worker_id in ["0", "not-a-number", ""] {
-            let temp_dir = TempDir::new().unwrap();
-            let config_path = temp_dir.path().join("worker.yaml");
-            fs::write(
-                &config_path,
-                format!(
-                    r#"
-worker.id: "{worker_id}"
-worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
-worker.metadata.endpoints: "http://127.0.0.1:18080"
-"#
-                ),
-            )
-            .unwrap();
-
-            let error = WorkerConfig::load(&config_path).unwrap_err();
-
-            assert!(error.message.contains("worker.id"));
-        }
     }
 
     #[test]

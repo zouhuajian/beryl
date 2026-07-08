@@ -11,8 +11,8 @@ use crate::metrics::MetadataMetrics;
 use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use crate::readiness::{wait_for_root_ready_with_inputs, RootReadinessGate, RootReadinessLogFields, RootReadyInputs};
 use crate::service::{
-    validate_filesystem_permission_mode, FileSystemAuthorityDeps, FileSystemRuntimeDeps, MetadataFileSystemServiceDeps,
-    MetadataFileSystemServiceImpl, SharedWorkerCommitHook,
+    FileSystemAuthorityDeps, FileSystemRuntimeDeps, MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl,
+    SharedWorkerCommitHook,
 };
 use crate::state::RaftStateStore;
 use crate::worker::{MetadataWorkerServiceImpl, WorkerBackgroundHandle, WorkerManager};
@@ -236,7 +236,6 @@ pub fn init_observability(config: &MetadataConfig) -> Result<Observability, DynE
         rpc_addr = %config.rpc_addr,
         metrics_bind = %config.observability.metrics.prometheus.bind,
         storage_dir = %config.storage_dir.display(),
-        authz_mode = ?config.authz.filesystem.mode,
         node_id = config.raft.node_id,
         raft_mode = ?config.raft.mode,
         authority_group_name = %config.authority.group_name,
@@ -427,12 +426,11 @@ impl Readiness {
 
 /// Constructs the filesystem RPC service without owning readiness lifecycle.
 pub async fn build_filesystem_service(
-    config: &MetadataConfig,
+    _config: &MetadataConfig,
     authority: &MetadataAuthority,
     worker_manager: Arc<WorkerManager>,
     readiness: &Readiness,
 ) -> Result<MetadataFileSystemServiceImpl, DynError> {
-    validate_filesystem_permission_mode(config.authz.filesystem.mode)?;
     let write_session_manager = Arc::new(crate::write_session::WriteSessionManager::default());
     let inode_lease_manager = Arc::new(crate::inode_lease::InodeLeaseManager::default());
     let worker_commit_hook: SharedWorkerCommitHook = Arc::new(Mutex::new(None));
@@ -525,7 +523,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BootstrapConfig, MetadataAuthorityConfig, MetadataAuthzConfig, RaftConfig, WorkerConfig};
+    use crate::config::{BootstrapConfig, MetadataAuthorityConfig, RaftConfig, WorkerConfig};
     use crate::ensure_root_mount_for_format;
     use common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction};
     use common::header::{RequestHeader, ResponseHeader};
@@ -636,7 +634,6 @@ mod tests {
             cluster_id: "local".to_string(),
             rpc_addr: "127.0.0.1:18080".parse().unwrap(),
             storage_dir: std::path::PathBuf::from("data/metadata"),
-            authz: MetadataAuthzConfig::default(),
             raft: RaftConfig::default(),
             authority: MetadataAuthorityConfig {
                 group_name: GroupName::parse("root").unwrap(),

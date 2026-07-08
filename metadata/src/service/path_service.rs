@@ -4,10 +4,9 @@
 //! FileSystemServiceProto implementation.
 //!
 //! This module keeps the complete path-first RPC API view. It orchestrates
-//! request context extraction, guard checks, path resolution, permission
-//! checks, FsCore calls, and response/header construction.
+//! request context extraction, guard checks, path resolution, FsCore calls, and
+//! response/header construction.
 //!
-//! Permission checks currently use the metadata NONE policy in GuardChain.
 //! Domain freshness, session, lease, and fencing semantics remain in FsCore.
 
 use super::domain::{
@@ -22,11 +21,11 @@ use super::{
     header_from_rpc_error, lease_id_from_proto, lease_id_to_proto, location_to_proto, ok_header_from_core_success,
     presented_fencing_from_proto, request_context_from_proto, validate_active_write_layout, write_target_to_proto,
 };
-use super::{FsCore, PermissionBits, SharedWorkerCommitHook};
+use super::{FsCore, SharedWorkerCommitHook};
 use crate::error::{to_fs_error_detail, MetadataError};
 use crate::mount::MountTable;
 use crate::observe;
-use crate::path_resolver::{MountContext, PathResolver, ResolvedPath};
+use crate::path_resolver::{MountContext, PathResolver};
 use crate::raft::RocksDBStorage;
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use proto::metadata::*;
@@ -292,13 +291,11 @@ impl MetadataFileSystemServiceImpl {
         };
 
         let mut parent_inode_id = mount_ctx.root_inode_id;
-        let mut traverse_dir_inode_ids = Vec::with_capacity(components.len());
         let mut last_create_success = None;
         let mut last_created_parent_inode_id = None;
         let freshness = Self::freshness_from_header(&req.header);
 
         for name in components {
-            traverse_dir_inode_ids.push(parent_inode_id);
             match self.path_resolver.get_dentry(parent_inode_id, &name) {
                 Ok(Some(child_inode_id)) => {
                     let inode = match self.path_resolver.get_inode(child_inode_id) {
@@ -328,25 +325,6 @@ impl MetadataFileSystemServiceImpl {
                 }
                 Ok(None) => {
                     let create_parent_inode_id = parent_inode_id;
-                    let resolved_parent = ResolvedPath {
-                        mount_ctx: mount_ctx.clone(),
-                        parent_inode_id: Some(create_parent_inode_id),
-                        name: Some(name.clone()),
-                        inode_id: None,
-                        traverse_dir_inode_ids: traverse_dir_inode_ids.clone(),
-                    };
-                    guard_or_error!(
-                        self,
-                        req,
-                        CreateDirectoryResponseProto,
-                        self.guard_chain.check_parent_perm(
-                            &req_ctx,
-                            PermissionBits::WRITE,
-                            &req.path,
-                            &resolved_parent,
-                        )
-                    );
-
                     let mut child_ctx = req_ctx.clone();
                     child_ctx.caller = req_ctx.caller.child();
                     match self
@@ -481,13 +459,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(GetStatusResponseProto, header);
             }
         };
-        guard_or_error!(
-            self,
-            req,
-            GetStatusResponseProto,
-            self.guard_chain
-                .check_perm(&req_ctx, PermissionBits::READ, &req.path, &resolved)
-        );
         let inode_id = match resolved.expect_inode() {
             Ok(inode_id) => inode_id,
             Err(err) => {
@@ -540,13 +511,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(CreateDirectoryResponseProto, header);
             }
         };
-        guard_or_error!(
-            self,
-            req,
-            CreateDirectoryResponseProto,
-            self.guard_chain
-                .check_parent_perm(&req_ctx, PermissionBits::WRITE, &req.path, &resolved)
-        );
         let parent_inode_id = match resolved.expect_parent() {
             Ok(parent_inode_id) => parent_inode_id,
             Err(err) => {
@@ -643,13 +607,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(DeleteResponseProto, self.header_from_path_error(&req.header, err, None))
             }
         };
-        guard_or_error!(
-            self,
-            req,
-            DeleteResponseProto,
-            self.guard_chain
-                .check_parent_perm(&req_ctx, PermissionBits::WRITE, &req.path, &resolved)
-        );
         let parent_inode_id = match resolved.expect_parent() {
             Ok(parent_inode_id) => parent_inode_id,
             Err(err) => {
@@ -785,20 +742,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 return error_response!(RenameResponseProto, self.header_from_path_error(&req.header, err, None))
             }
         };
-        guard_or_error!(
-            self,
-            req,
-            RenameResponseProto,
-            self.guard_chain
-                .check_parent_perm(&req_ctx, PermissionBits::WRITE, &req.src_path, &src_resolved)
-        );
-        guard_or_error!(
-            self,
-            req,
-            RenameResponseProto,
-            self.guard_chain
-                .check_parent_perm(&req_ctx, PermissionBits::WRITE, &req.dst_path, &dst_resolved)
-        );
         let src_parent_inode_id = match src_resolved.expect_parent() {
             Ok(parent_inode_id) => parent_inode_id,
             Err(err) => {
@@ -919,13 +862,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             );
         }
-        guard_or_error!(
-            self,
-            req,
-            ListStatusResponseProto,
-            self.guard_chain
-                .check_perm(&req_ctx, PermissionBits::READ, &req.path, &resolved)
-        );
         let inode_id = match resolved.expect_inode() {
             Ok(inode_id) => inode_id,
             Err(err) => {
@@ -1002,13 +938,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
         };
-        guard_or_error!(
-            self,
-            req,
-            OpenFileResponseProto,
-            self.guard_chain
-                .check_perm(&req_ctx, PermissionBits::READ, &req.path, &resolved)
-        );
         guard_or_error!(
             self,
             req,
@@ -1107,13 +1036,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         )
                     }
                 };
-                guard_or_error!(
-                    self,
-                    req,
-                    GetBlockLocationsResponseProto,
-                    self.guard_chain
-                        .check_perm(&req_ctx, PermissionBits::READ, &path, &resolved)
-                );
                 guard_or_error!(
                     self,
                     req,
@@ -1259,13 +1181,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         self,
                         req,
                         CreateFileResponseProto,
-                        self.guard_chain
-                            .check_perm(&req_ctx, PermissionBits::WRITE, &req.path, &resolved)
-                    );
-                    guard_or_error!(
-                        self,
-                        req,
-                        CreateFileResponseProto,
                         self.guard_chain.check_data_write(&req_ctx, resolved.mount_ctx.mount_id)
                     );
                     match resolved.expect_inode() {
@@ -1288,13 +1203,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                             )
                         }
                     };
-                    guard_or_error!(
-                        self,
-                        req,
-                        CreateFileResponseProto,
-                        self.guard_chain
-                            .check_parent_perm(&req_ctx, PermissionBits::WRITE, &req.path, &resolved)
-                    );
                     let attrs = match file_attrs_from_proto(req.attrs) {
                         Ok(attrs) => attrs,
                         Err(err) => {
@@ -1412,13 +1320,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     )
                 }
             };
-            guard_or_error!(
-                self,
-                req,
-                CreateFileResponseProto,
-                self.guard_chain
-                    .check_parent_perm(&req_ctx, PermissionBits::WRITE, &req.path, &resolved)
-            );
             let attrs = match file_attrs_from_proto(req.attrs) {
                 Ok(attrs) => attrs,
                 Err(err) => {
@@ -1610,13 +1511,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
         };
-        guard_or_error!(
-            self,
-            req,
-            AppendFileResponseProto,
-            self.guard_chain
-                .check_perm(&req_ctx, PermissionBits::WRITE, &req.path, &resolved)
-        );
         guard_or_error!(
             self,
             req,
@@ -2193,18 +2087,5 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             ),
             Err(failure) => error_response!(SyncWriteResponseProto, header_from_core_failure(&req_ctx, &failure)),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn path_service_does_not_branch_on_authz_scheme() {
-        let source = include_str!("path_service.rs");
-
-        assert!(!source.contains(concat!("Authz", "Scheme")));
-        assert!(!source.contains(concat!("authz", "_targets_for_")));
-        assert!(!source.contains(concat!("traverse", "_pre_checks")));
-        assert!(!source.contains(concat!("sticky", "_pre_checks")));
     }
 }

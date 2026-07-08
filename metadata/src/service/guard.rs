@@ -3,12 +3,10 @@
 
 //! Request guard pipeline for metadata services.
 
-use super::auth::{self, PermissionBits};
 use super::domain::RequestContext;
 use crate::data_io::DataIoOp;
 use crate::error::{to_rpc_error, MetadataError};
 use crate::mount::{DataIoPolicy, MountTable, ROOT_MOUNT_PREFIX};
-use crate::path_resolver::ResolvedPath;
 use crate::raft::AppRaftNode;
 use crate::readiness::RootReadinessGate;
 use common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint, RpcErrorDetail};
@@ -88,33 +86,6 @@ impl GuardChain {
         self.readiness.check()?;
         self.leadership.check(ctx)?;
         self.data_io.check(mount_id, DataIoOp::Write)
-    }
-
-    pub async fn check_perm(
-        &self,
-        ctx: &RequestContext,
-        bits: PermissionBits,
-        path: &str,
-        resolved: &ResolvedPath,
-    ) -> Result<(), GuardFailure> {
-        auth::check_perm(ctx, bits, path, resolved);
-        Ok(())
-    }
-
-    pub async fn check_parent_perm(
-        &self,
-        ctx: &RequestContext,
-        bits: PermissionBits,
-        path: &str,
-        resolved: &ResolvedPath,
-    ) -> Result<(), GuardFailure> {
-        auth::check_parent_perm(ctx, bits, path, resolved);
-        Ok(())
-    }
-
-    pub async fn check_super(&self, ctx: &RequestContext) -> Result<(), GuardFailure> {
-        auth::check_super(ctx);
-        Ok(())
     }
 }
 
@@ -234,25 +205,6 @@ mod tests {
             caller: caller.clone(),
             traceparent: caller.trace_context.traceparent.clone(),
             route_epoch: None,
-            principal: caller.principal.clone(),
-            real_user: caller.real_user.clone(),
-            doas: caller.doas.clone(),
-            authn_type: caller.authn_type,
-        }
-    }
-
-    fn resolved_path() -> ResolvedPath {
-        ResolvedPath {
-            mount_ctx: crate::path_resolver::MountContext {
-                mount_id: MountId::new(1),
-                mount_epoch: 1,
-                owner_group_name: group_name("root"),
-                root_inode_id: ROOT_INODE_ID,
-            },
-            parent_inode_id: Some(ROOT_INODE_ID),
-            name: Some("file".to_string()),
-            inode_id: Some(types::fs::InodeId::new(2)),
-            traverse_dir_inode_ids: vec![ROOT_INODE_ID],
         }
     }
 
@@ -351,22 +303,5 @@ mod tests {
         assert!(err.err.message.contains("RootDataIoForbidden"));
         assert_eq!(err.group_name, Some(root_entry.namespace_owner_group_name.clone()));
         assert_eq!(err.mount_epoch, Some(root_entry.mount_epoch));
-    }
-
-    #[tokio::test]
-    async fn permission_methods_use_current_none_policy() {
-        let chain = GuardChain::new(Arc::new(MountTable::new()));
-        let ctx = request_context(5);
-        let resolved = resolved_path();
-
-        chain
-            .check_perm(&ctx, PermissionBits::READ, "/file", &resolved)
-            .await
-            .unwrap();
-        chain
-            .check_parent_perm(&ctx, PermissionBits::WRITE, "/file", &resolved)
-            .await
-            .unwrap();
-        chain.check_super(&ctx).await.unwrap();
     }
 }

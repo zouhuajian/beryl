@@ -69,14 +69,6 @@ pub struct RequestHeader {
     pub state: Vec<GroupStateWatermark>,
     /// Optional route epoch observed by client.
     pub route_epoch: Option<u64>,
-    /// Authenticated principal/user identity for audit and diagnostics.
-    pub principal: Option<String>,
-    /// Real user identity carried for proxy-user diagnostics.
-    pub real_user: Option<String>,
-    /// Proxy/doAs target user carried for diagnostics.
-    pub doas: Option<String>,
-    /// Authentication type marker for the request.
-    pub authn_type: AuthnType,
     /// Absolute deadline (Unix epoch milliseconds).
     pub deadline: Deadline,
     /// Optional caller context for auditing/diagnostics.
@@ -162,16 +154,6 @@ impl CallerContextFields {
     }
 }
 
-/// Authentication type marker for request identity.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum AuthnType {
-    #[default]
-    Unspecified,
-    Simple,
-    Kerberos,
-    Token,
-}
-
 /// Response header carried with every RPC response.
 #[derive(Clone, Debug)]
 pub struct ResponseHeader {
@@ -233,10 +215,6 @@ impl RequestHeader {
             mount_epoch: None,
             state: Vec::new(),
             route_epoch: None,
-            principal: None,
-            real_user: None,
-            doas: None,
-            authn_type: AuthnType::Unspecified,
             deadline,
             caller_context: None,
             retry_count: 0,
@@ -290,30 +268,6 @@ impl RequestHeader {
         self
     }
 
-    /// Set the authenticated principal.
-    pub fn with_principal(mut self, principal: impl Into<String>) -> Self {
-        self.principal = Some(principal.into());
-        self
-    }
-
-    /// Set the real user identity.
-    pub fn with_real_user(mut self, real_user: impl Into<String>) -> Self {
-        self.real_user = Some(real_user.into());
-        self
-    }
-
-    /// Set the doAs/proxy user identity.
-    pub fn with_doas(mut self, doas: impl Into<String>) -> Self {
-        self.doas = Some(doas.into());
-        self
-    }
-
-    /// Set the request authentication type marker.
-    pub fn with_authn_type(mut self, authn_type: AuthnType) -> Self {
-        self.authn_type = authn_type;
-        self
-    }
-
     /// Create a child header (for nested calls).
     ///
     /// Inherits client_id, deadline, trace context, state watermarks, and group name.
@@ -330,10 +284,6 @@ impl RequestHeader {
             mount_epoch: self.mount_epoch,
             state: self.state.clone(),
             route_epoch: self.route_epoch,
-            principal: self.principal.clone(),
-            real_user: self.real_user.clone(),
-            doas: self.doas.clone(),
-            authn_type: self.authn_type,
             deadline: self.deadline,
             caller_context: self.caller_context.clone(),
             retry_count: 0,
@@ -353,10 +303,6 @@ impl RequestHeader {
             mount_epoch: self.mount_epoch,
             state: self.state.clone(),
             route_epoch: self.route_epoch,
-            principal: self.principal.clone(),
-            real_user: self.real_user.clone(),
-            doas: self.doas.clone(),
-            authn_type: self.authn_type,
             deadline: self.deadline,
             caller_context: self.caller_context.clone(),
             retry_count: self.retry_count + 1,

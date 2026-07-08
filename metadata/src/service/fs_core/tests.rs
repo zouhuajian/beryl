@@ -15,7 +15,7 @@ use crate::state::{MemoryStateStore, RouteEpoch};
 use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerInfo, WorkerManager};
 use async_trait::async_trait;
 use common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail, WorkerErrorKind};
-use common::header::{AuthnType, CallerContext, RequestHeader};
+use common::header::{CallerContext, RequestHeader};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -68,10 +68,6 @@ fn request_context() -> RequestContext {
         caller: RequestHeader::new(ClientId::new(7)),
         traceparent: None,
         route_epoch: None,
-        principal: None,
-        real_user: None,
-        doas: None,
-        authn_type: AuthnType::Unspecified,
     }
 }
 

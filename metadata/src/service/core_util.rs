@@ -35,17 +35,9 @@ pub fn request_context_from_proto(
     if !caller.state.is_empty() {
         Span::current().record("state", format!("{:?}", caller.state));
     }
-    if let Some(principal) = &caller.principal {
-        Span::current().record("principal", principal);
-    }
-
     Ok(RequestContext {
         traceparent: caller.trace_context.traceparent.clone(),
         route_epoch: req_header.as_ref().and_then(|h| h.route_epoch),
-        principal: caller.principal.clone(),
-        real_user: caller.real_user.clone(),
-        doas: caller.doas.clone(),
-        authn_type: caller.authn_type,
         caller,
     })
 }
@@ -313,16 +305,6 @@ pub fn retryable_header(
 ) -> proto::common::ResponseHeaderProto {
     let err = RpcErrorDetail::retry(kind, retry_after_ms, message);
     header_from_rpc_error(req_header, group_name, mount_epoch, &err)
-}
-
-pub fn permission_denied_rpc_error(op: Option<&str>, detail: Option<&str>) -> RpcErrorDetail {
-    let message = match (op, detail) {
-        (Some(op), Some(detail)) => format!("permission denied: op={} target={}", op, detail),
-        (Some(op), None) => format!("permission denied: op={}", op),
-        (None, Some(detail)) => format!("permission denied: target={}", detail),
-        (None, None) => "permission denied".to_string(),
-    };
-    RpcErrorDetail::fs(FsErrorCode::EAcces, message)
 }
 
 pub fn lease_id_from_proto(lease_id: Option<proto::common::LeaseIdProto>) -> Option<LeaseId> {

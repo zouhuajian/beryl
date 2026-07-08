@@ -10,9 +10,7 @@ use std::time::Duration;
 use client::{ClientConfig, FsClient};
 use common::observe::ObservabilityConfig;
 use common::FlatConfig;
-use metadata::config::{
-    BootstrapConfig, MetadataAuthorityConfig, MetadataAuthzConfig, MetadataConfig, RaftConfig, WorkerConfig,
-};
+use metadata::config::{BootstrapConfig, MetadataAuthorityConfig, MetadataConfig, RaftConfig, WorkerConfig};
 use metadata::lifecycle::format_metadata_storage;
 use metadata::runtime::{build_authority, build_filesystem_service, build_readiness};
 use metadata::worker::{MetadataWorkerServiceImpl, WorkerManager};
@@ -323,7 +321,6 @@ fn metadata_config(
         cluster_id: CLUSTER_ID.to_string(),
         rpc_addr,
         storage_dir,
-        authz: MetadataAuthzConfig::default(),
         raft: RaftConfig::default(),
         authority: MetadataAuthorityConfig { group_name },
         worker: WorkerConfig::default(),

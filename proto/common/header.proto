@@ -81,37 +81,16 @@ message RequestHeaderProto {
   /// Used by FileSystemService layout/write-session APIs for refresh+replay loops.
   optional uint64 route_epoch = 6;
 
-  /// Authenticated principal/user identity.
-  /// In ACL mode this must be non-empty; in NONE/RANGER it may be empty.
-  string principal = 7;
-
-  /// Real user identity (proxy-user scenarios, reserved for future use).
-  string real_user = 8;
-
-  /// Proxy user / doAs target user (reserved for future use).
-  string doas = 9;
-
-  /// Authentication type marker (stub enum for future authn integrations).
-  AuthnTypeProto authn_type = 10;
-
   /// Absolute deadline (Unix epoch milliseconds).
   /// For gRPC, grpc-timeout should be authoritative; this is the cross-transport shared wire form.
-  int64 deadline_ms = 11;
+  int64 deadline_ms = 7;
 
   /// Optional caller context for auditing/diagnostics.
   /// This is NOT a generic extension point for protocol-critical fields.
-  CallerContextProto caller_context = 12;
+  CallerContextProto caller_context = 8;
 
   /// Optional retry count from client perspective (0 = first attempt).
-  int32 retry_count = 13;
-}
-
-/// Authentication type of the request principal.
-enum AuthnTypeProto {
-  AUTHN_TYPE_PROTO_UNSPECIFIED = 0;
-  AUTHN_TYPE_PROTO_SIMPLE = 1;
-  AUTHN_TYPE_PROTO_KERBEROS = 2;
-  AUTHN_TYPE_PROTO_TOKEN = 3;
+  int32 retry_count = 9;
 }
 
 /// Human-oriented context for auditing and lightweight diagnostics.

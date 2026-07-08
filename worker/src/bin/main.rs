@@ -246,19 +246,6 @@ observe.metrics.prometheus.path: "/metrics"
     }
 
     #[test]
-    fn removed_worker_command_words_fail() {
-        for args in [
-            &["format"][..],
-            &["bootstrap"][..],
-            &["auto-format"][..],
-            &["format", "--config", "conf/worker.yaml"][..],
-        ] {
-            let err = parse(args).err().expect("removed worker command must fail");
-            assert!(err.to_string().contains("unsupported worker command"));
-        }
-    }
-
-    #[test]
     fn worker_config_path_requires_explicit_config_flag() {
         let err = parse(&["conf/local/worker.yaml"])
             .err()

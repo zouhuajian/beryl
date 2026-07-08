@@ -17,7 +17,6 @@ metadata.bootstrap.ready.timeout_ms: 10000
 metadata.bootstrap.ready.warn_after_ms: 1000
 metadata.bootstrap.ready.fail_fast: true
 
-metadata.authz.filesystem.mode: "NONE"
 metadata.repair.max_queue_size: 10000
 metadata.repair.max_attempts: 3
 metadata.repair.inflight_timeout_ms: 300000

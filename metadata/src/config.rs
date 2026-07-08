@@ -16,10 +16,8 @@ use types::GroupName;
 const VECTON_CLUSTER_ID: &str = "vecton.cluster.id";
 const METADATA_RPC_ADDR: &str = "metadata.rpc.addr";
 const METADATA_RPC_PORT: &str = "metadata.rpc.port";
-const METADATA_HTTP_BIND: &str = "metadata.http.bind";
 const METADATA_GROUP_NAME: &str = "metadata.group.name";
 const METADATA_STORAGE_DIR: &str = "metadata.storage.dir";
-const METADATA_AUTHZ_FILESYSTEM_MODE: &str = "metadata.authz.filesystem.mode";
 const METADATA_RAFT_MODE: &str = "metadata.raft.mode";
 const METADATA_RAFT_NODE_ID: &str = "metadata.raft.node_id";
 const METADATA_REPAIR_MAX_QUEUE_SIZE: &str = "metadata.repair.max_queue_size";
@@ -34,15 +32,6 @@ const METADATA_BOOTSTRAP_ROOT_READY_WARN_AFTER_MS: &str = "metadata.bootstrap.ro
 const METADATA_BOOTSTRAP_READY_TIMEOUT_MS: &str = "metadata.bootstrap.ready.timeout_ms";
 const METADATA_BOOTSTRAP_READY_WARN_AFTER_MS: &str = "metadata.bootstrap.ready.warn_after_ms";
 const METADATA_BOOTSTRAP_READY_FAIL_FAST: &str = "metadata.bootstrap.ready.fail_fast";
-const REMOVED_METADATA_KEYS: &[&str] = &[
-    "metadata.authority.group_id",
-    "metadata.group.id",
-    "metadata.group_id",
-    METADATA_HTTP_BIND,
-    "metadata.raft.peers",
-    "metadata.bootstrap.auto_format",
-    "metadata.auto_format",
-];
 
 /// Metadata service configuration.
 #[derive(Clone, Debug)]
@@ -53,8 +42,6 @@ pub struct MetadataConfig {
     pub rpc_addr: SocketAddr,
     /// Local directory for metadata persistent state.
     pub storage_dir: PathBuf,
-    /// Authz mode configuration.
-    pub authz: MetadataAuthzConfig,
     /// Raft configuration.
     pub raft: RaftConfig,
     /// Metadata authority configuration.
@@ -71,45 +58,6 @@ pub struct MetadataConfig {
 #[derive(Clone, Debug)]
 pub struct BootstrapConfig {
     pub root_readiness: RootReadinessConfig,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum FileSystemAuthzMode {
-    #[default]
-    None,
-    Ranger,
-    Acl,
-}
-
-impl FileSystemAuthzMode {
-    fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_uppercase().as_str() {
-            "NONE" => Some(Self::None),
-            "RANGER" => Some(Self::Ranger),
-            "ACL" => Some(Self::Acl),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct FileSystemAuthzConfig {
-    pub mode: FileSystemAuthzMode,
-}
-
-#[derive(Clone, Debug)]
-pub struct MetadataAuthzConfig {
-    pub filesystem: FileSystemAuthzConfig,
-}
-
-impl Default for MetadataAuthzConfig {
-    fn default() -> Self {
-        Self {
-            filesystem: FileSystemAuthzConfig {
-                mode: FileSystemAuthzMode::None,
-            },
-        }
-    }
 }
 
 /// Worker and repair configuration.
@@ -209,8 +157,6 @@ impl MetadataConfig {
     pub fn from_server_config(server_config: ServerConfig) -> Result<Self, CommonError> {
         let flat = server_config.as_flat();
 
-        reject_removed_keys(flat)?;
-
         let cluster_id = get_str_or(flat, VECTON_CLUSTER_ID, "local-vecton")?;
         if cluster_id.trim().is_empty() {
             return Err(invalid_config(VECTON_CLUSTER_ID, "must not be empty"));
@@ -219,20 +165,6 @@ impl MetadataConfig {
         let rpc_addr = rpc_addr_from_config(flat)?;
         let observability = ObservabilityConfig::from_flat(flat)?;
         let storage_dir = PathBuf::from(get_str_or(flat, METADATA_STORAGE_DIR, "data/metadata")?);
-
-        let filesystem_mode_raw = get_str_or(flat, METADATA_AUTHZ_FILESYSTEM_MODE, "NONE")?;
-        let filesystem_mode = FileSystemAuthzMode::parse(&filesystem_mode_raw).ok_or_else(|| {
-            CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                format!(
-                    "Invalid metadata.authz.filesystem.mode={}, expected one of NONE|RANGER|ACL",
-                    filesystem_mode_raw
-                ),
-            )
-        })?;
-        let authz = MetadataAuthzConfig {
-            filesystem: FileSystemAuthzConfig { mode: filesystem_mode },
-        };
 
         let raft_mode_raw = get_str_or(flat, METADATA_RAFT_MODE, "single")?;
         let raft_mode = RaftMode::parse(&raft_mode_raw)
@@ -277,7 +209,6 @@ impl MetadataConfig {
             cluster_id,
             rpc_addr,
             storage_dir,
-            authz,
             raft,
             authority,
             worker,
@@ -285,15 +216,6 @@ impl MetadataConfig {
             observability,
         })
     }
-}
-
-fn reject_removed_keys(flat: &common::config::FlatConfig) -> Result<(), CommonError> {
-    for key in REMOVED_METADATA_KEYS {
-        if flat.contains_key(key) {
-            return Err(invalid_config(key, "is unsupported"));
-        }
-    }
-    Ok(())
 }
 
 fn parse_group_name(key: &'static str, raw: String) -> Result<GroupName, CommonError> {
@@ -426,7 +348,6 @@ mod tests {
                 cluster_id: "local-vecton".to_string(),
                 rpc_addr: "0.0.0.0:18080".parse().unwrap(),
                 storage_dir: PathBuf::from("data/metadata"),
-                authz: MetadataAuthzConfig::default(),
                 raft: RaftConfig::default(),
                 authority: MetadataAuthorityConfig::default(),
                 worker: WorkerConfig::default(),
@@ -469,23 +390,6 @@ mod tests {
     }
 
     #[test]
-    fn authz_mode_defaults_to_none() {
-        let config = MetadataConfig::default();
-        assert_eq!(config.authz.filesystem.mode, FileSystemAuthzMode::None);
-        assert_eq!(config.storage_dir, std::path::PathBuf::from("data/metadata"));
-        assert_eq!(config.authority.group_name.as_str(), "root");
-    }
-
-    #[test]
-    fn authz_mode_parses_valid_values() {
-        let mut flat = test_flat();
-        flat.set("metadata.authz.filesystem.mode", "acl");
-
-        let config = MetadataConfig::from_server_config(ServerConfig::from_flat(flat)).unwrap();
-        assert_eq!(config.authz.filesystem.mode, FileSystemAuthzMode::Acl);
-    }
-
-    #[test]
     fn canonical_group_name_loads_from_metadata_group_name() {
         let mut flat = test_flat();
         flat.set("metadata.group.name", "root-prod");
@@ -506,41 +410,6 @@ mod tests {
         assert_eq!(config.observability.log.format, "json");
         assert_eq!(config.observability.log.output, "stdout");
         assert_eq!(config.observability.metrics.prometheus.bind, "127.0.0.1:19081");
-    }
-
-    #[test]
-    fn metadata_http_bind_is_rejected_without_disabling_metrics_config() {
-        let mut flat = test_flat();
-        flat.set(METADATA_HTTP_BIND, "127.0.0.1:18081");
-
-        let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat))
-            .expect_err("metadata.http.bind must not imply an active HTTP/admin service");
-
-        assert!(err.message.contains(METADATA_HTTP_BIND));
-        assert!(err.message.contains("unsupported"));
-    }
-
-    #[test]
-    fn removed_metadata_keys_are_rejected() {
-        for key in [
-            "metadata.authority.group_id",
-            "metadata.group.id",
-            "metadata.group_id",
-            "metadata.raft.peers",
-            "metadata.bootstrap.auto_format",
-            "metadata.auto_format",
-        ] {
-            let mut flat = test_flat();
-            flat.set(key, "legacy");
-
-            let err = MetadataConfig::from_server_config(ServerConfig::from_flat(flat))
-                .expect_err("removed metadata key must fail");
-
-            assert!(
-                err.message.contains(key),
-                "error for {key} should mention the removed key: {err:?}"
-            );
-        }
     }
 
     #[test]
@@ -583,7 +452,7 @@ mod tests {
 
     #[test]
     fn string_keys_reject_present_wrong_type_values() {
-        for key in [METADATA_RPC_ADDR, METADATA_STORAGE_DIR, METADATA_AUTHZ_FILESYSTEM_MODE] {
+        for key in [METADATA_RPC_ADDR, METADATA_STORAGE_DIR] {
             let mut flat = test_flat();
             flat.set(key, true);
 

@@ -195,6 +195,6 @@ mod tests {
         flat.set("client.metadata.group.analytics.endpoints", "10.0.1.1:18080");
         let config = ClientConfig::from_flat(flat).expect("group-scoped metadata config");
 
-        FsClient::try_new(config).expect("client should not require legacy endpoint config");
+        FsClient::try_new(config).expect("client should use group-scoped metadata config");
     }
 }

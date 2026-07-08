@@ -15,9 +15,6 @@ metadata.rpc.port: 18080
 # metadata live under this directory.
 metadata.storage.dir: "data/metadata"
 
-# Filesystem authz provider. The current runtime supports NONE.
-metadata.authz.filesystem.mode: "NONE"
-
 # Single-group metadata authority baseline.
 metadata.group.name: "root"
 

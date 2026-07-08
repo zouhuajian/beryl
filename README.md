@@ -45,7 +45,6 @@ Vecton is a Rust-based distributed storage/cache layer for big data and AI workl
 - Reads and writes currently go through metadata-authorized worker storage.
 - Worker registration, heartbeat, and full block-report convergence are active runtime paths.
 - `route_epoch`, `mount_epoch`, and `GroupStateWatermark` are active freshness checks.
-- Unsupported legacy, admin, peer, and cluster-mode config keys are rejected rather than treated as compatibility aliases.
 - UFS is present as an adapter boundary, but current reads and writes do not use it.
 - Multi-group metadata is future work.
 - `/local` is the current local development namespace.
