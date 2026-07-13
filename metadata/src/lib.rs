@@ -49,10 +49,35 @@
 //! runtime; they do not mean multi-group metadata is supported. Product
 //! boundaries are summarized in `docs/freshness-and-ownership.md` and the
 //! crate README.
+//!
+//! Raft adapters and raw authority storage are intentionally not part of the
+//! crate API:
+//!
+//! ```compile_fail
+//! use metadata::raft::RocksDBStorage;
+//! ```
+//!
+//! Derived routing state cannot be mutated through the crate API:
+//!
+//! ```compile_fail
+//! use metadata::mount::{DataIoPolicy, MountKind};
+//! use metadata::MountTable;
+//! use types::fs::InodeId;
+//! use types::GroupName;
+//!
+//! let table = MountTable::new();
+//! table.create_mount(
+//!     "/bypass".to_string(),
+//!     MountKind::Internal,
+//!     None,
+//!     DataIoPolicy::Allow,
+//!     GroupName::parse("root").unwrap(),
+//!     InodeId::new(1),
+//! );
+//! ```
 
 pub mod config;
 pub(crate) mod data_io;
-pub(crate) mod destructive_gate;
 pub(crate) mod error;
 pub(crate) mod inflight_registry;
 pub mod inode_lease;
@@ -63,10 +88,9 @@ pub mod mount;
 pub(crate) mod observe;
 pub(crate) mod path_resolver;
 pub mod placement;
-pub mod raft;
+pub(crate) mod raft;
 pub(crate) mod raft_conv;
 pub mod readiness;
-pub(crate) mod root_init;
 pub mod runtime;
 pub mod service;
 pub mod state;
@@ -77,6 +101,5 @@ pub use config::MetadataConfig;
 pub use error::{MetadataError, MetadataResult};
 pub use metrics::MetadataMetrics;
 pub use mount::MountTable;
-pub use readiness::{wait_for_root_ready, RootReadinessConfig, RootReadinessGate};
-pub use root_init::ensure_root_mount_for_format;
+pub use readiness::{RootReadinessConfig, RootReadinessGate};
 pub use state::{RouteEpoch, StateStore};

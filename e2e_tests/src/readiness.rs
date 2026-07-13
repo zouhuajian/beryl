@@ -68,7 +68,7 @@ impl ReadinessCheck {
 
 pub async fn wait_for_metadata_filesystem(client: &FsClient) -> TestResult<()> {
     ReadinessCheck::startup("metadata filesystem readiness")
-        .wait_for_async(|| async { client.stat("/local").await.is_ok() })
+        .wait_for_async(|| async { client.stat("/").await.is_ok() })
         .await
 }
 

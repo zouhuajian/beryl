@@ -86,10 +86,11 @@ pub struct MetadataWorkerServiceImpl {
     /// Mount table used to compute mount_epoch for lease gating.
     _mount_table: Arc<crate::mount::MountTable>,
     served_group_name: GroupName,
+    registration_serial: tokio::sync::Mutex<()>,
 }
 
 impl MetadataWorkerServiceImpl {
-    pub fn new(
+    pub(crate) fn new(
         raft_node: Arc<AppRaftNode>,
         worker_manager: Arc<WorkerManager>,
         mount_table: Arc<crate::mount::MountTable>,
@@ -104,6 +105,7 @@ impl MetadataWorkerServiceImpl {
             slot_metrics: None, // Will be set via set_slot_metrics
             _mount_table: mount_table,
             served_group_name,
+            registration_serial: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -581,6 +583,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     return self.invalid_request_response(&req.header, register_worker_response_with_header, message)
                 }
             };
+            let _registration_guard = self.registration_serial.lock().await;
             if let Err(error) = self.worker_manager.validate_worker_registration_preflight(
                 &group_name,
                 worker_id,
@@ -602,15 +605,17 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 }
             };
 
-            let command = Command::RegisterWorker {
+            let command = Command::new(
                 dedup,
-                group_name: group_name.clone(),
-                worker_id,
-                worker_run_id,
-                address: address.clone(),
-                worker_net_protocol,
-                fault_domain: None,
-            };
+                crate::raft::proposal_timestamp_ms(),
+                crate::raft::Mutation::RegisterWorkerDescriptor {
+                    group_name: group_name.clone(),
+                    worker_id,
+                    address: address.clone(),
+                    worker_net_protocol,
+                    fault_domain: None,
+                },
+            );
 
             let accepted_worker_id = match self.raft_node.propose(command).await {
                 Ok(AppDataResponse::Worker(WorkerCommandResult::Upserted(worker_id))) => worker_id,
@@ -635,6 +640,16 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                         worker_id.as_raw()
                     )),
                 );
+            }
+            if let Err(error) = self.worker_manager.register_worker_run(
+                &group_name,
+                accepted_worker_id,
+                address.clone(),
+                worker_net_protocol,
+                worker_run_id,
+                None,
+            ) {
+                return self.metadata_error_response(&req.header, register_worker_response_with_header, error);
             }
 
             info!(
@@ -1304,7 +1319,6 @@ mod tests {
         Counter, CounterFn, Gauge, Histogram, HistogramFn, Key, KeyName, Metadata, Recorder, SharedString, Unit,
     };
     use proto::convert::rpc_error_from_proto;
-    use std::future::Future;
     use std::io;
     use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
@@ -1390,11 +1404,6 @@ mod tests {
         tracing::Dispatch::new(subscriber)
     }
 
-    async fn run_with_log_dispatch<T>(dispatch: &tracing::Dispatch, future: impl Future<Output = T>) -> T {
-        let _dispatch_guard = tracing::dispatcher::set_default(dispatch);
-        future.await
-    }
-
     fn assert_error_kind(error: &proto::common::ErrorDetailProto, expected_kind: ErrorKind) -> RpcErrorDetail {
         let rpc_error = rpc_error_from_proto(error);
         assert_eq!(rpc_error.kind, expected_kind, "{rpc_error:?}");
@@ -1444,9 +1453,13 @@ mod tests {
     async fn leader_raft(dir: &TempDir) -> Arc<AppRaftNode> {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
-        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), mount_table));
+        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
         let raft_config = crate::config::RaftConfig::default();
-        let raft_node = Arc::new(AppRaftNode::new(1, storage, state_machine, &raft_config).await.unwrap());
+        let raft_node = Arc::new(
+            AppRaftNode::new(1, storage, state_machine, mount_table, &raft_config)
+                .await
+                .unwrap(),
+        );
         raft_node
             .initialize_single_node("127.0.0.1:0".to_string())
             .await
@@ -1464,9 +1477,13 @@ mod tests {
     async fn nonleader_raft(dir: &TempDir) -> Arc<AppRaftNode> {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
-        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), mount_table));
+        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
         let raft_config = crate::config::RaftConfig::default();
-        let raft_node = Arc::new(AppRaftNode::new(1, storage, state_machine, &raft_config).await.unwrap());
+        let raft_node = Arc::new(
+            AppRaftNode::new(1, storage, state_machine, mount_table, &raft_config)
+                .await
+                .unwrap(),
+        );
         assert!(!raft_node.is_leader());
         raft_node
     }
@@ -1745,7 +1762,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let raft_node = leader_raft(&dir).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
-        raft_node.set_worker_manager(Arc::clone(&worker_manager)).unwrap();
         let service = MetadataWorkerServiceImpl::new(
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
@@ -1755,7 +1771,7 @@ mod tests {
         let output = Arc::new(Mutex::new(Vec::new()));
         let dispatch = captured_json_subscriber(&output);
 
-        run_with_log_dispatch(&dispatch, async {
+        async {
             let response = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
                 &service,
                 Request::new(register_request_with_header(
@@ -1767,7 +1783,8 @@ mod tests {
             .expect("register worker response")
             .into_inner();
             assert!(response.header.expect("header").error.is_none());
-        })
+        }
+        .with_subscriber(dispatch)
         .await;
 
         let logs = captured_logs(&output);
@@ -2609,7 +2626,6 @@ mod tests {
         let raft_node = leader_raft(&dir).await;
         let before_state_id = raft_node.get_last_applied_state_id();
         let worker_manager = Arc::new(WorkerManager::new(60));
-        raft_node.set_worker_manager(Arc::clone(&worker_manager)).unwrap();
         let service = MetadataWorkerServiceImpl::new(
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
@@ -3306,7 +3322,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let raft_node = leader_raft(&dir).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
-        raft_node.set_worker_manager(Arc::clone(&worker_manager)).unwrap();
         let worker_run_id = test_worker_run_id();
         let service = MetadataWorkerServiceImpl::new(
             Arc::clone(&raft_node),
@@ -3352,7 +3367,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_worker_service_does_not_mutate_live_manager_without_apply_observer() {
+    async fn register_worker_publishes_live_run_only_after_raft_success() {
         let dir = TempDir::new().unwrap();
         let raft_node = leader_raft(&dir).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
@@ -3384,12 +3399,20 @@ mod tests {
         .into_inner();
 
         assert!(response.header.as_ref().expect("header").error.is_none());
-        assert!(worker_manager
-            .get_descriptor(&group_name("root"), WorkerId::new(124))
-            .is_none());
-        assert!(worker_manager
-            .get_registration(&group_name("root"), WorkerId::new(124))
-            .is_none());
+        assert_eq!(
+            worker_manager
+                .get_descriptor(&group_name("root"), WorkerId::new(124))
+                .expect("published descriptor")
+                .address,
+            "127.0.0.1:9091"
+        );
+        assert_eq!(
+            worker_manager
+                .get_registration(&group_name("root"), WorkerId::new(124))
+                .expect("published live run")
+                .worker_run_id,
+            worker_run_id
+        );
     }
 
     #[tokio::test]
@@ -3397,7 +3420,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let raft_node = leader_raft(&dir).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
-        raft_node.set_worker_manager(Arc::clone(&worker_manager)).unwrap();
         let service = MetadataWorkerServiceImpl::new(
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
@@ -3510,7 +3532,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let raft_node = leader_raft(&dir).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
-        raft_node.set_worker_manager(Arc::clone(&worker_manager)).unwrap();
         let service = MetadataWorkerServiceImpl::new(
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
@@ -3577,7 +3598,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let raft_node = leader_raft(&dir).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
-        raft_node.set_worker_manager(Arc::clone(&worker_manager)).unwrap();
         let service = MetadataWorkerServiceImpl::new(
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),

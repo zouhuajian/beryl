@@ -10,7 +10,6 @@ use crate::raft::RocksDBStorage;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use types::fs::InodeId;
 use types::ids::MountId;
 use types::GroupName;
@@ -64,20 +63,65 @@ pub struct MountEntry {
 
 /// Mount table: manages all mount entries.
 pub struct MountTable {
-    entries: Arc<RwLock<HashMap<MountId, MountEntry>>>,
-    prefix_index: Arc<RwLock<HashMap<String, MountId>>>, // mount_prefix -> mount_id
-    next_mount_id: Arc<RwLock<u64>>,
-    epoch: Arc<RwLock<u64>>,
+    state: RwLock<MountTableState>,
+}
+
+#[derive(Debug)]
+pub(crate) struct MountTableState {
+    entries: HashMap<MountId, MountEntry>,
+    prefix_index: HashMap<String, MountId>,
+    epoch: u64,
 }
 
 impl MountTable {
     pub fn new() -> Self {
         Self {
-            entries: Arc::new(RwLock::new(HashMap::new())),
-            prefix_index: Arc::new(RwLock::new(HashMap::new())),
-            next_mount_id: Arc::new(RwLock::new(1)),
-            epoch: Arc::new(RwLock::new(1)),
+            state: RwLock::new(MountTableState {
+                entries: HashMap::new(),
+                prefix_index: HashMap::new(),
+                epoch: 1,
+            }),
         }
+    }
+
+    pub(crate) fn build_replacement(mounts: Vec<MountEntry>) -> MetadataResult<MountTableState> {
+        let mut entries = HashMap::with_capacity(mounts.len());
+        let mut prefix_index = HashMap::with_capacity(mounts.len());
+        let mut max_epoch = 0u64;
+
+        for entry in mounts {
+            max_epoch = max_epoch.max(entry.mount_epoch);
+
+            if entries.contains_key(&entry.mount_id) {
+                return Err(MetadataError::Internal(format!(
+                    "Duplicate mount ID in storage: {:?}",
+                    entry.mount_id
+                )));
+            }
+            if let Some(existing_id) = prefix_index.get(&entry.mount_prefix) {
+                return Err(MetadataError::Internal(format!(
+                    "Duplicate mount prefix in storage: {} (mount_id: {:?} and {:?})",
+                    entry.mount_prefix, existing_id, entry.mount_id
+                )));
+            }
+
+            prefix_index.insert(entry.mount_prefix.clone(), entry.mount_id);
+            entries.insert(entry.mount_id, entry);
+        }
+
+        let epoch = max_epoch
+            .checked_add(1)
+            .ok_or_else(|| MetadataError::Internal("Mount epoch exhausted while loading storage".to_string()))?;
+
+        Ok(MountTableState {
+            entries,
+            prefix_index,
+            epoch,
+        })
+    }
+
+    pub(crate) fn replace(&self, replacement: MountTableState) {
+        *self.state.write() = replacement;
     }
 
     /// Load mount entries from RocksDB storage.
@@ -85,45 +129,17 @@ impl MountTable {
     /// This should be called at service startup to restore mounts from persistent storage.
     /// Returns an empty table if no mounts exist (first startup), but returns error
     /// if RocksDB read fails or data is corrupted.
-    pub fn load_from_storage(storage: &RocksDBStorage) -> MetadataResult<Self> {
+    pub(crate) fn load_from_storage(storage: &RocksDBStorage) -> MetadataResult<Self> {
         let mounts = storage.list_mounts()?;
-
-        let mut entries = HashMap::new();
-        let mut prefix_index = HashMap::new();
-        let mut max_mount_id = 0u64;
-        let mut max_epoch = 0u64;
-
-        // Build entries and prefix_index from loaded mounts
-        for entry in mounts {
-            let mount_id_raw = entry.mount_id.as_raw();
-            max_mount_id = max_mount_id.max(mount_id_raw);
-            max_epoch = max_epoch.max(entry.mount_epoch);
-
-            // Check for duplicate prefix (data corruption)
-            if prefix_index.contains_key(&entry.mount_prefix) {
-                let existing_id = prefix_index[&entry.mount_prefix];
-                return Err(MetadataError::Internal(format!(
-                    "Duplicate mount prefix in storage: {} (mount_id: {:?} and {:?})",
-                    entry.mount_prefix, existing_id, entry.mount_id
-                )));
-            }
-
-            entries.insert(entry.mount_id, entry.clone());
-            prefix_index.insert(entry.mount_prefix, entry.mount_id);
-        }
-
+        let state = Self::build_replacement(mounts)?;
         Ok(Self {
-            entries: Arc::new(RwLock::new(entries)),
-            prefix_index: Arc::new(RwLock::new(prefix_index)),
-            next_mount_id: Arc::new(RwLock::new(max_mount_id + 1)),
-            epoch: Arc::new(RwLock::new(max_epoch + 1)),
+            state: RwLock::new(state),
         })
     }
 
-    /// Create a new mount entry.
-    ///
-    /// The root_inode_id must already exist as a directory inode.
-    pub fn create_mount(
+    /// Build a derived mount entry for tests.
+    #[cfg(test)]
+    pub(crate) fn create_mount(
         &self,
         mount_prefix: String,
         mount_kind: MountKind,
@@ -132,21 +148,25 @@ impl MountTable {
         namespace_owner_group_name: GroupName,
         root_inode_id: InodeId,
     ) -> MetadataResult<MountEntry> {
-        let mut entries = self.entries.write();
-        let mut prefix_index = self.prefix_index.write();
-        let mut epoch = self.epoch.write();
+        let mut state = self.state.write();
 
         // Check if prefix already exists
-        if prefix_index.contains_key(&mount_prefix) {
+        if state.prefix_index.contains_key(&mount_prefix) {
             return Err(MetadataError::AlreadyExists(format!(
                 "Mount prefix already exists: {}",
                 mount_prefix
             )));
         }
 
-        let mut next_id = self.next_mount_id.write();
-        let mount_id = MountId::new(*next_id);
-        *next_id += 1;
+        let next_mount_id = state
+            .entries
+            .keys()
+            .map(|mount_id| mount_id.as_raw())
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| MetadataError::Internal("test mount ID allocator exhausted".to_string()))?;
+        let mount_id = MountId::new(next_mount_id);
 
         let entry = MountEntry {
             mount_id,
@@ -154,27 +174,26 @@ impl MountTable {
             mount_kind,
             ufs_uri,
             data_io_policy,
-            mount_epoch: *epoch,
+            mount_epoch: state.epoch,
             namespace_owner_group_name,
             root_inode_id,
         };
 
-        entries.insert(mount_id, entry.clone());
-        prefix_index.insert(mount_prefix, mount_id);
-        *epoch += 1;
+        state.entries.insert(mount_id, entry.clone());
+        state.prefix_index.insert(mount_prefix, mount_id);
+        state.epoch += 1;
 
         Ok(entry)
     }
 
-    /// Delete a mount entry.
-    pub fn delete_mount(&self, mount_id: MountId) -> MetadataResult<()> {
-        let mut entries = self.entries.write();
-        let mut prefix_index = self.prefix_index.write();
-        let mut epoch = self.epoch.write();
+    /// Delete a derived mount entry in tests.
+    #[cfg(test)]
+    pub(crate) fn delete_mount(&self, mount_id: MountId) -> MetadataResult<()> {
+        let mut state = self.state.write();
 
-        if let Some(entry) = entries.remove(&mount_id) {
-            prefix_index.remove(&entry.mount_prefix);
-            *epoch += 1;
+        if let Some(entry) = state.entries.remove(&mount_id) {
+            state.prefix_index.remove(&entry.mount_prefix);
+            state.epoch += 1;
             Ok(())
         } else {
             Err(MetadataError::NotFound(format!("Mount not found: {:?}", mount_id)))
@@ -183,22 +202,20 @@ impl MountTable {
 
     /// Upsert (insert or update) a mount entry.
     ///
-    /// Used by Raft state machine to synchronize MountTable after RocksDB write.
-    /// This ensures in-memory MountTable stays consistent with RocksDB.
-    pub fn upsert(&self, entry: MountEntry) -> MetadataResult<()> {
-        let mut entries = self.entries.write();
-        let mut prefix_index = self.prefix_index.write();
-        let mut epoch = self.epoch.write();
+    /// Used by Raft read-view publication after the authoritative RocksDB commit.
+    pub(crate) fn upsert(&self, entry: MountEntry) -> MetadataResult<()> {
+        let mut state = self.state.write();
 
         // Remove old prefix mapping if updating existing mount
-        if let Some(old_entry) = entries.get(&entry.mount_id) {
+        if let Some(old_entry) = state.entries.get(&entry.mount_id) {
             if old_entry.mount_prefix != entry.mount_prefix {
-                prefix_index.remove(&old_entry.mount_prefix);
+                let old_prefix = old_entry.mount_prefix.clone();
+                state.prefix_index.remove(&old_prefix);
             }
         }
 
         // Check for prefix conflict (different mount_id with same prefix)
-        if let Some(&existing_id) = prefix_index.get(&entry.mount_prefix) {
+        if let Some(&existing_id) = state.prefix_index.get(&entry.mount_prefix) {
             if existing_id != entry.mount_id {
                 return Err(MetadataError::AlreadyExists(format!(
                     "Mount prefix already exists: {} (mount_id: {:?})",
@@ -208,50 +225,46 @@ impl MountTable {
         }
 
         // Update entries and prefix_index
-        entries.insert(entry.mount_id, entry.clone());
-        prefix_index.insert(entry.mount_prefix, entry.mount_id);
+        state.entries.insert(entry.mount_id, entry.clone());
+        state.prefix_index.insert(entry.mount_prefix, entry.mount_id);
 
         // Update epoch to match entry's mount_epoch from RocksDB.
-        *epoch = entry.mount_epoch.max(*epoch);
+        state.epoch = entry.mount_epoch.max(state.epoch);
 
         Ok(())
     }
 
-    /// Remove a mount entry by ID.
-    ///
-    /// Used by Raft state machine to synchronize MountTable after RocksDB delete.
-    pub fn remove(&self, mount_id: MountId) -> MetadataResult<()> {
+    /// Remove a derived mount entry in tests.
+    #[cfg(test)]
+    pub(crate) fn remove(&self, mount_id: MountId) -> MetadataResult<()> {
         self.delete_mount(mount_id)
     }
 
     /// List all mount entries.
     pub fn list_mounts(&self) -> Vec<MountEntry> {
-        let entries = self.entries.read();
-        entries.values().cloned().collect()
+        self.state.read().entries.values().cloned().collect()
     }
 
     /// Get mount entry by ID.
     pub fn get_mount(&self, mount_id: MountId) -> MetadataResult<Option<MountEntry>> {
-        let entries = self.entries.read();
-        Ok(entries.get(&mount_id).cloned())
+        Ok(self.state.read().entries.get(&mount_id).cloned())
     }
 
     /// Resolve vecton path to UFS path.
     ///
     /// Returns (ufs_uri, relative_path) if a mount matches the prefix.
     pub fn resolve_path(&self, unified_path: &str) -> MetadataResult<Option<(String, String)>> {
-        let prefix_index = self.prefix_index.read();
-        let entries = self.entries.read();
+        let state = self.state.read();
 
         // Find the longest matching prefix
         let mut best_match: Option<(String, String)> = None;
         let mut best_prefix_len = 0;
 
-        for (prefix, &mount_id) in prefix_index.iter() {
+        for (prefix, &mount_id) in &state.prefix_index {
             if mount_prefix_matches_path(prefix, unified_path) {
                 let prefix_len = prefix.len();
                 if prefix_len > best_prefix_len {
-                    if let Some(entry) = entries.get(&mount_id) {
+                    if let Some(entry) = state.entries.get(&mount_id) {
                         let ufs_uri = match entry.ufs_uri.as_ref() {
                             Some(uri) => uri,
                             None => continue,
@@ -275,15 +288,7 @@ impl MountTable {
 
     /// Get current mount epoch.
     pub fn epoch(&self) -> u64 {
-        *self.epoch.read()
-    }
-
-    /// Allocate a new mount ID (in-memory only).
-    pub fn allocate_mount_id(&self) -> MountId {
-        let mut next_id = self.next_mount_id.write();
-        let mount_id = MountId::new(*next_id);
-        *next_id += 1;
-        mount_id
+        self.state.read().epoch
     }
 }
 
@@ -520,5 +525,91 @@ mod tests {
         // Resolve should return None
         let result = mount_table.resolve_path("/any/path").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn duplicate_prefix_replacement_does_not_change_current_table() {
+        let table = MountTable::new();
+        table
+            .create_mount(
+                "/current".to_string(),
+                MountKind::External,
+                Some("ufs://current".to_string()),
+                DataIoPolicy::Allow,
+                GroupName::parse("root").unwrap(),
+                InodeId::new(1),
+            )
+            .unwrap();
+        let original_epoch = table.epoch();
+
+        let duplicate_prefix = vec![
+            MountEntry {
+                mount_id: MountId::new(10),
+                mount_prefix: "/replacement".to_string(),
+                mount_kind: MountKind::External,
+                ufs_uri: Some("ufs://first".to_string()),
+                data_io_policy: DataIoPolicy::Allow,
+                mount_epoch: 10,
+                namespace_owner_group_name: GroupName::parse("root").unwrap(),
+                root_inode_id: InodeId::new(10),
+            },
+            MountEntry {
+                mount_id: MountId::new(11),
+                mount_prefix: "/replacement".to_string(),
+                mount_kind: MountKind::External,
+                ufs_uri: Some("ufs://second".to_string()),
+                data_io_policy: DataIoPolicy::Allow,
+                mount_epoch: 11,
+                namespace_owner_group_name: GroupName::parse("root").unwrap(),
+                root_inode_id: InodeId::new(11),
+            },
+        ];
+
+        let error = MountTable::build_replacement(duplicate_prefix).unwrap_err();
+        assert!(error.to_string().contains("Duplicate mount prefix"));
+        assert_eq!(table.epoch(), original_epoch);
+        assert_eq!(table.list_mounts().len(), 1);
+        assert_eq!(
+            table.resolve_path("/current/file").unwrap(),
+            Some(("ufs://current".to_string(), "file".to_string()))
+        );
+        assert!(table.resolve_path("/replacement/file").unwrap().is_none());
+    }
+
+    #[test]
+    fn replacement_updates_entries_prefix_and_epoch_together() {
+        let table = MountTable::new();
+        table
+            .create_mount(
+                "/old".to_string(),
+                MountKind::External,
+                Some("ufs://old".to_string()),
+                DataIoPolicy::Allow,
+                GroupName::parse("root").unwrap(),
+                InodeId::new(1),
+            )
+            .unwrap();
+
+        let replacement = MountTable::build_replacement(vec![MountEntry {
+            mount_id: MountId::new(9),
+            mount_prefix: "/new".to_string(),
+            mount_kind: MountKind::External,
+            ufs_uri: Some("ufs://new".to_string()),
+            data_io_policy: DataIoPolicy::Allow,
+            mount_epoch: 41,
+            namespace_owner_group_name: GroupName::parse("root").unwrap(),
+            root_inode_id: InodeId::new(9),
+        }])
+        .unwrap();
+        table.replace(replacement);
+
+        {
+            let state = table.state.read();
+            assert_eq!(state.entries.len(), 1);
+            assert_eq!(state.entries[&MountId::new(9)].mount_prefix, "/new");
+            assert_eq!(state.prefix_index.get("/new"), Some(&MountId::new(9)));
+            assert!(!state.prefix_index.contains_key("/old"));
+            assert_eq!(state.epoch, 42);
+        }
     }
 }

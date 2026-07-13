@@ -20,10 +20,22 @@ pub(crate) const METADATA_RAFT_PROPOSALS_TOTAL: &str = "metadata_raft_proposals_
 pub(crate) const METADATA_RAFT_PROPOSE_DURATION_SECONDS: &str = "metadata_raft_propose_duration_seconds";
 pub(crate) const METADATA_RAFT_APPLY_TOTAL: &str = "metadata_raft_apply_total";
 pub(crate) const METADATA_RAFT_APPLY_DURATION_SECONDS: &str = "metadata_raft_apply_duration_seconds";
+pub(crate) const METADATA_RAFT_LOG_DURABLE_WRITE_BYTES_TOTAL: &str = "metadata_raft_log_durable_write_bytes_total";
+pub(crate) const METADATA_RAFT_LOG_DURABLE_WRITE_DURATION_SECONDS: &str =
+    "metadata_raft_log_durable_write_duration_seconds";
+pub(crate) const METADATA_RAFT_SNAPSHOT_BYTES_TOTAL: &str = "metadata_raft_snapshot_bytes_total";
+pub(crate) const METADATA_RAFT_SNAPSHOT_DURATION_SECONDS: &str = "metadata_raft_snapshot_duration_seconds";
+pub(crate) const METADATA_RAFT_DEDUP_RECORDS: &str = "metadata_raft_dedup_records";
+pub(crate) const METADATA_RAFT_DEDUP_BYTES: &str = "metadata_raft_dedup_bytes";
+pub(crate) const METADATA_RAFT_STORAGE_CLEANUP_TOTAL: &str = "metadata_raft_storage_cleanup_total";
+pub(crate) const METADATA_RAFT_ACTIVE_GENERATION: &str = "metadata_raft_active_generation";
+pub(crate) const METADATA_RAFT_AUTHORITY_COMMIT_DURATION_SECONDS: &str =
+    "metadata_raft_authority_commit_duration_seconds";
 pub(crate) const METADATA_RPC_REQUESTS_TOTAL: &str = "metadata_rpc_requests_total";
 pub(crate) const METADATA_RPC_REQUEST_DURATION_SECONDS: &str = "metadata_rpc_request_duration_seconds";
 pub(crate) const METADATA_FS_OPS_TOTAL: &str = "metadata_fs_ops_total";
 pub(crate) const METADATA_FS_OP_DURATION_SECONDS: &str = "metadata_fs_op_duration_seconds";
+pub(crate) const METADATA_ROCKSDB_READS_TOTAL: &str = "metadata_rocksdb_reads_total";
 pub(crate) const METADATA_WORKER_LIVE: &str = "metadata_worker_live";
 pub(crate) const METADATA_WORKER_REGISTERED_TOTAL: &str = "metadata_worker_registered_total";
 pub(crate) const METADATA_WORKER_REGISTRATION_DURATION_SECONDS: &str = "metadata_worker_registration_duration_seconds";
@@ -33,10 +45,6 @@ pub(crate) const METADATA_WORKER_HEARTBEAT_LAG_SECONDS: &str = "metadata_worker_
 pub(crate) const METADATA_WORKER_BLOCK_REPORT_TOTAL: &str = "metadata_worker_block_report_total";
 pub(crate) const METADATA_WORKER_BLOCK_REPORT_DURATION_SECONDS: &str = "metadata_worker_block_report_duration_seconds";
 pub(crate) const METADATA_WORKER_BLOCK_REPORT_BLOCKS_TOTAL: &str = "metadata_worker_block_report_blocks_total";
-pub(crate) const METADATA_MAINTENANCE_ORPHAN_QUEUE_DEPTH: &str = "metadata_maintenance_orphan_queue_depth";
-pub(crate) const METADATA_MAINTENANCE_ORPHAN_CLEANUP_TOTAL: &str = "metadata_maintenance_orphan_cleanup_total";
-pub(crate) const METADATA_DELETE_QUEUE_DEPTH: &str = "metadata_delete_queue_depth";
-pub(crate) const METADATA_DELETE_TASKS_TOTAL: &str = "metadata_delete_tasks_total";
 pub(crate) const METADATA_REPAIR_QUEUE_DEPTH: &str = "metadata_repair_queue_depth";
 pub(crate) const METADATA_REPAIR_ATTEMPTS_TOTAL: &str = "metadata_repair_attempts_total";
 
@@ -103,6 +111,56 @@ pub(crate) fn record_raft_apply(status: &str, error_kind: &str, duration_seconds
     .record(duration_seconds);
 }
 
+pub(crate) fn record_raft_log_durable_write(status: &'static str, bytes: usize, duration_seconds: f64) {
+    metrics::counter!(METADATA_RAFT_LOG_DURABLE_WRITE_BYTES_TOTAL, "status" => status).increment(bytes as u64);
+    metrics::histogram!(METADATA_RAFT_LOG_DURABLE_WRITE_DURATION_SECONDS, "status" => status).record(duration_seconds);
+}
+
+pub(crate) fn record_raft_snapshot(
+    operation: &'static str,
+    stage: &'static str,
+    status: &'static str,
+    bytes: u64,
+    duration_seconds: f64,
+) {
+    metrics::counter!(
+        METADATA_RAFT_SNAPSHOT_BYTES_TOTAL,
+        "operation" => operation,
+        "stage" => stage,
+        "status" => status
+    )
+    .increment(bytes);
+    metrics::histogram!(
+        METADATA_RAFT_SNAPSHOT_DURATION_SECONDS,
+        "operation" => operation,
+        "stage" => stage,
+        "status" => status
+    )
+    .record(duration_seconds);
+}
+
+pub(crate) fn record_raft_dedup_insert(bytes: usize) {
+    metrics::gauge!(METADATA_RAFT_DEDUP_RECORDS).increment(1.0);
+    metrics::gauge!(METADATA_RAFT_DEDUP_BYTES).increment(bytes as f64);
+}
+
+pub(crate) fn record_raft_dedup_state(records: u64, bytes: u64) {
+    metrics::gauge!(METADATA_RAFT_DEDUP_RECORDS).set(records as f64);
+    metrics::gauge!(METADATA_RAFT_DEDUP_BYTES).set(bytes as f64);
+}
+
+pub(crate) fn record_raft_storage_cleanup(kind: &'static str, count: usize) {
+    metrics::counter!(METADATA_RAFT_STORAGE_CLEANUP_TOTAL, "kind" => kind).increment(count as u64);
+}
+
+pub(crate) fn record_raft_active_generation(generation: u64) {
+    metrics::gauge!(METADATA_RAFT_ACTIVE_GENERATION).set(generation as f64);
+}
+
+pub(crate) fn record_raft_authority_commit(status: &'static str, duration_seconds: f64) {
+    metrics::histogram!(METADATA_RAFT_AUTHORITY_COMMIT_DURATION_SECONDS, "status" => status).record(duration_seconds);
+}
+
 pub(crate) fn record_rpc_request(service: &str, method: &str, status: &str, error_kind: &str, duration_seconds: f64) {
     metrics::counter!(
         METADATA_RPC_REQUESTS_TOTAL,
@@ -137,6 +195,10 @@ pub(crate) fn record_fs_op(operation: &str, status: &str, error_kind: &str, dura
         "error_kind" => error_kind.to_string()
     )
     .record(duration_seconds);
+}
+
+pub(crate) fn record_rocksdb_read(kind: &'static str) {
+    metrics::counter!(METADATA_ROCKSDB_READS_TOTAL, "kind" => kind).increment(1);
 }
 
 pub(crate) fn set_worker_live(count: usize) {
@@ -200,32 +262,6 @@ pub(crate) fn record_worker_block_report_blocks(change: &str, count: usize) {
     }
     metrics::counter!(METADATA_WORKER_BLOCK_REPORT_BLOCKS_TOTAL, "change" => change.to_string())
         .increment(count as u64);
-}
-
-pub(crate) fn set_orphan_queue_depth(depth: usize) {
-    metrics::gauge!(METADATA_MAINTENANCE_ORPHAN_QUEUE_DEPTH).set(depth as f64);
-}
-
-pub(crate) fn record_orphan_cleanup(status: &str, reason: &str) {
-    metrics::counter!(
-        METADATA_MAINTENANCE_ORPHAN_CLEANUP_TOTAL,
-        "status" => status.to_string(),
-        "reason" => reason.to_string()
-    )
-    .increment(1);
-}
-
-pub(crate) fn set_delete_queue_depth(depth: usize) {
-    metrics::gauge!(METADATA_DELETE_QUEUE_DEPTH).set(depth as f64);
-}
-
-pub(crate) fn record_delete_task(status: &str, error_kind: &str) {
-    metrics::counter!(
-        METADATA_DELETE_TASKS_TOTAL,
-        "status" => status.to_string(),
-        "error_kind" => error_kind.to_string()
-    )
-    .increment(1);
 }
 
 pub(crate) fn set_repair_queue_depth(depth: usize) {
@@ -382,8 +418,18 @@ fn ufs_error_kind(kind: UfsErrorKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::{AppMetadataRaftState, AppRaftStateMachine, Command, DedupKey, Mutation, RocksDBStorage};
+    use metrics::{
+        Counter, CounterFn, Gauge, GaugeFn, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
+    };
+    use openraft::{LeaderId, LogId};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use types::fs::{FileAttrs, InodeId};
+    use types::{CallId, ClientId};
 
-    fn metadata_metric_contract_names() -> [&'static str; 30] {
+    fn metadata_metric_contract_names() -> [&'static str; 36] {
         [
             METADATA_UP,
             METADATA_BUILD_INFO,
@@ -396,10 +442,20 @@ mod tests {
             METADATA_RAFT_PROPOSE_DURATION_SECONDS,
             METADATA_RAFT_APPLY_TOTAL,
             METADATA_RAFT_APPLY_DURATION_SECONDS,
+            METADATA_RAFT_LOG_DURABLE_WRITE_BYTES_TOTAL,
+            METADATA_RAFT_LOG_DURABLE_WRITE_DURATION_SECONDS,
+            METADATA_RAFT_SNAPSHOT_BYTES_TOTAL,
+            METADATA_RAFT_SNAPSHOT_DURATION_SECONDS,
+            METADATA_RAFT_DEDUP_RECORDS,
+            METADATA_RAFT_DEDUP_BYTES,
+            METADATA_RAFT_STORAGE_CLEANUP_TOTAL,
+            METADATA_RAFT_ACTIVE_GENERATION,
+            METADATA_RAFT_AUTHORITY_COMMIT_DURATION_SECONDS,
             METADATA_RPC_REQUESTS_TOTAL,
             METADATA_RPC_REQUEST_DURATION_SECONDS,
             METADATA_FS_OPS_TOTAL,
             METADATA_FS_OP_DURATION_SECONDS,
+            METADATA_ROCKSDB_READS_TOTAL,
             METADATA_WORKER_LIVE,
             METADATA_WORKER_REGISTERED_TOTAL,
             METADATA_WORKER_REGISTRATION_DURATION_SECONDS,
@@ -409,10 +465,6 @@ mod tests {
             METADATA_WORKER_BLOCK_REPORT_TOTAL,
             METADATA_WORKER_BLOCK_REPORT_DURATION_SECONDS,
             METADATA_WORKER_BLOCK_REPORT_BLOCKS_TOTAL,
-            METADATA_MAINTENANCE_ORPHAN_QUEUE_DEPTH,
-            METADATA_MAINTENANCE_ORPHAN_CLEANUP_TOTAL,
-            METADATA_DELETE_QUEUE_DEPTH,
-            METADATA_DELETE_TASKS_TOTAL,
             METADATA_REPAIR_QUEUE_DEPTH,
             METADATA_REPAIR_ATTEMPTS_TOTAL,
         ]
@@ -427,9 +479,9 @@ mod tests {
             "error_kind",
             "method",
             "operation",
+            "stage",
             "kind",
             "change",
-            "reason",
         ]
     }
 
@@ -448,10 +500,20 @@ mod tests {
             "metadata_raft_propose_duration_seconds",
             "metadata_raft_apply_total",
             "metadata_raft_apply_duration_seconds",
+            "metadata_raft_log_durable_write_bytes_total",
+            "metadata_raft_log_durable_write_duration_seconds",
+            "metadata_raft_snapshot_bytes_total",
+            "metadata_raft_snapshot_duration_seconds",
+            "metadata_raft_dedup_records",
+            "metadata_raft_dedup_bytes",
+            "metadata_raft_storage_cleanup_total",
+            "metadata_raft_active_generation",
+            "metadata_raft_authority_commit_duration_seconds",
             "metadata_rpc_requests_total",
             "metadata_rpc_request_duration_seconds",
             "metadata_fs_ops_total",
             "metadata_fs_op_duration_seconds",
+            "metadata_rocksdb_reads_total",
             "metadata_worker_live",
             "metadata_worker_registered_total",
             "metadata_worker_registration_duration_seconds",
@@ -461,10 +523,6 @@ mod tests {
             "metadata_worker_block_report_total",
             "metadata_worker_block_report_duration_seconds",
             "metadata_worker_block_report_blocks_total",
-            "metadata_maintenance_orphan_queue_depth",
-            "metadata_maintenance_orphan_cleanup_total",
-            "metadata_delete_queue_depth",
-            "metadata_delete_tasks_total",
             "metadata_repair_queue_depth",
             "metadata_repair_attempts_total",
         ];
@@ -511,8 +569,6 @@ mod tests {
             METADATA_RAFT_COMMITTED_INDEX,
             METADATA_WORKER_LIVE,
             METADATA_WORKER_HEARTBEAT_LAG_SECONDS,
-            METADATA_MAINTENANCE_ORPHAN_QUEUE_DEPTH,
-            METADATA_DELETE_QUEUE_DEPTH,
             METADATA_REPAIR_QUEUE_DEPTH,
         ] {
             assert!(
@@ -532,19 +588,173 @@ mod tests {
         record_raft_indexes(Some(3), Some(4));
         record_raft_proposal("ok", "none", 0.001);
         record_raft_apply("ok", "none", 0.002);
+        record_raft_log_durable_write("ok", 128, 0.002);
+        record_raft_snapshot("build", "complete", "ok", 1024, 0.002);
+        record_raft_dedup_insert(128);
+        record_raft_dedup_state(1, 128);
+        record_raft_storage_cleanup("retired_generation", 1);
+        record_raft_active_generation(1);
+        record_raft_authority_commit("ok", 0.001);
         record_rpc_request("metadata_worker", "register_worker", "ok", "none", 0.003);
         record_fs_op("create_file", "ok", "none", 0.004);
+        record_rocksdb_read("inode");
         set_worker_live(1);
         record_worker_registration("ok", "none", 0.005);
         record_worker_heartbeat("ok", "none", 0.006);
         record_worker_heartbeat_lag(0.0);
         record_worker_block_report("full", "ok", "none", 0.007);
         record_worker_block_report_blocks("added", 1);
-        set_orphan_queue_depth(0);
-        record_orphan_cleanup("ok", "empty");
-        set_delete_queue_depth(0);
-        record_delete_task("ok", "none");
         set_repair_queue_depth(0);
         record_repair_attempt("ok", "none");
+    }
+
+    #[test]
+    fn raft_storage_operations_publish_dedup_and_cleanup_metrics() {
+        let recorder = RaftStorageRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            record_raft_snapshot("build", "complete", "ok", 128, 0.001);
+        });
+        assert_eq!(recorder.snapshot_stage_seen.load(Ordering::Relaxed), 1);
+
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let dedup = DedupKey::new(ClientId::new(91), CallId::new());
+        let command = Command::new(
+            dedup,
+            1,
+            Mutation::Mkdir {
+                parent_inode_id: InodeId::new(999),
+                name: "missing-parent".to_string(),
+                attrs: FileAttrs::new(),
+            },
+        );
+        let raft_state = AppMetadataRaftState {
+            last_applied_log_id: Some(LogId::new(LeaderId::new(1, 1), 1)),
+            ..AppMetadataRaftState::default()
+        };
+        let state_machine = AppRaftStateMachine::new(Arc::clone(&storage));
+
+        metrics::with_local_recorder(&recorder, || {
+            state_machine.apply_committed(command, &raft_state).unwrap();
+        });
+        assert_eq!(recorder.dedup_records.load(Ordering::Relaxed), 1);
+        assert!(recorder.dedup_bytes.load(Ordering::Relaxed) > 0);
+        assert_eq!(recorder.authority_commit_samples.load(Ordering::Relaxed), 1);
+
+        recorder.dedup_records.store(0, Ordering::Relaxed);
+        recorder.dedup_bytes.store(0, Ordering::Relaxed);
+        drop(state_machine);
+        drop(storage);
+
+        let reopened = metrics::with_local_recorder(&recorder, || {
+            Arc::new(RocksDBStorage::open_existing_for_start(dir.path()).unwrap())
+        });
+        assert_eq!(recorder.dedup_records.load(Ordering::Relaxed), 1);
+        assert!(recorder.dedup_bytes.load(Ordering::Relaxed) > 0);
+
+        metrics::with_local_recorder(&recorder, || {
+            let staged = reopened.create_staged_generation().unwrap();
+            reopened
+                .publish_staged_generation_with(staged, |_old, _new| Ok(()), |_new| Ok(()))
+                .unwrap();
+            reopened.cleanup_retired_generations().unwrap();
+        });
+        assert_eq!(recorder.dedup_records.load(Ordering::Relaxed), 0);
+        assert_eq!(recorder.dedup_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(recorder.active_generation.load(Ordering::Relaxed), 2);
+        assert_eq!(recorder.cleanup_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[derive(Default)]
+    struct RaftStorageRecorder {
+        dedup_records: Arc<AtomicU64>,
+        dedup_bytes: Arc<AtomicU64>,
+        active_generation: Arc<AtomicU64>,
+        authority_commit_samples: Arc<AtomicU64>,
+        snapshot_stage_seen: Arc<AtomicU64>,
+        cleanup_total: Arc<AtomicU64>,
+    }
+
+    impl Recorder for RaftStorageRecorder {
+        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
+            if key.name() == "metadata_raft_storage_cleanup_total" {
+                Counter::from_arc(Arc::new(AtomicMetric {
+                    value: Arc::clone(&self.cleanup_total),
+                }))
+            } else {
+                Counter::noop()
+            }
+        }
+
+        fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+            let value = match key.name() {
+                "metadata_raft_dedup_records" => Arc::clone(&self.dedup_records),
+                "metadata_raft_dedup_bytes" => Arc::clone(&self.dedup_bytes),
+                "metadata_raft_active_generation" => Arc::clone(&self.active_generation),
+                _ => return Gauge::noop(),
+            };
+            Gauge::from_arc(Arc::new(AtomicMetric { value }))
+        }
+
+        fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+            if key.name() == METADATA_RAFT_SNAPSHOT_DURATION_SECONDS
+                && key
+                    .labels()
+                    .any(|label| label.key() == "stage" && label.value() == "complete")
+            {
+                self.snapshot_stage_seen.store(1, Ordering::Relaxed);
+            }
+            if key.name() == "metadata_raft_authority_commit_duration_seconds" {
+                Histogram::from_arc(Arc::new(SampleCounter {
+                    samples: Arc::clone(&self.authority_commit_samples),
+                }))
+            } else {
+                Histogram::noop()
+            }
+        }
+    }
+
+    struct AtomicMetric {
+        value: Arc<AtomicU64>,
+    }
+
+    impl CounterFn for AtomicMetric {
+        fn increment(&self, value: u64) {
+            self.value.fetch_add(value, Ordering::Relaxed);
+        }
+
+        fn absolute(&self, value: u64) {
+            self.value.store(value, Ordering::Relaxed);
+        }
+    }
+
+    impl GaugeFn for AtomicMetric {
+        fn increment(&self, value: f64) {
+            self.value.fetch_add(value as u64, Ordering::Relaxed);
+        }
+
+        fn decrement(&self, value: f64) {
+            self.value.fetch_sub(value as u64, Ordering::Relaxed);
+        }
+
+        fn set(&self, value: f64) {
+            self.value.store(value as u64, Ordering::Relaxed);
+        }
+    }
+
+    struct SampleCounter {
+        samples: Arc<AtomicU64>,
+    }
+
+    impl metrics::HistogramFn for SampleCounter {
+        fn record(&self, _value: f64) {
+            self.samples.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }

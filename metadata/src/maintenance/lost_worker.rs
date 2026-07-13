@@ -114,7 +114,7 @@ impl LostWorkerCleanupService {
 #[cfg(test)]
 mod tests {
     use crate::maintenance::lost_worker::{LostWorkerCleanupDeps, LostWorkerCleanupService};
-    use crate::maintenance::repair::{OrphanQueue, RepairPlanner, RepairPolicy, RepairQueue};
+    use crate::maintenance::repair::{RepairPlanner, RepairPolicy, RepairQueue};
     use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
     use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerInfo, WorkerManager};
     use crate::MountTable;
@@ -130,9 +130,13 @@ mod tests {
     async fn test_raft(dir: &TempDir, leader: bool) -> Arc<AppRaftNode> {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
-        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), mount_table));
+        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
         let raft_config = crate::config::RaftConfig::default();
-        let raft_node = Arc::new(AppRaftNode::new(1, storage, state_machine, &raft_config).await.unwrap());
+        let raft_node = Arc::new(
+            AppRaftNode::new(1, storage, state_machine, mount_table, &raft_config)
+                .await
+                .unwrap(),
+        );
         if leader {
             raft_node
                 .initialize_single_node("127.0.0.1:0".to_string())
@@ -237,25 +241,17 @@ mod tests {
         raft_node: Arc<AppRaftNode>,
         worker_manager: Arc<WorkerManager>,
         repair_queue: Arc<RepairQueue>,
-        orphan_queue: Arc<OrphanQueue>,
     ) -> LostWorkerCleanupService {
-        service_with_policy(
-            raft_node,
-            worker_manager,
-            repair_queue,
-            orphan_queue,
-            RepairPolicy::default(),
-        )
+        service_with_policy(raft_node, worker_manager, repair_queue, RepairPolicy::default())
     }
 
     fn service_with_policy(
         raft_node: Arc<AppRaftNode>,
         worker_manager: Arc<WorkerManager>,
         repair_queue: Arc<RepairQueue>,
-        orphan_queue: Arc<OrphanQueue>,
         repair_policy: RepairPolicy,
     ) -> LostWorkerCleanupService {
-        let repair_planner = Arc::new(RepairPlanner::new(orphan_queue));
+        let repair_planner = Arc::new(RepairPlanner::new());
         LostWorkerCleanupService::new(LostWorkerCleanupDeps {
             raft_node,
             worker_manager,
@@ -271,7 +267,6 @@ mod tests {
         let raft_node = test_raft(&dir, true).await;
         let worker_manager = Arc::new(WorkerManager::new(1));
         let repair_queue = Arc::new(RepairQueue::new(100));
-        let orphan_queue = Arc::new(OrphanQueue::new(100));
         let source = WorkerId::new(1);
         let target_a = WorkerId::new(2);
         let target_b = WorkerId::new(3);
@@ -289,7 +284,6 @@ mod tests {
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
             Arc::clone(&repair_queue),
-            Arc::clone(&orphan_queue),
         )
         .run_once()
         .await
@@ -317,7 +311,6 @@ mod tests {
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
             Arc::clone(&repair_queue),
-            Arc::clone(&orphan_queue),
         )
         .run_once()
         .await
@@ -335,7 +328,6 @@ mod tests {
         let raft_node = test_raft(&dir, true).await;
         let worker_manager = Arc::new(WorkerManager::new(1));
         let repair_queue = Arc::new(RepairQueue::new(100));
-        let orphan_queue = Arc::new(OrphanQueue::new(100));
         let group_name_value = group_name("root");
         let worker_id = WorkerId::new(9);
         worker_manager
@@ -346,7 +338,6 @@ mod tests {
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
             Arc::clone(&repair_queue),
-            Arc::clone(&orphan_queue),
         )
         .run_once()
         .await
@@ -367,14 +358,12 @@ mod tests {
         let raft_node = test_raft(&dir, true).await;
         let worker_manager = Arc::new(WorkerManager::new(1));
         let repair_queue = Arc::new(RepairQueue::new(100));
-        let orphan_queue = Arc::new(OrphanQueue::new(100));
         live_worker(&worker_manager, WorkerId::new(1));
 
         let outcome = service(
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
             Arc::clone(&repair_queue),
-            Arc::clone(&orphan_queue),
         )
         .run_once()
         .await
@@ -392,7 +381,6 @@ mod tests {
         let raft_node = test_raft(&dir, true).await;
         let worker_manager = Arc::new(WorkerManager::new(1));
         let repair_queue = Arc::new(RepairQueue::new(100));
-        let orphan_queue = Arc::new(OrphanQueue::new(100));
         let source = WorkerId::new(1);
         let target_a = WorkerId::new(2);
         let target_b = WorkerId::new(3);
@@ -410,7 +398,6 @@ mod tests {
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
             Arc::clone(&repair_queue),
-            Arc::clone(&orphan_queue),
             RepairPolicy {
                 default_replication_factor: 2,
             },
@@ -439,7 +426,6 @@ mod tests {
         let raft_node = test_raft(&dir, false).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
         let repair_queue = Arc::new(RepairQueue::new(100));
-        let orphan_queue = Arc::new(OrphanQueue::new(100));
         let dead = WorkerId::new(1);
         let block_id = BlockId::new(DataHandleId::new(12), BlockIndex::new(0));
         live_worker(&worker_manager, dead);
@@ -449,7 +435,6 @@ mod tests {
             Arc::clone(&raft_node),
             Arc::clone(&worker_manager),
             Arc::clone(&repair_queue),
-            Arc::clone(&orphan_queue),
         )
         .run_once()
         .await

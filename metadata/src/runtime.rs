@@ -4,8 +4,7 @@
 //! Runtime composition root for the metadata binary.
 
 use crate::inflight_registry::InflightRegistry;
-use crate::maintenance::delete::{DeleteExecutor, DeleteExecutorHandle};
-use crate::maintenance::repair::{OrphanQueue, RepairPlanner, RepairPolicy, RepairQueue};
+use crate::maintenance::repair::{RepairPlanner, RepairPolicy, RepairQueue};
 use crate::maintenance::{MaintenanceHandle, MaintenanceService};
 use crate::metrics::MetadataMetrics;
 use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
@@ -40,12 +39,34 @@ pub struct Observability {
 
 /// Authoritative metadata dependencies built before public services are exposed.
 pub struct MetadataAuthority {
-    pub storage: Arc<RocksDBStorage>,
-    pub mount_table: Arc<MountTable>,
-    pub raft_node: Arc<AppRaftNode>,
-    pub state_store: Arc<dyn crate::state::StateStore>,
-    pub metadata_metrics: Arc<MetadataMetrics>,
-    pub group_name: GroupName,
+    pub(crate) storage: Arc<RocksDBStorage>,
+    pub(crate) mount_table: Arc<MountTable>,
+    pub(crate) raft_node: Arc<AppRaftNode>,
+    pub(crate) state_store: Arc<dyn crate::state::StateStore>,
+    pub(crate) metadata_metrics: Arc<MetadataMetrics>,
+    pub(crate) group_name: GroupName,
+}
+
+impl MetadataAuthority {
+    /// Build the worker control-plane service without exposing Raft/storage internals.
+    pub fn worker_service(&self, manager: Arc<WorkerManager>) -> MetadataWorkerServiceImpl {
+        MetadataWorkerServiceImpl::new(
+            Arc::clone(&self.raft_node),
+            manager,
+            Arc::clone(&self.mount_table),
+            self.group_name.clone(),
+        )
+    }
+
+    /// Return durable worker descriptors needed to rebuild process-local soft state.
+    pub fn registered_workers(&self) -> crate::MetadataResult<Vec<crate::worker::WorkerInfo>> {
+        self.storage.list_workers()
+    }
+
+    /// Stop the authority's Raft runtime.
+    pub async fn shutdown(&self) -> crate::MetadataResult<()> {
+        self.raft_node.shutdown().await
+    }
 }
 
 /// Required worker runtime soft state shared by worker RPC and background work.
@@ -57,10 +78,8 @@ pub struct WorkerRuntime {
 #[derive(Clone)]
 pub(crate) struct MaintenanceRepairState {
     repair_queue: Arc<RepairQueue>,
-    orphan_queue: Arc<OrphanQueue>,
     repair_planner: Arc<RepairPlanner>,
     repair_policy: RepairPolicy,
-    shared_inflight_registry: Arc<InflightRegistry>,
 }
 
 /// Worker-owned background lifecycle started after authority and maintenance are available.
@@ -72,9 +91,7 @@ pub struct WorkerBackground {
 pub struct Maintenance {
     _repair_state: MaintenanceRepairState,
     _maintenance_service: Arc<MaintenanceService>,
-    _delete_executor: Arc<DeleteExecutor>,
     _maintenance_handle: MaintenanceHandle,
-    _delete_executor_handle: DeleteExecutorHandle,
 }
 
 /// Readiness gate, watcher task, and health service state.
@@ -119,16 +136,13 @@ impl MaintenanceRepairState {
         let shared_inflight_registry = Arc::new(InflightRegistry::new(5 * 60 * 1000));
         repair_queue.set_inflight_registry(Arc::clone(&shared_inflight_registry));
         let repair_queue = Arc::new(repair_queue);
-        let orphan_queue = Arc::new(OrphanQueue::new(10_000));
-        let repair_planner = Arc::new(RepairPlanner::new(Arc::clone(&orphan_queue)));
+        let repair_planner = Arc::new(RepairPlanner::new());
         let repair_policy = RepairPolicy::default();
 
         Self {
             repair_queue,
-            orphan_queue,
             repair_planner,
             repair_policy,
-            shared_inflight_registry,
         }
     }
 }
@@ -177,7 +191,7 @@ impl MetadataServer {
         crate::lifecycle::prepare_metadata_start(config.as_ref()).await?;
         let authority = build_authority(config.as_ref()).await?;
         let maintenance_repair = build_maintenance_repair_state(config.as_ref());
-        let (worker, mut worker_service) = build_worker_runtime(&authority, &maintenance_repair);
+        let (worker, mut worker_service) = build_worker_runtime(&authority, &maintenance_repair)?;
         let readiness = build_readiness(config.as_ref(), &authority).await;
         let filesystem =
             build_filesystem_service(config.as_ref(), &authority, Arc::clone(&worker.manager), &readiness).await?;
@@ -258,20 +272,19 @@ pub async fn build_authority(config: &MetadataConfig) -> Result<MetadataAuthorit
         MountTable::load_from_storage(storage.as_ref())
             .map_err(|e| format!("Failed to load mount table from storage: {e}"))?,
     );
-
-    let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
+    let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
 
     let raft_node = Arc::new(
         AppRaftNode::new(
             config.raft.node_id,
             Arc::clone(&storage),
             Arc::clone(&state_machine),
+            Arc::clone(&mount_table),
             &config.raft,
         )
         .await
         .map_err(|e| format!("Failed to initialize Raft node: {e}"))?,
     );
-
     let state_store: Arc<dyn crate::state::StateStore> = Arc::new(RaftStateStore::new(Arc::clone(&raft_node)));
 
     Ok(MetadataAuthority {
@@ -297,54 +310,35 @@ pub(crate) fn build_maintenance_repair_state(config: &MetadataConfig) -> Mainten
 pub(crate) fn build_worker_runtime(
     authority: &MetadataAuthority,
     _repair: &MaintenanceRepairState,
-) -> (WorkerRuntime, MetadataWorkerServiceImpl) {
+) -> Result<(WorkerRuntime, MetadataWorkerServiceImpl), DynError> {
     let worker = WorkerRuntime::new();
-    authority
-        .raft_node
-        .set_worker_manager(Arc::clone(&worker.manager))
-        .expect("worker registration replay into live WorkerManager should succeed");
+    worker
+        .manager
+        .load_registered_workers(authority.storage.list_workers()?)?;
     let service = worker.service(authority);
-    (worker, service)
+    Ok((worker, service))
 }
 
 /// Starts metadata maintenance side effects after authority and worker state exist.
 pub(crate) async fn build_maintenance(
     authority: &MetadataAuthority,
     worker: &WorkerRuntime,
-    readiness: &Readiness,
+    _readiness: &Readiness,
     repair: MaintenanceRepairState,
 ) -> Maintenance {
-    let maintenance_service = Arc::new(MaintenanceService::new_with_inflight_registry(
+    let maintenance_service = Arc::new(MaintenanceService::new(
         Arc::clone(&authority.raft_node),
-        Arc::clone(&authority.storage),
         Arc::clone(&worker.manager),
         Arc::clone(&repair.repair_queue),
-        Arc::clone(&repair.orphan_queue),
         Arc::clone(&repair.repair_planner),
-        Arc::clone(&authority.metadata_metrics),
-        Some(Arc::clone(&repair.shared_inflight_registry)),
-        Arc::clone(&authority.mount_table),
-        readiness.gate(),
         repair.repair_policy,
     ));
     let maintenance_handle = maintenance_service.start();
 
-    let delete_executor = Arc::new(DeleteExecutor::new(
-        Arc::clone(&authority.raft_node),
-        Arc::clone(&authority.storage),
-        Arc::clone(&worker.manager),
-        Arc::clone(&authority.metadata_metrics),
-        Arc::clone(&authority.mount_table),
-        Arc::clone(&repair.shared_inflight_registry),
-    ));
-    let delete_executor_handle = delete_executor.start();
-
     Maintenance {
         _repair_state: repair,
         _maintenance_service: maintenance_service,
-        _delete_executor: delete_executor,
         _maintenance_handle: maintenance_handle,
-        _delete_executor_handle: delete_executor_handle,
     }
 }
 
@@ -450,7 +444,7 @@ pub async fn build_filesystem_service(
             metrics: Some(Arc::clone(&authority.metadata_metrics)),
             readiness_gate: Some(readiness.gate()),
         },
-    });
+    })?;
 
     Ok(filesystem_service)
 }
@@ -524,24 +518,27 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use crate::config::{BootstrapConfig, MetadataAuthorityConfig, RaftConfig, WorkerConfig};
-    use crate::ensure_root_mount_for_format;
+    use crate::raft::{Command, DedupKey};
     use common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction};
     use common::header::{RequestHeader, ResponseHeader};
     use proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
     use proto::metadata::{MsyncRequestProto, MsyncResponseProto};
+    use std::time::Duration;
     use tempfile::TempDir;
+    use types::ids::WorkerId;
     use types::{ClientId, GroupName, GroupStateWatermark, RaftLogId};
 
     async fn test_authority(dir: &TempDir) -> MetadataAuthority {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::load_from_storage(storage.as_ref()).unwrap());
-        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
+        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
         let raft_config = RaftConfig::default();
         let raft_node = Arc::new(
             AppRaftNode::new(
                 raft_config.node_id,
                 Arc::clone(&storage),
                 Arc::clone(&state_machine),
+                Arc::clone(&mount_table),
                 &raft_config,
             )
             .await
@@ -553,7 +550,20 @@ mod tests {
             .unwrap();
 
         let group_name = GroupName::parse("root").unwrap();
-        ensure_root_mount_for_format(Arc::clone(&raft_node), Arc::clone(&mount_table), group_name.clone())
+        for _ in 0..100 {
+            if raft_node.is_leader() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        raft_node
+            .propose(Command::new(
+                DedupKey::new(ClientId::new(u128::MAX), types::CallId::new()),
+                1,
+                crate::raft::Mutation::BootstrapNamespace {
+                    group_name: group_name.clone(),
+                },
+            ))
             .await
             .unwrap();
 
@@ -582,12 +592,18 @@ mod tests {
     async fn nonleader_filesystem_service(dir: &TempDir) -> MetadataFileSystemServiceImpl {
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::load_from_storage(storage.as_ref()).unwrap());
-        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
+        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
         let raft_config = RaftConfig::default();
         let raft_node = Arc::new(
-            AppRaftNode::new(raft_config.node_id, Arc::clone(&storage), state_machine, &raft_config)
-                .await
-                .unwrap(),
+            AppRaftNode::new(
+                raft_config.node_id,
+                Arc::clone(&storage),
+                state_machine,
+                Arc::clone(&mount_table),
+                &raft_config,
+            )
+            .await
+            .unwrap(),
         );
         MetadataFileSystemServiceImpl::new(MetadataFileSystemServiceDeps {
             authority: FileSystemAuthorityDeps {
@@ -606,6 +622,7 @@ mod tests {
                 readiness_gate: None,
             },
         })
+        .unwrap()
     }
 
     async fn call_msync(service: &MetadataFileSystemServiceImpl, header: RequestHeader) -> MsyncResponseProto {
@@ -665,17 +682,54 @@ mod tests {
         let config = test_config();
         let authority = test_authority(&dir).await;
         let maintenance_repair = build_maintenance_repair_state(&config);
-        let (worker_runtime, mut worker_service) = build_worker_runtime(&authority, &maintenance_repair);
+        let (worker_runtime, mut worker_service) = build_worker_runtime(&authority, &maintenance_repair).unwrap();
         let readiness = build_readiness(&config, &authority).await;
         let maintenance = build_maintenance(&authority, &worker_runtime, &readiness, maintenance_repair).await;
         let worker_background = build_worker_background(&worker_runtime, &mut worker_service, &maintenance);
         let _worker_background = worker_background;
-        assert!(Arc::strong_count(&maintenance._delete_executor) >= 2);
-        assert_eq!(maintenance._maintenance_handle.task_count(), 8);
+        assert_eq!(maintenance._maintenance_handle.task_count(), 3);
         let _filesystem =
             build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
                 .await
                 .unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_runtime_loads_durable_descriptors_without_live_registration() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let authority = test_authority(&dir).await;
+        let worker_id = WorkerId::new(91);
+        authority
+            .storage
+            .put_worker(&crate::worker::WorkerInfo {
+                group_name: authority.group_name.clone(),
+                worker_id,
+                address: "127.0.0.1:19091".to_string(),
+                worker_net_protocol: 1,
+                capacity_total: 0,
+                capacity_used: 0,
+                capacity_available: 0,
+                active_reads: 0,
+                active_writes: 0,
+                health: crate::worker::HealthStatus::Healthy,
+                last_heartbeat: 0,
+                fault_domain: Some("rack-a".to_string()),
+            })
+            .unwrap();
+
+        let repair = build_maintenance_repair_state(&config);
+        let (worker, _service) = build_worker_runtime(&authority, &repair).unwrap();
+
+        let descriptor = worker
+            .manager
+            .get_descriptor(&authority.group_name, worker_id)
+            .expect("durable descriptor");
+        assert_eq!(descriptor.address, "127.0.0.1:19091");
+        assert!(worker
+            .manager
+            .get_registration(&authority.group_name, worker_id)
+            .is_none());
     }
 
     #[tokio::test]
@@ -685,7 +739,7 @@ mod tests {
         let authority = test_authority(&dir).await;
         let readiness = build_readiness(&config, &authority).await;
         let maintenance_repair = build_maintenance_repair_state(&config);
-        let (worker_runtime, mut worker_service) = build_worker_runtime(&authority, &maintenance_repair);
+        let (worker_runtime, mut worker_service) = build_worker_runtime(&authority, &maintenance_repair).unwrap();
         let filesystem = build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
             .await
             .unwrap();
@@ -695,7 +749,7 @@ mod tests {
             compose_services(filesystem, worker_service, readiness, worker_background, maintenance);
 
         assert_eq!(handles._worker_background._handle.task_count(), 0);
-        assert_eq!(handles._maintenance._maintenance_handle.task_count(), 8);
+        assert_eq!(handles._maintenance._maintenance_handle.task_count(), 3);
         assert!(Arc::strong_count(&handles._readiness.gate) >= 1);
         let _readiness_watcher_finished = handles._readiness._watcher.is_finished();
     }
@@ -708,7 +762,7 @@ mod tests {
         let config = test_config();
         let readiness = build_readiness(&config, &authority).await;
         let maintenance_repair = build_maintenance_repair_state(&config);
-        let (worker_runtime, _worker_service) = build_worker_runtime(&authority, &maintenance_repair);
+        let (worker_runtime, _worker_service) = build_worker_runtime(&authority, &maintenance_repair).unwrap();
         let service = build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
             .await
             .unwrap();
@@ -738,7 +792,7 @@ mod tests {
         let config = test_config();
         let readiness = build_readiness(&config, &authority).await;
         let maintenance_repair = build_maintenance_repair_state(&config);
-        let (worker_runtime, _worker_service) = build_worker_runtime(&authority, &maintenance_repair);
+        let (worker_runtime, _worker_service) = build_worker_runtime(&authority, &maintenance_repair).unwrap();
         let service = build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
             .await
             .unwrap();
@@ -767,7 +821,7 @@ mod tests {
         let config = test_config();
         let readiness = build_readiness(&config, &authority).await;
         let maintenance_repair = build_maintenance_repair_state(&config);
-        let (worker_runtime, _worker_service) = build_worker_runtime(&authority, &maintenance_repair);
+        let (worker_runtime, _worker_service) = build_worker_runtime(&authority, &maintenance_repair).unwrap();
         let service = build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
             .await
             .unwrap();
@@ -790,7 +844,7 @@ mod tests {
         let config = test_config();
         let readiness = build_readiness(&config, &authority).await;
         let maintenance_repair = build_maintenance_repair_state(&config);
-        let (worker_runtime, _worker_service) = build_worker_runtime(&authority, &maintenance_repair);
+        let (worker_runtime, _worker_service) = build_worker_runtime(&authority, &maintenance_repair).unwrap();
         let service = build_filesystem_service(&config, &authority, Arc::clone(&worker_runtime.manager), &readiness)
             .await
             .unwrap();
@@ -833,24 +887,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maintenance_repair_state_is_maintenance_owned() {
-        let dir = TempDir::new().unwrap();
-        let config = test_config();
-        let authority = test_authority(&dir).await;
-        let repair = build_maintenance_repair_state(&config);
-        let expected_registry = Arc::clone(&repair.shared_inflight_registry);
-        let (worker_runtime, _worker_service) = build_worker_runtime(&authority, &repair);
-        let readiness = build_readiness(&config, &authority).await;
-        let maintenance = build_maintenance(&authority, &worker_runtime, &readiness, repair).await;
-
-        assert!(Arc::ptr_eq(
-            &maintenance._repair_state.shared_inflight_registry,
-            &expected_registry
-        ));
-        assert_eq!(maintenance._maintenance_handle.task_count(), 8);
-    }
-
-    #[tokio::test]
     async fn metadata_server_build_composes_required_runtime() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
@@ -870,7 +906,7 @@ mod tests {
             .any(|entry| entry.mount_prefix == "/"));
         assert!(server.worker.manager.is_blockreport_converged(0).converged);
         assert_eq!(server.handles._worker_background._handle.task_count(), 0);
-        assert_eq!(server.handles._maintenance._maintenance_handle.task_count(), 8);
+        assert_eq!(server.handles._maintenance._maintenance_handle.task_count(), 3);
         assert!(Arc::strong_count(&server.handles._readiness.gate) >= 1);
     }
 

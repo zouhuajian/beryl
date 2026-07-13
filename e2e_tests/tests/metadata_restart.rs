@@ -29,11 +29,11 @@ use types::{BlockFormatId, ClientId};
 async fn committed_visible_file_survives_metadata_restart() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
-    let path = "/local/restart/committed";
+    let path = "/restart/committed";
     let payload = Bytes::from(deterministic_bytes(1_537));
     let create_options = CreateOptions::overwrite().with_block_size(1024).with_chunk_size(1024);
 
-    client.mkdirs("/local/restart", true).await.expect("create restart dir");
+    client.mkdirs("/restart", true).await.expect("create restart dir");
     let mut writer = client.create(path, create_options).await.expect("create file");
     writer.write_all(payload.clone()).await.expect("write file");
     writer.close().await.expect("close file");
@@ -56,11 +56,11 @@ async fn committed_visible_file_survives_metadata_restart() {
 async fn restart_after_create_before_close_fails_stale_writer_without_publishing_bytes() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
-    client.mkdirs("/local/restart", true).await.expect("create restart dir");
+    client.mkdirs("/restart", true).await.expect("create restart dir");
 
     let mut writer = client
         .create(
-            "/local/restart/create-before-close",
+            "/restart/create-before-close",
             CreateOptions::overwrite().with_block_size(1024).with_chunk_size(1024),
         )
         .await
@@ -70,7 +70,7 @@ async fn restart_after_create_before_close_fails_stale_writer_without_publishing
 
     let err = writer.close().await.expect_err("stale writer must fail closed");
     assert_stale_writer_error(&err);
-    assert_no_committed_bytes(&cluster, "/local/restart/create-before-close")
+    assert_no_committed_bytes(&cluster, "/restart/create-before-close")
         .await
         .expect("no committed bytes");
     cluster.shutdown().await.expect("shutdown cluster");
@@ -80,11 +80,11 @@ async fn restart_after_create_before_close_fails_stale_writer_without_publishing
 async fn restart_after_add_block_before_worker_commit_rejects_stale_writer_and_hides_data() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
-    client.mkdirs("/local/restart", true).await.expect("create restart dir");
+    client.mkdirs("/restart", true).await.expect("create restart dir");
 
     let mut writer = client
         .create(
-            "/local/restart/add-block-before-worker-commit",
+            "/restart/add-block-before-worker-commit",
             CreateOptions::overwrite().with_block_size(1024).with_chunk_size(1024),
         )
         .await
@@ -98,10 +98,10 @@ async fn restart_after_add_block_before_worker_commit_rejects_stale_writer_and_h
 
     let err = writer.renew_lease().await.expect_err("stale writer must fail closed");
     assert_stale_writer_error(&err);
-    assert_no_committed_bytes(&cluster, "/local/restart/add-block-before-worker-commit")
+    assert_no_committed_bytes(&cluster, "/restart/add-block-before-worker-commit")
         .await
         .expect("no committed bytes");
-    assert_no_metadata_locations(&cluster, "/local/restart/add-block-before-worker-commit", 1024)
+    assert_no_metadata_locations(&cluster, "/restart/add-block-before-worker-commit", 1024)
         .await
         .expect("no metadata locations");
     cluster.shutdown().await.expect("shutdown cluster");
@@ -110,7 +110,7 @@ async fn restart_after_add_block_before_worker_commit_rejects_stale_writer_and_h
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_after_worker_commit_before_metadata_commit_hides_uncommitted_block() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
-    let active = raw_create_commit_worker_block(&cluster, "/local/restart/worker-commit-no-metadata", b"worker-ready")
+    let active = raw_create_commit_worker_block(&cluster, "/restart/worker-commit-no-metadata", b"worker-ready")
         .await
         .expect("commit worker block without CommitFile");
     assert_eq!(cluster.ready_block_count().expect("ready blocks before restart"), 1);
@@ -121,10 +121,10 @@ async fn restart_after_worker_commit_before_metadata_commit_hides_uncommitted_bl
         .await
         .expect("stale CommitFile must fail");
     assert_eq!(cluster.ready_block_count().expect("ready blocks after restart"), 1);
-    assert_no_committed_bytes(&cluster, "/local/restart/worker-commit-no-metadata")
+    assert_no_committed_bytes(&cluster, "/restart/worker-commit-no-metadata")
         .await
         .expect("worker-only block not visible");
-    assert_no_metadata_locations(&cluster, "/local/restart/worker-commit-no-metadata", 11)
+    assert_no_metadata_locations(&cluster, "/restart/worker-commit-no-metadata", 11)
         .await
         .expect("worker-only block has no metadata locations");
     cluster.shutdown().await.expect("shutdown cluster");
@@ -134,10 +134,10 @@ async fn restart_after_worker_commit_before_metadata_commit_hides_uncommitted_bl
 async fn existing_visible_data_remains_readable_while_active_write_fails_closed() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
-    client.mkdirs("/local/restart", true).await.expect("create restart dir");
+    client.mkdirs("/restart", true).await.expect("create restart dir");
 
-    let visible_path = "/local/restart/existing-visible";
-    let active_path = "/local/restart/active-hidden";
+    let visible_path = "/restart/existing-visible";
+    let active_path = "/restart/active-hidden";
     let visible = Bytes::from_static(b"already-visible");
     let hidden = Bytes::from_static(b"hidden-after-restart");
     let create_options = CreateOptions::overwrite().with_block_size(1024).with_chunk_size(1024);
@@ -195,7 +195,7 @@ async fn raw_create_commit_worker_block(
     payload: &[u8],
 ) -> TestResult<RawWorkerCommittedWrite> {
     let client = cluster.client();
-    client.mkdirs("/local/restart", true).await.expect("create restart dir");
+    client.mkdirs("/restart", true).await.expect("create restart dir");
 
     let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint()).await?;
     let create = metadata

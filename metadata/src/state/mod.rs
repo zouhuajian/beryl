@@ -16,9 +16,6 @@ pub use raft_store::RaftStateStore;
 use crate::error::MetadataResult;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use types::block::{BlockPlacement, BlockState};
-use types::ids::{BlockId, DataHandleId};
-use types::lease::Lease;
 
 /// Authoritative route epoch used by metadata stale-route validation.
 ///
@@ -36,102 +33,6 @@ impl RouteEpoch {
     }
 }
 
-/// Block metadata stored in state.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BlockMetaState {
-    pub block_id: BlockId,
-    pub inode_id: types::fs::InodeId,
-    pub data_handle_id: DataHandleId,
-    pub state: BlockState,
-    pub placement: BlockPlacement,
-    pub committed_length: u64,
-}
-
-/// Lease state stored in state.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LeaseState {
-    pub block_id: BlockId,
-    pub lease: Lease,
-}
-
-/// Delete intent reason.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum DeleteIntentReason {
-    /// GC: block is unreferenced and eligible for deletion.
-    Gc,
-    /// Orphan: block exists on worker but not in metadata.
-    Orphan,
-    /// Lease: lease expired and block should be deleted.
-    Lease,
-    /// Manual: manual deletion request.
-    Manual,
-    /// OverRep: block has more replicas than desired (over-replicated cleanup).
-    OverRep,
-}
-
-/// Delete intent execution status (persisted in RocksDB).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-pub enum DeleteIntentStatus {
-    /// Pending: not yet started execution.
-    #[default]
-    Pending,
-    /// InFlight: command sent, waiting for ack.
-    InFlight,
-    /// Completed: all required acks received.
-    Completed,
-    /// Failed: non-retryable failure.
-    Failed,
-}
-
-/// Delete intent for block deletion.
-///
-/// This is an authoritative, recoverable, low-frequency intent that is persisted in Raft.
-/// Current DeleteExecutor status transitions use `Command::UpdateDeleteIntentStatus`.
-/// Do not use this model as justification for direct RocksDB status writes.
-///
-/// Carries the metadata group name and guard watermark used for delete execution gating.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DeleteIntent {
-    /// Unique intent ID (UUID or u64).
-    pub intent_id: u64,
-    /// Block ID to delete.
-    pub block_id: BlockId,
-    /// Reason for deletion.
-    pub reason: DeleteIntentReason,
-    /// Creation timestamp (milliseconds since epoch).
-    pub created_at_ms: u64,
-    /// Not before timestamp (milliseconds since epoch).
-    /// Intent should not be executed before this time (grace window).
-    pub not_before_ms: u64,
-    /// Metadata group name this intent belongs to.
-    /// Required for execution gate control.
-    #[serde(default)]
-    pub group_name: Option<types::GroupName>,
-    /// Guard watermark (group_name + state_id).
-    /// Used for execution gating: only execute if the target metadata group
-    /// has applied at least up to guard_watermark.state_id.
-    #[serde(default)]
-    pub guard_watermark: Option<types::group_watermark::GroupStateWatermark>,
-    /// Mount epoch at intent creation time (optional).
-    /// Used for route consistency checking.
-    #[serde(default)]
-    pub mount_epoch: Option<types::group_watermark::MountEpoch>,
-    /// Single-group guard state ID used when no group-scoped watermark is stored.
-    /// If guard_watermark is provided, this is ignored.
-    pub guard_state_id: types::RaftLogId,
-    /// Target workers (optional, can be empty for now).
-    pub target_workers: Vec<types::ids::WorkerId>,
-    /// Execution status (persisted in RocksDB, not via Raft).
-    #[serde(default)]
-    pub status: DeleteIntentStatus,
-    /// Finished timestamp (milliseconds since epoch, None if not finished).
-    #[serde(default)]
-    pub finished_at_ms: Option<u64>,
-    /// Last error message (for Failed status).
-    #[serde(default)]
-    pub last_error_msg: Option<String>,
-}
-
 /// State store trait for freshness reads needed by `FsCore`.
 ///
 /// Authoritative metadata mutations go through Raft commands and apply batches.
@@ -145,18 +46,7 @@ pub trait StateStore: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::ids::BlockIndex;
-
-    #[tokio::test]
-    async fn test_block_id_format() {
-        let data_handle_id = DataHandleId::new(42);
-        let block_index = BlockIndex::new(7);
-        let block_id = BlockId::new(data_handle_id, block_index);
-
-        assert_eq!(block_id.data_handle_id.as_raw(), 42);
-        assert_eq!(block_id.index.as_raw(), 7);
-        assert_eq!(format!("{}", block_id), "42:7");
-    }
+    use types::ids::DataHandleId;
 
     #[tokio::test]
     async fn test_route_epoch() {

@@ -610,7 +610,18 @@ fn worker_manager_api_does_not_expose_production_any_group_lookup() {
 fn production_worker_lookup_sources_reject_implicit_group_patterns() {
     let sources = [
         ("metadata/src/worker/manager.rs", include_str!("manager.rs")),
-        ("metadata/src/raft/storage.rs", include_str!("../raft/storage.rs")),
+        (
+            "metadata/src/raft/storage/mod.rs",
+            include_str!("../raft/storage/mod.rs"),
+        ),
+        (
+            "metadata/src/raft/storage/query.rs",
+            include_str!("../raft/storage/query.rs"),
+        ),
+        (
+            "metadata/src/raft/storage/transaction.rs",
+            include_str!("../raft/storage/transaction.rs"),
+        ),
         (
             "metadata/src/service/fs_core/read.rs",
             include_str!("../service/fs_core/read.rs"),
@@ -618,14 +629,6 @@ fn production_worker_lookup_sources_reject_implicit_group_patterns() {
         (
             "metadata/src/service/fs_core/write_session.rs",
             include_str!("../service/fs_core/write_session.rs"),
-        ),
-        (
-            "metadata/src/maintenance/delete/executor.rs",
-            include_str!("../maintenance/delete/executor.rs"),
-        ),
-        (
-            "metadata/src/maintenance/overrep.rs",
-            include_str!("../maintenance/overrep.rs"),
         ),
         (
             "metadata/src/maintenance/repair/planner.rs",

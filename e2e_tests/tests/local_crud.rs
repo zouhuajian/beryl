@@ -9,9 +9,9 @@ use e2e_tests::{data::deterministic_bytes, TestCluster};
 async fn local_client_crud_roundtrip() {
     let mut cluster = TestCluster::start().await.expect("start hermetic local cluster");
     let client = cluster.client();
-    let dir = "/local/e2e";
-    let path = "/local/e2e/file";
-    let renamed_path = "/local/e2e/file.renamed";
+    let dir = "/e2e";
+    let path = "/e2e/file";
+    let renamed_path = "/e2e/file.renamed";
 
     let created_dir = client.mkdirs(dir, true).await.expect("mkdirs through metadata");
     assert_eq!(created_dir.path(), dir);

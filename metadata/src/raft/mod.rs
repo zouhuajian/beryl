@@ -1,31 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Raft state machine implementation for metadata service.
+//! Metadata Raft subsystem.
 //!
-//! This module implements a Raft-driven state machine that replaces the in-memory
-//! state store with a strongly consistent, distributed state machine.
+//! Protocol types, node/network adapters, the application state machine, and
+//! OpenRaft storage-v2 implementations are kept as separate capabilities.
 
 mod command;
-mod log_store;
 mod network;
 mod node;
-mod snapshot;
+mod read_view;
+mod response;
 mod state_machine;
-mod state_machine_store;
 mod storage;
 mod types;
 
-pub use command::{Command, FileCommitMode};
-pub use log_store::{AppLogReader, AppLogStorage};
-pub use network::{Network, NetworkFactory};
-pub use node::AppRaftNode;
-pub use snapshot::SnapshotFile;
-pub use state_machine::AppRaftStateMachine;
-pub use state_machine_store::{AppSnapshotBuilder, StateMachineStorage};
-pub use storage::{AppliedResult, RocksDBStorage};
-pub use types::{
-    AppDataResponse, AppMetadataRaftState, BlockCommandResult, CommandFingerprint, DedupKey, DeleteIntentsResult,
-    FsCommandResult, FsErrnoResult, FsOkResult, LeaseCommandResult, MetadataNode, MetadataRaftTypeConfig,
-    MountCommandResult, ShardGroupInfo, WorkerCommandResult,
-};
+pub(crate) use command::proposal_timestamp_ms;
+pub(crate) use command::{Command, FileCommitMode, Mutation};
+pub(crate) use node::AppRaftNode;
+pub(crate) use read_view::{MetadataReadView, RoutingDelta};
+pub(crate) use response::{AppDataResponse, FsCommandResult, WorkerCommandResult};
+pub(crate) use state_machine::AppRaftStateMachine;
+pub(crate) use storage::{RocksDBStorage, StorageIdentity};
+pub(crate) use types::{AppMetadataRaftState, CommandFingerprint, DedupKey};

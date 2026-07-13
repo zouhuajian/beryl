@@ -204,7 +204,6 @@ impl MetadataConfig {
             fail_fast: get_bool_or(flat, METADATA_BOOTSTRAP_READY_FAIL_FAST, false)?,
         };
         let bootstrap = BootstrapConfig { root_readiness };
-
         Ok(Self {
             cluster_id,
             rpc_addr,

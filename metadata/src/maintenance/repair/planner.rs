@@ -15,8 +15,6 @@
 //! - Local testing of planning decisions without widening the product surface
 
 use super::actions::RepairAction;
-use super::orphan::OrphanQueue;
-use std::sync::Arc;
 use types::ids::{BlockId, WorkerId};
 
 /// Internal planner for converting maintenance observations into actions.
@@ -33,35 +31,16 @@ use types::ids::{BlockId, WorkerId};
 ///
 /// - Replication factor checks (current locations vs target)
 /// - Rebalance decisions (currently emits no copy actions)
-/// - orphan_queue: suspected orphan blocks (signals, not actions)
-///
 /// # Outputs
 ///
 /// - RepairAction::Replicate (when replication factor not met)
 /// - RepairAction::EvictReplica (for excess replicas)
-///
-/// Orphan/GC physical deletion is represented by DeleteIntent and consumed by
-/// DeleteExecutor, not by RepairPlanner.
-pub struct RepairPlanner {
-    /// Orphan queue stores *suspected* orphan blocks reported by workers.
-    ///
-    /// # Role
-    ///
-    /// Items in this queue are **signals**, not repair actions:
-    /// - Workers report blocks that exist on disk but not in metadata
-    /// - These are candidates for cleanup, but require confirmation
-    /// - This queue serves as input to repair decision logic
-    ///
-    /// RepairPlanner does NOT directly create delete work from orphan_queue.
-    /// Confirmed orphan cleanup is converted to DeleteIntent by maintenance.
-    _orphan_queue: Arc<OrphanQueue>,
-}
+#[derive(Default)]
+pub struct RepairPlanner;
 
 impl RepairPlanner {
-    pub fn new(orphan_queue: Arc<OrphanQueue>) -> Self {
-        Self {
-            _orphan_queue: orphan_queue,
-        }
+    pub fn new() -> Self {
+        Self
     }
 
     /// Plan replication actions for a block (pure planning, no side effects).

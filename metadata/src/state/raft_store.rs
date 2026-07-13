@@ -15,7 +15,7 @@ pub struct RaftStateStore {
 }
 
 impl RaftStateStore {
-    pub fn new(raft_node: Arc<AppRaftNode>) -> Self {
+    pub(crate) fn new(raft_node: Arc<AppRaftNode>) -> Self {
         Self { raft_node }
     }
 }
@@ -23,6 +23,6 @@ impl RaftStateStore {
 #[async_trait]
 impl StateStore for RaftStateStore {
     async fn get_route_epoch(&self) -> MetadataResult<RouteEpoch> {
-        self.raft_node.read(false, |sm| sm.storage().get_route_epoch()).await
+        self.raft_node.read(false, |_| Ok(self.raft_node.route_epoch())).await
     }
 }

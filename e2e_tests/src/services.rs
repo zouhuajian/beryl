@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use metadata::raft::AppRaftNode;
+use metadata::runtime::MetadataAuthority;
 use metadata::service::MetadataFileSystemServiceImpl;
 use metadata::worker::MetadataWorkerServiceImpl;
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProtoServer;
@@ -26,7 +26,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct MetadataServiceInstance {
     handle: ServerHandle,
-    raft_node: Option<Arc<AppRaftNode>>,
+    authority: Option<MetadataAuthority>,
 }
 
 impl MetadataServiceInstance {
@@ -34,7 +34,7 @@ impl MetadataServiceInstance {
         listener: TcpListener,
         filesystem: MetadataFileSystemServiceImpl,
         worker: MetadataWorkerServiceImpl,
-        raft_node: Arc<AppRaftNode>,
+        authority: MetadataAuthority,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -49,14 +49,14 @@ impl MetadataServiceInstance {
         });
         Self {
             handle: ServerHandle::new(shutdown_tx, task),
-            raft_node: Some(raft_node),
+            authority: Some(authority),
         }
     }
 
     pub async fn shutdown(&mut self) -> TestResult<()> {
         self.handle.shutdown().await?;
-        if let Some(raft_node) = self.raft_node.take() {
-            raft_node.shutdown().await?;
+        if let Some(authority) = self.authority.take() {
+            authority.shutdown().await?;
         }
         Ok(())
     }

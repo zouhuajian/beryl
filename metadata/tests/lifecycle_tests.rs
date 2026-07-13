@@ -3,16 +3,9 @@
 
 use metadata::config::{MetadataConfig, RaftMode};
 use metadata::lifecycle::{
-    format_metadata_storage, metadata_marker_path, prepare_metadata_start, MetadataStorageMarker,
+    format_metadata_storage, metadata_marker_path, prepare_metadata_start, FormatState, MetadataStorageMarker,
 };
-use metadata::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
-use metadata::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
-use metadata::readiness::{wait_for_root_ready, RootReadinessConfig, RootReadinessGate};
-use metadata::{ensure_root_mount_for_format, MountTable};
-use std::sync::Arc;
 use tempfile::TempDir;
-use types::ids::MountId;
-use types::GroupName;
 
 fn write_config(dir: &TempDir, group_name: &str, raft_mode: &str) -> std::path::PathBuf {
     let storage_dir = dir.path().join("metadata");
@@ -53,6 +46,22 @@ fn storage_entries(path: &std::path::Path) -> Vec<String> {
     entries
 }
 
+fn marker_for(config: &MetadataConfig, state: FormatState) -> MetadataStorageMarker {
+    MetadataStorageMarker {
+        state,
+        cluster_id: config.cluster_id.clone(),
+        group_name: config.authority.group_name.clone(),
+        node_id: config.raft.node_id,
+        storage_uuid: "test-storage".to_string(),
+        format_version: 2,
+        created_at_ms: 1,
+        software_version: "test".to_string(),
+        bootstrap_client_id: "42".to_string(),
+        bootstrap_call_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+        bootstrap_proposed_at_ms: 1,
+    }
+}
+
 #[tokio::test]
 async fn metadata_format_creates_marker_without_group_id() {
     let dir = TempDir::new().unwrap();
@@ -64,6 +73,8 @@ async fn metadata_format_creates_marker_without_group_id() {
     assert_eq!(marker.cluster_id, "test-cluster");
     assert_eq!(marker.group_name.as_str(), "root");
     assert_eq!(marker.node_id, 1);
+    assert_eq!(marker.state, FormatState::Ready);
+    assert_eq!(marker.format_version, 2);
     assert!(metadata_marker_path(&config).exists());
 
     let marker_json: serde_json::Value =
@@ -82,6 +93,89 @@ async fn metadata_format_refuses_existing_marker() {
     let err = format_metadata_storage(&config).await.unwrap_err();
 
     assert!(err.to_string().contains("already formatted"));
+}
+
+#[tokio::test]
+async fn metadata_format_resumes_matching_formatting_marker_with_stable_bootstrap_identity() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "root", "single");
+    let config = MetadataConfig::load(&config_path).unwrap();
+    std::fs::create_dir_all(&config.storage_dir).unwrap();
+    let formatting = marker_for(&config, FormatState::Formatting);
+    std::fs::write(
+        metadata_marker_path(&config),
+        serde_json::to_vec_pretty(&formatting).unwrap(),
+    )
+    .unwrap();
+
+    let ready = format_metadata_storage(&config).await.unwrap();
+
+    assert_eq!(ready.state, FormatState::Ready);
+    assert_eq!(ready.storage_uuid, formatting.storage_uuid);
+    assert_eq!(ready.bootstrap_client_id, formatting.bootstrap_client_id);
+    assert_eq!(ready.bootstrap_call_id, formatting.bootstrap_call_id);
+    assert_eq!(ready.bootstrap_proposed_at_ms, formatting.bootstrap_proposed_at_ms);
+}
+
+#[tokio::test]
+async fn metadata_format_recovers_synced_unpublished_marker_temp() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "root", "single");
+    let config = MetadataConfig::load(&config_path).unwrap();
+    std::fs::create_dir_all(&config.storage_dir).unwrap();
+    let formatting = marker_for(&config, FormatState::Formatting);
+    let marker_path = metadata_marker_path(&config);
+    std::fs::write(
+        marker_path.with_extension("json.tmp"),
+        serde_json::to_vec_pretty(&formatting).unwrap(),
+    )
+    .unwrap();
+
+    let ready = format_metadata_storage(&config).await.unwrap();
+
+    assert_eq!(ready.state, FormatState::Ready);
+    assert_eq!(ready.storage_uuid, formatting.storage_uuid);
+    assert_eq!(ready.bootstrap_call_id, formatting.bootstrap_call_id);
+    assert!(!marker_path.with_extension("json.tmp").exists());
+}
+
+#[tokio::test]
+async fn metadata_start_rejects_formatting_marker_without_mutating_storage() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "root", "single");
+    let config = MetadataConfig::load(&config_path).unwrap();
+    std::fs::create_dir_all(&config.storage_dir).unwrap();
+    let formatting = marker_for(&config, FormatState::Formatting);
+    std::fs::write(
+        metadata_marker_path(&config),
+        serde_json::to_vec_pretty(&formatting).unwrap(),
+    )
+    .unwrap();
+
+    let error = prepare_metadata_start(&config).await.unwrap_err();
+
+    assert!(error.to_string().contains("format is incomplete"));
+    assert!(!config.storage_dir.join("CURRENT").exists());
+}
+
+#[tokio::test]
+async fn metadata_format_validates_bootstrap_identity_before_creating_rocksdb() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "root", "single");
+    let config = MetadataConfig::load(&config_path).unwrap();
+    std::fs::create_dir_all(&config.storage_dir).unwrap();
+    let mut formatting = marker_for(&config, FormatState::Formatting);
+    formatting.bootstrap_call_id = "not-a-uuid".to_string();
+    std::fs::write(
+        metadata_marker_path(&config),
+        serde_json::to_vec_pretty(&formatting).unwrap(),
+    )
+    .unwrap();
+
+    let error = format_metadata_storage(&config).await.unwrap_err();
+
+    assert!(error.to_string().contains("bootstrap_call_id is invalid"));
+    assert!(!config.storage_dir.join("CURRENT").exists());
 }
 
 #[tokio::test]
@@ -119,15 +213,7 @@ async fn metadata_start_fails_when_marker_exists_without_rocksdb_state() {
     let config_path = write_config(&dir, "root", "single");
     let config = MetadataConfig::load(&config_path).unwrap();
     std::fs::create_dir_all(&config.storage_dir).unwrap();
-    let marker = MetadataStorageMarker {
-        cluster_id: config.cluster_id.clone(),
-        group_name: config.authority.group_name.clone(),
-        node_id: config.raft.node_id,
-        storage_uuid: "marker-only-storage".to_string(),
-        format_version: 1,
-        created_at_ms: 1,
-        software_version: "test".to_string(),
-    };
+    let marker = marker_for(&config, FormatState::Ready);
     std::fs::write(
         metadata_marker_path(&config),
         serde_json::to_vec_pretty(&marker).unwrap(),
@@ -161,6 +247,31 @@ async fn metadata_start_fails_on_marker_config_mismatch() {
 }
 
 #[tokio::test]
+async fn metadata_start_rejects_marker_from_another_storage() {
+    let first_dir = TempDir::new().unwrap();
+    let first_config_path = write_config(&first_dir, "root", "single");
+    let first_config = MetadataConfig::load(&first_config_path).unwrap();
+    format_metadata_storage(&first_config).await.unwrap();
+
+    let second_dir = TempDir::new().unwrap();
+    let second_config_path = write_config(&second_dir, "root", "single");
+    let second_config = MetadataConfig::load(&second_config_path).unwrap();
+    format_metadata_storage(&second_config).await.unwrap();
+
+    std::fs::write(
+        metadata_marker_path(&first_config),
+        std::fs::read(metadata_marker_path(&second_config)).unwrap(),
+    )
+    .unwrap();
+
+    let error = prepare_metadata_start(&first_config)
+        .await
+        .expect_err("a marker must be bound to exactly one RocksDB store");
+
+    assert!(error.to_string().contains("storage identity mismatch"), "{error}");
+}
+
+#[tokio::test]
 async fn metadata_marker_rejects_legacy_group_id_and_unknown_fields() {
     for extra_field in ["group_id", "unknown_field"] {
         let dir = TempDir::new().unwrap();
@@ -187,237 +298,32 @@ async fn metadata_marker_rejects_legacy_group_id_and_unknown_fields() {
         let err = prepare_metadata_start(&config).await.unwrap_err();
         let message = err.to_string();
         assert!(message.contains("old marker format unsupported"), "{message}");
-        assert!(message.contains("clean storage"), "{message}");
-        assert!(message.contains("future migration command"), "{message}");
+        assert!(message.contains("reformat metadata storage"), "{message}");
     }
 }
 
 #[tokio::test]
-async fn metadata_format_initializes_single_node_membership() {
+async fn metadata_start_rejects_format_v1_with_explicit_reformat_error() {
     let dir = TempDir::new().unwrap();
     let config_path = write_config(&dir, "root", "single");
     let config = MetadataConfig::load(&config_path).unwrap();
     format_metadata_storage(&config).await.unwrap();
-
-    let storage = Arc::new(RocksDBStorage::create_for_format(&config.storage_dir).unwrap());
-    let mount_table = Arc::new(MountTable::load_from_storage(storage.as_ref()).unwrap());
-    let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
-    let raft_node = AppRaftNode::new(config.raft.node_id, Arc::clone(&storage), state_machine, &config.raft)
-        .await
-        .unwrap();
-
-    assert!(raft_node.is_initialized().await.unwrap());
-}
-
-#[tokio::test]
-async fn metadata_start_readiness_does_not_create_missing_root_mount() {
-    let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-    let mount_table = Arc::new(MountTable::load_from_storage(storage.as_ref()).unwrap());
-    let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
-    let raft_config = metadata::config::RaftConfig {
-        mode: metadata::config::RaftMode::Single,
-        ..metadata::config::RaftConfig::default()
-    };
-    let raft_node = Arc::new(
-        AppRaftNode::new(raft_config.node_id, Arc::clone(&storage), state_machine, &raft_config)
-            .await
-            .unwrap(),
-    );
-    raft_node
-        .initialize_single_node("127.0.0.1:0".to_string())
-        .await
-        .unwrap();
-
-    let err = wait_for_root_ready(
-        raft_node,
-        Arc::clone(&mount_table),
-        GroupName::parse("root").unwrap(),
-        Arc::new(RootReadinessGate::new(None)),
-        RootReadinessConfig {
-            initial_backoff_ms: 1,
-            max_backoff_ms: 2,
-            warn_after_ms: 1,
-            timeout_ms: 10,
-            fail_fast: true,
-        },
-    )
-    .await
-    .unwrap_err();
-
-    let message = err.to_string();
-    assert!(message.contains("RootMountMissing"), "{message}");
-    assert!(mount_table
-        .list_mounts()
-        .into_iter()
-        .all(|mount| mount.mount_prefix != ROOT_MOUNT_PREFIX));
-    assert!(storage.get_inode(metadata::mount::ROOT_INODE_ID).unwrap().is_none());
-}
-
-#[tokio::test]
-async fn metadata_readiness_rejects_root_mount_with_wrong_owner_group() {
-    let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-    let mount_table = Arc::new(MountTable::load_from_storage(storage.as_ref()).unwrap());
-    mount_table
-        .upsert(MountEntry {
-            mount_id: MountId::new(1),
-            mount_prefix: ROOT_MOUNT_PREFIX.to_string(),
-            mount_kind: MountKind::Internal,
-            ufs_uri: None,
-            data_io_policy: DataIoPolicy::Forbid,
-            mount_epoch: 1,
-            namespace_owner_group_name: GroupName::parse("other").unwrap(),
-            root_inode_id: ROOT_INODE_ID,
-        })
-        .unwrap();
-    let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
-    let raft_config = metadata::config::RaftConfig {
-        mode: metadata::config::RaftMode::Single,
-        ..metadata::config::RaftConfig::default()
-    };
-    let raft_node = Arc::new(
-        AppRaftNode::new(raft_config.node_id, Arc::clone(&storage), state_machine, &raft_config)
-            .await
-            .unwrap(),
-    );
-    raft_node
-        .initialize_single_node("127.0.0.1:0".to_string())
-        .await
-        .unwrap();
-    let readiness_gate = Arc::new(RootReadinessGate::new(None));
-
-    let err = wait_for_root_ready(
-        raft_node,
-        Arc::clone(&mount_table),
-        GroupName::parse("root").unwrap(),
-        Arc::clone(&readiness_gate),
-        RootReadinessConfig {
-            initial_backoff_ms: 1,
-            max_backoff_ms: 2,
-            warn_after_ms: 1,
-            timeout_ms: 10,
-            fail_fast: true,
-        },
-    )
-    .await
-    .expect_err("wrong root owner group must not become ready");
-
-    let message = err.to_string();
-    assert!(
-        message.contains("owner group") || message.contains("RootMountOwnerMismatch"),
-        "{message}"
-    );
-    assert!(!readiness_gate.is_ready());
-}
-
-#[tokio::test]
-async fn metadata_format_creates_root_namespace_through_raft_path() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "root", "single");
-    let config = MetadataConfig::load(&config_path).unwrap();
-    format_metadata_storage(&config).await.unwrap();
-
-    prepare_metadata_start(&config).await.unwrap();
-
-    let storage = RocksDBStorage::create_for_format(&config.storage_dir).unwrap();
-    let mount_table = MountTable::load_from_storage(&storage).unwrap();
-    assert!(storage.get_inode(metadata::mount::ROOT_INODE_ID).unwrap().is_some());
-    assert!(mount_table
-        .list_mounts()
-        .into_iter()
-        .any(|mount| mount.mount_prefix == metadata::mount::ROOT_MOUNT_PREFIX));
-    let local = mount_table
-        .list_mounts()
-        .into_iter()
-        .find(|mount| mount.mount_prefix == "/local")
-        .expect("local writable mount should exist after format");
-    assert_eq!(local.mount_kind, MountKind::Internal);
-    assert_eq!(local.data_io_policy, DataIoPolicy::Allow);
-    assert_eq!(local.namespace_owner_group_name, GroupName::parse("root").unwrap());
-    assert!(storage.get_inode(local.root_inode_id).unwrap().is_some());
-}
-
-#[tokio::test]
-async fn metadata_start_rejects_old_local_layout_without_local_mount() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "root", "single");
-    let config = MetadataConfig::load(&config_path).unwrap();
-    let storage = Arc::new(RocksDBStorage::create_for_format(&config.storage_dir).unwrap());
-    let mount_table = Arc::new(MountTable::load_from_storage(storage.as_ref()).unwrap());
-    let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
-    let raft_node = Arc::new(
-        AppRaftNode::new(config.raft.node_id, Arc::clone(&storage), state_machine, &config.raft)
-            .await
-            .unwrap(),
-    );
-    raft_node
-        .initialize_single_node(config.rpc_addr.to_string())
-        .await
-        .unwrap();
-    ensure_root_mount_for_format(
-        Arc::clone(&raft_node),
-        Arc::clone(&mount_table),
-        config.authority.group_name.clone(),
-    )
-    .await
-    .unwrap();
-    raft_node.shutdown().await.unwrap();
-    let marker = MetadataStorageMarker {
-        cluster_id: config.cluster_id.clone(),
-        group_name: config.authority.group_name.clone(),
-        node_id: config.raft.node_id,
-        storage_uuid: "old-root-only-storage".to_string(),
-        format_version: 1,
-        created_at_ms: 1,
-        software_version: "test".to_string(),
-    };
+    let mut marker: MetadataStorageMarker =
+        serde_json::from_slice(&std::fs::read(metadata_marker_path(&config)).unwrap()).unwrap();
+    marker.format_version = 1;
     std::fs::write(
         metadata_marker_path(&config),
         serde_json::to_vec_pretty(&marker).unwrap(),
     )
     .unwrap();
-    drop(raft_node);
-    drop(mount_table);
-    drop(storage);
 
     let err = prepare_metadata_start(&config)
         .await
-        .expect_err("old local layout without /local must fail fast");
+        .expect_err("format v1 must fail fast");
     let message = err.to_string();
 
-    assert!(message.contains("missing required /local mount"), "{message}");
-    assert!(message.contains("older layout"), "{message}");
-    assert!(message.contains("Re-run metadata format"), "{message}");
-    let storage = RocksDBStorage::create_for_format(&config.storage_dir).unwrap();
-    let mounts = MountTable::load_from_storage(&storage).unwrap().list_mounts();
-    assert!(mounts.iter().all(|mount| mount.mount_prefix != "/local"));
-}
-
-#[tokio::test]
-async fn metadata_start_rejects_local_mount_without_data_io() {
-    let dir = TempDir::new().unwrap();
-    let config_path = write_config(&dir, "root", "single");
-    let config = MetadataConfig::load(&config_path).unwrap();
-    format_metadata_storage(&config).await.unwrap();
-    let storage = RocksDBStorage::create_for_format(&config.storage_dir).unwrap();
-    let mut local = MountTable::load_from_storage(&storage)
-        .unwrap()
-        .list_mounts()
-        .into_iter()
-        .find(|mount| mount.mount_prefix == "/local")
-        .expect("/local mount after format");
-    local.data_io_policy = DataIoPolicy::Forbid;
-    storage.put_mount(&local).unwrap();
-    drop(storage);
-
-    let err = prepare_metadata_start(&config)
-        .await
-        .expect_err("/local must be writable for data IO on start");
-    let message = err.to_string();
-
-    assert!(message.contains("local writable mount"), "{message}");
-    assert!(message.contains("violates"), "{message}");
+    assert!(message.contains("format_version=1"), "{message}");
+    assert!(message.contains("reformat metadata storage"), "{message}");
 }
 
 #[tokio::test]
@@ -445,41 +351,4 @@ async fn metadata_cluster_mode_fails_as_unsupported() {
 
     assert!(format_err.to_string().contains("cluster Raft mode is not implemented"));
     assert!(start_err.to_string().contains("cluster Raft mode is not implemented"));
-}
-
-#[tokio::test]
-async fn metadata_readiness_timeout_reports_raft_reason() {
-    let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-    let mount_table = Arc::new(MountTable::load_from_storage(storage.as_ref()).unwrap());
-    let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
-    let raft_config = metadata::config::RaftConfig {
-        mode: metadata::config::RaftMode::Single,
-        ..metadata::config::RaftConfig::default()
-    };
-    let raft_node = Arc::new(
-        AppRaftNode::new(raft_config.node_id, Arc::clone(&storage), state_machine, &raft_config)
-            .await
-            .unwrap(),
-    );
-
-    let err = wait_for_root_ready(
-        raft_node,
-        mount_table,
-        GroupName::parse("root").unwrap(),
-        Arc::new(RootReadinessGate::new(None)),
-        RootReadinessConfig {
-            initial_backoff_ms: 1,
-            max_backoff_ms: 2,
-            warn_after_ms: 1,
-            timeout_ms: 10,
-            fail_fast: true,
-        },
-    )
-    .await
-    .unwrap_err();
-
-    let message = err.to_string();
-    assert!(message.contains("RaftUninitialized"));
-    assert!(message.contains("root readiness timed out"));
 }

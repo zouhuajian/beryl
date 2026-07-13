@@ -145,45 +145,6 @@ impl RootReadinessGate {
     }
 }
 
-pub async fn wait_for_root_ready(
-    raft_node: Arc<AppRaftNode>,
-    mount_table: Arc<MountTable>,
-    namespace_owner_group_name: GroupName,
-    readiness_gate: Arc<RootReadinessGate>,
-    config: RootReadinessConfig,
-) -> MetadataResult<()> {
-    wait_for_root_ready_with_metrics(
-        raft_node,
-        mount_table,
-        namespace_owner_group_name,
-        readiness_gate,
-        config,
-        None,
-    )
-    .await
-}
-
-pub async fn wait_for_root_ready_with_metrics(
-    raft_node: Arc<AppRaftNode>,
-    mount_table: Arc<MountTable>,
-    namespace_owner_group_name: GroupName,
-    readiness_gate: Arc<RootReadinessGate>,
-    config: RootReadinessConfig,
-    metrics: Option<Arc<MetadataMetrics>>,
-) -> MetadataResult<()> {
-    wait_for_root_ready_inner(RootReadyInputs {
-        raft_node,
-        mount_table,
-        storage: None,
-        namespace_owner_group_name: namespace_owner_group_name.clone(),
-        readiness_gate,
-        config,
-        metrics,
-        log_fields: RootReadinessLogFields::unknown(&namespace_owner_group_name),
-    })
-    .await
-}
-
 pub(crate) struct RootReadyInputs {
     pub(crate) raft_node: Arc<AppRaftNode>,
     pub(crate) mount_table: Arc<MountTable>,
@@ -237,10 +198,10 @@ async fn wait_for_root_ready_inner(inputs: RootReadyInputs) -> MetadataResult<()
             }
             if existing.mount_kind != MountKind::Internal
                 || existing.ufs_uri.is_some()
-                || existing.data_io_policy != DataIoPolicy::Forbid
+                || existing.data_io_policy != DataIoPolicy::Allow
             {
                 return Err(MetadataError::InvalidArgument(
-                    "root mount exists but violates internal/no-ufs/forbid-data-io invariants".to_string(),
+                    "root mount exists but violates writable internal root invariants".to_string(),
                 ));
             }
             if existing.namespace_owner_group_name != namespace_owner_group_name {
@@ -328,3 +289,6 @@ async fn wait_for_root_ready_inner(inputs: RootReadyInputs) -> MetadataResult<()
         backoff_ms = (backoff_ms * 2).min(config.max_backoff_ms.max(backoff_ms));
     }
 }
+
+#[path = "readiness/tests.rs"]
+mod tests;

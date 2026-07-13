@@ -6,7 +6,7 @@
 use super::domain::RequestContext;
 use crate::data_io::DataIoOp;
 use crate::error::{to_rpc_error, MetadataError};
-use crate::mount::{DataIoPolicy, MountTable, ROOT_MOUNT_PREFIX};
+use crate::mount::{DataIoPolicy, MountTable};
 use crate::raft::AppRaftNode;
 use crate::readiness::RootReadinessGate;
 use common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint, RpcErrorDetail};
@@ -166,14 +166,13 @@ impl DataIoPolicyGuard {
             return Ok(());
         }
 
-        let reason = if mount_entry.mount_prefix == ROOT_MOUNT_PREFIX {
-            "RootDataIoForbidden"
-        } else {
-            "MountHasNoUfs"
-        };
         let err = RpcErrorDetail::fs(
             FsErrorCode::ENotsup,
-            format!("{reason}: op={} mount_prefix={}", op.as_str(), mount_entry.mount_prefix),
+            format!(
+                "MountDataIoForbidden: op={} mount_prefix={}",
+                op.as_str(),
+                mount_entry.mount_prefix
+            ),
         );
         Err(GuardFailure::new(err).with_mount(
             Some(mount_entry.namespace_owner_group_name),
@@ -186,7 +185,7 @@ impl DataIoPolicyGuard {
 mod tests {
     use super::*;
     use crate::config::RaftConfig;
-    use crate::mount::{DataIoPolicy, MountKind, ROOT_INODE_ID};
+    use crate::mount::{DataIoPolicy, MountKind, ROOT_INODE_ID, ROOT_MOUNT_PREFIX};
     use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
     use crate::readiness::RootReadinessGate;
     use common::error::rpc::InternalErrorKind;
@@ -244,9 +243,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
-        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
+        let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
         let raft_config = RaftConfig::default();
-        let raft_node = Arc::new(AppRaftNode::new(1, storage, state_machine, &raft_config).await.unwrap());
+        let raft_node = Arc::new(
+            AppRaftNode::new(1, storage, state_machine, Arc::clone(&mount_table), &raft_config)
+                .await
+                .unwrap(),
+        );
         assert!(!raft_node.is_leader());
         let chain = GuardChain::new(mount_table).with_raft_node(Some(raft_node));
 
@@ -259,11 +262,11 @@ mod tests {
     #[tokio::test]
     async fn check_data_write_checks_leadership_before_data_io_policy() {
         let mount_table = Arc::new(MountTable::new());
-        let root_entry = mount_table
+        let mount_entry = mount_table
             .create_mount(
-                ROOT_MOUNT_PREFIX.to_string(),
-                MountKind::Internal,
-                None,
+                "/archive".to_string(),
+                MountKind::External,
+                Some("s3://archive".to_string()),
                 DataIoPolicy::Forbid,
                 group_name("root"),
                 ROOT_INODE_ID,
@@ -272,7 +275,7 @@ mod tests {
         let chain = GuardChain::new(Arc::clone(&mount_table));
 
         let err = chain
-            .check_data_write(&request_context(3), root_entry.mount_id)
+            .check_data_write(&request_context(3), mount_entry.mount_id)
             .await
             .unwrap_err();
         assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
@@ -280,28 +283,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn data_io_guard_forbids_root() {
+    async fn data_io_guard_allows_writable_root() {
         let mount_table = Arc::new(MountTable::new());
         let root_entry = mount_table
             .create_mount(
                 ROOT_MOUNT_PREFIX.to_string(),
                 MountKind::Internal,
                 None,
-                DataIoPolicy::Forbid,
+                DataIoPolicy::Allow,
                 group_name("root"),
                 ROOT_INODE_ID,
             )
             .unwrap();
         let chain = GuardChain::new(Arc::clone(&mount_table));
 
-        let err = chain
+        chain
             .check_data_read(&request_context(3), root_entry.mount_id)
             .await
-            .unwrap_err();
-        assert_eq!(err.err.kind, ErrorKind::Fs(FsErrorCode::ENotsup));
-        assert_eq!(err.err.recovery, RecoveryAction::Fail);
-        assert!(err.err.message.contains("RootDataIoForbidden"));
-        assert_eq!(err.group_name, Some(root_entry.namespace_owner_group_name.clone()));
-        assert_eq!(err.mount_epoch, Some(root_entry.mount_epoch));
+            .unwrap();
     }
 }

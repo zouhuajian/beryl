@@ -353,7 +353,10 @@ impl<'a> WriteSessionCoordinator<'a> {
             }
         };
 
-        let route_epoch = self.core.authoritative_route_epoch().await;
+        let route_epoch = match self.core.authoritative_route_epoch().await {
+            Ok(route_epoch) => Some(route_epoch),
+            Err(error) => return self.core.failure_from_error(&req.ctx, error, group_name, mount_epoch),
+        };
         self.core.success_with_route_epoch(
             &req.ctx,
             RenewLeaseOutput { expires_at_ms },
@@ -548,16 +551,19 @@ impl<'a> WriteSessionCoordinator<'a> {
                     .failure_from_error(&req.ctx, err, group_name.clone(), mount_epoch)
             }
         };
-        let command = Command::SyncWrite {
+        let command = Command::new(
             dedup,
-            inode_id: session.inode_id,
-            extents,
-            target_size: req.target_size,
-            lease_id: session.lease_id,
-            open_epoch: session.open_epoch,
-            lease_epoch: req.lease_epoch,
-            commit_mode: Self::commit_mode_for_session(&session),
-        };
+            crate::raft::proposal_timestamp_ms(),
+            crate::raft::Mutation::SyncWrite {
+                inode_id: session.inode_id,
+                extents,
+                target_size: req.target_size,
+                lease_id: session.lease_id,
+                open_epoch: session.open_epoch,
+                lease_epoch: req.lease_epoch,
+                commit_mode: Self::commit_mode_for_session(&session),
+            },
+        );
         let file_version = match self.core.propose_fs_write_command(CoreWriteOp::SetAttr, command).await {
             Ok(FsCommandResult::Ok(ok)) => ok.file_version,
             Ok(FsCommandResult::Err(err)) => {
@@ -607,7 +613,7 @@ impl<'a> WriteSessionCoordinator<'a> {
             }
         };
 
-        let inode = match storage.get_inode(inode_id) {
+        let inode = match self.core.read_inode(inode_id) {
             Ok(Some(inode)) => inode,
             Ok(None) => {
                 return self.core.failure_from_error(
@@ -669,7 +675,7 @@ impl<'a> WriteSessionCoordinator<'a> {
         };
 
         let desired_len = req.desired_len.unwrap_or(4 * 1024 * 1024);
-        let layout = match storage.get_layout(inode_id) {
+        let layout = match self.core.read_layout(inode_id) {
             Ok(layout) => layout,
             Err(err) => {
                 return self.core.failure_from_error(&req.ctx, err, group_name, mount_epoch);
@@ -1253,13 +1259,12 @@ impl<'a> WriteSessionCoordinator<'a> {
             Err(err) => return self.core.failure_from_error(&req.ctx, err, None, None),
         };
 
-        if let Some(replay) = self.replay_close_write_if_applied(&req, &dedup).await {
-            return replay;
-        }
-
         let session = match self.core.write_session_manager.get_session(file_handle) {
             Some(session) => session,
             None => {
+                if let Some(replay) = self.replay_close_write_if_applied(&req, &dedup).await {
+                    return replay;
+                }
                 return self.core.session_terminal_failure(
                     &req.ctx,
                     ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
@@ -1434,16 +1439,19 @@ impl<'a> WriteSessionCoordinator<'a> {
             Err(failure) => return Err(failure),
         };
 
-        let command = Command::CloseWrite {
+        let command = Command::new(
             dedup,
-            inode_id: session.inode_id,
-            extents,
-            final_size: req.intent.final_size,
-            lease_id: session.lease_id,
-            open_epoch: session.open_epoch,
-            lease_epoch: request_lease_epoch,
-            commit_mode: Self::commit_mode_for_session(&session),
-        };
+            crate::raft::proposal_timestamp_ms(),
+            crate::raft::Mutation::CloseWrite {
+                inode_id: session.inode_id,
+                extents,
+                final_size: req.intent.final_size,
+                lease_id: session.lease_id,
+                open_epoch: session.open_epoch,
+                lease_epoch: request_lease_epoch,
+                commit_mode: Self::commit_mode_for_session(&session),
+            },
+        );
         let file_version = match self.core.propose_fs_write_command(CoreWriteOp::SetAttr, command).await {
             Ok(FsCommandResult::Ok(ok)) => ok.file_version,
             Ok(FsCommandResult::Err(err)) => {
@@ -1512,7 +1520,10 @@ impl<'a> WriteSessionCoordinator<'a> {
             ));
         }
 
-        let route_epoch = self.core.authoritative_route_epoch().await;
+        let route_epoch = match self.core.authoritative_route_epoch().await {
+            Ok(route_epoch) => Some(route_epoch),
+            Err(error) => return Some(self.core.failure_from_error(&req.ctx, error, group_name, mount_epoch)),
+        };
         match applied.result {
             AppDataResponse::Fs(FsCommandResult::Ok(ok)) => Some(self.core.success_with_route_epoch(
                 &req.ctx,
@@ -1567,8 +1578,9 @@ impl<'a> WriteSessionCoordinator<'a> {
                     token_block.data_handle_id
                 ))
             })?;
-        let inode = storage
-            .get_inode(inode_id)?
+        let inode = self
+            .core
+            .read_inode(inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {}", inode_id)))?;
         let (group_name, mount_epoch) = self.core.mount_hints_for_mount(inode.mount_id);
 
@@ -1586,15 +1598,20 @@ impl<'a> WriteSessionCoordinator<'a> {
             })
             .collect();
 
-        let build_command = |commit_mode| Command::CloseWrite {
-            dedup: dedup.clone(),
-            inode_id,
-            extents: extents.clone(),
-            final_size: req.intent.final_size,
-            lease_id,
-            open_epoch: req.open_epoch,
-            lease_epoch: req.lease_epoch,
-            commit_mode,
+        let build_command = |commit_mode| {
+            Command::new(
+                dedup.clone(),
+                crate::raft::proposal_timestamp_ms(),
+                crate::raft::Mutation::CloseWrite {
+                    inode_id,
+                    extents: extents.clone(),
+                    final_size: req.intent.final_size,
+                    lease_id,
+                    open_epoch: req.open_epoch,
+                    lease_epoch: req.lease_epoch,
+                    commit_mode,
+                },
+            )
         };
 
         let replace = build_command(FileCommitMode::Replace);

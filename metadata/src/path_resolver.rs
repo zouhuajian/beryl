@@ -60,7 +60,7 @@ pub struct PathResolver {
 }
 
 impl PathResolver {
-    pub fn new(mount_table: Arc<MountTable>, storage: Arc<RocksDBStorage>) -> Self {
+    pub(crate) fn new(mount_table: Arc<MountTable>, storage: Arc<RocksDBStorage>) -> Self {
         Self { mount_table, storage }
     }
 
@@ -207,7 +207,7 @@ impl PathResolver {
         }
 
         // Optionally check if entry already exists (for lookup operations)
-        let inode_id = self.storage.get_dentry(parent_inode_id, &name).ok().flatten();
+        let inode_id = self.storage.get_dentry(parent_inode_id, &name)?;
 
         Ok(ResolvedPath {
             mount_ctx: MountContext {
@@ -287,10 +287,15 @@ impl PathResolver {
 mod tests {
     use super::*;
     use crate::mount::{DataIoPolicy, MountKind, MountTable};
+    use crate::raft::RocksDBStorage;
     use tempfile::TempDir;
     use types::fs::{FileAttrs, Inode, InodeId};
     use types::ids::DataHandleId;
     use types::GroupName;
+
+    fn test_resolver(mount_table: Arc<MountTable>, storage: Arc<RocksDBStorage>) -> PathResolver {
+        PathResolver::new(mount_table, storage)
+    }
 
     #[test]
     fn test_normalize() {
@@ -321,7 +326,7 @@ mod tests {
             )
             .unwrap();
 
-        let resolver = PathResolver::new(mount_table.clone(), storage);
+        let resolver = test_resolver(mount_table.clone(), storage);
 
         // Test mount resolution
         let (mount, components) = resolver.resolve_mount("/mnt/s3/file.txt").unwrap();
@@ -351,7 +356,7 @@ mod tests {
                 "/".to_string(),
                 crate::mount::MountKind::Internal,
                 None,
-                crate::mount::DataIoPolicy::Forbid,
+                crate::mount::DataIoPolicy::Allow,
                 GroupName::parse("g3").unwrap(),
                 InodeId::new(3),
             )
@@ -423,7 +428,7 @@ mod tests {
             .unwrap();
         storage.put_dentry(dir_b, "c", file_c).unwrap();
 
-        let resolver = PathResolver::new(mount_table, storage);
+        let resolver = test_resolver(mount_table, storage);
         let resolved = resolver.resolve_inode("/mnt/test/a/b/c").unwrap();
         assert_eq!(resolved.expect_inode().unwrap(), file_c);
         assert_eq!(resolved.expect_parent().unwrap(), dir_b);
@@ -470,7 +475,7 @@ mod tests {
             .unwrap();
         storage.put_dentry(dir_a, "b", dir_b).unwrap();
 
-        let resolver = PathResolver::new(mount_table, storage);
+        let resolver = test_resolver(mount_table, storage);
         let resolved = resolver.resolve_path("/mnt/test2/a/b/new-file").unwrap();
         assert_eq!(resolved.expect_parent().unwrap(), dir_b);
         assert_eq!(resolved.expect_name().unwrap(), "new-file");

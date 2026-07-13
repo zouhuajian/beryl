@@ -20,7 +20,7 @@ use types::{ClientId, WorkerRunId};
 async fn committed_file_is_readable_after_worker_restart_full_report_convergence() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
-    let path = "/local/worker-restart/committed";
+    let path = "/worker-restart/committed";
     let payload = write_closed_file(&cluster, path, 1_537, 1024)
         .await
         .expect("write committed file");
@@ -55,7 +55,7 @@ async fn committed_file_is_readable_after_worker_restart_full_report_convergence
 async fn read_locations_before_full_report_convergence_are_unavailable_then_recover() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
-    let path = "/local/worker-restart/pre-convergence";
+    let path = "/worker-restart/pre-convergence";
     let payload = write_closed_file(&cluster, path, 1_537, 1024)
         .await
         .expect("write committed file");
@@ -82,7 +82,7 @@ async fn read_locations_before_full_report_convergence_are_unavailable_then_reco
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_old_worker_run_is_rejected_after_restart() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
-    let path = "/local/worker-restart/stale-run";
+    let path = "/worker-restart/stale-run";
     let payload = write_closed_file(&cluster, path, 1_537, 1024)
         .await
         .expect("write committed file");
@@ -115,7 +115,7 @@ async fn stale_old_worker_run_is_rejected_after_restart() {
 async fn multi_block_file_is_readable_after_worker_restart_full_report_convergence() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
     let client = cluster.client().clone();
-    let path = "/local/worker-restart/multi-block";
+    let path = "/worker-restart/multi-block";
     let payload = write_closed_file(&cluster, path, 5_123, 1024)
         .await
         .expect("write multi-block file");
@@ -146,7 +146,7 @@ async fn write_closed_file(
 ) -> TestResult<Bytes> {
     cluster
         .client()
-        .mkdirs("/local/worker-restart", true)
+        .mkdirs("/worker-restart", true)
         .await
         .expect("create worker restart dir");
     let payload = Bytes::from(deterministic_bytes(payload_len));

@@ -12,8 +12,9 @@ use common::observe::ObservabilityConfig;
 use common::FlatConfig;
 use metadata::config::{BootstrapConfig, MetadataAuthorityConfig, MetadataConfig, RaftConfig, WorkerConfig};
 use metadata::lifecycle::format_metadata_storage;
+use metadata::lifecycle::prepare_metadata_start;
 use metadata::runtime::{build_authority, build_filesystem_service, build_readiness};
-use metadata::worker::{MetadataWorkerServiceImpl, WorkerManager};
+use metadata::worker::WorkerManager;
 use tokio::net::TcpListener;
 use types::{GroupName, Tier, WorkerId, WorkerRunId};
 use worker::config::{
@@ -64,7 +65,7 @@ impl TestCluster {
         let metadata_config = metadata_config(temp_state.metadata_dir(), metadata_addr, group_name.clone())?;
         format_metadata_storage(&metadata_config).await?;
         let (metadata_server, worker_manager) =
-            start_metadata_instance(&metadata_config, metadata_port.into_listener(), &group_name).await?;
+            start_metadata_instance(&metadata_config, metadata_port.into_listener()).await?;
 
         let client = client_for(metadata_addr, group_name.clone())?;
         readiness::wait_for_metadata_filesystem(&client).await?;
@@ -170,8 +171,7 @@ impl TestCluster {
     pub async fn restart_metadata(&mut self) -> TestResult<()> {
         self.metadata_server.shutdown().await?;
         let listener = TcpListener::bind(self.metadata_addr).await?;
-        let (metadata_server, worker_manager) =
-            start_metadata_instance(&self.metadata_config, listener, &self.group_name).await?;
+        let (metadata_server, worker_manager) = start_metadata_instance(&self.metadata_config, listener).await?;
         self.metadata_server = metadata_server;
         self.worker_manager = worker_manager;
 
@@ -226,14 +226,16 @@ impl Drop for TestCluster {
 async fn start_metadata_instance(
     metadata_config: &MetadataConfig,
     listener: TcpListener,
-    group_name: &GroupName,
 ) -> TestResult<(MetadataServiceInstance, Arc<WorkerManager>)> {
+    prepare_metadata_start(metadata_config)
+        .await
+        .map_err(|err| io::Error::other(err.to_string()))?;
     let authority = build_authority(metadata_config)
         .await
         .map_err(|err| io::Error::other(err.to_string()))?;
     let worker_manager = Arc::new(WorkerManager::new(60));
     worker_manager.reset_worker_soft_state();
-    authority.raft_node.set_worker_manager(Arc::clone(&worker_manager))?;
+    worker_manager.load_registered_workers(authority.registered_workers()?)?;
     let readiness_state = build_readiness(metadata_config, &authority).await;
     let filesystem = build_filesystem_service(
         metadata_config,
@@ -243,14 +245,8 @@ async fn start_metadata_instance(
     )
     .await
     .map_err(|err| io::Error::other(err.to_string()))?;
-    let worker_control = MetadataWorkerServiceImpl::new(
-        Arc::clone(&authority.raft_node),
-        Arc::clone(&worker_manager),
-        Arc::clone(&authority.mount_table),
-        group_name.clone(),
-    );
-    let metadata_server =
-        MetadataServiceInstance::start(listener, filesystem, worker_control, Arc::clone(&authority.raft_node));
+    let worker_control = authority.worker_service(Arc::clone(&worker_manager));
+    let metadata_server = MetadataServiceInstance::start(listener, filesystem, worker_control, authority);
     Ok((metadata_server, worker_manager))
 }
 

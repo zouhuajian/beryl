@@ -21,7 +21,7 @@ pub struct MsyncHandler {
 
 impl MsyncHandler {
     /// Create an Msync handler bound to one authoritative metadata group.
-    pub fn new(raft_node: Arc<AppRaftNode>, group_name: GroupName) -> Self {
+    pub(crate) fn new(raft_node: Arc<AppRaftNode>, group_name: GroupName) -> Self {
         Self { raft_node, group_name }
     }
 

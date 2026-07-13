@@ -23,7 +23,6 @@ pub use core_util::{
 pub(crate) use fs_core::FsCore;
 pub use fs_core::SharedWorkerCommitHook;
 pub use guard::{GuardChain, GuardFailure};
-pub use msync::MsyncHandler;
-pub use path_service::{
-    FileSystemAuthorityDeps, FileSystemRuntimeDeps, MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl,
-};
+pub(crate) use msync::MsyncHandler;
+pub use path_service::MetadataFileSystemServiceImpl;
+pub(crate) use path_service::{FileSystemAuthorityDeps, FileSystemRuntimeDeps, MetadataFileSystemServiceDeps};

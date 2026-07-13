@@ -47,7 +47,7 @@ Vecton is a Rust-based distributed storage/cache layer for big data and AI workl
 - `route_epoch`, `mount_epoch`, and `GroupStateWatermark` are active freshness checks.
 - UFS is present as an adapter boundary, but current reads and writes do not use it.
 - Multi-group metadata is future work.
-- `/local` is the current local development namespace.
+- The internal writable namespace is rooted at `/`; `/local` has no special namespace semantics.
 
 ## What Works Today
 

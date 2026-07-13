@@ -165,11 +165,7 @@ impl FsCore {
         req_ctx: &RequestContext,
         inode_id: InodeId,
     ) -> CoreResult<InodeMountGuardInputs> {
-        let storage = match self.storage_for_ctx(req_ctx) {
-            Ok(storage) => storage,
-            Err(failure) => return Err(failure),
-        };
-        let inode = match storage.get_inode(inode_id) {
+        let inode = match self.read_inode(inode_id) {
             Ok(Some(inode)) => inode,
             Ok(None) => {
                 return self.failure_from_error(
@@ -195,19 +191,7 @@ impl FsCore {
     pub(crate) async fn execute_get_attr(&self, req: GetAttrInput) -> CoreResult<GetAttrOutput> {
         let started = Instant::now();
         let result = async {
-            let storage = match self.storage.as_ref() {
-                Some(storage) => storage,
-                None => {
-                    return self.failure_from_error(
-                        &req.ctx,
-                        MetadataError::Internal("Storage not available".to_string()),
-                        None,
-                        None,
-                    );
-                }
-            };
-
-            let inode = match storage.get_inode(req.inode_id) {
+            let inode = match self.read_inode(req.inode_id) {
                 Ok(Some(inode)) => inode,
                 Ok(None) => {
                     return self.failure_from_error(
@@ -284,7 +268,7 @@ impl FsCore {
                 }
             };
 
-            let parent_inode = match storage.get_inode(req.parent_inode_id) {
+            let parent_inode = match self.read_inode(req.parent_inode_id) {
                 Ok(Some(parent_inode)) => parent_inode,
                 Ok(None) => {
                     return self.failure_from_error(
@@ -318,7 +302,7 @@ impl FsCore {
 
             let mut dir_entries = Vec::with_capacity(entries.len());
             for (name, child_inode_id) in entries {
-                let child_inode = match storage.get_inode(child_inode_id) {
+                let child_inode = match self.read_inode(child_inode_id) {
                     Ok(Some(child_inode)) => child_inode,
                     Ok(None) => {
                         return self.failure_from_error_with_route_epoch(
@@ -370,19 +354,7 @@ impl FsCore {
     pub(crate) async fn execute_get_file_layout(&self, req: GetFileLayoutInput) -> CoreResult<GetFileLayoutOutput> {
         let started = Instant::now();
         let result = async {
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-            }
-        };
-
-        let inode = match storage.get_inode(req.inode_id) {
+        let inode = match self.read_inode(req.inode_id) {
             Ok(Some(inode)) => inode,
             Ok(None) => {
                 return self.failure_from_error(
@@ -439,10 +411,7 @@ impl FsCore {
                 );
             }
         }
-        if let Err(err) = storage.validate_data_handle_owner(data_handle_id, Some(req.inode_id)) {
-            return self.failure_from_error_with_route_epoch(&req.ctx, err, group_name, mount_epoch, route_epoch);
-        }
-        let layout = match storage.get_layout(req.inode_id) {
+        let layout = match self.read_layout(req.inode_id) {
             Ok(layout) => layout,
             Err(err) => {
                 return self.failure_from_error_with_route_epoch(&req.ctx, err, group_name, mount_epoch, route_epoch)

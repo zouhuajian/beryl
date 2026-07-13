@@ -12,7 +12,7 @@
 - Namespace delete is active; complete physical resident-block reclamation is not productized unless explicitly implemented and tested.
 - `route_epoch`, `mount_epoch`, and `GroupStateWatermark` are active correctness mechanisms, not future-only noise.
 - Multi-group metadata is future work.
-- `/local` is a current local development namespace, not the product identity.
+- The internal writable namespace is rooted at `/`; `/local` has no special namespace semantics.
 
 ## Core Rules
 

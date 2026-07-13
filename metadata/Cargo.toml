@@ -44,7 +44,9 @@ openraft = { workspace = true, features = ["serde", "storage-v2"] }
 
 # Storage
 rocksdb = { workspace = true, default-features = false, features = ["snappy"] }
+fs2 = { workspace = true }
 bincode = { workspace = true }
+lru = { workspace = true }
 
 # Hashing (for stable worker identity)
 sha2 = { workspace = true }

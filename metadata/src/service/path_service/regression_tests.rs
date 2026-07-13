@@ -3,21 +3,20 @@
 
 //! Behavioral regression tests for path service guard/error contracts.
 
+use crate::config::RaftConfig;
+use crate::mount::{DataIoPolicy, MountKind, MountTable, ROOT_INODE_ID};
+use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
+use crate::readiness::RootReadinessGate;
+use crate::service::{
+    FileSystemAuthorityDeps, FileSystemRuntimeDeps, MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl,
+    SharedWorkerCommitHook,
+};
+use crate::state::RouteEpoch;
+use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerManager};
 use common::error::rpc::{
     ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail,
 };
 use common::header::RequestHeader;
-use metadata::config::RaftConfig;
-use metadata::mount::{DataIoPolicy, MountKind, MountTable, ROOT_INODE_ID};
-use metadata::raft::{AppMetadataRaftState, AppRaftNode, AppRaftStateMachine, RocksDBStorage};
-use metadata::readiness::RootReadinessGate;
-use metadata::service::{
-    FileSystemAuthorityDeps, FileSystemRuntimeDeps, MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl,
-    SharedWorkerCommitHook,
-};
-use metadata::state::RouteEpoch;
-use metadata::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerManager};
-use openraft::{LeaderId, LogId};
 use proto::common::{
     DataHandleIdProto, FsErrnoProto, GroupStateWatermarkProto, RaftLogIdProto, RequestHeaderProto, ResponseHeaderProto,
 };
@@ -46,8 +45,9 @@ struct PathTestEnv {
     _temp_dir: TempDir,
     storage: Arc<RocksDBStorage>,
     mount_table: Arc<MountTable>,
+    raft_node: Option<Arc<AppRaftNode>>,
     service: MetadataFileSystemServiceImpl,
-    write_session_manager: Arc<metadata::write_session::WriteSessionManager>,
+    write_session_manager: Arc<crate::write_session::WriteSessionManager>,
     worker_manager: Option<Arc<WorkerManager>>,
     mount_id: types::ids::MountId,
     root_inode_id: InodeId,
@@ -66,8 +66,8 @@ impl TestStateStore {
 }
 
 #[async_trait::async_trait]
-impl metadata::state::StateStore for TestStateStore {
-    async fn get_route_epoch(&self) -> metadata::MetadataResult<RouteEpoch> {
+impl crate::state::StateStore for TestStateStore {
+    async fn get_route_epoch(&self) -> crate::MetadataResult<RouteEpoch> {
         Ok(self.route_epoch)
     }
 }
@@ -185,18 +185,6 @@ fn watermark_proto(group_name: &str, state_id: RaftLogId) -> GroupStateWatermark
             index: state_id.index,
         }),
     }
-}
-
-fn persist_last_applied(env: &PathTestEnv, state_id: RaftLogId) {
-    env.storage
-        .persist_raft_state(&AppMetadataRaftState {
-            last_applied_log_id: Some(LogId::new(
-                LeaderId::new(state_id.term, state_id.leader_node_id),
-                state_id.index,
-            )),
-            ..Default::default()
-        })
-        .expect("persist last_applied state");
 }
 
 fn header_error(response_header: Option<ResponseHeaderProto>) -> proto::common::ErrorDetailProto {
@@ -330,9 +318,9 @@ fn build_env(
         .put_inode(&Inode::new_dir(root_inode_id, root_attrs, mount_entry.mount_id))
         .expect("put root inode");
 
-    let state_store: Arc<dyn metadata::state::StateStore> = Arc::new(TestStateStore::new());
-    let write_session_manager = Arc::new(metadata::write_session::WriteSessionManager::default());
-    let inode_lease_manager = Arc::new(metadata::inode_lease::InodeLeaseManager::default());
+    let state_store: Arc<dyn crate::state::StateStore> = Arc::new(TestStateStore::new());
+    let write_session_manager = Arc::new(crate::write_session::WriteSessionManager::default());
+    let inode_lease_manager = Arc::new(crate::inode_lease::InodeLeaseManager::default());
     let worker_commit_hook: SharedWorkerCommitHook = Arc::new(Mutex::new(None));
 
     let service = MetadataFileSystemServiceImpl::new(MetadataFileSystemServiceDeps {
@@ -351,12 +339,14 @@ fn build_env(
             metrics: None,
             readiness_gate,
         },
-    });
+    })
+    .unwrap();
 
     PathTestEnv {
         _temp_dir: temp_dir,
         storage,
         mount_table,
+        raft_node: None,
         service,
         write_session_manager,
         worker_manager: None,
@@ -419,12 +409,18 @@ async fn build_env_with_optional_raft(
         .put_inode(&Inode::new_dir(root_inode_id, root_attrs, mount_entry.mount_id))
         .expect("put root inode");
 
-    let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table)));
+    let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
     let raft_config = RaftConfig::default();
     let raft_node = Arc::new(
-        AppRaftNode::new(1, Arc::clone(&storage), state_machine, &raft_config)
-            .await
-            .expect("create raft node"),
+        AppRaftNode::new(
+            1,
+            Arc::clone(&storage),
+            state_machine,
+            Arc::clone(&mount_table),
+            &raft_config,
+        )
+        .await
+        .expect("create raft node"),
     );
     if initialize_single_node {
         raft_node
@@ -442,9 +438,9 @@ async fn build_env_with_optional_raft(
         assert!(!raft_node.is_leader(), "uninitialized raft node must not be leader");
     }
 
-    let state_store: Arc<dyn metadata::state::StateStore> = Arc::new(TestStateStore::new());
-    let write_session_manager = Arc::new(metadata::write_session::WriteSessionManager::default());
-    let inode_lease_manager = Arc::new(metadata::inode_lease::InodeLeaseManager::default());
+    let state_store: Arc<dyn crate::state::StateStore> = Arc::new(TestStateStore::new());
+    let write_session_manager = Arc::new(crate::write_session::WriteSessionManager::default());
+    let inode_lease_manager = Arc::new(crate::inode_lease::InodeLeaseManager::default());
     let worker_commit_hook: SharedWorkerCommitHook = Arc::new(Mutex::new(None));
 
     let service = MetadataFileSystemServiceImpl::new(MetadataFileSystemServiceDeps {
@@ -452,7 +448,7 @@ async fn build_env_with_optional_raft(
             state_store,
             mount_table: Arc::clone(&mount_table),
             storage: Arc::clone(&storage),
-            raft_node: Some(raft_node),
+            raft_node: Some(Arc::clone(&raft_node)),
             group_name: group_name("root"),
         },
         runtime: FileSystemRuntimeDeps {
@@ -463,12 +459,14 @@ async fn build_env_with_optional_raft(
             metrics: None,
             readiness_gate: None,
         },
-    });
+    })
+    .unwrap();
 
     PathTestEnv {
         _temp_dir: temp_dir,
         storage,
         mount_table,
+        raft_node: Some(raft_node),
         service,
         write_session_manager,
         worker_manager,
@@ -1276,9 +1274,17 @@ async fn stale_route_epoch_returns_refresh_metadata_header_with_consumable_route
 #[tokio::test]
 async fn stale_state_id_returns_stale_state_without_epoch_domain_mixup() {
     let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
-    let local_state_id = RaftLogId::new(1, 1, 10);
-    let required_state_id = RaftLogId::new(1, 1, 12);
-    persist_last_applied(&env, local_state_id);
+    let local_state_id = env
+        .raft_node
+        .as_ref()
+        .expect("raft node")
+        .get_last_applied_state_id()
+        .expect("initialized raft applied state");
+    let required_state_id = RaftLogId::new(
+        local_state_id.term,
+        local_state_id.leader_node_id,
+        local_state_id.index + 1,
+    );
 
     let response = FileSystemServiceProto::get_status(
         &env.service,
@@ -1310,8 +1316,12 @@ async fn stale_state_id_returns_stale_state_without_epoch_domain_mixup() {
 #[tokio::test]
 async fn leader_success_header_includes_group_state_watermark_when_last_applied_is_known() {
     let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
-    let last_applied = RaftLogId::new(2, 1, 20);
-    persist_last_applied(&env, last_applied);
+    let last_applied = env
+        .raft_node
+        .as_ref()
+        .expect("raft node")
+        .get_last_applied_state_id()
+        .expect("initialized raft applied state");
 
     let response = FileSystemServiceProto::get_status(
         &env.service,
@@ -1400,8 +1410,8 @@ async fn leadership_precedence_write_returns_not_leader_before_not_found() {
 }
 
 #[tokio::test]
-async fn leadership_precedence_data_io_returns_not_leader_before_root_policy_error() {
-    let env = build_env_with_nonleader_raft("/", DataIoPolicy::Forbid).await;
+async fn leadership_precedence_data_io_returns_not_leader_before_mount_policy_error() {
+    let env = build_env_with_nonleader_raft("/mnt/test", DataIoPolicy::Forbid).await;
     let file_inode_id = InodeId::new(2001);
     env.storage
         .put_inode(&Inode::new_file(
@@ -1419,7 +1429,7 @@ async fn leadership_precedence_data_io_returns_not_leader_before_root_policy_err
         &env.service,
         Request::new(AppendFileRequestProto {
             header: header(3),
-            path: "/file".to_string(),
+            path: "/mnt/test/file".to_string(),
             desired_len: Some(0),
         }),
     )
@@ -1429,39 +1439,6 @@ async fn leadership_precedence_data_io_returns_not_leader_before_root_policy_err
 
     let err = header_error(response.header);
     assert_not_leader(&err);
-}
-
-#[tokio::test]
-async fn root_mount_data_io_gate_is_enforced() {
-    let env = build_env_with_raft("/", DataIoPolicy::Forbid).await;
-    let file_inode_id = InodeId::new(3001);
-    env.storage
-        .put_inode(&Inode::new_file(
-            file_inode_id,
-            FileAttrs::new(),
-            env.mount_id,
-            DataHandleId::new(3001),
-        ))
-        .expect("put test file inode");
-    env.storage
-        .put_dentry(env.root_inode_id, "file", file_inode_id)
-        .expect("put test file dentry");
-
-    let response = FileSystemServiceProto::append_file(
-        &env.service,
-        Request::new(AppendFileRequestProto {
-            header: header(8),
-            path: "/file".to_string(),
-            desired_len: Some(0),
-        }),
-    )
-    .await
-    .expect("transport status must remain OK")
-    .into_inner();
-    let err = header_error(response.header);
-
-    assert_fs_errno(&err, FsErrnoProto::FsErrnoEnotsup);
-    assert!(err.message.contains("RootDataIoForbidden"));
 }
 
 #[tokio::test]
@@ -1881,7 +1858,6 @@ async fn commit_file_public_replay_returns_persisted_result_and_rejects_fingerpr
         DataHandleId::new(block_id.data_handle_id),
         BlockIndex::new(block_id.block_index),
     );
-    assert_eq!(env.storage.get_block_ref_count(typed_block_id).unwrap(), Some(1));
     publish_reported_location(&env, typed_block_id, first_file_version, target.effective_len);
 
     let locations = FileSystemServiceProto::get_block_locations(
@@ -1918,7 +1894,6 @@ async fn commit_file_public_replay_returns_persisted_result_and_rejects_fingerpr
     assert_success_header(second.header);
     assert_eq!(second.committed_size, first.committed_size);
     assert_eq!(second.file_version, Some(first_file_version));
-    assert_eq!(env.storage.get_block_ref_count(typed_block_id).unwrap(), Some(1));
 
     let inode = env.storage.get_inode(file_inode_id).unwrap().expect("committed inode");
     assert_eq!(inode.attrs.size, 128);
@@ -1951,7 +1926,6 @@ async fn commit_file_public_replay_returns_persisted_result_and_rejects_fingerpr
     let err = header_error(mismatch.header);
     assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
     assert!(err.message.contains("reused with different command payload"));
-    assert_eq!(env.storage.get_block_ref_count(typed_block_id).unwrap(), Some(1));
     let after_mismatch = env
         .storage
         .get_inode(file_inode_id)
@@ -2071,11 +2045,10 @@ async fn recursive_delete_nested_tree_success_removes_subtree_only() {
     assert!(env.storage.get_inode(env.root_inode_id).unwrap().is_some());
     assert_eq!(env.storage.get_inode_by_data_handle(file1_handle).unwrap(), None);
     assert_eq!(env.storage.get_inode_by_data_handle(file2_handle).unwrap(), None);
-    assert_eq!(env.storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 0);
 }
 
 #[tokio::test]
-async fn recursive_delete_extent_file_cleans_layout_refcount_intent_and_replays_once() {
+async fn recursive_delete_extent_file_cleans_namespace_layout_and_owner_once() {
     let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
     let dir = InodeId::new(4201);
     let file = InodeId::new(4202);
@@ -2083,10 +2056,6 @@ async fn recursive_delete_extent_file_cleans_layout_refcount_intent_and_replays_
     let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
     put_dir(&env, env.root_inode_id, "dir", dir);
     put_extent_file(&env, dir, "file", file, data_handle_id, block_id, 64);
-    env.storage
-        .put_block_ref_count(block_id, 1)
-        .expect("put block refcount");
-
     let delete_header = header(142);
     let first = FileSystemServiceProto::delete(
         &env.service,
@@ -2105,8 +2074,6 @@ async fn recursive_delete_extent_file_cleans_layout_refcount_intent_and_replays_
     assert!(env.storage.get_inode(file).unwrap().is_none());
     assert!(env.storage.get_layout(file).is_err());
     assert_eq!(env.storage.get_inode_by_data_handle(data_handle_id).unwrap(), None);
-    assert_eq!(env.storage.get_block_ref_count(block_id).unwrap(), None);
-    assert_eq!(env.storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 1);
 
     let replay = FileSystemServiceProto::delete(
         &env.service,
@@ -2121,8 +2088,6 @@ async fn recursive_delete_extent_file_cleans_layout_refcount_intent_and_replays_
     .into_inner();
 
     assert_success_header(replay.header);
-    assert_eq!(env.storage.get_block_ref_count(block_id).unwrap(), None);
-    assert_eq!(env.storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -2198,7 +2163,6 @@ async fn recursive_delete_rejects_active_write_session_without_half_delete() {
         Some(file_inode_id)
     );
     assert!(env.write_session_manager.get_session(write_handle.handle_id).is_some());
-    assert_eq!(env.storage.list_pending_delete_intents(10, u64::MAX).unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -2221,7 +2185,7 @@ async fn recursive_delete_rejects_root_or_mount_root_without_mutation() {
     assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
     assert!(env.storage.get_inode(env.root_inode_id).unwrap().is_some());
 
-    let root_env = build_env_with_raft("/", DataIoPolicy::Forbid).await;
+    let root_env = build_env_with_raft("/", DataIoPolicy::Allow).await;
     let root_response = FileSystemServiceProto::delete(
         &root_env.service,
         Request::new(DeleteRequestProto {

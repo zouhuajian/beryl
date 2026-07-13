@@ -33,12 +33,15 @@ impl FsCore {
         let result = match self
             .propose_fs_write_command(
                 CoreWriteOp::Mkdir,
-                Command::Mkdir {
+                Command::new(
                     dedup,
-                    parent_inode_id: req.parent_inode_id,
-                    name: req.name,
-                    attrs: req.attrs,
-                },
+                    crate::raft::proposal_timestamp_ms(),
+                    crate::raft::Mutation::Mkdir {
+                        parent_inode_id: req.parent_inode_id,
+                        name: req.name,
+                        attrs: req.attrs,
+                    },
+                ),
             )
             .await
         {
@@ -55,13 +58,19 @@ impl FsCore {
 
         match result {
             FsCommandResult::Ok(ok) => {
-                let created_attrs = match (self.storage.as_ref(), ok.inode_id) {
-                    (Some(storage), Some(inode_id)) => storage
-                        .get_inode(inode_id)
-                        .ok()
-                        .flatten()
-                        .map(|inode| inode.attrs.clone()),
-                    _ => None,
+                let created_attrs = match ok.inode_id {
+                    Some(inode_id) => match self.read_inode(inode_id) {
+                        Ok(inode) => inode.map(|inode| inode.attrs),
+                        Err(err) => {
+                            return self.failure_from_error(
+                                &req.ctx,
+                                err,
+                                Some(ctx.namespace_owner_group_name.clone()),
+                                Some(ctx.mount_epoch),
+                            );
+                        }
+                    },
+                    None => None,
                 };
 
                 self.success(
@@ -109,13 +118,16 @@ impl FsCore {
         let result = match self
             .propose_fs_write_command(
                 CoreWriteOp::Create,
-                Command::Create {
+                Command::new(
                     dedup,
-                    parent_inode_id: req.parent_inode_id,
-                    name: req.name,
-                    attrs: req.attrs,
-                    layout: req.layout,
-                },
+                    crate::raft::proposal_timestamp_ms(),
+                    crate::raft::Mutation::CreateFile {
+                        parent_inode_id: req.parent_inode_id,
+                        name: req.name,
+                        attrs: req.attrs,
+                        layout: req.layout,
+                    },
+                ),
             )
             .await
         {
@@ -132,13 +144,19 @@ impl FsCore {
 
         match result {
             FsCommandResult::Ok(ok) => {
-                let created_attrs = match (self.storage.as_ref(), ok.inode_id) {
-                    (Some(storage), Some(inode_id)) => storage
-                        .get_inode(inode_id)
-                        .ok()
-                        .flatten()
-                        .map(|inode| inode.attrs.clone()),
-                    _ => None,
+                let created_attrs = match ok.inode_id {
+                    Some(inode_id) => match self.read_inode(inode_id) {
+                        Ok(inode) => inode.map(|inode| inode.attrs),
+                        Err(err) => {
+                            return self.failure_from_error(
+                                &req.ctx,
+                                err,
+                                Some(ctx.namespace_owner_group_name.clone()),
+                                Some(ctx.mount_epoch),
+                            );
+                        }
+                    },
+                    None => None,
                 };
 
                 self.success(
@@ -168,9 +186,9 @@ impl FsCore {
             Err(err) => return Err(err),
         };
 
-        if let Some(storage) = self.storage.as_ref() {
-            match storage.get_dentry(req.parent_inode_id, &req.name) {
-                Ok(Some(child_inode_id)) => match storage.get_inode(child_inode_id) {
+        if self.storage.is_some() {
+            match self.read_dentry(req.parent_inode_id, &req.name) {
+                Ok(Some(child_inode_id)) => match self.read_inode(child_inode_id) {
                     Ok(Some(inode)) if inode.kind.is_file() => {
                         if self.write_session_manager.has_active_session(child_inode_id)
                             || self.inode_lease_manager.has_active_lease(child_inode_id)
@@ -221,11 +239,14 @@ impl FsCore {
         let result = match self
             .propose_fs_write_command(
                 CoreWriteOp::Unlink,
-                Command::Unlink {
+                Command::new(
                     dedup,
-                    parent_inode_id: req.parent_inode_id,
-                    name: req.name,
-                },
+                    crate::raft::proposal_timestamp_ms(),
+                    crate::raft::Mutation::Unlink {
+                        parent_inode_id: req.parent_inode_id,
+                        name: req.name,
+                    },
+                ),
             )
             .await
         {
@@ -283,11 +304,14 @@ impl FsCore {
         let result = match self
             .propose_fs_write_command(
                 CoreWriteOp::DeleteEmptyDir,
-                Command::DeleteEmptyDir {
+                Command::new(
                     dedup,
-                    parent_inode_id: req.parent_inode_id,
-                    name: req.name,
-                },
+                    crate::raft::proposal_timestamp_ms(),
+                    crate::raft::Mutation::DeleteEmptyDir {
+                        parent_inode_id: req.parent_inode_id,
+                        name: req.name,
+                    },
+                ),
             )
             .await
         {
@@ -337,11 +361,14 @@ impl FsCore {
                 );
             }
         };
-        let command = Command::DeleteTree {
-            dedup: dedup.clone(),
-            parent_inode_id: req.parent_inode_id,
-            name: req.name.clone(),
-        };
+        let command = Command::new(
+            dedup.clone(),
+            crate::raft::proposal_timestamp_ms(),
+            crate::raft::Mutation::DeleteTree {
+                parent_inode_id: req.parent_inode_id,
+                name: req.name.clone(),
+            },
+        );
         let fingerprint = command.fingerprint();
 
         if let Some(storage) = self.storage.as_ref() {
@@ -429,10 +456,10 @@ impl FsCore {
         parent_inode_id: types::fs::InodeId,
         name: &str,
     ) -> Result<(), MetadataError> {
-        let Some(root_inode_id) = storage.get_dentry(parent_inode_id, name)? else {
+        let Some(root_inode_id) = self.read_dentry(parent_inode_id, name)? else {
             return Ok(());
         };
-        let Some(root_inode) = storage.get_inode(root_inode_id)? else {
+        let Some(root_inode) = self.read_inode(root_inode_id)? else {
             return Ok(());
         };
         let mount_id = root_inode.mount_id;
@@ -453,7 +480,7 @@ impl FsCore {
             }
             if inode.kind.is_dir() {
                 for (_, child_inode_id) in storage.list_dentries(inode_id)? {
-                    if let Some(child_inode) = storage.get_inode(child_inode_id)? {
+                    if let Some(child_inode) = self.read_inode(child_inode_id)? {
                         stack.push((child_inode_id, child_inode));
                     }
                 }
@@ -474,19 +501,7 @@ impl FsCore {
             );
         }
 
-        let storage = match self.storage.as_ref() {
-            Some(storage) => storage,
-            None => {
-                return self.failure_from_error(
-                    &req.ctx,
-                    MetadataError::Internal("Storage not available".to_string()),
-                    None,
-                    None,
-                );
-            }
-        };
-
-        let src_parent_inode = match storage.get_inode(req.src_parent_inode_id) {
+        let src_parent_inode = match self.read_inode(req.src_parent_inode_id) {
             Ok(Some(inode)) => inode,
             Ok(None) => {
                 return self.failure_from_error(
@@ -498,7 +513,7 @@ impl FsCore {
             }
             Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
         };
-        let dst_parent_inode = match storage.get_inode(req.dst_parent_inode_id) {
+        let dst_parent_inode = match self.read_inode(req.dst_parent_inode_id) {
             Ok(Some(inode)) => inode,
             Ok(None) => {
                 return self.failure_from_error(
@@ -560,7 +575,7 @@ impl FsCore {
                     }
 
                     if can_precheck {
-                        match storage.get_dentry(req.dst_parent_inode_id, &req.dst_name) {
+                        match self.read_dentry(req.dst_parent_inode_id, &req.dst_name) {
                             Ok(Some(_)) => {
                                 return self.failure_from_error(
                                     &req.ctx,
@@ -587,8 +602,8 @@ impl FsCore {
             }
         }
 
-        match storage.get_dentry(req.dst_parent_inode_id, &req.dst_name) {
-            Ok(Some(dst_inode_id)) => match storage.get_inode(dst_inode_id) {
+        match self.read_dentry(req.dst_parent_inode_id, &req.dst_name) {
+            Ok(Some(dst_inode_id)) => match self.read_inode(dst_inode_id) {
                 Ok(Some(inode)) if inode.kind.is_file() => {
                     if self.write_session_manager.has_active_session(dst_inode_id)
                         || self.inode_lease_manager.has_active_lease(dst_inode_id)
@@ -638,14 +653,17 @@ impl FsCore {
         let result = match self
             .propose_fs_write_command(
                 CoreWriteOp::Rename,
-                Command::Rename {
+                Command::new(
                     dedup,
-                    src_parent_inode_id: req.src_parent_inode_id,
-                    src_name: req.src_name,
-                    dst_parent_inode_id: req.dst_parent_inode_id,
-                    dst_name: req.dst_name,
-                    flags: req.flags,
-                },
+                    crate::raft::proposal_timestamp_ms(),
+                    crate::raft::Mutation::Rename {
+                        src_parent_inode_id: req.src_parent_inode_id,
+                        src_name: req.src_name,
+                        dst_parent_inode_id: req.dst_parent_inode_id,
+                        dst_name: req.dst_name,
+                        flags: req.flags,
+                    },
+                ),
             )
             .await
         {

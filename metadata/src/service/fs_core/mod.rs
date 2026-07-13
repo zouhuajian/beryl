@@ -117,7 +117,7 @@ impl FsCore {
         DedupKey::from_header_identity(&caller_ctx.identity()).map_err(MetadataError::InvalidArgument)
     }
 
-    async fn authoritative_route_epoch(&self) -> Option<u64> {
+    async fn authoritative_route_epoch(&self) -> MetadataResult<u64> {
         self.freshness_validator.authoritative_route_epoch().await
     }
 
@@ -372,35 +372,39 @@ impl FsCore {
         Ok(ctx)
     }
 
-    fn storage_for_ctx<'a>(&'a self, req_ctx: &RequestContext) -> Result<&'a Arc<RocksDBStorage>, CoreFailure> {
-        self.storage.as_ref().ok_or_else(|| {
-            core_failure_from_metadata_error(
-                req_ctx,
-                MetadataError::Internal("Storage not available".to_string()),
-                None,
-                None,
-                None,
-            )
-        })
+    fn read_inode(&self, inode_id: InodeId) -> MetadataResult<Option<types::fs::Inode>> {
+        self.storage
+            .as_ref()
+            .ok_or_else(|| MetadataError::Internal("Storage not available".to_string()))?
+            .get_inode(inode_id)
+    }
+
+    fn read_dentry(&self, parent_inode_id: InodeId, name: &str) -> MetadataResult<Option<InodeId>> {
+        self.storage
+            .as_ref()
+            .ok_or_else(|| MetadataError::Internal("Storage not available".to_string()))?
+            .get_dentry(parent_inode_id, name)
+    }
+
+    fn read_layout(&self, inode_id: InodeId) -> MetadataResult<types::layout::FileLayout> {
+        self.storage
+            .as_ref()
+            .ok_or_else(|| MetadataError::Internal("Storage not available".to_string()))?
+            .get_layout(inode_id)
     }
 
     fn route_fs_write_ctx(&self, op: CoreWriteOp, parent_inode_ids: &[InodeId]) -> MetadataResult<RoutedFsWriteCtx> {
-        let storage = self
-            .storage
-            .as_ref()
-            .ok_or_else(|| MetadataError::Internal("Storage not available".to_string()))?;
-
         let parent_inode_id = parent_inode_ids
             .first()
             .ok_or_else(|| MetadataError::InvalidArgument("No parent inode provided".to_string()))?;
-        let parent_inode = storage
-            .get_inode(*parent_inode_id)?
+        let parent_inode = self
+            .read_inode(*parent_inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("Parent inode not found: {}", parent_inode_id)))?;
 
         let mount_id = parent_inode.mount_id;
         for other_parent in parent_inode_ids.iter().skip(1) {
-            let inode = storage
-                .get_inode(*other_parent)?
+            let inode = self
+                .read_inode(*other_parent)?
                 .ok_or_else(|| MetadataError::NotFound(format!("Parent inode not found: {}", other_parent)))?;
             if inode.mount_id != mount_id {
                 return Err(MetadataError::CrossMountRename(
@@ -448,40 +452,6 @@ impl FsCore {
             error
         })?;
 
-        let dedup_key = command.dedup_key().clone();
-        let fingerprint = command.fingerprint();
-
-        if let Some(storage) = &self.storage {
-            if let Some(existing) = storage.get_applied_result(&dedup_key).inspect_err(|error| {
-                observe::record_fs_op(
-                    op.metric_label(),
-                    "error",
-                    observe::metadata_error_kind(error),
-                    started.elapsed().as_secs_f64(),
-                );
-            })? {
-                if existing.fingerprint != fingerprint {
-                    let error = MetadataError::InvalidArgument(format!(
-                        "call_id {} reused with different command payload",
-                        dedup_key.call_id
-                    ));
-                    observe::record_fs_op(
-                        op.metric_label(),
-                        "error",
-                        observe::metadata_error_kind(&error),
-                        started.elapsed().as_secs_f64(),
-                    );
-                    return Err(error);
-                }
-                let result = match existing.result {
-                    AppDataResponse::Fs(res) => res,
-                    _ => FsCommandResult::ok(),
-                };
-                record_fs_write_result(op, started, &result);
-                return Ok(result);
-            }
-        }
-
         if let Some(metrics) = &self.metrics {
             metrics.fs_raft_appends_total.fetch_add(1, Ordering::Relaxed);
             match op {
@@ -511,8 +481,7 @@ impl FsCore {
 
         let response = match raft_node.propose(command).await {
             Ok(response) => response,
-            Err(e) => {
-                let error = MetadataError::Internal(format!("Failed to propose command: {}", e));
+            Err(error) => {
                 observe::record_fs_op(
                     op.metric_label(),
                     "error",

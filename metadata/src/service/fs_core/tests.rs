@@ -5,15 +5,14 @@ use super::*;
 use crate::config::RaftConfig;
 use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
 use crate::placement::{ReportedBlockLocation, WorkerPlacementView};
-use crate::raft::{AppRaftNode, AppRaftStateMachine, Command, DedupKey, RocksDBStorage};
+use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use crate::service::domain::{
     AbortWriteInput, AddBlockInput, CloseWriteInput, CloseWriteIntent, CoreResult, CreateInput, Freshness,
     GetAttrInput, GetFileLayoutInput, OpenWriteInput, PresentedFencingToken, ReadDirInput, RenameInput,
     RenewLeaseInput, RequestContext, SessionKey, SyncWriteInput, SyncWriteMode, UnlinkInput,
 };
-use crate::state::{MemoryStateStore, RouteEpoch};
+use crate::state::MemoryStateStore;
 use crate::worker::{BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerInfo, WorkerManager};
-use async_trait::async_trait;
 use common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail, WorkerErrorKind};
 use common::header::{CallerContext, RequestHeader};
 use std::sync::atomic::Ordering;
@@ -28,10 +27,6 @@ use types::worker::WorkerNetProtocol;
 use types::{CommittedBlock, GroupName, Tier, TierFree, WorkerEndpointInfo, WorkerRunId, WriteTarget};
 
 use super::freshness::{FreshnessValidator, StaleStateStatus};
-
-struct StorageBackedRouteEpochStore {
-    storage: Arc<RocksDBStorage>,
-}
 
 impl FsCore {
     fn new_default(state_store: Arc<dyn StateStore>, mount_table: Arc<MountTable>) -> Self {
@@ -53,13 +48,6 @@ impl FsCore {
 
     fn inode_lease_manager_for_test(&self) -> Arc<crate::inode_lease::InodeLeaseManager> {
         Arc::clone(&self.inode_lease_manager)
-    }
-}
-
-#[async_trait]
-impl StateStore for StorageBackedRouteEpochStore {
-    async fn get_route_epoch(&self) -> MetadataResult<RouteEpoch> {
-        self.storage.get_route_epoch()
     }
 }
 
@@ -353,7 +341,7 @@ fn refresh_hint(error: &RpcErrorDetail) -> &RefreshHint {
 }
 
 #[tokio::test]
-async fn get_file_layout_returns_reported_locations_using_read_placement() {
+async fn get_file_layout_uses_inode_authority_without_reverse_owner_read() {
     let dir = TempDir::new().unwrap();
     let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
     let mount_id = MountId::new(48);
@@ -408,7 +396,6 @@ async fn get_file_layout_returns_reported_locations_using_read_placement() {
     };
     storage.put_inode(&inode).unwrap();
     storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
-    storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
     let mut ctx = request_context();
     ctx.caller = ctx.caller.with_caller_context(CallerContext {
@@ -1137,13 +1124,16 @@ async fn list_status_propagates_child_inode_load_error() {
     storage
         .put_dentry(parent_inode_id, "bad-child", child_inode_id)
         .unwrap();
-    let inodes_cf = storage.db().cf_handle("inodes").expect("inodes column family");
     let mut key = b"inode/".to_vec();
     key.extend_from_slice(&child_inode_id.to_be_bytes());
     storage
-        .db()
-        .put_cf(inodes_cf, key, b"not-json-inode")
-        .expect("write malformed child inode value");
+        .with_pinned_db(|db| {
+            let inodes_cf = db.cf_handle("inodes").expect("inodes column family");
+            db.put_cf(inodes_cf, key, b"not-json-inode")
+                .expect("write malformed child inode value");
+            Ok(())
+        })
+        .unwrap();
 
     let failure = fs_core
         .execute_read_dir(ReadDirInput {
@@ -1688,7 +1678,6 @@ fn seed_committed_file_version(env: &WriteFlowEnv, file_version: u64, lease_epoc
         other => panic!("unexpected inode data: {:?}", other),
     }
     env.storage.put_inode(&inode).unwrap();
-    env.storage.put_block_ref_count(block_id, 1).unwrap();
 }
 
 fn publish_env_block_location(env: &WriteFlowEnv, block_id: BlockId, block_stamp: u64, report_seq: u64) {
@@ -1715,10 +1704,10 @@ async fn single_node_raft(
     storage: Arc<RocksDBStorage>,
     mount_table: Arc<MountTable>,
 ) -> (Arc<AppRaftNode>, Arc<AppRaftStateMachine>) {
-    let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage), mount_table));
+    let state_machine = Arc::new(AppRaftStateMachine::new(Arc::clone(&storage)));
     let raft_config = RaftConfig::default();
     let raft_node = Arc::new(
-        AppRaftNode::new(1, storage, Arc::clone(&state_machine), &raft_config)
+        AppRaftNode::new(1, storage, Arc::clone(&state_machine), mount_table, &raft_config)
             .await
             .unwrap(),
     );
@@ -2175,6 +2164,49 @@ async fn create_file_persists_valid_client_layout_shape() {
     let inode_id = success.payload.inode_id.expect("created inode id");
 
     assert_eq!(storage.get_layout(inode_id).unwrap(), layout);
+}
+
+#[tokio::test]
+async fn create_replay_advances_applied_state_without_allocating_again() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+    let mount_id = MountId::new(60);
+    let group_name_value = group_name("g10");
+    let parent_inode_id = InodeId::new(600);
+    storage
+        .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
+        .unwrap();
+    let mut fs_core = fs_core_with_mount(mount_id, 9, &group_name_value);
+    let mount_table = Arc::clone(&fs_core.mount_table);
+    let (raft_node, _state_machine) = single_node_raft(Arc::clone(&storage), mount_table).await;
+    fs_core.set_storage(Arc::clone(&storage));
+    fs_core.set_raft_node(Arc::clone(&raft_node));
+    fs_core.set_worker_manager(worker_manager_for_write_targets(&group_name_value));
+    let request = CreateInput {
+        ctx: request_context(),
+        parent_inode_id,
+        name: "replayed-file".to_string(),
+        attrs: FileAttrs::new(),
+        layout: FileLayout::new(4096, 4096, 1),
+        freshness: Freshness::default(),
+    };
+
+    let first = fs_core.execute_create(request.clone()).await.unwrap();
+    let first_applied = raft_node.get_last_applied_state_id().unwrap();
+    let next_inode_after_first = storage.get_next_inode_id().unwrap();
+    let replay = fs_core.execute_create(request.clone()).await.unwrap();
+    let replay_applied = raft_node.get_last_applied_state_id().unwrap();
+    let mut mismatch = request;
+    mismatch.name = "different-file".to_string();
+    let mismatch_failure = fs_core.execute_create(mismatch).await.unwrap_err();
+    let mismatch_applied = raft_node.get_last_applied_state_id().unwrap();
+
+    assert_eq!(replay.payload.inode_id, first.payload.inode_id);
+    assert!(replay_applied.index > first_applied.index);
+    assert_fail(&mismatch_failure.error, ErrorKind::Fs(FsErrorCode::EInval));
+    assert!(mismatch_applied.index > replay_applied.index);
+    assert_eq!(storage.get_next_inode_id().unwrap(), next_inode_after_first);
+    assert_eq!(storage.get_dentry(parent_inode_id, "different-file").unwrap(), None);
 }
 
 #[tokio::test]
@@ -3397,10 +3429,6 @@ async fn replay_keeps_file_version() {
     assert!(fs_core.write_session_for_handle(file_handle).is_none());
 
     let inode_after_first = storage.get_inode(inode_id).unwrap().unwrap();
-    let block_ref_after_first = storage
-        .get_block_ref_count(BlockId::new(data_handle_id, BlockIndex::new(0)))
-        .unwrap();
-
     let replay = fs_core
         .execute_close_write(request.clone())
         .await
@@ -3410,12 +3438,6 @@ async fn replay_keeps_file_version() {
     assert_eq!(replay.payload.file_version, first.payload.file_version);
     assert!(fs_core.write_session_for_handle(file_handle).is_none());
     assert_eq!(storage.get_inode(inode_id).unwrap().unwrap(), inode_after_first);
-    assert_eq!(
-        storage
-            .get_block_ref_count(BlockId::new(data_handle_id, BlockIndex::new(0)))
-            .unwrap(),
-        block_ref_after_first
-    );
 
     let mut mismatch = request;
     mismatch.intent.final_size = 65;
@@ -3426,12 +3448,6 @@ async fn replay_keeps_file_version() {
     assert_fail(&mismatch_failure.error, ErrorKind::Fs(FsErrorCode::EInval));
     assert!(fs_core.write_session_for_handle(file_handle).is_none());
     assert_eq!(storage.get_inode(inode_id).unwrap().unwrap(), inode_after_first);
-    assert_eq!(
-        storage
-            .get_block_ref_count(BlockId::new(data_handle_id, BlockIndex::new(0)))
-            .unwrap(),
-        block_ref_after_first
-    );
 }
 
 #[tokio::test]
@@ -3759,130 +3775,4 @@ async fn close_write_session_missing_without_applied_result_stays_session_invali
 
     assert_reopen_write_session(&failure.error, ErrorKind::Metadata(MetadataErrorKind::SessionInvalid));
     assert_eq!(failure.group_name, Some(group_name_value));
-}
-
-#[tokio::test]
-async fn create_mount_route_epoch_progression_rejects_stale_client_route_epoch() {
-    let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-    let mount_table = Arc::new(MountTable::new());
-    let state_machine = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
-
-    let mount_id = MountId::new(21);
-    let root_inode_id = InodeId::new(210);
-    storage
-        .put_inode(&Inode::new_dir(root_inode_id, FileAttrs::new(), mount_id))
-        .unwrap();
-
-    let stale_route_epoch = storage.get_route_epoch().unwrap().as_u64();
-    state_machine
-        .apply(Command::CreateMount {
-            dedup: DedupKey::system(),
-            mount_id,
-            mount_prefix: "/mnt/route".to_string(),
-            mount_kind: MountKind::External,
-            ufs_uri: Some("ufs://route".to_string()),
-            data_io_policy: DataIoPolicy::Allow,
-            namespace_owner_group_name: group_name("g6"),
-            root_inode_id,
-        })
-        .unwrap();
-
-    let advanced_route_epoch = storage.get_route_epoch().unwrap().as_u64();
-    assert_eq!(advanced_route_epoch, stale_route_epoch + 1);
-
-    let fs_core = FsCore::new_default(
-        Arc::new(StorageBackedRouteEpochStore {
-            storage: Arc::clone(&storage),
-        }),
-        mount_table,
-    );
-    let failure = fs_core
-        .validate_route_epoch(
-            &request_context(),
-            Freshness {
-                mount_epoch: Some(1),
-                route_epoch: Some(stale_route_epoch),
-            },
-            Some(group_name("g6")),
-            Some(1),
-            "OpenWrite",
-        )
-        .await
-        .unwrap_err();
-
-    assert_refresh_metadata(
-        &failure.error,
-        ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
-    );
-    let hint = refresh_hint(&failure.error);
-    assert_eq!(hint.route_epoch, Some(advanced_route_epoch));
-    assert_eq!(hint.mount_epoch, Some(1));
-    assert_eq!(failure.route_epoch, Some(advanced_route_epoch));
-}
-
-#[tokio::test]
-async fn delete_mount_route_epoch_progression_rejects_stale_client_route_epoch() {
-    let dir = TempDir::new().unwrap();
-    let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-    let mount_table = Arc::new(MountTable::new());
-    let state_machine = AppRaftStateMachine::new(Arc::clone(&storage), Arc::clone(&mount_table));
-
-    let mount_id = MountId::new(31);
-    let root_inode_id = InodeId::new(310);
-    storage
-        .put_inode(&Inode::new_dir(root_inode_id, FileAttrs::new(), mount_id))
-        .unwrap();
-
-    state_machine
-        .apply(Command::CreateMount {
-            dedup: DedupKey::system(),
-            mount_id,
-            mount_prefix: "/mnt/delete-route".to_string(),
-            mount_kind: MountKind::External,
-            ufs_uri: Some("ufs://delete-route".to_string()),
-            data_io_policy: DataIoPolicy::Allow,
-            namespace_owner_group_name: group_name("g8"),
-            root_inode_id,
-        })
-        .unwrap();
-
-    let stale_route_epoch = storage.get_route_epoch().unwrap().as_u64();
-    state_machine
-        .apply(Command::DeleteMount {
-            dedup: DedupKey::system(),
-            mount_id,
-        })
-        .unwrap();
-
-    let advanced_route_epoch = storage.get_route_epoch().unwrap().as_u64();
-    assert_eq!(advanced_route_epoch, stale_route_epoch + 1);
-
-    let fs_core = FsCore::new_default(
-        Arc::new(StorageBackedRouteEpochStore {
-            storage: Arc::clone(&storage),
-        }),
-        mount_table,
-    );
-    let failure = fs_core
-        .validate_route_epoch(
-            &request_context(),
-            Freshness {
-                mount_epoch: None,
-                route_epoch: Some(stale_route_epoch),
-            },
-            None,
-            None,
-            "GetFileLayout",
-        )
-        .await
-        .unwrap_err();
-
-    assert_refresh_metadata(
-        &failure.error,
-        ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
-    );
-    let hint = refresh_hint(&failure.error);
-    assert_eq!(hint.route_epoch, Some(advanced_route_epoch));
-    assert_eq!(failure.route_epoch, Some(advanced_route_epoch));
 }

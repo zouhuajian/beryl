@@ -15,9 +15,6 @@ mod service;
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
-mod manager_contract_tests;
-
 pub use manager::{
     BlockReportBlock, BlockReportBlockState, HealthStatus, WorkerDescriptor, WorkerInfo, WorkerLiveState, WorkerManager,
 };

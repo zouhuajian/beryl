@@ -46,6 +46,7 @@ openraft = { version = "0.9.21", features = ["serde", "storage-v2"] }
 
 # Storage
 rocksdb = { version = "0.22.0", default-features = false, features = ["snappy"] }
+fs2 = "0.4.3"
 opendal = { version = "0.55.0", features = ["services-fs", "services-s3", "services-oss"] }
 tikv-jemalloc-ctl = "0.6.1"
 

@@ -22,7 +22,7 @@ use super::{
     presented_fencing_from_proto, request_context_from_proto, validate_active_write_layout, write_target_to_proto,
 };
 use super::{FsCore, SharedWorkerCommitHook};
-use crate::error::{to_fs_error_detail, MetadataError};
+use crate::error::{to_fs_error_detail, MetadataError, MetadataResult};
 use crate::mount::MountTable;
 use crate::observe;
 use crate::path_resolver::{MountContext, PathResolver};
@@ -111,30 +111,30 @@ macro_rules! guard_or_error {
     }};
 }
 
-pub struct MetadataFileSystemServiceDeps {
-    pub authority: FileSystemAuthorityDeps,
-    pub runtime: FileSystemRuntimeDeps,
+pub(crate) struct MetadataFileSystemServiceDeps {
+    pub(crate) authority: FileSystemAuthorityDeps,
+    pub(crate) runtime: FileSystemRuntimeDeps,
 }
 
-pub struct FileSystemAuthorityDeps {
-    pub state_store: Arc<dyn crate::state::StateStore>,
-    pub mount_table: Arc<MountTable>,
-    pub storage: Arc<RocksDBStorage>,
-    pub raft_node: Option<Arc<crate::raft::AppRaftNode>>,
-    pub group_name: types::GroupName,
+pub(crate) struct FileSystemAuthorityDeps {
+    pub(crate) state_store: Arc<dyn crate::state::StateStore>,
+    pub(crate) mount_table: Arc<MountTable>,
+    pub(crate) storage: Arc<RocksDBStorage>,
+    pub(crate) raft_node: Option<Arc<crate::raft::AppRaftNode>>,
+    pub(crate) group_name: types::GroupName,
 }
 
-pub struct FileSystemRuntimeDeps {
-    pub write_session_manager: Arc<crate::write_session::WriteSessionManager>,
-    pub inode_lease_manager: Arc<crate::inode_lease::InodeLeaseManager>,
-    pub worker_commit_hook: SharedWorkerCommitHook,
-    pub worker_manager: Option<Arc<crate::worker::WorkerManager>>,
-    pub metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
-    pub readiness_gate: Option<Arc<crate::readiness::RootReadinessGate>>,
+pub(crate) struct FileSystemRuntimeDeps {
+    pub(crate) write_session_manager: Arc<crate::write_session::WriteSessionManager>,
+    pub(crate) inode_lease_manager: Arc<crate::inode_lease::InodeLeaseManager>,
+    pub(crate) worker_commit_hook: SharedWorkerCommitHook,
+    pub(crate) worker_manager: Option<Arc<crate::worker::WorkerManager>>,
+    pub(crate) metrics: Option<Arc<crate::metrics::MetadataMetrics>>,
+    pub(crate) readiness_gate: Option<Arc<crate::readiness::RootReadinessGate>>,
 }
 
 impl MetadataFileSystemServiceImpl {
-    pub fn new(deps: MetadataFileSystemServiceDeps) -> Self {
+    pub(crate) fn new(deps: MetadataFileSystemServiceDeps) -> MetadataResult<Self> {
         let MetadataFileSystemServiceDeps { authority, runtime } = deps;
         let FileSystemAuthorityDeps {
             state_store,
@@ -178,13 +178,13 @@ impl MetadataFileSystemServiceImpl {
             .as_ref()
             .map(|raft_node| MsyncHandler::new(Arc::clone(raft_node), group_name));
 
-        Self {
+        Ok(Self {
             path_resolver,
             fs_core,
             guard_chain,
             msync,
             _metrics: metrics,
-        }
+        })
     }
 
     fn header_from_path_error(
@@ -2089,3 +2089,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "path_service/regression_tests.rs"]
+mod regression_tests;

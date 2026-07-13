@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
+use crate::error::MetadataResult;
 use crate::mount::MountTable;
 use crate::service::core_util::{core_failure_from_metadata_error, refresh_metadata_core_failure};
 use crate::service::domain::{CoreFailure, Freshness, RequestContext};
@@ -30,8 +31,8 @@ impl FreshnessValidator {
         }
     }
 
-    pub(super) async fn authoritative_route_epoch(&self) -> Option<u64> {
-        self.state_store.get_route_epoch().await.ok().map(|v| v.as_u64())
+    pub(super) async fn authoritative_route_epoch(&self) -> MetadataResult<u64> {
+        self.state_store.get_route_epoch().await.map(|epoch| epoch.as_u64())
     }
 
     pub(super) fn mount_hints_for_mount(&self, mount_id: MountId) -> (Option<GroupName>, Option<u64>) {
@@ -193,5 +194,30 @@ impl FreshnessValidator {
 
     fn replay_hint(intent: &str) -> String {
         format!("refresh metadata and reopen write handle, then replay {}", intent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::MetadataError;
+    use crate::state::RouteEpoch;
+
+    struct FailingStateStore;
+
+    #[async_trait::async_trait]
+    impl StateStore for FailingStateStore {
+        async fn get_route_epoch(&self) -> MetadataResult<RouteEpoch> {
+            Err(MetadataError::Internal("route epoch unavailable".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn authoritative_route_epoch_propagates_state_store_failure() {
+        let validator = FreshnessValidator::new(Arc::new(FailingStateStore), Arc::new(MountTable::new()));
+
+        let error = validator.authoritative_route_epoch().await.unwrap_err();
+
+        assert!(matches!(error, MetadataError::Internal(_)));
     }
 }

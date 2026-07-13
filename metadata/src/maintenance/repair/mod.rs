@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Internal repair queue, planner, and orphan-signal primitives.
+//! Internal repair queue and planner primitives.
 //!
 //! These types are maintenance internals for safety and cleanup. They are not
 //! a complete productized repair or rebalance lifecycle.
@@ -11,11 +11,9 @@
 //! - `actions.rs`: RepairAction enum (planning layer output)
 //! - `queue.rs`: RepairQueue (state machine, deduplication, retry)
 //! - `planner.rs`: RepairPlanner (pure planning logic)
-//! - `orphan.rs`: OrphanQueue (orphan block tracking)
 
 mod actions;
 mod metrics;
-mod orphan;
 mod planner;
 mod policy;
 mod queue;
@@ -23,7 +21,6 @@ mod types;
 
 pub use actions::RepairAction;
 pub(crate) use metrics::RepairMetrics;
-pub use orphan::OrphanQueue;
 pub use planner::RepairPlanner;
 pub use policy::RepairPolicy;
 pub use queue::RepairQueue;
@@ -81,8 +78,7 @@ mod tests {
 
     #[test]
     fn test_planner_plan_replication() {
-        let orphan_queue = Arc::new(OrphanQueue::new(100));
-        let planner = RepairPlanner::new(orphan_queue);
+        let planner = RepairPlanner::new();
 
         let block_id = make_block_id(1, 0);
         let current_locations = vec![make_worker_id(1)];
@@ -285,8 +281,7 @@ mod tests {
     // Regression test for planner determinism.
     #[test]
     fn test_planner_stable_output() {
-        let orphan_queue = Arc::new(OrphanQueue::new(100));
-        let planner = RepairPlanner::new(orphan_queue);
+        let planner = RepairPlanner::new();
 
         let block_id = make_block_id(1, 0);
         let current_locations = vec![make_worker_id(1)];
@@ -315,8 +310,7 @@ mod tests {
     #[test]
     fn test_planner_overrep_evict_replicas() {
         // Verify over-replication scenario produces EvictReplica actions.
-        let orphan_queue = Arc::new(OrphanQueue::new(100));
-        let planner = RepairPlanner::new(orphan_queue);
+        let planner = RepairPlanner::new();
 
         let block_id = make_block_id(1, 0);
         let current_locations = vec![
@@ -343,81 +337,6 @@ mod tests {
                 _ => panic!("Expected EvictReplica action"),
             }
         }
-    }
-
-    #[test]
-    fn test_orphan_queue_min_age() {
-        use std::thread;
-        use std::time::Duration;
-
-        // Create queue with 100ms min_age
-        let queue = OrphanQueue::with_config(100, 100);
-        let block_id = make_block_id(1, 0);
-        let worker1 = make_worker_id(1);
-
-        // Add orphan
-        queue.add(block_id, worker1);
-        assert_eq!(queue.len(), 1);
-
-        // Immediately try to dequeue - should return None (not past min_age)
-        assert!(queue.dequeue().is_none());
-
-        // Wait for min_age to pass
-        thread::sleep(Duration::from_millis(150));
-
-        // Now should be able to dequeue
-        let result = queue.dequeue();
-        assert!(result.is_some());
-        let (bid, wid) = result.unwrap();
-        assert_eq!(bid, block_id);
-        assert_eq!(wid, worker1);
-        assert_eq!(queue.len(), 0);
-    }
-
-    #[test]
-    fn test_orphan_queue_peek_oldest() {
-        let queue = OrphanQueue::with_config(100, 0); // No min_age for this test
-        let block_id1 = make_block_id(1, 0);
-        let block_id2 = make_block_id(2, 0);
-        let worker1 = make_worker_id(1);
-
-        queue.add(block_id1, worker1);
-        queue.add(block_id2, worker1);
-
-        // Peek should return the oldest (first added)
-        let peeked = queue.peek_oldest();
-        assert!(peeked.is_some());
-        let (bid, _) = peeked.unwrap();
-        assert_eq!(bid, block_id1);
-
-        // Queue should still have 2 items
-        assert_eq!(queue.len(), 2);
-    }
-
-    #[test]
-    fn test_orphan_queue_len_eligible() {
-        use std::thread;
-        use std::time::Duration;
-
-        let queue = OrphanQueue::with_config(100, 100); // 100ms min_age
-        let block_id1 = make_block_id(1, 0);
-        let block_id2 = make_block_id(2, 0);
-        let worker1 = make_worker_id(1);
-
-        queue.add(block_id1, worker1);
-        thread::sleep(Duration::from_millis(50));
-        queue.add(block_id2, worker1);
-
-        // Initially, no eligible orphans
-        assert_eq!(queue.len_eligible(), 0);
-
-        // Wait for first orphan to become eligible
-        thread::sleep(Duration::from_millis(60));
-        assert_eq!(queue.len_eligible(), 1);
-
-        // Wait for second orphan to become eligible
-        thread::sleep(Duration::from_millis(50));
-        assert_eq!(queue.len_eligible(), 2);
     }
 
     #[test]
