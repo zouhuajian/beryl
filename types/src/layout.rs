@@ -54,52 +54,30 @@ pub struct BlockFormatIdError {
 /// multi-replica write support.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FileLayout {
-    block_size: u32, // bytes
-    chunk_size: u32, // bytes
-    block_format_id: BlockFormatId,
-    replication: u8,
+    pub block_size: u32, // bytes
+    pub chunk_size: u32, // bytes
+    pub block_format_id: BlockFormatId,
+    pub replication: u8,
 }
 
 impl FileLayout {
     /// Construct a layout for a newly created file using the current block format.
-    pub fn try_new(block_size: u32, chunk_size: u32, replication: u8) -> Result<Self, FileLayoutError> {
-        Self::try_with_block_format(block_size, chunk_size, replication, BlockFormatId::CURRENT_FOR_NEW_FILE)
+    pub const fn new(block_size: u32, chunk_size: u32, replication: u8) -> Self {
+        Self::with_block_format(block_size, chunk_size, replication, BlockFormatId::CURRENT_FOR_NEW_FILE)
     }
 
-    pub fn try_with_block_format(
+    pub const fn with_block_format(
         block_size: u32,
         chunk_size: u32,
         replication: u8,
         block_format_id: BlockFormatId,
-    ) -> Result<Self, FileLayoutError> {
-        let layout = Self {
+    ) -> Self {
+        Self {
             block_size,
             chunk_size,
             block_format_id,
             replication,
-        };
-        layout.validate()?;
-        Ok(layout)
-    }
-
-    #[inline]
-    pub const fn block_size(&self) -> u32 {
-        self.block_size
-    }
-
-    #[inline]
-    pub const fn chunk_size(&self) -> u32 {
-        self.chunk_size
-    }
-
-    #[inline]
-    pub const fn block_format_id(&self) -> BlockFormatId {
-        self.block_format_id
-    }
-
-    #[inline]
-    pub const fn replication(&self) -> u8 {
-        self.replication
+        }
     }
 
     pub fn validate(&self) -> Result<(), FileLayoutError> {
@@ -343,10 +321,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chunks_per_block_uses_valid_layout() {
-        assert_eq!(FileLayout::try_new(4096, 4096, 1).unwrap().chunks_per_block(), 1);
-        assert_eq!(FileLayout::try_new(8192, 4096, 1).unwrap().chunks_per_block(), 2);
-        assert_eq!(FileLayout::try_new(6 * 4096, 4096, 1).unwrap().chunks_per_block(), 6);
+    fn chunks_per_block_uses_valid_layouts() {
+        assert_eq!(FileLayout::new(4096, 4096, 1).chunks_per_block(), 1);
+        assert_eq!(FileLayout::new(8192, 4096, 1).chunks_per_block(), 2);
+        assert_eq!(FileLayout::new(6 * 4096, 4096, 1).chunks_per_block(), 6);
     }
 
     #[test]
@@ -358,7 +336,7 @@ mod tests {
         assert_eq!(full.chunk_size, 1024);
         assert_eq!(full.effective_len, 4096);
 
-        let layout = FileLayout::try_new(4096, 1024, 1).unwrap();
+        let layout = FileLayout::new(4096, 1024, 1);
         let tail = BlockShape::for_effective_len(&layout, 3072).expect("tail block shape must pass");
         assert_eq!(tail.effective_len, 3072);
     }

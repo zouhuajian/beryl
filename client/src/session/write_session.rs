@@ -90,7 +90,7 @@ impl WriteSession {
 
     /// Metadata-confirmed block size as a usize for local buffering decisions.
     pub(crate) fn block_size_usize(&self) -> usize {
-        self.layout.block_size() as usize
+        self.layout.block_size as usize
     }
 
     /// Accept bytes into the SDK-visible write cursor.
@@ -1320,7 +1320,7 @@ mod tests {
     }
 
     fn test_layout() -> FileLayout {
-        FileLayout::try_new(1024, 1024, 1).unwrap()
+        FileLayout::new(1024, 1024, 1)
     }
 
     fn write_handle_proto(handle_id: u64, data_handle_id: u64) -> WriteHandleProto {

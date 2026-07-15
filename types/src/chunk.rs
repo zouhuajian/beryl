@@ -89,11 +89,12 @@ mod tests {
     use super::*;
 
     fn layout_with_chunks(chunks: u32) -> FileLayout {
-        FileLayout::try_new(chunks * 4096, 4096, 1).unwrap()
+        FileLayout::new(chunks * 4096, 4096, 1)
     }
 
     #[test]
     fn chunk_bitmap_sizes_words_by_chunks_per_block_boundaries() {
+        assert_eq!(ChunkBitmap::with_capacity_for(&layout_with_chunks(0)).bits.len(), 0);
         assert_eq!(ChunkBitmap::with_capacity_for(&layout_with_chunks(1)).bits.len(), 1);
         assert_eq!(ChunkBitmap::with_capacity_for(&layout_with_chunks(64)).bits.len(), 1);
         assert_eq!(ChunkBitmap::with_capacity_for(&layout_with_chunks(65)).bits.len(), 2);

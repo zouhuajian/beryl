@@ -802,7 +802,7 @@ mod tests {
                 parent_inode_id,
                 name: "file".to_string(),
                 attrs: FileAttrs::new(),
-                layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
+                layout: FileLayout::new(4096, 4096, 1),
             },
         );
 
@@ -822,10 +822,7 @@ mod tests {
             .expect("mapping should exist");
         assert_eq!(mapped, inode_id, "data handle owner mapping must match created inode");
         assert_eq!(storage.get_dentry(parent_inode_id, "file").unwrap(), Some(inode_id));
-        assert_eq!(
-            storage.get_layout(inode_id).unwrap(),
-            FileLayout::try_new(4096, 4096, 1).unwrap()
-        );
+        assert_eq!(storage.get_layout(inode_id).unwrap(), FileLayout::new(4096, 4096, 1));
     }
 
     #[test]
@@ -847,7 +844,7 @@ mod tests {
                 parent_inode_id,
                 name: "file".to_string(),
                 attrs: FileAttrs::new(),
-                layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
+                layout: FileLayout::new(4096, 4096, 1),
             },
         );
 
@@ -943,7 +940,7 @@ mod tests {
                     parent_inode_id,
                     name: "old".to_string(),
                     attrs: FileAttrs::new(),
-                    layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
+                    layout: FileLayout::new(4096, 4096, 1),
                 },
             ))
             .unwrap();
@@ -989,7 +986,7 @@ mod tests {
                     parent_inode_id,
                     name: "old".to_string(),
                     attrs: FileAttrs::new(),
-                    layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
+                    layout: FileLayout::new(4096, 4096, 1),
                 },
             ))
             .unwrap(),
@@ -1074,7 +1071,7 @@ mod tests {
                     parent_inode_id,
                     name: "source".to_string(),
                     attrs: FileAttrs::new(),
-                    layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
+                    layout: FileLayout::new(4096, 4096, 1),
                 },
             ))
             .unwrap();
@@ -1091,7 +1088,7 @@ mod tests {
                     parent_inode_id,
                     name: "target".to_string(),
                     attrs: FileAttrs::new(),
-                    layout: FileLayout::try_new(8192, 8192, 1).unwrap(),
+                    layout: FileLayout::new(8192, 8192, 1),
                 },
             ))
             .unwrap();
@@ -1155,7 +1152,7 @@ mod tests {
                     parent_inode_id,
                     name: "source".to_string(),
                     attrs: FileAttrs::new(),
-                    layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
+                    layout: FileLayout::new(4096, 4096, 1),
                 },
             ))
             .unwrap(),
@@ -1216,7 +1213,7 @@ mod tests {
                     parent_inode_id,
                     name: "source".to_string(),
                     attrs: FileAttrs::new(),
-                    layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
+                    layout: FileLayout::new(4096, 4096, 1),
                 },
             ))
             .unwrap(),
@@ -1330,7 +1327,7 @@ mod tests {
                     parent_inode_id,
                     name: "source".to_string(),
                     attrs: FileAttrs::new(),
-                    layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
+                    layout: FileLayout::new(4096, 4096, 1),
                 },
             ))
             .unwrap(),
@@ -1344,7 +1341,7 @@ mod tests {
                     parent_inode_id,
                     name: "target".to_string(),
                     attrs: FileAttrs::new(),
-                    layout: FileLayout::try_new(8192, 8192, 1).unwrap(),
+                    layout: FileLayout::new(8192, 8192, 1),
                 },
             ))
             .unwrap(),
@@ -1394,7 +1391,7 @@ mod tests {
                     parent_inode_id,
                     name: "source".to_string(),
                     attrs: FileAttrs::new(),
-                    layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
+                    layout: FileLayout::new(4096, 4096, 1),
                 },
             ))
             .unwrap(),
@@ -1447,7 +1444,7 @@ mod tests {
                     parent_inode_id,
                     name: "source".to_string(),
                     attrs: FileAttrs::new(),
-                    layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
+                    layout: FileLayout::new(4096, 4096, 1),
                 },
             ))
             .unwrap(),
@@ -1511,7 +1508,7 @@ mod tests {
                     parent_inode_id,
                     name: "first".to_string(),
                     attrs: FileAttrs::new(),
-                    layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
+                    layout: FileLayout::new(4096, 4096, 1),
                 },
             ))
             .unwrap();
@@ -1523,7 +1520,7 @@ mod tests {
                     parent_inode_id,
                     name: "second".to_string(),
                     attrs: FileAttrs::new(),
-                    layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
+                    layout: FileLayout::new(4096, 4096, 1),
                 },
             ))
             .unwrap();
@@ -1558,7 +1555,7 @@ mod tests {
                         parent_inode_id,
                         name: "before-reopen".to_string(),
                         attrs: FileAttrs::new(),
-                        layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
+                        layout: FileLayout::new(4096, 4096, 1),
                     },
                 ))
                 .unwrap();
@@ -1578,7 +1575,7 @@ mod tests {
                     parent_inode_id,
                     name: "after-reopen".to_string(),
                     attrs: FileAttrs::new(),
-                    layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
+                    layout: FileLayout::new(4096, 4096, 1),
                 },
             ))
             .unwrap();
@@ -1605,13 +1602,7 @@ mod tests {
         storage.put_inode(&parent).unwrap();
         parent.attrs.update_mtime_ctime(1);
         storage
-            .create_file_atomic(
-                parent_inode_id,
-                "file",
-                &inode,
-                &parent,
-                FileLayout::try_new(4096, 4096, 1).unwrap(),
-            )
+            .create_file_atomic(parent_inode_id, "file", &inode, &parent, FileLayout::new(4096, 4096, 1))
             .unwrap();
 
         let dedup = dedup_for_test(80);

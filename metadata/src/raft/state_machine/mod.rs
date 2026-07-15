@@ -914,9 +914,7 @@ pub(crate) mod tests {
         storage.put_inode(&parent).unwrap();
         storage.put_inode(&inode).unwrap();
         storage.put_dentry(parent_inode_id, name, inode_id).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
         inode
     }

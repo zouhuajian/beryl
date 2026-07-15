@@ -612,8 +612,8 @@ impl MetadataFileSystem {
         if let Err(err) = validate_active_write_layout(&layout) {
             return self.failure_from_error(&req.ctx, err, group_name, mount_epoch);
         }
-        let block_size = u64::from(layout.block_size());
-        let chunk_size = layout.chunk_size();
+        let block_size = u64::from(layout.block_size);
+        let chunk_size = layout.chunk_size;
         let current_file_version = match &inode.data {
             types::fs::InodeData::File { file_version, .. } => *file_version,
             _ => None,
@@ -677,7 +677,7 @@ impl MetadataFileSystem {
                 caller: caller.clone(),
                 existing: Vec::new(),
                 exclude_workers: Vec::new(),
-                target_replicas: layout.replication(),
+                target_replicas: layout.replication,
             };
             let placement = planner.plan(&placement_req, &placement_views);
             if placement.status != PlacementStatus::Ok {
@@ -788,7 +788,7 @@ impl MetadataFileSystem {
                 fencing_token: target_token,
                 block_stamp,
                 chunk_size,
-                block_format_id: layout.block_format_id(),
+                block_format_id: layout.block_format_id,
                 tier: planned.tier,
             };
             let target_shape = match BlockShape::new(
@@ -1046,7 +1046,7 @@ impl MetadataFileSystem {
         };
 
         let desired_len = desired_len.unwrap_or(4 * 1024 * 1024);
-        let block_size = u64::from(layout.block_size());
+        let block_size = u64::from(layout.block_size);
         let num_blocks = desired_len.div_ceil(block_size).clamp(1, 10);
         let placement_views = worker_manager.collect_worker_placement_views(&placement_group_name);
         let caller = req_ctx
@@ -1066,7 +1066,7 @@ impl MetadataFileSystem {
                 caller: caller.clone(),
                 existing: Vec::new(),
                 exclude_workers: Vec::new(),
-                target_replicas: layout.replication(),
+                target_replicas: layout.replication,
             };
             let placement = planner.plan(&placement_req, &placement_views);
             if placement.status != PlacementStatus::Ok || placement.workers.is_empty() {
@@ -1310,7 +1310,7 @@ mod tests {
     #[tokio::test]
     async fn open_write_target_uses_stored_file_layout_shape() {
         let env = write_flow_env(0).await;
-        let layout = FileLayout::try_with_block_format(8192, 1024, 1, types::BlockFormatId::FULL_EFFECTIVE).unwrap();
+        let layout = FileLayout::with_block_format(8192, 1024, 1, types::BlockFormatId::FULL_EFFECTIVE);
         env.storage.put_layout(env.inode_id, layout).unwrap();
         let open = env
             .filesystem
@@ -1327,9 +1327,9 @@ mod tests {
 
         let target = add_block_for_key(&env.filesystem, &key, 2048).await;
 
-        assert_eq!(target.block_format_id, layout.block_format_id());
-        assert_eq!(target.block_size, u64::from(layout.block_size()));
-        assert_eq!(target.chunk_size, layout.chunk_size());
+        assert_eq!(target.block_format_id, layout.block_format_id);
+        assert_eq!(target.block_size, u64::from(layout.block_size));
+        assert_eq!(target.chunk_size, layout.chunk_size);
         assert_eq!(target.effective_len, 2048);
     }
 

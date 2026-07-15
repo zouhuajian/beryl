@@ -842,7 +842,7 @@ impl MetadataFileSystem {
                         caller: caller.clone(),
                         existing: reported.clone(),
                         exclude_workers: Vec::new(),
-                        target_replicas: layout.replication(),
+                        target_replicas: layout.replication,
                     },
                     &usable_views,
                 );
@@ -886,9 +886,9 @@ impl MetadataFileSystem {
                 len: extent.len,
                 block_stamp,
                 workers,
-                block_format_id: layout.block_format_id(),
-                block_size: u64::from(layout.block_size()),
-                chunk_size: layout.chunk_size(),
+                block_format_id: layout.block_format_id,
+                block_size: u64::from(layout.block_size),
+                chunk_size: layout.chunk_size,
                 effective_len,
             });
         }
@@ -985,9 +985,7 @@ mod tests {
             lease_epoch: None,
         };
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
 
         let mut ctx = request_context();
         ctx.caller = ctx.caller.with_caller_context(CallerContext {
@@ -1059,9 +1057,7 @@ mod tests {
             lease_epoch: None,
         };
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let failure = filesystem
@@ -1132,9 +1128,7 @@ mod tests {
             lease_epoch: None,
         };
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let failure = filesystem
@@ -1206,9 +1200,7 @@ mod tests {
             lease_epoch: None,
         };
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let failure = filesystem
@@ -1286,9 +1278,7 @@ mod tests {
             lease_epoch: None,
         };
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let failure = filesystem
@@ -1412,9 +1402,7 @@ mod tests {
             lease_epoch: None,
         };
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let failure = filesystem
@@ -1502,9 +1490,7 @@ mod tests {
             lease_epoch: None,
         };
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let failure = filesystem
@@ -1549,9 +1535,7 @@ mod tests {
             lease_epoch: None,
         };
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let failure = filesystem
@@ -1597,9 +1581,7 @@ mod tests {
             lease_epoch: Some(1),
         };
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let failure = filesystem
@@ -1791,9 +1773,7 @@ mod tests {
         storage
             .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
             .unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let failure = filesystem
@@ -1862,9 +1842,7 @@ mod tests {
         storage
             .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
             .unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let failure = filesystem
@@ -1912,9 +1890,7 @@ mod tests {
             .with_storage(Arc::clone(&storage))
             .build();
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let success = filesystem
@@ -1961,9 +1937,7 @@ mod tests {
             .with_storage(Arc::clone(&storage))
             .build();
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let success = filesystem

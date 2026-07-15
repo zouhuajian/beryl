@@ -307,6 +307,7 @@ impl OperationExecutor {
         options: CreateOptions,
     ) -> ClientResult<WriteHandle> {
         let path = path.into_string();
+        let layout = layout_for_new_file(&options)?;
         let create_mode = match options.create_mode {
             CreateMode::CreateNew => proto::metadata::CreateModeProto::CreateNew,
             CreateMode::CreateOrOverwrite => proto::metadata::CreateModeProto::CreateOrOverwrite,
@@ -318,7 +319,7 @@ impl OperationExecutor {
                     header: None,
                     path: path.clone(),
                     attrs: Some(default_file_attrs()),
-                    layout: Some(layout_for_new_file(&options)),
+                    layout: Some(layout),
                     create_mode: create_mode as i32,
                     desired_len: Some(default_write_preallocation_len()),
                 },
@@ -888,13 +889,17 @@ fn default_dir_attrs() -> proto::fs::FileAttrsProto {
     }
 }
 
-fn layout_for_new_file(options: &CreateOptions) -> proto::common::FileLayoutProto {
-    proto::common::FileLayoutProto {
-        block_size: options.block_size,
-        chunk_size: options.chunk_size,
-        replication: DEFAULT_REPLICATION,
-        block_format_id: options.block_format_id.as_raw(),
-    }
+fn layout_for_new_file(options: &CreateOptions) -> ClientResult<proto::common::FileLayoutProto> {
+    let layout = FileLayout::with_block_format(
+        options.block_size,
+        options.chunk_size,
+        DEFAULT_REPLICATION,
+        options.block_format_id,
+    );
+    layout
+        .validate()
+        .map_err(|err| ClientError::InvalidLayout(format!("CreateOptions layout invalid: {err}")))?;
+    Ok((&layout).into())
 }
 
 fn file_status_from_response(

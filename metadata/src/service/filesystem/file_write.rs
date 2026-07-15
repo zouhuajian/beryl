@@ -91,9 +91,9 @@ impl MetadataFileSystem {
                     file_handle = payload.session_key.file_handle,
                     lease_id = payload.session_key.lease_id.as_raw(),
                     lease_epoch = payload.session_key.lease_epoch,
-                    layout_block_size = payload.layout.block_size(),
-                    layout_chunk_size = payload.layout.chunk_size(),
-                    replication = payload.layout.replication(),
+                    layout_block_size = payload.layout.block_size,
+                    layout_chunk_size = payload.layout.chunk_size,
+                    replication = payload.layout.replication,
                     initial_target_count = payload.write_targets.len(),
                     desired_len,
                     mount_epoch = success.mount_epoch,
@@ -391,7 +391,7 @@ impl MetadataFileSystem {
 }
 
 pub(super) fn validate_active_write_layout(layout: &FileLayout) -> Result<(), MetadataError> {
-    if layout.replication() != 1 {
+    if layout.replication != 1 {
         return Err(MetadataError::InvalidArgument(
             "multi-replica write is not supported yet; replication must be 1".to_string(),
         ));
@@ -414,9 +414,7 @@ mod tests {
         storage
             .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
             .unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name("g7"))
@@ -449,9 +447,7 @@ mod tests {
         storage
             .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
             .unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
@@ -539,7 +535,7 @@ mod tests {
             .with_raft_node(raft_node)
             .with_worker_manager(worker_manager_for_write_targets(&group_name_value))
             .build();
-        let layout = FileLayout::try_with_block_format(8192, 1024, 1, types::BlockFormatId::FULL_EFFECTIVE).unwrap();
+        let layout = FileLayout::with_block_format(8192, 1024, 1, types::BlockFormatId::FULL_EFFECTIVE);
 
         let success = filesystem
             .create_resolved(CreateInput {
@@ -580,7 +576,7 @@ mod tests {
             parent_inode_id,
             name: "replayed-file".to_string(),
             attrs: FileAttrs::new(),
-            layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
+            layout: FileLayout::new(4096, 4096, 1),
             freshness: Freshness::default(),
         };
 
@@ -613,9 +609,7 @@ mod tests {
         storage
             .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
             .unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 2).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 2)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
@@ -654,7 +648,7 @@ mod tests {
             .preflight_open_write_runtime(
                 &request_context(),
                 Some(4096),
-                FileLayout::try_new(4096, 4096, 1).unwrap(),
+                FileLayout::new(4096, 4096, 1),
                 None,
                 None,
             )

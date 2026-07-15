@@ -487,7 +487,7 @@ mod tests {
         let data_handle_id = DataHandleId::new(12);
         let inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id, data_handle_id);
         parent.attrs.update_mtime_ctime(100);
-        let layout = FileLayout::try_new(4096, 4096, 1).unwrap();
+        let layout = FileLayout::new(4096, 4096, 1);
 
         storage
             .create_file_atomic(parent_inode_id, "file", &inode, &parent, layout)
@@ -517,7 +517,7 @@ mod tests {
         let data_handle_id = DataHandleId::new(12);
         let inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id, data_handle_id);
         parent.attrs.update_mtime_ctime(100);
-        let layout = FileLayout::try_new(4096, 4096, 1).unwrap();
+        let layout = FileLayout::new(4096, 4096, 1);
         let dedup = DedupKey::new(ClientId::new(101), types::CallId::new());
         let applied = AppliedResult {
             fingerprint: CommandFingerprint(77),
@@ -566,7 +566,7 @@ mod tests {
         let inode_id = InodeId::new(11);
         let data_handle_id = DataHandleId::new(12);
         let inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id, data_handle_id);
-        let layout = FileLayout::try_new(4096, 4096, 1).unwrap();
+        let layout = FileLayout::new(4096, 4096, 1);
         storage.put_inode(&parent).unwrap();
         storage
             .create_file_atomic(parent_inode_id, "file", &inode, &parent, layout)
@@ -674,7 +674,7 @@ mod tests {
         let inode_id = InodeId::new(13);
         let data_handle_id = DataHandleId::new(130);
         let mut inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
-        let layout = FileLayout::try_new(4096, 4096, 1).unwrap();
+        let layout = FileLayout::new(4096, 4096, 1);
         let block_id = BlockId::new(data_handle_id, types::ids::BlockIndex::new(0));
         if let InodeData::File {
             extents,
@@ -712,6 +712,20 @@ mod tests {
         assert_eq!(stored.attrs.size, 64);
         assert_eq!(storage.get_layout(inode_id).unwrap(), layout);
         assert!(storage.get_applied_result(&dedup).unwrap().is_some());
+    }
+
+    #[test]
+    fn get_layout_rejects_invalid_persisted_value() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
+        let inode_id = InodeId::new(14);
+
+        storage.put_layout(inode_id, FileLayout::new(4096, 0, 1)).unwrap();
+
+        let error = storage
+            .get_layout(inode_id)
+            .expect_err("invalid persisted layout must fail closed");
+        assert!(error.to_string().contains("Invalid file layout"));
     }
 
     #[test]

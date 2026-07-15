@@ -556,10 +556,7 @@ mod tests {
             }
             other => panic!("unexpected inode data: {:?}", other),
         }
-        assert_eq!(
-            storage.get_layout(inode_id).unwrap(),
-            FileLayout::try_new(4096, 4096, 1).unwrap()
-        );
+        assert_eq!(storage.get_layout(inode_id).unwrap(), FileLayout::new(4096, 4096, 1));
         assert!(storage.get_applied_result(&dedup).unwrap().is_some());
     }
 
@@ -643,10 +640,7 @@ mod tests {
             }
             other => panic!("unexpected inode data: {:?}", other),
         }
-        assert_eq!(
-            storage.get_layout(inode_id).unwrap(),
-            FileLayout::try_new(4096, 4096, 1).unwrap()
-        );
+        assert_eq!(storage.get_layout(inode_id).unwrap(), FileLayout::new(4096, 4096, 1));
     }
 
     #[test]
@@ -812,9 +806,7 @@ mod tests {
         let data_handle_id = DataHandleId::new(99);
         let inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let block_id = BlockId::new(data_handle_id, BlockIndex::new(0));
@@ -945,9 +937,7 @@ mod tests {
         let data_handle_id = DataHandleId::new(173);
         let inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         expect_fs_errno(
@@ -977,9 +967,7 @@ mod tests {
         let data_handle_id = DataHandleId::new(174);
         let inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         expect_fs_errno(
@@ -1009,9 +997,7 @@ mod tests {
         let data_handle_id = DataHandleId::new(175);
         let inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         expect_fs_errno(
@@ -1044,9 +1030,7 @@ mod tests {
             extents.push(old_extent);
         }
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         expect_fs_errno(
@@ -1079,9 +1063,7 @@ mod tests {
             extents.push(close_extent(data_handle_id, 0, 0, 64));
         }
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         expect_fs_ok(
@@ -1122,9 +1104,7 @@ mod tests {
             extents.push(close_extent(data_handle_id, 0, 0, 64));
         }
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         expect_fs_ok(
@@ -1165,9 +1145,7 @@ mod tests {
             extents.push(old_extent);
         }
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         expect_fs_errno(
@@ -1194,9 +1172,7 @@ mod tests {
         let data_handle_id = DataHandleId::new(180);
         let inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let dedup = dedup_for_test(100);
@@ -1246,9 +1222,7 @@ mod tests {
             });
         }
         storage.put_inode(&inode).unwrap();
-        storage
-            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
-            .unwrap();
+        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         expect_fs_ok(
@@ -1294,7 +1268,7 @@ mod tests {
         let inode_id = InodeId::new(70);
         let data_handle_id = DataHandleId::new(170);
         let inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
-        let layout = FileLayout::try_new(4096, 4096, 1).unwrap();
+        let layout = FileLayout::new(4096, 4096, 1);
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, layout).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
@@ -1350,7 +1324,7 @@ mod tests {
         let inode_id = InodeId::new(71);
         let data_handle_id = DataHandleId::new(171);
         let inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
-        let layout = FileLayout::try_new(4096, 4096, 1).unwrap();
+        let layout = FileLayout::new(4096, 4096, 1);
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, layout).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
@@ -1394,7 +1368,7 @@ mod tests {
         let inode_id = InodeId::new(72);
         let data_handle_id = DataHandleId::new(172);
         let inode = Inode::new_file(inode_id, FileAttrs::new(), MountId::new(1), data_handle_id);
-        let layout = FileLayout::try_new(4096, 4096, 1).unwrap();
+        let layout = FileLayout::new(4096, 4096, 1);
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, layout).unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
@@ -1470,7 +1444,7 @@ mod tests {
                 parent_inode_id,
                 name: "first".to_string(),
                 attrs: FileAttrs::new(),
-                layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
+                layout: FileLayout::new(4096, 4096, 1),
             },
         );
         let mismatch = Command::new(
@@ -1480,7 +1454,7 @@ mod tests {
                 parent_inode_id,
                 name: "second".to_string(),
                 attrs: FileAttrs::new(),
-                layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
+                layout: FileLayout::new(4096, 4096, 1),
             },
         );
 

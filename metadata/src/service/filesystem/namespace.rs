@@ -684,10 +684,10 @@ mod tests {
         storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
         storage.put_dentry(parent_inode_id, "target", target_inode_id).unwrap();
         storage
-            .put_layout(source_inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
+            .put_layout(source_inode_id, FileLayout::new(4096, 4096, 1))
             .unwrap();
         storage
-            .put_layout(target_inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
+            .put_layout(target_inode_id, FileLayout::new(4096, 4096, 1))
             .unwrap();
         storage.put_data_handle_owner(source_handle, source_inode_id).unwrap();
         storage.put_data_handle_owner(target_handle, target_inode_id).unwrap();
@@ -762,10 +762,10 @@ mod tests {
         storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
         storage.put_dentry(parent_inode_id, "target", target_inode_id).unwrap();
         storage
-            .put_layout(source_inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
+            .put_layout(source_inode_id, FileLayout::new(4096, 4096, 1))
             .unwrap();
         storage
-            .put_layout(target_inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
+            .put_layout(target_inode_id, FileLayout::new(4096, 4096, 1))
             .unwrap();
         storage.put_data_handle_owner(source_handle, source_inode_id).unwrap();
         storage.put_data_handle_owner(target_handle, target_inode_id).unwrap();
@@ -843,10 +843,10 @@ mod tests {
         storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
         storage.put_dentry(parent_inode_id, "target", target_inode_id).unwrap();
         storage
-            .put_layout(source_inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
+            .put_layout(source_inode_id, FileLayout::new(4096, 4096, 1))
             .unwrap();
         storage
-            .put_layout(target_inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
+            .put_layout(target_inode_id, FileLayout::new(4096, 4096, 1))
             .unwrap();
         storage.put_data_handle_owner(source_handle, source_inode_id).unwrap();
         storage.put_data_handle_owner(target_handle, target_inode_id).unwrap();

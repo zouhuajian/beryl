@@ -143,10 +143,35 @@ async fn create_options_custom_layout_maps_to_create_request() {
         Some(RecordedLayout {
             block_size: 8 * 1024 * 1024,
             chunk_size: 1024 * 1024,
-            replication: DEFAULT_REPLICATION,
+            replication: u32::from(DEFAULT_REPLICATION),
             block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
         })
     );
+}
+
+#[tokio::test]
+async fn create_rejects_invalid_layout_options_before_rpc() {
+    let gateway = Arc::new(MockGateway::default());
+    let client = fs_client_with_gateway(test_config("root"), gateway.clone()).expect("client");
+
+    for options in [
+        CreateOptions::create().with_block_size(0),
+        CreateOptions::create().with_chunk_size(0),
+        CreateOptions::create().with_block_size(1024).with_chunk_size(4096),
+        CreateOptions::create().with_block_size(4097).with_chunk_size(1024),
+    ] {
+        let err = client
+            .create("/created", options)
+            .await
+            .expect_err("invalid create layout must fail locally");
+
+        assert!(
+            matches!(&err, ClientError::InvalidLayout(msg) if msg.contains("CreateOptions layout invalid")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    assert!(gateway.calls().is_empty());
 }
 
 #[tokio::test]
@@ -1142,7 +1167,7 @@ fn recorded_layout_values(block_size: u32, chunk_size: u32) -> RecordedLayout {
     RecordedLayout {
         block_size,
         chunk_size,
-        replication: DEFAULT_REPLICATION,
+        replication: u32::from(DEFAULT_REPLICATION),
         block_format_id: types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
     }
 }
