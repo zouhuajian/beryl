@@ -27,9 +27,9 @@ use common::error::rpc::{ErrorKind, RefreshHint, RpcErrorDetail};
 use common::header::RequestHeader;
 use std::sync::Arc;
 use types::fs::{FsErrorCode, InodeId};
-use types::ids::{BlockId, LeaseId, MountId, WorkerId};
+use types::ids::{BlockId, LeaseId, WorkerId};
 use types::lease::FencingToken;
-use types::{GroupName, GroupStateWatermark, RaftLogId, WorkerEndpointInfo};
+use types::{GroupName, GroupStateWatermark, WorkerEndpointInfo};
 
 use admission::{AdmissionFailure, AdmissionGuard};
 use command::{RoutedFsWriteCtx, WriteCommandKind};
@@ -432,44 +432,6 @@ impl MetadataFileSystem {
 
     fn replay_hint(intent: &str) -> String {
         format!("refresh metadata and reopen write handle, then replay {}", intent)
-    }
-
-    pub(crate) fn mount_hints_for_mount(&self, mount_id: MountId) -> (Option<GroupName>, Option<u64>) {
-        self.freshness_validator.mount_hints_for_mount(mount_id)
-    }
-
-    fn validate_mount_epoch_for_mount(
-        &self,
-        ctx: &RequestContext,
-        freshness: Freshness,
-        mount_id: MountId,
-    ) -> Result<(Option<GroupName>, Option<u64>), FsFailure> {
-        self.freshness_validator
-            .validate_mount_epoch_for_mount(ctx, freshness, mount_id)
-    }
-
-    async fn validate_route_epoch(
-        &self,
-        ctx: &RequestContext,
-        freshness: Freshness,
-        group_name: Option<GroupName>,
-        mount_epoch: Option<u64>,
-        intent: &str,
-    ) -> Result<Option<u64>, FsFailure> {
-        self.freshness_validator
-            .validate_route_epoch(ctx, freshness, group_name, mount_epoch, intent)
-            .await
-    }
-
-    fn validate_stale_state(
-        &self,
-        ctx: &RequestContext,
-        last_applied: Option<RaftLogId>,
-        group_name: Option<GroupName>,
-        mount_epoch: Option<u64>,
-    ) -> Result<StaleStateStatus, FsFailure> {
-        self.freshness_validator
-            .validate_stale_state(ctx, last_applied, group_name, mount_epoch)
     }
 
     fn fencing_token_matches_session(

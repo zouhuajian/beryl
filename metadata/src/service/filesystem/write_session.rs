@@ -298,11 +298,15 @@ impl MetadataFileSystem {
         };
 
         let (group_name, mount_epoch) =
-            match self.validate_mount_epoch_for_mount(&req.ctx, req.freshness, session.mount_id) {
+            match self
+                .freshness_validator
+                .validate_mount_epoch(&req.ctx, req.freshness, session.mount_id)
+            {
                 Ok(hints) => hints,
                 Err(err) => return Err(err),
             };
         let route_epoch = match self
+            .freshness_validator
             .validate_route_epoch(
                 &req.ctx,
                 req.freshness,
@@ -422,7 +426,10 @@ impl MetadataFileSystem {
         };
 
         let (group_name, mount_epoch) =
-            match self.validate_mount_epoch_for_mount(&req.ctx, req.freshness, session.mount_id) {
+            match self
+                .freshness_validator
+                .validate_mount_epoch(&req.ctx, req.freshness, session.mount_id)
+            {
                 Ok(hints) => hints,
                 Err(err) => return Err(err),
             };
@@ -572,12 +579,16 @@ impl MetadataFileSystem {
         }
 
         let (group_name, mount_epoch) =
-            match self.validate_mount_epoch_for_mount(&req.ctx, req.freshness, inode.mount_id) {
+            match self
+                .freshness_validator
+                .validate_mount_epoch(&req.ctx, req.freshness, inode.mount_id)
+            {
                 Ok(hints) => hints,
                 Err(err) => return Err(err),
             };
 
         let route_epoch = match self
+            .freshness_validator
             .validate_route_epoch(&req.ctx, req.freshness, group_name.clone(), mount_epoch, "OpenWrite")
             .await
         {
@@ -884,11 +895,15 @@ impl MetadataFileSystem {
         };
 
         let (group_name, mount_epoch) =
-            match self.validate_mount_epoch_for_mount(&req.ctx, req.freshness, session.mount_id) {
+            match self
+                .freshness_validator
+                .validate_mount_epoch(&req.ctx, req.freshness, session.mount_id)
+            {
                 Ok(hints) => hints,
                 Err(err) => return Err(err),
             };
         let route_epoch = match self
+            .freshness_validator
             .validate_route_epoch(&req.ctx, req.freshness, group_name.clone(), mount_epoch, "AddBlock")
             .await
         {

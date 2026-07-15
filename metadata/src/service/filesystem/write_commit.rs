@@ -227,12 +227,16 @@ impl MetadataFileSystem {
         };
 
         let (group_name, mount_epoch) =
-            match self.validate_mount_epoch_for_mount(&req.ctx, req.freshness, session.mount_id) {
+            match self
+                .freshness_validator
+                .validate_mount_epoch(&req.ctx, req.freshness, session.mount_id)
+            {
                 Ok(hints) => hints,
                 Err(err) => return Err(err),
             };
 
         let route_epoch = match self
+            .freshness_validator
             .validate_route_epoch(&req.ctx, req.freshness, group_name.clone(), mount_epoch, "SyncWrite")
             .await
         {
@@ -609,12 +613,16 @@ impl MetadataFileSystem {
         };
 
         let (group_name, mount_epoch) =
-            match self.validate_mount_epoch_for_mount(&req.ctx, req.freshness, session.mount_id) {
+            match self
+                .freshness_validator
+                .validate_mount_epoch(&req.ctx, req.freshness, session.mount_id)
+            {
                 Ok(hints) => hints,
                 Err(err) => return Err(err),
             };
 
         let route_epoch = match self
+            .freshness_validator
             .validate_route_epoch(&req.ctx, req.freshness, group_name.clone(), mount_epoch, "CommitFile")
             .await
         {
@@ -897,7 +905,7 @@ impl MetadataFileSystem {
         let inode = self
             .read_inode(inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("Inode not found: {}", inode_id)))?;
-        let (group_name, mount_epoch) = self.mount_hints_for_mount(inode.mount_id);
+        let (group_name, mount_epoch) = self.freshness_validator.mount_hints_for_mount(inode.mount_id);
 
         let extents: Vec<_> = req
             .intent

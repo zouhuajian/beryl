@@ -79,9 +79,9 @@ impl MetadataFileSystem {
             }
         };
 
-        if let Err(failure) =
-            self.freshness_validator
-                .validate_routed_write_mount_epoch(req_ctx, freshness, ctx.mount_id)
+        if let Err(failure) = self
+            .freshness_validator
+            .validate_mount_epoch(req_ctx, freshness, ctx.mount_id)
         {
             if let Some(metrics) = &self.metrics {
                 metrics

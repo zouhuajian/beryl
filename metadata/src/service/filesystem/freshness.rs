@@ -44,52 +44,26 @@ impl FreshnessValidator {
         }
     }
 
-    pub(super) fn validate_mount_epoch_for_mount(
+    pub(super) fn validate_mount_epoch(
         &self,
         ctx: &RequestContext,
         freshness: Freshness,
         mount_id: MountId,
-    ) -> Result<(Option<GroupName>, Option<u64>), FsFailure> {
-        self.validate_routed_write_mount_epoch(ctx, freshness, mount_id)
-    }
-
-    pub(super) fn validate_routed_write_mount_epoch(
-        &self,
-        ctx: &RequestContext,
-        freshness: Freshness,
-        mount_id: MountId,
-    ) -> Result<(Option<GroupName>, Option<u64>), FsFailure> {
-        self.validate_mount_epoch_for_mount_with_replay(ctx, freshness, mount_id, Some("request"))
-    }
-
-    fn validate_mount_epoch_for_mount_with_replay(
-        &self,
-        ctx: &RequestContext,
-        freshness: Freshness,
-        mount_id: MountId,
-        replay_intent: Option<&str>,
     ) -> Result<(Option<GroupName>, Option<u64>), FsFailure> {
         let (group_name, mount_epoch) = self.mount_hints_for_mount(mount_id);
         if let (Some(client_mount_epoch), Some(server_mount_epoch)) =
             (freshness.mount_epoch.or(ctx.caller.mount_epoch), mount_epoch)
         {
             if client_mount_epoch != server_mount_epoch {
-                let message = match replay_intent {
-                    Some(intent) => format!(
-                        "mount_epoch mismatch: client={}, server={}; {}",
-                        client_mount_epoch,
-                        server_mount_epoch,
-                        Self::replay_hint(intent)
-                    ),
-                    None => format!(
-                        "mount_epoch mismatch: client={}, server={}",
-                        client_mount_epoch, server_mount_epoch
-                    ),
-                };
                 return Err(refresh_metadata_fs_failure(
                     ctx,
                     ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
-                    message,
+                    format!(
+                        "mount_epoch mismatch: client={}, server={}; {}",
+                        client_mount_epoch,
+                        server_mount_epoch,
+                        Self::replay_hint("request")
+                    ),
                     group_name.clone(),
                     Some(server_mount_epoch),
                     None,
@@ -222,7 +196,7 @@ mod tests {
     use crate::service::filesystem::test_support::*;
 
     #[test]
-    fn freshness_validator_rejects_routed_write_mount_epoch_with_replay_hint() {
+    fn freshness_validator_rejects_mount_epoch_with_replay_hint() {
         let mount_id = MountId::new(12);
         let group_name_value = group_name("g4");
         let mount_table = Arc::new(MountTable::new());
@@ -242,7 +216,7 @@ mod tests {
         let ctx = request_context();
 
         let failure = validator
-            .validate_routed_write_mount_epoch(
+            .validate_mount_epoch(
                 &ctx,
                 Freshness {
                     mount_epoch: Some(4),

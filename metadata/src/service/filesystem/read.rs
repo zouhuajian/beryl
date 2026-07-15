@@ -343,11 +343,14 @@ impl MetadataFileSystem {
         mount_id: types::ids::MountId,
         intent: &str,
     ) -> Result<(Option<GroupName>, Option<u64>, Option<u64>), FsFailure> {
-        let (group_name, mount_epoch) = self.validate_mount_epoch_for_mount(req_ctx, freshness, mount_id)?;
+        let (group_name, mount_epoch) = self
+            .freshness_validator
+            .validate_mount_epoch(req_ctx, freshness, mount_id)?;
         let route_epoch = self
+            .freshness_validator
             .validate_route_epoch(req_ctx, freshness, group_name.clone(), mount_epoch, intent)
             .await?;
-        match self.validate_stale_state(
+        match self.freshness_validator.validate_stale_state(
             req_ctx,
             self.raft_node
                 .as_ref()

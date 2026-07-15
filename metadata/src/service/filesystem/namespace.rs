@@ -477,7 +477,9 @@ impl MetadataFileSystem {
                     .fs_write_cross_mount_rename_exdev_total
                     .fetch_add(1, Ordering::Relaxed);
             }
-            let (group_name, mount_epoch) = self.mount_hints_for_mount(src_parent_inode.mount_id);
+            let (group_name, mount_epoch) = self
+                .freshness_validator
+                .mount_hints_for_mount(src_parent_inode.mount_id);
             return self.failure_from_error(
                 &req.ctx,
                 MetadataError::CrossMountRename(format!(
@@ -503,7 +505,7 @@ impl MetadataFileSystem {
             if let Some(raft_node) = self.raft_node.as_ref() {
                 if raft_node.is_leader() {
                     let mut can_precheck = true;
-                    match self.validate_stale_state(
+                    match self.freshness_validator.validate_stale_state(
                         &req.ctx,
                         raft_node.get_last_applied_state_id(),
                         Some(ctx.namespace_owner_group_name.clone()),
