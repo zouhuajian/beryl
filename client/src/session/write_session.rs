@@ -477,11 +477,6 @@ impl WriteSession {
         matches!(self.state, WriteSessionState::CommitUnknown)
     }
 
-    /// Reject close attempts on handles that already reached a terminal state.
-    pub(crate) fn ensure_close_allowed(&mut self) -> ClientResult<()> {
-        self.ensure_open_for_close()
-    }
-
     /// Reject writes unless the session is open and the lease is locally valid.
     pub(crate) fn ensure_open_for_write(&mut self) -> ClientResult<()> {
         self.ensure_open_for_write_at_ms(unix_now_ms())

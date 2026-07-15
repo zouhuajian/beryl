@@ -332,7 +332,7 @@ impl FileWriter {
         let session_ref = self.handle.write_session();
         let mut session = session_ref.lock().await;
         self.renew_lease_if_needed(&mut session).await?;
-        session.ensure_close_allowed()?;
+        session.ensure_open_for_close()?;
         let path = session.path().to_string();
         self.flush_pending_bytes(&mut session).await?;
         let final_size = session.cursor();
