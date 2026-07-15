@@ -213,7 +213,7 @@ impl OperationContext {
         let client_name = client_name.into();
         validate_client_name(&client_name)?;
         let operation_name = operation_name.into();
-        let replay_safety = crate::runtime::policy::ReplayPolicyTable::safety_for(kind);
+        let replay_safety = crate::runtime::policy::replay_safety_for(kind);
         let operation_fingerprint = identity.fingerprint(kind, &operation_name);
         Ok(Self {
             client_id,

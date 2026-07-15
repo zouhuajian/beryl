@@ -19,7 +19,7 @@ use crate::metrics::{ClientMetric, ClientMetricEvent, ClientMetricLabels, Client
 use crate::rpc_error::ClientAction;
 use crate::runtime::classify::{ErrorClass, ErrorClassifier, MetadataRefreshCause};
 pub(crate) use crate::runtime::context::{AttemptContext, OperationContext, OperationIdentity};
-use crate::runtime::policy::{OperationKind, ReplayPolicyTable};
+use crate::runtime::policy::{ensure_replay_allowed, OperationKind};
 use crate::runtime::refresh::MetadataTargets;
 use crate::runtime::ClientIdentity;
 use crate::runtime::{BackoffPolicy, BackoffSleeper};
@@ -32,7 +32,6 @@ pub(crate) struct OperationExecutor {
     identity: ClientIdentity,
     gateway: Arc<dyn MetadataGateway>,
     metadata_targets: MetadataTargets,
-    replay_policy: ReplayPolicyTable,
     classifier: ErrorClassifier,
     retry: RetryConfig,
     refresh: RefreshConfig,
@@ -55,7 +54,6 @@ impl OperationExecutor {
             identity,
             gateway,
             metadata_targets,
-            replay_policy: ReplayPolicyTable::new(),
             classifier: ErrorClassifier,
             retry: config.retry.clone(),
             refresh: config.refresh.clone(),
@@ -669,10 +667,7 @@ impl OperationExecutor {
                                 );
                                 return Err(err);
                             }
-                            if let Err(policy_err) = self
-                                .replay_policy
-                                .ensure_replay_allowed(&operation, Some(observed_fingerprint))
-                            {
+                            if let Err(policy_err) = ensure_replay_allowed(&operation, Some(observed_fingerprint)) {
                                 self.record_replay_denied(&operation);
                                 return Err(policy_err);
                             }
@@ -708,10 +703,7 @@ impl OperationExecutor {
                                 );
                                 return Err(err);
                             }
-                            if let Err(policy_err) = self
-                                .replay_policy
-                                .ensure_replay_allowed(&operation, Some(observed_fingerprint))
-                            {
+                            if let Err(policy_err) = ensure_replay_allowed(&operation, Some(observed_fingerprint)) {
                                 self.record_replay_denied(&operation);
                                 return Err(policy_err);
                             }

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Replay policy table for client operations.
+//! Replay safety rules for client operations.
 
 use crate::error::{ClientError, ClientResult};
-use crate::runtime::context::{OperationContext, OperationFingerprint, OperationIdentity};
+use crate::runtime::context::{OperationContext, OperationFingerprint};
 
 /// Logical operation category used by replay policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -59,73 +59,42 @@ pub(crate) enum ReplaySafety {
     BestEffortCleanup,
 }
 
-/// Explicit replay policy table.
-#[derive(Clone, Debug)]
-pub(crate) struct ReplayPolicyTable;
-
-impl Default for ReplayPolicyTable {
-    fn default() -> Self {
-        Self::new()
+/// Return the replay safety requirement for an operation kind.
+pub(crate) fn replay_safety_for(kind: OperationKind) -> ReplaySafety {
+    match kind {
+        OperationKind::MetadataRead | OperationKind::WorkerReadData => ReplaySafety::Idempotent,
+        OperationKind::MetadataMutation => ReplaySafety::StableCallId,
+        OperationKind::MetadataSessionBarrier | OperationKind::WorkerWriteData => ReplaySafety::StableSession,
+        OperationKind::CleanupBestEffort => ReplaySafety::BestEffortCleanup,
     }
 }
 
-impl ReplayPolicyTable {
-    /// Create a replay policy table and verify the explicit policy classes are covered.
-    pub(crate) fn new() -> Self {
-        Self::assert_contract_complete();
-        Self
+/// Reject unsafe mutation or session replay before an executor retries.
+pub(crate) fn ensure_replay_allowed(
+    operation: &OperationContext,
+    observed_fingerprint: Option<OperationFingerprint>,
+) -> ClientResult<()> {
+    let safety = operation.replay_safety();
+    let Some(observed_fingerprint) = observed_fingerprint else {
+        return Err(ClientError::Unsupported(format!(
+            "replay for {:?} requires {safety:?}",
+            operation.kind()
+        )));
+    };
+    if observed_fingerprint != operation.operation_fingerprint() {
+        return Err(ClientError::Unsupported(format!(
+            "replay for {:?} denied: operation fingerprint changed",
+            operation.kind()
+        )));
     }
-
-    fn assert_contract_complete() {
-        let _ = [
-            Self::safety_for(OperationKind::MetadataRead),
-            Self::safety_for(OperationKind::MetadataMutation),
-            Self::safety_for(OperationKind::MetadataSessionBarrier),
-            Self::safety_for(OperationKind::WorkerReadData),
-            Self::safety_for(OperationKind::WorkerWriteData),
-            Self::safety_for(OperationKind::CleanupBestEffort),
-        ];
-        let _ = OperationIdentity::session("", "");
-    }
-
-    /// Return the replay safety requirement for an operation kind.
-    pub(crate) fn safety_for(kind: OperationKind) -> ReplaySafety {
-        match kind {
-            OperationKind::MetadataRead | OperationKind::WorkerReadData => ReplaySafety::Idempotent,
-            OperationKind::MetadataMutation => ReplaySafety::StableCallId,
-            OperationKind::MetadataSessionBarrier | OperationKind::WorkerWriteData => ReplaySafety::StableSession,
-            OperationKind::CleanupBestEffort => ReplaySafety::BestEffortCleanup,
-        }
-    }
-
-    /// Reject unsafe mutation or session replay before an executor retries.
-    pub(crate) fn ensure_replay_allowed(
-        &self,
-        operation: &OperationContext,
-        observed_fingerprint: Option<OperationFingerprint>,
-    ) -> ClientResult<()> {
-        let safety = operation.replay_safety();
-        let Some(observed_fingerprint) = observed_fingerprint else {
-            return Err(ClientError::Unsupported(format!(
-                "replay for {:?} requires {safety:?}",
-                operation.kind()
-            )));
-        };
-        if observed_fingerprint != operation.operation_fingerprint() {
-            return Err(ClientError::Unsupported(format!(
-                "replay for {:?} denied: operation fingerprint changed",
-                operation.kind()
-            )));
-        }
-        match safety {
-            ReplaySafety::Idempotent | ReplaySafety::StableCallId => Ok(()),
-            ReplaySafety::BestEffortCleanup => Ok(()),
-            ReplaySafety::StableSession if operation.has_session_identity() => Ok(()),
-            ReplaySafety::StableSession => Err(ClientError::Unsupported(format!(
-                "replay for {:?} requires StableSession",
-                operation.kind()
-            ))),
-        }
+    match safety {
+        ReplaySafety::Idempotent | ReplaySafety::StableCallId => Ok(()),
+        ReplaySafety::BestEffortCleanup => Ok(()),
+        ReplaySafety::StableSession if operation.has_session_identity() => Ok(()),
+        ReplaySafety::StableSession => Err(ClientError::Unsupported(format!(
+            "replay for {:?} requires StableSession",
+            operation.kind()
+        ))),
     }
 }
 
@@ -145,14 +114,10 @@ mod tests {
         )
         .expect("mutation context");
 
-        let err = ReplayPolicyTable
-            .ensure_replay_allowed(&mutation, None)
-            .expect_err("mutation replay without call id must fail");
+        let err = ensure_replay_allowed(&mutation, None).expect_err("mutation replay without call id must fail");
 
         assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("StableCallId")));
-        assert!(ReplayPolicyTable
-            .ensure_replay_allowed(&mutation, Some(mutation.operation_fingerprint()))
-            .is_ok());
+        assert!(ensure_replay_allowed(&mutation, Some(mutation.operation_fingerprint())).is_ok());
     }
 
     #[test]
@@ -166,9 +131,7 @@ mod tests {
         .expect("mutation context");
         let changed = OperationIdentity::path("/beta").fingerprint(OperationKind::MetadataMutation, "Delete");
 
-        let err = ReplayPolicyTable
-            .ensure_replay_allowed(&mutation, Some(changed))
-            .expect_err("changed mutation identity must fail");
+        let err = ensure_replay_allowed(&mutation, Some(changed)).expect_err("changed mutation identity must fail");
 
         assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("operation fingerprint")));
     }
@@ -182,8 +145,7 @@ mod tests {
             OperationIdentity::path("/alpha"),
         )
         .expect("barrier context");
-        let err = ReplayPolicyTable
-            .ensure_replay_allowed(&barrier, Some(barrier.operation_fingerprint()))
+        let err = ensure_replay_allowed(&barrier, Some(barrier.operation_fingerprint()))
             .expect_err("session replay without session identity must fail");
 
         assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("StableSession")));
@@ -194,9 +156,7 @@ mod tests {
             OperationIdentity::session("/alpha", "write-handle-1"),
         )
         .expect("barrier context");
-        assert!(ReplayPolicyTable
-            .ensure_replay_allowed(&with_session, Some(with_session.operation_fingerprint()))
-            .is_ok());
+        assert!(ensure_replay_allowed(&with_session, Some(with_session.operation_fingerprint())).is_ok());
     }
 
     #[test]
@@ -212,9 +172,8 @@ mod tests {
             .with_detail("final_size=6")
             .fingerprint(OperationKind::MetadataSessionBarrier, "CommitFile");
 
-        let err = ReplayPolicyTable
-            .ensure_replay_allowed(&barrier, Some(changed))
-            .expect_err("changed session barrier fingerprint must fail");
+        let err =
+            ensure_replay_allowed(&barrier, Some(changed)).expect_err("changed session barrier fingerprint must fail");
 
         assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("operation fingerprint")));
     }
@@ -222,7 +181,7 @@ mod tests {
     #[test]
     fn cleanup_replay_is_best_effort_but_still_requires_call_id() {
         assert_eq!(
-            ReplayPolicyTable::safety_for(OperationKind::CleanupBestEffort),
+            replay_safety_for(OperationKind::CleanupBestEffort),
             ReplaySafety::BestEffortCleanup
         );
         let cleanup = OperationContext::new(
@@ -232,33 +191,9 @@ mod tests {
             OperationIdentity::path("/alpha"),
         )
         .expect("cleanup context");
-        let err = ReplayPolicyTable
-            .ensure_replay_allowed(&cleanup, None)
-            .expect_err("cleanup replay without call id must fail");
+        let err = ensure_replay_allowed(&cleanup, None).expect_err("cleanup replay without call id must fail");
 
         assert!(matches!(err, ClientError::Unsupported(msg) if msg.contains("BestEffortCleanup")));
-        assert!(ReplayPolicyTable
-            .ensure_replay_allowed(&cleanup, Some(cleanup.operation_fingerprint()))
-            .is_ok());
-    }
-
-    #[test]
-    fn mutation_and_session_barrier_do_not_blind_retry() {
-        for (kind, identity) in [
-            (OperationKind::MetadataMutation, OperationIdentity::path("/alpha")),
-            (
-                OperationKind::MetadataSessionBarrier,
-                OperationIdentity::session("/alpha", "write-handle-1"),
-            ),
-        ] {
-            let operation =
-                OperationContext::new(ClientId::new(7), kind, "ReplayGuard", identity).expect("operation context");
-
-            let err = ReplayPolicyTable
-                .ensure_replay_allowed(&operation, None)
-                .expect_err("replay without stable fingerprint must fail");
-
-            assert!(matches!(err, ClientError::Unsupported(_)));
-        }
+        assert!(ensure_replay_allowed(&cleanup, Some(cleanup.operation_fingerprint())).is_ok());
     }
 }
