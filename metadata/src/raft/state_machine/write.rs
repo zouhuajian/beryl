@@ -44,7 +44,7 @@ impl AppRaftStateMachine {
 
             // lease_id/open_epoch are part of the command fingerprint and replay
             // identity, but the Raft apply layer has no authoritative runtime
-            // write-session table after restart. FsCore validates the live session
+            // write-session table after restart. MetadataFileSystem validates the live session
             // before proposing; apply can only persist the lease_epoch carried here.
             let _ = (lease_id, open_epoch);
 
@@ -232,7 +232,7 @@ impl AppRaftStateMachine {
                 )));
             }
 
-            // FsCore validates the live runtime session before proposing. The
+            // MetadataFileSystem validates the live runtime session before proposing. The
             // Raft command carries lease identity so dedup replay still rejects
             // calls that reuse a call_id for a different write barrier.
             let _ = (lease_id, open_epoch);

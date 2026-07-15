@@ -1,19 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Write session management for the data plane.
+//! Runtime registry for write-session handles.
 //!
-//! WriteSession is a runtime-only structure (not persisted to Raft).
-//! It tracks internal write sessions and is cleaned up on CommitFile, AbortFileWrite, or TTL expiry.
+//! Sessions are leader-local and are normally removed on CommitFile or AbortFileWrite.
+//! LeaseManager is the authority for whether a write is still active; this
+//! registry only stores handle state needed to continue an admitted write.
 
-use crate::inode_lease::WriteMode;
+use crate::inode_lease::{LeaseManager, WriteMode};
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use types::fs::Extent;
 use types::fs::InodeId;
-use types::ids::{ClientId, DataHandleId, LeaseId, MountId};
+use types::ids::{DataHandleId, LeaseId, MountId};
 use types::lease::FencingToken;
 use types::{BlockShape, WriteTarget};
 
@@ -38,27 +36,12 @@ pub struct WriteSession {
     pub base_size: u64,
     /// Write mode (WRITE or APPEND).
     pub mode: WriteMode,
-    /// Pending extents (accumulated before close).
-    pub pending_extents: Vec<Extent>,
-    /// Pending size (accumulated before close).
-    pub pending_size: u64,
     /// Precomputed write targets for AddBlock.
     pub write_targets: Vec<WriteTarget>,
     /// Targets already issued to the client through AddBlock.
     pub issued_targets: Vec<WriteTarget>,
     /// Next write target to hand out through AddBlock.
     pub next_target_index: usize,
-    /// Writer identity (client_id / call_id).
-    pub writer_identity: WriterIdentity,
-    /// Created timestamp (for TTL cleanup).
-    pub created_at_ms: u64,
-}
-
-/// Writer identity (client + call for tracking).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WriterIdentity {
-    pub client_id: ClientId,
-    pub call_id: types::CallId,
 }
 
 /// Inputs needed to create a runtime write session.
@@ -73,36 +56,22 @@ pub struct CreateSessionInput {
     pub base_size: u64,
     pub mode: WriteMode,
     pub write_targets: Vec<WriteTarget>,
-    pub writer_identity: WriterIdentity,
 }
 
-/// Write session manager (in-memory, leader-only).
-pub struct WriteSessionManager {
-    /// Active write sessions: file_handle -> WriteSession.
-    sessions: Arc<RwLock<HashMap<u64, WriteSession>>>,
+/// In-memory, leader-local registry of write-session handles.
+pub struct SessionRegistry {
+    /// Write sessions: file_handle -> WriteSession.
+    sessions: RwLock<HashMap<u64, WriteSession>>,
     /// Next file handle ID.
-    next_file_handle: Arc<RwLock<u64>>,
-    /// Session TTL in milliseconds (default: 1 hour).
-    session_ttl_ms: u64,
+    next_file_handle: RwLock<u64>,
 }
 
-impl WriteSessionManager {
-    /// Create a new WriteSessionManager.
-    pub fn new(session_ttl_ms: u64) -> Self {
-        Self {
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            next_file_handle: Arc::new(RwLock::new(1)),
-            session_ttl_ms,
-        }
-    }
-
+impl SessionRegistry {
     /// Create a new write session.
     pub fn create_session(&self, input: CreateSessionInput) -> u64 {
         let mut next_id = self.next_file_handle.write();
         let file_handle = *next_id;
         *next_id += 1;
-
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 
         let session = WriteSession {
             inode_id: input.inode_id,
@@ -114,13 +83,9 @@ impl WriteSessionManager {
             open_epoch: input.open_epoch,
             base_size: input.base_size,
             mode: input.mode,
-            pending_extents: Vec::new(),
-            pending_size: 0,
             write_targets: input.write_targets,
             issued_targets: Vec::new(),
             next_target_index: 0,
-            writer_identity: input.writer_identity,
-            created_at_ms: now_ms,
         };
 
         self.sessions.write().insert(file_handle, session);
@@ -166,45 +131,95 @@ impl WriteSessionManager {
         self.sessions.write().remove(&file_handle)
     }
 
-    /// Clean up expired sessions (should be called periodically).
-    pub fn cleanup_expired(&self) -> usize {
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-
+    /// Remove handles for an inode whose lease is no longer current.
+    pub fn remove_inactive_for_inode(&self, inode_id: InodeId, lease_manager: &LeaseManager) -> usize {
         let mut sessions = self.sessions.write();
-        let expired: Vec<u64> = sessions
-            .iter()
-            .filter(|(_, session)| now_ms - session.created_at_ms > self.session_ttl_ms)
-            .map(|(handle, _)| *handle)
-            .collect();
-
-        for handle in &expired {
-            sessions.remove(handle);
-        }
-
-        expired.len()
-    }
-
-    /// Get all sessions for an inode (for conflict detection).
-    pub fn get_sessions_for_inode(&self, inode_id: InodeId) -> Vec<u64> {
-        self.sessions
-            .read()
-            .iter()
-            .filter(|(_, session)| session.inode_id == inode_id)
-            .map(|(handle, _)| *handle)
-            .collect()
-    }
-
-    /// Check if an inode has an active write session.
-    pub fn has_active_session(&self, inode_id: InodeId) -> bool {
-        self.sessions
-            .read()
-            .values()
-            .any(|session| session.inode_id == inode_id)
+        let previous_len = sessions.len();
+        sessions.retain(|_, session| {
+            session.inode_id != inode_id
+                || lease_manager.is_active_lease(session.inode_id, session.lease_id, session.lease_epoch)
+        });
+        previous_len - sessions.len()
     }
 }
 
-impl Default for WriteSessionManager {
+impl Default for SessionRegistry {
     fn default() -> Self {
-        Self::new(3_600_000) // 1 hour default TTL
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+            next_file_handle: RwLock::new(1),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use types::ids::{BlockId, BlockIndex, ClientId};
+
+    fn create_input(inode_id: InodeId) -> CreateSessionInput {
+        let data_handle_id = DataHandleId::new(inode_id.as_raw());
+        CreateSessionInput {
+            inode_id,
+            mount_id: MountId::new(1),
+            data_handle_id,
+            lease_id: LeaseId::new(inode_id.as_raw().into()),
+            lease_epoch: 1,
+            fencing_token: FencingToken {
+                block_id: BlockId::new(data_handle_id, BlockIndex::new(0)),
+                owner: ClientId::new(1),
+                epoch: 1,
+            },
+            open_epoch: 1,
+            base_size: 0,
+            mode: WriteMode::Write,
+            write_targets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn create_get_and_remove_session() {
+        let registry = SessionRegistry::default();
+        let inode_id = InodeId::new(7);
+
+        let handle = registry.create_session(create_input(inode_id));
+
+        assert_eq!(
+            registry.get_session(handle).map(|session| session.inode_id),
+            Some(inode_id)
+        );
+        assert_eq!(
+            registry.remove_session(handle).map(|session| session.inode_id),
+            Some(inode_id)
+        );
+        assert!(registry.get_session(handle).is_none());
+    }
+
+    #[test]
+    fn concurrent_session_creation_allocates_unique_handles() {
+        let registry = Arc::new(SessionRegistry::default());
+        let workers = (0..8)
+            .map(|worker| {
+                let registry = Arc::clone(&registry);
+                std::thread::spawn(move || {
+                    (0..32)
+                        .map(|index| {
+                            let inode_id = InodeId::new(1 + worker * 32 + index);
+                            registry.create_session(create_input(inode_id))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut handles = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("session creator must not panic"))
+            .collect::<Vec<_>>();
+        handles.sort_unstable();
+        handles.dedup();
+
+        assert_eq!(handles.len(), 8 * 32);
     }
 }

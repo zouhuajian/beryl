@@ -3,14 +3,14 @@
 
 //! Path resolver: converts paths to inode IDs via mount resolution and dentry walking.
 //!
-//! This module provides the core path resolution logic for the PathService adapter layer.
+//! This module provides the core path resolution logic for metadata filesystem operations.
 //! It does NOT write any path indices to storage - it only reads from dentry/inode CFs.
 
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::{mount_prefix_matches_path, MountEntry, MountTable};
 use crate::raft::RocksDBStorage;
 use std::sync::Arc;
-use types::fs::{Inode, InodeId};
+use types::fs::InodeId;
 use types::ids::MountId;
 use types::GroupName;
 
@@ -33,24 +33,6 @@ pub struct ResolvedPath {
     pub parent_inode_id: Option<InodeId>,
     pub name: Option<String>,
     pub inode_id: Option<InodeId>,
-}
-
-impl ResolvedPath {
-    pub fn expect_inode(&self) -> MetadataResult<InodeId> {
-        self.inode_id
-            .ok_or_else(|| MetadataError::NotFound("resolved path has no target inode".to_string()))
-    }
-
-    pub fn expect_parent(&self) -> MetadataResult<InodeId> {
-        self.parent_inode_id
-            .ok_or_else(|| MetadataError::InvalidArgument("resolved path has no parent inode".to_string()))
-    }
-
-    pub fn expect_name(&self) -> MetadataResult<&str> {
-        self.name
-            .as_deref()
-            .ok_or_else(|| MetadataError::InvalidArgument("resolved path has no terminal name".to_string()))
-    }
 }
 
 /// Path resolver: converts paths to inode IDs.
@@ -170,16 +152,27 @@ impl PathResolver {
         Ok(current_inode_id)
     }
 
-    /// Resolve path to ResolvedPath (for create/unlink/rename operations).
-    /// Returns parent_inode_id and name for the target entry.
+    /// Resolve a path into its mount, parent entry, and optional target inode.
+    ///
+    /// The mount root resolves directly to its root inode without a parent or
+    /// terminal name. For other paths, the parent and terminal name are always
+    /// populated while the target inode remains optional so create operations
+    /// can resolve a path whose final entry does not exist yet.
     pub fn resolve_path(&self, path: &str) -> MetadataResult<ResolvedPath> {
         let (mount_entry, components) = self.resolve_mount(path)?;
 
         if components.is_empty() {
-            // Path is mount root
-            return Err(MetadataError::InvalidArgument(
-                "Cannot operate on mount root".to_string(),
-            ));
+            return Ok(ResolvedPath {
+                mount_ctx: MountContext {
+                    mount_id: mount_entry.mount_id,
+                    mount_epoch: mount_entry.mount_epoch,
+                    owner_group_name: mount_entry.namespace_owner_group_name,
+                    root_inode_id: mount_entry.root_inode_id,
+                },
+                parent_inode_id: None,
+                name: None,
+                inode_id: Some(mount_entry.root_inode_id),
+            });
         }
 
         // Split into parent components and name
@@ -206,7 +199,8 @@ impl PathResolver {
             )));
         }
 
-        // Optionally check if entry already exists (for lookup operations)
+        // The final entry is optional because create and rename destinations
+        // are valid resolution targets before their dentry exists.
         let inode_id = self.storage.get_dentry(parent_inode_id, &name)?;
 
         Ok(ResolvedPath {
@@ -219,40 +213,6 @@ impl PathResolver {
             parent_inode_id: Some(parent_inode_id),
             name: Some(name),
             inode_id,
-        })
-    }
-
-    /// Resolve path to a unified ResolvedPath with `inode_id` populated.
-    /// Returns the inode_id for the target path.
-    pub fn resolve_inode(&self, path: &str) -> MetadataResult<ResolvedPath> {
-        let (mount_entry, components) = self.resolve_mount(path)?;
-
-        let (inode_id, parent_inode_id, name) = if components.is_empty() {
-            (mount_entry.root_inode_id, None, None)
-        } else {
-            let (parent_components, name) = components.split_at(components.len() - 1);
-            let parent_inode_id = if parent_components.is_empty() {
-                mount_entry.root_inode_id
-            } else {
-                self.walk_dentry(mount_entry.root_inode_id, parent_components)?
-            };
-            let name = name[0].clone();
-            let inode_id = self.storage.get_dentry(parent_inode_id, &name)?.ok_or_else(|| {
-                MetadataError::NotFound(format!("Entry not found: {} (parent inode: {})", name, parent_inode_id))
-            })?;
-            (inode_id, Some(parent_inode_id), Some(name))
-        };
-
-        Ok(ResolvedPath {
-            mount_ctx: MountContext {
-                mount_id: mount_entry.mount_id,
-                mount_epoch: mount_entry.mount_epoch,
-                owner_group_name: mount_entry.namespace_owner_group_name,
-                root_inode_id: mount_entry.root_inode_id,
-            },
-            parent_inode_id,
-            name,
-            inode_id: Some(inode_id),
         })
     }
 
@@ -272,14 +232,6 @@ impl PathResolver {
         }
 
         Ok((src_resolved, dst_resolved))
-    }
-
-    pub(crate) fn get_inode(&self, inode_id: InodeId) -> MetadataResult<Option<Inode>> {
-        self.storage.get_inode(inode_id)
-    }
-
-    pub(crate) fn get_dentry(&self, parent_inode_id: InodeId, name: &str) -> MetadataResult<Option<InodeId>> {
-        self.storage.get_dentry(parent_inode_id, name)
     }
 }
 
@@ -376,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_inode_returns_parent_and_terminal_name_for_nested_path() {
+    fn resolve_path_returns_existing_target_parent_and_terminal_name() {
         let temp_dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(temp_dir.path()).unwrap());
         let mount_table = Arc::new(MountTable::new());
@@ -429,10 +381,15 @@ mod tests {
         storage.put_dentry(dir_b, "c", file_c).unwrap();
 
         let resolver = test_resolver(mount_table, storage);
-        let resolved = resolver.resolve_inode("/mnt/test/a/b/c").unwrap();
-        assert_eq!(resolved.expect_inode().unwrap(), file_c);
-        assert_eq!(resolved.expect_parent().unwrap(), dir_b);
-        assert_eq!(resolved.expect_name().unwrap(), "c");
+        let resolved = resolver.resolve_path("/mnt/test/a/b/c").unwrap();
+        assert_eq!(resolved.inode_id, Some(file_c));
+        assert_eq!(resolved.parent_inode_id, Some(dir_b));
+        assert_eq!(resolved.name.as_deref(), Some("c"));
+
+        let root = resolver.resolve_path("/mnt/test").unwrap();
+        assert_eq!(root.inode_id, Some(root_inode_id));
+        assert!(root.parent_inode_id.is_none());
+        assert!(root.name.is_none());
     }
 
     #[test]
@@ -477,8 +434,8 @@ mod tests {
 
         let resolver = test_resolver(mount_table, storage);
         let resolved = resolver.resolve_path("/mnt/test2/a/b/new-file").unwrap();
-        assert_eq!(resolved.expect_parent().unwrap(), dir_b);
-        assert_eq!(resolved.expect_name().unwrap(), "new-file");
+        assert_eq!(resolved.parent_inode_id, Some(dir_b));
+        assert_eq!(resolved.name.as_deref(), Some("new-file"));
         assert!(resolved.inode_id.is_none());
     }
 }

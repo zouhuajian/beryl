@@ -33,7 +33,7 @@ impl RouteEpoch {
     }
 }
 
-/// State store trait for freshness reads needed by `FsCore`.
+/// State store trait for freshness reads needed by `MetadataFileSystem`.
 ///
 /// Authoritative metadata mutations go through Raft commands and apply batches.
 /// This trait intentionally exposes only the current route freshness read.

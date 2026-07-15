@@ -3,7 +3,7 @@
 
 //! Request guard pipeline for metadata services.
 
-use super::domain::RequestContext;
+use super::RequestContext;
 use crate::data_io::DataIoOp;
 use crate::error::{to_rpc_error, MetadataError};
 use crate::mount::{DataIoPolicy, MountTable};
@@ -16,13 +16,13 @@ use types::ids::MountId;
 use types::GroupName;
 
 #[derive(Clone, Debug)]
-pub struct GuardFailure {
+pub struct AdmissionFailure {
     pub err: Box<RpcErrorDetail>,
     pub group_name: Option<GroupName>,
     pub mount_epoch: Option<u64>,
 }
 
-impl GuardFailure {
+impl AdmissionFailure {
     fn new(err: RpcErrorDetail) -> Self {
         Self {
             err: Box::new(err),
@@ -43,13 +43,13 @@ impl GuardFailure {
 }
 
 #[derive(Clone)]
-pub struct GuardChain {
+pub struct AdmissionGuard {
     readiness: ReadinessGuard,
     leadership: LeadershipGuard,
     data_io: DataIoPolicyGuard,
 }
 
-impl GuardChain {
+impl AdmissionGuard {
     pub fn new(mount_table: Arc<MountTable>) -> Self {
         Self {
             readiness: ReadinessGuard { readiness_gate: None },
@@ -68,21 +68,21 @@ impl GuardChain {
         self
     }
 
-    pub async fn check_meta_read(&self, _ctx: &RequestContext) -> Result<(), GuardFailure> {
+    pub async fn check_meta_read(&self, _ctx: &RequestContext) -> Result<(), AdmissionFailure> {
         self.readiness.check()
     }
 
-    pub async fn check_meta_write(&self, ctx: &RequestContext) -> Result<(), GuardFailure> {
+    pub async fn check_meta_write(&self, ctx: &RequestContext) -> Result<(), AdmissionFailure> {
         self.readiness.check()?;
         self.leadership.check(ctx)
     }
 
-    pub async fn check_data_read(&self, _ctx: &RequestContext, mount_id: MountId) -> Result<(), GuardFailure> {
+    pub async fn check_data_read(&self, _ctx: &RequestContext, mount_id: MountId) -> Result<(), AdmissionFailure> {
         self.readiness.check()?;
         self.data_io.check(mount_id, DataIoOp::Read)
     }
 
-    pub async fn check_data_write(&self, ctx: &RequestContext, mount_id: MountId) -> Result<(), GuardFailure> {
+    pub async fn check_data_write(&self, ctx: &RequestContext, mount_id: MountId) -> Result<(), AdmissionFailure> {
         self.readiness.check()?;
         self.leadership.check(ctx)?;
         self.data_io.check(mount_id, DataIoOp::Write)
@@ -95,14 +95,14 @@ struct ReadinessGuard {
 }
 
 impl ReadinessGuard {
-    fn check(&self) -> Result<(), GuardFailure> {
+    fn check(&self) -> Result<(), AdmissionFailure> {
         let Some(gate) = self.readiness_gate.as_ref() else {
             return Ok(());
         };
         if gate.is_ready() {
             return Ok(());
         }
-        Err(GuardFailure::from_rpc_metadata_error(
+        Err(AdmissionFailure::from_rpc_metadata_error(
             MetadataError::ServiceUnavailable("root mount not ready".to_string()),
         ))
     }
@@ -114,9 +114,9 @@ struct LeadershipGuard {
 }
 
 impl LeadershipGuard {
-    fn check(&self, ctx: &RequestContext) -> Result<(), GuardFailure> {
+    fn check(&self, ctx: &RequestContext) -> Result<(), AdmissionFailure> {
         let Some(raft_node) = self.raft_node.as_ref() else {
-            return Err(GuardFailure::from_rpc_metadata_error(
+            return Err(AdmissionFailure::from_rpc_metadata_error(
                 MetadataError::ServiceUnavailable("raft node not available".to_string()),
             ));
         };
@@ -128,7 +128,7 @@ impl LeadershipGuard {
                 group_name: ctx.caller.group_name.as_ref().map(ToString::to_string),
                 ..Default::default()
             };
-            Err(GuardFailure::new(RpcErrorDetail::refresh_metadata(
+            Err(AdmissionFailure::new(RpcErrorDetail::refresh_metadata(
                 ErrorKind::Metadata(MetadataErrorKind::NotLeader),
                 hint,
                 "not leader",
@@ -150,13 +150,13 @@ struct DataIoPolicyGuard {
 }
 
 impl DataIoPolicyGuard {
-    fn check(&self, mount_id: MountId, op: DataIoOp) -> Result<(), GuardFailure> {
+    fn check(&self, mount_id: MountId, op: DataIoOp) -> Result<(), AdmissionFailure> {
         let mount_entry = self
             .mount_table
             .get_mount(mount_id)
-            .map_err(GuardFailure::from_rpc_metadata_error)?
+            .map_err(AdmissionFailure::from_rpc_metadata_error)?
             .ok_or_else(|| {
-                GuardFailure::from_rpc_metadata_error(MetadataError::NotFound(format!(
+                AdmissionFailure::from_rpc_metadata_error(MetadataError::NotFound(format!(
                     "Mount not found: {:?}",
                     mount_id
                 )))
@@ -174,7 +174,7 @@ impl DataIoPolicyGuard {
                 mount_entry.mount_prefix
             ),
         );
-        Err(GuardFailure::new(err).with_mount(
+        Err(AdmissionFailure::new(err).with_mount(
             Some(mount_entry.namespace_owner_group_name),
             Some(mount_entry.mount_epoch),
         ))
@@ -201,8 +201,7 @@ mod tests {
     fn request_context(client_id: u128) -> RequestContext {
         let caller = RequestHeader::new(types::ClientId::new(client_id));
         RequestContext {
-            caller: caller.clone(),
-            traceparent: caller.trace_context.traceparent.clone(),
+            caller,
             route_epoch: None,
         }
     }
@@ -211,7 +210,7 @@ mod tests {
     async fn readiness_guard_blocks_when_not_ready() {
         let mount_table = Arc::new(MountTable::new());
         let gate = Arc::new(RootReadinessGate::new(None));
-        let chain = GuardChain::new(mount_table).with_readiness_gate(Some(Arc::clone(&gate)));
+        let chain = AdmissionGuard::new(mount_table).with_readiness_gate(Some(Arc::clone(&gate)));
 
         let err = chain.check_meta_read(&request_context(1)).await.unwrap_err();
         assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
@@ -222,7 +221,7 @@ mod tests {
     #[tokio::test]
     async fn check_meta_write_checks_readiness_then_leadership() {
         let gate = Arc::new(RootReadinessGate::new(None));
-        let chain = GuardChain::new(Arc::new(MountTable::new())).with_readiness_gate(Some(Arc::clone(&gate)));
+        let chain = AdmissionGuard::new(Arc::new(MountTable::new())).with_readiness_gate(Some(Arc::clone(&gate)));
 
         let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
         assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
@@ -231,7 +230,7 @@ mod tests {
 
     #[tokio::test]
     async fn leadership_guard_without_raft_node_returns_unavailable() {
-        let chain = GuardChain::new(Arc::new(MountTable::new()));
+        let chain = AdmissionGuard::new(Arc::new(MountTable::new()));
 
         let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
         assert_eq!(err.err.kind, ErrorKind::Internal(InternalErrorKind::NodeUnavailable));
@@ -251,7 +250,7 @@ mod tests {
                 .unwrap(),
         );
         assert!(!raft_node.is_leader());
-        let chain = GuardChain::new(mount_table).with_raft_node(Some(raft_node));
+        let chain = AdmissionGuard::new(mount_table).with_raft_node(Some(raft_node));
 
         let err = chain.check_meta_write(&request_context(2)).await.unwrap_err();
 
@@ -272,7 +271,7 @@ mod tests {
                 ROOT_INODE_ID,
             )
             .unwrap();
-        let chain = GuardChain::new(Arc::clone(&mount_table));
+        let chain = AdmissionGuard::new(Arc::clone(&mount_table));
 
         let err = chain
             .check_data_write(&request_context(3), mount_entry.mount_id)
@@ -295,7 +294,7 @@ mod tests {
                 ROOT_INODE_ID,
             )
             .unwrap();
-        let chain = GuardChain::new(Arc::clone(&mount_table));
+        let chain = AdmissionGuard::new(Arc::clone(&mount_table));
 
         chain
             .check_data_read(&request_context(3), root_entry.mount_id)

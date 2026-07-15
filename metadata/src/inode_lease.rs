@@ -50,7 +50,7 @@ pub struct ActiveLease {
 /// Note: After metadata restart, memory table is lost. New writers can
 /// acquire leases (lease_epoch increments), and old lease holders will
 /// fail on commit due to fencing (lease_epoch mismatch).
-pub struct InodeLeaseManager {
+pub struct LeaseManager {
     /// Active leases: inode_id -> ActiveLease.
     leases: Arc<RwLock<HashMap<InodeId, ActiveLease>>>,
     /// Lease TTL in milliseconds (default: 60 seconds).
@@ -59,8 +59,8 @@ pub struct InodeLeaseManager {
     cleanup_interval_ms: u64,
 }
 
-impl InodeLeaseManager {
-    /// Create a new InodeLeaseManager.
+impl LeaseManager {
+    /// Create a new LeaseManager.
     pub fn new(lease_ttl_ms: u64, cleanup_interval_ms: u64) -> Self {
         Self {
             leases: Arc::new(RwLock::new(HashMap::new())),
@@ -253,6 +253,16 @@ impl InodeLeaseManager {
             .unwrap_or(false)
     }
 
+    pub(crate) fn is_active_lease(&self, inode_id: InodeId, lease_id: LeaseId, lease_epoch: u64) -> bool {
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+
+        self.leases
+            .read()
+            .get(&inode_id)
+            .map(|lease| lease.lease_id == lease_id && lease.lease_epoch == lease_epoch && now_ms < lease.expires_at_ms)
+            .unwrap_or(false)
+    }
+
     /// Clean up expired leases (should be called periodically).
     pub fn cleanup_expired(&self) -> usize {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -288,7 +298,7 @@ impl InodeLeaseManager {
     }
 }
 
-impl Default for InodeLeaseManager {
+impl Default for LeaseManager {
     fn default() -> Self {
         Self::new(60_000, 10_000) // 60s TTL, 10s cleanup interval
     }

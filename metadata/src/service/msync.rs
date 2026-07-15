@@ -3,7 +3,7 @@
 
 //! FileSystemService Msync handler.
 
-use super::core_util::{header_from_rpc_error, ok_header_from_request};
+use super::wire::{header_from_rpc_error, ok_header_from_request};
 use crate::raft::AppRaftNode;
 use common::error::rpc::{
     ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RefreshHint, RpcErrorDetail,

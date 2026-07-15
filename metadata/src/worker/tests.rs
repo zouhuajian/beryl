@@ -623,12 +623,12 @@ fn production_worker_lookup_sources_reject_implicit_group_patterns() {
             include_str!("../raft/storage/transaction.rs"),
         ),
         (
-            "metadata/src/service/fs_core/read.rs",
-            include_str!("../service/fs_core/read.rs"),
+            "metadata/src/service/filesystem/read.rs",
+            include_str!("../service/filesystem/read.rs"),
         ),
         (
-            "metadata/src/service/fs_core/write_session.rs",
-            include_str!("../service/fs_core/write_session.rs"),
+            "metadata/src/service/filesystem/write_session.rs",
+            include_str!("../service/filesystem/write_session.rs"),
         ),
         (
             "metadata/src/maintenance/repair/planner.rs",

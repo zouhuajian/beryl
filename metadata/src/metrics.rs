@@ -4,7 +4,7 @@
 //! Process-local metadata counters shared by metadata subsystems.
 //!
 //! The common observability layer owns exported metrics. This module only holds
-//! in-process state used by metadata readiness, maintenance, and FsCore paths.
+//! in-process state used by metadata readiness, maintenance, and MetadataFileSystem paths.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;

@@ -93,9 +93,9 @@ pub(crate) mod raft_conv;
 pub mod readiness;
 pub mod runtime;
 pub mod service;
+pub(crate) mod session_registry;
 pub mod state;
 pub mod worker;
-pub mod write_session;
 
 pub use config::MetadataConfig;
 pub use error::{MetadataError, MetadataResult};

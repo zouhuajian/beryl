@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
+use super::{fs_failure_from_metadata_error, refresh_metadata_fs_failure, Freshness, FsFailure, RequestContext};
 use crate::error::MetadataResult;
 use crate::mount::MountTable;
-use crate::service::core_util::{core_failure_from_metadata_error, refresh_metadata_core_failure};
-use crate::service::domain::{CoreFailure, Freshness, RequestContext};
 use crate::state::StateStore;
 use common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint};
 use std::sync::Arc;
@@ -50,7 +49,7 @@ impl FreshnessValidator {
         ctx: &RequestContext,
         freshness: Freshness,
         mount_id: MountId,
-    ) -> Result<(Option<GroupName>, Option<u64>), CoreFailure> {
+    ) -> Result<(Option<GroupName>, Option<u64>), FsFailure> {
         self.validate_routed_write_mount_epoch(ctx, freshness, mount_id)
     }
 
@@ -59,7 +58,7 @@ impl FreshnessValidator {
         ctx: &RequestContext,
         freshness: Freshness,
         mount_id: MountId,
-    ) -> Result<(Option<GroupName>, Option<u64>), CoreFailure> {
+    ) -> Result<(Option<GroupName>, Option<u64>), FsFailure> {
         self.validate_mount_epoch_for_mount_with_replay(ctx, freshness, mount_id, Some("request"))
     }
 
@@ -69,7 +68,7 @@ impl FreshnessValidator {
         freshness: Freshness,
         mount_id: MountId,
         replay_intent: Option<&str>,
-    ) -> Result<(Option<GroupName>, Option<u64>), CoreFailure> {
+    ) -> Result<(Option<GroupName>, Option<u64>), FsFailure> {
         let (group_name, mount_epoch) = self.mount_hints_for_mount(mount_id);
         if let (Some(client_mount_epoch), Some(server_mount_epoch)) =
             (freshness.mount_epoch.or(ctx.caller.mount_epoch), mount_epoch)
@@ -87,7 +86,7 @@ impl FreshnessValidator {
                         client_mount_epoch, server_mount_epoch
                     ),
                 };
-                return Err(refresh_metadata_core_failure(
+                return Err(refresh_metadata_fs_failure(
                     ctx,
                     ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
                     message,
@@ -112,13 +111,13 @@ impl FreshnessValidator {
         group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
         intent: &str,
-    ) -> Result<Option<u64>, CoreFailure> {
+    ) -> Result<Option<u64>, FsFailure> {
         let client_route_epoch = freshness.route_epoch.or(ctx.route_epoch);
 
         let server_route_epoch = match self.state_store.get_route_epoch().await {
             Ok(v) => v.as_u64(),
             Err(err) => {
-                return Err(core_failure_from_metadata_error(
+                return Err(fs_failure_from_metadata_error(
                     ctx,
                     err,
                     group_name.clone(),
@@ -130,7 +129,7 @@ impl FreshnessValidator {
 
         if let Some(client_route_epoch) = client_route_epoch {
             if client_route_epoch != server_route_epoch {
-                return Err(refresh_metadata_core_failure(
+                return Err(refresh_metadata_fs_failure(
                     ctx,
                     ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch),
                     format!(
@@ -159,7 +158,7 @@ impl FreshnessValidator {
         last_applied: Option<RaftLogId>,
         group_name: Option<GroupName>,
         mount_epoch: Option<u64>,
-    ) -> Result<StaleStateStatus, CoreFailure> {
+    ) -> Result<StaleStateStatus, FsFailure> {
         let Some(group_name) = group_name else {
             return Ok(StaleStateStatus::Ready);
         };
@@ -176,7 +175,7 @@ impl FreshnessValidator {
             return Ok(StaleStateStatus::UnknownLastApplied);
         };
         if !last_applied.has_reached(&required_state_id) {
-            return Err(refresh_metadata_core_failure(
+            return Err(refresh_metadata_fs_failure(
                 ctx,
                 ErrorKind::Metadata(MetadataErrorKind::StaleState),
                 format!(
@@ -219,5 +218,86 @@ mod tests {
         let error = validator.authoritative_route_epoch().await.unwrap_err();
 
         assert!(matches!(error, MetadataError::Internal(_)));
+    }
+    use crate::service::filesystem::test_support::*;
+
+    #[test]
+    fn freshness_validator_rejects_routed_write_mount_epoch_with_replay_hint() {
+        let mount_id = MountId::new(12);
+        let group_name_value = group_name("g4");
+        let mount_table = Arc::new(MountTable::new());
+        mount_table
+            .upsert(MountEntry {
+                mount_id,
+                mount_prefix: "/data".to_string(),
+                mount_kind: MountKind::Internal,
+                ufs_uri: None,
+                data_io_policy: DataIoPolicy::Allow,
+                mount_epoch: 9,
+                namespace_owner_group_name: group_name_value.clone(),
+                root_inode_id: ROOT_INODE_ID,
+            })
+            .unwrap();
+        let validator = FreshnessValidator::new(Arc::new(MemoryStateStore::new()), mount_table);
+        let ctx = request_context();
+
+        let failure = validator
+            .validate_routed_write_mount_epoch(
+                &ctx,
+                Freshness {
+                    mount_epoch: Some(4),
+                    route_epoch: None,
+                },
+                mount_id,
+            )
+            .unwrap_err();
+
+        assert_refresh_metadata(
+            &failure.error,
+            ErrorKind::Metadata(MetadataErrorKind::MountEpochMismatch),
+        );
+        assert_eq!(
+            failure.error.message,
+            "mount_epoch mismatch: client=4, server=9; refresh metadata and reopen write handle, then replay request"
+        );
+        let hint = refresh_hint(&failure.error);
+        assert_eq!(hint.group_name, Some(group_name_value.to_string()));
+        assert_eq!(hint.mount_epoch, Some(9));
+        assert_eq!(failure.group_name, Some(group_name_value.clone()));
+        assert_eq!(failure.mount_epoch, Some(9));
+    }
+
+    #[test]
+    fn freshness_validator_rejects_stale_state_watermark() {
+        let group_name_value = group_name("g4");
+        let validator = FreshnessValidator::new(Arc::new(MemoryStateStore::new()), Arc::new(MountTable::new()));
+        let mut ctx = request_context();
+        ctx.caller.state = vec![types::GroupStateWatermark::new(
+            group_name_value.clone(),
+            types::RaftLogId::new(1, 7, 12),
+        )];
+
+        let failure = validator
+            .validate_stale_state(
+                &ctx,
+                Some(types::RaftLogId::new(1, 7, 10)),
+                Some(group_name_value.clone()),
+                Some(9),
+            )
+            .unwrap_err();
+
+        assert_refresh_metadata(&failure.error, ErrorKind::Metadata(MetadataErrorKind::StaleState));
+        assert_eq!(
+        failure.error.message,
+        "Stale state: last_applied=RaftLogId { term: 1, leader_node_id: 7, index: 10 } < required=RaftLogId { term: 1, leader_node_id: 7, index: 12 }"
+    );
+        assert_eq!(failure.group_name, Some(group_name_value.clone()));
+        assert_eq!(failure.mount_epoch, Some(9));
+        assert!(failure.state.is_empty());
+
+        let unknown = validator
+            .validate_stale_state(&ctx, None, Some(group_name_value.clone()), Some(9))
+            .expect("missing last_applied should preserve existing precheck fallback");
+        assert_eq!(unknown, StaleStateStatus::UnknownLastApplied);
     }
 }

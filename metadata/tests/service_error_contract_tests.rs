@@ -12,7 +12,7 @@ use types::GroupName;
 
 const SCAN_ROOTS: &[&str] = &["src/service", "src/worker", "../worker/src"];
 const REQUIRED_SCAN_FILES: &[&str] = &[
-    "src/service/path_service.rs",
+    "src/service/rpc.rs",
     "src/worker/service.rs",
     "../worker/src/net/server/grpc.rs",
 ];

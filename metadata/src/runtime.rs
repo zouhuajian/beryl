@@ -9,17 +9,14 @@ use crate::maintenance::{MaintenanceHandle, MaintenanceService};
 use crate::metrics::MetadataMetrics;
 use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
 use crate::readiness::{wait_for_root_ready_with_inputs, RootReadinessGate, RootReadinessLogFields, RootReadyInputs};
-use crate::service::{
-    FileSystemAuthorityDeps, FileSystemRuntimeDeps, MetadataFileSystemServiceDeps, MetadataFileSystemServiceImpl,
-    SharedWorkerCommitHook,
-};
+use crate::service::{MetadataFileSystem, MetadataFileSystemDeps, MetadataFileSystemServiceImpl, MsyncHandler};
 use crate::state::RaftStateStore;
 use crate::worker::{MetadataWorkerServiceImpl, WorkerBackgroundHandle, WorkerManager};
 use crate::{observe, MetadataConfig, MountTable};
 use common::observe::{init_observability as init_common_observability, ObservabilityGuard, ServiceInfo};
 use proto::metadata::file_system_service_proto_server::FileSystemServiceProtoServer;
 use proto::metadata::metadata_worker_service_proto_server::MetadataWorkerServiceProtoServer;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::signal;
 use tokio::task::JoinHandle;
 use tonic::transport as tonic_net;
@@ -425,28 +422,25 @@ pub async fn build_filesystem_service(
     worker_manager: Arc<WorkerManager>,
     readiness: &Readiness,
 ) -> Result<MetadataFileSystemServiceImpl, DynError> {
-    let write_session_manager = Arc::new(crate::write_session::WriteSessionManager::default());
-    let inode_lease_manager = Arc::new(crate::inode_lease::InodeLeaseManager::default());
-    let worker_commit_hook: SharedWorkerCommitHook = Arc::new(Mutex::new(None));
-    let filesystem_service = MetadataFileSystemServiceImpl::new(MetadataFileSystemServiceDeps {
-        authority: FileSystemAuthorityDeps {
-            state_store: Arc::clone(&authority.state_store),
-            mount_table: Arc::clone(&authority.mount_table),
-            storage: Arc::clone(&authority.storage),
-            raft_node: Some(Arc::clone(&authority.raft_node)),
-            group_name: authority.group_name.clone(),
-        },
-        runtime: FileSystemRuntimeDeps {
-            write_session_manager,
-            inode_lease_manager,
-            worker_commit_hook,
-            worker_manager: Some(worker_manager),
-            metrics: Some(Arc::clone(&authority.metadata_metrics)),
-            readiness_gate: Some(readiness.gate()),
-        },
-    })?;
+    let session_registry = Arc::new(crate::session_registry::SessionRegistry::default());
+    let lease_manager = Arc::new(crate::inode_lease::LeaseManager::default());
+    let filesystem = Arc::new(MetadataFileSystem::new(MetadataFileSystemDeps {
+        state_store: Arc::clone(&authority.state_store),
+        mount_table: Arc::clone(&authority.mount_table),
+        storage: Arc::clone(&authority.storage),
+        raft_node: Some(Arc::clone(&authority.raft_node)),
+        session_registry,
+        lease_manager,
+        worker_manager: Some(worker_manager),
+        metrics: Some(Arc::clone(&authority.metadata_metrics)),
+        readiness_gate: Some(readiness.gate()),
+    }));
+    let msync = Some(MsyncHandler::new(
+        Arc::clone(&authority.raft_node),
+        authority.group_name.clone(),
+    ));
 
-    Ok(filesystem_service)
+    Ok(MetadataFileSystemServiceImpl::new(filesystem, msync))
 }
 
 /// Separates RPC service values from lifecycle handles before entering server code.
@@ -605,24 +599,20 @@ mod tests {
             .await
             .unwrap(),
         );
-        MetadataFileSystemServiceImpl::new(MetadataFileSystemServiceDeps {
-            authority: FileSystemAuthorityDeps {
-                state_store: Arc::new(RaftStateStore::new(Arc::clone(&raft_node))),
-                mount_table,
-                storage,
-                raft_node: Some(raft_node),
-                group_name: GroupName::parse("root").unwrap(),
-            },
-            runtime: FileSystemRuntimeDeps {
-                write_session_manager: Arc::new(crate::write_session::WriteSessionManager::default()),
-                inode_lease_manager: Arc::new(crate::inode_lease::InodeLeaseManager::default()),
-                worker_commit_hook: Arc::new(Mutex::new(None)),
-                worker_manager: None,
-                metrics: None,
-                readiness_gate: None,
-            },
-        })
-        .unwrap()
+        let group_name = GroupName::parse("root").unwrap();
+        let filesystem = Arc::new(MetadataFileSystem::new(MetadataFileSystemDeps {
+            state_store: Arc::new(RaftStateStore::new(Arc::clone(&raft_node))),
+            mount_table,
+            storage,
+            raft_node: Some(Arc::clone(&raft_node)),
+            session_registry: Arc::new(crate::session_registry::SessionRegistry::default()),
+            lease_manager: Arc::new(crate::inode_lease::LeaseManager::default()),
+            worker_manager: None,
+            metrics: None,
+            readiness_gate: None,
+        }));
+        let msync = Some(MsyncHandler::new(raft_node, group_name));
+        MetadataFileSystemServiceImpl::new(filesystem, msync)
     }
 
     async fn call_msync(service: &MetadataFileSystemServiceImpl, header: RequestHeader) -> MsyncResponseProto {

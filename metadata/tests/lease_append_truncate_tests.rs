@@ -3,7 +3,7 @@
 
 //! Tests for lease / append / truncate behavior.
 
-use metadata::inode_lease::{InodeLeaseManager, WriteMode};
+use metadata::inode_lease::{LeaseManager, WriteMode};
 use types::fs::InodeId;
 use types::ids::ClientId;
 use types::ids::{BlockId, BlockIndex, DataHandleId};
@@ -11,7 +11,7 @@ use types::CallId;
 
 #[test]
 fn test_lease_conflict() {
-    let manager = InodeLeaseManager::default();
+    let manager = LeaseManager::default();
     let inode_id = InodeId::new(1);
     let client1 = ClientId::new(1);
     let client2 = ClientId::new(2);
@@ -29,7 +29,7 @@ fn test_lease_conflict() {
 
 #[test]
 fn test_lease_renew() {
-    let manager = InodeLeaseManager::default();
+    let manager = LeaseManager::default();
     let inode_id = InodeId::new(1);
     let client_id = ClientId::new(1);
 
@@ -46,7 +46,7 @@ fn test_lease_renew() {
 
 #[test]
 fn test_lease_expire_and_steal() {
-    let manager = InodeLeaseManager::default();
+    let manager = LeaseManager::default();
     let inode_id = InodeId::new(1);
     let client1 = ClientId::new(1);
     let _client2 = ClientId::new(2);
@@ -67,7 +67,7 @@ fn test_lease_expire_and_steal() {
 
 #[test]
 fn test_lease_fencing() {
-    let manager = InodeLeaseManager::default();
+    let manager = LeaseManager::default();
     let inode_id = InodeId::new(1);
     let client1 = ClientId::new(1);
     let client2 = ClientId::new(2);
@@ -95,7 +95,7 @@ fn test_lease_fencing() {
 
 #[test]
 fn test_append_mode_base_size() {
-    let manager = InodeLeaseManager::default();
+    let manager = LeaseManager::default();
     let inode_id = InodeId::new(1);
     let client_id = ClientId::new(1);
 

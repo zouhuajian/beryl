@@ -1,21 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Vecton Contributors
 
-//! Core wire/context utilities shared by service adapters and FsCore.
+//! Proto/domain and response-header conversion for metadata services.
 
-use super::domain::{CoreFailure, CoreSuccess, PresentedFencingToken, RequestContext};
-use crate::error::{to_fs_error_detail, MetadataError};
-use common::error::rpc::{ErrorKind, ProtocolErrorKind, RefreshHint, RpcErrorDetail};
+use super::filesystem::{FsFailure, FsSuccess, PresentedFencingToken, RequestContext};
+use crate::error::MetadataError;
+use common::error::rpc::{ErrorKind, ProtocolErrorKind, RpcErrorDetail};
 use common::header::{RequestHeader, ResponseHeader};
 use tracing::Span;
-use types::fs::FsErrorCode;
-use types::ids::{BlockId, LeaseId, WorkerId};
+use types::ids::{BlockId, LeaseId};
 use types::layout::FileLayout;
 use types::lease::FencingToken;
-use types::{FileBlockLocation, GroupName, GroupStateWatermark, WorkerEndpointInfo, WriteTarget};
+use types::{FileBlockLocation, GroupName, GroupStateWatermark, WriteTarget};
 
 #[allow(clippy::result_large_err)]
-pub fn request_context_from_proto(
+pub(crate) fn request_context_from_proto(
     req_header: &Option<proto::common::RequestHeaderProto>,
 ) -> Result<RequestContext, RpcErrorDetail> {
     let proto_header = req_header
@@ -36,20 +35,19 @@ pub fn request_context_from_proto(
         Span::current().record("state", format!("{:?}", caller.state));
     }
     Ok(RequestContext {
-        traceparent: caller.trace_context.traceparent.clone(),
         route_epoch: req_header.as_ref().and_then(|h| h.route_epoch),
         caller,
     })
 }
 
 #[allow(clippy::result_large_err)]
-pub fn extract_and_inject_context(
+pub(crate) fn extract_and_inject_context(
     req_header: &Option<proto::common::RequestHeaderProto>,
 ) -> Result<RequestHeader, RpcErrorDetail> {
     request_context_from_proto(req_header).map(|ctx| ctx.caller)
 }
 
-pub fn invalid_header_rpc_error(message: impl Into<String>) -> RpcErrorDetail {
+pub(crate) fn invalid_header_rpc_error(message: impl Into<String>) -> RpcErrorDetail {
     RpcErrorDetail::fail(ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader), message)
 }
 
@@ -88,7 +86,7 @@ fn client_from_request_header(
         .and_then(|client| common::header::ClientInfo::try_from(client).ok())
 }
 
-pub fn ok_header_from_context(
+pub(crate) fn ok_header_from_context(
     ctx: &RequestContext,
     group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
@@ -98,7 +96,7 @@ pub fn ok_header_from_context(
     build_base_response_header(ctx, group_name, mount_epoch, route_epoch, state)
 }
 
-pub fn header_from_rpc_error_with_context(
+pub(crate) fn header_from_rpc_error_with_context(
     ctx: &RequestContext,
     group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
@@ -111,9 +109,9 @@ pub fn header_from_rpc_error_with_context(
     header
 }
 
-pub fn ok_header_from_core_success<T>(
+pub(crate) fn ok_header_from_fs_success<T>(
     ctx: &RequestContext,
-    success: &CoreSuccess<T>,
+    success: &FsSuccess<T>,
 ) -> proto::common::ResponseHeaderProto {
     ok_header_from_context(
         ctx,
@@ -124,7 +122,7 @@ pub fn ok_header_from_core_success<T>(
     )
 }
 
-pub fn header_from_core_failure(ctx: &RequestContext, failure: &CoreFailure) -> proto::common::ResponseHeaderProto {
+pub(crate) fn header_from_fs_failure(ctx: &RequestContext, failure: &FsFailure) -> proto::common::ResponseHeaderProto {
     header_from_rpc_error_with_context(
         ctx,
         failure.group_name.clone(),
@@ -135,52 +133,7 @@ pub fn header_from_core_failure(ctx: &RequestContext, failure: &CoreFailure) -> 
     )
 }
 
-pub(crate) fn core_failure_from_metadata_error(
-    ctx: &RequestContext,
-    err: MetadataError,
-    group_name: Option<GroupName>,
-    mount_epoch: Option<u64>,
-    route_epoch: Option<u64>,
-) -> CoreFailure {
-    core_failure_from_rpc_error(ctx, to_fs_error_detail(err), group_name, mount_epoch, route_epoch)
-}
-
-fn core_failure_from_rpc_error(
-    _ctx: &RequestContext,
-    err: RpcErrorDetail,
-    group_name: Option<GroupName>,
-    mount_epoch: Option<u64>,
-    route_epoch: Option<u64>,
-) -> CoreFailure {
-    CoreFailure::new(err, group_name, mount_epoch, route_epoch, Vec::new())
-}
-
-// Refresh-metadata failures must keep caller and server hint fields explicit.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn refresh_metadata_core_failure(
-    ctx: &RequestContext,
-    kind: ErrorKind,
-    message: impl Into<String>,
-    group_name: Option<GroupName>,
-    mount_epoch: Option<u64>,
-    route_epoch: Option<u64>,
-    hint: Option<RefreshHint>,
-) -> CoreFailure {
-    let err = RpcErrorDetail::refresh_metadata(kind, hint.unwrap_or_default(), message);
-    core_failure_from_rpc_error(ctx, err, group_name, mount_epoch, route_epoch)
-}
-
-pub(crate) fn fatal_fs_core_failure(
-    ctx: &RequestContext,
-    errno: FsErrorCode,
-    message: impl Into<String>,
-    group_name: Option<GroupName>,
-    mount_epoch: Option<u64>,
-) -> CoreFailure {
-    core_failure_from_rpc_error(ctx, RpcErrorDetail::fs(errno, message), group_name, mount_epoch, None)
-}
-
-pub fn ok_header_from_request(
+pub(crate) fn ok_header_from_request(
     req_header: &Option<proto::common::RequestHeaderProto>,
     group_name: Option<GroupName>,
     mount_epoch: Option<u64>,
@@ -224,7 +177,7 @@ pub fn header_from_rpc_error(
     header
 }
 
-pub fn file_attrs_to_proto(attrs: &types::fs::FileAttrs) -> proto::fs::FileAttrsProto {
+pub(crate) fn file_attrs_to_proto(attrs: &types::fs::FileAttrs) -> proto::fs::FileAttrsProto {
     proto::fs::FileAttrsProto {
         mode: attrs.mode,
         uid: attrs.uid,
@@ -237,7 +190,9 @@ pub fn file_attrs_to_proto(attrs: &types::fs::FileAttrs) -> proto::fs::FileAttrs
     }
 }
 
-pub fn file_attrs_from_proto(attrs: Option<proto::fs::FileAttrsProto>) -> Result<types::fs::FileAttrs, MetadataError> {
+pub(crate) fn file_attrs_from_proto(
+    attrs: Option<proto::fs::FileAttrsProto>,
+) -> Result<types::fs::FileAttrs, MetadataError> {
     let attrs = attrs.ok_or_else(|| MetadataError::InvalidArgument("Missing FileAttrs".to_string()))?;
     Ok(types::fs::FileAttrs {
         mode: attrs.mode,
@@ -251,73 +206,26 @@ pub fn file_attrs_from_proto(attrs: Option<proto::fs::FileAttrsProto>) -> Result
     })
 }
 
-pub fn file_layout_from_proto(layout: Option<proto::common::FileLayoutProto>) -> Result<FileLayout, MetadataError> {
+pub(crate) fn file_layout_from_proto(
+    layout: Option<proto::common::FileLayoutProto>,
+) -> Result<FileLayout, MetadataError> {
     let layout = layout.ok_or_else(|| MetadataError::InvalidArgument("Missing FileLayout".to_string()))?;
     FileLayout::try_from(layout).map_err(MetadataError::InvalidArgument)
 }
 
-pub fn validate_active_write_layout(layout: &FileLayout) -> Result<(), MetadataError> {
-    layout
-        .validate()
-        .map_err(|err| MetadataError::InvalidArgument(err.to_string()))?;
-    if layout.replication != 1 {
-        return Err(MetadataError::InvalidArgument(
-            "multi-replica write is not supported yet; replication must be 1".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-pub fn fatal_fs_header(
-    req_header: &Option<proto::common::RequestHeaderProto>,
-    errno: FsErrorCode,
-    message: impl Into<String>,
-    group_name: Option<GroupName>,
-    mount_epoch: Option<u64>,
-) -> proto::common::ResponseHeaderProto {
-    let err = RpcErrorDetail::fs(errno, message);
-    header_from_rpc_error(req_header, group_name, mount_epoch, &err)
-}
-
-pub fn refresh_metadata_header(
-    req_header: &Option<proto::common::RequestHeaderProto>,
-    kind: ErrorKind,
-    message: impl Into<String>,
-    group_name: Option<GroupName>,
-    mount_epoch: Option<u64>,
-) -> proto::common::ResponseHeaderProto {
-    let hint = RefreshHint {
-        group_name: group_name.as_ref().map(ToString::to_string),
-        mount_epoch,
-        ..Default::default()
-    };
-    let err = RpcErrorDetail::refresh_metadata(kind, hint, message);
-    header_from_rpc_error(req_header, group_name, mount_epoch, &err)
-}
-
-pub fn retryable_header(
-    req_header: &Option<proto::common::RequestHeaderProto>,
-    kind: ErrorKind,
-    retry_after_ms: Option<u64>,
-    message: impl Into<String>,
-    group_name: Option<GroupName>,
-    mount_epoch: Option<u64>,
-) -> proto::common::ResponseHeaderProto {
-    let err = RpcErrorDetail::retry(kind, retry_after_ms, message);
-    header_from_rpc_error(req_header, group_name, mount_epoch, &err)
-}
-
-pub fn lease_id_from_proto(lease_id: Option<proto::common::LeaseIdProto>) -> Option<LeaseId> {
+pub(crate) fn lease_id_from_proto(lease_id: Option<proto::common::LeaseIdProto>) -> Option<LeaseId> {
     lease_id.map(|lease_id_proto| {
         LeaseId::try_from(lease_id_proto).unwrap_or_else(|()| unreachable!("LeaseIdProto conversion is infallible"))
     })
 }
 
-pub fn lease_id_to_proto(lease_id: LeaseId) -> proto::common::LeaseIdProto {
+pub(crate) fn lease_id_to_proto(lease_id: LeaseId) -> proto::common::LeaseIdProto {
     lease_id.into()
 }
 
-pub fn presented_fencing_from_proto(token: Option<proto::common::FencingTokenProto>) -> Option<PresentedFencingToken> {
+pub(crate) fn presented_fencing_from_proto(
+    token: Option<proto::common::FencingTokenProto>,
+) -> Option<PresentedFencingToken> {
     token.and_then(|token_proto| {
         let owner = proto::convert::required_client_id(token_proto.owner, "owner").ok()?;
         Some(PresentedFencingToken {
@@ -328,25 +236,15 @@ pub fn presented_fencing_from_proto(token: Option<proto::common::FencingTokenPro
     })
 }
 
-pub fn fencing_to_proto(token: FencingToken) -> proto::common::FencingTokenProto {
+pub(crate) fn fencing_to_proto(token: FencingToken) -> proto::common::FencingTokenProto {
     token.into()
 }
 
-pub fn worker_endpoint_from_parts(
-    worker_id: WorkerId,
-    endpoint: String,
-    worker_net_protocol: i32,
-    worker_run_id: types::WorkerRunId,
-) -> Result<WorkerEndpointInfo, MetadataError> {
-    proto::convert::worker_endpoint_info_from_parts(worker_id, endpoint, worker_net_protocol, worker_run_id.to_string())
-        .map_err(MetadataError::InvalidArgument)
-}
-
-pub fn write_target_to_proto(target: &WriteTarget) -> proto::metadata::WriteTargetProto {
+pub(crate) fn write_target_to_proto(target: &WriteTarget) -> proto::metadata::WriteTargetProto {
     target.into()
 }
 
-pub fn location_to_proto(location: &FileBlockLocation) -> proto::metadata::FileBlockLocationProto {
+pub(crate) fn location_to_proto(location: &FileBlockLocation) -> proto::metadata::FileBlockLocationProto {
     location.into()
 }
 
