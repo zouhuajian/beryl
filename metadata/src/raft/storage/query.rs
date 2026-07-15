@@ -6,11 +6,6 @@ use super::*;
 impl RocksDBStorage {
     /// Get applied result for idempotency.
     pub fn get_applied_result(&self, request: &DedupKey) -> MetadataResult<Option<AppliedResult>> {
-        let _generation = self.pin_generation()?;
-        self.get_applied_result_without_ttl_eviction(request)
-    }
-
-    pub fn get_applied_result_without_ttl_eviction(&self, request: &DedupKey) -> MetadataResult<Option<AppliedResult>> {
         crate::observe::record_rocksdb_read("dedup");
         let generation = self.pin_generation()?;
         let db = generation.db();

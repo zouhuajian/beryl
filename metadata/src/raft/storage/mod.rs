@@ -362,10 +362,7 @@ mod tests {
             .commit_apply_batch(AuthorityBatch::default(), &dedup, result, &raft_state)
             .unwrap();
 
-        assert!(storage
-            .get_applied_result_without_ttl_eviction(&dedup)
-            .unwrap()
-            .is_some());
+        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
         assert_eq!(storage.load_raft_state().unwrap().last_applied_log_id, Some(applied));
     }
 

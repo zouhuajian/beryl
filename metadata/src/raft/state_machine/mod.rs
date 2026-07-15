@@ -122,7 +122,7 @@ impl AppRaftStateMachine {
         // Dedup hit returns the persisted replay record without re-running the mutation.
         if let Some(applied) = self
             .storage
-            .get_applied_result_without_ttl_eviction(&dedup_key)
+            .get_applied_result(&dedup_key)
             .map_err(FatalApplyError::new)?
         {
             if applied.fingerprint != fingerprint {

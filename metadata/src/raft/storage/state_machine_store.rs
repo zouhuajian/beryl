@@ -1137,15 +1137,9 @@ mod tests {
         let command = worker_command(dedup.clone(), "127.0.0.1:18081");
 
         store.apply([normal_entry(1, command.clone())]).await.unwrap();
-        let original = storage
-            .get_applied_result_without_ttl_eviction(&dedup)
-            .unwrap()
-            .unwrap();
+        let original = storage.get_applied_result(&dedup).unwrap().unwrap();
         store.apply([normal_entry(2, command)]).await.unwrap();
-        let replayed = storage
-            .get_applied_result_without_ttl_eviction(&dedup)
-            .unwrap()
-            .unwrap();
+        let replayed = storage.get_applied_result(&dedup).unwrap().unwrap();
 
         assert_eq!(original.fingerprint, replayed.fingerprint);
         assert_eq!(original.created_at_ms, replayed.created_at_ms);
@@ -1159,18 +1153,12 @@ mod tests {
         let original_command = worker_command(dedup.clone(), "127.0.0.1:18082");
 
         store.apply([normal_entry(1, original_command.clone())]).await.unwrap();
-        let original = storage
-            .get_applied_result_without_ttl_eviction(&dedup)
-            .unwrap()
-            .unwrap();
+        let original = storage.get_applied_result(&dedup).unwrap().unwrap();
         let responses = store
             .apply([normal_entry(2, worker_command(dedup.clone(), "127.0.0.1:28082"))])
             .await
             .unwrap();
-        let retained = storage
-            .get_applied_result_without_ttl_eviction(&dedup)
-            .unwrap()
-            .unwrap();
+        let retained = storage.get_applied_result(&dedup).unwrap().unwrap();
 
         assert!(matches!(responses.as_slice(), [AppDataResponse::Rejected(_)]));
         assert_eq!(original.fingerprint, retained.fingerprint);
@@ -1196,10 +1184,7 @@ mod tests {
         let responses = store.apply([normal_entry(1, command)]).await.unwrap();
 
         assert!(matches!(responses.as_slice(), [AppDataResponse::Rejected(_)]));
-        assert!(storage
-            .get_applied_result_without_ttl_eviction(&dedup)
-            .unwrap()
-            .is_some());
+        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
         assert_eq!(storage.load_raft_state().unwrap().last_applied_log_id.unwrap().index, 1);
     }
 
@@ -1227,10 +1212,7 @@ mod tests {
         );
 
         assert!(store.apply([normal_entry(1, command)]).await.is_err());
-        assert!(storage
-            .get_applied_result_without_ttl_eviction(&dedup)
-            .unwrap()
-            .is_none());
+        assert!(storage.get_applied_result(&dedup).unwrap().is_none());
         assert!(storage.load_raft_state().unwrap().last_applied_log_id.is_none());
     }
 
@@ -1267,10 +1249,7 @@ mod tests {
             storage.get_inode_by_data_handle(DataHandleId::new(1)).unwrap(),
             Some(InodeId::new(2))
         );
-        assert!(storage
-            .get_applied_result_without_ttl_eviction(&dedup)
-            .unwrap()
-            .is_some());
+        assert!(storage.get_applied_result(&dedup).unwrap().is_some());
 
         drop(store);
         drop(storage);
@@ -1328,10 +1307,7 @@ mod tests {
             [AppDataResponse::Fs(crate::raft::FsCommandResult::Err(_))]
         ));
         assert_eq!(before, after);
-        assert!(storage
-            .get_applied_result_without_ttl_eviction(&rejected_dedup)
-            .unwrap()
-            .is_some());
+        assert!(storage.get_applied_result(&rejected_dedup).unwrap().is_some());
         assert_eq!(storage.load_raft_state().unwrap().last_applied_log_id.unwrap().index, 2);
     }
 
