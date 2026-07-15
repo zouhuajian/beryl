@@ -1435,7 +1435,9 @@ mod tests {
         storage
             .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
             .unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+        storage
+            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
+            .unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let file_handle = install_write_session(&filesystem, inode_id, mount_id);
@@ -1681,7 +1683,9 @@ mod tests {
         storage
             .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
             .unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+        storage
+            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
+            .unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let file_handle = install_write_session(&filesystem, inode_id, mount_id);

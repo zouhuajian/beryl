@@ -126,8 +126,8 @@ impl PlacementPlan {
             "placement failed: status={:?} group={} format={} required={} policy=[{}] live={} group_ok={} format_ok={} tier_ok={} capacity_ok={} max_free={} max_worker={} max_tier={}",
             self.status,
             req.group_name,
-            req.layout.block_format_id.as_raw(),
-            req.layout.block_size,
+            req.layout.block_format_id().as_raw(),
+            req.layout.block_size(),
             write_tier_policy_label(),
             self.stats.live_count,
             self.stats.group_count,
@@ -200,7 +200,7 @@ fn choose_live_targets(
     use_locality: bool,
 ) -> PlacementPlan {
     let exclude: HashSet<WorkerId> = req.exclude_workers.iter().copied().collect();
-    let required_len = u64::from(req.layout.block_size);
+    let required_len = u64::from(req.layout.block_size());
     let mut stats = PlacementStats::default();
     let live_candidates: Vec<_> = workers
         .iter()
@@ -222,7 +222,7 @@ fn choose_live_targets(
 
     let format_candidates: Vec<_> = group_candidates
         .into_iter()
-        .filter(|worker| supports_block_format(worker, req.layout.block_format_id))
+        .filter(|worker| supports_block_format(worker, req.layout.block_format_id()))
         .collect();
     stats.format_count = format_candidates.len();
     if format_candidates.is_empty() {
@@ -266,7 +266,7 @@ fn choose_write_targets(
     use_locality: bool,
     mut stats: PlacementStats,
 ) -> PlacementPlan {
-    let required_len = u64::from(req.layout.block_size);
+    let required_len = u64::from(req.layout.block_size());
     for worker in &workers {
         for tier in WRITE_TIER_ORDER {
             if let Some(free_bytes) = tier_free_bytes(worker, tier) {
@@ -502,7 +502,7 @@ mod tests {
             op: PlacementOp::Write,
             block_id: BlockId::new(DataHandleId::new(1), BlockIndex::new(0)),
             block_stamp: Some(7),
-            layout: FileLayout::new(block_size, 1024, 1),
+            layout: FileLayout::try_new(block_size, 1024, 1).unwrap(),
             caller: None,
             existing: Vec::new(),
             exclude_workers: Vec::new(),

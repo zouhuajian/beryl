@@ -91,9 +91,9 @@ impl MetadataFileSystem {
                     file_handle = payload.session_key.file_handle,
                     lease_id = payload.session_key.lease_id.as_raw(),
                     lease_epoch = payload.session_key.lease_epoch,
-                    layout_block_size = payload.layout.block_size,
-                    layout_chunk_size = payload.layout.chunk_size,
-                    replication = payload.layout.replication,
+                    layout_block_size = payload.layout.block_size(),
+                    layout_chunk_size = payload.layout.chunk_size(),
+                    replication = payload.layout.replication(),
                     initial_target_count = payload.write_targets.len(),
                     desired_len,
                     mount_epoch = success.mount_epoch,
@@ -391,10 +391,7 @@ impl MetadataFileSystem {
 }
 
 pub(super) fn validate_active_write_layout(layout: &FileLayout) -> Result<(), MetadataError> {
-    layout
-        .validate()
-        .map_err(|err| MetadataError::InvalidArgument(err.to_string()))?;
-    if layout.replication != 1 {
+    if layout.replication() != 1 {
         return Err(MetadataError::InvalidArgument(
             "multi-replica write is not supported yet; replication must be 1".to_string(),
         ));
@@ -417,7 +414,9 @@ mod tests {
         storage
             .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
             .unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+        storage
+            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
+            .unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name("g7"))
@@ -450,7 +449,9 @@ mod tests {
         storage
             .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
             .unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+        storage
+            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
+            .unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
@@ -538,7 +539,7 @@ mod tests {
             .with_raft_node(raft_node)
             .with_worker_manager(worker_manager_for_write_targets(&group_name_value))
             .build();
-        let layout = FileLayout::with_block_format(8192, 1024, 1, types::BlockFormatId::FULL_EFFECTIVE);
+        let layout = FileLayout::try_with_block_format(8192, 1024, 1, types::BlockFormatId::FULL_EFFECTIVE).unwrap();
 
         let success = filesystem
             .create_resolved(CreateInput {
@@ -579,7 +580,7 @@ mod tests {
             parent_inode_id,
             name: "replayed-file".to_string(),
             attrs: FileAttrs::new(),
-            layout: FileLayout::new(4096, 4096, 1),
+            layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
             freshness: Freshness::default(),
         };
 
@@ -602,25 +603,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_file_rejects_invalid_block_chunk_shape() {
-        let filesystem = filesystem_without_mount();
-
-        let failure = filesystem
-            .create_resolved(CreateInput {
-                ctx: request_context(),
-                parent_inode_id: InodeId::new(1),
-                name: "file".to_string(),
-                attrs: FileAttrs::new(),
-                layout: FileLayout::new(4097, 1024, 1),
-                freshness: Freshness::default(),
-            })
-            .await
-            .expect_err("invalid create layout must fail before storage mutation");
-
-        assert!(failure.error.message.contains("multiple of chunk_size"));
-    }
-
-    #[tokio::test]
     async fn open_write_rejects_multi_replica_layout_until_durable_replication_exists() {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
@@ -631,7 +613,9 @@ mod tests {
         storage
             .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
             .unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 2)).unwrap();
+        storage
+            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 2).unwrap())
+            .unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
@@ -660,48 +644,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn open_write_rejects_layout_shape_worker_would_reject() {
-        for (layout, expected) in [
-            (FileLayout::new(4097, 1024, 1), "multiple of chunk_size"),
-            (FileLayout::new(1024, 4096, 1), "chunk_size must not exceed block_size"),
-        ] {
-            let dir = TempDir::new().unwrap();
-            let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
-            let mount_id = MountId::new(55);
-            let group_name_value = group_name("g9");
-            let inode_id = InodeId::new(550);
-            let data_handle_id = DataHandleId::new(9550);
-            storage
-                .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id, data_handle_id))
-                .unwrap();
-            storage.put_layout(inode_id, layout).unwrap();
-            storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
-
-            let filesystem = filesystem_builder_with_mount(mount_id, 9, &group_name_value)
-                .with_storage(storage)
-                .with_worker_manager(worker_manager_for_write_targets(&group_name_value))
-                .build();
-
-            let failure = filesystem
-                .open_write_resolved(OpenWriteInput {
-                    ctx: request_context(),
-                    inode_id,
-                    desired_len: Some(4096),
-                    mode: crate::inode_lease::WriteMode::Write,
-                    freshness: Freshness::default(),
-                })
-                .await
-                .expect_err("invalid layout shape must fail active write");
-
-            assert!(
-                failure.error.message.contains(expected),
-                "expected {expected:?} in {}",
-                failure.error.message
-            );
-        }
-    }
-
     #[test]
     fn open_write_preflight_rejects_placement_without_authoritative_group() {
         let filesystem = filesystem_builder_without_mount()
@@ -712,7 +654,7 @@ mod tests {
             .preflight_open_write_runtime(
                 &request_context(),
                 Some(4096),
-                FileLayout::new(4096, 4096, 1),
+                FileLayout::try_new(4096, 4096, 1).unwrap(),
                 None,
                 None,
             )

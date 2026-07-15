@@ -44,7 +44,7 @@ fn worker(group_name: &GroupName, worker_id: u64, worker_run_id: WorkerRunId, ho
 }
 
 fn request(group_name: &GroupName, op: PlacementOp, block_id: BlockId) -> PlacementRequest {
-    let layout = FileLayout::new(4096, 1024, 1);
+    let layout = FileLayout::try_new(4096, 1024, 1).unwrap();
     PlacementRequest {
         group_name: group_name.clone(),
         op,
@@ -54,7 +54,7 @@ fn request(group_name: &GroupName, op: PlacementOp, block_id: BlockId) -> Placem
         caller: None,
         existing: Vec::new(),
         exclude_workers: Vec::new(),
-        target_replicas: layout.replication,
+        target_replicas: layout.replication(),
     }
 }
 
@@ -295,7 +295,7 @@ fn write_uses_layout_replication_and_prefers_caller_locality() {
 
     let plan = PlacementPlanner.plan(&req, &workers);
 
-    assert_eq!(req.target_replicas, req.layout.replication);
+    assert_eq!(req.target_replicas, req.layout.replication());
     assert_eq!(req.target_replicas, 1);
     assert_eq!(plan.status, PlacementStatus::Ok);
     assert_eq!(

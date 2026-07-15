@@ -1390,7 +1390,7 @@ mod tests {
             .put_dentry(parent_inode_id, name, inode_id)
             .expect("put file dentry");
         env.storage
-            .put_layout(inode_id, FileLayout::new(4096, 4096, 1))
+            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
             .expect("put file layout");
         env.storage
             .put_data_handle_owner(data_handle_id, inode_id)
@@ -1462,7 +1462,7 @@ mod tests {
             .put_dentry(parent_inode_id, name, inode_id)
             .expect("put extent file dentry");
         env.storage
-            .put_layout(inode_id, FileLayout::new(4096, 4096, 1))
+            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
             .expect("put extent file layout");
         env.storage
             .put_data_handle_owner(data_handle_id, inode_id)
@@ -1829,7 +1829,7 @@ mod tests {
             .put_dentry(env.root_inode_id, "file", file_inode_id)
             .expect("put file dentry");
         env.storage
-            .put_layout(file_inode_id, FileLayout::new(4096, 4096, 1))
+            .put_layout(file_inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
             .expect("put layout");
         env.storage
             .put_data_handle_owner(current_handle, file_inode_id)
@@ -1885,7 +1885,7 @@ mod tests {
             .put_dentry(env.root_inode_id, "file", file_inode_id)
             .expect("put file dentry");
         env.storage
-            .put_layout(file_inode_id, FileLayout::new(4096, 4096, 1))
+            .put_layout(file_inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
             .expect("put layout");
         env.storage
             .put_data_handle_owner(current_handle, file_inode_id)
@@ -2444,7 +2444,7 @@ mod tests {
             .expect("load parent inode")
             .expect("parent inode must exist");
         let file_inode = Inode::new_file(file_inode_id, FileAttrs::new(), env.mount_id, data_handle_id);
-        let layout = FileLayout::new(4096, 4096, 1);
+        let layout = FileLayout::try_new(4096, 4096, 1).unwrap();
         env.storage
             .create_file_atomic(env.root_inode_id, "file", &file_inode, &parent, layout)
             .expect("create empty file");

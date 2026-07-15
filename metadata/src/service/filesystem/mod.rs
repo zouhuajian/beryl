@@ -892,10 +892,6 @@ mod test_support {
         TestFilesystemBuilder::new(Arc::new(MountTable::new()))
     }
 
-    pub(super) fn filesystem_without_mount() -> TestFilesystem {
-        filesystem_builder_without_mount().build()
-    }
-
     pub(super) fn assert_block_location_unavailable(failure: &FsFailure, block_id: BlockId) {
         assert_refresh_metadata(
             &failure.error,
@@ -1092,7 +1088,9 @@ mod test_support {
         storage
             .put_inode(&Inode::new_file(inode_id, attrs, mount_id, data_handle_id))
             .unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096, 4096, 1)).unwrap();
+        storage
+            .put_layout(inode_id, FileLayout::try_new(4096, 4096, 1).unwrap())
+            .unwrap();
         storage.put_data_handle_owner(data_handle_id, inode_id).unwrap();
 
         WriteFlowEnv {

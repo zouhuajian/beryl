@@ -1250,7 +1250,7 @@ mod tests {
                 parent_inode_id,
                 name: "file".to_string(),
                 attrs: FileAttrs::new(),
-                layout: FileLayout::new(4096, 4096, 1),
+                layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
             },
         );
 
@@ -1303,7 +1303,7 @@ mod tests {
                 parent_inode_id,
                 name: "file".to_string(),
                 attrs: FileAttrs::new(),
-                layout: FileLayout::new(4096, 4096, 1),
+                layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
             },
         );
         store.apply([normal_entry(1, first)]).await.unwrap();
@@ -1316,7 +1316,7 @@ mod tests {
                 parent_inode_id,
                 name: "file".to_string(),
                 attrs: FileAttrs::new(),
-                layout: FileLayout::new(4096, 4096, 1),
+                layout: FileLayout::try_new(4096, 4096, 1).unwrap(),
             },
         );
 

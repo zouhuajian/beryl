@@ -252,21 +252,18 @@ impl TryFrom<proto_common::FileLayoutProto> for FileLayout {
             u8::try_from(layout.replication).map_err(|_| "FileLayoutProto.replication does not fit u8".to_string())?;
         let block_format_id = types::layout::BlockFormatId::from_raw(layout.block_format_id)
             .map_err(|err| format!("FileLayoutProto.block_format_id invalid: {err}"))?;
-        let layout = FileLayout::with_block_format(layout.block_size, layout.chunk_size, replication, block_format_id);
-        layout
-            .validate()
-            .map_err(|err| format!("FileLayoutProto invalid: {err}"))?;
-        Ok(layout)
+        FileLayout::try_with_block_format(layout.block_size, layout.chunk_size, replication, block_format_id)
+            .map_err(|err| format!("FileLayoutProto invalid: {err}"))
     }
 }
 
 impl From<&FileLayout> for proto_common::FileLayoutProto {
     fn from(layout: &FileLayout) -> Self {
         Self {
-            block_size: layout.block_size,
-            chunk_size: layout.chunk_size,
-            replication: u32::from(layout.replication),
-            block_format_id: layout.block_format_id.as_raw(),
+            block_size: layout.block_size(),
+            chunk_size: layout.chunk_size(),
+            replication: u32::from(layout.replication()),
+            block_format_id: layout.block_format_id().as_raw(),
         }
     }
 }
@@ -1513,8 +1510,13 @@ mod tests {
 
     #[test]
     fn file_layout_proto_roundtrip_preserves_block_format_id() {
-        let layout =
-            types::layout::FileLayout::with_block_format(4096, 1024, 1, types::layout::BlockFormatId::FULL_EFFECTIVE);
+        let layout = types::layout::FileLayout::try_with_block_format(
+            4096,
+            1024,
+            1,
+            types::layout::BlockFormatId::FULL_EFFECTIVE,
+        )
+        .unwrap();
 
         let proto: proto_common::FileLayoutProto = layout.into();
         assert_eq!(proto.block_format_id, 1);
@@ -1524,22 +1526,40 @@ mod tests {
     }
 
     #[test]
-    fn file_layout_proto_rejects_missing_or_unknown_block_format_id() {
-        let missing = proto_common::FileLayoutProto {
+    fn file_layout_proto_rejects_invalid_values() {
+        let valid = proto_common::FileLayoutProto {
             block_size: 4096,
             chunk_size: 1024,
             replication: 1,
-            block_format_id: 0,
+            block_format_id: types::layout::BlockFormatId::FULL_EFFECTIVE.as_raw(),
         };
-        let err = types::layout::FileLayout::try_from(missing).expect_err("missing format must fail");
-        assert!(err.contains("block_format_id"));
-
-        let unknown = proto_common::FileLayoutProto {
-            block_format_id: 99,
-            ..missing
-        };
-        let err = types::layout::FileLayout::try_from(unknown).expect_err("unknown format must fail");
-        assert!(err.contains("block_format_id"));
+        for (layout, expected) in [
+            (
+                proto_common::FileLayoutProto {
+                    block_format_id: 0,
+                    ..valid
+                },
+                "block_format_id",
+            ),
+            (
+                proto_common::FileLayoutProto {
+                    block_format_id: 99,
+                    ..valid
+                },
+                "block_format_id",
+            ),
+            (proto_common::FileLayoutProto { chunk_size: 0, ..valid }, "chunk_size"),
+            (
+                proto_common::FileLayoutProto {
+                    replication: 0,
+                    ..valid
+                },
+                "replication",
+            ),
+        ] {
+            let err = types::layout::FileLayout::try_from(layout).expect_err("invalid layout must fail");
+            assert!(err.contains(expected), "unexpected error: {err}");
+        }
     }
 
     #[test]
