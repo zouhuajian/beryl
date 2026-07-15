@@ -479,58 +479,48 @@ impl WriteSession {
 
     /// Reject writes unless the session is open and the lease is locally valid.
     pub(crate) fn ensure_open_for_write(&mut self) -> ClientResult<()> {
-        self.ensure_open_for_write_at_ms(unix_now_ms())
+        self.ensure_operation_allowed(WriteSessionOperation::Write)
     }
 
     /// Reject close unless the session can start or continue a safe close.
     pub(crate) fn ensure_open_for_close(&mut self) -> ClientResult<()> {
-        self.ensure_open_for_close_at_ms(unix_now_ms())
+        self.ensure_operation_allowed(WriteSessionOperation::Close)
     }
 
     /// Reject abort unless cleanup is safe to attempt.
     pub(crate) fn ensure_open_for_abort(&mut self) -> ClientResult<()> {
-        self.ensure_open_for_abort_at_ms(unix_now_ms())
+        self.ensure_operation_allowed(WriteSessionOperation::Abort)
     }
 
     /// Reject lease renew unless the handle still represents an open session.
     pub(crate) fn ensure_open_for_renew(&mut self) -> ClientResult<()> {
-        self.ensure_open_for_renew_at_ms(unix_now_ms())
+        self.ensure_operation_allowed(WriteSessionOperation::Renew)
     }
 
     /// Reject side-effect-free barriers after validating session state.
     pub(crate) fn ensure_open_for_barrier(&mut self) -> ClientResult<()> {
-        self.ensure_open_for_barrier_at_ms(unix_now_ms())
+        self.ensure_operation_allowed(WriteSessionOperation::Barrier)
     }
 
-    fn ensure_open_for_write_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
-        self.ensure_state_allows_write()?;
-        self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS)
+    fn ensure_operation_allowed(&mut self, operation: WriteSessionOperation) -> ClientResult<()> {
+        self.ensure_operation_allowed_at_ms(operation, unix_now_ms())
     }
 
-    fn ensure_open_for_close_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
-        match self.state {
-            WriteSessionState::Open => self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS),
-            WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown => Ok(()),
-            _ => self.state_error(),
-        }
-    }
-
-    fn ensure_open_for_abort_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
-        match self.state {
-            WriteSessionState::Open => self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS),
-            WriteSessionState::AbortUnknown => Ok(()),
-            _ => self.state_error(),
-        }
-    }
-
-    fn ensure_open_for_renew_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
-        self.ensure_state_allows_write()?;
-        self.ensure_lease_valid_at_ms(now_ms, 0)
-    }
-
-    fn ensure_open_for_barrier_at_ms(&mut self, now_ms: u64) -> ClientResult<()> {
-        self.ensure_state_allows_write()?;
-        self.ensure_lease_valid_at_ms(now_ms, LEASE_EXPIRY_SAFETY_WINDOW_MS)
+    fn ensure_operation_allowed_at_ms(&mut self, operation: WriteSessionOperation, now_ms: u64) -> ClientResult<()> {
+        let safety_window_ms = match (self.state, operation) {
+            (WriteSessionState::Open, WriteSessionOperation::Renew) => 0,
+            (
+                WriteSessionState::Open,
+                WriteSessionOperation::Write
+                | WriteSessionOperation::Close
+                | WriteSessionOperation::Abort
+                | WriteSessionOperation::Barrier,
+            ) => LEASE_EXPIRY_SAFETY_WINDOW_MS,
+            (WriteSessionState::CommitStarted | WriteSessionState::CommitUnknown, WriteSessionOperation::Close)
+            | (WriteSessionState::AbortUnknown, WriteSessionOperation::Abort) => return Ok(()),
+            _ => return Err(self.state_error_value()),
+        };
+        self.ensure_lease_valid_at_ms(now_ms, safety_window_ms)
     }
 
     fn should_renew_lease_at_ms(&mut self, now_ms: u64, renew_before_expiry_ms: u64) -> ClientResult<bool> {
@@ -547,13 +537,6 @@ impl WriteSession {
             });
         }
         Ok(expires_at_ms.saturating_sub(now_ms) <= renew_before_expiry_ms)
-    }
-
-    fn ensure_state_allows_write(&self) -> ClientResult<()> {
-        match self.state {
-            WriteSessionState::Open => Ok(()),
-            _ => self.state_error(),
-        }
     }
 
     fn ensure_lease_valid_at_ms(&mut self, now_ms: u64, safety_window_ms: u64) -> ClientResult<()> {
@@ -573,13 +556,6 @@ impl WriteSession {
             });
         }
         Ok(())
-    }
-
-    fn state_error(&self) -> ClientResult<()> {
-        if matches!(self.state, WriteSessionState::Open) {
-            return Ok(());
-        }
-        Err(self.state_error_value())
     }
 
     fn state_error_value(&self) -> ClientError {
@@ -704,6 +680,15 @@ enum WriteSessionState {
     SessionInvalid,
     SessionExpired,
     AbortUnknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteSessionOperation {
+    Write,
+    Close,
+    Abort,
+    Renew,
+    Barrier,
 }
 
 fn unix_now_ms() -> u64 {
@@ -1188,11 +1173,11 @@ mod tests {
         };
         assert!(matches!(err, ClientError::UnknownOutcome(msg) if msg.contains("worker block commit")));
         assert!(matches!(
-            session.ensure_open_for_write_at_ms(0),
+            session.ensure_operation_allowed_at_ms(WriteSessionOperation::Write, 0),
             Err(ClientError::StaleHandle { reason }) if reason.contains("abort outcome")
         ));
         assert!(matches!(
-            session.ensure_open_for_close_at_ms(0),
+            session.ensure_operation_allowed_at_ms(WriteSessionOperation::Close, 0),
             Err(ClientError::StaleHandle { reason }) if reason.contains("abort outcome")
         ));
     }
@@ -1211,100 +1196,109 @@ mod tests {
 
         session.update_expires_at_ms(1_000);
         let err = session
-            .ensure_open_for_write_at_ms(1_001)
+            .ensure_operation_allowed_at_ms(WriteSessionOperation::Write, 1_001)
             .expect_err("expired lease must block write");
         assert!(matches!(err, ClientError::StaleHandle { reason } if reason.contains("expired")));
 
-        for rejected in [
-            session.ensure_open_for_write_at_ms(1_001),
-            session.ensure_open_for_close_at_ms(1_001),
-            session.ensure_open_for_renew_at_ms(1_001),
-            session.ensure_open_for_abort_at_ms(1_001),
-            session.ensure_open_for_barrier_at_ms(1_001),
+        for operation in [
+            WriteSessionOperation::Write,
+            WriteSessionOperation::Close,
+            WriteSessionOperation::Abort,
+            WriteSessionOperation::Renew,
+            WriteSessionOperation::Barrier,
         ] {
+            let rejected = session.ensure_operation_allowed_at_ms(operation, 1_001);
             assert!(matches!(rejected, Err(ClientError::StaleHandle { reason }) if reason.contains("expired")));
         }
     }
 
     #[test]
-    fn state_transition_table_covers_all_write_session_states() {
-        #[derive(Clone, Copy)]
-        enum Operation {
-            Write,
-            Close,
-            Abort,
-            RenewLease,
-            Barrier,
-        }
-
-        let cases = [
-            (WriteSessionState::Open, Operation::Write, true),
-            (WriteSessionState::Open, Operation::Close, true),
-            (WriteSessionState::Open, Operation::Abort, true),
-            (WriteSessionState::Open, Operation::RenewLease, true),
-            (WriteSessionState::Open, Operation::Barrier, true),
-            (WriteSessionState::CommitStarted, Operation::Write, false),
-            (WriteSessionState::CommitStarted, Operation::Close, true),
-            (WriteSessionState::CommitStarted, Operation::Abort, false),
-            (WriteSessionState::CommitStarted, Operation::RenewLease, false),
-            (WriteSessionState::CommitStarted, Operation::Barrier, false),
-            (WriteSessionState::CommitUnknown, Operation::Write, false),
-            (WriteSessionState::CommitUnknown, Operation::Close, true),
-            (WriteSessionState::CommitUnknown, Operation::Abort, false),
-            (WriteSessionState::CommitUnknown, Operation::RenewLease, false),
-            (WriteSessionState::CommitUnknown, Operation::Barrier, false),
-            (WriteSessionState::Closed, Operation::Write, false),
-            (WriteSessionState::Closed, Operation::Close, false),
-            (WriteSessionState::Closed, Operation::Abort, false),
-            (WriteSessionState::Closed, Operation::RenewLease, false),
-            (WriteSessionState::Closed, Operation::Barrier, false),
-            (WriteSessionState::Aborted, Operation::Write, false),
-            (WriteSessionState::Aborted, Operation::Close, false),
-            (WriteSessionState::Aborted, Operation::Abort, false),
-            (WriteSessionState::Aborted, Operation::RenewLease, false),
-            (WriteSessionState::Aborted, Operation::Barrier, false),
-            (WriteSessionState::UnknownOutcome, Operation::Write, false),
-            (WriteSessionState::UnknownOutcome, Operation::Close, false),
-            (WriteSessionState::UnknownOutcome, Operation::Abort, false),
-            (WriteSessionState::UnknownOutcome, Operation::RenewLease, false),
-            (WriteSessionState::UnknownOutcome, Operation::Barrier, false),
-            (WriteSessionState::SessionInvalid, Operation::Write, false),
-            (WriteSessionState::SessionInvalid, Operation::Close, false),
-            (WriteSessionState::SessionInvalid, Operation::Abort, false),
-            (WriteSessionState::SessionInvalid, Operation::RenewLease, false),
-            (WriteSessionState::SessionInvalid, Operation::Barrier, false),
-            (WriteSessionState::SessionExpired, Operation::Write, false),
-            (WriteSessionState::SessionExpired, Operation::Close, false),
-            (WriteSessionState::SessionExpired, Operation::Abort, false),
-            (WriteSessionState::SessionExpired, Operation::RenewLease, false),
-            (WriteSessionState::SessionExpired, Operation::Barrier, false),
-            (WriteSessionState::AbortUnknown, Operation::Write, false),
-            (WriteSessionState::AbortUnknown, Operation::Close, false),
-            (WriteSessionState::AbortUnknown, Operation::Abort, true),
-            (WriteSessionState::AbortUnknown, Operation::RenewLease, false),
-            (WriteSessionState::AbortUnknown, Operation::Barrier, false),
-        ];
-
-        for (state, operation, allowed) in cases {
-            let mut session = WriteSession::new(
+    fn operation_gate_preserves_lease_and_retry_semantics() {
+        let new_session = |expires_at_ms| {
+            WriteSession::new(
                 "/alpha".to_string(),
                 DataHandleId::new(302),
                 test_layout(),
                 write_handle_proto(1, 302),
                 0,
-                10_000,
+                expires_at_ms,
             )
-            .expect("session");
-            session.state = state;
+            .expect("session")
+        };
 
-            let result = match operation {
-                Operation::Write => session.ensure_open_for_write_at_ms(0),
-                Operation::Close => session.ensure_open_for_close_at_ms(0),
-                Operation::Abort => session.ensure_open_for_abort_at_ms(0),
-                Operation::RenewLease => session.ensure_open_for_renew_at_ms(0),
-                Operation::Barrier => session.ensure_open_for_barrier_at_ms(0),
-            };
-            assert_eq!(result.is_ok(), allowed, "unexpected transition for {state:?}");
+        let mut renew = new_session(1_000);
+        renew
+            .ensure_operation_allowed_at_ms(WriteSessionOperation::Renew, 1)
+            .expect("renew may run inside the side-effect safety window");
+
+        for operation in [
+            WriteSessionOperation::Write,
+            WriteSessionOperation::Close,
+            WriteSessionOperation::Abort,
+            WriteSessionOperation::Barrier,
+        ] {
+            let mut session = new_session(1_000);
+            let error = session
+                .ensure_operation_allowed_at_ms(operation, 1)
+                .expect_err("new side effects must stop near lease expiry");
+            assert!(matches!(error, ClientError::StaleHandle { reason } if reason.contains("near expiry")));
+        }
+
+        for (state, operation) in [
+            (WriteSessionState::CommitStarted, WriteSessionOperation::Close),
+            (WriteSessionState::CommitUnknown, WriteSessionOperation::Close),
+            (WriteSessionState::AbortUnknown, WriteSessionOperation::Abort),
+        ] {
+            let mut session = new_session(1);
+            session.state = state;
+            session
+                .ensure_operation_allowed_at_ms(operation, 2)
+                .expect("frozen cleanup or commit retry must not be blocked by lease expiry");
+            assert_eq!(session.state, state);
+        }
+    }
+
+    #[test]
+    fn state_transition_table_covers_all_write_session_states() {
+        let operations = [
+            WriteSessionOperation::Write,
+            WriteSessionOperation::Close,
+            WriteSessionOperation::Abort,
+            WriteSessionOperation::Renew,
+            WriteSessionOperation::Barrier,
+        ];
+        let cases = [
+            (WriteSessionState::Open, [true, true, true, true, true]),
+            (WriteSessionState::CommitStarted, [false, true, false, false, false]),
+            (WriteSessionState::CommitUnknown, [false, true, false, false, false]),
+            (WriteSessionState::Closed, [false, false, false, false, false]),
+            (WriteSessionState::Aborted, [false, false, false, false, false]),
+            (WriteSessionState::UnknownOutcome, [false, false, false, false, false]),
+            (WriteSessionState::SessionInvalid, [false, false, false, false, false]),
+            (WriteSessionState::SessionExpired, [false, false, false, false, false]),
+            (WriteSessionState::AbortUnknown, [false, false, true, false, false]),
+        ];
+
+        for (state, expected) in cases {
+            for (operation, allowed) in operations.into_iter().zip(expected) {
+                let mut session = WriteSession::new(
+                    "/alpha".to_string(),
+                    DataHandleId::new(302),
+                    test_layout(),
+                    write_handle_proto(1, 302),
+                    0,
+                    10_000,
+                )
+                .expect("session");
+                session.state = state;
+
+                let result = session.ensure_operation_allowed_at_ms(operation, 0);
+                assert_eq!(
+                    result.is_ok(),
+                    allowed,
+                    "unexpected transition for {state:?} and {operation:?}"
+                );
+            }
         }
     }
 
