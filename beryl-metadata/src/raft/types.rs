@@ -6,9 +6,13 @@
 use crate::raft::storage::SnapshotFile;
 use beryl_common::header::HeaderIdentity;
 use beryl_types::ids::ClientId;
-use beryl_types::CallId;
-use openraft::RaftTypeConfig;
+use beryl_types::{CallId, RaftLogId};
+use openraft::{LogId, RaftTypeConfig};
 use serde::{Deserialize, Serialize};
+
+pub(super) fn from_openraft_log_id(log_id: LogId<u64>) -> RaftLogId {
+    RaftLogId::new(log_id.leader_id.term, log_id.leader_id.node_id, log_id.index)
+}
 
 /// Raft type configuration for metadata service.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]

@@ -6,8 +6,7 @@
 use crate::error::MetadataResult;
 use crate::mount::{MountEntry, MountTable, MountTableState};
 use crate::raft::storage::RocksDBStorage;
-use crate::raft::types::AppMetadataRaftState;
-use crate::raft_conv;
+use crate::raft::types::{from_openraft_log_id, AppMetadataRaftState};
 use crate::state::RouteEpoch;
 use beryl_types::RaftLogId;
 use parking_lot::RwLock;
@@ -49,10 +48,7 @@ impl MetadataReadView {
     }
 
     pub(crate) fn last_applied(&self) -> Option<RaftLogId> {
-        self.raft_state
-            .read()
-            .last_applied_log_id
-            .map(raft_conv::from_openraft_log_id)
+        self.raft_state.read().last_applied_log_id.map(from_openraft_log_id)
     }
 
     pub(crate) fn raft_state(&self) -> AppMetadataRaftState {

@@ -89,7 +89,6 @@ pub(crate) mod observe;
 pub(crate) mod path_resolver;
 pub mod placement;
 pub(crate) mod raft;
-pub(crate) mod raft_conv;
 pub mod readiness;
 pub mod runtime;
 pub mod service;

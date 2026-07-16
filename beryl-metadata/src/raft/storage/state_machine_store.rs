@@ -13,9 +13,8 @@ use crate::raft::storage::snapshot::{
 use crate::raft::storage::snapshot::{snapshot_file_in_use, SnapshotFile};
 use crate::raft::storage::snapshot::{IncomingSnapshotToken, SnapshotInstallTracker};
 use crate::raft::storage::{RocksDBStorage, StorageIdentity, STATE_CFS};
-use crate::raft::types::{AppMetadataRaftState, MetadataNode, MetadataRaftTypeConfig};
+use crate::raft::types::{from_openraft_log_id, AppMetadataRaftState, MetadataNode, MetadataRaftTypeConfig};
 use crate::raft::MetadataReadView;
-use crate::raft_conv;
 use crate::state::RouteEpoch;
 use openraft::storage::{RaftStateMachine, SnapshotSignature};
 use openraft::AnyError;
@@ -401,10 +400,8 @@ fn build_snapshot_generation(storage: &RocksDBStorage) -> MetadataResult<Snapsho
             last_membership: raft_state.membership.clone(),
             snapshot_id,
         };
-        let identity = SnapshotIdentity::current(
-            storage_identity.group_name,
-            meta.last_log_id.map(raft_conv::from_openraft_log_id),
-        );
+        let identity =
+            SnapshotIdentity::current(storage_identity.group_name, meta.last_log_id.map(from_openraft_log_id));
         let temporary_path = temp_snapshot_path(storage, &meta.snapshot_id);
         let final_path = snapshot_file_path(storage, &meta.snapshot_id);
 
@@ -488,10 +485,7 @@ fn install_snapshot_generation(
         .map_err(|error| MetadataError::Internal(format!("rewind incoming snapshot: {error}")))?;
 
     let local_identity = storage.storage_identity()?;
-    let expected = SnapshotIdentity::current(
-        local_identity.group_name.clone(),
-        Some(raft_conv::from_openraft_log_id(boundary)),
-    );
+    let expected = SnapshotIdentity::current(local_identity.group_name.clone(), Some(from_openraft_log_id(boundary)));
     let staged = storage.create_staged_generation()?;
     decode_into_staged(staged.db(), &mut incoming_file, &expected)?;
     let routing = load_mount_replacement(staged.db())?;
