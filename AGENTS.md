@@ -1,4 +1,4 @@
-# Vecton Agent Instructions
+# Beryl Agent Instructions
 
 `AGENTS.md` files are operational instructions for AI coding agents. Follow this file first, then the local `AGENTS.md` for every touched subtree.
 
@@ -28,20 +28,20 @@
 
 ## Architecture Ownership
 
-- `types`: stable domain and value types.
-- `common`: shared errors, headers, config mechanics, retry/time helpers, and observability utilities.
-- `proto`: protobuf/gRPC schema, generated bindings, and structural conversions.
-- `metadata`: namespace, layout, visibility, leases/write sessions, worker registry, block locations, freshness, and Raft/RocksDB-backed metadata state.
-- `worker`: local block storage, stream execution, block commit/abort/sync, registration, heartbeat, and block reports.
-- `client`: Rust native API and metadata/worker RPC orchestration.
-- `ufs`: external backend and adapter boundary.
+- `beryl-types`: stable domain and value types.
+- `beryl-common`: shared errors, headers, config mechanics, retry/time helpers, and observability utilities.
+- `beryl-proto`: protobuf/gRPC schema, generated bindings, and structural conversions.
+- `beryl-metadata`: namespace, layout, visibility, leases/write sessions, worker registry, block locations, freshness, and Raft/RocksDB-backed metadata state.
+- `beryl-worker`: local block storage, stream execution, block commit/abort/sync, registration, heartbeat, and block reports.
+- `beryl-client`: Rust native API and metadata/worker RPC orchestration.
+- `beryl-ufs`: external backend and adapter boundary.
 
 Production dependency direction must stay clean:
 
-- `client` must not production-depend on `metadata` or `worker`.
-- `worker` must not production-depend on `metadata` or `client`.
-- `metadata`, `worker`, and `client` should use `types`, `common`, and `proto` for shared contracts as appropriate.
-- `ufs` must not depend on `metadata`, `worker`, or `client`.
+- `beryl-client` must not production-depend on `beryl-metadata` or `beryl-worker`.
+- `beryl-worker` must not production-depend on `beryl-metadata` or `beryl-client`.
+- `beryl-metadata`, `beryl-worker`, and `beryl-client` should use `beryl-types`, `beryl-common`, and `beryl-proto` for shared contracts as appropriate.
+- `beryl-ufs` must not depend on `beryl-metadata`, `beryl-worker`, or `beryl-client`.
 
 ## Current Priorities
 
@@ -58,7 +58,7 @@ Production dependency direction must stay clean:
 cargo fmt --all -- --check
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p e2e_tests
+cargo test -p beryl-e2e
 cargo test --workspace
 ```
 

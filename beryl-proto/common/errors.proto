@@ -1,0 +1,171 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Beryl Contributors
+
+syntax = "proto3";
+
+package common;
+
+import "common/common.proto";
+
+// RPC error model.
+//
+// ErrorKindProto records the failure fact. RecoveryActionProto records the
+// caller action. ErrorContextProto is diagnostic only.
+
+message ErrorDetailProto {
+  ErrorKindProto kind = 1;
+  RecoveryActionProto recovery = 2;
+  string message = 3;
+  ErrorContextProto detail = 4;
+}
+
+message ErrorKindProto {
+  oneof kind {
+    FsErrnoProto fs = 1;
+    MetadataErrorKindProto metadata = 2;
+    WorkerErrorKindProto worker = 3;
+    UfsErrorKindProto ufs = 4;
+    ProtocolErrorKindProto protocol = 5;
+    InternalErrorKindProto internal = 6;
+  }
+}
+
+enum MetadataErrorKindProto {
+  METADATA_ERROR_KIND_UNSPECIFIED = 0;
+  METADATA_ERROR_KIND_NOT_FOUND = 1;
+  METADATA_ERROR_KIND_ALREADY_EXISTS = 2;
+  METADATA_ERROR_KIND_NOT_DIRECTORY = 3;
+  METADATA_ERROR_KIND_IS_DIRECTORY = 4;
+  METADATA_ERROR_KIND_DIRECTORY_NOT_EMPTY = 5;
+  METADATA_ERROR_KIND_CROSS_MOUNT_RENAME = 6;
+  METADATA_ERROR_KIND_BUSY = 7;
+  METADATA_ERROR_KIND_CONFLICT = 8;
+  METADATA_ERROR_KIND_NOT_LEADER = 9;
+  METADATA_ERROR_KIND_STALE_STATE = 10;
+  METADATA_ERROR_KIND_MOUNT_EPOCH_MISMATCH = 11;
+  METADATA_ERROR_KIND_ROUTE_EPOCH_MISMATCH = 12;
+  METADATA_ERROR_KIND_OWNER_GROUP_MISMATCH = 13;
+  METADATA_ERROR_KIND_GROUP_MISMATCH = 14;
+  METADATA_ERROR_KIND_FENCING = 15;
+  METADATA_ERROR_KIND_SESSION_INVALID = 16;
+  METADATA_ERROR_KIND_SESSION_EXPIRED = 17;
+  METADATA_ERROR_KIND_EPOCH_MISMATCH = 18;
+  METADATA_ERROR_KIND_RESOURCE_EXHAUSTED = 19;
+}
+
+enum WorkerErrorKindProto {
+  WORKER_ERROR_KIND_UNSPECIFIED = 0;
+  WORKER_ERROR_KIND_NOT_REGISTERED = 1;
+  WORKER_ERROR_KIND_RUN_MISMATCH = 2;
+  WORKER_ERROR_KIND_DESCRIPTOR_MISMATCH = 3;
+  WORKER_ERROR_KIND_FULL_REPORT_REQUIRED = 4;
+  WORKER_ERROR_KIND_BLOCK_LOCATION_UNAVAILABLE = 5;
+  WORKER_ERROR_KIND_BLOCK_STAMP_MISMATCH = 6;
+  WORKER_ERROR_KIND_NODE_UNAVAILABLE = 7;
+  WORKER_ERROR_KIND_TIMEOUT = 8;
+  WORKER_ERROR_KIND_RESOURCE_EXHAUSTED = 9;
+  WORKER_ERROR_KIND_CONFLICT = 10;
+  WORKER_ERROR_KIND_CORRUPT = 11;
+  WORKER_ERROR_KIND_FENCING = 12;
+  WORKER_ERROR_KIND_CANCELLED = 13;
+  WORKER_ERROR_KIND_IO = 14;
+}
+
+enum UfsErrorKindProto {
+  UFS_ERROR_KIND_UNSPECIFIED = 0;
+  UFS_ERROR_KIND_NOT_FOUND = 1;
+  UFS_ERROR_KIND_PERMISSION_DENIED = 2;
+  UFS_ERROR_KIND_UNSUPPORTED = 3;
+  UFS_ERROR_KIND_NOT_IMPLEMENTED = 4;
+  UFS_ERROR_KIND_INVALID_SPEC = 5;
+  UFS_ERROR_KIND_INVALID_PATH = 6;
+  UFS_ERROR_KIND_UNEXPECTED_EOF = 7;
+  UFS_ERROR_KIND_BACKEND = 8;
+  UFS_ERROR_KIND_OVERLOADED = 9;
+  UFS_ERROR_KIND_TIMEOUT = 10;
+}
+
+enum ProtocolErrorKindProto {
+  PROTOCOL_ERROR_KIND_UNSPECIFIED = 0;
+  PROTOCOL_ERROR_KIND_INVALID_HEADER = 1;
+  PROTOCOL_ERROR_KIND_INVALID_ARGUMENT = 2;
+  PROTOCOL_ERROR_KIND_PERMISSION_DENIED = 3;
+  PROTOCOL_ERROR_KIND_UNSUPPORTED = 4;
+  PROTOCOL_ERROR_KIND_CANCELLED = 5;
+  PROTOCOL_ERROR_KIND_CORRUPT = 6;
+}
+
+enum InternalErrorKindProto {
+  INTERNAL_ERROR_KIND_UNSPECIFIED = 0;
+  INTERNAL_ERROR_KIND_NODE_UNAVAILABLE = 1;
+  INTERNAL_ERROR_KIND_TIMEOUT = 2;
+  INTERNAL_ERROR_KIND_RESOURCE_EXHAUSTED = 3;
+  INTERNAL_ERROR_KIND_CANCELLED = 4;
+  INTERNAL_ERROR_KIND_CORRUPT = 5;
+  INTERNAL_ERROR_KIND_INTERNAL = 6;
+}
+
+message RecoveryActionProto {
+  oneof action {
+    FailRecoveryProto fail = 1;
+    RetryRecoveryProto retry = 2;
+    RefreshMetadataRecoveryProto refresh_metadata = 3;
+    ReopenWriteSessionRecoveryProto reopen_write_session = 4;
+    RegisterWorkerRecoveryProto register_worker = 5;
+    SendFullBlockReportRecoveryProto send_full_block_report = 6;
+  }
+}
+
+message FailRecoveryProto {}
+
+message RetryRecoveryProto {
+  optional uint64 after_ms = 1;
+}
+
+message RefreshMetadataRecoveryProto {
+  RefreshHintProto hint = 1;
+}
+
+message ReopenWriteSessionRecoveryProto {
+  RefreshHintProto hint = 1;
+}
+
+message RegisterWorkerRecoveryProto {}
+
+message SendFullBlockReportRecoveryProto {}
+
+message ErrorContextProto {
+  repeated ErrorContextFieldProto fields = 1;
+}
+
+message ErrorContextFieldProto {
+  string key = 1;
+  string value = 2;
+}
+
+message RefreshHintProto {
+  optional string leader_endpoint = 1;
+  optional string group_name = 2;
+  optional uint64 mount_epoch = 3;
+  optional string mount_prefix = 4;
+  optional uint64 route_epoch = 5;
+  repeated WorkerEndpointInfoProto worker_endpoints = 6;
+  bool worker_resolve_required = 7;
+}
+
+enum FsErrnoProto {
+  FS_ERRNO_OK = 0;
+  FS_ERRNO_ENOENT = 1;
+  FS_ERRNO_EEXIST = 2;
+  FS_ERRNO_ENOTEMPTY = 3;
+  FS_ERRNO_ENOTDIR = 4;
+  FS_ERRNO_EISDIR = 5;
+  FS_ERRNO_EXDEV = 6;
+  FS_ERRNO_EPERM = 7;
+  FS_ERRNO_EACCES = 8;
+  FS_ERRNO_EINVAL = 9;
+  FS_ERRNO_ENOTSUP = 10;
+  FS_ERRNO_ENOTIMPL = 11;
+  FS_ERRNO_EAGAIN = 12;
+  FS_ERRNO_EBUSY = 13;
+}

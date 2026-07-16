@@ -1,13 +1,13 @@
 [workspace]
 members = [
-    "common",
-    "types",
-    "proto",
-    "metadata",
-    "ufs",
-    "worker",
-    "client",
-    "e2e_tests",
+    "beryl-common",
+    "beryl-types",
+    "beryl-proto",
+    "beryl-metadata",
+    "beryl-ufs",
+    "beryl-worker",
+    "beryl-client",
+    "beryl-e2e",
 ]
 resolver = "2"
 

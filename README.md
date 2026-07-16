@@ -1,21 +1,21 @@
-# Vecton
+# Beryl
 
 ## Overview
 
-Vecton is a Rust-based distributed storage/cache layer for big data and AI workloads. It uses a metadata control plane to manage namespace, file layout, data visibility, and worker-resident data. Clients coordinate metadata RPCs with worker data RPCs so visible data is served through metadata-authorized workers.
+Beryl is a Rust-based distributed storage/cache layer for big data and AI workloads. It uses a metadata control plane to manage namespace, file layout, data visibility, and worker-resident data. Clients coordinate metadata RPCs with worker data RPCs so visible data is served through metadata-authorized workers.
 
-## Why Vecton?
+## Why Beryl?
 
 - Large data systems need metadata paths that can scale with file count, namespace activity, and data-plane parallelism.
 - Centralized metadata can become a bottleneck when all namespace, layout, and visibility decisions converge on one authority.
-- Vecton explores a metadata-authorized architecture where metadata owns visibility and workers execute the data plane.
+- Beryl explores a metadata-authorized architecture where metadata owns visibility and workers execute the data plane.
 - The long-term direction is mount-level metadata sharding.
 
 ## Core Semantics
 
 - Metadata is the authority for namespace, file layout, and data visibility.
 - Workers store and serve blocks authorized by metadata.
-- Data made visible by metadata is Vecton resident data.
+- Data made visible by metadata is Beryl resident data.
 - Namespace delete removes the metadata namespace entry and visible layout.
 - Physical resident-block reclamation is future/partial: delete intents exist, but no active worker delete RPC path is wired today.
 - External storage integration is adapter-only today, not the active read/write path.
@@ -35,7 +35,7 @@ Vecton is a Rust-based distributed storage/cache layer for big data and AI workl
   - Provides the adapter boundary for external backends.
   - Current reads and writes do not use it.
 - Shared crates
-  - `types`, `common`, and `proto` provide stable domain values, shared infrastructure, and wire contracts.
+  - `beryl-types`, `beryl-common`, and `beryl-proto` provide stable domain values, shared infrastructure, and wire contracts.
 
 ## Current Status
 
@@ -82,34 +82,34 @@ Vecton is a Rust-based distributed storage/cache layer for big data and AI workl
 
 ## Crates
 
-- `types`
+- `beryl-types`
   - Stable domain and value types shared by crates used in the current runtime.
   - Includes IDs, layout values, block values, epochs, and watermarks at the domain level.
-- `common`
+- `beryl-common`
   - Shared infrastructure for errors, headers, config loading, retry/time helpers, and observability.
   - Does not own product behavior.
-- `proto`
+- `beryl-proto`
   - Protobuf/gRPC contracts and generated Rust bindings.
   - Covers the current metadata filesystem, metadata-worker control, and worker data services.
   - Admin and metadata-peer schemas are future/schema-only, not active runtime services.
-- `metadata`
+- `beryl-metadata`
   - Namespace, layout, visibility, lease, worker registry, block location, freshness, and Raft/RocksDB authority.
   - Multi-group metadata remains future work.
   - Maintenance internals do not make repair/rebalance a completed product behavior.
-- `worker`
+- `beryl-worker`
   - Local block storage and metadata-authorized data-plane execution.
   - Does not own namespace visibility or file layout decisions.
   - Uses the current gRPC data service and worker-local filesystem storage path.
-- `client`
+- `beryl-client`
   - Rust native API and orchestration for metadata and worker RPCs.
   - Does not provide POSIX, FUSE, or Hadoop compatibility today.
-- `ufs`
+- `beryl-ufs`
   - External backend adapter boundary.
   - Current reads and writes do not use it.
 
 ## Quick Start
 
-Vecton requires local metadata and worker configuration. The repository provides default and local debug profiles.
+Beryl requires local metadata and worker configuration. The repository provides default and local debug profiles.
 
 Development checks:
 
@@ -123,17 +123,17 @@ make verify
 Default one-metadata, one-worker startup:
 
 ```bash
-metadata format --config conf/metadata.yaml
-metadata start --config conf/metadata.yaml
-worker start --config conf/worker.yaml
+beryl-metadata format --config conf/metadata.yaml
+beryl-metadata start --config conf/metadata.yaml
+beryl-worker start --config conf/worker.yaml
 ```
 
 Local one-metadata, one-worker startup:
 
 ```bash
-metadata format --config conf/local/metadata.yaml
-metadata start --config conf/local/metadata.yaml
-worker start --config conf/local/worker.yaml
+beryl-metadata format --config conf/local/metadata.yaml
+beryl-metadata start --config conf/local/metadata.yaml
+beryl-worker start --config conf/local/worker.yaml
 ```
 
 The client reads `conf/client-site.yaml` or `conf/local/client-site.yaml` depending on caller configuration.

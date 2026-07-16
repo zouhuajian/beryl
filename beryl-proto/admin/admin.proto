@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Beryl Contributors
+
+syntax = "proto3";
+
+package admin;
+
+import "common/common.proto";
+import "common/header.proto";
+import "metadata/peer.proto";
+
+// ============================================================================
+// Shard Management: Policy & Configuration
+// ============================================================================
+
+/// Shard group policy: defines replication, consistency, and placement.
+message ShardGroupPolicy {
+  /// Replication factor (number of replicas per shard).
+  uint32 replication_factor = 1;
+  /// Consistency level: STRONG, EVENTUAL, etc.
+  string consistency_level = 2;
+  /// Placement strategy: RANDOM, RACK_AWARE, ZONE_AWARE, etc.
+  string placement_strategy = 3;
+  /// Optional: placement constraints (key-value pairs).
+  map<string, string> placement_constraints = 4;
+}
+
+/// Shard specification: defines how to create shards.
+message ShardSpec {
+  /// Number of shards to create (if using count-based).
+  uint32 count = 1;
+  /// Shard ranges to create (if using range-based).
+  repeated metapeer.ShardRangeProto ranges = 2;
+  /// Optional: initial key distribution hint.
+  string distribution_hint = 3;
+}
+
+// ============================================================================
+// Shard Management: Create Shard Group
+// ============================================================================
+
+message CreateShardGroupRequest {
+  common.RequestHeaderProto header = 1;
+  reserved 2;
+  reserved "shard_group_id";
+  /// Shard group policy.
+  ShardGroupPolicy policy = 3;
+  /// Shard specification.
+  ShardSpec shards_to_create = 4;
+  /// Optional: initial member node IDs (for placement).
+  repeated uint64 initial_members = 5;
+  /// Optional: mount bindings (mount_id -> shard mapping).
+  map<uint64, common.ShardIdProto> mount_bindings = 6;
+  /// Optional: idempotency key (for retry safety).
+  string idempotency_key = 7;
+  /// Stable group identity.
+  string group_name = 8;
+}
+
+message CreateShardGroupResponse {
+  common.ResponseHeaderProto header = 1;
+  /// Created shard group.
+  metapeer.ShardGroupProto shard_group = 2;
+  /// Created shards.
+  repeated metapeer.ShardInfoProto shards = 3;
+  /// Shard group version/epoch.
+  uint64 version = 4;
+  /// Cluster epoch after creation.
+  uint64 cluster_epoch = 5;
+}
+
+// ============================================================================
+// Shard Management: Add Shards to Group
+// ============================================================================
+
+message AddShardsToGroupRequest {
+  common.RequestHeaderProto header = 1;
+  reserved 2;
+  reserved "shard_group_id";
+  /// Shard specification for new shards.
+  ShardSpec shards_to_add = 3;
+  /// Optional: target node IDs for placement.
+  repeated uint64 target_nodes = 4;
+  /// Optional: idempotency key.
+  string idempotency_key = 5;
+  /// Stable group identity.
+  string group_name = 6;
+}
+
+message AddShardsToGroupResponse {
+  common.ResponseHeaderProto header = 1;
+  /// Added shards.
+  repeated metapeer.ShardInfoProto added_shards = 2;
+  /// Updated shard group version.
+  uint64 version = 3;
+  /// Cluster epoch after addition.
+  uint64 cluster_epoch = 4;
+}
+
+// ============================================================================
+// Shard Management: Split Shard (future extension)
+// ============================================================================
+
+message SplitShardRequest {
+  common.RequestHeaderProto header = 1;
+  common.ShardIdProto shard_id = 2;
+  /// Split point (key where to split).
+  string split_key = 3;
+  /// Optional: idempotency key.
+  string idempotency_key = 4;
+}
+
+message SplitShardResponse {
+  common.ResponseHeaderProto header = 1;
+  /// Original shard (updated range).
+  metapeer.ShardInfoProto original_shard = 2;
+  /// New shard (created from split).
+  metapeer.ShardInfoProto new_shard = 3;
+  /// Updated version.
+  uint64 version = 4;
+}
+
+// ============================================================================
+// Shard Management: Merge Shard (future extension)
+// ============================================================================
+
+message MergeShardRequest {
+  common.RequestHeaderProto header = 1;
+  /// Shards to merge (must be adjacent and in same group).
+  repeated common.ShardIdProto shard_ids = 2;
+  /// Optional: idempotency key.
+  string idempotency_key = 3;
+}
+
+message MergeShardResponse {
+  common.ResponseHeaderProto header = 1;
+  /// Merged shard.
+  metapeer.ShardInfoProto merged_shard = 2;
+  /// Updated version.
+  uint64 version = 3;
+}
+
+// ============================================================================
+// Shard Management: Rebalance (future extension, structure only)
+// ============================================================================
+
+message RebalanceShardGroupRequest {
+  common.RequestHeaderProto header = 1;
+  reserved 2;
+  reserved "shard_group_id";
+  /// Rebalance strategy: BALANCE_LOAD, MINIMIZE_MOVEMENT, etc.
+  string strategy = 3;
+  /// Optional: target node IDs (if specified, rebalance to these nodes).
+  repeated uint64 target_nodes = 4;
+  /// Stable group identity.
+  string group_name = 5;
+}
+
+message RebalanceShardGroupResponse {
+  common.ResponseHeaderProto header = 1;
+  /// Proposed shard movements (for preview).
+  repeated ShardMovement movements = 2;
+  /// Whether rebalance was actually performed (or just preview).
+  bool performed = 3;
+  /// Updated version if performed.
+  uint64 version = 4;
+}
+
+message ShardMovement {
+  common.ShardIdProto shard_id = 1;
+  /// Source node ID.
+  uint64 from_node_id = 2;
+  /// Target node ID.
+  uint64 to_node_id = 3;
+  /// Movement priority/order.
+  uint32 priority = 4;
+}
+
+// ============================================================================
+// Shard Management: Query Operations
+// ============================================================================
+
+message GetShardGroupRequest {
+  common.RequestHeaderProto header = 1;
+  reserved 2;
+  reserved "shard_group_id";
+  /// Optional: include detailed shard information.
+  bool include_shards = 3;
+  /// Stable group identity.
+  string group_name = 4;
+}
+
+message GetShardGroupResponse {
+  common.ResponseHeaderProto header = 1;
+  metapeer.ShardGroupProto shard_group = 2;
+  /// Detailed shard information (if requested).
+  repeated metapeer.ShardInfoProto shards = 3;
+}
+
+message ListShardGroupsRequest {
+  common.RequestHeaderProto header = 1;
+  /// Optional: filter by mount ID.
+  common.MountIdProto mount_id = 2;
+  /// Optional: pagination offset.
+  uint64 offset = 3;
+  /// Optional: pagination limit.
+  uint32 limit = 4;
+}
+
+message ListShardGroupsResponse {
+  common.ResponseHeaderProto header = 1;
+  repeated metapeer.ShardGroupProto shard_groups = 2;
+  /// Total count (if available).
+  uint64 total_count = 3;
+  /// Next offset for pagination.
+  uint64 next_offset = 4;
+}
+
+// ============================================================================
+// Shard Admin Service
+// ============================================================================
+
+service ShardAdminService {
+  /// Create a new shard group with specified shards.
+  /// Idempotent: if idempotency_key is provided and matches existing group, returns existing.
+  rpc CreateShardGroup(CreateShardGroupRequest) returns (CreateShardGroupResponse);
+  
+  /// Add shards to an existing shard group.
+  /// Idempotent: if idempotency_key is provided, duplicate requests are ignored.
+  rpc AddShardsToGroup(AddShardsToGroupRequest) returns (AddShardsToGroupResponse);
+  
+  /// Split a shard into two shards (future extension).
+  /// Reserved for future implementation.
+  rpc SplitShard(SplitShardRequest) returns (SplitShardResponse);
+  
+  /// Merge multiple shards into one (future extension).
+  /// Reserved for future implementation.
+  rpc MergeShard(MergeShardRequest) returns (MergeShardResponse);
+  
+  /// Rebalance shards within a group (future extension, structure only).
+  /// Reserved for future implementation.
+  rpc RebalanceShardGroup(RebalanceShardGroupRequest) returns (RebalanceShardGroupResponse);
+  
+  /// Get shard group information.
+  rpc GetShardGroup(GetShardGroupRequest) returns (GetShardGroupResponse);
+  
+  /// List shard groups (with optional filtering).
+  rpc ListShardGroups(ListShardGroupsRequest) returns (ListShardGroupsResponse);
+}

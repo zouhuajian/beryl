@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2026 Vecton Contributors
+# SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-# Vecton client-site baseline.
+# Beryl client-site baseline.
 # This file intentionally contains only keys consumed by the current client
 # runtime.
 

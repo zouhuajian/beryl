@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2026 Vecton Contributors
+# SPDX-FileCopyrightText: 2026 Beryl Contributors
 
 edition = "2021"
 max_width = 120

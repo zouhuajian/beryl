@@ -1,0 +1,29 @@
+[package]
+name = "beryl-ufs"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+# JVM-backed HDFS support (requires libjvm and Java headers). Enable explicitly for HDFS builds/tests.
+ufs-jvm = ["opendal/services-hdfs"]
+
+[dependencies]
+beryl-types = { path = "../beryl-types" }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+opendal = { workspace = true, features = ["services-fs", "services-s3", "services-oss"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+# Observability (use common module)
+beryl-common = { path = "../beryl-common", features = ["prometheus"] }
+metrics = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

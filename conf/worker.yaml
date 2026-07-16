@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2026 Vecton Contributors
+# SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-# Vecton worker baseline. Run with:
-# worker start --config conf/worker.yaml
+# Beryl worker baseline. Run with:
+# beryl-worker start --config conf/worker.yaml
 
-vecton.cluster.id: "local-vecton"
+cluster.id: "local-beryl"
 
 # Worker data service.
 worker.identity.path: "data/worker/worker.identity"
@@ -33,6 +33,6 @@ worker.metadata.register_retry_max_backoff_ms: 5000
 
 observe.log.format: compact
 observe.log.output: stderr
-observe.log.level: "info,vecton=info,metadata=info,worker=info,common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
+observe.log.level: "info,beryl_metadata=info,beryl_worker=info,beryl_common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
 observe.metrics.prometheus.bind: "127.0.0.1:19091"
 observe.metrics.prometheus.path: "/metrics"

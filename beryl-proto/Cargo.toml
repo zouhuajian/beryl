@@ -1,0 +1,15 @@
+[package]
+name = "beryl-proto"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+beryl-types = { path = "../beryl-types" }
+beryl-common = { path = "../beryl-common" }
+
+prost = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }

@@ -70,10 +70,10 @@ log/
 
 # Data directories (add as needed for worker/meta local runs)
 data/
-!client/src/data/
-!client/src/data/**
-!worker/src/data/
-!worker/src/data/**
+!beryl-client/src/data/
+!beryl-client/src/data/**
+!beryl-worker/src/data/
+!beryl-worker/src/data/**
 tmp/
 run/
 pids/

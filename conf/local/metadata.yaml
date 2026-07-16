@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2026 Vecton Contributors
+# SPDX-FileCopyrightText: 2026 Beryl Contributors
 
 # Local metadata debug profile. Run with:
-# metadata format --config conf/local/metadata.yaml
-# metadata start --config conf/local/metadata.yaml
+# beryl-metadata format --config conf/local/metadata.yaml
+# beryl-metadata start --config conf/local/metadata.yaml
 
-vecton.cluster.id: "local-vecton"
+cluster.id: "local-beryl"
 
 metadata.group.name: "root"
 metadata.storage.dir: "./data/metadata"
@@ -26,6 +26,6 @@ metadata.repair.worker_inflight_limit: 4
 
 observe.log.format: compact
 observe.log.output: stderr
-observe.log.level: "info,vecton=info,metadata=info,worker=info,common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
+observe.log.level: "info,beryl_metadata=info,beryl_worker=info,beryl_common=info,openraft=warn,tonic=warn,tower=warn,h2=warn"
 observe.metrics.prometheus.bind: "127.0.0.1:18081"
 observe.metrics.prometheus.path: "/metrics"
