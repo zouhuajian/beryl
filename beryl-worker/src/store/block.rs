@@ -23,7 +23,7 @@ pub type StoreResult<T> = Result<T, WorkerError>;
 
 const BLOCK_META_MAGIC: [u8; 4] = *b"BRYL";
 const BLOCK_META_HEADER_LEN: usize = 20;
-const BLOCK_META_VERSION: u32 = 2;
+const BLOCK_META_VERSION: u32 = 3;
 const MAX_META_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 
 /// Fixed little-endian header for a block metadata file.
@@ -1509,7 +1509,7 @@ mod tests {
 
     fn protobuf_payload_missing_group_name(meta: &BlockMetaPayload) -> Vec<u8> {
         let encoded = valid_payload(meta);
-        let identity = remove_field(&field_payload(&encoded, 1), 3);
+        let identity = remove_field(&field_payload(&encoded, 1), 2);
         replace_field_payload(&encoded, 1, &identity)
     }
 
@@ -1533,12 +1533,6 @@ mod tests {
         let encoded = valid_payload(meta);
         let visibility = replace_varint_field(&field_payload(&encoded, 4), 1, block_state as u64);
         replace_field_payload(&encoded, 4, &visibility)
-    }
-
-    fn protobuf_payload_with_checksum_kind(meta: &BlockMetaPayload, checksum_kind: i32) -> Vec<u8> {
-        let encoded = valid_payload(meta);
-        let format = replace_varint_field(&field_payload(&encoded, 2), 4, checksum_kind as u64);
-        replace_field_payload(&encoded, 2, &format)
     }
 
     fn protobuf_payload_with_format_id(meta: &BlockMetaPayload, format_id: u32) -> Vec<u8> {
@@ -1949,14 +1943,20 @@ mod tests {
     }
 
     #[test]
-    fn load_meta_rejects_unsupported_version() {
+    fn load_meta_rejects_previous_block_meta_version_without_rewriting_it() {
         let (_temp, store) = store();
         let (group_name_value, block_id) = ids();
         publish_default_block(&store, group_name_value, block_id);
         let paths = store.paths(group_name_value, block_id);
-        overwrite_header_u32(&paths, 4, BLOCK_META_VERSION + 1);
+        overwrite_header_u32(&paths, 4, BLOCK_META_VERSION - 1);
+        let unsupported = fs::read(&paths.meta_path).expect("read unsupported meta");
 
         assert_corrupt(store.load_meta(group_name_value, block_id));
+        assert_eq!(
+            fs::read(&paths.meta_path).expect("read meta after rejection"),
+            unsupported,
+            "rejecting the previous block meta version must not rewrite it"
+        );
     }
 
     #[test]
@@ -2070,34 +2070,6 @@ mod tests {
         let valid = store.load_meta(group_name_value, block_id).expect("load meta");
 
         let payload = protobuf_payload_with_block_state(&valid, 99);
-        persist_raw_payload(&paths, &payload);
-
-        assert_corrupt(store.load_meta(group_name_value, block_id));
-    }
-
-    #[test]
-    fn load_meta_rejects_unspecified_checksum_kind() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        publish_default_block(&store, group_name_value, block_id);
-        let paths = store.paths(group_name_value, block_id);
-        let valid = store.load_meta(group_name_value, block_id).expect("load meta");
-
-        let payload = protobuf_payload_with_checksum_kind(&valid, 0);
-        persist_raw_payload(&paths, &payload);
-
-        assert_corrupt(store.load_meta(group_name_value, block_id));
-    }
-
-    #[test]
-    fn load_meta_rejects_unsupported_checksum_kind() {
-        let (_temp, store) = store();
-        let (group_name_value, block_id) = ids();
-        publish_default_block(&store, group_name_value, block_id);
-        let paths = store.paths(group_name_value, block_id);
-        let valid = store.load_meta(group_name_value, block_id).expect("load meta");
-
-        let payload = protobuf_payload_with_checksum_kind(&valid, 99);
         persist_raw_payload(&paths, &payload);
 
         assert_corrupt(store.load_meta(group_name_value, block_id));
@@ -2361,7 +2333,6 @@ mod tests {
                 invalid.format.chunk_size = 3072;
                 encode_meta_payload(&invalid).expect("encode chunk size mismatch")
             },
-            |valid: &BlockMetaPayload| protobuf_payload_with_checksum_kind(valid, 99),
         ] {
             let (_temp, store) = store();
             let (group_name_value, block_id) = ids();

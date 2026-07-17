@@ -5,9 +5,7 @@
 
 use crate::error::WorkerError;
 use crate::store::dirs::StoreReport;
-use beryl_common::error::rpc::{
-    ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, UfsErrorKind, WorkerErrorKind,
-};
+use beryl_common::error::rpc::{ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, WorkerErrorKind};
 
 pub(crate) const WORKER_UP: &str = "worker_up";
 pub(crate) const WORKER_BUILD_INFO: &str = "worker_build_info";
@@ -217,7 +215,6 @@ pub(crate) fn worker_error_kind(error: &WorkerError) -> &'static str {
 fn error_kind_label(kind: ErrorKind) -> &'static str {
     match kind {
         ErrorKind::Fs(_) => "fs",
-        ErrorKind::Ufs(kind) => ufs_error_kind(kind),
         ErrorKind::Protocol(ProtocolErrorKind::InvalidHeader) => "invalid_header",
         ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument) => "invalid_argument",
         ErrorKind::Protocol(ProtocolErrorKind::PermissionDenied) => "permission_denied",
@@ -285,21 +282,6 @@ fn protocol_error_kind(kind: ProtocolErrorKind) -> &'static str {
         ProtocolErrorKind::Unsupported => "unsupported",
         ProtocolErrorKind::Cancelled => "cancelled",
         ProtocolErrorKind::Corrupt => "corrupt",
-    }
-}
-
-fn ufs_error_kind(kind: UfsErrorKind) -> &'static str {
-    match kind {
-        UfsErrorKind::NotFound => "ufs_not_found",
-        UfsErrorKind::PermissionDenied => "ufs_permission_denied",
-        UfsErrorKind::Unsupported => "ufs_unsupported",
-        UfsErrorKind::NotImplemented => "ufs_not_implemented",
-        UfsErrorKind::InvalidSpec => "ufs_invalid_spec",
-        UfsErrorKind::InvalidPath => "ufs_invalid_path",
-        UfsErrorKind::UnexpectedEof => "ufs_unexpected_eof",
-        UfsErrorKind::Backend => "ufs_backend",
-        UfsErrorKind::Overloaded => "ufs_overloaded",
-        UfsErrorKind::Timeout => "ufs_timeout",
     }
 }
 

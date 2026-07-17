@@ -26,7 +26,6 @@ pub(crate) struct OpenWriteOutput {
     pub(crate) base_size: u64,
     pub(crate) expires_at_ms: u64,
     pub(crate) content_revision: u64,
-    pub(crate) mode: crate::inode_lease::WriteMode,
 }
 
 #[derive(Clone, Debug)]
@@ -838,6 +837,5 @@ fn open_write_output(session: &crate::session_registry::WriteSession) -> OpenWri
         base_size: session.base_size,
         expires_at_ms: session.expires_at_ms,
         content_revision: session.content_revision,
-        mode: session.mode,
     }
 }

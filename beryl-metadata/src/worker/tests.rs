@@ -18,22 +18,8 @@ fn group_name(raw: &str) -> GroupName {
 
 #[test]
 fn worker_net_protocol_label_uses_readable_names() {
-    assert_eq!(
-        worker_net_protocol_label(beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified as i32),
-        "unspecified"
-    );
-    assert_eq!(
-        worker_net_protocol_label(beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32),
-        "grpc"
-    );
-    assert_eq!(
-        worker_net_protocol_label(beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolQuic as i32),
-        "quic"
-    );
-    assert_eq!(
-        worker_net_protocol_label(beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolRdma as i32),
-        "rdma"
-    );
+    assert_eq!(worker_net_protocol_label(1), "grpc");
+    assert_eq!(worker_net_protocol_label(0), "unknown");
     assert_eq!(worker_net_protocol_label(99), "unknown");
 }
 
@@ -68,11 +54,7 @@ fn report_block(index: u32) -> BlockReportBlock {
 fn report_block_with_id(block_id: BlockId) -> BlockReportBlock {
     BlockReportBlock {
         block_id,
-        data_handle_id: block_id.data_handle_id.as_raw(),
-        block_index: block_id.index.as_raw(),
         block_stamp: u64::from(block_id.index.as_raw()) + 100,
-        effective_len: 4096,
-        committed_length: 4096,
         block_state: BlockReportBlockState::Ready,
     }
 }

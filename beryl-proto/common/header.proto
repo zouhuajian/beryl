@@ -48,10 +48,6 @@ message ClientInfoProto {
 
 /// Request header carried with every RPC request (metadata-plane and optionally data-plane).
 ///
-/// RPC error cross-transport propagation:
-/// - gRPC: embedded in request messages AND (optionally) mirrored into gRPC metadata for early reject.
-/// - QUIC/RDMA/CUSTOM: serialized as the first frame/message before the request body.
-///
 /// NOTE:
 /// - Keep this message small and stable. Do not use it as a "catch-all".
 message RequestHeaderProto {
@@ -89,8 +85,6 @@ message RequestHeaderProto {
   /// This is NOT a generic extension point for protocol-critical fields.
   CallerContextProto caller_context = 8;
 
-  /// Optional retry count from client perspective (0 = first attempt).
-  int32 retry_count = 9;
 }
 
 /// Human-oriented context for auditing and lightweight diagnostics.
@@ -99,8 +93,6 @@ message CallerContextProto {
   /// Example: "type=spark,job=42"
   string context = 1;
 
-  /// Optional signature for tamper detection or provenance (opaque).
-  bytes signature = 2;
 }
 
 /// Raft log position used as a monotonic "state watermark".
@@ -124,14 +116,11 @@ message RaftLogIdProto {
 /// state-machine applied RaftLogId. It is not a committed index, append index,
 /// private apply counter, route_epoch, mount_epoch, or call_id.
 message GroupStateWatermarkProto {
-  reserved 1;
-  reserved "group_id";
-
   /// State-machine applied RaftLogId for this group.
-  RaftLogIdProto state_id = 2;
+  RaftLogIdProto state_id = 1;
 
   /// Stable metadata group name this watermark belongs to.
-  string group_name = 3;
+  string group_name = 2;
 }
 
 /// Response header carried with every RPC response.

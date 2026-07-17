@@ -98,9 +98,6 @@ pub struct WorkerConfig {
     pub default_frame_size: u32,
     /// Upper bound for negotiated transport frame payload size.
     pub max_frame_size: u32,
-    /// Per-stream application-level in-flight byte window.
-    /// This is independent from protocol-native flow control.
-    pub window_bytes: u32,
     /// Idle timeout for runtime stream state.
     pub stream_idle_timeout_ms: u64,
     /// Worker-local block store configuration.
@@ -130,7 +127,6 @@ impl WorkerConfig {
         let default_rpc_max_inflight = 100usize;
         let default_frame_size = 1024 * 1024;
         let default_max_frame_size = 4 * 1024 * 1024;
-        let default_window_bytes = 8 * 1024 * 1024;
         let default_stream_idle_timeout_ms = 60_000u64;
         let default_store = WorkerStoreConfig::default();
         let metadata_defaults = WorkerRegistrationConfig::default();
@@ -163,7 +159,9 @@ impl WorkerConfig {
             default_max_frame_size,
             "worker.max_frame_size",
         )?;
-        let window_bytes = Self::bytes_u32(&worker_sub, "window_bytes", default_window_bytes, "worker.window_bytes")?;
+        if worker_sub.contains_key("window_bytes") {
+            return Err(invalid_config("worker.window_bytes", "is no longer supported"));
+        }
         let stream_idle_timeout_ms = Self::usize_or(
             &worker_sub,
             "stream.idle_timeout_ms",
@@ -209,7 +207,6 @@ impl WorkerConfig {
             rpc_max_inflight,
             default_frame_size,
             max_frame_size,
-            window_bytes,
             stream_idle_timeout_ms,
             store,
             net: WorkerNetConfig::grpc_from_rpc(rpc_bind, rpc_max_inflight, max_frame_size),
@@ -227,7 +224,6 @@ impl WorkerConfig {
             rpc_max_inflight = config.rpc_max_inflight,
             default_frame_size = config.default_frame_size,
             max_frame_size = config.max_frame_size,
-            window_bytes = config.window_bytes,
             store_dirs = config.store.dirs.len(),
             store_reserve_space_bytes = config.store.reserve_space_bytes,
             store_selection_policy = %config.store.selection_policy,
@@ -297,13 +293,6 @@ impl WorkerConfig {
                     "worker.default_frame_size ({}) must be <= worker.max_frame_size ({})",
                     self.default_frame_size, self.max_frame_size
                 ),
-            ));
-        }
-
-        if self.window_bytes == 0 {
-            return Err(CommonError::new(
-                CommonErrorKind::InvalidArgument,
-                "worker.window_bytes must be greater than zero",
             ));
         }
 
@@ -818,7 +807,6 @@ mod tests {
             rpc_max_inflight: 100,
             default_frame_size: 1024 * 1024,
             max_frame_size: 4 * 1024 * 1024,
-            window_bytes: 8 * 1024 * 1024,
             stream_idle_timeout_ms: 60_000,
             store: WorkerStoreConfig::default(),
             net: WorkerNetConfig::grpc_from_rpc("0.0.0.0:9090".to_string(), 100, 4 * 1024 * 1024),
@@ -903,7 +891,6 @@ worker.metadata.endpoints: "http://127.0.0.1:18080"
         assert_eq!(config.rpc_max_inflight, 100);
         assert_eq!(config.default_frame_size, 1024 * 1024);
         assert_eq!(config.max_frame_size, 4 * 1024 * 1024);
-        assert_eq!(config.window_bytes, 8 * 1024 * 1024);
         assert_eq!(config.stream_idle_timeout_ms, 60_000);
         let hdd0 = config.store.dirs.get("hdd0").unwrap();
         assert_eq!(config.store.dirs.len(), 1);
@@ -959,7 +946,6 @@ worker.rpc.advertised_endpoint: "http://127.0.0.1:19091"
 worker.rpc.max_inflight: 8
 worker.default_frame_size: 4096
 worker.max_frame_size: 8192
-worker.window_bytes: 16384
 worker.stream.idle_timeout_ms: 500
 worker.store.dirs.ssd0.path: "/tmp/beryl-worker/ssd0"
 worker.store.dirs.ssd0.tier: "SSD"
@@ -987,7 +973,6 @@ worker.metadata.register_retry_max_backoff_ms: 250
         assert_eq!(config.rpc_max_inflight, 8);
         assert_eq!(config.default_frame_size, 4096);
         assert_eq!(config.max_frame_size, 8192);
-        assert_eq!(config.window_bytes, 16_384);
         assert_eq!(config.stream_idle_timeout_ms, 500);
         let ssd0 = config.store.dirs.get("ssd0").unwrap();
         let hdd0 = config.store.dirs.get("hdd0").unwrap();
@@ -1080,6 +1065,28 @@ worker.metadata.endpoints: "http://127.0.0.1:18080"
         let error = WorkerConfig::load(&config_path).unwrap_err();
 
         assert!(error.message.contains("must be <="));
+    }
+
+    #[test]
+    fn rejects_removed_window_bytes_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("worker.yaml");
+        fs::write(
+            &config_path,
+            with_test_observe_yaml(
+                r#"
+worker.rpc.advertised_endpoint: "http://127.0.0.1:9090"
+worker.window_bytes: 8192
+worker.metadata.endpoints: "http://127.0.0.1:18080"
+"#,
+            ),
+        )
+        .unwrap();
+
+        let error = WorkerConfig::load(&config_path).unwrap_err();
+
+        assert!(error.message.contains("worker.window_bytes"));
+        assert!(error.message.contains("no longer supported"));
     }
 
     #[test]

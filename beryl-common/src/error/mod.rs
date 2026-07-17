@@ -13,8 +13,8 @@ pub mod rpc {
     //! - `ErrorKind`: the fact that failed.
     //! - `RecoveryAction`: what a caller should do next.
     //!
-    //! Human-readable `message` and structured `detail` are diagnostic only.
-    //! Machine control flow must branch on `kind` and `recovery`.
+    //! Human-readable `message` is diagnostic only. Machine control flow must
+    //! branch on `kind` and `recovery`.
 
     use beryl_types::fs::FsErrorCode;
     use serde::{Deserialize, Serialize};
@@ -26,7 +26,6 @@ pub mod rpc {
         Fs(FsErrorCode),
         Metadata(MetadataErrorKind),
         Worker(WorkerErrorKind),
-        Ufs(UfsErrorKind),
         Protocol(ProtocolErrorKind),
         Internal(InternalErrorKind),
     }
@@ -76,22 +75,6 @@ pub mod rpc {
         Io,
     }
 
-    /// UFS-domain failure fact.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-    pub enum UfsErrorKind {
-        NotFound,
-        PermissionDenied,
-        Unsupported,
-        NotImplemented,
-        InvalidSpec,
-        InvalidPath,
-        UnexpectedEof,
-        Backend,
-        Overloaded,
-        Timeout,
-    }
-
     /// Protocol and request-shape failure fact.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
     #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -133,7 +116,6 @@ pub mod rpc {
     pub struct WorkerEndpointHint {
         pub worker_id: u64,
         pub endpoint: String,
-        pub worker_net_protocol: i32,
     }
 
     /// Structured refresh hints attached to RPC errors.
@@ -148,26 +130,12 @@ pub mod rpc {
         pub worker_resolve_required: bool,
     }
 
-    /// Diagnostic structured data. This must not drive control flow.
-    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct ErrorDetail {
-        pub fields: Vec<ErrorDetailField>,
-    }
-
-    /// One diagnostic field in `ErrorDetail`.
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct ErrorDetailField {
-        pub key: String,
-        pub value: String,
-    }
-
     /// RPC error model for Beryl.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct RpcErrorDetail {
         pub kind: ErrorKind,
         pub recovery: RecoveryAction,
         pub message: String,
-        pub detail: ErrorDetail,
     }
 
     impl RpcErrorDetail {
@@ -176,7 +144,6 @@ pub mod rpc {
                 kind,
                 recovery,
                 message: message.into(),
-                detail: ErrorDetail::default(),
             }
         }
 
@@ -206,14 +173,6 @@ pub mod rpc {
 
         pub fn send_full_block_report(kind: ErrorKind, message: impl Into<String>) -> Self {
             Self::new(kind, RecoveryAction::SendFullBlockReport, message)
-        }
-
-        pub fn with_detail_field(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-            self.detail.fields.push(ErrorDetailField {
-                key: key.into(),
-                value: value.into(),
-            });
-            self
         }
     }
 }

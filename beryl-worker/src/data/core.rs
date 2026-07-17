@@ -49,9 +49,6 @@ pub struct StreamContext {
     /// Transport frame payload size negotiated at stream open.
     /// This controls network batching and does not define StorageChunk size.
     pub frame_size: u32,
-    /// Per-stream application-level in-flight byte window.
-    /// This is independent from protocol-native flow control.
-    pub window_bytes: u32,
     /// Logical block stamp used for direct read/write validation.
     /// It changes on logical commit or block metadata changes, not on ordinary reads.
     pub block_stamp: u64,
@@ -97,9 +94,6 @@ pub struct ReadOpenResult {
     /// Transport frame payload size negotiated at stream open.
     /// This controls network batching and does not define StorageChunk size.
     pub frame_size: u32,
-    /// Per-stream application-level in-flight byte window.
-    /// This is independent from protocol-native flow control.
-    pub window_bytes: u32,
     /// Logical block stamp used for direct read validation.
     pub block_stamp: u64,
     /// Block-local readable committed prefix length.
@@ -138,8 +132,6 @@ pub struct WriteOpenResult {
     pub stream_id: StreamId,
     /// Transport frame payload size negotiated at stream open.
     pub frame_size: u32,
-    /// Per-stream application-level in-flight byte window.
-    pub window_bytes: u32,
     /// Logical block stamp used for direct write validation.
     pub block_stamp: u64,
     /// Published effective length reported to the caller.
@@ -312,28 +304,20 @@ impl WorkerCore {
     pub fn with_options(
         default_frame_size: u32,
         max_frame_size: u32,
-        window_bytes: u32,
         stream_idle_timeout: Duration,
         store_dir: PathBuf,
     ) -> Self {
         let block_store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(store_dir)));
-        Self::with_local_store(
-            default_frame_size,
-            max_frame_size,
-            window_bytes,
-            stream_idle_timeout,
-            block_store,
-        )
+        Self::with_local_store(default_frame_size, max_frame_size, stream_idle_timeout, block_store)
     }
 
     pub fn with_local_store(
         default_frame_size: u32,
         max_frame_size: u32,
-        window_bytes: u32,
         stream_idle_timeout: Duration,
         block_store: Arc<dyn LocalBlockStore + Send + Sync>,
     ) -> Self {
-        let block_manager = Arc::new(BlockManager::new(default_frame_size, max_frame_size, window_bytes));
+        let block_manager = Arc::new(BlockManager::new(default_frame_size, max_frame_size));
         Self {
             stream_manager: Arc::new(StreamManager::new(stream_idle_timeout)),
             block_manager,
@@ -348,10 +332,6 @@ impl WorkerCore {
 
     pub fn max_frame_size(&self) -> u32 {
         self.block_manager.max_frame_size()
-    }
-
-    pub fn window_bytes(&self) -> u32 {
-        self.block_manager.window_bytes()
     }
 
     pub fn stream_manager(&self) -> Arc<StreamManager> {
@@ -377,7 +357,6 @@ impl WorkerCore {
             start_offset: req.byte_range.offset,
             end_offset,
             frame_size,
-            window_bytes: self.window_bytes(),
             block_stamp: snapshot.block_stamp,
             block_format_id: snapshot.block_format_id,
             block_size: snapshot.block_size,
@@ -391,7 +370,6 @@ impl WorkerCore {
         Ok(ReadOpenResult {
             stream_id,
             frame_size,
-            window_bytes: self.window_bytes(),
             block_stamp: snapshot.block_stamp,
             committed_length: snapshot.effective_len,
         })
@@ -456,7 +434,6 @@ impl WorkerCore {
                 start_offset: 0,
                 end_offset: req.effective_len,
                 frame_size,
-                window_bytes: self.window_bytes(),
                 block_stamp: req.block_stamp,
                 block_format_id: req.block_format_id,
                 block_size: req.block_size,
@@ -470,7 +447,6 @@ impl WorkerCore {
             Ok(WriteOpenResult {
                 stream_id,
                 frame_size,
-                window_bytes: self.window_bytes(),
                 block_stamp: req.block_stamp,
                 committed_length: 0,
             })

@@ -17,11 +17,8 @@ message BlockMetaPayloadProto {
 }
 
 message BlockIdentityProto {
-  reserved 2;
-  reserved "group_id";
-
   common.BlockIdProto block_id = 1;
-  string group_name = 3;
+  string group_name = 2;
 }
 
 message BlockFormatProto {
@@ -30,8 +27,6 @@ message BlockFormatProto {
   // valid length is stored in BlockSource.effective_len.
   uint64 block_size = 2;
   uint32 chunk_size = 3;
-  // Checksum algorithm for .blk StorageChunk data; it does not protect this metadata file.
-  ChecksumKindProto checksum_kind = 4;
 }
 
 message BlockSourceProto {
@@ -47,9 +42,4 @@ enum BlockStateProto {
   BLOCK_STATE_UNSPECIFIED = 0;
   BLOCK_STATE_READY = 1;
   BLOCK_STATE_CORRUPT = 2;
-}
-
-enum ChecksumKindProto {
-  CHECKSUM_KIND_UNSPECIFIED = 0;
-  CHECKSUM_KIND_NONE = 1;
 }

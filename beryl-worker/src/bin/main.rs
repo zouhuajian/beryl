@@ -51,7 +51,6 @@ async fn main() -> Result<()> {
         rpc_max_inflight = config.rpc_max_inflight,
         default_frame_size = config.default_frame_size,
         max_frame_size = config.max_frame_size,
-        window_bytes = config.window_bytes,
         store_dirs = config.store.dirs.len(),
         store_reserve_space_bytes = config.store.reserve_space_bytes,
         store_selection_policy = %config.store.selection_policy,
@@ -96,7 +95,6 @@ async fn main() -> Result<()> {
     let core = Arc::new(WorkerCore::with_local_store(
         config.default_frame_size,
         config.max_frame_size,
-        config.window_bytes,
         Duration::from_millis(config.stream_idle_timeout_ms),
         block_store.clone(),
     ));

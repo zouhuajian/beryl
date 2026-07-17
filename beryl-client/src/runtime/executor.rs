@@ -242,7 +242,6 @@ impl MetadataExecutor {
                     path: path.clone(),
                     attrs: Some(default_file_attrs()),
                     layout: Some(layout_for_new_file(&options)?),
-                    create_mode: beryl_proto::metadata::CreateModeProto::CreateNew as i32,
                 },
                 |gateway, ctx, req| async move { gateway.create_file(ctx, req).await },
             )
@@ -283,7 +282,11 @@ impl MetadataExecutor {
                 "OpenWrite returned a different layout than CreateFile".to_string(),
             ));
         }
-        write_handle_from_open_response(path, open)
+        write_handle_from_open_response(
+            path,
+            beryl_proto::metadata::OpenWriteModeProto::OpenWriteModeWrite,
+            open,
+        )
     }
 
     pub(crate) async fn open_append(&self, path: NamespacePathBuf) -> ClientResult<WriteHandle> {
@@ -295,7 +298,11 @@ impl MetadataExecutor {
                 self.operation_deadline(),
             )
             .await?;
-        write_handle_from_open_response(path, open)
+        write_handle_from_open_response(
+            path,
+            beryl_proto::metadata::OpenWriteModeProto::OpenWriteModeAppend,
+            open,
+        )
     }
 
     async fn open_write_request(
@@ -404,7 +411,6 @@ impl MetadataExecutor {
         session: &WriteSession,
         mut committed_blocks: Vec<CommittedBlock>,
         target_size: u64,
-        mode: beryl_proto::metadata::WriteSyncModeProto,
         deadline: OperationDeadline,
     ) -> ClientResult<beryl_proto::metadata::SyncWriteResponseProto> {
         if session.mode() == beryl_proto::metadata::OpenWriteModeProto::OpenWriteModeAppend {
@@ -415,7 +421,6 @@ impl MetadataExecutor {
             write_handle: Some(session.write_handle()),
             committed_blocks: committed_blocks.iter().map(Into::into).collect(),
             target_size,
-            mode: mode as i32,
             expected_content_revision: session.content_revision(),
             write_mode: session.mode() as i32,
             expected_file_size: session.base_size(),
@@ -803,6 +808,7 @@ fn layout_for_new_file(options: &CreateOptions) -> ClientResult<beryl_proto::com
 
 fn write_handle_from_open_response(
     path: String,
+    mode: beryl_proto::metadata::OpenWriteModeProto,
     response: beryl_proto::metadata::OpenWriteResponseProto,
 ) -> ClientResult<WriteHandle> {
     let layout = response
@@ -821,8 +827,7 @@ fn write_handle_from_open_response(
         response.base_size,
         expires_at_ms,
         response.content_revision,
-        beryl_proto::metadata::OpenWriteModeProto::try_from(response.mode)
-            .map_err(|_| ClientError::Metadata("OpenWriteResponseProto.mode invalid".to_string()))?,
+        mode,
     )?;
     Ok(WriteHandle::new(path, response.base_size, session))
 }

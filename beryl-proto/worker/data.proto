@@ -13,50 +13,46 @@ import "worker/data_header.proto";
 // Worker Data Service: block-local stream and sync API
 // ============================================================================
 //
-// Block is the management, routing, reporting, replication, migration,
-// eviction, and repair task unit. StorageChunk is a worker-local IO,
-// checksum, and valid-bitmap granularity used inside block operations.
+// Block is the current storage, routing, and reporting unit. StorageChunk is a
+// worker-local IO granularity used inside block operations.
 // TransportFrame is represented by the stream request/response payloads below.
 // StorageChunk and TransportFrame are intentionally not encoded as the same
 // message.
 
 message OpenReadStreamRequestProto {
-  reserved 2;
-  reserved "group_id";
-
   // Low-frequency data-plane control header.
   // High-frequency ReadStream frames must not carry this header.
   worker.DataRequestHeaderProto header = 1;
 
   // Target block. Worker data-plane APIs are block-local and must not parse
   // file-level offsets or layouts.
-  common.BlockIdProto block_id = 3;
+  common.BlockIdProto block_id = 2;
 
   // Block-local byte range to read. The offset is relative to block_id,
   // not relative to the file/data handle.
-  common.ByteRangeProto byte_range = 4;
+  common.ByteRangeProto byte_range = 3;
 
   // Metadata-issued logical block stamp for direct read validation.
   // Must be non-zero. Worker validation rejects zero, stale, or mismatched
   // block stamps.
-  uint64 block_stamp = 5;
+  uint64 block_stamp = 4;
 
   // Client-preferred transport frame payload size in bytes.
   // The worker may clamp or adjust it and returns the accepted value.
   // This is not the worker-local StorageChunk size.
-  uint32 frame_size = 6;
+  uint32 frame_size = 5;
 
   // Metadata-confirmed worker process-run identity for the selected endpoint.
-  string worker_run_id = 7;
+  string worker_run_id = 6;
 
   // Metadata-issued expected block layout facts from the authoritative FileLayout.
-  uint32 block_format_id = 8;
-  uint64 block_size = 9;
-  uint32 chunk_size = 10;
-  uint64 effective_len = 11;
+  uint32 block_format_id = 7;
+  uint64 block_size = 8;
+  uint32 chunk_size = 9;
+  uint64 effective_len = 10;
 
   // Stable metadata group name for the local block-store lookup.
-  string group_name = 12;
+  string group_name = 11;
 }
 
 message OpenReadStreamResponseProto {
@@ -71,16 +67,12 @@ message OpenReadStreamResponseProto {
   // This controls network batching only and does not affect on-disk format.
   uint32 frame_size = 3;
 
-  // Per-stream application-level in-flight byte window.
-  // This is separate from protocol-native flow control such as HTTP/2.
-  uint32 window_bytes = 4;
-
   // Worker's current logical block stamp.
-  uint64 block_stamp = 5;
+  uint64 block_stamp = 4;
 
   // Block-local readable committed prefix length in bytes.
   // This is not the sum of ready chunks.
-  uint64 committed_length = 6;
+  uint64 committed_length = 5;
 }
 
 message ReadStreamRequestProto {
@@ -91,59 +83,52 @@ message ReadStreamRequestProto {
 message ReadStreamResponseProto {
   uint64 offset_in_block = 1;
   bytes data = 2;
-  uint32 checksum32 = 3;
-  bool eos = 4;
+  bool eos = 3;
 }
 
 message OpenWriteStreamRequestProto {
-  reserved 2;
-  reserved "group_id";
-
   // Low-frequency data-plane control header.
   // High-frequency WriteStream frames must not carry this header.
   worker.DataRequestHeaderProto header = 1;
 
   // Target block. Writes are block-local.
-  common.BlockIdProto block_id = 3;
+  common.BlockIdProto block_id = 2;
 
   // Metadata-issued expected Beryl block data/meta interpretation format.
   // StoreBackend / IoEngine selection is worker-local and is not encoded here.
-  uint32 block_format_id = 4;
+  uint32 block_format_id = 3;
 
   // Full logical block size for this block format, from the persisted
   // FileLayout. This value is persisted in worker BlockMeta.format.block_size.
   // Tail length is carried separately through CommitWrite.effective_len.
-  uint64 block_size = 5;
+  uint64 block_size = 4;
 
   // Metadata-issued StorageChunk size for this block format.
-  uint32 chunk_size = 6;
-
-  // StorageChunk checksum algorithm for this local block.
-  worker.ChecksumKindProto checksum_kind = 7;
+  uint32 chunk_size = 5;
 
   // Metadata-assigned logical block stamp to publish on commit.
   // Must be non-zero for write streams.
-  uint64 block_stamp = 8;
+  uint64 block_stamp = 6;
 
   // Required fencing token issued by metadata.
   // Worker must reject stale writers before accepting data frames.
-  common.FencingTokenProto token = 9;
+  common.FencingTokenProto token = 7;
 
   // Client-preferred transport frame payload size in bytes.
   // This is not the worker-local StorageChunk size.
-  uint32 frame_size = 10;
+  uint32 frame_size = 8;
 
   // Metadata-confirmed worker process-run identity for the selected endpoint.
-  string worker_run_id = 11;
+  string worker_run_id = 9;
 
   // Metadata-issued valid length for this write target.
-  uint64 effective_len = 12;
+  uint64 effective_len = 10;
 
   // Stable metadata group name for the local block-store staging lookup.
-  string group_name = 13;
+  string group_name = 11;
 
   // Worker-local storage tier requested by metadata for this block replica.
-  common.TierProto tier = 14;
+  common.TierProto tier = 12;
 }
 
 message OpenWriteStreamResponseProto {
@@ -156,17 +141,12 @@ message OpenWriteStreamResponseProto {
   // Worker-accepted transport frame payload size in bytes.
   uint32 frame_size = 3;
 
-  // Per-stream application-level in-flight byte window.
-  // The writer should not keep more than this many unacknowledged bytes
-  // outstanding for this stream.
-  uint32 window_bytes = 4;
-
   // Metadata-assigned logical block stamp to publish on commit.
   // Must be non-zero for write streams.
-  uint64 block_stamp = 5;
+  uint64 block_stamp = 4;
 
   // Block-local readable committed prefix length in bytes.
-  uint64 committed_length = 6;
+  uint64 committed_length = 5;
 }
 
 message WriteStreamRequestProto {
@@ -174,7 +154,6 @@ message WriteStreamRequestProto {
   uint64 seq = 2;
   uint64 offset_in_block = 3;
   bytes data = 4;
-  uint32 checksum32 = 5;
 }
 
 message WriteStreamResponseProto {
@@ -184,33 +163,30 @@ message WriteStreamResponseProto {
 }
 
 message CommitWriteRequestProto {
-  reserved 2;
-  reserved "group_id";
-
   worker.DataRequestHeaderProto header = 1;
-  common.BlockIdProto block_id = 3;
-  common.StreamIdProto stream_id = 4;
+  common.BlockIdProto block_id = 2;
+  common.StreamIdProto stream_id = 3;
 
   // Publishes the complete effective block length for FullBlockFileStore.
-  uint64 effective_len = 5;
+  uint64 effective_len = 4;
 
   // Metadata-assigned logical block stamp to persist at publish time.
-  uint64 block_stamp = 6;
+  uint64 block_stamp = 5;
 
-  common.FencingTokenProto token = 7;
-  uint64 commit_seq = 8;
-  bool require_sync = 9;
+  common.FencingTokenProto token = 6;
+  uint64 commit_seq = 7;
+  bool require_sync = 8;
 
   // Metadata-confirmed worker process-run identity for the selected endpoint.
-  string worker_run_id = 10;
+  string worker_run_id = 9;
 
   // Metadata-issued expected block layout facts from the authoritative FileLayout.
-  uint32 block_format_id = 11;
-  uint64 block_size = 12;
-  uint32 chunk_size = 13;
+  uint32 block_format_id = 10;
+  uint64 block_size = 11;
+  uint32 chunk_size = 12;
 
   // Stable metadata group name for the local block-store lookup.
-  string group_name = 14;
+  string group_name = 13;
 }
 
 message CommitWriteResponseProto {
@@ -225,28 +201,25 @@ message CommitWriteResponseProto {
 }
 
 message SyncCommittedBlockRequestProto {
-  reserved 2;
-  reserved "group_id";
-
   worker.DataRequestHeaderProto header = 1;
-  common.BlockIdProto block_id = 3;
+  common.BlockIdProto block_id = 2;
 
   // Metadata-authoritative logical block_stamp for the committed block version.
-  uint64 block_stamp = 4;
+  uint64 block_stamp = 3;
 
   // Complete committed block length expected by the metadata-visible prefix.
-  uint64 expected_block_len = 5;
+  uint64 expected_block_len = 4;
 
   // Metadata-confirmed worker process-run identity for the selected endpoint.
-  string worker_run_id = 6;
+  string worker_run_id = 5;
 
   // Metadata-issued expected block layout facts from the authoritative FileLayout.
-  uint32 block_format_id = 7;
-  uint64 block_size = 8;
-  uint32 chunk_size = 9;
+  uint32 block_format_id = 6;
+  uint64 block_size = 7;
+  uint32 chunk_size = 8;
 
   // Stable metadata group name for the local block-store lookup.
-  string group_name = 10;
+  string group_name = 9;
 }
 
 message SyncCommittedBlockResponseProto {
@@ -258,16 +231,13 @@ message SyncCommittedBlockResponseProto {
 }
 
 message AbortWriteRequestProto {
-  reserved 2;
-  reserved "group_id";
-
   worker.DataRequestHeaderProto header = 1;
-  common.BlockIdProto block_id = 3;
-  common.StreamIdProto stream_id = 4;
-  common.FencingTokenProto token = 5;
+  common.BlockIdProto block_id = 2;
+  common.StreamIdProto stream_id = 3;
+  common.FencingTokenProto token = 4;
 
   // Stable metadata group name for the local block-store lookup.
-  string group_name = 6;
+  string group_name = 5;
 }
 
 message AbortWriteResponseProto {

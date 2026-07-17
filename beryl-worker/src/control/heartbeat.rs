@@ -14,8 +14,7 @@ use beryl_proto::common::{EndpointProto, RequestHeaderProto};
 use beryl_proto::convert::{require_worker_run_id, rpc_error_from_proto};
 use beryl_proto::metadata::metadata_worker_service_proto_client::MetadataWorkerServiceProtoClient;
 use beryl_proto::metadata::{
-    CapacityInfoProto, HealthStatusProto, HeartbeatRequestProto, HeartbeatResponseProto, LoadInfoProto,
-    MetadataServerRoleProto, TierFreeProto,
+    CapacityInfoProto, HealthStatusProto, HeartbeatRequestProto, HeartbeatResponseProto, LoadInfoProto, TierFreeProto,
 };
 use beryl_types::{GroupName, TierFree, WorkerRunId};
 use thiserror::Error;
@@ -29,7 +28,6 @@ use crate::control::{
     metadata_tonic_request, ControlIdentity, ControlOp, MetadataRegistrar, Registration, RegistrationDescriptor,
     RegistrationSet,
 };
-use crate::net::protocol::WorkerNetProtocol;
 use crate::observe;
 use crate::store::dirs::{StoreDirs, StoreReport};
 
@@ -42,8 +40,6 @@ pub struct HeartbeatSnapshot {
     pub tier_free: Vec<TierFree>,
     pub active_reads: u32,
     pub active_writes: u32,
-    pub cpu_usage_percent: u32,
-    pub memory_used_bytes: u64,
 }
 
 #[derive(Debug, Error)]
@@ -192,7 +188,6 @@ impl MetadataHeartbeatLoop {
             advertised_endpoint: Some(EndpointProto {
                 host: self.descriptor.endpoint_host.clone(),
                 port: self.descriptor.endpoint_port,
-                protocol: self.descriptor.worker_net_protocol.to_string(),
             }),
             capacity: Some(CapacityInfoProto {
                 total_bytes: snapshot.capacity_total_bytes,
@@ -210,13 +205,8 @@ impl MetadataHeartbeatLoop {
             load: Some(LoadInfoProto {
                 active_reads: snapshot.active_reads,
                 active_writes: snapshot.active_writes,
-                cpu_usage_percent: snapshot.cpu_usage_percent,
-                memory_used_bytes: snapshot.memory_used_bytes,
             }),
             health: HealthStatusProto::HealthStatusHealthy as i32,
-            worker_net_protocol: worker_protocol_to_proto(self.descriptor.worker_net_protocol) as i32,
-            acks: Vec::new(),
-            group_name: registration.group_name.to_string(),
         }
     }
 
@@ -328,14 +318,23 @@ fn classify_heartbeat_response(
     request: &HeartbeatRequestProto,
     response: HeartbeatResponseProto,
 ) -> Result<HeartbeatPeerOutcome, HeartbeatError> {
+    let response_group_name = response
+        .header
+        .as_ref()
+        .map(|header| header.group_name.as_str())
+        .ok_or_else(|| HeartbeatError::Fatal("metadata heartbeat response missing ResponseHeader".to_string()))?;
+    let request_group_name = request
+        .header
+        .as_ref()
+        .map(|header| header.group_name.as_str())
+        .ok_or_else(|| HeartbeatError::Fatal("metadata heartbeat request missing RequestHeader".to_string()))?;
+    if response_group_name != request_group_name {
+        return Err(HeartbeatError::Fatal(format!(
+            "metadata heartbeat response confirmed group_name {response_group_name}, expected {request_group_name}"
+        )));
+    }
     if let Some(outcome) = classify_header(response.header.as_ref())? {
         return Ok(outcome);
-    }
-    if response.group_name != request.group_name {
-        return Err(HeartbeatError::Fatal(format!(
-            "metadata heartbeat response confirmed group_name {}, expected {}",
-            response.group_name, request.group_name
-        )));
     }
     if response.worker_id != request.worker_id {
         return Err(HeartbeatError::Fatal(
@@ -353,9 +352,6 @@ fn classify_heartbeat_response(
         return Err(HeartbeatError::Fatal(
             "metadata heartbeat response did not confirm worker_run_id".to_string(),
         ));
-    }
-    if response.server_role() == MetadataServerRoleProto::MetadataServerRoleFollower && !response.commands.is_empty() {
-        warn!("Ignoring worker commands returned by follower heartbeat response");
     }
     let liveness_timeout = Duration::from_millis(u64::from(response.liveness_timeout_ms.max(1)));
     Ok(HeartbeatPeerOutcome::Accepted { liveness_timeout })
@@ -401,10 +397,4 @@ fn heartbeat_request_header(group_name: &GroupName, op: &ControlOp) -> RequestHe
     let mut header = RequestHeader::new(op.client_id).with_group_name(group_name.clone());
     header.client.call_id = op.call_id;
     (&header).into()
-}
-
-fn worker_protocol_to_proto(protocol: WorkerNetProtocol) -> beryl_proto::common::WorkerNetProtocolProto {
-    match protocol {
-        WorkerNetProtocol::Grpc => beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc,
-    }
 }

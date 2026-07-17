@@ -990,7 +990,6 @@ mod tests {
         let mut ctx = request_context();
         ctx.caller = ctx.caller.with_caller_context(CallerContext {
             context: "host=127.0.0.2".to_string(),
-            signature: None,
         });
 
         let success = filesystem
@@ -2011,7 +2010,7 @@ mod tests {
             .expect("open write should succeed");
         let key = open.payload;
         let target = add_block_for_key(&env.filesystem, &key, 64).await;
-        let close = commit_for_key(
+        commit_for_key(
             &env.filesystem,
             &key,
             vec![committed_block(
@@ -2056,7 +2055,6 @@ mod tests {
             .await
             .expect("locations should succeed");
 
-        assert_eq!(close.payload.content_revision, Some(1));
         assert_eq!(locations.payload.content_revision, Some(1));
         assert_eq!(stored_content_revision(&env.storage, env.inode_id), Some(1));
     }

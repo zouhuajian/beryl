@@ -973,7 +973,6 @@ mod tests {
                 header: Some(ok_data_header(request.header.as_ref())),
                 stream_id: Some(beryl_proto::common::StreamIdProto { high: 1, low: 1 }),
                 frame_size: request.frame_size.max(1),
-                window_bytes: 0,
                 block_stamp: request.block_stamp,
                 committed_length: request.effective_len,
             }))
@@ -1009,7 +1008,6 @@ mod tests {
                 header: Some(ok_data_header(request.header.as_ref())),
                 stream_id: Some(beryl_proto::common::StreamIdProto { high: 1, low: 1 }),
                 frame_size: request.frame_size.max(1),
-                window_bytes: 0,
                 block_stamp: request.block_stamp,
                 committed_length: 0,
             }))
@@ -1121,7 +1119,6 @@ mod tests {
         ReadStreamResponseProto {
             offset_in_block,
             data,
-            checksum32: 0,
             eos,
         }
     }
@@ -1204,7 +1201,6 @@ mod tests {
             header: Some(data_header_with_error(rpc_error)),
             stream_id: None,
             frame_size: 0,
-            window_bytes: 0,
             block_stamp: 0,
             committed_length: 0,
         }

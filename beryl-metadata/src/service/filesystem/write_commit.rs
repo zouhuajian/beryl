@@ -27,7 +27,6 @@ pub(crate) struct SyncWriteOutput {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CloseWriteOutput {
     pub(crate) committed_size: u64,
-    pub(crate) content_revision: Option<u64>,
 }
 
 pub(crate) struct CommitFileArgs {
@@ -102,7 +101,6 @@ impl MetadataFileSystem {
                 committed_block_count,
                 committed_bytes,
                 lease_epoch = handle.lease_epoch,
-                content_revision = success.payload.content_revision,
                 mount_epoch = success.mount_epoch,
                 route_epoch = success.route_epoch,
                 "CommitFile committed"
@@ -171,6 +169,40 @@ impl MetadataFileSystem {
         }
     }
 
+    fn active_publish_session(
+        &self,
+        ctx: &RequestContext,
+        data_handle_id: DataHandleId,
+        lease_epoch: u64,
+        publish_mode: PublishMode,
+        operation: &'static str,
+    ) -> Result<Option<crate::session_registry::WriteSession>, FsFailure> {
+        let Some(session) = self.session_registry.get_session(data_handle_id) else {
+            return Ok(None);
+        };
+        let invalid = |message| match self.session_terminal_failure::<()>(
+            ctx,
+            ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+            message,
+            None,
+            None,
+        ) {
+            Err(failure) => failure,
+            Ok(_) => unreachable!("session_terminal_failure always returns Err"),
+        };
+        if session.open_client_id != ctx.caller.client.client_id {
+            return Err(invalid(format!(
+                "{operation} client does not own data_handle_id={data_handle_id}"
+            )));
+        }
+        if session.lease_epoch != lease_epoch || Self::publish_mode_for_session(&session) != publish_mode {
+            return Err(invalid(format!(
+                "{operation} publish precondition does not match the active session"
+            )));
+        }
+        Ok(Some(session))
+    }
+
     /// Resolve an ambiguous publish from the durable file state.
     ///
     /// This is state-equivalence recovery, not historical request replay. Once
@@ -205,7 +237,7 @@ impl MetadataFileSystem {
                 )))
             }
         };
-        if stored_lease_epoch != lease_epoch && stored_lease_epoch != lease_epoch.saturating_add(1) {
+        if stored_lease_epoch != lease_epoch && lease_epoch.checked_add(1) != Some(stored_lease_epoch) {
             return Err(MetadataError::LeaseFenced {
                 expected: stored_lease_epoch,
                 got: lease_epoch,
@@ -253,7 +285,7 @@ impl MetadataFileSystem {
                     && extent.block_offset == 0
                     && extent.len == block.len
             });
-        if content_revision == expected_content_revision.saturating_add(1) && state_matches {
+        if expected_content_revision.checked_add(1) == Some(content_revision) && state_matches {
             return Ok(Some((inode_id, inode.mount_id, content_revision)));
         }
         if content_revision == expected_content_revision && intent.committed_blocks.is_empty() && state_matches {
@@ -295,6 +327,11 @@ impl MetadataFileSystem {
     ) -> FsResult<SyncWriteOutput> {
         let data_handle_id = handle.data_handle_id;
         let lease_epoch = handle.lease_epoch;
+        let active_session =
+            match self.active_publish_session(ctx, data_handle_id, lease_epoch, publish_mode, "SyncWrite") {
+                Ok(session) => session,
+                Err(failure) => return Err(failure),
+            };
         match self.resolve_published_state(
             data_handle_id,
             lease_epoch,
@@ -303,10 +340,22 @@ impl MetadataFileSystem {
             publish_mode,
         ) {
             Ok(Some((_inode_id, mount_id, content_revision))) => {
+                if active_session.as_ref().is_some_and(|session| {
+                    session.content_revision != expected_content_revision
+                        && session.content_revision != content_revision
+                }) {
+                    return self.session_terminal_failure(
+                        ctx,
+                        ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                        "SyncWrite content revision does not match the active session".to_string(),
+                        None,
+                        None,
+                    );
+                }
                 let (group_name, mount_epoch, route_epoch) = self
                     .completed_publish_hints(ctx, freshness, mount_id, "SyncWrite")
                     .await?;
-                if self.session_registry.get_session(data_handle_id).is_some() {
+                if active_session.is_some() {
                     let _ = self.session_registry.update_published_state(
                         data_handle_id,
                         lease_epoch,
@@ -328,7 +377,7 @@ impl MetadataFileSystem {
             Ok(None) => {}
             Err(err) => return self.failure_from_error(ctx, err, None, None),
         }
-        let session = match self.session_registry.get_session(data_handle_id) {
+        let session = match active_session {
             Some(session) => session,
             None => {
                 return self.session_terminal_failure(
@@ -340,9 +389,7 @@ impl MetadataFileSystem {
                 );
             }
         };
-        if session.content_revision != expected_content_revision
-            || Self::publish_mode_for_session(&session) != publish_mode
-        {
+        if session.content_revision != expected_content_revision {
             return self.session_terminal_failure(
                 ctx,
                 ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
@@ -351,16 +398,6 @@ impl MetadataFileSystem {
                 None,
             );
         }
-        if session.open_client_id != ctx.caller.client.client_id {
-            return self.session_terminal_failure(
-                ctx,
-                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
-                format!("SyncWrite client does not own data_handle_id={}", data_handle_id),
-                None,
-                None,
-            );
-        }
-
         let (group_name, mount_epoch) =
             match self
                 .freshness_validator
@@ -679,6 +716,11 @@ impl MetadataFileSystem {
     ) -> FsResult<CloseWriteOutput> {
         let data_handle_id = handle.data_handle_id;
         let lease_epoch = handle.lease_epoch;
+        let active_session =
+            match self.active_publish_session(ctx, data_handle_id, lease_epoch, publish_mode, "CommitFile") {
+                Ok(session) => session,
+                Err(failure) => return Err(failure),
+            };
         match self.resolve_published_state(
             data_handle_id,
             lease_epoch,
@@ -687,6 +729,18 @@ impl MetadataFileSystem {
             publish_mode,
         ) {
             Ok(Some((_inode_id, mount_id, content_revision))) => {
+                if active_session.as_ref().is_some_and(|session| {
+                    session.content_revision != expected_content_revision
+                        && session.content_revision != content_revision
+                }) {
+                    return self.session_terminal_failure(
+                        ctx,
+                        ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                        "CommitFile content revision does not match the active session".to_string(),
+                        None,
+                        None,
+                    );
+                }
                 let (group_name, mount_epoch, route_epoch) = self
                     .completed_publish_hints(ctx, freshness, mount_id, "CommitFile")
                     .await?;
@@ -700,7 +754,6 @@ impl MetadataFileSystem {
                     ctx,
                     CloseWriteOutput {
                         committed_size: intent.final_size,
-                        content_revision: Some(content_revision),
                     },
                     group_name,
                     mount_epoch,
@@ -710,7 +763,7 @@ impl MetadataFileSystem {
             Ok(None) => {}
             Err(err) => return self.failure_from_error(ctx, err, None, None),
         }
-        let session = match self.session_registry.get_session(data_handle_id) {
+        let session = match active_session {
             Some(session) => session,
             None => {
                 return self.session_terminal_failure(
@@ -722,9 +775,7 @@ impl MetadataFileSystem {
                 );
             }
         };
-        if session.content_revision != expected_content_revision
-            || Self::publish_mode_for_session(&session) != publish_mode
-        {
+        if session.content_revision != expected_content_revision {
             return self.session_terminal_failure(
                 ctx,
                 ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
@@ -733,16 +784,6 @@ impl MetadataFileSystem {
                 None,
             );
         }
-        if session.open_client_id != ctx.caller.client.client_id {
-            return self.session_terminal_failure(
-                ctx,
-                ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
-                format!("CommitFile client does not own data_handle_id={}", data_handle_id),
-                None,
-                None,
-            );
-        }
-
         let (group_name, mount_epoch) =
             match self
                 .freshness_validator
@@ -864,17 +905,14 @@ impl MetadataFileSystem {
                 );
             }
         };
-        let content_revision = match content_revision {
-            Some(content_revision) => content_revision,
-            None => {
-                return self.failure_from_error(
-                    ctx,
-                    MetadataError::Internal("PublishFile returned no content revision".to_string()),
-                    Some(routed.namespace_owner_group_name.clone()),
-                    Some(routed.mount_epoch),
-                )
-            }
-        };
+        if content_revision.is_none() {
+            return self.failure_from_error(
+                ctx,
+                MetadataError::Internal("PublishFile returned no content revision".to_string()),
+                Some(routed.namespace_owner_group_name.clone()),
+                Some(routed.mount_epoch),
+            );
+        }
 
         self.lease_manager.release(session.inode_id, session.lease_epoch);
         self.session_registry
@@ -884,7 +922,6 @@ impl MetadataFileSystem {
             ctx,
             CloseWriteOutput {
                 committed_size: intent.final_size,
-                content_revision: Some(content_revision),
             },
             Some(routed.namespace_owner_group_name.clone()),
             Some(routed.mount_epoch),

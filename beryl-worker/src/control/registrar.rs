@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use beryl_common::error::rpc::{RecoveryAction, RpcErrorDetail};
 use beryl_common::header::RequestHeader;
-use beryl_proto::common::{EndpointProto, RequestHeaderProto, WorkerNetProtocolProto};
+use beryl_proto::common::{EndpointProto, RequestHeaderProto};
 use beryl_proto::convert::{require_worker_run_id, rpc_error_from_proto};
 use beryl_proto::metadata::metadata_worker_service_proto_client::MetadataWorkerServiceProtoClient;
 use beryl_proto::metadata::{RegisterWorkerRequestProto, RegisterWorkerResponseProto};
@@ -111,14 +111,14 @@ impl MetadataRegistrar {
 
     pub async fn register_once(&self) -> Result<Registration, RegistrationError> {
         let op = self.control_identity.new_op();
-        self.register_once_with_op(&op, 0).await
+        self.register_once_with_op(&op).await
     }
 
-    async fn register_once_with_op(&self, op: &ControlOp, retry_count: i32) -> Result<Registration, RegistrationError> {
+    async fn register_once_with_op(&self, op: &ControlOp) -> Result<Registration, RegistrationError> {
         let timeout = Duration::from_millis(self.config.register_timeout_ms);
         let channel = self.connect(timeout).await?;
         let mut client = MetadataWorkerServiceProtoClient::new(channel);
-        let request = self.build_request(op, retry_count);
+        let request = self.build_request(op);
         let tonic_request = metadata_tonic_request(request.clone(), request.header.as_ref());
         let response = time::timeout(timeout, client.register_worker(tonic_request))
             .await
@@ -139,10 +139,8 @@ impl MetadataRegistrar {
         let mut backoff = Duration::from_millis(self.config.register_retry_initial_backoff_ms);
         let max_backoff = Duration::from_millis(self.config.register_retry_max_backoff_ms);
         let op = self.control_identity.new_op();
-        let mut retry_count = 0i32;
-
         loop {
-            match self.register_once_with_op(&op, retry_count).await {
+            match self.register_once_with_op(&op).await {
                 Ok(registration) => {
                     info!(
                         group_name = %registration.group_name,
@@ -163,7 +161,6 @@ impl MetadataRegistrar {
                         _ = &mut shutdown => return Err(RegistrationError::Cancelled),
                     }
                     backoff = (backoff * 2).min(max_backoff);
-                    retry_count = retry_count.saturating_add(1);
                 }
                 Err(error) => return Err(error),
             }
@@ -177,22 +174,15 @@ impl MetadataRegistrar {
             .map_err(|err| RegistrationError::Retryable(format!("metadata endpoint unavailable: {err}")))
     }
 
-    fn build_request(&self, op: &ControlOp, retry_count: i32) -> RegisterWorkerRequestProto {
+    fn build_request(&self, op: &ControlOp) -> RegisterWorkerRequestProto {
         RegisterWorkerRequestProto {
-            header: Some(registration_request_header(
-                &self.descriptor.group_name,
-                op,
-                retry_count,
-            )),
+            header: Some(registration_request_header(&self.descriptor.group_name, op)),
             worker_id: self.descriptor.worker_id.as_raw(),
             worker_run_id: self.descriptor.worker_run_id.to_string(),
             advertised_endpoint: Some(EndpointProto {
                 host: self.descriptor.endpoint_host.clone(),
                 port: self.descriptor.endpoint_port,
-                protocol: self.descriptor.worker_net_protocol.to_string(),
             }),
-            worker_net_protocol: worker_protocol_to_proto(self.descriptor.worker_net_protocol) as i32,
-            group_name: self.descriptor.group_name.to_string(),
         }
     }
 
@@ -200,13 +190,17 @@ impl MetadataRegistrar {
         &self,
         response: RegisterWorkerResponseProto,
     ) -> Result<Registration, RegistrationError> {
-        classify_header(response.header)?;
-        if response.group_name != self.descriptor.group_name.as_str() {
+        let header = response
+            .header
+            .as_ref()
+            .ok_or_else(|| RegistrationError::Fatal("metadata register response missing ResponseHeader".to_string()))?;
+        if header.group_name != self.descriptor.group_name.as_str() {
             return Err(RegistrationError::Fatal(format!(
                 "metadata register response confirmed group_name {}, expected {}",
-                response.group_name, self.descriptor.group_name
+                header.group_name, self.descriptor.group_name
             )));
         }
+        classify_header(response.header)?;
         if response.worker_id != self.descriptor.worker_id.as_raw() {
             return Err(RegistrationError::Fatal(
                 "metadata register response did not confirm worker_id".to_string(),
@@ -232,18 +226,10 @@ impl MetadataRegistrar {
     }
 }
 
-fn registration_request_header(group_name: &GroupName, op: &ControlOp, retry_count: i32) -> RequestHeaderProto {
-    let mut header = RequestHeader::new(op.client_id)
-        .with_group_name(group_name.clone())
-        .with_retry_count(retry_count);
+fn registration_request_header(group_name: &GroupName, op: &ControlOp) -> RequestHeaderProto {
+    let mut header = RequestHeader::new(op.client_id).with_group_name(group_name.clone());
     header.client.call_id = op.call_id;
     (&header).into()
-}
-
-fn worker_protocol_to_proto(protocol: WorkerNetProtocol) -> WorkerNetProtocolProto {
-    match protocol {
-        WorkerNetProtocol::Grpc => WorkerNetProtocolProto::WorkerNetProtocolGrpc,
-    }
 }
 
 fn classify_header(header: Option<beryl_proto::common::ResponseHeaderProto>) -> Result<(), RegistrationError> {

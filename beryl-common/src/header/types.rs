@@ -73,8 +73,6 @@ pub struct RequestHeader {
     pub deadline: Deadline,
     /// Optional caller context for auditing/diagnostics.
     pub caller_context: Option<CallerContext>,
-    /// Optional retry count from client perspective (0 = first attempt).
-    pub retry_count: i32,
 }
 
 /// Human-oriented context for auditing and lightweight diagnostics.
@@ -82,8 +80,6 @@ pub struct RequestHeader {
 pub struct CallerContext {
     /// Example: "type=spark,job=42"
     pub context: String,
-    /// Optional signature for tamper detection or provenance (opaque).
-    pub signature: Option<Vec<u8>>,
 }
 
 pub const CALLER_CONTEXT_IP: &str = "ip";
@@ -217,7 +213,6 @@ impl RequestHeader {
             route_epoch: None,
             deadline,
             caller_context: None,
-            retry_count: 0,
         }
     }
 
@@ -262,12 +257,6 @@ impl RequestHeader {
         self
     }
 
-    /// Set the retry count.
-    pub fn with_retry_count(mut self, retry_count: i32) -> Self {
-        self.retry_count = retry_count;
-        self
-    }
-
     /// Create a child header (for nested calls).
     ///
     /// Inherits client_id, deadline, trace context, state watermarks, and group name.
@@ -286,7 +275,6 @@ impl RequestHeader {
             route_epoch: self.route_epoch,
             deadline: self.deadline,
             caller_context: self.caller_context.clone(),
-            retry_count: 0,
         }
     }
 
@@ -305,7 +293,6 @@ impl RequestHeader {
             route_epoch: self.route_epoch,
             deadline: self.deadline,
             caller_context: self.caller_context.clone(),
-            retry_count: self.retry_count + 1,
         }
     }
 

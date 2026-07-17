@@ -146,13 +146,13 @@ fn worker_endpoint_from_parts(
     worker_net_protocol: i32,
     worker_run_id: beryl_types::WorkerRunId,
 ) -> Result<WorkerEndpointInfo, MetadataError> {
-    beryl_proto::convert::worker_endpoint_info_from_parts(
-        worker_id,
-        endpoint,
-        worker_net_protocol,
-        worker_run_id.to_string(),
-    )
-    .map_err(MetadataError::InvalidArgument)
+    if worker_net_protocol != 1 {
+        return Err(MetadataError::InvalidArgument(format!(
+            "unsupported persisted worker network protocol {worker_net_protocol}"
+        )));
+    }
+    beryl_proto::convert::worker_endpoint_info_from_parts(worker_id, endpoint, worker_run_id.to_string())
+        .map_err(MetadataError::InvalidArgument)
 }
 
 fn missing_resolved_target_error(resolved: &ResolvedPath) -> MetadataError {
@@ -704,11 +704,7 @@ mod test_support {
     ) -> BlockReportBlock {
         BlockReportBlock {
             block_id,
-            data_handle_id: block_id.data_handle_id.as_raw(),
-            block_index: block_id.index.as_raw(),
             block_stamp,
-            effective_len: 4096,
-            committed_length: 4096,
             block_state,
         }
     }
@@ -876,7 +872,6 @@ mod test_support {
             block_id,
             file_offset,
             len,
-            checksum: None,
         }
     }
 
@@ -924,7 +919,12 @@ mod test_support {
                 },
                 Freshness::default(),
                 key.content_revision,
-                match key.mode {
+                match filesystem
+                    .session_registry
+                    .get_session(key.data_handle_id)
+                    .expect("active write session")
+                    .mode
+                {
                     crate::inode_lease::WriteMode::Write => crate::raft::PublishMode::ReplaceIfUnchanged,
                     crate::inode_lease::WriteMode::Append => crate::raft::PublishMode::AppendIfUnchanged,
                 },

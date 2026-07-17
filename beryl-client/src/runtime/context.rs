@@ -169,7 +169,6 @@ pub(crate) struct AttemptContext {
     call_id_text: String,
     group_name: Option<GroupName>,
     metadata_endpoint: Option<String>,
-    attempt_number: u32,
     mount_epoch: Option<u64>,
     route_epoch: Option<u64>,
     state: Vec<beryl_proto::common::GroupStateWatermarkProto>,
@@ -181,7 +180,7 @@ impl AttemptContext {
     pub(crate) fn for_metadata(
         operation: &OperationContext,
         group_name: GroupName,
-        attempt_number: u32,
+        _attempt_number: u32,
     ) -> ClientResult<Self> {
         validate_client_id(operation.client_id)?;
         Ok(Self {
@@ -189,7 +188,6 @@ impl AttemptContext {
             operation: operation.clone(),
             group_name: Some(group_name),
             metadata_endpoint: None,
-            attempt_number,
             mount_epoch: None,
             route_epoch: None,
             state: Vec::new(),
@@ -198,13 +196,12 @@ impl AttemptContext {
     }
 
     /// Create a data-plane context. Data RPCs carry block ownership in their operation payload.
-    pub(crate) fn for_data(operation: &OperationContext, attempt_number: u32) -> Self {
+    pub(crate) fn for_data(operation: &OperationContext, _attempt_number: u32) -> Self {
         Self {
             call_id_text: operation.call_id.to_string(),
             operation: operation.clone(),
             group_name: None,
             metadata_endpoint: None,
-            attempt_number,
             mount_epoch: None,
             route_epoch: None,
             state: Vec::new(),
@@ -305,7 +302,6 @@ impl AttemptContext {
             deadline_ms: self.deadline_ms(),
             caller_context: None,
             state: self.state.clone(),
-            retry_count: self.attempt_number as i32,
             route_epoch: self.route_epoch,
         })
     }

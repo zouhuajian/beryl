@@ -23,10 +23,9 @@ mod tests {
     };
     use beryl_proto::metadata::{
         BlockReportRequestProto, BlockReportResponseProto, HeartbeatRequestProto, HeartbeatResponseProto,
-        MetadataServerRoleProto, RegisterWorkerRequestProto, RegisterWorkerResponseProto, WorkerCommandProto,
+        RegisterWorkerRequestProto, RegisterWorkerResponseProto,
     };
     use beryl_proto::worker::worker_data_service_server::WorkerDataService;
-    use beryl_proto::worker::ChecksumKindProto;
     use beryl_proto::worker::{
         AbortWriteRequestProto, CommitWriteRequestProto, DataRequestHeaderProto, OpenReadStreamRequestProto,
         OpenWriteStreamRequestProto, ReadStreamRequestProto, SyncCommittedBlockRequestProto, WriteStreamRequestProto,
@@ -91,7 +90,6 @@ mod tests {
             rpc_max_inflight: 100,
             default_frame_size: 1024 * 1024,
             max_frame_size: 4 * 1024 * 1024,
-            window_bytes: 8 * 1024 * 1024,
             stream_idle_timeout_ms: 60_000,
             store: crate::config::WorkerStoreConfig::default(),
             net: WorkerNetConfig::grpc_from_rpc("0.0.0.0:9090".to_string(), 100, 4 * 1024 * 1024),
@@ -205,12 +203,7 @@ mod tests {
 
     #[derive(Clone)]
     enum MockHeartbeatReply {
-        Ok {
-            worker_id: u64,
-            worker_run_id: WorkerRunId,
-            server_role: MetadataServerRoleProto,
-            commands: Vec<WorkerCommandProto>,
-        },
+        Ok { worker_id: u64, worker_run_id: WorkerRunId },
         HeaderError(RpcErrorDetail),
         Status(Status),
     }
@@ -259,7 +252,6 @@ mod tests {
                     worker_run_id,
                 } => Ok(Response::new(RegisterWorkerResponseProto {
                     header: Some(response_header_from_request(&request, None)),
-                    group_name: request.group_name.clone(),
                     worker_id,
                     accepted_worker_run_id: worker_run_id.to_string(),
                 })),
@@ -274,13 +266,11 @@ mod tests {
                             "malformed success header",
                         )),
                     )),
-                    group_name: request.group_name.clone(),
                     worker_id,
                     accepted_worker_run_id: worker_run_id.to_string(),
                 })),
                 MockRegisterReply::HeaderError(error) => Ok(Response::new(RegisterWorkerResponseProto {
                     header: Some(response_header_from_request(&request, Some(error))),
-                    group_name: request.group_name.clone(),
                     worker_id: 0,
                     accepted_worker_run_id: String::new(),
                 })),
@@ -303,26 +293,17 @@ mod tests {
                 .unwrap_or(MockHeartbeatReply::Ok {
                     worker_id: request.worker_id,
                     worker_run_id: WorkerRunId::parse(&request.worker_run_id).unwrap_or_else(|_| test_worker_run_id()),
-                    server_role: MetadataServerRoleProto::MetadataServerRoleFollower,
-                    commands: Vec::new(),
                 });
 
             match reply {
                 MockHeartbeatReply::Ok {
                     worker_id,
                     worker_run_id,
-                    server_role,
-                    commands,
                 } => Ok(Response::new(HeartbeatResponseProto {
                     header: Some(response_header_from_heartbeat_request(&request, None)),
-                    commands,
-                    group_name: request.group_name.clone(),
                     worker_id,
                     accepted_worker_run_id: worker_run_id.to_string(),
-                    heartbeat_interval_ms: 1_000,
                     liveness_timeout_ms: 5_000,
-                    server_role: server_role as i32,
-                    leader_hint: None,
                 })),
                 MockHeartbeatReply::HeaderError(error) => Ok(Response::new(HeartbeatResponseProto {
                     header: Some(response_header_from_heartbeat_request(&request, Some(error))),
@@ -351,13 +332,11 @@ mod tests {
                     header: Some(response_header_from_block_report_request(&request, None)),
                     report_seq: request.report_seq,
                     next_delta_seq: 0,
-                    retry_after_ms: 0,
                 })),
                 MockBlockReportReply::HeaderError(error) => Ok(Response::new(BlockReportResponseProto {
                     header: Some(response_header_from_block_report_request(&request, Some(error))),
                     report_seq: request.report_seq,
                     next_delta_seq: 0,
-                    retry_after_ms: 0,
                 })),
                 MockBlockReportReply::Status(status) => Err(status),
             }
@@ -571,8 +550,10 @@ mod tests {
         let requests = mock.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
-        assert_eq!(request.group_name, group_name().as_str());
-        assert_eq!(request.header.as_ref().expect("header").group_name, request.group_name);
+        assert_eq!(
+            request.header.as_ref().expect("header").group_name,
+            group_name().as_str()
+        );
         assert_eq!(request.worker_id, 42);
         assert_eq!(request.worker_run_id, worker_run_id.to_string());
         assert_eq!(
@@ -580,12 +561,7 @@ mod tests {
             Some(EndpointProto {
                 host: "127.0.0.1".to_string(),
                 port: 9090,
-                protocol: "grpc".to_string(),
             })
-        );
-        assert_eq!(
-            request.worker_net_protocol,
-            beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32
         );
         shutdown.send(()).ok();
     }
@@ -707,8 +683,6 @@ mod tests {
         assert_ne!(first_client_id.as_raw(), 0);
         assert_eq!(first_client_id, second_client_id);
         assert_eq!(first_client.call_id, second_client.call_id);
-        assert_eq!(first_header.retry_count, 0);
-        assert_eq!(second_header.retry_count, 1);
         shutdown.send(()).ok();
     }
 
@@ -773,15 +747,11 @@ mod tests {
         let (endpoint_a, mock_a, shutdown_a) = start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::Ok {
             worker_id: 42,
             worker_run_id,
-            server_role: MetadataServerRoleProto::MetadataServerRoleLeader,
-            commands: Vec::new(),
         }])
         .await;
         let (endpoint_b, mock_b, shutdown_b) = start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::Ok {
             worker_id: 42,
             worker_run_id,
-            server_role: MetadataServerRoleProto::MetadataServerRoleFollower,
-            commands: Vec::new(),
         }])
         .await;
         let state = Arc::new(RegistrationSet::new());
@@ -812,8 +782,6 @@ mod tests {
                 }],
                 active_reads: 1,
                 active_writes: 2,
-                cpu_usage_percent: 4,
-                memory_used_bytes: 5,
             })
             .await
             .expect("heartbeat round");
@@ -826,8 +794,10 @@ mod tests {
             let requests = mock.heartbeat_requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
             let request = &requests[0];
-            assert_eq!(request.group_name, group_name().as_str());
-            assert_eq!(request.header.as_ref().expect("header").group_name, request.group_name);
+            assert_eq!(
+                request.header.as_ref().expect("header").group_name,
+                group_name().as_str()
+            );
             identities.push(control_call_identity(request.header.as_ref().expect("header")));
             assert_eq!(request.worker_id, 42);
             assert_eq!(request.worker_run_id, worker_run_id.to_string());
@@ -843,7 +813,6 @@ mod tests {
                 Some(EndpointProto {
                     host: "127.0.0.1".to_string(),
                     port: 9090,
-                    protocol: "grpc".to_string(),
                 })
             );
         }
@@ -858,8 +827,6 @@ mod tests {
         let (endpoint, mock, shutdown) = start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::Ok {
             worker_id: 42,
             worker_run_id,
-            server_role: MetadataServerRoleProto::MetadataServerRoleLeader,
-            commands: Vec::new(),
         }])
         .await;
         let state = Arc::new(RegistrationSet::new());
@@ -974,8 +941,6 @@ mod tests {
         let (endpoint_b, _mock_b, shutdown_b) = start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::Ok {
             worker_id: 42,
             worker_run_id,
-            server_role: MetadataServerRoleProto::MetadataServerRoleFollower,
-            commands: Vec::new(),
         }])
         .await;
         let state = Arc::new(RegistrationSet::new());
@@ -1142,40 +1107,6 @@ mod tests {
 
         let report_round = reporter.send_full_once().await.expect("block report after recovery");
         assert_eq!(report_round.accepted_peers, 1);
-        shutdown.send(()).ok();
-    }
-
-    #[tokio::test]
-    async fn follower_heartbeat_commands_are_ignored_for_readiness() {
-        let worker_run_id = test_worker_run_id();
-        let (endpoint, _mock, shutdown) = start_mock_metadata_with_heartbeat(vec![MockHeartbeatReply::Ok {
-            worker_id: 42,
-            worker_run_id,
-            server_role: MetadataServerRoleProto::MetadataServerRoleFollower,
-            commands: vec![WorkerCommandProto {
-                task_id: 1,
-                command: None,
-            }],
-        }])
-        .await;
-        let state = Arc::new(RegistrationSet::new());
-        state.record_registered(Registration {
-            group_name: group_name(),
-            worker_id: WorkerId::new(42),
-            worker_run_id,
-            advertised_endpoint: "http://127.0.0.1:9090".to_string(),
-        });
-        let heartbeat = MetadataHeartbeatLoop::new(
-            test_registration_config(endpoint),
-            test_registration_descriptor(worker_run_id),
-            Arc::clone(&state),
-        )
-        .expect("heartbeat loop");
-
-        let round = heartbeat.send_once(HeartbeatSnapshot::default()).await.unwrap();
-
-        assert_eq!(round.accepted_peers, 1);
-        assert!(state.is_ready(&group_name()));
         shutdown.send(()).ok();
     }
 
@@ -1404,10 +1335,9 @@ mod tests {
         assert_eq!(round.accepted_peers, 1);
         let requests = mock.block_report_requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].group_name, group_name().as_str());
         assert_eq!(
             requests[0].header.as_ref().expect("header").group_name,
-            requests[0].group_name
+            group_name().as_str()
         );
         let (first_client_id, first_call_id) =
             control_call_identity(requests[0].header.as_ref().expect("first header"));
@@ -1731,7 +1661,10 @@ mod tests {
         let (delta_client_id, delta_call_id) = control_call_identity(request.header.as_ref().expect("delta header"));
         assert_eq!(full_client_id, delta_client_id);
         assert_ne!(full_call_id, delta_call_id);
-        assert_eq!(request.header.as_ref().expect("header").group_name, request.group_name);
+        assert_eq!(
+            request.header.as_ref().expect("header").group_name,
+            group_name().as_str()
+        );
         assert!(matches!(
             request.report.as_ref(),
             Some(beryl_proto::metadata::block_report_request_proto::Report::Delta(_))
@@ -1804,7 +1737,6 @@ mod tests {
             start_offset: 0,
             end_offset: 4096,
             frame_size: 8192,
-            window_bytes: 65_536,
             block_stamp: 17,
             block_format_id: BlockFormatId::FULL_EFFECTIVE,
             block_size: BLOCK_SIZE,
@@ -1820,11 +1752,7 @@ mod tests {
         Bytes::from((0..BLOCK_SIZE).map(|idx| (idx % 251) as u8).collect::<Vec<_>>())
     }
 
-    fn core_with_store(
-        default_frame_size: u32,
-        max_frame_size: u32,
-        window_bytes: u32,
-    ) -> (TempDir, Arc<FullBlockFileStore>, WorkerCore) {
+    fn core_with_store(default_frame_size: u32, max_frame_size: u32) -> (TempDir, Arc<FullBlockFileStore>, WorkerCore) {
         let temp = TempDir::new().expect("tempdir");
         let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
             temp.path().to_path_buf(),
@@ -1832,7 +1760,6 @@ mod tests {
         let core = WorkerCore::with_local_store(
             default_frame_size,
             max_frame_size,
-            window_bytes,
             Duration::from_secs(60),
             store.clone(),
         );
@@ -2002,7 +1929,6 @@ mod tests {
             block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
             block_stamp: BLOCK_STAMP,
             chunk_size: CHUNK_SIZE,
-            checksum_kind: ChecksumKindProto::ChecksumKindNone as i32,
             token: Some(test_token_proto()),
             frame_size,
             worker_run_id: test_worker_run_id().to_string(),
@@ -2164,7 +2090,6 @@ mod tests {
             seq: 5,
             offset_in_block: 2048,
             data: data.clone(),
-            checksum32: 123,
         };
 
         let domain = proto_to_write_frame(request).unwrap();
@@ -2174,7 +2099,7 @@ mod tests {
         assert_eq!(domain.offset_in_block, 2048);
         assert_eq!(domain.data, data);
         assert_eq!(domain.data.as_ptr(), data.as_ptr());
-        assert_eq!(domain.checksum32, 123);
+        assert_eq!(domain.checksum32, 0);
     }
 
     #[test]
@@ -2285,7 +2210,6 @@ mod tests {
             seq: 1,
             offset_in_block: 0,
             data: Bytes::new(),
-            checksum32: 0,
         })
         .unwrap_err();
         assert!(write_frame_err.to_string().contains("missing stream_id"));
@@ -2311,12 +2235,11 @@ mod tests {
 
     #[tokio::test]
     async fn open_write_creates_staging_stream() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
 
         let result = core.open_write(write_open_request()).await.expect("open write");
 
         assert_eq!(result.frame_size, 2048);
-        assert_eq!(result.window_bytes, 4096);
         assert_eq!(result.block_stamp, BLOCK_STAMP);
         assert_eq!(result.committed_length, 0);
 
@@ -2342,7 +2265,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_write_rejects_invalid_metadata_shape_before_staging() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         let paths = store.paths(&group_name(), block_id());
 
         let mut zero_stamp = write_open_request();
@@ -2364,7 +2287,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_write_rejects_invalid_fencing_token() {
-        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, _store, core) = core_with_store(512, 2048);
         let mut req = write_open_request();
         req.token = FencingToken::new(block_id(), ClientId::new(9), 0);
 
@@ -2376,7 +2299,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_write_rejects_existing_ready_block() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
 
         assert_refresh_metadata(
@@ -2388,7 +2311,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_write_rejects_existing_ready_block_shape_mismatch() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
         let mut req = write_open_request();
         req.block_size = BLOCK_SIZE * 2;
@@ -2402,7 +2325,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_write_rejects_existing_ready_block_stamp_mismatch() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP + 1);
 
         assert_refresh_metadata(
@@ -2414,7 +2337,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_stream_writes_staging_data_and_advances_state() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
         let data = Bytes::from_static(b"abcd");
 
@@ -2441,7 +2364,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_stream_rejects_seq_gap() {
-        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, _store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
 
         let result = core
@@ -2466,7 +2389,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_stream_rejects_offset_gap() {
-        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, _store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
 
         let result = core
@@ -2491,7 +2414,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_stream_rejects_read_stream() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
         let open = core
             .open_read(read_open_request_for(0, 4, BLOCK_STAMP, 512))
@@ -2516,7 +2439,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_write_publishes_ready_block() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
         let data = payload();
         core.write_stream(WriteFrame {
@@ -2559,7 +2482,7 @@ mod tests {
 
     #[tokio::test]
     async fn multichunk_write_commit_and_read_returns_exact_effective_bytes() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         let effective_len = 3073;
         let data = payload().slice(0..effective_len as usize);
         let mut open_req = write_open_request();
@@ -2642,7 +2565,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_write_accepts_non_chunk_aligned_tail_and_persists_full_block_shape() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
         let effective_len = u64::from(CHUNK_SIZE) + 1;
         core.write_stream(WriteFrame {
@@ -2674,7 +2597,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_write_rejects_effective_len_larger_than_block_size() {
-        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, _store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
 
         assert_invalid_argument(
@@ -2690,7 +2613,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_write_rejects_layout_mismatch_against_open_request() {
-        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, _store, core) = core_with_store(512, 2048);
         let mut open_req = write_open_request();
         open_req.effective_len = 4;
         let open = core.open_write(open_req).await.expect("open write");
@@ -2719,7 +2642,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_write_rejects_incomplete_block() {
-        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, _store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
         core.write_stream(WriteFrame {
             stream_id: open.stream_id,
@@ -2744,7 +2667,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_write_rejects_token_mismatch() {
-        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, _store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
         let data = payload();
         core.write_stream(WriteFrame {
@@ -2775,7 +2698,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_write_removes_stream_after_success() {
-        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, _store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
         core.write_stream(WriteFrame {
             stream_id: open.stream_id,
@@ -2810,7 +2733,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_commit_fails_without_republishing_or_corrupting_ready_block() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
         let data = payload();
         core.write_stream(WriteFrame {
@@ -2852,7 +2775,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_committed_block_succeeds_after_terminal_commit_without_stream() {
-        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, _store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
         core.write_stream(WriteFrame {
             stream_id: open.stream_id,
@@ -2885,7 +2808,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_committed_block_rejects_missing_wrong_generation_and_uncommitted_block() {
-        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, _store, core) = core_with_store(512, 2048);
         assert_refresh_metadata(
             core.sync_committed_block(sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE))
                 .await,
@@ -2930,7 +2853,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_committed_block_rejects_block_layout_mismatch() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(store.as_ref(), payload(), BLOCK_STAMP);
 
         let mut block_size_mismatch = sync_committed_block_request(BLOCK_STAMP, BLOCK_SIZE);
@@ -2950,7 +2873,7 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_sync_committed_block_is_idempotent() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(store.as_ref(), payload(), BLOCK_STAMP);
 
         let first = core
@@ -2967,7 +2890,7 @@ mod tests {
 
     #[tokio::test]
     async fn abort_write_removes_stream_and_staging_block() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
         core.write_stream(WriteFrame {
             stream_id: open.stream_id,
@@ -2996,7 +2919,7 @@ mod tests {
 
     #[tokio::test]
     async fn abort_write_keeps_no_readable_block() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
 
         core.abort_write(AbortWriteRequest {
@@ -3012,7 +2935,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_write_then_abort_is_not_ready_or_reportable() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
         core.write_stream(WriteFrame {
             stream_id: open.stream_id,
@@ -3043,7 +2966,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_after_abort_fails_without_publishing_ready_block() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
         core.write_stream(WriteFrame {
             stream_id: open.stream_id,
@@ -3076,7 +2999,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_abort_fails_without_publishing_ready_block() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
 
         core.abort_write(AbortWriteRequest {
@@ -3099,7 +3022,7 @@ mod tests {
 
     #[tokio::test]
     async fn abort_after_successful_commit_does_not_damage_ready_block() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
         let data = payload();
         core.write_stream(WriteFrame {
@@ -3135,7 +3058,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_stream_cancellation_discards_partial_staging_state() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         let core = Arc::new(core);
         let service = registered_data_service(Arc::clone(&core));
         let open = service
@@ -3153,7 +3076,6 @@ mod tests {
                     seq: 1,
                     offset_in_block: 0,
                     data: Bytes::from_static(b"partial"),
-                    checksum32: 0,
                 }),
                 Err(cancelled),
             ]))
@@ -3169,7 +3091,7 @@ mod tests {
 
     #[tokio::test]
     async fn recover_after_uncommitted_write_is_not_readable() {
-        let (temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (temp, _store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
         core.write_stream(WriteFrame {
             stream_id: open.stream_id,
@@ -3188,7 +3110,7 @@ mod tests {
 
     #[tokio::test]
     async fn incomplete_staging_write_is_ignored_by_ready_block_scan() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         let open = core.open_write(write_open_request()).await.expect("open write");
         core.write_stream(WriteFrame {
             stream_id: open.stream_id,
@@ -3209,7 +3131,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_read_ready_block_succeeds() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
 
         let result = core
@@ -3218,7 +3140,6 @@ mod tests {
             .expect("open read");
 
         assert_eq!(result.frame_size, 512);
-        assert_eq!(result.window_bytes, 4096);
         assert_eq!(result.block_stamp, BLOCK_STAMP);
         assert_eq!(result.committed_length, BLOCK_SIZE);
 
@@ -3243,13 +3164,7 @@ mod tests {
         let store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(custom_dir.path().to_path_buf()));
         publish_ready_block(&store, payload(), BLOCK_STAMP);
 
-        let core = WorkerCore::with_options(
-            512,
-            2048,
-            4096,
-            Duration::from_secs(60),
-            custom_dir.path().to_path_buf(),
-        );
+        let core = WorkerCore::with_options(512, 2048, Duration::from_secs(60), custom_dir.path().to_path_buf());
 
         let result = core
             .open_read(read_open_request_for(0, 8, BLOCK_STAMP, 512))
@@ -3283,7 +3198,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_read_rejects_block_stamp_mismatch() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
 
         assert_refresh_metadata(
@@ -3296,7 +3211,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_read_rejects_block_layout_mismatch() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
 
         let mut block_size_mismatch = read_open_request_for(0, 1024, BLOCK_STAMP, 512);
@@ -3317,7 +3232,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_read_rejects_zero_block_stamp_for_ready_block() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
 
         assert_invalid_argument(core.open_read(read_open_request_for(0, 1024, 0, 512)).await);
@@ -3326,7 +3241,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_read_rejects_missing_block() {
-        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, _store, core) = core_with_store(512, 2048);
 
         assert_refresh_metadata(
             core.open_read(read_open_request_for(0, 1024, BLOCK_STAMP, 512)).await,
@@ -3337,7 +3252,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_read_rejects_out_of_bounds_range() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
 
         assert_invalid_argument(core.open_read(read_open_request_for(4090, 16, BLOCK_STAMP, 512)).await);
@@ -3346,7 +3261,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_stream_reads_single_frame() {
-        let (_temp, store, core) = core_with_store(1024, 2048, 4096);
+        let (_temp, store, core) = core_with_store(1024, 2048);
         let data = payload();
         publish_ready_block(&store, data.clone(), BLOCK_STAMP);
         let open = core
@@ -3365,7 +3280,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_stream_advances_cursor_across_calls() {
-        let (_temp, store, core) = core_with_store(4, 16, 4096);
+        let (_temp, store, core) = core_with_store(4, 16);
         let data = payload();
         publish_ready_block(&store, data.clone(), BLOCK_STAMP);
         let open = core
@@ -3391,7 +3306,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_stream_respects_max_bytes() {
-        let (_temp, store, core) = core_with_store(8, 16, 4096);
+        let (_temp, store, core) = core_with_store(8, 16);
         let data = payload();
         publish_ready_block(&store, data.clone(), BLOCK_STAMP);
         let open = core
@@ -3409,7 +3324,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_stream_offset_length_and_eof_boundaries_are_exact() {
-        let (_temp, store, core) = core_with_store(513, 2048, 4096);
+        let (_temp, store, core) = core_with_store(513, 2048);
         let effective_len = u64::from(CHUNK_SIZE) * 2 + 17;
         let data = payload().slice(0..effective_len as usize);
         publish_ready_block(&store, data.clone(), BLOCK_STAMP);
@@ -3496,14 +3411,14 @@ mod tests {
 
     #[tokio::test]
     async fn read_stream_rejects_missing_stream() {
-        let (_temp, _store, core) = core_with_store(8, 16, 4096);
+        let (_temp, _store, core) = core_with_store(8, 16);
 
         assert_not_found(core.read_stream(stream_id(), 1024).await);
     }
 
     #[tokio::test]
     async fn read_stream_rejects_write_stream() {
-        let (_temp, _store, core) = core_with_store(8, 16, 4096);
+        let (_temp, _store, core) = core_with_store(8, 16);
         let state = StreamState::new(write_stream_context());
         core.stream_manager().register(state).await;
 
@@ -3520,7 +3435,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_write_stream_returns_success_response() {
-        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, _store, core) = core_with_store(512, 2048);
         let service = registered_data_service(Arc::new(core));
 
         let response = service
@@ -3532,14 +3447,13 @@ mod tests {
         assert!(response.header.expect("header").error.is_none());
         assert!(response.stream_id.is_some());
         assert_eq!(response.frame_size, 512);
-        assert_eq!(response.window_bytes, 4096);
         assert_eq!(response.block_stamp, BLOCK_STAMP);
         assert_eq!(response.committed_length, 0);
     }
 
     #[tokio::test]
     async fn guarded_data_service_rejects_open_before_registration() {
-        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, _store, core) = core_with_store(512, 2048);
         let state = Arc::new(RegistrationSet::new());
         let service = WorkerDataServiceImpl::new(Arc::new(core), Arc::clone(&state));
 
@@ -3557,7 +3471,7 @@ mod tests {
 
     #[tokio::test]
     async fn guarded_data_service_allows_open_after_registration() {
-        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, _store, core) = core_with_store(512, 2048);
         let state = Arc::new(RegistrationSet::new());
         mark_registered(&state);
         let service = WorkerDataServiceImpl::new(Arc::new(core), Arc::clone(&state));
@@ -3574,7 +3488,7 @@ mod tests {
 
     #[tokio::test]
     async fn guarded_data_service_rejects_stale_worker_run_id() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
         let service = registered_data_service(Arc::new(core));
         let mut request = open_read_proto(0, 1024, BLOCK_STAMP, 0);
@@ -3593,7 +3507,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_stream_returns_written_through() {
-        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, _store, core) = core_with_store(512, 2048);
         let core = Arc::new(core);
         let state = Arc::new(RegistrationSet::new());
         mark_registered(&state);
@@ -3606,7 +3520,6 @@ mod tests {
                 seq: 1,
                 offset_in_block: 0,
                 data: Bytes::from_static(b"abcd"),
-                checksum32: 0,
             })]))
             .await
             .expect("write stream response");
@@ -3623,7 +3536,6 @@ mod tests {
         let core = Arc::new(WorkerCore::with_local_store(
             512,
             2048,
-            4096,
             Duration::from_secs(60),
             store.clone(),
         ));
@@ -3643,7 +3555,6 @@ mod tests {
                 seq: 2,
                 offset_in_block: 0,
                 data: Bytes::from_static(b"abcd"),
-                checksum32: 0,
             })]))
             .await
             .expect("write stream response");
@@ -3659,7 +3570,7 @@ mod tests {
 
         metrics::with_local_recorder(&recorder, || {
             futures::executor::block_on(async {
-                let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+                let (_temp, _store, core) = core_with_store(512, 2048);
                 let core = Arc::new(core);
                 let service = registered_data_service(Arc::clone(&core));
                 let open = service
@@ -3676,7 +3587,6 @@ mod tests {
                         seq: 2,
                         offset_in_block: 0,
                         data: Bytes::from_static(b"abcd"),
-                        checksum32: 0,
                     })]))
                     .await
                     .expect("write stream response");
@@ -3698,7 +3608,7 @@ mod tests {
 
         metrics::with_local_recorder(&recorder, || {
             futures::executor::block_on(async {
-                let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+                let (_temp, _store, core) = core_with_store(512, 2048);
                 let service = registered_data_service(Arc::new(core));
                 let open = service
                     .open_write_stream(tonic::Request::new(open_write_proto(2048)))
@@ -3716,14 +3626,12 @@ mod tests {
                             seq: 1,
                             offset_in_block: 0,
                             data: data.slice(0..2048),
-                            checksum32: 0,
                         }),
                         Ok(WriteStreamRequestProto {
                             stream_id: Some(crate::data::convert::stream_id_to_proto(stream_id)),
                             seq: 2,
                             offset_in_block: 2048,
                             data: data.slice(2048..4096),
-                            checksum32: 0,
                         }),
                     ]))
                     .await
@@ -3751,7 +3659,7 @@ mod tests {
 
         metrics::with_local_recorder(&recorder, || {
             futures::executor::block_on(async {
-                let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+                let (_temp, _store, core) = core_with_store(512, 2048);
                 let core = Arc::new(core);
                 let service = registered_data_service(Arc::clone(&core));
                 let open = service
@@ -3785,7 +3693,7 @@ mod tests {
 
         metrics::with_local_recorder(&recorder, || {
             futures::executor::block_on(async {
-                let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+                let (_temp, _store, core) = core_with_store(512, 2048);
                 let service = registered_data_service(Arc::new(core));
                 let open = service
                     .open_write_stream(tonic::Request::new(open_write_proto(2048)))
@@ -3820,7 +3728,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_write_returns_success_after_full_write() {
-        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, _store, core) = core_with_store(512, 2048);
         let core = Arc::new(core);
         let service = registered_data_service(Arc::clone(&core));
         let open = service
@@ -3863,7 +3771,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_committed_block_returns_success_for_ready_block() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
         let service = registered_data_service(Arc::new(core));
 
@@ -3880,7 +3788,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_read_stream_returns_success_response_for_ready_block() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
         let service = registered_data_service(Arc::new(core));
 
@@ -3893,14 +3801,13 @@ mod tests {
         assert!(response.header.expect("header").error.is_none());
         assert!(response.stream_id.is_some());
         assert_eq!(response.frame_size, 512);
-        assert_eq!(response.window_bytes, 4096);
         assert_eq!(response.block_stamp, BLOCK_STAMP);
         assert_eq!(response.committed_length, BLOCK_SIZE);
     }
 
     #[tokio::test]
     async fn open_read_stream_returns_refresh_metadata_on_stale_stamp() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
         let service = registered_data_service(Arc::new(core));
 
@@ -3921,7 +3828,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_read_stream_returns_unavailable_location_on_missing_block() {
-        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, _store, core) = core_with_store(512, 2048);
         let service = registered_data_service(Arc::new(core));
 
         let response = service
@@ -3941,7 +3848,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_read_stream_returns_header_error_on_zero_stamp() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
         let service = registered_data_service(Arc::new(core));
 
@@ -3963,7 +3870,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_stream_returns_data_frames() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         let data = payload();
         publish_ready_block(&store, data.clone(), BLOCK_STAMP);
         let service = registered_data_service(Arc::new(core));
@@ -4001,7 +3908,7 @@ mod tests {
 
         metrics::with_local_recorder(&recorder, || {
             futures::executor::block_on(async {
-                let (_temp, store, core) = core_with_store(512, 2048, 4096);
+                let (_temp, store, core) = core_with_store(512, 2048);
                 publish_ready_block(&store, payload(), BLOCK_STAMP);
                 let core = Arc::new(core);
                 let service = registered_data_service(Arc::clone(&core));
@@ -4046,7 +3953,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_stream_response_drop_decrements_inflight_once() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         publish_ready_block(&store, payload(), BLOCK_STAMP);
         let core = Arc::new(core);
         let service = registered_data_service(Arc::clone(&core));
@@ -4078,7 +3985,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_stream_early_drop_does_not_affect_later_read() {
-        let (_temp, store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, store, core) = core_with_store(512, 2048);
         let data = payload();
         publish_ready_block(&store, data.clone(), BLOCK_STAMP);
         let core = Arc::new(core);
@@ -4154,7 +4061,7 @@ mod tests {
 
         metrics::with_local_recorder(&recorder, || {
             futures::executor::block_on(async {
-                let (_temp, store, core) = core_with_store(512, 2048, 4096);
+                let (_temp, store, core) = core_with_store(512, 2048);
                 publish_ready_block(&store, payload(), BLOCK_STAMP);
                 let paths = store.paths(&group_name(), block_id());
                 let core = Arc::new(core);
@@ -4201,7 +4108,7 @@ mod tests {
 
     #[tokio::test]
     async fn service_read_stream_rejects_missing_stream() {
-        let (_temp, _store, core) = core_with_store(512, 2048, 4096);
+        let (_temp, _store, core) = core_with_store(512, 2048);
         let service = registered_data_service(Arc::new(core));
 
         let read_status = match service
@@ -4593,18 +4500,17 @@ mod tests {
             proto_message_fields(proto, "OpenWriteStreamRequestProto"),
             vec![
                 ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.BlockIdProto", "block_id", 3),
-                ("uint32", "block_format_id", 4),
-                ("uint64", "block_size", 5),
-                ("uint32", "chunk_size", 6),
-                ("worker.ChecksumKindProto", "checksum_kind", 7),
-                ("uint64", "block_stamp", 8),
-                ("common.FencingTokenProto", "token", 9),
-                ("uint32", "frame_size", 10),
-                ("string", "worker_run_id", 11),
-                ("uint64", "effective_len", 12),
-                ("string", "group_name", 13),
-                ("common.TierProto", "tier", 14),
+                ("common.BlockIdProto", "block_id", 2),
+                ("uint32", "block_format_id", 3),
+                ("uint64", "block_size", 4),
+                ("uint32", "chunk_size", 5),
+                ("uint64", "block_stamp", 6),
+                ("common.FencingTokenProto", "token", 7),
+                ("uint32", "frame_size", 8),
+                ("string", "worker_run_id", 9),
+                ("uint64", "effective_len", 10),
+                ("string", "group_name", 11),
+                ("common.TierProto", "tier", 12),
             ]
         );
         assert_eq!(
@@ -4613,9 +4519,8 @@ mod tests {
                 ("worker.DataResponseHeaderProto", "header", 1),
                 ("common.StreamIdProto", "stream_id", 2),
                 ("uint32", "frame_size", 3),
-                ("uint32", "window_bytes", 4),
-                ("uint64", "block_stamp", 5),
-                ("uint64", "committed_length", 6),
+                ("uint64", "block_stamp", 4),
+                ("uint64", "committed_length", 5),
             ]
         );
         assert_eq!(
@@ -4624,27 +4529,26 @@ mod tests {
                 ("worker.DataResponseHeaderProto", "header", 1),
                 ("common.StreamIdProto", "stream_id", 2),
                 ("uint32", "frame_size", 3),
-                ("uint32", "window_bytes", 4),
-                ("uint64", "block_stamp", 5),
-                ("uint64", "committed_length", 6),
+                ("uint64", "block_stamp", 4),
+                ("uint64", "committed_length", 5),
             ]
         );
         assert_eq!(
             proto_message_fields(proto, "CommitWriteRequestProto"),
             vec![
                 ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.BlockIdProto", "block_id", 3),
-                ("common.StreamIdProto", "stream_id", 4),
-                ("uint64", "effective_len", 5),
-                ("uint64", "block_stamp", 6),
-                ("common.FencingTokenProto", "token", 7),
-                ("uint64", "commit_seq", 8),
-                ("bool", "require_sync", 9),
-                ("string", "worker_run_id", 10),
-                ("uint32", "block_format_id", 11),
-                ("uint64", "block_size", 12),
-                ("uint32", "chunk_size", 13),
-                ("string", "group_name", 14),
+                ("common.BlockIdProto", "block_id", 2),
+                ("common.StreamIdProto", "stream_id", 3),
+                ("uint64", "effective_len", 4),
+                ("uint64", "block_stamp", 5),
+                ("common.FencingTokenProto", "token", 6),
+                ("uint64", "commit_seq", 7),
+                ("bool", "require_sync", 8),
+                ("string", "worker_run_id", 9),
+                ("uint32", "block_format_id", 10),
+                ("uint64", "block_size", 11),
+                ("uint32", "chunk_size", 12),
+                ("string", "group_name", 13),
             ]
         );
         assert_eq!(
@@ -4660,14 +4564,14 @@ mod tests {
             proto_message_fields(proto, "SyncCommittedBlockRequestProto"),
             vec![
                 ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.BlockIdProto", "block_id", 3),
-                ("uint64", "block_stamp", 4),
-                ("uint64", "expected_block_len", 5),
-                ("string", "worker_run_id", 6),
-                ("uint32", "block_format_id", 7),
-                ("uint64", "block_size", 8),
-                ("uint32", "chunk_size", 9),
-                ("string", "group_name", 10),
+                ("common.BlockIdProto", "block_id", 2),
+                ("uint64", "block_stamp", 3),
+                ("uint64", "expected_block_len", 4),
+                ("string", "worker_run_id", 5),
+                ("uint32", "block_format_id", 6),
+                ("uint64", "block_size", 7),
+                ("uint32", "chunk_size", 8),
+                ("string", "group_name", 9),
             ]
         );
         assert_eq!(
@@ -4682,10 +4586,10 @@ mod tests {
             proto_message_fields(proto, "AbortWriteRequestProto"),
             vec![
                 ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.BlockIdProto", "block_id", 3),
-                ("common.StreamIdProto", "stream_id", 4),
-                ("common.FencingTokenProto", "token", 5),
-                ("string", "group_name", 6),
+                ("common.BlockIdProto", "block_id", 2),
+                ("common.StreamIdProto", "stream_id", 3),
+                ("common.FencingTokenProto", "token", 4),
+                ("string", "group_name", 5),
             ]
         );
         assert_eq!(

@@ -7,9 +7,9 @@ use beryl_common::header::RequestHeader;
 use beryl_proto::common::{BlockIdProto, ByteRangeProto, FencingTokenProto, StreamIdProto, TierProto};
 use beryl_proto::convert as proto_convert;
 use beryl_proto::worker::{
-    AbortWriteRequestProto, ChecksumKindProto, CommitWriteRequestProto, DataRequestHeaderProto,
-    OpenReadStreamRequestProto, OpenWriteStreamRequestProto, ReadStreamResponseProto, SyncCommittedBlockRequestProto,
-    WriteStreamRequestProto, WriteStreamResponseProto,
+    AbortWriteRequestProto, CommitWriteRequestProto, DataRequestHeaderProto, OpenReadStreamRequestProto,
+    OpenWriteStreamRequestProto, ReadStreamResponseProto, SyncCommittedBlockRequestProto, WriteStreamRequestProto,
+    WriteStreamResponseProto,
 };
 use beryl_types::chunk::ByteRange;
 use beryl_types::ids::{BlockId, StreamId};
@@ -80,7 +80,6 @@ pub fn write_open_request_to_proto(req: WriteOpenRequest, ctx: &RequestHeader) -
         block_size: req.block_size,
         block_stamp: req.block_stamp,
         chunk_size: req.chunk_size,
-        checksum_kind: checksum_kind_to_proto(req.checksum_kind),
         token: Some(fencing_token_to_proto(req.token)),
         frame_size: req.frame_size,
         block_format_id: req.block_format_id.as_raw(),
@@ -96,7 +95,6 @@ pub fn write_frame_to_proto(frame: WriteFrame) -> WriteStreamRequestProto {
         seq: frame.seq,
         offset_in_block: frame.offset_in_block,
         data: frame.data,
-        checksum32: frame.checksum32,
     }
 }
 
@@ -149,7 +147,7 @@ pub fn proto_to_read_frame(proto: ReadStreamResponseProto) -> ReadFrame {
     ReadFrame {
         offset_in_block: proto.offset_in_block,
         data: proto.data,
-        checksum32: proto.checksum32,
+        checksum32: 0,
         eos: proto.eos,
     }
 }
@@ -190,7 +188,6 @@ pub fn proto_to_write_open_request(proto: OpenWriteStreamRequestProto) -> Worker
     let group_name = proto_to_group_name(&proto.group_name, "group_name")?;
     let block_id = proto_to_block_id(proto.block_id, "block_id")?;
     let token = proto_to_required_fencing_token(proto.token, "token")?;
-    let checksum_kind = proto_to_checksum_kind(proto.checksum_kind)?;
     let block_format_id = BlockFormatId::from_raw(proto.block_format_id)
         .map_err(|err| WorkerError::InvalidArgument(format!("block_format_id invalid: {err}")))?;
     let worker_run_id = proto_to_worker_run_id(&proto.worker_run_id)?;
@@ -208,7 +205,7 @@ pub fn proto_to_write_open_request(proto: OpenWriteStreamRequestProto) -> Worker
         block_format_id,
         chunk_size: proto.chunk_size,
         effective_len: proto.effective_len,
-        checksum_kind,
+        checksum_kind: ChecksumKind::None,
         tier,
     })
 }
@@ -221,7 +218,7 @@ pub fn proto_to_write_frame(proto: WriteStreamRequestProto) -> WorkerCoreResult<
         seq: proto.seq,
         offset_in_block: proto.offset_in_block,
         data: proto.data,
-        checksum32: proto.checksum32,
+        checksum32: 0,
     })
 }
 
@@ -305,21 +302,4 @@ fn proto_to_group_name(value: &str, field_name: &str) -> WorkerCoreResult<GroupN
         return Err(WorkerError::InvalidArgument(format!("missing {field_name}")));
     }
     GroupName::parse(value).map_err(|err| WorkerError::InvalidArgument(format!("{field_name} invalid: {err}")))
-}
-
-fn proto_to_checksum_kind(checksum_kind: i32) -> WorkerCoreResult<ChecksumKind> {
-    match ChecksumKindProto::try_from(checksum_kind)
-        .map_err(|_| WorkerError::InvalidArgument("unsupported checksum_kind".to_string()))?
-    {
-        ChecksumKindProto::ChecksumKindNone => Ok(ChecksumKind::None),
-        ChecksumKindProto::ChecksumKindUnspecified => Err(WorkerError::InvalidArgument(
-            "checksum_kind must be specified".to_string(),
-        )),
-    }
-}
-
-fn checksum_kind_to_proto(checksum_kind: ChecksumKind) -> i32 {
-    match checksum_kind {
-        ChecksumKind::None => ChecksumKindProto::ChecksumKindNone as i32,
-    }
 }

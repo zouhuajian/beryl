@@ -205,7 +205,6 @@ impl RequestHeaderCodec {
                 .map(Deadline::from_unix_ms)
                 .unwrap_or_else(|| Deadline::from_now(std::time::Duration::from_secs(30))),
             caller_context: None,
-            retry_count: 0,
         })
     }
 }
@@ -302,7 +301,6 @@ mod tests {
             route_epoch: None,
             deadline,
             caller_context: None,
-            retry_count: 0,
         };
 
         // Encode

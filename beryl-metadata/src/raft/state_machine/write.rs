@@ -213,7 +213,7 @@ impl AppRaftStateMachine {
                             )
                     }
                 };
-            if current_content_revision == expected_content_revision.saturating_add(1) && state_matches {
+            if expected_content_revision.checked_add(1) == Some(current_content_revision) && state_matches {
                 return Ok((
                     inode,
                     layout,

@@ -4,8 +4,8 @@
 #[cfg(test)]
 mod tests {
     use super::super::rpc::{
-        ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail, UfsErrorKind,
-        WorkerErrorKind,
+        ErrorKind, InternalErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RefreshHint,
+        RpcErrorDetail, WorkerErrorKind,
     };
     use beryl_types::fs::FsErrorCode;
 
@@ -63,9 +63,9 @@ mod tests {
     fn error_kind_is_domain_layered() {
         let metadata = ErrorKind::Metadata(MetadataErrorKind::NotLeader);
         let worker = ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch);
-        let ufs = ErrorKind::Ufs(UfsErrorKind::Backend);
+        let protocol = ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument);
 
         assert_ne!(metadata, worker);
-        assert_ne!(worker, ufs);
+        assert_ne!(worker, protocol);
     }
 }

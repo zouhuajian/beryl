@@ -161,13 +161,26 @@ impl MetadataFileSystem {
             }
         };
 
-        let fs_result = match response {
-            CommandResult::Fs(res) => res,
-            _ => FsCommandResult::ok(),
-        };
+        let fs_result = require_fs_command_result(response).inspect_err(|error| {
+            observe::record_fs_op(
+                operation_name,
+                "error",
+                observe::metadata_error_kind(error),
+                started.elapsed().as_secs_f64(),
+            );
+        })?;
 
         record_fs_write_result(operation_name, started, &fs_result);
         Ok(fs_result)
+    }
+}
+
+fn require_fs_command_result(response: CommandResult) -> MetadataResult<FsCommandResult> {
+    match response {
+        CommandResult::Fs(result) => Ok(result),
+        unexpected => Err(MetadataError::Internal(format!(
+            "filesystem Raft command returned unexpected result: {unexpected:?}"
+        ))),
     }
 }
 
@@ -184,5 +197,20 @@ fn record_fs_write_result(operation_name: &'static str, started: Instant, result
                 started.elapsed().as_secs_f64(),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_filesystem_raft_result_fails_closed() {
+        let error = require_fs_command_result(CommandResult::None).expect_err("unexpected result must fail");
+
+        assert!(matches!(
+            error,
+            MetadataError::Internal(message) if message.contains("unexpected result")
+        ));
     }
 }

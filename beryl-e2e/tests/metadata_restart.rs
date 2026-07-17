@@ -12,13 +12,13 @@ use beryl_proto::metadata::file_system_service_proto_client::FileSystemServicePr
 use beryl_proto::metadata::get_block_locations_request_proto;
 use beryl_proto::metadata::{
     AbortFileWriteRequestProto, AddBlockRequestProto, CommitFileRequestProto, CommittedBlockProto,
-    CreateFileRequestProto, CreateModeProto, GetBlockLocationsRequestProto, OpenWriteModeProto, OpenWriteRequestProto,
-    WriteHandleProto, WriteTargetProto,
+    CreateFileRequestProto, GetBlockLocationsRequestProto, OpenWriteModeProto, OpenWriteRequestProto, WriteHandleProto,
+    WriteTargetProto,
 };
 use beryl_proto::worker::worker_data_service_client::WorkerDataServiceClient;
 use beryl_proto::worker::{
-    ChecksumKindProto, CommitWriteRequestProto, DataRequestHeaderProto, DataResponseHeaderProto,
-    OpenWriteStreamRequestProto, WriteStreamRequestProto,
+    CommitWriteRequestProto, DataRequestHeaderProto, DataResponseHeaderProto, OpenWriteStreamRequestProto,
+    WriteStreamRequestProto,
 };
 use beryl_types::fs::FsErrorCode;
 use beryl_types::{BlockFormatId, ClientId};
@@ -218,7 +218,6 @@ async fn session_operations_converge_by_predecessor_and_ensure_absent() {
             replication: 1,
             block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
         }),
-        create_mode: CreateModeProto::CreateNew as i32,
     };
     let create = metadata
         .create_file(Request::new(create_request))
@@ -297,7 +296,8 @@ async fn session_operations_converge_by_predecessor_and_ensure_absent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completed_commit_is_resolved_from_durable_state_after_metadata_restart() {
     let mut cluster = TestCluster::start().await.expect("start cluster");
-    let active = raw_create_commit_worker_block(&cluster, "/restart/durable-publish", b"durable-publish")
+    let path = "/restart/durable-publish";
+    let active = raw_create_commit_worker_block(&cluster, path, b"durable-publish")
         .await
         .expect("prepare committed worker block");
     let request = CommitFileRequestProto {
@@ -318,7 +318,6 @@ async fn completed_commit_is_resolved_from_durable_state_after_metadata_restart(
         .expect("first CommitFile")
         .into_inner();
     assert_metadata_ok(first.header);
-    let first_revision = first.content_revision.expect("content revision");
 
     cluster.restart_metadata().await.expect("restart metadata");
 
@@ -332,7 +331,6 @@ async fn completed_commit_is_resolved_from_durable_state_after_metadata_restart(
         .into_inner();
     assert_metadata_ok(replay.header);
     assert_eq!(replay.committed_size, first.committed_size);
-    assert_eq!(replay.content_revision, Some(first_revision));
     cluster.shutdown().await.expect("shutdown cluster");
 }
 
@@ -369,7 +367,6 @@ async fn raw_create_commit_worker_block(
                 replication: 1,
                 block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
             }),
-            create_mode: CreateModeProto::CreateNew as i32,
         }))
         .await?
         .into_inner();
@@ -386,7 +383,7 @@ async fn raw_create_commit_worker_block(
     assert_metadata_ok(open.header);
     let expected_content_revision = open.content_revision;
     let expected_file_size = open.base_size;
-    let write_mode = open.mode;
+    let write_mode = OpenWriteModeProto::OpenWriteModeWrite as i32;
     let write_handle = open.write_handle.expect("write handle");
 
     let add_block = metadata
@@ -405,7 +402,6 @@ async fn raw_create_commit_worker_block(
         block_id: target.block_id,
         file_offset: target.file_offset,
         len: payload.len() as u64,
-        checksum: None,
     };
 
     Ok(RawWorkerCommittedWrite {
@@ -463,7 +459,6 @@ async fn write_and_commit_worker_target(target: &WriteTargetProto, payload: &[u8
             block_format_id: target.block_format_id,
             block_size: target.block_size,
             chunk_size: target.chunk_size,
-            checksum_kind: ChecksumKindProto::ChecksumKindNone as i32,
             block_stamp: target.block_stamp,
             token: target.fencing_token,
             frame_size: payload.len().max(1) as u32,
@@ -481,7 +476,6 @@ async fn write_and_commit_worker_target(target: &WriteTargetProto, payload: &[u8
             seq: 1,
             offset_in_block: 0,
             data: payload.to_vec().into(),
-            checksum32: 0,
         }])))
         .await?
         .into_inner();

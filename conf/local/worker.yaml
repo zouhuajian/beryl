@@ -20,7 +20,6 @@ worker.rpc.advertised_endpoint: "http://127.0.0.1:19090"
 worker.rpc.max_inflight: 100
 worker.default_frame_size: "1MB"
 worker.max_frame_size: "4MB"
-worker.window_bytes: "8MB"
 worker.stream.idle_timeout_ms: 60000
 
 worker.metadata.group.name: "root"

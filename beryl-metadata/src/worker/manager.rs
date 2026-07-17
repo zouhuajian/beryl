@@ -118,13 +118,13 @@ fn ready_block_ids<'a>(blocks: impl Iterator<Item = &'a BlockReportBlock>) -> Ha
         .collect()
 }
 
+pub(super) const WORKER_NET_PROTOCOL_GRPC: i32 = 1;
+
 pub(super) fn worker_net_protocol_label(worker_net_protocol: i32) -> &'static str {
-    match beryl_proto::common::WorkerNetProtocolProto::try_from(worker_net_protocol) {
-        Ok(beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified) => "unspecified",
-        Ok(beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc) => "grpc",
-        Ok(beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolQuic) => "quic",
-        Ok(beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolRdma) => "rdma",
-        Err(_) => "unknown",
+    if worker_net_protocol == WORKER_NET_PROTOCOL_GRPC {
+        "grpc"
+    } else {
+        "unknown"
     }
 }
 
@@ -198,11 +198,7 @@ pub enum BlockReportBlockState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockReportBlock {
     pub block_id: BlockId,
-    pub data_handle_id: u64,
-    pub block_index: u32,
     pub block_stamp: u64,
-    pub effective_len: u64,
-    pub committed_length: u64,
     pub block_state: BlockReportBlockState,
 }
 

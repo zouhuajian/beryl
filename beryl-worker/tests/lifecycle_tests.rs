@@ -212,6 +212,32 @@ fn worker_start_refuses_invalid_final_storage_info() {
 }
 
 #[test]
+fn worker_start_rejects_storage_format_v1_without_rewriting_it() {
+    let dir = TempDir::new().unwrap();
+    let config_path = write_config(&dir, "cluster-a", "root");
+    let config = WorkerConfig::load(&config_path).unwrap();
+    let worker_id = prepare_worker_start(&config).unwrap();
+    let info_path = worker_storage_info_path(&config);
+    let old_info = format!(
+        r#"{{
+  "cluster_id": "cluster-a",
+  "worker_id": {},
+  "storage_uuid": "storage-a",
+  "format_version": 1,
+  "created_at_ms": 1,
+  "software_version": "test"
+}}"#,
+        worker_id.as_raw()
+    );
+    std::fs::write(&info_path, old_info.as_bytes()).unwrap();
+
+    let error = prepare_worker_start(&config).unwrap_err();
+
+    assert!(error.to_string().contains("format_version=1"));
+    assert_eq!(std::fs::read(&info_path).unwrap(), old_info.as_bytes());
+}
+
+#[test]
 fn worker_storage_info_rejects_legacy_group_id_and_unknown_fields() {
     for extra_field in ["group_id", "unknown_field"] {
         let dir = TempDir::new().unwrap();
@@ -225,7 +251,7 @@ fn worker_storage_info_rejects_legacy_group_id_and_unknown_fields() {
   "cluster_id": "cluster-a",
   "worker_id": {},
   "storage_uuid": "storage-a",
-  "format_version": 1,
+  "format_version": 2,
   "created_at_ms": 1,
   "software_version": "test",
   "{extra_field}": 1

@@ -7,7 +7,7 @@ use beryl_proto::common::TierProto;
 use beryl_proto::convert::parse_known_tier;
 use beryl_proto::worker::{
     BlockFormatProto, BlockIdentityProto, BlockMetaPayloadProto, BlockSourceProto, BlockStateProto,
-    BlockVisibilityProto, ChecksumKindProto,
+    BlockVisibilityProto,
 };
 use beryl_types::ids::BlockId;
 use beryl_types::layout::BlockFormatId;
@@ -71,7 +71,6 @@ fn meta_to_proto_without_visibility(meta: &BlockMetaPayload) -> StoreResult<Bloc
             format_id: meta.format.format_id.as_raw(),
             block_size: meta.format.block_size,
             chunk_size,
-            checksum_kind: checksum_kind_to_proto(meta.format.checksum_kind) as i32,
         }),
         source: Some(BlockSourceProto {
             effective_len: meta.source.effective_len,
@@ -162,7 +161,7 @@ fn meta_fields_from_proto(
                 .map_err(|err| corrupt(format!("unsupported block format id: {err}")))?,
             block_size: format.block_size,
             chunk_size: u64::from(format.chunk_size),
-            checksum_kind: checksum_kind_from_proto(format.checksum_kind)?,
+            checksum_kind: ChecksumKind::None,
         },
         source: BlockSource {
             effective_len: source.effective_len,
@@ -185,19 +184,6 @@ fn block_state_from_proto(block_state: i32) -> StoreResult<BlockState> {
         BlockStateProto::BlockStateUnspecified => Err(corrupt("block state must be specified")),
         BlockStateProto::BlockStateReady => Ok(BlockState::Ready),
         BlockStateProto::BlockStateCorrupt => Ok(BlockState::Corrupt),
-    }
-}
-
-fn checksum_kind_to_proto(checksum_kind: ChecksumKind) -> ChecksumKindProto {
-    match checksum_kind {
-        ChecksumKind::None => ChecksumKindProto::ChecksumKindNone,
-    }
-}
-
-fn checksum_kind_from_proto(checksum_kind: i32) -> StoreResult<ChecksumKind> {
-    match ChecksumKindProto::try_from(checksum_kind).map_err(|_| corrupt("unsupported checksum kind"))? {
-        ChecksumKindProto::ChecksumKindUnspecified => Err(corrupt("checksum kind must be specified")),
-        ChecksumKindProto::ChecksumKindNone => Ok(ChecksumKind::None),
     }
 }
 

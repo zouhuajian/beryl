@@ -292,7 +292,6 @@ fn start_worker_instance(
     let worker_core = Arc::new(WorkerCore::with_local_store(
         worker_config.default_frame_size,
         worker_config.max_frame_size,
-        worker_config.window_bytes,
         Duration::from_millis(worker_config.stream_idle_timeout_ms),
         Arc::clone(&block_store) as Arc<dyn beryl_worker::store::block::LocalBlockStore + Send + Sync>,
     ));
@@ -359,7 +358,6 @@ fn worker_config(
         rpc_max_inflight: 100,
         default_frame_size: 1024 * 1024,
         max_frame_size: 4 * 1024 * 1024,
-        window_bytes: 8 * 1024 * 1024,
         stream_idle_timeout_ms: 60_000,
         store: WorkerStoreConfig {
             dirs,

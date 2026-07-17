@@ -99,7 +99,7 @@ fn core(temp_dir: &TempDir) -> WorkerCore {
     let store = Arc::new(FullBlockFileStore::new(FullBlockFileStoreConfig::new(
         temp_dir.path().to_path_buf(),
     )));
-    WorkerCore::with_local_store(1024, 1024, 4096, Duration::from_secs(60), store)
+    WorkerCore::with_local_store(1024, 1024, Duration::from_secs(60), store)
 }
 
 #[tokio::test(flavor = "current_thread")]

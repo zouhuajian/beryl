@@ -5,7 +5,7 @@
 
 use super::manager::{
     worker_net_protocol_label, BlockReportBlock, BlockReportBlockState, BlockReportDeltaEntry, BlockReportDeltaOp,
-    WorkerManager,
+    WorkerManager, WORKER_NET_PROTOCOL_GRPC,
 };
 use super::metrics::WorkerMetrics;
 use crate::error::{to_rpc_error, MetadataError, MetadataResult};
@@ -250,31 +250,12 @@ impl MetadataWorkerServiceImpl {
         WorkerBackgroundHandle {}
     }
 
-    fn heartbeat_interval_ms(&self) -> u32 {
-        1_000
-    }
-
     fn liveness_timeout_ms(&self) -> u32 {
         self.worker_manager
             .heartbeat_timeout_sec()
             .saturating_mul(1000)
             .try_into()
             .unwrap_or(u32::MAX)
-    }
-
-    fn server_role(&self) -> MetadataServerRoleProto {
-        if self.raft_node.is_leader() {
-            MetadataServerRoleProto::MetadataServerRoleLeader
-        } else {
-            MetadataServerRoleProto::MetadataServerRoleFollower
-        }
-    }
-
-    fn leader_hint(&self) -> Option<beryl_proto::common::EndpointProto> {
-        let leader_id = self.raft_node.get_leader_id()?;
-        let membership = self.raft_node.get_membership()?;
-        let (_, node) = membership.nodes().find(|(node_id, _)| **node_id == leader_id)?;
-        parse_metadata_endpoint(&node.address)
     }
 
     fn full_report_required_response<T>(
@@ -309,11 +290,7 @@ impl MetadataWorkerServiceImpl {
         };
         Ok(BlockReportBlock {
             block_id,
-            data_handle_id: block.data_handle_id,
-            block_index: block.block_index,
             block_stamp: block.block_stamp,
-            effective_len: block.effective_len,
-            committed_length: block.committed_length,
             block_state,
         })
     }
@@ -431,9 +408,6 @@ fn trace_context_proto_is_empty(context: &beryl_proto::common::TraceContextProto
 }
 
 fn validate_advertised_endpoint(endpoint: beryl_proto::common::EndpointProto) -> Result<String, String> {
-    if endpoint.protocol != "grpc" {
-        return Err("advertised_endpoint protocol must be grpc".to_string());
-    }
     if endpoint.host.trim().is_empty() {
         return Err("advertised_endpoint host must not be empty".to_string());
     }
@@ -464,43 +438,13 @@ fn parse_tier_free(entries: &[TierFreeProto]) -> Result<Vec<TierFree>, String> {
         .collect()
 }
 
-fn check_header_group_name(
+fn parse_worker_request_group_name(
     req_header: &Option<beryl_proto::common::RequestHeaderProto>,
-    body_group_name: &GroupName,
-) -> Result<(), String> {
-    let Some(header) = req_header.as_ref() else {
-        return Ok(());
-    };
-    let Some(header_group_name) =
-        GroupName::parse_optional(&header.group_name).map_err(|err| format!("header group_name is invalid: {err}"))?
-    else {
-        return Ok(());
-    };
-    if header_group_name == *body_group_name {
-        return Ok(());
-    }
-    Err(format!(
-        "header group_name {} does not match body group_name {}",
-        header_group_name, body_group_name
-    ))
-}
-
-fn parse_worker_request_group_name(raw: &str) -> Result<GroupName, String> {
-    GroupName::parse(raw).map_err(|error| format!("group_name is invalid: {error}"))
-}
-
-fn parse_metadata_endpoint(address: &str) -> Option<beryl_proto::common::EndpointProto> {
-    let without_scheme = address
-        .strip_prefix("http://")
-        .or_else(|| address.strip_prefix("https://"))
-        .unwrap_or(address);
-    let (host, port) = without_scheme.rsplit_once(':')?;
-    let port = port.parse::<u32>().ok()?;
-    Some(beryl_proto::common::EndpointProto {
-        host: host.trim_matches(['[', ']']).to_string(),
-        port,
-        protocol: "grpc".to_string(),
-    })
+) -> Result<GroupName, String> {
+    let header = req_header
+        .as_ref()
+        .ok_or_else(|| "request header is required".to_string())?;
+    GroupName::parse(&header.group_name).map_err(|error| format!("header group_name is invalid: {error}"))
 }
 
 #[tonic::async_trait]
@@ -532,15 +476,12 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 );
             }
 
-            let group_name = match parse_worker_request_group_name(&req.group_name) {
+            let group_name = match parse_worker_request_group_name(&req.header) {
                 Ok(group_name) => group_name,
                 Err(error) => {
                     return self.invalid_request_response(&req.header, register_worker_response_with_header, error)
                 }
             };
-            if let Err(message) = check_header_group_name(&req.header, &group_name) {
-                return self.invalid_request_response(&req.header, register_worker_response_with_header, message);
-            }
             if group_name != self.served_group_name {
                 return self.invalid_request_response(
                     &req.header,
@@ -565,14 +506,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                     return self.invalid_request_response(&req.header, register_worker_response_with_header, error)
                 }
             };
-            let worker_net_protocol = req.worker_net_protocol;
-            if req.worker_net_protocol() != beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc {
-                return self.invalid_request_response(
-                    &req.header,
-                    register_worker_response_with_header,
-                    "worker_net_protocol must be gRPC for startup registration",
-                );
-            }
+            let worker_net_protocol = WORKER_NET_PROTOCOL_GRPC;
             let endpoint = match req.advertised_endpoint {
                 Some(endpoint) => endpoint,
                 None => {
@@ -662,7 +596,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 header: Some(self.create_response_header_from_request(&req.header, Some(&group_name))),
                 worker_id: accepted_worker_id.as_raw(),
                 accepted_worker_run_id: worker_run_id.to_string(),
-                group_name: group_name.to_string(),
             }))
         }
         .await;
@@ -691,13 +624,10 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 Err(error) => return self.response_with_error(&req.header, error, heartbeat_response_with_header),
             };
 
-            let group_name = match parse_worker_request_group_name(&req.group_name) {
+            let group_name = match parse_worker_request_group_name(&req.header) {
                 Ok(group_name) => group_name,
                 Err(error) => return self.invalid_request_response(&req.header, heartbeat_response_with_header, error),
             };
-            if let Err(message) = check_header_group_name(&req.header, &group_name) {
-                return self.invalid_request_response(&req.header, heartbeat_response_with_header, message);
-            }
             if group_name != self.served_group_name {
                 return self.group_mismatch_response(
                     &req.header,
@@ -746,14 +676,7 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
             };
 
             let health_proto = req.health();
-            let worker_net_protocol = req.worker_net_protocol;
-            if req.worker_net_protocol() != beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc {
-                return self.invalid_request_response(
-                    &req.header,
-                    heartbeat_response_with_header,
-                    "worker_net_protocol must be gRPC for heartbeat",
-                );
-            }
+            let worker_net_protocol = WORKER_NET_PROTOCOL_GRPC;
             let endpoint = match req.advertised_endpoint {
                 Some(endpoint) => endpoint,
                 None => {
@@ -947,24 +870,11 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 .unwrap_or(live_state.last_seen_ms);
             observe::record_worker_heartbeat_lag(now_ms.saturating_sub(live_state.last_seen_ms) as f64 / 1000.0);
 
-            if !req.acks.is_empty() {
-                warn!(
-                    worker_id = worker_id.as_raw(),
-                    ack_count = req.acks.len(),
-                    "Ignoring worker command acks because command ack handling is not enabled"
-                );
-            }
-
             Ok(Response::new(HeartbeatResponseProto {
                 header: Some(self.create_response_header_from_request(&req.header, Some(&group_name))),
-                commands: Vec::new(),
                 worker_id: live_state.worker_id.as_raw(),
                 accepted_worker_run_id: live_state.worker_run_id.to_string(),
-                heartbeat_interval_ms: self.heartbeat_interval_ms(),
                 liveness_timeout_ms: self.liveness_timeout_ms(),
-                server_role: self.server_role() as i32,
-                leader_hint: self.leader_hint(),
-                group_name: group_name.to_string(),
             }))
         }
         .await;
@@ -994,15 +904,12 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 Err(error) => return self.response_with_error(&req.header, error, block_report_response_with_header),
             };
 
-            let group_name = match parse_worker_request_group_name(&req.group_name) {
+            let group_name = match parse_worker_request_group_name(&req.header) {
                 Ok(group_name) => group_name,
                 Err(error) => {
                     return self.invalid_request_response(&req.header, block_report_response_with_header, error)
                 }
             };
-            if let Err(message) = check_header_group_name(&req.header, &group_name) {
-                return self.invalid_request_response(&req.header, block_report_response_with_header, message);
-            }
             if group_name != self.served_group_name {
                 return self.group_mismatch_response(
                     &req.header,
@@ -1285,7 +1192,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 header: Some(self.create_response_header_from_request(&req.header, Some(&group_name))),
                 report_seq,
                 next_delta_seq: result.next_delta_seq,
-                retry_after_ms: 0,
             }))
         }
         .await;
@@ -1487,11 +1393,7 @@ mod tests {
     fn report_block_proto(block_id: BlockId) -> BlockReportBlockProto {
         BlockReportBlockProto {
             block_id: Some(block_proto(block_id)),
-            data_handle_id: block_id.data_handle_id.as_raw(),
-            block_index: block_id.index.as_raw(),
             block_stamp: 100 + u64::from(block_id.index.as_raw()),
-            effective_len: 4096,
-            committed_length: 4096,
             block_state: BlockReportBlockStateProto::BlockReportBlockStateReady as i32,
         }
     }
@@ -1505,12 +1407,8 @@ mod tests {
         final_batch: bool,
         blocks: Vec<BlockId>,
     ) -> BlockReportRequestProto {
-        let group_name = group_name.to_string();
         BlockReportRequestProto {
-            header: Some(valid_request_header(
-                &GroupName::parse(&group_name).expect("valid test group name"),
-                ClientId::new(71),
-            )),
+            header: Some(valid_request_header(&group_name, ClientId::new(71))),
             worker_id: worker_id.as_raw(),
             worker_run_id: worker_run_id.to_string(),
             report_seq,
@@ -1519,7 +1417,6 @@ mod tests {
                 final_batch,
                 blocks: blocks.into_iter().map(report_block_proto).collect(),
             })),
-            group_name,
         }
     }
 
@@ -1531,12 +1428,8 @@ mod tests {
         delta_seq: u64,
         deltas: Vec<(BlockReportDeltaOpProto, BlockId)>,
     ) -> BlockReportRequestProto {
-        let group_name = group_name.to_string();
         BlockReportRequestProto {
-            header: Some(valid_request_header(
-                &GroupName::parse(&group_name).expect("valid test group name"),
-                ClientId::new(72),
-            )),
+            header: Some(valid_request_header(&group_name, ClientId::new(72))),
             worker_id: worker_id.as_raw(),
             worker_run_id: worker_run_id.to_string(),
             report_seq,
@@ -1550,7 +1443,6 @@ mod tests {
                     })
                     .collect(),
             })),
-            group_name,
         }
     }
 
@@ -1636,19 +1528,14 @@ mod tests {
         heartbeat_seq: u64,
         endpoint_port: u32,
     ) -> HeartbeatRequestProto {
-        let group_name = group_name.to_string();
         HeartbeatRequestProto {
-            header: Some(valid_request_header(
-                &GroupName::parse(&group_name).expect("valid test group name"),
-                ClientId::new(73),
-            )),
+            header: Some(valid_request_header(&group_name, ClientId::new(73))),
             worker_id: worker_id.as_raw(),
             worker_run_id: worker_run_id.to_string(),
             heartbeat_seq,
             advertised_endpoint: Some(beryl_proto::common::EndpointProto {
                 host: "127.0.0.1".to_string(),
                 port: endpoint_port,
-                protocol: "grpc".to_string(),
             }),
             capacity: Some(CapacityInfoProto {
                 total_bytes: 1_000,
@@ -1662,13 +1549,8 @@ mod tests {
             load: Some(LoadInfoProto {
                 active_reads: 0,
                 active_writes: 0,
-                cpu_usage_percent: 0,
-                memory_used_bytes: 0,
             }),
             health: HealthStatusProto::HealthStatusHealthy as i32,
-            worker_net_protocol: beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-            acks: Vec::new(),
-            group_name,
         }
     }
 
@@ -1731,10 +1613,7 @@ mod tests {
             advertised_endpoint: Some(beryl_proto::common::EndpointProto {
                 host: "127.0.0.1".to_string(),
                 port: 9090 + worker_id.as_raw() as u32,
-                protocol: "grpc".to_string(),
             }),
-            worker_net_protocol: beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-            group_name: "root".to_string(),
         }
     }
 
@@ -2721,7 +2600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn follower_block_report_updates_local_view_without_commands() {
+    async fn follower_block_report_updates_local_view() {
         let dir = TempDir::new().unwrap();
         let raft_node = nonleader_raft(&dir).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
@@ -2751,11 +2630,7 @@ mod tests {
                 true,
                 vec![BlockReportBlock {
                     block_id,
-                    data_handle_id: block_id.data_handle_id.as_raw(),
-                    block_index: block_id.index.as_raw(),
                     block_stamp: 100,
-                    effective_len: 4096,
-                    committed_length: 4096,
                     block_state: BlockReportBlockState::Ready,
                 }],
             )
@@ -2808,8 +2683,6 @@ mod tests {
                 worker_id: 9,
                 worker_run_id: test_worker_run_id().to_string(),
                 advertised_endpoint: None,
-                worker_net_protocol: beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-                group_name: "root".to_string(),
             }),
         )
         .await
@@ -2843,8 +2716,6 @@ mod tests {
                         worker_id: 9,
                         worker_run_id: test_worker_run_id().to_string(),
                         advertised_endpoint: None,
-                        worker_net_protocol: beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-                        group_name: "root".to_string(),
                     }),
                 )
                 .await
@@ -2908,7 +2779,7 @@ mod tests {
                 &group_name("root"),
                 worker_id,
                 "127.0.0.1:9090".to_string(),
-                beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+                WORKER_NET_PROTOCOL_GRPC,
                 test_worker_run_id(),
                 None,
             )
@@ -3041,7 +2912,7 @@ mod tests {
                 &group_name("root"),
                 worker_id,
                 "127.0.0.1:9090".to_string(),
-                beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
+                WORKER_NET_PROTOCOL_GRPC,
                 None,
             )
             .unwrap();
@@ -3194,7 +3065,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_service_rejects_header_body_group_name_mismatch() {
+    async fn worker_service_rejects_non_served_header_group() {
         let dir = TempDir::new().unwrap();
         let raft_node = leader_raft(&dir).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
@@ -3214,10 +3085,7 @@ mod tests {
                 advertised_endpoint: Some(beryl_proto::common::EndpointProto {
                     host: "127.0.0.1".to_string(),
                     port: 9090,
-                    protocol: "grpc".to_string(),
                 }),
-                worker_net_protocol: beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-                group_name: "root".to_string(),
             }),
         )
         .await
@@ -3226,7 +3094,7 @@ mod tests {
 
         let error = register_response.header.expect("header").error.expect("header error");
         let error = assert_error_fail(&error, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
-        assert!(error.message.contains("header group_name"));
+        assert!(error.message.contains("served metadata group"));
         assert!(worker_manager
             .get_descriptor(&group_name("root"), WorkerId::new(9))
             .is_none());
@@ -3240,8 +3108,8 @@ mod tests {
                 .into_inner();
 
         let error = heartbeat_response.header.expect("header").error.expect("header error");
-        let error = assert_error_fail(&error, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
-        assert!(error.message.contains("header group_name"));
+        let error = assert_error_fail(&error, ErrorKind::Metadata(MetadataErrorKind::GroupMismatch));
+        assert!(error.message.contains("served metadata group"));
 
         let block_id = BlockId::from_u64_u32(1000, 0);
         let mut block_report = full_report_request(
@@ -3267,8 +3135,8 @@ mod tests {
             .expect("header")
             .error
             .expect("header error");
-        let error = assert_error_fail(&error, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
-        assert!(error.message.contains("header group_name"));
+        let error = assert_error_fail(&error, ErrorKind::Metadata(MetadataErrorKind::GroupMismatch));
+        assert!(error.message.contains("served metadata group"));
         assert!(worker_manager
             .get_block_locations(&group_name("root"), block_id)
             .is_empty());
@@ -3295,10 +3163,7 @@ mod tests {
                 advertised_endpoint: Some(beryl_proto::common::EndpointProto {
                     host: "127.0.0.1".to_string(),
                     port: 9090,
-                    protocol: "grpc".to_string(),
                 }),
-                worker_net_protocol: beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-                group_name: "root".to_string(),
             }),
         )
         .await
@@ -3331,10 +3196,7 @@ mod tests {
                 advertised_endpoint: Some(beryl_proto::common::EndpointProto {
                     host: "127.0.0.1".to_string(),
                     port: 9090,
-                    protocol: "grpc".to_string(),
                 }),
-                worker_net_protocol: beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-                group_name: "root".to_string(),
             }),
         )
         .await
@@ -3342,7 +3204,7 @@ mod tests {
         .into_inner();
 
         assert!(response.header.as_ref().expect("header").error.is_none());
-        assert_eq!(response.group_name, "root");
+        assert_eq!(response.header.as_ref().expect("header").group_name, "root");
         assert_eq!(response.worker_id, 123);
         assert_eq!(response.accepted_worker_run_id, worker_run_id.to_string());
         let descriptor = worker_manager
@@ -3380,10 +3242,7 @@ mod tests {
                 advertised_endpoint: Some(beryl_proto::common::EndpointProto {
                     host: "127.0.0.1".to_string(),
                     port: 9091,
-                    protocol: "grpc".to_string(),
                 }),
-                worker_net_protocol: beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-                group_name: "root".to_string(),
             }),
         )
         .await
@@ -3425,10 +3284,7 @@ mod tests {
             advertised_endpoint: Some(beryl_proto::common::EndpointProto {
                 host: "127.0.0.1".to_string(),
                 port: 9090,
-                protocol: "grpc".to_string(),
             }),
-            worker_net_protocol: beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-            group_name: "root".to_string(),
         };
 
         let first = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
@@ -3507,7 +3363,6 @@ mod tests {
         next_request.advertised_endpoint = Some(beryl_proto::common::EndpointProto {
             host: "127.0.0.1".to_string(),
             port: 9091,
-            protocol: "grpc".to_string(),
         });
         let next = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
             &service,
@@ -3537,10 +3392,7 @@ mod tests {
             advertised_endpoint: Some(beryl_proto::common::EndpointProto {
                 host: "127.0.0.1".to_string(),
                 port,
-                protocol: "grpc".to_string(),
             }),
-            worker_net_protocol: beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-            group_name: "root".to_string(),
         };
 
         let first = <MetadataWorkerServiceImpl as MetadataWorkerServiceProto>::register_worker(
@@ -3603,10 +3455,7 @@ mod tests {
             advertised_endpoint: Some(beryl_proto::common::EndpointProto {
                 host: "127.0.0.1".to_string(),
                 port,
-                protocol: "grpc".to_string(),
             }),
-            worker_net_protocol: beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-            group_name: "root".to_string(),
         };
         let worker_id = WorkerId::new(126);
 
@@ -3699,10 +3548,7 @@ mod tests {
                 advertised_endpoint: Some(beryl_proto::common::EndpointProto {
                     host: "127.0.0.1".to_string(),
                     port: 9090,
-                    protocol: "grpc".to_string(),
                 }),
-                worker_net_protocol: beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
-                group_name: "other".to_string(),
             }),
         )
         .await
@@ -3779,7 +3625,6 @@ mod tests {
 
         let error = response.header.expect("header").error.expect("header error");
         assert_error_register_worker(&error, ErrorKind::Worker(WorkerErrorKind::NotRegistered));
-        assert!(response.commands.is_empty());
     }
 
     #[tokio::test]
@@ -3882,7 +3727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn follower_heartbeat_accepts_liveness_but_returns_empty_commands() {
+    async fn follower_heartbeat_accepts_liveness() {
         let dir = TempDir::new().unwrap();
         let raft_node = nonleader_raft(&dir).await;
         let worker_manager = Arc::new(WorkerManager::new(60));
@@ -3919,14 +3764,9 @@ mod tests {
         .into_inner();
 
         assert!(response.header.as_ref().expect("header").error.is_none());
-        assert_eq!(response.group_name, "root");
+        assert_eq!(response.header.as_ref().expect("header").group_name, "root");
         assert_eq!(response.worker_id, worker_id.as_raw());
         assert_eq!(response.accepted_worker_run_id, test_worker_run_id().to_string());
-        assert_eq!(
-            response.server_role(),
-            MetadataServerRoleProto::MetadataServerRoleFollower
-        );
-        assert!(response.commands.is_empty());
         assert!(worker_manager.is_worker_live(&group_name("root"), worker_id));
     }
 
@@ -3969,11 +3809,6 @@ mod tests {
         .into_inner();
 
         assert!(response.header.as_ref().expect("header").error.is_none());
-        assert_eq!(
-            response.server_role(),
-            MetadataServerRoleProto::MetadataServerRoleLeader
-        );
-        assert!(response.commands.is_empty());
         assert_eq!(raft_node.get_last_applied_state_id(), before_state_id);
         assert!(worker_manager.is_worker_live(&group_name("root"), worker_id));
     }
@@ -3991,7 +3826,6 @@ mod tests {
         );
 
         let mut request = heartbeat_request(group_name("root"), WorkerId::new(14), test_worker_run_id(), 1, 9090);
-        request.group_name = "other".to_string();
         request.header.as_mut().expect("header").group_name = "other".to_string();
 
         let response =
@@ -4002,7 +3836,6 @@ mod tests {
 
         let error = response.header.expect("header").error.expect("header error");
         assert_error_fail(&error, ErrorKind::Metadata(MetadataErrorKind::GroupMismatch));
-        assert!(response.commands.is_empty());
     }
 
     #[tokio::test]
@@ -4091,7 +3924,6 @@ mod tests {
                         block: None,
                     }],
                 })),
-                group_name: "root".to_string(),
             }),
         )
         .await

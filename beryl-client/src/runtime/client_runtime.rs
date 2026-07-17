@@ -425,7 +425,6 @@ fn committed_block_from_pending(pending: &PendingBlock) -> beryl_types::Committe
         block_id: target.block_id,
         file_offset: target.file_offset,
         len: pending.written_len(),
-        checksum: None,
     }
 }
 

@@ -35,7 +35,6 @@ fn test_request_header_with_client_info() {
 
     let child_same_id = header.child_with_same_call_id();
     assert_eq!(child_same_id.client.call_id, header.client.call_id);
-    assert_eq!(child_same_id.retry_count, header.retry_count + 1);
 }
 
 #[test]
@@ -105,7 +104,6 @@ fn header_identity_matches_request_client_call_and_group() {
 fn caller_context_fields_parse_locality_hints_and_ignore_invalid_entries() {
     let context = CallerContext {
         context: "ip=10.0.0.1,host=worker-a,az=az-a,rack=rack-1,region=us-west".to_string(),
-        signature: None,
     };
     let from_context = CallerContextFields::from_caller_context(&context);
     assert_eq!(from_context.ip(), Some("10.0.0.1"));

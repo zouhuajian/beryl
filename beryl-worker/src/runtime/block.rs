@@ -34,21 +34,15 @@ pub struct BlockManager {
     default_frame_size: u32,
     /// Upper bound for negotiated transport frame payload size.
     max_frame_size: u32,
-    /// Per-stream application-level in-flight byte window.
-    /// This is independent from protocol-native flow control.
-    window_bytes: u32,
 }
 
 impl BlockManager {
     pub const DEFAULT_FRAME_SIZE: u32 = 1024 * 1024;
     pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
-    pub const DEFAULT_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
-
-    pub const fn new(default_frame_size: u32, max_frame_size: u32, window_bytes: u32) -> Self {
+    pub const fn new(default_frame_size: u32, max_frame_size: u32) -> Self {
         Self {
             default_frame_size,
             max_frame_size,
-            window_bytes,
         }
     }
 
@@ -58,10 +52,6 @@ impl BlockManager {
 
     pub const fn max_frame_size(&self) -> u32 {
         self.max_frame_size
-    }
-
-    pub const fn window_bytes(&self) -> u32 {
-        self.window_bytes
     }
 
     pub fn validate_read(
@@ -160,10 +150,6 @@ impl BlockManager {
 
 impl Default for BlockManager {
     fn default() -> Self {
-        Self::new(
-            Self::DEFAULT_FRAME_SIZE,
-            Self::MAX_FRAME_SIZE,
-            Self::DEFAULT_WINDOW_BYTES,
-        )
+        Self::new(Self::DEFAULT_FRAME_SIZE, Self::MAX_FRAME_SIZE)
     }
 }

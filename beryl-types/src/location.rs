@@ -42,7 +42,6 @@ pub struct CommittedBlock {
     pub block_id: BlockId,
     pub file_offset: u64,
     pub len: u64,
-    pub checksum: Option<Vec<u8>>,
 }
 
 /// Metadata-authoritative readable location for one file range backed by a block.

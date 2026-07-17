@@ -477,8 +477,7 @@ impl MetadataBlockReportLoop {
             } else {
                 Vec::new()
             };
-            // Each batch is submitted once here. If retry is added, create this op before
-            // the retry loop and preserve it across attempts, changing only retry_count.
+            // Each batch is submitted once here. Any future retry must preserve this op.
             let op = self.control_identity.new_op();
             let request = BlockReportRequestProto {
                 header: Some(block_report_request_header(&registration.group_name, &op)),
@@ -490,7 +489,6 @@ impl MetadataBlockReportLoop {
                     final_batch: batch_idx + 1 == total_batches,
                     blocks: batch_blocks,
                 })),
-                group_name: registration.group_name.to_string(),
             };
             let tonic_request = metadata_tonic_request(request.clone(), request.header.as_ref());
             let response = time::timeout(timeout, client.block_report(tonic_request))
@@ -532,7 +530,6 @@ impl MetadataBlockReportLoop {
                 delta_seq,
                 deltas: deltas.to_vec(),
             })),
-            group_name: registration.group_name.to_string(),
         };
         let tonic_request = metadata_tonic_request(request.clone(), request.header.as_ref());
         let response = time::timeout(timeout, client.block_report(tonic_request))
@@ -589,11 +586,7 @@ fn meta_to_report_block(meta: BlockMetaPayload) -> Result<BlockReportBlockProto,
     let block_id = meta.identity.block_id;
     Ok(BlockReportBlockProto {
         block_id: Some(block_id.into()),
-        data_handle_id: block_id.data_handle_id.as_raw(),
-        block_index: block_id.index.as_raw(),
         block_stamp: meta.visibility.block_stamp,
-        effective_len: meta.source.effective_len,
-        committed_length: meta.source.effective_len,
         block_state: block_state as i32,
     })
 }
@@ -616,6 +609,21 @@ fn classify_block_report_response(
     request: &BlockReportRequestProto,
     response: BlockReportResponseProto,
 ) -> Result<BlockReportPeerOutcome, BlockReportError> {
+    let response_group_name = response
+        .header
+        .as_ref()
+        .map(|header| header.group_name.as_str())
+        .ok_or_else(|| BlockReportError::Fatal("metadata block report response missing ResponseHeader".to_string()))?;
+    let request_group_name = request
+        .header
+        .as_ref()
+        .map(|header| header.group_name.as_str())
+        .ok_or_else(|| BlockReportError::Fatal("metadata block report request missing RequestHeader".to_string()))?;
+    if response_group_name != request_group_name {
+        return Err(BlockReportError::Fatal(format!(
+            "metadata block report response confirmed group_name {response_group_name}, expected {request_group_name}"
+        )));
+    }
     if let Some(outcome) = classify_header(response.header.as_ref())? {
         return Ok(outcome);
     }

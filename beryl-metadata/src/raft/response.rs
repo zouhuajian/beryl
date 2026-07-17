@@ -162,12 +162,6 @@ pub(crate) enum FsCommandResult {
     Err(FsErrnoResult),
 }
 
-impl FsCommandResult {
-    pub fn ok() -> Self {
-        FsCommandResult::Ok(FsOkResult::default())
-    }
-}
-
 /// Successful FS command payload (minimal for now; extensible).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub(crate) struct FsOkResult {

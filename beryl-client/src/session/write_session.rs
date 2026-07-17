@@ -400,10 +400,7 @@ impl WriteSession {
     }
 
     /// Mark the session closed after metadata commit succeeds.
-    pub(crate) fn mark_closed(&mut self, content_revision: Option<u64>) {
-        if let Some(content_revision) = content_revision {
-            self.content_revision = content_revision;
-        }
+    pub(crate) fn mark_closed(&mut self) {
         self.state = WriteSessionState::Closed;
     }
 
@@ -785,9 +782,9 @@ fn validate_write_handle(handle: &WriteHandleProto) -> ClientResult<DataHandleId
         .as_ref()
         .filter(|id| id.value != 0)
         .ok_or_else(|| ClientError::Metadata("write handle data_handle_id must be present and non-zero".to_string()))?;
-    if handle.lease_epoch == 0 {
+    if handle.write_lease_epoch == 0 {
         return Err(ClientError::Metadata(
-            "write handle lease_epoch must be non-zero".to_string(),
+            "write handle write_lease_epoch must be non-zero".to_string(),
         ));
     }
     Ok(DataHandleId::new(data_handle_id.value))
@@ -909,7 +906,7 @@ mod tests {
         let first_ctx = AttemptContext::for_metadata(&first.operation, test_group_name(), 0).expect("first context");
         session.mark_commit_unknown();
 
-        session.write_handle.lease_epoch = 2;
+        session.write_handle.write_lease_epoch = 2;
         let err = session
             .prepare_commit_file(
                 ClientId::new(7),
@@ -921,7 +918,7 @@ mod tests {
             .expect_err("changed session identity must fail");
         assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("write handle changed")));
 
-        session.write_handle.lease_epoch = 1;
+        session.write_handle.write_lease_epoch = 1;
         let retry = session
             .prepare_commit_file(
                 ClientId::new(7),
@@ -1001,14 +998,14 @@ mod tests {
         let first_ctx = AttemptContext::for_metadata(&first.metadata_operation(), test_group_name(), 0)
             .expect("first metadata context");
 
-        session.write_handle.lease_epoch = 2;
+        session.write_handle.write_lease_epoch = 2;
         let err = match session.prepare_abort_cleanup(ClientId::new(7), "test-client", OperationDeadline::new(1_000)) {
             Ok(_) => panic!("identity drift must reject abort replay"),
             Err(err) => err,
         };
         assert!(matches!(err, ClientError::InvalidArgument(msg) if msg.contains("handle changed")));
 
-        session.write_handle.lease_epoch = 1;
+        session.write_handle.write_lease_epoch = 1;
         let retry = session
             .prepare_abort_cleanup(ClientId::new(7), "test-client", OperationDeadline::new(1_000))
             .expect("retry abort plan");
@@ -1179,7 +1176,7 @@ mod tests {
     fn write_handle_proto(_handle_id: u64, data_handle_id: u64) -> WriteHandleProto {
         WriteHandleProto {
             data_handle_id: Some(beryl_proto::common::DataHandleIdProto { value: data_handle_id }),
-            lease_epoch: 1,
+            write_lease_epoch: 1,
         }
     }
 
@@ -1188,7 +1185,6 @@ mod tests {
             block_id: BlockId::new(DataHandleId::new(data_handle_id), BlockIndex::new(block_index)),
             file_offset,
             len,
-            checksum: None,
         }
     }
 
@@ -1244,11 +1240,10 @@ mod tests {
 
     fn block_write_handle_signature(
         block: &WorkerBlockWriteHandle,
-    ) -> (String, u64, i32, String, u64, u64, u64, u32, u64, u64, u64) {
+    ) -> (String, u64, String, u64, u64, u64, u32, u64, u64, u64) {
         (
             block.group_name.to_string(),
             block.worker.worker_id.as_raw(),
-            beryl_proto::common::WorkerNetProtocolProto::from(block.worker.worker_net_protocol) as i32,
             block.worker.worker_run_id.to_string(),
             block.target.file_offset,
             block.target.effective_len,

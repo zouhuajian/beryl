@@ -12,15 +12,15 @@ use crate::metadata as proto_metadata;
 use ::beryl_common::{
     Deadline,
     error::rpc::{
-        ErrorDetail, ErrorDetailField, ErrorKind as RpcErrorKind, InternalErrorKind as RpcInternalErrorKind,
+        ErrorKind as RpcErrorKind, InternalErrorKind as RpcInternalErrorKind,
         MetadataErrorKind as RpcMetadataErrorKind, ProtocolErrorKind as RpcProtocolErrorKind,
-        RecoveryAction as RpcRecoveryAction, RefreshHint as RpcRefreshHint, RpcErrorDetail,
-        UfsErrorKind as RpcUfsErrorKind, WorkerEndpointHint, WorkerErrorKind as RpcWorkerErrorKind,
+        RecoveryAction as RpcRecoveryAction, RefreshHint as RpcRefreshHint, RpcErrorDetail, WorkerEndpointHint,
+        WorkerErrorKind as RpcWorkerErrorKind,
     },
     header::{CallerContext, ClientInfo, RequestHeader, ResponseHeader, TraceContext},
 };
 use beryl_types::chunk::ByteRange;
-use beryl_types::ids::{BlockId, BlockIndex, ChunkId, ChunkIndex, DataHandleId, MountId, ShardId, StreamId, WorkerId};
+use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, StreamId, WorkerId};
 use beryl_types::layout::{BlockShape, FileLayout};
 use beryl_types::lease::FencingToken;
 use beryl_types::{
@@ -66,38 +66,6 @@ impl TryFrom<proto_common::BlockIdProto> for BlockId {
     }
 }
 
-impl From<ChunkId> for proto_common::ChunkIdProto {
-    fn from(id: ChunkId) -> Self {
-        proto_common::ChunkIdProto {
-            block: Some(id.block.into()),
-            chunk_index: id.index.as_raw(),
-        }
-    }
-}
-
-impl TryFrom<proto_common::ChunkIdProto> for ChunkId {
-    type Error = ();
-
-    fn try_from(id: proto_common::ChunkIdProto) -> Result<Self, Self::Error> {
-        let block = id.block.ok_or(())?.try_into()?;
-        Ok(ChunkId::new(block, ChunkIndex::new(id.chunk_index)))
-    }
-}
-
-impl From<WorkerId> for proto_common::WorkerIdProto {
-    fn from(id: WorkerId) -> Self {
-        proto_common::WorkerIdProto { value: id.as_raw() }
-    }
-}
-
-impl TryFrom<proto_common::WorkerIdProto> for WorkerId {
-    type Error = ();
-
-    fn try_from(id: proto_common::WorkerIdProto) -> Result<Self, Self::Error> {
-        Ok(WorkerId::new(id.value))
-    }
-}
-
 impl From<ClientId> for proto_common::ClientIdProto {
     fn from(id: ClientId) -> Self {
         let value = id.as_raw();
@@ -136,34 +104,6 @@ impl TryFrom<proto_common::StreamIdProto> for StreamId {
     fn try_from(id: proto_common::StreamIdProto) -> Result<Self, Self::Error> {
         let value = ((id.high as u128) << 64) | (id.low as u128);
         Ok(StreamId::new(value))
-    }
-}
-
-impl From<ShardId> for proto_common::ShardIdProto {
-    fn from(id: ShardId) -> Self {
-        proto_common::ShardIdProto { value: id.as_raw() }
-    }
-}
-
-impl TryFrom<proto_common::ShardIdProto> for ShardId {
-    type Error = ();
-
-    fn try_from(id: proto_common::ShardIdProto) -> Result<Self, Self::Error> {
-        Ok(ShardId::new(id.value))
-    }
-}
-
-impl From<MountId> for proto_common::MountIdProto {
-    fn from(id: MountId) -> Self {
-        proto_common::MountIdProto { value: id.as_raw() }
-    }
-}
-
-impl TryFrom<proto_common::MountIdProto> for MountId {
-    type Error = ();
-
-    fn try_from(id: proto_common::MountIdProto) -> Result<Self, Self::Error> {
-        Ok(MountId::new(id.value))
     }
 }
 
@@ -357,46 +297,6 @@ pub fn require_worker_run_id(value: &str, field_name: &str) -> Result<WorkerRunI
     WorkerRunId::parse(value).map_err(|err| format!("{field_name} invalid: {err}"))
 }
 
-/// Parse a known, explicitly specified worker network protocol value.
-///
-/// Caller-owned policy still decides whether a known protocol is supported or
-/// whether unspecified/unknown values should default, reject, or trigger refresh.
-pub fn parse_known_worker_net_protocol(value: i32) -> Result<proto_common::WorkerNetProtocolProto, String> {
-    let protocol = proto_common::WorkerNetProtocolProto::try_from(value)
-        .map_err(|_| format!("unknown worker_net_protocol value {value}"))?;
-    if protocol == proto_common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified {
-        return Err("unspecified worker_net_protocol must not default to gRPC".to_string());
-    }
-    Ok(protocol)
-}
-
-impl From<WorkerNetProtocol> for proto_common::WorkerNetProtocolProto {
-    fn from(protocol: WorkerNetProtocol) -> Self {
-        match protocol {
-            WorkerNetProtocol::Grpc => proto_common::WorkerNetProtocolProto::WorkerNetProtocolGrpc,
-        }
-    }
-}
-
-impl TryFrom<proto_common::WorkerNetProtocolProto> for WorkerNetProtocol {
-    type Error = String;
-
-    fn try_from(protocol: proto_common::WorkerNetProtocolProto) -> Result<Self, Self::Error> {
-        match protocol {
-            proto_common::WorkerNetProtocolProto::WorkerNetProtocolGrpc => Ok(Self::Grpc),
-            proto_common::WorkerNetProtocolProto::WorkerNetProtocolQuic => {
-                Err("QUIC worker_net_protocol is not supported by the Rust runtime".to_string())
-            }
-            proto_common::WorkerNetProtocolProto::WorkerNetProtocolRdma => {
-                Err("RDMA worker_net_protocol is not supported by the Rust runtime".to_string())
-            }
-            proto_common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified => {
-                Err("unspecified worker_net_protocol must not default to gRPC".to_string())
-            }
-        }
-    }
-}
-
 impl From<Tier> for proto_common::TierProto {
     fn from(tier: Tier) -> Self {
         match tier {
@@ -435,7 +335,6 @@ impl TryFrom<proto_common::WorkerEndpointInfoProto> for WorkerEndpointInfo {
         worker_endpoint_info_from_parts(
             WorkerId::new(endpoint.worker_id),
             endpoint.endpoint,
-            endpoint.worker_net_protocol,
             endpoint.worker_run_id,
         )
     }
@@ -443,12 +342,9 @@ impl TryFrom<proto_common::WorkerEndpointInfoProto> for WorkerEndpointInfo {
 
 /// Build a shared worker endpoint value from raw wire-shaped fields.
 ///
-/// This performs structural parsing only; protocol support and cache policy
-/// remain caller-owned decisions.
 pub fn worker_endpoint_info_from_parts(
     worker_id: WorkerId,
     endpoint: String,
-    worker_net_protocol: i32,
     worker_run_id: String,
 ) -> Result<WorkerEndpointInfo, String> {
     if worker_id.as_raw() == 0 {
@@ -458,11 +354,10 @@ pub fn worker_endpoint_info_from_parts(
         return Err("WorkerEndpointInfoProto.endpoint must not be empty".to_string());
     }
     let worker_run_id = require_worker_run_id(&worker_run_id, "WorkerEndpointInfoProto.worker_run_id")?;
-    let protocol = parse_known_worker_net_protocol(worker_net_protocol)?;
     Ok(WorkerEndpointInfo {
         worker_id,
         endpoint,
-        worker_net_protocol: protocol.try_into()?,
+        worker_net_protocol: WorkerNetProtocol::Grpc,
         worker_run_id,
     })
 }
@@ -472,7 +367,6 @@ impl From<&WorkerEndpointInfo> for proto_common::WorkerEndpointInfoProto {
         Self {
             worker_id: endpoint.worker_id.as_raw(),
             endpoint: endpoint.endpoint.clone(),
-            worker_net_protocol: proto_common::WorkerNetProtocolProto::from(endpoint.worker_net_protocol) as i32,
             worker_run_id: endpoint.worker_run_id.to_string(),
         }
     }
@@ -483,7 +377,6 @@ impl From<WorkerEndpointInfo> for proto_common::WorkerEndpointInfoProto {
         Self {
             worker_id: endpoint.worker_id.as_raw(),
             endpoint: endpoint.endpoint,
-            worker_net_protocol: proto_common::WorkerNetProtocolProto::from(endpoint.worker_net_protocol) as i32,
             worker_run_id: endpoint.worker_run_id.to_string(),
         }
     }
@@ -580,7 +473,6 @@ impl TryFrom<proto_metadata::CommittedBlockProto> for CommittedBlock {
             block_id,
             file_offset: block.file_offset,
             len: block.len,
-            checksum: block.checksum,
         })
     }
 }
@@ -591,7 +483,6 @@ impl From<&CommittedBlock> for proto_metadata::CommittedBlockProto {
             block_id: Some(block.block_id.into()),
             file_offset: block.file_offset,
             len: block.len,
-            checksum: block.checksum.clone(),
         }
     }
 }
@@ -602,7 +493,6 @@ impl From<CommittedBlock> for proto_metadata::CommittedBlockProto {
             block_id: Some(block.block_id.into()),
             file_offset: block.file_offset,
             len: block.len,
-            checksum: block.checksum,
         }
     }
 }
@@ -811,14 +701,7 @@ impl TryFrom<proto_common::RequestHeaderProto> for RequestHeader {
         let client = proto.client.ok_or_else(|| "missing client".to_string())?.try_into()?;
         let deadline = Deadline::from_unix_ms(proto.deadline_ms);
         let trace_context = optional_trace_context(proto.trace_context);
-        let caller_context = proto.caller_context.map(|cc| CallerContext {
-            context: cc.context,
-            signature: if cc.signature.is_empty() {
-                None
-            } else {
-                Some(cc.signature)
-            },
-        });
+        let caller_context = proto.caller_context.map(|cc| CallerContext { context: cc.context });
         let state = proto
             .state
             .into_iter()
@@ -834,7 +717,6 @@ impl TryFrom<proto_common::RequestHeaderProto> for RequestHeader {
             route_epoch: proto.route_epoch,
             deadline,
             caller_context,
-            retry_count: proto.retry_count,
         })
     }
 }
@@ -858,9 +740,7 @@ impl From<&RequestHeader> for proto_common::RequestHeaderProto {
                 .as_ref()
                 .map(|cc| proto_common::CallerContextProto {
                     context: cc.context.clone(),
-                    signature: cc.signature.clone().unwrap_or_default(),
                 }),
-            retry_count: header.retry_count,
         }
     }
 }
@@ -922,21 +802,13 @@ impl From<&CallerContext> for proto_common::CallerContextProto {
     fn from(ctx: &CallerContext) -> Self {
         proto_common::CallerContextProto {
             context: ctx.context.clone(),
-            signature: ctx.signature.clone().unwrap_or_default(),
         }
     }
 }
 
 impl From<proto_common::CallerContextProto> for CallerContext {
     fn from(proto: proto_common::CallerContextProto) -> Self {
-        CallerContext {
-            context: proto.context,
-            signature: if proto.signature.is_empty() {
-                None
-            } else {
-                Some(proto.signature)
-            },
-        }
+        CallerContext { context: proto.context }
     }
 }
 
@@ -1112,37 +984,6 @@ fn worker_kind_to_proto(kind: RpcWorkerErrorKind) -> proto_common::WorkerErrorKi
     }
 }
 
-fn ufs_kind_proto_to_kind(kind: proto_common::UfsErrorKindProto) -> RpcUfsErrorKind {
-    match kind {
-        proto_common::UfsErrorKindProto::UfsErrorKindUnspecified => RpcUfsErrorKind::Backend,
-        proto_common::UfsErrorKindProto::UfsErrorKindNotFound => RpcUfsErrorKind::NotFound,
-        proto_common::UfsErrorKindProto::UfsErrorKindPermissionDenied => RpcUfsErrorKind::PermissionDenied,
-        proto_common::UfsErrorKindProto::UfsErrorKindUnsupported => RpcUfsErrorKind::Unsupported,
-        proto_common::UfsErrorKindProto::UfsErrorKindNotImplemented => RpcUfsErrorKind::NotImplemented,
-        proto_common::UfsErrorKindProto::UfsErrorKindInvalidSpec => RpcUfsErrorKind::InvalidSpec,
-        proto_common::UfsErrorKindProto::UfsErrorKindInvalidPath => RpcUfsErrorKind::InvalidPath,
-        proto_common::UfsErrorKindProto::UfsErrorKindUnexpectedEof => RpcUfsErrorKind::UnexpectedEof,
-        proto_common::UfsErrorKindProto::UfsErrorKindBackend => RpcUfsErrorKind::Backend,
-        proto_common::UfsErrorKindProto::UfsErrorKindOverloaded => RpcUfsErrorKind::Overloaded,
-        proto_common::UfsErrorKindProto::UfsErrorKindTimeout => RpcUfsErrorKind::Timeout,
-    }
-}
-
-fn ufs_kind_to_proto(kind: RpcUfsErrorKind) -> proto_common::UfsErrorKindProto {
-    match kind {
-        RpcUfsErrorKind::NotFound => proto_common::UfsErrorKindProto::UfsErrorKindNotFound,
-        RpcUfsErrorKind::PermissionDenied => proto_common::UfsErrorKindProto::UfsErrorKindPermissionDenied,
-        RpcUfsErrorKind::Unsupported => proto_common::UfsErrorKindProto::UfsErrorKindUnsupported,
-        RpcUfsErrorKind::NotImplemented => proto_common::UfsErrorKindProto::UfsErrorKindNotImplemented,
-        RpcUfsErrorKind::InvalidSpec => proto_common::UfsErrorKindProto::UfsErrorKindInvalidSpec,
-        RpcUfsErrorKind::InvalidPath => proto_common::UfsErrorKindProto::UfsErrorKindInvalidPath,
-        RpcUfsErrorKind::UnexpectedEof => proto_common::UfsErrorKindProto::UfsErrorKindUnexpectedEof,
-        RpcUfsErrorKind::Backend => proto_common::UfsErrorKindProto::UfsErrorKindBackend,
-        RpcUfsErrorKind::Overloaded => proto_common::UfsErrorKindProto::UfsErrorKindOverloaded,
-        RpcUfsErrorKind::Timeout => proto_common::UfsErrorKindProto::UfsErrorKindTimeout,
-    }
-}
-
 fn protocol_kind_proto_to_kind(kind: proto_common::ProtocolErrorKindProto) -> RpcProtocolErrorKind {
     match kind {
         proto_common::ProtocolErrorKindProto::ProtocolErrorKindUnspecified => RpcProtocolErrorKind::InvalidHeader,
@@ -1210,11 +1051,6 @@ fn error_kind_proto_to_kind(kind: Option<&proto_common::ErrorKindProto>) -> RpcE
                 .unwrap_or(proto_common::WorkerErrorKindProto::WorkerErrorKindUnspecified);
             RpcErrorKind::Worker(worker_kind_proto_to_kind(kind))
         }
-        Some(proto_common::error_kind_proto::Kind::Ufs(kind)) => {
-            let kind = proto_common::UfsErrorKindProto::try_from(*kind)
-                .unwrap_or(proto_common::UfsErrorKindProto::UfsErrorKindUnspecified);
-            RpcErrorKind::Ufs(ufs_kind_proto_to_kind(kind))
-        }
         Some(proto_common::error_kind_proto::Kind::Protocol(kind)) => {
             let kind = proto_common::ProtocolErrorKindProto::try_from(*kind)
                 .unwrap_or(proto_common::ProtocolErrorKindProto::ProtocolErrorKindUnspecified);
@@ -1236,7 +1072,6 @@ fn error_kind_to_proto(kind: RpcErrorKind) -> proto_common::ErrorKindProto {
             proto_common::error_kind_proto::Kind::Metadata(metadata_kind_to_proto(kind) as i32)
         }
         RpcErrorKind::Worker(kind) => proto_common::error_kind_proto::Kind::Worker(worker_kind_to_proto(kind) as i32),
-        RpcErrorKind::Ufs(kind) => proto_common::error_kind_proto::Kind::Ufs(ufs_kind_to_proto(kind) as i32),
         RpcErrorKind::Protocol(kind) => {
             proto_common::error_kind_proto::Kind::Protocol(protocol_kind_to_proto(kind) as i32)
         }
@@ -1260,7 +1095,6 @@ fn refresh_hint_proto_to_hint(hint: Option<&proto_common::RefreshHintProto>) -> 
             .map(|endpoint| WorkerEndpointHint {
                 worker_id: endpoint.worker_id,
                 endpoint: endpoint.endpoint.clone(),
-                worker_net_protocol: endpoint.worker_net_protocol,
             })
             .collect(),
         worker_resolve_required: hint.worker_resolve_required,
@@ -1280,7 +1114,6 @@ fn refresh_hint_to_proto(hint: &RpcRefreshHint) -> proto_common::RefreshHintProt
             .map(|endpoint| proto_common::WorkerEndpointInfoProto {
                 worker_id: endpoint.worker_id,
                 endpoint: endpoint.endpoint.clone(),
-                worker_net_protocol: endpoint.worker_net_protocol,
                 worker_run_id: String::new(),
             })
             .collect(),
@@ -1342,39 +1175,12 @@ fn recovery_action_to_proto(action: &RpcRecoveryAction) -> proto_common::Recover
     proto_common::RecoveryActionProto { action: Some(action) }
 }
 
-fn error_context_proto_to_detail(detail: Option<&proto_common::ErrorContextProto>) -> ErrorDetail {
-    ErrorDetail {
-        fields: detail
-            .into_iter()
-            .flat_map(|detail| detail.fields.iter())
-            .map(|field| ErrorDetailField {
-                key: field.key.clone(),
-                value: field.value.clone(),
-            })
-            .collect(),
-    }
-}
-
-fn error_detail_to_context(detail: &ErrorDetail) -> Option<proto_common::ErrorContextProto> {
-    (!detail.fields.is_empty()).then(|| proto_common::ErrorContextProto {
-        fields: detail
-            .fields
-            .iter()
-            .map(|field| proto_common::ErrorContextFieldProto {
-                key: field.key.clone(),
-                value: field.value.clone(),
-            })
-            .collect(),
-    })
-}
-
 /// Convert proto ErrorDetailProto into RPC error.
 pub fn rpc_error_from_proto(err_detail: &proto_common::ErrorDetailProto) -> RpcErrorDetail {
     RpcErrorDetail {
         kind: error_kind_proto_to_kind(err_detail.kind.as_ref()),
         recovery: recovery_proto_to_action(err_detail.recovery.as_ref()),
         message: err_detail.message.clone(),
-        detail: error_context_proto_to_detail(err_detail.detail.as_ref()),
     }
 }
 
@@ -1384,7 +1190,6 @@ pub fn rpc_error_to_proto(err: &RpcErrorDetail) -> proto_common::ErrorDetailProt
         kind: Some(error_kind_to_proto(err.kind)),
         recovery: Some(recovery_action_to_proto(&err.recovery)),
         message: err.message.clone(),
-        detail: error_detail_to_context(&err.detail),
     }
 }
 
@@ -1586,7 +1391,6 @@ mod tests {
                 ("uint64", "route_epoch", 6),
                 ("int64", "deadline_ms", 7),
                 ("CallerContextProto", "caller_context", 8),
-                ("int32", "retry_count", 9),
             ]
         );
         assert_eq!(
@@ -1601,14 +1405,11 @@ mod tests {
             ]
         );
         let request_header = proto_message_body(header_proto, "RequestHeaderProto");
-        assert!(!proto_message_has_reserved_statement(request_header));
         assert!(!request_header.contains(concat!("request", "_id")));
         assert!(!request_header.contains(concat!("trace", "_id")));
         assert!(!request_header.contains("traceparent"));
         assert!(!request_header.contains("tracestate"));
         assert!(!request_header.contains("baggage"));
-        let response_header = proto_message_body(header_proto, "ResponseHeaderProto");
-        assert!(!proto_message_has_reserved_statement(response_header));
 
         let data_header_proto = include_str!("../worker/data_header.proto");
         assert_eq!(
@@ -1626,7 +1427,6 @@ mod tests {
             ]
         );
         let data_request_header = proto_message_body(data_header_proto, "DataRequestHeaderProto");
-        assert!(!proto_message_has_reserved_statement(data_request_header));
         assert!(!data_request_header.contains(concat!("request", "_id")));
         assert!(!data_request_header.contains(concat!("trace", "_id")));
         assert!(!data_request_header.contains("traceparent"));
@@ -1639,8 +1439,7 @@ mod tests {
             vec![
                 ("uint64", "worker_id", 1),
                 ("string", "endpoint", 2),
-                ("WorkerNetProtocolProto", "worker_net_protocol", 3),
-                ("string", "worker_run_id", 4),
+                ("string", "worker_run_id", 3),
             ]
         );
         assert_eq!(
@@ -1670,7 +1469,6 @@ mod tests {
                 ("ErrorKindProto", "kind", 1),
                 ("RecoveryActionProto", "recovery", 2),
                 ("string", "message", 3),
-                ("ErrorContextProto", "detail", 4),
             ]
         );
         let error_detail = proto_message_body(errors_proto, "ErrorDetailProto");
@@ -1683,9 +1481,8 @@ mod tests {
                 ("FsErrnoProto", "fs", 1),
                 ("MetadataErrorKindProto", "metadata", 2),
                 ("WorkerErrorKindProto", "worker", 3),
-                ("UfsErrorKindProto", "ufs", 4),
-                ("ProtocolErrorKindProto", "protocol", 5),
-                ("InternalErrorKindProto", "internal", 6),
+                ("ProtocolErrorKindProto", "protocol", 4),
+                ("InternalErrorKindProto", "internal", 5),
             ]
         );
         assert_eq!(
@@ -1727,6 +1524,15 @@ mod tests {
         );
 
         let metadata_proto = include_str!("../metadata/filesystem.proto");
+        let write_handle = proto_message_body(metadata_proto, "WriteHandleProto");
+        assert_eq!(
+            proto_message_fields(metadata_proto, "WriteHandleProto"),
+            vec![
+                ("common.DataHandleIdProto", "data_handle_id", 1),
+                ("uint64", "write_lease_epoch", 2),
+            ]
+        );
+        assert!(!write_handle.contains("reserved"));
         assert_eq!(
             proto_message_fields(metadata_proto, "WriteTargetProto"),
             vec![
@@ -1797,10 +1603,8 @@ mod tests {
             proto_message_fields(metadata_proto, "CreateFileResponseProto"),
             vec![
                 ("common.ResponseHeaderProto", "header", 1),
-                ("common.DataHandleIdProto", "data_handle_id", 3),
-                ("common.FileLayoutProto", "layout", 7),
-                ("fs.InodeIdProto", "inode_id", 8),
-                ("uint64", "file_size", 9),
+                ("common.DataHandleIdProto", "data_handle_id", 2),
+                ("common.FileLayoutProto", "layout", 3),
             ]
         );
         assert_eq!(
@@ -1817,11 +1621,10 @@ mod tests {
             vec![
                 ("common.ResponseHeaderProto", "header", 1),
                 ("WriteHandleProto", "write_handle", 2),
-                ("uint64", "base_size", 4),
-                ("uint64", "expires_at_ms", 6),
-                ("common.FileLayoutProto", "layout", 7),
-                ("uint64", "content_revision", 8),
-                ("OpenWriteModeProto", "mode", 9),
+                ("uint64", "base_size", 3),
+                ("uint64", "expires_at_ms", 4),
+                ("common.FileLayoutProto", "layout", 5),
+                ("uint64", "content_revision", 6),
             ]
         );
         assert_eq!(
@@ -1838,11 +1641,18 @@ mod tests {
             vec![
                 ("common.RequestHeaderProto", "header", 1),
                 ("WriteHandleProto", "write_handle", 2),
-                ("CommittedBlockProto", "committed_blocks", 4),
-                ("uint64", "final_size", 5),
-                ("uint64", "expected_content_revision", 6),
-                ("OpenWriteModeProto", "write_mode", 7),
-                ("uint64", "expected_file_size", 8),
+                ("CommittedBlockProto", "committed_blocks", 3),
+                ("uint64", "final_size", 4),
+                ("uint64", "expected_content_revision", 5),
+                ("OpenWriteModeProto", "write_mode", 6),
+                ("uint64", "expected_file_size", 7),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(metadata_proto, "CommitFileResponseProto"),
+            vec![
+                ("common.ResponseHeaderProto", "header", 1),
+                ("uint64", "committed_size", 2),
             ]
         );
         assert_eq!(
@@ -1850,12 +1660,11 @@ mod tests {
             vec![
                 ("common.RequestHeaderProto", "header", 1),
                 ("WriteHandleProto", "write_handle", 2),
-                ("CommittedBlockProto", "committed_blocks", 4),
-                ("uint64", "target_size", 5),
-                ("WriteSyncModeProto", "mode", 6),
-                ("uint64", "expected_content_revision", 8),
-                ("OpenWriteModeProto", "write_mode", 9),
-                ("uint64", "expected_file_size", 10),
+                ("CommittedBlockProto", "committed_blocks", 3),
+                ("uint64", "target_size", 4),
+                ("uint64", "expected_content_revision", 5),
+                ("OpenWriteModeProto", "write_mode", 6),
+                ("uint64", "expected_file_size", 7),
             ]
         );
 
@@ -1864,62 +1673,50 @@ mod tests {
             proto_message_fields(metadata_worker_proto, "RegisterWorkerRequestProto"),
             vec![
                 ("common.RequestHeaderProto", "header", 1),
-                ("uint64", "worker_id", 3),
-                ("string", "worker_run_id", 4),
-                ("common.EndpointProto", "advertised_endpoint", 5),
-                ("common.WorkerNetProtocolProto", "worker_net_protocol", 9),
-                ("string", "group_name", 10),
+                ("uint64", "worker_id", 2),
+                ("string", "worker_run_id", 3),
+                ("common.EndpointProto", "advertised_endpoint", 4),
             ]
         );
         assert_eq!(
             proto_message_fields(metadata_worker_proto, "RegisterWorkerResponseProto"),
             vec![
                 ("common.ResponseHeaderProto", "header", 1),
-                ("uint64", "worker_id", 3),
-                ("string", "accepted_worker_run_id", 4),
-                ("string", "group_name", 5),
+                ("uint64", "worker_id", 2),
+                ("string", "accepted_worker_run_id", 3),
             ]
         );
         assert_eq!(
             proto_message_fields(metadata_worker_proto, "HeartbeatRequestProto"),
             vec![
                 ("common.RequestHeaderProto", "header", 1),
-                ("uint64", "worker_id", 3),
-                ("string", "worker_run_id", 4),
-                ("uint64", "heartbeat_seq", 5),
-                ("common.EndpointProto", "advertised_endpoint", 6),
-                ("common.WorkerNetProtocolProto", "worker_net_protocol", 7),
-                ("CapacityInfoProto", "capacity", 8),
-                ("LoadInfoProto", "load", 9),
-                ("HealthStatusProto", "health", 10),
-                ("TaskAckProto", "acks", 11),
-                ("string", "group_name", 12),
+                ("uint64", "worker_id", 2),
+                ("string", "worker_run_id", 3),
+                ("uint64", "heartbeat_seq", 4),
+                ("common.EndpointProto", "advertised_endpoint", 5),
+                ("CapacityInfoProto", "capacity", 6),
+                ("LoadInfoProto", "load", 7),
+                ("HealthStatusProto", "health", 8),
             ]
         );
         assert_eq!(
             proto_message_fields(metadata_worker_proto, "HeartbeatResponseProto"),
             vec![
                 ("common.ResponseHeaderProto", "header", 1),
-                ("WorkerCommandProto", "commands", 2),
-                ("uint64", "worker_id", 7),
-                ("string", "accepted_worker_run_id", 8),
-                ("uint32", "heartbeat_interval_ms", 9),
-                ("uint32", "liveness_timeout_ms", 10),
-                ("MetadataServerRoleProto", "server_role", 11),
-                ("common.EndpointProto", "leader_hint", 12),
-                ("string", "group_name", 13),
+                ("uint64", "worker_id", 2),
+                ("string", "accepted_worker_run_id", 3),
+                ("uint32", "liveness_timeout_ms", 4),
             ]
         );
         assert_eq!(
             proto_message_fields(metadata_worker_proto, "BlockReportRequestProto"),
             vec![
                 ("common.RequestHeaderProto", "header", 1),
-                ("uint64", "worker_id", 3),
-                ("string", "worker_run_id", 4),
-                ("uint64", "report_seq", 5),
-                ("FullBlockReportBatchProto", "full", 6),
-                ("DeltaBlockReportProto", "delta", 7),
-                ("string", "group_name", 8),
+                ("uint64", "worker_id", 2),
+                ("string", "worker_run_id", 3),
+                ("uint64", "report_seq", 4),
+                ("FullBlockReportBatchProto", "full", 5),
+                ("DeltaBlockReportProto", "delta", 6),
             ]
         );
 
@@ -1928,16 +1725,16 @@ mod tests {
             proto_message_fields(worker_data_proto, "OpenReadStreamRequestProto"),
             vec![
                 ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.BlockIdProto", "block_id", 3),
-                ("common.ByteRangeProto", "byte_range", 4),
-                ("uint64", "block_stamp", 5),
-                ("uint32", "frame_size", 6),
-                ("string", "worker_run_id", 7),
-                ("uint32", "block_format_id", 8),
-                ("uint64", "block_size", 9),
-                ("uint32", "chunk_size", 10),
-                ("uint64", "effective_len", 11),
-                ("string", "group_name", 12),
+                ("common.BlockIdProto", "block_id", 2),
+                ("common.ByteRangeProto", "byte_range", 3),
+                ("uint64", "block_stamp", 4),
+                ("uint32", "frame_size", 5),
+                ("string", "worker_run_id", 6),
+                ("uint32", "block_format_id", 7),
+                ("uint64", "block_size", 8),
+                ("uint32", "chunk_size", 9),
+                ("uint64", "effective_len", 10),
+                ("string", "group_name", 11),
             ]
         );
         assert_eq!(
@@ -1946,27 +1743,25 @@ mod tests {
                 ("worker.DataResponseHeaderProto", "header", 1),
                 ("common.StreamIdProto", "stream_id", 2),
                 ("uint32", "frame_size", 3),
-                ("uint32", "window_bytes", 4),
-                ("uint64", "block_stamp", 5),
-                ("uint64", "committed_length", 6),
+                ("uint64", "block_stamp", 4),
+                ("uint64", "committed_length", 5),
             ]
         );
         assert_eq!(
             proto_message_fields(worker_data_proto, "OpenWriteStreamRequestProto"),
             vec![
                 ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.BlockIdProto", "block_id", 3),
-                ("uint32", "block_format_id", 4),
-                ("uint64", "block_size", 5),
-                ("uint32", "chunk_size", 6),
-                ("worker.ChecksumKindProto", "checksum_kind", 7),
-                ("uint64", "block_stamp", 8),
-                ("common.FencingTokenProto", "token", 9),
-                ("uint32", "frame_size", 10),
-                ("string", "worker_run_id", 11),
-                ("uint64", "effective_len", 12),
-                ("string", "group_name", 13),
-                ("common.TierProto", "tier", 14),
+                ("common.BlockIdProto", "block_id", 2),
+                ("uint32", "block_format_id", 3),
+                ("uint64", "block_size", 4),
+                ("uint32", "chunk_size", 5),
+                ("uint64", "block_stamp", 6),
+                ("common.FencingTokenProto", "token", 7),
+                ("uint32", "frame_size", 8),
+                ("string", "worker_run_id", 9),
+                ("uint64", "effective_len", 10),
+                ("string", "group_name", 11),
+                ("common.TierProto", "tier", 12),
             ]
         );
         assert_eq!(
@@ -1975,27 +1770,26 @@ mod tests {
                 ("worker.DataResponseHeaderProto", "header", 1),
                 ("common.StreamIdProto", "stream_id", 2),
                 ("uint32", "frame_size", 3),
-                ("uint32", "window_bytes", 4),
-                ("uint64", "block_stamp", 5),
-                ("uint64", "committed_length", 6),
+                ("uint64", "block_stamp", 4),
+                ("uint64", "committed_length", 5),
             ]
         );
         assert_eq!(
             proto_message_fields(worker_data_proto, "CommitWriteRequestProto"),
             vec![
                 ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.BlockIdProto", "block_id", 3),
-                ("common.StreamIdProto", "stream_id", 4),
-                ("uint64", "effective_len", 5),
-                ("uint64", "block_stamp", 6),
-                ("common.FencingTokenProto", "token", 7),
-                ("uint64", "commit_seq", 8),
-                ("bool", "require_sync", 9),
-                ("string", "worker_run_id", 10),
-                ("uint32", "block_format_id", 11),
-                ("uint64", "block_size", 12),
-                ("uint32", "chunk_size", 13),
-                ("string", "group_name", 14),
+                ("common.BlockIdProto", "block_id", 2),
+                ("common.StreamIdProto", "stream_id", 3),
+                ("uint64", "effective_len", 4),
+                ("uint64", "block_stamp", 5),
+                ("common.FencingTokenProto", "token", 6),
+                ("uint64", "commit_seq", 7),
+                ("bool", "require_sync", 8),
+                ("string", "worker_run_id", 9),
+                ("uint32", "block_format_id", 10),
+                ("uint64", "block_size", 11),
+                ("uint32", "chunk_size", 12),
+                ("string", "group_name", 13),
             ]
         );
         assert_eq!(
@@ -2011,14 +1805,14 @@ mod tests {
             proto_message_fields(worker_data_proto, "SyncCommittedBlockRequestProto"),
             vec![
                 ("worker.DataRequestHeaderProto", "header", 1),
-                ("common.BlockIdProto", "block_id", 3),
-                ("uint64", "block_stamp", 4),
-                ("uint64", "expected_block_len", 5),
-                ("string", "worker_run_id", 6),
-                ("uint32", "block_format_id", 7),
-                ("uint64", "block_size", 8),
-                ("uint32", "chunk_size", 9),
-                ("string", "group_name", 10),
+                ("common.BlockIdProto", "block_id", 2),
+                ("uint64", "block_stamp", 3),
+                ("uint64", "expected_block_len", 4),
+                ("string", "worker_run_id", 5),
+                ("uint32", "block_format_id", 6),
+                ("uint64", "block_size", 7),
+                ("uint32", "chunk_size", 8),
+                ("string", "group_name", 9),
             ]
         );
         assert_eq!(
@@ -2047,12 +1841,11 @@ mod tests {
                 ("uint32", "format_id", 1),
                 ("uint64", "block_size", 2),
                 ("uint32", "chunk_size", 3),
-                ("ChecksumKindProto", "checksum_kind", 4),
             ]
         );
         assert_eq!(
             proto_message_fields(block_meta_proto, "BlockIdentityProto"),
-            vec![("common.BlockIdProto", "block_id", 1), ("string", "group_name", 3),]
+            vec![("common.BlockIdProto", "block_id", 1), ("string", "group_name", 2),]
         );
         assert_eq!(
             proto_message_fields(block_meta_proto, "BlockSourceProto"),
@@ -2062,6 +1855,33 @@ mod tests {
             proto_message_fields(block_meta_proto, "BlockVisibilityProto"),
             vec![("BlockStateProto", "block_state", 1), ("uint64", "block_stamp", 2)]
         );
+    }
+
+    #[test]
+    fn all_proto_message_fields_are_contiguous_and_unreserved() {
+        for (path, source) in [
+            ("common/common.proto", include_str!("../common/common.proto")),
+            ("common/errors.proto", include_str!("../common/errors.proto")),
+            ("common/header.proto", include_str!("../common/header.proto")),
+            ("fs/types.proto", include_str!("../fs/types.proto")),
+            (
+                "metadata/filesystem.proto",
+                include_str!("../metadata/filesystem.proto"),
+            ),
+            ("metadata/worker.proto", include_str!("../metadata/worker.proto")),
+            ("worker/block_meta.proto", include_str!("../worker/block_meta.proto")),
+            ("worker/data.proto", include_str!("../worker/data.proto")),
+            ("worker/data_header.proto", include_str!("../worker/data_header.proto")),
+        ] {
+            assert!(
+                !source.lines().any(|line| line.trim_start().starts_with("reserved ")),
+                "{path} still contains reserved fields"
+            );
+            for (message, tags) in proto_message_tag_sets(source) {
+                let expected = (1..=tags.len() as u32).collect::<Vec<_>>();
+                assert_eq!(tags, expected, "{path} message {message} has non-contiguous field tags");
+            }
+        }
     }
 
     #[test]
@@ -2171,7 +1991,6 @@ mod tests {
                     )),
                 }),
                 message: "route epoch mismatch".to_string(),
-                detail: None,
             }),
             state: Vec::new(),
             group_name: "root".to_string(),
@@ -2346,33 +2165,6 @@ mod tests {
     }
 
     #[test]
-    fn worker_net_protocol_parser_rejects_unspecified_and_unknown_but_accepts_known_values() {
-        let unspecified =
-            parse_known_worker_net_protocol(proto_common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified as i32)
-                .expect_err("unspecified must fail");
-        assert!(unspecified.contains("unspecified worker_net_protocol"));
-
-        let unknown = parse_known_worker_net_protocol(99).expect_err("unknown must fail");
-        assert!(unknown.contains("unknown worker_net_protocol value 99"));
-
-        assert_eq!(
-            parse_known_worker_net_protocol(proto_common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32)
-                .expect("grpc must parse"),
-            proto_common::WorkerNetProtocolProto::WorkerNetProtocolGrpc
-        );
-        assert_eq!(
-            parse_known_worker_net_protocol(proto_common::WorkerNetProtocolProto::WorkerNetProtocolQuic as i32)
-                .expect("quic must parse"),
-            proto_common::WorkerNetProtocolProto::WorkerNetProtocolQuic
-        );
-        assert_eq!(
-            parse_known_worker_net_protocol(proto_common::WorkerNetProtocolProto::WorkerNetProtocolRdma as i32)
-                .expect("rdma must parse"),
-            proto_common::WorkerNetProtocolProto::WorkerNetProtocolRdma
-        );
-    }
-
-    #[test]
     fn require_worker_run_id_preserves_field_context() {
         let parsed = require_worker_run_id(
             "550e8400-e29b-41d4-a716-446655440000",
@@ -2398,42 +2190,10 @@ mod tests {
     }
 
     #[test]
-    fn worker_net_protocol_domain_conversion_rejects_unsupported_wire_values() {
-        assert_eq!(
-            beryl_types::WorkerNetProtocol::try_from(proto_common::WorkerNetProtocolProto::WorkerNetProtocolGrpc)
-                .expect("grpc is supported"),
-            beryl_types::WorkerNetProtocol::Grpc
-        );
-        let quic =
-            beryl_types::WorkerNetProtocol::try_from(proto_common::WorkerNetProtocolProto::WorkerNetProtocolQuic)
-                .expect_err("quic wire value is not a supported runtime protocol");
-        assert!(quic.contains("QUIC worker_net_protocol is not supported"));
-        let rdma =
-            beryl_types::WorkerNetProtocol::try_from(proto_common::WorkerNetProtocolProto::WorkerNetProtocolRdma)
-                .expect_err("rdma wire value is not a supported runtime protocol");
-        assert!(rdma.contains("RDMA worker_net_protocol is not supported"));
-    }
-
-    #[test]
-    fn worker_endpoint_info_conversion_rejects_unspecified_protocol() {
-        let endpoint = proto_common::WorkerEndpointInfoProto {
-            worker_id: 7,
-            endpoint: "127.0.0.1:19101".to_string(),
-            worker_net_protocol: proto_common::WorkerNetProtocolProto::WorkerNetProtocolUnspecified as i32,
-            worker_run_id: test_worker_run_id().to_string(),
-        };
-
-        let err = beryl_types::WorkerEndpointInfo::try_from(endpoint).expect_err("unspecified protocol must fail");
-
-        assert!(err.contains("unspecified worker_net_protocol"));
-    }
-
-    #[test]
     fn shared_location_conversion_rejects_malformed_required_fields() {
         let endpoint = || proto_common::WorkerEndpointInfoProto {
             worker_id: 7,
             endpoint: "127.0.0.1:19101".to_string(),
-            worker_net_protocol: proto_common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
             worker_run_id: test_worker_run_id().to_string(),
         };
         let block_id = BlockId::from_u64_u32(42, 3);
@@ -2528,7 +2288,6 @@ mod tests {
             block_id,
             file_offset: 128,
             len: 4096,
-            checksum: Some(vec![1, 2, 3]),
         };
         let decoded_committed =
             beryl_types::CommittedBlock::try_from(proto_metadata::CommittedBlockProto::from(committed.clone()))
@@ -2586,16 +2345,6 @@ mod tests {
         &source[body_start..body_end]
     }
 
-    fn proto_message_has_reserved_statement(body: &str) -> bool {
-        body.lines().any(|raw_line| {
-            raw_line
-                .split_once("//")
-                .map_or(raw_line, |(statement, _)| statement)
-                .trim_start()
-                .starts_with("reserved")
-        })
-    }
-
     fn proto_enum_values<'a>(source: &'a str, enum_name: &str) -> Vec<(&'a str, u32)> {
         proto_enum_body(source, enum_name)
             .lines()
@@ -2623,5 +2372,40 @@ mod tests {
             .map(|offset| body_start + offset)
             .unwrap_or_else(|| panic!("unterminated proto enum {enum_name}"));
         &source[body_start..body_end]
+    }
+
+    fn proto_message_tag_sets(source: &str) -> Vec<(String, Vec<u32>)> {
+        let mut messages = Vec::new();
+        let mut current: Option<(String, Vec<u32>)> = None;
+        let mut depth = 0usize;
+
+        for raw_line in source.lines() {
+            let line = raw_line.split_once("//").map_or(raw_line, |(code, _)| code).trim();
+            if current.is_none() {
+                if let Some(name) = line.strip_prefix("message ").and_then(|decl| decl.strip_suffix(" {")) {
+                    current = Some((name.to_string(), Vec::new()));
+                    depth = 1;
+                }
+                continue;
+            }
+
+            if line.ends_with(';')
+                && let Some((_, tag)) = line.trim_end_matches(';').split_once(" = ")
+                && let Ok(tag) = tag.parse::<u32>()
+            {
+                current.as_mut().expect("message state").1.push(tag);
+            }
+
+            depth = depth
+                .saturating_add(line.chars().filter(|ch| *ch == '{').count())
+                .saturating_sub(line.chars().filter(|ch| *ch == '}').count());
+            if depth == 0 {
+                let mut message = current.take().expect("message state");
+                message.1.sort_unstable();
+                messages.push(message);
+            }
+        }
+        assert!(current.is_none(), "unterminated proto message");
+        messages
     }
 }

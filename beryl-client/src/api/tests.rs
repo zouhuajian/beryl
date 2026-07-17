@@ -23,9 +23,8 @@ use beryl_common::error::rpc::{
 };
 use beryl_proto::metadata::{
     AbortFileWriteResponseProto, CommitFileResponseProto, CreateDirectoryResponseProto, CreateFileResponseProto,
-    CreateModeProto, DeleteResponseProto, GetStatusResponseProto, ListStatusResponseProto, OpenFileResponseProto,
+    DeleteResponseProto, GetStatusResponseProto, ListStatusResponseProto, OpenFileResponseProto,
     OpenWriteResponseProto, RenameResponseProto, RenewLeaseResponseProto, SyncWriteResponseProto, WriteHandleProto,
-    WriteSyncModeProto,
 };
 use beryl_types::lease::FencingToken;
 use beryl_types::{
@@ -223,7 +222,6 @@ async fn create_returns_writer_and_maps_create_new_mode() {
     assert_eq!(writer.path(), "/created");
     let calls = gateway.calls();
     assert_eq!(methods(&calls), vec!["create_file", "open_write"]);
-    assert_eq!(calls[0].create_mode, Some(CreateModeProto::CreateNew as i32));
     assert_ne!(calls[0].call_id, calls[1].call_id);
     assert_eq!(calls[0].deadline_ms, calls[1].deadline_ms);
     assert!(calls[0].deadline_ms > 0);
@@ -842,10 +840,7 @@ async fn writer_write_crossing_block_boundary_emits_full_blocks_and_buffers_tail
 
 #[tokio::test]
 async fn writer_sync_publishes_prefix_and_keeps_writer_usable() {
-    for (sync_mode, expected_sync_flags) in [
-        (WriteSyncModeProto::WriteSyncModeVisibility, vec![false, false]),
-        (WriteSyncModeProto::WriteSyncModeDurability, vec![true, false]),
-    ] {
+    for (durable, expected_sync_flags) in [(false, vec![false, false]), (true, vec![true, false])] {
         let layout = recorded_layout_values(8, 4);
         let gateway = Arc::new(MockGateway::with_create_response_layout(Some(layout)));
         let worker = Arc::new(MockDataClient::default());
@@ -861,14 +856,10 @@ async fn writer_sync_publishes_prefix_and_keeps_writer_usable() {
         assert_eq!(add_block_lens(&gateway.calls()), Vec::<u64>::new());
         assert_eq!(worker.write_lens(), Vec::<u64>::new());
 
-        match sync_mode {
-            WriteSyncModeProto::WriteSyncModeVisibility => {
-                writer.sync_write_visibility().await.expect("visibility sync")
-            }
-            WriteSyncModeProto::WriteSyncModeDurability => {
-                writer.sync_write_durability().await.expect("durability sync")
-            }
-            WriteSyncModeProto::WriteSyncModeUnspecified => unreachable!("sync test cases use explicit modes"),
+        if durable {
+            writer.sync_write_durability().await.expect("durability sync");
+        } else {
+            writer.sync_write_visibility().await.expect("visibility sync");
         }
         writer
             .write_all(Bytes::from_static(b"!"))
@@ -881,7 +872,6 @@ async fn writer_sync_publishes_prefix_and_keeps_writer_usable() {
             .into_iter()
             .find(|call| call.method == "sync_write")
             .expect("sync_write call");
-        assert_eq!(sync_call.sync_mode, Some(sync_mode as i32));
         assert_eq!(sync_call.target_size, Some(5));
         assert_eq!(sync_call.committed_block_lens, vec![5]);
         assert_eq!(worker.commit_sync_flags(), expected_sync_flags);
@@ -903,19 +893,7 @@ async fn writer_durability_after_visibility_uses_sync_committed_block() {
     writer.sync_write_visibility().await.expect("visibility sync");
     writer.sync_write_durability().await.expect("durability sync");
 
-    let sync_modes = gateway
-        .calls()
-        .into_iter()
-        .filter(|call| call.method == "sync_write")
-        .map(|call| call.sync_mode)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        sync_modes,
-        vec![
-            Some(WriteSyncModeProto::WriteSyncModeVisibility as i32),
-            Some(WriteSyncModeProto::WriteSyncModeDurability as i32),
-        ]
-    );
+    assert_eq!(method_count(&gateway.calls(), "sync_write"), 2);
     assert_eq!(worker.commit_sync_flags(), vec![false]);
     assert_eq!(worker.block_sync_lens(), vec![5]);
 }
@@ -1286,8 +1264,6 @@ struct RecordedCall {
     final_size: Option<u64>,
     committed_block_offsets: Vec<u64>,
     committed_block_lens: Vec<u64>,
-    sync_mode: Option<i32>,
-    create_mode: Option<i32>,
     create_layout: Option<RecordedLayout>,
     add_block_desired_len: Option<u64>,
 }
@@ -1522,8 +1498,6 @@ impl MockGateway {
             final_size: None,
             committed_block_offsets: Vec::new(),
             committed_block_lens: Vec::new(),
-            sync_mode: None,
-            create_mode: None,
             create_layout: None,
             add_block_desired_len: None,
         });
@@ -1542,8 +1516,6 @@ impl MockGateway {
             final_size: None,
             committed_block_offsets: Vec::new(),
             committed_block_lens: Vec::new(),
-            sync_mode: None,
-            create_mode: Some(req.create_mode),
             create_layout: req.layout.as_ref().map(recorded_layout),
             add_block_desired_len: None,
         });
@@ -1567,8 +1539,6 @@ impl MockGateway {
             final_size: None,
             committed_block_offsets: Vec::new(),
             committed_block_lens: Vec::new(),
-            sync_mode: None,
-            create_mode: None,
             create_layout: None,
             add_block_desired_len: None,
         });
@@ -1592,8 +1562,6 @@ impl MockGateway {
             final_size: Some(req.final_size),
             committed_block_offsets: req.committed_blocks.iter().map(|block| block.file_offset).collect(),
             committed_block_lens: req.committed_blocks.iter().map(|block| block.len).collect(),
-            sync_mode: None,
-            create_mode: None,
             create_layout: None,
             add_block_desired_len: None,
         });
@@ -1616,8 +1584,6 @@ impl MockGateway {
             final_size: None,
             committed_block_offsets: req.committed_blocks.iter().map(|block| block.file_offset).collect(),
             committed_block_lens: req.committed_blocks.iter().map(|block| block.len).collect(),
-            sync_mode: Some(req.mode),
-            create_mode: None,
             create_layout: None,
             add_block_desired_len: None,
         });
@@ -1636,8 +1602,6 @@ impl MockGateway {
             final_size: None,
             committed_block_offsets: Vec::new(),
             committed_block_lens: Vec::new(),
-            sync_mode: None,
-            create_mode: None,
             create_layout: None,
             add_block_desired_len: req.desired_len,
         });
@@ -1777,8 +1741,6 @@ impl MetadataGateway for MockGateway {
         }
         Ok(CreateFileResponseProto {
             data_handle_id: Some(beryl_proto::common::DataHandleIdProto { value: 302 }),
-            inode_id: Some(beryl_proto::fs::InodeIdProto { value: 301 }),
-            file_size: 0,
             layout: response_layout.map(layout_proto),
             ..CreateFileResponseProto::default()
         })
@@ -1839,7 +1801,6 @@ impl MetadataGateway for MockGateway {
             expires_at_ms: u64::MAX / 2,
             layout: response_layout.map(layout_proto),
             content_revision: 0,
-            mode: req.mode,
             ..OpenWriteResponseProto::default()
         })
     }
@@ -1908,7 +1869,6 @@ impl MetadataGateway for MockGateway {
             .unwrap_or(req.final_size);
         Ok(CommitFileResponseProto {
             committed_size,
-            content_revision: Some(1),
             ..CommitFileResponseProto::default()
         })
     }
@@ -2291,7 +2251,7 @@ fn file_attrs_proto(size: u64) -> beryl_proto::fs::FileAttrsProto {
 fn write_handle_proto(_handle_id: u64, data_handle_id: u64) -> WriteHandleProto {
     WriteHandleProto {
         data_handle_id: Some(beryl_proto::common::DataHandleIdProto { value: data_handle_id }),
-        lease_epoch: 1,
+        write_lease_epoch: 1,
     }
 }
 

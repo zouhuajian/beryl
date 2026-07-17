@@ -10,11 +10,6 @@ package fs;
 // Purpose: FS domain canonical types for use by metadata APIs.
 // ============================================================================
 
-/// Inode identifier (64-bit).
-message InodeIdProto {
-  uint64 value = 1;
-}
-
 /// Inode kind (file, directory, symlink).
 enum InodeKindProto {
   INODE_KIND_UNSPECIFIED = 0;

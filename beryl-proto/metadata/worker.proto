@@ -13,72 +13,38 @@ import "common/header.proto";
 // ============================================================================
 
 message RegisterWorkerRequestProto {
-  reserved 2;
-  reserved "group_id";
-
   common.RequestHeaderProto header = 1;
   /// Stable logical worker identity supplied by the worker.
-  uint64 worker_id = 3;
+  uint64 worker_id = 2;
   /// UUID generated once for this worker process start; not an epoch.
-  string worker_run_id = 4;
+  string worker_run_id = 3;
   /// Routable worker data endpoint advertised to metadata and clients.
-  common.EndpointProto advertised_endpoint = 5;
-  reserved 6, 7, 8;
-  reserved "capabilities", "version", "labels";
-  /// Worker network protocol. Current runtime accepts gRPC only.
-  common.WorkerNetProtocolProto worker_net_protocol = 9;
-  /// Stable metadata group name this registration targets.
-  string group_name = 10;
+  common.EndpointProto advertised_endpoint = 4;
 }
 
 message RegisterWorkerResponseProto {
-  reserved 2;
-  reserved "group_id";
-
   common.ResponseHeaderProto header = 1;
   /// Confirmed stable worker identity.
-  uint64 worker_id = 3;
+  uint64 worker_id = 2;
   /// Accepted process-run identity for this group.
-  string accepted_worker_run_id = 4;
-  /// Stable metadata group name that accepted this registration.
-  string group_name = 5;
-}
-
-message WorkerConfigProto {
-  /// Heartbeat interval in seconds.
-  uint32 heartbeat_interval_sec = 1;
-  /// Block report interval in seconds.
-  uint32 block_report_interval_sec = 2;
-  /// Other configuration parameters.
-  map<string, string> params = 3;
+  string accepted_worker_run_id = 3;
 }
 
 message HeartbeatRequestProto {
-  reserved 2;
-  reserved "group_id";
-
   common.RequestHeaderProto header = 1;
-  uint64 worker_id = 3;
+  uint64 worker_id = 2;
   /// UUID accepted by RegisterWorker for this worker process run.
-  string worker_run_id = 4;
+  string worker_run_id = 3;
   /// Monotonic sequence number scoped to (group_name, worker_run_id).
-  uint64 heartbeat_seq = 5;
+  uint64 heartbeat_seq = 4;
   /// Current advertised data endpoint; must match the registered descriptor.
-  common.EndpointProto advertised_endpoint = 6;
-  /// Worker network protocol. Current runtime accepts gRPC only.
-  common.WorkerNetProtocolProto worker_net_protocol = 7;
+  common.EndpointProto advertised_endpoint = 5;
   /// Capacity information.
-  CapacityInfoProto capacity = 8;
+  CapacityInfoProto capacity = 6;
   /// Load information.
-  LoadInfoProto load = 9;
+  LoadInfoProto load = 7;
   /// Health status.
-  HealthStatusProto health = 10;
-  /// Heartbeat identity is group_name + worker_id + worker_run_id.
-  /// Block report and command ack protocols are separate from heartbeat.
-  /// Task acknowledgments (completed tasks).
-  repeated TaskAckProto acks = 11;
-  /// Stable metadata group name this heartbeat targets.
-  string group_name = 12;
+  HealthStatusProto health = 8;
 }
 
 message CapacityInfoProto {
@@ -102,10 +68,6 @@ message LoadInfoProto {
   uint32 active_reads = 1;
   /// Number of active write operations.
   uint32 active_writes = 2;
-  /// CPU usage percentage (0-100).
-  uint32 cpu_usage_percent = 3;
-  /// Memory usage in bytes.
-  uint64 memory_used_bytes = 4;
 }
 
 enum HealthStatusProto {
@@ -116,184 +78,13 @@ enum HealthStatusProto {
 }
 
 message HeartbeatResponseProto {
-  reserved 6;
-  reserved "group_id";
-
   common.ResponseHeaderProto header = 1;
-  /// Commands from metadata to worker. Followers must not return mutating commands.
-  repeated WorkerCommandProto commands = 2;
   /// Confirmed stable worker identity.
-  uint64 worker_id = 7;
+  uint64 worker_id = 2;
   /// Accepted live worker process-run identity.
-  string accepted_worker_run_id = 8;
-  /// Metadata-recommended heartbeat interval.
-  uint32 heartbeat_interval_ms = 9;
+  string accepted_worker_run_id = 3;
   /// Local liveness timeout used by metadata for this worker run.
-  uint32 liveness_timeout_ms = 10;
-  /// Role of the metadata node that accepted this heartbeat.
-  MetadataServerRoleProto server_role = 11;
-  /// Best-effort leader endpoint hint when this node knows one.
-  common.EndpointProto leader_hint = 12;
-  /// Stable metadata group name that accepted this heartbeat.
-  string group_name = 13;
-}
-
-enum MetadataServerRoleProto {
-  METADATA_SERVER_ROLE_UNKNOWN = 0;
-  METADATA_SERVER_ROLE_LEADER = 1;
-  METADATA_SERVER_ROLE_FOLLOWER = 2;
-}
-
-message WorkerCommandProto {
-  reserved 7, 8;
-  reserved "request_full_block_report", "block_report_backoff";
-
-  /// Task ID for acknowledgment.
-  uint64 task_id = 1;
-  oneof command {
-    EvictCommandProto evict = 2;
-    DeleteBlocksCommandProto delete_blocks = 9;  // Enhanced delete with per-block status
-    ReplicateCommandProto replicate = 3;
-    MoveCopyCommandProto move_copy = 4;
-    ThrottleCommandProto throttle = 5;
-    ConfigRefreshCommandProto config_refresh = 6;
-  }
-}
-
-message EvictCommandProto {
-  /// Block IDs to evict.
-  repeated common.BlockIdProto block_ids = 1;
-  /// Reason for eviction.
-  string reason = 2;
-  /// Delete intent ID (for idempotency and progress tracking).
-  uint64 intent_id = 3;
-  /// Operation kind: DELETE or COMPACT.
-  DeleteOpKindProto op_kind = 4;
-  /// Not before timestamp (milliseconds since epoch, optional grace window).
-  uint64 not_before_ms = 5;
-  /// Expected metadata epoch (for consistency check, optional).
-  uint64 expected_epoch = 6;
-}
-
-/// Delete operation kind.
-enum DeleteOpKindProto {
-  DELETE_OP_KIND_UNSPECIFIED = 0;
-  DELETE_OP_KIND_DELETE = 1;      // Delete block (tombstone or remove)
-  DELETE_OP_KIND_COMPACT = 2;     // Compact/merge block (future use)
-  DELETE_OP_KIND_REPLICA_EVICT = 3; // Evict replica (delete only local copy, keep other replicas)
-}
-
-/// DeleteBlocks command: Enhanced delete with per-block status reporting.
-message DeleteBlocksCommandProto {
-  /// Delete intent ID (for idempotency and progress tracking).
-  uint64 intent_id = 1;
-  /// Operation kind: DELETE or COMPACT.
-  DeleteOpKindProto op_kind = 2;
-  /// Blocks to delete with per-block metadata.
-  repeated DeleteBlockRequestProto blocks = 3;
-  /// Not before timestamp (milliseconds since epoch, optional grace window).
-  uint64 not_before_ms = 4;
-  /// Expected metadata epoch (for consistency check, optional).
-  uint64 expected_epoch = 5;
-}
-
-/// Per-block delete request.
-message DeleteBlockRequestProto {
-  /// Block ID to delete.
-  common.BlockIdProto block_id = 1;
-  /// Optional: expected state (for conflict detection).
-  string expected_state = 2;
-}
-
-/// Per-block delete result (in TaskAck or DeleteBlocksResponse).
-message DeleteBlockResultProto {
-  /// Block ID.
-  common.BlockIdProto block_id = 1;
-  /// Delete status.
-  DeleteBlockStatusProto status = 2;
-  /// Task-local failure class for retry/backoff decisions.
-  TaskFailureClassProto error_class = 3;
-  /// Retry after milliseconds (if retryable).
-  uint32 retry_after_ms = 4;
-  /// Optional error message.
-  string message = 5;
-}
-
-/// Delete block status.
-enum DeleteBlockStatusProto {
-  DELETE_BLOCK_STATUS_UNSPECIFIED = 0;
-  DELETE_BLOCK_STATUS_DELETED = 1;        // Block deleted (tombstoned or removed)
-  DELETE_BLOCK_STATUS_TOMBSTONED = 2;     // Block marked as tombstone (soft delete)
-  DELETE_BLOCK_STATUS_NOT_FOUND = 3;       // Block not found (idempotent success)
-  DELETE_BLOCK_STATUS_IN_PROGRESS = 4;    // Delete in progress (metadata should retry/poll)
-  DELETE_BLOCK_STATUS_BUSY = 5;            // Block busy (write/repair in-flight, RETRYABLE)
-  DELETE_BLOCK_STATUS_CONFLICT = 6;        // State conflict (e.g., expected_state mismatch, RETRYABLE)
-  DELETE_BLOCK_STATUS_FAILED_FATAL = 7;    // Permanent failure (should not retry)
-}
-
-message ReplicateCommandProto {
-  /// Block ID to replicate.
-  common.BlockIdProto block_id = 1;
-  /// Target worker IDs for replication.
-  repeated uint64 target_worker_ids = 2;
-}
-
-message MoveCopyCommandProto {
-  /// Block ID to move.
-  common.BlockIdProto block_id = 1;
-  /// Source worker ID (from where to copy).
-  uint64 from_worker_id = 2;
-  /// Target worker ID (to where to copy).
-  uint64 to_worker_id = 3;
-}
-
-message ThrottleCommandProto {
-  /// Throttle read operations (0 = no limit, >0 = max concurrent).
-  uint32 max_reads = 1;
-  /// Throttle write operations (0 = no limit, >0 = max concurrent).
-  uint32 max_writes = 2;
-}
-
-message ConfigRefreshCommandProto {
-  /// Updated configuration.
-  WorkerConfigProto config = 1;
-}
-
-/// Task acknowledgment.
-message TaskAckProto {
-  /// Task ID being acknowledged.
-  uint64 task_id = 1;
-  /// Acknowledgment status.
-  TaskAckStatusProto status = 2;
-  /// Optional error message (for failures).
-  string error_message = 3;
-  /// Task-local failure class for adaptive backoff.
-  TaskFailureClassProto error_class = 4;
-  /// Optional error code (for detailed classification).
-  string error_code = 5;
-  /// For MoveCopy: whether verification passed.
-  bool verify_ok = 6;
-  /// For DeleteBlocks: per-block results.
-  repeated DeleteBlockResultProto block_results = 7;
-  /// Delete intent ID (for DeleteBlocks command).
-  uint64 intent_id = 8;
-}
-
-/// Task acknowledgment status.
-enum TaskAckStatusProto {
-  TASK_ACK_STATUS_UNSPECIFIED = 0;
-  TASK_ACK_STATUS_SUCCESS = 1;
-  TASK_ACK_STATUS_FAILED = 2;
-  TASK_ACK_STATUS_RETRYABLE_FAILED = 3;
-}
-
-/// Task-local failure class for adaptive backoff and retry strategy.
-enum TaskFailureClassProto {
-  TASK_FAILURE_CLASS_UNSPECIFIED = 0;
-  TASK_FAILURE_CLASS_OK = 1;
-  TASK_FAILURE_CLASS_RETRYABLE = 2;  // Transient error, should retry with backoff
-  TASK_FAILURE_CLASS_FATAL = 3;       // Permanent error, should not retry
-  TASK_FAILURE_CLASS_NEED_REFRESH = 4; // Need to refresh task source state before retry
+  uint32 liveness_timeout_ms = 4;
 }
 
 // ============================================================================
@@ -311,15 +102,9 @@ enum BlockReportBlockStateProto {
 
 /// Block-level location entry. Chunk bitmaps and range routing are out of scope.
 message BlockReportBlockProto {
-  reserved 3;
-
   common.BlockIdProto block_id = 1;
-  uint64 data_handle_id = 2;
-  uint32 block_index = 4;
-  uint64 block_stamp = 5;
-  uint64 effective_len = 6;
-  uint64 committed_length = 7;
-  BlockReportBlockStateProto block_state = 8;
+  uint64 block_stamp = 2;
+  BlockReportBlockStateProto block_state = 3;
 }
 
 /// Delta operation type for the current published full-report baseline.
@@ -349,22 +134,17 @@ message DeltaBlockReportProto {
 }
 
 message BlockReportRequestProto {
-  reserved 2;
-  reserved "group_id";
-
   common.RequestHeaderProto header = 1;
   /// Stable logical worker identity.
-  uint64 worker_id = 3;
+  uint64 worker_id = 2;
   /// Current live worker process-run identity.
-  string worker_run_id = 4;
+  string worker_run_id = 3;
   /// Monotonic within one worker run and one group.
-  uint64 report_seq = 5;
+  uint64 report_seq = 4;
   oneof report {
-    FullBlockReportBatchProto full = 6;
-    DeltaBlockReportProto delta = 7;
+    FullBlockReportBatchProto full = 5;
+    DeltaBlockReportProto delta = 6;
   }
-  /// Stable metadata group name this block report targets.
-  string group_name = 8;
 }
 
 message BlockReportResponseProto {
@@ -373,8 +153,6 @@ message BlockReportResponseProto {
   uint64 report_seq = 2;
   /// Next delta sequence expected by metadata for the current published baseline.
   uint64 next_delta_seq = 3;
-  /// Optional retry hint for throttled full-report submission.
-  uint32 retry_after_ms = 4;
 }
 
 // ============================================================================

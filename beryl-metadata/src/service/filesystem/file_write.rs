@@ -31,7 +31,6 @@ pub(crate) struct CreatedFileOutput {
     pub(crate) inode_id: InodeId,
     pub(crate) data_handle_id: DataHandleId,
     pub(crate) layout: FileLayout,
-    pub(crate) file_size: u64,
 }
 
 impl MetadataFileSystem {
@@ -227,14 +226,13 @@ impl MetadataFileSystem {
         };
 
         match result {
-            FsCommandResult::Ok(ok) => match (ok.inode_id, ok.data_handle_id, ok.attrs, ok.layout) {
-                (Some(inode_id), Some(data_handle_id), Some(attrs), Some(layout)) => self.success(
+            FsCommandResult::Ok(ok) => match (ok.inode_id, ok.data_handle_id, ok.layout) {
+                (Some(inode_id), Some(data_handle_id), Some(layout)) => self.success(
                     request_ctx,
                     CreatedFileOutput {
                         inode_id,
                         data_handle_id,
                         layout,
-                        file_size: attrs.size,
                     },
                     Some(ctx.namespace_owner_group_name.clone()),
                     Some(ctx.mount_epoch),

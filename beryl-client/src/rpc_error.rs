@@ -21,8 +21,6 @@ pub struct EndpointHint {
     pub worker_id: u64,
     /// Endpoint address.
     pub endpoint: String,
-    /// Worker network protocol as proto enum raw value.
-    pub worker_net_protocol: i32,
 }
 
 impl From<beryl_proto::common::WorkerEndpointInfoProto> for EndpointHint {
@@ -30,7 +28,6 @@ impl From<beryl_proto::common::WorkerEndpointInfoProto> for EndpointHint {
         Self {
             worker_id: value.worker_id,
             endpoint: value.endpoint,
-            worker_net_protocol: value.worker_net_protocol,
         }
     }
 }
@@ -40,7 +37,6 @@ impl From<beryl_common::error::rpc::WorkerEndpointHint> for EndpointHint {
         Self {
             worker_id: value.worker_id,
             endpoint: value.endpoint,
-            worker_net_protocol: value.worker_net_protocol,
         }
     }
 }
@@ -313,12 +309,10 @@ mod tests {
                     WorkerEndpointHint {
                         worker_id: 5,
                         endpoint: "127.0.0.1:9005".to_string(),
-                        worker_net_protocol: beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
                     },
                     WorkerEndpointHint {
                         worker_id: 6,
                         endpoint: "127.0.0.1:9006".to_string(),
-                        worker_net_protocol: beryl_proto::common::WorkerNetProtocolProto::WorkerNetProtocolGrpc as i32,
                     },
                 ],
                 worker_resolve_required: true,

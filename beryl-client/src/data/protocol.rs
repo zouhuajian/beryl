@@ -86,7 +86,6 @@ pub(super) fn build_open_write_stream_request(
         block_size: target.target.block_size,
         block_stamp: target.target.block_stamp,
         chunk_size: target.target.chunk_size,
-        checksum_kind: beryl_proto::worker::ChecksumKindProto::ChecksumKindNone as i32,
         token: Some(target.target.fencing_token.into()),
         frame_size: default_frame_size(target.target.effective_len.min(u64::from(u32::MAX)) as u32),
         block_format_id: target.target.block_format_id.as_raw(),
@@ -156,7 +155,6 @@ pub(super) fn build_write_stream_requests(
             seq,
             offset_in_block: offset as u64,
             data: data.slice(offset..end),
-            checksum32: 0,
         });
         offset = end;
     }
@@ -1081,7 +1079,6 @@ mod tests {
         beryl_proto::worker::ReadStreamResponseProto {
             offset_in_block,
             data: Bytes::from_static(data),
-            checksum32: 0,
             eos,
         }
     }

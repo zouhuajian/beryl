@@ -113,7 +113,7 @@ impl MetadataFileSystemServiceImpl {
     fn write_handle(data_handle_id: DataHandleId, lease_epoch: u64) -> WriteHandleProto {
         WriteHandleProto {
             data_handle_id: Some(Self::data_handle_proto(data_handle_id)),
-            lease_epoch,
+            write_lease_epoch: lease_epoch,
         }
     }
 
@@ -136,9 +136,12 @@ impl MetadataFileSystemServiceImpl {
         if data_handle_id.value == 0 {
             return Err(invalid("write_handle.data_handle_id must be non-zero"));
         }
+        if handle.write_lease_epoch == 0 {
+            return Err(invalid("write_handle.write_lease_epoch must be non-zero"));
+        }
         Ok(PresentedWriteHandle {
             data_handle_id: DataHandleId::new(data_handle_id.value),
-            lease_epoch: handle.lease_epoch,
+            lease_epoch: handle.write_lease_epoch,
         })
     }
 
@@ -438,10 +441,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
     ) -> Result<Response<CreateFileResponseProto>, Status> {
         let req = request.into_inner();
         let req_ctx = request_context_or_error!(req, CreateFileResponseProto);
-        let mode = match CreateModeProto::try_from(req.create_mode) {
-            Ok(CreateModeProto::CreateNew) => Ok(()),
-            _ => Err(MetadataError::InvalidArgument("create mode is required".to_string())),
-        };
 
         match self
             .filesystem
@@ -451,7 +450,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     path: req.path,
                     parsed_attrs: file_attrs_from_proto(req.attrs),
                     parsed_layout: file_layout_from_proto(req.layout),
-                    parsed_mode: mode,
+                    parsed_mode: Ok(()),
                     freshness: Self::freshness_from_header(&req.header),
                 },
             )
@@ -463,10 +462,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 response_with_header!(
                     CreateFileResponseProto {
                         data_handle_id: Some(Self::data_handle_proto(payload.data_handle_id)),
-                        inode_id: Some(beryl_proto::fs::InodeIdProto {
-                            value: payload.inode_id.as_raw()
-                        }),
-                        file_size: payload.file_size,
                         layout: Some((&payload.layout).into()),
                         ..Default::default()
                     },
@@ -520,10 +515,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         expires_at_ms: payload.expires_at_ms,
                         layout: Some((&payload.layout).into()),
                         content_revision: payload.content_revision,
-                        mode: match payload.mode {
-                            crate::inode_lease::WriteMode::Write => OpenWriteModeProto::OpenWriteModeWrite as i32,
-                            crate::inode_lease::WriteMode::Append => OpenWriteModeProto::OpenWriteModeAppend as i32,
-                        },
                         ..Default::default()
                     },
                     header
@@ -635,7 +626,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             Ok(success) => response_with_header!(
                 CommitFileResponseProto {
                     committed_size: success.payload.committed_size,
-                    content_revision: success.payload.content_revision,
                     ..Default::default()
                 },
                 ok_header_from_fs_success(&req_ctx, &success)
@@ -721,18 +711,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
             Ok(handle) => handle,
             Err(header) => return response_with_header!(SyncWriteResponseProto::default(), *header),
         };
-        match WriteSyncModeProto::try_from(req.mode) {
-            Ok(WriteSyncModeProto::WriteSyncModeVisibility | WriteSyncModeProto::WriteSyncModeDurability) => {}
-            Ok(WriteSyncModeProto::WriteSyncModeUnspecified) | Err(_) => {
-                return error_response!(
-                    SyncWriteResponseProto,
-                    Self::header_from_conversion_error(
-                        &req.header,
-                        MetadataError::InvalidArgument("SyncWrite mode must be visibility or durability".to_string()),
-                    )
-                )
-            }
-        };
         let publish_mode = match OpenWriteModeProto::try_from(req.write_mode) {
             Ok(OpenWriteModeProto::OpenWriteModeWrite) => crate::raft::PublishMode::ReplaceIfUnchanged,
             Ok(OpenWriteModeProto::OpenWriteModeAppend) => crate::raft::PublishMode::AppendIfUnchanged,
@@ -807,9 +785,9 @@ mod tests {
     use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
     use beryl_proto::metadata::{
         get_block_locations_request_proto, AddBlockRequestProto, CommitFileRequestProto, CommittedBlockProto,
-        CreateDirectoryRequestProto, CreateFileRequestProto, CreateModeProto, DeleteRequestProto,
-        GetBlockLocationsRequestProto, GetStatusRequestProto, ListStatusRequestProto, OpenWriteModeProto,
-        OpenWriteRequestProto, RenameRequestProto, SyncWriteRequestProto, WriteHandleProto, WriteSyncModeProto,
+        CreateDirectoryRequestProto, CreateFileRequestProto, DeleteRequestProto, GetBlockLocationsRequestProto,
+        GetStatusRequestProto, ListStatusRequestProto, OpenWriteModeProto, OpenWriteRequestProto, RenameRequestProto,
+        SyncWriteRequestProto, WriteHandleProto,
     };
     use beryl_types::fs::{Extent, FileAttrs, FsErrorCode, Inode, InodeId};
     use beryl_types::ids::{BlockId, BlockIndex, DataHandleId, WorkerId};
@@ -1187,7 +1165,7 @@ mod tests {
         manager
     }
 
-    fn publish_reported_location(env: &PathTestEnv, block_id: BlockId, block_stamp: u64, effective_len: u64) {
+    fn publish_reported_location(env: &PathTestEnv, block_id: BlockId, block_stamp: u64, _effective_len: u64) {
         let worker_manager = env.worker_manager.as_ref().expect("worker manager");
         let worker_id = WorkerId::new(1);
         let worker_run_id = worker_manager
@@ -1204,11 +1182,7 @@ mod tests {
                 true,
                 vec![BlockReportBlock {
                     block_id,
-                    data_handle_id: block_id.data_handle_id.as_raw(),
-                    block_index: block_id.index.as_raw(),
                     block_stamp,
-                    effective_len,
-                    committed_length: effective_len,
                     block_state: BlockReportBlockState::Ready,
                 }],
             )
@@ -1237,7 +1211,6 @@ mod tests {
                     replication: 1,
                     block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
                 }),
-                create_mode: CreateModeProto::CreateNew as i32,
             }),
         )
         .await
@@ -1259,7 +1232,7 @@ mod tests {
         .into_inner();
         assert_success_header(open.header);
         let expected_content_revision = open.content_revision;
-        let write_mode = open.mode;
+        let write_mode = OpenWriteModeProto::OpenWriteModeWrite as i32;
         let write_handle = open.write_handle.expect("write handle");
         let target = FileSystemServiceProto::add_block(
             &env.service,
@@ -1279,7 +1252,6 @@ mod tests {
             block_id: target.block_id,
             file_offset: target.file_offset,
             len: target.effective_len,
-            checksum: None,
         };
 
         (write_handle, committed, expected_content_revision, write_mode)
@@ -1762,37 +1734,16 @@ mod tests {
         let (write_handle, committed, expected_content_revision, write_mode) =
             open_write_session_with_committed_block(&env, "/mnt/test/sync-validation", 40).await;
 
-        let unspecified = FileSystemServiceProto::sync_write(
-            &env.service,
-            Request::new(SyncWriteRequestProto {
-                header: header(40),
-                write_handle: Some(write_handle),
-                committed_blocks: vec![committed.clone()],
-                target_size: 128,
-                mode: WriteSyncModeProto::WriteSyncModeUnspecified as i32,
-                expected_content_revision,
-                write_mode,
-                expected_file_size: 0,
-            }),
-        )
-        .await
-        .expect("transport status must remain OK")
-        .into_inner();
-        let err = header_error(unspecified.header);
-        assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
-        assert!(err.message.contains("SyncWrite mode"));
-
         let missing_data_handle = FileSystemServiceProto::sync_write(
             &env.service,
             Request::new(SyncWriteRequestProto {
                 header: header(40),
                 write_handle: Some(WriteHandleProto {
                     data_handle_id: None,
-                    lease_epoch: write_handle.lease_epoch,
+                    write_lease_epoch: write_handle.write_lease_epoch,
                 }),
-                committed_blocks: vec![committed.clone()],
+                committed_blocks: vec![committed],
                 target_size: 128,
-                mode: WriteSyncModeProto::WriteSyncModeVisibility as i32,
                 expected_content_revision,
                 write_mode,
                 expected_file_size: 0,
@@ -1814,7 +1765,6 @@ mod tests {
                 write_handle: Some(write_handle),
                 committed_blocks: vec![mismatched],
                 target_size: 128,
-                mode: WriteSyncModeProto::WriteSyncModeVisibility as i32,
                 expected_content_revision,
                 write_mode,
                 expected_file_size: 0,
@@ -1829,6 +1779,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_epoch_write_handle_cannot_resolve_an_unopened_empty_file() {
+        let env = build_env_with_raft("/mnt/test", DataIoPolicy::Allow).await;
+        let client_id = 41;
+        let create = FileSystemServiceProto::create_file(
+            &env.service,
+            Request::new(CreateFileRequestProto {
+                header: header(client_id),
+                path: "/mnt/test/unopened-empty".to_string(),
+                attrs: Some(beryl_proto::fs::FileAttrsProto {
+                    mode: 0o644,
+                    uid: 1000,
+                    gid: 1000,
+                    ..Default::default()
+                }),
+                layout: Some(beryl_proto::common::FileLayoutProto {
+                    block_size: 4096,
+                    chunk_size: 4096,
+                    replication: 1,
+                    block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
+                }),
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        assert_success_header(create.header);
+        let zero_epoch_handle = WriteHandleProto {
+            data_handle_id: create.data_handle_id,
+            write_lease_epoch: 0,
+        };
+
+        let sync = FileSystemServiceProto::sync_write(
+            &env.service,
+            Request::new(SyncWriteRequestProto {
+                header: header(client_id),
+                write_handle: Some(zero_epoch_handle),
+                committed_blocks: Vec::new(),
+                target_size: 0,
+                expected_content_revision: 0,
+                write_mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
+                expected_file_size: 0,
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        let sync_error = header_error(sync.header);
+        assert_fs_errno(&sync_error, FsErrnoProto::FsErrnoEinval);
+        assert!(sync_error.message.contains("write_lease_epoch"));
+
+        let commit = FileSystemServiceProto::commit_file(
+            &env.service,
+            Request::new(CommitFileRequestProto {
+                header: header(client_id),
+                write_handle: Some(zero_epoch_handle),
+                committed_blocks: Vec::new(),
+                final_size: 0,
+                expected_content_revision: 0,
+                write_mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
+                expected_file_size: 0,
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        let commit_error = header_error(commit.header);
+        assert_fs_errno(&commit_error, FsErrnoProto::FsErrnoEinval);
+        assert!(commit_error.message.contains("write_lease_epoch"));
+    }
+
+    #[tokio::test]
     async fn sync_write_valid_request_publishes_prefix_and_keeps_session_open() {
         let env = build_env_with_raft_and_workers(
             "/mnt/test",
@@ -1836,37 +1857,28 @@ mod tests {
             Some(worker_manager_for_write_targets()),
         )
         .await;
-        let (write_handle, committed, mut expected_content_revision, write_mode) =
+        let (write_handle, committed, expected_content_revision, write_mode) =
             open_write_session_with_committed_block(&env, "/mnt/test/sync-publish", 50).await;
-        let mut expected_file_size = 0;
-
-        for mode in [
-            WriteSyncModeProto::WriteSyncModeVisibility,
-            WriteSyncModeProto::WriteSyncModeDurability,
-        ] {
-            let response = FileSystemServiceProto::sync_write(
-                &env.service,
-                Request::new(SyncWriteRequestProto {
-                    header: header(50),
-                    write_handle: Some(write_handle),
-                    committed_blocks: vec![committed.clone()],
-                    target_size: 128,
-                    mode: mode as i32,
-                    expected_content_revision,
-                    write_mode,
-                    expected_file_size,
-                }),
-            )
-            .await
-            .expect("transport status must remain OK")
-            .into_inner();
-            assert_success_header(response.header);
-            assert_eq!(response.synced_size, 128);
-            expected_content_revision = response.content_revision.expect("content revision");
-            expected_file_size = response.synced_size;
-            let data_handle_id = DataHandleId::new(write_handle.data_handle_id.as_ref().expect("data handle").value);
-            assert!(env.session_registry.get_session(data_handle_id).is_some());
-        }
+        let response = FileSystemServiceProto::sync_write(
+            &env.service,
+            Request::new(SyncWriteRequestProto {
+                header: header(50),
+                write_handle: Some(write_handle),
+                committed_blocks: vec![committed],
+                target_size: 128,
+                expected_content_revision,
+                write_mode,
+                expected_file_size: 0,
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        assert_success_header(response.header);
+        assert_eq!(response.synced_size, 128);
+        assert!(response.content_revision.is_some());
+        let data_handle_id = DataHandleId::new(write_handle.data_handle_id.as_ref().expect("data handle").value);
+        assert!(env.session_registry.get_session(data_handle_id).is_some());
     }
 
     #[tokio::test]
@@ -1884,7 +1896,6 @@ mod tests {
             write_handle: Some(write_handle),
             committed_blocks: vec![committed],
             target_size: 128,
-            mode: WriteSyncModeProto::WriteSyncModeVisibility as i32,
             expected_content_revision,
             write_mode,
             expected_file_size: 0,
@@ -1898,7 +1909,7 @@ mod tests {
         let first_content_revision = first.content_revision.expect("content revision");
         let data_handle_id = DataHandleId::new(write_handle.data_handle_id.as_ref().expect("data handle").value);
         env.session_registry
-            .remove_session_if_epoch(data_handle_id, write_handle.lease_epoch)
+            .remove_session_if_epoch(data_handle_id, write_handle.write_lease_epoch)
             .expect("remove session to model cleanup or restart");
 
         let replay = FileSystemServiceProto::sync_write(&env.service, Request::new(request.clone()))
@@ -1918,6 +1929,84 @@ mod tests {
         let err = header_error(changed.header);
         assert_fs_errno(&err, FsErrnoProto::FsErrnoEinval);
         assert!(err.message.contains("completed publish payload"));
+    }
+
+    #[tokio::test]
+    async fn completed_publish_recovery_cannot_bypass_active_session_owner() {
+        let env = build_env_with_raft_and_workers(
+            "/mnt/test",
+            DataIoPolicy::Allow,
+            Some(worker_manager_for_write_targets()),
+        )
+        .await;
+        let owner_client_id = 53;
+        let foreign_client_id = 54;
+        let (write_handle, committed, expected_content_revision, write_mode) =
+            open_write_session_with_committed_block(&env, "/mnt/test/owned-completed-publish", owner_client_id).await;
+        let owner_sync = SyncWriteRequestProto {
+            header: header(owner_client_id),
+            write_handle: Some(write_handle),
+            committed_blocks: vec![committed],
+            target_size: 128,
+            expected_content_revision,
+            write_mode,
+            expected_file_size: 0,
+        };
+        let first = FileSystemServiceProto::sync_write(&env.service, Request::new(owner_sync.clone()))
+            .await
+            .expect("transport status must remain OK")
+            .into_inner();
+        assert_success_header(first.header);
+        let data_handle_id = DataHandleId::new(write_handle.data_handle_id.as_ref().expect("data handle").value);
+
+        let mut foreign_sync = owner_sync;
+        foreign_sync.header = header(foreign_client_id);
+        let rejected_sync = FileSystemServiceProto::sync_write(&env.service, Request::new(foreign_sync))
+            .await
+            .expect("transport status must remain OK")
+            .into_inner();
+        assert_eq!(
+            rpc_error(&header_error(rejected_sync.header)).kind,
+            ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)
+        );
+        assert!(env.session_registry.get_session(data_handle_id).is_some());
+
+        let foreign_commit = CommitFileRequestProto {
+            header: header(foreign_client_id),
+            write_handle: Some(write_handle),
+            committed_blocks: vec![committed],
+            final_size: 128,
+            expected_content_revision,
+            write_mode,
+            expected_file_size: 0,
+        };
+        let rejected_commit = FileSystemServiceProto::commit_file(&env.service, Request::new(foreign_commit))
+            .await
+            .expect("transport status must remain OK")
+            .into_inner();
+        assert_eq!(
+            rpc_error(&header_error(rejected_commit.header)).kind,
+            ErrorKind::Metadata(MetadataErrorKind::SessionInvalid)
+        );
+        assert!(env.session_registry.get_session(data_handle_id).is_some());
+
+        let owner_commit = FileSystemServiceProto::commit_file(
+            &env.service,
+            Request::new(CommitFileRequestProto {
+                header: header(owner_client_id),
+                write_handle: Some(write_handle),
+                committed_blocks: vec![committed],
+                final_size: 128,
+                expected_content_revision,
+                write_mode,
+                expected_file_size: 0,
+            }),
+        )
+        .await
+        .expect("transport status must remain OK")
+        .into_inner();
+        assert_success_header(owner_commit.header);
+        assert!(env.session_registry.get_session(data_handle_id).is_none());
     }
 
     #[tokio::test]
@@ -1947,7 +2036,6 @@ mod tests {
                     replication: 1,
                     block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
                 }),
-                create_mode: CreateModeProto::CreateNew as i32,
             }),
         )
         .await
@@ -2002,13 +2090,11 @@ mod tests {
             block_id: first_target.block_id,
             file_offset: first_target.file_offset,
             len: first_target.effective_len,
-            checksum: None,
         };
         let second = CommittedBlockProto {
             block_id: second_target.block_id,
             file_offset: second_target.file_offset,
             len: second_target.effective_len,
-            checksum: None,
         };
 
         let published = FileSystemServiceProto::commit_file(
@@ -2016,10 +2102,10 @@ mod tests {
             Request::new(CommitFileRequestProto {
                 header: header(client_id),
                 write_handle: Some(write_handle),
-                committed_blocks: vec![first, second.clone()],
+                committed_blocks: vec![first, second],
                 final_size: 256,
                 expected_content_revision: open.content_revision,
-                write_mode: open.mode,
+                write_mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
                 expected_file_size: 0,
             }),
         )
@@ -2033,7 +2119,7 @@ mod tests {
             Request::new(CommitFileRequestProto {
                 header: header(client_id),
                 write_handle: Some(write_handle),
-                committed_blocks: vec![second.clone()],
+                committed_blocks: vec![second],
                 final_size: 256,
                 expected_content_revision: open.content_revision,
                 write_mode: OpenWriteModeProto::OpenWriteModeAppend as i32,
@@ -2044,7 +2130,7 @@ mod tests {
         .expect("transport status must remain OK")
         .into_inner();
         assert_success_header(equivalent.header);
-        assert_eq!(equivalent.content_revision, published.content_revision);
+        assert_eq!(equivalent.committed_size, published.committed_size);
 
         let non_equivalent = FileSystemServiceProto::commit_file(
             &env.service,
@@ -2206,7 +2292,6 @@ mod tests {
                     replication: 1,
                     block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
                 }),
-                create_mode: CreateModeProto::CreateNew as i32,
             }),
         )
         .await
@@ -2243,7 +2328,6 @@ mod tests {
                     replication: 1,
                     block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
                 }),
-                create_mode: CreateModeProto::CreateNew as i32,
             }),
         )
         .await
@@ -2266,7 +2350,7 @@ mod tests {
         .into_inner();
         assert_success_header(open.header);
         let expected_content_revision = open.content_revision;
-        let write_mode = open.mode;
+        let write_mode = OpenWriteModeProto::OpenWriteModeWrite as i32;
         let write_handle = open.write_handle.expect("write handle");
         let file_inode_id = env
             .storage
@@ -2296,7 +2380,6 @@ mod tests {
             block_id: Some(block_id),
             file_offset: target.file_offset,
             len: target.effective_len,
-            checksum: None,
         }];
 
         let commit_header = header(30);
@@ -2317,7 +2400,19 @@ mod tests {
         .into_inner();
         assert_success_header(first.header);
         assert_eq!(first.committed_size, 128);
-        let first_content_revision = first.content_revision.expect("first file version");
+        let first_content_revision = match env
+            .storage
+            .get_inode(file_inode_id)
+            .unwrap()
+            .expect("committed inode")
+            .data
+        {
+            beryl_types::fs::InodeData::File {
+                content_revision: Some(content_revision),
+                ..
+            } => content_revision,
+            other => panic!("expected committed file inode data, got {:?}", other),
+        };
         assert_ne!(first_content_revision, 0);
         assert!(env.session_registry.get_session(session_data_handle).is_none());
         let typed_block_id = BlockId::new(
@@ -2361,7 +2456,6 @@ mod tests {
         .into_inner();
         assert_success_header(second.header);
         assert_eq!(second.committed_size, first.committed_size);
-        assert_eq!(second.content_revision, Some(first_content_revision));
 
         let inode = env.storage.get_inode(file_inode_id).unwrap().expect("committed inode");
         assert_eq!(inode.attrs.size, 128);
@@ -2537,7 +2631,6 @@ mod tests {
                     replication: 1,
                     block_format_id: beryl_types::BlockFormatId::CURRENT_FOR_NEW_FILE.as_raw(),
                 }),
-                create_mode: CreateModeProto::CreateNew as i32,
             }),
         )
         .await

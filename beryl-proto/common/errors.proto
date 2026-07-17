@@ -10,13 +10,12 @@ import "common/common.proto";
 // RPC error model.
 //
 // ErrorKindProto records the failure fact. RecoveryActionProto records the
-// caller action. ErrorContextProto is diagnostic only.
+// caller action.
 
 message ErrorDetailProto {
   ErrorKindProto kind = 1;
   RecoveryActionProto recovery = 2;
   string message = 3;
-  ErrorContextProto detail = 4;
 }
 
 message ErrorKindProto {
@@ -24,9 +23,8 @@ message ErrorKindProto {
     FsErrnoProto fs = 1;
     MetadataErrorKindProto metadata = 2;
     WorkerErrorKindProto worker = 3;
-    UfsErrorKindProto ufs = 4;
-    ProtocolErrorKindProto protocol = 5;
-    InternalErrorKindProto internal = 6;
+    ProtocolErrorKindProto protocol = 4;
+    InternalErrorKindProto internal = 5;
   }
 }
 
@@ -69,20 +67,6 @@ enum WorkerErrorKindProto {
   WORKER_ERROR_KIND_FENCING = 12;
   WORKER_ERROR_KIND_CANCELLED = 13;
   WORKER_ERROR_KIND_IO = 14;
-}
-
-enum UfsErrorKindProto {
-  UFS_ERROR_KIND_UNSPECIFIED = 0;
-  UFS_ERROR_KIND_NOT_FOUND = 1;
-  UFS_ERROR_KIND_PERMISSION_DENIED = 2;
-  UFS_ERROR_KIND_UNSUPPORTED = 3;
-  UFS_ERROR_KIND_NOT_IMPLEMENTED = 4;
-  UFS_ERROR_KIND_INVALID_SPEC = 5;
-  UFS_ERROR_KIND_INVALID_PATH = 6;
-  UFS_ERROR_KIND_UNEXPECTED_EOF = 7;
-  UFS_ERROR_KIND_BACKEND = 8;
-  UFS_ERROR_KIND_OVERLOADED = 9;
-  UFS_ERROR_KIND_TIMEOUT = 10;
 }
 
 enum ProtocolErrorKindProto {
@@ -133,15 +117,6 @@ message ReopenWriteSessionRecoveryProto {
 message RegisterWorkerRecoveryProto {}
 
 message SendFullBlockReportRecoveryProto {}
-
-message ErrorContextProto {
-  repeated ErrorContextFieldProto fields = 1;
-}
-
-message ErrorContextFieldProto {
-  string key = 1;
-  string value = 2;
-}
 
 message RefreshHintProto {
   optional string leader_endpoint = 1;

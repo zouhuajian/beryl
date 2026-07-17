@@ -192,11 +192,7 @@ mod tests {
     fn report_block(block_id: BlockId) -> BlockReportBlock {
         BlockReportBlock {
             block_id,
-            data_handle_id: block_id.data_handle_id.as_raw(),
-            block_index: block_id.index.as_raw(),
             block_stamp: u64::from(block_id.index.as_raw()) + 1,
-            effective_len: 4096,
-            committed_length: 4096,
             block_state: BlockReportBlockState::Ready,
         }
     }

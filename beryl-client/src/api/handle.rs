@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
-use beryl_proto::metadata::WriteSyncModeProto;
 use beryl_types::DataHandleId;
 use bytes::{Bytes, BytesMut};
 use tokio::sync::Mutex;
@@ -248,14 +247,12 @@ impl FileWriter {
 
     /// Publishes the written prefix for visibility while keeping the writer open.
     pub async fn sync_write_visibility(&mut self) -> ClientResult<()> {
-        self.sync_write_barrier(WriteSyncModeProto::WriteSyncModeVisibility)
-            .await
+        self.sync_write_barrier(WorkerCommitLevel::Visible).await
     }
 
     /// Publishes the written prefix for durability while keeping the writer open.
     pub async fn sync_write_durability(&mut self) -> ClientResult<()> {
-        self.sync_write_barrier(WriteSyncModeProto::WriteSyncModeDurability)
-            .await
+        self.sync_write_barrier(WorkerCommitLevel::Durable).await
     }
 
     /// Renews the writer lease while keeping the write session open.
@@ -339,7 +336,7 @@ impl FileWriter {
         match self.runtime.executor.commit_file(plan).await {
             Ok(response) => {
                 validate_commit_file_size(response.committed_size, final_size)?;
-                session.mark_closed(response.content_revision);
+                session.mark_closed();
                 Ok(())
             }
             Err(err) if is_unknown_session_barrier_outcome(&err) => {
@@ -427,7 +424,7 @@ impl FileWriter {
     }
 
     /// Flushes worker data to the requested level and publishes the metadata sync barrier.
-    async fn sync_write_barrier(&mut self, mode: WriteSyncModeProto) -> ClientResult<()> {
+    async fn sync_write_barrier(&mut self, required_level: WorkerCommitLevel) -> ClientResult<()> {
         let deadline = self.runtime.executor.operation_deadline();
         let session_ref = self.handle.write_session();
         let mut session = session_ref.lock().await;
@@ -436,7 +433,6 @@ impl FileWriter {
         let path = session.path().to_string();
         self.flush_pending_bytes(&mut session, deadline.clone()).await?;
         let target_size = session.cursor();
-        let required_level = sync_write_required_commit_level(mode)?;
         let committed_blocks = self
             .runtime
             .commit_pending_blocks_for_barrier(&mut session, required_level, deadline.clone())
@@ -444,7 +440,7 @@ impl FileWriter {
         match self
             .runtime
             .executor
-            .sync_write(&session, committed_blocks, target_size, mode, deadline)
+            .sync_write(&session, committed_blocks, target_size, deadline)
             .await
         {
             Ok(response) => {
@@ -517,17 +513,6 @@ fn buffer_write(session: &mut WriteSession, data: Bytes) -> ClientResult<Vec<Byt
         }
     }
     Ok(blocks)
-}
-
-/// Maps a public sync mode to the worker commit level required before metadata publication.
-fn sync_write_required_commit_level(mode: WriteSyncModeProto) -> ClientResult<WorkerCommitLevel> {
-    match mode {
-        WriteSyncModeProto::WriteSyncModeDurability => Ok(WorkerCommitLevel::Durable),
-        WriteSyncModeProto::WriteSyncModeVisibility => Ok(WorkerCommitLevel::Visible),
-        WriteSyncModeProto::WriteSyncModeUnspecified => Err(ClientError::InvalidArgument(
-            "SyncWrite mode must be visibility or durability".to_string(),
-        )),
-    }
 }
 
 fn validate_commit_file_size(committed_size: u64, final_size: u64) -> ClientResult<()> {

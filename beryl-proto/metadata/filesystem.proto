@@ -33,14 +33,7 @@ import "fs/types.proto";
 
 message WriteHandleProto {
   common.DataHandleIdProto data_handle_id = 1;
-  uint64 lease_epoch = 2;
-  reserved 3, 4, 5;
-}
-
-enum CreateModeProto {
-  CREATE_MODE_UNSPECIFIED = 0;
-  CREATE_NEW = 1;
-  reserved 2;
+  uint64 write_lease_epoch = 2;
 }
 
 message WriteTargetProto {
@@ -71,7 +64,6 @@ message CommittedBlockProto {
   common.BlockIdProto block_id = 1;
   uint64 file_offset = 2;
   uint64 len = 3;
-  optional bytes checksum = 4;
 }
 
 message FileBlockLocationProto {
@@ -199,19 +191,13 @@ message CreateFileRequestProto {
   string path = 2;
   fs.FileAttrsProto attrs = 3;
   common.FileLayoutProto layout = 4;
-  CreateModeProto create_mode = 5;
-  reserved 6;
 }
 
 message CreateFileResponseProto {
-  reserved 2, 4, 5, 6;
-
   common.ResponseHeaderProto header = 1;
-  common.DataHandleIdProto data_handle_id = 3;
+  common.DataHandleIdProto data_handle_id = 2;
   // Metadata-stored FileLayout accepted by the durable namespace mutation.
-  common.FileLayoutProto layout = 7;
-  fs.InodeIdProto inode_id = 8;
-  uint64 file_size = 9;
+  common.FileLayoutProto layout = 3;
 }
 
 enum OpenWriteModeProto {
@@ -228,18 +214,14 @@ message OpenWriteRequestProto {
 }
 
 message OpenWriteResponseProto {
-  reserved 3, 5;
-
   common.ResponseHeaderProto header = 1;
   WriteHandleProto write_handle = 2;
-  uint64 base_size = 4;
-  uint64 expires_at_ms = 6;
+  uint64 base_size = 3;
+  uint64 expires_at_ms = 4;
   // Metadata-stored FileLayout for the existing file.
-  common.FileLayoutProto layout = 7;
+  common.FileLayoutProto layout = 5;
   // Durable content revision used as the publish CAS precondition.
-  uint64 content_revision = 8;
-  // Authoritative mode of this write session.
-  OpenWriteModeProto mode = 9;
+  uint64 content_revision = 6;
 }
 
 message AddBlockRequestProto {
@@ -259,19 +241,16 @@ message AddBlockResponseProto {
 message CommitFileRequestProto {
   common.RequestHeaderProto header = 1;
   WriteHandleProto write_handle = 2;
-  reserved 3;
-  repeated CommittedBlockProto committed_blocks = 4;
-  uint64 final_size = 5;
-  uint64 expected_content_revision = 6;
-  OpenWriteModeProto write_mode = 7;
-  uint64 expected_file_size = 8;
+  repeated CommittedBlockProto committed_blocks = 3;
+  uint64 final_size = 4;
+  uint64 expected_content_revision = 5;
+  OpenWriteModeProto write_mode = 6;
+  uint64 expected_file_size = 7;
 }
 
 message CommitFileResponseProto {
   common.ResponseHeaderProto header = 1;
   uint64 committed_size = 2;
-  // Durable visible file state version published by the successful commit.
-  optional uint64 content_revision = 3;
 }
 
 message AbortFileWriteRequestProto {
@@ -293,27 +272,14 @@ message RenewLeaseResponseProto {
   uint64 expires_at_ms = 2;
 }
 
-// SyncWrite is a write-session barrier that keeps the write handle open.
-enum WriteSyncModeProto {
-  WRITE_SYNC_MODE_UNSPECIFIED = 0;
-  // VISIBILITY publishes committed data up to target_size to new readers.
-  WRITE_SYNC_MODE_VISIBILITY = 1;
-  // DURABILITY means VISIBILITY after the client has requested worker durable
-  // sync for the published prefix.
-  WRITE_SYNC_MODE_DURABILITY = 2;
-}
-
 message SyncWriteRequestProto {
   common.RequestHeaderProto header = 1;
   WriteHandleProto write_handle = 2;
-  reserved 3, 7;
-  reserved "data_handle_id", "flags";
-  repeated CommittedBlockProto committed_blocks = 4;
-  uint64 target_size = 5;
-  WriteSyncModeProto mode = 6;
-  uint64 expected_content_revision = 8;
-  OpenWriteModeProto write_mode = 9;
-  uint64 expected_file_size = 10;
+  repeated CommittedBlockProto committed_blocks = 3;
+  uint64 target_size = 4;
+  uint64 expected_content_revision = 5;
+  OpenWriteModeProto write_mode = 6;
+  uint64 expected_file_size = 7;
 }
 
 message SyncWriteResponseProto {
